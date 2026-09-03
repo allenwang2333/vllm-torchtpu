@@ -1,0 +1,1863 @@
+{
+  "purpose": "bkv_p swept to 9 and past it, at common score-matrix width, plus an f64 numpy top-k oracle over every p timed in the full op.",
+  "methodology": {
+    "trials": 9,
+    "warmup": 3,
+    "target_s": 0.05,
+    "chain_r": [
+      1,
+      2,
+      3
+    ],
+    "quick": false,
+    "r2_reject_below": 0.999,
+    "device_statistic": "chain slope: d t / d R, intercept discarded",
+    "nst_common_section_a": 256,
+    "p_min": 0,
+    "p_max": 1000000,
+    "resolved_arms": {
+      "A_p_sweep": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        16,
+        20,
+        24,
+        32
+      ],
+      "A2_p_beyond": [
+        40,
+        48,
+        64
+      ],
+      "C_full_p_like_for_like": [
+        1,
+        2,
+        3,
+        5,
+        9,
+        10
+      ],
+      "C_full_p_width_confounded": [
+        4,
+        8,
+        16
+      ],
+      "C_ctx": [
+        8192,
+        8704,
+        9216
+      ],
+      "D_exact_ctx": [
+        4096,
+        6144,
+        8192
+      ],
+      "D_exact_p": [
+        2,
+        3,
+        4,
+        6,
+        9
+      ],
+      "E_controls": [
+        [
+          80,
+          [
+            2,
+            3,
+            9
+          ]
+        ],
+        [
+          128,
+          [
+            2,
+            3,
+            9,
+            16
+          ]
+        ]
+      ],
+      "F_p": [
+        6,
+        8,
+        9,
+        10,
+        12,
+        16,
+        24,
+        32,
+        48
+      ],
+      "F_limits_mib": [
+        16,
+        32,
+        64,
+        100,
+        128,
+        256
+      ],
+      "F_timed_p": [
+        9,
+        12,
+        16
+      ],
+      "F_timed_limits_mib": [
+        100,
+        256
+      ]
+    },
+    "note": "wall clock is NOT reported as device time anywhere; the dispatch floor is a clamp, not an addend, and is never subtracted."
+  },
+  "modelled_prediction": {
+    "model": "t_us = 6.24 + 7.41*num_bkv + 6.65*pages_fetched_per_seq",
+    "source": "probes/baseline-device-time.md sec.3, fitted on bkv_p in {2,3,4} x ctx in {8192,8704,9216}, r2 0.9967",
+    "status": "MODELLED, not measured. Every t_us below is a prediction."
+  },
+  "modules": {
+    "streamindex_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py",
+      "md5": "1e221f10cbf3573aa0d2ae78c3463532"
+    },
+    "sparsecore_topk.py": {
+      "path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "md5": "8bc9e25b8701a53a97704564b9fbc658"
+    },
+    "bench_streamidx_topk.py": {
+      "path": "/root/instruments/bench_streamidx_topk.py",
+      "md5": "e8e492d13e59c4a1675cc7a98c5a0813"
+    },
+    "_stage_a.py": {
+      "path": "/root/probes/_stage_a.py",
+      "md5": "eea6a51bb40a2bbf7cf5b39571753b62"
+    }
+  },
+  "jax": "0.10.2",
+  "device_kind": "TPU7x",
+  "num_devices": 8,
+  "geometry_decode": {
+    "pages_per_seq": 9,
+    "num_sublanes_total": 80,
+    "num_positions": 10240,
+    "num_tokens": 64,
+    "score_buffer_bytes": 2621440,
+    "kv_cache_bytes": 150994944,
+    "kv_stream_bytes": 167772160,
+    "kv_stream_useful_bytes": 84541440,
+    "total_pages": 576,
+    "bq_sz": 1,
+    "bkv_sz": 2048,
+    "num_bq": 1,
+    "num_bkv": 5
+  },
+  "shape": "prod_decode_b64_ctx8704",
+  "shape_preflight": {
+    "full_op": "ShapeDtypeStruct(shape=(64, 2048), dtype=int32)",
+    "stage_a_p2_nst80": "ShapeDtypeStruct(shape=(64, 80, 128), dtype=float32)",
+    "stage_a_p9_nst256": "ShapeDtypeStruct(shape=(64, 256, 128), dtype=float32)",
+    "ok": true
+  },
+  "F_vmem_wall": [
+    {
+      "bkv_p": 6,
+      "ctx": 8704,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 12,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 96,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 12.0,
+      "modelled_stage_a_us": 100.86,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 12582912,
+      "bo_scores_double_buf_bytes": 196608,
+      "limits": {
+        "16": {
+          "compiles": true
+        },
+        "32": {
+          "compiles": true
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 16,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 8,
+      "ctx": 8704,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 16,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 128,
+      "full_op_num_sublanes_total": 128,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 16.0,
+      "modelled_stage_a_us": 127.46,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 16777216,
+      "bo_scores_double_buf_bytes": 262144,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_8.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_8/StreamIdxTC-d-bq_1-bkvp_8/pallas_call\" stack_frame_id=6}. Scoped allocation with size 16.29M and limit 16.00M exceeded scoped  ...[truncated]"
+        },
+        "32": {
+          "compiles": true
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 32,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 9,
+      "exact_cover": true,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 18874368,
+      "bo_scores_double_buf_bytes": 294912,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_9.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_9/StreamIdxTC-d-bq_1-bkvp_9/pallas_call\" stack_frame_id=6}. Scoped allocation with size 18.32M and limit 16.00M exceeded scoped  ...[truncated]"
+        },
+        "32": {
+          "compiles": true
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 32,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 10,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 10,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 80,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 20.0,
+      "modelled_stage_a_us": 80.15,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 20971520,
+      "bo_scores_double_buf_bytes": 327680,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_10.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_10/StreamIdxTC-d-bq_1-bkvp_10/pallas_call\" stack_frame_id=6}. Scoped allocation with size 20.35M and limit 16.00M exceeded scop ...[truncated]"
+        },
+        "32": {
+          "compiles": true
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 32,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 12,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 12,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 96,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 24.0,
+      "modelled_stage_a_us": 93.45,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 25165824,
+      "bo_scores_double_buf_bytes": 393216,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_12.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_12/StreamIdxTC-d-bq_1-bkvp_12/pallas_call\" stack_frame_id=6}. Scoped allocation with size 24.41M and limit 16.00M exceeded scop ...[truncated]"
+        },
+        "32": {
+          "compiles": true
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 32,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 16,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 16,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 128,
+      "full_op_num_sublanes_total": 128,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 32.0,
+      "modelled_stage_a_us": 120.05,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 33554432,
+      "bo_scores_double_buf_bytes": 524288,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_16.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_16/StreamIdxTC-d-bq_1-bkvp_16/pallas_call\" stack_frame_id=6}. Scoped allocation with size 32.54M and limit 16.00M exceeded scop ...[truncated]"
+        },
+        "32": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_16.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_16/StreamIdxTC-d-bq_1-bkvp_16/pallas_call\" stack_frame_id=6}. Scoped allocation with size 32.54M and limit 32.00M exceeded scop ...[truncated]"
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 64,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 24,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 24,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 192,
+      "full_op_num_sublanes_total": 192,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 48.0,
+      "modelled_stage_a_us": 173.25,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 50331648,
+      "bo_scores_double_buf_bytes": 786432,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_24.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_24/StreamIdxTC-d-bq_1-bkvp_24/pallas_call\" stack_frame_id=6}. Scoped allocation with size 48.79M and limit 16.00M exceeded scop ...[truncated]"
+        },
+        "32": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:\\nRan out of memory in memory space vmem while allocating on stack for %StreamIdxTC-d-bq_1-bkvp_24.1 = f32[64,256,128]{2,1,0:T(8,128)} custom-call(%constant.26, %copy-done.2, %copy-done.1, %copy-done.3, %iota_multiply_fusion, /*index=5*/%broadcast.3, %broadcast.2, %copy-done, %copy.1, %ckv.1, /*index=10*/%broadcast_in_dim.1), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, frontend_attributes={kernel_metadata={}}, metadata={op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_24/StreamIdxTC-d-bq_1-bkvp_24/pallas_call\" stack_frame_id=6}. Scoped allocation with size 48.79M and limit 32.00M exceeded scop ...[truncated]"
+        },
+        "64": {
+          "compiles": true
+        },
+        "100": {
+          "compiles": true
+        },
+        "128": {
+          "compiles": true
+        },
+        "256": {
+          "compiles": true
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": 64,
+      "compiles_at_production_default_100MiB": true
+    },
+    {
+      "bkv_p": 32,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 32,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 256,
+      "full_op_num_sublanes_total": 256,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 64.0,
+      "modelled_stage_a_us": 226.45,
+      "num_sublanes_total": 256,
+      "bkv_double_buf_bytes": 67108864,
+      "bo_scores_double_buf_bytes": 1048576,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 85.00M of 63.94M vmem. Exceeded vmem capacity by 21.06M.\\n\\nProgram vmem requirement 85.00M:\\n    scoped           85.00M\\n\\n  Largest program allocations in vmem:\\n\\n  1. Size: 64.00M\\n     Operator: op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_32/StreamIdxTC-d-bq_1-bkvp_32/pallas_call\"\\n     Shape: s8[2,4,8192,4,256]{4,3,2,1,0:T(4,128)(4,1)}\\n     Unpadded size: 64.00M\\n     Tag: scratch operand\\n     XLA label: StreamIdxTC-d-bq_1-bkvp_32.1 = custom-call(constant.26, copy-done.2, copy-done.1, copy-done.3, ...(+7)), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing ...[truncated]"
+        },
+        "32": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 85.00M of 63.94M vmem. Exceeded vmem capacity by 21.06M.\\n\\nProgram vmem requirement 85.00M:\\n    scoped           85.00M\\n\\n  Largest program allocations in vmem:\\n\\n  1. Size: 64.00M\\n     Operator: op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_32/StreamIdxTC-d-bq_1-bkvp_32/pallas_call\"\\n     Shape: s8[2,4,8192,4,256]{4,3,2,1,0:T(4,128)(4,1)}\\n     Unpadded size: 64.00M\\n     Tag: scratch operand\\n     XLA label: StreamIdxTC-d-bq_1-bkvp_32.1 = custom-call(constant.26, copy-done.2, copy-done.1, copy-done.3, ...(+7)), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing ...[truncated]"
+        },
+        "64": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 85.00M of 63.94M vmem. Exceeded vmem capacity by 21.06M.\\n\\nProgram vmem requirement 85.00M:\\n    scoped           85.00M\\n\\n  Largest program allocations in vmem:\\n\\n  1. Size: 64.00M\\n     Operator: op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_32/StreamIdxTC-d-bq_1-bkvp_32/pallas_call\"\\n     Shape: s8[2,4,8192,4,256]{4,3,2,1,0:T(4,128)(4,1)}\\n     Unpadded size: 64.00M\\n     Tag: scratch operand\\n     XLA label: StreamIdxTC-d-bq_1-bkvp_32.1 = custom-call(constant.26, sl.1, pi.1, cql.1, ...(+7)), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, fro ...[truncated]"
+        },
+        "100": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 85.00M of 63.94M vmem. Exceeded vmem capacity by 21.06M.\\n\\nProgram vmem requirement 85.00M:\\n    scoped           85.00M\\n\\n  Largest program allocations in vmem:\\n\\n  1. Size: 64.00M\\n     Operator: op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_32/StreamIdxTC-d-bq_1-bkvp_32/pallas_call\"\\n     Shape: s8[2,4,8192,4,256]{4,3,2,1,0:T(4,128)(4,1)}\\n     Unpadded size: 64.00M\\n     Tag: scratch operand\\n     XLA label: StreamIdxTC-d-bq_1-bkvp_32.1 = custom-call(constant.26, sl.1, pi.1, cql.1, ...(+7)), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, fro ...[truncated]"
+        },
+        "128": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 85.00M of 63.94M vmem. Exceeded vmem capacity by 21.06M.\\n\\nProgram vmem requirement 85.00M:\\n    scoped           85.00M\\n\\n  Largest program allocations in vmem:\\n\\n  1. Size: 64.00M\\n     Operator: op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_32/StreamIdxTC-d-bq_1-bkvp_32/pallas_call\"\\n     Shape: s8[2,4,8192,4,256]{4,3,2,1,0:T(4,128)(4,1)}\\n     Unpadded size: 64.00M\\n     Tag: scratch operand\\n     XLA label: StreamIdxTC-d-bq_1-bkvp_32.1 = custom-call(constant.26, sl.1, pi.1, cql.1, ...(+7)), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, fro ...[truncated]"
+        },
+        "256": {
+          "compiles": false,
+          "error": "JaxRuntimeError('RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 85.00M of 63.94M vmem. Exceeded vmem capacity by 21.06M.\\n\\nProgram vmem requirement 85.00M:\\n    scoped           85.00M\\n\\n  Largest program allocations in vmem:\\n\\n  1. Size: 64.00M\\n     Operator: op_name=\"jit(f)/StreamIdxTC-d-bq_1-bkvp_32/StreamIdxTC-d-bq_1-bkvp_32/pallas_call\"\\n     Shape: s8[2,4,8192,4,256]{4,3,2,1,0:T(4,128)(4,1)}\\n     Unpadded size: 64.00M\\n     Tag: scratch operand\\n     XLA label: StreamIdxTC-d-bq_1-bkvp_32.1 = custom-call(constant.26, sl.1, pi.1, cql.1, ...(+7)), custom_call_target=\"tpu_custom_call\", operand_layout_constraints={s32[], s32[64]{0}, s32[576]{0}, s32[65]{0}, s32[2]{0}, s32[3]{0}, s32[2]{0}, f8e4m3fn[64,32,128]{2,1,0}, f32[64,32]{1,0}, u8[576,256,4,256]{3,2,1,0}, f32[64,256,128]{2,1,0}}, output_to_operand_aliasing={{}: (10, {})}, fro ...[truncated]"
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": null,
+      "compiles_at_production_default_100MiB": false
+    },
+    {
+      "bkv_p": 48,
+      "ctx": 8704,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 48,
+      "pages_needed": 9,
+      "exact_cover": false,
+      "sublanes_written": 384,
+      "full_op_num_sublanes_total": 384,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 96.0,
+      "modelled_stage_a_us": 332.85,
+      "num_sublanes_total": 384,
+      "bkv_double_buf_bytes": 100663296,
+      "bo_scores_double_buf_bytes": 1572864,
+      "limits": {
+        "16": {
+          "compiles": false,
+          "error": "JaxRuntimeError(\"RESOURCE_EXHAUSTED: Allocation (size=100663296) would exceed memory (size=67108864) :: #allocation2 [shape = 's8[2,4,12288,4,256]{4,3,2,1,0:T(4,128)(4,1)}', space=vmem, size = 0x6000000, scoped, tag = 'scratch operand'] :: StreamIdxTC-d-bq_1-bkvp_48.1\")"
+        },
+        "32": {
+          "compiles": false,
+          "error": "JaxRuntimeError(\"RESOURCE_EXHAUSTED: Allocation (size=100663296) would exceed memory (size=67108864) :: #allocation2 [shape = 's8[2,4,12288,4,256]{4,3,2,1,0:T(4,128)(4,1)}', space=vmem, size = 0x6000000, scoped, tag = 'scratch operand'] :: StreamIdxTC-d-bq_1-bkvp_48.1\")"
+        },
+        "64": {
+          "compiles": false,
+          "error": "JaxRuntimeError(\"RESOURCE_EXHAUSTED: Allocation (size=100663296) would exceed memory (size=67108864) :: #allocation2 [shape = 's8[2,4,12288,4,256]{4,3,2,1,0:T(4,128)(4,1)}', space=vmem, size = 0x6000000, scoped, tag = 'scratch operand'] :: StreamIdxTC-d-bq_1-bkvp_48.1\")"
+        },
+        "100": {
+          "compiles": false,
+          "error": "JaxRuntimeError(\"RESOURCE_EXHAUSTED: Allocation (size=100663296) would exceed memory (size=67108864) :: #allocation2 [shape = 's8[2,4,12288,4,256]{4,3,2,1,0:T(4,128)(4,1)}', space=vmem, size = 0x6000000, scoped, tag = 'scratch operand'] :: StreamIdxTC-d-bq_1-bkvp_48.1\")"
+        },
+        "128": {
+          "compiles": false,
+          "error": "JaxRuntimeError(\"RESOURCE_EXHAUSTED: Allocation (size=100663296) would exceed memory (size=67108864) :: #allocation2 [shape = 's8[2,4,12288,4,256]{4,3,2,1,0:T(4,128)(4,1)}', space=vmem, size = 0x6000000, scoped, tag = 'scratch operand'] :: StreamIdxTC-d-bq_1-bkvp_48.1\")"
+        },
+        "256": {
+          "compiles": false,
+          "error": "JaxRuntimeError(\"RESOURCE_EXHAUSTED: Allocation (size=100663296) would exceed memory (size=67108864) :: #allocation2 [shape = 's8[2,4,12288,4,256]{4,3,2,1,0:T(4,128)(4,1)}', space=vmem, size = 0x6000000, scoped, tag = 'scratch operand'] :: StreamIdxTC-d-bq_1-bkvp_48.1\")"
+        }
+      },
+      "min_vmem_limit_mib_that_compiles": null,
+      "compiles_at_production_default_100MiB": false
+    }
+  ],
+  "F_vmem_limit_timed": [
+    {
+      "bkv_p": 9,
+      "vmem_limit_mib": 100,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.739982423052584,
+        "slope_us_per_call": 82.2948928627697,
+        "r2": 0.9999979851545917,
+        "points_us": {
+          "1": 92.10231777008933,
+          "2": 174.19488318005784,
+          "3": 256.69210349562866
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "vmem_limit_mib": 256,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.56246610941353,
+        "slope_us_per_call": 82.34809806878225,
+        "r2": 0.9999988273182527,
+        "points_us": {
+          "1": 91.96204948239028,
+          "2": 174.1556916385889,
+          "3": 256.6582456199547
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 12,
+      "vmem_limit_mib": 100,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.603309867851799,
+        "slope_us_per_call": 108.68526330856493,
+        "r2": 0.9999999390236815,
+        "points_us": {
+          "1": 118.30406814313879,
+          "2": 226.9428465515375,
+          "3": 335.6745947602686
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 12,
+      "vmem_limit_mib": 256,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 11.045412510973794,
+        "slope_us_per_call": 108.09334744040787,
+        "r2": 0.9999948844880207,
+        "points_us": {
+          "1": 119.27991096551219,
+          "2": 226.94980536352813,
+          "3": 335.4666058463279
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 16,
+      "vmem_limit_mib": 100,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.394162208614665,
+        "slope_us_per_call": 143.3411024806107,
+        "r2": 0.9999999939331128,
+        "points_us": {
+          "1": 152.72881864802912,
+          "2": 296.0892592522281,
+          "3": 439.41102360925044
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 16,
+      "vmem_limit_mib": 256,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.590322146834682,
+        "slope_us_per_call": 143.29922270721144,
+        "r2": 0.9999997385239874,
+        "points_us": {
+          "1": 152.93185058380325,
+          "2": 296.1041561017434,
+          "3": 439.530295998226
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    }
+  ],
+  "G1_argmin_vs_P": [
+    {
+      "bkv_p": 1,
+      "ctx": 2048,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 2,
+      "pages_needed": 2,
+      "exact_cover": true,
+      "sublanes_written": 16,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 2.0,
+      "modelled_stage_a_us": 34.36,
+      "P_opt_cdiv_ctx_pagesize": 2,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.846167066331512,
+        "slope_us_per_call": 35.46414507139034,
+        "r2": 0.9999996032006205,
+        "points_us": {
+          "1": 45.323209902307866,
+          "2": 80.7486616799401,
+          "3": 116.25150004508852
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 2048,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 2,
+      "pages_needed": 2,
+      "exact_cover": true,
+      "sublanes_written": 16,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 26.95,
+      "P_opt_cdiv_ctx_pagesize": 2,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.743450985190023,
+        "slope_us_per_call": 25.92828283264106,
+        "r2": 0.9999837460916537,
+        "points_us": {
+          "1": 35.61138127667781,
+          "2": 61.72072173277867,
+          "3": 87.46794694195991
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 3,
+      "ctx": 2048,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 3,
+      "pages_needed": 2,
+      "exact_cover": false,
+      "sublanes_written": 24,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 6.0,
+      "modelled_stage_a_us": 33.6,
+      "P_opt_cdiv_ctx_pagesize": 2,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.236423994103642,
+        "slope_us_per_call": 33.257730884350664,
+        "r2": 0.9999892199667436,
+        "points_us": {
+          "1": 42.55719896819856,
+          "2": 75.62579758331647,
+          "3": 109.07266073689986
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 2048,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 2,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 2,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.339756195816138,
+        "slope_us_per_call": 82.08389705152562,
+        "r2": 0.9999970515418851,
+        "points_us": {
+          "1": 92.50502908296549,
+          "2": 174.34479862761995,
+          "3": 256.67282318601667
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 3072,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 4,
+      "pages_needed": 3,
+      "exact_cover": false,
+      "sublanes_written": 32,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 47.66,
+      "P_opt_cdiv_ctx_pagesize": 3,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.701291600731793,
+        "slope_us_per_call": 48.59210804646761,
+        "r2": 0.9999998979598304,
+        "points_us": {
+          "1": 58.302361353793565,
+          "2": 106.86758428047865,
+          "3": 155.48657744672875
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 3,
+      "ctx": 3072,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 3,
+      "pages_needed": 3,
+      "exact_cover": true,
+      "sublanes_written": 24,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 6.0,
+      "modelled_stage_a_us": 33.6,
+      "P_opt_cdiv_ctx_pagesize": 3,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.275065941921566,
+        "slope_us_per_call": 33.30705490259876,
+        "r2": 0.9999215323356967,
+        "points_us": {
+          "1": 42.75246922458921,
+          "2": 75.54847898698131,
+          "3": 109.3665790297867
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 4,
+      "ctx": 3072,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 4,
+      "pages_needed": 3,
+      "exact_cover": false,
+      "sublanes_written": 32,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 8.0,
+      "modelled_stage_a_us": 40.25,
+      "P_opt_cdiv_ctx_pagesize": 3,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.383043716426444,
+        "slope_us_per_call": 40.75295178012716,
+        "r2": 0.999991241531677,
+        "points_us": {
+          "1": 50.205628387629986,
+          "2": 90.749681494528,
+          "3": 131.7115319478843
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 3072,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 3,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 3,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.675124569102787,
+        "slope_us_per_call": 82.351236133241,
+        "r2": 0.9999998019400067,
+        "points_us": {
+          "1": 92.04752032497996,
+          "2": 174.33527759031247,
+          "3": 256.74999259146193
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 4096,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 4,
+      "pages_needed": 4,
+      "exact_cover": true,
+      "sublanes_written": 32,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 47.66,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.8035489675614,
+        "slope_us_per_call": 48.67967026591113,
+        "r2": 0.999975949797135,
+        "points_us": {
+          "1": 58.62105172127485,
+          "2": 106.8872245237789,
+          "3": 155.98039225309708
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 3,
+      "ctx": 4096,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 6,
+      "pages_needed": 4,
+      "exact_cover": false,
+      "sublanes_written": 48,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 6.0,
+      "modelled_stage_a_us": 60.96,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.5659048450422,
+        "slope_us_per_call": 61.919352511126476,
+        "r2": 0.9999997674822587,
+        "points_us": {
+          "1": 71.46801907829074,
+          "2": 133.43908642305107,
+          "3": 195.30672410054365
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 4,
+      "ctx": 4096,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 4,
+      "pages_needed": 4,
+      "exact_cover": true,
+      "sublanes_written": 32,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 8.0,
+      "modelled_stage_a_us": 40.25,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.127903670355648,
+        "slope_us_per_call": 40.89762648226067,
+        "r2": 0.9999768393266003,
+        "points_us": {
+          "1": 50.139166717606834,
+          "2": 90.69588350489586,
+          "3": 131.93441968212818
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 5,
+      "ctx": 4096,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 5,
+      "pages_needed": 4,
+      "exact_cover": false,
+      "sublanes_written": 40,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 10.0,
+      "modelled_stage_a_us": 46.9,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.351343218418396,
+        "slope_us_per_call": 48.887284613773936,
+        "r2": 0.9999873870960994,
+        "points_us": {
+          "1": 58.338868873730554,
+          "2": 106.92543036288978,
+          "3": 156.1134381012784
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 4096,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 4,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.507579776138593,
+        "slope_us_per_call": 82.11358624203399,
+        "r2": 0.9999873423299872,
+        "points_us": {
+          "1": 92.45249750138504,
+          "2": 175.0720892937816,
+          "3": 256.67966998545296
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 5120,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 6,
+      "pages_needed": 5,
+      "exact_cover": false,
+      "sublanes_written": 48,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 68.37,
+      "P_opt_cdiv_ctx_pagesize": 5,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.659821191330133,
+        "slope_us_per_call": 68.11701038042148,
+        "r2": 0.9999993495856181,
+        "points_us": {
+          "1": 77.74511471355413,
+          "2": 145.957275668568,
+          "3": 213.97913547439708
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 4,
+      "ctx": 5120,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 8,
+      "pages_needed": 5,
+      "exact_cover": false,
+      "sublanes_written": 64,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 8.0,
+      "modelled_stage_a_us": 74.26,
+      "P_opt_cdiv_ctx_pagesize": 5,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.538476457000021,
+        "slope_us_per_call": 74.9677205117485,
+        "r2": 0.9999862682858053,
+        "points_us": {
+          "1": 85.34580632220215,
+          "2": 160.79469877358986,
+          "3": 235.2812473456991
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 5,
+      "ctx": 5120,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 5,
+      "pages_needed": 5,
+      "exact_cover": true,
+      "sublanes_written": 40,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 10.0,
+      "modelled_stage_a_us": 46.9,
+      "P_opt_cdiv_ctx_pagesize": 5,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.421456383251192,
+        "slope_us_per_call": 48.99313888619876,
+        "r2": 0.9999773443796408,
+        "points_us": {
+          "1": 58.27995730524368,
+          "2": 107.67701008406125,
+          "3": 156.26623507764114
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 6,
+      "ctx": 5120,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 6,
+      "pages_needed": 5,
+      "exact_cover": false,
+      "sublanes_written": 48,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 12.0,
+      "modelled_stage_a_us": 53.55,
+      "P_opt_cdiv_ctx_pagesize": 5,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 8.886752397383656,
+        "slope_us_per_call": 57.69766413107178,
+        "r2": 0.9999797131151424,
+        "points_us": {
+          "1": 66.7344574390898,
+          "2": 123.9819988382585,
+          "3": 182.12978570123335
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 5120,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 5,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 5,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.984174362028627,
+        "slope_us_per_call": 82.30260909606548,
+        "r2": 0.999968152148989,
+        "points_us": {
+          "1": 92.01861977736581,
+          "2": 175.12571991561617,
+          "3": 256.6238379694967
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 6144,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 6,
+      "pages_needed": 6,
+      "exact_cover": true,
+      "sublanes_written": 48,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 68.37,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.228591208458612,
+        "slope_us_per_call": 67.90344666052734,
+        "r2": 0.9999964639790861,
+        "points_us": {
+          "1": 78.20575855566427,
+          "2": 145.88804315615653,
+          "3": 214.0126518767189
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 5,
+      "ctx": 6144,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 10,
+      "pages_needed": 6,
+      "exact_cover": false,
+      "sublanes_written": 80,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 10.0,
+      "modelled_stage_a_us": 87.56,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.940982703813681,
+        "slope_us_per_call": 88.94291777110581,
+        "r2": 0.9999978373751753,
+        "points_us": {
+          "1": 98.8083839830425,
+          "2": 187.97785122977928,
+          "3": 276.6942195252541
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 6,
+      "ctx": 6144,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 6,
+      "pages_needed": 6,
+      "exact_cover": true,
+      "sublanes_written": 48,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 12.0,
+      "modelled_stage_a_us": 53.55,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.243892504150802,
+        "slope_us_per_call": 57.43062575448509,
+        "r2": 0.9999961246438707,
+        "points_us": {
+          "1": 66.73979216013186,
+          "2": 123.97459621012906,
+          "3": 181.60104366910198
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 7,
+      "ctx": 6144,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 7,
+      "pages_needed": 6,
+      "exact_cover": false,
+      "sublanes_written": 56,
+      "full_op_num_sublanes_total": 112,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 14.0,
+      "modelled_stage_a_us": 60.2,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.473700935580451,
+        "slope_us_per_call": 65.64842443324218,
+        "r2": 0.9999731598970909,
+        "points_us": {
+          "1": 74.92576149247941,
+          "2": 141.16327755475118,
+          "3": 206.22261035896372
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 6144,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 6,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.086091584360407,
+        "slope_us_per_call": 82.25450169687211,
+        "r2": 0.9999902090959635,
+        "points_us": {
+          "1": 92.1919954156405,
+          "2": 174.89229070928855,
+          "3": 256.70099880938466
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 7168,
+      "num_bkv": 4,
+      "pages_fetched_per_seq": 8,
+      "pages_needed": 7,
+      "exact_cover": false,
+      "sublanes_written": 64,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 89.08,
+      "P_opt_cdiv_ctx_pagesize": 7,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.919237808298018,
+        "slope_us_per_call": 90.33469262810304,
+        "r2": 0.999999911990579,
+        "points_us": {
+          "1": 100.23845800575107,
+          "2": 190.61956792580386,
+          "3": 280.90784326195717
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 6,
+      "ctx": 7168,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 12,
+      "pages_needed": 7,
+      "exact_cover": false,
+      "sublanes_written": 96,
+      "full_op_num_sublanes_total": 96,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 12.0,
+      "modelled_stage_a_us": 100.86,
+      "P_opt_cdiv_ctx_pagesize": 7,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.062373509188255,
+        "slope_us_per_call": 105.08627487556468,
+        "r2": 0.999995042677871,
+        "points_us": {
+          "1": 115.01356248596781,
+          "2": 220.50509505788796,
+          "3": 325.18611223709706
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 7,
+      "ctx": 7168,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 7,
+      "pages_needed": 7,
+      "exact_cover": true,
+      "sublanes_written": 56,
+      "full_op_num_sublanes_total": 112,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 14.0,
+      "modelled_stage_a_us": 60.2,
+      "P_opt_cdiv_ctx_pagesize": 7,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.496828232612467,
+        "slope_us_per_call": 65.40564828622392,
+        "r2": 0.9999999186333719,
+        "points_us": {
+          "1": 74.91324805897905,
+          "2": 140.28658172477492,
+          "3": 205.72454463142682
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 8,
+      "ctx": 7168,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 8,
+      "pages_needed": 7,
+      "exact_cover": false,
+      "sublanes_written": 64,
+      "full_op_num_sublanes_total": 128,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 16.0,
+      "modelled_stage_a_us": 66.85,
+      "P_opt_cdiv_ctx_pagesize": 7,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.72377307624263,
+        "slope_us_per_call": 73.9512841228388,
+        "r2": 0.9999826878287972,
+        "points_us": {
+          "1": 83.497407440855,
+          "2": 157.98164083837315,
+          "3": 231.39997568653254
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 7168,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 7,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 7,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.623702995931176,
+        "slope_us_per_call": 82.00071072628224,
+        "r2": 0.9999945730673908,
+        "points_us": {
+          "1": 92.73470353053987,
+          "2": 174.4045448318428,
+          "3": 256.73612498310433
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 8192,
+      "num_bkv": 4,
+      "pages_fetched_per_seq": 8,
+      "pages_needed": 8,
+      "exact_cover": true,
+      "sublanes_written": 64,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 89.08,
+      "P_opt_cdiv_ctx_pagesize": 8,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.430773934240378,
+        "slope_us_per_call": 90.05206402608552,
+        "r2": 0.9999998120136211,
+        "points_us": {
+          "1": 100.5053801591543,
+          "2": 190.48981758875445,
+          "3": 280.6095082113253
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 7,
+      "ctx": 8192,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 14,
+      "pages_needed": 8,
+      "exact_cover": false,
+      "sublanes_written": 112,
+      "full_op_num_sublanes_total": 112,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 14.0,
+      "modelled_stage_a_us": 114.16,
+      "P_opt_cdiv_ctx_pagesize": 8,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.859934506337195,
+        "slope_us_per_call": 121.23369922667015,
+        "r2": 0.9999962351255379,
+        "points_us": {
+          "1": 131.22944593695655,
+          "2": 252.05570855177936,
+          "3": 373.6968443902967
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 8,
+      "ctx": 8192,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 8,
+      "pages_needed": 8,
+      "exact_cover": true,
+      "sublanes_written": 64,
+      "full_op_num_sublanes_total": 128,
+      "full_op_like_for_like_with_bkvp2": false,
+      "bkv_double_buffer_MiB": 16.0,
+      "modelled_stage_a_us": 66.85,
+      "P_opt_cdiv_ctx_pagesize": 8,
+      "is_p_equals_P": true,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 9.552059635504845,
+        "slope_us_per_call": 73.98371072729464,
+        "r2": 0.9999983160164413,
+        "points_us": {
+          "1": 83.48034037642668,
+          "2": 157.63034106283968,
+          "3": 231.44776183101587
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 8192,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 8,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 8,
+      "is_p_equals_P": false,
+      "num_sublanes_total": 256,
+      "chain": {
+        "intercept_us": 10.514104651325356,
+        "slope_us_per_call": 82.11432827702232,
+        "r2": 0.9999949955726167,
+        "points_us": {
+          "1": 92.5223765970797,
+          "2": 174.95487386790606,
+          "3": 256.75103315112426
+        },
+        "marker": null,
+        "marker_counts": {},
+        "chain_intact": null,
+        "r2_ok": true
+      }
+    }
+  ],
+  "G2_full_op_short_ctx": [
+    {
+      "bkv_p": 2,
+      "ctx": 2048,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 2,
+      "pages_needed": 2,
+      "exact_cover": true,
+      "sublanes_written": 16,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 26.95,
+      "P_opt_cdiv_ctx_pagesize": 2,
+      "chain": {
+        "intercept_us": 17.70332656838424,
+        "slope_us_per_call": 10.92434080888518,
+        "r2": 0.999956569673007,
+        "points_us": {
+          "1": 28.586101151354935,
+          "2": 39.63514063798357,
+          "3": 50.434782769125285
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 2048,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 2,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 2,
+      "chain": {
+        "intercept_us": 4.4651115195812245,
+        "slope_us_per_call": 21.28354309007291,
+        "r2": 0.9244828278928581,
+        "points_us": {
+          "1": 29.260672621955216,
+          "2": 40.00816167512488,
+          "3": 71.82775880210102
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": false
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 4096,
+      "num_bkv": 2,
+      "pages_fetched_per_seq": 4,
+      "pages_needed": 4,
+      "exact_cover": true,
+      "sublanes_written": 32,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 47.66,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "chain": {
+        "intercept_us": 19.707160258133758,
+        "slope_us_per_call": 98.95796390959032,
+        "r2": 0.9999989844675674,
+        "points_us": {
+          "1": 118.60754873071399,
+          "2": 217.73823895133458,
+          "3": 316.5234765498945
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 4096,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 4,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 4,
+      "chain": {
+        "intercept_us": 14.760736107906215,
+        "slope_us_per_call": 136.53947244598086,
+        "r2": 0.9998588255255367,
+        "points_us": {
+          "1": 152.23692110800124,
+          "2": 285.96625589163955,
+          "3": 425.3158659999629
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 6144,
+      "num_bkv": 3,
+      "pages_fetched_per_seq": 6,
+      "pages_needed": 6,
+      "exact_cover": true,
+      "sublanes_written": 48,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 68.37,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "chain": {
+        "intercept_us": 18.66653528946925,
+        "slope_us_per_call": 122.65583924448006,
+        "r2": 0.9999979992336907,
+        "points_us": {
+          "1": 141.2222071761085,
+          "2": 264.17854849411094,
+          "3": 386.53388566506857
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 6144,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 6,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 6,
+      "chain": {
+        "intercept_us": 15.369390779075987,
+        "slope_us_per_call": 140.07483207781794,
+        "r2": 0.9998616739151595,
+        "points_us": {
+          "1": 156.3954441530618,
+          "2": 293.61661234237613,
+          "3": 436.5451083086976
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 2,
+      "ctx": 8192,
+      "num_bkv": 4,
+      "pages_fetched_per_seq": 8,
+      "pages_needed": 8,
+      "exact_cover": true,
+      "sublanes_written": 64,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 4.0,
+      "modelled_stage_a_us": 89.08,
+      "P_opt_cdiv_ctx_pagesize": 8,
+      "chain": {
+        "intercept_us": 19.79828405604613,
+        "slope_us_per_call": 149.2921754146681,
+        "r2": 0.9999971377301337,
+        "points_us": {
+          "1": 168.94463435497903,
+          "2": 318.67428511685256,
+          "3": 467.528985184315
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    },
+    {
+      "bkv_p": 9,
+      "ctx": 8192,
+      "num_bkv": 1,
+      "pages_fetched_per_seq": 9,
+      "pages_needed": 8,
+      "exact_cover": false,
+      "sublanes_written": 72,
+      "full_op_num_sublanes_total": 80,
+      "full_op_like_for_like_with_bkvp2": true,
+      "bkv_double_buffer_MiB": 18.0,
+      "modelled_stage_a_us": 73.5,
+      "P_opt_cdiv_ctx_pagesize": 8,
+      "chain": {
+        "intercept_us": 15.227887404215862,
+        "slope_us_per_call": 144.99713062912565,
+        "r2": 0.9998713295380366,
+        "points_us": {
+          "1": 161.1746736757812,
+          "2": 303.322837377588,
+          "3": 451.1689349340323
+        },
+        "marker": "StreamIdxTC",
+        "marker_counts": {
+          "1": 12,
+          "3": 36
+        },
+        "chain_intact": true,
+        "r2_ok": true
+      }
+    }
+  ]
+}

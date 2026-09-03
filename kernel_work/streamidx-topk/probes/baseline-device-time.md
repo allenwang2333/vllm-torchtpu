@@ -407,10 +407,14 @@ optimistic, which is what a contended measurement of a ratio would be expected t
   at 8704/9216 on stage A while *losing* 3.5 % on the full op to the wider score matrix. It is a
   real candidate at short contexts and is disqualified at long ones by `num_sublanes_total`.
 * **The model extrapolates to something better than anything swept, and it was not measured.**
-  `6.24 + 7.41·blk + 6.65·pg` at P=9 favours `p=9` → 1 block, 9 pages → **~67 µs modelled**, −39 %
-  against `p=2`. `p ∈ {1,3,9}` are the exact divisors of 9. This is `modelled` extrapolation
-  outside the swept range, VMEM may forbid it, and it is named here as the single cheapest
-  follow-up rather than as a result.
+  `6.24 + 7.41·blk + 6.65·pg` at P=9 favours `p=9` → 1 block, 9 pages → **73.5 µs modelled**,
+  **−32.9 %** against `p=2`'s measured 109.60 µs at `nst 80`. `p ∈ {1,3,9}` are the exact divisors
+  of 9. This is `modelled` extrapolation outside the swept range, VMEM may forbid it, and it is
+  named here as the single cheapest follow-up rather than as a result.
+
+  > **Corrected 2026-09-03.** This bullet first read "~67 µs modelled, −39 %", which dropped the
+  > model's 6.24 µs intercept: `6.24 + 7.41·1 + 6.65·9 = 73.5`, not 66.9. The corrected figure is
+  > still `modelled`, and the sweep that measures it is `probes/bkvp-extended.md`.
 
 ---
 
