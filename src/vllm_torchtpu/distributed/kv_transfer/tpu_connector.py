@@ -18,7 +18,6 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 """
 
 import json
-import os
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
@@ -1402,13 +1401,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                         pcp_size=pcp_size)) for group, ids in zip(
                             self._stage3_transfer_groups, group_block_ids)
             ]
-
-        if os.environ.get("TPU_RAIDEN_DEBUG_BLOCK_TABLES") == "1":
-            logger.info(
-                "STAGE3_DBG req=%s computed=%d prompt=%d num_tokens=%d "
-                "groups=%s", request.request_id, computed_tokens,
-                prompt_tokens, num_tokens,
-                [list(ids) for ids in (group_block_ids or [])])
 
         # Count the pages this send would carry that the allocator has already
         # taken back. The connector skips against `num_tokens`, the transfer
