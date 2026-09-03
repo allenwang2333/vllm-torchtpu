@@ -1,0 +1,410 @@
+# R1c — where the 973.9 ns lives, and what the dump cannot tell us
+
+**Reads after `R1.md` and `R1b.md`.**
+
+R1b **measured** Option A's DMA-free `compute` arm at `bkv_p = 9` to be **973.9 ns/block** cheaper
+than the incumbent's, and showed the halved payload contributes ≈ nothing to the *fetch* because
+94.3 % of the incumbent's DMA is already hidden. R1b left open *why the compute arm is cheaper*,
+with two candidates:
+
+- **(T) the eliminated lane transpose.** The incumbent extracts its e8m0 scales as
+  `flat_bkv[:, 128:129].T` (`streamindex_topk.py:267-268`) — a `(bkv_sz,1) -> (1,bkv_sz)` shuffle of
+  a byte column sitting at **lane offset 128** inside a 256-lane record. Option A's scale rows are
+  already lane-major, so the same extraction is a reshape.
+- **(W) the halved payload width.** The incumbent's record is 256 lanes and it uses 128.
+
+The stake as posed: under **(T)** a variant might capture the saving *without touching the cache
+format*, which would strictly dominate Option A. Under **(W)** no such variant exists.
+
+> ## Verdict — **narrowed, not settled**
+>
+> **(T) is where the cost is.** Four independent readings agree: XLU bundle occupancy is
+> **46.24 % in the incumbent against 1.05 % in both Option A arms**; the incumbent alone carries
+> 288 `vector<128x128xi8>` tile transposes; the final-LLO delta is **+4,926 ops**, of which
+> `vcombine` + `slane` cross-lane ops account for **5,760**; and the backward slice from
+> `tpu.matmul` is **byte-identical across all three arms**, so the payload-consumption path costs
+> the same everywhere.
+>
+> **(W) is narrowed, NOT refuted.** An earlier draft of this document claimed it was, on the
+> grounds that `tpu.load` counts match (9,296 vs 9,368). **That reasoning was wrong and the
+> artifact contradicts it.** Instruction *count* is not byte count: the incumbent's loads carry
+> `sublanes [true,true,false...]` against Option A's `[true,false,...]`, so the incumbent reads
+> **9,437,184 B per grid block against Option A's 4,755,456 B — a factor of 1.985** — in the same
+> number of instructions. (W) costs **no extra vector instructions**; it costs **2× the VMEM read
+> bytes and 2× the landing buffer**, and this static dump cannot price either.
+>
+> **The three arms cannot separate (T) from (W) at all.** Scale placement and record width are
+> perfectly collinear across them: `inc` = {lane-128 scale, 256-lane record}, both A arms =
+> {lane-major scale rows, 128-lane record}. **There is no arm with a 256-lane record and lane-major
+> scale rows.** That one arm — compile-only, minutes on the existing harness — is the experiment
+> that would settle this, and it has not been run. See §4.1.
+>
+> **`R1b` §3.2's `[rev]` tilt toward payload width is NOT superseded.** On the load-width evidence
+> it was right about the bytes; what it did not have was the XLU and transpose evidence showing the
+> *instruction* cost is all on the scale path.
+
+---
+
+## 0. Provenance, and what class of number everything below is
+
+| | |
+|---|---|
+| Job | **`j-a78a5081-7f73-42ad-b483`**, `JobStatus: Succeeded` |
+| Shape | serial, single shard, **not** fanned out; three arms one after another |
+| Driver | `probes/probe_llo_capture.py` (this branch) |
+| Capture flags | `LIBTPU_INIT_ARGS="--xla_jf_dump_to=<d>/jf --xla_jf_dump_llo_text=true --xla_mosaic_dump_to=<d>/mosaic"`, set **above `import jax`** and above the probe import |
+| Gate | `CAPTURE OK` printed for all three arms (non-empty `jf` and `mosaic`) |
+| Volume | 35,735 files / 3.82 GB, via `cdk job sync-outputs j-a78a5081-7f73-42ad-b483` |
+| jax | **0.10.2** for all three arms — deliberately *not* upgraded; see below |
+| Reader | `xprof-cli` at `.claude/skills/xprof-llo/.venv_cli/bin/xprof-cli`, `--bypass_cache=True` on every comparison |
+| Census | `probes/llo_census.py`, output saved as `probes/R1c_census.txt` |
+
+**Arm identity is weaker than an earlier draft claimed.** `probe_kpack_consumer.source_md5()` hashes
+**`streamindex_topk.py` from the image** (`b0099c0a27ad014fc814a1f543b32313`), not the probe. It
+being equal across arms is guaranteed by construction — same image, same file, same process — and
+is a check that could not have failed. What *does* tie the arms together: all three ran in one job
+from one mapped source tree, and the dump's VMEM scratch shapes match `build_arm` exactly
+(`2×4×2304×4×256` for `inc`, `2×4×2322×4×128` for both A arms).
+
+> ### ⚠️ Everything in this document is **static compile-time analysis**
+>
+> Opcode counts, VLIW bundle counts, allocation sizes and occupancy percentages are read out of the
+> compiler's own dump. **None of it is measured time.** The only measured numbers here are carried
+> in from R1b and are marked. Nothing here goes to `/log-experiment`.
+>
+> **This job's wall-clock (~43 min) is meaningless** and is quoted nowhere as a result: it runs one
+> iteration per arm purely to force compilation with dump flags on.
+
+**On not upgrading jax to 0.11.0.** `/xprof-llo` requires jaxlib 0.11.0 for *trace-side* capture,
+where 0.10.2 against libtpu 0.0.44.1 mismatches `PLUGIN_Profiler_Api`. This is a **dump-side**
+capture: no profiler, only compiler flags writing files. Upgrading would risk changing the very
+lowering being censused, which must match the jax 0.10.2 compilation R1b timed. The capture gate is
+what makes this safe to assert rather than assume; it passed on all three arms.
+
+**Run-order artifact.** `inc` ran first and its `mosaic/` directory holds 26 extra files — earlier
+SparseCore and setup episodes, not kernel episodes. Each arm's kernel episode is 18 files: `inc`
+`1788406475661658498`, `a_reshape` `1788407246630451635`, `a_concat` `1788407983335631851`.
+
+---
+
+## 1. Where the arms differ in the Mosaic IR
+
+### 1.1 The transposes are author-written; the relayout in front of them is not
+
+The **original** module (pass `-0001`, before any Mosaic pass) already contains, in `inc` only:
+
+```
+%transpose3A = tpu.transpose %slice3A_52, [1, 0] : vector<9216x1xi8> -> vector<1x9216xi8>   (× 4)
+```
+
+Zero in either A arm. These are `streamindex_topk.py:267`'s `.T`, one per sequence in the batch.
+*(An earlier draft asserted "nobody put a transpose in the source; the layout mismatch summoned it."
+That is false, and the test it rested on — zero `tpu.relayout` at `post-infer-vector-layout` — is a
+check that could not have failed, since relayout-insertion is the next pass.)*
+
+What the compiler adds is the **relayout that feeds them**. `tpu.relayout` by pass:
+
+| pass | `inc` | `a_reshape` | `a_concat` |
+|---|---|---|---|
+| `-0010 post-infer-vector-layout` | 0 | 0 | 0 |
+| `-0011 post-relayout-insertion` | **43** | **43** | **327** |
+| `-0012 post-apply-vector-layout` | 0 | 0 | 0 |
+
+Grouped by signature at `-0011`:
+
+| signature | `inc` | `a_reshape` | `a_concat` |
+|---|---|---|---|
+| `vector<9216x128xi8>` in `8,{0,0},(4,128)` -> out `8,{0,0},(32,128)` — **the payload** | **4** | **4** | **4** |
+| `vector<9216x1xi8>` in `8,{0,128},(4,128)` -> out `8,{0,0},(32,128)` — **the scale column** | **4** | 0 | 0 |
+| `vector<9x2x4x128xi8>` in `8,{0,0},(4,128)` -> out `8,{0,0},(32,128)` — A's scale | 0 | **4** | 0 |
+| `vector<1x128xi8>` in `8,{k,0},(4,128)`, k ∈ {0,1,2,3} — a_concat's scale | 0 | 0 | **288** |
+| the f32 score-side relayouts, shared | 35 | 35 | 35 |
+| the landing-buffer relayout, `1x1x1x4x256xi8` vs `…x128xi8` | 1 | 1 | 1 |
+
+**The payload relayout is the same op in every arm** — same source type, same in-layout, same
+out-layout, same count. Mosaic folds the `flat[:, :128]` lane slice into it; the incumbent does not
+materialise a 256-lane *value* and then narrow it.
+
+**The only structural difference is the scale**, and the in-layout names the mechanism:
+**lane offset `{0,128}`** — the scale byte inside the 256-lane record — being relaid out to
+lane-major `(32,128)` tiling so the author's transpose can consume it.
+
+### 1.2 `a_concat` resolves R1b's count-vs-cost conflation
+
+R1b reasoned that `a_concat` builds its scale operand a structurally very different way (72
+materialised `(1,128)` rows concatenated along lanes) yet lands within 0.6 % of `a_reshape`, so the
+scale path could not be what costs. That inference **conflated relayout count with relayout cost**.
+`a_concat`'s 288 relayouts are `vector<1x128xi8>` — one vreg-row each, differing only in a sublane
+offset. The incumbent's 4 are `vector<9216x1xi8>` column transposes at lane offset 128. 288 cheap
+ops and 4 expensive ones is not a contradiction. **This part of R1b's `[rev]` correction does not
+survive.**
+
+---
+
+## 2. The op census — and why the headline number in the first draft was wrong
+
+### 2.1 The correct pass labels, and three different deltas
+
+An earlier draft of this document reported "+45,983 ops at `post-apply-vector-layout`" and derived
+a 100.2 % attribution from it. Both the label and the inference were wrong. `llo_census.py`'s
+`pass_file()` matches by substring and takes the last hit, so `"post-apply-vector-layout"` resolves
+to **`-0013 …-simplify`**, not `-0012`. And the MLIR at that stage is dominated by IR that never
+executes. The three deltas, all `inc − a_reshape`:
+
+| stage | `inc` | `a_reshape` | `a_concat` | Δ (inc − a_reshape) |
+|---|---:|---:|---:|---:|
+| `-0012 post-apply-vector-layout` | 185,797 | 131,657 | 133,953 | **+54,140** |
+| `-0013 post-apply-vector-layout-simplify` | 114,653 | 68,670 | 71,258 | **+45,983** |
+| **`-0018 post-finalize-llo`** — the last stage before codegen | **44,562** | **39,636** | **39,488** | **+4,926** |
+
+**Quote `+4,926`.** It is the only one of the three that is close to executed code. The MLIR deltas
+are ~9–11× larger and are not a cost model. At `-0018` the delta decomposes cleanly:
+
+| op family at `-0018` | `inc` | `a_reshape` | `a_concat` | Δ |
+|---|---:|---:|---:|---:|
+| `vcombine*` (cross-lane combine) | 11,775 | 8,319 | 8,319 | **+3,456** = 12 / transpose |
+| `slane*` (sublane movement) | 9,435 | 7,131 | 7,275 | **+2,304** = 8 / transpose |
+| **their sum** | | | | **+5,760** = **20 / transpose**, against a net delta of +4,926 |
+
+*Withdrawn from the earlier draft:* the claim that each transpose "lowers into 96 sublane_shuffle +
+64 gather = 160 ops = 46,080 = 100.2 % of the delta". Those 96 and 64 were **defined** in the
+script as the deltas divided by 288, so multiplying back and comparing to the delta is an identity,
+not a check — it says only "the other op deltas net to −97". It was also read from a file that
+still contains all 288 `tpu.transpose` ops, so those shuffles cannot be the transposes' lowering;
+they are the relayout cascade *around* them.
+
+### 2.2 The `-0013` census, with the dead-IR caveat attached
+
+Reported because §1's structural reading is easier to see here, **not** as a cost model:
+
+| op | `inc` | `a_reshape` | `a_concat` | Δ |
+|---|---:|---:|---:|---:|
+| `tpu.sublane_shuffle` | 56,167 | 28,519 | 30,031 | +27,648 |
+| `tpu.gather` | 37,459 | 19,027 | 20,035 | +18,432 |
+| `tpu.load` | **9,296** | **9,368** | **9,368** | **−72** |
+| `tpu.bitcast_vreg` | 1,769 | 2,057 | 2,057 | −288 |
+| `arith.select` | 331 | 619 | 331 | −288 |
+| `tpu.roll_vectors` / `tpu.unroll_vectors` | 437 / 432 | 149 / 144 | 149 / 144 | +288 / +288 |
+| `arith.mulf` / `maximumf` / `addf` / `cmpi` | 1440 / 1152 / 970 / 584 | identical | identical | **0** |
+| **`tpu.transpose`** | **288** | **0** | **0** | **+288** |
+| **`tpu.matmul`** | **144** | **144** | **144** | **0** |
+| TOTAL | 114,653 | 68,670 | 71,258 | +45,983 |
+
+Ops are matched in operator position (`%r = d.op` or a statement-leading `d.op`), which excludes
+memref layout *attributes* like `tpu.tiled`. Three alternative regexes give the same Δ.
+
+**`tpu.matmul` = 144 in all three arms**, same `f8e4m3` operands. The arms do the same arithmetic —
+the comparison was never between a kernel and a cheaper kernel. The review of this document
+strengthened that independently: a backward def-use slice from `tpu.matmul` returns **27,965 defs,
+8,064 sublane_shuffles and 6,912 gathers, byte-identical in all three arms**. The
+payload-consumption path costs the same everywhere.
+
+### 2.3 `tpu.load` — what it does and does not show
+
+**It does not show what an earlier draft claimed.** The counts match (9,296 vs 9,368) but the masks
+do not:
+
+```
+inc  × 9,216 : tpu.load ... sublanes [true, true,  false×6] : memref<1x1x2304x4x256xi8, ...>
+a_*  × 9,288 : tpu.load ... sublanes [true, false, false×6] : memref<1x1x2322x4x128xi8, ...>
+```
+
+Two enabled sublanes × 128 lanes × 4 packed bytes = **1,024 B per load** in `inc`; **512 B** in both
+A arms. Per grid block: 9,216 × 1024 = **9,437,184 B** against 9,288 × 512 = **4,755,456 B**,
+**1.985×**. That reproduces R1b §3.2's 9.4 MB / 4.76 MB figure to the byte. The −72 count delta is
+not evidence of anything: A's buffer carries 18 extra scale rows (`2322` vs `2304`), × 4 = 72.
+
+So the correct statement about the payload width is narrow and specific:
+
+> **The 508 pad bytes ride in the same load instruction as the payload.** The width costs the
+> incumbent **zero extra vector operations**. It costs **1.985× the VMEM read bytes** and **1.98×
+> the landing buffer** (18.23 vs 9.3 MiB). Whether those extra bytes cost cycles — whether a masked
+> 2-sublane load retires slower than a 1-sublane one — is a hardware question **this static dump
+> cannot answer**, and it is the open channel through which (W) could still be real.
+
+---
+
+## 3. LLO fit summary — `tpu_custom_call.1`
+
+*Static compile-time analysis. `bundles` is code size, not cycles.*
+
+| field | `inc` | `a_reshape` | `a_concat` |
+|---|---:|---:|---:|
+| **XLU bundle occupancy** | **46.24 %** | **1.05 %** | **1.05 %** |
+| VMEM allocated | 18.23 MiB | 9.30 MiB | 9.30 MiB |
+| bundles (`spills.bundles` / `totals.total_bundles`) | 8,417 / 8,351 | 6,590 / 6,524 | 6,557 / 6,491 |
+| spills + fills | 5,262 + 5,453 | 511 + 657 | 470 + 616 |
+| VSTORE (of which `VSTORE:SPILL`) | 43.42 % (**42.83**) | 8.39 % (7.54) | 7.70 % (6.89) |
+| VLOAD (of which `VLOAD:FILL`) | 88.12 % (**42.12**) | 82.35 % (9.36) | 82.26 % (8.88) |
+| VALU | 96.04 % | 95.02 % | 94.98 % |
+| MXU | 13.63 % | 17.48 % | 17.57 % |
+| MXU matmuls | 144 | 144 | 144 |
+| overlap(MXU+mem) | 13.5 % | 13.6 % | 13.3 % |
+| mem-stall (MXU idle) | 77.7 % | 70.6 % | 70.4 % |
+| verdict | VPU-serialized | VPU-serialized | VPU-serialized |
+
+**XLU is the single best datum in the dump and the first draft omitted it.** 46.24 % against
+1.05 % — a 44× gap on the cross-lane unit, which is exactly where a 128×128 byte transpose executes
+and where nothing else in this kernel goes. Nothing about payload width would touch the XLU.
+
+**Almost all of the incumbent's store traffic is spill traffic**: 42.83 of 43.42 percentage points,
+and 42.12 of 88.12 on the load side is fills. The spill rate is 1.27/bundle against 0.18 — but note
+`xprof-cli`'s own warning that this ratio *"shrinks when work is removed… never use either as a
+grading metric"*. The spills co-vary with the scale path; per §4.1 this design cannot separate them
+from record width.
+
+**Two bundle fields exist and differ by exactly 66 in every arm.** The table names both. Ratios
+below use `spills.bundles`.
+
+| ratio | static bundles | R1b measured `compute` ns/block | discrepancy |
+|---|---:|---:|---:|
+| `inc` / `a_reshape` | 8,417 / 6,590 = 1.2772 | 4192.9 / 3219.0 = 1.3025 | 1.98 % |
+| `a_concat` / `a_reshape` | 6,557 / 6,590 = 0.9950 | 3199.9 / 3219.0 = 0.9941 | 0.09 % |
+
+**Do not lean on this.** It is two points, and this document contains its own counterexample:
+`a_concat` has **+3.8 % IR** against `a_reshape` at `-0013` yet **−0.5 % bundles** and **−0.6 %
+measured** — the op census gets the *sign* wrong there. That is the same op census §2.2 rests on,
+which is why §2.1 quotes `-0018` instead.
+
+---
+
+## 4. What this means for Option A
+
+### 4.1 The experiment that is missing, and it is cheap
+
+**The three arms are collinear in the two hypotheses.** Every arm pairs scale placement with record
+width: `inc` = {lane-128 scale, 256-lane record}, both A arms = {lane-major rows, 128-lane record}.
+`a_concat` varies only the *reader-side formulation* of A's scale path, not the format. So the
+strongest thing this dump can say is:
+
+- (T) accounts for **all of the instruction-count delta** — XLU 44×, 288 transposes, +5,760
+  cross-lane ops at `-0018`, matmul cone identical.
+- (W) accounts for **none of it**, and for **all of a 1.985× VMEM-read-byte delta** that the dump
+  cannot price.
+
+**The missing fourth arm is a 256-lane record with the e8m0 scales broken out into separate
+lane-major rows.** If its census and bundle count land at `a_reshape`'s, (T) is established and the
+payload width is confirmed free. If they land at `inc`'s, the width is the mechanism after all. It
+is a compile-only arm, minutes on `probe_llo_capture.py` as it stands, and it is the one thing the
+current three cannot do. **Per the brief I have not built it** — but it, not a sixth kernel build,
+is the next thing worth doing.
+
+### 4.2 The reader-side variant: weaker than the first draft claimed
+
+The saving is on the scale path — but *scale placement is itself part of the cache format*. The
+expensive relayout exists because the byte sits at **lane offset 128 of a 256-lane `(4,128)`-tiled
+record**, and any reader-side-only fix still has to get it out of there. So the first draft's
+"a variant strictly dominates Option A" is **not established**. Candidates, honestly priced:
+
+1. **Widen before transposing.** `streamindex_topk.py:267-268` runs `.T` on the **i8** slice, then
+   bitcasts, then `astype(bf16)`. Reordering to widen first puts the transpose on `(16,128)` bf16
+   tiling instead of `(32,128)` i8. Bit-exact by inspection (`astype` is elementwise, transpose is a
+   permutation, so reordering cannot change a value) — an argument, not a test. **But it targets
+   the 288 tile transposes, not the lane-128 relayout cascade that feeds them**, and the cascade is
+   the larger part. Also note it is a change to **`streamindex_topk.py`, which this exercise may not
+   modify** — if so, this candidate is not buildable here at all.
+2. **Route the transpose through the MXU.** MXU sits at 13.63 % and every arm's verdict is
+   *MXU starved*; moving a permutation off a 96 %-occupied VALU is the right direction. Requires
+   candidate 1 first, and inherits its limits.
+3. **Move the scale multiply onto the K operand.** `_compute_scores` applies the scale *after* the
+   head-sum, as `s_summed * scale[1, bkv_sz]`, which is why it must be lane-major. Scaling the K
+   rows before the matmul needs `scale[bkv_sz, 1]` — a **lane broadcast of a sublane-major column,
+   which is free** and removes the transpose *and* the relayout outright. Algebraically exact (e8m0
+   is unsigned so the scale is positive and commutes through `maximum(s, 0)`; the head-sum is
+   linear) but **not bit-identical**, since the multiply moves from f32-after-accumulation to
+   before it. Needs an accuracy check, not a bit-identity check. **This is the only candidate that
+   actually removes the cost, and it is the only one that is genuinely reader-side.**
+4. *(Ruled out)* A separate DMA gathering the scale column. A DMA copies rectangles; landing a
+   `(bkv_sz,1)` slice leaves it sublane-major and the transpose is still owed.
+
+**What it is worth.** If the whole `compute` delta were recovered: 973.9 ns/block × 16 blocks =
+**−15.58 µs**. *(An earlier draft wrote −15.30 µs here. That figure is the **`full`**-mode delta,
+−956.05 ns/block × 16, which is Option A's own measured net; the `compute` delta is 973.9 and the
+difference is R1b §3.3's +17.8 ns/block wrong-sign fetch residual.)* Only candidate 3 could
+plausibly reach the whole of it, and only candidate 3 changes numerics. This is a **static-analysis
+ceiling, not a prediction and not a measurement.**
+
+### 4.3 The final numbers, with R1b's four `[rev]` corrections carried in
+
+| quantity | value | class |
+|---|---|---|
+| Baseline decode call, incumbent `bkv_p = 2`, ctx 8704 | **170.58 µs** device self time (`hlo_stats`) | measured |
+| Decode call at `bkv_p = 9` | **143.39 µs** device / 145.95 µs chain slope | measured |
+| Requirement bar, −13 % of 143.39 | **18.64 µs** | derived |
+| Requirement bar, −22 % of 143.39 | **31.55 µs** | derived |
+| **Option A's stake on top of `bkv_p = 9`** (`full` mode) | **−15.30 µs** — 10.7 % of the p=9 call | measured per-block, ×16 extrapolation |
+| Its `compute`-only component | −973.9 ns/block = −15.58 µs | measured per-block, ×16 |
+| **Shortfall against A's own −13 % floor** | **17.9 % short** | derived |
+| **`[rev]`** Modelled HBM bound at `bkv_p = 9`: 151.0 MB / 3.70e12 = 40.81 µs = 48.4 % of the 84.279 µs stage A; halving it removes at most | **~20.4 µs** — **not** the ~15 µs mis-transferred from `bkv_p = 2` | **modelled**, never measured |
+| **`[rev]`** Cross-arm contamination in the probe | **2.4–9.7 %** (arms 188.83–760.88 µs); the 9.7 % arm is `a_reshape/fetch/bkvp9`, which carries the −1323.8 ns delta | measured |
+| Fetch already hidden behind compute at `bkv_p = 9` | **94.3 %** | measured |
+| Consumer correctness | bit-identical **inside the probe**; **no named test job against the real kernel** | measured, in-probe only |
+| Correctness status of the −15.30 µs | **⚠️ unverified** | — |
+
+The ~20.4 µs modelled bound and the −15.30 µs measured stake are **two unrelated quantities**; the
+near-coincidence with the mis-computed ~15 µs was exactly that. Never quote the modelled figure as
+corroboration of the measured one.
+
+### 4.4 The one-line answer
+
+> **Option A as a whole is not recommended** — but on the arithmetic, not on the mechanism: it
+> delivers −15.30 µs against its own −13 % floor of 18.64 µs, **17.9 % short**, with the writer-side
+> change and the prefill exposure still unmeasured and the number still `⚠️ unverified`. The
+> mechanism finding does **not** independently condemn it: the dump shows the cost is the scale
+> placement, which is a cache-format property, so a reader-side variant that dominates Option A is
+> **plausible but unproven** — candidate 3 in §4.2 is the only one that would, and it changes
+> numerics. **Before spending anything else here, run the fourth arm in §4.1.**
+
+---
+
+## 5. Limitations
+
+1. **All static.** No cycle counts. The bundle-ratio agreement in §3 is suggestive, is two points,
+   and is contradicted in sign by `a_concat` in the same table.
+2. **(T) and (W) are collinear across all three arms** (§4.1). "Confirmed / refuted" is a
+   vocabulary this design cannot issue; "narrowed" is what it earns.
+3. **The dump cannot price bytes.** Whether a masked 2-sublane load retires slower than a 1-sublane
+   one decides whether (W)'s 4.68 MB/block of extra VMEM reads is free. Unanswered.
+4. **`tpu.transpose` -> 20 LLO ops each is this lowering**, on jax 0.10.2 / libtpu 0.0.44.1, at this
+   tiling. A different jaxlib may lower it better, which would shrink the prize.
+5. **The probe's geometry, not the model's.** `bkv_p = 9`, ctx 8704, `SEQ_BATCH_SIZE = 4`,
+   `BQ_SZ = 1`, `num_grid = 8`.
+6. **No variant was built or measured.** §4.2's prices are arguments.
+7. **Candidate 1 may be out of scope** (it edits `streamindex_topk.py`) and candidate 3 changes
+   numerics. Neither has a test.
+8. **The −15.30 µs is unchanged**: `provisional` / `⚠️ unverified`, a ×16 extrapolation from a probe
+   covering 82.5 % of stage A, carrying the 2.4–9.7 % contamination band.
+9. **Prefill was never measured**, here or in R1b. It remains the largest unquantified risk.
+10. **This document's first draft was wrong in two load-bearing places** — it claimed (W) refuted on
+    a load *count*, and derived a 100.2 % attribution that was an identity read from a mislabelled
+    pass. Both were caught by `/critical-review` (§6) and are corrected above. The census script was
+    corrected in the same pass.
+
+---
+
+## 6. Review
+
+`/critical-review` was run on the first draft of this document in a clean context, against the raw
+dump rather than this prose. Disposition: **`PARTIALLY CONFIRMED`**. It reproduced every LLO
+fit-summary figure and every R1b figure carried into §4.3 exactly, and confirmed the census regex
+against three independent alternatives. It found, and I verified against the artifact before
+accepting each one:
+
+| severity | finding | disposition |
+|---|---|---|
+| CRITICAL | "(W) refuted" is contradicted by the load masks — 1.985× bytes in equal instruction count | **accepted**, verdict and §2.3 rewritten; R1b's `[rev]` un-superseded |
+| CRITICAL | the 46,080 / 100.2 % attribution is an identity, from a mislabelled pass, over mostly-dead IR | **accepted**, replaced with the `-0018` delta of +4,926 |
+| HIGH | 4 `tpu.transpose` are author-written, present in pass `-0001` | **accepted**, §1.1 rewritten |
+| HIGH | §4.2's ceiling is not supported by candidate 1, which reaches only the tile transposes | **accepted**, §4.2 repriced |
+| HIGH | (T) and (W) are collinear; no arm separates them | **accepted**, §4.1 added with the missing fourth arm |
+| MEDIUM | 973.9 × 16 = 15.58 µs; the 15.30 is the `full` delta | **accepted**, both now stated |
+| MEDIUM | XLU 46.24 % vs 1.05 % omitted from §3 — the best evidence in the dump | **accepted**, added |
+| MEDIUM | two bundle fields; a_concat's sign counterexample | **accepted**, both stated |
+| LOW | `source_md5` hashes the kernel module, not the probe; no `matpush1` in `op_counts`; line 267-268 not 266-268 | **accepted**, all three fixed |
+| LOW | correctness row labelled "measured" | **accepted**, qualified as in-probe only |
+
+The review also produced two results by a method this document did not use — a def-use slice — that
+**support** the direction of the finding: the backward cone from `tpu.matmul` is byte-identical
+across all three arms, and the live cone exclusive to the transposes is ~104 % of the post-DCE
+delta. Both are quoted in §2.2 with their provenance, and both rest on a hand-written regex parser
+rather than an MLIR parser, which the reviewer flagged itself.

@@ -1,5 +1,16 @@
 # R1b — The gate at the `bkv_p` we now ship, and the changed consumer
 
+> **EXTENDED — read `R1c.md` next.** R1b's measurements all stand, and so does §3.2's `[rev]`
+> refusal to attribute the 973.9 ns. The `/xprof-llo` dump (job `j-a78a5081-7f73-42ad-b483`)
+> **narrows** it without settling it: the *instruction-count* delta is entirely on the scale path
+> (XLU bundle occupancy 46.24 % in the incumbent vs 1.05 % in both A arms; 288
+> `vector<128x128xi8>` transposes present only in the incumbent), while §3.2's payload-width
+> reading is confirmed on the *byte* axis — the incumbent's loads enable 2 sublanes against A's 1,
+> so 9.44 MB/block against 4.76 MB in the same number of load instructions. The three arms are
+> **collinear** in scale placement and record width, so neither hypothesis can be isolated; the
+> missing fourth arm is named in `R1c.md` §4.1. `R1c.md` §4.4 recommends **against** Option A —
+> on this document's arithmetic (−15.30 µs vs an 18.64 µs floor), not on the mechanism.
+
 R1 answered Flip 1 at `bkv_p = 2` and found Option A short of its gate. Two things have changed
 since, and both are measured here.
 
