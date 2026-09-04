@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_DSA_CHUNK_BY_BUCKET: bool = False
 
 
 def env_with_choices(
@@ -399,6 +400,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+
+    # Pick the sparse (DSA) MLA gather/attention chunk size from the padded
+    # token bucket instead of using the kernel's single default of 64. See
+    # `sparse_mla_gather_chunk_size` in layers/common/attention_interface.py.
+    # Off keeps the shipping behaviour exactly.
+    "TPU_DSA_CHUNK_BY_BUCKET":
+    env_bool("TPU_DSA_CHUNK_BY_BUCKET", default=False),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
