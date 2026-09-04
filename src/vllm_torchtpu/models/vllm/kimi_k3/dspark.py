@@ -18,6 +18,8 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                                               get_draft_quant_config,
                                               maybe_prefix)
 
+from vllm_torchtpu.layers.common.quantization import quantize_kv
+
 from .attention import MultiHeadLatentAttention
 from .layers import KimiMLP
 
@@ -187,11 +189,24 @@ class K3DSparkModel(nn.Module):
                 device=context.device,
             )
             _, k_pe = wrapper.rotary_emb(positions, dummy_q_pe, k_pe)
-            # RoPE is configured with fp32 frequencies and may promote its
-            # output even when the projected context is bf16.  The dense MLA
-            # cache-update kernel requires both latent cache components to
-            # have exactly the cache dtype.
-            k_pe = k_pe.to(dtype=core.kv_cache.dtype)
+            # This context path bypasses the regular MLA forward, so mirror
+            # its cache quantization here.  RoPE may also promote k_pe to
+            # fp32; both latent components must reach the cache-update kernel
+            # in the cache dtype and with the layer's KV scale applied.
+            cache_dtype = getattr(core, "kv_cache_quantized_dtype", None)
+            if cache_dtype is not None:
+                k_scale = getattr(core, "_k_scale_float", None) or 1.0
+                kv_c, _ = quantize_kv(cache_dtype,
+                                      kv_c,
+                                      value=None,
+                                      k_scale=k_scale)
+                k_pe, _ = quantize_kv(cache_dtype,
+                                      k_pe,
+                                      value=None,
+                                      k_scale=k_scale)
+            else:
+                kv_c = kv_c.to(dtype=core.kv_cache.dtype)
+                k_pe = k_pe.to(dtype=core.kv_cache.dtype)
             ql_nope = torch.zeros(
                 (num_tokens, wrapper.num_heads, self.config.kv_lora_rank),
                 dtype=context.dtype,
