@@ -31,7 +31,13 @@ REPS="${REPS:-3}"
 # count, so without a control on THIS image every other arm is a cross-build
 # comparison. The lossless pair is measured before the lossy arm, because
 # c1+e8m0 can land on ladder+probe alone while k1 needs an accuracy run.
-ARMS_DEFAULT="base c1e8m0 k1 hierep stacked"
+# c1e8m0 is NOT in the default list: the E8M0 half showed a perfect 36.75 MiB
+# operand in HLO while the LLO DMA descriptor stayed at 43,008 granules -- not
+# one byte saved, because the scale's degenerate sublane dim pads back up under
+# the narrow tiling. Until that lane confirms the granule count falls, a
+# "c1e8m0" arm would measure C1 alone and the difference would be reported as
+# an interaction. Run `c1` until then, and swap it for `c1e8m0` on confirmation.
+ARMS_DEFAULT="base c1 k1 hierep stacked"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -56,6 +62,17 @@ arm_env() {
     hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;  # lane I2: env + loader patch
     stacked)  echo "$(arm_env c1e8m0) $(arm_env k1) $(arm_env hierep)" ;;
     *)        echo "__UNKNOWN__" ;;
+  esac
+}
+# hierEP is two changes wearing one name. The loader fix is a 3-line CORRECTNESS
+# bug (BK #299 served a model whose experts were never initialised) and lands on
+# its own unit test with no pod time at all; the env flag is a PERFORMANCE lever
+# worth -7.3..-9.6% in r3. Reporting them together would make a 3-line bug fix
+# look like it needs a pod run to justify.
+arm_notes() {
+  case "$1" in
+    hierep|stacked) echo "${K3_ARM_NOTES:-}hierEP is a correctness fix (3-line loader realignment, landable on its unit test alone, no pod time required) PLUS a performance flag (TPU_MOE_HIERARCHICAL_EP). The ladder number here prices only the flag; the fix must not be gated on it." ;;
+    *) echo "${K3_ARM_NOTES:-}" ;;
   esac
 }
 arm_touches_weights() { case "$1" in base) return 1 ;; *) return 0 ;; esac; }
@@ -84,19 +101,27 @@ report_compile_seconds() {  # <server log>
   say "compile: ${s:-<not reported>} | gates: ${gates}"
 }
 # Void the arm rather than print a line: hierarchical EP that silently falls
-# back is an arm measuring nothing, and it looks like a null result.
+# back is an arm measuring nothing, and it reads as a null result.
+#
+# The bank-shape assertion is the whole gate. Grepping for the "falling back to
+# flat expert parallelism" warning is NOT a second check: that line comes from
+# `logger.warning_once`, which defaults to scope="local" -- local rank 0 of each
+# host, 4 ranks of 32 -- so its ABSENCE says nothing about the other 28 and a
+# silent fallback on 28 ranks would pass. It is still counted and printed,
+# because a non-zero count is informative even though a zero is not.
 hierep_gate() {  # <server log>
-  local want='w13 (56, 3072, 1792)' hits fallbacks
-  hits=$(grep -c "$want" "$1" 2>/dev/null || echo 0)
-  fallbacks=$(grep -ciE 'hierarchical.*(fallback|disabled|not supported)' "$1" 2>/dev/null || echo 0)
-  say "hierEP gate: '$want' seen ${hits}x (need all 32 ranks), fallbacks=${fallbacks}"
-  if [ "$hits" -lt 32 ] || [ "$fallbacks" -gt 0 ]; then
+  local want='w13 (56, 3072, 1792) (ep_size=16, moe_tp_size=2)' hits warned
+  hits=$(grep -cF "$want" "$1" 2>/dev/null || echo 0)
+  warned=$(grep -ciE 'falling back to flat expert parallelism' "$1" 2>/dev/null || echo 0)
+  say "hierEP gate: bank shape seen on ${hits}/32 ranks; fallback warnings ${warned} (host-scoped, informative only when > 0)"
+  if [ "$hits" -lt 32 ]; then
     say "hierEP GATE FAILED -- arm VOID, its numbers must not be reported"
     return 1
   fi
+  [ "$warned" -gt 0 ] && say "hierEP: fallback warned on at least one host -- treat the arm as VOID"
+  [ "$warned" -gt 0 ] && return 1
   return 0
 }
-ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""
 sanity_probe() {  # <tag>
   [ -f "$PROBE" ] || { say "no probe script; skipping"; return 0; }
   local o="${OUT}/$1/probe.txt"
@@ -161,7 +186,7 @@ for arm in ${*:-$ARMS_DEFAULT}; do
         "compilation_seconds=${ARM_COMPILE_SECONDS:-}" "cache_cleared=true" \
         "sanity_verdict=${ARM_SANITY:-NOT_RUN}" \
         ${ARM_WORST_RATIO:+"worst_distinct_ratio=${ARM_WORST_RATIO}"} \
-        "notes=${K3_ARM_NOTES:-}" || say "arm json failed for ${arm}"
+        "notes=$(arm_notes "$arm")" || say "arm json failed for ${arm}"
   )
 done
 
