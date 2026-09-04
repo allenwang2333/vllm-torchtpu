@@ -260,9 +260,29 @@ corruption_eval() {  # <results dir> <tag>
       --model local-completions \
       --model_args "model=${K3_EVAL_MODEL:-moonshotai/Kimi-K3},base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=32,tokenized_requests=False" \
       --output_path "$out" > "$1/gsm8k_corruption.log" 2>&1 || true
-  ARM_GSM8K=$(grep -oE '"exact_match,[^"]*": *[0-9.]+' "$1/gsm8k_corruption.log" 2>/dev/null \
-      | grep -oE '[0-9.]+$' | head -1)
-  say "corruption eval (${2}): gsm8k exact_match=${ARM_GSM8K:-<none>} over ${K3_GSM8K_LIMIT:-150} prompts"
+  # lm_eval writes its numbers to a results JSON, and its stdout table is not a
+  # reliable place to grep them from. Read the JSON; fall back to the log; and if
+  # neither yields a number say so LOUDLY -- build 380 printed
+  # "exact_match=<none>" and carried on, which is a detector that cannot pass.
+  ARM_GSM8K=$(python3 - "$1" <<'PYEOF' 2>/dev/null
+import glob, json, sys
+for f in glob.glob(sys.argv[1] + "/gsm8k_corruption*/**/*.json", recursive=True) + \
+         glob.glob(sys.argv[1] + "/gsm8k_corruption*.json"):
+    try: d = json.load(open(f))
+    except Exception: continue
+    for task, r in (d.get("results") or {}).items():
+        for k, v in r.items():
+            if k.startswith("exact_match") and isinstance(v, (int, float)):
+                print(v); sys.exit(0)
+PYEOF
+)
+  [ -z "$ARM_GSM8K" ] && ARM_GSM8K=$(grep -oE '"exact_match[^"]*": *[0-9.]+' "$1/gsm8k_corruption.log" 2>/dev/null | grep -oE '[0-9.]+$' | head -1)
+  if [ -z "$ARM_GSM8K" ]; then
+    say "CORRUPTION EVAL PRODUCED NO NUMBER -- this is a detector that cannot pass, not a pass. Arm ${2} has NO correctness evidence."
+    say "  lm_eval tail: $(tail -3 "$1/gsm8k_corruption.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+    return 0
+  fi
+  say "corruption eval (${2}): gsm8k exact_match=${ARM_GSM8K} over ${K3_GSM8K_LIMIT:-150} prompts"
   if [ -n "$ARM_GSM8K" ] && awk "BEGIN{exit !(${ARM_GSM8K} < ${K3_GSM8K_FLOOR:-0.5})}"; then
     say "CORRUPTION SUSPECTED: gsm8k ${ARM_GSM8K} < ${K3_GSM8K_FLOOR:-0.5} -- this arm's numbers are VOID"
     return 1

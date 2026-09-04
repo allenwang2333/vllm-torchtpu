@@ -167,6 +167,15 @@ say "collection check: ${n_pb} xplane inputs -> ${n_planes} reduced plane files"
 if [ "$n_pb" -gt 0 ] && [ "$n_planes" -eq 0 ]; then
   say "+++ COLLECTION FAILED: ${n_pb} traces on disk reduced to nothing. Raw traces are KEPT; re-run with K3_COLLECT_ONLY=1."
   rc=1
+  K3_DROP_RAW=0            # never delete the input to a reduction that produced nothing
+elif [ "$n_planes" -gt 0 ] && [ "${K3_DROP_RAW_IF_VERIFIED:-0}" = "1" ]; then
+  # The reduction demonstrably worked on THIS data, so its input is now
+  # redundant and it is the largest thing on the disk. Deleting it here rather
+  # than at arm end is the ordering that matters: a reduction that produces
+  # nothing still keeps its input, which is the property that made build 377
+  # recoverable.
+  say "reduction verified (${n_planes} planes from ${n_pb} traces) -- dropping the raws"
+  K3_DROP_RAW=1
 fi
 upload "$BUNDLE"
 
