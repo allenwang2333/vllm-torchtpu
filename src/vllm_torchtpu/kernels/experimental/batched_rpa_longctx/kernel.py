@@ -533,12 +533,10 @@ def rpa_kernel(
             scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
             num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes
-            )
-            kv_ref_flat = final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes
-            )
+            q_ref_flat = final_allocs[0].window_ref.bitcast(
+                jnp.uint32).reshape(-1, num_lanes)
+            kv_ref_flat = final_allocs[1].window_ref.bitcast(
+                jnp.uint32).reshape(-1, num_lanes)
 
             # Explicitly zero out scratches and Q/KV buffers.
             for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
