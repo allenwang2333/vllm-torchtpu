@@ -157,165 +157,91 @@ where it lands.
 
 ## 4. Sliding window
 
-Three of DSv4's six groups attend over a sliding window instead of the whole
-prompt, and that is the one piece of geometry the transfer cannot simply copy.
-A windowed group's block table is mostly holes, and getting the holes wrong is
-what killed the engine on the first real runs.
+Three of DSv4's six groups attend over a sliding window, and that is the one
+piece of geometry the transfer cannot copy straight. A windowed group's block
+table is mostly holes.
 
 ### 4a. vLLM hands the old pages back
 
-A window of W tokens can never reach further back than W tokens, so every page
-that falls behind it is unreachable and vLLM returns it to the shared pool. It
-does not shorten the block table. It writes page 0, the reserved null block,
-over the entry (`single_type_kv_cache_manager.py:507-544`,
-`block_pool.py:188-192`). The count it frees is
+A window of W tokens cannot reach further back than W tokens, so vLLM returns
+every page behind it to the pool. It does not shorten the block table; it
+writes page 0, the reserved null block, over the entry
+(`single_type_kv_cache_manager.py:507-544`, `block_pool.py:188-192`). The count
+is
 
 ```
   pages_freed = max(0, num_computed_tokens - W + 1) // page_size
 ```
 
 at `:862`. Group 4 pages at 16 tokens under an 8-token window, so a 375-token
-request ends up looking like this:
+request keeps one page and nulls the other 23. That is correct, not a bug.
 
-```
-  [ 0  0  0  ...  0 | 13 ]
-    \__ 23 nulls __/   ^ the one page still holding live KV
+### 4b. The transfer makes the same cut
 
-  24 entries, one page of real data. That is correct, not a bug: an 8-token
-  window cannot reach back past a single 16-token page.
-```
+Those nulls are all page 0, so shipping them hands Raiden one destination named
+23 times. It rejects a duplicate destination, and the rejection raises out of
+`execute_model` on the producer worker, killing the engine and every unrelated
+request riding on it.
 
-### 4b. So the transfer has to make the same cut
-
-Sending those nulls is wrong twice over. They hold nothing the decode replica
-can attend to, and they are all the same page number, so Raiden gets handed one
-destination named 23 times. It rejects a duplicate destination, and the
-rejection raises out of `execute_model` on the producer worker, which kills the
-engine and every unrelated request riding on it.
-
-The connector therefore drops the dead prefix before it builds the transfer,
-using the same formula the allocator used (`_stage3_skipped_window_pages`,
-`tpu_connector.py:144-163`, and the trim itself at `:165-205`). Producer and
-consumer each run it against the same request length and the same page
-geometry, which is what keeps their two page lists paired entry for entry.
-
-For that to work every group has to carry its own window, so `window_tokens`
-rides in `_Stage3TransferGroup` next to `page_tokens`. Reading it takes one
-extra step, because DSv4 hands its groups over as `UniformTypeKVCacheSpecs`,
-which has no `sliding_window` of its own; `_stage3_group_window_tokens`
-(`:237-248`) unwraps the wrapper and asks one of the layers underneath.
+So the connector drops the dead prefix using the allocator's own formula
+(`_stage3_skipped_window_pages`, `tpu_connector.py:144-163`, trim at
+`:165-205`). Producer and consumer both run it on the same request length and
+page geometry, which keeps their page lists paired entry for entry. Each group
+carries its own `window_tokens` in `_Stage3TransferGroup`. DSv4 wraps its groups
+in `UniformTypeKVCacheSpecs`, which has no `sliding_window`, so
+`_stage3_group_window_tokens` (`:237-248`) unwraps it and asks a layer.
 
 ### 4c. The two numbers have to be one number
 
-Look at what each side counts from. The allocator frees against
-`num_computed_tokens`, which is how far the producer has actually run. The
-connector skips against `num_tokens`, the transfer prefix, and the transfer
-prefix is one token shorter by design, because the last prompt token is
-withheld so the decode replica can recompute it and get its first logits
-(`tpu_connector.py:1393-1410`).
-
-Two correct numbers, one token apart. One token is enough to cross a page
-boundary:
+The allocator frees against `num_computed_tokens`, how far the producer ran.
+The connector skips against `num_tokens`, the transfer prefix, which is one
+token shorter because the last prompt token is withheld for the decode replica
+to recompute (`:1393-1410`). One token is enough to cross a page boundary:
 
 ```
-  prompt 375, producer runs to computed = 375, num_tokens = 374
+  prompt 375, computed 375, num_tokens 374
 
     allocator frees   (375 - 8 + 1) // 16 = 23 pages
     connector skips   (374 - 8 + 1) // 16 = 22 pages
-
-  [ 0 x 23 | 13 ]
-    \______/
-      the connector skips only the first 22, so entry 22 is a null listed
-      as a real destination, and it goes over the wire dead
 ```
 
-The two agree whenever `computed - W + 1` and `num_tokens - W + 1` fall in the
-same page, and drift by one whenever they do not, which for group 4 is one
-request in sixteen.
+Entry 22 is then a null listed as a real destination. For group 4 that happens
+on one request in sixteen.
 
-### 4d. The fix is to stop the producer where the handoff stops
+The fix is to stop the producer where the handoff stops. It drops the final
+prompt token from its own request before prefill, so it computes N-1 and
+`num_computed_tokens` really is N-1 (`_maybe_truncate_prompt_for_handoff`,
+`:779-810`). Both formulas then read 374 and cannot disagree. Nothing on the
+wire moves, because `num_tokens` was 374 either way. The decode replica runs
+that same formula on that same 374, so it frees the pages the producer skipped
+and expects exactly what arrived. The two sides match by construction, not by
+separate arithmetic landing on the same answer.
 
-Rather than reconcile two numbers, make there be one. The producer drops the
-final prompt token from its own request before prefill runs, so it computes
-N-1 tokens and `num_computed_tokens` really is N-1
-(`_maybe_truncate_prompt_for_handoff`, `tpu_connector.py:779-810`). Both
-formulas now read the same input and cannot disagree:
+Mamba needed this first, for its own reason: its state advances every token, so
+a producer running to N ships h(N) and the decode replica advances the
+recurrence twice. The trigger was keyed to Mamba groups, and
+`_stage3_truncates_prompt` (`:1085-1096`) widens it to any group with a window.
 
-```
-  prompt 375, producer prefills 374, num_tokens = 374
+### 4d. The guard, for what truncation cannot reach
 
-    allocator frees   (374 - 8 + 1) // 16 = 22 pages
-    connector skips   (374 - 8 + 1) // 16 = 22 pages
-```
-
-Nothing on the wire changes. `num_tokens` is 374 either way, so the byte spans,
-the page-count checks and the whole consumer side are untouched; the only thing
-that moves is the allocator's input.
-
-The decode replica lands in the same place for the same reason. It still gets
-the full 375-token prompt from the proxy and still recomputes token 374, and
-its own allocator runs that same formula on that same 374, so it frees the 22
-pages the producer skipped and expects exactly the pages the producer sent.
-That is the part worth insisting on: the two sides match by construction, not
-because their separate arithmetic happens to land on the same answer.
-
-The machinery for this already existed, for a different model. Mamba state
-advances with every token, so a producer that runs to N ships h(N) and the
-decode replica then advances the recurrence a second time over token N;
-truncating ships h(N-1) instead. The trigger was keyed to Mamba groups, and
-`_stage3_truncates_prompt` (`tpu_connector.py:1085-1096`) widens it to any
-group that has a window.
-
-### 4e. The guard, for what truncation cannot reach
-
-Truncation fixes the producer that stops at the prompt. It does nothing for a
-client that hits the prefill port directly and generates a whole answer, which
-is exactly what our accuracy oracle does when it queries prefill alone for a
-non-disaggregated baseline. Then the producer runs far past the handoff and the
-allocator keeps freeing:
-
-```
-  prompt 114, producer runs on to 161
-
-  at 161 tokens the group holds ceil(161/16) = 11 pages, and the allocator
-  has freed (161 - 8 + 1) // 16 = 9 of them:
-
-    [ 0 x 9 | 250  18 ]
-
-  the connector normalizes to the 113-token prefix, ceil(113/16) = 8 pages,
-  which throws away both live ones:
-
-    [ 0 x 8 ]
-
-  and then skips 6, leaving two nulls. Two nulls is the duplicate destination.
-```
-
-By that point the entire 113-token prefix has genuinely fallen out of an
-8-token window. The allocator did nothing wrong and the data is gone, so there
-is nothing to repair and the only question is how to fail.
+A client that hits the prefill port directly and generates a full answer still
+runs past the handoff, which is what our accuracy oracle does to get a
+non-disaggregated baseline. A 114-token prompt run out to 161 leaves the whole
+113-token prefix behind an 8-token window, so normalizing back to the prefix
+throws away both live pages and ships two nulls. The data is genuinely gone and
+the allocator did nothing wrong, so the only question is how to fail.
 
 The guard counts the nulls left in the range rather than re-deriving where the
-allocator got to, because reading what the table says beats assuming two
-formulas agree (`_stage3_recycled_transfer_pages`, `:208-235`). More than one
-null and it drops the send, so the decode replica prefills the request itself:
-slow, but nothing dies. Exactly one and it warns and ships, because a hole in
-one window is survivable and dropping is worse, given that the decode replica
-is provisioned to decode and falls over trying to prefill a long prompt.
+allocator got to (`_stage3_recycled_transfer_pages`, `:208-235`). More than one
+drops the send and the decode replica prefills the request itself, which is slow
+but survivable. Exactly one warns and ships, because a hole in one window beats
+making a decode replica prefill a long prompt.
 
 Raiden's rejection of a duplicate destination is not visible in this tree.
 `tpu_sync`'s Python layer has no such check and the native code is not here, so
 it is inferred from the crash.
 
-### 4f. Why no other model has ever hit this
-
-The skip is zero unless the group has a window (`tpu_connector.py:157`), and
-full attention never reports skipped tokens: the base manager returns 0 and
-`FullAttentionManager` does not override it
-(`single_type_kv_cache_manager.py:546-557`). Qwen3.5 and GLM have a single
-full-attention group, so their block tables never contain a null, the two
-numbers cannot drift, and none of section 4 is reachable. The last captured row
-in `test_stage3_window_recycled_pages.py` makes the point directly: a 1024-token
-page with no window, at 4371 tokens, yields zero dead pages.
-
-You need a windowed group to see any of this, and before this PR no windowed
-model went down the Raiden path at all.
+None of this is reachable without a window. Full attention never reports skipped
+tokens (`single_type_kv_cache_manager.py:546-557`), so Qwen3.5 and GLM never get
+a null in a block table, and before this PR no windowed model went down the
+Raiden path at all.
