@@ -1,0 +1,24 @@
+# [branch-local] Kimi-K3 InferenceX AgentX trace replay on the v7x-32 pod.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_agentx.yml.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "K3 AgentX replay conc 4 ctx 128k (TPU v7x-32)"
+    key: k3_agentx
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx --conc 4 --max-model-len 131072 --fast 1"
+    artifact_paths:
+      - "perf_eval_results/**/*"
