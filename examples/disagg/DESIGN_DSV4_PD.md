@@ -1,125 +1,8 @@
 # How DeepSeek-V4's KV cache gets from the prefill machine to the decode machine
 
-Background for PR #684. Written for someone who has never seen this codebase.
+Background for PR #684.
 
-## 1. Why split the work across two machines
-
-When you send a prompt to a language model, the server does two jobs that look
-nothing alike.
-
-**Prefill** reads your whole prompt at once. Thousands of tokens in parallel,
-enormous matrix multiplies, chips pinned at 100%.
-
-**Decode** writes the answer one token at a time. Each step touches one token,
-so the chips are mostly idle, waiting on memory.
-
-Running both on the same chips is wasteful, because a long prefill stalls
-everyone else's decode steps. So you put them on separate machines:
-
-```
-   "What is the capital of France?"   (131 tokens, say)
-                 |
-                 v
-   +----------------------+                        +----------------------+
-   |       PREFILL        |                        |        DECODE        |
-   |   8 Ironwood chips   |  ---- KV cache ---->   |   8 Ironwood chips   |
-   |  reads all 131 at    |                        |  emits one token at  |
-   |  once, then stops    |                        |  a time              |
-   +----------------------+                        +----------------------+
-                                                              |
-                                                              v
-                                                           "Paris"
-```
-
-That's P/D disaggregation. Everything in this PR is about the arrow.
-
-## 2. What actually has to move, and why it isn't a copy
-
-While prefill reads your prompt it builds a **KV cache**: for each token, in
-each layer, a pair of vectors the model must keep in order to attend back to
-that token later. Decode cannot produce a single word without it.
-
-The arrow is not a memcpy, and that's the first thing to understand. The two
-machines lay the same data out differently.
-
-```
-  PREFILL splits ONE request across chips by token position (PCP):
-
-     chip0: tokens 0-15    chip1: tokens 16-31   ...   chip7: tokens 112-127
-
-  DECODE splits DIFFERENT requests across chips (DP):
-
-     chip0: request A (all of it)   chip1: request B (all of it)  ...
-```
-
-Prefill wants every chip working on your one prompt, because that's how you
-finish a big matrix multiply fast. Decode wants every chip on a different user,
-because one user's decode step is too small to fill a chip. So the KV for your
-request starts scattered across eight chips and must arrive gathered on one.
-
-Rearranging it in flight is called **resharding**, and it's why this path uses
-Raiden (`tpu_sync`) instead of the default ZMQ transport. The env var that picks
-it is documented as "Controller-driven PCP->DP pool resharding"
-(`envs.py:248-254`). You can see the assumption baked into the connector: it
-converts between scheduler blocks and physical pages with
-`scheduler_block_tokens = page_tokens * pcp_size` (`tpu_connector.py:1336`),
-because one scheduler-level block is spread across `pcp_size` chips.
-
-## 3. Pages and block tables
-
-You can't hand each request one contiguous slab of memory, because you don't
-know how long the answer will be and you'd shred memory into unusable gaps. So
-vLLM does what an operating system does: fixed-size **pages**.
-
-```
-  physical KV memory, numbered slots:
-  +--------+--------+--------+--------+--------+--------+
-  | page 0 | page 1 | page 2 | page 3 | page 4 | page 5 |  ...
-  +--------+--------+--------+--------+--------+--------+
-
-  your request's BLOCK TABLE:  [17, 4, 92]
-      "my first page lives in slot 17, my second in slot 4, my third in slot 92"
-```
-
-Three facts here carry the whole rest of the document.
-
-Pages come from **one shared pool** for the entire engine
-(`kv_cache_coordinator.py:91-96`), and a page is only handed out when nobody
-holds it (`block_pool.py:542-573`). So a page number belongs to exactly one
-owner at a time. That turns out to be the only thing keeping DSv4 from
-corrupting itself.
-
-Page 0 is reserved as the **null block**, meaning "nothing here"
-(`block_pool.py:188-192`). Freeing a page means writing 0 into that slot of the
-block table.
-
-And Raiden's interface is exactly `(which memory region, which page numbers,
-how many tokens)` (`byte_spans.py:391`). It has no idea what a model is. That
-narrowness is what DSv4 breaks.
-
-## 4. What the code assumed before this PR
-
-One group of layers, one page size, one block table:
-
-```
-BEFORE  (base commit 293a4737)
-
-  self._stage3_fa_group_index = 0        # which group? there's only one. an int.
-  self.block_size = 128                  # one page size for the entire model
-  request_finished(req, [17, 4, 92])     # one flat list of page numbers
-```
-
-`tpu_connector.py:276`, `:513`, `:386-389`. It didn't just assume this, it
-refused to start otherwise, with the error *"requires exactly one full-attention
-KV cache group"* (`:283-287`).
-
-For Qwen3.5 and GLM that's simply true, and the code is correct as written.
-
-## 5. Layer, array, cache group, pool tag
-
-These four words sound like they nest, and they don't. Getting them straight is
-most of the battle, which is why the PR puts their definitions in
-`pool_manifest.py`'s docstrings.
+## 1. Some quick definitions
 
 ```
   LAYER        a block of the neural network. DSv4 layer 0, layer 1, ...
@@ -132,11 +15,14 @@ most of the battle, which is why the PR puts their definitions in
                bundled into one group, and that group has ONE block table
                shared by every layer in it.
 
+  BLOCK TABLE  where a request's pages physically live. [17, 4, 92] means
+               "my first page is in slot 17, my second in slot 4, my third
+               in slot 92".
+
   POOL TAG     Raiden's name for a transferable set of bytes, e.g. "dsv4.swa.g1"
 ```
 
-The relationship is many-to-many in both directions, which is the uncomfortable
-part:
+The relationship is many-to-many in both directions:
 
 ```
    layer 0  ---owns--->  attention cache  ---lives on--->  array A0  ---in--->  group 0
@@ -144,11 +30,14 @@ part:
             ---owns--->  compressor state ---lives on--->  array A0  ---in--->  group 4
 ```
 
-One layer, three caches, one array, three different groups.
+## 2. Why DeepSeek-V4 breaks the old assumption
 
-## 6. Why DeepSeek-V4 breaks the old assumption
+Stage 3 was built for one cache group with one page size, and it refused to
+start on anything else, with the error *"requires exactly one full-attention KV
+cache group"* (`tpu_connector.py:283-287`, base commit `293a4737`). DSv4 breaks
+that twice over.
 
-### 6a. Six groups, six page sizes, six windows
+### 2a. Six groups, six page sizes, six windows
 
 DSv4 mixes several kinds of attention in one model, so vLLM ends up with six
 cache groups. Here is the real geometry, taken from block tables captured off a
@@ -170,16 +59,13 @@ Page size in tokens is just `group.kv_cache_spec.block_size`
 (`tpu_runner.py:5936-5939`); 1024 comes from `tpu_platform.py:1141-1148`, 128
 from `deepseek_v4_attention_op.py:281-289`.
 
-There's a nice wrinkle. Every group uses the **same number of bytes** per page,
-and vLLM asserts it (`kv_cache_utils.py:992-998`). What differs is how many
-tokens fit in those bytes, because the groups compress at different ratios. So
-"how many pages does this 2000-token request need?" has six simultaneously
-correct answers, from 2 to 125. A single `self.block_size` cannot express that.
+Every group's page is the same size in bytes, and vLLM asserts it
+(`kv_cache_utils.py:992-998`). What differs is how many tokens fit in those
+bytes, because each group compresses at a different ratio. So a 2000-token
+request needs 2 pages in group 0 and 125 in group 4, and a single
+`self.block_size` cannot say both.
 
-### 6b. The caches share memory
-
-This is the harder half, and it's the one that makes the change genuinely
-necessary rather than merely tedious.
+### 2b. The caches share memory
 
 DSv4 does not give each cache its own memory. It overlays them, in three
 separate places in the allocator: sliding-window caches are bound to the same
@@ -203,21 +89,19 @@ Dumping the arrays of a short DSv4 config makes it concrete:
 ```
 
 Now say you hand Raiden "array A0, pages 3 and 7." **That instruction is
-ambiguous.** Four caches begin at byte 0 of A0. Nothing in the bytes says who
-owns page 3.
+ambiguous.** Four caches begin at byte 0 of A0, and nothing in the bytes says
+who owns page 3.
 
-So what prevents them from trampling each other during normal inference?
-Exactly one thing, and it's the invariant from section 3: the allocator never
-gives one page number to two groups at the same time. If group 1's SWA cache
-holds page 3, nobody else holds page 3, so "A0, page 3" happens to be unique in
-practice. That's real, and it's load-bearing, but Raiden cannot see it, because
-Raiden sees a byte range and a list of integers.
+What saves it is that groups own disjoint pages: every page comes from one
+shared pool (`kv_cache_coordinator.py:91-96`), so if group 1's SWA cache holds
+page 3, no other group does. Raiden cannot see that, because all it sees is a
+byte range and a list of integers.
 
-## 7. The plumbing that was added
+## 3. The plumbing that was added
 
-Four things, each answering one problem above.
-
-**A transfer plan with one record per group,** replacing the single integer
+**Each cache group gets its own transfer record.** Stage 3 used to hold a single
+page size for the whole model. It now builds one `_Stage3TransferGroup` per
+group, carrying that group's index, page size and window
 (`tpu_connector.py:125-137`, `:251-296`):
 
 ```python
@@ -229,10 +113,10 @@ class _Stage3TransferGroup:
 ```
 
 **Every pool tag names its group,** via a `.g<N>` suffix (`tags.py:30-32`,
-`pool_manifest.py:1168`). This is the fix for 6b: `dsv4.swa.g1` reads page
+`pool_manifest.py:1168`). This is the fix for 2b: `dsv4.swa.g1` reads page
 numbers out of group 1's block table and no other, so the ambiguous "A0, page 3"
-becomes the unambiguous "group 1's page 3", which the disjointness invariant
-guarantees is unique.
+becomes the unambiguous "group 1's page 3", which disjointness guarantees is
+unique.
 
 **A refusal at startup** if two layers of the *same* group ever land on the same
 array (`pool_manifest.py:1156-1164`, with the runner keeping its own copy at
@@ -241,31 +125,45 @@ the pages really would collide. Better to die at startup than corrupt KV
 quietly.
 
 **Per-group block tables on the wire:** `group_block_ids: list[list[int]]`
-threaded through the send metadata (`tpu_connector.py:598-613`).
+threaded through the send metadata (`tpu_connector.py:598-613`). One list per
+group instead of one flat list for the model:
 
 ```
-  BEFORE                             AFTER
-  group index    : 0                 [(0, 1024, None), (1, 128, 128),
-  page size      : 128                (2, 128, 128),   (3, 32, 8),
-  block table    : [17, 4, 92]        (4, 16, 8),      (5, 32, 128)]
-  tag            : "kv.fa"
-                                     [[17,4], [9,31,8], [12,5,7], ...]
-                                     "dsv4.csa.nope.g0", "dsv4.swa.g1", ...
+  BEFORE: one group, so one of everything.
+
+    page size 128     block table [17, 4, 92]     pool tag "kv.fa"
+
+  AFTER: one row per cache group.
+
+    group  page  window  block table        pool tag
+    -----  ----  ------  -----------------  -----------------
+      0    1024  none    [17, 4]            dsv4.csa.nope.g0
+      1     128  128     [9, 31, 8]         dsv4.swa.g1
+      2     128  128     [22, 6, 44]        dsv4.swa.g2
+      3      32  8       [3, 19]            dsv4.state.idx.g3
+      4      16  8       [12, 5, 7, 40]     dsv4.state.csa.g4
+      5      32  128     [61, 2]            dsv4.state.hca.g5
 ```
 
-Most of the PR's 2712 added lines are that six-way split repeated. It appears
-twice over, once on the producer side where spans are registered and once on the
-consumer side where destination blocks are built, because those are separate
-code paths in `tpu_connector.py`. Then again in the byte-span lowering, the
-manifest builder, and the tests.
+One send now carries all six block tables at once. Raiden reads row N's table
+only through row N's tag, so a page number is never interpreted against a group
+that does not own it. The tables have different lengths because the groups have
+different page sizes, all describing the same request.
 
-## 8. The bug the real runs shook out
+That is where most of the PR's 2712 lines go: every place that handled one group
+now loops over six, and each of those places exists twice, once where the
+producer registers what it is sending and once where the consumer works out
+where it lands.
+
+## 4. The bug the real runs shook out
 
 ### The setup
 
 Sliding-window attention only ever looks back W tokens. Anything older is
-unreachable, so vLLM frees those pages and writes the null block over their
-slots (`single_type_kv_cache_manager.py:507-544`). The count is
+unreachable, so vLLM frees those pages and points their block-table slots at
+page 0, the reserved null block meaning "nothing here"
+(`single_type_kv_cache_manager.py:507-544`, `block_pool.py:188-192`). The count
+freed is
 
 ```
   pages_freed = max(0, num_computed_tokens - window + 1) // page_size
@@ -361,7 +259,9 @@ nulls are page 0, so Raiden receives the same destination page twice in one
 transfer: two sources writing to one slot. It rejects that outright, and the
 rejection raises out of `execute_model` on the producer worker, which kills the
 engine and every unrelated request riding on it. A single null is merely wrong
-data going to a real slot, which nothing detects.
+data going to a real slot, which nothing detects. That rejection is not visible
+in this tree, since `tpu_sync`'s Python layer has no such check and the native
+code is not here; it is inferred from the crash.
 
 Notice also what step 2 tells you: by the time the producer reached token 161,
 **the entire 113-token prefix had fallen out of an 8-token window and been
@@ -381,6 +281,10 @@ formulas agree (`tpu_connector.py:208-235`).
   dropping is worse, because the decode replica is provisioned to decode and
   falls over trying to prefill a long prompt.
 
+The real repair is for the producer to publish the page count it actually
+dropped, rather than having the consumer re-derive it. Until then the guard is
+what keeps the engine alive.
+
 ### Why no other model has ever hit this
 
 The skip is zero unless the group has a sliding window
@@ -394,35 +298,3 @@ yields zero dead pages.
 
 You need a windowed group to see this, and before this PR no windowed model went
 down the Raiden path at all.
-
-## 9. Vocabulary
-
-**Token** a word-piece. **KV cache** the per-token vectors the model keeps in
-order to attend back. **Page (block)** a fixed-size slice of KV memory. **Block
-table** the list mapping a request's logical pages to physical slots. **Cache
-group** layers that page identically and therefore share one block table. **Null
-block** page 0, meaning freed. **Array** one physical tensor in HBM. **Pool tag**
-Raiden's name for a transferable byte set. **Resharding** rearranging KV in
-flight because the two machines shard differently. **PCP** prefill context
-parallel, splitting one request's tokens across chips. **DP** data parallel,
-splitting different requests across chips.
-
-## 10. What is not verified from code in this tree
-
-**Raiden's duplicate-destination rejection is not visible here.** The `tpu_sync`
-Python layer has no such check, so it lives in the native code. The claim rests
-on the observed crash, not a line anyone can cite.
-
-**The nine-tags-over-six-groups mapping is observed, not derived.** The `.gN`
-index is purely positional (`tags.py:30-32`), and which role lands where depends
-on layer counts living in the checkpoint config rather than either repo. The
-synthetic fixture in `test_raiden_pool_manifest.py:762-768` deliberately uses a
-different mapping to make that point.
-
-**The single-null case is knowingly left imperfect.** The real repair is for the
-producer to publish the page count it actually dropped instead of making the
-consumer re-derive it. The guard is how you stop dying while that's outstanding.
-
-**"Stage 3" is project jargon** with no definition anywhere in the repo.
-Functionally it's the Raiden-backed resharding path selected by
-`TPU_KV_RESHARD_TRANSPORT=raiden`.
