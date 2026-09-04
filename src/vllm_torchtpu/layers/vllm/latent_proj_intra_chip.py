@@ -124,9 +124,12 @@ def shard_group_or_none(output_size: int):
     return group
 
 
-# >= mxu_column_size, so gmm_v2 takes `should_dequantize_after_matmul` and the
-# MXU eats fp8 directly. At 32 it would dequantize *before* the matmul and put
-# the VPU work back in.
+# Measured, not reasoned: at 128 the M=1 kernel is 6461 issue slots against the
+# bf16 baseline's 20 840 and is DMA-bound (r5/k/K_ARMS.md). Note it is BELOW
+# tpu7x's mxu_column_size of 256 (jax tpu_info.py:458), so gmm_v2 takes
+# `should_dequantize_before_matmul` -- the dequantize is a prologue over the
+# weight tile, and at this size it is still cheaper than the bytes it saves.
+# 256 would take the cheaper `after` branch and is untested.
 FP8_BLOCK = 128
 
 
