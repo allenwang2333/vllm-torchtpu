@@ -93,6 +93,9 @@ arm_env() {
     # ride the bit-identical argument and owes an accuracy run. And it is a
     # SUBSTITUTE for hierarchical EP, not an addend -- both take their saving
     # out of the per-active-expert cost on the busiest rank.
+    # If it dies ~20 min in with an HBM OOM during process_weights_after_loading,
+    # that is requant_unpack_kmajor's ~2.5 GB f32 transient per rank for w13, not
+    # the rig -- and block 512 does not help, the transient is the same.
     f3pp)     echo "MOE_REQUANTIZE_BLOCK_SIZE=256 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
     c1e8m0|c1_compactscale)
               echo "TPU_KDA_GPROJ_LAYOUT=head_major TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
@@ -170,13 +173,19 @@ report_compile_seconds() {  # <server log>
 # because a non-zero count is informative even though a zero is not.
 # `MOE_REQUANTIZE_BLOCK_SIZE=None` means "unset", which from outside looks exactly
 # like the default -- so this arm's most likely failure is a clean null from an
-# env var that never took. Assert the branch actually flipped.
+# env var that never took, and it would read as a duplicate of baseline.
+#
+# The decisive evidence is the kernel selected at LOAD time, before any number
+# exists: `pallas::nvfp4_requant_kmajor_b256` if the block size took,
+# `pallas::nvfp4_load_kmajor` if it did not. Name-matching the profile cannot
+# substitute -- the gmm_v2 kernel's name is byte-identical in both arms.
 requant_gate() {  # <server log>
-  local hits
-  hits=$(grep -ciE 'requantiz(e|ing).*(256|block_size=256)' "$1" 2>/dev/null || echo 0)
-  say "requant gate: block-256 evidence in server log = ${hits}"
-  if [ "$hits" -eq 0 ]; then
-    say "REQUANT GATE FAILED -- no evidence the block size took; arm VOID"
+  local took missed
+  took=$(grep -c 'nvfp4_requant_kmajor_b256' "$1" 2>/dev/null || echo 0)
+  missed=$(grep -c 'nvfp4_load_kmajor' "$1" 2>/dev/null || echo 0)
+  say "requant gate: nvfp4_requant_kmajor_b256=${took} nvfp4_load_kmajor=${missed}"
+  if [ "$took" -eq 0 ]; then
+    say "REQUANT GATE FAILED -- the block size did not take; this arm is a duplicate of baseline. VOID"
     return 1
   fi
   return 0
