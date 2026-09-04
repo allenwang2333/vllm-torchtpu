@@ -65,16 +65,27 @@ def main():
         nprompts[str(c)] = ds[0].get("num_prompts")
 
     # Deltas against this build's own base arm, when it exists next to us.
-    base_path = os.path.join(os.path.dirname(out), "base.json")
-    if arm != "base" and os.path.exists(base_path):
+    # ABBA names cells base_1, base_2, ...; a plain ladder names it base.
+    # Average the control cells that exist rather than picking one, so the
+    # in-job drift between them widens the comparison instead of hiding in it.
+    import glob as _glob
+    base_paths = sorted(_glob.glob(os.path.join(os.path.dirname(out), "base*.json")))
+    if not arm.startswith("base") and base_paths:
         try:
-            base = json.load(open(base_path))["cells"]
+            base_docs = [json.load(open(b))["cells"] for b in base_paths]
+            base = {}
+            for c in base_docs[0]:
+                vals = [d[c] for d in base_docs if c in d]
+                base[c] = {"ttft_ms": statistics.median(v["ttft_ms"] for v in vals),
+                           "tpot_ms": statistics.median(v["tpot_ms"] for v in vals),
+                           "n_control_cells": len(vals)}
             for c, cell in cells.items():
                 if c in base:
                     cell["d_ttft_pct_vs_base"] = round(
                         (cell["ttft_ms"] / base[c]["ttft_ms"] - 1) * 100, 2)
                     cell["d_tpot_pct_vs_base"] = round(
                         (cell["tpot_ms"] / base[c]["tpot_ms"] - 1) * 100, 2)
+                    cell["n_control_cells"] = base[c]["n_control_cells"]
         except Exception as e:
             print(f"[arm_json] could not read base arm: {e}", file=sys.stderr)
 

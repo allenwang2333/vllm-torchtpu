@@ -150,7 +150,13 @@ report_compile_seconds() {  # <server log>
 # because a non-zero count is informative even though a zero is not.
 hierep_gate() {  # <server log>
   local want='w13 (56, 3072, 1792) (ep_size=16, moe_tp_size=2)' hits warned
-  hits=$(grep -cF "$want" "$1" 2>/dev/null || echo 0)
+  # Ray collapses lines that differ only in numbers into one plus
+  # "[repeated Nx across cluster]", so a plain grep -c reads 1 on a 32-rank pod.
+  local lit rep
+  lit=$(grep -cF "$want" "$1" 2>/dev/null || echo 0)
+  rep=$(grep -F "$want" "$1" 2>/dev/null | grep -oE 'repeated ([0-9]+)x across cluster' \
+        | grep -oE '[0-9]+' | awk '{t+=$1} END{print t+0}')
+  hits=$(( lit + rep ))
   warned=$(grep -ciE 'falling back to flat expert parallelism' "$1" 2>/dev/null || echo 0)
   say "hierEP gate: bank shape seen on ${hits}/32 ranks; fallback warnings ${warned} (host-scoped, informative only when > 0)"
   if [ "$hits" -lt 32 ]; then
@@ -161,21 +167,24 @@ hierep_gate() {  # <server log>
   [ "$warned" -gt 0 ] && return 1
   return 0
 }
-sanity_probe() {  # <tag>
-  [ -f "$PROBE" ] || { say "no probe script; skipping"; return 0; }
-  local o="${OUT}/$1/probe.txt"
-  python3 "$PROBE" --host 127.0.0.1 --port 8000 --model moonshotai/Kimi-K3 \
-      --out "${OUT}/$1/completions.json" 2>&1 | tee "$o" | tail -5
-  ARM_WORST_RATIO="$(grep -oE 'worst_distinct_ratio[=: ]+[0-9.]+' "$o" | grep -oE '[0-9.]+$' | tail -1)"
-  ARM_SANITY="$(grep -oE 'verdict[=: ]+[A-Z_]+' "$o" | grep -oE '[A-Z_]+$' | tail -1)"
-  ARM_SANITY="${ARM_SANITY:-UNKNOWN}"
+ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""
+# The probe runs on EVERY arm, control included. A probe failure on `base` means
+# the probe is miscalibrated and neither arm counts -- a different conclusion
+# from "the treatment broke the model", and only running it on both tells them
+# apart. run_benchmarks.sh owns the invocation (SANITY_PROBE=1) and exits
+# non-zero on failure, so a fast-but-garbage arm cannot report a TPOT at all.
+read_sanity() {  # <results dir>
+  local j="$1/sanity_probe.json"
+  [ -f "$j" ] || { ARM_SANITY="NOT_RUN"; return 0; }
+  ARM_SANITY=$(python3 -c "import json;print(json.load(open('$j')).get('verdict','UNKNOWN'))" 2>/dev/null || echo UNKNOWN)
+  ARM_WORST_RATIO=$(python3 -c "import json;print(json.load(open('$j')).get('worst_distinct_ratio',''))" 2>/dev/null || echo "")
   say "sanity: ${ARM_SANITY} worst_distinct_ratio=${ARM_WORST_RATIO:-?}"
 }
 
 # --- one lifetime ------------------------------------------------------------
-run_lifetime() {  # <arm> <config> <cells...>  where a cell is "conc:num_prompts"
-  local arm="$1" cfg="$2"; shift 2
-  local base="${OUT}/${arm}/${cfg}" first=1 cell conc np r
+run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_prompts"
+  local cell_label="$1" arm="$2" cfg="$3"; shift 3
+  local base="${OUT}/${cell_label}/${cfg}" first=1 cell conc np r
   for r in $(seq 1 "$REPS"); do
     for cell in "$@"; do
       conc="${cell%%:*}"; np="${cell##*:}"
@@ -188,7 +197,7 @@ run_lifetime() {  # <arm> <config> <cells...>  where a cell is "conc:num_prompts
         if arm_needs_hierep_gate "$arm"; then
           hierep_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; }
         fi
-        arm_touches_weights "$arm" && sanity_probe "$arm"
+        read_sanity "${base}/c${conc}/rep${r}"
       else
         say "${arm}/${cfg} c=${conc} np=${np} rep ${r} (against the running server)"
         K3_CONC="$conc" K3_NUM_PROMPTS="$np" bash "$BENCH" --config "$cfg" \
@@ -214,7 +223,14 @@ run_lifetime() {  # <arm> <config> <cells...>  where a cell is "conc:num_prompts
 # last arm to a full disk is acceptable; losing the first two to a death
 # mid-write is not, so stop cleanly and let the summary still run.
 MIN_FREE_MB="${MIN_FREE_MB:-15000}"
+declare -A ARM_SEEN=()
 for arm in ${*:-$ARMS_DEFAULT}; do
+  # ABBA runs the same arm twice (hier,base,base,hier). Each occurrence is its
+  # own cell: same label, separate directory, separate JSON. The in-job drift
+  # between two same-arm cells is what makes a band separation meaningful and it
+  # is only visible if they are not averaged together on the way in.
+  ARM_SEEN[$arm]=$(( ${ARM_SEEN[$arm]:-0} + 1 ))
+  cell="${arm}#${ARM_SEEN[$arm]}"
   free_mb=$(df -Pm / | awk 'NR==2{print $4}')
   if [ "${free_mb:-0}" -lt "$MIN_FREE_MB" ]; then
     say "SKIPPING arm ${arm} and everything after it: ${free_mb} MB free < ${MIN_FREE_MB} MB floor"
@@ -237,20 +253,21 @@ for arm in ${*:-$ARMS_DEFAULT}; do
     # the base numbers under the arm's label -- a clean-looking null.
     { echo -n "--- [ladder] [env-audit] arm=${arm}"; for g in $K3_GATES; do
         printf ' %s=%s' "$g" "$(printenv "$g" 2>/dev/null || echo '<unset>')"; done; echo; }
+    export SANITY_PROBE=1
     clear_compile_cache
     if ! arm_preflight "$arm"; then rc=1; exit 0; fi
-    run_lifetime "$arm" kimi-k3-tp32-ep-best-lo ${K3_CELLS_LO:-1:8 2:8 4:16 8:32}
+    run_lifetime "$cell" "$arm" kimi-k3-tp32-ep-best-lo ${K3_CELLS_LO:-1:8 2:8 4:16 8:32}
     # The hi rung needs its OWN lifetime (max_num_seqs 8 -> 32 is a server flag),
     # i.e. a second ~20-50 min bring-up per arm. On a one-agent queue that is the
     # dominant cost, so hi runs only for the arms whose claim reaches c>=16 --
     # by default the control and the stack.
     case " ${K3_ARMS_WITH_HI:-base stacked} " in
-      *" $arm "*) run_lifetime "$arm" kimi-k3-tp32-ep-best-hi ${K3_CELLS_HI:-16:32 32:32} ;;
+      *" $arm "*) run_lifetime "$cell" "$arm" kimi-k3-tp32-ep-best-hi ${K3_CELLS_HI:-16:32 32:32} ;;
       *) say "hi rung skipped for arm ${arm} (K3_ARMS_WITH_HI='${K3_ARMS_WITH_HI:-base stacked}')" ;;
     esac
     # One file per arm, in the reviewer's contract shape. The reviewer is the
     # single writer to the operator's tracker; lanes emit JSON and never touch it.
-    python3 "${SCRIPT_DIR}/k3r5_arm_json.py" "$arm" "${OUT}/${arm}" "${OUT}/ladder/${arm}.json" \
+    python3 "${SCRIPT_DIR}/k3r5_arm_json.py" "$arm" "${OUT}/${cell}" "${OUT}/ladder/${cell//#/_}.json" \
         "sha=${BUILDKITE_COMMIT:-}" "weights=${K3_WEIGHTS:-real}" "gate_env=${env_list}" \
         "compilation_seconds=${ARM_COMPILE_SECONDS:-}" "cache_cleared=true" \
         "sanity_verdict=${ARM_SANITY:-NOT_RUN}" \
