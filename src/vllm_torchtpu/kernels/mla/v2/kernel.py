@@ -2533,10 +2533,38 @@ def mla_ragged_paged_attention(
             cache_kv,
         )
 
+    def run_mla_kernel_if_nonempty(ql_nope, q_pe, new_kv_c, new_k_pe, cache_kv,
+                                   kv_lens, page_indices, cu_q_lens, *,
+                                   start_seq_idx, end_seq_idx, **kwargs):
+        """Launch a segment's kernel only if the segment holds a sequence.
+
+        Every segment's bounds are device values, so an empty segment still
+        launches: its grid `(end - start) // batch_size` is zero and the call
+        is pure launch overhead. A decode-only step leaves the batched-decode
+        and mixed segments empty and pays for both, on every MLA layer --
+        measured 1.11 and 0.96 us per launch, 47.6 us/step over 23 layers.
+        The skipped branch returns the two aliased buffers untouched, which is
+        what the kernel would have done with an empty grid.
+
+        Same device-valued `lax.cond` the KDA path uses for its prefill
+        segment (`kda_attention_op.py`), and the same reason.
+        """
+        operands = (ql_nope, q_pe, new_kv_c, new_k_pe, cache_kv, kv_lens,
+                    page_indices, cu_q_lens)
+        return jax.lax.cond(
+            start_seq_idx < end_seq_idx,
+            lambda ops: run_mla_kernel(*ops,
+                                       start_seq_idx=start_seq_idx,
+                                       end_seq_idx=end_seq_idx,
+                                       **kwargs),
+            lambda ops: (ops[0], ops[4]),
+            operands,
+        )
+
     batch_distribution = (distribution[0] //
                           decode_batch_size) * decode_batch_size
     # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv = run_mla_kernel_if_nonempty(
         ql_nope,
         q_pe,
         new_kv_c,
@@ -2556,7 +2584,7 @@ def mla_ragged_paged_attention(
         case=MlaCase.BATCHED_DECODE,
     )
     # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv = run_mla_kernel_if_nonempty(
         ql_nope,
         q_pe,
         new_kv_c,
@@ -2578,7 +2606,7 @@ def mla_ragged_paged_attention(
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
-        ql_nope, updated_kv = run_mla_kernel(
+        ql_nope, updated_kv = run_mla_kernel_if_nonempty(
             ql_nope,
             q_pe,
             new_kv_c,
@@ -2599,7 +2627,7 @@ def mla_ragged_paged_attention(
         )
 
     # Handle mixed case where the query length per sequence is variable.
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv = run_mla_kernel_if_nonempty(
         ql_nope,
         q_pe,
         new_kv_c,
