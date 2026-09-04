@@ -71,4 +71,30 @@ EVAL_TOLERANCE="0.025"
 CONCURRENCY_OPTIONS="${K3_CONC:-1 2 4 8}"
 NUM_PROMPTS="${K3_NUM_PROMPTS:-16}"
 MAX_NUM_SEQS=8
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 --compilation-config {\"compile_sizes\":[1,2,4,8,8192]}"
+# Opt-in phased-profiler wiring, OFF by default. K3_PROFILE_CAPTURE=1 boots the
+# server able to capture, and nothing more: `--profiler-config.*` and the
+# `phased_profiler_*` additional-config key are diagnostic-only and are in
+# HASH_IGNORED_ADDITIONAL_CONFIG_KEYS, so the compiled graph and the compile
+# cache key are identical either way, and the client only sends `--profile`
+# when CAPTURE_PROFILE=1 -- which the ladder sets for exactly one extra cell.
+# That buys the c=1 decode window for ~4 minutes of an existing lifetime
+# instead of a second 1561 GB bring-up.
+PROFILE_ARGS=""
+if [ "${K3_PROFILE_CAPTURE:-0}" = "1" ]; then
+  export USE_PHASED_PROFILER=1
+  # Load-bearing. run_benchmarks.sh INFERS CAPTURE_PROFILE=1 from a caller-supplied
+  # torch_profiler_dir, which would make the bench client send --profile on every
+  # measured rep -- the exact contamination this arrangement exists to avoid. An
+  # explicit value always wins, so pin it off and let the ladder's capture cell
+  # pass CAPTURE_PROFILE=1 for itself.
+  export CAPTURE_PROFILE="${CAPTURE_PROFILE:-0}"
+  K3_PROFILE_DIR="${K3_PROFILE_DIR:-/root/.cache/huggingface/k3r5_profile/ladder/${BUILDKITE_BUILD_NUMBER:-local}}"
+  # `--profiler-config.profiler` is what creates the /start_profile route, and
+  # the route is decided at BOOT. The capture cell runs against the already
+  # running server with --host, so the flag has to be here rather than in the
+  # block run_benchmarks.sh appends only when CAPTURE_PROFILE=1.
+  PROFILE_ARGS=" --profiler-config.profiler torch --profiler-config.ignore_frontend true --profiler-config.torch_profiler_dir ${K3_PROFILE_DIR} --profiler-config.max_iterations ${K3_PROFILE_MAX_ITERS:-8} --additional-config={\"phased_profiler_decode_only_kv_len_threshold\":8200}"
+  echo "[env-audit] ladder profile capture armed: ${K3_PROFILE_DIR}"
+fi
+
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 --compilation-config {\"compile_sizes\":[1,2,4,8,8192]}${PROFILE_ARGS}"

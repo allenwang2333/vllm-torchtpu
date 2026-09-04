@@ -170,6 +170,16 @@ run_lifetime() {  # <arm> <config> <cells...>  where a cell is "conc:num_prompts
       fi
     done
   done
+  # A NAMED fourth cell, not a fifth rep: c=1 with the profiler armed, against
+  # the server that is already up. run_benchmarks.sh only sends --profile when
+  # CAPTURE_PROFILE=1, so the three measured reps above never saw it. Costs ~4
+  # minutes; a standalone capture costs a 1561 GB bring-up.
+  if [ "${K3_PROFILE_CAPTURE:-0}" = "1" ] && [ "$cfg" = "kimi-k3-tp32-ep-best-lo" ]; then
+    say "${arm}/${cfg}: profiled capture cell (c=1, NOT a rep -- excluded from the arm's medians)"
+    CAPTURE_PROFILE=1 K3_CONC=1 K3_NUM_PROMPTS="${K3_PROFILE_PROMPTS:-4}" \
+      bash "$BENCH" --config "$cfg" --results-dir "${base}/profile_c1" --host 127.0.0.1 || rc=1
+  fi
+
   say "${arm}/${cfg}: stopping server"
   bash "$CLEANUP" || true
 }
@@ -182,6 +192,9 @@ for arm in ${*:-$ARMS_DEFAULT}; do
   say "env: ${env_list:-<none: this is the control>}"
   ( # subshell: one arm's exports must not leak into the next
     for kv in $env_list; do export "${kv?}"; done
+    # The capture rides the control arm: it is the one whose serve flags are the
+    # shipping recipe, so its decode window describes what we actually ship.
+    case " ${K3_PROFILE_ARMS:-base} " in *" $arm "*) export K3_PROFILE_CAPTURE=1 ;; *) export K3_PROFILE_CAPTURE=0 ;; esac
     clear_compile_cache
     run_lifetime "$arm" kimi-k3-tp32-ep-best-lo ${K3_CELLS_LO:-1:8 2:8 4:16 8:32}
     # The hi rung needs its OWN lifetime (max_num_seqs 8 -> 32 is a server flag),

@@ -27,9 +27,15 @@ def main():
     arm, root, out = sys.argv[1], sys.argv[2], sys.argv[3]
     extra = dict(kv.split("=", 1) for kv in sys.argv[4:] if "=" in kv)
 
-    reps = {}
+    reps, profiled = {}, []
     for f in glob.glob(os.path.join(root, "**", "isl*_osl*_c*.json"), recursive=True):
         if ".warmup" in f:
+            continue
+        # The profiled capture cell is a named artifact, not a rep: it runs with
+        # --profile and a different prompt count, and averaging it into the
+        # medians would quietly move the number the arm is judged on.
+        if os.sep + "profile_c1" + os.sep in f:
+            profiled.append(f)
             continue
         try:
             d = json.load(open(f))
@@ -88,6 +94,7 @@ def main():
         "sanity": {"verdict": extra.get("sanity_verdict", "NOT_RUN"),
                    "worst_distinct_ratio": float(extra["worst_distinct_ratio"])
                    if "worst_distinct_ratio" in extra else None},
+        "profile_capture_cells": sorted(os.path.relpath(f, root) for f in profiled),
         "notes": extra.get("notes", ""),
     }
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
