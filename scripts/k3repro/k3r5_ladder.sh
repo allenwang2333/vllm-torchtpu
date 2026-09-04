@@ -327,11 +327,13 @@ run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_pro
 # ~10.6 GB per server lifetime against a shared 100 GB boot disk. Losing the
 # last arm to a full disk is acceptable; losing the first two to a death
 # mid-write is not, so stop cleanly and let the summary still run.
-# 15000 stopped build 377 after ONE arm with 14,998 MB free -- a 2 MB miss on a
-# floor I picked by guessing, which cost four arms. The real consumer is the raw
-# traces we now keep (~10 GB per capture arm), so the floor belongs just above
-# one arm's working set, not above a whole build's.
-MIN_FREE_MB="${MIN_FREE_MB:-6000}"
+# Left at 15000 deliberately. It stopped build 377 after one arm with 14,998 MB
+# free, and the temptation is to read a 2 MB miss as a floor set too high. It is
+# not: one arm consumed 28,693 MB, so 43.7 GB of free space was only ever going
+# to hold ONE arm and the second would have died mid-write instead of stopping
+# cleanly. Tuning this number down would convert a clean stop into a lost build.
+# The fix is fewer cells per arm, not a lower floor.
+MIN_FREE_MB="${MIN_FREE_MB:-15000}"
 declare -A ARM_SEEN=()
 export K3_ARMS_EXPECTED="${*:-$ARMS_DEFAULT}"
 for arm in ${*:-$ARMS_DEFAULT}; do
@@ -366,7 +368,15 @@ for arm in ${*:-$ARMS_DEFAULT}; do
     export SANITY_PROBE=1
     clear_compile_cache
     if ! arm_preflight "$arm"; then rc=1; exit 0; fi
-    run_lifetime "$cell" "$arm" kimi-k3-tp32-ep-best-lo ${K3_CELLS_LO:-1:8 2:8 4:16 8:32}
+    # A treatment arm needs only the cells we report. base carries the full
+    # ladder because it is the denominator; every other arm runs c=1 and c=8,
+    # which is where the deltas are taken and is ~half the cells, half the disk
+    # and half the time. Nothing analytical is lost: deltas are per-concurrency.
+    case "$arm" in
+      base*) cells="${K3_CELLS_LO:-1:8 2:8 4:16 8:32}" ;;
+      *)     cells="${K3_CELLS_TREATMENT:-1:8 8:32}" ;;
+    esac
+    run_lifetime "$cell" "$arm" kimi-k3-tp32-ep-best-lo $cells
     # The hi rung needs its OWN lifetime (max_num_seqs 8 -> 32 is a server flag),
     # i.e. a second ~20-50 min bring-up per arm. On a one-agent queue that is the
     # dominant cost, so hi runs only for the arms whose claim reaches c>=16 --
