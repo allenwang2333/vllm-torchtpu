@@ -370,7 +370,7 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         raw_gate: jax.Array,  # [T, H * D]
         beta: jax.Array,  # [T, H]
         output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # [num_slots, K - 1, 3, H, D]
+        conv_state: jax.Array,  # [num_slots, K - 1, 1, 3 * H * D]
         recurrent_state: jax.Array,  # [num_slots, H, K, V]
         conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
         a_log: jax.Array,  # [H]
@@ -386,10 +386,11 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
         kernel_size = conv_weight.shape[0]
 
-        # `mixed_qkv`, `conv_state` and `conv_weight` all lay their channels
-        # out as (3, H, D) in row-major order, which is exactly the flat
-        # `dim` axis the fused kernel indexes -- the reshapes are free. The
-        # kernel wants the weight transposed to [dim, 1, kernel_size].
+        # `mixed_qkv` and `conv_weight` lay their channels out as (3, H, D) in
+        # row-major order, which is exactly the flat `dim` axis the fused
+        # kernel indexes -- the reshapes are free -- and `conv_state` already
+        # arrives in the kernel's (K - 1, 1, dim) slot layout. The kernel
+        # wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
 
@@ -449,7 +450,8 @@ def build_kimi_dispatched_kda_op(
         raw_gate: jax.Array,  # [T, H * D]
         beta: jax.Array,  # [T, H]
         output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # paged short-convolution cache
+        # [num_slots, K - 1, 1, 3 * H * D] or [num_slots, K - 1, 3, H, D]
+        conv_state: jax.Array,
         recurrent_state: jax.Array,  # [num_slots, H, K, V]
         conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
         a_log: jax.Array,  # [H]
@@ -468,7 +470,10 @@ def build_kimi_dispatched_kda_op(
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         has_initial_state = seq_lens > query_lens
-        conv_in = conv_state
+        # `decode_kda` indexes the state per (qkv, head, channel); the dense cache
+        # arrives in the fused kernel's flat (taps, 1, dim) layout.
+        conv_in = conv_state.reshape(conv_state.shape[0], -1, 3, num_heads,
+                                     head_dim)
         # Both convolution paths take the same fused weight, built once at load
         # time by `KimiDeltaAttention.process_weights_after_loading`. It used
         # to be concatenated from the checkpoint's three tensors here, on every
@@ -645,7 +650,7 @@ def build_kimi_dispatched_kda_op(
         output = _gated_output_norm(output, output_gate, norm_weight, eps,
                                     activation_dtype)
 
-        return output, conv_after_prefill, new_pool
+        return output, conv_after_prefill.reshape(conv_state.shape), new_pool
 
     # The fused core replaces the whole op, prefill included, so it overrides
     # the chunked/mega selection rather than composing with it.

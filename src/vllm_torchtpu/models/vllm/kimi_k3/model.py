@@ -322,8 +322,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         local_heads = (kda_config["num_heads"] //
                        vllm_config.parallel_config.tensor_parallel_size)
         return (
-            (kda_config["short_conv_kernel_size"] - 1, 3, local_heads,
-             kda_config["head_dim"]),
+            (kda_config["short_conv_kernel_size"] - 1, 1,
+             3 * local_heads * kda_config["head_dim"]),
             (local_heads, kda_config["head_dim"], kda_config["head_dim"]),
         )
 

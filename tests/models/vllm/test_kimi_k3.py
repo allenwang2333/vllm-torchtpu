@@ -786,6 +786,33 @@ def test_kda_custom_ops_compile_as_one_full_graph(
                                torch.ones_like(recurrent_cache))
 
 
+def test_kda_state_shapes_use_the_fused_kernel_conv_layout() -> None:
+    """Both declaration sites hand vLLM the conv cache as (taps, 1, 3*H*D).
+
+    The fused kernel streams each slot as (taps, 1, dim) rows; declaring that
+    shape gives the cache the same device layout and keeps XLA from relaying
+    out the whole pool around every kernel call.
+    """
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    layer.conv_size, layer.num_heads, layer.head_dim = 4, 3, 128
+    layer.local_projection_size = layer.num_heads * layer.head_dim
+    conv_shape, recurrent_shape = layer.get_state_shape()
+    assert conv_shape == (3, 1, 1152)
+    assert recurrent_shape == (3, 128, 128)
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(
+            linear_attn_config={
+                "num_heads": 96,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+            })),
+        parallel_config=SimpleNamespace(tensor_parallel_size=32),
+    )
+    assert KimiLinearForCausalLM.get_mamba_state_shape_from_config(
+        vllm_config) == (conv_shape, recurrent_shape)
+
+
 @pytest.mark.parametrize("num_blocks", [0, 8],
                          ids=["prefix-only", "with-blocks"])
 def test_attention_residual_matches_reference(num_blocks: int) -> None:
