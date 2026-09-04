@@ -210,6 +210,24 @@ hierep_gate() {  # <server log>
   [ "$warned" -gt 0 ] && return 1
   return 0
 }
+# Pre-flight for arms whose gate has a two-sided CPU test. Rank is the entire
+# difference between -10% and +9% for K1 -- a per-channel (rank-1) scale takes
+# the XLA dot path and loses on issue slots -- so it is asserted before a
+# lifetime is spent, not read out of a log afterwards. Costs ~10 s.
+arm_preflight() {  # <arm>
+  local t=""
+  case "$1" in
+    k1|stacked) t="tests/layers/vllm/gate_fp8_latent_proj.py" ;;
+  esac
+  [ -n "$t" ] && [ -f "${SCRIPT_DIR}/../../$t" ] || return 0
+  say "preflight ${1}: ${t}"
+  if PYTHONPATH="${SCRIPT_DIR}/../../src:${PYTHONPATH:-}" python3 "${SCRIPT_DIR}/../../$t" 2>&1 | tail -6; then
+    return 0
+  fi
+  say "PREFLIGHT FAILED for arm ${1} -- VOID, not spending a lifetime on it"
+  return 1
+}
+
 ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""
 # The probe runs on EVERY arm, control included. A probe failure on `base` means
 # the probe is miscalibrated and neither arm counts -- a different conclusion
