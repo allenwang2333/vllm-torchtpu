@@ -566,6 +566,25 @@ if [ "$START_SERVER" = "1" ]; then
     start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
 fi
 
+# A latency number from an arm that changes what the model *is* proves nothing
+# on its own: BK #299 reported a healthy median TPOT for a Kimi-K3 whose routed
+# experts were half uninitialized. Set SANITY_PROBE=1 on any arm that touches
+# weight loading or expert placement, and on its control.
+if [ "${SANITY_PROBE:-0}" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+    # Not `probe | tee`: that hands the pipeline's status to tee unless
+    # pipefail happens to be set, which is how a gate quietly stops gating.
+    probe_status=0
+    python3 "$SCRIPT_DIR/moe_sanity_probe.py" --port "$PORT" \
+        --label "$CONFIG_NAME" --out "$RESULTS_DIR/sanity_probe.json" \
+        > "$RESULTS_DIR/sanity_probe.log" 2>&1 || probe_status=$?
+    tee -a "$log_file" < "$RESULTS_DIR/sanity_probe.log"
+    if [ "$probe_status" -ne 0 ]; then
+        echo "ERROR: sanity probe failed (exit $probe_status);" \
+             "this arm's numbers are void."
+        exit 1
+    fi
+fi
+
 exit_code=0
 
 for isl_osl_config in $ISL_OSL_CONFIGS; do
