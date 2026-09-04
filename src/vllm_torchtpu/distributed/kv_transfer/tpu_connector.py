@@ -776,10 +776,26 @@ class TPUConnectorScheduler:
             "TPUConnectorScheduler --> kv_ip=%s | kv_port=%s | side_channel_port=%s",
             self.kv_ip, self.kv_port, self.side_channel_port)
 
-    def _maybe_truncate_for_mamba(self, request: "Request") -> None:
-        """P-side: drop the last prompt token so prefill ships the mamba
-        state h(N-1); D's recompute of token N then reproduces h(N) instead
-        of advancing the recurrence a second time."""
+    def _maybe_truncate_prompt_for_handoff(self, request: "Request") -> None:
+        """P-side: drop the last prompt token so P stops where the handoff does.
+
+        The transfer always excludes the final prompt token, since D has to
+        recompute it to get its first logits. Let P compute it anyway and P
+        sits one token ahead of what it publishes, which matters wherever
+        state is derived from how far P actually ran rather than from the
+        transfer extent.
+
+        Mamba state advances with every token, so shipping h(N) would have D
+        advance the recurrence a second time over token N. Stopping at N-1
+        ships h(N-1) and D's recompute reproduces h(N).
+
+        A sliding window frees pages behind itself against
+        `num_computed_tokens`, while the connector skips those same pages
+        against the transfer extent. The two disagree whenever `N - W + 1`
+        lands on a page boundary, and the send then lists a page the allocator
+        has already recycled. Stopping at N-1 puts both formulas on the same
+        input, so they agree by construction instead of by luck.
+        """
         if request.num_prompt_tokens <= 1:
             return
         params = request.kv_transfer_params
@@ -1066,6 +1082,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         logger.info("TPURaidenConnectorScheduler --> kv_ip=%s | kv_port=%s",
                     self.kv_ip, self.kv_port)
 
+    def _stage3_truncates_prompt(self) -> bool:
+        """Whether this model needs P to stop one token short of its prompt.
+
+        Mamba state and sliding-window page recycling both key off how far P
+        actually ran, so both need P to stop where the transfer stops. A model
+        with neither can let P run to the end of the prompt; the extra token
+        changes nothing anyone reads.
+        """
+        return bool(self._stage3_mamba_group_indices) or any(
+            group.window_tokens for group in self._stage3_transfer_groups)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -1073,8 +1100,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> tuple[int, bool]:
         if self.is_producer:
             if (_use_raiden_stage3_transport()
-                    and self._stage3_mamba_group_indices):
-                self._maybe_truncate_for_mamba(request)
+                    and self._stage3_truncates_prompt()):
+                self._maybe_truncate_prompt_for_handoff(request)
             return 0, False
         if not request.kv_transfer_params:
             return 0, False
@@ -1374,6 +1401,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if isinstance(finish_params, dict) and bool(
                 finish_params.get("_p_side_truncated")):
             # The producer already dropped one token; N-1 is already applied.
+            # This branch is also what makes num_tokens equal computed_tokens,
+            # which is what the sliding-window skip needs: the allocator freed
+            # against computed_tokens, so anything else re-derives a different
+            # page boundary and lists a page that is already back in the pool.
             num_tokens = min(computed_tokens, prompt_tokens)
         else:
             num_tokens = min(computed_tokens, prompt_tokens - 1)
