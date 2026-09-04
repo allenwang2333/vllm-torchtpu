@@ -668,6 +668,20 @@ spec:
                         2>&1 | tee "$CDK_OUTPUT_DIR/oracle_after.log"
                       AFTER_RC=${PIPESTATUS[0]}
 
+                      # Perf, last, because it is the only step that does not
+                      # gate the result. A failure here means the numbers are
+                      # missing, not that the transfer is wrong, and the run is
+                      # still worth its correctness verdict.
+                      python3 dsv4_pd_bench.py \
+                        --base "$PROXY" \
+                        --model deepseek-ai/DeepSeek-V4-Flash \
+                        --prompt-tokens 1024 \
+                        --max-tokens 128 \
+                        --concurrency 1,4,16 \
+                        --requests-per-level 32 \
+                        --out "$CDK_OUTPUT_DIR/bench.json" \
+                        2>&1 | tee "$CDK_OUTPUT_DIR/bench.log" || true
+
                       if [ "$ORACLE_RC" != "0" ]; then
                         echo "RESULT: FAIL (oracle had misses; see oracle.json)"
                         exit 1
