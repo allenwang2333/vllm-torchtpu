@@ -37,7 +37,14 @@ REPS="${REPS:-3}"
 # the narrow tiling. Until that lane confirms the granule count falls, a
 # "c1e8m0" arm would measure C1 alone and the difference would be reported as
 # an interaction. Run `c1` until then, and swap it for `c1e8m0` on confirmation.
-ARMS_DEFAULT="base c1 k1 hierep stacked"
+# k1 is HELD: in arm C's HLO the fp8 parameter enters as T(32,128)(4,1) while the
+# consumer wants T(8,128)(4,1), so a full-tensor retile `copy` lands on the weight
+# where the bf16 baseline gets a free bitcast. If that copy is an HBM round-trip it
+# is 25.69 R + 25.69 W + 25.69 R = 77.07 MB against the baseline 51.38 MB -- a 1.50x
+# REGRESSION, not a win. Both projections are also genuinely M=1 at decode pad 1, so
+# XLA may take the matvec off the MXU onto a VPU broadcast/multiply/reduce. Both are
+# CPU-checkable in minutes; a ~50 min pod lifetime is the wrong way to find out.
+ARMS_DEFAULT="base c1 hierep stacked"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -51,14 +58,14 @@ rc=0
 # "the flag was set" and "the program changed" are two different claims and an
 # env-gated patch that silently reuses the previous arm's executable is exactly
 # the r3 A/B that had to be voided.
-K3_GATES="K3_FP8_LATENT K3_KDA_OPROJ_RELAYOUT K3_SCALE_E8M0_NARROW K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
+K3_GATES="TPU_K3_FP8_LATENT_PROJ K3_KDA_OPROJ_RELAYOUT K3_SCALE_E8M0_NARROW K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
 arm_env() {
   case "$1" in
     base)     echo "" ;;                                    # the control, all gates off
     c1)       echo "K3_KDA_OPROJ_RELAYOUT=1" ;;             # lane I1: KDA o_proj load-time relayout
     e8m0)     echo "K3_SCALE_E8M0_NARROW=1" ;;              # lane I1: scale upcast into WeightsRef.get_scale()
     c1e8m0)   echo "K3_KDA_OPROJ_RELAYOUT=1 K3_SCALE_E8M0_NARROW=1" ;;  # the lossless pair: landable without an eval
-    k1)       echo "K3_FP8_LATENT=1" ;;                     # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
+    k1)       echo "TPU_K3_FP8_LATENT_PROJ=1" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
     hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;  # lane I2: env + loader patch
     stacked)  echo "$(arm_env c1e8m0) $(arm_env k1) $(arm_env hierep)" ;;
     *)        echo "__UNKNOWN__" ;;

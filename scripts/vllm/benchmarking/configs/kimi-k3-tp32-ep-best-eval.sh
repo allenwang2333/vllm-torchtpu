@@ -62,7 +62,7 @@ GPU_MEMORY_UTILIZATION=0.82
 #   unverified numerics change on an unverified first one, and neither could be
 #   attributed. It costs a whole server lifetime; skip it and note the gap
 #   rather than dropping an arm that has a hypothesis behind it.
-export K3_FP8_LATENT="${K3_FP8_LATENT:-${BUILDKITE_K3_FP8_LATENT:-0}}"
+export TPU_K3_FP8_LATENT_PROJ="${TPU_K3_FP8_LATENT_PROJ:-${BUILDKITE_K3_FP8_LATENT:-0}}"
 KV_CACHE_DTYPE="${K3_KV_DTYPE:-${BUILDKITE_K3_KV_DTYPE:-fp8}}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }--trust-remote-code"
@@ -116,4 +116,4 @@ MAX_NUM_SEQS=8
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 --compilation-config {\"compile_sizes\":[1,8,8192]}"
 
 # The run's own environment is the evidence for what it ran with.
-echo "[env-audit] eval arm: K3_FP8_LATENT=${K3_FP8_LATENT} KV_CACHE_DTYPE=${KV_CACHE_DTYPE} MAX_NUM_SEQS=${MAX_NUM_SEQS} MODEL=${MODEL}"
+echo "[env-audit] eval arm: TPU_K3_FP8_LATENT_PROJ=${TPU_K3_FP8_LATENT_PROJ} KV_CACHE_DTYPE=${KV_CACHE_DTYPE} MAX_NUM_SEQS=${MAX_NUM_SEQS} MODEL=${MODEL}"
