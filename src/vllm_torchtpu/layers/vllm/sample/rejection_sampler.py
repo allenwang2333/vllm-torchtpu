@@ -418,13 +418,18 @@ def _random_rejection_sample_with_segment(
 
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
+    # Only declared draft slots may participate in rejection sampling.
+    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
+    valid_slot_mask = torch.any(match_mask &
+                                (group_indices.unsqueeze(0) < draft_limits),
+                                dim=0)
     large_value = total_tokens
 
     if total_tokens > 0:
         rejection_indices = torch.where(
-            accepted,
-            torch.tensor(large_value, dtype=torch.int32, device=device),
+            valid_slot_mask & ~accepted,
             group_indices,
+            torch.tensor(large_value, dtype=torch.int32, device=device),
         )
         masked_rejection_indices = torch.where(
             match_mask,
@@ -442,10 +447,14 @@ def _random_rejection_sample_with_segment(
         )
 
     if total_tokens > 0:
+        # Clamp padding segment sentinels for a safe gather.
+        safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
         first_rejection_idx_broadcast = first_rejection_idx_per_segment[
-            segment_ids]
-        before_rejection = group_indices < first_rejection_idx_broadcast
-        at_rejection = group_indices == first_rejection_idx_broadcast
+            safe_segment_ids]
+        before_rejection = (valid_slot_mask
+                            & (group_indices < first_rejection_idx_broadcast))
+        at_rejection = (valid_slot_mask
+                        & (group_indices == first_rejection_idx_broadcast))
         main_tokens = torch.where(
             before_rejection,
             draft_token_ids.to(torch.int32),
@@ -464,8 +473,9 @@ def _random_rejection_sample_with_segment(
     no_draft_tokens = num_draft_tokens == 0
     should_get_bonus = all_accepted | no_draft_tokens
 
+    # Route padding positions to an extra sink row for a safe scatter.
     selected_tokens = torch.full(
-        (batch_size, max_draft_tokens + 1),
+        (batch_size + 1, max_draft_tokens + 1),
         PLACEHOLDER_TOKEN_ID,
         dtype=torch.int32,
         device=device,
@@ -473,7 +483,14 @@ def _random_rejection_sample_with_segment(
 
     segment_ids = segment_ids.to(torch.int64)
     group_indices = group_indices.to(torch.int64)
-    selected_tokens[segment_ids, group_indices] = main_tokens
+    scatter_segment_ids = torch.where(
+        valid_slot_mask,
+        segment_ids,
+        torch.full_like(segment_ids, batch_size),
+    )
+    scatter_group_indices = torch.where(valid_slot_mask, group_indices,
+                                        torch.zeros_like(group_indices))
+    selected_tokens[scatter_segment_ids, scatter_group_indices] = main_tokens
 
     accepted_count = torch.where(
         all_accepted,
@@ -490,4 +507,4 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range,
                     accepted_count] = bonus_token_at_accepted_count
 
-    return selected_tokens
+    return selected_tokens[:batch_size]
