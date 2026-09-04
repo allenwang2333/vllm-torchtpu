@@ -195,6 +195,59 @@ def _get_linear_quant_config(
             enable_quantized_matmul_kernel)
 
 
+# e2m1, in the order `torch.float4_e2m1fn_x2` unpacks them.
+_FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0,
+                    -1.5, -2.0, -3.0, -4.0, -6.0)
+_FP4_MAX = 6.0
+
+
+def quantize_linear_to_native_fp4(
+    weight: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A `[n_out, n_in]` float weight to the native-FP4 operand `gmm_v2` wants.
+
+    Distinct from `fused_moe_gmm.quantize_to_native_fp4_kmajor`, which packs
+    pairs along **K** for a rhs that crosses the bridge as `uint8`. A dense
+    linear reaches `gmm_v2` through `_quantized_matmul_jax`, whose rhs is a
+    *native* `float4_e2m1fn[n_in, n_out]` -- and the torch carrier for that is
+    `float4_e2m1fn_x2` with the **last** axis halved
+    (`distributed/sharded_jax_op.py:85`). So the pairs pack along **N** while
+    the scale blocks run along **K**; the two axes are orthogonal, which is
+    what makes both conventions expressible at once.
+
+    Block 256 rather than the checkpoint's 32: `gmm_v2` dequantizes *before*
+    the matmul whenever `quant_block_size < mxu_column_size` (256 on tpu7x),
+    and that prologue unpacks the whole weight tile regardless of M -- 13 118
+    issue slots against 6 159 for the `after` branch at decode's M=1. It is
+    also finer than the 512 the routed experts are already requantized to at
+    load (`mxfp4.py:319`), so this is numerically the more conservative of two
+    shipped settings, not a new regime.
+    """
+    n_out, n_in = weight.shape
+    if n_in % block_size:
+        raise ValueError(f"n_in {n_in} must divide the FP4 block {block_size}")
+    if n_out % 2:
+        raise ValueError(f"n_out {n_out} must be even to pack FP4 pairs")
+    # K-major, so the contraction is a plain (m, k) @ (k, n).
+    w = weight.t().to(torch.float32).contiguous()              # [n_in, n_out]
+    blocked = w.reshape(n_in // block_size, block_size, n_out)
+    scale = blocked.abs().amax(dim=1, keepdim=True) / _FP4_MAX  # [b, 1, n_out]
+    inv = torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+    q = (blocked * inv).clamp(-_FP4_MAX, _FP4_MAX).reshape(n_in, n_out)
+    lut = torch.tensor(_FP4_E2M1_VALUES, dtype=torch.float32, device=w.device)
+    idx = (q.unsqueeze(-1) - lut).abs().argmin(dim=-1).to(torch.uint8)
+    # Pack along N: element 2j goes to the low nibble of byte j, matching the
+    # carrier's unpack order.
+    pairs = idx.reshape(n_in, n_out // 2, 2)
+    packed = (pairs[..., 0] | (pairs[..., 1] << 4)).contiguous()
+    # `[b, 1, n_out]` already carries gmm_v2's singleton middle axis, so the
+    # leading group axis is the only thing missing. `_quantized_matmul_jax`
+    # rejects anything else (`Blockwise weight scale axis 2 must be 1`).
+    return (packed.view(torch.float4_e2m1fn_x2),
+            scale.unsqueeze(0).contiguous())  # [1, n_in/block, 1, n_out]
+
+
 def _format_linear_scale_for_runtime(
     weight_scale: torch.Tensor,
     *,
@@ -1130,3 +1183,50 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+
+class VllmMxfp4LinearMethodTPU(VllmFp8LinearMethodTPU):
+    """Dense linear whose weight is requantized to native MXFP4 at load.
+
+    Everything except the weight production is inherited: `create_weights`
+    allocates the bf16 parameter (the checkpoint ships these unquantized), and
+    `apply` is `quantized_matmul`, which dispatches on the scale's **rank**
+    rather than the weight's dtype -- so a rank-4 scale routes an FP4 rhs to
+    `gmm_v2` through exactly the path the FP8 blockwise weight takes.
+    """
+
+    FP4_BLOCK = 256
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            raise ValueError(
+                "MXFP4 latent projections requantize from a bf16 checkpoint; "
+                "an FP8-serialized checkpoint is not the intended input.")
+        if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            return  # reload paths re-enter this hook
+        weight, weight_scale = quantize_linear_to_native_fp4(
+            layer.weight.data, self.FP4_BLOCK)
+        replace_parameter(layer, "weight",
+                          torch.nn.Parameter(weight, requires_grad=False))
+        replace_parameter(layer, "weight_scale",
+                          torch.nn.Parameter(weight_scale,
+                                             requires_grad=False))
+        layer.weight_block_size = (self.FP4_BLOCK, 1)
+        setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+        if layer.weight.device.type == "tpu":
+            synchronize_tensors([layer.weight, layer.weight_scale])
+        logger.info_once(
+            "MXFP4 linear weights requantized for runtime: [%d, %d] -> native "
+            "fp4 block %d, scale %s", layer.weight_scale.shape[-1],
+            layer.weight_scale.shape[1] * self.FP4_BLOCK, self.FP4_BLOCK,
+            tuple(layer.weight_scale.shape))
+
+
+class VllmMxfp4LatentConfig(VllmFp8Config):
+    """Selects `VllmMxfp4LinearMethodTPU` for the layers it is handed to."""
+
+    def get_quant_method(self, layer, prefix):
+        from vllm.model_executor.layers.linear import LinearBase
+        if isinstance(layer, LinearBase):
+            return VllmMxfp4LinearMethodTPU(self, self.get_linear_config(layer))
+        return super().get_quant_method(layer, prefix)

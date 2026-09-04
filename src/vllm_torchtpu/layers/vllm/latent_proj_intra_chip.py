@@ -177,7 +177,18 @@ def fp8_quant_config_or(
     non-None config here would mean the model changed underneath this
     assumption and silently overriding it is the wrong failure.
     """
-    if quant_config is not None or not envs.TPU_K3_FP8_LATENT_PROJ:
+    if quant_config is not None:
+        return quant_config
+    if envs.TPU_K3_MXFP4_LATENT_PROJ:
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+            VllmMxfp4LatentConfig
+        logger.info_once(
+            "Latent MoE projections quantized to MXFP4 at load, block %d "
+            "(TPU_K3_MXFP4_LATENT_PROJ). Lossier than fp8: e2m1 carries 1 "
+            "mantissa bit against bf16's 7.", 256)
+        return VllmMxfp4LatentConfig(is_checkpoint_fp8_serialized=False,
+                                     activation_scheme="dynamic")
+    if not envs.TPU_K3_FP8_LATENT_PROJ:
         return quant_config
     logger.info_once(
         "Latent MoE projections quantized to fp8 at load, blockwise at %d "
