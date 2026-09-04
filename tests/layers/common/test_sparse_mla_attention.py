@@ -27,8 +27,12 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import PCP_AXIS_NAME
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
+    build_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
                                                       SparseMLAKVCacheSpec)
@@ -314,3 +318,181 @@ class SparseMlaAttentionTest(parameterized.TestCase):
                                           list(range(num_seqs + 1)), kv_c_deq,
                                           k_pe_deq)
         self._check(output, expected, valid)
+
+
+# =====================================================================
+# PCP parity.
+# =====================================================================
+
+PCP_SIZE = 8
+# The kernel batches `attention_kernel_batch_size` = 16 tokens, so it is the
+# *local* token count that must be a multiple of 16 -- hence 16 * PCP_SIZE
+# globally. One sequence fills PAGES_PER_SEQ * PAGE_SIZE exactly.
+PCP_LOCAL_TOKENS = 16
+PCP_TOKENS = PCP_LOCAL_TOKENS * PCP_SIZE
+
+
+@pytest.mark.multichip
+class SparseMlaAttentionPcpTest(parameterized.TestCase):
+    """Design C: PCP shards queries, not KV, so parity must be *bit-exact*.
+
+    Under PCP the KV caches stay replicated and every rank runs the ordinary
+    single-shard kernel over its own `num_tokens / pcp_size` queries with the
+    full `topk` block. No score is split across ranks, so nothing is merged
+    and no `exp`/reduction-order difference can creep in -- unlike a KV-sharded
+    design, where an LSE merge is only ever accurate to ~1e-6. `assert_array_equal`
+    is therefore the honest assertion here; `allclose` would hide a real
+    regression into partial-softmax territory.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.rng = np.random.default_rng(20260901)
+        self.k_scale = 1.5
+        self.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("sparse MLA kernel requires a TPU (SparseCore).")
+        if len(jax.devices()) < PCP_SIZE:
+            self.skipTest(
+                f"needs {PCP_SIZE} devices, have {len(jax.devices())}")
+
+    def _inputs(self):
+        """One prefill sequence, causal top-k, in natural request-major order."""
+        kv_c = self.rng.standard_normal(
+            (PCP_TOKENS, LKV_DIM)).astype(np.float32)
+        k_pe = self.rng.standard_normal(
+            (PCP_TOKENS, ROPE_DIM)).astype(np.float32)
+        return dict(
+            ql_nope=jnp.asarray(self.rng.standard_normal(
+                (PCP_TOKENS, NUM_HEADS, LKV_DIM)).astype(np.float32),
+                                dtype=jnp.bfloat16),
+            q_pe=jnp.asarray(self.rng.standard_normal(
+                (PCP_TOKENS, NUM_HEADS, ROPE_DIM)).astype(np.float32),
+                             dtype=jnp.bfloat16),
+            kv_c_fp8=_quantize_fp8(kv_c, self.k_scale),
+            k_pe_fp8=_quantize_fp8(k_pe, self.k_scale),
+            topk_rows=jnp.asarray(_causal_topk(list(range(PCP_TOKENS)),
+                                               PCP_TOKENS),
+                                  dtype=jnp.int32),
+            block_tables=jnp.asarray(
+                self.rng.permutation(TOTAL_PAGES)[:PAGES_PER_SEQ],
+                dtype=jnp.int32),
+        )
+
+    def test_pcp_output_is_bit_identical_to_the_unsharded_path(self):
+        inp = self._inputs()
+        seq_lens = jnp.asarray([PCP_TOKENS], jnp.int32)
+        distribution = jnp.asarray([0, 1, 1], jnp.int32)
+        global_qsl = jnp.asarray([0, PCP_TOKENS], jnp.int32)
+
+        single = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x", ))
+        ref_nope, ref_rope, ref_out = \
+            attention_interface.sparse_mla_attention(
+                inp["ql_nope"], inp["q_pe"], inp["kv_c_fp8"], inp["k_pe_fp8"],
+                *_empty_pair(), inp["topk_rows"], seq_lens,
+                inp["block_tables"], global_qsl, distribution, single,
+                NOPE_SPEC, ROPE_SPEC, sm_scale=self.sm_scale,
+                k_scale=self.k_scale)
+
+        # Rank-major packing: with interleave_size=1 rank r owns global tokens
+        # r, r + pcp, r + 2*pcp, ... so `order` is what the runner's
+        # `prepare_pcp_sequence_layout` applies to the token buffers.
+        order, inverse = build_pcp_rank_major_token_order([PCP_TOKENS],
+                                                          PCP_SIZE, 1,
+                                                          PCP_TOKENS)
+        order = np.asarray(order)
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:PCP_SIZE]),
+                                 (PCP_AXIS_NAME, ))
+        sharded = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(PCP_AXIS_NAME))
+
+        # Every rank runs the same per-sequence query count here, but pass the
+        # stacked form regardless: that is the shape the API takes under PCP.
+        local_qsl = jnp.tile(jnp.asarray([0, PCP_LOCAL_TOKENS], jnp.int32),
+                             (PCP_SIZE, 1))
+        pcp_nope, pcp_rope, pcp_out = \
+            attention_interface.sparse_mla_attention(
+                jax.device_put(inp["ql_nope"][order], sharded),
+                jax.device_put(inp["q_pe"][order], sharded),
+                inp["kv_c_fp8"],  # global rows, replicated
+                inp["k_pe_fp8"],
+                *_empty_pair(),
+                jax.device_put(inp["topk_rows"][order], sharded),
+                seq_lens, inp["block_tables"], local_qsl, distribution, mesh,
+                NOPE_SPEC, ROPE_SPEC, sm_scale=self.sm_scale,
+                k_scale=self.k_scale, pcp_size=PCP_SIZE,
+                global_query_start_loc=global_qsl)
+
+        # Undo the packing before comparing; the caches are already global.
+        got = np.asarray(pcp_out)[np.asarray(inverse)]
+        np.testing.assert_array_equal(got, np.asarray(ref_out))
+        np.testing.assert_array_equal(np.asarray(pcp_nope),
+                                      np.asarray(ref_nope))
+        np.testing.assert_array_equal(np.asarray(pcp_rope),
+                                      np.asarray(ref_rope))
+
+    def test_pcp_requires_global_query_start_loc(self):
+        inp = self._inputs()
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:PCP_SIZE]),
+                                 (PCP_AXIS_NAME, ))
+        with self.assertRaisesRegex(ValueError, "global_query_start_loc"):
+            attention_interface.sparse_mla_attention(
+                inp["ql_nope"],
+                inp["q_pe"],
+                inp["kv_c_fp8"],
+                inp["k_pe_fp8"],
+                *_empty_pair(),
+                inp["topk_rows"],
+                jnp.asarray([PCP_TOKENS], jnp.int32),
+                inp["block_tables"],
+                jnp.asarray([0, PCP_TOKENS], jnp.int32),
+                jnp.asarray([0, 1, 1], jnp.int32),
+                mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
+                pcp_size=PCP_SIZE)
+
+    def test_pcp_rejects_an_unstacked_query_start_loc(self):
+        inp = self._inputs()
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:PCP_SIZE]),
+                                 (PCP_AXIS_NAME, ))
+        global_qsl = jnp.asarray([0, PCP_TOKENS], jnp.int32)
+        with self.assertRaisesRegex(ValueError, "per-rank stacked"):
+            attention_interface.sparse_mla_attention(
+                inp["ql_nope"],
+                inp["q_pe"],
+                inp["kv_c_fp8"],
+                inp["k_pe_fp8"],
+                *_empty_pair(),
+                inp["topk_rows"],
+                jnp.asarray([PCP_TOKENS], jnp.int32),
+                inp["block_tables"],
+                global_qsl,  # [num_seqs + 1], not [pcp_size, num_seqs + 1]
+                jnp.asarray([0, 1, 1], jnp.int32),
+                mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
+                pcp_size=PCP_SIZE,
+                global_query_start_loc=global_qsl)
+
+    def test_pcp_rejects_a_mesh_without_a_pcp_axis(self):
+        inp = self._inputs()
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:PCP_SIZE]), ("x", ))
+        global_qsl = jnp.asarray([0, PCP_TOKENS], jnp.int32)
+        with self.assertRaisesRegex(ValueError, PCP_AXIS_NAME):
+            attention_interface.sparse_mla_attention(
+                inp["ql_nope"],
+                inp["q_pe"],
+                inp["kv_c_fp8"],
+                inp["k_pe_fp8"],
+                *_empty_pair(),
+                inp["topk_rows"],
+                jnp.asarray([PCP_TOKENS], jnp.int32),
+                inp["block_tables"],
+                global_qsl,
+                jnp.asarray([0, 1, 1], jnp.int32),
+                mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
+                pcp_size=PCP_SIZE,
+                global_query_start_loc=global_qsl)

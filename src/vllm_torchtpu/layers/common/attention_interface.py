@@ -18,6 +18,7 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import PCP_AXIS_NAME
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
@@ -733,22 +734,25 @@ def mla_attention(
 
 
 def sparse_mla_attention(
-        ql_nope: jax.Array,
-        q_pe: jax.Array,
-        kv_c_normed: jax.Array,
-        k_pe: jax.Array,
-        kv_cache_nope: jax.Array,
-        kv_cache_rope: jax.Array,
-        topk_indices: jax.Array,
-        seq_lens: jax.Array,
-        block_tables: jax.Array,
-        query_start_loc: jax.Array,
-        request_distribution: jax.Array,
-        mesh: Mesh,
-        nope_spec: SparseMLAKVCacheSpec,
-        rope_spec: SparseMLAKVCacheSpec,
-        sm_scale: float | None = None,
-        k_scale: float | None = None
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    pcp_size: int = 1,
+    global_query_start_loc: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -756,19 +760,30 @@ def sparse_mla_attention(
       ql_nope: Query nope latents (`[num_tokens, num_heads, lkv_dim]`).
       q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
-      k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
+        Under PCP these are the *global* rows (see below), so the leading
+        dimension is `pcp_size` times that of `ql_nope`.
+      k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`). Global under PCP,
+        like `kv_c_normed`.
       kv_cache_nope: Paged uint8 nope cache, shaped by `nope_spec`.
       kv_cache_rope: Paged uint8 rope cache, shaped by `rope_spec`.
       topk_indices: Indexer output specifying tokens to gather (`[num_tokens, topk]`).
       seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
       block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
-      query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
+      query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`). Under
+        PCP this is per-rank and ranks disagree whenever a sequence's query
+        length is not a multiple of `pcp_size`, so it is passed stacked as
+        `[pcp_size, num_seqs + 1]` and split along the PCP axis.
       request_distribution: Tensor of (decode_end, prefill_end, num_seqs) indexing bounds.
       mesh: Target sharding mesh.
       nope_spec: Layout descriptor the nope cache was allocated from.
       rope_spec: Layout descriptor the rope cache was allocated from.
       sm_scale: Softmax temperature scale.
       k_scale: Dequantization scale for fp8 keys.
+      pcp_size: PCP world size. When > 1 the query axis is sharded over
+        `PCP_AXIS_NAME` and the KV caches stay replicated (see below).
+      global_query_start_loc: Cumulative new-token counts over *all* PCP
+        ranks' tokens (`[num_seqs + 1]`), indexing `kv_c_normed`/`k_pe`.
+        Required when `pcp_size > 1`, ignored otherwise.
 
     Returns:
       A tuple containing:
@@ -786,7 +801,57 @@ def sparse_mla_attention(
         into `kv_cache` before SparseCore gather execution.
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
+
+    PCP (`pcp_size > 1`):
+      Sparse attention costs O(num_tokens * topk) regardless of context
+      length, so the only axis worth splitting is the query axis -- which
+      needs no KV sharding at all. `ql_nope`, `q_pe`, `topk_indices` and the
+      output are sharded over the token axis; both KV caches stay
+      *replicated*. Each rank then attends over the full `topk` block for its
+      own tokens using the unmodified kernel, so the result is
+      **bit-identical** to the unsharded path rather than merely close, which
+      an LSE merge over a KV-sharded cache could not be (different exp
+      offsets, different reduction trees).
+
+      The one collective this costs: a replicated cache must hold *every*
+      rank's new rows before attention runs, because a rank's token attends to
+      earlier positions of the same step that its peers own. So the caller
+      passes `kv_c_normed`/`k_pe` already all-gathered into global token order
+      (`pcp.all_gather_equal_tokens`), and every rank writes the same rows
+      into its copy of the cache -- which is what keeps the replicas
+      identical. Those tensors are MQA-shaped (one `lkv_dim + rope_dim` row
+      per token, not per head), so the gather is ~640 B/token, not
+      ~640 B/token/head.
+
+      Hence two token spaces are live at once: `global_query_start_loc`
+      indexes the gathered rows for the cache write, while `query_start_loc`
+      indexes this rank's own queries for attention. `seq_lens` and
+      `block_tables` are in global sequence coordinates either way and stay
+      replicated.
+
+      `request_distribution` stays replicated too, which assumes every rank
+      holds at least one query row for every sequence in the batch -- true for
+      the rank-major token layout the runner builds as long as each sequence's
+      query length is at least `pcp_size * interleave_size`.
     """
+    if pcp_size > 1:
+        if PCP_AXIS_NAME not in mesh.axis_names:
+            raise ValueError(f"pcp_size={pcp_size} requires a mesh with a "
+                             f"{PCP_AXIS_NAME!r} axis, got {mesh.axis_names}.")
+        if mesh.shape[PCP_AXIS_NAME] != pcp_size:
+            raise ValueError(
+                f"pcp_size={pcp_size} does not match mesh axis "
+                f"{PCP_AXIS_NAME!r} of size {mesh.shape[PCP_AXIS_NAME]}.")
+        if global_query_start_loc is None:
+            raise ValueError(
+                "sparse_mla_attention requires global_query_start_loc when "
+                "pcp_size > 1: the replicated KV cache is written in global "
+                "token coordinates while attention runs on local queries.")
+        if query_start_loc.shape[:1] != (pcp_size, ):
+            raise ValueError(
+                "sparse_mla_attention expects a per-rank stacked "
+                f"query_start_loc of shape [{pcp_size}, num_seqs + 1] when "
+                f"pcp_size={pcp_size}, got {query_start_loc.shape}.")
     # dsa_gather moves one (`TILE_SUBROWS`, `TILE_LANE_BYTES`) uint8 tile of
     # nope and one `TILE_LANE_BYTES`-byte lane row of rope per token; other
     # head dims don't fit its address arithmetic.
@@ -800,21 +865,26 @@ def sparse_mla_attention(
             f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
             f"{rope_dim}")
 
+    # Under PCP only the query side is sharded; the KV caches and everything
+    # in global sequence coordinates stay replicated.
+    q_axis = PCP_AXIS_NAME if pcp_size > 1 else None
     in_specs = (
-        P(None, None, None),  # ql_nope
-        P(None, None, None),  # q_pe
-        P(None, None),  # kv_c_normed
-        P(None, None),  # k_pe
+        P(q_axis, None, None),  # ql_nope
+        P(q_axis, None, None),  # q_pe
+        P(None, None),  # kv_c_normed (global rows under PCP)
+        P(None, None),  # k_pe (global rows under PCP)
         P(None),  # kv_cache_nope
         P(None),  # kv_cache_rope
-        P(None),  # topk_indices
+        P(q_axis),  # topk_indices
         P(None),  # seq_lens
         P(None),  # block_tables
-        P(None),  # query_start_loc
+        # [pcp_size, num_seqs + 1] under PCP, [num_seqs + 1] otherwise.
+        P(q_axis, None) if pcp_size > 1 else P(None),  # query_start_loc
+        P(None),  # global_query_start_loc
         P(None),  # request_distribution
     )
     out_specs = (
-        P(None, None, None),  # attn output (T, N, D)
+        P(q_axis, None, None),  # attn output (T, N, D)
         P(None),  # updated nope cache
         P(None),  # updated rope cache
     )
@@ -825,7 +895,10 @@ def sparse_mla_attention(
                                            kv_cache_nope, kv_cache_rope,
                                            topk_idx, seq_lens_, block_tables_,
                                            query_start_loc_,
+                                           global_query_start_loc_,
                                            request_distribution_):
+        # The cache write is in global token coordinates and is identical on
+        # every rank, which is what keeps the replicated caches in agreement.
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
             kv_cache_nope,
             kv_cache_rope,
@@ -833,11 +906,17 @@ def sparse_mla_attention(
             k_pe,
             seq_lens_,
             block_tables_,
-            query_start_loc_,
+            global_query_start_loc_,
             nope_spec=nope_spec,
             rope_spec=rope_spec)
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # ...while attention runs on this rank's queries only, hence the local
+        # `query_start_loc_` -- which arrives as this rank's row of the stacked
+        # per-rank array. `topk_idx` and `block_tables_` stay global: the
+        # kernel only ever uses them to address the (replicated) cache.
+        if pcp_size > 1:
+            query_start_loc_ = query_start_loc_[0]
         output = sparse_mla_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -857,13 +936,15 @@ def sparse_mla_attention(
         return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
-        shard_map.shard_map(_sparse_mla_ragged_paged_attention,
-                            mesh=mesh,
-                            in_specs=in_specs,
-                            out_specs=out_specs,
-                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
-                                              kv_cache_nope, kv_cache_rope,
-                                              topk_indices, seq_lens,
-                                              block_tables, query_start_loc,
-                                              request_distribution)
+        shard_map.shard_map(
+            _sparse_mla_ragged_paged_attention,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope,
+                              kv_cache_rope, topk_indices, seq_lens,
+                              block_tables, query_start_loc,
+                              query_start_loc if global_query_start_loc is None
+                              else global_query_start_loc,
+                              request_distribution)
     return new_kv_cache_nope, new_kv_cache_rope, output

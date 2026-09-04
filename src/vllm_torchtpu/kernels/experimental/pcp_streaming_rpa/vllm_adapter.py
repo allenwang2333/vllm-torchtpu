@@ -192,6 +192,7 @@ def pcp_streaming_jax_op(
     mesh: jax.sharding.Mesh,
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Sequence[PartitionSpec] | None = None,
+    fake_outputs: Callable[..., object] | None = None,
 ):
     """Register a PCP streaming custom op with explicit output sharding.
 
@@ -199,6 +200,20 @@ def pcp_streaming_jax_op(
     lowered.out_avals, but jax.export records shard_map outputs there as
     replicated. Explicit out_shardings are preserved in _out_named_shardings;
     the PCP-specific JaxCallable uses that to allocate local torch outputs.
+
+    `fake_outputs` overrides the meta/fake rule. The default rule derives the
+    output shapes by lowering the jax function, and `jax_placeholders` has to
+    scale every sharded dim up to its global size to do that -- which means
+    building `8 * s` out of a torch `SymInt` and handing it to jax, whose
+    `_canonicalize_dimension` calls `operator.index` on it. Under Dynamo that
+    resolves the symbol to its hint and records `Eq(8*s, 128)`, so the token
+    dim vLLM marked dynamic gets specialized to whichever bucket happened to
+    be traced first; every other bucket is then refused by
+    `compilation.shape_variants` and Dynamo raises ConstraintViolationError.
+    (`jax_placeholders` with no mesh does not scale anything, which is why the
+    non-PCP pallas ops are unaffected.) A caller whose output shapes follow
+    from its input shapes can pass them directly and keep the dim symbolic;
+    the real call path still lowers per concrete shape.
     """
     wrapped_fn = build_pcp_streaming_callable(
         name,
@@ -221,6 +236,8 @@ def pcp_streaming_jax_op(
     result = torch.library.custom_op(name, op_target, mutates_args=())
 
     def fake_fn(*args, **kwargs):
+        if fake_outputs is not None:
+            return fake_outputs(*args, **kwargs)
         jax_args = pallas_impl.jax_placeholders(
             args,
             mesh=mesh,
@@ -242,6 +259,41 @@ def pcp_streaming_jax_op(
 
 def get_pcp_streaming_mesh():
     return get_or_create_pcp_mesh(axis_name=PCP_AXIS_NAME)
+
+
+def pcp_to_request_major(packed: jax.Array, request_major_to_packed: jax.Array,
+                         *, mesh: jax.sharding.Mesh) -> jax.Array:
+    """Undo the runner's rank-major token packing, returning a replicated array.
+
+    Every token-major tensor crossing a PCP op boundary arrives as this rank's
+    contiguous slice of the packed buffer: rank 0's tokens, then rank 1's, and
+    so on. Anything indexed by the *global* `query_start_loc` -- the replicated
+    KV-cache writes, the indexer's scoring -- needs natural request-major order
+    instead.
+
+    The gather has to be an explicit collective inside `shard_map`. Reordering
+    at jit level instead (a plain `jnp.take` on a `P(PCP_AXIS_NAME)` input)
+    lowers to a bare `stablehlo.all_reduce` whose `replica_groups` name a mesh
+    symbol that does not survive `exported`, and XLA rejects the module with
+    "mesh symbol 'mesh' not found".
+    """
+
+    def _local(local_packed, take):
+        full = jax.lax.all_gather(local_packed,
+                                  PCP_AXIS_NAME,
+                                  axis=0,
+                                  tiled=True)
+        return jax.numpy.take(full, take, axis=0)
+
+    # Every rank all-gathers the same buffer and applies the same permutation,
+    # so the result is genuinely replicated.
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(PartitionSpec(PCP_AXIS_NAME), PartitionSpec()),
+        out_specs=PartitionSpec(),
+        check_vma=False,
+    )(packed, request_major_to_packed)
 
 
 def make_pcp_streaming_rpa_kernel(

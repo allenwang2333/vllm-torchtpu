@@ -90,6 +90,27 @@ def pcp_local_length(global_len, pcp_rank, pcp_size: int, interleave_c: int):
                                           interleave_c)
 
 
+def pcp_rank_as_data(pcp_axis_name: str, pcp_size: int):
+    """This shard's index along `pcp_axis_name`, without `lax.axis_index`.
+
+    `lax.axis_index` is the obvious spelling, but it lowers to `partition-id`,
+    which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
+    through its `jax.export` bridge ("partitionId instruction is not supported
+    for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
+    a replicated iota says the same thing with an instruction the partitioner
+    accepts: every device splits `[0..pcp_size)` into single elements and
+    keeps the chunks addressed to it, so device `r` receives `r` from each
+    peer and every lane of the result is `r`.
+
+    Same trick as `pcp_streaming_rpa/wrapper.py`'s
+    `_select_replicated_shard_for_pcp_rank`, on an iota rather than real data.
+    Must be called from inside a `shard_map` body.
+    """
+    ranks = jnp.arange(pcp_size, dtype=jnp.int32)
+    exchanged = lax.all_to_all(ranks, pcp_axis_name, 0, 0, tiled=True)
+    return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
+
+
 class MlaCase(Enum):
     """Represents the different cases for MLA."""
 
@@ -1082,7 +1103,7 @@ def streamindex_topk_pcp(
 
     def _local(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
                distribution, token_order):
-        pcp_rank = lax.axis_index(pcp_axis_name)
+        pcp_rank = pcp_rank_as_data(pcp_axis_name, pcp_size)
 
         # A virtual page ordinal resolves to a physical block within this rank's
         # own shard; `cache_kv.shape[0]` is the local block count inside

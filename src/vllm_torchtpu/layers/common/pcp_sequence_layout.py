@@ -20,8 +20,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
     build_pcp_logits_indices as _build_pcp_logits_indices
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import \
-    pcp_local_token_counts
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
+    pcp_local_query_start_locs, pcp_local_token_counts)
 from vllm_torchtpu.layers.common.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL, AllSequenceLayoutPlanner,
     SequenceLayoutDescriptor, SequenceLayoutKind, SequenceLayoutPlan,
@@ -328,6 +328,40 @@ class PcpSequenceLayoutEligibility:
         )
 
 
+def _pcp_permutation_capacity(max_num_tokens: int, pcp_size: int) -> int:
+    """Fixed row count for both PCP token permutation tables.
+
+    The backbone FX graph is traced once and replayed for every token bucket,
+    and anything read off `forward_context.attn_metadata` enters that trace
+    with a *static* shape -- only the runner's explicitly dynamic inputs stay
+    symbolic. Every other PCP metadata tensor is sized by `max_num_seqs` or by
+    the block count, so it is already bucket independent. These two tables are
+    the only ones whose natural length is the token count, which froze them at
+    whichever bucket was traced first and then silently truncated every larger
+    one. Sizing them by the largest bucket instead makes the traced shape
+    correct everywhere; consumers slice back to the live length off `q`, whose
+    token dim really is symbolic.
+    """
+    return int(max_num_tokens) * int(pcp_size)
+
+
+def _pad_pcp_permutation(table: torch.Tensor, capacity: int,
+                         pad_value: int) -> torch.Tensor:
+    """Right-pad a permutation table to `capacity` rows."""
+    if table.shape[0] > capacity:
+        raise ValueError(
+            f"PCP permutation table has {table.shape[0]} entries, more than "
+            f"the {capacity} the largest token bucket allows.")
+    if table.shape[0] == capacity:
+        return table
+    padded = torch.full((capacity, ),
+                        pad_value,
+                        dtype=table.dtype,
+                        device=table.device)
+    padded[:table.shape[0]] = table
+    return padded
+
+
 @dataclass(frozen=True)
 class PcpPreparedBatch:
     local_token_slice: slice
@@ -339,6 +373,9 @@ class PcpPreparedBatch:
     logits_owner_mask_cpu: torch.Tensor
     packed_to_request_major_token_indices: np.ndarray
     request_major_to_packed_token_indices: np.ndarray
+    local_query_start_loc_cpu: torch.Tensor
+    packed_to_request_major_cpu: torch.Tensor
+    request_major_to_packed_cpu: torch.Tensor
 
 
 class PcpSequenceLayoutPlanner:
@@ -346,6 +383,7 @@ class PcpSequenceLayoutPlanner:
     def __init__(self, eligibility: PcpSequenceLayoutEligibility):
         self.eligibility = eligibility
         self._all_planner = AllSequenceLayoutPlanner()
+        self._max_num_tokens: int | None = None
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "PcpSequenceLayoutPlanner":
@@ -371,6 +409,18 @@ class PcpSequenceLayoutPlanner:
                                     required_num_tokens: int) -> None:
         if self.enabled:
             _ensure_host_token_buffer_capacity(runner, required_num_tokens)
+
+    def set_max_num_tokens(self, max_num_tokens: int) -> None:
+        """Record the largest token bucket, for `_pcp_permutation_capacity`."""
+        self._max_num_tokens = int(max_num_tokens)
+
+    def _permutation_capacity(self) -> int:
+        if self._max_num_tokens is None:
+            raise RuntimeError(
+                "PCP layout planning needs the runner's largest token bucket; "
+                "`set_max_num_tokens` was never called.")
+        return _pcp_permutation_capacity(self._max_num_tokens,
+                                         self.eligibility.pcp_size)
 
     def prepare_real(
         self,
@@ -419,6 +469,7 @@ class PcpSequenceLayoutPlanner:
             padded_num_reqs,
             decision=decision,
         )
+        capacity = self._permutation_capacity()
         return SequenceLayoutPlan(
             descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
             token_slice=prepared.local_token_slice,
@@ -436,6 +487,15 @@ class PcpSequenceLayoutPlanner:
                 prepared.packed_to_request_major_token_indices),
             _request_major_to_packed_token_indices=(
                 prepared.request_major_to_packed_token_indices),
+            pcp_local_query_start_loc_cpu=prepared.local_query_start_loc_cpu,
+            # -1 is `packed_to_request_major`'s documented pad (the consumer
+            # masks those rows); the inverse pads with 0 to keep its gather in
+            # bounds, matching how `prepare_pcp_sequence_layout` already pads
+            # it up to the live token count.
+            pcp_packed_to_request_major_cpu=_pad_pcp_permutation(
+                prepared.packed_to_request_major_cpu, capacity, -1),
+            pcp_request_major_to_packed_cpu=_pad_pcp_permutation(
+                prepared.request_major_to_packed_cpu, capacity, 0),
         )
 
     def prepare_dummy(
@@ -453,6 +513,12 @@ class PcpSequenceLayoutPlanner:
                 kv_cache_initialized=False,
             )
         num_tokens = int(num_tokens)
+        num_reqs = int(num_reqs)
+        # Mirror the runner's dummy query lens (one token per active request)
+        # so the traced program sees the same stacked local query_start_loc
+        # shape -- and plausible values -- as a real step.
+        dummy_query_lens = np.zeros(num_reqs, dtype=np.int32)
+        dummy_query_lens[:min(num_tokens, num_reqs)] = 1
         return SequenceLayoutPlan(
             descriptor=PCP_STREAMING_SEQUENCE_LAYOUT_DESCRIPTOR,
             token_slice=slice(0, num_tokens),
@@ -461,6 +527,20 @@ class PcpSequenceLayoutPlanner:
             local_num_tokens=num_tokens,
             local_padded_num_tokens=num_tokens,
             requires_hidden_state_gather=True,
+            pcp_local_query_start_loc_cpu=torch.from_numpy(
+                pcp_local_query_start_locs(
+                    dummy_query_lens,
+                    self.eligibility.pcp_size,
+                    self.eligibility.interleave_size,
+                )),
+            # Identity permutations: a dummy step only needs the shape and an
+            # in-bounds gather, and its tokens carry no meaning to reorder.
+            # Identity over the whole capacity, so the trace and every real
+            # step agree on the length; see `_pcp_permutation_capacity`.
+            pcp_packed_to_request_major_cpu=torch.arange(
+                self._permutation_capacity(), dtype=torch.int32),
+            pcp_request_major_to_packed_cpu=torch.arange(
+                self._permutation_capacity(), dtype=torch.int32),
         )
 
     def finalize_hidden_states(
@@ -595,7 +675,7 @@ def prepare_pcp_sequence_layout(
     decision: PcpSequenceLayoutDecision | None = None,
 ) -> PcpPreparedBatch:
     """Prepare native PCP streaming host state for a real request."""
-    del total_num_scheduled_tokens, use_max_model_len, target_num_reqs
+    del total_num_scheduled_tokens, use_max_model_len
     if decision is None:
         decision = PcpSequenceLayoutEligibility.from_vllm_config(
             runner.vllm_config).evaluate_runner_chunk(
@@ -667,6 +747,33 @@ def prepare_pcp_sequence_layout(
     packed_to_request_major_token_indices[
         request_major_to_packed_token_indices] = np.arange(
             request_major_to_packed_token_indices.size, dtype=np.int64)
+
+    # Padded, upload-ready copies of both permutation directions. The inverse
+    # only covers real tokens (it is `build_pcp_rank_major_token_order`'s
+    # `inverse_order`), so pad it with 0: every consumer masks rows at or past
+    # `query_start_loc[-1]` by token index, and 0 keeps the gather in bounds.
+    request_major_to_packed_cpu = torch.zeros(
+        padded_total_num_scheduled_tokens, dtype=torch.int32)
+    request_major_to_packed_cpu[:request_major_to_packed_token_indices.
+                                size] = torch.from_numpy(
+                                    request_major_to_packed_token_indices.
+                                    astype(np.int32))
+    packed_to_request_major_cpu = torch.from_numpy(
+        packed_to_request_major_token_indices.astype(np.int32))
+
+    # Attention runs on this rank's slice of the packed buffer, so it needs a
+    # query_start_loc measured in local tokens. Width matches the global
+    # query_start_loc the runner sends (`target_num_reqs + 1`) so both index
+    # the same request slots. Kept stacked over ranks: `sparse_mla_attention`
+    # shards it on the PCP axis and each rank reads its own row.
+    local_query_start_loc_cpu = torch.from_numpy(
+        pcp_local_query_start_locs(
+            num_scheduled_tokens_per_req,
+            pcp_size,
+            interleave_size,
+            token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
+            num_reqs_padded=int(target_num_reqs),
+        ))
 
     local_padded_total_num_scheduled_tokens = (
         padded_total_num_scheduled_tokens // pcp_size)
@@ -744,4 +851,7 @@ def prepare_pcp_sequence_layout(
             packed_to_request_major_token_indices),
         request_major_to_packed_token_indices=(
             request_major_to_packed_token_indices),
+        local_query_start_loc_cpu=local_query_start_loc_cpu,
+        packed_to_request_major_cpu=packed_to_request_major_cpu,
+        request_major_to_packed_cpu=request_major_to_packed_cpu,
     )

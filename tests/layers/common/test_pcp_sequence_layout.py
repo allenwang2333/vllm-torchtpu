@@ -661,6 +661,94 @@ def test_pcp_sequence_layout_planner_returns_partial_plan(monkeypatch):
     torch.testing.assert_close(selected, expected)
 
 
+def test_pcp_plan_carries_the_attention_token_bookkeeping(monkeypatch):
+    """The three device-bound PCP fields must describe the same packing.
+
+    Sparse-MLA attention under PCP reads all three: the stacked per-rank
+    `query_start_loc` to bound its own queries, and the two permutations to
+    move token-major tensors between packed and request-major order. If they
+    disagree, a rank silently attends over another rank's rows, so this pins
+    them against each other and against the plan's own packed indices.
+    """
+    query_lens = [25, 9, 40]
+    total = sum(query_lens)
+    runner = _planner_runner_stub(
+        scheduled=query_lens,
+        computed=[0, 0, 0],
+        prompt=query_lens,
+        token_paddings=[256],
+    )
+    planner = PcpSequenceLayoutPlanner(
+        _eligibility(pcp_size=2, interleave_size=4))
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.common.pcp_sequence_layout._get_native_pcp_rank",
+        lambda: 0)
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.common.pcp_sequence_layout."
+        "_get_native_pcp_world_size", lambda: 2)
+
+    plan = planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output(query_lens),
+        start_index=0,
+        num_reqs=3,
+        num_scheduled_tokens_per_req=np.asarray(query_lens, dtype=np.int32),
+        total_num_scheduled_tokens=total,
+        use_max_model_len=True,
+        target_num_reqs=8,
+        padded_num_reqs=8,
+    )
+
+    padded = plan.global_padded_num_tokens
+    packed_to_request = plan.pcp_packed_to_request_major_cpu
+    request_to_packed = plan.pcp_request_major_to_packed_cpu
+    qsl = plan.pcp_local_query_start_loc_cpu
+
+    # Same width as the runner's global query_start_loc, one row per rank.
+    assert qsl.shape == (2, 9)
+    assert packed_to_request.shape == (padded, )
+    assert request_to_packed.shape == (padded, )
+
+    # The device views must be the plan's own numpy permutations, padded.
+    np.testing.assert_array_equal(
+        packed_to_request.numpy(),
+        plan.packed_to_request_major_token_indices.astype(np.int32))
+    np.testing.assert_array_equal(
+        request_to_packed.numpy()[:total],
+        plan._request_major_to_packed_token_indices.astype(np.int32))
+
+    # Round trip: gathering the packed buffer with `request_to_packed` must
+    # recover request-major order, which is what the op does at jit level.
+    packed = np.full(padded, -1, dtype=np.int64)
+    real = packed_to_request.numpy() >= 0
+    packed[real] = packed_to_request.numpy()[real]
+    np.testing.assert_array_equal(packed[request_to_packed.numpy()[:total]],
+                                  np.arange(total))
+
+    # Every real token lands in exactly one rank's slice, and each rank's row
+    # totals its own share.
+    per_rank = padded // 2
+    for rank in range(2):
+        slots = packed_to_request.numpy()[rank * per_rank:(rank + 1) *
+                                          per_rank]
+        assert int((slots >= 0).sum()) == int(qsl[rank, 3])
+        assert int(qsl[rank, -1]) == int(qsl[rank, 3])
+    assert int(qsl[:, -1].sum()) == total
+
+    # Request boundaries inside a rank's slice: token counts per request must
+    # match the cumsum, in request order.
+    request_of_token = np.repeat(np.arange(3), query_lens)
+    for rank in range(2):
+        slots = packed_to_request.numpy()[rank * per_rank:(rank + 1) *
+                                          per_rank]
+        owned = request_of_token[slots[slots >= 0]]
+        # Within a rank's region tokens stay request-major, hence sorted.
+        assert (np.diff(owned) >= 0).all()
+        np.testing.assert_array_equal(
+            np.cumsum(np.bincount(owned, minlength=3)), qsl[rank, 1:4].numpy())
+
+
 def test_pcp_sequence_layout_planner_returns_all_when_disabled():
     runner = _planner_runner_stub(
         scheduled=[25],

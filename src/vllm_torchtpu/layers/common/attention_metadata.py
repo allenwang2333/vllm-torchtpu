@@ -30,6 +30,9 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "pcp_local_query_start_loc",
+        "pcp_packed_to_request_major",
+        "pcp_request_major_to_packed",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -81,6 +84,31 @@ class AttentionMetadata(object):
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | None = None
+    # --- PCP (prefill context parallel) token bookkeeping -------------------
+    # Under PCP the runner packs the chunk's tokens rank-major and hands each
+    # rank a contiguous slice, so `query_start_loc` above -- which stays
+    # *global*, because the replicated sparse-MLA cache write addresses the
+    # whole token stream -- no longer describes what a rank actually holds.
+    # These three fields carry what the sharded attention path needs on top.
+    # None whenever PCP is off.
+    #
+    # (pcp_size, max_num_seqs + 1) int32 — row `r` is rank `r`'s
+    # query_start_loc over its own slice. Ranks disagree whenever a query
+    # length is not a multiple of pcp_size * interleave_size, hence stacked
+    # rather than one shared vector; `sparse_mla_attention` shards it on the
+    # PCP axis so each rank reads its own row.
+    pcp_local_query_start_loc: jax.Array | None = None
+    # (padded_total_num_scheduled_tokens,) int32 — packed slot -> natural
+    # request-major token index, `-1` for padding. This is `token_order` from
+    # `build_pcp_rank_major_token_order`, which `streamindex_topk_pcp` takes
+    # directly.
+    pcp_packed_to_request_major: jax.Array | None = None
+    # (padded_total_num_scheduled_tokens,) int32 — the inverse: request-major
+    # index -> packed slot. Used to un-permute an all-gathered token-major
+    # tensor (which comes back in rank-major packed order) before handing it
+    # to code that indexes by the global query_start_loc. Padding entries are
+    # 0; the consumers drop those rows by token index anyway.
+    pcp_request_major_to_packed: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -127,6 +155,11 @@ class AttentionMetadataBuilderContext:
     unified_mamba_state_indices: list[torch.Tensor] | None = None
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR)
+    # Device tensors for the PCP fields of the same names on
+    # AttentionMetadata. None unless PCP is on.
+    pcp_local_query_start_loc: torch.Tensor | None = None
+    pcp_packed_to_request_major: torch.Tensor | None = None
+    pcp_request_major_to_packed: torch.Tensor | None = None
     # Per-chunk cache of the shared mamba row-offset plan, keyed by
     # (target_block_size, target_num_blocks) -> (state_index, ckpt_index,
     # ckpt_in_row). Valid only because every context is constructed fresh
@@ -411,6 +444,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            pcp_local_query_start_loc=ctx.pcp_local_query_start_loc,
+            pcp_packed_to_request_major=ctx.pcp_packed_to_request_major,
+            pcp_request_major_to_packed=ctx.pcp_request_major_to_packed,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,

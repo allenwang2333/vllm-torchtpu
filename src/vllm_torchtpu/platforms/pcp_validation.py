@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def _has_sparse_attention(vllm_config: Any) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    return getattr(hf_config, "index_topk", None) is not None
+
+
 @dataclass(frozen=True)
 class PcpStaticConfig:
     pcp_size: int
@@ -16,6 +22,9 @@ class PcpStaticConfig:
     num_speculative_tokens: int
     is_kv_producer: bool | None
     kv_role: str | None
+    # GLM-5.2 / DeepSeek sparse attention: the model config carries an
+    # `index_topk`, i.e. attention runs over an indexer-selected subset.
+    sparse_attention: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -75,6 +84,7 @@ class PcpStaticSupportValidator:
             num_speculative_tokens=num_speculative_tokens,
             is_kv_producer=is_kv_producer,
             kv_role=kv_role,
+            sparse_attention=_has_sparse_attention(vllm_config),
         )
 
     @staticmethod

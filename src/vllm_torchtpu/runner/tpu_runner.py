@@ -330,6 +330,43 @@ def _get_sequence_layout_planner_for_runner(runner: Any):
     return runner.sequence_layout_planner
 
 
+def _pcp_token_bookkeeping(layout_plan: Any,
+                           device: Any) -> dict[str, torch.Tensor]:
+    """Upload the PCP-only token bookkeeping for the attention builders.
+
+    Empty for every non-PCP layout, so the default path keeps building the
+    exact same AttentionMetadata it always did. Under PCP the sharded
+    attention path needs the per-rank query_start_loc and both directions of
+    the rank-major token permutation; see the fields of the same names on
+    AttentionMetadata.
+    """
+    fields = (
+        ("pcp_local_query_start_loc",
+         getattr(layout_plan, "pcp_local_query_start_loc_cpu", None)),
+        ("pcp_packed_to_request_major",
+         getattr(layout_plan, "pcp_packed_to_request_major_cpu", None)),
+        ("pcp_request_major_to_packed",
+         getattr(layout_plan, "pcp_request_major_to_packed_cpu", None)),
+    )
+    return {
+        name: tensor.to(device, non_blocking=True)
+        for name, tensor in fields if tensor is not None
+    }
+
+
+def _sparse_mla_pcp_replication(vllm_config: Any) -> int:
+    """How many PCP ranks' worth of KV a sparse-MLA page must hold.
+
+    `pcp_size` when PCP is on (the caches are replicated, not sharded),
+    1 otherwise. Kept as one accessor so the spec's byte accounting and the
+    allocation's page geometry cannot drift apart.
+    """
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    # Non-int only reaches here from a stubbed config; treat it as "no PCP"
+    # rather than letting it propagate into the page-size arithmetic.
+    return pcp_size if isinstance(pcp_size, int) and pcp_size > 1 else 1
+
+
 def _validate_libtpu_version() -> None:
     """Validate libtpu opportunistically if it is present."""
     libtpu_version = importlib_metadata.version("libtpu")
@@ -654,6 +691,10 @@ class TPUModelRunner(GPUModelRunner):
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
+        # The layout planner sizes its token-indexed metadata by the largest
+        # bucket rather than the current one, because the backbone graph is
+        # traced once and replayed for all of them.
+        self.sequence_layout_planner.set_max_num_tokens(self.max_num_tokens)
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention")
         self.num_kv_heads = self.model_config.get_num_kv_heads(
@@ -1351,6 +1392,16 @@ class TPUModelRunner(GPUModelRunner):
                         attn_module.head_size,
                         self.kv_cache_dtype,
                     ))
+                pcp_replication = _sparse_mla_pcp_replication(self.vllm_config)
+                if pcp_replication > 1 and getattr(attn_module, "use_sparse",
+                                                   False):
+                    # Sparse (DSA) MLA under PCP replicates the nope/rope
+                    # caches instead of sharding them -- that is what makes
+                    # attention bit-identical to the unsharded path (see
+                    # `sparse_mla_attention`). One logical block therefore
+                    # costs pcp_size pages' worth of bytes on *every* rank,
+                    # not one, and vLLM must size the pool accordingly.
+                    page_size_padded *= pcp_replication
                 kv_cache_spec[layer_name] = MLAAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
@@ -3234,6 +3285,7 @@ class TPUModelRunner(GPUModelRunner):
                 [] if self._unified_kv_layout
                 and self.mamba_slot_read_offsets is not None else None),
             sequence_layout_descriptor=layout_plan.descriptor,
+            **_pcp_token_bookkeeping(layout_plan, self.device),
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -4652,6 +4704,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
+                **_pcp_token_bookkeeping(dummy_layout_plan, self.device),
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(
@@ -6321,10 +6374,16 @@ class TPUModelRunner(GPUModelRunner):
                     if getattr(attn_module, "use_sparse", False):
                         # Split (nope, rope) cache in uint8 dtype
                         # (expected by `dsa_gather`).
+                        # Under PCP the page spans the whole *logical* block
+                        # (all pcp_size ranks' positions), because this cache
+                        # is replicated rather than sharded; the page-size
+                        # inflation in get_kv_cache_spec reserved the bytes.
                         specs = (
                             PallasMLAttentionBackend.get_sparse_kv_cache_specs(
                                 num_blocks,
-                                kv_cache_spec.block_size,
+                                (kv_cache_spec.block_size *
+                                 _sparse_mla_pcp_replication(
+                                     self.vllm_config)),
                                 kv_cache_spec.head_size,
                                 kv_cache_spec.dtype,
                             ))

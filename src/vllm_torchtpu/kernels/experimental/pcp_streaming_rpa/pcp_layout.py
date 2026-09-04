@@ -110,6 +110,70 @@ def pcp_local_token_counts(
     return counts.astype(np.int32)
 
 
+def pcp_local_query_start_locs(
+    num_scheduled_tokens_per_req: list[int] | np.ndarray,
+    pcp_size: int,
+    interleave_size: int,
+    token_owner_start_offsets_per_req: list[int] | np.ndarray | None = None,
+    *,
+    num_reqs_padded: int | None = None,
+    token_start_offsets_per_req: list[int] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-rank cumulative query offsets, one row per PCP rank.
+
+    Returns ``[pcp_size, num_reqs + 1]`` (or ``num_reqs_padded + 1``): row
+    ``r`` is the ``query_start_loc`` a rank sees over *its own* slice of the
+    packed token buffer. Ranks disagree whenever a request's query length is
+    not a multiple of ``pcp_size * interleave_size``, which is why this cannot
+    be one shared vector.
+
+    This is valid only because ``build_pcp_rank_major_token_order`` fills each
+    rank's region request by request, in request order -- so within a rank the
+    tokens of request ``i`` are contiguous and precede those of request
+    ``i + 1``, and a cumulative sum of the per-request local counts addresses
+    them. The loop below walks the same chunk ranges in the same order for
+    exactly that reason; keep the two in step.
+
+    Padded request slots repeat the last real offset, so they have zero length
+    rather than a negative one -- matching how the runner pads the global
+    ``query_start_loc``.
+    """
+    tokens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+    num_reqs = int(tokens.size)
+    width = (num_reqs if num_reqs_padded is None else int(num_reqs_padded)) + 1
+    if width < num_reqs + 1:
+        raise ValueError(
+            f"{num_reqs_padded=} cannot hold {num_reqs} requests.")
+    if pcp_size <= 1:
+        starts = np.zeros((1, width), dtype=np.int32)
+        if num_reqs:
+            starts[0, 1:num_reqs + 1] = np.cumsum(tokens)
+            starts[0, num_reqs + 1:] = starts[0, num_reqs]
+        return starts
+    if interleave_size <= 0:
+        raise ValueError("cp_kv_cache_interleave_size must be positive.")
+
+    starts = np.zeros((pcp_size, width), dtype=np.int64)
+    if num_reqs == 0:
+        return starts.astype(np.int32)
+    owner_starts = _resolve_token_owner_start_offsets(
+        tokens,
+        token_owner_start_offsets_per_req,
+        token_start_offsets_per_req,
+    )
+    running = np.zeros(pcp_size, dtype=np.int64)
+    for req, (q_len, token_owner_start) in enumerate(zip(tokens,
+                                                         owner_starts)):
+        for rank in range(pcp_size):
+            for chunk_start, chunk_end in pcp_token_owner_chunk_ranges(
+                    int(q_len), int(token_owner_start), rank, pcp_size,
+                    interleave_size):
+                running[rank] += chunk_end - chunk_start
+        starts[:, req + 1] = running
+    starts[:, num_reqs + 1:] = running[:, None]
+    return starts.astype(np.int32)
+
+
 def build_pcp_rank_major_token_order(
     num_scheduled_tokens_per_req: list[int] | np.ndarray,
     pcp_size: int,

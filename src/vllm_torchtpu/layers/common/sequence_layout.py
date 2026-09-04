@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import bisect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
@@ -62,10 +62,42 @@ class SequenceLayoutPlan:
     # token order to the layout's packed global token order. Default layouts
     # keep the same order and leave this as None.
     _request_major_to_packed_token_indices: np.ndarray | None = None
+    # Optional `[pcp_size, num_reqs_padded + 1]` per-rank query_start_loc over
+    # each rank's own slice of the packed token buffer. Ranks disagree on the
+    # per-request counts, so this cannot be one shared vector; attention reads
+    # its own row. The runner's `query_start_loc` stays global, because the
+    # replicated KV-cache write still addresses the full token stream.
+    #
+    # The three tensor fields below are `compare=False`: they are derived
+    # entirely from the shape fields above, and `==` on a dataclass holding a
+    # multi-element tensor raises rather than comparing.
+    pcp_local_query_start_loc_cpu: torch.Tensor | None = field(default=None,
+                                                               compare=False)
+    # `(global_padded_num_tokens,)` int32 views of the two token permutations
+    # above, ready to upload. Kept separate from the numpy arrays because the
+    # host-side localize path indexes them by real-token count while the
+    # device path needs the padded length. `-1` pads the packed -> request
+    # direction; the inverse pads with 0 (those rows are dropped by token
+    # index downstream).
+    pcp_packed_to_request_major_cpu: torch.Tensor | None = field(default=None,
+                                                                 compare=False)
+    pcp_request_major_to_packed_cpu: torch.Tensor | None = field(default=None,
+                                                                 compare=False)
 
     @property
     def kind(self) -> SequenceLayoutKind:
         return self.descriptor.kind
+
+    @property
+    def packed_to_request_major_token_indices(self) -> np.ndarray | None:
+        """Packed global token order -> request-major order, or None.
+
+        Attention layers that all-gather a token-major tensor back to the full
+        batch need this to undo the rank-major packing: the gather concatenates
+        rank regions, so the result is packed order, not request order. Padding
+        rows are -1.
+        """
+        return self._packed_to_request_major_token_indices
 
     def local_index_for_request_major_token(
             self, request_major_index: int) -> int | None:
@@ -202,6 +234,9 @@ class SequenceLayoutPlanner(Protocol):
                                     required_num_tokens: int) -> None:
         ...
 
+    def set_max_num_tokens(self, max_num_tokens: int) -> None:
+        ...
+
     def prepare_real(
         self,
         *,
@@ -269,6 +304,9 @@ class AllSequenceLayoutPlanner:
     def reserve_host_token_capacity(self, runner: Any,
                                     required_num_tokens: int) -> None:
         del runner, required_num_tokens
+
+    def set_max_num_tokens(self, max_num_tokens: int) -> None:
+        del max_num_tokens
 
     def prepare_real(
         self,
