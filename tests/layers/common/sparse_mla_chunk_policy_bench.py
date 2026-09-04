@@ -570,12 +570,22 @@ def run_case(case: str,
                                       *data["static"]).as_text(debug_info=True)
                 except TypeError:
                     txt = chain.lower(probe, *data["static"]).as_text()
+                # The kernel gathers `min(chunk, T)` rows per iteration, so a
+                # chunk wider than the token count lowers to `gcz_<T>`, not to
+                # `gcz_<chunk>`. That is correct behaviour and the gate must
+                # expect it -- an earlier revision asserted `gcz_<chunk>`
+                # unconditionally and failed j-aada678c's `c128`-at-64-tokens
+                # arm spuriously. The `gcs_tags` check still uses the
+                # UNCLAMPED value: the call site's `named_scope` records what
+                # the policy returned, which is the thing being audited.
+                eff = min(resolved[arm], n)
                 lowered[arm] = {
                     "gcs_tags": gcs_tags(txt),
-                    "mla_calls": mla_call_count(txt, resolved[arm]),
+                    "effective_chunk": eff,
+                    "mla_calls": mla_call_count(txt, eff),
                     "mla_calls_other": {
                         c: mla_call_count(txt, c)
-                        for c in (8, 16, 32, 64, 128) if c != resolved[arm]
+                        for c in (8, 16, 32, 64, 128) if c != eff
                     },
                 }
                 del probe
@@ -699,8 +709,11 @@ def run_case(case: str,
         f"  resolved chunk: "
         f"{ {k: v for k, v in resolved.items() if not k.startswith('off#')} }")
     for arm in lowered:
+        eff = lowered[arm]["effective_chunk"]
+        clamped = ("" if eff == resolved[arm] else
+                   f" (clamped from {resolved[arm]} by T={n})")
         print(f"  lowered[{arm}]: gcs_tags={lowered[arm]['gcs_tags']} "
-              f"mla_pallas_calls@gcz_{resolved[arm]}="
+              f"mla_pallas_calls@gcz_{eff}{clamped}="
               f"{lowered[arm]['mla_calls']} "
               f"other={lowered[arm]['mla_calls_other']}")
     for k in arms:
@@ -926,10 +939,24 @@ def check_case(rec, want_pair):
         # the whole of what the HLO can tell us, and it is enough: it
         # cannot be satisfied by a call site that computed the right
         # number and then failed to pass it to the kernel.
+        # The kernel clamps a chunk wider than the token count, so the scope
+        # to look for is `gcz_min(chunk, T)`, not `gcz_<chunk>`.
+        eff = rec["lowered"][arm].get("effective_chunk",
+                                      min(exp, rec["num_tokens"]))
         if rec["lowered"][arm]["mla_calls"] < 1:
             fails.append(
-                f"{tag}/{arm}: no MLA pallas_call at gcz_{exp} in the "
+                f"{tag}/{arm}: no MLA pallas_call at gcz_{eff} in the "
                 "HLO -- the resolved chunk never reached the kernel")
+        # A chunk at or above the token count is one chunk, which is exactly
+        # what `off` already measures here. Such an arm duplicates the control
+        # and its timing is not a measurement of the chunk size it is named
+        # for, so refuse it rather than let it be reported as one.
+        if arm not in ("off", "on") and eff == min(exp_off, rec["num_tokens"]):
+            fails.append(
+                f"{tag}/{arm}: chunk {exp} clamps to {eff} at "
+                f"{rec['num_tokens']} tokens, which is what `off` "
+                f"({exp_off}) already measures -- this arm is a duplicate "
+                "control, not a measurement of that chunk size")
         stray = {
             c: k
             for c, k in rec["lowered"][arm]["mla_calls_other"].items() if k
@@ -937,9 +964,13 @@ def check_case(rec, want_pair):
         if stray:
             fails.append(f"{tag}/{arm}: HLO also contains MLA calls at "
                          f"other chunk sizes {stray}")
-    if exp_off == exp_on:
-        fails.append(f"{tag}: the two arms resolve to the SAME chunk, "
-                     "so this case discriminates nothing")
+    # Compare the EFFECTIVE chunks: 64 and 128 are the same single-chunk
+    # program at 64 tokens, so equality after clamping is what makes a case
+    # vacuous, not equality of the requested values.
+    if min(exp_off, rec["num_tokens"]) == min(exp_on, rec["num_tokens"]):
+        fails.append(f"{tag}: the two arms resolve to the SAME chunk at "
+                     f"{rec['num_tokens']} tokens, so this case "
+                     "discriminates nothing")
     if not rec["finite"]:
         fails.append(f"{tag}: non-finite output")
     # `distinct_output_values` is INFORMATIONAL. It is a proxy for
