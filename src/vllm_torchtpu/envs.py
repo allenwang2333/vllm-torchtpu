@@ -431,13 +431,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_K3_FP8_LATENT_PROJ":
     env_bool("TPU_K3_FP8_LATENT_PROJ"),
 
-    # As above but MXFP4 at block 256, which is ~1.5x the byte saving of fp8
-    # for the same two weights and lands on gmm_v2's dequantize-AFTER branch.
-    # Wins over TPU_K3_FP8_LATENT_PROJ where both are set. LOSSIER still:
-    # e2m1 is 1 mantissa bit. Block 256 is finer than the 512 the routed
-    # experts are already requantized to at load, so the format is shipped --
-    # but these two sit on every token's critical path with no averaging over
-    # experts, so they get their own accuracy run.
+    # MEASURED +382% ON HARDWARE (build 381, sliced-8, c=1). DO NOT ENABLE.
+    #
+    # Retained deliberately, and NOT dead code: this is the reproduction case
+    # for a 21x per-instruction fusion pathology at M=1. The kernel is fine --
+    # `moe/gmm` came in at 384.0 us, CHEAPER than the fp8 arm's 403.7, and the
+    # fp4 carrier reaches gmm_v2 exactly as intended. The cost is entirely
+    # outside it: `matmul/fusion` 187.0 -> 2230.0 us, because the fp4 UNPACK
+    # lands in a fusion at M=1 where there is no matmul to amortise it
+    # against (19.6 us/instr against bf16's 0.94). A byte-only or
+    # kernel-only analysis cannot see this, and the next person to reach for
+    # a sub-byte weight on a dense projection at decode batch 1 will need the
+    # reproduction more than they need a clean diff.
+    #
+    # As above but MXFP4 at block 256, ~1.5x the byte saving of fp8 for the
+    # same two weights, on gmm_v2's dequantize-AFTER branch. LOSSIER still:
+    # e2m1 is 1 mantissa bit.
     "TPU_K3_MXFP4_LATENT_PROJ":
     env_bool("TPU_K3_MXFP4_LATENT_PROJ"),
 
