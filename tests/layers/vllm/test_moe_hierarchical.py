@@ -302,3 +302,109 @@ def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
                         (4, 0, 2, 0))
     moe_hierarchical.align_ep_weight_filter()
     assert default_loader.compute_local_expert_ids(224, 8, 0) == chip
+
+
+def _fake_vllm_config(num_experts: int, tp_size: int):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        model_config=SimpleNamespace(is_moe=True,
+                                     get_num_experts=lambda: num_experts),
+        parallel_config=SimpleNamespace(enable_expert_parallel=True,
+                                        enable_ep_weight_filter=True,
+                                        enable_eplb=False,
+                                        data_parallel_size=1,
+                                        tensor_parallel_size=tp_size,
+                                        prefill_context_parallel_size=1,
+                                        expert_placement_strategy="linear"))
+
+
+# (tp_size, chips, tp_rank, chip): the pod shape K3 runs at (TP32 over 16
+# chips, 896 experts -> 56 per chip) and the TP8 surrogate the flag was
+# rehearsed on (4 chips -> 224 per chip).
+_RUNAI_CASES = [
+    (32, 16, 0, 0),
+    (32, 16, 9, 4),
+    (32, 16, 31, 15),
+    (8, 4, 1, 0),
+    (8, 4, 5, 2),
+]
+
+
+@pytest.mark.parametrize("tp_size,chips,tp_rank,chip", _RUNAI_CASES)
+def test_runai_sharded_fetch_reads_the_chip_block(monkeypatch, tp_size, chips,
+                                                  tp_rank, chip) -> None:
+    """The Run:AI streaming filter must agree with the layer's chip split.
+
+    K3 loads with ``--load-format runai_streamer``, and that path does not go
+    through ``DefaultModelLoader``: it calls this module's own
+    ``_compute_local_expert_ids``, which imports ``compute_local_expert_ids``
+    straight from ``ep_weight_filter`` and so never sees
+    ``align_ep_weight_filter``'s patch of the ``default_loader`` namespace.
+    Before this was fixed, BK #299 logged both lines in the same server --
+    ``moe_hierarchical.py:69 ... ep_size=16`` and ``[sharded-ep-load]
+    ep_size=32 ... keeps 28/896`` -- i.e. every rank built 56 expert slots and
+    streamed the bytes for 28 of them.
+
+    ``align_ep_weight_filter()`` is deliberately NOT called here: the fetch
+    plan has to be right on its own, not because some earlier import patched
+    a third module's attribute.
+    """
+    import vllm.config as vllm_config_mod
+    import vllm.distributed as vllm_dist
+
+    from vllm_torchtpu import model_loader_patches
+    from vllm_torchtpu.layers.vllm import moe_hierarchical
+
+    num_experts = 896
+    per_chip = num_experts // chips
+    per_rank = num_experts // tp_size
+
+    monkeypatch.setattr(vllm_config_mod, "get_current_vllm_config",
+                        lambda: _fake_vllm_config(num_experts, tp_size))
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank",
+                        lambda: tp_rank)
+    monkeypatch.setattr(
+        moe_hierarchical, "hierarchical_split_or_none", lambda:
+        (chips, chip, tp_size // chips, tp_rank % (tp_size // chips)))
+
+    got = model_loader_patches._compute_local_expert_ids()
+    assert got == set(range(chip * per_chip, (chip + 1) * per_chip))
+
+    # And with the flag off the flat rank-derived block is unchanged.
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_split_or_none",
+                        lambda: None)
+    flat = model_loader_patches._compute_local_expert_ids()
+    assert flat == set(range(tp_rank * per_rank, (tp_rank + 1) * per_rank))
+    assert flat < got, "the flat block is the half of the chip block it fetched"
+
+
+def test_both_chiplets_of_a_chip_fetch_the_same_experts(monkeypatch) -> None:
+    """The bug's signature: complementary halves, so neither shard is whole.
+
+    Under the chip split the two cores of a chip hold complementary
+    *intermediate* shards of the SAME experts, so both must stream the same
+    expert ids. The rank-derived block gives them disjoint ones -- for every
+    routed expert exactly one of its two intermediate shards is present, which
+    raises nothing and serves.
+    """
+    import vllm.config as vllm_config_mod
+    import vllm.distributed as vllm_dist
+
+    from vllm_torchtpu import model_loader_patches
+    from vllm_torchtpu.layers.vllm import moe_hierarchical
+
+    monkeypatch.setattr(vllm_config_mod, "get_current_vllm_config",
+                        lambda: _fake_vllm_config(896, 32))
+
+    fetched = {}
+    for tp_rank in (8, 9):  # the two chiplets of chip 4
+        monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank",
+                            lambda r=tp_rank: r)
+        monkeypatch.setattr(
+            moe_hierarchical, "hierarchical_split_or_none", lambda r=tp_rank:
+            (16, r // 2, 2, r % 2))
+        fetched[tp_rank] = model_loader_patches._compute_local_expert_ids()
+
+    assert fetched[8] == fetched[9] == set(range(224, 280))
+    assert not fetched[8].isdisjoint(fetched[9]), (
+        "complementary halves -- this is what BK #299 streamed")

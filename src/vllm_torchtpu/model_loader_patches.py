@@ -70,12 +70,16 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
 def _compute_local_expert_ids() -> Optional[set[int]]:
     """Local expert ids for this rank, or None when filtering is off.
 
-    Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26) so the
-    fetch-time filter and the FusedMoE expert map agree by construction.
+    Mirrors ``DefaultModelLoader._init_ep_weight_filter`` (vLLM 0.26), and the
+    chip split when hierarchical MoE is on, so the fetch-time filter and the
+    FusedMoE expert map agree by construction.
     """
     from vllm.config import get_current_vllm_config
     from vllm.model_executor.model_loader.ep_weight_filter import \
         compute_local_expert_ids
+
+    from vllm_torchtpu.layers.vllm.moe_hierarchical import \
+        hierarchical_split_or_none
 
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
@@ -101,6 +105,20 @@ def _compute_local_expert_ids() -> Optional[set[int]]:
     pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
     ep_size = dp_size * pcp_size * tp_size
     ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+
+    # Under TPU_MOE_HIERARCHICAL_EP the FusedMoE layer shards experts between
+    # CHIPS, so this rank's expert map covers its chip's whole block and the
+    # rank-derived pair above names only the half its own chiplet would own.
+    # `align_ep_weight_filter` corrects the DefaultModelLoader path by patching
+    # `default_loader.compute_local_expert_ids`; this function imports the
+    # unpatched original straight from `ep_weight_filter`, so without this the
+    # Run:AI streaming path -- the one K3 loads with -- fetches half the block
+    # and leaves the layer's remaining expert slots at their `torch.empty`
+    # values, silently. Consulting the split here rather than leaning on that
+    # patch also keeps the two paths independent of each other's import order.
+    split = hierarchical_split_or_none()
+    if split is not None:
+        ep_size, ep_rank = split[0], split[1]
 
     local_ids = compute_local_expert_ids(
         num_experts,
