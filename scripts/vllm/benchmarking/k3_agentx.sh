@@ -51,7 +51,25 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$RESULTS_DIR"
-trap 'echo "[k3-agentx] cleanup"; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT TERM
+# On any exit: surface the server's own failure (run_benchmarks.sh only
+# tails 200 lines, which the loader's progress bars fill with blanks) and
+# record what the results dir holds, so a startup death is diagnosable from
+# the job log alone even when the artifact copy-back comes up empty.
+# shellcheck disable=SC2317  # invoked via trap
+cleanup() {
+    echo "[k3-agentx] cleanup"
+    bash "$SCRIPT_DIR/cleanup_server.sh"
+    if [ -f "$RESULTS_DIR/server.log" ]; then
+        echo "[k3-agentx] ===== server.log: error context ====="
+        tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' \
+            | grep -v -E 'ActorHandle|ray_executor_v2.py:566|Failed to kill|client_mode_hook|auto_init_hook|_raylet|ray/_private' \
+            | grep -n -E -B3 -A25 'Traceback|Error|Exception|NotImplemented|Killed|OOM|halt' | tail -150 | cut -c1-400
+        echo "[k3-agentx] ===== server.log: last 40 non-blank lines ====="
+        tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
+    fi
+    echo "[k3-agentx] results dir:"; find "$RESULTS_DIR" -maxdepth 2 2>/dev/null | head -30
+}
+trap cleanup EXIT INT TERM
 
 # Server geometry knobs consumed by the config (env-overridable there).
 export MAX_MODEL_LEN="$MAX_MODEL_LEN_ARG"
