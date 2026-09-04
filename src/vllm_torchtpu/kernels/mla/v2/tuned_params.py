@@ -1107,11 +1107,12 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         vmem_limit_bytes=62914560,
     ),
     # Kimi-K3 TP32 DSpark target verify on TPU v7x with block-16 FP8 KV.
-    # Synthetic acceptance length 4 produces six queries per sequence. These
-    # buckets cover C=1/2/4/8/16/32 respectively.
+    # Synthetic acceptance length 4 produces six active queries per sequence;
+    # the token and sequence dimensions below include serving bucket padding.
+    # These entries cover C=1/2/4/8/16/32 respectively.
     TuningKey(
         case="mixed",
-        max_num_tokens=6,
+        max_num_tokens=8,
         actual_num_q_heads=3,
         actual_lkv_dim=512,
         actual_r_dim=64,
@@ -1123,14 +1124,14 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         pages_per_seq=2048,
     ):
     TunableParams(
-        q_split=1,
+        q_split=3,
         num_kv_pages_per_block=16,
-        num_queries_per_block=8,
+        num_queries_per_block=6,
         vmem_limit_bytes=62914560,
     ),
     TuningKey(
         case="mixed",
-        max_num_tokens=12,
+        max_num_tokens=16,
         actual_num_q_heads=3,
         actual_lkv_dim=512,
         actual_r_dim=64,
@@ -1138,32 +1139,32 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=2,
-        pages_per_seq=2048,
-    ):
-    TunableParams(
-        q_split=1,
-        num_kv_pages_per_block=16,
-        num_queries_per_block=8,
-        vmem_limit_bytes=62914560,
-    ),
-    TuningKey(
-        case="mixed",
-        max_num_tokens=24,
-        actual_num_q_heads=3,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="float8_e4m3fn",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=4,
-        kv_packing=4,
-        max_num_seqs=4,
+        max_num_seqs=3,
         pages_per_seq=2048,
     ):
     TunableParams(
         q_split=3,
         num_kv_pages_per_block=16,
         num_queries_per_block=6,
+        vmem_limit_bytes=62914560,
+    ),
+    TuningKey(
+        case="mixed",
+        max_num_tokens=32,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype="float8_e4m3fn",
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=4,
+        kv_packing=4,
+        max_num_seqs=6,
+        pages_per_seq=2048,
+    ):
+    TunableParams(
+        q_split=3,
+        num_kv_pages_per_block=16,
+        num_queries_per_block=12,
         vmem_limit_bytes=62914560,
     ),
     TuningKey(
@@ -1176,13 +1177,13 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=8,
+        max_num_seqs=9,
         pages_per_seq=2048,
     ):
     TunableParams(
         q_split=1,
         num_kv_pages_per_block=16,
-        num_queries_per_block=8,
+        num_queries_per_block=16,
         vmem_limit_bytes=62914560,
     ),
     TuningKey(
@@ -1195,7 +1196,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=16,
+        max_num_seqs=19,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1214,7 +1215,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=32,
+        max_num_seqs=38,
         pages_per_seq=2048,
     ):
     TunableParams(
