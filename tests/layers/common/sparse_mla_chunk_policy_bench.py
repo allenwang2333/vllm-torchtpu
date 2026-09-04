@@ -275,14 +275,33 @@ def mla_call_count(lowered_text, chunk):
     chunk size, not the KV page count (the comment at the new call site in
     `attention_interface.py` has this backwards). That makes the kernel's own
     scope a sufficient, independent read-back of which chunk size the policy
-    actually delivered, and the count is `depth * cdiv(T, chunk)`.
+    actually delivered.
+
+    The returned NUMBER is informational only, and in particular it is NOT
+    `depth * cdiv(T, chunk)`. MLIR prints repeated source locations through a
+    deduplicated alias table (`#loc7 = loc("...")` defined once, referenced as
+    `loc(#loc7)` thereafter), so a raw string count over `as_text()` counts
+    unique location DEFINITIONS, not op instances. Measured on
+    j-b77c8a7e-8da5-4236-9dba: decode depth 4 gave 3 (off) and 6 (on) against
+    an op-count expectation of 4 and 16, and the `sparse-mla-gcs_` tag count
+    was 2 in all four lowerings -- constant across chain depths 4 and 2, which
+    a genuine per-op count cannot be. What IS load-bearing, and what the gate
+    below checks, is EXCLUSIVITY: the lowering must contain this chunk size
+    and zero occurrences of any other, which alias-dedup cannot fake because a
+    chunk size that never appears has no location to alias.
     """
     return lowered_text.count(f"MLA-p_{CSA_TOPK}-bz_16-gcz_{chunk}")
 
 
-def run_case(case: str, rounds: int, reps: int, report: dict):
+def run_case(case: str, rounds: int, reps: int, report: dict, depth: int = 0):
     data = build_case(case)
-    depth = CHAIN[case]
+    # `depth` is the number of MLA layer calls chained back to back. It is the
+    # one knob that decides whether the gather of layer i+1 can overlap the
+    # attention of layer i -- production has 78 layers in a row, the earlier
+    # kernel-level sweep had exactly one call in isolation, and the two gave
+    # OPPOSITE signs at decode. Sweeping it is how you tell which end of that
+    # range production sits at.
+    depth = depth or CHAIN[case]
     n = data["num_tokens"]
     mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
 
@@ -345,12 +364,21 @@ def run_case(case: str, rounds: int, reps: int, report: dict):
         # with the chunk size.
         distinct_values = int(np.unique(off_bits).size)
 
-        # ---- negative control: the SAME comparison, on a copy of the OFF
-        # ---- output with one element perturbed. If this does not reject,
-        # ---- the green result above is unfalsifiable.
-        poisoned = off_bits.copy()
-        poisoned[0, 0, 0] ^= np.uint16(1)
-        control_rejects = not np.array_equal(off_bits, poisoned)
+        # ---- negative control, run through the WHOLE pipeline rather than on
+        # ---- a numpy copy. Re-execute the OFF chain with `topk_indices`
+        # ---- rolled by one row: same shapes, same executable, no recompile,
+        # ---- but every token now attends to its neighbour's window. If the
+        # ---- comparison above cannot see THAT, then `bit_identical=True` is
+        # ---- unfalsifiable and says nothing about the chunk size.
+        # ---- (The earlier form of this control flipped a bit in a numpy copy
+        # ---- of the OFF output, which only proved `np.array_equal` works.)
+        attention_interface.DSA_CHUNK_BY_BUCKET = False
+        poison_args = list(data["args"])
+        poison_args[6] = jnp.roll(poison_args[6], 1, axis=0)
+        poison_out = jax.block_until_ready(chains["off"](*poison_args))
+        control_rejects = not np.array_equal(off_bits, _bits(poison_out))
+        control_frac_changed = float(
+            np.mean(off_bits != _bits(poison_out)))
 
         # ---- timing, arms interleaved and reshuffled every round.
         rng = random.Random(20260904)
@@ -388,6 +416,7 @@ def run_case(case: str, rounds: int, reps: int, report: dict):
         max_abs_diff=max_abs_diff,
         distinct_output_values=distinct_values,
         negative_control_rejects=control_rejects,
+        control_frac_changed=control_frac_changed,
     )
     report["cases"].append(rec)
 
@@ -403,8 +432,9 @@ def run_case(case: str, rounds: int, reps: int, report: dict):
     print(f"  null floor n=3 [{min(nulls):+.3f}%, {max(nulls):+.3f}%] "
           f"span {max(nulls) - min(nulls):.3f} pts")
     print(f"  ON vs OFF: finite={finite} bit_identical={bit_identical} "
-          f"max_abs_diff={max_abs_diff} "
-          f"negative_control_rejects={control_rejects}")
+          f"max_abs_diff={max_abs_diff} distinct_out={distinct_values} "
+          f"negative_control_rejects={control_rejects} "
+          f"control_frac_changed={control_frac_changed:.4f}")
     return rec
 
 
@@ -413,6 +443,8 @@ def main():
     ap.add_argument("--cases", default="decode,prefill")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--depth", type=int, default=0,
+                    help="override the chain depth (0 = the per-case default)")
     ap.add_argument("--json-out", default="")
     args = ap.parse_args()
 
@@ -435,7 +467,7 @@ def main():
 
     fails = []
     for case in args.cases.split(","):
-        rec = run_case(case, args.rounds, args.reps, report)
+        rec = run_case(case, args.rounds, args.reps, report, args.depth)
         exp_off, exp_on = want[case]
         if (rec["resolved_chunk"]["off"], rec["resolved_chunk"]["on"]) != \
                 (exp_off, exp_on):
@@ -453,14 +485,16 @@ def main():
             if tags and set(tags) != {exp}:
                 fails.append(f"{case}/{arm}: HLO carries gcs tags {tags}, "
                              f"expected only {exp}")
-            want_calls = rec["chain_depth"] * math.ceil(
-                rec["num_tokens"] / exp)
-            if rec["lowered"][arm]["mla_calls"] != want_calls:
+            # Presence, not count -- see `mla_call_count`: MLIR alias-dedups
+            # repeated locations, so the count is not `depth * cdiv(T, chunk)`
+            # and never could be. Presence + the exclusivity check below is
+            # the whole of what the HLO can tell us, and it is enough: it
+            # cannot be satisfied by a call site that computed the right
+            # number and then failed to pass it to the kernel.
+            if rec["lowered"][arm]["mla_calls"] < 1:
                 fails.append(
-                    f"{case}/{arm}: {rec['lowered'][arm]['mla_calls']} "
-                    f"MLA pallas_calls at gcz_{exp} in the HLO, expected "
-                    f"{want_calls} (depth {rec['chain_depth']} x "
-                    f"cdiv({rec['num_tokens']}, {exp}))")
+                    f"{case}/{arm}: no MLA pallas_call at gcz_{exp} in the "
+                    "HLO -- the resolved chunk never reached the kernel")
             stray = {c: k
                      for c, k in rec["lowered"][arm]["mla_calls_other"].items()
                      if k}
@@ -472,17 +506,26 @@ def main():
                          "so this case discriminates nothing")
         if not rec["finite"]:
             fails.append(f"{case}: non-finite output")
-        if rec["distinct_output_values"] < 1000:
-            fails.append(
-                f"{case}: only {rec['distinct_output_values']} distinct "
-                "output values -- a near-constant output makes the "
-                "bit-identity result vacuous")
+        # `distinct_output_values` is INFORMATIONAL. It is a proxy for
+        # "the output is not a constant", and it is a poor one: at prefill
+        # every output element is a softmax-weighted mean of 2048 random fp8
+        # latents, which concentrates hard and then quantizes to a handful of
+        # bf16 codes (52 measured on j-b77c8a7e-8da5-4236-9dba) while still
+        # being fully data-dependent. The real anti-vacuity check is the
+        # rolled-`topk` control below, which perturbs the INPUT and requires
+        # the comparison to see it.
         if not rec["bit_identical"]:
             fails.append(f"{case}: ON is NOT bit-identical to OFF "
                          f"(max_abs_diff {rec['max_abs_diff']})")
         if not rec["negative_control_rejects"]:
-            fails.append(f"{case}: negative control did not reject; the "
-                         "bit-identity result above is unfalsifiable")
+            fails.append(f"{case}: rolled-topk control did not change the "
+                         "output; the bit-identity result above is "
+                         "unfalsifiable")
+        if rec["control_frac_changed"] < 0.10:
+            fails.append(
+                f"{case}: rolled-topk control changed only "
+                f"{rec['control_frac_changed']:.4f} of output elements -- too "
+                "few for bit-identity to be meaningful evidence")
 
     if args.json_out:
         with open(args.json_out, "w") as f:
