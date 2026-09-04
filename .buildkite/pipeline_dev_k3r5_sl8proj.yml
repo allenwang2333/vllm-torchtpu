@@ -39,6 +39,11 @@ steps:
       BUILDKITE_K3_FP8_LATENT: "0"
       BUILDKITE_K3_MXFP4_LATENT: "0"
     commands:
+      # Ten seconds of CPU before ~10 minutes of TPU. The forward gate is the one
+      # that reproduces build 375 arm C's exact failure -- a packed float4 carrier
+      # whose stored minor dim is half the logical one -- so it must pass before
+      # the mxfp4 arm is worth booting at all.
+      - "bash .buildkite/scripts/run_in_docker.sh bash -c 'PYTHONPATH=/root/torchtpu-vllm/src python3 tests/layers/vllm/gate_latent_forward_shape.py && PYTHONPATH=/root/torchtpu-vllm/src python3 tests/layers/vllm/gate_fp8_latent_proj.py'"
       - "rm -rf /dev/shm/torch_tpu_cache || true"
       - "K3_RESULTS_DIR=perf_eval_results/sl8-bf16 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
     artifact_paths: [ "perf_eval_results/**/*" ]
@@ -69,4 +74,10 @@ steps:
     commands:
       - "rm -rf /dev/shm/torch_tpu_cache || true"
       - "K3_RESULTS_DIR=perf_eval_results/sl8-mxfp4b256 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+      # K's three-way falsifier on matmul/fusion's instruction count vs bf16:
+      #   +21  the fusion barrier is dispatch-created and branch-independent
+      #   ~0   it is branch-dependent and mxfp4 nets the full -9.5%
+      #   >21  the `after` path adds something neither lane has found
+      # Read it from the capture; this line only records that it is the test.
+      - "echo '[test] score matmul/fusion instr delta vs bf16 against K: +21 / ~0 / >21'"
     artifact_paths: [ "perf_eval_results/**/*" ]
