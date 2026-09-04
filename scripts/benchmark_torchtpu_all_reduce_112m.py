@@ -22,6 +22,9 @@ compiler experiments can be supplied normally, for example:
 Use ``--topology-aware`` to create the full-world group from
 ``torch.tpu.topology_aware_mesh`` while preserving its rank order. Use
 ``--chunks=2`` to reproduce the experimental tuple of two 56-MiB operands.
+Use ``--mode rs_ag`` to replace the single all-reduce with an explicit
+reduce-scatter (dim 0) followed by an all-gather through the functional
+collectives, or ``--mode rs_only`` / ``--mode ag_only`` to time one phase.
 """
 
 from __future__ import annotations
@@ -42,6 +45,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--expected-world-size", type=int, default=32)
     parser.add_argument("--chunks", type=int, default=1)
+    parser.add_argument(
+        "--mode",
+        choices=("all_reduce", "rs_ag", "rs_only", "ag_only"),
+        default="all_reduce",
+        help="all_reduce: dist.all_reduce (default). rs_ag: explicit "
+        "reduce_scatter_tensor + all_gather_tensor over dim 0. rs_only / "
+        "ag_only: that single phase, with the same per-phase shapes.",
+    )
     parser.add_argument("--split-dim", type=int, choices=(0, 1), default=1)
     parser.add_argument("--topology-aware", action="store_true")
     parser.add_argument(
@@ -68,6 +79,7 @@ def main() -> None:
     import torch
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
+    from torch.distributed import _functional_collectives as funcol
     from torch_tpu._internal import compile as tpu_compile
 
     if args.warmups < 0 or args.iterations <= 0:
@@ -115,6 +127,12 @@ def main() -> None:
 
         if args.tokens % args.chunks and args.split_dim == 0:
             raise ValueError("tokens must be divisible by chunks")
+        if args.mode != "all_reduce" and (
+                args.tokens //
+            (args.chunks if args.split_dim == 0 else 1)) % world_size:
+            raise ValueError(
+                "tokens per chunk must be divisible by world size "
+                "for the reduce-scatter modes")
         if args.width % args.chunks and args.split_dim == 1:
             raise ValueError("width must be divisible by chunks")
 
@@ -132,14 +150,29 @@ def main() -> None:
             device="tpu",
         )
 
+        collective_group = group if group is not None else dist.group.WORLD
+
+        def collective(part):
+            # clone makes each chunk a contiguous collective operand and
+            # leaves the reusable benchmark input unchanged.
+            operand = part.clone()
+            if args.mode == "all_reduce":
+                dist.all_reduce(operand, group=group)
+                return operand
+            if args.mode == "ag_only":
+                shard = operand[:operand.shape[0] // world_size]
+                return funcol.all_gather_tensor(shard, 0, collective_group)
+            scattered = funcol.reduce_scatter_tensor(operand, "sum", 0,
+                                                     collective_group)
+            if args.mode == "rs_only":
+                return scattered
+            return funcol.all_gather_tensor(scattered, 0, collective_group)
+
         def reduce_then_consume(value):
-            reduced = []
-            for part in value.chunk(args.chunks, dim=args.split_dim):
-                # clone makes each chunk a contiguous collective operand and
-                # leaves the reusable benchmark input unchanged.
-                result = part.clone()
-                dist.all_reduce(result, group=group)
-                reduced.append(result)
+            reduced = [
+                collective(part)
+                for part in value.chunk(args.chunks, dim=args.split_dim)
+            ]
             return torch.cat(reduced, dim=args.split_dim) + 1
 
         compiled = torch.compile(
@@ -152,10 +185,17 @@ def main() -> None:
         output = compiled(source)
         synchronize(output)
         observed = float(output[0, 0].cpu())
-        expected = (world_size + 1) / 2 + 1
-        if observed != expected:
+        # Row 0 of the output is the reduced row 0 (all_reduce, rs_ag,
+        # rs_only: rank r holds reduced rows starting at r*tokens/world) or,
+        # for ag_only, rank 0's own unreduced shard.
+        expected = (1 / world_size + 1 if args.mode == "ag_only" else
+                    (world_size + 1) / 2 + 1)
+        # The functional reduce-scatter may accumulate bf16 in a different
+        # order than the fused all-reduce; allow rounding there only.
+        tolerance = 0.0 if args.mode == "all_reduce" else 0.5
+        if abs(observed - expected) > tolerance:
             raise RuntimeError(
-                f"all-reduce validation failed: observed {observed}, "
+                f"{args.mode} validation failed: observed {observed}, "
                 f"expected {expected}")
 
         for _ in range(args.warmups):
@@ -224,6 +264,8 @@ def main() -> None:
             "message_bytes": message_bytes,
             "message_mib": message_bytes / (1 << 20),
             "chunks": args.chunks,
+            "mode": args.mode,
+            "output_shape": list(output.shape),
             "chunk_mib": message_bytes / args.chunks / (1 << 20),
             "split_dim": args.split_dim,
             "topology_aware": args.topology_aware,

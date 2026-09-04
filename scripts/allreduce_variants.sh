@@ -18,6 +18,10 @@ NPROC="${NPROC_PER_NODE:-8}"
 OUT="${ALLREDUCE_OUT:-/perf_eval_results/allreduce}"
 SCRIPT=/root/torchtpu-vllm/scripts/benchmark_torchtpu_all_reduce_112m.py
 ITER="${ALLREDUCE_ITERATIONS:-100}"
+# Optional variant selection: positional args (from run_multihost.sh) or
+# ALLREDUCE_VARIANTS, space-separated names; empty = run every variant.
+VARIANTS="${*:-${ALLREDUCE_VARIANTS:-}}"
+want() { [ -z "$VARIANTS" ] || [[ " $VARIANTS " == *" $1 "* ]]; }
 mkdir -p "$OUT"
 
 # What vllm_torchtpu/env_override.py injects for tpu7x before libtpu loads
@@ -26,7 +30,7 @@ TT_SERVING_FLAGS="--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_c
 FORCE_TC_FLAGS="--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1073741824 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1073741824"
 SC_HIER_FLAGS="$TT_SERVING_FLAGS --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true"
 
-echo "[allreduce] node=$NODE_RANK/$NNODES master=$MASTER_ADDR nproc=$NPROC topology=${TORCH_TPU_TOPOLOGY:-unset}"
+echo "[allreduce] node=$NODE_RANK/$NNODES master=$MASTER_ADDR nproc=$NPROC topology=${TORCH_TPU_TOPOLOGY:-unset} variants=${VARIANTS:-all}"
 echo "[allreduce] slicebuilder=${TORCH_TPU_SLICEBUILDER_ADDRESSES:-unset}"
 python3 -c "import torch, torch_tpu; print('[allreduce] torch', torch.__version__)" 2>/dev/null | grep allreduce || true
 pip show torch-tpu 2>/dev/null | grep -i '^Version' | sed 's/^/[allreduce] torch-tpu /' || true
@@ -58,7 +62,8 @@ for line in open(sys.argv[1]):
     r = json.loads(line)
     if r.get("rank") == 0:
         print(f"[allreduce] RESULT {sys.argv[2]}: median={r['median_ms']:.3f} ms p90={r['p90_ms']:.3f} p99={r['p99_ms']:.3f} min={r['min_ms']:.3f} "
-              f"algo={r['algorithm_gbps']:.1f} GB/s bus={r['ring_equivalent_bus_gbps']:.1f} GB/s msg={r['message_mib']:.0f} MiB world={r['world_size']}")
+              f"algo={r['algorithm_gbps']:.1f} GB/s bus={r['ring_equivalent_bus_gbps']:.1f} GB/s msg={r['message_mib']:.0f} MiB world={r['world_size']} "
+              f"mode={r.get('mode', 'all_reduce')} out={r.get('output_shape')}")
 PYEOF
     fi
     return "$rc"
@@ -67,7 +72,7 @@ PYEOF
 # 1. Baseline = the reported repro: raw torch_tpu, libtpu defaults, no
 #    TPU_*_BOUNDS. If the slice refuses to initialize without the bounds env
 #    from the original recipe, retry once with it and keep it for the rest.
-if ! run_variant baseline 30201 ""; then
+if want baseline && ! run_variant baseline 30201 ""; then
     echo "[allreduce] baseline failed without TPU_*_BOUNDS; retrying with the recipe's bounds env"
     export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
     export TPU_HOST_BOUNDS=1,1,4
@@ -76,22 +81,40 @@ fi
 
 # 2. What vLLM serving actually gets (SC offload threshold 64 MiB => this
 #    112 MiB all-reduce is offloaded to SparseCore under vllm_torchtpu).
-run_variant tt_serving_flags 30202 "$TT_SERVING_FLAGS" || true
+want tt_serving_flags && run_variant tt_serving_flags 30202 "$TT_SERVING_FLAGS" || true
 
 # 3. Force the collective to stay on TensorCore (threshold 1 GiB).
-run_variant force_tensorcore 30203 "$FORCE_TC_FLAGS" || true
+want force_tensorcore && run_variant force_tensorcore 30203 "$FORCE_TC_FLAGS" || true
 
 # 4. The flag from the original ask, on top of the serving flags.
-run_variant sc_hierarchical_ar 30204 "$SC_HIER_FLAGS" || true
+want sc_hierarchical_ar && run_variant sc_hierarchical_ar 30204 "$SC_HIER_FLAGS" || true
 
 # 5. Topology-aware group from torch.tpu.topology_aware_mesh.
-run_variant topology_aware 30205 "" --topology-aware || true
+want topology_aware && run_variant topology_aware 30205 "" --topology-aware || true
 
 # 6. Two 56-MiB operands instead of one 112-MiB operand.
-run_variant chunks2 30206 "" --chunks=2 || true
+want chunks2 && run_variant chunks2 30206 "" --chunks=2 || true
 
 # 7. Decode-sized message ([16, 7168] = 224 KiB) for the latency floor.
-run_variant decode_16tok 30207 "" --tokens 16 || true
+want decode_16tok && run_variant decode_16tok 30207 "" --tokens 16 || true
+
+# 8. Explicit reduce-scatter + all-gather (functional collectives) instead
+#    of one all-reduce: does the compiler's all-reduce beat the manual
+#    decomposition, and how do the two phases split the time?
+want rs_ag && run_variant rs_ag 30208 "" --mode rs_ag || true
+
+# 9./10. Each phase alone (reduce-scatter of the 112 MiB operand; all-gather
+#    of the 3.5 MiB per-rank shard back to 112 MiB).
+want rs_only && run_variant rs_only 30209 "" --mode rs_only || true
+want ag_only && run_variant ag_only 30210 "" --mode ag_only || true
+
+# 11. Same decomposition on 56-MiB halves.
+want rs_ag_chunks2 && run_variant rs_ag_chunks2 30212 "" --mode rs_ag --chunks=2 || true
+
+# 12. All-reduce with SparseCore collective offload switched off (the XLA
+#    option tpu_platform.py used for the unified KV pool), to obtain the
+#    TensorCore all-reduce the offload-min-size flags never reached.
+want tc_offload_off && run_variant tc_offload_off 30213 "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false" || true
 
 echo "[allreduce] node=$NODE_RANK all variants done"
 if [ "$NODE_RANK" = "0" ]; then
