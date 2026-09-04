@@ -224,24 +224,41 @@ recurrence twice. The trigger was keyed to Mamba groups, and
 
 ### 4d. The guard, for what truncation cannot reach
 
-A client that hits the prefill port directly and generates a full answer still
-runs past the handoff, which is what our accuracy oracle does to get a
-non-disaggregated baseline. A 114-token prompt run out to 161 leaves the whole
-113-token prefix behind an 8-token window, so normalizing back to the prefix
-throws away both live pages and ships two nulls. The data is genuinely gone and
-the allocator did nothing wrong, so the only question is how to fail.
+Truncation controls a producer that stops at the prompt. A client that hits the
+prefill port directly and generates a full answer runs past it anyway, which is
+what our accuracy oracle does when it asks prefill alone for a baseline.
 
-The guard counts the nulls left in the range rather than re-deriving where the
-allocator got to (`_stage3_recycled_transfer_pages`, `:208-235`). More than one
-drops the send and the decode replica prefills the request itself, which is slow
-but survivable. Exactly one warns and ships, because a hole in one window beats
-making a decode replica prefill a long prompt.
+Run far enough and every page of the transfer prefix falls out of the window, so
+what the connector is left holding is nothing but page 0:
 
-Raiden's rejection of a duplicate destination is not visible in this tree.
-`tpu_sync`'s Python layer has no such check and the native code is not here, so
-it is inferred from the crash.
+```
+  prompt 114, producer runs on to 161, transfer prefix still 113 tokens
 
-None of this is reachable without a window. Full attention never reports skipped
-tokens (`single_type_kv_cache_manager.py:546-557`), so Qwen3.5 and GLM never get
-a null in a block table, and before this PR no windowed model went down the
-Raiden path at all.
+  11 pages at 161 tokens, allocator has freed 9   [ 0 x 9 | 250  18 ]
+  cut back to the 113-token prefix, 8 pages       [ 0 x 8 ]
+  skip the 6 the window already dropped           [ 0  0 ]
+```
+
+How many nulls are left is what decides the damage. One is a single wrong page
+sent to a real destination, and nothing detects it. Two are both page 0, so
+Raiden is told to write two sources into one destination; it rejects the
+transfer, and the rejection kills the engine.
+
+So the guard counts them (`_stage3_recycled_transfer_pages`, `:208-235`),
+reading what the block table says rather than re-deriving where the allocator
+got to. More than one drops the send and the decode replica prefills the request
+itself, which is slow but survivable. Exactly one warns and ships, because a
+hole in one window beats making a decode replica prefill a long prompt. Neither
+is a repair: by this point the KV is genuinely gone, and the allocator did
+nothing wrong in freeing it.
+
+Raiden's rejection is not visible in this tree. `tpu_sync`'s Python layer has no
+such check and the native code is not here, so it is inferred from the crash.
+
+### 4e. Why no other model hits this
+
+Full attention never reports skipped tokens
+(`single_type_kv_cache_manager.py:546-557`), so a group without a window never
+gets a null in its block table. Qwen3.5 and GLM have one full-attention group,
+so nothing in section 4 can reach them. Before this PR no windowed model went
+down the Raiden path at all.
