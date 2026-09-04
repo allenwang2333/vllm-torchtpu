@@ -26,6 +26,9 @@ import vllm_torchtpu.models.vllm.kimi_k3.moe as kimi_moe
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.vllm.custom_ops import \
     kda_attention_op as kimi_custom_ops
+from vllm_torchtpu.layers.vllm.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+    VllmUnquantizedLinearMethod
 from vllm_torchtpu.models.vllm.kimi_k3 import (KimiDeltaAttention,
                                                KimiK3ForConditionalGeneration,
                                                KimiLinearForCausalLM,
@@ -604,6 +607,98 @@ def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
 
     expected = torch.cat((column_weight[2:], replicated_weight), dim=0)
     torch.testing.assert_close(layer.weight, expected)
+
+
+def _build_kda_layer(monkeypatch: pytest.MonkeyPatch) -> KimiDeltaAttention:
+    """A real `KimiDeltaAttention` with stand-in linears, full-rank gate on.
+
+    No `VllmConfig`: building one needs a `torch.device("tpu")`, which does not
+    exist on a host without chips, and this test is about a layout decision the
+    constructor makes from the model config alone.
+    """
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self, input_size, output_size, *args, **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            self.output_size = (sum(output_size) if isinstance(
+                output_size, list) else output_size)
+            self.weight = nn.Parameter(
+                torch.empty(self.output_size, input_size))
+
+    for name in ("ColumnParallelLinear", "MergedColumnParallelLinear",
+                 "ReplicatedLinear", "RowParallelLinear"):
+        monkeypatch.setattr(kimi_attention, name, FakeLinear)
+    monkeypatch.setattr(kimi_attention, "RMSNorm",
+                        lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    monkeypatch.setattr(kimi_attention, "is_conv_state_dim_first",
+                        lambda: True)
+    monkeypatch.setattr(kimi_attention, "build_kimi_dispatched_kda_op",
+                        lambda *a, **k: None)
+    config = KimiLinearConfig(
+        hidden_size=16,
+        num_attention_heads=4,
+        linear_attn_config={
+            "head_dim": 4,
+            "num_heads": 4,
+            "short_conv_kernel_size": 3,
+            "use_full_rank_gate": True,
+            "kda_layers": [0],
+            "full_attn_layers": [1],
+        },
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        quant_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    return KimiDeltaAttention(config,
+                              vllm_config,
+                              prefix="model.layers.0.self_attn")
+
+
+def test_kda_gate_weight_keeps_the_head_major_layout(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`g_proj` -- and only `g_proj` -- opts out of the canonical (k, n) flip.
+
+    Its output is read as [T, heads, head_dim], so the canonical layout costs a
+    transpose of the whole weight every step; see `KEEP_VLLM_LAYOUT_ATTR`.
+    """
+    layer = _build_kda_layer(monkeypatch)
+    assert getattr(layer.g_proj, KEEP_VLLM_LAYOUT_ATTR, False)
+    for other in (layer.fused_qkvb_proj, layer.f_a_proj, layer.f_b_proj,
+                  layer.o_proj):
+        assert not getattr(other, KEEP_VLLM_LAYOUT_ATTR, False)
+
+
+def test_kda_gate_layout_env_restores_the_canonical_flip(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The paired control for measuring the copy is one environment variable."""
+    monkeypatch.setenv("TPU_KDA_GPROJ_LAYOUT", "canonical")
+    layer = _build_kda_layer(monkeypatch)
+    assert not getattr(layer.g_proj, KEEP_VLLM_LAYOUT_ATTR, False)
+
+
+def test_keep_vllm_layout_marker_decides_the_stored_weight_shape() -> None:
+    """The marker is load-bearing in both directions, not decoration."""
+    method = VllmUnquantizedLinearMethod()
+    n_out, n_in = 8, 32
+
+    def make() -> nn.Module:
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.empty(n_out, n_in),
+                                    requires_grad=False)
+        return layer
+
+    marked, plain = make(), make()
+    setattr(marked, KEEP_VLLM_LAYOUT_ATTR, True)
+    method.process_weights_after_loading(marked)
+    method.process_weights_after_loading(plain)
+    assert tuple(marked.weight.shape) == (n_out, n_in)
+    assert tuple(plain.weight.shape) == (n_in, n_out)
 
 
 class _Projection(nn.Module):
