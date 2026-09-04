@@ -1,0 +1,43 @@
+# Kimi-K3 concurrency sweep on CURRENT MAIN, REAL weights, tpu7x-32.
+#
+# Zero source changes: `git diff origin/main -- src/` is empty on this branch.
+# That became possible only when #539 merged `runai_repull`; before it, every
+# off-head rank died at worker init resolving the head-local Run:AI cache dir
+# (dev build 362), and the same recipe needed the fix cherry-picked (#363).
+#
+# One pod step, two server lifetimes, three repeats per cell:
+#   max_num_seqs 8   -> c = 1, 2, 4, 8   (MLA tuned row hits)
+#   max_num_seqs 32  -> c = 16, 32       (tuned row cannot hit -- see config)
+#
+# Comparison point is main's own committed nightly baseline for this model and
+# shape: baselines/perf/kimi-k3-tp32-ep.baseline.json, TTFT 4038.1 / TPOT 30.899.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_real_sweep.yml.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":chart_with_upwards_trend: K3 TP32 REAL-weight concurrency sweep on main (8k/1k, c=1..32)"
+    key: k3_real_sweep
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      # Budget for two 1561 GB EP-sharded streams plus cold XLA compiles.
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      # The sweep compiles a bucket per decode batch size; the CI image would
+      # otherwise make the first request at a new shape fatal.
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+      SKIP_DB_UPLOAD: "1"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/k3repro/k3_real_sweep.sh"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"

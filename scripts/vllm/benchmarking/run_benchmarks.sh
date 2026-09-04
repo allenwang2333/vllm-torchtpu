@@ -448,7 +448,12 @@ run_benchmark_once() {
 # the client falls back to MODEL.
 PULLED_TOKENIZER_DIR=""
 if [ -z "${TOKENIZER:-}" ] && [ -n "$MODEL_URI" ]; then
-    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
+    # `|| true`: this runs under `set -o pipefail`, so in an environment where
+    # vllm is not importable -- a laptop running the DRY_RUN gate, most obviously
+    # -- the assignment fails and takes the whole script with it, silently, before
+    # its first line of output. The documented behaviour for an unresolvable dir
+    # is to fall back to MODEL.
+    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1 || true)
 fi
 
 bench_tokenizer_dir() {
