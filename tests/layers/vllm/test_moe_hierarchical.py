@@ -491,3 +491,15 @@ def test_expert_bank_gate_follows_linear_placement_on_a_ragged_count() -> None:
     assert expert_bank_mismatch((5, 0, 2, 0), 12, 3, 5, 2) is None
     assert expert_bank_mismatch((5, 4, 2, 1), 12, 2, 5, 2) is None
     assert expert_bank_mismatch((5, 4, 2, 1), 12, 3, 5, 2) is not None
+
+
+def test_the_flag_is_copied_to_ray_v1_workers() -> None:
+    """A rank that never receives the flag runs flat and nothing notices.
+
+    The bank gate is conditioned on the flag being set on that rank, so it is
+    silent on exactly the rank that lost it. The V1 Ray executor copies only
+    `get_env_vars_to_copy(additional_vars=platform.additional_env_vars)`.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    assert "TPU_MOE_HIERARCHICAL_EP" in TpuPlatform.additional_env_vars
