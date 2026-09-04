@@ -373,8 +373,15 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         self._require_tpu()
         with mock.patch.object(attention_interface,
                                "sparse_mla_gather_chunk_size",
-                               lambda n: chunk):
+                               side_effect=lambda n: chunk) as patched:
             output, expected, valid = self._run_causal_case(q_lens, topk)
+        # Anti-vacuity: if the call site had captured the function at import
+        # rather than looking it up on the module, the patch would be inert
+        # and every case here would pass while testing only chunk 64.
+        self.assertGreater(
+            patched.call_count, 0,
+            "the chunk policy was never consulted; the patch "
+            "is inert and this case tests nothing")
         self.assertEqual(int(valid.sum()), sum(q_lens))
         self._check(output, expected, valid)
 
