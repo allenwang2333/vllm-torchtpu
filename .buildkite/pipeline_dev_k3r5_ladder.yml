@@ -1,0 +1,36 @@
+# Round-5 batched ladder: several one-variable arms on ONE pod slot.
+#
+# The v7x-32 queue has a single agent, so this is one build with several server
+# lifetimes rather than one build per lane. Every arm runs the same standing
+# ladder, so arms are comparable to each other and to #365.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r5_ladder.yml
+# Choose arms with BUILDKITE_K3_ARMS (default: all of them, in cost order).
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":ladder: K3 TP32 batched ladder, real weights (v7x-32)"
+    key: k3r5_ladder
+    depends_on: build_docker
+    timeout_in_minutes: 720
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      # Budget for one 1561 GB EP-sharded stream per arm plus cold XLA compiles.
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      # Each arm compiles its own bucket set; without this the first request at
+      # a new shape is fatal in the CI image.
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+      SKIP_DB_UPLOAD: "1"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/k3repro/k3r5_ladder.sh ${BUILDKITE_K3_ARMS:-}"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
