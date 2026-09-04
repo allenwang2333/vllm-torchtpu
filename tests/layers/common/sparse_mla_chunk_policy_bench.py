@@ -40,14 +40,20 @@ test runs at a toy geometry (16 pages of 32 tokens, 16 heads, topk 64):
     (chunk x topk x 512 B = 128 MiB, against 64 MiB shipping) compiles and
     runs at the production topk.
 
-Harness fidelity: the two axes added in the second revision
------------------------------------------------------------
+Harness fidelity: three axes, and what each one was worth
+---------------------------------------------------------
 The first revision of this bench reported the OPPOSITE sign from the
 kernel-level sweep at decode (+24.8% here against -13.4% there) while agreeing
 with it to 6.8% on the one-stage arm. An artifact that hits only the arm with
-more pipeline stages is what suppressed cross-layer overlap looks like, and a
-review found two places where this harness diverged from production in exactly
-that direction. Both are now command-line axes rather than assumptions:
+more pipeline stages is what suppressed cross-layer overlap looks like. Three
+such divergences have now been found and each is a command-line axis rather
+than an assumption, so its size can be read off instead of argued about.
+
+MEASURED (job j-e1bff428, decode, per-layer marginal `D`): fixing the first
+two moved the ON penalty from +28.1% to +25.7%, i.e. almost not at all -- they
+were real (they cut `D_off` 178.41 -> 113.67 us, 36%) but they cut BOTH arms
+alike, so they were never the sign flip. The third one is the candidate that
+remains, and it is the only one that is arm-asymmetric by construction.
 
   --cache-mode per-layer|shared
       Production builds one `pallas::sparse_mla_attention_<layer>` op per
@@ -59,12 +65,24 @@ that direction. Both are now command-line axes rather than assumptions:
       Production's op is built with `donate_argnums=(0, 1)`
       (`layers/vllm/attention.py:1541`). The first revision used a plain
       `jax.jit`, so a 272 MB cache pair was copied per invocation.
+  --serial-topk
+      `topk` is a loop invariant here, so no iteration's gather depends on
+      anything the chain produces and XLA may hoist all `depth` gathers and
+      schedule them against each other. Production computes `topk_indices`
+      per layer from that layer's own hidden states
+      (`layers/vllm/custom_ops/mla_attention_op.py:185`), so layer `i`'s
+      gather cannot start until layer `i-1` has finished. This is the one
+      divergence that CANNOT cancel in the ON/OFF ratio: free cross-layer
+      overlap is worth much more to the arm with one big exposed gather than
+      to the arm that already overlaps internally. The signature is in the
+      data -- chaining cut the isolated kernel-level per-layer cost by 40.3%
+      at chunk 64 but by only 13.4% at chunk 16.
 
 `--cache-mode shared --no-donate` is therefore the POSITIVE CONTROL, and it
 has a job to do: the depth axis had no positive control before, so a null
-there was uninterpretable. If that combination does not reproduce the first
-revision's decode penalty, the first revision is irreproducible and neither
-number decides anything.
+there was uninterpretable. It has since done it -- that combination reproduced
+the first revision's decode penalty to +28.1% against +28.0%, so the first
+revision is reproducible and the disagreement is about fidelity, not noise.
 
 Shape provenance
 ----------------
@@ -269,7 +287,11 @@ def make_caches(n_pairs: int):
     return tuple(out)
 
 
-def make_chain(mesh, depth: int, per_layer: bool, donate: bool):
+def make_chain(mesh,
+               depth: int,
+               per_layer: bool,
+               donate: bool,
+               serial_topk: bool = False):
     """`depth` wrapper calls, output fed back in as the next `ql_nope`.
 
     The feedback is what stops XLA from CSE-ing the repeats into one call,
@@ -294,8 +316,29 @@ def make_chain(mesh, depth: int, per_layer: bool, donate: bool):
         Production's op is built with `donate_argnums=(0, 1)`
         (`layers/vllm/attention.py:1541`). Without donation a 272 MB cache pair
         is copied on every invocation -- 201-453 us at plausible HBM rates,
-        which brackets the fitted per-invocation constant the first version
-        attributed to compute.
+        which brackets the first version's fitted PER-INVOCATION constant of
+        357.2 us. (That figure was originally mislabelled a per-layer
+        marginal; it is the coefficient on `1/depth`, which is where a
+        per-invocation copy belongs, so the copy explanation is the coherent
+        one. Measured: donation moves the per-layer marginal by 0.6%, from
+        178.41 to 177.40 us, and the whole 272 MB copy lands in `C`, which
+        drops 298.61 -> 15.97 us/call.)
+
+    `serial_topk`
+        The third divergence, found only after `per_layer` and `donate` were
+        both fixed and the decode penalty did not move. `topk` is passed in as
+        a loop invariant, so every iteration's gather depends on nothing the
+        chain produces and XLA is free to hoist all `depth` gathers and
+        schedule them against each other. Production cannot do that: each
+        layer's `topk_indices` comes from that layer's own hidden states
+        (`layers/vllm/custom_ops/mla_attention_op.py:185`, `topk_op(...)`),
+        so layer `i`'s gather cannot start until layer `i-1` has finished.
+
+        The free cross-layer overlap is worth far more to the arm with one big
+        exposed gather than to the arm that already overlaps internally, so it
+        does not cancel in the ratio -- chaining cut the isolated per-layer
+        cost by 40.3% at chunk 64 and by only 13.4% at chunk 16. `True`
+        restores the dependency edge without perturbing a single index.
     """
 
     def chain(caches, ql_nope, q_pe, kv_c, k_pe, topk, seq_lens, block_tables,
@@ -304,9 +347,19 @@ def make_chain(mesh, depth: int, per_layer: bool, donate: bool):
         out = ql_nope
         for i in range(depth):
             j = 2 * i if per_layer else 0
+            tk = topk
+            if serial_topk:
+                # Make this layer's gather indices depend on this layer's
+                # input, as production's per-layer indexer does. The predicate
+                # is true at runtime so `tk` is `topk` exactly, and the two
+                # branches differ so XLA cannot fold the select away and lose
+                # the edge. Reading one element is enough: the data dependency
+                # is on the buffer, not on how much of it is consumed.
+                ok = jnp.isfinite(out[0, 0, 0].astype(jnp.float32))
+                tk = jnp.where(ok, topk, topk * 0)
             caches[j], caches[j + 1], out = \
                 attention_interface.sparse_mla_attention(
-                    out, q_pe, kv_c, k_pe, caches[j], caches[j + 1], topk,
+                    out, q_pe, kv_c, k_pe, caches[j], caches[j + 1], tk,
                     seq_lens, block_tables, qsl, dist, mesh,
                     sm_scale=SM_SCALE, k_scale=K_SCALE)
             out = out.astype(ql_nope.dtype)
@@ -444,6 +497,7 @@ def run_case(case: str,
              depth: int = 0,
              per_layer: bool = True,
              donate: bool = True,
+             serial_topk: bool = False,
              extra_chunks=(),
              max_cache_gb: float = 40.0,
              data=None):
@@ -488,14 +542,17 @@ def run_case(case: str,
     # serve the SAME executable to every later arm -- five arms, one
     # compilation, a perfect null result, and nothing in the output would say
     # so. A fresh wrapper per arm has a fresh cache.
-    chains = {arm: make_chain(mesh, depth, per_layer, donate) for arm in arms}
+    chains = {
+        arm: make_chain(mesh, depth, per_layer, donate, serial_topk)
+        for arm in arms
+    }
     # A SIXTH chain, never timed, that exists only to run the rolled-topk
     # negative control. The first version ran that control through
     # `chains["off"]`, which made `off` the one arm to execute an extra
     # invocation and a recompile-free re-dispatch -- so `off` was not
     # exchangeable with its own nulls, and the null floor it anchored was not
     # a floor for it. Semantically identical to `off`; asserted so below.
-    poison_chain = make_chain(mesh, depth, per_layer, donate)
+    poison_chain = make_chain(mesh, depth, per_layer, donate, serial_topk)
 
     resolved = {}
     lowered = {}
@@ -599,7 +656,7 @@ def run_case(case: str,
     # The floor is the spread of the OFF-equivalent arms about THEIR OWN mean,
     # not about `off`. Measuring it relative to `off` forces `off`'s deviation
     # to zero by construction and understates the span -- on the first run of
-    # this bench by 9.3x at prefill depth 2 (0.101 pts reported against 0.945
+    # this bench by 9.3x at DECODE depth 2 (0.101 pts reported against 0.945
     # pts actual). `off` is one draw from the null, not the null.
     ref = statistics.mean([med[k] for k in off_like])
     null_dev = {k: (med[k] - ref) / ref * 100.0 for k in off_like}
@@ -612,6 +669,7 @@ def run_case(case: str,
         chain_depth=depth,
         per_layer_caches=per_layer,
         donate=donate,
+        serial_topk=serial_topk,
         cache_gb=total_gb,
         rounds=rounds,
         reps=reps,
@@ -684,6 +742,13 @@ def main():
                     action="store_true",
                     help="drop donate_argnums. Production donates "
                     "(attention.py:1541); this is for the positive control.")
+    ap.add_argument("--serial-topk",
+                    action="store_true",
+                    help="make each layer's gather indices depend on the "
+                    "previous layer's output, as production's per-layer "
+                    "indexer does (mla_attention_op.py:185). Without it XLA "
+                    "hoists every gather in the chain and schedules them "
+                    "against each other, an overlap production cannot have.")
     ap.add_argument("--extra-chunks",
                     default="",
                     help="comma-separated chunk sizes to add as forced arms, "
@@ -712,6 +777,7 @@ def main():
         "dispatch_floor_us_informational": dispatch_floor(),
         "cache_mode": args.cache_mode,
         "donate": donate,
+        "serial_topk": args.serial_topk,
         "extra_chunks": extra,
         "cases": [],
     }
@@ -725,7 +791,8 @@ def main():
         report["hbm"] = f"unavailable: {exc}"
     print(f"dispatch floor (informational): "
           f"{report['dispatch_floor_us_informational']:.2f} us")
-    print(f"cache_mode={args.cache_mode} donate={donate} extra_chunks={extra}")
+    print(f"cache_mode={args.cache_mode} donate={donate} "
+          f"serial_topk={args.serial_topk} extra_chunks={extra}")
     print(f"hbm: {report['hbm']}")
 
     max_cache_gb = args.max_cache_gb
@@ -754,6 +821,7 @@ def main():
                            depth,
                            per_layer=per_layer,
                            donate=donate,
+                           serial_topk=args.serial_topk,
                            extra_chunks=extra,
                            max_cache_gb=max_cache_gb,
                            data=data)
@@ -761,7 +829,8 @@ def main():
                 fails.append(f"{case} depth={depth}: skipped, see above")
                 continue
             fails.extend(check_case(rec, want[case]))
-        fails.extend(depth_fit(case, report, per_layer, donate))
+        fails.extend(
+            depth_fit(case, report, per_layer, donate, args.serial_topk))
 
     if args.json_out:
         with open(args.json_out, "w") as f:
@@ -777,7 +846,7 @@ def main():
     return 0
 
 
-def depth_fit(case, report, per_layer, donate):
+def depth_fit(case, report, per_layer, donate, serial_topk):
     """Least-squares `T(depth) = C + depth*D` over this case's depth points.
 
     `D` is the marginal cost of one more pipeline stage and is the ONLY figure
@@ -792,8 +861,9 @@ def depth_fit(case, report, per_layer, donate):
     effect means the depth axis has not resolved anything.
     """
     recs = [
-        r for r in report["cases"] if r["case"] == case
-        and r["per_layer_caches"] == per_layer and r["donate"] == donate
+        r for r in report["cases"]
+        if r["case"] == case and r["per_layer_caches"] == per_layer
+        and r["donate"] == donate and r["serial_topk"] == serial_topk
     ]
     if len({r["chain_depth"] for r in recs}) < 2:
         return []
@@ -805,7 +875,8 @@ def depth_fit(case, report, per_layer, donate):
         den = sum((x - mx)**2 for x in xs)
         d = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
         out[arm] = {"D_us_per_layer": d, "C_us_per_call": my - d * mx}
-    key = f"{case}/per_layer={per_layer}/donate={donate}"
+    key = (f"{case}/per_layer={per_layer}/donate={donate}"
+           f"/serial_topk={serial_topk}")
     report.setdefault("depth_fit", {})[key] = {
         "depths": [r["chain_depth"] for r in recs],
         "per_arm": out,
