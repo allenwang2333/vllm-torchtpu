@@ -2,12 +2,33 @@
 
 Companion to [coding_guidance.md](coding_guidance.md), which carries the general
 coding rules (R-1.x–R-8.x) and the author checklist. This document carries
-the performance (§1) and quantization (§2) standards. Rules here are
-numbered **P-\<n\>** (performance) and **Q-\<n\>** (quantization); those IDs
-cited anywhere in the document set refer to the rules below, and R-x.y
-cited below refers to the coding guidance.
+the PR-discipline (§0), performance (§1), and quantization (§2) standards.
+Rules here are numbered **PR-\<n\>** (PR discipline), **P-\<n\>**
+(performance), and **Q-\<n\>** (quantization); those IDs cited anywhere in
+the document set refer to the rules below, and R-x.y cited below refers to
+the coding guidance.
 
 ---
+
+## 0. PR discipline
+
+Applies to all optimization work — performance (§1) and quantization
+(§2) alike.
+
+- **PR-1** Optimization PRs are tiny and mechanism-described; perf PRs carry
+  per-mode speedups (decode/prefill/mixed) in the description. Update CI
+  perf thresholds in the same PR that moves performance.
+- **PR-2** **Revert fast on numeric issues** — a revert PR is a first-class
+  mitigation; root-cause offline.
+- **PR-3** **When copying or porting code from another repo, state where it
+  came from and what you changed** (source repo/file, in the code comment
+  and PR description) — so the reviewer can diff against the original
+  instead of reviewing from scratch, and maintainers know where upstream
+  fixes land. Version kernels (v2, v3), then deprecate and delete the
+  superseded one on R-7.5's timeline. A kernel that exists in two homes
+  (internal + OSS copies) is updated in both on every change.
+- **PR-4** PR descriptions carry an honest **Limitations** section:
+  unsupported shapes/configs, known perf gaps, follow-up TODOs.
 
 ## 1. Performance work
 
@@ -29,19 +50,10 @@ cited below refers to the coding guidance.
 
 ### 1.2 Let the compiler work
 
-- **P-5** **`shard_map` is a last resort.** Prefer regular JAX ops +
-  `with_sharding_constraint`; over-explicit code blocks future compiler
-  optimizations. `shard_map` is justified in exactly two cases: (a) wrapping
-  a Pallas kernel (the compiler can't see inside); (b) a hand-written
-  collective XLA won't emit — and only after a reshard-hint attempt failed,
-  with a trace showing the win.
-- **P-6** **Never disable replication/VMA checks outside kernels**
-  (`check_rep=False` / `check_vma=False`) — it silently permits per-device
-  numeric divergence. Kernels are the only legitimate use.
-- **P-7** Shard via jit signatures (`in_shardings`/`out_shardings`) instead
+- **P-5** Shard via jit signatures (`in_shardings`/`out_shardings`) instead
   of manual reshard functions; use the global mesh context instead of
   threading `mesh` through every signature.
-- **P-8** Before hand-coding a collective, try hinting XLA (a reshard before
+- **P-6** Before hand-coding a collective, try hinting XLA (a reshard before
   return). Cast to bf16 *before* collectives when numerics tolerate it — and
   verify like any dtype change. Fix mis-fusions at the HLO-pass level (flip
   the responsible pass's flag), not by sprinkling `optimization_barrier`.
@@ -52,63 +64,46 @@ cited below refers to the coding guidance.
 Argue kernel decisions in terms of VREG / VMEM / SMEM / HBM bandwidth / MXU
 dtype throughput / DMA latency:
 
-- **P-9** VREG lifetime: quantize per-loop-iteration to avoid spills; don't
+- **P-7** VREG lifetime: quantize per-loop-iteration to avoid spills; don't
   materialize zero-init accumulators up front; write results directly to
   `out_ref` on the last step instead of scratch-then-copy.
-- **P-10** HBM traffic: avoid unnecessary zero-initialization; fuse ops to
+- **P-8** HBM traffic: avoid unnecessary zero-initialization; fuse ops to
   avoid HBM round trips.
-- **P-11** MXU throughput: w8a16 beats w16a16 — never silently upcast
+- **P-9** MXU throughput: w8a16 beats w16a16 — never silently upcast
   weights or activations to 16-bit compute; ride 4-bit weights on the fp8
   path (u4→fp8, not u4→bf16); unpack packed formats with shifts/masks, not
   dtype up/down-cast chains.
-- **P-12** SMEM: don't allocate the maximum — the compiler needs headroom.
-- **P-13** DMA: small DMAs are latency-bound — fewer hops beats equal total
+- **P-10** SMEM: don't allocate the maximum — the compiler needs headroom.
+- **P-11** DMA: small DMAs are latency-bound — fewer hops beats equal total
   bytes; compute the split crossover from the cost model. Never
   `start(); wait()` back-to-back — pipeline with buffering.
-- **P-14** Layout is a first-class cost: fix interleaved splits by
+- **P-12** Layout is a first-class cost: fix interleaved splits by
   preprocessing weights at load time; sublane `jnp.repeat` inside a kernel is
   not cheap.
-- **P-15** Optimization barriers hide in innocuous constructs:
+- **P-13** Optimization barriers hide in innocuous constructs:
   `jax.named_scope`, `lax.cond` in the hot loop (a `lax.cond` in the main
   kernel loop regresses *all* workloads). Don't allocate never-read memory
   just to keep a signature fixed.
 
-### 1.4 Move work off the hot path; tuned values are derived or tabled
+### 1.4 Additional considerations
 
-- **P-16** **Weight-loading time is where heavy tensor work belongs**:
+- **P-14** **Weight-loading time is where heavy tensor work belongs**:
   dequantization, scale broadcasting, KV-head replication, weight transposes
   normalized once by the kernel contract so no per-backend branching survives
   into the forward pass. Call-time `jnp.pad` on the inference path needs
   trace proof or a redesign — the runner pads shapes upstream; kernels don't
   carry unaligned-shape complexity. Memory validation for any weight-loading
   change — quantized or not — follows Q-6.
-- **P-17** **Every threshold should be computable from a cost model** (DMA
+- **P-15** **Every threshold should be computable from a cost model** (DMA
   latency vs bandwidth, VMEM budget per TPU generation). Heuristics need
   theoretical backing with a code pointer to the derivation.
-- **P-18** **Block sizes live in tuned tables inside the kernel directory**
+- **P-16** **Block sizes live in tuned tables inside the kernel directory**
   (`kernels/*/tuned_block_sizes.py`), keyed by workload, imported as normal
   Python data — never JSON resolved via `__file__`-relative paths. Misses log
   `warning_once` with the full lookup key; new workloads add table entries,
   not env overrides.
-- **P-19** Know each kernel's hard envelope (mesh rank, EP-only, dtype
+- **P-17** Know each kernel's hard envelope (mesh rank, EP-only, dtype
   packing, JAX version range) and gate callers on it explicitly.
-
-### 1.5 Perf work discipline
-
-- **P-20** Perf PRs are tiny and mechanism-described, with per-mode speedups
-  (decode/prefill/mixed) in the description. Update CI perf thresholds in the
-  same PR that moves performance.
-- **P-21** **Revert fast on numeric issues** — a revert PR is a first-class
-  mitigation; root-cause offline.
-- **P-22** **When copying or porting code from another repo, state where it
-  came from and what you changed** (source repo/file, in the code comment
-  and PR description) — so the reviewer can diff against the original
-  instead of reviewing from scratch, and maintainers know where upstream
-  fixes land. Version kernels (v2, v3), then deprecate and delete the
-  superseded one on R-7.5's timeline. A kernel that exists in two homes
-  (internal + OSS copies) is updated in both on every change.
-- **P-23** PR descriptions carry an honest **Limitations** section:
-  unsupported shapes/configs, known perf gaps, follow-up TODOs.
 
 ## 2. Quantization
 

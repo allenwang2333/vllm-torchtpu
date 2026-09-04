@@ -13,7 +13,8 @@ optimization doc) in their findings.
 
 Rules are numbered `R-<section>.<n>` so findings and instructions can point at
 them precisely. IDs are global across the document set: R-1.x–R-8.x live
-here; P-x (performance) and Q-x (quantization) live in the companion
+here; PR-x (PR discipline), P-x (performance), and Q-x (quantization) live
+in the companion
 [optimization_best_practices.md](optimization_best_practices.md).
 
 Two meta-principles organize this document set:
@@ -61,7 +62,7 @@ Two meta-principles organize this document set:
   the relevant shapes/values, and name the failure mode. A reader with only
   the log (no source) should be able to identify root cause and the file to
   inspect. Use `warning_once`/`info_once` for per-process one-shot messages
-  (e.g. unexpected fallback paths; tuned-table misses follow P-18 in the
+  (e.g. unexpected fallback paths; tuned-table misses follow P-16 in the
   optimization doc); log only the branch the user didn't expect.
 - **R-1.8** **Minimize comments — prefer self-documenting code.** Eliminate
   comments that restate what the code already says; rename or restructure
@@ -316,7 +317,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   (c) a documented quality/perf tradeoff dial whose exact mode stays
   available. **Never make tuning values (block sizes, thresholds, buffer
   sizes) knobs** — derive them from a cost model or add a tuned-table entry
-  (P-18, optimization doc).
+  (P-16, optimization doc).
 - **R-6.3** **Collapse special cases into existing arguments** when
   semantics allow: fold `zero_point` into `bias`; treat MLA as attention
   with `num_kv_heads=1`; decode and spec-decode must not behave differently.
@@ -389,7 +390,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   compressed-tensors MoE"), not the model that prompted it; the body is a
   terse bullet list of mechanisms; fix PRs state the original bug and the
   fix mechanism; perf PRs carry per-mode speedups and every PR carries an
-  honest Limitations section when limitations exist (P-20 and P-23 in
+  honest Limitations section when limitations exist (PR-1 and PR-4 in
   the optimization doc).
 - **R-7.12** **No internal-only references anywhere that lands in the public
   repo** — code, comments, yml, scripts, commit messages, PR text alike: no
@@ -471,7 +472,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
    parameterized; wired into CI with correct markers; runnable on small
    hardware. (R-8.x)
 9. **Thresholds** — CI perf thresholds updated in the same PR if performance
-   moved. (P-20, optimization doc)
+   moved. (PR-1, optimization doc)
 10. **Hygiene** — `pre-commit run --all-files` clean; 80 columns; license
     headers; explicit imports; no internal links. (R-1.x, R-7.12)
 11. **Lifecycle** — WIP as Draft; branch updated by rebase, never merge;
@@ -508,4 +509,4 @@ argument, or config field, ask *"can this be computed from something already
 in scope — a shape, a dtype, `pltpu.get_tpu_info()`, the mesh, the vLLM
 config?"* If yes, compute it there (R-4.2–R-4.7). If it genuinely cannot be
 derived, prefer a tuned-table entry with a stated derivation over a
-user-facing knob (P-17 and P-18 in the optimization doc).
+user-facing knob (P-15 and P-16 in the optimization doc).
