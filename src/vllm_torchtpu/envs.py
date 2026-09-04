@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_MOE_COMPACT_SCALE: str = "off"
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -379,6 +380,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None,
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
+    # MXFP4 routed-expert scales: "off" keeps the shipped f32 [E, blocks, 1, N]
+    # layout; "e8m0" and "bf16" store [E, blocks, N] in the narrow dtype and let
+    # gmm_v2 widen per tile in VMEM. Lossless either way -- E8M0 values are
+    # powers of two -- and it removes 20% (e8m0) or 10% (bf16) of every byte the
+    # routed GEMM fetches from HBM.
+    "TPU_MOE_COMPACT_SCALE":
+    env_with_choices("TPU_MOE_COMPACT_SCALE", "off", ["off", "bf16", "e8m0"]),
+
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
