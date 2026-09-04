@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_KDA_GPROJ_LAYOUT: str = "head_major"
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -181,6 +182,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
+    # How KDA's full-rank output-gate weight (`g_proj`) is stored. Its
+    # consumer reads the gate head-major, as [heads, head_dim, hidden], which
+    # is bitwise vLLM's [n_out, n_in] and is not the canonical (k, n) layout
+    # every other dense weight takes; storing it (k, n) costs a full transpose
+    # of the 5.5 MB weight on every KDA layer on every step. "canonical"
+    # restores that, as the paired control for measuring the difference.
+    "TPU_KDA_GPROJ_LAYOUT":
+    env_with_choices("TPU_KDA_GPROJ_LAYOUT", "head_major",
+                     ["head_major", "canonical"]),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

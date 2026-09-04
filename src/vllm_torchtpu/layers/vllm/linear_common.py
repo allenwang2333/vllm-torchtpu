@@ -22,6 +22,13 @@ from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 # `process_weights_after_loading`, so it is set by the time the layout decision
 # is made -- and it moves with the code if a layer is renamed, which a
 # name-matched list would not.
+#
+# A weight reached only through `apply` can want the upstream layout too, when
+# what reads it raw is the *output*: a consumer that views the result as a
+# rank-3 [T, heads, head_dim] makes the fusion want the weight as
+# [heads, head_dim, n_in], which `[n_out, n_in]` already is bitwise. There the
+# canonical flip buys a full transpose of the weight on every step (K3's KDA
+# `g_proj`, `models/vllm/kimi_k3/attention.py`).
 KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 
 # Idempotence guard, set by the linear method once it has flipped a weight.

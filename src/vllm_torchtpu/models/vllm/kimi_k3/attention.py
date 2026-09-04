@@ -29,9 +29,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import \
     build_kimi_dispatched_kda_op
+from vllm_torchtpu.layers.vllm.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -408,6 +410,19 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_proj",
             )
+            if envs.TPU_KDA_GPROJ_LAYOUT == "head_major":
+                # The gate is consumed head-major -- `_gated_output_norm`
+                # reshapes it to [T, heads, head_dim] to multiply it into the
+                # KDA kernel's output, whose layout the kernel pins. So the
+                # fusion that computes the gate wants the weight as
+                # [heads, head_dim, hidden], which vLLM's [n_out, n_in] *is*,
+                # bitwise, and the canonical (k, n) layout is not: flipping it
+                # makes XLA transpose the whole 5.5 MB weight back on every
+                # step (`copy bf16[7168,384]{1,0:T(8,128)} -> {0,1:T(16,128)}`,
+                # 4.92 us x 69 KDA layers = 339 us of the 18.95 ms K3 step).
+                # Keeping the vLLM layout turns that copy into a plain DMA
+                # prefetch of the same bytes.
+                setattr(self.g_proj, KEEP_VLLM_LAYOUT_ATTR, True)
         else:
             self.fused_fa_ga_proj = MergedColumnParallelLinear(
                 config.hidden_size,
