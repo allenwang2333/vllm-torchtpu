@@ -122,11 +122,27 @@ run_lm_eval() {
                 --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
                 --apply_chat_template
             )
+            # `continue_final_message` belongs only to tasks that prefill a
+            # trailing assistant turn -- in lm-eval, exactly the tasks that set
+            # `gen_prefix`. Sent to a task whose prompt ends on a *user* turn it
+            # is not merely useless: transformers strips that turn's terminator
+            # and the model is asked to continue the user's own message. Keep
+            # this list keyed on tasks known to prefill, so a task added later
+            # fails safe by not getting the flag.
+            case "$task" in
+                mmlu_llama*|arc_challenge_llama|arc_challenge_chat)
+                    prefills_assistant_turn=1 ;;
+                *)
+                    prefills_assistant_turn=0 ;;
+            esac
             if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
                 lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
-            else
+            elif [ "$prefills_assistant_turn" = "1" ]; then
                 lm_eval_args+=(--fewshot_as_multiturn true)
                 lm_eval_args+=(--gen_kwargs '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}')
+            else
+                lm_eval_args+=(--fewshot_as_multiturn true)
+                lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
             fi
             ;;
     esac

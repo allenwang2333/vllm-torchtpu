@@ -80,6 +80,33 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 ```
 
+## Assistant-prefill tasks (`mmlu_llama`)
+
+lm-eval tasks that set `gen_prefix` end their prompt with a partially written
+assistant turn (`"The best answer is"`) and exact-match only the continuation
+(`"B."`). Two things follow.
+
+**`continue_final_message` goes only to those tasks.** `run_eval_flow.sh` keys it
+on the task name. Sent to a task whose prompt ends on a *user* turn it is worse
+than useless: transformers strips that turn's terminator and the model is asked
+to continue the user's own message.
+
+**Score them on the letter when the server renders the turn closed.** A model
+whose chat renderer cannot leave the turn open restates the stem, and
+`strict_match` reads ~0 for a model that is answering correctly. Re-score from
+the logged samples — no re-serving:
+
+```bash
+lm_eval ... --tasks mmlu_llama --log_samples --output_path <DIR>
+python3 scripts/vllm/benchmarking/rescore_gen_prefix.py --results-dir <DIR>
+```
+
+This emits `results_mmlu_llama_tpu.json` with `exact_match,letter-extract`, a
+**separate** task with its own baseline: letter-extraction and
+strict-continuation measure different things, and the existing `mmlu_llama`
+baselines were calibrated on the latter. It fails rather than scoring if any
+response has no letter, or if too many lack the task's carrier phrase.
+
 ## Prerequisites
 
 - vLLM installed (provides `benchmark_serving.py`)

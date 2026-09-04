@@ -186,6 +186,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # eval config turns it on, since a prefilled assistant turn needs it.
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
+    # Same defect on Kimi-K3, but on by default: unlike the DSv4 knob this one
+    # has no silently-working state to preserve. Off, a prefilled assistant
+    # turn is rendered closed and the score is wrong with no diagnostic; on, it
+    # either renders correctly or raises. Defaulting DSv4's off is how K3 went
+    # a release without the same fix.
+    "TPU_K3_HONOR_CONTINUE_FINAL_MESSAGE":
+    env_bool("TPU_K3_HONOR_CONTINUE_FINAL_MESSAGE", default=True),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
     "TPU_SPARSE_MLA_NOPE_LAYOUT":
     env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore",

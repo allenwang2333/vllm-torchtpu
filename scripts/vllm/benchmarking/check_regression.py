@@ -45,6 +45,8 @@ RESULT_FILENAME_RE = re.compile(r"^isl(\d+)_osl(\d+)_c(\d+)\.json$")
 ACC_KEYS = (
     "exact_match,strict_match",
     "exact_match,custom-extract",
+    # rescore_gen_prefix.py; see its docstring for why it is a separate task.
+    "exact_match,letter-extract",
     "exact_match,flexible-extract",
     "acc,none",
     "exact_match,none",
@@ -56,6 +58,7 @@ ACC_KEYS = (
 STDERR_KEYS = (
     "exact_match_stderr,strict_match",
     "exact_match_stderr,custom-extract",
+    "exact_match_stderr,letter-extract",
     "exact_match_stderr,flexible-extract",
     "acc_stderr,none",
     "pass@1_stderr,create_test",
