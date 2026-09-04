@@ -935,24 +935,37 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def _require_pcp_projection_parameters(
             self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the Qwen3.5 FP8 QKVZ parameters required by fusion."""
+        """Return merged QKVZ parameters accepted by projection fusion."""
         if (hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz")
                 or self.gqa_interleaved_layout):
-            raise RuntimeError("GDN pooled PCP prefill requires the Qwen3.5 "
-                               "non-interleaved QKVZ layout.")
+            raise RuntimeError("GDN pooled PCP prefill requires a merged, "
+                               "non-interleaved QKVZ projection.")
 
         projection = self.in_proj_qkvz
         weight = getattr(projection, "weight", None)
         weight_scale = getattr(projection, "weight_scale", None)
         bias = getattr(projection, "bias", None)
-        if (weight is None or weight_scale is None
-                or weight.dtype != torch.float8_e4m3fn
-                or weight_scale.dtype != torch.float32
-                or weight_scale.ndim != 1 or bias is not None):
+        if weight is None or bias is not None:
             raise RuntimeError(
-                "GDN pooled PCP prefill requires bias-free float8_e4m3fn "
-                "QKVZ weights with a rank-1 FP32 scale.")
-        return weight, weight_scale
+                "GDN pooled PCP prefill requires a bias-free merged QKVZ "
+                "projection.")
+        if weight.dtype == torch.float8_e4m3fn:
+            if (weight_scale is None or weight_scale.dtype != torch.float32
+                    or weight_scale.ndim != 1):
+                raise RuntimeError(
+                    "GDN pooled PCP prefill requires float8_e4m3fn QKVZ "
+                    "weights to have a rank-1 FP32 scale.")
+            return weight, weight_scale
+        if weight.dtype == torch.bfloat16:
+            # The shared JAX op signature includes a scale argument. The BF16
+            # Pallas variant statically ignores it, so a single-element tensor
+            # avoids materializing a fake per-output-channel scale.
+            scale_placeholder = torch.ones(
+                (1, ), dtype=torch.float32, device=weight.device)
+            return weight, scale_placeholder
+        raise RuntimeError(
+            "GDN pooled PCP prefill requires float8_e4m3fn or bfloat16 "
+            f"QKVZ weights, got {weight.dtype}.")
 
     def _has_active_pooled_pcp_state(self, kv_cache) -> bool:
         """Whether a PCP-configured worker owns an allocated unified pool."""

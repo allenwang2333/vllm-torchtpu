@@ -13,12 +13,13 @@
 # limitations under the License.
 """PCP projection/communication fused with the GDN v3 compute pipeline.
 
-The Qwen3.5 FP8 entry projects QKVZ in-kernel and interleaves all but the first
-projection block with GDN tiles. BA exchange, gated normalization, and the
-final output projection remain outside. GDN state streams directly to and from
-the unified KV pool through a StateSourcePlan. QKV is written directly into a
-compact destination-major HBM layout, so each source rank pushes one contiguous
-rank-local token chunk per destination without head-width padding.
+The Qwen3.5 FP8 and Qwen3.8 BF16 entries project QKVZ in-kernel and interleave
+all but the first projection block with GDN tiles. BA exchange, gated
+normalization, and the final output projection remain outside. GDN state
+streams directly to and from the unified KV pool through a StateSourcePlan.
+QKV is written directly into a compact destination-major HBM layout, so each
+source rank pushes one contiguous rank-local token chunk per destination
+without head-width padding.
 
 For PCP size ``P`` and local communication chunk ``C``, one logical compute
 stage contains ``P * C`` request-major tokens and one PCP-local head shard.
@@ -48,6 +49,8 @@ class _ProjectionConfig:
     token_block_size: int
     out_block_size: int
     qkv_dim: int
+    z_tile_rows: int
+    quantized: bool
 
 
 _TPU_TILE_ROWS = 8
@@ -544,13 +547,14 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 ],
                 sem=projection_weight_sem,
             ).start()
-            pltpu.make_async_copy(
-                src_ref=projection_weight_scale_ref.at[pl.ds(
-                    source_row, width)],
-                dst_ref=projection_weight_scale_vmem_ref.at[pl.ds(
-                    destination_row, width)],
-                sem=projection_scale_sem,
-            ).start()
+            if projection_cfg.quantized:
+                pltpu.make_async_copy(
+                    src_ref=projection_weight_scale_ref.at[pl.ds(
+                        source_row, width)],
+                    dst_ref=projection_weight_scale_vmem_ref.at[pl.ds(
+                        destination_row, width)],
+                    sem=projection_scale_sem,
+                ).start()
 
         @pl.when(is_qkv)
         def _start_qkv() -> None:
@@ -610,23 +614,25 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 _previous_projection_out_block(out_block), )
 
         @pl.when(out_block == 0)
-        def _quantize_projection_x() -> None:
+        def _prepare_projection_x() -> None:
             pltpu.make_async_copy(
                 src_ref=projection_x_ref,
                 dst_ref=projection_x_ref,
                 sem=projection_x_sem,
             ).wait()
-            x = projection_x_ref[...]
-            dtype_info = jnp.finfo(projection_weight_ref.dtype)
-            x_abs_max = jnp.max(jnp.abs(x), axis=1)
-            x_scale = (x_abs_max.astype(jnp.float32) / float(dtype_info.max))
-            x_scale = jnp.where(x_scale == 0, 1.0, x_scale)
-            projection_x_q_ref[...] = jnp.clip(
-                x.astype(jnp.float32) / x_scale[:, None],
-                float(dtype_info.min),
-                float(dtype_info.max),
-            ).astype(projection_weight_ref.dtype)
-            projection_x_scale_ref[...] = x_scale
+            if projection_cfg.quantized:
+                x = projection_x_ref[...]
+                dtype_info = jnp.finfo(projection_weight_ref.dtype)
+                x_abs_max = jnp.max(jnp.abs(x), axis=1)
+                x_scale = (x_abs_max.astype(jnp.float32) /
+                           float(dtype_info.max))
+                x_scale = jnp.where(x_scale == 0, 1.0, x_scale)
+                projection_x_q_ref[...] = jnp.clip(
+                    x.astype(jnp.float32) / x_scale[:, None],
+                    float(dtype_info.min),
+                    float(dtype_info.max),
+                ).astype(projection_weight_ref.dtype)
+                projection_x_scale_ref[...] = x_scale
 
         is_qkv, destination, z_group = _projection_job(out_block)
 
@@ -635,26 +641,35 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 pl.ds(0, width),
                 :,
             ]
-            scale_ref = projection_weight_scale_vmem_ref.at[pl.ds(0, width)]
             pltpu.make_async_copy(
                 src_ref=weight_ref,
                 dst_ref=weight_ref,
                 sem=projection_weight_sem,
             ).wait()
-            pltpu.make_async_copy(
-                src_ref=scale_ref,
-                dst_ref=scale_ref,
-                sem=projection_scale_sem,
-            ).wait()
-
-            acc = jax.lax.dot_general(
-                projection_x_q_ref[...],
-                projection_weight_vmem_ref[pl.ds(0, width), :],
-                dimension_numbers=(((1, ), (1, )), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            acc *= projection_x_scale_ref[...][:, None]
-            acc *= projection_weight_scale_vmem_ref[pl.ds(0, width)][None, :]
+            if projection_cfg.quantized:
+                scale_ref = projection_weight_scale_vmem_ref.at[pl.ds(
+                    0, width)]
+                pltpu.make_async_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    sem=projection_scale_sem,
+                ).wait()
+                acc = jax.lax.dot_general(
+                    projection_x_q_ref[...],
+                    projection_weight_vmem_ref[pl.ds(0, width), :],
+                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                acc *= projection_x_scale_ref[...][:, None]
+                acc *= projection_weight_scale_vmem_ref[pl.ds(
+                    0, width)][None, :]
+            else:
+                acc = jax.lax.dot_general(
+                    projection_x_ref[...],
+                    projection_weight_vmem_ref[pl.ds(0, width), :],
+                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
             return acc.astype(hidden_ref.dtype)
 
         @pl.when(is_qkv)
@@ -679,7 +694,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 values,
                 (
                     (0, 0),
-                    (0, _TPU_TILE_ROWS - lanes),
+                    (0, projection_cfg.z_tile_rows - lanes),
                     (0, 0),
                 ),
             )
@@ -1270,18 +1285,20 @@ def fused_qkvz_projection_pcp_gdn(
     if hidden_states.ndim != 2 or qkvz_weight.ndim != 2:
         raise ValueError("Projection fusion requires rank-2 hidden states "
                          "and QKVZ weight.")
-    if qkvz_weight_scale.ndim != 1:
-        raise ValueError("Projection fusion requires a per-channel rank-1 "
-                         "weight scale.")
     if hidden_states.dtype != jnp.bfloat16:
         raise ValueError("Projection fusion requires BF16 hidden states, got "
                          f"{hidden_states.dtype}.")
-    if qkvz_weight.dtype != jnp.float8_e4m3fn:
-        raise ValueError("Projection fusion requires float8_e4m3fn weights, "
-                         f"got {qkvz_weight.dtype}.")
-    if qkvz_weight_scale.dtype != jnp.float32:
-        raise ValueError("Projection fusion requires FP32 weight scales, got "
-                         f"{qkvz_weight_scale.dtype}.")
+    quantized_projection = qkvz_weight.dtype == jnp.float8_e4m3fn
+    if not quantized_projection and qkvz_weight.dtype != jnp.bfloat16:
+        raise ValueError("Projection fusion requires float8_e4m3fn or BF16 "
+                         f"weights, got {qkvz_weight.dtype}.")
+    if quantized_projection:
+        if qkvz_weight_scale.ndim != 1:
+            raise ValueError("FP8 projection fusion requires a per-channel "
+                             "rank-1 weight scale.")
+        if qkvz_weight_scale.dtype != jnp.float32:
+            raise ValueError("FP8 projection fusion requires FP32 weight "
+                             f"scales, got {qkvz_weight_scale.dtype}.")
     if hidden_states.shape[1] != qkvz_weight.shape[1]:
         raise ValueError("Projection input and weight K dimensions differ: "
                          f"{hidden_states.shape[1]} and "
@@ -1290,7 +1307,8 @@ def fused_qkvz_projection_pcp_gdn(
         raise ValueError("Unexpected QKVZ projection width: "
                          f"expected={expected_qkvz_dim}, "
                          f"got={qkvz_weight.shape[0]}.")
-    if qkvz_weight_scale.shape[0] != expected_qkvz_dim:
+    if (quantized_projection
+            and qkvz_weight_scale.shape[0] != expected_qkvz_dim):
         raise ValueError(
             "QKVZ scale width differs from the projection weight: "
             f"{qkvz_weight_scale.shape[0]} and "
@@ -1308,17 +1326,19 @@ def fused_qkvz_projection_pcp_gdn(
         raise ValueError("Projection K dimension must be MXU aligned to 256, "
                          f"got {hidden_states.shape[1]}.")
     if (shard_key_dim % _TPU_TILE_COLUMNS != 0
-            or shard_value_dim % _TPU_TILE_COLUMNS != 0
-            or shard_value_dim > _TPU_TILE_ROWS * _TPU_TILE_COLUMNS):
+            or shard_value_dim % _TPU_TILE_COLUMNS != 0):
         raise ValueError(
-            "QKVZ projection requires tile-aligned PCP-local shards and a Z "
-            "shard that fits one physical output tile: "
+            "QKVZ projection requires tile-aligned PCP-local shards: "
             f"{shard_key_dim=} {shard_value_dim=} "
             f"{projection_out_block_size=}.")
+    z_tile_rows = max(_TPU_TILE_ROWS,
+                      shard_value_dim // _TPU_TILE_COLUMNS)
     projection_cfg = _ProjectionConfig(
         token_block_size=projection_token_block_size,
         out_block_size=projection_out_block_size,
         qkv_dim=expected_local_qkv_dim,
+        z_tile_rows=z_tile_rows,
+        quantized=quantized_projection,
     )
 
     if b.shape[1] != local_n_v:
@@ -1446,7 +1466,7 @@ def fused_qkvz_projection_pcp_gdn(
         (
             local_num_tokens,
             num_z_out_blocks,
-            _TPU_TILE_ROWS,
+            projection_cfg.z_tile_rows,
             _TPU_TILE_COLUMNS,
         ),
         act_out_dtype,
@@ -1470,6 +1490,16 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         state_source.dtype,
     )
+    # The BF16 path reads activation and weight tiles directly. Keep one-cell
+    # placeholders for the FP8-only quantization scratch so the outer-kernel
+    # signature stays common without paying their VMEM cost.
+    projection_x_q_shape = ((projection_cfg.token_block_size,
+                             hidden_states.shape[1])
+                            if projection_cfg.quantized else (1, 1))
+    projection_x_scale_shape = ((projection_cfg.token_block_size, )
+                                if projection_cfg.quantized else (1, ))
+    projection_weight_scale_shape = ((projection_cfg.out_block_size, )
+                                     if projection_cfg.quantized else (1, ))
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -1480,11 +1510,11 @@ def fused_qkvz_projection_pcp_gdn(
             hidden_states.dtype,
         ),
         pltpu.VMEM(
-            (projection_cfg.token_block_size, hidden_states.shape[1]),
+            projection_x_q_shape,
             qkvz_weight.dtype,
         ),
         pltpu.VMEM(
-            (projection_cfg.token_block_size, ),
+            projection_x_scale_shape,
             jnp.float32,
         ),
         pltpu.VMEM(
@@ -1492,7 +1522,7 @@ def fused_qkvz_projection_pcp_gdn(
             qkvz_weight.dtype,
         ),
         pltpu.VMEM(
-            (projection_cfg.out_block_size, ),
+            projection_weight_scale_shape,
             qkvz_weight_scale.dtype,
         ),
         pltpu.VMEM(
@@ -1507,7 +1537,7 @@ def fused_qkvz_projection_pcp_gdn(
         pltpu.VMEM(
             (
                 projection_cfg.token_block_size,
-                _TPU_TILE_ROWS,
+                projection_cfg.z_tile_rows,
                 _TPU_TILE_COLUMNS,
             ),
             act_out_dtype,
@@ -1521,8 +1551,10 @@ def fused_qkvz_projection_pcp_gdn(
         state_input_offset + 7: 1,
     }
     carry_shapes = cfg.get_scratch_shape_dict()
+    projection_dtype_name = ("fp8" if projection_cfg.quantized else "bf16")
     kernel_name = ("fused_pcp_qkvz_projection_gdn_per_seq_compact_qkv"
-                   f"_c{comm_chunk_size}_p{pcp_size}_pooled")
+                   f"_{projection_dtype_name}_c{comm_chunk_size}_p{pcp_size}"
+                   "_pooled")
     # The compiler may retain more transient tiles as this limit rises. Use
     # the same 90% hardware budget as the production GMM kernels.
     vmem_limit_bytes = int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)

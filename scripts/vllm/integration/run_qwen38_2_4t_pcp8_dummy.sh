@@ -39,7 +39,10 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.75}"
 # Keep the VMEM bring-up tuning scoped to this launch. With a 256-token query
 # block the kernel's default q_compute_size is also 256.
 PCP_Q_BLOCK_SIZE="${PCP_Q_BLOCK_SIZE:-256}"
-PCP_KV_INTERLEAVE_SIZE="${PCP_KV_INTERLEAVE_SIZE:-256}"
+# BF16 GDN QKVZ projection doubles the weight-tile footprint. Keep the
+# correctness-first communication chunk small enough for the fused
+# projection/A2A/GDN program to fit in TPU VMEM.
+PCP_KV_INTERLEAVE_SIZE="${PCP_KV_INTERLEAVE_SIZE:-16}"
 ADDITIONAL_CONFIG="${ADDITIONAL_CONFIG:-{\"pcp_streaming_rpa_q_block_size\":${PCP_Q_BLOCK_SIZE}}}"
 # The default directory is the official serialized-FP8 metadata, matching the
 # Qwen3.5 daily launch while dummy loading avoids all weight downloads. Its
@@ -139,7 +142,6 @@ exec "$SERVER_BIN" serve "$MODEL_DIR" \
   --no-disable-hybrid-kv-cache-manager \
   --language-model-only \
   --load-format dummy \
-  --enforce-eager \
   --host "$HOST" \
   --port "$PORT" \
   "$@"

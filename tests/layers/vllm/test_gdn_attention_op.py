@@ -1020,6 +1020,22 @@ class TestVllmGatedDeltaNetAttention:
         assert attn.norm.call_args.args[1] is fused_z
         assert torch.all(output == 5)
 
+    def test_pooled_pcp_fused_projection_accepts_bf16_without_scale(self):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.gqa_interleaved_layout = False
+        qkvz_weight = torch.ones((192, 64), dtype=torch.bfloat16)
+        attn.in_proj_qkvz = SimpleNamespace(
+            weight=qkvz_weight,
+            bias=None,
+        )
+
+        weight, scale = attn._require_pcp_projection_parameters()
+
+        assert weight is qkvz_weight
+        assert scale.shape == (1, )
+        assert scale.dtype == torch.float32
+        assert scale.device == qkvz_weight.device
+
     @patch(
         "vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op.get_forward_context"
     )
