@@ -31,7 +31,7 @@ REPS="${REPS:-3}"
 # count, so without a control on THIS image every other arm is a cross-build
 # comparison. The lossless pair is measured before the lossy arm, because
 # c1+e8m0 can land on ladder+probe alone while k1 needs an accuracy run.
-ARMS_DEFAULT="base c1e8m0 hierep k1 stacked"
+ARMS_DEFAULT="base c1e8m0 k1 hierep stacked"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -74,11 +74,13 @@ clear_compile_cache() {
 }
 # Prints the gate values NEXT TO the compile time on purpose: an arm is only
 # honest if both "the flag was set" and "the program was rebuilt" are true.
+ARM_COMPILE_SECONDS=""
 report_compile_seconds() {  # <server log>
   local s
   s=$(grep -oE 'compilation_seconds[^0-9]*([0-9]+\.?[0-9]*)' "$1" 2>/dev/null | tail -1)
   local g gates=""
   for g in $K3_GATES; do gates="${gates}${g}=${!g:-0} "; done
+  ARM_COMPILE_SECONDS="$(printf '%s' "${s:-}" | grep -oE '[0-9]+\.?[0-9]*' | tail -1)"
   say "compile: ${s:-<not reported>} | gates: ${gates}"
 }
 # Void the arm rather than print a line: hierarchical EP that silently falls
@@ -94,10 +96,16 @@ hierep_gate() {  # <server log>
   fi
   return 0
 }
+ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""
 sanity_probe() {  # <tag>
   [ -f "$PROBE" ] || { say "no probe script; skipping"; return 0; }
+  local o="${OUT}/$1/probe.txt"
   python3 "$PROBE" --host 127.0.0.1 --port 8000 --model moonshotai/Kimi-K3 \
-      --out "${OUT}/$1/completions.json" 2>&1 | tail -5
+      --out "${OUT}/$1/completions.json" 2>&1 | tee "$o" | tail -5
+  ARM_WORST_RATIO="$(grep -oE 'worst_distinct_ratio[=: ]+[0-9.]+' "$o" | grep -oE '[0-9.]+$' | tail -1)"
+  ARM_SANITY="$(grep -oE 'verdict[=: ]+[A-Z_]+' "$o" | grep -oE '[A-Z_]+$' | tail -1)"
+  ARM_SANITY="${ARM_SANITY:-UNKNOWN}"
+  say "sanity: ${ARM_SANITY} worst_distinct_ratio=${ARM_WORST_RATIO:-?}"
 }
 
 # --- one lifetime ------------------------------------------------------------
@@ -137,8 +145,23 @@ for arm in ${*:-$ARMS_DEFAULT}; do
   ( # subshell: one arm's exports must not leak into the next
     for kv in $env_list; do export "${kv?}"; done
     clear_compile_cache
-    run_lifetime "$arm" kimi-k3-tp32-ep-best-lo 1:16 2:16 4:16 8:32
-    [ "${K3_LADDER_HI:-1}" = "1" ] && run_lifetime "$arm" kimi-k3-tp32-ep-best-hi 16:64 32:64
+    run_lifetime "$arm" kimi-k3-tp32-ep-best-lo ${K3_CELLS_LO:-1:8 2:8 4:16 8:32}
+    # The hi rung needs its OWN lifetime (max_num_seqs 8 -> 32 is a server flag),
+    # i.e. a second ~20-50 min bring-up per arm. On a one-agent queue that is the
+    # dominant cost, so hi runs only for the arms whose claim reaches c>=16 --
+    # by default the control and the stack.
+    case " ${K3_ARMS_WITH_HI:-base stacked} " in
+      *" $arm "*) run_lifetime "$arm" kimi-k3-tp32-ep-best-hi ${K3_CELLS_HI:-16:32 32:32} ;;
+      *) say "hi rung skipped for arm ${arm} (K3_ARMS_WITH_HI='${K3_ARMS_WITH_HI:-base stacked}')" ;;
+    esac
+    # One file per arm, in the reviewer's contract shape. The reviewer is the
+    # single writer to the operator's tracker; lanes emit JSON and never touch it.
+    python3 "${SCRIPT_DIR}/k3r5_arm_json.py" "$arm" "${OUT}/${arm}" "${OUT}/ladder/${arm}.json" \
+        "sha=${BUILDKITE_COMMIT:-}" "weights=${K3_WEIGHTS:-real}" "gate_env=${env_list}" \
+        "compilation_seconds=${ARM_COMPILE_SECONDS:-}" "cache_cleared=true" \
+        "sanity_verdict=${ARM_SANITY:-NOT_RUN}" \
+        ${ARM_WORST_RATIO:+"worst_distinct_ratio=${ARM_WORST_RATIO}"} \
+        "notes=${K3_ARM_NOTES:-}" || say "arm json failed for ${arm}"
   )
 done
 
