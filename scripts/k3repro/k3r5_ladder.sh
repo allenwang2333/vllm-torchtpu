@@ -97,6 +97,12 @@ arm_env() {
     # that is requant_unpack_kmajor's ~2.5 GB f32 transient per rank for w13, not
     # the rig -- and block 512 does not help, the transient is the same.
     f3pp)     echo "MOE_REQUANTIZE_BLOCK_SIZE=256 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
+    # The 2x2's fourth cell. "F2 and F3'' are substitutes, not addends" has been
+    # asserted from mechanism five times and measured zero times -- both take
+    # their saving from per-active-expert cost on the busiest rank. With base,
+    # f2 and f3pp beside it the interaction term falls straight out: additive if
+    # d(f2f3pp) ~ d(f2) + d(f3pp), substitutes if it is nearer max(d) than sum(d).
+    f2f3pp)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1 MOE_REQUANTIZE_BLOCK_SIZE=256 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
     c1e8m0|c1_compactscale)
               echo "TPU_KDA_GPROJ_LAYOUT=head_major TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
     k1)       echo "TPU_K3_FP8_LATENT_PROJ=1 TPU_KDA_GPROJ_LAYOUT=canonical" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
@@ -112,13 +118,14 @@ arm_env() {
 # look like it needs a pod run to justify.
 arm_notes() {
   case "$1" in
+    f2f3pp) echo "${K3_ARM_NOTES:-}The 2x2's interaction cell. Predictions carried in: F2 -5.23% (r3 measured -7.3..-9.6%), F3'' -3.58% in-plan / -2.69% as measured on hardware. If they are perfect substitutes the joint is ~max(the two), not the sum. Both levers are env-only; F3'' is LOSSY and this build measures performance only." ;;
     stacked) echo "${K3_ARM_NOTES:-}Expect sub-additive: 77% of the compact-scale win is the STRAGGLER, not the GEMM -- shrinking scale bytes shrinks the spacing of the expert ladder, and the wait is that ladder's spread. hierEP attacks the same spread from the other side, so c1_compactscale x hierep is the pair most likely to overlap; report that pair's shortfall separately from the aggregate. Also: hierEP is a correctness fix (3-line loader realignment, landable on its unit test alone) PLUS a performance flag; the ladder prices only the flag." ;;
     hierep) echo "${K3_ARM_NOTES:-}hierEP is a correctness fix (3-line loader realignment, landable on its unit test alone, no pod time required) PLUS a performance flag (TPU_MOE_HIERARCHICAL_EP). The ladder number here prices only the flag; the fix must not be gated on it." ;;
     *) echo "${K3_ARM_NOTES:-}" ;;
   esac
 }
 arm_touches_weights() { case "$1" in base) return 1 ;; *) return 0 ;; esac; }
-arm_needs_hierep_gate() { case "$1" in hierep|stacked) return 0 ;; *) return 1 ;; esac; }
+arm_needs_hierep_gate() { case "$1" in hierep|f2f3pp|stacked) return 0 ;; *) return 1 ;; esac; }
 
 say() { echo "--- [ladder] $*"; }
 
@@ -255,7 +262,7 @@ run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_pro
             --results-dir "${base}/c${conc}/rep${r}" --keep-alive || rc=1
         first=0
         report_compile_seconds "${base}/c${conc}/rep${r}/server.log"
-        case "$arm" in f3pp|stacked) requant_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; } ;; esac
+        case "$arm" in f3pp|f2f3pp|stacked) requant_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; } ;; esac
         if arm_needs_hierep_gate "$arm"; then
           hierep_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; }
         fi
