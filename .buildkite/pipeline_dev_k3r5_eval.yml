@@ -1,0 +1,85 @@
+# Kimi-K3 accuracy: does the round-5 numerics change alter what the model says?
+#
+# One config, one lm_eval invocation, one checkpoint, matched max_num_seqs --
+# the arms differ by exactly one environment variable each, and the DELTA
+# between arms is the result. There is no prior K3 accuracy number at TP32, so
+# an absolute score answers nothing on its own.
+#
+#   baseline    the shipping perf recipe                     (control)
+#   k1          + fp8 latent projections  -- LOSSY, bf16 -> float8_e4m3fn,
+#               3 mantissa bits against 7 on 184 instructions/step
+#   kvauto      --kv-cache-dtype auto instead of fp8
+#
+# Why the third arm exists: the perf recipe has run fp8 KV from the start with
+# NO K3 accuracy number under it. Without `kvauto`, K1 stacks a second
+# unverified numerics change on an unverified first one and neither can be
+# attributed. It is third because it is the one to drop if the agent is needed
+# elsewhere -- and if it is dropped, the gap is reported, not ignored.
+#
+# NOTE on kvauto's perf numbers: `--kv-cache-dtype auto` and block 256 are a
+# PAIR. The only page-256 K3 `mixed` tuned row is keyed fp8, so the auto arm
+# misses the MLA tuned row and its TTFT returns to ~2050 ms. That is expected
+# and is not a regression; this arm is an accuracy measurement.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r5_eval.yml
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":mag: K3 accuracy BASELINE (control): shipping recipe"
+    key: k3r5_eval_base
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_32_queue
+    env: &evalenv
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+      SKIP_DB_UPLOAD: "1"
+      BUILDKITE_K3_FP8_LATENT: "0"
+      BUILDKITE_K3_KV_DTYPE: "fp8"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep-best-eval --run-lm-eval --results-dir /perf_eval_results/k3r5-eval-base"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":mag: K3 accuracy K1: fp8 latent projections (LOSSY)"
+    key: k3r5_eval_k1
+    depends_on: k3r5_eval_base
+    allow_dependency_failure: true
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      <<: *evalenv
+      BUILDKITE_K3_FP8_LATENT: "1"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep-best-eval --run-lm-eval --results-dir /perf_eval_results/k3r5-eval-k1"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":mag: K3 accuracy KV auto: the fp8-KV numerics we never verified"
+    key: k3r5_eval_kvauto
+    depends_on: k3r5_eval_k1
+    allow_dependency_failure: true
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      <<: *evalenv
+      BUILDKITE_K3_KV_DTYPE: "auto"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep-best-eval --run-lm-eval --results-dir /perf_eval_results/k3r5-eval-kvauto"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
