@@ -44,7 +44,7 @@ REPS="${REPS:-3}"
 # REGRESSION, not a win. Both projections are also genuinely M=1 at decode pad 1, so
 # XLA may take the matvec off the MXU onto a VPU broadcast/multiply/reduce. Both are
 # CPU-checkable in minutes; a ~50 min pod lifetime is the wrong way to find out.
-ARMS_DEFAULT="base c1 hierep stacked"
+ARMS_DEFAULT="base c1_compactscale hierep stacked"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -58,16 +58,21 @@ rc=0
 # "the flag was set" and "the program changed" are two different claims and an
 # env-gated patch that silently reuses the previous arm's executable is exactly
 # the r3 A/B that had to be voided.
-K3_GATES="TPU_K3_FP8_LATENT_PROJ K3_KDA_OPROJ_RELAYOUT K3_SCALE_E8M0_NARROW K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
+K3_GATES="TPU_K3_FP8_LATENT_PROJ K3_KDA_OPROJ_RELAYOUT TPU_MOE_COMPACT_SCALE K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
 arm_env() {
   case "$1" in
     base)     echo "" ;;                                    # the control, all gates off
     c1)       echo "K3_KDA_OPROJ_RELAYOUT=1" ;;             # lane I1: KDA o_proj load-time relayout
-    e8m0)     echo "K3_SCALE_E8M0_NARROW=1" ;;              # lane I1: scale upcast into WeightsRef.get_scale()
-    c1e8m0)   echo "K3_KDA_OPROJ_RELAYOUT=1 K3_SCALE_E8M0_NARROW=1" ;;  # the lossless pair: landable without an eval
+    # Compact MoE scale. e8m0 over bf16 because it is the same diff for twice the
+    # win (43,008 -> 21,504 -> 10,752 granules) and equally lossless: E8M0 encodes
+    # powers of two, which both float8_e8m0fnu and bf16 hold exactly, so the
+    # arithmetic is unchanged and no accuracy run is owed.
+    e8m0)     echo "TPU_MOE_COMPACT_SCALE=e8m0" ;;
+    c1e8m0|c1_compactscale)
+              echo "K3_KDA_OPROJ_RELAYOUT=1 TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
     k1)       echo "TPU_K3_FP8_LATENT_PROJ=1" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
     hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;  # lane I2: env + loader patch
-    stacked)  echo "$(arm_env c1e8m0) $(arm_env k1) $(arm_env hierep)" ;;
+    stacked)  echo "$(arm_env c1_compactscale) $(arm_env k1) $(arm_env hierep)" ;;
     *)        echo "__UNKNOWN__" ;;
   esac
 }
@@ -78,7 +83,8 @@ arm_env() {
 # look like it needs a pod run to justify.
 arm_notes() {
   case "$1" in
-    hierep|stacked) echo "${K3_ARM_NOTES:-}hierEP is a correctness fix (3-line loader realignment, landable on its unit test alone, no pod time required) PLUS a performance flag (TPU_MOE_HIERARCHICAL_EP). The ladder number here prices only the flag; the fix must not be gated on it." ;;
+    stacked) echo "${K3_ARM_NOTES:-}Expect sub-additive: 77% of the compact-scale win is the STRAGGLER, not the GEMM -- shrinking scale bytes shrinks the spacing of the expert ladder, and the wait is that ladder's spread. hierEP attacks the same spread from the other side, so c1_compactscale x hierep is the pair most likely to overlap; report that pair's shortfall separately from the aggregate. Also: hierEP is a correctness fix (3-line loader realignment, landable on its unit test alone) PLUS a performance flag; the ladder prices only the flag." ;;
+    hierep) echo "${K3_ARM_NOTES:-}hierEP is a correctness fix (3-line loader realignment, landable on its unit test alone, no pod time required) PLUS a performance flag (TPU_MOE_HIERARCHICAL_EP). The ladder number here prices only the flag; the fix must not be gated on it." ;;
     *) echo "${K3_ARM_NOTES:-}" ;;
   esac
 }
