@@ -640,6 +640,11 @@ class TpuPlatform(Platform):
         "modelopt_fp4", "deepseek_v4_fp8"
     ]
 
+    # Copied driver -> worker by the V1 Ray executor, which filters through
+    # this list; the V2 executor copies the whole driver environment and
+    # ignores it. A feature flag missing here runs on the driver and on none of
+    # the 31 workers -- and TPU_MOE_HIERARCHICAL_EP's bank gate cannot catch
+    # that, because on a rank that never received the flag it is simply off.
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND", "VLLM_MLA_DISABLE", "TPU_BACKEND_TYPE",
@@ -650,7 +655,7 @@ class TpuPlatform(Platform):
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
         "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK",
-        "MOE_FUSED_EP_V2_SHARDED_PLAN"
+        "MOE_FUSED_EP_V2_SHARDED_PLAN", "TPU_MOE_HIERARCHICAL_EP"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
