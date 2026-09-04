@@ -4,14 +4,19 @@
 Both peers work out which leading pages of a windowed group are dead from
 ``num_tokens``, the transfer prefix. The allocator, meanwhile, freed pages
 against wherever the producer actually stopped. Those two numbers agree only
-while the producer halts at the handoff token, and the proxy is what arranges
-that by pinning the prefill leg to ``max_tokens=1``.
+while the producer halts at the handoff token.
 
 Let them drift and the send lists a page the allocator has already pointed at
 the null block. One dead page arrives as a hole in the decode replica's window
 and nothing complains. Two collide into a duplicate destination, which Raiden
 rejects by raising out of ``execute_model`` on the producer worker, killing the
 engine and every other in-flight request with it.
+
+``_stage3_truncates_prompt`` is what stops the drift: the producer prefills
+N-1 tokens, so the allocator and the connector read the same number and the
+two page counts cannot disagree. The dead-page count remains as a guard for
+the case truncation cannot reach, a client that hits the prefill port directly
+and generates past the handoff.
 
 The tables below are verbatim ``group_block_ids`` captured from a live
 DP4/DP4 DeepSeek-V4-Flash pair, so the geometry and the null runs are the real
@@ -25,7 +30,8 @@ from __future__ import annotations
 import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
-    _stage3_recycled_transfer_pages, _stage3_skipped_window_pages)
+    TPURaidenConnectorScheduler, _stage3_recycled_transfer_pages,
+    _stage3_skipped_window_pages, _Stage3TransferGroup)
 
 # DeepSeek-V4-Flash compressor-state geometry: a 16-token page under an
 # 8-token window, the tightest ratio the model has and so the first to drift.
@@ -84,6 +90,52 @@ def test_producer_that_kept_generating_is_caught():
         num_tokens=113,
         page_tokens=_STATE_CSA_PAGE,
         window_tokens=_STATE_CSA_WINDOW) == 2
+
+
+def test_truncation_removes_the_drift_at_its_source():
+    """Stopping the producer at N-1 puts both formulas on the same input.
+
+    This is the repair the guard above only reports. The 375-token prompt that
+    drifts by a page becomes a 374-token prefill, so the allocator frees the
+    same 22 pages the connector skips and no dead page is listed at all.
+    """
+    truncated = 374
+    freed = max(0, truncated - _STATE_CSA_WINDOW + 1) // _STATE_CSA_PAGE
+    assert freed == _stage3_skipped_window_pages(
+        num_tokens=truncated,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW)
+    ids = [0] * freed + [13, 41]
+    assert _stage3_recycled_transfer_pages(
+        ids,
+        num_tokens=truncated,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW) == 0
+
+
+@pytest.mark.parametrize(
+    "mamba_indices,windows,expected",
+    [
+        # Qwen3.5 and GLM: one full-attention group, so P may run to the end
+        # of the prompt.
+        ([], [None], False),
+        # A windowed group recycles pages against how far P ran.
+        ([], [None, 128, 8], True),
+        # The original Mamba reason, unchanged.
+        ([2], [None], True),
+        # Both at once still truncates exactly once.
+        ([2], [None, 8], True),
+    ],
+)
+def test_which_models_truncate_the_prompt(mamba_indices, windows, expected):
+    scheduler = TPURaidenConnectorScheduler.__new__(
+        TPURaidenConnectorScheduler)
+    scheduler._stage3_mamba_group_indices = list(mamba_indices)
+    scheduler._stage3_transfer_groups = tuple(
+        _Stage3TransferGroup(
+            cache_group_index=index, page_tokens=16, window_tokens=window)
+        for index, window in enumerate(windows))
+    assert scheduler._stage3_truncates_prompt() is expected
 
 
 @pytest.mark.parametrize(
