@@ -70,6 +70,7 @@ def _make_runner(*,
     runner.supports_mm_inputs = False
     runner.lora_config = None
     runner.speculative_config = None
+    runner._rpav_enabled = False
     runner._pcp_mtp_k1_enabled = pcp_mtp_k1_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
@@ -588,6 +589,52 @@ def test_prepare_inputs_batch_flat_decode_can_leave_rank_with_only_padding(
     torch.testing.assert_close(
         logits_indices.cpu(), torch.tensor([0, 1] + [-1] * 6,
                                            dtype=torch.int32))
+
+
+def test_prepare_inputs_cached_decode_keeps_mamba_windowed_distribution():
+    """A decode metadata cache hit must still build the GDN distribution."""
+    scheduled = [1]
+    runner = _make_runner(num_computed_tokens=[16],
+                          prompt_tokens=[64],
+                          scheduled_tokens=scheduled,
+                          token_paddings=[8])
+
+    # Decode runs without PCP packing, so its layout has stable logits indices
+    # and is eligible for the metadata cache used by the failing DP8 service.
+    runner.parallel_config.prefill_context_parallel_size = 1
+    runner.sequence_layout_planner = create_sequence_layout_planner(
+        runner.vllm_config)
+
+    speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner.speculative_config = speculative_config
+    runner.vllm_config.speculative_config = speculative_config
+    runner._mamba_slot_stride = 4
+    runner.mamba_state_indices_cpu = torch.zeros(runner.max_num_reqs,
+                                                 dtype=torch.int32)
+    runner._init_mamba_slot_pool = (
+        TPUModelRunner._init_mamba_slot_pool.__get__(runner))
+    runner._build_mamba_state_indices = (
+        TPUModelRunner._build_mamba_state_indices.__get__(runner))
+    runner._init_mamba_slot_pool(1 + runner.max_num_reqs *
+                                 runner._mamba_slot_stride)
+    runner.mamba_slot_read_offsets = torch.zeros(
+        1 + runner.max_num_reqs * runner._mamba_slot_stride, dtype=torch.int32)
+    runner._combined_request_distribution_cpu = torch.zeros(6,
+                                                            dtype=torch.int32)
+
+    scheduler_output = _scheduler_output(scheduled)
+    TPUModelRunner._prepare_inputs(runner, scheduler_output, 0, 1, 1)
+    assert runner._decode_device_cache_key is not None
+
+    runner.input_batch.num_computed_tokens_cpu[0] += 1
+    metadata, *_ = TPUModelRunner._prepare_inputs(runner, scheduler_output, 0,
+                                                  1, 1)
+
+    torch.testing.assert_close(metadata["layer.0"].request_distribution.cpu(),
+                               torch.tensor([1, 1, 1], dtype=torch.int32))
+    torch.testing.assert_close(
+        runner._attn_metadata_builder_ctx.mamba_request_distribution.cpu(),
+        torch.tensor([1, 1, 1], dtype=torch.int32))
 
 
 def test_prepare_inputs_pcp_owner_does_not_rotate_with_absolute_q_start(

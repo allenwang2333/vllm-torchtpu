@@ -113,6 +113,13 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     return min_page_size
 
 
+def _get_verify_q_bucket(vllm_config: VllmConfig | None) -> int | None:
+    if vllm_config is None or vllm_config.speculative_config is None:
+        return None
+    return next_power_of_2(
+        vllm_config.speculative_config.num_speculative_tokens + 1)
+
+
 def _pallas_rpa_kernel_impl(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -358,8 +365,12 @@ def _pallas_rpa_kernel_batched(
     skip_kv_update: bool,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout,
+    verify_q_bucket: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
+    rpa_func = ragged_paged_attention_batched
+    if verify_q_bucket is not None:
+        rpa_func = functools.partial(rpa_func, verify_q_bucket=verify_q_bucket)
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -376,7 +387,7 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=ragged_paged_attention_batched,
+        rpa_func=rpa_func,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
@@ -697,6 +708,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         skip_kv_update: bool = False,
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
+        verify_q_bucket: int | None = None,
     ):
         ctx = get_vllm_model_wrapper_context()
         vllm_config = ctx.vllm_config
@@ -705,7 +717,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                          None)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
-                      cp_kv_cache_interleave_size, max_model_len)
+                      cp_kv_cache_interleave_size, max_model_len,
+                      verify_q_bucket)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -722,7 +735,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                         self.sliding_window, self.scale, self.logits_soft_cap,
                         id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
                         use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask)
+                        max_model_len, self.use_causal_mask, verify_q_bucket)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -746,6 +759,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
             # Prepare wrapper function with static arguments.
+            kernel_entry_kwargs = ({
+                "verify_q_bucket": verify_q_bucket
+            } if verify_q_bucket is not None else {})
             wrapped_fn = functools.partial(
                 self._kernel_entry,
                 mesh=mesh,
@@ -761,6 +777,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "kv_layout": self.kv_layout
                 } if "kv_layout" in inspect.signature(
                     self._kernel_entry).parameters else {}),
+                **kernel_entry_kwargs,
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
@@ -1195,6 +1212,31 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+
+    def _build_rpa_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool = False,
+        use_pcp_streaming: bool = False,
+        cp_kv_cache_interleave_size: int = 0,
+    ):
+        verify_q_bucket = None
+        if (envs.USE_BATCHED_RPA_LONGCTX and self.kv_layout
+                is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                and not use_pcp_streaming):
+            ctx = get_vllm_model_wrapper_context()
+            verify_q_bucket = _get_verify_q_bucket(ctx.vllm_config)
+        return super()._build_rpa_kernel(
+            q_scale,
+            k_scale,
+            v_scale,
+            skip_kv_update=skip_kv_update,
+            use_pcp_streaming=use_pcp_streaming,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            verify_q_bucket=verify_q_bucket,
+        )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

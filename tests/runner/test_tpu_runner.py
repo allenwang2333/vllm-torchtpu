@@ -26,6 +26,8 @@ from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.utils import set_kv_cache_layout
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheTensor,
                                         MambaSpec, MLAAttentionSpec)
@@ -54,6 +56,35 @@ def _attention_layer_mock():
     layer = MagicMock(spec=Attention)
     layer.get_attn_backend.return_value = PallasAttentionBackend
     return layer
+
+
+@pytest.mark.parametrize(
+    ("use_longctx", "use_seq_on_lane", "speculative_config", "backend",
+     "pcp_size", "expected"),
+    [
+        (True, True, object(), AttentionBackendEnum.CUSTOM, 1, True),
+        (True, False, object(), AttentionBackendEnum.CUSTOM, 1, False),
+        (False, True, object(), AttentionBackendEnum.CUSTOM, 1, False),
+        (True, True, None, AttentionBackendEnum.CUSTOM, 1, False),
+        (True, True, object(), AttentionBackendEnum.FLASH_ATTN, 1, False),
+        (True, True, object(), AttentionBackendEnum.CUSTOM, 2, False),
+    ],
+)
+def test_rpav_is_enabled_only_for_seq_on_lane_longctx_non_pcp_spec_decode(
+        monkeypatch, use_longctx, use_seq_on_lane, speculative_config, backend,
+        pcp_size, expected):
+    """RPAv partitioning requires the supported non-PCP attention path."""
+    monkeypatch.setattr(tpu_runner.envs, "USE_BATCHED_RPA_LONGCTX",
+                        use_longctx)
+    set_kv_cache_layout("HND" if use_seq_on_lane else "NHD")
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        attention_config=SimpleNamespace(backend=backend),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size),
+    )
+
+    assert tpu_runner._should_enable_rpav(vllm_config) is expected
 
 
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
@@ -1994,8 +2025,8 @@ class TestCompactMambaSlotPool:
 class TestReorderBatchForRpa:
     """Unit tests for the RPA batch reordering. With spec decode the batch is
     partitioned into three contiguous segments [decode][verify][prefill]; the
-    returned (num_decode, num_windowed) split is fed to both RPA (decode-only
-    front) and the GDN windowed kernel (decode + verify)."""
+    returned (num_decode, num_windowed) split feeds long-context batched RPA's
+    D/V/M segments and the GDN windowed kernel (decode + verify)."""
 
     def _make_runner(self):
         runner = MagicMock(spec=TPUModelRunner)
@@ -2042,12 +2073,13 @@ class TestReorderBatchForRpa:
         num_decode and num_windowed."""
         runner = self._make_runner()
         self._batch(runner, ["pf", "vr", "dc", "vr2", "dc2"])
-        # dc, dc2: 1-token decode; vr, vr2: multi-token spec verify; pf: prefill
+        # pf and vr2 deliberately have the same query length: membership in
+        # scheduled_spec_decode_tokens, not query width, identifies verify.
         sched = self._sched({
-            "pf": 16,
-            "vr": 3,
+            "pf": 4,
+            "vr": 2,
             "dc": 1,
-            "vr2": 3,
+            "vr2": 4,
             "dc2": 1
         },
                             spec_reqs=("vr", "vr2"))

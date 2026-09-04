@@ -132,7 +132,9 @@ def test_calculate_block_sizes_longctx_generation(generation, chip_version,
     with patch("jax.experimental.pallas.tpu.get_tpu_info",
                return_value=_create_mock_tpu_info(generation,
                                                   chip_version=chip_version)):
-        decode_blocks, prefill_blocks = longctx_wrapper.calculate_block_sizes(
-            model_cfg, serve_cfg, vmem_limit)
+        decode_blocks, verify_blocks, mixed_blocks = (
+            longctx_wrapper.calculate_block_sizes(model_cfg, serve_cfg,
+                                                  vmem_limit))
+        assert verify_blocks is None
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
-        assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+        assert mixed_blocks.bq_sz >= mixed_blocks.bq_c_sz >= expected_bq_c_min

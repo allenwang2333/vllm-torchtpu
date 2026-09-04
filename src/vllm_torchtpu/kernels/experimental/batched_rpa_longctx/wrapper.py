@@ -177,8 +177,15 @@ def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
-) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
+    verify_q_bucket: int | None = None,
+) -> tuple[configs.BlockSizes, configs.BlockSizes | None, configs.BlockSizes]:
+    """Calculate block sizes for decode, verify, and mixed requests."""
+
+    valid_verify_q_bucket = verify_q_bucket is None or (
+        verify_q_bucket > 0 and verify_q_bucket & (verify_q_bucket - 1) == 0)
+    assert valid_verify_q_bucket, (
+        "verify_q_bucket must be a positive power of two or None, "
+        f"got {verify_q_bucket}")
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -375,12 +382,16 @@ def calculate_block_sizes(
     n_buffer = 3
     # Fixed value based on experimental results.
     decode_batch_size = 8
-    prefill_batch_size = 2
+    verify_batch_size = 2
+    mixed_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
+    verify_block_sizes = (None if verify_q_bucket
+                          is None else find_best_block_sizes(
+                              verify_batch_size, n_buffer, verify_q_bucket))
+    mixed_block_sizes = find_best_block_sizes(mixed_batch_size, n_buffer)
 
-    return decode_block_sizes, prefill_block_sizes
+    return decode_block_sizes, verify_block_sizes, mixed_block_sizes
 
 
 @jax.jit(
@@ -401,6 +412,7 @@ def calculate_block_sizes(
         "use_causal_mask",
         "skip_kv_update",
         "kv_layout",
+        "verify_q_bucket",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -430,6 +442,7 @@ def ragged_paged_attention(
     use_causal_mask: bool = True,
     skip_kv_update: bool = False,
     kv_layout: configs.KVLayout | None = None,
+    verify_q_bucket: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -446,8 +459,8 @@ def ragged_paged_attention(
         cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
             length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
             b=cu_q_lens[i+1] represents q/k/v of sequence i.
-        distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
-            sequences. distribution[2] represents total number of sequences.
+        distribution: [3]. End offsets of decode, verify, and mixed sequences.
+            distribution[2] represents the total number of sequences.
         sm_scale: Softmax scale value.
         sliding_window: Size of sliding window (also known as local attention). kvs
             outside of the window is not fetched from hbm and masked out during
@@ -471,6 +484,8 @@ def ragged_paged_attention(
             target layer earlier in the same forward pass, ignores its own k/v
             inputs, and does not write the cache back. Inverse of upstream
             tpu-inference's `update_kv_cache`.
+        verify_q_bucket: Static power-of-two query width for speculative
+            verification. None removes the verify kernel from the traced graph.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -540,8 +555,8 @@ def ragged_paged_attention(
         page_size=page_size,
     )
 
-    default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes)
+    default_decode, default_verify, default_mixed = calculate_block_sizes(
+        model_cfgs, serve_cfgs, vmem_limit_bytes, verify_q_bucket)
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
@@ -550,8 +565,12 @@ def ragged_paged_attention(
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
+        elif mode == configs.RpaCase.VERIFY:
+            assert default_verify is not None, (
+                "VERIFY mode requires a statically configured query bucket")
+            effective_blocks = default_verify
         else:
-            effective_blocks = prefill_block_sizes or default_prefill
+            effective_blocks = prefill_block_sizes or default_mixed
 
         cfgs = configs.RpaConfigs(
             block=effective_blocks,
@@ -591,6 +610,10 @@ def ragged_paged_attention(
 
     o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.DECODE, q_hbm,
                                                  kv_cache)
+    if default_verify is not None:
+        o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.VERIFY,
+                                                     o_hbm_alias_q_hbm,
+                                                     kv_cache)
     o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.MIXED,
                                                  o_hbm_alias_q_hbm, kv_cache)
 

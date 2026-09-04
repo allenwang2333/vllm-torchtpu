@@ -54,6 +54,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
@@ -245,6 +246,13 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
+
+
+def _should_enable_rpav(vllm_config: VllmConfig) -> bool:
+    return (envs.USE_BATCHED_RPA_LONGCTX and get_kv_cache_layout() == "HND"
+            and vllm_config.speculative_config is not None and
+            vllm_config.attention_config.backend == AttentionBackendEnum.CUSTOM
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1)
 
 
 def _spec_warmup_all_token_ids(
@@ -772,6 +780,7 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        self._rpav_enabled = _should_enable_rpav(self.vllm_config)
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
         self.structured_decoding_manager = StructuredDecodingManager(self)
@@ -1161,9 +1170,9 @@ class TPUModelRunner(GPUModelRunner):
 
         With speculative decoding the order is three segments:
         [1-token decodes][spec verify windows][prefill/mixed]. Ragged paged
-        attention keeps its 1-token decode front segment, while the GDN
-        kernel's windowed mode covers the first two segments contiguously
-        (see `AttentionMetadata.mamba_request_distribution`).
+        long-context batched RPA exposes the middle segment to RPAv, while the
+        GDN kernel's windowed mode covers the first two segments contiguously (see
+        `AttentionMetadata.mamba_request_distribution`).
 
         Returns:
             (num_decode, num_windowed): the number of 1-token decode requests
@@ -3136,6 +3145,9 @@ class TPUModelRunner(GPUModelRunner):
         can_cache_decode_metadata = (is_decode_only
                                      and spec_decode_metadata is None and
                                      layout_plan.logits_indices_cpu is None)
+        chunk_num_decode = max(0, min(num_decode_reqs - start_index, num_reqs))
+        chunk_num_windowed = max(
+            0, min(num_windowed_reqs - start_index, num_reqs))
 
         if (can_cache_decode_metadata
                 and decode_cache_key == self._decode_device_cache_key):
@@ -3172,13 +3184,12 @@ class TPUModelRunner(GPUModelRunner):
                     self.query_start_loc_cpu[1:padded_num_reqs + 1] - 1).to(
                         self.device, non_blocking=True)
 
-            # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
-            chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+            # Long-context batched RPA uses
+            # [decode_end, verify_end, mixed_end]. Other RPA backends retain
+            # [decode_end, decode_end, mixed_end].
             self._request_distribution_cpu[0] = chunk_num_decode
-            self._request_distribution_cpu[1] = chunk_num_decode
+            self._request_distribution_cpu[1] = (
+                chunk_num_windowed if self._rpav_enabled else chunk_num_decode)
             self._request_distribution_cpu[2] = num_reqs
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
@@ -3200,21 +3211,17 @@ class TPUModelRunner(GPUModelRunner):
 
         # Spec decode with mamba layers: the GDN kernel's windowed segment
         # covers 1-token decodes AND speculative verify windows (the batch is
-        # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
-        # while RPA keeps its 1-token-decode-only front segment.
+        # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa).
         mamba_request_distribution = None
         if self.mamba_slot_read_offsets is not None:
-            chunk_num_windowed = max(
-                0, min(num_windowed_reqs - start_index, num_reqs))
-            chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
             # One H2D copy, two views (see the staging tensor's comment for
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
             # same base tensor, matching the traced graph structure.
             combined = self._combined_request_distribution_cpu
             combined[0] = chunk_num_decode
-            combined[1] = chunk_num_decode
+            combined[1] = (chunk_num_windowed
+                           if self._rpav_enabled else chunk_num_decode)
             combined[2] = num_reqs
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed

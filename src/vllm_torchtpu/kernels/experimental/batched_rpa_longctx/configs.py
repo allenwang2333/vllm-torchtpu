@@ -113,12 +113,12 @@ class RpaCase(enum.StrEnum):
     """Represents the different cases for Ragged Paged Attention.
 
     - DECODE: Sequences are in decode-only mode (q_len = 1).
-    - PREFILL: Sequences are in prefill-only mode (q_len > 1, static).
+    - VERIFY: Sequences contain speculative verification queries.
     - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
     """
 
     DECODE = enum.auto()
-    PREFILL = enum.auto()
+    VERIFY = enum.auto()
     MIXED = enum.auto()
 
     @property
@@ -126,8 +126,8 @@ class RpaCase(enum.StrEnum):
         match self:
             case RpaCase.DECODE:
                 return "d"
-            case RpaCase.PREFILL:
-                return "p"
+            case RpaCase.VERIFY:
+                return "v"
             case RpaCase.MIXED:
                 return "m"
 
@@ -138,7 +138,7 @@ class RpaCase(enum.StrEnum):
         match self:
             case RpaCase.DECODE:
                 return 0, distribution[0]
-            case RpaCase.PREFILL:
+            case RpaCase.VERIFY:
                 return distribution[0], distribution[1]
             case RpaCase.MIXED:
                 return distribution[1], distribution[2]
@@ -221,8 +221,6 @@ class RpaConfigs:
 
     @property
     def bkv_p_cache(self) -> int:
-        if self.mode == RpaCase.PREFILL:
-            return 0
         return self.bkv_p
 
     @property
