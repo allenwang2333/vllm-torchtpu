@@ -134,6 +134,14 @@ def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor,
         raise ValueError(
             f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
             f"{w_q.shape[0]}.")
+    # The output width below is `w_q`'s last dim, which is the PACKED extent
+    # for a sub-byte carrier -- half the logical one. That produces a
+    # correctly-typed, wrongly-shaped result and fails much further down the
+    # graph. `quantized_matmul_fp4` reads the width off the scale instead.
+    if w_q.dtype == torch.float4_e2m1fn_x2:
+        raise ValueError(
+            "quantized_matmul cannot size a packed sub-byte weight; use "
+            "quantized_matmul_fp4, which takes n_out from the scale.")
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
