@@ -1197,6 +1197,24 @@ class VllmMxfp4LinearMethodTPU(VllmFp8LinearMethodTPU):
 
     FP4_BLOCK = 256
 
+    def apply(self, layer, x, bias=None):
+        """`quantized_matmul_fp4`, not the FP8 `quantized_matmul`.
+
+        Both take the same `float4_e2m1fn_x2` carrier, but the FP8 entry point
+        derives the output width from `w_q.shape[-1]` -- which for a sub-byte
+        carrier is the PACKED extent, half the logical one. The FP4 entry
+        point takes it from `w_s.shape[-1]` instead ("the logical n_out
+        carried by the scale", `linear_common.py`), which is the only operand
+        that still knows it. Getting this wrong does not fail here: it
+        produces a correctly-typed `[T, n_out/2]` and dies further down the
+        graph in whatever consumes the projection, during fake-tensor
+        propagation rather than eager execution.
+        """
+        from vllm_torchtpu.layers.vllm.linear_common import \
+            quantized_matmul_fp4
+        out = quantized_matmul_fp4(x, layer.weight, layer.weight_scale)
+        return out if bias is None else out + bias
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.quant_config.is_checkpoint_fp8_serialized:
             raise ValueError(
