@@ -235,7 +235,30 @@ arm_preflight() {  # <arm>
   return 1
 }
 
-ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""
+ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""; ARM_GSM8K=""
+# A CORRUPTION detector, not an accuracy measurement, and the distinction is why
+# it is cheap: quantization error and corruption differ by two orders of
+# magnitude. No eval that fits in a pod cell can resolve a 0.4 pp quantization
+# effect -- but a load-time change that silently corrupts weights does not move
+# GSM8K by 0.4 pp, it moves it from ~0.99 to near zero. 150 prompts through
+# /v1/completions on a warm server, a couple of minutes, and it turns "no
+# verdict" into a verdict.
+corruption_eval() {  # <results dir> <tag>
+  command -v lm_eval >/dev/null 2>&1 || { say "lm_eval absent; corruption eval skipped"; return 0; }
+  local out="$1/gsm8k_corruption.json"
+  lm_eval --tasks gsm8k --limit "${K3_GSM8K_LIMIT:-150}" \
+      --model local-completions \
+      --model_args "model=${K3_EVAL_MODEL:-moonshotai/Kimi-K3},base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=32,tokenized_requests=False" \
+      --output_path "$out" > "$1/gsm8k_corruption.log" 2>&1 || true
+  ARM_GSM8K=$(grep -oE '"exact_match,[^"]*": *[0-9.]+' "$1/gsm8k_corruption.log" 2>/dev/null \
+      | grep -oE '[0-9.]+$' | head -1)
+  say "corruption eval (${2}): gsm8k exact_match=${ARM_GSM8K:-<none>} over ${K3_GSM8K_LIMIT:-150} prompts"
+  if [ -n "$ARM_GSM8K" ] && awk "BEGIN{exit !(${ARM_GSM8K} < ${K3_GSM8K_FLOOR:-0.5})}"; then
+    say "CORRUPTION SUSPECTED: gsm8k ${ARM_GSM8K} < ${K3_GSM8K_FLOOR:-0.5} -- this arm's numbers are VOID"
+    return 1
+  fi
+  return 0
+}
 # The probe runs on EVERY arm, control included. A probe failure on `base` means
 # the probe is miscalibrated and neither arm counts -- a different conclusion
 # from "the treatment broke the model", and only running it on both tells them
@@ -243,7 +266,15 @@ ARM_SANITY="NOT_RUN"; ARM_WORST_RATIO=""
 # non-zero on failure, so a fast-but-garbage arm cannot report a TPOT at all.
 read_sanity() {  # <results dir>
   local j="$1/sanity_probe.json"
-  [ -f "$j" ] || { ARM_SANITY="NOT_RUN"; return 0; }
+  # An absence reported as an absence. "NOT_RUN" must never be read as "fine":
+  # on an arm that touches weights it means the arm has no correctness evidence
+  # at all, which is a different statement from "the model was checked and was
+  # healthy" -- and BK #299 is why the difference matters.
+  if [ ! -f "$j" ]; then
+    ARM_SANITY="ABSENT"
+    say "sanity: ABSENT -- no verdict was produced. This arm has NO correctness evidence."
+    return 0
+  fi
   ARM_SANITY=$(python3 -c "import json;print(json.load(open('$j')).get('verdict','UNKNOWN'))" 2>/dev/null || echo UNKNOWN)
   ARM_WORST_RATIO=$(python3 -c "import json;print(json.load(open('$j')).get('worst_distinct_ratio',''))" 2>/dev/null || echo "")
   say "sanity: ${ARM_SANITY} worst_distinct_ratio=${ARM_WORST_RATIO:-?}"
@@ -267,6 +298,11 @@ run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_pro
           hierep_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; }
         fi
         read_sanity "${base}/c${conc}/rep${r}"
+        # Every arm that changes weights at load, and its control, so the
+        # control calibrates the detector rather than being assumed healthy.
+        if [ "${K3_CORRUPTION_EVAL:-1}" = "1" ]; then
+          corruption_eval "${base}/c${conc}/rep${r}" "$arm" || { rc=1; return 1; }
+        fi
       else
         say "${arm}/${cfg} c=${conc} np=${np} rep ${r} (against the running server)"
         K3_CONC="$conc" K3_NUM_PROMPTS="$np" bash "$BENCH" --config "$cfg" \
@@ -342,6 +378,7 @@ for arm in ${*:-$ARMS_DEFAULT}; do
         "compilation_seconds=${ARM_COMPILE_SECONDS:-}" "cache_cleared=true" \
         "sanity_verdict=${ARM_SANITY:-NOT_RUN}" \
         ${ARM_WORST_RATIO:+"worst_distinct_ratio=${ARM_WORST_RATIO}"} \
+        ${ARM_GSM8K:+"gsm8k_exact_match=${ARM_GSM8K}"} \
         "notes=$(arm_notes "$arm")" || say "arm json failed for ${arm}"
   )
 done

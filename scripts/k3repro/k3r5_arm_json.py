@@ -103,6 +103,8 @@ def main():
         },
         "cells": cells,
         "sanity": {"verdict": extra.get("sanity_verdict", "NOT_RUN"),
+                   "gsm8k_exact_match": float(extra["gsm8k_exact_match"])
+                   if "gsm8k_exact_match" in extra else None,
                    "worst_distinct_ratio": float(extra["worst_distinct_ratio"])
                    if "worst_distinct_ratio" in extra else None},
         "profile_capture_cells": sorted(os.path.relpath(f, root) for f in profiled),
