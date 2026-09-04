@@ -15,9 +15,11 @@
 """KV offload store/load round trip: does a recalled block replay the same
 bytes?
 
-The rig (run_dsv4_offload_correctness.sh) runs one engine with
-max_num_seqs=1, so every pass has identical single-request batch geometry and
-a cold/warm difference is the cache and nothing else.
+The rig (run_dsv4_offload_correctness.sh) runs max_num_seqs=1 and pins every
+request to a single data-parallel rank (--dp-rank), so all three passes are
+served by the same engine with identical single-request batch geometry and a
+cold/warm difference is the cache and nothing else. The pin is not optional at
+DP > 1: each rank owns its own Raiden store and its own prefix cache.
 
 Per prompt length L, three passes over the SAME prompt:
 
@@ -71,10 +73,13 @@ PREFIX_BLOCKS = (1, 2, 4)
 DEFAULT_SALT = "offload-1788410251"
 
 
-def _post(base, path, payload, timeout):
+def _post(base, path, payload, timeout, headers=None):
     req = urllib.request.Request(base + path,
                                  data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"},
+                                 headers={
+                                     "Content-Type": "application/json",
+                                     **(headers or {})
+                                 },
                                  method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -115,7 +120,7 @@ def manifest_code(namespace: str) -> str:
     return str(random.Random(namespace).randrange(100000, 1000000))
 
 
-def build_prompt(namespace: str, code: str, lines: int, pad: int = 0) -> str:
+def build_prompt(namespace: str, code: str, lines: int) -> str:
     """A coherent ledger, not random ids. Three properties are load-bearing:
     the namespace is on line 1, so each length owns its hash chain from block
     0 onward; the answer the closing question asks for is in the opening
@@ -129,14 +134,6 @@ def build_prompt(namespace: str, code: str, lines: int, pad: int = 0) -> str:
         "The entries below are filed one per shipment, in order.",
     ]
     body = [f"Entry {i:04d}: {FILLER[i % len(FILLER)]}." for i in range(lines)]
-    # Fine-grained length control. Entries move the count ~13 tokens at a
-    # time, which is far too coarse to land on a chosen residue mod 128 (see
-    # size_prompt), so `pad` adds cheap one-token words. It sits directly
-    # under the head, i.e. deep inside the prefix that gets recalled, so it is
-    # part of what the warm arms have to reproduce rather than dead weight in
-    # the always-recomputed tail.
-    if pad > 0:
-        body.insert(0, "Index terms: " + " ".join(["x"] * pad) + ".")
     tail = [
         "",
         f"Question about archive {namespace}: give its manifest code, then "
@@ -146,55 +143,43 @@ def build_prompt(namespace: str, code: str, lines: int, pad: int = 0) -> str:
     return "\n".join(head + body + tail)
 
 
-def size_prompt(client, namespace, code, aim, hit_block, jam_period=128):
-    """Grow the ledger until the server tokenizes it to round the target length."""
-    band_lo = aim
-    band_hi = ((aim - 1) // hit_block + 1) * hit_block
-    # Coarse: land just BELOW the band. Padding only ever adds tokens, so the
-    # fine stage can reach the band minimum only if the coarse stage stops
-    # short of it; aiming inside the band instead would overshoot to the next
-    # residue a whole 128 higher and dilute the recalled prefix's share of the
-    # prompt for no gain.
-    coarse_aim = band_lo - hit_block // 16
-    lines, pad = 8, 0
+def size_prompt(client, namespace, code, aim, hit_block):
+    """Grow the ledger until the server tokenizes it into the band that
+    recalls the wanted number of whole blocks.
+    """
+    # The band `aim` names: from the smallest L whose whole-prefix hit is
+    # aim's up to the largest. A prompt of exactly whole blocks cannot claim
+    # its own last block, hence the +1.
+    lo = ((aim - 1) // hit_block) * hit_block + 1
+    hi = lo - 1 + hit_block
+    # Whole entries quantize the count, so accept a little inside either edge
+    # rather than oscillating around an exact target that is not required.
+    margin = hit_block // 16
+    lines = 8
     text = build_prompt(namespace, code, lines)
     count = client.tokenize(text)
-    for _ in range(5):
-        if abs(count - coarse_aim) <= hit_block // 16:
+    for _ in range(6):
+        if lo + margin <= count <= hi - margin:
             break
-        lines = max(4, round(lines * coarse_aim / max(count, 1)))
+        # Solving by ratio: the ledger is dominated by uniform entries, so the
+        # token count is very close to linear in `lines`.
+        lines = max(4, round(lines * aim / max(count, 1)))
         text = build_prompt(namespace, code, lines)
         count = client.tokenize(text)
-
-    # Fine: pad up to the next length congruent to 1 mod jam_period. The pad
-    # line carries a fixed cost of its own ("Index terms: ... .") on top of
-    # the one-token words, so measure that with a single probe rather than
-    # guessing -- guessing it low overshoots the target and rounds the prompt
-    # up to the next residue, a whole 128 tokens of recalled prefix wasted.
-    probe = client.tokenize(build_prompt(namespace, code, lines, 1))
-    overhead = probe - count - 1
-    base = max(count + overhead + 1, band_lo)
-    target = base + ((1 - base) % jam_period)
-    if target <= band_hi:
-        pad = target - count - overhead
-        for _ in range(6):
-            text = build_prompt(namespace, code, lines, pad)
-            count = client.tokenize(text)
-            if count == target:
-                break
-            # Solving by difference, so this still converges if the tokenizer
-            # ever merges the pad words into fewer than one token each.
-            pad += target - count
-            if pad < 1:
-                break
     return text, count
 
 
 class Client:
 
-    def __init__(self, base, model, timeout, max_tokens):
+    def __init__(self, base, model, timeout, max_tokens, dp_rank=None):
         self.base, self.model = base, model
         self.timeout, self.max_tokens = timeout, max_tokens
+        # Every request carries the same data-parallel rank, which is what
+        # makes this smoke meaningful at DP > 1.
+        self.dp_rank = dp_rank
+        self.headers = ({} if dp_rank is None else {
+            "X-data-parallel-rank": str(dp_rank)
+        })
 
     def _chat_wrapper(self, text):
         """The chat-template arguments every request shares. They must be
@@ -232,7 +217,7 @@ class Client:
         taken without it measures a prompt nobody sends. Tokenizing publishes
         nothing into any cache."""
         status, body = _post(self.base, "/tokenize", self._chat_wrapper(text),
-                             120)
+                             120, self.headers)
         if status != 200:
             raise SystemExit(
                 f"the server did not answer /tokenize (HTTP {status}): the "
@@ -259,7 +244,8 @@ class Client:
                        temperature=0.0,
                        seed=0,
                        return_token_ids=True)
-        return _post(self.base, "/v1/chat/completions", payload, self.timeout)
+        return _post(self.base, "/v1/chat/completions", payload, self.timeout,
+                     self.headers)
 
     def ask(self, tag, prompt):
         before = _metrics(self.base)
@@ -310,7 +296,12 @@ class Client:
 
     def reset_prefix_cache(self, attempts=10):
         for _ in range(attempts):
-            status, body = _post(self.base, "/reset_prefix_cache", {}, 120)
+            # Not affected by the pin: reset_prefix_cache is a utility
+            # call the DP client broadcasts to every engine, so this clears
+            # all ranks. That is a superset of what the pinned rank needs and
+            # leaves the store arm's floor intact.
+            status, body = _post(self.base, "/reset_prefix_cache", {}, 120,
+                                 self.headers)
             if status == 404:
                 raise SystemExit(
                     "POST /reset_prefix_cache is not mounted: relaunch the "
@@ -352,7 +343,7 @@ def run_length(client, salt, want_blocks, settle_s, hit_block):
     namespace = f"{salt}-b{want_blocks}"
     code = manifest_code(namespace)
 
-    aim = want_blocks * hit_block + 128 + 1
+    aim = want_blocks * hit_block + hit_block // 8
     prompt, sized = size_prompt(client, namespace, code, aim, hit_block)
     print(f"  sized: {sized} tokens (aim {aim}), manifest code {code}",
           flush=True)
@@ -529,6 +520,16 @@ def main() -> int:
                     "recall can be caught by, and all three arms are cut "
                     "at the same place")
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--dp-rank",
+                    type=int,
+                    default=0,
+                    help="pin every request to this data-parallel rank via "
+                    "the X-data-parallel-rank header. Required at DP > 1: "
+                    "each rank owns a separate Raiden store and prefix "
+                    "cache, so an unpinned run can store on one rank and "
+                    "query another. Rank 0 by default, which is also valid "
+                    "at DP 1; pass a negative value to send no header and "
+                    "let the server load balance")
     ap.add_argument("--salt",
                     default=DEFAULT_SALT,
                     help="prompt namespace; every cold arm requires it to be "
@@ -553,7 +554,9 @@ def main() -> int:
     hit_block = args.hit_block_size
     if hit_block <= 0:
         raise SystemExit("--hit-block-size must be positive")
-    client = Client(args.base, args.model, args.timeout, args.max_tokens)
+    dp_rank = args.dp_rank if args.dp_rank >= 0 else None
+    client = Client(args.base, args.model, args.timeout, args.max_tokens,
+                    dp_rank)
     failures = []
 
     # A rung also has to leave room for the generation, or the engine rejects
@@ -576,7 +579,8 @@ def main() -> int:
 
     print(
         f"=== offload store/load correctness, salt={salt}, "
-        f"hit block={hit_block}, prefixes={list(ladder)} blocks ===",
+        f"hit block={hit_block}, prefixes={list(ladder)} blocks, "
+        f"dp_rank={dp_rank if dp_rank is not None else 'unpinned'} ===",
         flush=True)
 
     for blocks in ladder:

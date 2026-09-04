@@ -64,6 +64,7 @@ export TORCH_DIST_TIMEOUT=1200 VLLM_RPC_TIMEOUT=1200000
 export VLLM_SHM_BROADCAST_TIMEOUT_S=1200 VLLM_ENGINE_ITERATION_TIMEOUT_S=1200
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 export PYTHONHASHSEED=0
+export RAIDEN_EXPECTED_WORKERS_TIMEOUT_S="${RAIDEN_EXPECTED_WORKERS_TIMEOUT_S:-900}"
 # Mounts POST /reset_prefix_cache. Without it the smoke cannot reach the store.
 export VLLM_SERVER_DEV_MODE=1
 
@@ -76,7 +77,18 @@ print(s.getsockname()[1])
 s.close()' 2>/dev/null || echo 8123)}"
 MODEL="${MODEL:-/mnt/pd/DeepSeek-V4-Flash-local}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Flash}"
-CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-68719476736}"
+# DP 8 / TP 1, with every request pinned to one rank (see serve() below).
+DP_SIZE="${DP_SIZE:-8}"
+TP_SIZE="${TP_SIZE:-1}"
+DP_RANK="${DP_RANK:-0}"
+# PER DP REPLICA, not per server: each rank builds its own KVCacheStore, so the
+# host reserves DP_SIZE times this. 25 GiB x 8 = 200 GiB on a 944 GiB box.
+# Keep the product well under host DRAM: asking for 64 GiB each reserves
+# ~512 GiB, and the kernel OOM killer then takes out a worker, which surfaces
+# minutes later as an unrelated-looking registration timeout on another rank.
+CPU_BYTES_TO_USE="${CPU_BYTES_TO_USE:-26843545600}"
+# Base port. Each rank binds RAIDEN_CONTROLLER_PORT + dp_rank_local, so DP 8
+# claims 27801..27808.
 RAIDEN_CONTROLLER_PORT="${RAIDEN_CONTROLLER_PORT:-27801}"
 RUN_ROOT="${RUN_ROOT:-${SCRATCH_ROOT}/dsv4_offload_ci}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
@@ -93,13 +105,13 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.67}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
 
 KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${RAIDEN_CONTROLLER_PORT}"',"raiden_job_name":"dsv4-offload-probe"}}'
 
 # max-num-seqs 1 gives every pass identical single-request batch geometry, so
-# a cold/warm difference is the cache and nothing else. DP1/TP8 for the same
-# reason: DP8+EP is nondeterministic on its own and fakes a failure.
+# a cold/warm difference is the cache and nothing else.
+
 serve() {
   exec "${VLLM_BIN}" serve "${MODEL}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
@@ -112,8 +124,8 @@ serve() {
     --enable-prefix-caching \
     --enable-prompt-tokens-details \
     --gpu-memory-utilization="${GPU_MEM_UTIL}" \
-    --data-parallel-size=1 \
-    --tensor-parallel-size=8 \
+    --data-parallel-size="${DP_SIZE}" \
+    --tensor-parallel-size="${TP_SIZE}" \
     --no-async-scheduling \
     --enable-expert-parallel \
     --port "${PORT}" \
@@ -149,7 +161,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "===== launching DSv4 (DP1/TP8) on port ${PORT} ====="
+echo "===== launching DSv4 (DP${DP_SIZE}/TP${TP_SIZE}), requests pinned to \
+dp rank ${DP_RANK}, on port ${PORT} ====="
 ( serve ) >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
@@ -170,6 +183,7 @@ echo "server is healthy"
 # up publishes nothing the smoke could later mistake for its own cold prompt.
 until curl -sf --max-time 300 -X POST "${BASE}/v1/completions" \
     -H "Content-Type: application/json" \
+    -H "X-data-parallel-rank: ${DP_RANK}" \
     -d "{\"model\": \"${SERVED_MODEL_NAME}\", \"prompt\": \"Hello\", \"max_tokens\": 2}" \
     >/dev/null; do
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -183,7 +197,8 @@ until curl -sf --max-time 300 -X POST "${BASE}/v1/completions" \
 done
 echo "engine is ready"
 
-SMOKE_ARGS=(--base "${BASE}" --model "${SERVED_MODEL_NAME}")
+SMOKE_ARGS=(--base "${BASE}" --model "${SERVED_MODEL_NAME}"
+            --dp-rank "${DP_RANK}")
 SMOKE_ARGS+=("$@")
 
 "${PYTHON_BIN}" "${script_dir}/smoke_basic_offload_correctness.py" \
