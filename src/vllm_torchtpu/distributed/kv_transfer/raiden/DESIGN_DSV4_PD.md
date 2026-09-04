@@ -1,6 +1,6 @@
 # How DeepSeek-V4's KV cache gets from the prefill machine to the decode machine
 
-Background for PR #684.
+Written alongside PR #684, which admitted DSv4 into Raiden Stage 3.
 
 ## 1. Some quick definitions
 
