@@ -17,7 +17,8 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu.layers.vllm.latent_proj_intra_chip import \
     make_latent_projection
 from vllm_torchtpu.layers.vllm.moe_hierarchical import (
-    hierarchical_moe_parallel_config, hierarchical_split_or_none)
+    expert_bank_mismatch, hierarchical_moe_parallel_config,
+    hierarchical_split_or_none)
 from vllm_torchtpu.logger import init_logger
 
 from .layers import KimiMLP
@@ -125,8 +126,8 @@ class KimiMoE(nn.Module):
         padded_intermediate_size = config.moe_intermediate_size
         min_per_partition = getattr(config,
                                     "min_moe_intermediate_per_partition", 128)
+        split = hierarchical_split_or_none()
         if self.use_ep:
-            split = hierarchical_split_or_none()
             moe_tp_size = split[2] if split is not None else 1
         else:
             moe_tp_size = self.tp_size
@@ -196,6 +197,25 @@ class KimiMoE(nn.Module):
                 "MoE expert bank on this rank: w13 %s (ep_size=%d, "
                 "moe_tp_size=%d of %d routed experts)", tuple(w13.shape),
                 ep_size, moe_tp_size, config.num_experts)
+
+        # And a gate, because a line in a log is only a control if somebody
+        # reads all 32 of them. Every way the chip split can fail to take --
+        # `patched_make` declining a use_ep=False config, a vLLM whose
+        # FusedMoEParallelConfig no longer routes through `make` -- leaves a
+        # server that starts, serves, and benchmarks flat EP under a
+        # hierarchical-EP flag. Refuse instead.
+        if split is not None and w13 is not None:
+            if ep_size is None:
+                raise RuntimeError(
+                    "TPU_MOE_HIERARCHICAL_EP is set but this FusedMoE config "
+                    "exposes no ep_size, so the expert bank cannot be checked "
+                    "against the chip split. Unverifiable is not the same as "
+                    "fine.")
+            mismatch = expert_bank_mismatch(split, config.num_experts,
+                                            int(w13.shape[0]), ep_size,
+                                            moe_tp_size)
+            if mismatch:
+                raise RuntimeError(f"{mismatch} (w13 {tuple(w13.shape)})")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape

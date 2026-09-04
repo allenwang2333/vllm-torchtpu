@@ -17,8 +17,9 @@ logger = init_logger(__name__)
 def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     """``(ep_size, ep_rank, tp_size, tp_rank)``, or ``None`` to stay flat.
 
-    ``None`` is the safe answer everywhere: the caller keeps vLLM's own
-    parallel config and the model runs exactly as it does today.
+    ``None`` means the flag is off (or there is nothing to split at TP1) and
+    the caller keeps vLLM's own parallel config. It never means "the flag was
+    set and we quietly did something else": that raises.
     """
     if not envs.TPU_MOE_HIERARCHICAL_EP:
         return None
@@ -33,12 +34,44 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
 
     split = hierarchical_moe_split(world_size, rank)
     if split is None:
-        logger.warning_once(
-            "TPU_MOE_HIERARCHICAL_EP is set but the chip topology could not be "
-            "used; falling back to flat expert parallelism.")
-        return None
+        # Not a warning. `warning_once` resolves scope="local", i.e. local rank
+        # 0 of each host -- 4 of 32 ranks on a 4-host pod -- so a per-rank
+        # fallback is invisible on the other 28 and the server still starts,
+        # benchmarks a parallelism nobody asked for, and reports a number.
+        # `hierarchical_moe_split` has already logged which of its three
+        # preconditions failed.
+        raise RuntimeError(
+            f"TPU_MOE_HIERARCHICAL_EP is set but the chip topology could not "
+            f"be used on TP rank {rank} of {world_size}; refusing to serve "
+            f"flat expert parallelism under a hierarchical-EP flag. Unset "
+            f"TPU_MOE_HIERARCHICAL_EP to run flat.")
 
     return split
+
+
+def expert_bank_mismatch(split: tuple[int, int, int, int] | None,
+                         num_experts: int, num_local_experts: int,
+                         ep_size: int, moe_tp_size: int) -> str | None:
+    """Why this rank's expert bank contradicts the chip split, or ``None``.
+
+    The bank a rank hands the gmm is the one statement about the MoE split
+    that no later layer of indirection can contradict, so it is what the flag
+    is gated on rather than the config that was supposed to produce it.
+    """
+    if split is None:
+        return None
+    # vLLM's linear placement, so a num_experts that does not divide evenly
+    # gives the low ep_ranks the remainder rather than tripping this gate.
+    base, remainder = divmod(num_experts, split[0])
+    want = (base + (1 if split[1] < remainder else 0), split[0], split[2])
+    got = (num_local_experts, ep_size, moe_tp_size)
+    if got == want:
+        return None
+    return (f"TPU_MOE_HIERARCHICAL_EP is set and the chip split is {split}, "
+            f"but this rank built {got[0]} local experts with "
+            f"ep_size={got[1]}, moe_tp_size={got[2]}; expected {want[0]} "
+            f"experts, ep_size={want[1]}, moe_tp_size={want[2]}. Serving "
+            f"would measure a parallelism that was not the one requested.")
 
 
 _filter_patched = False
