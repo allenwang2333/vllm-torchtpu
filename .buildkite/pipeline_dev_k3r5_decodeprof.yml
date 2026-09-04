@@ -1,0 +1,88 @@
+# Kimi-K3 DECODE-ONLY device profile, round 5 lane A.
+#
+# Every profile this campaign has taken is a prefill profile, and at c=1 prefill
+# is 5% of wall clock (e2e = 0.995 s + 1024 x 18.95 ms). This pipeline produces a
+# device-time breakdown of the other 95%, at c=1 and c=8, on real weights and the
+# current best-lo recipe, with the TensorCore plane as the denominator.
+#
+# Zero source changes: `git diff <main> -- src/` is empty on this branch. The
+# capture is turned on entirely from the config file, which run_benchmarks.sh
+# sources INSIDE the container -- a build-level `env:` cannot deliver
+# USE_PHASED_PROFILER, because run_multihost.sh forwards a fixed allowlist plus
+# BUILDKITE_* and neither name is in it.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r5_decodeprof.yml
+#
+# One config file serves both rigs (BUILDKITE_K3_RIG, forwarded verbatim by both
+# container drivers). Run the free v7x-8 rehearsal FIRST if you can: it proves
+# the artifact layout, the phase classification and the analysis script before
+# the single v7x-32 agent is spent. Its levels describe an 8-layer surrogate and
+# gate nothing.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":test_tube: K3-sliced8 decode-profile REHEARSAL (v7x-8, free)"
+    key: k3r5_rehearsal
+    depends_on: build_docker
+    timeout_in_minutes: 150
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      BUILDKITE_K3_RIG: "sliced8"
+    commands:
+      - "bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: ":microscope: K3 TP32 DECODE-ONLY profile, c=1 and c=8 (v7x-32, real weights)"
+    key: k3r5_tp32_profile
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      # Budget for a 1561 GB EP-sharded stream plus cold XLA compiles.
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BUILDKITE_K3_RIG: "tp32"
+    commands:
+      - "bash .buildkite/scripts/k3r5_decodeprof_run.sh tp32"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  # Passenger arm, and deliberately on the SURROGATE. Two libtpu flags print
+  # which all-reduce implementation is selected for a small 32-way reduction --
+  # the fact that decides whether the collective row is a latency floor or a
+  # bandwidth cost. They are kept off the measured arm because an unknown libtpu
+  # flag aborts at TPU init and a flag that changes the compile changes the thing
+  # being measured; running them here first says whether libtpu accepts them at
+  # all, on hardware that costs nothing. Serialised behind the rehearsal so the
+  # two v7x-8 cells share one agent.
+  - label: ":satellite: K3-sliced8 all-reduce implementation trace (v7x-8, passenger)"
+    key: k3r5_artrace
+    depends_on: k3r5_rehearsal
+    allow_dependency_failure: true
+    timeout_in_minutes: 150
+    agents:
+      queue: tpu_v7x_8_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      BUILDKITE_K3_RIG: "sliced8"
+      BUILDKITE_K3_ALLREDUCE_TRACING: "1"
+    commands:
+      # /dev/shm/torch_tpu_cache is not keyed on LIBTPU_INIT_ARGS: a warm cache
+      # would hand back the untraced executable and a clean, wrong answer.
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+    artifact_paths:
+      - "perf_eval_results/**/*"
