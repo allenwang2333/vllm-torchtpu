@@ -26,27 +26,36 @@ CLEANUP="${SCRIPT_DIR}/../vllm/benchmarking/cleanup_server.sh"
 PROBE="${SCRIPT_DIR}/../vllm/benchmarking/k3_completion_probe.py"
 OUT="${OUT:-/perf_eval_results/k3r5-ladder}"
 REPS="${REPS:-3}"
-ARMS_DEFAULT="base k1 hierep c1scale stacked"
+# Cost order, and it is not arbitrary: `base` is first because #365 is on a
+# different branch, a different image and a c=8 cell with a different prompt
+# count, so without a control on THIS image every other arm is a cross-build
+# comparison. The lossless pair is measured before the lossy arm, because
+# c1+e8m0 can land on ladder+probe alone while k1 needs an accuracy run.
+ARMS_DEFAULT="base c1e8m0 hierep k1 stacked"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
-# Each arm is a list of `NAME=VALUE` exports plus two flags: whether it touches
-# weights/loading/layout (-> the sanity probe is mandatory: build 299 reported a
-# healthy TPOT for a model with half its experts uninitialised) and whether it
-# needs the hierarchical-EP shape gate.
+# Every lane's change is a SOURCE patch carried on this branch behind its own
+# env gate, so one image serves every arm and an arm is still exactly one
+# variable. Every gate defaults OFF, which makes `base` byte-identical in
+# behaviour to unmodified 76d747572.
+#
+# The gate must change the compiled graph when it flips. That is why the cache
+# is cleared per arm and compilation_seconds is printed with the gate values:
+# "the flag was set" and "the program changed" are two different claims and an
+# env-gated patch that silently reuses the previous arm's executable is exactly
+# the r3 A/B that had to be voided.
+K3_GATES="K3_FP8_LATENT K3_KDA_OPROJ_RELAYOUT K3_SCALE_E8M0_NARROW K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
 arm_env() {
   case "$1" in
-    base)    echo "" ;;
-    # Lane K: fp8 the two latent projections (moe.py:86,97 quant_config=None),
-    # weight 51.38 -> 25.69 MB on 184 instructions/step.
-    k1)      echo "${K3_ARM_K1_ENV:-TPU_MOE_LATENT_PROJ_FP8=1}" ;;
-    # Lane I2: hierarchical EP, which needs the loader realignment fix to be in
-    # the image -- without it the experts are never initialised.
-    hierep)  echo "TPU_MOE_HIERARCHICAL_EP=1" ;;
-    # Lane I1: KDA o_proj relayout + E8M0 scale narrowing.
-    c1scale) echo "${K3_ARM_C1_ENV:-TPU_KDA_OPROJ_RELAYOUT=1 TPU_MOE_SCALE_E8M0_NARROW=1}" ;;
-    stacked) echo "$(arm_env k1) $(arm_env hierep) $(arm_env c1scale)" ;;
-    *)       echo "__UNKNOWN__" ;;
+    base)     echo "" ;;                                    # the control, all gates off
+    c1)       echo "K3_KDA_OPROJ_RELAYOUT=1" ;;             # lane I1: KDA o_proj load-time relayout
+    e8m0)     echo "K3_SCALE_E8M0_NARROW=1" ;;              # lane I1: scale upcast into WeightsRef.get_scale()
+    c1e8m0)   echo "K3_KDA_OPROJ_RELAYOUT=1 K3_SCALE_E8M0_NARROW=1" ;;  # the lossless pair: landable without an eval
+    k1)       echo "K3_FP8_LATENT=1" ;;                     # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
+    hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;  # lane I2: env + loader patch
+    stacked)  echo "$(arm_env c1e8m0) $(arm_env k1) $(arm_env hierep)" ;;
+    *)        echo "__UNKNOWN__" ;;
   esac
 }
 arm_touches_weights() { case "$1" in base) return 1 ;; *) return 0 ;; esac; }
@@ -63,10 +72,14 @@ clear_compile_cache() {
   rm -rf /dev/shm/torch_tpu_cache 2>/dev/null || true
   say "compile cache cleared"
 }
+# Prints the gate values NEXT TO the compile time on purpose: an arm is only
+# honest if both "the flag was set" and "the program was rebuilt" are true.
 report_compile_seconds() {  # <server log>
   local s
   s=$(grep -oE 'compilation_seconds[^0-9]*([0-9]+\.?[0-9]*)' "$1" 2>/dev/null | tail -1)
-  say "compile: ${s:-<not reported>}"
+  local g gates=""
+  for g in $K3_GATES; do gates="${gates}${g}=${!g:-0} "; done
+  say "compile: ${s:-<not reported>} | gates: ${gates}"
 }
 # Void the arm rather than print a line: hierarchical EP that silently falls
 # back is an arm measuring nothing, and it looks like a null result.
