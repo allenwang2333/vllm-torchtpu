@@ -2065,8 +2065,19 @@ def prepare_q_nope_inputs(
 
     # Align T to sublane_multiple (i.e. dtype_packing * 8).
     # This is needed for xpose_pipeline to work efficiently.
+    #
+    # Both the helper and its padding are dead when one of the two swapped
+    # axes is degenerate: (N, 1, D) -> (1, N, D) has the same element order,
+    # so XLA lowers `jnp.transpose` on it to a bitcast and no element moves.
+    # At decode T is 1 and the alignment would pad 15 of every 16 rows for a
+    # copy that does not need to happen. `q_pe` already reaches the kernel
+    # with T unpadded (`prepare_q_inputs` aligns only heads and head_dim), so
+    # this makes the two query operands agree rather than diverge.
+    degenerate_transpose = (actual_num_q_heads == 1
+                            or actual_max_num_tokens == 1)
     sublane_multiple = get_dtype_packing(q.dtype) * 8
-    max_num_tokens = align_to(actual_max_num_tokens, sublane_multiple)
+    max_num_tokens = (actual_max_num_tokens if degenerate_transpose else
+                      align_to(actual_max_num_tokens, sublane_multiple))
     q = jnp.pad(
         q,
         (
@@ -2076,6 +2087,8 @@ def prepare_q_nope_inputs(
         ),
         constant_values=0,
     )
+    if degenerate_transpose:
+        return jnp.transpose(q, (1, 0, 2))
     # Physical transpose: (N, T, D) -> (T, N, D), pipelined over T.
     try:
         q = xpose_pipeline(q,
@@ -2129,6 +2142,13 @@ def prepare_outputs(
     actual_head_dim: int,
     vmem_limit_bytes: int | None = None,
 ):
+    # No element moves when one of the swapped axes is degenerate; see
+    # `prepare_q_nope_inputs`.
+    if out.shape[0] == 1 or out.shape[1] == 1:
+        return jnp.transpose(
+            out,
+            (1, 0,
+             2))[:actual_num_q_heads, :actual_max_num_tokens, :actual_head_dim]
     # Physical transpose: (T, N, D) -> (N, T, D), pipelined over T.
     try:
         # Tile to maximum of 160 (multi host bsz)

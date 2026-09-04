@@ -9,7 +9,9 @@
 import jax.numpy as jnp
 import numpy as np
 
-from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
+from vllm_torchtpu.kernels.mla.v2.kernel import (align_to, get_dtype_packing,
+                                                 mla_ragged_paged_attention,
+                                                 prepare_q_nope_inputs)
 
 
 def test_query_heads_are_padded_only_in_vmem() -> None:
@@ -223,3 +225,37 @@ def test_batched_decode_matches_unbatched_decode() -> None:
         np.asarray(batched_cache),
         np.asarray(unbatched_cache),
     )
+
+
+def test_degenerate_query_transpose_is_values_only() -> None:
+    """`prepare_q_nope_inputs` must not pad T when the transpose is a bitcast.
+
+    At decode T is 1, so head-major (N, 1, L) and token-major (1, N, L) have the
+    same element order. Padding T to the transpose helper's sublane multiple
+    would make 15 of every 16 rows padding for a copy that never happens.
+    """
+    heads, tokens, lkv = 3, 1, 512
+    q = jnp.arange(heads * tokens * lkv,
+                   dtype=jnp.bfloat16).reshape(heads, tokens, lkv)
+
+    out = prepare_q_nope_inputs(q)
+
+    packed_heads = align_to(heads, get_dtype_packing(q.dtype))
+    assert out.shape == (tokens, packed_heads, lkv), (
+        "T must reach the kernel unpadded; only heads are aligned")
+    np.testing.assert_array_equal(np.asarray(out[:, :heads, :]),
+                                  np.asarray(jnp.transpose(q, (1, 0, 2))))
+    np.testing.assert_array_equal(np.asarray(out[:, heads:, :]), 0)
+
+
+def test_multi_token_query_still_pads_for_the_transpose_helper() -> None:
+    """Inert where it must be: T > 1 keeps the sublane alignment."""
+    heads, tokens, lkv = 3, 8, 512
+    q = jnp.zeros((heads, tokens, lkv), jnp.bfloat16)
+    sublane_multiple = get_dtype_packing(q.dtype) * 8
+    assert align_to(tokens, sublane_multiple) != tokens, "pick a T that pads"
+
+    out = prepare_q_nope_inputs(q)
+
+    assert out.shape == (align_to(tokens, sublane_multiple),
+                         align_to(heads, get_dtype_packing(q.dtype)), lkv)
