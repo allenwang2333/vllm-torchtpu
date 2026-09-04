@@ -52,6 +52,8 @@ run_variant() {
     local rc="${PIPESTATUS[0]}"
     grep -h "TORCHTPU_ALL_REDUCE_RESULT" "$OUT/$name/node${NODE_RANK}.log" \
         | sed 's/^.*TORCHTPU_ALL_REDUCE_RESULT //' > "$OUT/$name/results_node${NODE_RANK}.jsonl" || true
+    grep -h "TORCHTPU_ALL_REDUCE_VERIFY" "$OUT/$name/node${NODE_RANK}.log" \
+        | sed 's/^.*TORCHTPU_ALL_REDUCE_VERIFY //' > "$OUT/$name/verify_node${NODE_RANK}.txt" || true
     local n
     n=$(wc -l < "$OUT/$name/results_node${NODE_RANK}.jsonl" 2>/dev/null || echo 0)
     echo "=== [allreduce] variant=$name node=$NODE_RANK rc=$rc result_records=$n"
@@ -115,6 +117,16 @@ want rs_ag_chunks2 && run_variant rs_ag_chunks2 30212 "" --mode rs_ag --chunks=2
 #    option tpu_platform.py used for the unified KV pool), to obtain the
 #    TensorCore all-reduce the offload-min-size flags never reached.
 want tc_offload_off && run_variant tc_offload_off 30213 "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false" || true
+
+# 13+. Correctness: structured input, every element on every rank vs a CPU
+#    float64 reference; fp32 runs are exact-summable, bf16 shows rounding.
+port=30220
+for m in all_reduce rs_ag rs_only ag_only; do
+    want verify_${m}_f32 && run_variant verify_${m}_f32 $port "" --mode $m --dtype float32 --verify --iterations 5 --warmups 1 || true
+    port=$((port + 1))
+    want verify_${m}_bf16 && run_variant verify_${m}_bf16 $port "" --mode $m --verify --iterations 5 --warmups 1 || true
+    port=$((port + 1))
+done
 
 echo "[allreduce] node=$NODE_RANK all variants done"
 if [ "$NODE_RANK" = "0" ]; then

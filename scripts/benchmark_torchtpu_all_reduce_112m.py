@@ -54,6 +54,15 @@ def parse_args() -> argparse.Namespace:
         "ag_only: that single phase, with the same per-phase shapes.",
     )
     parser.add_argument("--split-dim", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--dtype", choices=("bfloat16", "float32"),
+                        default="bfloat16")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="after timing, run the compiled collective on a structured "
+        "input (value depends on rank, row and column) and compare every "
+        "element on every rank against a CPU float64 reference",
+    )
     parser.add_argument("--topology-aware", action="store_true")
     parser.add_argument(
         "--topology-mesh-shape",
@@ -142,11 +151,12 @@ def main() -> None:
         dist.all_reduce(ready, group=group)
         synchronize(ready)
 
+        dtype = getattr(torch, args.dtype)
         rank_value = (rank + 1) / world_size
         source = torch.full(
             (args.tokens, args.width),
             rank_value,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             device="tpu",
         )
 
@@ -209,10 +219,67 @@ def main() -> None:
             synchronize(output)
             latencies_ms.append((time.perf_counter_ns() - start_ns) / 1e6)
 
-        message_bytes = args.tokens * args.width * 2
+        message_bytes = args.tokens * args.width * source.element_size()
         median_ms = statistics.median(latencies_ms)
         algorithm_gbps = message_bytes / (median_ms / 1e3) / 1e9
         bus_gbps = algorithm_gbps * 2 * (world_size - 1) / world_size
+
+        verify = None
+        if args.verify:
+            # Structured input: element (i, j) on rank r is
+            # (r + 1) * ((i + j) % 5 + 1); every value <= 32 * 5 is exact in
+            # bf16, so the only rounding is in the device's accumulation.
+            grid = ((torch.arange(args.tokens, dtype=torch.float64).view(-1, 1)
+                     + torch.arange(args.width, dtype=torch.float64).view(1, -1))
+                    % 5 + 1)
+            local = (rank + 1) * grid
+            per_rank_sum = world_size * (world_size + 1) / 2
+            if args.mode == "ag_only":
+                # Output row block b (of world_size blocks) is rank b's shard.
+                rows = args.tokens // world_size
+                blocks = [(b + 1) * grid[:rows] for b in range(world_size)]
+                reference = torch.cat(blocks, dim=0)
+            elif args.mode == "rs_only":
+                rows = args.tokens // world_size
+                if args.chunks > 1 and args.split_dim == 0:
+                    parts = [(per_rank_sum * c)[rank * rows // args.chunks:(rank + 1) * rows // args.chunks]
+                             for c in grid.chunk(args.chunks, dim=0)]
+                    reference = torch.cat(parts, dim=0)
+                else:
+                    reference = torch.cat(
+                        [(per_rank_sum * c)[rank * rows:(rank + 1) * rows]
+                         for c in grid.chunk(args.chunks, dim=args.split_dim)],
+                        dim=args.split_dim)
+            else:
+                reference = per_rank_sum * grid
+            reference = reference + 1
+            structured = local.to(dtype).to("tpu")
+            result = compiled(structured)
+            synchronize(result)
+            got = result.cpu().to(torch.float64)
+            if got.shape != reference.shape:
+                raise RuntimeError(
+                    f"verify: output shape {tuple(got.shape)} != reference "
+                    f"{tuple(reference.shape)}")
+            err = (got - reference).abs()
+            rel = err / reference.abs()
+            worst = int(err.argmax())
+            rounded_ref = reference.to(dtype).to(torch.float64)
+            verify = {
+                "max_abs_err": float(err.max()),
+                "max_rel_err": float(rel.max()),
+                "mean_abs_err": float(err.mean()),
+                "n_exact_vs_f64": int((err == 0).sum()),
+                "n_exact_vs_dtype_rounded_ref":
+                int((got == rounded_ref).sum()),
+                "n_elements": int(err.numel()),
+                "worst_index": [worst // got.shape[1], worst % got.shape[1]],
+                "worst_got": float(got.flatten()[worst]),
+                "worst_expected": float(reference.flatten()[worst]),
+                "reference_shape": list(reference.shape),
+            }
+            print(f"TORCHTPU_ALL_REDUCE_VERIFY rank={rank} mode={args.mode} "
+                  f"dtype={args.dtype} " + json.dumps(verify), flush=True)
 
         if args.profile_dir is not None:
             # Every peer must execute the profiled collective. Rank 0 alone
@@ -260,7 +327,7 @@ def main() -> None:
             "local_rank": int(os.environ.get("LOCAL_RANK", "-1")),
             "world_size": world_size,
             "shape": [args.tokens, args.width],
-            "dtype": "bfloat16",
+            "dtype": args.dtype,
             "message_bytes": message_bytes,
             "message_mib": message_bytes / (1 << 20),
             "chunks": args.chunks,
@@ -283,6 +350,7 @@ def main() -> None:
             "ring_equivalent_bus_gbps": bus_gbps,
             "observed": observed,
             "expected": expected,
+            "verify": verify,
         }
         print("TORCHTPU_ALL_REDUCE_RESULT " + json.dumps(result), flush=True)
     finally:

@@ -36,7 +36,7 @@ steps:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       # Space-separated variant names from scripts/allreduce_variants.sh;
       # empty runs the whole matrix.
-      ALLREDUCE_VARIANTS: "baseline rs_ag rs_only ag_only rs_ag_chunks2 tc_offload_off"
+      ALLREDUCE_VARIANTS: "verify_all_reduce_f32 verify_rs_ag_f32 verify_rs_only_f32 verify_ag_only_f32 verify_all_reduce_bf16 verify_rs_ag_bf16 verify_rs_only_bf16 verify_ag_only_bf16"
     commands:
       - "bash .buildkite/scripts/run_multihost.sh --backend torchrun scripts/allreduce_variants.sh $${ALLREDUCE_VARIANTS:-}"
       - |
