@@ -58,6 +58,16 @@
 #   git archive --format=tar.gz -o pr684.tar.gz HEAD
 #   gsutil cp pr684.tar.gz gs://alynie-k3-scratch/repos/vllm-torchtpu/prs/
 #
+# Or skip the upload and ship the working checkout straight in, which is faster
+# to iterate on and cannot go stale:
+#
+#   cdk job create dsv4-pd-dp8-dp8-raiden --tags agent-jobs \
+#       --map-dir "$PWD:*:/workspace/pr684-src"
+#
+# Every container copies /workspace/pr684-src over the extracted tarball when
+# that directory exists, so the tarball only has to be recent enough to have the
+# right dependencies.
+#
 # The checkpoint is the other input. DeepSeek-V4-Flash is not under
 # gs://cloud-devkit/ckpt/hf, which holds only Qwen and nvidia/GLM, and no other
 # recipe in the cluster runs a DeepSeek model, so there was nothing to reuse. The
@@ -155,6 +165,13 @@ spec:
                       curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
                         "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      # A working checkout shipped in with --map-dir wins over
+                      # the tarball, so a run can carry code that has not been
+                      # staged in GCS. Without the mapping this does nothing.
+                      if [ -d /workspace/pr684-src ]; then
+                        cp -a /workspace/pr684-src/. /workspace/vllm-torchtpu/
+                        echo "source: /workspace/pr684-src overlaid on the tarball"
+                      fi
                       export PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:${PYTHONPATH:-}
 
                       # Preflight. Every one of these fails loudly at startup
@@ -390,6 +407,13 @@ spec:
                       curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
                         "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      # A working checkout shipped in with --map-dir wins over
+                      # the tarball, so a run can carry code that has not been
+                      # staged in GCS. Without the mapping this does nothing.
+                      if [ -d /workspace/pr684-src ]; then
+                        cp -a /workspace/pr684-src/. /workspace/vllm-torchtpu/
+                        echo "source: /workspace/pr684-src overlaid on the tarball"
+                      fi
 
                       PREFILLER_DNS="${JS_NAME}-prefill-0-0.${JS_NAME}"
                       DECODER_DNS="${JS_NAME}-decode-0-0.${JS_NAME}"
@@ -462,6 +486,13 @@ spec:
                       curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
                         "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      # A working checkout shipped in with --map-dir wins over
+                      # the tarball, so a run can carry code that has not been
+                      # staged in GCS. Without the mapping this does nothing.
+                      if [ -d /workspace/pr684-src ]; then
+                        cp -a /workspace/pr684-src/. /workspace/vllm-torchtpu/
+                        echo "source: /workspace/pr684-src overlaid on the tarball"
+                      fi
                       export PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:${PYTHONPATH:-}
                       # $MODEL is a gs:// URI and vLLM reads object storage only
                       # through the Run:ai streamer, which this image does not ship.
@@ -627,6 +658,13 @@ spec:
                       curl -sSf -m 300 -H "Authorization: Bearer $GCS_TOKEN" -o /tmp/pr684.tar.gz \
                         "https://storage.googleapis.com/storage/v1/b/${GCS_PATH%%/*}/o/$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "${GCS_PATH#*/}")?alt=media"
                       tar -xzf /tmp/pr684.tar.gz -C /workspace/vllm-torchtpu
+                      # A working checkout shipped in with --map-dir wins over
+                      # the tarball, so a run can carry code that has not been
+                      # staged in GCS. Without the mapping this does nothing.
+                      if [ -d /workspace/pr684-src ]; then
+                        cp -a /workspace/pr684-src/. /workspace/vllm-torchtpu/
+                        echo "source: /workspace/pr684-src overlaid on the tarball"
+                      fi
                       cd /workspace/vllm-torchtpu/examples/disagg
 
                       # T1.1 and T1.2. Lengths straddle the SWA page boundary:
