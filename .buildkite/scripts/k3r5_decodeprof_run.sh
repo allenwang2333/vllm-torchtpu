@@ -16,7 +16,13 @@
 # Run the Kimi-K3 decode-only phased capture and collect it from EVERY host of
 # the slice -- including the hosts whose container is about to be deleted.
 #
-# Usage: k3r5_decodeprof_run.sh [tp32|sliced8]
+# Usage: k3r5_decodeprof_run.sh [tp32|sliced8] [inner command ...]
+#
+# With no inner command it runs the decode-profile config. With one, it runs
+# that instead and still collects every host's capture -- which is how the
+# ladder gets its folded-in c=1 window off the pod. A capture that nothing
+# collects is a capture that dies with the slice, and the ladder harness runs
+# INSIDE the container where it cannot reach the worker hosts.
 #
 # Two things make this more than a one-liner:
 #
@@ -33,12 +39,14 @@
 set -uo pipefail
 
 RIG="${1:-${BUILDKITE_K3_RIG:-tp32}}"
+shift || true
+INNER=("$@")
 CONFIG="${CONFIG:-kimi-k3-tp32-ep-best-lo-profile}"
 BUILD="${BUILDKITE_BUILD_NUMBER:-local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 REDUCE="${REPO_DIR}/scripts/profiling/xprof_reduce.py"
-RESULTS="perf_eval_results/k3r5-decodeprof-${RIG}"
+RESULTS="${K3_RESULTS_DIR:-perf_eval_results/k3r5-decodeprof-${RIG}}"
 XPROF_OUT="${RESULTS}/xprof"
 
 # The container reads this; both container drivers forward BUILDKITE_* verbatim
@@ -55,10 +63,14 @@ upload() {
 mkdir -p "$RESULTS"
 case "$RIG" in
   tp32)
-    HOST_PROFILE_DIR="${HOME}/hf_home/k3r5_profile/tp32/${BUILD}"
+    HOST_PROFILE_DIR="${HOME}/hf_home/k3r5_profile/${K3_PROFILE_SUBDIR:-tp32}/${BUILD}"
     say "TP32 pod run; per-host capture dir ${HOST_PROFILE_DIR}"
-    bash "${SCRIPT_DIR}/run_multihost.sh" bash ./scripts/vllm/benchmarking/run_benchmarks.sh \
-        --config "$CONFIG" --results-dir "/${RESULTS}"
+    if [ "${#INNER[@]}" -gt 0 ]; then
+      bash "${SCRIPT_DIR}/run_multihost.sh" "${INNER[@]}"
+    else
+      bash "${SCRIPT_DIR}/run_multihost.sh" bash ./scripts/vllm/benchmarking/run_benchmarks.sh \
+          --config "$CONFIG" --results-dir "/${RESULTS}"
+    fi
     rc=$?
     ;;
   sliced8)
@@ -66,8 +78,12 @@ case "$RIG" in
     # capture is already in the workspace when the container exits.
     HOST_PROFILE_DIR="perf_eval_results/k3r5_profile/sliced8/${BUILD}"
     say "sliced8 single-host rehearsal; capture dir ${HOST_PROFILE_DIR}"
-    bash "${SCRIPT_DIR}/run_in_docker.sh" bash ./scripts/vllm/benchmarking/run_benchmarks.sh \
-        --config "$CONFIG" --results-dir "/${RESULTS}"
+    if [ "${#INNER[@]}" -gt 0 ]; then
+      bash "${SCRIPT_DIR}/run_in_docker.sh" "${INNER[@]}"
+    else
+      bash "${SCRIPT_DIR}/run_in_docker.sh" bash ./scripts/vllm/benchmarking/run_benchmarks.sh \
+          --config "$CONFIG" --results-dir "/${RESULTS}"
+    fi
     rc=$?
     ;;
   *)
@@ -163,7 +179,7 @@ if [ "$RIG" = "tp32" ]; then
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "cat > ~/xprof_reduce.py" < "$REDUCE" || continue
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "
       set -u
-      SRC=\"\$HOME/hf_home/k3r5_profile/tp32/${BUILD}\"
+      SRC=\"\$HOME/hf_home/k3r5_profile/${K3_PROFILE_SUBDIR:-tp32}/${BUILD}\"
       DST=/tmp/k3r5_xpr_${BUILD}
       rm -rf \"\$DST\"; mkdir -p \"\$DST\"
       [ -d \"\$SRC\" ] || { echo \"host${widx}: no capture at \$SRC\" >&2; exit 0; }
@@ -188,15 +204,15 @@ if [ "$RIG" = "tp32" ]; then
     # which turned a re-reduce into a re-run of the pod.
     if [ "${K3_DROP_RAW:-0}" = "1" ]; then
       ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" \
-        "rm -rf /tmp/k3r5_xpr_${BUILD} ~/xprof_reduce.py; sudo -n rm -rf \"\$HOME/hf_home/k3r5_profile/tp32/${BUILD}\" 2>/dev/null || true" || true
+        "rm -rf /tmp/k3r5_xpr_${BUILD} ~/xprof_reduce.py; sudo -n rm -rf \"\$HOME/hf_home/k3r5_profile/${K3_PROFILE_SUBDIR:-tp32}/${BUILD}\" 2>/dev/null || true" || true
     else
       ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "rm -rf /tmp/k3r5_xpr_${BUILD} ~/xprof_reduce.py" || true
     fi
   done
   if [ "${K3_DROP_RAW:-0}" = "1" ]; then
-    sudo -n rm -rf "${HOME}/hf_home/k3r5_profile/tp32/${BUILD}" 2>/dev/null || true
+    sudo -n rm -rf "${HOME}/hf_home/k3r5_profile/${K3_PROFILE_SUBDIR:-tp32}/${BUILD}" 2>/dev/null || true
   else
-    say "raw traces kept at ${HOME}/hf_home/k3r5_profile/tp32/${BUILD} (K3_DROP_RAW=1 to drop)"
+    say "raw traces kept at ${HOME}/hf_home/k3r5_profile/${K3_PROFILE_SUBDIR:-tp32}/${BUILD} (K3_DROP_RAW=1 to drop)"
   fi
 fi
 

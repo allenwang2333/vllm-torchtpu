@@ -30,7 +30,12 @@ steps:
       VLLM_XLA_CHECK_RECOMPILATION: "0"
       SKIP_DB_UPLOAD: "1"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/k3repro/k3r5_ladder.sh ${BUILDKITE_K3_ARMS:-}"
+      # Through the collector, not straight at run_multihost.sh: the base and c1
+      # arms take a decode capture, and on a Ray slice 24 of 32 ranks write it
+      # into a container cleanup() deletes on exit. The ladder harness runs
+      # INSIDE that container and cannot reach the worker hosts; this wrapper
+      # runs on the agent and collects every host after the slice is gone.
+      - "K3_PROFILE_SUBDIR=ladder K3_RESULTS_DIR=perf_eval_results/k3r5-ladder bash .buildkite/scripts/k3r5_decodeprof_run.sh tp32 bash ./scripts/k3repro/k3r5_ladder.sh ${BUILDKITE_K3_ARMS:-}"
       - "du -sh perf_eval_results/* || true"
     artifact_paths:
       - "perf_eval_results/**/*"
