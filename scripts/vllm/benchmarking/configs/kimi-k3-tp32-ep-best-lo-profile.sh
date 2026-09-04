@@ -103,6 +103,13 @@ NUM_PROMPTS=8
 # profiled pass must never be the number anyone quotes.
 BENCHMARK_WARMUP_RUNS="${K3_WARMUP_RUNS:-1}"
 
+# The two latent-projection gates, so the surrogate can measure the per-instruction
+# cost of all three dtypes on real hardware before a pod arm is spent on any of
+# them. Selected by BUILDKITE_* because that is the only name both container
+# drivers forward; both default OFF, so an unset arm is the bf16 baseline.
+export TPU_K3_FP8_LATENT_PROJ="${TPU_K3_FP8_LATENT_PROJ:-${BUILDKITE_K3_FP8_LATENT:-0}}"
+export TPU_K3_MXFP4_LATENT_PROJ="${TPU_K3_MXFP4_LATENT_PROJ:-${BUILDKITE_K3_MXFP4_LATENT:-0}}"
+
 export USE_PHASED_PROFILER=1
 export CAPTURE_PROFILE=1
 # Pinned, not inherited. #448 (IntraChipColumnParallelLinear) has merged and is
@@ -163,4 +170,4 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --e
 # environment is the evidence for what it ran with. Two of us have already been
 # wrong about TPU_LATENT_PROJ_INTRA_CHIP_TP by reading the source instead of the
 # run.
-echo "[env-audit] K3_RIG=${K3_RIG} TP=${TENSOR_PARALLELISM} USE_PHASED_PROFILER=${USE_PHASED_PROFILER} CAPTURE_PROFILE=${CAPTURE_PROFILE} TPU_LATENT_PROJ_INTRA_CHIP_TP=${TPU_LATENT_PROJ_INTRA_CHIP_TP} LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-<unset>} PROFILE_DIR=${K3_PROFILE_DIR}"
+echo "[env-audit] K3_RIG=${K3_RIG} TP=${TENSOR_PARALLELISM} USE_PHASED_PROFILER=${USE_PHASED_PROFILER} CAPTURE_PROFILE=${CAPTURE_PROFILE} TPU_LATENT_PROJ_INTRA_CHIP_TP=${TPU_LATENT_PROJ_INTRA_CHIP_TP} FP8_LATENT=${TPU_K3_FP8_LATENT_PROJ} MXFP4_LATENT=${TPU_K3_MXFP4_LATENT_PROJ} LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-<unset>} PROFILE_DIR=${K3_PROFILE_DIR}"

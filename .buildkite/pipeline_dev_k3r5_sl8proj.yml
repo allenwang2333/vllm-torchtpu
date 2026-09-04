@@ -1,0 +1,72 @@
+# Per-instruction cost of the latent projections, on the free queue.
+#
+# The two latent projections are REPLICATED, not sharded: every rank reads the
+# full 51.38 MB weight each step at TP8 exactly as at TP32. So the per-instruction
+# time transfers even though nothing else about the surrogate does.
+#
+# What this cell can say: whether bf16 / fp8-b128 / mxfp4-b256 land near
+# 21.4 / 11.8 / 6.2 us per instruction on real hardware rather than in a static
+# bundle count. What it CANNOT say: any TP32 TPOT delta -- different collective
+# depth, different straggler population, 8 layers instead of 93, so the *share*
+# is meaningless here and must not be quoted.
+#
+# THE TEST IS THE RATIOS, NOT THE LEVELS, and the rule is written before the
+# numbers: predicted 1.00 : 0.55 : 0.29. If the surrogate is uniformly less
+# contended all three levels shift together and the ratios survive -- ratios
+# within ~10% confirms the model on hardware. Ratios off by more means one of the
+# two locked predictions (fp8 -6.0%, mxfp4 -9.5%) is wrong before a pod arm is
+# spent on it, which is the cheap outcome worth buying.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r5_sl8proj.yml
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":straight_ruler: sl8 latent proj A: bf16 baseline"
+    key: sl8_bf16
+    depends_on: build_docker
+    timeout_in_minutes: 150
+    agents: { queue: tpu_v7x_8_queue }
+    env: &sl8
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      BUILDKITE_K3_RIG: "sliced8"
+      BUILDKITE_K3_FP8_LATENT: "0"
+      BUILDKITE_K3_MXFP4_LATENT: "0"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "K3_RESULTS_DIR=perf_eval_results/sl8-bf16 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+    artifact_paths: [ "perf_eval_results/**/*" ]
+
+  - label: ":straight_ruler: sl8 latent proj B: fp8 blockwise-128"
+    key: sl8_fp8
+    depends_on: sl8_bf16
+    allow_dependency_failure: true
+    timeout_in_minutes: 150
+    agents: { queue: tpu_v7x_8_queue }
+    env:
+      <<: *sl8
+      BUILDKITE_K3_FP8_LATENT: "1"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "K3_RESULTS_DIR=perf_eval_results/sl8-fp8b128 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+    artifact_paths: [ "perf_eval_results/**/*" ]
+
+  - label: ":straight_ruler: sl8 latent proj C: mxfp4 block-256"
+    key: sl8_mxfp4
+    depends_on: sl8_fp8
+    allow_dependency_failure: true
+    timeout_in_minutes: 150
+    agents: { queue: tpu_v7x_8_queue }
+    env:
+      <<: *sl8
+      BUILDKITE_K3_MXFP4_LATENT: "1"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "K3_RESULTS_DIR=perf_eval_results/sl8-mxfp4b256 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+    artifact_paths: [ "perf_eval_results/**/*" ]
