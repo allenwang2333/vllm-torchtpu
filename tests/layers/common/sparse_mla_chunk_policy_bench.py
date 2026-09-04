@@ -40,6 +40,32 @@ test runs at a toy geometry (16 pages of 32 tokens, 16 heads, topk 64):
     (chunk x topk x 512 B = 128 MiB, against 64 MiB shipping) compiles and
     runs at the production topk.
 
+Harness fidelity: the two axes added in the second revision
+-----------------------------------------------------------
+The first revision of this bench reported the OPPOSITE sign from the
+kernel-level sweep at decode (+24.8% here against -13.4% there) while agreeing
+with it to 6.8% on the one-stage arm. An artifact that hits only the arm with
+more pipeline stages is what suppressed cross-layer overlap looks like, and a
+review found two places where this harness diverged from production in exactly
+that direction. Both are now command-line axes rather than assumptions:
+
+  --cache-mode per-layer|shared
+      Production builds one `pallas::sparse_mla_attention_<layer>` op per
+      layer, each with its own KV cache pair; 78 layers, 78 caches, no layer's
+      gather waiting on another layer's cache write. `shared` (the first
+      revision's behaviour) threads ONE pair through every iteration and so
+      serialises what the chunk size exists to overlap.
+  --no-donate
+      Production's op is built with `donate_argnums=(0, 1)`
+      (`layers/vllm/attention.py:1541`). The first revision used a plain
+      `jax.jit`, so a 272 MB cache pair was copied per invocation.
+
+`--cache-mode shared --no-donate` is therefore the POSITIVE CONTROL, and it
+has a job to do: the depth axis had no positive control before, so a null
+there was uninterpretable. If that combination does not reproduce the first
+revision's decode penalty, the first revision is irreproducible and neither
+number decides anything.
+
 Shape provenance
 ----------------
 Every constant below is derived from a production artifact, not inherited
@@ -176,24 +202,14 @@ def build_case(case: str):
         k = min(win, CSA_TOPK)
         topk[t, :k] = rng.choice(win, size=k, replace=False)
 
-    # --- caches, queries, this step's latents.
-    nope_cache = jnp.asarray(
-        _fp8_bytes(rng,
-                   (TOTAL_PAGES, PAGE_SIZE, dsa_gather.TILE_SUBROWS,
-                    dsa_gather.TILE_LANE_BYTES)))
-    rope_cache = jnp.asarray(
-        _fp8_bytes(rng, (TOTAL_PAGES, PAGE_SIZE // dsa_gather.TILE_SUBROWS,
-                         dsa_gather.TILE_SUBROWS, dsa_gather.TILE_LANE_BYTES)))
-
-    ql_nope = jnp.asarray(
-        rng.standard_normal((num_tokens, NUM_HEADS, LKV_DIM), np.float32),
-        dtype=jnp.bfloat16)
-    q_pe = jnp.asarray(
-        rng.standard_normal((num_tokens, NUM_HEADS, ROPE_DIM), np.float32),
-        dtype=jnp.bfloat16)
+    ql_nope = jnp.asarray(rng.standard_normal((num_tokens, NUM_HEADS, LKV_DIM),
+                                              np.float32),
+                          dtype=jnp.bfloat16)
+    q_pe = jnp.asarray(rng.standard_normal((num_tokens, NUM_HEADS, ROPE_DIM),
+                                           np.float32),
+                       dtype=jnp.bfloat16)
     kv_c = jax.lax.bitcast_convert_type(
-        jnp.asarray(_fp8_bytes(rng, (num_tokens, LKV_DIM))),
-        jnp.float8_e4m3fn)
+        jnp.asarray(_fp8_bytes(rng, (num_tokens, LKV_DIM))), jnp.float8_e4m3fn)
     k_pe = jax.lax.bitcast_convert_type(
         jnp.asarray(_fp8_bytes(rng, (num_tokens, ROPE_DIM))),
         jnp.float8_e4m3fn)
@@ -201,54 +217,163 @@ def build_case(case: str):
     return dict(
         case=case,
         num_tokens=num_tokens,
-        args=(ql_nope, q_pe, kv_c, k_pe, nope_cache, rope_cache,
-              jnp.asarray(topk), jnp.asarray(seq_lens),
-              jnp.asarray(block_tables), jnp.asarray(qsl),
-              jnp.asarray(np.asarray(distribution, np.int32))),
+        # Everything EXCEPT the KV caches. The caches are built separately, on
+        # demand, by `make_caches` -- see there for why they cannot live in a
+        # shared tuple any more.
+        static=(ql_nope, q_pe, kv_c, k_pe, jnp.asarray(topk),
+                jnp.asarray(seq_lens), jnp.asarray(block_tables),
+                jnp.asarray(qsl),
+                jnp.asarray(np.asarray(distribution, np.int32))),
     )
 
 
-def make_chain(mesh, depth: int):
+#: Index of `topk_indices` inside the `static` tuple above, used by the
+#: rolled-topk negative control.
+STATIC_TOPK_IDX = 4
+
+NOPE_SHAPE = (TOTAL_PAGES, PAGE_SIZE, dsa_gather.TILE_SUBROWS,
+              dsa_gather.TILE_LANE_BYTES)
+ROPE_SHAPE = (TOTAL_PAGES, PAGE_SIZE // dsa_gather.TILE_SUBROWS,
+              dsa_gather.TILE_SUBROWS, dsa_gather.TILE_LANE_BYTES)
+CACHE_PAIR_BYTES = int(np.prod(NOPE_SHAPE) + np.prod(ROPE_SHAPE))
+
+
+def make_caches(n_pairs: int):
+    """`n_pairs` INDEPENDENT KV cache pairs, as fresh device buffers.
+
+    Two reasons this is a function rather than a field of `build_case`.
+
+    Distinctness. Production builds one `pallas::sparse_mla_attention_<layer>`
+    op per layer (`layers/vllm/attention.py:1535-1541`), each closing over that
+    layer's own cache pair; GLM-5.2 has 78 of them and no layer's attention
+    waits on another layer's cache write. A chain that threads ONE pair through
+    every iteration imposes a serialisation edge production does not have, and
+    that edge lands only on the arm with more pipeline stages -- which is
+    exactly the shape of the artifact this bench is now being re-run to rule in
+    or out. `--cache-mode per-layer` gives iteration `i` the pair at slot `2i`.
+
+    Freshness. Under `donate_argnums` a consumed buffer is invalidated, so an
+    arm cannot be handed the buffers another arm already ran on, and the timing
+    loop has to thread each call's output caches into the next call -- which is
+    also what production does step to step.
+
+    Seeds differ per pair so the layers hold different data, as in production,
+    but they are fixed, so every arm sees byte-identical caches and the ON-vs-
+    OFF bit comparison stays meaningful.
+    """
+    out = []
+    for i in range(n_pairs):
+        r = np.random.default_rng(20260904 + 1000 * i)
+        out.append(jnp.asarray(_fp8_bytes(r, NOPE_SHAPE)))
+        out.append(jnp.asarray(_fp8_bytes(r, ROPE_SHAPE)))
+    return tuple(out)
+
+
+def make_chain(mesh, depth: int, per_layer: bool, donate: bool):
     """`depth` wrapper calls, output fed back in as the next `ql_nope`.
 
     The feedback is what stops XLA from CSE-ing the repeats into one call,
     and it mirrors a layer stack: `output` and `ql_nope` have the same shape
     `[T, NUM_HEADS, LKV_DIM]`.
+
+    Two axes, both of which the first version of this bench got wrong in the
+    same direction, and both of which are now settable so the error can be
+    measured rather than argued about:
+
+    `per_layer`
+        `True` gives iteration `i` its own cache pair, as production does.
+        `False` threads one pair through all `depth` iterations, which is what
+        the first version did -- iteration `i+1`'s gather then depends on
+        iteration `i`'s cache write, suppressing exactly the cross-layer
+        overlap that a smaller chunk size exists to create. `False` is kept as
+        the POSITIVE CONTROL: it must reproduce the earlier +28% decode
+        penalty, or the earlier job is simply irreproducible and neither
+        number means anything.
+
+    `donate`
+        Production's op is built with `donate_argnums=(0, 1)`
+        (`layers/vllm/attention.py:1541`). Without donation a 272 MB cache pair
+        is copied on every invocation -- 201-453 us at plausible HBM rates,
+        which brackets the fitted per-invocation constant the first version
+        attributed to compute.
     """
 
-    def chain(ql_nope, q_pe, kv_c, k_pe, nope_cache, rope_cache, topk,
-              seq_lens, block_tables, qsl, dist):
+    def chain(caches, ql_nope, q_pe, kv_c, k_pe, topk, seq_lens, block_tables,
+              qsl, dist):
+        caches = list(caches)
         out = ql_nope
-        for _ in range(depth):
-            nope_cache, rope_cache, out = \
+        for i in range(depth):
+            j = 2 * i if per_layer else 0
+            caches[j], caches[j + 1], out = \
                 attention_interface.sparse_mla_attention(
-                    out, q_pe, kv_c, k_pe, nope_cache, rope_cache, topk,
+                    out, q_pe, kv_c, k_pe, caches[j], caches[j + 1], topk,
                     seq_lens, block_tables, qsl, dist, mesh,
                     sm_scale=SM_SCALE, k_scale=K_SCALE)
             out = out.astype(ql_nope.dtype)
-        return out
+        # The updated caches are returned only when they are donated, and the
+        # two go together on purpose. Donated, returning them is free -- XLA
+        # aliases the output onto the input buffer -- and it is REQUIRED,
+        # because a donated buffer is invalidated and the next call needs the
+        # new one. Not donated, returning them would add a copy-out the
+        # original version of this bench did not have, and `--no-donate` exists
+        # precisely to reproduce that original. So `--no-donate` returns just
+        # the activation, exactly as before.
+        return (tuple(caches), out) if donate else out
 
-    return jax.jit(chain)
+    return jax.jit(chain, donate_argnums=(0, ) if donate else ())
 
 
-def _time(fn, reps):
-    jax.block_until_ready(fn())
+def _call(chain, caches, static, donate):
+    """One chain invocation; returns `(next_caches_or_None, activation)`."""
+    if donate:
+        new_caches, out = chain(caches, *static)
+        return new_caches, out
+    return None, chain(caches, *static)
+
+
+def _time(chain, caches, static, reps, donate):
+    """Mean of `reps` invocations; returns `(caches, us_per_chain_call)`.
+
+    Under donation the caches must be threaded: call `n`'s output pair is
+    call `n+1`'s input pair, because the input was invalidated. That is also
+    what production does from one decode step to the next, so the dependency
+    it creates is a real one rather than a harness artifact. Without donation
+    the same buffers are reused every rep, as in the original version.
+    """
+    new, r = _call(chain, caches, static, donate)
+    jax.block_until_ready((new, r) if donate else r)
+    caches = new if donate else caches
     t0 = time.perf_counter()
     for _ in range(reps):
-        r = fn()
-    jax.block_until_ready(r)
-    return (time.perf_counter() - t0) / reps * 1e6  # us per chained call
+        new, r = _call(chain, caches, static, donate)
+        if donate:
+            caches = new
+    jax.block_until_ready((caches, r) if donate else r)
+    return caches, (time.perf_counter() - t0) / reps * 1e6
 
 
 def dispatch_floor():
+    """Per-invocation dispatch slope on a trivial one-argument jit.
+
+    Informational only, and deliberately labelled as such in the report: it
+    prices neither the chain's eleven arguments nor its 272 MB cache pair, so
+    it is a LOWER bound on this bench's own per-invocation constant, not an
+    estimate of it. The `C` term of the depth fit is the real measurement.
+    """
     x = jnp.zeros((8, 128), jnp.float32)
     f = jax.jit(lambda a: a + 1.0)
-    jax.block_until_ready(f(x))
+
+    def bare(reps):
+        jax.block_until_ready(f(x))
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            r = f(x)
+        jax.block_until_ready(r)
+        return time.perf_counter() - t0
+
     lo, hi = 20, 200
-    _time(lambda: f(x), hi)
-    t_lo = _time(lambda: f(x), lo) * lo
-    t_hi = _time(lambda: f(x), hi) * hi
-    return (t_hi - t_lo) / (hi - lo)
+    bare(hi)
+    return (bare(hi) - bare(lo)) / (hi - lo) * 1e6
 
 
 def gcs_tags(lowered_text):
@@ -272,10 +397,11 @@ def mla_call_count(lowered_text, chunk):
     The kernel builds its scope inside `run_mla_kernel`, whose `cache_kv_*`
     parameters hold the GATHERED buffers, not the caches -- so
     `MLA-p_<topk>-bz_<kernel_batch_size>-gcz_<chunk_size>`. `gcz_` is the
-    chunk size, not the KV page count (the comment at the new call site in
-    `attention_interface.py` has this backwards). That makes the kernel's own
-    scope a sufficient, independent read-back of which chunk size the policy
-    actually delivered.
+    chunk size, not the KV page count. That makes the kernel's own scope a
+    sufficient, independent read-back of which chunk size the policy actually
+    delivered. (An earlier comment at the call site in
+    `attention_interface.py` had this backwards; it has since been corrected
+    there, and the `jax.named_scope` tag kept as belt and braces.)
 
     The returned NUMBER is informational only, and in particular it is NOT
     `depth * cdiv(T, chunk)`. MLIR prints repeated source locations through a
@@ -293,8 +419,35 @@ def mla_call_count(lowered_text, chunk):
     return lowered_text.count(f"MLA-p_{CSA_TOPK}-bz_16-gcz_{chunk}")
 
 
-def run_case(case: str, rounds: int, reps: int, report: dict, depth: int = 0):
-    data = build_case(case)
+#: The shipped policy function, captured before any arm overwrites the module
+#: attribute. `off`/`on`/the nulls all run THIS function (with the module flag
+#: set), so they test the real thing; a forced-chunk arm such as `c32` swaps in
+#: a constant, which is the only way to reach a chunk size the bucket rule
+#: never emits.
+_REAL_POLICY = attention_interface.sparse_mla_gather_chunk_size
+
+
+def _apply_arm(name: str, force):
+    if force is None:
+        attention_interface.sparse_mla_gather_chunk_size = _REAL_POLICY
+        attention_interface.DSA_CHUNK_BY_BUCKET = (name == "on")
+    else:
+        attention_interface.DSA_CHUNK_BY_BUCKET = False
+        attention_interface.sparse_mla_gather_chunk_size = \
+            lambda n, _c=force: _c
+
+
+def run_case(case: str,
+             rounds: int,
+             reps: int,
+             report: dict,
+             depth: int = 0,
+             per_layer: bool = True,
+             donate: bool = True,
+             extra_chunks=(),
+             max_cache_gb: float = 40.0,
+             data=None):
+    data = data if data is not None else build_case(case)
     # `depth` is the number of MLA layer calls chained back to back. It is the
     # one knob that decides whether the gather of layer i+1 can overlap the
     # attention of layer i -- production has 78 layers in a row, the earlier
@@ -308,13 +461,25 @@ def run_case(case: str, rounds: int, reps: int, report: dict, depth: int = 0):
     # ---- arms. `#null1..3` are OFF as well: identical work under a different
     # ---- name, so their spread is this case's floor. One null is a number,
     # ---- three are a floor.
-    arms = {
-        "off": False,
-        "on": True,
-        "off#null1": False,
-        "off#null2": False,
-        "off#null3": False,
-    }
+    arms = {"off": None, "on": None}
+    for c in extra_chunks:
+        arms[f"c{c}"] = int(c)
+    arms.update({"off#null1": None, "off#null2": None, "off#null3": None})
+    off_like = [k for k in arms if k.startswith("off")]
+
+    n_pairs = depth if per_layer else 1
+    # Every arm holds its own cache set for the whole interleaved timing loop,
+    # so they are all resident at once. Refuse rather than OOM the pod: a job
+    # that dies here reports nothing, and the depth sweep it was part of loses
+    # its other points too.
+    total_gb = len(arms) * n_pairs * CACHE_PAIR_BYTES / 1e9
+    print(f"\n[{case} depth={depth} per_layer={per_layer} donate={donate}] "
+          f"caches: {n_pairs} pair(s)/arm x {len(arms)} arms = "
+          f"{total_gb:.2f} GB")
+    if total_gb > max_cache_gb:
+        print(f"GATE: FAIL {case} depth={depth}: cache footprint "
+              f"{total_gb:.2f} GB exceeds --max-cache-gb {max_cache_gb}")
+        return None
 
     # ONE `jax.jit` OBJECT PER ARM, and this is not a style choice. The chunk
     # size is read from a module global at trace time; `jax.jit`'s cache key
@@ -323,85 +488,131 @@ def run_case(case: str, rounds: int, reps: int, report: dict, depth: int = 0):
     # serve the SAME executable to every later arm -- five arms, one
     # compilation, a perfect null result, and nothing in the output would say
     # so. A fresh wrapper per arm has a fresh cache.
-    chains = {arm: make_chain(mesh, depth) for arm in arms}
+    chains = {arm: make_chain(mesh, depth, per_layer, donate) for arm in arms}
+    # A SIXTH chain, never timed, that exists only to run the rolled-topk
+    # negative control. The first version ran that control through
+    # `chains["off"]`, which made `off` the one arm to execute an extra
+    # invocation and a recompile-free re-dispatch -- so `off` was not
+    # exchangeable with its own nulls, and the null floor it anchored was not
+    # a floor for it. Semantically identical to `off`; asserted so below.
+    poison_chain = make_chain(mesh, depth, per_layer, donate)
 
     resolved = {}
     lowered = {}
     outputs = {}
-    saved = attention_interface.DSA_CHUNK_BY_BUCKET
+    saved_flag = attention_interface.DSA_CHUNK_BY_BUCKET
     try:
-        for arm, flag in arms.items():
-            attention_interface.DSA_CHUNK_BY_BUCKET = flag
+        for arm, force in arms.items():
+            _apply_arm(arm, force)
             resolved[arm] = attention_interface.sparse_mla_gather_chunk_size(n)
             chain = chains[arm]
-            if arm in ("off", "on"):
+            if arm == "off" or arm == "on" or force is not None:
+                probe = make_caches(n_pairs)
                 try:
-                    txt = chain.lower(*data["args"]).as_text(debug_info=True)
+                    txt = chain.lower(probe,
+                                      *data["static"]).as_text(debug_info=True)
                 except TypeError:
-                    txt = chain.lower(*data["args"]).as_text()
+                    txt = chain.lower(probe, *data["static"]).as_text()
                 lowered[arm] = {
                     "gcs_tags": gcs_tags(txt),
                     "mla_calls": mla_call_count(txt, resolved[arm]),
                     "mla_calls_other": {
                         c: mla_call_count(txt, c)
-                        for c in (16, 32, 64, 128) if c != resolved[arm]
+                        for c in (8, 16, 32, 64, 128) if c != resolved[arm]
                     },
                 }
-            outputs[arm] = jax.block_until_ready(chain(*data["args"]))
+                del probe
+            caches = make_caches(n_pairs)
+            new_caches, out = _call(chain, caches, data["static"], donate)
+            outputs[arm] = jax.block_until_ready(out)
+            del caches, new_caches
 
-        # ---- correctness: ON must be bit-identical to OFF.
+        # ---- correctness: every other arm must be bit-identical to OFF.
         def _bits(x):
             return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
 
         a = np.asarray(outputs["off"].astype(jnp.float32))
-        b = np.asarray(outputs["on"].astype(jnp.float32))
-        finite = bool(np.isfinite(a).all() and np.isfinite(b).all())
-        off_bits, on_bits = _bits(outputs["off"]), _bits(outputs["on"])
-        bit_identical = bool(np.array_equal(off_bits, on_bits))
-        max_abs_diff = float(np.max(np.abs(a - b))) if finite else float("nan")
+        off_bits = _bits(outputs["off"])
+        finite = bool(np.isfinite(a).all())
+        bit_identical = True
+        max_abs_diff = 0.0
+        for arm in arms:
+            if arm == "off":
+                continue
+            b = np.asarray(outputs[arm].astype(jnp.float32))
+            finite = finite and bool(np.isfinite(b).all())
+            bit_identical = bit_identical and bool(
+                np.array_equal(off_bits, _bits(outputs[arm])))
+            if finite:
+                max_abs_diff = max(max_abs_diff, float(np.max(np.abs(a - b))))
         # Anti-vacuity: a run whose output is a constant (all-zero, say) would
         # be bit-identical across arms for a reason that has nothing to do
         # with the chunk size.
         distinct_values = int(np.unique(off_bits).size)
 
         # ---- negative control, run through the WHOLE pipeline rather than on
-        # ---- a numpy copy. Re-execute the OFF chain with `topk_indices`
-        # ---- rolled by one row: same shapes, same executable, no recompile,
-        # ---- but every token now attends to its neighbour's window. If the
-        # ---- comparison above cannot see THAT, then `bit_identical=True` is
-        # ---- unfalsifiable and says nothing about the chunk size.
+        # ---- a numpy copy. Execute an OFF-equivalent chain with
+        # ---- `topk_indices` rolled by one row: same shapes, same executable,
+        # ---- no recompile, but every token now attends to its neighbour's
+        # ---- window. If the comparison above cannot see THAT, then
+        # ---- `bit_identical=True` is unfalsifiable and says nothing about the
+        # ---- chunk size.
         # ---- (The earlier form of this control flipped a bit in a numpy copy
         # ---- of the OFF output, which only proved `np.array_equal` works.)
-        attention_interface.DSA_CHUNK_BY_BUCKET = False
-        poison_args = list(data["args"])
-        poison_args[6] = jnp.roll(poison_args[6], 1, axis=0)
-        poison_out = jax.block_until_ready(chains["off"](*poison_args))
+        _apply_arm("off", None)
+        clean = jax.block_until_ready(
+            _call(poison_chain, make_caches(n_pairs), data["static"],
+                  donate)[1])
+        # The control is only evidence about `off` if the vehicle carrying it
+        # IS `off`. Cheap to prove, so prove it rather than assume it.
+        poison_vehicle_matches_off = bool(
+            np.array_equal(off_bits, _bits(clean)))
+        poison_static = list(data["static"])
+        poison_static[STATIC_TOPK_IDX] = jnp.roll(
+            poison_static[STATIC_TOPK_IDX], 1, axis=0)
+        poison_out = jax.block_until_ready(
+            _call(poison_chain, make_caches(n_pairs), tuple(poison_static),
+                  donate)[1])
         control_rejects = not np.array_equal(off_bits, _bits(poison_out))
-        control_frac_changed = float(
-            np.mean(off_bits != _bits(poison_out)))
+        control_frac_changed = float(np.mean(off_bits != _bits(poison_out)))
+        del clean, poison_out
 
         # ---- timing, arms interleaved and reshuffled every round.
+        live = {arm: make_caches(n_pairs) for arm in arms}
         rng = random.Random(20260904)
         per_round = {k: [] for k in arms}
         for _ in range(rounds):
             order = list(arms)
             rng.shuffle(order)
             for arm in order:
-                attention_interface.DSA_CHUNK_BY_BUCKET = arms[arm]
-                c = chains[arm]
-                per_round[arm].append(_time(lambda: c(*data["args"]), reps))
+                _apply_arm(arm, arms[arm])
+                live[arm], us = _time(chains[arm], live[arm], data["static"],
+                                      reps, donate)
+                per_round[arm].append(us)
+        del live
     finally:
-        attention_interface.DSA_CHUNK_BY_BUCKET = saved
+        attention_interface.DSA_CHUNK_BY_BUCKET = saved_flag
+        attention_interface.sparse_mla_gather_chunk_size = _REAL_POLICY
 
     med = {k: statistics.median(v) / depth for k, v in per_round.items()}
-    base = med["off"]
-    delta = {k: (v - base) / base * 100.0 for k, v in med.items()}
-    nulls = [delta[k] for k in ("off#null1", "off#null2", "off#null3")]
+    delta = {k: (v - med["off"]) / med["off"] * 100.0 for k, v in med.items()}
+    # The floor is the spread of the OFF-equivalent arms about THEIR OWN mean,
+    # not about `off`. Measuring it relative to `off` forces `off`'s deviation
+    # to zero by construction and understates the span -- on the first run of
+    # this bench by 9.3x at prefill depth 2 (0.101 pts reported against 0.945
+    # pts actual). `off` is one draw from the null, not the null.
+    ref = statistics.mean([med[k] for k in off_like])
+    null_dev = {k: (med[k] - ref) / ref * 100.0 for k in off_like}
+    null_span_pts = max(null_dev.values()) - min(null_dev.values())
+    delta_vs_null_mean = {k: (v - ref) / ref * 100.0 for k, v in med.items()}
 
     rec = dict(
         case=case,
         num_tokens=n,
         chain_depth=depth,
+        per_layer_caches=per_layer,
+        donate=donate,
+        cache_gb=total_gb,
         rounds=rounds,
         reps=reps,
         resolved_chunk=resolved,
@@ -409,32 +620,43 @@ def run_case(case: str, rounds: int, reps: int, report: dict, depth: int = 0):
         us_per_call_median=med,
         per_round_us=per_round,
         delta_pct_vs_off=delta,
-        null_floor_pct=[min(nulls), max(nulls)],
-        null_span_pts=max(nulls) - min(nulls),
+        delta_pct_vs_null_mean=delta_vs_null_mean,
+        null_dev_pct=null_dev,
+        null_floor_pct=[min(null_dev.values()),
+                        max(null_dev.values())],
+        null_span_pts=null_span_pts,
         finite=finite,
         bit_identical=bit_identical,
         max_abs_diff=max_abs_diff,
         distinct_output_values=distinct_values,
         negative_control_rejects=control_rejects,
         control_frac_changed=control_frac_changed,
+        poison_vehicle_matches_off=poison_vehicle_matches_off,
     )
     report["cases"].append(rec)
 
-    print(f"\n=== {case}  T={n}  chain={depth}  rounds={rounds} reps={reps}")
-    print(f"  resolved chunk: off={resolved['off']} on={resolved['on']}")
-    for arm in ("off", "on"):
+    print(f"=== {case}  T={n}  chain={depth}  per_layer={per_layer}  "
+          f"donate={donate}  rounds={rounds} reps={reps}")
+    print(
+        f"  resolved chunk: "
+        f"{ {k: v for k, v in resolved.items() if not k.startswith('off#')} }")
+    for arm in lowered:
         print(f"  lowered[{arm}]: gcs_tags={lowered[arm]['gcs_tags']} "
               f"mla_pallas_calls@gcz_{resolved[arm]}="
               f"{lowered[arm]['mla_calls']} "
               f"other={lowered[arm]['mla_calls_other']}")
     for k in arms:
-        print(f"  {k:12s} med {med[k]:10.2f} us/call   {delta[k]:+7.3f}%")
-    print(f"  null floor n=3 [{min(nulls):+.3f}%, {max(nulls):+.3f}%] "
-          f"span {max(nulls) - min(nulls):.3f} pts")
+        print(
+            f"  {k:12s} med {med[k]:10.2f} us/layer  vs_off {delta[k]:+7.3f}%"
+            f"  vs_nullmean {delta_vs_null_mean[k]:+7.3f}%")
+    print(f"  null floor n={len(off_like)} (about their own mean) "
+          f"[{min(null_dev.values()):+.3f}%, {max(null_dev.values()):+.3f}%] "
+          f"span {null_span_pts:.3f} pts")
     print(f"  ON vs OFF: finite={finite} bit_identical={bit_identical} "
           f"max_abs_diff={max_abs_diff} distinct_out={distinct_values} "
           f"negative_control_rejects={control_rejects} "
-          f"control_frac_changed={control_frac_changed:.4f}")
+          f"control_frac_changed={control_frac_changed:.4f} "
+          f"poison_vehicle_matches_off={poison_vehicle_matches_off}")
     return rec
 
 
@@ -443,8 +665,36 @@ def main():
     ap.add_argument("--cases", default="decode,prefill")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--reps", type=int, default=20)
-    ap.add_argument("--depth", type=int, default=0,
+    ap.add_argument("--depth",
+                    type=int,
+                    default=0,
                     help="override the chain depth (0 = the per-case default)")
+    ap.add_argument("--depths",
+                    default="",
+                    help="comma-separated chain depths to sweep; overrides "
+                    "--depth. Three or more points make the C + depth*D fit "
+                    "identifiable, which one or two cannot.")
+    ap.add_argument("--cache-mode",
+                    default="per-layer",
+                    choices=("per-layer", "shared"),
+                    help="per-layer matches production (one cache pair per "
+                    "MLA call); shared reproduces the first version of this "
+                    "bench and is the positive control")
+    ap.add_argument("--no-donate",
+                    action="store_true",
+                    help="drop donate_argnums. Production donates "
+                    "(attention.py:1541); this is for the positive control.")
+    ap.add_argument("--extra-chunks",
+                    default="",
+                    help="comma-separated chunk sizes to add as forced arms, "
+                    "e.g. 32 -- values the bucket rule never emits")
+    ap.add_argument("--max-cache-gb",
+                    type=float,
+                    default=0.0,
+                    help="0 = 55%% of the device's reported HBM limit. The "
+                    "per-layer cache mode scales as depth x arms, so a deep "
+                    "sweep can ask for more HBM than the chip has; refusing "
+                    "loudly beats an OOM that also loses the other depths.")
     ap.add_argument("--json-out", default="")
     args = ap.parse_args()
 
@@ -452,80 +702,66 @@ def main():
         print("GATE: FAIL not a TPU")
         return 2
 
+    per_layer = args.cache_mode == "per-layer"
+    donate = not args.no_donate
+    extra = [int(c) for c in args.extra_chunks.split(",") if c.strip()]
+
     report = {
         "jax": jax.__version__,
         "devices": [str(d) for d in jax.devices()],
-        "dispatch_floor_us": dispatch_floor(),
+        "dispatch_floor_us_informational": dispatch_floor(),
+        "cache_mode": args.cache_mode,
+        "donate": donate,
+        "extra_chunks": extra,
         "cases": [],
     }
-    print(f"dispatch floor: {report['dispatch_floor_us']:.2f} us")
+    try:
+        report["hbm"] = {
+            k: v
+            for k, v in jax.local_devices()[0].memory_stats().items()
+            if "bytes" in k
+        }
+    except Exception as exc:  # pragma: no cover - platform dependent
+        report["hbm"] = f"unavailable: {exc}"
+    print(f"dispatch floor (informational): "
+          f"{report['dispatch_floor_us_informational']:.2f} us")
+    print(f"cache_mode={args.cache_mode} donate={donate} extra_chunks={extra}")
+    print(f"hbm: {report['hbm']}")
+
+    max_cache_gb = args.max_cache_gb
+    if not max_cache_gb:
+        limit = (report["hbm"] or {}).get("bytes_limit") \
+            if isinstance(report["hbm"], dict) else None
+        max_cache_gb = 0.55 * limit / 1e9 if limit else 20.0
+    report["max_cache_gb"] = max_cache_gb
+    print(f"max_cache_gb: {max_cache_gb:.1f}")
 
     # What the bucket policy is SUPPOSED to resolve to, per case. Stated here
     # rather than read back from the code, so a policy edit that changes the
     # branch boundaries fails this bench instead of silently redefining it.
     want = {"decode": (64, 16), "prefill": (64, 128)}
 
+    depths = [int(d) for d in args.depths.split(",") if d.strip()]
+
     fails = []
     for case in args.cases.split(","):
-        rec = run_case(case, args.rounds, args.reps, report, args.depth)
-        exp_off, exp_on = want[case]
-        if (rec["resolved_chunk"]["off"], rec["resolved_chunk"]["on"]) != \
-                (exp_off, exp_on):
-            fails.append(f"{case}: policy resolved "
-                         f"{rec['resolved_chunk']} want off={exp_off} "
-                         f"on={exp_on}")
-        for arm, exp in (("off", exp_off), ("on", exp_on)):
-            # `gcs_tags` come from the new `jax.named_scope` and only survive
-            # into the text if this jax build emits debug info; empty is
-            # tolerated, wrong is not. The `gcz_` count below is the check
-            # that has to hold -- it is the KERNEL's own scope, so it cannot
-            # be satisfied by a call site that computed the right number and
-            # then failed to pass it.
-            tags = rec["lowered"][arm]["gcs_tags"]
-            if tags and set(tags) != {exp}:
-                fails.append(f"{case}/{arm}: HLO carries gcs tags {tags}, "
-                             f"expected only {exp}")
-            # Presence, not count -- see `mla_call_count`: MLIR alias-dedups
-            # repeated locations, so the count is not `depth * cdiv(T, chunk)`
-            # and never could be. Presence + the exclusivity check below is
-            # the whole of what the HLO can tell us, and it is enough: it
-            # cannot be satisfied by a call site that computed the right
-            # number and then failed to pass it to the kernel.
-            if rec["lowered"][arm]["mla_calls"] < 1:
-                fails.append(
-                    f"{case}/{arm}: no MLA pallas_call at gcz_{exp} in the "
-                    "HLO -- the resolved chunk never reached the kernel")
-            stray = {c: k
-                     for c, k in rec["lowered"][arm]["mla_calls_other"].items()
-                     if k}
-            if stray:
-                fails.append(f"{case}/{arm}: HLO also contains MLA calls at "
-                             f"other chunk sizes {stray}")
-        if exp_off == exp_on:
-            fails.append(f"{case}: the two arms resolve to the SAME chunk, "
-                         "so this case discriminates nothing")
-        if not rec["finite"]:
-            fails.append(f"{case}: non-finite output")
-        # `distinct_output_values` is INFORMATIONAL. It is a proxy for
-        # "the output is not a constant", and it is a poor one: at prefill
-        # every output element is a softmax-weighted mean of 2048 random fp8
-        # latents, which concentrates hard and then quantizes to a handful of
-        # bf16 codes (52 measured on j-b77c8a7e-8da5-4236-9dba) while still
-        # being fully data-dependent. The real anti-vacuity check is the
-        # rolled-`topk` control below, which perturbs the INPUT and requires
-        # the comparison to see it.
-        if not rec["bit_identical"]:
-            fails.append(f"{case}: ON is NOT bit-identical to OFF "
-                         f"(max_abs_diff {rec['max_abs_diff']})")
-        if not rec["negative_control_rejects"]:
-            fails.append(f"{case}: rolled-topk control did not change the "
-                         "output; the bit-identity result above is "
-                         "unfalsifiable")
-        if rec["control_frac_changed"] < 0.10:
-            fails.append(
-                f"{case}: rolled-topk control changed only "
-                f"{rec['control_frac_changed']:.4f} of output elements -- too "
-                "few for bit-identity to be meaningful evidence")
+        data = build_case(case)
+        for depth in (depths or [args.depth]):
+            rec = run_case(case,
+                           args.rounds,
+                           args.reps,
+                           report,
+                           depth,
+                           per_layer=per_layer,
+                           donate=donate,
+                           extra_chunks=extra,
+                           max_cache_gb=max_cache_gb,
+                           data=data)
+            if rec is None:
+                fails.append(f"{case} depth={depth}: skipped, see above")
+                continue
+            fails.extend(check_case(rec, want[case]))
+        fails.extend(depth_fit(case, report, per_layer, donate))
 
     if args.json_out:
         with open(args.json_out, "w") as f:
@@ -539,6 +775,126 @@ def main():
     print("GATE: PASS policy resolved as specified, reached the kernel "
           "(HLO tags + call counts), output bit-identical, control rejects")
     return 0
+
+
+def depth_fit(case, report, per_layer, donate):
+    """Least-squares `T(depth) = C + depth*D` over this case's depth points.
+
+    `D` is the marginal cost of one more pipeline stage and is the ONLY figure
+    that should be quoted as the per-layer effect: the raw `us/layer` ratio at
+    a single depth carries `C/depth`, a per-invocation constant that has
+    nothing to do with the chunk size and that shrinks as depth grows. Needs
+    >= 2 depths to fit at all and >= 3 to be worth believing.
+
+    The `dD` column for the three null arms is the floor on `D` itself, and it
+    is the number to read before believing any `dD` on `on`: a fit through two
+    points inherits both points' noise, so a null spread wider than the ON
+    effect means the depth axis has not resolved anything.
+    """
+    recs = [
+        r for r in report["cases"] if r["case"] == case
+        and r["per_layer_caches"] == per_layer and r["donate"] == donate
+    ]
+    if len({r["chain_depth"] for r in recs}) < 2:
+        return []
+    out = {}
+    for arm in recs[0]["us_per_call_median"]:
+        xs = [float(r["chain_depth"]) for r in recs]
+        ys = [r["us_per_call_median"][arm] * r["chain_depth"] for r in recs]
+        mx, my = statistics.mean(xs), statistics.mean(ys)
+        den = sum((x - mx)**2 for x in xs)
+        d = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+        out[arm] = {"D_us_per_layer": d, "C_us_per_call": my - d * mx}
+    key = f"{case}/per_layer={per_layer}/donate={donate}"
+    report.setdefault("depth_fit", {})[key] = {
+        "depths": [r["chain_depth"] for r in recs],
+        "per_arm": out,
+    }
+    base = out["off"]["D_us_per_layer"]
+    print(f"\n--- {key} depth fit over "
+          f"{[r['chain_depth'] for r in recs]}  (T = C + depth*D)")
+    for arm, v in out.items():
+        print(f"  {arm:12s} D {v['D_us_per_layer']:9.2f} us/layer  "
+              f"C {v['C_us_per_call']:9.2f} us/call  "
+              f"dD {(v['D_us_per_layer'] - base) / base * 100.0:+7.3f}%")
+    return []
+
+
+def check_case(rec, want_pair):
+    fails = []
+    case, depth = rec["case"], rec["chain_depth"]
+    tag = f"{case} depth={depth}"
+    exp_off, exp_on = want_pair
+    if (rec["resolved_chunk"]["off"], rec["resolved_chunk"]["on"]) != \
+            (exp_off, exp_on):
+        fails.append(f"{tag}: policy resolved {rec['resolved_chunk']} "
+                     f"want off={exp_off} on={exp_on}")
+    # Forced arms are checked against their own name, so a typo'd
+    # `--extra-chunks` cannot silently benchmark the default a second time.
+    expect = {"off": exp_off, "on": exp_on}
+    for arm in rec["lowered"]:
+        if arm.startswith("c"):
+            expect[arm] = int(arm[1:])
+    for arm, exp in expect.items():
+        if rec["resolved_chunk"][arm] != exp:
+            fails.append(f"{tag}/{arm}: resolved chunk "
+                         f"{rec['resolved_chunk'][arm]}, expected {exp}")
+        # `gcs_tags` come from the new `jax.named_scope` and only survive
+        # into the text if this jax build emits debug info; empty is
+        # tolerated, wrong is not. The `gcz_` count below is the check
+        # that has to hold -- it is the KERNEL's own scope, so it cannot
+        # be satisfied by a call site that computed the right number and
+        # then failed to pass it.
+        tags = rec["lowered"][arm]["gcs_tags"]
+        if tags and set(tags) != {exp}:
+            fails.append(f"{tag}/{arm}: HLO carries gcs tags {tags}, "
+                         f"expected only {exp}")
+        # Presence, not count -- see `mla_call_count`: MLIR alias-dedups
+        # repeated locations, so the count is not `depth * cdiv(T, chunk)`
+        # and never could be. Presence + the exclusivity check below is
+        # the whole of what the HLO can tell us, and it is enough: it
+        # cannot be satisfied by a call site that computed the right
+        # number and then failed to pass it to the kernel.
+        if rec["lowered"][arm]["mla_calls"] < 1:
+            fails.append(
+                f"{tag}/{arm}: no MLA pallas_call at gcz_{exp} in the "
+                "HLO -- the resolved chunk never reached the kernel")
+        stray = {
+            c: k
+            for c, k in rec["lowered"][arm]["mla_calls_other"].items() if k
+        }
+        if stray:
+            fails.append(f"{tag}/{arm}: HLO also contains MLA calls at "
+                         f"other chunk sizes {stray}")
+    if exp_off == exp_on:
+        fails.append(f"{tag}: the two arms resolve to the SAME chunk, "
+                     "so this case discriminates nothing")
+    if not rec["finite"]:
+        fails.append(f"{tag}: non-finite output")
+    # `distinct_output_values` is INFORMATIONAL. It is a proxy for
+    # "the output is not a constant", and it is a poor one: at prefill
+    # every output element is a softmax-weighted mean of 2048 random fp8
+    # latents, which concentrates hard and then quantizes to a handful of
+    # bf16 codes (52 measured on j-b77c8a7e-8da5-4236-9dba) while still
+    # being fully data-dependent. The real anti-vacuity check is the
+    # rolled-`topk` control below, which perturbs the INPUT and requires
+    # the comparison to see it.
+    if not rec["bit_identical"]:
+        fails.append(f"{tag}: an arm is NOT bit-identical to OFF "
+                     f"(max_abs_diff {rec['max_abs_diff']})")
+    if not rec["poison_vehicle_matches_off"]:
+        fails.append(f"{tag}: the negative control's chain does not reproduce "
+                     "OFF on clean inputs, so the control says nothing "
+                     "about OFF")
+    if not rec["negative_control_rejects"]:
+        fails.append(f"{tag}: rolled-topk control did not change the "
+                     "output; the bit-identity result above is unfalsifiable")
+    if rec["control_frac_changed"] < 0.10:
+        fails.append(
+            f"{tag}: rolled-topk control changed only "
+            f"{rec['control_frac_changed']:.4f} of output elements -- too "
+            "few for bit-identity to be meaningful evidence")
+    return fails
 
 
 if __name__ == "__main__":

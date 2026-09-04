@@ -868,9 +868,11 @@ def sparse_mla_attention(
         # this resolves at trace time and is a valid kernel `static_argname`.
         gather_chunk = sparse_mla_gather_chunk_size(q.shape[0])
         # Names the chosen chunk size into the HLO op metadata so a profile can
-        # prove which branch fired. The kernel's own scope name cannot: its
-        # `gcz_` field is the KV page count (kernel.py:567) and its `bz_` field
-        # is 16 for chunk 16, 64 and 128 alike.
+        # prove which branch fired without decoding the kernel's own scope
+        # name. That name (kernel.py:567) does carry it -- `gcz_` is
+        # `cache_kv_nope.shape[0]`, and `cache_kv_nope` is the *gathered*
+        # buffer, so it is the chunk's token count -- but the encoding is not
+        # obvious, and `bz_` is 16 for chunk 16, 64 and 128 alike.
         with jax.named_scope(f"sparse-mla-gcs_{gather_chunk}"):
             output = sparse_mla_ragged_paged_attention(
                 q,
