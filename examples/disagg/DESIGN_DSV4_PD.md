@@ -222,38 +222,23 @@ a producer running to N ships h(N) and the decode replica advances the
 recurrence twice. The trigger was keyed to Mamba groups, and
 `_stage3_truncates_prompt` (`:1085-1096`) widens it to any group with a window.
 
-### 4d. The guard, for what truncation cannot reach
+### 4d. When prefill runs past the handoff
 
-Truncation controls a producer that stops at the prompt. A client that hits the
-prefill port directly and generates a full answer runs past it anyway, which is
-what our accuracy oracle does when it asks prefill alone for a baseline.
+Truncation only controls a producer that stops at the prompt. Hit the prefill
+port directly, outside the proxy, and it generates a full answer instead: the
+window slides forward, the pages it was going to send get recycled, and by
+`request_finished` there is nothing left to transfer.
 
-Run far enough and every page of the transfer prefix falls out of the window, so
-what the connector is left holding is nothing but page 0:
+The connector catches that by counting how many pages in the range are the null
+block (`_stage3_recycled_transfer_pages`, `:208-235`) and drops the send, so the
+decode replica prefills the request itself. Slower, but correct. Without it two
+recycled pages arrive as page 0 twice, one destination named by two sources,
+which Raiden rejects and which takes the engine down with it. That rejection is
+inferred from the crash; `tpu_sync`'s native code is not in this tree.
 
-```
-  prompt 114, producer runs on to 161, transfer prefix still 113 tokens
-
-  11 pages at 161 tokens, allocator has freed 9   [ 0 x 9 | 250  18 ]
-  cut back to the 113-token prefix, 8 pages       [ 0 x 8 ]
-  skip the 6 the window already dropped           [ 0  0 ]
-```
-
-How many nulls are left is what decides the damage. One is a single wrong page
-sent to a real destination, and nothing detects it. Two are both page 0, so
-Raiden is told to write two sources into one destination; it rejects the
-transfer, and the rejection kills the engine.
-
-So the guard counts them (`_stage3_recycled_transfer_pages`, `:208-235`),
-reading what the block table says rather than re-deriving where the allocator
-got to. More than one drops the send and the decode replica prefills the request
-itself, which is slow but survivable. Exactly one warns and ships, because a
-hole in one window beats making a decode replica prefill a long prompt. Neither
-is a repair: by this point the KV is genuinely gone, and the allocator did
-nothing wrong in freeing it.
-
-Raiden's rejection is not visible in this tree. `tpu_sync`'s Python layer has no
-such check and the native code is not here, so it is inferred from the crash.
+A real disaggregated deployment never gets here, because everything goes through
+the proxy. We got here because our accuracy oracle queries prefill alone for a
+non-disaggregated baseline.
 
 ### 4e. Why no other model hits this
 
