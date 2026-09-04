@@ -414,11 +414,11 @@ def fused_moe_func(
     supported. Weights must be packed along the contracting dimension (K-axis) in LSB-first order.
     """
 
-    # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N] expected by gmm_v2.
-    if w1_scale is not None and w1_scale.ndim == 3:
-        w1_scale = jnp.expand_dims(w1_scale, 2)
-    if w2_scale is not None and w2_scale.ndim == 3:
-        w2_scale = jnp.expand_dims(w2_scale, 2)
+    # A 3D scale [experts, blocks, N] is handed to gmm_v2 as-is: it accepts both
+    # that and the legacy 4D [experts, blocks, 1, N]. Do NOT re-add the
+    # degenerate axis -- for a narrow scale dtype it tiles T(2,128)/T(4,128)
+    # instead of f32's T(1,128) and pads the bytes straight back to 4 per
+    # element, which is the whole cost the narrow dtype exists to remove.
 
     num_tokens, hidden_size = hidden_states.shape
 

@@ -169,8 +169,28 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 # gmm_v2 scale layout: [E, num_blocks, 1, N]
                 return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
 
-            w13_scale_4d = _to_kernel_scale(w13_scale)
-            w2_scale_4d = _to_kernel_scale(w2_scale)
+            def _to_compact_scale(u8: torch.Tensor,
+                                  dtype: torch.dtype) -> torch.Tensor:
+                # [E, N, num_blocks] uint8 e8m0 -> [E, num_blocks, N] narrow.
+                # No `unsqueeze(-2)`: the degenerate sublane axis makes a narrow
+                # scale tile T(2,128)/T(4,128) instead of f32's T(1,128) and pads
+                # every element back to 4 bytes, cancelling the saving exactly
+                # (measured: the LLO scale DMA stays at 43008 granules).
+                if dtype == torch.float8_e8m0fnu:
+                    return _fresh(u8.movedim(-1, 1).view(torch.float8_e8m0fnu))
+                return _fresh(e8m0_to_fp32(u8).movedim(-1, 1).to(dtype))
+
+            compact = envs.TPU_MOE_COMPACT_SCALE
+            if compact != "off":
+                # Lossless: E8M0 encodes powers of two, which both e8m0 and
+                # bf16 represent exactly. gmm_v2 widens per tile in VMEM.
+                narrow = (torch.float8_e8m0fnu
+                          if compact == "e8m0" else torch.bfloat16)
+                w13_scale_4d = _to_compact_scale(w13_weight_scale, narrow)
+                w2_scale_4d = _to_compact_scale(w2_weight_scale, narrow)
+            else:
+                w13_scale_4d = _to_kernel_scale(w13_scale)
+                w2_scale_4d = _to_kernel_scale(w2_scale)
 
             # Unpack to native fp4 in the kernel's K-major layout once at load
             # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
