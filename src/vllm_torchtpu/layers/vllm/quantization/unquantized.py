@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
 from vllm_torchtpu.layers.vllm import moe_routing
@@ -169,6 +170,17 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, LinearBase):
+            quantize_prefixes = envs.QUANTIZE_ON_LOAD_PREFIXES
+            if any(p in prefix for p in quantize_prefixes) and "kv_b_proj" not in prefix:
+                from vllm_torchtpu.layers.vllm.quantization.fp8 import (
+                    VllmFp8Config, VllmFp8LinearMethodTPU)
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8LinearMethodTPU(
+                    fp8_config, self.get_linear_config(layer), prefix=prefix)
+
             # TPU-native dense linear: canonical (k, n) weight layout so the
             # forward pass is (m, k) @ (k, n) rather than vLLM's
             # (m, k) @ (n, k).T.

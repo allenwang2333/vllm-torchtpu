@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
@@ -357,6 +358,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
         # For compatibility reasons.
+        self.prefix = prefix
         self.kv_sharing_target_layer_name = None
         self.attn_type = AttentionType.DECODER
         self.sliding_window = None
@@ -391,6 +393,23 @@ class VllmTPUMLAAttention(MLAAttention):
                                                   requires_grad=False)
 
         device = torch.device("tpu")
+
+        prefix = getattr(self, "prefix", getattr(self, "layer_name", ""))
+        if any(p in prefix for p in envs.QUANTIZE_ON_LOAD_PREFIXES):
+            W_UK_T, w_uk_scale = quantize_tensor(
+                self.W_UK_T.to(torch.float32), torch.float8_e4m3fn, axis=1
+            )
+            W_UV, w_uv_scale = quantize_tensor(
+                self.W_UV.to(torch.float32), torch.float8_e4m3fn, axis=1
+            )
+            self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
+            self.W_UV = Parameter(W_UV, requires_grad=False)
+            self.W_UK_T_scale = Parameter(
+                _fresh(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
+            )
+            self.W_UV_scale = Parameter(
+                _fresh(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
+            )
 
         # move W_UK_T and W_UV into fresh contiguous buffers
         self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)

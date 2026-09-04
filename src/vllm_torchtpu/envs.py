@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
 
 
 def env_with_choices(
@@ -452,6 +453,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Comma-separated module prefix names that will be quantized to FP8 on load.
+    "QUANTIZE_ON_LOAD_PREFIXES":
+    lambda: [
+        p.strip()
+        for p in os.getenv("QUANTIZE_ON_LOAD_PREFIXES", "").split(",")
+        if p.strip()
+    ],
 }
 
 
