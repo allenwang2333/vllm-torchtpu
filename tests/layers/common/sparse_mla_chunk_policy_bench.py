@@ -890,17 +890,41 @@ def depth_fit(case, report, per_layer, donate, serial_topk):
         out[arm] = {"D_us_per_layer": d, "C_us_per_call": my - d * mx}
     key = (f"{case}/per_layer={per_layer}/donate={donate}"
            f"/serial_topk={serial_topk}")
+    # Anchor `dD` on the mean of the OFF-equivalent arms, exactly as `run_case`
+    # anchors the single-depth delta -- and for the same reason: `off` is one
+    # draw from the null, so anchoring on it forces `off`'s own deviation to
+    # zero and understates the floor. This function had the defect that
+    # `run_case` had already been fixed for, and it understated the depth-fit
+    # null floor by 1.00x / 3.79x / 1.47x / 1.55x across the four blocks of
+    # j-aada678c. It matters most where the effect is small: the PREFILL ON arm
+    # reads +0.148% against `off` and -2.246% against the null mean, so the
+    # anchor decides the SIGN there. Both are far inside the floor, which is
+    # the actual finding, but only the null-mean view makes that visible.
+    off_like = [k for k in out if k.startswith("off")]
+    base = statistics.mean([out[k]["D_us_per_layer"] for k in off_like])
+    null_dev = {
+        k: (out[k]["D_us_per_layer"] - base) / base * 100.0
+        for k in off_like
+    }
+    null_span_pts = max(null_dev.values()) - min(null_dev.values())
     report.setdefault("depth_fit", {})[key] = {
         "depths": [r["chain_depth"] for r in recs],
         "per_arm": out,
+        "null_anchor_D_us_per_layer": base,
+        "null_arms": off_like,
+        "null_dev_pct": null_dev,
+        "null_span_pts": null_span_pts,
     }
-    base = out["off"]["D_us_per_layer"]
     print(f"\n--- {key} depth fit over "
           f"{[r['chain_depth'] for r in recs]}  (T = C + depth*D)")
     for arm, v in out.items():
         print(f"  {arm:12s} D {v['D_us_per_layer']:9.2f} us/layer  "
               f"C {v['C_us_per_call']:9.2f} us/call  "
               f"dD {(v['D_us_per_layer'] - base) / base * 100.0:+7.3f}%")
+    print(f"  null floor on D: n={len(off_like)} arms about their own mean, "
+          f"span {null_span_pts:.3f} pts "
+          f"({', '.join(f'{k} {v:+.3f}%' for k, v in null_dev.items())}) "
+          f"-- read any dD above against THIS, not against zero")
     return []
 
 
