@@ -286,6 +286,7 @@ run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_pro
 # mid-write is not, so stop cleanly and let the summary still run.
 MIN_FREE_MB="${MIN_FREE_MB:-15000}"
 declare -A ARM_SEEN=()
+export K3_ARMS_EXPECTED="${*:-$ARMS_DEFAULT}"
 for arm in ${*:-$ARMS_DEFAULT}; do
   # ABBA runs the same arm twice (hier,base,base,hier). Each occurrence is its
   # own cell: same label, separate directory, separate JSON. The in-job drift
@@ -369,5 +370,19 @@ for key in sorted(cells, key=lambda k: (k[0], k[1])):
           f"{med:>10.3f}{sp:>7.2f}%{vb:>9}{vr:>9}")
 print("\n#365 same ladder: TPOT 18.954 / 19.405 / 21.128 / 28.420 / 47.083 / 82.705")
 print("Spread band from #365 is 2.05%; c=8 was 3.48% at 16 prompts, hence 32 here.")
+# ARITY POST-CONDITION. Build 374 skipped every arm on a runtime 127 and exited
+# GREEN with this table printing zero rows. A green build is not evidence that
+# the work ran; the cheapest thing that is, is counting.
+import os
+want = len((os.environ.get("K3_ARMS_EXPECTED") or "").split())
+if want and len({a for a, _ in cells}) != want:
+    print(f"\nPOST-CONDITION FAILED: {len({a for a, _ in cells})} arms in the summary, "
+          f"{want} requested -- an arm ran no cells. This build is VOID.")
+    sys.exit(3)
 PYEOF
+summary_rc=$?
+if [ "$summary_rc" -ne 0 ]; then
+  say "+++ LADDER VOID: the summary has fewer arms than were requested"
+  rc=$summary_rc
+fi
 exit "$rc"
