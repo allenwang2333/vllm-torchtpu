@@ -472,17 +472,27 @@ def _dispatched_kda_core(
                                       total_tokens)
 
     # --- decode segment: fused convolution + recurrence ---------------
+    # One grid step per row, and a row is a *request* -- but a decode request
+    # holds exactly one token, so the segment can never hold more rows than the
+    # token bucket, and `_match_rows(decode_out, num_tokens)` below discards
+    # any it did. The two buckets are sized independently (`num_seqs` from
+    # `MIN_NUM_SEQS`, `num_tokens` from `compile_sizes`), so at low
+    # concurrency `num_seqs` is the larger by a factor of 8 and every one of
+    # those grid steps is null work on the reserved slot.
+    num_decode_rows = min(num_seqs, num_tokens)
     decode_out, conv_after_decode, pool_after_decode = decode_kda(
-        _match_rows(mixed_qkv, num_seqs),
-        _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads, head_dim),
-        _activate_beta(_match_rows(beta, num_seqs)),
+        _match_rows(mixed_qkv, num_decode_rows),
+        _match_rows(raw_gate, num_decode_rows).reshape(num_decode_rows,
+                                                       num_heads, head_dim),
+        _activate_beta(_match_rows(beta, num_decode_rows)),
         conv_in,
         conv_weight,
         recurrent_state,
         a_log,
         dt_bias.reshape(num_heads, head_dim),
-        _null_out_non_decode(state_indices, decode_end),
-        has_initial_state,
+        _match_rows(_null_out_non_decode(state_indices, decode_end),
+                    num_decode_rows),
+        _match_rows(has_initial_state, num_decode_rows),
         lower_bound=lower_bound,
         # The pool is [slots, H, K, V], which is the layout the recurrence
         # indexes as state[k, v]; no in-kernel swap.

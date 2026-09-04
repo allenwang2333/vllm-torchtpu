@@ -701,6 +701,88 @@ def test_keep_vllm_layout_marker_decides_the_stored_weight_shape() -> None:
     assert tuple(plain.weight.shape) == (n_in, n_out)
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "num_seqs", "expected_rows"),
+    [
+        (1, 8, 1),  # c=1: the request bucket is 8x the token bucket
+        (8, 8, 8),  # buckets agree: unchanged
+        (16, 8, 8),  # prefill: the request bucket is the smaller one
+    ])
+def test_kda_decode_segment_never_exceeds_the_token_bucket(
+        monkeypatch: pytest.MonkeyPatch, num_tokens: int, num_seqs: int,
+        expected_rows: int) -> None:
+    """The decode grid is one step per *row*, and rows are capped by tokens.
+
+    `num_seqs` (MIN_NUM_SEQS) and `num_tokens` (compile_sizes) are sized
+    independently, so at c=1 the request bucket is 8x the token bucket and
+    every extra grid step is null work on the reserved slot.
+    """
+    import jax.numpy as jnp
+
+    heads, head_dim, kernel = 2, 4, 4
+    seen: dict[str, int] = {}
+
+    def fake_decode_kda(mixed_qkv, g, beta, conv_state, state_weight, state,
+                        *args, **kwargs):
+        del state_weight, kwargs
+        state_indices, has_initial_state = args[-2], args[-1]
+        seen.update(rows=mixed_qkv.shape[0],
+                    gate=g.shape[0],
+                    beta=beta.shape[0],
+                    indices=state_indices.shape[0],
+                    has_initial=has_initial_state.shape[0])
+        out = jnp.zeros((mixed_qkv.shape[0], heads, head_dim), mixed_qkv.dtype)
+        return out, conv_state, state
+
+    def fake_short_conv(mixed_qkv, conv_state, *args, **kwargs):
+        del args, kwargs
+        return jnp.zeros_like(mixed_qkv), conv_state
+
+    def fake_chunk_kda(q, *args, **kwargs):
+        del args
+        n_max = kwargs["N_max"]
+        return (jnp.zeros((q.shape[0], 1, q.shape[2], q.shape[3]), q.dtype),
+                jnp.zeros((1, n_max, heads, head_dim, head_dim), jnp.float32))
+
+    monkeypatch.setattr(kimi_custom_ops, "decode_kda", fake_decode_kda)
+    monkeypatch.setattr(kimi_custom_ops, "kimi_short_conv_scan",
+                        fake_short_conv)
+    monkeypatch.setattr(kimi_custom_ops, "chunk_kda", fake_chunk_kda)
+
+    def bf16(*shape):
+        return jnp.zeros(shape, jnp.bfloat16)
+
+    output, _conv, _pool = kimi_custom_ops._dispatched_kda_core(
+        bf16(num_tokens, 3 * heads * head_dim),
+        bf16(num_tokens, heads * head_dim),
+        bf16(num_tokens, heads),
+        bf16(num_tokens, heads * head_dim),
+        jnp.zeros((num_seqs + 1, kernel - 1, 3, heads, head_dim),
+                  jnp.bfloat16),
+        jnp.zeros((num_seqs + 1, heads, head_dim, head_dim), jnp.float32),
+        bf16(kernel, 3, heads, head_dim),
+        jnp.zeros(heads, jnp.float32),
+        jnp.zeros(heads * head_dim, jnp.float32),
+        bf16(head_dim),
+        jnp.arange(num_seqs + 1, dtype=jnp.int32),
+        jnp.arange(1, num_seqs + 1, dtype=jnp.int32),
+        jnp.ones(num_seqs, jnp.int32),
+        jnp.asarray([1, 1, 1], jnp.int32),
+        lower_bound=None,
+        eps=1e-5,
+    )
+
+    assert seen == {
+        "rows": expected_rows,
+        "gate": expected_rows,
+        "beta": expected_rows,
+        "indices": expected_rows,
+        "has_initial": expected_rows,
+    }
+    # Whatever the segment produced, the caller still returns token rows.
+    assert output.shape == (num_tokens, heads, head_dim)
+
+
 class _Projection(nn.Module):
 
     def __init__(self, output_size: int) -> None:
