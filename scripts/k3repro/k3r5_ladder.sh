@@ -44,7 +44,9 @@ REPS="${REPS:-3}"
 # REGRESSION, not a win. Both projections are also genuinely M=1 at decode pad 1, so
 # XLA may take the matvec off the MXU onto a VPU broadcast/multiply/reduce. Both are
 # CPU-checkable in minutes; a ~50 min pod lifetime is the wrong way to find out.
-ARMS_DEFAULT="base c1_compactscale hierep stacked"
+# base is the denominator and mandatory; k1 carries the largest single lever and a
+# locked prediction; e8m0 is the smallest and the one to lose if the disk runs out.
+ARMS_DEFAULT="base k1 e8m0"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -58,18 +60,18 @@ rc=0
 # "the flag was set" and "the program changed" are two different claims and an
 # env-gated patch that silently reuses the previous arm's executable is exactly
 # the r3 A/B that had to be voided.
-K3_GATES="TPU_K3_FP8_LATENT_PROJ K3_KDA_OPROJ_RELAYOUT TPU_MOE_COMPACT_SCALE K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
+K3_GATES="TPU_K3_FP8_LATENT_PROJ TPU_KDA_GPROJ_LAYOUT TPU_MOE_COMPACT_SCALE K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
 arm_env() {
   case "$1" in
     base)     echo "" ;;                                    # the control, all gates off
-    c1)       echo "K3_KDA_OPROJ_RELAYOUT=1" ;;             # lane I1: KDA o_proj load-time relayout
+    c1)       echo "TPU_KDA_GPROJ_LAYOUT=${K3_C1_LAYOUT:-lane_major}" ;;  # lane I1: KDA g_proj relayout (default head_major)
     # Compact MoE scale. e8m0 over bf16 because it is the same diff for twice the
     # win (43,008 -> 21,504 -> 10,752 granules) and equally lossless: E8M0 encodes
     # powers of two, which both float8_e8m0fnu and bf16 hold exactly, so the
     # arithmetic is unchanged and no accuracy run is owed.
     e8m0)     echo "TPU_MOE_COMPACT_SCALE=e8m0" ;;
     c1e8m0|c1_compactscale)
-              echo "K3_KDA_OPROJ_RELAYOUT=1 TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
+              echo "TPU_KDA_GPROJ_LAYOUT=${K3_C1_LAYOUT:-lane_major} TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
     k1)       echo "TPU_K3_FP8_LATENT_PROJ=1" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
     hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;  # lane I2: env + loader patch
     stacked)  echo "$(arm_env c1_compactscale) $(arm_env k1) $(arm_env hierep)" ;;
@@ -184,7 +186,18 @@ run_lifetime() {  # <arm> <config> <cells...>  where a cell is "conc:num_prompts
   bash "$CLEANUP" || true
 }
 
+# ~10.6 GB per server lifetime against a shared 100 GB boot disk. Losing the
+# last arm to a full disk is acceptable; losing the first two to a death
+# mid-write is not, so stop cleanly and let the summary still run.
+MIN_FREE_MB="${MIN_FREE_MB:-15000}"
 for arm in ${*:-$ARMS_DEFAULT}; do
+  free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  if [ "${free_mb:-0}" -lt "$MIN_FREE_MB" ]; then
+    say "SKIPPING arm ${arm} and everything after it: ${free_mb} MB free < ${MIN_FREE_MB} MB floor"
+    rc=1
+    break
+  fi
+  say "disk before ${arm}: ${free_mb} MB free"
   env_list="$(arm_env "$arm")"
   if [ "$env_list" = "__UNKNOWN__" ]; then say "unknown arm '$arm' -- skipped"; rc=1; continue; fi
   echo ""
@@ -195,7 +208,13 @@ for arm in ${*:-$ARMS_DEFAULT}; do
     # The capture rides the control arm: it is the one whose serve flags are the
     # shipping recipe, so its decode window describes what we actually ship.
     case " ${K3_PROFILE_ARMS:-base} " in *" $arm "*) export K3_PROFILE_CAPTURE=1 ;; *) export K3_PROFILE_CAPTURE=0 ;; esac
+    # The environment, read back from the environment. "I exported it" and "the
+    # process has it" are different claims, and a silently unset gate reproduces
+    # the base numbers under the arm's label -- a clean-looking null.
+    { echo -n "--- [ladder] [env-audit] arm=${arm}"; for g in $K3_GATES; do
+        printf ' %s=%s' "$g" "$(printenv "$g" 2>/dev/null || echo '<unset>')"; done; echo; }
     clear_compile_cache
+    if ! arm_preflight "$arm"; then rc=1; exit 0; fi
     run_lifetime "$arm" kimi-k3-tp32-ep-best-lo ${K3_CELLS_LO:-1:8 2:8 4:16 8:32}
     # The hi rung needs its OWN lifetime (max_num_seqs 8 -> 32 is a server flag),
     # i.e. a second ~20-50 min bring-up per arm. On a one-agent queue that is the
