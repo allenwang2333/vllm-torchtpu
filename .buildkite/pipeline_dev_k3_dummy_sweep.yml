@@ -1,0 +1,41 @@
+# Kimi-K3 concurrency sweep on CURRENT MAIN, dummy weights, tpu7x-32.
+#
+# Zero source changes: git diff gh/main -- src/ is empty on this branch. That is
+# only possible with dummy weights -- serving the gs:// URI with real weights
+# needs `runai_repull` from open PR #539, without which every off-head rank dies
+# resolving the head-local streamer cache dir (build 362). Dummy serves the HF
+# repo id, which resolves identically on all four hosts, so this is the widest
+# coverage obtainable on unmodified main today.
+#
+# One pod step, two server lifetimes, three repeats per cell:
+#   max_num_seqs 8   -> c = 1, 2, 4, 8   (MLA tuned row hits)
+#   max_num_seqs 32  -> c = 16, 32       (tuned row cannot hit -- see the config)
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_dummy_sweep.yml.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":chart_with_upwards_trend: K3 TP32 dummy-weight concurrency sweep on main (8k/1k, c=1..32)"
+    key: k3_dummy_sweep
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      # The sweep compiles a bucket per decode batch size; the CI image would
+      # otherwise make the first request at a new shape fatal.
+      VLLM_XLA_CHECK_RECOMPILATION: "0"
+      SKIP_DB_UPLOAD: "1"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/k3repro/k3_dummy_sweep.sh"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
