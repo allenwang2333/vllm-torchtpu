@@ -93,19 +93,34 @@ reduce_tree() {  # <capture root> <output root> <label>
     df -h . 2>/dev/null | tail -2
   } > "${dst}/trace_census.txt"
   say "$label: $(grep -c 'xplane.pb' "${dst}/trace_census.txt" || echo 0) xplane files"
+  # ONE OUTPUT DIRECTORY PER CAPTURE TIMESTAMP, not per phase. The profiler is
+  # armed once per benchmark cell, so two concurrencies produce two sibling
+  # <ts> dirs under <phase>/plugins/profile/ whose files have IDENTICAL names
+  # (rank0_<host>.xplane.pb in both). xprof_reduce keys its output on that
+  # basename alone, so reducing the phase dir writes both armings to the same
+  # planes/<base>__<plane>.json.gz and the second silently overwrites the
+  # first: build 367 shipped a 98 MB bundle that had lost its entire c=1
+  # window, with no error anywhere. Reduce each <ts> separately.
+  local tsdir ts
+  while IFS= read -r tsdir; do
+    [ -d "$tsdir" ] || continue
+    ts="$(basename "$tsdir")"
+    phase="$(basename "$(dirname "$(dirname "$tsdir")")")"
+    say "  reducing ${label}/${phase}/${ts}"
+    "${PY[@]}" "$REDUCE" --root "$tsdir" --out "${dst}/${phase}/${ts}" --slim rank0 --meta-from rank0 || true
+    gzip -f "${dst}/${phase}/${ts}"/slim/*.slim.xplane.pb 2>/dev/null || true
+  done < <(find "$src" -type d -path '*/plugins/profile/*' -mindepth 3 -maxdepth 3 2>/dev/null | sort)
+  # The per-step batch composition stats stay in the rank sandboxes and are the
+  # proof the window is decode-only. They are tiny, they cover every arming, and
+  # they must not be lost.
   while IFS= read -r pdir; do
     cap="$(dirname "$(dirname "$pdir")")"
     phase="$(basename "$cap")"
-    say "  reducing ${label}/${phase}"
-    "${PY[@]}" "$REDUCE" --root "$cap" --out "${dst}/${phase}" --slim rank0 --meta-from rank0 || true
-    # The per-step batch composition stats stay in the rank sandboxes and are
-    # the proof the window is decode-only. They are tiny and must not be lost.
     mkdir -p "${dst}/${phase}/stats"
     while IFS= read -r -d '' f; do
       mkdir -p "${dst}/${phase}/stats/$(basename "$(dirname "$f")")"
       cp "$f" "${dst}/${phase}/stats/$(basename "$(dirname "$f")")/" || true
     done < <(find "$cap" -name 'batch_composition_stats_*.json' -print0 2>/dev/null)
-    gzip -f "${dst}/${phase}"/slim/*.slim.xplane.pb 2>/dev/null || true
   done < <(find "$src" -type d -path '*/plugins/profile' 2>/dev/null | sort)
 }
 
@@ -153,9 +168,12 @@ if [ "$RIG" = "tp32" ]; then
       rm -rf \"\$DST\"; mkdir -p \"\$DST\"
       [ -d \"\$SRC\" ] || { echo \"host${widx}: no capture at \$SRC\" >&2; exit 0; }
       find \"\$SRC\" -name '*.xplane.pb' -printf '%s\t%p\n' 2>/dev/null | sort -rn > \"\$DST/trace_census.txt\"
+      find \"\$SRC\" -mindepth 3 -maxdepth 3 -type d -path '*/plugins/profile/*' | sort | while read -r t; do
+        ts=\$(basename \"\$t\"); phase=\$(basename \$(dirname \$(dirname \"\$t\")))
+        python3 ~/xprof_reduce.py --root \"\$t\" --out \"\$DST/\$phase/\$ts\" --slim none --meta-from none >&2 || true
+      done
       find \"\$SRC\" -type d -path '*/plugins/profile' | sort | while read -r p; do
         cap=\$(dirname \$(dirname \"\$p\")); phase=\$(basename \"\$cap\")
-        python3 ~/xprof_reduce.py --root \"\$cap\" --out \"\$DST/\$phase\" --slim none --meta-from none >&2 || true
         mkdir -p \"\$DST/\$phase/stats\"
         find \"\$cap\" -name 'batch_composition_stats_*.json' -print0 | while IFS= read -r -d '' f; do
           r=\$(basename \$(dirname \"\$f\")); mkdir -p \"\$DST/\$phase/stats/\$r\"; cp \"\$f\" \"\$DST/\$phase/stats/\$r/\" || true
@@ -165,11 +183,21 @@ if [ "$RIG" = "tp32" ]; then
     say "  host${widx} (${ip}): $(du -h "$tgz" 2>/dev/null | cut -f1)"
     upload "$tgz"
     # Leave nothing behind: the boot disk is 100 GB and the raw traces are GBs.
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" \
-      "rm -rf /tmp/k3r5_xpr_${BUILD} ~/xprof_reduce.py; sudo -n rm -rf \"\$HOME/hf_home/k3r5_profile/tp32/${BUILD}\" 2>/dev/null || true" || true
+    # Keep the raw traces unless asked to drop them. Build 367's bundle lost a
+    # whole window to a silent overwrite and the raws had already been deleted,
+    # which turned a re-reduce into a re-run of the pod.
+    if [ "${K3_DROP_RAW:-0}" = "1" ]; then
+      ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" \
+        "rm -rf /tmp/k3r5_xpr_${BUILD} ~/xprof_reduce.py; sudo -n rm -rf \"\$HOME/hf_home/k3r5_profile/tp32/${BUILD}\" 2>/dev/null || true" || true
+    else
+      ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "rm -rf /tmp/k3r5_xpr_${BUILD} ~/xprof_reduce.py" || true
+    fi
   done
-  sudo -n rm -rf "${HOME}/hf_home/k3r5_profile/tp32/${BUILD}" 2>/dev/null \
-    || rm -rf "${HOME}/hf_home/k3r5_profile/tp32/${BUILD}" 2>/dev/null || true
+  if [ "${K3_DROP_RAW:-0}" = "1" ]; then
+    sudo -n rm -rf "${HOME}/hf_home/k3r5_profile/tp32/${BUILD}" 2>/dev/null || true
+  else
+    say "raw traces kept at ${HOME}/hf_home/k3r5_profile/tp32/${BUILD} (K3_DROP_RAW=1 to drop)"
+  fi
 fi
 
 say "collected:"
