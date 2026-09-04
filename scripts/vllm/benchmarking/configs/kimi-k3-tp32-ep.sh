@@ -2,40 +2,28 @@
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Nightly perf benchmark for Kimi-K3 on the multihost TPU v7x-32 pod
 # (4 hosts x 8 chips): TP=32 with EP. Single-request latency probe at
-# 8k in / 1k out. Baseline calibrated on the pod from two dev-pipeline
-# runs with run-to-run spread <= 0.3% on every gated metric — the
+# 8k in / 1k out. Baseline calibrated on the pod from three repeats in one
+# server lifetime, run-to-run spread <= 0.3% on every gated metric — the
 # default 5% perf tolerance applies.
-# Serve flags below are the set measured by a TP32 A/B campaign on this exact
-# rig; each is a flag, none is a source change. Measured on the full 1561 GB
-# checkpoint, real weights, 8192/1024, c=1, against this config's own previous
-# settings:
+# Serve flags select the tuned MLA path for this model on this topology. The v2
+# MLA tuning table carries an entry for K3 at TP32 keyed on (max_num_tokens,
+# q_heads, kv_dtype, page_size_per_kv_packing, max_num_seqs, pages_per_seq), and
+# the settings below are what set those fields:
 #
-#   --block-size 256                  -42.6% TTFT   (dev build 311 vs 289)
-#   MLA tuned-row geometry            -30.4% TTFT   (dev build 317)
-#   --async-scheduling                -24.2% TPOT   (dev build 327)
-#   compile_sizes[0] = 1              -21.0% TPOT   (dev build 338)
+#   max_num_tokens           <- MAX_NUM_BATCHED_TOKENS 8192 + compile size 8192
+#   actual_num_q_heads       <- 96 / TP32 = 3
+#   kv_dtype                 <- KV_CACHE_DTYPE fp8
+#   page_size_per_kv_packing <- block size 256 / kv_packing 4 = 64
+#   max_num_seqs             <- MAX_NUM_SEQS 8
+#   pages_per_seq            <- ceil(MAX_MODEL_LEN 10240 / block size 256) = 40
 #
-#   together: TTFT 4038.1 -> 995.2 ms (-75.4%), TPOT 30.899 -> 18.954 ms
-#   (-38.7%), output 28.7 -> 50.2 tok/s (1.75x). Dev build 365, 3 repeats,
-#   spread 0.26% TTFT / 0.01% TPOT.
+# Changing max-model-len, block-size, kv-cache-dtype or max-num-seqs drops the
+# lookup to the untuned fallback with no warning, so treat those four as one
+# setting rather than four. The table has no K3 TP32 entry above max_num_seqs 8,
+# which is why this config stays a single-request latency probe.
 #
-# The MLA tuned row is the fragile part. kernels/mla/v2/tuned_params.py:1169 is
-# keyed on the exact tuple below, and four flags here set it:
-#   max_num_tokens 8192      <- MAX_NUM_BATCHED_TOKENS 8192 + compile size 8192
-#   actual_num_q_heads 3     <- 96 / TP32
-#   kv_dtype float8_e4m3fn   <- KV_CACHE_DTYPE fp8
-#   page_size_per_kv_packing <- block_size 256 / kv_packing 4 = 64
-#   max_num_seqs 8           <- MAX_NUM_SEQS 8
-#   pages_per_seq 40         <- ceil(MAX_MODEL_LEN 10240 / 256)
-# Change any one of max-model-len, block-size, kv-cache-dtype or max-num-seqs
-# and the row stops matching: the kernel falls back silently and TTFT returns
-# to ~2050 ms. There are exactly two K3 TP32 rows in that table and both are
-# keyed max_num_seqs=8, which is also why this config cannot be run above c=8.
-#
-# NOT enabled: TPU_MOE_HIERARCHICAL_EP=1, worth a further -7.3%..-9.6% TPOT.
-# On the runai_streamer path it serves a model whose expert weights are never
-# initialised unless the loader realignment fix is applied, and that fix is not
-# on main. A fast number from a broken model is worth less than no number.
+# compile_sizes[0] = 1: a decode step is padded up to the next compiled size, so
+# without a 1 in the list a single-sequence step runs a 16-token shape.
 MODEL="moonshotai/Kimi-K3"
 # v7x-32 hosts have no data disk that fits the 1561 GB checkpoint, so
 # weights stream directly from GCS via --load-format runai_streamer.
@@ -64,11 +52,9 @@ NUM_PROMPTS=64
 # 8192:1024 lengths, so TTFT/TPOT medians are comparable run to run.
 RANDOM_RANGE_RATIO="0.0"
 
-# Server configuration (mirrors the proven multihost bring-up recipe):
-# - max-model-len=9216: exact nominal length for 8192 in + 1024 out.
-# - max-num-batched-tokens=512 / max-num-seqs=1: bs=1 latency regime.
-# 10240, not 9216: pages_per_seq = ceil(max_model_len / block_size) must be 40
-# for the tuned MLA row below. Still covers 8192 in + 1024 out.
+# Server configuration:
+# 10240 gives pages_per_seq 40 at block size 256, the value the tuned MLA entry
+# is keyed on. Still the exact nominal length for 8192 in + 1024 out.
 MAX_MODEL_LEN=10240
 MAX_NUM_BATCHED_TOKENS=8192
 MAX_NUM_SEQS=8
