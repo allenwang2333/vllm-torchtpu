@@ -138,30 +138,14 @@ def _compute_gdn_tile(
     compute_qkv_ref: jax.Array,
     *,
     cfg: config.GDNConfig,
-    comm_chunk_size: int,
 ) -> None:
     """Convert one received BF16 tile and run the existing GDN inner kernel."""
     p_id = pl.program_id(0)
     stage = stage_metadata_ref.tile_stage[p_id]
     recv_slot = lax.rem(stage, 2)
-    token_start = pl.multiple_of(
-        stage_metadata_ref.tile_row_in_stage[p_id],
-        16,
-    )
-    source_rank = token_start // comm_chunk_size
-    source_offset = lax.rem(token_start, comm_chunk_size)
-    source_row = stage_metadata_ref.rank_row_start[stage, source_rank]
-    source_prefix = lax.rem(source_row, _TPU_TILE_ROWS)
-    receive_group_stride = _qkv_receive_group_stride(
-        comm_chunk_size,
-        cfg.tile_size,
-    )
-    receive_group_start = (source_rank * receive_group_stride +
-                           source_offset // _TPU_TILE_ROWS)
-    tile_prefix = lax.rem(
-        source_prefix + source_offset,
-        _TPU_TILE_ROWS,
-    )
+    token_start = stage_metadata_ref.tile_qkv_row_in_stage[p_id]
+    receive_group_start = token_start // _TPU_TILE_ROWS
+    tile_prefix = lax.rem(token_start, _TPU_TILE_ROWS)
 
     def _load_qkv(prefix: int) -> None:
 
@@ -412,7 +396,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         local_groups = lax.select(is_local, valid_groups, 0)
         remote_groups = lax.select(is_local, 0, valid_groups)
         src_group = src_row // _TPU_TILE_ROWS
-        dst_group = rank * receive_group_stride
+        dst_row = stage_metadata_ref.rank_qkv_recv_start[stage, rank]
+        dst_group = (dst_row - src_prefix) // _TPU_TILE_ROWS
 
         pltpu.make_async_copy(
             src_ref=projected_qkv_ref.at[
@@ -916,7 +901,6 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             received_qkv_ref,
             compute_qkv_ref,
             cfg=cfg,
-            comm_chunk_size=comm_chunk_size,
         )
 
         @pl.when(projection_is_active)
@@ -1187,6 +1171,7 @@ def _scatter_compact_state_updates(
         "kernel_size",
         "pcp_size",
         "comm_chunk_size",
+        "interleave_size",
         "mixed_tile_size",
         "compute_precision",
         "mesh_axis_names",
@@ -1217,6 +1202,7 @@ def fused_qkvz_projection_pcp_gdn(
     kernel_size: int,
     pcp_size: int,
     comm_chunk_size: int,
+    interleave_size: int,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
     state_plan: config.StateSourcePlan,
@@ -1230,7 +1216,9 @@ def fused_qkvz_projection_pcp_gdn(
     value-head shard. state_source is this rank's unified KV pool; state_plan
     describes its conv and recurrent byte regions. Runtime stage metadata
     handles mixed request lengths and arbitrary absolute query offsets without
-    expanding active work to the compile bucket.
+    expanding active work to the compile bucket. ``interleave_size`` defines
+    public token ownership; ``comm_chunk_size`` independently bounds the fused
+    kernel's projection, communication, and double-buffered VMEM windows.
     """
     if pcp_size <= 1:
         raise ValueError("The PCP fused GDN kernel requires pcp_size > 1.")
@@ -1244,6 +1232,13 @@ def fused_qkvz_projection_pcp_gdn(
             f"{mesh_axis_names!r}.")
     if comm_chunk_size <= 0:
         raise ValueError("comm_chunk_size must be positive.")
+    if interleave_size < comm_chunk_size:
+        raise ValueError("interleave_size must be at least comm_chunk_size: "
+                         f"{interleave_size=} {comm_chunk_size=}.")
+    if interleave_size % comm_chunk_size != 0:
+        raise ValueError("interleave_size must be divisible by "
+                         f"comm_chunk_size: {interleave_size=} "
+                         f"{comm_chunk_size=}.")
     dma_row_alignment = 8 * (4 // hidden_states.dtype.itemsize)
     if comm_chunk_size % dma_row_alignment != 0:
         raise ValueError(
@@ -1415,6 +1410,7 @@ def fused_qkvz_projection_pcp_gdn(
             projection_token_block_size=projection_cfg.token_block_size,
             num_qkv_out_blocks=num_qkv_out_blocks,
             num_projection_out_blocks=num_projection_out_blocks,
+            interleave_size=interleave_size,
         ))
     metadata_spec = jax.tree.map(
         lambda _: pl.BlockSpec(memory_space=pltpu.SMEM),
@@ -1553,8 +1549,8 @@ def fused_qkvz_projection_pcp_gdn(
     carry_shapes = cfg.get_scratch_shape_dict()
     projection_dtype_name = ("fp8" if projection_cfg.quantized else "bf16")
     kernel_name = ("fused_pcp_qkvz_projection_gdn_per_seq_compact_qkv"
-                   f"_{projection_dtype_name}_c{comm_chunk_size}_p{pcp_size}"
-                   "_pooled")
+                   f"_{projection_dtype_name}_i{interleave_size}"
+                   f"_c{comm_chunk_size}_p{pcp_size}_pooled")
     # The compiler may retain more transient tiles as this limit rises. Use
     # the same 90% hardware budget as the production GMM kernels.
     vmem_limit_bytes = int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)

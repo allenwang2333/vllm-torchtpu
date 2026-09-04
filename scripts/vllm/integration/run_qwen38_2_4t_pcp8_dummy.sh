@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Bring up the official Qwen3.8-2.4T-A95B config with eight transformer
-# layers, dummy weights, and single-host PCP=8. Only the layer count is pruned;
-# GDN heads, full-attention heads and MoE experts keep the official model
-# geometry. This is a startup smoke test and does not reproduce the rank-local
-# shapes or collectives of the future 32-rank deployment.
+# layers, dummy weights, and single-host PCP=8. The GDN head geometry is
+# reduced to K/Q=8 and V=32 so each PCP rank gets K/Q=1 and V=4, matching the
+# worst-case rank-local head allocation planned for the 32-rank deployment.
 
 set -Eeuo pipefail
 
@@ -18,13 +17,16 @@ unset VLLM_BIN
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-18080}"
 
-# Keep the Hugging Face files pristine: all smoke-test pruning is applied at
-# runtime. Eight layers select exactly two
-# [linear_attention x3, full_attention] cycles. Head counts and expert counts
-# remain at their official values; PCP8 therefore uses ordinary GDN sharding
-# from K/Q=16 and V=128 to K/Q=2 and V=16 per rank.
+# Keep the Hugging Face files pristine: all smoke-test pruning and GDN head
+# overrides are applied at runtime. Eight layers select exactly two
+# [linear_attention x3, full_attention] cycles. Full-attention heads and MoE
+# experts keep the official model geometry.
 NUM_HIDDEN_LAYERS="${NUM_HIDDEN_LAYERS:-8}"
-HF_OVERRIDES="${HF_OVERRIDES:-{\"num_hidden_layers\":${NUM_HIDDEN_LAYERS}}}"
+LINEAR_NUM_KEY_HEADS="${LINEAR_NUM_KEY_HEADS:-8}"
+LINEAR_NUM_VALUE_HEADS="${LINEAR_NUM_VALUE_HEADS:-32}"
+if [[ -z "${HF_OVERRIDES:-}" ]]; then
+  HF_OVERRIDES="{\"num_hidden_layers\":${NUM_HIDDEN_LAYERS},\"linear_num_key_heads\":${LINEAR_NUM_KEY_HEADS},\"linear_num_value_heads\":${LINEAR_NUM_VALUE_HEADS}}"
+fi
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 # This is the global scheduler budget. PCP8 compiles the corresponding
 # rank-local 512-token bucket (4096 global tokens).
@@ -39,11 +41,12 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.75}"
 # Keep the VMEM bring-up tuning scoped to this launch. With a 256-token query
 # block the kernel's default q_compute_size is also 256.
 PCP_Q_BLOCK_SIZE="${PCP_Q_BLOCK_SIZE:-256}"
-# BF16 GDN QKVZ projection doubles the weight-tile footprint. Keep the
-# correctness-first communication chunk small enough for the fused
-# projection/A2A/GDN program to fit in TPU VMEM.
-PCP_KV_INTERLEAVE_SIZE="${PCP_KV_INTERLEAVE_SIZE:-16}"
-ADDITIONAL_CONFIG="${ADDITIONAL_CONFIG:-{\"pcp_streaming_rpa_q_block_size\":${PCP_Q_BLOCK_SIZE}}}"
+# Keep the public PCP token ownership/layout at the production-like value.
+PCP_KV_INTERLEAVE_SIZE="${PCP_KV_INTERLEAVE_SIZE:-256}"
+# With the reduced rank-local GDN geometry, the fused projection/A2A/GDN
+# staging chunk fits at the full public interleave size.
+PCP_GDN_COMM_CHUNK_SIZE="${PCP_GDN_COMM_CHUNK_SIZE:-256}"
+ADDITIONAL_CONFIG="${ADDITIONAL_CONFIG:-{\"pcp_streaming_rpa_q_block_size\":${PCP_Q_BLOCK_SIZE},\"pcp_gdn_comm_chunk_size\":${PCP_GDN_COMM_CHUNK_SIZE}}}"
 # The default directory is the official serialized-FP8 metadata, matching the
 # Qwen3.5 daily launch while dummy loading avoids all weight downloads. Its
 # config still declares BF16 model/activation dtype and controls exactly which

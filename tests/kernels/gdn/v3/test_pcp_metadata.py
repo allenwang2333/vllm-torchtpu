@@ -139,6 +139,47 @@ def test_schedule_splits_cross_request_batch_flat_pcp_rounds():
     )
 
 
+def test_pipeline_chunk_can_be_smaller_than_layout_interleave():
+    cfg = _cfg(batch_size=64, tile_size=4)
+    seq_lens, query_start, state_indices, distribution = _metadata_inputs(
+        lengths=[64],
+        offsets=[0],
+        max_num_seqs=2,
+    )
+
+    metadata, schedule = pcp_metadata.compute_pcp_stage_metadata(
+        cfg,
+        seq_lens,
+        query_start,
+        state_indices,
+        distribution[0],
+        distribution[-1],
+        pcp_size=4,
+        comm_chunk_size=4,
+        interleave_size=16,
+        projection_token_block_size=8,
+        num_qkv_out_blocks=4,
+        num_projection_out_blocks=8,
+    )
+
+    assert int(schedule.num_stages) == 4
+    np.testing.assert_array_equal(np.asarray(schedule.num_tokens[:4]),
+                                  [16, 16, 16, 16])
+    np.testing.assert_array_equal(
+        np.asarray(schedule.rank_valid_rows[:4]),
+        [[16, 0, 0, 0], [0, 16, 0, 0], [0, 0, 16, 0],
+         [0, 0, 0, 16]],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(schedule.rank_row_start[:4]),
+        [[0, 0, 0, 0], [16, 0, 0, 0], [16, 16, 0, 0],
+         [16, 16, 16, 0]],
+    )
+    np.testing.assert_array_equal(np.asarray(schedule.rank_active_row_end),
+                                  [16, 16, 16, 16])
+    assert int(metadata.num_tiles) == 16
+
+
 def test_dual_coordinates_separate_token_ownership_from_absolute_state():
     cfg = _cfg(batch_size=128, tile_size=4)
     seq_lens, query_start, state_indices, distribution = _metadata_inputs(

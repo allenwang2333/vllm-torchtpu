@@ -1025,9 +1025,12 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    comm_chunk_size: int | None = None,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
+    if comm_chunk_size is None:
+        comm_chunk_size = interleave_size
     pcp_axis = "pcp"
     if pcp_axis not in mesh.axis_names:
         raise NotImplementedError(
@@ -1176,7 +1179,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             d_v=d_v,
             kernel_size=kernel_size,
             pcp_size=pcp_size,
-            comm_chunk_size=interleave_size,
+            comm_chunk_size=comm_chunk_size,
+            interleave_size=interleave_size,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
             state_plan=state_plan,
