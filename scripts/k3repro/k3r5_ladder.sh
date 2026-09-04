@@ -112,7 +112,15 @@ clear_compile_cache() {
   du -sh /dev/shm/torch_tpu_cache /root/.cache/vllm /root/.cache/huggingface /perf_eval_results 2>/dev/null | sed 's/^/    /' || true
   df -Pm / /dev/shm 2>/dev/null | sed 's/^/    /' || true
   rm -rf /dev/shm/torch_tpu_cache 2>/dev/null || true
-  say "compile cache cleared (every arm changes code or env, so it was invalid anyway)"
+  # A POSITIVE signal, not an assumption. The cache is not keyed on env vars or
+  # libtpu flags, so a stale hit would run the BASE program under this arm's
+  # label and report a perfect, clean null -- indistinguishable from a real
+  # negative, and it would retire a candidate on an artifact.
+  if [ -e /dev/shm/torch_tpu_cache ]; then
+    say "WARNING: /dev/shm/torch_tpu_cache still present after rm -- arm may reuse a stale program"
+  else
+    say "compile cache absent at arm start (proved, not assumed)"
+  fi
 }
 # Prints the gate values NEXT TO the compile time on purpose: an arm is only
 # honest if both "the flag was set" and "the program was rebuilt" are true.
@@ -123,6 +131,12 @@ report_compile_seconds() {  # <server log>
   local g gates=""
   for g in $K3_GATES; do gates="${gates}${g}=${!g:-0} "; done
   ARM_COMPILE_SECONDS="$(printf '%s' "${s:-}" | grep -oE '[0-9]+\.?[0-9]*' | tail -1)"
+  # ~45 s fresh against ~23 s cached. An arm that reports a cache-hit compile
+  # time did not run its own program, whatever its env said.
+  if [ -n "${ARM_COMPILE_SECONDS:-}" ] && awk "BEGIN{exit !(${ARM_COMPILE_SECONDS} < 30)}"; then
+    say "WARNING: compile ${ARM_COMPILE_SECONDS}s looks like a CACHE HIT -- treat this arm as suspect"
+  fi
+  say "cache dir after boot: $(du -sh /dev/shm/torch_tpu_cache 2>/dev/null | cut -f1 || echo absent)"
   say "compile: ${s:-<not reported>} | gates: ${gates}"
 }
 # Void the arm rather than print a line: hierarchical EP that silently falls
