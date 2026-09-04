@@ -179,22 +179,32 @@ report_compile_seconds() {  # <server log>
 # silent fallback on 28 ranks would pass. It is still counted and printed,
 # because a non-zero count is informative even though a zero is not.
 # `MOE_REQUANTIZE_BLOCK_SIZE=None` means "unset", which from outside looks exactly
-# like the default -- so this arm's most likely failure is a clean null from an
-# env var that never took, and it would read as a duplicate of baseline.
+# like the default, so an env var that never took would report a clean null.
 #
-# The decisive evidence is the kernel selected at LOAD time, before any number
-# exists: `pallas::nvfp4_requant_kmajor_b256` if the block size took,
-# `pallas::nvfp4_load_kmajor` if it did not. Name-matching the profile cannot
-# substitute -- the gmm_v2 kernel's name is byte-identical in both arms.
+# BUT: build 378 proved this gate can also fail in the OPPOSITE direction. Both
+# its arms logged ZERO `nvfp4_*` and zero `pallas::` strings -- this rig's server
+# log does not name kernels at all -- so the gate voided the treatment arm for a
+# reason that had nothing to do with the treatment, and would have voided the
+# baseline too had it been applied there. A gate that cannot pass is exactly as
+# useless as a gate that cannot fail, and it is more dangerous because it
+# destroys a good arm instead of blessing a bad one.
+#
+# So: void only when the log DOES name kernels and names the wrong one. When it
+# names none, say UNINFORMATIVE, keep the arm, and fall back to the evidence we
+# do have -- the [env-audit] readback that the variable reached the process, and
+# the capture's own operand shapes after the fact.
 requant_gate() {  # <server log>
   local took missed
   took=$(grep -c 'nvfp4_requant_kmajor_b256' "$1" 2>/dev/null || echo 0)
   missed=$(grep -c 'nvfp4_load_kmajor' "$1" 2>/dev/null || echo 0)
   say "requant gate: nvfp4_requant_kmajor_b256=${took} nvfp4_load_kmajor=${missed}"
-  if [ "$took" -eq 0 ]; then
-    say "REQUANT GATE FAILED -- the block size did not take; this arm is a duplicate of baseline. VOID"
+  if [ "$took" -gt 0 ]; then return 0; fi
+  if [ "$missed" -gt 0 ]; then
+    say "REQUANT GATE FAILED -- the log names the load kernel and not the requant one; the block size did not take. VOID"
     return 1
   fi
+  say "requant gate UNINFORMATIVE: this log names no nvfp4 kernel in either arm, so absence proves nothing."
+  say "  falling back to the [env-audit] readback above and to the capture's operand shapes."
   return 0
 }
 
