@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_K3_FP8_LATENT_PROJ: bool = False
+    TPU_K3_MXFP4_LATENT_PROJ: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -429,6 +430,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --kv-cache-dtype fp8, so the two numerics changes compound.
     "TPU_K3_FP8_LATENT_PROJ":
     env_bool("TPU_K3_FP8_LATENT_PROJ"),
+
+    # As above but MXFP4 at block 256, which is ~1.5x the byte saving of fp8
+    # for the same two weights and lands on gmm_v2's dequantize-AFTER branch.
+    # Wins over TPU_K3_FP8_LATENT_PROJ where both are set. LOSSIER still:
+    # e2m1 is 1 mantissa bit. Block 256 is finer than the 512 the routed
+    # experts are already requantized to at load, so the format is shipped --
+    # but these two sit on every token's critical path with no averaging over
+    # experts, so they get their own accuracy run.
+    "TPU_K3_MXFP4_LATENT_PROJ":
+    env_bool("TPU_K3_MXFP4_LATENT_PROJ"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
