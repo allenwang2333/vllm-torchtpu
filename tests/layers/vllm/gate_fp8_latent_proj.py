@@ -64,6 +64,12 @@ def arm(on: bool):
         out[nm + ".wshape_after"] = tuple(layer.weight.shape)
         out[nm + ".bytes"] = layer.weight.numel() * layer.weight.element_size()
         out[nm + ".has_scale"] = hasattr(layer, "weight_scale")
+        sc = getattr(layer, "weight_scale", None)
+        # The scale's RANK is what _quantized_matmul_jax dispatches on:
+        # 1-D -> plain XLA dot (VPU rewrite at M=1, a regression);
+        # rank-4 -> gmm_v2 (MXU at M=1). This is the load-bearing assertion.
+        out[nm + ".scale_rank"] = None if sc is None else sc.ndim
+        out[nm + ".scale_shape"] = None if sc is None else tuple(sc.shape)
     return out
 
 
@@ -90,6 +96,11 @@ check("ON  up   weight is float8_e4m3fn", on["up.wdtype_after"], "torch.float8_e
 check("ON  down weight is EXACTLY half", on["down.bytes"], BF16 // 2)
 check("ON  up   weight is EXACTLY half", on["up.bytes"], BF16 // 2)
 check("ON  carries a weight_scale", on["down.has_scale"], True)
+# The whole difference between -10% and +9%: rank 4 reaches gmm_v2, rank 1 does not.
+check("ON  down scale is RANK 4 (-> gmm_v2)", on["down.scale_rank"], 4)
+check("ON  up   scale is RANK 4 (-> gmm_v2)", on["up.scale_rank"], 4)
+check("ON  down scale is [1, K/128, 1, N]", on["down.scale_shape"], (1, HID // 128, 1, LAT))
+check("ON  up   scale is [1, K/128, 1, N]", on["up.scale_shape"], (1, LAT // 128, 1, HID))
 # --- both arms still build the same LAYER, so the gate changes dtype only ----
 check("both arms are ReplicatedLinear", (off["down.replicated"], on["down.replicated"]), (True, True))
 # The fp8 loader transposes to canonical (k, n) at load (fp8.py:1053-1065) so the

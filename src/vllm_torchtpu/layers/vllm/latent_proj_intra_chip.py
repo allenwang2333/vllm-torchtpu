@@ -124,6 +124,37 @@ def shard_group_or_none(output_size: int):
     return group
 
 
+# >= mxu_column_size, so gmm_v2 takes `should_dequantize_after_matmul` and the
+# MXU eats fp8 directly. At 32 it would dequantize *before* the matmul and put
+# the VPU work back in.
+FP8_BLOCK = 128
+
+
+def _blockwise_fp8_config():
+    """fp8 whose scale is blockwise, so `quantized_matmul` reaches ``gmm_v2``.
+
+    The scale's **rank** is what `_quantized_matmul_jax` dispatches on: a 1-D
+    per-channel scale takes the plain XLA dot, and at decode's M=1 XLA rewrites
+    that off the MXU into a VPU broadcast/multiply/reduce which costs more than
+    halving the bytes saves (measured: 2.2x the issue slots of the bf16
+    baseline). A rank-4 blockwise scale takes ``gmm_v2``, a Pallas kernel not
+    subject to that rule -- it stays on the MXU at M=1 and consumes the
+    parameter's native tiling, so there is no relayout either.
+    """
+    from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config
+
+    class _BlockwiseFp8Config(VllmFp8Config):
+
+        def get_linear_config(self, layer):
+            config = super().get_linear_config(layer)
+            config.enable_quantized_matmul_kernel = True
+            config.requant_block_size = FP8_BLOCK
+            return config
+
+    return _BlockwiseFp8Config(is_checkpoint_fp8_serialized=False,
+                               activation_scheme="dynamic")
+
+
 def fp8_quant_config_or(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
@@ -145,13 +176,11 @@ def fp8_quant_config_or(
     """
     if quant_config is not None or not envs.TPU_K3_FP8_LATENT_PROJ:
         return quant_config
-    from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config
     logger.info_once(
-        "Latent MoE projections quantized to fp8 at load "
+        "Latent MoE projections quantized to fp8 at load, blockwise at %d "
         "(TPU_K3_FP8_LATENT_PROJ). This is lossy: e4m3 carries 3 mantissa "
-        "bits against bf16's 7.")
-    return VllmFp8Config(is_checkpoint_fp8_serialized=False,
-                         activation_scheme="dynamic")
+        "bits against bf16's 7.", FP8_BLOCK)
+    return _blockwise_fp8_config()
 
 
 def make_latent_projection(

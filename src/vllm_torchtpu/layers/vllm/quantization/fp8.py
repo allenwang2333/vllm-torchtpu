@@ -1034,10 +1034,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_quant_config=self._linear_quant_config,
                 ))
         else:
-            requant_dtype = torch.float8_e4m3fn
-            requant_block_size = None
-            blockwise_kernel = False
-            desired_quant_dtype = "fp8"
+            # Honour the same linear config the serialized branch honours.
+            # It used to hard-code per-channel here, so a caller asking for a
+            # blockwise scale silently got a 1-D one -- and the scale's *rank*
+            # is what `_quantized_matmul_jax` dispatches on, so that quietly
+            # selected the plain XLA dot over `gmm_v2`.
+            (desired_quant_dtype, requant_dtype, requant_block_size,
+             blockwise_kernel) = self._linear_quant_config
             weight, weight_scale = quantize_tensor(
                 layer.weight.data.to(torch.float32),
                 quant_dtype=requant_dtype,
