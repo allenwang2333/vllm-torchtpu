@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_K3_FP8_LATENT_PROJ: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
@@ -426,6 +427,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP":
     env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+
+    # Quantize the same two projections to fp8 at load instead of sharding
+    # them. They are 184 instructions per decode step (92 MoE layers x 2) and
+    # each streams a full 51.38 MB bf16 weight from HBM at 2.2-2.4 TB/s, which
+    # is the fastest dense read in the program -- so the bytes are the only
+    # lever, and unlike TPU_LATENT_PROJ_INTRA_CHIP_TP this one inserts no
+    # collective. LOSSY: e4m3 has 3 mantissa bits against bf16's 7. Gate an
+    # accuracy run on it before default-on, and note the recipe already runs
+    # --kv-cache-dtype fp8, so the two numerics changes compound.
+    "TPU_K3_FP8_LATENT_PROJ":
+    env_bool("TPU_K3_FP8_LATENT_PROJ"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
