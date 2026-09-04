@@ -131,16 +131,25 @@ def test_no_forced_embedding_sharing():
     assert p._force_share_target_embeddings is False
 
 
-def test_k3_context_rope_matches_mla_cache_dtype():
+@pytest.mark.parametrize("cache_dtype,k_scale", [
+    (torch.bfloat16, None),
+    (torch.float8_e4m3fn, 2.0),
+])
+def test_k3_context_kv_matches_mla_cache_quantization(cache_dtype, k_scale):
     context = torch.ones((2, 4), dtype=torch.bfloat16)
 
     class _Core:
 
         def __init__(self):
-            self.kv_cache = torch.empty((1, ), dtype=torch.bfloat16)
+            self.kv_cache = torch.empty((1, ), dtype=cache_dtype)
+            self.kv_cache_quantized_dtype = (cache_dtype
+                                             if k_scale is not None else None)
+            self._k_scale_float = k_scale
+            self.kv_c = None
             self.k_pe = None
 
-        def mla_op(self, _cache, _q_nope, _q_pe, _kv_c, k_pe, *_metadata):
+        def mla_op(self, _cache, _q_nope, _q_pe, kv_c, k_pe, *_metadata):
+            self.kv_c = kv_c
             self.k_pe = k_pe
 
     core = _Core()
@@ -175,5 +184,10 @@ def test_k3_context_rope_matches_mla_cache_dtype():
         metadata=metadata,
     )
 
-    assert core.k_pe is not None
+    assert core.kv_c is not None
+    assert core.kv_c.dtype == core.kv_cache.dtype
     assert core.k_pe.dtype == core.kv_cache.dtype
+    if k_scale is not None:
+        torch.testing.assert_close(core.kv_c.float() * k_scale, context[:, :2])
+        torch.testing.assert_close(core.k_pe.float() * k_scale,
+                                   torch.ones_like(core.k_pe.float()))
