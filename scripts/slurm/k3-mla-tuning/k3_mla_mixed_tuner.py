@@ -3,7 +3,8 @@
 
 Although target verification happens during decode, a request containing more
 than one query token is routed through the MLA kernel's mixed segment.  The
-default shapes model C=1/2/4/8/16/32 with six valid query tokens per sequence.
+default shapes model C=1/2/4/8/16/32 with six valid query tokens per sequence,
+including the compile-bucket padding observed in the serving process.
 Candidates that fail compilation or the all-ones numerical check are rejected
 before latency ranking.
 """
@@ -56,15 +57,25 @@ from vllm_torchtpu.kernels.mla.v2.kernel import \
     mla_ragged_paged_attention  # noqa: E402
 
 
-def parse_shapes(value: str) -> list[tuple[int, int]]:
-    shapes: list[tuple[int, int]] = []
+def parse_shapes(value: str) -> list[tuple[int, int, int, int]]:
+    shapes: list[tuple[int, int, int, int]] = []
     for item in value.split(","):
-        num_sequences, separator, query_length = item.partition(":")
-        if not separator:
+        fields = [int(field) for field in item.split(":")]
+        if len(fields) not in (2, 4):
             raise argparse.ArgumentTypeError(
-                f"shape must be NUM_SEQUENCES:QUERY_LENGTH: {item}")
-        shape = (int(num_sequences), int(query_length))
-        if shape[0] <= 0 or shape[1] <= 1:
+                "shape must be NUM_SEQUENCES:QUERY_LENGTH or "
+                "NUM_SEQUENCES:QUERY_LENGTH:MAX_NUM_TOKENS:MAX_NUM_SEQS: "
+                f"{item}")
+        num_sequences, query_length = fields[:2]
+        if len(fields) == 2:
+            max_num_tokens = num_sequences * query_length
+            max_num_seqs = num_sequences
+        else:
+            max_num_tokens, max_num_seqs = fields[2:]
+        shape = (num_sequences, query_length, max_num_tokens, max_num_seqs)
+        if (num_sequences <= 0 or query_length <= 1
+                or max_num_tokens < num_sequences * query_length
+                or max_num_seqs < num_sequences):
             raise argparse.ArgumentTypeError(f"invalid shape: {item}")
         shapes.append(shape)
     return shapes
@@ -107,6 +118,7 @@ def make_inputs(
     num_sequences: int,
     query_length: int,
     *,
+    max_num_tokens: int,
     kv_len: int,
     kv_dtype: str,
     total_pages: int,
@@ -118,7 +130,7 @@ def make_inputs(
     lkv_dim: int,
     r_dim: int,
 ):
-    physical_tokens = num_sequences * query_length
+    active_tokens = num_sequences * query_length
     model_axis_size = len(jax.devices())
     num_heads = local_num_heads * model_axis_size
     logical_page_size = page_size_per_kv_packing * kv_packing
@@ -139,15 +151,15 @@ def make_inputs(
 
     # Match mla_attention's serving boundary: queries are token-major with the
     # global head count and are sharded over the eight-device model axis.
-    ql_nope = jnp.ones((physical_tokens, num_heads, lkv_dim),
+    ql_nope = jnp.ones((max_num_tokens, num_heads, lkv_dim),
                        dtype=jnp.bfloat16)
-    q_pe = jnp.ones((physical_tokens, num_heads, r_dim), dtype=jnp.bfloat16)
+    q_pe = jnp.ones((max_num_tokens, num_heads, r_dim), dtype=jnp.bfloat16)
     cache_dtype = {
         "bfloat16": jnp.bfloat16,
         "float8_e4m3fn": jnp.float8_e4m3fn,
     }[kv_dtype]
-    new_kv_c = jnp.ones((physical_tokens, lkv_dim), dtype=cache_dtype)
-    new_k_pe = jnp.ones((physical_tokens, r_dim), dtype=cache_dtype)
+    new_kv_c = jnp.ones((max_num_tokens, lkv_dim), dtype=cache_dtype)
+    new_k_pe = jnp.ones((max_num_tokens, r_dim), dtype=cache_dtype)
     padded_r_dim = math.ceil(r_dim / 128) * 128
     cache_kv = jnp.ones(
         (total_pages, page_size_per_kv_packing, kv_packing,
@@ -157,9 +169,7 @@ def make_inputs(
 
     kv_lens = jnp.zeros((max_num_seqs, ), dtype=jnp.int32)
     kv_lens = kv_lens.at[:num_sequences].set(kv_len)
-    cu_q_lens = jnp.full((max_num_seqs + 1, ),
-                         physical_tokens,
-                         dtype=jnp.int32)
+    cu_q_lens = jnp.full((max_num_seqs + 1, ), active_tokens, dtype=jnp.int32)
     cu_q_lens = cu_q_lens.at[:num_sequences + 1].set(
         jnp.arange(num_sequences + 1, dtype=jnp.int32) * query_length)
     page_indices = jnp.full((max_num_seqs * pages_per_seq, ),
@@ -273,6 +283,7 @@ def tune_candidate(
     num_sequences: int,
     query_length: int,
     *,
+    max_num_tokens: int,
     kv_len: int,
     kv_dtype: str,
     bkv: int,
@@ -290,10 +301,11 @@ def tune_candidate(
     lkv_dim: int,
     r_dim: int,
 ) -> dict:
-    physical_tokens = num_sequences * query_length
+    active_tokens = num_sequences * query_length
     mesh, inputs = make_inputs(
         num_sequences,
         query_length,
+        max_num_tokens=max_num_tokens,
         kv_len=kv_len,
         kv_dtype=kv_dtype,
         total_pages=total_pages,
@@ -317,7 +329,7 @@ def tune_candidate(
     output, updated_cache = invoke(*inputs)
     jax.block_until_ready((output, updated_cache))
     expected_output_shape = (
-        physical_tokens,
+        max_num_tokens,
         local_num_heads * len(jax.devices()),
         lkv_dim,
     )
@@ -346,7 +358,8 @@ def tune_candidate(
         "event": "result",
         "num_sequences": num_sequences,
         "query_length": query_length,
-        "physical_tokens": physical_tokens,
+        "active_tokens": active_tokens,
+        "max_num_tokens": max_num_tokens,
         "max_num_seqs": max_num_seqs,
         "kv_len": kv_len,
         "kv_dtype": kv_dtype,
@@ -369,7 +382,7 @@ def tune_candidate(
         "max_ms": max(latencies_ms),
         "output_shape": list(output.shape),
     }
-    host_output = np.asarray(output[:physical_tokens], dtype=np.float32)
+    host_output = np.asarray(output[:active_tokens], dtype=np.float32)
     result["finite"] = bool(np.isfinite(host_output).all())
     result["max_abs_error_from_one"] = float(np.max(np.abs(host_output - 1.0)))
     if not result["finite"] or result["max_abs_error_from_one"] > 0.02:
@@ -386,8 +399,11 @@ def main() -> int:
     parser.add_argument(
         "--shapes",
         type=parse_shapes,
-        default=parse_shapes("1:6,2:6,4:6,8:6,16:6,32:6"),
-        help="Comma-separated NUM_SEQUENCES:QUERY_LENGTH workloads.",
+        default=parse_shapes("1:6:8:1,2:6:16:3,4:6:32:6,8:6:48:9,"
+                             "16:6:96:19,32:6:192:38"),
+        help=("Comma-separated NUM_SEQUENCES:QUERY_LENGTH workloads, "
+              "optionally followed by :MAX_NUM_TOKENS:MAX_NUM_SEQS to "
+              "model serving compile-bucket padding."),
     )
     parser.add_argument(
         "--candidates",
@@ -537,8 +553,9 @@ def main() -> int:
             output_file,
         )
 
-        for num_sequences, query_length in args.shapes:
-            workload_max_num_seqs = args.max_num_seqs or num_sequences
+        for (num_sequences, query_length, max_num_tokens,
+             shape_max_num_seqs) in args.shapes:
+            workload_max_num_seqs = args.max_num_seqs or shape_max_num_seqs
             for q_split in args.q_splits:
                 for bkv, bq in args.candidates:
                     started = time.time()
@@ -546,6 +563,7 @@ def main() -> int:
                         result = tune_candidate(
                             num_sequences,
                             query_length,
+                            max_num_tokens=max_num_tokens,
                             kv_len=args.kv_len,
                             kv_dtype=args.kv_dtype,
                             bkv=bkv,
@@ -569,7 +587,9 @@ def main() -> int:
                             "event": "error",
                             "num_sequences": num_sequences,
                             "query_length": query_length,
-                            "physical_tokens": num_sequences * query_length,
+                            "active_tokens": num_sequences * query_length,
+                            "max_num_tokens": max_num_tokens,
+                            "max_num_seqs": workload_max_num_seqs,
                             "kv_len": args.kv_len,
                             "kv_dtype": args.kv_dtype,
                             "bkv": bkv,
