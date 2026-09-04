@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_COUNTING_SORT: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
@@ -392,6 +393,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Order the routed rows by expert id with a counting sort instead of two
+    # `jnp.argsort` calls. The keys are expert ids, so the alphabet is
+    # `local_num_experts + 1` symbols; the sort XLA emits is a bitonic network
+    # that does not know that. On Kimi-K3 TP32+EP32 decode (BK #367, pad 8) the
+    # two sorts are 474.8 us/step = 2.04% of the TensorCore plane, and they are
+    # latency-bound: 345 issue slots against a 4059-cycle dependency path of
+    # cross-lane permutes. Off by default -- not yet validated on hardware.
+    "TPU_MOE_COUNTING_SORT":
+    env_bool("TPU_MOE_COUNTING_SORT"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

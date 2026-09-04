@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
     ragged_gather_reduce as ragged_gather_reduce_v3
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.layers.common import counting_sort
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -212,16 +213,29 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    sorted_indices = jnp.argsort(sort_keys)
-    argsort_revert_indices = jnp.argsort(sorted_indices)
+
+    if envs.TPU_MOE_COUNTING_SORT and counting_sort.applicable(
+            sort_keys.shape[0]):
+        # The keys are expert ids, so the alphabet is `local_num_experts + 1`
+        # symbols and the two argsorts below are a bitonic network solving a
+        # counting-sort problem. Same one-hot answers `group_sizes_local`.
+        key_onehot = counting_sort.key_onehot(sort_keys, local_num_experts + 1)
+        argsort_revert_indices = counting_sort.sort_positions(key_onehot)
+        sorted_indices = counting_sort.invert_permutation(
+            argsort_revert_indices)
+        # Column `local_num_experts` is the invalid sentinel, so dropping it is
+        # exactly the `valid_mask` multiply the argsort path needs.
+        group_sizes_local = key_onehot[:, :local_num_experts].sum(axis=0)
+    else:
+        sorted_indices = jnp.argsort(sort_keys)
+        argsort_revert_indices = jnp.argsort(sorted_indices)
+        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+        group_sizes_local = (jax.nn.one_hot(
+            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                             valid_mask[:, None].astype(jnp.int32))
+        group_sizes_local = group_sizes_local.sum(axis=0)
 
     token_indices_sorted = token_indices_flat[sorted_indices]
-    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-    group_sizes_local = (jax.nn.one_hot(
-        topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                         valid_mask[:, None].astype(jnp.int32))
-    group_sizes_local = group_sizes_local.sum(axis=0)
-
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
