@@ -105,6 +105,9 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
+[project.entry-points."v6d.offload_providers"]
+"tpu.tpu_dma" = "vllm_torchtpu.offload.v6d.provider:get_provider"
+
 [tool.pytest.ini_options]
 markers = [
     "nightly: tests that only run in the nightly CI workflow",
