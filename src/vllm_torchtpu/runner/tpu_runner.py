@@ -1280,7 +1280,9 @@ class TPUModelRunner(GPUModelRunner):
                     # enables the memory saving of cross-layer kv sharing, allowing
                     # a given amount of memory to accommodate longer context lengths
                     # or enable more requests to be processed simultaneously.
-                    self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                    normalized_layer_name = layer_name.replace(
+                        "draft_model.model.layers.", "draft_model.layers.")
+                    self.shared_kv_cache_layers[normalized_layer_name] = kv_tgt_layer
                     continue
 
                 if attn_module.attn_type == AttentionType.DECODER:
@@ -1372,6 +1374,22 @@ class TPUModelRunner(GPUModelRunner):
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
+        
+        # Force Gemma-4 MTP KV cache sharing aliases directly into the spec
+        if self._is_async_drafter and hasattr(self.drafter, "draft_model") and self.drafter.draft_model is not None:
+            if not hasattr(self, "shared_kv_cache_layers") or self.shared_kv_cache_layers is None:
+                self.shared_kv_cache_layers = {}
+            for draft_idx, layer in enumerate(self.drafter.draft_model.model.layers):
+                if hasattr(layer, "self_attn") and getattr(layer.self_attn, "attn", None) is not None:
+                    attn = layer.self_attn.attn
+                    if getattr(attn, "kv_sharing_target_layer_name", None) is not None:
+                        target_layer_name = attn.kv_sharing_target_layer_name
+                        draft_layer_name = f"draft_model.layers.{draft_idx}.self_attn.attn"
+                        
+                        self.shared_kv_cache_layers[draft_layer_name] = target_layer_name
+                        kv_cache_spec.pop(draft_layer_name, None)
+                        logger.info("[TPU KV SPEC CHECK] Registered draft layer alias (and omitted from spec): %s -> %s", draft_layer_name, target_layer_name)
+
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
@@ -3713,6 +3731,12 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
+                if self.speculative_config is not None or getattr(
+                        self, "_pcp_mtp_k1_enabled", False):
+                    hidden_states = sequence_layout_planner.finalize_hidden_states(
+                        hidden_states,
+                        layout_plan,
+                    )
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -4020,6 +4044,25 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_p,
                     all_greedy=False).view(-1)
         if all_greedy:
+            # Safe diagnostic logging on Rank 0 to inspect rejection sampler inputs
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank
+                is_rank0 = (get_tensor_model_parallel_rank() == 0)
+            except Exception:
+                is_rank0 = True
+            if is_rank0:
+                try:
+                    logger.info(
+                        "[TPU DIAG REJECT] DRAFT TOKENS: %s | TARGET ARGMAX: %s | DRAFT LENGTHS: %s | SEGMENT IDS: %s | GROUP INDICES: %s",
+                        md.draft_token_ids.cpu().tolist()[:10],
+                        target_logits.argmax(dim=-1).cpu().tolist()[:10],
+                        md.draft_lengths.cpu().tolist()[:10],
+                        md.segment_ids.cpu().tolist()[:10],
+                        md.group_indices.cpu().tolist()[:10],
+                    )
+                except Exception as e:
+                    logger.warning("[TPU DIAG REJECT] Failed to log rejection inputs: %s", e)
+
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
@@ -5833,6 +5876,7 @@ class TPUModelRunner(GPUModelRunner):
 
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
         ):
+            logger.info("[TPU KV ALIAS CHECK] Aliasing %s -> %s", layer_name, target_layer_name)
             logger.debug("%s reuses KV cache of %s", layer_name,
                          target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
@@ -6432,6 +6476,12 @@ class TPUModelRunner(GPUModelRunner):
         #     pallas.set_buffer_donor_(kv_cache, True)
 
         # Reset kv_caches list (tpu_bind_kv_cache expects empty list)
+        if hasattr(self, "shared_kv_cache_layers") and self.shared_kv_cache_layers:
+            for draft_layer, target_layer in self.shared_kv_cache_layers.items():
+                if target_layer in kv_caches:
+                    kv_caches[draft_layer] = kv_caches[target_layer]
+                    logger.info("[TPU KV ALIAS CHECK] Bound physical cache: %s -> %s", draft_layer, target_layer)
+
         self.kv_caches = []
 
         # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names

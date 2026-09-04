@@ -235,6 +235,11 @@ class Eagle3Proposer:
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
 
+            if not hasattr(self.runner, "shared_kv_cache_layers") or self.runner.shared_kv_cache_layers is None:
+                self.runner.shared_kv_cache_layers = {}
+            draft_layer_name = f"draft_model.layers.{draft_idx}.self_attn.attn"
+            self.runner.shared_kv_cache_layers[draft_layer_name] = target_layer_name
+
             logger.info(
                 "Gemma4 MTP (TPU): draft layer %d (%s) -> %s",
                 draft_idx,
@@ -546,7 +551,8 @@ class Eagle3Proposer:
                                  device=runner.device))
             for step in range(1, K):
                 for ci, chunk in enumerate(chunks):
-                    loop_positions[ci] = loop_positions[ci] + 1
+                    if self.speculative_config.method != "mtp":
+                        loop_positions[ci] = loop_positions[ci] + 1
                     # Prev step's [p] tokens feed directly — already bucketed.
                     loop_input_ids = draft_tokens_per_chunk[ci][-1]
                     last_hidden, hidden = self._forward_draft(
@@ -555,7 +561,7 @@ class Eagle3Proposer:
                         positions=loop_positions[ci],
                         target_hidden_states=loop_hidden[ci],
                         step_idx=step,
-                        seq_lens_delta=step,
+                        seq_lens_delta=0 if self.speculative_config.method == "mtp" else step,
                         num_rejected_np=(None if is_async else
                                          rejected_per_chunk[ci]),
                         num_tokens_padded=padded_nr_per_chunk[ci],
@@ -981,7 +987,7 @@ class Eagle3Proposer:
         result = dict(per_layer_attn_metadata)
 
         # Explicitly alias draft layer names to their corresponding target layer metadata
-        static_fwd_ctx = runner.vllm_config.compilation_config.static_forward_context
+        static_fwd_ctx = get_layers_from_vllm_config(runner.vllm_config, AttentionLayerBase)
         for name in self._draft_attn_layer_names:
             layer_module = static_fwd_ctx.get(name)
             if layer_module is not None:
@@ -995,6 +1001,9 @@ class Eagle3Proposer:
                             "not found in attention metadata results.",
                             target_name, name
                         )
+                else:
+                    if per_layer_attn_metadata:
+                        result[name] = next(iter(per_layer_attn_metadata.values()))
 
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
@@ -1054,6 +1063,24 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
+
+        if self.speculative_config.method == "mtp": # and step_idx == 0:
+            # The target model output its valid hidden state at the verified slot (last_token_indices - 1).
+            # The draft model evaluates at last_token_indices. We must copy the state forward 
+            # so the MTP pre_projection doesn't concatenate with zeros!
+            num_reqs = chunk.num_reqs
+            if num_rejected_np is None:
+                num_rejected_out = torch.zeros(num_reqs, dtype=torch.int32, device=target_hidden_states.device)
+            else:
+                num_rejected_out = torch.from_numpy(num_rejected_np).to(target_hidden_states.device)
+            qsl_end = chunk.attn_ctx.query_start_loc[1:num_reqs + 1].to(torch.int64)
+            last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
+
+            target_hidden_states = target_hidden_states.clone()
+            valid_hidden_states = target_hidden_states[last_token_indices - 1]
+            target_hidden_states.index_copy_(0, last_token_indices, valid_hidden_states)
+            
+            logger.debug("[TPU DIAG] Copied hidden states from verified slot to draft slot for MTP.")
 
         kwargs = {
             "input_ids": input_ids,
