@@ -124,6 +124,36 @@ def shard_group_or_none(output_size: int):
     return group
 
 
+def fp8_quant_config_or(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Under ``TPU_K3_FP8_LATENT_PROJ``, quantize the projection to fp8 at load.
+
+    The two projections are 184 instructions per decode step, each a clean pass
+    over a full 51.38 MB bf16 weight -- measured at 2.2-2.4 TB/s, the fastest
+    dense HBM read in the model, so there is no rate to recover and bytes are
+    the only lever. ``VllmFp8LinearMethodTPU`` already quantizes a *bf16*
+    checkpoint weight at load (`fp8.py` `process_weights_after_loading`, the
+    ``is_checkpoint_fp8_serialized == False`` branch) and keeps it fp8 through
+    ``quantized_matmul``, which is what makes this a config change rather than
+    a kernel.
+
+    Left alone if the caller already has a quant config: K3's checkpoint stores
+    these two as plain bf16 ``.weight`` and everything else mxfp4, so a
+    non-None config here would mean the model changed underneath this
+    assumption and silently overriding it is the wrong failure.
+    """
+    if quant_config is not None or not envs.TPU_K3_FP8_LATENT_PROJ:
+        return quant_config
+    from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config
+    logger.info_once(
+        "Latent MoE projections quantized to fp8 at load "
+        "(TPU_K3_FP8_LATENT_PROJ). This is lossy: e4m3 carries 3 mantissa "
+        "bits against bf16's 7.")
+    return VllmFp8Config(is_checkpoint_fp8_serialized=False,
+                         activation_scheme="dynamic")
+
+
 def make_latent_projection(
     input_size: int,
     output_size: int,
@@ -132,7 +162,12 @@ def make_latent_projection(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> ReplicatedLinear | IntraChipColumnParallelLinear:
-    """The intra-chip sharded projection when it applies, else the replicated one."""
+    """The intra-chip sharded projection when it applies, else the replicated one.
+
+    Orthogonal to ``TPU_K3_FP8_LATENT_PROJ``, which changes the *dtype* of
+    whichever of the two comes back; the levers compose on bytes.
+    """
+    quant_config = fp8_quant_config_or(quant_config)
     group = shard_group_or_none(output_size)
     if group is None:
         return ReplicatedLinear(
