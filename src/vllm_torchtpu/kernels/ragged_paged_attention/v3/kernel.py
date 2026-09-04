@@ -437,6 +437,8 @@ def _ragged_paged_attention_kernel_loop(
         processed_q_len,
         processed_kv_len,
         effective_kv_len,
+        apply_causal_mask: bool = use_causal_mask,
+        skip_block_kv_mask: bool = skip_kv_mask,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -484,11 +486,11 @@ def _ragged_paged_attention_kernel_loop(
             int_ty, v.shape, 0)
 
         mask = None
-        if use_causal_mask:
+        if apply_causal_mask:
             assert not skip_kv_mask
             mask = mask_and(mask, q_span >= k_span)
 
-        if not skip_kv_mask:
+        if not skip_block_kv_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
             v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
@@ -502,7 +504,9 @@ def _ragged_paged_attention_kernel_loop(
         m_prev = m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        # Shift m_curr by -ln(256.0) so p is scaled by 256.0 for FP8 precision with 0 VPU mul overhead
+        m_shifted = m_curr - 5.54517744 if v.dtype == jnp.float8_e4m3fn else m_curr
+        p = jnp.exp(s - broadcast_minor(m_shifted, s.shape))
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
         exp_m_diff = jnp.exp(m_prev - m_curr)
@@ -526,7 +530,8 @@ def _ragged_paged_attention_kernel_loop(
                                     128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head,
                                head_dim)
-        pv = jnp.matmul(p, v,
+        # Since both p and l_ref are scaled by 256.0 when v is fp8, 256.0 cancels out automatically in acc / l
+        pv = jnp.matmul(p.astype(v.dtype) if v.dtype == jnp.float8_e4m3fn else p, v,
                         preferred_element_type=jnp.float32).astype(out_dtype)
         if v_scale is not None:
             pv *= v_scale
@@ -948,8 +953,7 @@ def _ragged_paged_attention_kernel_loop(
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
-            @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
-            def compute_with_bkv(bkv_idx):
+            def _run_bkv_body(bkv_idx, apply_causal_mask=use_causal_mask, skip_block_kv_mask=skip_kv_mask):
                 assert bkv_sz % kv_packing == 0
 
                 # Get next bkv ids.
@@ -1035,6 +1039,8 @@ def _ragged_paged_attention_kernel_loop(
                                 processed_q_len=processed_q_len + bq_start,
                                 processed_kv_len=processed_kv_len + bkv_start,
                                 effective_kv_len=effective_kv_len,
+                                apply_causal_mask=apply_causal_mask,
+                                skip_block_kv_mask=skip_block_kv_mask,
                             )
                             if prev_lm_slice is not None:
                                 flash_attention_step2_pv(
@@ -1056,6 +1062,23 @@ def _ragged_paged_attention_kernel_loop(
                         prev_exp_m_diff,
                         acc_ref.at[*prev_lm_slice],
                     )
+
+            if use_causal_mask and q_hbm_ref.shape[1] >= 512:
+                bkv_idx_of_first_causal_mask = processed_q_len // bkv_sz
+                unmasked_end_bkv_idx = jnp.maximum(start_bkv_idx, bkv_idx_of_first_causal_mask)
+                unmasked_end_bkv_idx = jnp.minimum(unmasked_end_bkv_idx, end_bkv_idx)
+
+                @pl.loop(start_bkv_idx, unmasked_end_bkv_idx, unroll=False)
+                def compute_with_bkv_unmasked(bkv_idx):
+                    _run_bkv_body(bkv_idx, apply_causal_mask=False, skip_block_kv_mask=True)
+
+                @pl.loop(unmasked_end_bkv_idx, end_bkv_idx, unroll=False)
+                def compute_with_bkv_masked(bkv_idx):
+                    _run_bkv_body(bkv_idx, apply_causal_mask=True, skip_block_kv_mask=skip_kv_mask)
+            else:
+                @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
+                def compute_with_bkv(bkv_idx):
+                    _run_bkv_body(bkv_idx, apply_causal_mask=use_causal_mask, skip_block_kv_mask=skip_kv_mask)
 
             # Load acc and calculate final output.
             acc = acc_ref[...]

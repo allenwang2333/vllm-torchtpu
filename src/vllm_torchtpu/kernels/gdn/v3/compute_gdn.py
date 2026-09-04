@@ -41,6 +41,67 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     # NOTE: if chunk_size=1, compiler will perform DCE.
     out_dtype = t.dtype
     chunk = t.shape[-1]
+    if chunk == 64:
+        num_heads = t.shape[0]
+        # 2-Level MXU Block Doubling: solve 16x16 diagonal blocks first via Pallas-compatible slice + stack, then double 16 -> 32 -> 64 via MXU dots
+        t_16 = jnp.stack(
+            [
+                t[:, 0:16, 0:16],
+                t[:, 16:32, 16:32],
+                t[:, 32:48, 32:48],
+                t[:, 48:64, 48:64],
+            ],
+            axis=1,
+        )
+        inv_16 = invert_triangular_matrix(t_16.reshape(num_heads * 4, 16, 16), block_size=8).reshape(num_heads, 4, 16, 16)
+
+        inv_00, inv_11, inv_22, inv_33 = (
+            inv_16[:, 0],
+            inv_16[:, 1],
+            inv_16[:, 2],
+            inv_16[:, 3],
+        )
+        t_10 = t[:, 16:32, 0:16]
+        t_32 = t[:, 48:64, 32:48]
+
+        def bmm(lhs, rhs):
+            return jax.lax.dot(
+                lhs,
+                rhs,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+
+        inv_10 = -bmm(inv_11, bmm(t_10, inv_00))
+        inv_32 = -bmm(inv_33, bmm(t_32, inv_22))
+
+        z_16 = jnp.zeros_like(inv_00)
+        inv_top = jnp.concatenate(
+            [
+                jnp.concatenate([inv_00, z_16], axis=2),
+                jnp.concatenate([inv_10, inv_11], axis=2),
+            ],
+            axis=1,
+        )
+        inv_bot = jnp.concatenate(
+            [
+                jnp.concatenate([inv_22, z_16], axis=2),
+                jnp.concatenate([inv_32, inv_33], axis=2),
+            ],
+            axis=1,
+        )
+
+        t_bl = t[:, 32:64, 0:32]
+        inv_bl = -bmm(inv_bot, bmm(t_bl, inv_top))
+
+        z_32 = jnp.zeros_like(inv_top)
+        return jnp.concatenate(
+            [
+                jnp.concatenate([inv_top, z_32], axis=2),
+                jnp.concatenate([inv_bl, inv_bot], axis=2),
+            ],
+            axis=1,
+        ).astype(out_dtype)
     block_size = min(block_size, chunk)
     num_blocks = chunk // block_size
 
@@ -118,7 +179,7 @@ def chunked_gdn_per_seq(
     q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
     k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
 
-    # Compute cumulative sum of decay.
+    # Compute cumulative sum of decay (Pallas lowering compatible loop).
     # [1, 1, num_v_heads]
     g_cum_sum_list = [gating_log[:, :1]]
     for row in range(1, cfg.chunk_size):
