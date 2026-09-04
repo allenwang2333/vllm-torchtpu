@@ -46,7 +46,7 @@ REPS="${REPS:-3}"
 # CPU-checkable in minutes; a ~50 min pod lifetime is the wrong way to find out.
 # base is the denominator and mandatory; k1 carries the largest single lever and a
 # locked prediction; e8m0 is the smallest and the one to lose if the disk runs out.
-ARMS_DEFAULT="base k1 c1 e8m0"
+ARMS_DEFAULT="base k1 c1 e8m0 bf16"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -74,6 +74,13 @@ arm_env() {
     # powers of two, which both float8_e8m0fnu and bf16 hold exactly, so the
     # arithmetic is unchanged and no accuracy run is owed.
     e8m0)     echo "TPU_MOE_COMPACT_SCALE=e8m0 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
+    # bf16 is not a weaker e8m0, it is the SECOND POINT ON A LINE. At the
+    # marginal expert DMA (5.9 us for 13.76 MB at 2.33 TB/s) and issue (~6 us)
+    # are equal, so removing bytes buys almost nothing while added issue is paid
+    # in full. bf16 costs +1,264 slots for -0.66 us of DMA, e8m0 +2,076 for
+    # -1.33: two points whose slope IS the issue-vs-DMA exchange rate at M=1,
+    # which prices every future narrowing in this kernel rather than this one.
+    bf16)     echo "TPU_MOE_COMPACT_SCALE=bf16 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
     c1e8m0|c1_compactscale)
               echo "TPU_KDA_GPROJ_LAYOUT=head_major TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
     k1)       echo "TPU_K3_FP8_LATENT_PROJ=1 TPU_KDA_GPROJ_LAYOUT=canonical" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
