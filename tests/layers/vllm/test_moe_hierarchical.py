@@ -398,13 +398,96 @@ def test_both_chiplets_of_a_chip_fetch_the_same_experts(monkeypatch) -> None:
 
     fetched = {}
     for tp_rank in (8, 9):  # the two chiplets of chip 4
-        monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank",
+        monkeypatch.setattr(vllm_dist,
+                            "get_tensor_model_parallel_rank",
                             lambda r=tp_rank: r)
-        monkeypatch.setattr(
-            moe_hierarchical, "hierarchical_split_or_none", lambda r=tp_rank:
-            (16, r // 2, 2, r % 2))
+        monkeypatch.setattr(moe_hierarchical,
+                            "hierarchical_split_or_none",
+                            lambda r=tp_rank: (16, r // 2, 2, r % 2))
         fetched[tp_rank] = model_loader_patches._compute_local_expert_ids()
 
     assert fetched[8] == fetched[9] == set(range(224, 280))
-    assert not fetched[8].isdisjoint(fetched[9]), (
-        "complementary halves -- this is what BK #299 streamed")
+    assert not fetched[8].isdisjoint(
+        fetched[9]), ("complementary halves -- this is what BK #299 streamed")
+
+
+def test_an_unusable_topology_refuses_to_serve_instead_of_falling_back(
+        monkeypatch) -> None:
+    """The flag is an assertion, not a request.
+
+    The old code logged `warning_once`, whose default scope is "local" -- local
+    rank 0 of each host, 4 of 32 on a 4-host pod -- so 28 ranks could fall back
+    to flat EP unobserved while the server started and reported a TPOT. Both
+    directions are asserted: it must also stay quiet when there is nothing to
+    honour.
+    """
+    import vllm.distributed as vllm_dist
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.vllm import moe_hierarchical
+
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", True)
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size",
+                        lambda: 32)
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank", lambda: 7)
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_moe_split",
+                        lambda *a: None)
+    with pytest.raises(RuntimeError, match="refusing to serve flat"):
+        moe_hierarchical.hierarchical_split_or_none()
+
+    # ... and the same unusable topology is silent with the flag off.
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
+    assert moe_hierarchical.hierarchical_split_or_none() is None
+
+    # ... and at TP1 there is no split to make, flag or not.
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", True)
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    assert moe_hierarchical.hierarchical_split_or_none() is None
+
+    # ... and a usable topology returns the split rather than raising.
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size",
+                        lambda: 32)
+    monkeypatch.setattr(moe_hierarchical, "hierarchical_moe_split", lambda *a:
+                        (16, 3, 2, 1))
+    assert moe_hierarchical.hierarchical_split_or_none() == (16, 3, 2, 1)
+
+
+@pytest.mark.parametrize(
+    "num_local,ep_size,moe_tp,fires",
+    [
+        (56, 16, 2, False),  # the K3 pod arm: 896/16 experts at half width
+        (28, 32, 1, True),  # flat EP32: the split did not take at all
+        (56, 16, 1, True),  # experts split by chip, width not
+        (28, 16, 2, True),  # width split, experts still per rank
+    ])
+def test_expert_bank_gate_fires_only_when_the_bank_disagrees(
+        num_local, ep_size, moe_tp, fires) -> None:
+    """The bank shape is the gate, and it must be able to return both answers.
+
+    A control that can only say "ok" is not a control; each row here is a way
+    the chip split can fail to reach the weights while the server still starts.
+    """
+    from vllm_torchtpu.layers.vllm.moe_hierarchical import expert_bank_mismatch
+
+    reason = expert_bank_mismatch((16, 3, 2, 1), 896, num_local, ep_size,
+                                  moe_tp)
+    assert (reason is not None) == fires, reason
+    if fires:
+        assert "56 experts, ep_size=16, moe_tp_size=2" in reason
+    # With the flag off there is nothing to contradict.
+    assert expert_bank_mismatch(None, 896, num_local, ep_size, moe_tp) is None
+
+
+def test_expert_bank_gate_follows_linear_placement_on_a_ragged_count() -> None:
+    """A num_experts that does not divide by the chip count is not a mismatch.
+
+    vLLM's linear placement hands the remainder to the low ep_ranks, so ep_rank
+    0 of 5 chips over 12 experts legitimately owns 3 and ep_rank 4 owns 2. A
+    gate that expected 12 // 5 everywhere would void a correct arm.
+    """
+    from vllm_torchtpu.layers.vllm.moe_hierarchical import expert_bank_mismatch
+
+    assert expert_bank_mismatch((5, 0, 2, 0), 12, 3, 5, 2) is None
+    assert expert_bank_mismatch((5, 4, 2, 1), 12, 2, 5, 2) is None
+    assert expert_bank_mismatch((5, 4, 2, 1), 12, 3, 5, 2) is not None
