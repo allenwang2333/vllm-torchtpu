@@ -89,7 +89,14 @@ PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$CONFIG_NAME.baseline.js
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 
 run_lm_eval() {
-    local task="$1"
+    # "task" or "task:limit". An empty limit means the FULL set: GSM8K at
+    # --limit 200 has an MDD of 4.78 pp, which cannot resolve anything we care
+    # about; at its full 1319 it is 1.86 pp on the same server for a little more
+    # decode.
+    local spec="$1" task limit
+    task="${spec%%:*}"
+    limit="${spec#*:}"
+    [ "$limit" = "$spec" ] && limit="${K3_LM_EVAL_LIMIT:-100}"
     local baseline="scripts/vllm/benchmarking/baselines/eval/${CONFIG_NAME}.${task}.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
 
@@ -116,13 +123,19 @@ run_lm_eval() {
             )
             ;;
         *)
+            [ -n "$limit" ] && lm_eval_args+=(--limit "$limit")
             lm_eval_args+=(
-                --limit 100
                 --model local-chat-completions
                 --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
                 --apply_chat_template
             )
-            if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
+            # `continue_final_message` is dropped by K3's own chat encoder, so
+            # the multiturn few-shot path measures the template rather than the
+            # model. Tasks added for round 5 take the coherent path; mmlu_llama
+            # keeps its historical prompting so its numbers stay comparable.
+            local disable_mt="$MMLU_PRO_DISABLE_MULTITURN_ARGS"
+            case "$task" in mmlu_llama) disable_mt="${K3_MMLU_LLAMA_DISABLE_MULTITURN:-false}" ;; esac
+            if [ "$disable_mt" = "true" ]; then
                 lm_eval_args+=(--gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}')
             else
                 lm_eval_args+=(--fewshot_as_multiturn true)
@@ -253,8 +266,16 @@ fi
 # 4. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ]; then
-    run_lm_eval "mmlu_llama"
-    run_lm_eval "mmlu_pro"
+    # Default preserves the historical pair. Round 5 overrides it: mmlu_pro is
+    # the worst instrument available here -- --limit is PER SUBJECT, so its 14
+    # subjects give n=1400 against mmlu_llama's 57 -> 5700, i.e. 3.3x the
+    # minimum detectable difference, and as a chain-of-thought task at
+    # max_gen_toks 2048 one flipped token diverges the whole chain, so pairing
+    # rescues it ~2x instead of ~4x. It costs ~21x the decode for 3-5x worse
+    # resolution.
+    for _t in ${K3_LM_EVAL_TASKS:-mmlu_llama mmlu_pro}; do
+        run_lm_eval "$_t"
+    done
 fi
 
 # ========================================================

@@ -60,7 +60,7 @@ rc=0
 # "the flag was set" and "the program changed" are two different claims and an
 # env-gated patch that silently reuses the previous arm's executable is exactly
 # the r3 A/B that had to be voided.
-K3_GATES="TPU_K3_FP8_LATENT_PROJ TPU_KDA_GPROJ_LAYOUT TPU_MOE_COMPACT_SCALE K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
+K3_GATES="TPU_K3_FP8_LATENT_PROJ TPU_K3_MXFP4_LATENT_PROJ TPU_KDA_GPROJ_LAYOUT TPU_MOE_COMPACT_SCALE MOE_REQUANTIZE_BLOCK_SIZE K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
 arm_env() {
   case "$1" in
     # The control, and it has to SAY so. TPU_KDA_GPROJ_LAYOUT defaults to
@@ -81,6 +81,19 @@ arm_env() {
     # -1.33: two points whose slope IS the issue-vs-DMA exchange rate at M=1,
     # which prices every future narrowing in this kernel rather than this one.
     bf16)     echo "TPU_MOE_COMPACT_SCALE=bf16 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
+    # F3'': requantize the routed experts at block 256 instead of the shipped
+    # group 32. Env-only, no source change. It moves BOTH constraints the same
+    # way at once -- scale DMA 43,008 -> 5,376 granules (20.0% -> 2.9% of what
+    # the routed GEMM fetches, per-active-expert bytes -17.5%) AND leg-1 bundles
+    # 11,344 -> 5,670, because 256 >= tpu7x's mxu_column_size so fp4 goes
+    # straight to the MXU and the dequant prologue disappears. On a co-limited
+    # arm that is the one change shape the other constraint cannot absorb.
+    #
+    # LOSSY: group 32 -> block 256 is genuinely different numbers, so it cannot
+    # ride the bit-identical argument and owes an accuracy run. And it is a
+    # SUBSTITUTE for hierarchical EP, not an addend -- both take their saving
+    # out of the per-active-expert cost on the busiest rank.
+    f3pp)     echo "MOE_REQUANTIZE_BLOCK_SIZE=256 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
     c1e8m0|c1_compactscale)
               echo "TPU_KDA_GPROJ_LAYOUT=head_major TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
     k1)       echo "TPU_K3_FP8_LATENT_PROJ=1 TPU_KDA_GPROJ_LAYOUT=canonical" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
@@ -155,6 +168,20 @@ report_compile_seconds() {  # <server log>
 # host, 4 ranks of 32 -- so its ABSENCE says nothing about the other 28 and a
 # silent fallback on 28 ranks would pass. It is still counted and printed,
 # because a non-zero count is informative even though a zero is not.
+# `MOE_REQUANTIZE_BLOCK_SIZE=None` means "unset", which from outside looks exactly
+# like the default -- so this arm's most likely failure is a clean null from an
+# env var that never took. Assert the branch actually flipped.
+requant_gate() {  # <server log>
+  local hits
+  hits=$(grep -ciE 'requantiz(e|ing).*(256|block_size=256)' "$1" 2>/dev/null || echo 0)
+  say "requant gate: block-256 evidence in server log = ${hits}"
+  if [ "$hits" -eq 0 ]; then
+    say "REQUANT GATE FAILED -- no evidence the block size took; arm VOID"
+    return 1
+  fi
+  return 0
+}
+
 hierep_gate() {  # <server log>
   local want='w13 (56, 3072, 1792) (ep_size=16, moe_tp_size=2)' hits warned
   # Ray collapses lines that differ only in numbers into one plus
@@ -201,6 +228,7 @@ run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_pro
             --results-dir "${base}/c${conc}/rep${r}" --keep-alive || rc=1
         first=0
         report_compile_seconds "${base}/c${conc}/rep${r}/server.log"
+        case "$arm" in f3pp|stacked) requant_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; } ;; esac
         if arm_needs_hierep_gate "$arm"; then
           hierep_gate "${base}/c${conc}/rep${r}/server.log" || { rc=1; return 1; }
         fi
