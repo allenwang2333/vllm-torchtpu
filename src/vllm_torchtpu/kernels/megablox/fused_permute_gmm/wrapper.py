@@ -26,12 +26,9 @@ Design, relative to a contiguous `gmm_v2`:
     `config.gather_tiling`.
   * The index table is a kernel-invariant SMEM scalar-prefetch operand, so
     `tile_m` carries no window-copy alignment constraint.
-  * A bf16 pool is read as `bf16[size_src, size_k // 128, 128]`, which puts
-    the (2, 1) sub-word packing on the block axis instead of on rows, so a
-    row is whole 32-bit words and a plain per-row DMA is legal. Reading it
-    through an int32 row-pair view instead would move twice the bytes and
-    need a per-row parity bit -- as a lane-padded `[size_m, 1]` operand,
-    that bit cost more than the kernel saved.
+  * A bf16 pool is read lane-blocked, as `bf16[size_src, size_k // 128, 128]`,
+    which puts the (2, 1) sub-word packing on the block axis instead of on
+    rows, so a row is whole 32-bit words and a plain per-row DMA is legal.
 """
 import functools
 
@@ -157,6 +154,7 @@ def fused_permute_gmm(
     cfg = config.Config(gmm=gmm_cfgs,
                         tuning=tuning,
                         num_lanes=lanes,
+                        num_sublanes=info.num_sublanes,
                         mxu_columns=info.mxu_column_size)
 
     if cfg.tiles.tile_k != cfg.dims.size_k:
@@ -165,7 +163,7 @@ def fused_permute_gmm(
             f"({cfg.tiles.tile_k} != {cfg.dims.size_k})")
     # Pad the index table so a tile that runs past the last live row still
     # names a valid pool row (bounds checks are off).
-    idx = jnp.pad(gather_indices.astype(jnp.int32),
+    idx = jnp.pad(gather_indices.astype(config.INDEX_DTYPE),
                   (0, cfg.index_rows - padded_size_m),
                   mode="edge")
 

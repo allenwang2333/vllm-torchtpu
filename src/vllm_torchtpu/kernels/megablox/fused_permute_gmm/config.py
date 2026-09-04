@@ -28,21 +28,17 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox import gmm_v2
 
-# The invariant index table holds int32 pool rows.
-INDEX_BYTES = 4
+# The invariant index table's rows, as the wrapper casts them.
+INDEX_DTYPE = jnp.int32
 # TPU7x SMEM. Stands in for the device when op construction runs before one exists.
 V7X_SMEM_CAPACITY_BYTES = 1 << 20
-# `tpu.memref_reshape` refuses a 2nd-minor off the tile, and the u32 view of the ring
-# is tiled (4, 128).
-_U32_SUBLANE_TILE = 4
 # Where a scalar-prefetch operand starts to cliff on v7x. Measured, not derived.
 V7X_SMEM_INDEX_LIMIT_BYTES = 480_000
 # gmm_v2's own zero-init staging budget, kept so both kernels tile the zero fill alike.
 ZERO_TILE_TARGET_BYTES = 2 * 1024 * 1024
 # `gather_tiling`'s law, fitted on v7x at the serving fill; the constants are per-generation.
-TILE_MIN_ROWS = 16  # the fewest rows the law reasons about: one bf16 sublane block
 TILE_SPREAD_SIGMAS = 2.5  # headroom over the mean so a fat group still fits one tile
-TILE_ALIGN = 32  # a multiple of every lhs sublane block (16 bf16, 8 f32)
+TILE_ALIGN = 32  # the granularity the tile sweep resolved
 TILE_M_MIN = 64  # a skewed routing still gets a tile a group can fit in
 TILE_M_MAX = 512  # gmm_v2's ceiling at this dtype pair
 
@@ -51,9 +47,10 @@ TILE_M_MAX = 512  # gmm_v2's ceiling at this dtype pair
 class Tuning:
     """The fused kernel's knobs.
 
-    Every default is the value measured on TPU7x for Qwen3.5-397B at the serving
-    fill (0.6-12.5% of the padded pool live); none is derived from the hardware,
-    so another generation or routing regime wants a re-sweep.
+    Every default here was measured on TPU7x for Qwen3.5-397B at the serving
+    fill (0.6-12.5% of the padded pool live), so another generation or routing
+    regime wants a re-sweep. The exception is `smem_capacity_bytes`, which
+    `from_device` reads off the device.
 
     Attributes:
         num_slots: VMEM ring buffers for gathered tiles. Must exceed `lookahead`,
@@ -116,52 +113,50 @@ class Tuning:
     @property
     def max_index_rows(self) -> int:
         """Routed rows the index table can hold; above it the path declines."""
-        return self.smem_index_limit_bytes // INDEX_BYTES
+        return self.smem_index_limit_bytes // jnp.dtype(INDEX_DTYPE).itemsize
 
 
 def gather_tiling(rows: int, size_group: int) -> int:
     """tile_m for the gather path: mean live rows per group, plus spread.
 
-    Sizing to fill VMEM as `calculate_tiling` does gives 512 here, and is wrong
-    for two reasons. The gather ring holds `num_slots` whole tiles (6.3 MB at
-    192 rows vs 16.8 MB at 512, which the fit would then take out of tile_n),
-    and a gm tile carries only ~rows/size_group live rows while a tile pays its
-    issue prologue and relayout whole. Undersizing is worse than oversizing: a
-    tile smaller than a group splits it, and the split tiles' dots are exposed at
-    reduced MXU height on top of the per-tile cost, hence the spread term and the
-    floor for skewed routing. Measured on the plain gmm at the serving fills,
-    192 beats 512 by 1.5-4.4%; on the fused kernel a tile past the largest group
-    costs up to 5.6% (256 vs 208) and one below it 18% (192 vs 208).
+    A gm tile spans one group and the dot runs the height of its bucket, so the
+    tile follows the live rows per group rather than the VMEM fit
+    `calculate_tiling` takes. Not a gather cost: with no gather in either arm,
+    this tile and its bucket beat gmm_v2's own by 0.5-4.1% across the serving
+    fills. The two are a pair -- a bucket that tracks live rows costs
+    `tile_m // bucket_base` switch branches, which only a small tile affords.
+    Undersizing is the worse error: a tile below the largest group splits it and
+    the split dots run at reduced MXU height, hence the spread term and floor.
 
-    `rows` is the routed row count local to this shard: under EP only ~1/ep_size
-    of the gathered rows are local, which the caller folds in.
+    `rows` is the routed row count local to this shard; the caller folds in
+    ep_size.
     """
-    live = -(-max(TILE_MIN_ROWS, rows) // max(size_group, 1))
+    live = -(-rows // max(size_group, 1))
     # Ceiling of the spread term; the .999 tolerates float noise below 1e-3.
     live += int(TILE_SPREAD_SIGMAS * live**0.5 + 0.999)
     return int(
         min(TILE_M_MAX, max(TILE_M_MIN, gmm_v2.align_to(live, TILE_ALIGN))))
 
 
-def ring_chunks(row_chunks: int, pad: int) -> int:
+def ring_chunks(row_chunks: int, pad: int, num_sublanes: int) -> int:
     """Lane-blocks a padded ring row occupies.
 
-    Grows the pad rather than rejecting a shape: only a `size_k` multiple of 1024
-    satisfies the u32 tile at the nominal pad, and a row that lands back on a
-    power-of-two stride is the banking case the pad exists to avoid. The VMEM
-    estimate reads this too -- a second derivation there is how the tile law ends
-    up sizing a ring that does not fit.
+    Measured on v7x: past four lane-blocks, which every ring is, the LHS
+    build's flatten of the ring's u32 view takes only a chunk count that is a
+    whole number of sublanes, so the pad grows to the next legal one rather
+    than the shape being refused.
+    A count landing back on a power-of-two stride is the VMEM banking case the
+    pad exists to avoid. `estimate_vmem_bytes` prices the ring through here.
     """
-    step = 2 * _U32_SUBLANE_TILE
     chunks = row_chunks + pad
-    chunks += -chunks % step
-    return chunks + step if chunks & (chunks - 1) == 0 else chunks
+    chunks += -chunks % num_sublanes
+    return chunks + num_sublanes if chunks & (chunks - 1) == 0 else chunks
 
 
 def estimate_vmem_bytes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
                         rhs_cfgs: gmm_v2.InputConfigs, tile_m: int,
                         tile_n: int, fuse_factor: int, *, tuning: "Tuning",
-                        num_lanes: int) -> int:
+                        num_lanes: int, num_sublanes: int) -> int:
     """This kernel's VMEM footprint at tile_k == size_k.
 
     `calculate_tiling`'s estimate does not apply: the pipelined LHS tile is
@@ -173,8 +168,8 @@ def estimate_vmem_bytes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
 
     # The ring is padded per row; pricing it any other way lets the tile law pick
     # a tile whose ring does not fit.
-    ring_k = ring_chunks(tile_k // num_lanes,
-                         tuning.ring_pad_slots) * num_lanes
+    ring_k = ring_chunks(tile_k // num_lanes, tuning.ring_pad_slots,
+                         num_sublanes) * num_lanes
     gather = tuning.num_slots * tile_m * ring_k * lhs_bytes
     lhs = tile_m * tile_k * lhs_bytes  # the rows as the dot wants them
     if lhs_cfgs.should_quantize:
@@ -242,7 +237,9 @@ def gather_tile_sizes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
                                tile_n,
                                fuse_factor,
                                tuning=tuning,
-                               num_lanes=lanes) > vmem_limit_bytes):
+                               num_lanes=lanes,
+                               num_sublanes=info.num_sublanes)
+           > vmem_limit_bytes):
         if tile_n > tile_n_floor or (tile_m <= sublane and tile_n > lanes):
             num_n_tiles += 1
             tile_n = gmm_v2.align_to(size_n_per_rhs,
@@ -276,6 +273,7 @@ class Config:
     gmm: gmm_v2.GmmConfigs
     tuning: Tuning
     num_lanes: int
+    num_sublanes: int
     mxu_columns: int
 
     @property
@@ -335,7 +333,8 @@ class Config:
     @property
     def ring_chunks(self) -> int:
         """Lane-blocks a ring row occupies, pad included."""
-        return ring_chunks(self.row_chunks, self.tuning.ring_pad_slots)
+        return ring_chunks(self.row_chunks, self.tuning.ring_pad_slots,
+                           self.num_sublanes)
 
     @property
     def gather_buffer_shape(self) -> tuple[int, int, int, int]:

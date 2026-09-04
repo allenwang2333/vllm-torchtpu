@@ -299,9 +299,9 @@ class GmmConfigs:
     def blocks_per_tile(self, mxu_columns: int) -> int:
         """(n, k) matmul blocks `inner_kernel` runs per gm tile, in its own order.
 
-        Lives here because `inner_kernel`'s loops do: a caller that re-derives it
-        elsewhere gets the `should_dequantize_before_matmul` case wrong, where the
-        k loop collapses to one block.
+        Lives beside those loops so a caller driving `inject` counts the blocks
+        the kernel will actually run, including the collapsed k loop under
+        `should_dequantize_before_matmul`.
         """
         fuse_factor = 2 if self.fuse_act is not None else 1
         if self.lhs_cfgs.should_quantize:

@@ -379,14 +379,13 @@ def test_ring_pad_is_priced_into_the_vmem_estimate():
     separates them is one where the pad has to round up, so this uses
     `size_k=3584` (28 lane-blocks + 8 = 36, rounded to 40).
 
-    The estimate is read through `num_slots`, which scales the gather term and
-    nothing else. Differencing a padded estimate against a zero-pad one would
-    not work: `ring_chunks(28, 0)` rounds to 40 as well, so both sides read zero
-    and the assertion would hold for any ring width.
+    The estimate is isolated through `num_slots`, which scales the gather term
+    and nothing else; differencing against a zero-pad estimate is vacuous, since
+    `ring_chunks(28, 0)` rounds to 40 as well.
     """
-    size_k, lanes, tile_m, tile_n, fuse = 3584, 128, 192, 1024, 2
+    size_k, lanes, sublanes, tile_m, tile_n, fuse = 3584, 128, 8, 192, 1024, 2
     tuning = Tuning()
-    chunks = ring_chunks(size_k // lanes, tuning.ring_pad_slots)
+    chunks = ring_chunks(size_k // lanes, tuning.ring_pad_slots, sublanes)
     assert chunks == 40 and chunks * lanes != size_k + tuning.ring_pad_slots * lanes
 
     dims = gmm_v2_mod.Dimensions(size_m=81920,
@@ -413,7 +412,8 @@ def test_ring_pad_is_priced_into_the_vmem_estimate():
                                    fuse,
                                    tuning=dataclasses.replace(
                                        tuning, num_slots=num_slots),
-                                   num_lanes=lanes)
+                                   num_lanes=lanes,
+                                   num_sublanes=sublanes)
 
     per_slot = est(tuning.num_slots + 1) - est(tuning.num_slots)
     itemsize = jnp.dtype(jnp.bfloat16).itemsize
