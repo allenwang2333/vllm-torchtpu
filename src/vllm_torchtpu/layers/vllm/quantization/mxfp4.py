@@ -74,6 +74,7 @@ from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  prebuild_fused_moe_kernel,
                                                  quantize_native_fp4_kmajor)
+from vllm_torchtpu.kernels.fused_moe.v2.host import WeightFormat
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
@@ -326,6 +327,14 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
     rhs_quant_dtype = jnp.float4_e2m1fn
 
+    @property
+    def supports_internal_mk(self) -> bool:
+        """Claim dispatch/combine only for a fused-EP layer that was armed."""
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            fused_moe_ep_supported
+        return (enable_pipelined_collective_and_compute()
+                or fused_moe_ep_supported(self))
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -448,8 +457,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             del layer.w13_bias, layer.w2_bias
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # TODO(upstream): Extract generic on-disk quantization cache to a
-        # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
         device = layer.w13_weight.device
 
@@ -458,8 +465,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             activation_str = "silu_and_mul_with_clamp"
         layer._tpu_activation_str = activation_str
 
-        (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
-         orig_intermediate) = self._dequantize_and_pad(layer)
+        (w13_weight_padded, w2_weight_padded, w13_bias_padded,
+         w2_bias_padded, orig_intermediate) = self._dequantize_and_pad(layer)
         (w13_weight_processed, w2_weight_processed, w13_weight_scale,
          w2_weight_scale) = self._requantize_native_fp4(
              w13_weight_padded, w2_weight_padded, orig_intermediate, device)
@@ -498,3 +505,48 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
             rhs_quant_dtype=jnp.float4_e2m1fn,
         )
+        # The bridge owns the FP4 storage/layout adaptation; it decides per
+        # layer whether its storage, routing, and activation semantics can use
+        # the fused kernel.  The bridge owns FP4 unpacking and DeepSeek-V4's
+        # clamped SwiGLU/sqrt-softplus/hash-router adaptation.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
+        setattr(
+            self, FUSED_MOE_EP_OP_ATTR,
+            prebuild_fused_moe_ep(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+                weight_format=WeightFormat.FP4,
+                rhs_qb=REQUANTIZED_BLOCK_SIZE,
+                clamp_limit=getattr(layer, "swiglu_limit", None),
+            ))
+
+    def _forward_monolithic_tpu(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Use fused EP only after its semantic compatibility check passed."""
+        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
+            fused_moe_ep, fused_moe_ep_supported)
+        if fused_moe_ep_supported(self):
+            return fused_moe_ep(
+                self,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                weight_format=WeightFormat.FP4,
+                input_ids=input_ids,
+                hash_indices_table=getattr(layer, "hash_indices_table", None),
+                e_score_correction_bias=getattr(
+                    layer, "e_score_correction_bias", None),
+            )
+        return super()._forward_monolithic_tpu(layer, x, router_logits,
+                                               input_ids=input_ids)
