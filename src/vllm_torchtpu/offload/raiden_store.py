@@ -118,9 +118,15 @@ def iter_leaf_kv_cache_specs(kv_cache_spec):
 def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     """Whether this model's KV cache consists of multiple tensors
        of different shapes.
+
+    The DSA/MLA models: a layer binds a (NoPE, RoPE) latent pair plus its own
+    indexer K cache, three arrays of three page sizes rather than one (the
+    shape pinned by test_register_kv_caches_ds_v4_alias_groups, and the same
+    three tensors the disagg path admits for GLM-5.2 as mla.nope / mla.rope /
+    dsa.idx).
     """
     return (vllm_config.model_config.architecture
-            in ("DeepseekV4ForCausalLM", ))
+            in ("DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"))
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):

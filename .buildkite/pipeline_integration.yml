@@ -128,6 +128,35 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: Nightly glm52-fp4-offload-correctness"
+        key: "integration_nightly_glm52_fp4_offload_correctness"
+        # Nightly only, and with more headroom than its DSv4 sibling: the
+        # NVFP4 checkpoint is ~465 GB, so weight load alone outlasts that
+        # rig's whole boot before any compilation starts.
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 180
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "/perf_eval_results/glm52_fp4_offload_ci"
+          SERVED_MODEL_NAME: "nvidia/GLM-5.2-NVFP4"
+        commands:
+          # Not a models--<org>--<name> hub snapshot but a plain checkpoint
+          # directory, so it lands at <hub root>/GLM-5.2-NVFP4 and is served
+          # by path below rather than by HF id.
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4/"
+          # MODEL is not on run_in_docker.sh's forwarding list, and the rig
+          # defaults it to the HF id, which would re-download the checkpoint;
+          # hand it the staged copy's in-container path (HF_HOME is mounted at
+          # /local_hf_cache) instead.
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            env MODEL=/local_hf_cache/hub/GLM-5.2-NVFP4
+            bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
         agents:
