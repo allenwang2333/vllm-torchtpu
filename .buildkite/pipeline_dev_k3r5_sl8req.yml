@@ -1,0 +1,63 @@
+# Does MOE_REQUANTIZE_BLOCK_SIZE=256 actually flip the gmm_v2 branch, and what
+# is the per-kernel time worth? On the free queue, while the pod is busy.
+#
+# F3'''s claim is PER KERNEL: on the routed-expert leg, block 256 reaches tpu7x's
+# mxu_column_size, so fp4 goes straight to the MXU, leg-1 bundles fall
+# 11,353 -> 5,679 (-50.0%) and MXU slots are unchanged at 2,690. That is a
+# property of the kernel and its config, not of the pod -- the surrogate runs the
+# SAME routed-expert kernels at the same quant_block_size, with fewer layers.
+#
+# Can say: whether the env var takes at all (the load-time kernel-name gate
+# below), whether the branch flipped, and the per-active-expert kernel time in
+# both arms -- which converts a static -50% bundle count into microseconds.
+# CANNOT say: any TP32 TPOT delta or any share. 8 layers, different collective
+# depth, different straggler population. No serving number from this cell may be
+# quoted as a K3 result.
+#
+# The gate has to be the load-time kernel name because the gmm_v2 kernel's name
+# is BYTE-IDENTICAL in both arms -- a profile cannot tell you which branch ran --
+# and because MOE_REQUANTIZE_BLOCK_SIZE defaults to None, so "unset" and "set"
+# look the same from outside and a silent no-op is the likeliest failure.
+#
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r5_sl8req.yml
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":scales: sl8 requant A: shipped group 32"
+    key: sl8_req_g32
+    depends_on: build_docker
+    timeout_in_minutes: 150
+    agents: { queue: tpu_v7x_8_queue }
+    env: &sl8req
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "5400"
+      BUILDKITE_K3_RIG: "sliced8"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "K3_RESULTS_DIR=perf_eval_results/sl8-req-g32 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+      - "echo '[gate] requant kernel census:'; grep -ho 'nvfp4_[a-z0-9_]*' perf_eval_results/sl8-req-g32/server.log 2>/dev/null | sort | uniq -c || true"
+    artifact_paths: [ "perf_eval_results/**/*" ]
+
+  - label: ":scales: sl8 requant B: block 256 (fp4 straight to the MXU)"
+    key: sl8_req_b256
+    depends_on: sl8_req_g32
+    allow_dependency_failure: true
+    timeout_in_minutes: 150
+    agents: { queue: tpu_v7x_8_queue }
+    env:
+      <<: *sl8req
+      BUILDKITE_K3_REQBLOCK: "256"
+    commands:
+      - "rm -rf /dev/shm/torch_tpu_cache || true"
+      - "K3_RESULTS_DIR=perf_eval_results/sl8-req-b256 bash .buildkite/scripts/k3r5_decodeprof_run.sh sliced8"
+      # If nvfp4_requant_kmajor_b256 is absent and nvfp4_load_kmajor is present,
+      # the variable did not take and this arm is a duplicate of arm A.
+      - "echo '[gate] requant kernel census:'; grep -ho 'nvfp4_[a-z0-9_]*' perf_eval_results/sl8-req-b256/server.log 2>/dev/null | sort | uniq -c || true"
+      - "grep -q 'nvfp4_requant_kmajor_b256' perf_eval_results/sl8-req-b256/server.log || { echo 'GATE FAILED: block size did not take; this arm is a duplicate of the baseline'; exit 1; }"
+    artifact_paths: [ "perf_eval_results/**/*" ]
