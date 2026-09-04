@@ -347,6 +347,7 @@ def tune_candidate(
         "num_sequences": num_sequences,
         "query_length": query_length,
         "physical_tokens": physical_tokens,
+        "max_num_seqs": max_num_seqs,
         "kv_len": kv_len,
         "kv_dtype": kv_dtype,
         "logical_page_size": page_size_per_kv_packing * kv_packing,
@@ -410,7 +411,13 @@ def main() -> int:
         default="float8_e4m3fn",
     )
     parser.add_argument("--total-pages", type=int, default=2048)
-    parser.add_argument("--max-num-seqs", type=int, default=32)
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help=("Static metadata sequence dimension. Zero matches serving by "
+              "using NUM_SEQUENCES for each workload."),
+    )
     parser.add_argument("--pages-per-seq", type=int, default=2048)
     parser.add_argument("--page-size-per-kv-packing", type=int, default=4)
     parser.add_argument("--kv-packing", type=int, default=4)
@@ -428,6 +435,8 @@ def main() -> int:
     if args.warmups < 0 or args.iterations <= 0:
         parser.error(
             "iterations must be positive; warmups must be nonnegative")
+    if args.max_num_seqs < 0:
+        parser.error("max-num-seqs must be nonnegative")
     expected_packing = 2 if args.kv_dtype == "bfloat16" else 4
     if args.kv_packing != expected_packing:
         parser.error(f"kv-packing={args.kv_packing} does not match "
@@ -505,7 +514,7 @@ def main() -> int:
                 "total_pages":
                 args.total_pages,
                 "max_num_seqs":
-                args.max_num_seqs,
+                args.max_num_seqs or "per-workload-num-sequences",
                 "pages_per_seq":
                 args.pages_per_seq,
                 "page_size_per_kv_packing":
@@ -529,6 +538,7 @@ def main() -> int:
         )
 
         for num_sequences, query_length in args.shapes:
+            workload_max_num_seqs = args.max_num_seqs or num_sequences
             for q_split in args.q_splits:
                 for bkv, bq in args.candidates:
                     started = time.time()
@@ -544,7 +554,7 @@ def main() -> int:
                             warmups=args.warmups,
                             iterations=args.iterations,
                             total_pages=args.total_pages,
-                            max_num_seqs=args.max_num_seqs,
+                            max_num_seqs=workload_max_num_seqs,
                             pages_per_seq=args.pages_per_seq,
                             page_size_per_kv_packing=args.
                             page_size_per_kv_packing,
