@@ -1119,13 +1119,13 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=32,
+        max_num_seqs=1,
         pages_per_seq=2048,
     ):
     TunableParams(
-        q_split=3,
+        q_split=1,
         num_kv_pages_per_block=16,
-        num_queries_per_block=6,
+        num_queries_per_block=8,
         vmem_limit_bytes=62914560,
     ),
     TuningKey(
@@ -1138,7 +1138,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=32,
+        max_num_seqs=2,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1157,13 +1157,13 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=32,
+        max_num_seqs=4,
         pages_per_seq=2048,
     ):
     TunableParams(
-        q_split=1,
+        q_split=3,
         num_kv_pages_per_block=16,
-        num_queries_per_block=8,
+        num_queries_per_block=6,
         vmem_limit_bytes=62914560,
     ),
     TuningKey(
@@ -1176,7 +1176,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=32,
+        max_num_seqs=8,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1195,7 +1195,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=32,
+        max_num_seqs=16,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1220,7 +1220,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     TunableParams(
         q_split=1,
         num_kv_pages_per_block=16,
-        num_queries_per_block=8,
+        num_queries_per_block=16,
         vmem_limit_bytes=62914560,
     ),
     # Kimi-K3 mixed prefill on TPU v7x-8 with TP8, BF16, and 4K tokens.
