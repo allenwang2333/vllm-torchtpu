@@ -8,7 +8,11 @@
 #   bash ./scripts/vllm/benchmarking/k3_agentx.sh \
 #       [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR] \
 #       [--conc 4] [--max-model-len 131072] [--duration 1200] [--fast 1] \
-#       [--ix-ref <InferenceX git ref>]
+#       [--apc 0|1] [--ix-ref <InferenceX git ref>]
+#
+# --apc 1 turns prefix caching on, which for K3 (hybrid) forces the unified
+# KV pool via TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1 (exported here; the Ray
+# executor v2 copies the driver environment to every worker).
 #
 # --fast 1 => AIPERF_EXPERIMENTAL_FAST: 20 min profiling window, one warmup
 # request per lane (bring-up mode). --fast 0 => the canonical 30 min window
@@ -28,6 +32,7 @@ MAX_MODEL_LEN_ARG=131072
 DURATION=1800
 FAST=1
 IX_REF="main"
+APC=0
 PORT=8000
 
 while [[ $# -gt 0 ]]; do
@@ -39,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --duration)      DURATION="$2"; shift 2 ;;
         --fast)          FAST="$2"; shift 2 ;;
         --ix-ref)        IX_REF="$2"; shift 2 ;;
+        --apc)           APC="$2"; shift 2 ;;
         *) echo "[k3-agentx] unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -51,8 +57,14 @@ trap 'echo "[k3-agentx] cleanup"; bash "$SCRIPT_DIR/cleanup_server.sh"' EXIT INT
 export MAX_MODEL_LEN="$MAX_MODEL_LEN_ARG"
 export MAX_NUM_SEQS=$((2 * CONC)); [ "$MAX_NUM_SEQS" -lt 4 ] && export MAX_NUM_SEQS=4
 export PORT
+if [ "$APC" = "1" ]; then
+    export ENABLE_PREFIX_CACHING=true
+    export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
+else
+    export ENABLE_PREFIX_CACHING=false
+fi
 
-echo "[k3-agentx] config=$CONFIG_NAME conc=$CONC max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS duration=$DURATION fast=$FAST ix_ref=$IX_REF"
+echo "[k3-agentx] config=$CONFIG_NAME conc=$CONC max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS duration=$DURATION fast=$FAST apc=$APC ix_ref=$IX_REF"
 echo "[k3-agentx] host: $(nproc) cpus, $(free -g | awk '/Mem:/{print $2}') GB RAM, python $(python3 --version 2>&1), uv $(uv --version 2>&1 || echo missing)"
 
 # ---------------------------------------------------------------- InferenceX
@@ -137,7 +149,7 @@ export MODEL_PREFIX=kimik3
 export TP=32 EP_SIZE=32 PP_SIZE=1 DCP_SIZE=1 PCP_SIZE=1
 export FRAMEWORK=vllm RUNNER_TYPE=tpu7x-32 PRECISION=fp8 SPEC_DECODING=none
 export IMAGE="${BUILDKITE_COMMIT:-local}"
-export RESULT_FILENAME="agentx_k3_tpu7x-32_c${CONC}_ctx${MAX_MODEL_LEN}"
+export RESULT_FILENAME="agentx_k3_tpu7x-32_c${CONC}_ctx${MAX_MODEL_LEN}_apc${APC}"
 export RESULT_DIR="$RESULTS_DIR/agentx"
 export AGENTIC_OUTPUT_DIR="$RESULTS_DIR"
 export ENABLE_AGENTX_POWER=0        # no nvidia-smi here

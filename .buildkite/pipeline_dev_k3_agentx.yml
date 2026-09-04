@@ -8,9 +8,27 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: "K3 AgentX replay conc 4 ctx 128k (TPU v7x-32)"
-    key: k3_agentx
+  - label: "K3 AgentX conc 4 ctx 128k, prefix caching + unified pool probe (TPU v7x-32)"
+    key: k3_agentx_apc
     depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-apc --conc 4 --max-model-len 131072 --fast 1 --apc 1"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "K3 AgentX conc 4 ctx 128k, no prefix caching (TPU v7x-32)"
+    key: k3_agentx_noapc
+    depends_on:
+      - build_docker
+      - k3_agentx_apc
+    allow_dependency_failure: true
     timeout_in_minutes: 420
     agents:
       queue: "tpu_v7x_32_queue"
@@ -19,6 +37,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx --conc 4 --max-model-len 131072 --fast 1"
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx --conc 4 --max-model-len 131072 --fast 1 --apc 0"
     artifact_paths:
       - "perf_eval_results/**/*"

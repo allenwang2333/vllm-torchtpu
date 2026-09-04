@@ -6,8 +6,11 @@
 # kimi-k3-tp32-ep.sh; differences:
 #   - long context: MAX_MODEL_LEN default 131072 (env-overridable by the
 #     driver); the aiperf client filters traces above it
-#   - prefix caching ON, which on the hybrid KDA+MLA model needs
-#     --mamba-cache-mode align (tpu_platform.py gate) and the unified KV pool
+#   - prefix caching via ENABLE_PREFIX_CACHING (driver --apc). On the hybrid
+#     KDA+MLA model it needs --mamba-cache-mode align AND the unified KV pool
+#     (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1: K3 is not in
+#     POOLED_GDN_ARCHITECTURES, and #546's pooled Kimi KDA op is not wired
+#     into kimi_k3/attention.py yet) — expected to fail, kept as the probe
 #   - throughput regime: max-num-seqs = 2 x concurrency, batched tokens 8192
 #   - gpu-memory-utilization 0.85 (0.7 leaves ~3 GiB/rank of KV = ~100k
 #     tokens, far too little for concurrent 128k contexts)
@@ -35,9 +38,13 @@ SERVER_READY_WAIT_MIN=240
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
-ENABLE_PREFIX_CACHING=true
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
+# Prefix caching on the hybrid needs the align cache mode (tpu_platform.py
+# gate); it is meaningless without prefix caching, so add it conditionally.
+APC_ARGS=""
+if [ "$ENABLE_PREFIX_CACHING" = "true" ]; then APC_ARGS="--mamba-cache-mode align "; fi
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --mamba-cache-mode align --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[16,32,64,128,256,512,1024,2048,4096,8192]}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} ${APC_ARGS}--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[16,32,64,128,256,512,1024,2048,4096,8192]}"
 
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
