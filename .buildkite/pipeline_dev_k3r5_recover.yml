@@ -1,0 +1,36 @@
+# Recover a previous build's kept raw xprof traces. No cluster, no TPU, no
+# benchmark: the collector runs on the agent and reaches the worker hosts by ssh,
+# so this is a couple of minutes on the v7x-32 agent rather than a bring-up.
+#
+# It exists because build 377's per-ts reduce searched at the wrong depth,
+# matched nothing, and shipped a 4 KB bundle beside a census listing 16 xplane
+# files. Keeping the raw traces by default -- the change made after 367 lost a
+# window to a basename collision -- is what makes this recoverable at all.
+#
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3r5_recover.yml
+#   BUILDKITE_K3_RECOVER_BUILD=377   BUILDKITE_K3_RECOVER_SUBDIR=ladder
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":package: Recover kept xprof traces from a previous build"
+    key: k3r5_recover
+    depends_on: build_docker
+    timeout_in_minutes: 60
+    agents:
+      queue: tpu_v7x_32_queue
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+    commands:
+      # What actually fills this disk is unknown: one ladder arm consumed
+      # 28.7 GB of which the compile cache explains ~4.2 GB and the artifacts
+      # 7.9 MB. Census it while the evidence is still on the box.
+      - "echo '--- disk census, largest first'; df -h /; sudo -n du -x --max-depth=2 / 2>/dev/null | sort -rn | head -30 || du -x --max-depth=2 $HOME 2>/dev/null | sort -rn | head -30"
+      - "K3_COLLECT_ONLY=1 K3_RECOVER_BUILD=${BUILDKITE_K3_RECOVER_BUILD:-377} K3_PROFILE_SUBDIR=${BUILDKITE_K3_RECOVER_SUBDIR:-ladder} K3_RESULTS_DIR=perf_eval_results/k3r5-recover bash .buildkite/scripts/k3r5_decodeprof_run.sh tp32"
+      - "du -sh perf_eval_results/* || true"
+    artifact_paths:
+      - "perf_eval_results/**/*"
