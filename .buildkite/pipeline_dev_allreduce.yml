@@ -1,0 +1,52 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# [branch-local] 112-MiB TP32 all-reduce microbenchmark matrix on the
+# tpu7x-32 pod (scripts/benchmark_torchtpu_all_reduce_112m.py via
+# scripts/allreduce_variants.sh, launched with run_multihost.sh --backend
+# torchrun). Rank-0 xplane traces + JSON results are copied to GCS from the
+# agent. Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_allreduce.yml.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "TP32 112-MiB all-reduce microbench (TPU v7x-32)"
+    key: allreduce_bench
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh --backend torchrun scripts/allreduce_variants.sh"
+      - |
+        out=perf_eval_results/allreduce
+        echo "--- results"
+        cat "$$out/summary.txt" 2>/dev/null || echo "(no summary.txt)"
+        echo "--- xplane traces"
+        find "$$out" -name '*.xplane.pb' | sed 's/^/  /' || true
+        dest="gs://cuiq-inference-test/woosuk1/build-$${BUILDKITE_BUILD_NUMBER}"
+        if gcloud storage cp -r perf_eval_results/* "$$dest/"; then
+          echo "uploaded to $$dest"
+        else
+          echo "GCS upload to $$dest failed; artifacts still carry everything"
+        fi
+    artifact_paths:
+      - "perf_eval_results/**/*"

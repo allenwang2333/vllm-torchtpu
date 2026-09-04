@@ -225,8 +225,13 @@ elif [ "$BACKEND" = "mp" ]; then
   source "${SCRIPT_DIR}/run_multihost_mp.sh"
   run_mp_multihost "$@"
   EXIT_CODE=$?
+elif [ "$BACKEND" = "torchrun" ]; then
+  # shellcheck source=.buildkite/scripts/run_multihost_torchrun.sh
+  source "${SCRIPT_DIR}/run_multihost_torchrun.sh"
+  run_torchrun_multihost "$@"
+  EXIT_CODE=$?
 else
-  echo "ERROR: Unknown backend: ${BACKEND}. Supported backends: ray, mp"
+  echo "ERROR: Unknown backend: ${BACKEND}. Supported backends: ray, mp, torchrun"
   exit 1
 fi
 

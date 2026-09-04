@@ -1,0 +1,104 @@
+#!/bin/bash
+# [branch-local] Per-host runner for the 112-MiB TP32 all-reduce microbench
+# (scripts/benchmark_torchtpu_all_reduce_112m.py) on the tpu7x-32 pod.
+#
+# Executed inside every host's container by run_multihost.sh --backend
+# torchrun, which exports NODE_RANK / NNODES / MASTER_ADDR / NPROC_PER_NODE /
+# TORCH_TPU_TOPOLOGY / TORCH_TPU_SLICEBUILDER_ADDRESSES (the same env the
+# Ray/mp executors hand vLLM workers). Runs a matrix of LIBTPU / script
+# variants; every variant is its own torchrun rendezvous on its own port, so
+# a failed variant on one host fails that variant on all hosts and the loop
+# moves on. Rank 0 (this host when NODE_RANK=0) writes the xplane profile.
+set -uo pipefail
+
+NODE_RANK="${NODE_RANK:?}"
+NNODES="${NNODES:?}"
+MASTER_ADDR="${MASTER_ADDR:?}"
+NPROC="${NPROC_PER_NODE:-8}"
+OUT="${ALLREDUCE_OUT:-/perf_eval_results/allreduce}"
+SCRIPT=/root/torchtpu-vllm/scripts/benchmark_torchtpu_all_reduce_112m.py
+ITER="${ALLREDUCE_ITERATIONS:-100}"
+mkdir -p "$OUT"
+
+# What vllm_torchtpu/env_override.py injects for tpu7x before libtpu loads
+# (the benchmark script imports torch_tpu directly, bypassing it).
+TT_SERVING_FLAGS="--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=67108864 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=67108864"
+FORCE_TC_FLAGS="--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1073741824 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1073741824"
+SC_HIER_FLAGS="$TT_SERVING_FLAGS --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true"
+
+echo "[allreduce] node=$NODE_RANK/$NNODES master=$MASTER_ADDR nproc=$NPROC topology=${TORCH_TPU_TOPOLOGY:-unset}"
+echo "[allreduce] slicebuilder=${TORCH_TPU_SLICEBUILDER_ADDRESSES:-unset}"
+python3 -c "import torch, torch_tpu; print('[allreduce] torch', torch.__version__)" 2>/dev/null | grep allreduce || true
+pip show torch-tpu 2>/dev/null | grep -i '^Version' | sed 's/^/[allreduce] torch-tpu /' || true
+pip show libtpu 2>/dev/null | grep -i '^Version' | sed 's/^/[allreduce] libtpu /' || true
+
+run_variant() {
+    # run_variant <name> <master_port> <LIBTPU_INIT_ARGS> [script args...]
+    local name="$1" port="$2" libtpu="$3"
+    shift 3
+    mkdir -p "$OUT/$name"
+    echo "=== [allreduce] variant=$name node=$NODE_RANK port=$port"
+    echo "=== [allreduce] LIBTPU_INIT_ARGS='$libtpu' args='$*'"
+    LIBTPU_INIT_ARGS="$libtpu" python3 -m torch.distributed.run \
+        --nnodes="$NNODES" --nproc-per-node="$NPROC" --node-rank="$NODE_RANK" \
+        --master-addr="$MASTER_ADDR" --master-port="$port" \
+        "$SCRIPT" --warmups 10 --iterations "$ITER" \
+        --profile-dir "$OUT/$name/profile" "$@" \
+        2>&1 | tee "$OUT/$name/node${NODE_RANK}.log"
+    local rc="${PIPESTATUS[0]}"
+    grep -h "TORCHTPU_ALL_REDUCE_RESULT" "$OUT/$name/node${NODE_RANK}.log" \
+        | sed 's/^.*TORCHTPU_ALL_REDUCE_RESULT //' > "$OUT/$name/results_node${NODE_RANK}.jsonl" || true
+    local n
+    n=$(wc -l < "$OUT/$name/results_node${NODE_RANK}.jsonl" 2>/dev/null || echo 0)
+    echo "=== [allreduce] variant=$name node=$NODE_RANK rc=$rc result_records=$n"
+    if [ "$NODE_RANK" = "0" ] && [ "$n" -gt 0 ]; then
+        python3 - "$OUT/$name/results_node0.jsonl" "$name" << 'PYEOF'
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r.get("rank") == 0:
+        print(f"[allreduce] RESULT {sys.argv[2]}: median={r['median_ms']:.3f} ms p90={r['p90_ms']:.3f} p99={r['p99_ms']:.3f} min={r['min_ms']:.3f} "
+              f"algo={r['algorithm_gbps']:.1f} GB/s bus={r['ring_equivalent_bus_gbps']:.1f} GB/s msg={r['message_mib']:.0f} MiB world={r['world_size']}")
+PYEOF
+    fi
+    return "$rc"
+}
+
+# 1. Baseline = the reported repro: raw torch_tpu, libtpu defaults, no
+#    TPU_*_BOUNDS. If the slice refuses to initialize without the bounds env
+#    from the original recipe, retry once with it and keep it for the rest.
+if ! run_variant baseline 30201 ""; then
+    echo "[allreduce] baseline failed without TPU_*_BOUNDS; retrying with the recipe's bounds env"
+    export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1
+    export TPU_HOST_BOUNDS=1,1,4
+    run_variant baseline_bounds 30211 "" || true
+fi
+
+# 2. What vLLM serving actually gets (SC offload threshold 64 MiB => this
+#    112 MiB all-reduce is offloaded to SparseCore under vllm_torchtpu).
+run_variant tt_serving_flags 30202 "$TT_SERVING_FLAGS" || true
+
+# 3. Force the collective to stay on TensorCore (threshold 1 GiB).
+run_variant force_tensorcore 30203 "$FORCE_TC_FLAGS" || true
+
+# 4. The flag from the original ask, on top of the serving flags.
+run_variant sc_hierarchical_ar 30204 "$SC_HIER_FLAGS" || true
+
+# 5. Topology-aware group from torch.tpu.topology_aware_mesh.
+run_variant topology_aware 30205 "" --topology-aware || true
+
+# 6. Two 56-MiB operands instead of one 112-MiB operand.
+run_variant chunks2 30206 "" --chunks=2 || true
+
+# 7. Decode-sized message ([16, 7168] = 224 KiB) for the latency floor.
+run_variant decode_16tok 30207 "" --tokens 16 || true
+
+echo "[allreduce] node=$NODE_RANK all variants done"
+if [ "$NODE_RANK" = "0" ]; then
+    echo "[allreduce] ===== SUMMARY (rank 0) ====="
+    grep -h "^\[allreduce\] RESULT" "$OUT"/*/node0.log 2>/dev/null || true
+    grep -h "\[allreduce\] RESULT" "$OUT"/*/node0.log 2>/dev/null | sed 's/.*\[allreduce\] //' > "$OUT/summary.txt" || true
+    echo "[allreduce] xplane traces:"
+    find "$OUT" -name '*.xplane.pb' 2>/dev/null || true
+fi
+exit 0
