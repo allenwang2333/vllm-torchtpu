@@ -327,7 +327,11 @@ run_lifetime() {  # <cell label> <arm> <config> <cells...>  cell = "conc:num_pro
 # ~10.6 GB per server lifetime against a shared 100 GB boot disk. Losing the
 # last arm to a full disk is acceptable; losing the first two to a death
 # mid-write is not, so stop cleanly and let the summary still run.
-MIN_FREE_MB="${MIN_FREE_MB:-15000}"
+# 15000 stopped build 377 after ONE arm with 14,998 MB free -- a 2 MB miss on a
+# floor I picked by guessing, which cost four arms. The real consumer is the raw
+# traces we now keep (~10 GB per capture arm), so the floor belongs just above
+# one arm's working set, not above a whole build's.
+MIN_FREE_MB="${MIN_FREE_MB:-6000}"
 declare -A ARM_SEEN=()
 export K3_ARMS_EXPECTED="${*:-$ARMS_DEFAULT}"
 for arm in ${*:-$ARMS_DEFAULT}; do

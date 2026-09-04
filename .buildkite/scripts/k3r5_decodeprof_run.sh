@@ -60,12 +60,19 @@ upload() {
 }
 
 # --- 1. run -----------------------------------------------------------------
+# K3_COLLECT_ONLY=1 skips the run and goes straight to collection: the collector
+# lives on the agent and reaches the workers by ssh, so recovering a previous
+# build's kept raw traces needs no cluster and no TPU. K3_RECOVER_BUILD names it.
 mkdir -p "$RESULTS"
+BUILD="${K3_RECOVER_BUILD:-$BUILD}"
 case "$RIG" in
   tp32)
     HOST_PROFILE_DIR="${HOME}/hf_home/k3r5_profile/${K3_PROFILE_SUBDIR:-tp32}/${BUILD}"
     say "TP32 pod run; per-host capture dir ${HOST_PROFILE_DIR}"
-    if [ "${#INNER[@]}" -gt 0 ]; then
+    if [ "${K3_COLLECT_ONLY:-0}" = "1" ]; then
+      say "collect-only: skipping the run, recovering ${HOST_PROFILE_DIR}"
+      rc=0
+    elif [ "${#INNER[@]}" -gt 0 ]; then
       bash "${SCRIPT_DIR}/run_multihost.sh" "${INNER[@]}"
     else
       bash "${SCRIPT_DIR}/run_multihost.sh" bash ./scripts/vllm/benchmarking/run_benchmarks.sh \
@@ -125,7 +132,12 @@ reduce_tree() {  # <capture root> <output root> <label>
     say "  reducing ${label}/${phase}/${ts}"
     "${PY[@]}" "$REDUCE" --root "$tsdir" --out "${dst}/${phase}/${ts}" --slim rank0 --meta-from rank0 || true
     gzip -f "${dst}/${phase}/${ts}"/slim/*.slim.xplane.pb 2>/dev/null || true
-  done < <(find "$src" -type d -path '*/plugins/profile/*' -mindepth 3 -maxdepth 3 2>/dev/null | sort)
+  # No depth limits: the ts directory sits at <phase>/plugins/profile/<ts>, four
+  # levels below the capture root, and a -maxdepth 3 here silently matched
+  # NOTHING in build 377 -- 16 xplane files on disk, a 4 KB bundle, no error.
+  # The -path pattern already pins the shape; the second clause keeps it to the
+  # ts directory itself rather than its children.
+  done < <(find "$src" -type d -path '*/plugins/profile/*' ! -path '*/plugins/profile/*/*' 2>/dev/null | sort)
   # The per-step batch composition stats stay in the rank sandboxes and are the
   # proof the window is decode-only. They are tiny, they cover every arming, and
   # they must not be lost.
@@ -146,6 +158,16 @@ reduce_tree "$HOST_PROFILE_DIR" "${XPROF_OUT}/host0" "host0"
 BUNDLE="perf_eval_results/k3r5_${RIG}_xprof_reduced.tgz"
 tar czf "$BUNDLE" -C "$RESULTS" . 2>/dev/null || true
 say "reduced bundle $(du -h "$BUNDLE" 2>/dev/null | cut -f1)"
+# Arity for the collector. Build 377 censused 16 xplane files and shipped a 4 KB
+# bundle: the reduce matched nothing and said nothing. A bundle with planes in it
+# is the only evidence the reduction ran.
+n_pb=$(grep -c 'xplane.pb' "${XPROF_OUT}/host0/trace_census.txt" 2>/dev/null || echo 0)
+n_planes=$(find "${XPROF_OUT}" -name '*.json.gz' -path '*planes*' 2>/dev/null | wc -l)
+say "collection check: ${n_pb} xplane inputs -> ${n_planes} reduced plane files"
+if [ "$n_pb" -gt 0 ] && [ "$n_planes" -eq 0 ]; then
+  say "+++ COLLECTION FAILED: ${n_pb} traces on disk reduced to nothing. Raw traces are KEPT; re-run with K3_COLLECT_ONLY=1."
+  rc=1
+fi
 upload "$BUNDLE"
 
 # --- 4. the other hosts of the slice ----------------------------------------
@@ -184,7 +206,7 @@ if [ "$RIG" = "tp32" ]; then
       rm -rf \"\$DST\"; mkdir -p \"\$DST\"
       [ -d \"\$SRC\" ] || { echo \"host${widx}: no capture at \$SRC\" >&2; exit 0; }
       find \"\$SRC\" -name '*.xplane.pb' -printf '%s\t%p\n' 2>/dev/null | sort -rn > \"\$DST/trace_census.txt\"
-      find \"\$SRC\" -mindepth 3 -maxdepth 3 -type d -path '*/plugins/profile/*' | sort | while read -r t; do
+      find \"\$SRC\" -type d -path '*/plugins/profile/*' ! -path '*/plugins/profile/*/*' | sort | while read -r t; do
         ts=\$(basename \"\$t\"); phase=\$(basename \$(dirname \$(dirname \"\$t\")))
         python3 ~/xprof_reduce.py --root \"\$t\" --out \"\$DST/\$phase/\$ts\" --slim none --meta-from none >&2 || true
       done
