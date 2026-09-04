@@ -46,7 +46,7 @@ REPS="${REPS:-3}"
 # CPU-checkable in minutes; a ~50 min pod lifetime is the wrong way to find out.
 # base is the denominator and mandatory; k1 carries the largest single lever and a
 # locked prediction; e8m0 is the smallest and the one to lose if the disk runs out.
-ARMS_DEFAULT="base k1 e8m0"
+ARMS_DEFAULT="base k1 c1 e8m0"
 rc=0
 
 # --- the arms, one variable each -------------------------------------------
@@ -63,18 +63,22 @@ rc=0
 K3_GATES="TPU_K3_FP8_LATENT_PROJ TPU_KDA_GPROJ_LAYOUT TPU_MOE_COMPACT_SCALE K3_HIEREP_LOADER_FIX TPU_MOE_HIERARCHICAL_EP"
 arm_env() {
   case "$1" in
-    base)     echo "" ;;                                    # the control, all gates off
-    c1)       echo "TPU_KDA_GPROJ_LAYOUT=${K3_C1_LAYOUT:-lane_major}" ;;  # lane I1: KDA g_proj relayout (default head_major)
+    # The control, and it has to SAY so. TPU_KDA_GPROJ_LAYOUT defaults to
+    # "head_major", which is I1's FIX, not today's behaviour -- so an unpinned
+    # base arm would quietly ship C1 and every delta measured against it would
+    # be understated by C1's whole effect. "canonical" is the shipping layout.
+    base)     echo "TPU_KDA_GPROJ_LAYOUT=canonical" ;;
+    c1)       echo "TPU_KDA_GPROJ_LAYOUT=head_major" ;;     # lane I1: KDA g_proj kept in the layout its consumer reads
     # Compact MoE scale. e8m0 over bf16 because it is the same diff for twice the
     # win (43,008 -> 21,504 -> 10,752 granules) and equally lossless: E8M0 encodes
     # powers of two, which both float8_e8m0fnu and bf16 hold exactly, so the
     # arithmetic is unchanged and no accuracy run is owed.
-    e8m0)     echo "TPU_MOE_COMPACT_SCALE=e8m0" ;;
+    e8m0)     echo "TPU_MOE_COMPACT_SCALE=e8m0 TPU_KDA_GPROJ_LAYOUT=canonical" ;;
     c1e8m0|c1_compactscale)
-              echo "TPU_KDA_GPROJ_LAYOUT=${K3_C1_LAYOUT:-lane_major} TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
-    k1)       echo "TPU_K3_FP8_LATENT_PROJ=1" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
-    hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;  # lane I2: env + loader patch
-    stacked)  echo "$(arm_env c1_compactscale) $(arm_env k1) $(arm_env hierep)" ;;
+              echo "TPU_KDA_GPROJ_LAYOUT=head_major TPU_MOE_COMPACT_SCALE=e8m0" ;;  # the lossless pair: lands on ladder + probe, no eval owed
+    k1)       echo "TPU_K3_FP8_LATENT_PROJ=1 TPU_KDA_GPROJ_LAYOUT=canonical" ;;         # lane K: fp8 the two latent projections. LOSSY -- needs an accuracy run
+    hierep)   echo "TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1 TPU_KDA_GPROJ_LAYOUT=canonical" ;;  # lane I2: env + loader patch
+    stacked)  echo "TPU_KDA_GPROJ_LAYOUT=head_major TPU_MOE_COMPACT_SCALE=e8m0 TPU_K3_FP8_LATENT_PROJ=1 TPU_MOE_HIERARCHICAL_EP=1 K3_HIEREP_LOADER_FIX=1" ;;
     *)        echo "__UNKNOWN__" ;;
   esac
 }
@@ -101,8 +105,14 @@ say() { echo "--- [ladder] $*"; }
 # makes compilation_seconds meaningful: ~45 s fresh, ~23 s on a hit, and an arm
 # that reports 23 s did not recompile.
 clear_compile_cache() {
+  # Measure before deleting. "10.6 GB per lifetime" is an inference from the
+  # boot disk moving, not a measurement of anything, and a diagnostic cannot be
+  # added after the job starts.
+  say "disk census before clearing:"
+  du -sh /dev/shm/torch_tpu_cache /root/.cache/vllm /root/.cache/huggingface /perf_eval_results 2>/dev/null | sed 's/^/    /' || true
+  df -Pm / /dev/shm 2>/dev/null | sed 's/^/    /' || true
   rm -rf /dev/shm/torch_tpu_cache 2>/dev/null || true
-  say "compile cache cleared"
+  say "compile cache cleared (every arm changes code or env, so it was invalid anyway)"
 }
 # Prints the gate values NEXT TO the compile time on purpose: an arm is only
 # honest if both "the flag was set" and "the program was rebuilt" are true.
@@ -207,7 +217,7 @@ for arm in ${*:-$ARMS_DEFAULT}; do
     for kv in $env_list; do export "${kv?}"; done
     # The capture rides the control arm: it is the one whose serve flags are the
     # shipping recipe, so its decode window describes what we actually ship.
-    case " ${K3_PROFILE_ARMS:-base} " in *" $arm "*) export K3_PROFILE_CAPTURE=1 ;; *) export K3_PROFILE_CAPTURE=0 ;; esac
+    case " ${K3_PROFILE_ARMS:-base c1} " in *" $arm "*) export K3_PROFILE_CAPTURE=1 ;; *) export K3_PROFILE_CAPTURE=0 ;; esac
     # The environment, read back from the environment. "I exported it" and "the
     # process has it" are different claims, and a silently unset gate reproduces
     # the base numbers under the arm's label -- a clean-looking null.
