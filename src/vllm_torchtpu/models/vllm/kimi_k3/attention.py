@@ -363,9 +363,14 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         prefix: str,
     ) -> None:
         super().__init__()
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError(
-                "TPU KDA does not support speculative decode")
+        # Draft length of the speculative verify window, 0 when spec decoding
+        # is off. Named as vLLM's own mamba layers name it
+        # (`GatedDeltaNetAttention.num_spec`) because the runner-side
+        # plumbing this feeds -- checkpoint slot groups, read offsets,
+        # `mamba_request_distribution` -- is shared with GDN and keyed on the
+        # same value.
+        self.num_spec = (vllm_config.speculative_config.num_speculative_tokens
+                         if vllm_config.speculative_config is not None else 0)
         kda_config = config.linear_attn_config
         if kda_config is None:
             raise ValueError("KDA requires linear_attn_config")
@@ -478,6 +483,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
+            num_spec=self.num_spec,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -494,6 +500,29 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         # Keep the KDA short-convolution cache in the Pallas DMA layout.
+        #
+        # Deliberately NOT widened by `num_spec`. vLLM's
+        # `MambaStateShapeCalculator.kda_state_shape` asks for
+        # `conv_kernel_size - 1 + num_spec` columns so a GPU verify step can
+        # roll back through a sliding window of conv inputs; on TPU the whole
+        # rollback is "select a checkpoint", with one full conv AND recurrent
+        # state written per window position into `num_spec + 1` consecutive
+        # slots (the runner's `_mamba_slot_stride`). The extra columns would
+        # never be read -- which is why the GDN op, whose vLLM base class does
+        # apply that widening, slices them straight back off before the kernel
+        # (gdn_attention_op.py:157-168). Not asking for them in the first
+        # place is the same thing without the slice, and keeps this hand-
+        # rolled shape honest about what the kernel touches.
+        #
+        # The part of the spec sizing that DOES apply needs nothing here:
+        # `MambaBase.get_kv_cache_spec` takes these shapes verbatim and adds
+        # `num_speculative_blocks = num_speculative_tokens` to the spec, which
+        # is what reserves the extra checkpoint slots the kernel writes.
+        #
+        # MUST stay identical to
+        # `Glm5NextForCausalLM.get_mamba_state_shape_from_config`; vLLM sizes
+        # and allocates the mamba pool from that classmethod and addresses it
+        # through this one.
         return (
             (self.conv_size - 1, 3, self.num_heads, self.head_dim),
             (self.num_heads, self.head_dim, self.head_dim),
@@ -565,6 +594,25 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = torch.zeros_like(query)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
+            # Speculative decoding: the KDA kernel's windowed segment covers
+            # 1-token decodes AND verify windows of up to num_spec + 1 tokens.
+            # The batch is ordered [decode][verify][prefill/mixed], so
+            # `mamba_request_distribution` moves the front boundary past the
+            # verify group while ragged paged attention keeps
+            # `request_distribution` with its 1-token-decode-only segment.
+            # Absent (None) whenever spec decoding is off.
+            request_distribution = metadata.request_distribution
+            mamba_request_distribution = getattr(metadata,
+                                                 "mamba_request_distribution",
+                                                 None)
+            if mamba_request_distribution is not None:
+                request_distribution = mamba_request_distribution
+            slot_read_offsets = getattr(metadata, "mamba_slot_read_offsets",
+                                        None)
+            if self.num_spec > 0:
+                assert slot_read_offsets is not None, (
+                    "Speculative decoding with KDA layers requires "
+                    "mamba_slot_read_offsets in the attention metadata.")
             output = self.dispatched_kda_op(
                 mixed_qkv,
                 raw_gate,
@@ -579,7 +627,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.query_start_loc,
                 metadata.mamba_state_indices,
                 metadata.seq_lens,
-                metadata.request_distribution,
+                request_distribution,
+                # Slot-indexed; the op gathers it to per-sequence with
+                # `state_indices` inside its traced core.
+                slot_read_offsets,
             ).flatten(1)
 
         output, _ = self.o_proj(output)

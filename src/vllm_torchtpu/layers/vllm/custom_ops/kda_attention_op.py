@@ -257,6 +257,7 @@ def _check_kda_abi(
     query_start_loc: jax.Array,
     state_indices: jax.Array,
     seq_lens: jax.Array,
+    slot_read_offsets: jax.Array | None = None,
 ) -> tuple[int, int, int, int]:
     """Validate the shared KDA operand contract; return the shape tuple.
 
@@ -294,6 +295,18 @@ def _check_kda_abi(
     if (query_start_loc.dtype != jnp.int32 or state_indices.dtype != jnp.int32
             or seq_lens.dtype != jnp.int32):
         raise TypeError("KDA metadata tensors must be int32")
+    if slot_read_offsets is not None:
+        # Indexed by *physical slot*, not by batch position, so its length is
+        # the slot-pool size and has nothing to do with `num_sequences`; the
+        # per-sequence form the kernel wants is the gather by `state_indices`
+        # that the caller does. Only the rank and dtype are checkable here,
+        # and both matter: a float or 2-D buffer would index garbage rather
+        # than fail.
+        if slot_read_offsets.ndim != 1:
+            raise ValueError(
+                "KDA slot read offsets must be a 1-D per-slot buffer")
+        if slot_read_offsets.dtype != jnp.int32:
+            raise TypeError("KDA metadata tensors must be int32")
     return num_tokens, num_sequences, num_heads, head_dim
 
 
@@ -355,7 +368,8 @@ def _get_kda_prefill_kernel() -> str:
     return kernel
 
 
-def _build_fused_core(lower_bound: float | None, eps: float):
+def _build_fused_core(lower_bound: float | None, eps: float,
+                      num_spec_tokens: int):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     One Pallas call replaces the four-stage manual pipeline: the fused kernel
@@ -366,8 +380,17 @@ def _build_fused_core(lower_bound: float | None, eps: float):
 
     Only `_gated_output_norm` stays outside, since the fused kernel has no
     notion of the output gate.
+
+    ``num_spec_tokens`` is the speculative draft length. It is baked in here
+    rather than passed per step because it sets the kernel's static window
+    size (`num_spec_tokens + 1` state checkpoints per sequence in VMEM), and
+    it therefore also has to appear in the op name -- see the caller.
     """
 
+    # One operand per line, each with its shape. Left alone because yapf
+    # reflows the whole block to fit the added line and splits `jax.Array`
+    # itself across two of them.
+    # yapf: disable
     def fused_core(
         mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
         raw_gate: jax.Array,  # [T, H * D]
@@ -383,11 +406,29 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+        slot_read_offsets: jax.Array | None = None,  # [num_slots]
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # yapf: enable
         num_tokens, _, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
-            dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
+            dt_bias, norm_weight, query_start_loc, state_indices, seq_lens,
+            slot_read_offsets)
         kernel_size = conv_weight.shape[0]
+
+        # Gather the per-slot offsets down to one per sequence, here rather
+        # than in the layer, for the same reason GDN gathers inside
+        # `run_jax_gdn_attention`: the layer hands the op the whole
+        # runner-owned buffer, whose length is the slot pool and so is
+        # constant across steps, while the kernel asserts one offset per
+        # sequence. Gathering on the torch side would put an index_select on
+        # the traced graph per KDA layer per step, outside the donated custom
+        # op, and would make the op's operand shape depend on the request
+        # bucket. The buffer is slot-indexed precisely so it survives requests
+        # being rescheduled or condensed, and `state_indices` -- already an
+        # operand -- is the only thing that knows which slot each batch
+        # position currently holds.
+        read_offsets = (None if slot_read_offsets is None else
+                        slot_read_offsets[state_indices])
 
         # `mixed_qkv`, `conv_state` and `conv_weight` all lay their channels
         # out as (3, H, D) in row-major order, which is exactly the flat
@@ -414,6 +455,13 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             state_indices=state_indices,
             distribution=distribution,
             seq_lens=seq_lens,
+            # Dense path only: `ckpt_indices` names one pool block per
+            # checkpoint and the wrapper requires it solely when
+            # `state_plan is not None`. Here the checkpoint group is
+            # `num_spec_tokens + 1` consecutive slots of the dense state
+            # tensor starting at `state_indices[s]`, so the base index plus
+            # `read_offsets` addresses it with no index array.
+            read_offsets=read_offsets,
             n_kq=num_heads,
             n_v=num_heads,
             d_k=head_dim,
@@ -421,6 +469,7 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             kernel_size=kernel_size,
             attention_mode=gdn_config.AttentionMode.KDA,
             gate_lower_bound=lower_bound,
+            num_spec_tokens=num_spec_tokens,
         )
 
         output = out.reshape(num_tokens, num_heads, head_dim)
@@ -446,11 +495,29 @@ def _dispatched_kda_core(
     state_indices: jax.Array,  # [N]
     seq_lens: jax.Array,  # [N]
     distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+    slot_read_offsets: jax.Array | None = None,  # [num_slots]
     *,
     lower_bound: float | None,
     eps: float,
+    num_spec_tokens: int = 0,
     use_mega_prefill: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    # Neither `decode_kda` nor the chunked/mega prefill kernels have a window:
+    # each keeps exactly one state per slot, reads it at `state_indices[s]`
+    # and writes it back there. There is no checkpoint to select with a read
+    # offset and none to emit for a rejected draft, so a verify step would
+    # silently resume from the wrong token instead of failing. Refuse rather
+    # than accept an operand this path cannot honour.
+    if num_spec_tokens > 0:
+        raise NotImplementedError(
+            "The manual KDA path (VLLM_TORCHTPU_KDA_FUSED=0) does not support "
+            f"speculative decoding (num_spec_tokens={num_spec_tokens}); it "
+            "keeps a single state per slot with no per-window-position "
+            "checkpoints. Use the fused path (VLLM_TORCHTPU_KDA_FUSED=1).")
+    if slot_read_offsets is not None:
+        raise NotImplementedError(
+            "The manual KDA path was handed slot read offsets, which only "
+            "mean something with a speculative window it cannot run.")
     num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
         mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
         dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
@@ -642,16 +709,26 @@ def build_kimi_dispatched_kda_op(
     lower_bound: float | None,
     eps: float,
     state_dim_first: bool,
+    num_spec: int = 0,
 ):
     """Build the KDA op that sends decode rows to the fused decode kernel.
 
     Takes the *pre-convolution* projection output and owns both caches, because
     ``decode_kda`` fuses the convolution into the recurrence and so cannot be fed
     by a separate convolution op the way the chunked kernel is.
+
+    ``num_spec`` is the speculative draft length (0 without spec decoding). It
+    is static: it sizes the kernel's per-sequence checkpoint window, so it is
+    baked into the traced core and into the op name rather than passed per
+    step.
     """
     prefill_kernel = _get_kda_prefill_kernel()
     use_mega_prefill = prefill_kernel == "mega"
 
+    # One operand per line, each with its shape. Left alone because yapf
+    # reflows the whole block to fit the added line and splits `jax.Array`
+    # itself across two of them.
+    # yapf: disable
     def dispatched_core(
         mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
         raw_gate: jax.Array,  # [T, H * D]
@@ -667,7 +744,9 @@ def build_kimi_dispatched_kda_op(
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
         distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+        slot_read_offsets: jax.Array | None = None,  # [num_slots]
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # yapf: enable
         return _dispatched_kda_core(mixed_qkv,
                                     raw_gate,
                                     beta,
@@ -682,16 +761,25 @@ def build_kimi_dispatched_kda_op(
                                     state_indices,
                                     seq_lens,
                                     distribution,
+                                    slot_read_offsets,
                                     lower_bound=lower_bound,
                                     eps=eps,
+                                    num_spec_tokens=num_spec,
                                     use_mega_prefill=use_mega_prefill)
 
     # The fused core replaces the whole op, prefill included, so it overrides
     # the chunked/mega selection rather than composing with it.
     use_fused = _use_fused_kda()
     variant = "fused" if use_fused else prefill_kernel
-    core = _build_fused_core(lower_bound,
-                             eps) if use_fused else dispatched_core
+    # Fail at construction, not at the first verify step: the manual path has
+    # no window and `_dispatched_kda_core` would otherwise only raise once
+    # something traced it.
+    if not use_fused and num_spec > 0:
+        raise NotImplementedError(
+            "VLLM_TORCHTPU_KDA_FUSED=0 selects the manual KDA path, which "
+            f"does not support speculative decoding (num_spec={num_spec}).")
+    core = (_build_fused_core(lower_bound, eps, num_spec)
+            if use_fused else dispatched_core)
 
     if use_fused and prefill_kernel != "chunked":
         logger.warning(
@@ -703,15 +791,21 @@ def build_kimi_dispatched_kda_op(
     # var, so the variant goes in the op name. If this line disagrees with the
     # kernels in a profile, the run came from cache.
     logger.info(
-        "KDA op %s: using the %s path.", prefix, "fused conv1d + GDN v3"
-        if use_fused else f"manual with {prefill_kernel} prefill")
+        "KDA op %s: using the %s path, num_spec=%d.", prefix,
+        "fused conv1d + GDN v3"
+        if use_fused else f"manual with {prefill_kernel} prefill", num_spec)
 
-    op_name = (f"pallas::kimi_dispatched_kda_{variant}_"
+    # `num_spec` joins the variant in the name for the same reason: it changes
+    # the traced kernel (window size, VMEM tiling, an extra operand) without
+    # changing anything the compile cache is keyed on.
+    op_name = (f"pallas::kimi_dispatched_kda_{variant}_spec{num_spec}_"
                f"{prefix.replace('.', '_')}")
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
 
     def _fake_dispatched(mixed_qkv, _raw_gate, _beta, _output_gate, conv_state,
                          recurrent_state, *args, **kwargs):
+        # `*args` already absorbs the optional `slot_read_offsets` tail; the
+        # output shapes do not depend on it.
         num_heads, head_dim = recurrent_state.shape[1:3]
         output = torch.empty((mixed_qkv.size(0), num_heads, head_dim),
                              dtype=mixed_qkv.dtype,
@@ -736,6 +830,7 @@ def build_kimi_dispatched_kda_op(
         state_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         distribution: torch.Tensor,
+        slot_read_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output, new_conv_state, new_pool = dispatched_op(
             mixed_qkv,
@@ -752,6 +847,7 @@ def build_kimi_dispatched_kda_op(
             state_indices,
             seq_lens,
             distribution,
+            slot_read_offsets,
         )
         conv_state.copy_(new_conv_state)
         recurrent_state.copy_(new_pool)

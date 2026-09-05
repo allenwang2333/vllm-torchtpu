@@ -726,6 +726,8 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    # Real layers always carry this; the __new__ harness has to state it.
+    layer.num_spec = 0
 
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
@@ -780,9 +782,10 @@ def test_kda_custom_ops_compile_as_one_full_graph(
             state_indices: torch.Tensor,
             seq_lens: torch.Tensor,
             distribution: torch.Tensor,
+            slot_read_offsets: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-            del conv_weight, distribution
+            del conv_weight, distribution, slot_read_offsets
             del query_start_loc, state_indices, seq_lens
             num_heads, head_dim = recurrent_state.shape[1:3]
             output = mixed_qkv[:, :num_heads * head_dim]
@@ -818,6 +821,8 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = False
+    # Real layers always carry this; the __new__ harness has to state it.
+    layer.num_spec = 0
     layer.dispatched_kda_op = kimi_custom_ops.build_kimi_dispatched_kda_op(
         "test_compile",
         lower_bound=None,
