@@ -29,10 +29,9 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_torchtpu.distributed.kv_transfer.raiden.transfer_plan import (
-    TransferGroup, recycled_transfer_pages, skipped_window_pages)
-from vllm_torchtpu.distributed.kv_transfer.tpu_connector import \
-    TPURaidenConnectorScheduler
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+    TPURaidenConnectorScheduler, _stage3_recycled_transfer_pages,
+    _stage3_skipped_window_pages, _Stage3TransferGroup)
 
 # DeepSeek-V4-Flash compressor-state geometry: a 16-token page under an
 # 8-token window, the tightest ratio the model has and so the first to drift.
@@ -45,13 +44,14 @@ def test_handoff_length_transfers_only_live_pages():
     # computed=114, num_tokens=113. The allocator freed six pages and the
     # connector skips six, so both live pages go over the wire.
     ids = [0, 0, 0, 0, 0, 0, 286, 58]
-    assert skipped_window_pages(num_tokens=113,
-                                page_tokens=_STATE_CSA_PAGE,
-                                window_tokens=_STATE_CSA_WINDOW) == 6
-    assert recycled_transfer_pages(ids,
-                                   num_tokens=113,
-                                   page_tokens=_STATE_CSA_PAGE,
-                                   window_tokens=_STATE_CSA_WINDOW) == 0
+    assert _stage3_skipped_window_pages(num_tokens=113,
+                                        page_tokens=_STATE_CSA_PAGE,
+                                        window_tokens=_STATE_CSA_WINDOW) == 6
+    assert _stage3_recycled_transfer_pages(
+        ids,
+        num_tokens=113,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW) == 0
 
 
 def test_one_page_of_drift_is_caught_rather_than_shipped_dead():
@@ -63,13 +63,14 @@ def test_one_page_of_drift_is_caught_rather_than_shipped_dead():
     and corrupts the decode replica's state anyway.
     """
     ids = [0] * 23 + [13]
-    assert skipped_window_pages(num_tokens=374,
-                                page_tokens=_STATE_CSA_PAGE,
-                                window_tokens=_STATE_CSA_WINDOW) == 22
-    assert recycled_transfer_pages(ids,
-                                   num_tokens=374,
-                                   page_tokens=_STATE_CSA_PAGE,
-                                   window_tokens=_STATE_CSA_WINDOW) == 1
+    assert _stage3_skipped_window_pages(num_tokens=374,
+                                        page_tokens=_STATE_CSA_PAGE,
+                                        window_tokens=_STATE_CSA_WINDOW) == 22
+    assert _stage3_recycled_transfer_pages(
+        ids,
+        num_tokens=374,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW) == 1
 
 
 def test_producer_that_kept_generating_is_caught():
@@ -84,10 +85,11 @@ def test_producer_that_kept_generating_is_caught():
     """
     # [0] * 9 + [250, 18], normalized down to the eight-page prefix.
     ids = [0] * 8
-    assert recycled_transfer_pages(ids,
-                                   num_tokens=113,
-                                   page_tokens=_STATE_CSA_PAGE,
-                                   window_tokens=_STATE_CSA_WINDOW) == 2
+    assert _stage3_recycled_transfer_pages(
+        ids,
+        num_tokens=113,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW) == 2
 
 
 def test_truncation_removes_the_drift_at_its_source():
@@ -99,14 +101,16 @@ def test_truncation_removes_the_drift_at_its_source():
     """
     truncated = 374
     freed = max(0, truncated - _STATE_CSA_WINDOW + 1) // _STATE_CSA_PAGE
-    assert freed == skipped_window_pages(num_tokens=truncated,
-                                         page_tokens=_STATE_CSA_PAGE,
-                                         window_tokens=_STATE_CSA_WINDOW)
+    assert freed == _stage3_skipped_window_pages(
+        num_tokens=truncated,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW)
     ids = [0] * freed + [13, 41]
-    assert recycled_transfer_pages(ids,
-                                   num_tokens=truncated,
-                                   page_tokens=_STATE_CSA_PAGE,
-                                   window_tokens=_STATE_CSA_WINDOW) == 0
+    assert _stage3_recycled_transfer_pages(
+        ids,
+        num_tokens=truncated,
+        page_tokens=_STATE_CSA_PAGE,
+        window_tokens=_STATE_CSA_WINDOW) == 0
 
 
 @pytest.mark.parametrize(
@@ -128,7 +132,7 @@ def test_which_models_truncate_the_prompt(mamba_indices, windows, expected):
         TPURaidenConnectorScheduler)
     scheduler._stage3_mamba_group_indices = list(mamba_indices)
     scheduler._stage3_transfer_groups = tuple(
-        TransferGroup(
+        _Stage3TransferGroup(
             cache_group_index=index, page_tokens=16, window_tokens=window)
         for index, window in enumerate(windows))
     assert scheduler._stage3_truncates_prompt() is expected
@@ -152,7 +156,8 @@ def test_which_models_truncate_the_prompt(mamba_indices, windows, expected):
 )
 def test_captured_group_tables(ids, num_tokens, page_tokens, window_tokens,
                                expected):
-    assert recycled_transfer_pages(ids,
-                                   num_tokens=num_tokens,
-                                   page_tokens=page_tokens,
-                                   window_tokens=window_tokens) == expected
+    assert _stage3_recycled_transfer_pages(
+        ids,
+        num_tokens=num_tokens,
+        page_tokens=page_tokens,
+        window_tokens=window_tokens) == expected
