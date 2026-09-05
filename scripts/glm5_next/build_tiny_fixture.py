@@ -59,7 +59,8 @@ from transformers.models.glm5_next import (Glm5NextConfig,
                                            Glm5NextForConditionalGeneration)
 
 #: ``kv_lora_rank`` the sparse-MLA path is hard-wired to. It is not a tuning
-#: knob: ``layers/common/attention_interface.py:805-807`` asserts
+#: knob: the lane-bytes assertion in ``layers/common/attention_interface.py``
+#: (search ``TILE_LANE_BYTES``) requires
 #: ``lkv_dim == TILE_SUBROWS * TILE_LANE_BYTES`` = 4 * 128 = 512 before it will
 #: build ``sparse_mla_attention``, and ``get_sparse_kv_cache_specs``
 #: (``layers/vllm/attention.py:1274-1283``) splits the MLA head into
@@ -579,7 +580,8 @@ def main() -> None:
                         f"{_PRODUCTION_KV_LORA_RANK + _SPARSE_ROPE_SLAB}."
                         f" Mandatory for anything that executes the "
                         f"sparse MLA consumer, which asserts lkv_dim == "
-                        f"512 (attention_interface.py:805-807).")
+                        f"512 (the TILE_LANE_BYTES assertion in "
+                        f"attention_interface.py).")
     parser.add_argument("--geometry-seq-len",
                         type=int,
                         default=192,

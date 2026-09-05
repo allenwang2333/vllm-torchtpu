@@ -13,6 +13,8 @@
 # limitations under the License.
 """Pure-XLA pieces of the GLM-5.3-Flash k-pool DSA indexer.
 
+Design notes: ``docs/models/glm5-3-flash-kpool.md``.
+
 Everything here is plain ``jnp`` on purpose. GLM's pooling is a 4-way
 per-channel softmax plus one 256-byte record per four tokens -- roughly 1 MFLOP
 and 512 KB of scatters at an 8192-token chunk, against ~33 GFLOP of scoring in

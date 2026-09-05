@@ -282,6 +282,28 @@ class VllmTPUIndexer(Indexer):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
+def maybe_rebind_indexer(indexer):
+    """Retype an upstream ``Indexer`` onto the TPU path; leave anything else.
+
+    Extracted from ``VllmTPUMultiHeadLatentAttentionWrapper.__init__`` so the
+    guard is a thing a test can call rather than a line inside a constructor
+    that needs a distributed group and a KV cache to reach.
+
+    ``VllmTPUIndexer.rebind`` is a ``__class__`` reassignment. Python will
+    perform it on *any* object with a compatible layout and raise nothing, so
+    an unguarded call on GLM-5.3's ``Glm5NextKpoolIndexer`` -- whose forward
+    takes no rotary embedding, reads no fused ``wk_weights_proj``, and whose
+    ``k_cache`` is a ratio-4 pooled cache rather than a per-token one --
+    silently produces a DeepSeek-V2 lightning indexer. ``rebind`` also
+    retypes ``indexer.k_cache.__class__`` and *mutates*
+    ``indexer.k_cache.head_dim``, so the damage outlives the indexer object.
+    Nothing downstream checks; the symptom is bad retrieval.
+    """
+    if isinstance(indexer, Indexer):
+        return VllmTPUIndexer.rebind(indexer)
+    return indexer
+
+
 def _fresh(t: torch.Tensor) -> torch.Tensor:
     """Allocate a fresh contiguous device buffer (breaks view/stride chains so
     the torch_tpu pallas boundary ships a plain row-major buffer)."""
@@ -496,10 +518,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,
         # including `DeepseekV2MLAAttention.indexer`.
-        indexer = mla_modules.indexer
-        if indexer is not None:
-            indexer = VllmTPUIndexer.rebind(indexer)
-        self.indexer = indexer
+        #
+        # GUARDED -- see `maybe_rebind_indexer`, which is where the reasoning
+        # and the test live. Unguarded, this line silently turns GLM-5.3's
+        # kpool indexer into the DeepSeek-V2 lightning indexer.
+        self.indexer = maybe_rebind_indexer(mla_modules.indexer)
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
