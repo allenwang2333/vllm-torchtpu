@@ -809,9 +809,82 @@ def _patch_vllm_offloading_config_build() -> None:
     logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
 
 
+#: ``layer_types`` spellings that mean "this layer has a KV cache". Sliding
+#: and chunked attention are full attention as far as the *count* goes; they
+#: differ in how much of the cache they keep, not in whether they have one.
+_FULL_ATTENTION_LAYER_TYPES = frozenset({
+    "attention",
+    "chunked_attention",
+    # DeepSeek-V4's three spellings (transformers
+    # ``configuration_deepseek_v4.DEEPSEEK_V4_LAYER_TYPES``). All three keep a
+    # KV cache; the compression ratio changes what a cached row *is*, not
+    # whether the layer has one. Listed pre-emptively because this repo ships
+    # a whole ``kernels/deepseek_v4/`` tree, so it is the likeliest config to
+    # meet this allowlist next.
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+    "deepseek_sparse_attention",
+    "full_attention",
+    "sliding_attention",
+})
+
+#: ``layer_types`` spellings that mean "this layer carries a recurrent state
+#: instead". GLM-5.3-Flash says ``linear_attention``; the same slot is spelled
+#: ``mamba`` by vLLM's own hybrids and ``gated_delta_net`` by Qwen3-Next.
+_LINEAR_ATTENTION_LAYER_TYPES = frozenset({
+    "gated_delta_net",
+    "kda",
+    "linear_attention",
+    "mamba",
+    "mamba2",
+})
+
+
+def _is_full_attention_layer_type(layer_type: str) -> bool:
+    """Classify one ``layer_types`` entry, or refuse to guess.
+
+    An allowlist, not ``!= "linear_attention"``, because the denylist form is
+    silent in the direction that hurts: a config spelling its linear layers
+    ``mamba`` or ``gated_delta_net`` would have every one of them counted as
+    full attention, the KV cache would be sized for the whole stack, and
+    nothing would report it -- the model still builds and still runs. There is
+    no safe default, so an unknown spelling raises and names itself.
+    """
+    if layer_type in _FULL_ATTENTION_LAYER_TYPES:
+        return True
+    if layer_type in _LINEAR_ATTENTION_LAYER_TYPES:
+        return False
+    raise ValueError(
+        f"layer_types carries an unrecognised entry {layer_type!r}. Add it to "
+        "_FULL_ATTENTION_LAYER_TYPES or _LINEAR_ATTENTION_LAYER_TYPES in "
+        "vllm_torchtpu/__init__.py. Guessing is not safe: counting a "
+        "recurrent layer as full attention sizes a KV cache for a layer that "
+        "has none, and nothing downstream reports it.")
+
+
 def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
-    for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
+    for KDA hybrids upstream cannot classify (Kimi-K3, GLM-5.3-Flash).
+
+    Upstream raises when a model mixes linear-attention and full-attention
+    layers without declaring the split through ``layer_types``. Two conventions
+    show up in the wild and they disagree about indexing, so the order of the
+    branches below matters:
+
+    * ``layer_types`` (GLM-5.3-Flash): a per-layer list, **0-indexed** by
+      construction. Authoritative when present, and read through
+      :func:`_is_full_attention_layer_type`, which raises rather than guess at
+      a spelling it does not know.
+    * ``linear_attn_config["kda_layers"]`` (Kimi-Linear / K3): a list of layer
+      ids that are KDA, **1-indexed** -- see
+      ``vllm/transformers_utils/configs/kimi_linear.py`` ``is_kda_layer``.
+
+    GLM-5.3-Flash ships *both*: a ``layer_types`` list and a
+    ``linear_attn_config`` that also carries a ``kda_layers`` key -- but a
+    **0-indexed** one. Reading GLM's list with Kimi's ``idx + 1`` rule silently
+    misclassifies every layer and mis-sizes the KV cache, so ``layer_types``
+    has to win, and the Kimi branch must not fire merely because
+    ``linear_attn_config`` exists.
     """
     from vllm.config.model import ModelConfig
 
@@ -828,11 +901,22 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
         except ValueError:
             pass
 
+        if block_type != "attention":
+            return original_get_num_layers(self, parallel_config, block_type)
+
         start, end = self.get_layers_start_end_indices(parallel_config)
+
+        layer_types = getattr(self.hf_text_config, "layer_types", None)
+        if layer_types:
+            return sum(
+                _is_full_attention_layer_type(layer_types[idx])
+                for idx in range(start, end))
+
         linear_attn_config = getattr(self.hf_text_config, "linear_attn_config",
                                      None)
-        if linear_attn_config is not None and block_type == "attention":
-            kda_layers = set(linear_attn_config.get("kda_layers", []))
+        if linear_attn_config and "kda_layers" in linear_attn_config:
+            # Kimi's 1-indexed convention; see the docstring.
+            kda_layers = set(linear_attn_config["kda_layers"])
             return sum(
                 (idx + 1) not in kda_layers for idx in range(start, end))
 
