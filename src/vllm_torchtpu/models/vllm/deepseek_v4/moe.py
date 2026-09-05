@@ -32,7 +32,32 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        apply_routed_scale_to_output: bool = True,
+        use_grouped_topk: bool = False,
     ):
+        """
+        Args:
+          use_grouped_topk: route through vLLM's grouped-top-k router. This is
+            not only about expert *groups*: ``e_score_correction_bias`` is
+            consumed **exclusively** inside
+            ``fused_moe/router/grouped_topk_router.py``, so with the default
+            plain router the bias is accepted and then silently ignored, and
+            top-k runs on the raw sigmoid scores. Any ``noaux_tc`` model needs
+            this True or it selects the wrong experts. Left False by default so
+            DeepSeek-V4's behaviour is unchanged.
+          apply_routed_scale_to_output: when True the runner multiplies the
+            *combined* MoE output by ``routed_scaling_factor``. vLLM only
+            compensates a shared expert for that when the shared expert is
+            fused into the expert slots (it sets the fused slot's weight to
+            ``1/routed_scaling_factor``, see
+            ``fused_moe/layer.py:305-317``). This layer passes a **separate**
+            shared-expert module, so with a scaling factor other than 1.0 the
+            shared expert would be scaled too. DeepSeek-V4 defaults the factor
+            to 1.0, which makes the choice a no-op; models that set a real
+            factor and keep a separate shared expert -- GLM-5.3-Flash uses 2.5
+            -- must pass False, which puts the scale on the router's top-k
+            weights instead and leaves the shared expert alone.
+        """
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         config = vllm_config.model_config.hf_config
@@ -57,7 +82,11 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
+        # `num_hash_layers` is DeepSeek-V4-specific. Other models reusing this
+        # MoE (GLM-5.3-Flash) have no hash-routed layers at all, and absent
+        # means zero of them.
+        num_hash_layers = getattr(config, "num_hash_layers", 0)
+        is_hash_moe = extract_layer_index(prefix) < num_hash_layers
         self.hash_indices_dtype = torch.int32
         if is_hash_moe:
             self.gate.tid2eid = nn.Parameter(
@@ -103,12 +132,17 @@ class DeepseekV4MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             scoring_func=self.scoring_func,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=(getattr(config, "n_group", None)
+                              if use_grouped_topk else None),
+            topk_group=(getattr(config, "topk_group", None)
+                        if use_grouped_topk else None),
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
-            apply_routed_scale_to_output=True,
+            apply_routed_scale_to_output=apply_routed_scale_to_output,
         )
 
         # The monolithic TPU MoE path never consults the router: MoERunner

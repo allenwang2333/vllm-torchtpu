@@ -6,6 +6,8 @@ _KIMI_K3_MODEL = ("vllm_torchtpu.models.vllm.kimi_k3:"
                   "KimiK3ForConditionalGeneration")
 _DSV4_MODEL = ("vllm_torchtpu.models.vllm.deepseek_v4:"
                "DeepseekV4ForCausalLM")
+_GLM5_NEXT_MODEL = ("vllm_torchtpu.models.vllm.glm5_next:"
+                    "Glm5NextForCausalLM")
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -20,4 +22,6 @@ def register_models() -> None:
     ModelRegistry.register_model("KimiK3ForConditionalGeneration",
                                  _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
+    # GLM-5.3-Flash, text-only stack.
+    ModelRegistry.register_model("Glm5NextForCausalLM", _GLM5_NEXT_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
