@@ -24,6 +24,7 @@ shipped FP8 checkpoint is 328 GB and runs at TP=8.
 | `kv_lora_rank` | 512 |
 | `index_kpool` / `index_topk` | 4 / 2048 |
 | MoE | 288 routed experts + 1 shared, `topk_method="noaux_tc"` |
+| vision | 24-block ViT on vLLM's `glm_ocr` merger |
 
 Both halves already existed in this repo, so most of the port is composition:
 KDA layers reuse `models/vllm/kimi_k3/attention.py:KimiDeltaAttention`
@@ -69,6 +70,22 @@ anything tidier. `quantization_config.modules_to_not_convert` is a list of
 exactly, so renaming `self_attn` to `attn` would silently stop all 34 bf16 KDA
 layers from being recognised as unquantized and hand them to the FP8 method.
 
+The same rule governs the vision tower and the sparse indexer, and it has bit
+once already. `glm_ocr` builds the fused vision attention projection at prefix
+`.qkv_proj` whenever any quant config is present — a rename matching
+GLM-4.5V-FP8's ignore list. GLM-5.3-Flash spells it
+`visual.blocks.N.attn.qkv`, so the rename made the skip miss, and all 24
+blocks computed on unscaled FP8 weights. Nothing failed: the module attribute
+is still `qkv`, `blocks.N.attn.qkv.weight` still loaded, and every loader
+check reported 298/298 tensors filled. The tower simply returned an entirely
+non-finite output, after which the sampler emitted one unused token id forever
+and the reply detokenized to the empty string — while text-only prompts of 18,
+135 and 343 tokens answered correctly. The fix is to build the tower with no
+quant config at all, which is what "every `visual.*` module is in
+`modules_to_not_convert`" actually means and is immune to spelling;
+`multimodal.py:_tower_quant_config` checks that premise rather than assuming
+it.
+
 ## MoE: two options DeepSeek-V4's layer did not need
 
 * `apply_routed_scale_to_output=False`. GLM has `routed_scaling_factor` 2.5
@@ -111,11 +128,15 @@ Several test suites are green-by-skip without their inputs. To run them:
    `transformers/models/glm5_next/` and it goes on `PYTHONPATH` ahead of the
    installed package; it stops being necessary the day `glm5_next` ships in a
    transformers release. That one variable is the only spelling — the scripts
-   and the suites both read it. Affected: `scripts/glm5_next/`.
+   and the suites both read it. Affected:
+   `test_glm5_next_mm_sizing.py`, `test_glm5_next_vision_parity.py`, and
+   `scripts/glm5_next/`.
 2. **The tiny fixture.** `scripts/glm5_next/build_tiny_fixture.py` writes a
    tiny random GLM-5.3-Flash checkpoint; `GLM5_NEXT_TINY` names where.
-3. **The oracles.** `scripts/glm5_next/dump_reference.py` captures the fp32
-   HF reference that `test_glm5_next_kda_parity.py` diffs against.
+3. **The oracles.** `scripts/glm5_next/dump_reference.py` and
+   `dump_vision_reference.py` capture the fp32 HF references that
+   `test_glm5_next_kda_parity.py` and `test_glm5_next_vision_parity.py` diff
+   against.
 
 `VLLM_TORCHTPU_CPU_STUB=1` is required for the whole rung; see
 `tests/stubs/torch_tpu.py`.
@@ -127,6 +148,7 @@ CPU, reproducible from this tree:
 | claim | where |
 | --- | --- |
 | KDA layers match the fp32 HF reference to rel 5e-7 (all 6 KDA layers of the tiny fixture) | `tests/kernels/test_glm5_next_kda_parity.py` |
+| the vision tower matches transformers stage by stage, fp32 ~1e-6 and bf16 within its noise floor | `tests/models/vllm/test_glm5_next_vision_parity.py` |
 
 On device, and **not reproducible from this tree** — these were run through an
 out-of-tree job recipe and their probe scripts are not part of the patch:
@@ -136,3 +158,4 @@ out-of-tree job recipe and their probe scripts are not part of the patch:
 | whole model agrees with the fp32 oracle per layer: worst rel-med 2.138e-02, top-1 0.9792, logit cosine 0.999763 | tiny fixture, 1 chip |
 | 189/189 parameters loaded, 0 missing, 0 unmapped | tiny fixture |
 | 328 GB FP8 checkpoint loads from 62 shards and generates coherent greedy text | real checkpoint, TP=8 |
+| image → text answers correctly about a synthetic image | real checkpoint, TP=8 |
