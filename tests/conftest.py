@@ -34,6 +34,34 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
+# Opt-in: run the model, layer and config tests on a CPU box by faking
+# `torch_tpu`.
+#
+# Everything under src/vllm_torchtpu/models/ and layers/vllm/custom_ops/
+# imports `torch_tpu._internal.pallas` at module scope, and the real package
+# needs a bazel-built extension plus libtpu. Without this, those modules are
+# not importable off-device at all and every structural question about a model
+# -- does it construct, do the layer types land on the right indices, do the
+# checkpoint names resolve -- has to wait for a TPU. Off by default so a real
+# TPU run is never shadowed by the stub.
+#
+# See tests/stubs/torch_tpu.py for what the stub does and does not model.
+if os.environ.get("VLLM_TORCHTPU_CPU_STUB") == "1":
+    try:
+        import torch_tpu  # noqa: F401
+    except ImportError:
+        # Loaded by path rather than imported by name: `tests` is not a
+        # package, so there is no import path to reach a sibling directory
+        # with that does not depend on how pytest happened to seed sys.path.
+        import importlib.util as _ilu
+        _stub_spec = _ilu.spec_from_file_location(
+            "_vllm_torchtpu_torch_tpu_cpu_stub",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "stubs",
+                         "torch_tpu.py"))
+        _stub = _ilu.module_from_spec(_stub_spec)
+        _stub_spec.loader.exec_module(_stub)
+        _stub.install()
+
 
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
