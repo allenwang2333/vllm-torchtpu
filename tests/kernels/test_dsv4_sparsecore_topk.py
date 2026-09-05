@@ -151,6 +151,17 @@ def _scores(kind: str, b: int, n: int, rng: np.random.Generator) -> np.ndarray:
         # 128K shape.
         return rng.integers(0, 17, size=(b, n),
                             dtype=np.int8).astype(np.float32)
+    if kind == "all_negative":
+        # Every score strictly negative, and that is the whole point.
+        # `monotone_key` is the identity for non-negative floats, so
+        # `emit_pairs` -- which recovers a score by re-applying the involution
+        # at emit time -- is only doing anything at all when a *winner* is
+        # negative. Under every other `kind` here the winners are positive and
+        # a kernel that dropped the involution entirely would still pass.
+        # Continuous and offset off zero, so the row is tie-free and the
+        # selection stays non-degenerate.
+        return (-np.abs(rng.standard_normal((b, n), dtype=np.float32))
+                - np.float32(1.0))
     if kind == "all_neg_inf":
         return np.full((b, n), -np.inf, np.float32)
     raise ValueError(kind)
@@ -276,7 +287,7 @@ TWO_STAGE_SHAPES = [p for p in SHAPES if p.values[3] > 1]
 
 @pytest.mark.parametrize("b,n,k,expected_p", TWO_STAGE_SHAPES)
 @pytest.mark.parametrize("flag_name", sorted(CANDIDATE_FLAGS))
-@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+@pytest.mark.parametrize("kind", ["random", "heavy_ties", "all_negative"])
 def test_candidate_flags_are_bit_identical_to_the_incumbent(
         b, n, k, expected_p, flag_name, kind):
     """Neither flag may change the answer, not even a tie-break.
@@ -290,6 +301,13 @@ def test_candidate_flags_are_bit_identical_to_the_incumbent(
     `heavy_ties` is here because that is where a reformulation is most likely
     to differ without being *wrong* -- and it still must not, because the two
     paths visit candidates in the same order.
+
+    `all_negative` is here because without it this test cannot fail for
+    `emit_pairs`. `monotone_key` is the identity on non-negative floats, so
+    under `random` and `heavy_ties` -- whose winners are the top 2048 of a
+    distribution centred at or above zero -- a kernel that dropped the
+    involution altogether stays bit-identical. Measured: mutating
+    `monotone_key` to the identity left the whole file green.
     """
     assert _pick_partition(b, n, k) == expected_p > 1, (
         "this test is meaningless on the single-stage path, where both flags "
@@ -299,6 +317,20 @@ def test_candidate_flags_are_bit_identical_to_the_incumbent(
     row_lengths = np.full(b, n, np.int32)
 
     base = _run(scores, k, row_lengths)
+    if kind == "all_negative":
+        # Non-vacuity, asserted rather than assumed: the case earns its place
+        # only if the winners really are negative *and* the selection is a
+        # choice. `row_length <= k` would make every live entry a winner
+        # regardless of its score, which is how this file's ragged rows manage
+        # to contain 2151 negative winners and still discriminate nothing.
+        assert k < int(row_lengths.min()), (
+            "selection is degenerate: every live entry wins, so score values "
+            "never enter the comparison")
+        won = np.take_along_axis(scores, base, axis=1)
+        assert (won < 0).all(), (
+            f"{int((won >= 0).sum())} of {won.size} winners are non-negative, "
+            f"so `monotone_key` is the identity for them and this case does "
+            f"not exercise the involution it exists to exercise")
     got = _run(scores, k, row_lengths, **CANDIDATE_FLAGS[flag_name])
     n_diff = int((base != got).sum())
     assert n_diff == 0, (
