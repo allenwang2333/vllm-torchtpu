@@ -1366,6 +1366,22 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
                     self.vllm_config)
             else:
+                # No spec, therefore no KV cache, therefore silence. Kept as
+                # `continue` rather than a raise because the set of
+                # `AttentionLayerBase` subclasses vLLM ships is open, and none
+                # of the ones without a branch here is exercised on TPU today,
+                # so a blanket raise would break models this cannot test. The
+                # warning is the compromise: an unrecognised cache module
+                # currently produces no spec, is never allocated, and says
+                # nothing about it -- and an unallocated cache is often not a
+                # crash but a zero-filled read, which is fluent and wrong.
+                logger.warning_once(
+                    "get_kv_cache_spec: %s (%s) is an AttentionLayerBase the "
+                    "TPU runner has no branch for, so it is allocated no KV "
+                    "cache at all. If it needs one, add an explicit branch "
+                    "here -- nothing downstream will report its absence.",
+                    layer_name,
+                    type(attn_module).__name__)
                 continue
 
         # Note: that each shared layer's target actually owns a KV cache (and
@@ -6292,6 +6308,32 @@ class TPUModelRunner(GPUModelRunner):
                     else:
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
+                # A block id above `kv_cache_config.num_blocks` can never be
+                # produced -- that is the count vLLM's block manager hands out
+                # and the width the block tables are built at -- so rows past
+                # it are unaddressable for EVERY layer type.
+                #
+                # The quotient above can exceed it, because vLLM gives every
+                # KVCacheTensor the same `size` while `shared_by` varies, and
+                # the divisor is the sum over `shared_by`. Measured on one
+                # hybrid model at TP=8, where all eleven tensors were
+                # 840549186560 B: eight tensors shared by six layers each took
+                # 4.04 GiB, the ninth (shared by four) took 4.04 GiB, and the
+                # tenth (shared by two) wanted 8.22 GiB -- double, purely
+                # because fewer layers divided the same size. `used` had
+                # climbed to 81.097 GiB against a cap of 87.159, leaving
+                # 6.062 GiB for an 8 GiB request, and the worker was killed
+                # with no Python traceback and no allocator error.
+                capped = min(num_blocks, kv_cache_config.num_blocks)
+                if capped != num_blocks:
+                    logger.warning_once(
+                        "KV cache: shared-tensor block count %d exceeds the "
+                        "block table's %d (tensor size %d shared by %d "
+                        "layers); using the block-table count. Rows past it "
+                        "cannot be addressed by any block id.",
+                        num_blocks, kv_cache_config.num_blocks, tensor_size,
+                        len(shared_by))
+                num_blocks = capped
             else:
                 num_blocks = kv_cache_config.num_blocks
 
