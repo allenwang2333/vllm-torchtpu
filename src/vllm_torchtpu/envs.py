@@ -33,13 +33,16 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
     TPU_RAIDEN_CLIENT_IMPL: str = "cpp"
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
+    TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -52,12 +55,22 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_ROPE_CACHE_TRUNCATE: bool = False
+    TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
+    TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
+    VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
+    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
 
 def env_with_choices(
@@ -169,6 +182,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT":
     env_bool("TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False),
+    # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
+    # Off by default so tokenizer behavior matches stock vLLM; the DSv4
+    # eval config turns it on, since a prefilled assistant turn needs it.
+    "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
+    env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
+    # NoPE and RoPE KV cache layouts allocated for sparse MLA.
+    "TPU_SPARSE_MLA_NOPE_LAYOUT":
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore",
+                     ["sparsecore", "tensorcore"]),
+    "TPU_SPARSE_MLA_ROPE_LAYOUT":
+    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
+                     ["sparsecore", "tensorcore"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),
@@ -260,6 +285,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("TPU_RAIDEN_ENGINE_ID", "0").strip(),
     "TPU_RAIDEN_TRANSFER_PARALLELISM":
     lambda: int(os.getenv("TPU_RAIDEN_TRANSFER_PARALLELISM") or "8"),
+    "TPU_RAIDEN_MAX_TRANSFER_TOKENS":
+    env_optional_int("TPU_RAIDEN_MAX_TRANSFER_TOKENS"),
     # Reshard control-plane hosting (zero sidecar processes): "store" hosts the
     # reshard service inside each engine's rank-0 worker via an in-process
     # KVCacheStore; "controller" keeps the external (sidecar) controller.
@@ -285,6 +312,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_RAIDEN_RESHARD_PORT_BASE") or "27000"),
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE":
     lambda: int(os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"),
+    # Decode-side prefix-cache-aware reshard loads: when true, the consumer
+    # subtracts the local prefix-cache hit and transfers only the missing
+    # FA suffix (page-aligned dst_skip_bytes clip planned by the source
+    # store); GDN state always transfers whole. When false, or when the
+    # installed client lacks dst_skip_bytes support, local hits are ignored
+    # and the full payload is pulled into every destination page.
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD":
+    env_bool("TPU_RAIDEN_PREFIX_AWARE_LOAD", False),
     # Selects the #193 SparseCore MoE token-movement path. When 0, the EP
     # ragged gather + gather-reduce fall back to the pre-#193 plain-JAX
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
@@ -301,6 +336,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Select the blockwise owner-output kernel after the outer one-hot MoE
+    # threshold has selected the TensorCore path. "off" keeps the dense
+    # one-hot combine; "on" enables the kernel for every shape that passes
+    # its dtype, alignment, and VMEM safety checks.
+    "TPU_MOE_OWNER_OUTPUT_MODE":
+    env_with_choices("TPU_MOE_OWNER_OUTPUT_MODE",
+                     "off", ["off", "on"],
+                     case_sensitive=False),
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
     # "v2" (default) = ragged_gather_v2; "v1" = legacy ragged_gather.
     "RAGGED_GATHER_VERSION":
@@ -355,11 +398,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":
     env_with_choices("TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]),
+    # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
+    # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
+    # program, instead of bracketing the per-rank compute with vLLM's
+    # all-gather and reduce-scatter. The transport then overlaps the matmuls;
+    # the reduce-scatter it replaces is otherwise fully exposed.
+    "USE_MOE_FUSED_EP_KERNEL":
+    env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # Largest node-wide token count, out of the scheduler's cap, at or above
+    # which the fused kernel is armed for the whole deployment. Decided once at
+    # weight load, not per step: a per-step choice would need the token count
+    # inside the traced graph, and on Qwen3.5-397B it also measured worse than
+    # arming everything. Below the threshold the grouped-matmul path serves.
+    "MOE_FUSED_EP_KERNEL_MIN_TOKENS":
+    lambda: int(os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")),
+    # Build each rank's two consumed routing-plan slices instead of
+    # replicating the full T * topk * experts plan arithmetic on every rank.
+    "MOE_FUSED_EP_V2_SHARDED_PLAN":
+    env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Shard Kimi K3's latent-MoE down/up projections across the cores of a
+    # chip instead of replicating them. They are unquantized [7168, 3584] and
+    # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
+    # time at TP=32; halving the bytes each core reads costs two on-package
+    # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
+    "TPU_LATENT_PROJ_INTRA_CHIP_TP":
+    env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE":
     env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+
+    # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
+    # layout at load, May cost more HBM due to padding.
+    "TPU_ROPE_CACHE_ROW_MAJOR":
+    env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    "TPU_MOE_HASH_TABLE_ROW_MAJOR":
+    env_bool("TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA":
     lambda: [
@@ -375,9 +450,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
     env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
+    # 0 = the arithmetic device-order layout (the one every disaggregated
+    # Raiden pair was verified with before #587; also the only option on a
+    # torch_tpu older than 2026-08-13, which lacks the API).
+    "TPU_PCP_TOPOLOGY_AWARE_MESH":
+    lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower(
+    ) not in ("0", "false", "off", "no"),
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Enables the block-major KV cache layout for Raiden offloading. Bundles all
+    # attention layer fragments into a single contiguous array in HBM, collapsing
+    # per-block transfers from F independent DMAs into a single hardware DMA.
+    # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
+    "VLLM_TPU_BLOCK_MAJOR_KV":
+    env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
 }
 
 

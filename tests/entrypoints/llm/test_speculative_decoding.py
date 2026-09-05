@@ -37,9 +37,21 @@ from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
 
-# Heavy Llama-3.1-8B spec-decode integration suite; presubmit deselects it via
-# `-m "not nightly"`, full coverage runs in the nightly workflow.
-pytestmark = pytest.mark.nightly
+# Spec-decode e2e integration suite, split across the PR and nightly steps in
+# `.buildkite/pipeline_tests.yml`:
+#
+#   correctness tests  -- unmarked, so they run at PR time AND nightly. A
+#       spec-decode correctness regression is expensive to find after the
+#       fact, and these paths (rejection sampling, chunked verify, draft
+#       proposal, the DP lockstep) have no cheaper coverage. Anything added
+#       here lands on the critical path of every PR; weigh its runtime.
+#
+#   `*_performance*`   -- `@pytest.mark.nightly`, so the PR steps
+#       (`-m "not nightly"`) deselect them and only the nightly steps run
+#       them. They assert acceptance-rate floors that are calibration
+#       sensitive: a loaded shared agent can push an otherwise healthy run
+#       under the floor, and the floors are re-measured against the nightly
+#       baselines anyway. They gate throughput, not correctness.
 
 
 def _is_v7x():
@@ -93,6 +105,14 @@ def get_mtp_test_prompts():
     ]
 
 
+def get_dspark_test_prompts():
+    num_prompts = 10
+    return [
+        "Predict the continuation of this sequence: 1 2 3 4 5 6 7 8"
+        for _ in range(num_prompts)
+    ]
+
+
 def get_test_prompts(speculative_config: dict):
     method = speculative_config["method"]
     if method == "ngram":
@@ -103,6 +123,8 @@ def get_test_prompts(speculative_config: dict):
         return get_dflash_test_prompts()
     if method == "mtp":
         return get_mtp_test_prompts()
+    if method == "dspark":
+        return get_dspark_test_prompts()
     raise NotImplementedError(f"{method} is not supported yet.")
 
 
@@ -125,6 +147,39 @@ QWEN35_MTP_MODEL = "Qwen/Qwen3.5-4B"
 # active parameter count small; the MTP head and method="mtp" are identical to
 # the 4B, so these tests still exercise the same speculative path.
 QWEN35_MTP_DP_MODEL = "Qwen/Qwen3.5-35B-A3B-FP8"
+
+# Separate draft checkpoint; block size 16, hence num_speculative_tokens=15.
+QWEN35_DFLASH_DP_DRAFT = "z-lab/Qwen3.5-35B-A3B-DFlash"
+
+# Measured 50.03% per engine on v7x at dp=2 x tp=4.
+DFLASH_DP_MIN_ACCEPTANCE_RATE = 0.45
+
+# dp=2 x tp=4: the deployed topology, and the only TP where the draft and
+# target KV geometry match. Same 8 chips as the MTP DP tests.
+DFLASH_DP_SIZE = 2
+DFLASH_DP_TP_SIZE = 4
+
+
+def _qwen35_dflash_dp_kwargs() -> dict:
+    return {
+        **QWEN35_KWARGS,
+        "data_parallel_size": DFLASH_DP_SIZE,
+        "tensor_parallel_size": DFLASH_DP_TP_SIZE,
+        "kv_cache_dtype": "fp8",
+        "enable_expert_parallel": True,
+    }
+
+
+def _qwen35_dflash_speculative_config() -> dict:
+    return {
+        "method": "dflash",
+        "model": QWEN35_DFLASH_DP_DRAFT,
+        "num_speculative_tokens": 15,
+        # A DFlash draft must shard exactly like its target; draft_tp=1 against
+        # a sharded target is rejected at KV-pool materialisation.
+        "draft_tensor_parallel_size": DFLASH_DP_TP_SIZE,
+    }
+
 
 # Engine kwargs every Qwen3.5 run in this file needs, on top of the shared
 # ones the helpers set.
@@ -186,42 +241,77 @@ SPEC_DRAFT_METRIC = "vllm:spec_decode_num_draft_tokens"
 SPEC_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens"
 
 
-def _assert_no_spec_divergence(prompts: list[str], ref_texts: list[str],
-                               spec_texts: list[str]):
+def _assert_no_spec_divergence(prompts: list[str],
+                               ref_texts: list[str],
+                               spec_texts: list[str],
+                               group_keys: list | None = None):
     """Speculation must not change greedy output. Shared by the in-process
     and served correctness tests so both apply the same standard.
 
-    Greedy decoding of one prompt has a single answer, but on TPU at batch > 1 the NO-SPEC reference does not
-    reproduce it on every row: a row's logits depend on its position in the
-    batch (tiling and reduction order), so a near-tie argmax can flip for one
-    row while its siblings agree. Comparing spec[i] to ref[i] positionally
-    charges such a baseline glitch to speculation. Compare each prompt's spec
-    rows against that prompt's majority reference output instead.
+    Greedy decoding of one prompt has a single answer, but on TPU at
+    batch > 1 NEITHER run reproduces it on every row: a row's logits depend
+    on its position in the batch (tiling and reduction order), so a near-tie
+    argmax can flip for one row while its siblings agree. Speculation does
+    not cause this -- the same flip, to the same alternative text, has been
+    observed in the no-spec reference -- and because the two runs batch
+    differently it lands on different rows. Comparing spec[i] to ref[i]
+    positionally charges it to speculation.
+
+    Compare each group's majority output instead. Every row of a group is
+    the same prompt with the same params, so each run must agree with itself
+    on a majority of the group, and the two majorities must then match. A
+    group of one degenerates to exact comparison, so unique-prompt callers
+    lose no strictness. A systematic masking or rejection bug moves a
+    group's majority and is still caught; a single flipped row inside an
+    otherwise-agreeing group is indistinguishable from the tiling noise
+    above and is tolerated -- for structured requests the caller's per-row
+    schema check still covers every row.
+
+    Rows are grouped by prompt. Pass `group_keys` when rows sharing a prompt
+    do NOT share sampling params (a mixed structured/unconstrained batch):
+    only rows that are supposed to produce the same text may vote in the
+    same majority, so the key has to carry whatever else varies per row.
     """
     assert len(ref_texts) == len(spec_texts) == len(prompts), (
         f"{len(prompts)} prompts, reference produced {len(ref_texts)} "
         f"outputs, speculative produced {len(spec_texts)}")
+    keys = prompts if group_keys is None else group_keys
+    assert len(keys) == len(prompts), (
+        f"{len(prompts)} prompts but {len(keys)} group keys")
 
-    rows_by_prompt: dict[str, list[int]] = collections.defaultdict(list)
-    for i, prompt in enumerate(prompts):
-        rows_by_prompt[prompt].append(i)
+    rows_by_key: dict[object, list[int]] = collections.defaultdict(list)
+    for i, key in enumerate(keys):
+        rows_by_key[key].append(i)
+    # A group votes on one expected text, so a key must be at least as
+    # fine-grained as the prompt. A key that pools rows with different
+    # prompts would compare unrelated outputs and still report a pass.
+    for key, rows in rows_by_key.items():
+        distinct = {prompts[i] for i in rows}
+        assert len(distinct) == 1, (
+            f"group key {key!r} pools {len(distinct)} different prompts "
+            f"across rows {rows}; the key must include the prompt")
 
-    misses = 0
-    for prompt, rows in rows_by_prompt.items():
-        counts = collections.Counter(ref_texts[i] for i in rows)
+    def majority(texts: list[str], rows: list[int], label: str,
+                 key: object) -> str:
+        counts = collections.Counter(texts[i] for i in rows)
         modal_text, modal_rows = counts.most_common(1)[0]
         if modal_rows != len(rows):
-            print(f"reference is not row-uniform for prompt {prompt!r}: "
-                  f"{len(counts)} distinct outputs across {len(rows)} rows "
+            print(f"{label} is not row-uniform for {key!r}: {len(counts)} "
+                  f"distinct outputs across {len(rows)} rows "
                   f"(majority {modal_rows}/{len(rows)})")
         assert modal_rows * 2 > len(rows), (
-            f"no majority reference output for prompt {prompt!r}; the "
-            f"baseline is too unstable to validate against: {dict(counts)}")
-        for i in rows:
-            if spec_texts[i] != modal_text:
-                misses += 1
-                print(f"ref_output: {modal_text}")
-                print(f"spec_output: {spec_texts[i]}")
+            f"no majority {label} output for {key!r}; it is too unstable to "
+            f"compare against: {dict(counts)}")
+        return modal_text
+
+    misses = 0
+    for key, rows in rows_by_key.items():
+        ref_modal = majority(ref_texts, rows, "reference", key)
+        spec_modal = majority(spec_texts, rows, "speculative", key)
+        if spec_modal != ref_modal:
+            misses += 1
+            print(f"ref_output: {ref_modal}")
+            print(f"spec_output: {spec_modal}")
 
     assert misses == 0
 
@@ -428,6 +518,46 @@ def test_dflash_correctness_greedy(
      pytest.param(True, id="async")])
 @pytest.mark.parametrize(
     "max_num_seqs", [pytest.param(1, id="bs1"),
+                     pytest.param(10, id="bs10")])
+def test_dspark_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    async_scheduling: bool,
+):
+    """DSpark must not change greedy output vs a no-spec reference.
+
+    Rejection sampling guarantees equality regardless of what the block
+    drafter proposes; a mismatch means the Markov sampling loop, the dense
+    query-block layout (K slots, anchor is the first prediction), or the
+    draft KV plumbing corrupted the verify pass.
+    """
+    model_name = "Qwen/Qwen3-4B"
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        model_name,
+        {
+            "method": "dspark",
+            "model": "deepseek-ai/dspark_qwen3_4b_block7",
+            "num_speculative_tokens": 7,
+            "draft_tensor_parallel_size": 1,
+        },
+        max_num_seqs=max_num_seqs,
+        async_scheduling=async_scheduling,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs", [pytest.param(1, id="bs1"),
                      pytest.param(4, id="bs4")])
 def test_qwen35_mtp_correctness_greedy(
     monkeypatch: pytest.MonkeyPatch,
@@ -522,6 +652,7 @@ def _test_performance_helper(
                                 speculative_config["method"])
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1800)
 def test_ngram_performance_greedy(
     monkeypatch: pytest.MonkeyPatch,
@@ -537,6 +668,7 @@ def test_ngram_performance_greedy(
                              min_acceptance_rate=0.85)
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
@@ -580,6 +712,7 @@ def test_eagle3_performance(
     )
 
 
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
@@ -619,6 +752,49 @@ def test_dflash_performance_greedy(
     )
 
 
+@pytest.mark.nightly
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [pytest.param(False, id="sync"),
+     pytest.param(True, id="async")])
+@pytest.mark.parametrize(
+    "max_num_seqs, min_acceptance_rate",
+    [pytest.param(1, 0.05, id="bs1"),
+     pytest.param(4, 0.07, id="bs4")])
+def test_dspark_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    max_num_seqs: int,
+    min_acceptance_rate: float,
+    async_scheduling: bool,
+):
+    """DSpark proposes and gets drafts accepted at a useful rate.
+
+    The floor is a collapse guard, not a quality target: it catches a
+    drafter that silently stops proposing or whose Markov-biased drafts
+    stop matching the target entirely.
+    """
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        {
+            "method": "dspark",
+            "model": "deepseek-ai/dspark_qwen3_4b_block7",
+            "num_speculative_tokens": 7,
+            "draft_tensor_parallel_size": 1,
+        },
+        min_acceptance_rate=min_acceptance_rate,
+        max_num_seqs=max_num_seqs,
+        model_name="Qwen/Qwen3-4B",
+        async_scheduling=async_scheduling,
+        extra_kwargs={"gpu_memory_utilization": 0.6},
+    )
+
+
+@pytest.mark.nightly
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize(
     "async_scheduling",
@@ -877,14 +1053,22 @@ def test_structured_output_spec_decode_correctness_greedy(
             if i % 2 == 0:
                 _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+        # (b) Speculation must not change greedy output. Compared per-group
+        # majority, not row-for-row: the unconstrained rows run the full 64
+        # free tokens, and at this batch size either run can flip one row on
+        # a near-tie (see _assert_no_spec_divergence) -- both directions have
+        # been observed here. Structured and unconstrained rows share a
+        # prompt but not sampling params, so the group key carries the params
+        # too; they must not vote in one majority. Every structured row is
+        # still checked individually by (a) above.
+        ref_texts = [o.outputs[0].text for o in ref_outputs]
+        spec_texts = [o.outputs[0].text for o in spec_outputs]
+        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
+                      for i, prompt in enumerate(test_prompts)]
+        _assert_no_spec_divergence(test_prompts,
+                                   ref_texts,
+                                   spec_texts,
+                                   group_keys=group_keys)
 
         # (c) The masked verify path actually saw draft traffic.
         num_draft_tokens = num_accepted_tokens = 0
@@ -1028,14 +1212,22 @@ def test_structured_output_eagle3_greedy(monkeypatch: pytest.MonkeyPatch,
             if i % 2 == 0:
                 _assert_valid_structured_json(spec.outputs[0].text)
 
-        # (b) Speculation must not change greedy output.
-        misses = 0
-        for ref, spec in zip(ref_outputs, spec_outputs):
-            if ref.outputs[0].text != spec.outputs[0].text:
-                misses += 1
-                print(f"ref:  {ref.outputs[0].text}")
-                print(f"spec: {spec.outputs[0].text}")
-        assert misses == 0
+        # (b) Speculation must not change greedy output. Compared per-group
+        # majority, not row-for-row: the unconstrained rows run the full 64
+        # free tokens, and at this batch size either run can flip one row on
+        # a near-tie (see _assert_no_spec_divergence) -- both directions have
+        # been observed here. Structured and unconstrained rows share a
+        # prompt but not sampling params, so the group key carries the params
+        # too; they must not vote in one majority. Every structured row is
+        # still checked individually by (a) above.
+        ref_texts = [o.outputs[0].text for o in ref_outputs]
+        spec_texts = [o.outputs[0].text for o in spec_outputs]
+        group_keys = [(prompt, "structured" if i % 2 == 0 else "free")
+                      for i, prompt in enumerate(test_prompts)]
+        _assert_no_spec_divergence(test_prompts,
+                                   ref_texts,
+                                   spec_texts,
+                                   group_keys=group_keys)
 
         # (c) The masked verify path actually saw draft traffic.
         num_draft_tokens = num_accepted_tokens = 0
@@ -1073,17 +1265,35 @@ def test_structured_output_eagle3_async_adversarial_choice(
     the choice or kill the request with a grammar error -- so every valid,
     completed output is direct evidence the deferred-bitmask path saw the
     real drafts.
+
+    Odd rows run unconstrained on the file's standard eagle3 prompt, whose
+    continuation the drafter predicts well. Those rows carry the
+    "speculation actually ran" floor, which the constrained rows cannot --
+    see the metric comment below.
     """
     model_name = "NousResearch/Meta-Llama-3.1-8B-Instruct"
     choices = ["strawberry banana kiwi", "pineapple mango papaya"]
-    params = SamplingParams(
+    constrained = SamplingParams(
         temperature=0,
         max_tokens=16,
         structured_outputs=StructuredOutputsParams(choice=choices),
     )
-    # Nothing in the prompt suggests the allowed strings: greedy wants a
-    # color word, the grammar only permits fruit.
-    prompts = ["My favorite color is " for _ in range(8)]
+    unconstrained = SamplingParams(temperature=0, max_tokens=16)
+    # Nothing in the constrained prompt suggests the allowed strings: greedy
+    # wants a color word, the grammar only permits fruit. The control rows
+    # use the drafter-friendly sequence prompt the other eagle3 tests rest
+    # their acceptance floors on -- the adversarial prompt is a poor control
+    # (measured: 8 accepted tokens across 4 rows, a thin margin over the
+    # floor), and nothing about the constrained rows depends on the control
+    # rows sharing their prompt.
+    prompts = [
+        "My favorite color is " if i % 2 == 0 else get_eagle3_test_prompts()[0]
+        for i in range(8)
+    ]
+    params = [
+        constrained if i % 2 == 0 else unconstrained
+        for i in range(len(prompts))
+    ]
 
     with monkeypatch.context():
         spec_llm = LLM(
@@ -1103,20 +1313,46 @@ def test_structured_output_eagle3_async_adversarial_choice(
         try:
             outputs = spec_llm.generate(prompts, params)
             assert len(outputs) == len(prompts)
-            for output in outputs:
+            for i, output in enumerate(outputs):
+                if i % 2:
+                    continue  # unconstrained control row
                 assert output.outputs[0].text in choices, (
                     f"constraint violated: {output.outputs[0].text!r}")
 
-            # The constrained region must have seen draft traffic, else the
-            # masked verify path was never exercised. No acceptance floor:
-            # the constraint is designed to reject the model's own drafts.
-            num_draft_tokens = 0
+            # Speculation must have actually run, or the checks above are
+            # just plain decoding and say nothing about the masked verify
+            # path. The floor is on ACCEPTED tokens and the unconstrained
+            # rows are what supply it; a drafted-token floor cannot work
+            # here.
+            #
+            # `vllm:spec_decode_num_draft_tokens` is reported net of the
+            # drafts the grammar threw out: under async scheduling the
+            # scheduler counts the K placeholder spec tokens it scheduled,
+            # then make_spec_decoding_stats() subtracts
+            # scheduler_output.num_invalid_spec_tokens -- the drafts
+            # update_draft_token_ids_in_output() handed to
+            # grammar.validate_tokens() and the grammar refused -- and
+            # records nothing once the remainder reaches 0. validate_tokens
+            # keeps only the accepted prefix, and this grammar is built to
+            # refuse the model's own drafts from the first position on, so a
+            # healthy deferred-bitmask path reports exactly 0 drafted on the
+            # constrained rows. A path that regressed to the -1 placeholders
+            # would never call validate_tokens and would report K per step
+            # instead: a >0 drafted floor fails on the working path and
+            # passes on the broken one.
+            num_draft_tokens = num_accepted_tokens = 0
             for metric in spec_llm.get_metrics():
                 if metric.name == SPEC_DRAFT_METRIC:
                     assert isinstance(metric, Counter)
                     num_draft_tokens += metric.value
-            assert num_draft_tokens > 0, \
-                "no draft tokens proposed under structured outputs"
+                elif metric.name == SPEC_ACCEPTED_METRIC:
+                    assert isinstance(metric, Counter)
+                    num_accepted_tokens += metric.value
+            print("adversarial choice + eagle3(async): "
+                  f"accepted={num_accepted_tokens} "
+                  f"drafted(net of grammar-rejected)={num_draft_tokens}")
+            assert num_accepted_tokens > 0, \
+                "no draft tokens accepted on the unconstrained control rows"
         finally:
             spec_llm.llm_engine.engine_core.shutdown()
             del spec_llm
@@ -1325,6 +1561,7 @@ _SERVE_TRANSLATED_KEYS = {
     "limit_mm_per_prompt",
     "disable_log_stats",
     "enable_expert_parallel",
+    "kv_cache_dtype",
 }
 
 
@@ -1343,7 +1580,7 @@ def _serve_args(kwargs: dict) -> list[str]:
 
     args: list[str] = []
     for key in ("max_model_len", "max_num_seqs", "tensor_parallel_size",
-                "data_parallel_size"):
+                "data_parallel_size", "kv_cache_dtype"):
         if kwargs.get(key) is not None:
             args += [f"--{key.replace('_', '-')}", str(kwargs[key])]
 
@@ -1380,12 +1617,15 @@ def _get_local_tpu_chip_count() -> int:
         pytest.skip(f"Unable to detect local TPU chip count: {e}")
 
 
-def _require_chips_for_dp() -> None:
-    tp = _get_tensor_parallel_size()
-    needed = DP_SIZE * tp
+def _require_chips_for_dp(
+    dp_size: int = DP_SIZE,
+    tp_size: int | None = None,
+) -> None:
+    tp = tp_size if tp_size is not None else _get_tensor_parallel_size()
+    needed = dp_size * tp
     available = _get_local_tpu_chip_count()
     if available < needed:
-        pytest.skip(f"DP spec decode needs {needed} chips (dp={DP_SIZE} x "
+        pytest.skip(f"DP spec decode needs {needed} chips (dp={dp_size} x "
                     f"tp={tp}), found {available}")
 
 
@@ -1569,6 +1809,7 @@ def test_qwen35_mtp_dp_correctness_greedy(
     )
 
 
+@pytest.mark.nightly
 @pytest.mark.multichip
 @pytest.mark.timeout(2400)
 def test_qwen35_mtp_dp_performance_greedy(
@@ -1590,4 +1831,46 @@ def test_qwen35_mtp_dp_performance_greedy(
         model_name=QWEN35_MTP_DP_MODEL,
         async_scheduling=False,
         extra_kwargs=_qwen35_dp_kwargs(),
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(3600)
+def test_qwen35_dflash_dp_correctness_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """DFlash under data parallelism must not change greedy output."""
+    _require_chips_for_dp(DFLASH_DP_SIZE, DFLASH_DP_TP_SIZE)
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_correctness_helper(
+        monkeypatch,
+        sampling_config,
+        QWEN35_MTP_DP_MODEL,
+        _qwen35_dflash_speculative_config(),
+        async_scheduling=False,
+        extra_kwargs=_qwen35_dflash_dp_kwargs(),
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.multichip
+@pytest.mark.timeout(2400)
+def test_qwen35_dflash_dp_performance_greedy(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+):
+    """Every DP engine drafts with DFlash, and drafts are accepted."""
+    _require_chips_for_dp(DFLASH_DP_SIZE, DFLASH_DP_TP_SIZE)
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+
+    _test_performance_helper(
+        monkeypatch,
+        sampling_config,
+        _qwen35_dflash_speculative_config(),
+        min_acceptance_rate=DFLASH_DP_MIN_ACCEPTANCE_RATE,
+        model_name=QWEN35_MTP_DP_MODEL,
+        async_scheduling=False,
+        extra_kwargs=_qwen35_dflash_dp_kwargs(),
     )

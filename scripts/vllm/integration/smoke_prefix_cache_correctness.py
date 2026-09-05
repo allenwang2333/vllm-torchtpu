@@ -261,9 +261,11 @@ def run_repeat_consistency(
 
 
 def build_shared_prefix(namespace: str, line_count: int) -> str:
-    return "\n".join(
-        f"{namespace} row {i:03d}: alpha=ALPHA-314 bravo=BRAVO-271 charlie=CHARLIE-159."
-        for i in range(line_count))
+    lines = [f"Prefix cache namespace={namespace}."]
+    lines.extend((f"Prefix cache fixture row {i:03d}: alpha=ALPHA-314 "
+                  f"bravo=BRAVO-271 charlie=CHARLIE-159.")
+                 for i in range(line_count))
+    return "\n".join(lines)
 
 
 def run_long_shared_prefix_cross_query(
@@ -304,7 +306,7 @@ def run_long_shared_prefix_cross_query(
             expected = answers[key]
             prompt = (
                 common_prefix +
-                f"\n\nQuery key: {key}. Answer exactly {expected} and no other text."
+                f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} and no other text."
             )
             result = chat(url, model, prompt, max_tokens, timeout)
             text = result.get("text", "")
@@ -425,9 +427,10 @@ def run_mixed_query_correctness(
         for name, kind, prompt_or_key, expected in sequence:
             if kind == "long":
                 key = prompt_or_key
-                prompt = (common_prefix +
-                          f"\n\nQuery key: {key}. Answer exactly {expected} "
-                          "and no other text.")
+                prompt = (
+                    common_prefix +
+                    f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
+                    "and no other text.")
             else:
                 prompt = prompt_or_key
 
@@ -527,9 +530,10 @@ def run_concurrent_mixed_query_correctness(
             for index in range(worker_count):
                 key = keys[index % len(keys)]
                 expected = answers[key]
-                prompt = (common_prefix +
-                          f"\n\nQuery key: {key}. Answer exactly {expected} "
-                          "and no other text.")
+                prompt = (
+                    common_prefix +
+                    f"\n\nUsing the fixture above, query key: {key}. Answer exactly {expected} "
+                    "and no other text.")
                 future = executor.submit(chat, url, model, prompt, max_tokens,
                                          timeout)
                 future_to_case[future] = (round_index, key, expected)
@@ -615,6 +619,11 @@ def parse_args() -> argparse.Namespace:
                         type=int,
                         default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600))
     parser.add_argument("--quick-probe-only", action="store_true")
+    parser.add_argument(
+        "--prefix-hit-probe-only",
+        action="store_true",
+        help="Run only the repeated long-prefix correctness probe.",
+    )
     parser.add_argument("--skip-short-qa", action="store_true")
     parser.add_argument("--short-repeat-lines",
                         type=int,
@@ -653,7 +662,23 @@ def main() -> int:
     if args.quick_probe_only:
         return run_quick_probe(url, args.model, args.timeout)
 
-    namespace = f"pc-correctness-{int(time.time())}"
+    namespace = f"pc-correctness-{time.time_ns()}"
+    if args.prefix_hit_probe_only:
+        requests, failures = run_repeat_consistency(
+            url,
+            args.model,
+            f"{namespace}-prefix-hit-probe",
+            args.long_repeat_lines,
+            args.long_repeat_count,
+            "NORTH-17",
+            8,
+            args.timeout,
+        )
+        print(f"PREFIX_CACHE_HIT_PROBE_REQUESTS {requests}")
+        print(f"PREFIX_CACHE_HIT_PROBE_FAILURES {failures}")
+        print(f"PREFIX_CACHE_HIT_PROBE_OK {int(failures == 0)}")
+        return 1 if failures else 0
+
     total_requests = 0
     failures = 0
 
