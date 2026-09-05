@@ -10,7 +10,7 @@ steps:
 
   - label: "K3 AgentX conc 4 ctx 128k, prefix caching + unified pool probe (TPU v7x-32)"
     key: k3_agentx_apc
-    skip: "root cause captured in vllm-org build 3: unified pool rejects the K3 MLA page (tpu_block_size_utils.py:252)"
+    skip: "root cause captured in build 3 (unified pool rejects K3 MLA page)"
     depends_on: build_docker
     timeout_in_minutes: 300
     agents:
