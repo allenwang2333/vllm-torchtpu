@@ -394,6 +394,33 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             atol=1e-6,
             err_msg=f"chunk {chunk} disagrees with the policy default")
 
+    def test_single_chunk_policy_is_semantically_neutral(self):
+        """`TPU_DSA_SINGLE_CHUNK` drives the real policy, not a patched lambda.
+
+        256 tokens in one chunk is four times the largest chunk any other case
+        here builds, and it is the shape of the diagnostic arm: one gather,
+        one attention call, nothing overlapping.
+        """
+        self._require_tpu()
+        q_lens, topk = [128, 128], 128
+        with mock.patch.object(attention_interface, "DSA_SINGLE_CHUNK", True):
+            self.assertEqual(
+                attention_interface.sparse_mla_gather_chunk_size(256), 256,
+                "the policy did not resolve to a single chunk; the rest of "
+                "this case would silently test the default")
+            output, expected, valid = self._run_causal_case(q_lens, topk)
+        self.assertEqual(int(valid.sum()), sum(q_lens))
+        self._check(output, expected, valid)
+
+        baseline, _, baseline_valid = self._run_causal_case(q_lens, topk)
+        np.testing.assert_array_equal(valid, baseline_valid)
+        np.testing.assert_allclose(
+            np.asarray(output.astype(jnp.float32))[valid],
+            np.asarray(baseline.astype(jnp.float32))[valid],
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg="single-chunk output disagrees with the policy default")
+
     def test_reference_check_detects_a_single_wrong_key(self):
         """Negative control: prove `_check` can fail at all.
 
@@ -446,9 +473,28 @@ class SparseMlaGatherChunkPolicyTest(parameterized.TestCase):
             }
         self.assertEqual(set(got.values()), {64})
 
+    def test_single_chunk_returns_the_bucket_itself(self):
+        """One chunk means chunk == n, for every bucket and both other modes.
+
+        `cdiv(n, n) == 1` is the property; asserting the returned value equals
+        the bucket is the same statement in the form the kernel consumes.
+        """
+        for by_bucket in (False, True):
+            with mock.patch.object(attention_interface, "DSA_SINGLE_CHUNK",
+                                   True), \
+                 mock.patch.object(attention_interface, "DSA_CHUNK_BY_BUCKET",
+                                   by_bucket):
+                got = {
+                    n: attention_interface.sparse_mla_gather_chunk_size(n)
+                    for n in self.EXPECTED_ON
+                }
+            self.assertEqual(got, {n: n for n in self.EXPECTED_ON},
+                             f"with DSA_CHUNK_BY_BUCKET={by_bucket}")
+
     def test_defaults_off(self):
-        """The knob must be opt-in, or the control arm is not a control."""
+        """The knobs must be opt-in, or the control arm is not a control."""
         self.assertFalse(envs.TPU_DSA_CHUNK_BY_BUCKET)
+        self.assertFalse(envs.TPU_DSA_SINGLE_CHUNK)
 
 
 class UpdateSparseMLAKvCacheTest(parameterized.TestCase):

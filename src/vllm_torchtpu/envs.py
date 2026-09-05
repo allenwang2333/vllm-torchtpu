@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_DSA_CHUNK_BY_BUCKET: bool = False
+    TPU_DSA_SINGLE_CHUNK: bool = False
 
 
 def env_with_choices(
@@ -407,6 +408,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Off keeps the shipping behaviour exactly.
     "TPU_DSA_CHUNK_BY_BUCKET":
     env_bool("TPU_DSA_CHUNK_BY_BUCKET", default=False),
+
+    # Force the sparse (DSA) MLA gather/attention to a single chunk per
+    # forward -- chunk size == the padded token bucket -- overriding both the
+    # bucket policy above and the kernel's default of 64. Diagnostic: it is
+    # the arm with no gather/attention overlap at all, so a profile prices the
+    # gather's whole cost instead of its exposed residual. It moves prefill
+    # only; a 64-token decode bucket is already a single chunk at the default.
+    # Off keeps the shipping behaviour exactly.
+    "TPU_DSA_SINGLE_CHUNK":
+    env_bool("TPU_DSA_SINGLE_CHUNK", default=False),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.

@@ -55,6 +55,7 @@ sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attent
 # Read once at import, like USE_BATCHED_RPA_LONGCTX above. Tests that need the
 # other setting patch this name directly rather than the environment.
 DSA_CHUNK_BY_BUCKET = envs.TPU_DSA_CHUNK_BY_BUCKET
+DSA_SINGLE_CHUNK = envs.TPU_DSA_SINGLE_CHUNK
 
 
 def sharded_flash_attention(
@@ -768,12 +769,26 @@ def sparse_mla_gather_chunk_size(num_padded_tokens: int) -> int:
     keyed on input shapes -- a value that is a pure function of the padded
     token count cannot create a cache entry that did not already exist.
 
+    `TPU_DSA_SINGLE_CHUNK` overrides both and returns the bucket itself, so
+    `cdiv(n, chunk) == 1` and the kernel unrolls exactly one gather and one
+    attention call. That is not a candidate configuration -- it is the
+    *diagnostic* end of the axis, the one arm in which nothing overlaps, so
+    the gather's whole cost is on the critical path and a profile reads it
+    directly instead of as a `full - kernel` residual. Note it changes nothing
+    at decode: a 64-token bucket at the default chunk of 64 is already a
+    single chunk, so this flag moves prefill only.
+
     Args:
       num_padded_tokens: `q.shape[0]`, already padded to a compile bucket.
 
     Returns:
       The `gather_and_attention_chunk_size` to pass to the kernel.
     """
+    if DSA_SINGLE_CHUNK:
+        # The kernel clamps the final chunk (`end_pos = min(...)` at
+        # kernel.py:638), so any value >= n would also give one chunk, but
+        # returning n exactly keeps the HLO metadata name truthful.
+        return num_padded_tokens
     if not DSA_CHUNK_BY_BUCKET:
         return _DSA_DEFAULT_CHUNK
     n = num_padded_tokens
