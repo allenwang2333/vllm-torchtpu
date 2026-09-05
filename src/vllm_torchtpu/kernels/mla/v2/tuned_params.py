@@ -1109,6 +1109,8 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     # Kimi-K3 TP32 DSpark target verify on TPU v7x with block-16 FP8 KV.
     # Five draft tokens plus the anchor produce six queries per sequence. The
     # dimensions below are the serving compile buckets for C=1/2/4/8/16/32.
+    # Ragged metadata is padded to the server-wide max_num_seqs rather than
+    # the active sequence count, so every key uses the configured value 32.
     TuningKey(
         case="mixed",
         max_num_tokens=8,
@@ -1119,7 +1121,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=1,
+        max_num_seqs=32,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1138,7 +1140,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=3,
+        max_num_seqs=32,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1157,7 +1159,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=6,
+        max_num_seqs=32,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1176,7 +1178,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=9,
+        max_num_seqs=32,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1195,7 +1197,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=19,
+        max_num_seqs=32,
         pages_per_seq=2048,
     ):
     TunableParams(
@@ -1214,7 +1216,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         q_dtype="bfloat16",
         page_size_per_kv_packing=4,
         kv_packing=4,
-        max_num_seqs=38,
+        max_num_seqs=32,
         pages_per_seq=2048,
     ):
     TunableParams(
