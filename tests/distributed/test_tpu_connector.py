@@ -26,6 +26,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+from vllm_torchtpu.distributed.kv_transfer.raiden.transfer_plan import (
+    Dsv4Pool, dsv4_pool_pages, plan_transfer_groups)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
@@ -35,9 +37,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3Dsv4Pool, _Stage3LoadMeta, _Stage3RegisteredSend,
-    _select_committed_mamba_blocks, _stage3_dsv4_pool_pages,
-    _stage3_transfer_groups, stage3_fa_raiden_id_fields)
+    _Stage3LoadMeta, _Stage3RegisteredSend, _select_committed_mamba_blocks,
+    stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -148,14 +149,14 @@ def _make_stage3_dsv4_kv_cache_config() -> KVCacheConfig:
 def test_stage3_transfer_groups_skips_mamba_state_groups():
     """Mamba state rides the state-class tags, not the page transfer."""
     config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
-    groups = _stage3_transfer_groups(config.kv_cache_groups, multi_group=False)
+    groups = plan_transfer_groups(config.kv_cache_groups, multi_group=False)
     assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(2, 16)]
 
 
 def test_stage3_transfer_groups_rejects_several_groups_by_default():
     with pytest.raises(ValueError, match="exactly one"):
-        _stage3_transfer_groups(
+        plan_transfer_groups(
             _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
             multi_group=False)
 
@@ -172,7 +173,7 @@ def test_stage3_transfer_groups_rejects_a_single_group_dsv4_plan():
     """
     single = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
     with pytest.raises(ValueError, match="TPU_RAIDEN_DSV4_ADMISSION"):
-        _stage3_transfer_groups(single.kv_cache_groups, multi_group=True)
+        plan_transfer_groups(single.kv_cache_groups, multi_group=True)
 
 
 def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
@@ -182,12 +183,12 @@ def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
         if isinstance(group.kv_cache_spec, MambaSpec)
     ]
     with pytest.raises(ValueError, match="at least one non-Mamba"):
-        _stage3_transfer_groups(mamba_only, multi_group=True)
+        plan_transfer_groups(mamba_only, multi_group=True)
 
 
 def test_stage3_transfer_groups_keeps_each_dsv4_group_page_size():
     """Group order is preserved and each group carries its own page size."""
-    groups = _stage3_transfer_groups(
+    groups = plan_transfer_groups(
         _make_stage3_dsv4_kv_cache_config().kv_cache_groups, multi_group=True)
     assert [(group.cache_group_index, group.page_tokens)
             for group in groups] == [(0, 1024), (1, 1024), (2, 128)]
@@ -4058,44 +4059,44 @@ def test_dsv4_window_trim_drops_the_null_prefix_and_its_tokens():
     a destination page list that repeats an ID, so leaving them in fails the
     whole transfer.
     """
-    pool = _Stage3Dsv4Pool(tag="dsv4.swa.g1",
-                           plan_position=1,
-                           page_tokens=128,
-                           live_bytes_per_block=131072,
-                           row_bytes=512,
-                           window_tokens=128)
+    pool = Dsv4Pool(tag="dsv4.swa.g1",
+                    plan_position=1,
+                    page_tokens=128,
+                    live_bytes_per_block=131072,
+                    row_bytes=512,
+                    window_tokens=128)
     # 1534 tokens over 128-token pages is 12 pages; the window keeps the last
     # two, matching SlidingWindowManager's (1534 - 128 + 1) // 128 == 10 skip.
     table = [0] * 10 + [41, 42]
 
-    pages, tokens = _stage3_dsv4_pool_pages(pool, table, 1534)
+    pages, tokens = dsv4_pool_pages(pool, table, 1534)
 
     assert pages == [41, 42]
     assert tokens == 1534 - 10 * 128
 
 
 def test_dsv4_window_trim_leaves_a_full_attention_group_alone():
-    pool = _Stage3Dsv4Pool(tag="dsv4.csa.nope.g0",
-                           plan_position=0,
-                           page_tokens=1024,
-                           live_bytes_per_block=131072,
-                           row_bytes=512)
+    pool = Dsv4Pool(tag="dsv4.csa.nope.g0",
+                    plan_position=0,
+                    page_tokens=1024,
+                    live_bytes_per_block=131072,
+                    row_bytes=512)
 
-    pages, tokens = _stage3_dsv4_pool_pages(pool, [7, 8], 1534)
+    pages, tokens = dsv4_pool_pages(pool, [7, 8], 1534)
 
     assert (pages, tokens) == ([7, 8], 1534)
 
 
 def test_dsv4_window_trim_rejects_a_table_that_still_repeats_a_page():
-    pool = _Stage3Dsv4Pool(tag="dsv4.swa.g1",
-                           plan_position=1,
-                           page_tokens=128,
-                           live_bytes_per_block=131072,
-                           row_bytes=512,
-                           window_tokens=128)
+    pool = Dsv4Pool(tag="dsv4.swa.g1",
+                    plan_position=1,
+                    page_tokens=128,
+                    live_bytes_per_block=131072,
+                    row_bytes=512,
+                    window_tokens=128)
 
     with pytest.raises(ValueError, match="still repeats a page"):
-        _stage3_dsv4_pool_pages(pool, [0] * 10 + [41, 41], 1534)
+        dsv4_pool_pages(pool, [0] * 10 + [41, 41], 1534)
 
 
 def test_dsv4_pool_plan_rejects_a_tag_outside_the_transfer_plan():
