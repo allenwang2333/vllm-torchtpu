@@ -30,6 +30,7 @@ from vllm_torchtpu.layers.common.sequence_layout import (
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "kpool_state_indices",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -81,6 +82,25 @@ class AttentionMetadata(object):
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | None = None
+    # (max_num_seqs,) int32 — per-request slot in the GLM-5.3 kpool *pending
+    # ring*, from the runner's stride-1 req_id-keyed pool
+    # (`runner/kpool_slots.py`). Slot 0 is the null sentinel every padded
+    # position writes; live positions hold `[1, max_num_reqs + 1)`.
+    #
+    # This is NOT `mamba_state_indices` and must never be substituted for it.
+    # That field is a mamba slot, and under unified-align mode it is derived
+    # from the device block table — i.e. an attention-pool *block id*, which
+    # exceeds `max_num_reqs + 1` by orders of magnitude. Indexing the kpool
+    # ring (`f32[max_num_reqs + 1, pending_depth, 2, index_head_dim]`) with one
+    # is a silent out-of-bounds read: XLA clamps it, the pooled key is wrong,
+    # nothing raises. See section 4(vii) of
+    # docs/glm5-3-flash-kpool-pending-state.md.
+    #
+    # None for every model without a kpool indexer, and for every attention
+    # group in a model that has one — the value is carried on every group's
+    # metadata because the indexer reads its own pooled-cache group's, and
+    # which group that is depends on the KV-cache layout.
+    kpool_state_indices: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -119,6 +139,12 @@ class AttentionMetadataBuilderContext:
     # emits no `mamba_ckpt_indices`.
     mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
+    # GLM-5.3 kpool pending-ring slot ids (device int32, length =
+    # target_num_reqs), built by `runner/kpool_slots.py`. Copied onto *every*
+    # group's AttentionMetadata, unlike the mamba fields: the kpool indexer
+    # reads the metadata of its own pooled-cache group, and that group id is
+    # not known here. None when the model has no kpool indexer.
+    kpool_state_indices: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
     # block ids it derived from its block table, so the post-sampling
@@ -411,6 +437,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            kpool_state_indices=ctx.kpool_state_indices,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,

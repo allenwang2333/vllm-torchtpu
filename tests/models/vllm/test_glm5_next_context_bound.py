@@ -13,11 +13,18 @@
 # limitations under the License.
 """The dense-MLA substitution has a context bound, and it must be enforced.
 
-Running GLM-5.3-Flash's full-attention layers densely is exact only while a
-sparse pooled indexer would have selected every causal token, i.e. while
+Running GLM-5.3-Flash's full-attention layers densely is exact only while the
+kpool indexer would have selected every causal token, i.e. while
 ``max_model_len <= index_topk``. Past that the reference attends sparsely and
 a dense build does not, and the output is wrong while still looking plausible
 -- the worst failure shape there is. So it raises rather than warns.
+
+The bound belongs to the *dense substitution*, not to the model. With the
+indexer built, longer contexts are legal and the bound does not apply; with it
+off -- the kill switch, an unsupported config, a fallback -- they are exactly
+as wrong as they ever were, and this is the only thing that says so. Every
+test below therefore states which of the two worlds it is in; one that did not
+would be testing whichever the environment happened to give it.
 """
 
 import types
@@ -39,13 +46,25 @@ def _text(index_topk=2048):
 
 @pytest.mark.parametrize("max_len", [128, 2047, 2048])
 def test_within_bound_is_allowed(max_len):
-    _check_context_within_dense_mla_bound(_cfg(max_len), _text())
+    _check_context_within_dense_mla_bound(_cfg(max_len),
+                                          _text(),
+                                          indexer_enabled=False)
 
 
 @pytest.mark.parametrize("max_len", [2049, 4096, 1_048_576])
-def test_beyond_bound_raises(max_len):
+def test_beyond_bound_raises_with_the_indexer_off(max_len):
     with pytest.raises(ValueError, match="exceeds index_topk"):
-        _check_context_within_dense_mla_bound(_cfg(max_len), _text())
+        _check_context_within_dense_mla_bound(_cfg(max_len),
+                                              _text(),
+                                              indexer_enabled=False)
+
+
+@pytest.mark.parametrize("max_len", [2049, 4096, 1_048_576])
+def test_beyond_bound_is_legal_with_the_indexer_on(max_len):
+    """The cap the kpool indexer exists to lift."""
+    _check_context_within_dense_mla_bound(_cfg(max_len),
+                                          _text(),
+                                          indexer_enabled=True)
 
 
 def test_the_escape_hatch_downgrades_to_a_warning(monkeypatch):
@@ -54,18 +73,44 @@ def test_the_escape_hatch_downgrades_to_a_warning(monkeypatch):
     Judging output past it is not, which is why it is opt-in and loud.
     """
     monkeypatch.setenv(_ALLOW_UNSOUND_CONTEXT, "1")
-    _check_context_within_dense_mla_bound(_cfg(1_048_576), _text())
+    _check_context_within_dense_mla_bound(_cfg(1_048_576),
+                                          _text(),
+                                          indexer_enabled=False)
 
 
 def test_bound_tracks_the_config_not_a_hardcoded_2048():
     """The tiny fixture and the real checkpoint must both be governed."""
     with pytest.raises(ValueError, match="index_topk=256"):
-        _check_context_within_dense_mla_bound(_cfg(512), _text(index_topk=256))
-    _check_context_within_dense_mla_bound(_cfg(512), _text(index_topk=4096))
+        _check_context_within_dense_mla_bound(_cfg(512),
+                                              _text(index_topk=256),
+                                              indexer_enabled=False)
+    _check_context_within_dense_mla_bound(_cfg(512),
+                                          _text(index_topk=4096),
+                                          indexer_enabled=False)
 
 
 def test_missing_fields_do_not_raise():
     """A config without index_topk is not this check's business."""
-    _check_context_within_dense_mla_bound(_cfg(4096), types.SimpleNamespace())
+    _check_context_within_dense_mla_bound(_cfg(4096),
+                                          types.SimpleNamespace(),
+                                          indexer_enabled=False)
     _check_context_within_dense_mla_bound(
-        types.SimpleNamespace(model_config=types.SimpleNamespace()), _text())
+        types.SimpleNamespace(model_config=types.SimpleNamespace()),
+        _text(),
+        indexer_enabled=False)
+
+
+def test_the_default_is_the_same_resolver_the_layers_use(monkeypatch):
+    """Omitting ``indexer_enabled`` must not mean "assume the safe answer".
+
+    The guard and the attention layers have to reach the same conclusion from
+    the same input, or the guard is protecting a model that was not built.
+    """
+    from vllm_torchtpu.models.vllm.glm5_next.attention import KPOOL_INDEXER_ENV
+
+    monkeypatch.setenv(KPOOL_INDEXER_ENV, "0")
+    with pytest.raises(ValueError, match="exceeds index_topk"):
+        _check_context_within_dense_mla_bound(_cfg(4096), _text())
+
+    monkeypatch.setenv(KPOOL_INDEXER_ENV, "1")
+    _check_context_within_dense_mla_bound(_cfg(4096), _text())

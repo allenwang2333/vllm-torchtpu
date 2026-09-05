@@ -8,8 +8,10 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import functools
 import math
 import os
+import sys
 import time
 from collections.abc import Collection
 from contextlib import contextmanager
@@ -99,6 +101,9 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.kpool_slots import (KpoolSlotPool,
+                                              assert_pool_matches_ring,
+                                              assert_slot_indices_sane)
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
 from vllm_torchtpu.runner.speculative_decoding_manager import (
@@ -285,6 +290,75 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     return isinstance(attn_module,
                       (DeepseekV4Attention, DeepseekV4SWACache,
                        DeepseekV4IndexerCache, CompressorStateCache))
+
+
+#: Import path of the module that defines the pooled indexer K cache.
+#: Spelled as a string, and looked up in `sys.modules` rather than imported,
+#: for the reason in `is_compressed_indexer_cache`.
+_KPOOL_INDEXER_MODULE_NAME = "vllm_torchtpu.models.vllm.glm5_next.indexer"
+
+
+@functools.lru_cache(maxsize=1)
+def _kpool_indexer_module():
+    """`models.vllm.glm5_next.indexer`, imported on first use.
+
+    **This is a real import of the whole `glm5_next` model tree**, not a
+    narrow one: Python executes the parent package's `__init__` before any
+    submodule, so `from ...glm5_next import indexer` runs `attention`,
+    `layers`, `model` and `mtp` too. That is acceptable *here* -- every caller
+    of this function has already established that a pooled cache exists, so
+    the GLM tree is by definition already imported -- and it is exactly what
+    `is_compressed_indexer_cache` must not do, because that predicate is
+    reached on every model's boot path.
+
+    Memoized so the cost is paid at most once.
+    """
+    from vllm_torchtpu.models.vllm.glm5_next import indexer as kpool_indexer
+    return kpool_indexer
+
+
+def is_compressed_indexer_cache(attn_module: AttentionLayerBase) -> bool:
+    """Whether this module owns a *compressed-page* indexer K cache.
+
+    Compressed means the page holds `block_size // compress_ratio` records,
+    not `block_size` of them. One normalization step gets that wrong if the
+    spec is not exempted, and it is silent:
+
+    `_normalize_one_spec` sizes an MLA page from `spec.block_size` rather
+    than `spec.storage_block_size` (`kv_cache_spec_normalizer.py:72-78`), so a
+    ratio-4 pooled page would be padded 4x -- 4096 B where 1024 B is
+    allocated. That is the whole of the local justification. (The
+    `_has_hybrid_attention_and_mamba` clause at
+    `kv_cache_spec_normalizer.py:42-50` pads every non-exempt spec up to the
+    model's maximum page, but it runs only under `enable_unified_kv_layout`,
+    which is False for GLM -- `Glm5NextForCausalLM` is not in
+    `POOLED_GDN_ARCHITECTURES` -- so it is not a path this model takes.)
+
+    Note what the exemption does **not** buy: it skips this repo's normalizer,
+    not vLLM's own `unify_kv_cache_spec_page_size`, which sees the same 1024 B
+    page next to the ~2.25 MB uniform page and rewrites `block_size` to match.
+    `_assert_pooled_page_size_survived_grouping` is where that is caught.
+
+    Deliberately **separate from `is_cache_for_ds_v4`** and used for
+    `exempt_layers` **only**. Folding it in there
+    would set `_is_ds_v4` at `:6147` and reroute the entire model through
+    `_initialize_ds_v4_kv_cache`, which raises inside `_classify_ds_v4_layers`
+    on GLM's first KDA layer.
+
+    **Answers False without importing anything.** This predicate runs once per
+    layer on *every* model's boot path, and `_kpool_indexer_module()` executes
+    the whole `glm5_next` package `__init__` -- Python runs a parent package
+    before any submodule, so there is no such thing as importing `indexer`
+    alone. An import error anywhere in GLM's tree would therefore become a
+    boot failure for Qwen, DeepSeek-V4 and everything else. The `sys.modules`
+    lookup is exact rather than conservative: `Glm5NextIndexerKCache` is
+    defined in that module, so an instance of it cannot exist unless the model
+    builder has already imported it and put it there.
+    """
+    module = sys.modules.get(_KPOOL_INDEXER_MODULE_NAME)
+    if module is None:
+        return False
+    return module.is_pooled_indexer_cache(attn_module)
 
 
 def _build_kv_connector_output(
@@ -558,6 +632,15 @@ class TPUModelRunner(GPUModelRunner):
         # True once the slot pool is initialized (hybrid model with mamba
         # layers); gates per-step mamba_state_indices construction.
         self._has_mamba_state: bool = False
+        # GLM-5.3 kpool: the stride-1 req_id -> pending-ring slot pool. All
+        # the logic is in `runner/kpool_slots.py` (this module is not
+        # importable on the CPU rung, so anything testable must live there);
+        # what stays here is allocation, the per-step call and the H2D. Built
+        # eagerly because its size is `max_num_reqs + 1` and needs no KV-cache
+        # config; `_has_kpool_state` is what gates it, and `load_model` sets
+        # that from the module tree.
+        self._kpool_slot_pool = KpoolSlotPool(self.max_num_reqs)
+        self._has_kpool_state: bool = False
         # Slot-indexed mamba read offsets for speculative decoding with
         # hybrid (attention + mamba) models; allocated in
         # `initialize_kv_cache` once the mamba pool size is known. See
@@ -679,6 +762,10 @@ class TPUModelRunner(GPUModelRunner):
         # CPU staging for compact-mamba per-request recurrent-slot ids; H2D
         # copied each step into `AttentionMetadata.mamba_state_indices`.
         self.mamba_state_indices_cpu = torch.zeros(self.max_num_reqs,
+                                                   dtype=torch.int32,
+                                                   device="cpu")
+        # Same, for the GLM-5.3 kpool pending ring. See `_kpool_slot_pool`.
+        self.kpool_state_indices_cpu = torch.zeros(self.max_num_reqs,
                                                    dtype=torch.int32,
                                                    device="cpu")
         # Block-table-derived mamba state: the state-block position each
@@ -1221,6 +1308,9 @@ class TPUModelRunner(GPUModelRunner):
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
         )
         backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+        # Before `_update_attention_page_size_padded`, which consumes
+        # `_find_non_ssm_backend`'s answer to size every attention page.
+        self._assert_pooled_indexer_backend_agrees(layers, backend_cls)
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
@@ -1239,6 +1329,10 @@ class TPUModelRunner(GPUModelRunner):
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
+        # Compressed-page indexer caches (GLM-5.3 kpool). Exempt from
+        # normalization for the same reason and by the same mechanism, but
+        # kept in their own set so `_is_ds_v4` never sees them.
+        compressed_indexer_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -1365,16 +1459,35 @@ class TPUModelRunner(GPUModelRunner):
                 # (head_dim fp8 bytes + 1 e8m0 scale byte per token).
                 kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(
                     self.vllm_config)
+            elif is_compressed_indexer_cache(attn_module):
+                # GLM-5.3 kpool pooled indexer K cache. It needs its own
+                # branch: the loop's terminal `else: continue` below means an
+                # unrecognised cache module produces no spec, is never
+                # allocated, and says nothing about it. An unallocated pooled
+                # cache is not a crash -- `bind_kv_cache` leaves the numel==0
+                # placeholder, or a zero-filled page reads back as a legal
+                # all-zero pooled key that scores exactly 0 through the ReLU
+                # at `streamindex_topk.py:333` and therefore always ranks
+                # last. The model then degrades to a recency window and stays
+                # fluent. `_assert_pooled_indexer_caches_have_specs` below is
+                # the tripwire for exactly that.
+                compressed_indexer_layers.add(layer_name)
+                spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                if spec is not None:
+                    spec = self._pad_pooled_spec_to_uniform_page(
+                        layer_name, spec, attn_module)
+                    kv_cache_spec[layer_name] = spec
+                logger.info("%s: %s", layer_name,
+                            attn_module.geometry.describe())
             else:
                 # No spec, therefore no KV cache, therefore silence. Kept as
                 # `continue` rather than a raise because the set of
-                # `AttentionLayerBase` subclasses vLLM ships is open, and none
-                # of the ones without a branch here is exercised on TPU today,
-                # so a blanket raise would break models this cannot test. The
-                # warning is the compromise: an unrecognised cache module
-                # currently produces no spec, is never allocated, and says
-                # nothing about it -- and an unallocated cache is often not a
-                # crash but a zero-filled read, which is fluent and wrong.
+                # `AttentionLayerBase` subclasses vLLM ships is open (MiniMax
+                # M3's indexer cache, Qwen4's QSA state cache, Inkling's conv
+                # state, ...) and none of them is exercised on TPU today, so a
+                # blanket raise would break models this change has no way to
+                # test. The warning is the compromise; a new cache of our own
+                # gets an explicit branch and a post-loop assertion instead.
                 logger.warning_once(
                     "get_kv_cache_spec: %s (%s) is an AttentionLayerBase the "
                     "TPU runner has no branch for, so it is allocated no KV "
@@ -1384,6 +1497,9 @@ class TPUModelRunner(GPUModelRunner):
                     type(attn_module).__name__)
                 continue
 
+        self._assert_pooled_indexer_caches_have_specs(
+            layers, kv_cache_spec, compressed_indexer_layers)
+
         # Note: that each shared layer's target actually owns a KV cache (and
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
@@ -1392,9 +1508,251 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_spec,
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
-            exempt_layers=ds_v4_layers,
+            exempt_layers=ds_v4_layers | compressed_indexer_layers,
             attention_backend=backend_cls,
         )
+
+    def _assert_pooled_indexer_caches_have_specs(
+        self,
+        layers: dict[str, AttentionLayerBase],
+        kv_cache_spec: dict[str, KVCacheSpec],
+        compressed_indexer_layers: set[str],
+    ) -> None:
+        """Every pooled indexer cache in the model got a spec.
+
+        The module loop's terminal `else: continue` is the failure mode this
+        exists for: a cache module the loop does not
+        recognise is dropped without a word, and a dropped *pooled* cache is
+        the worst kind of silent -- byte-zero pooled records score exactly 0
+        through the ReLU at `streamindex_topk.py:333`, so they are legal
+        candidates that always rank last and the model degrades to a recency
+        window with fluent output and no long-range retrieval.
+
+        Written against `layers` rather than against the branch's own
+        bookkeeping on purpose: comparing `compressed_indexer_layers` to
+        itself would pass even if the branch stopped being reached.
+        """
+        present = {
+            name
+            for name, module in layers.items()
+            if is_compressed_indexer_cache(module)
+        }
+        if not present:
+            return
+        _kpool_indexer_module().assert_kv_packing_matches_runner(
+            self._DS_V4_KV_PACKING)
+        missing = sorted(present - set(kv_cache_spec))
+        if missing:
+            raise ValueError(
+                f"glm5_next kpool: {len(missing)} of {len(present)} pooled "
+                f"indexer K caches produced no KVCacheSpec: {missing}. They "
+                "are therefore never allocated, and nothing else would say "
+                "so: an unwritten pooled record is byte-zero, scores 0 "
+                "through the ReLU at streamindex_topk.py:333, always ranks "
+                "last, and the layer degrades to a recency window with "
+                "perfectly fluent output. Check the module loop in "
+                "get_kv_cache_spec -- its terminal `else: continue` drops "
+                "any cache module it does not recognise.")
+        unexpected = sorted(present - compressed_indexer_layers)
+        if unexpected:
+            raise ValueError(
+                "glm5_next kpool: pooled indexer caches "
+                f"{unexpected} got a spec from some *other* branch of the "
+                "module loop, so they are not in exempt_layers and "
+                "`_normalize_one_spec` will pad their page from block_size "
+                "instead of storage_block_size (4x) and then, because the "
+                "model is hybrid, up to the model's max page size. Both are "
+                "silent over-allocations.")
+
+    def _assert_pooled_indexer_backend_agrees(
+        self,
+        layers: dict[str, AttentionLayerBase],
+        backend_cls: type[AttentionBackend] | None,
+    ) -> None:
+        """Adding a pooled cache must not repaginate the rest of the model.
+
+        `Platform._find_non_ssm_backend` returns the backend of the *first*
+        non-SSM `AttentionLayerBase` in registration order
+        (`vllm/platforms/interface.py:589-606`). An indexer cache registers
+        before its `mla_attn` sibling, so once the pooled caches exist they
+        can become that first layer -- and that answer decides
+        `cache_config.block_size` (via `get_min_page_size`,
+        `tpu_platform.py:1167-1175`) and `attn_page_size_bytes` (via
+        `_update_attention_page_size_padded`, `:1780-1783`), which is folded
+        into every attention spec's `page_size_padded`, into
+        `cache_config.mamba_page_size_padded`, and into the compact-mamba
+        block-count override. In other words, a pooled cache that returned a
+        different backend would repaginate the 34 KDA layers as a side
+        effect, which is exactly the "KDA layers untouched" claim this
+        exists to check.
+
+        `Glm5NextIndexerKCache.get_attn_backend` returns the MLA sibling's own
+        backend so the answer is order-independent. This asserts it.
+        """
+        pooled = [m for m in layers.values() if is_compressed_indexer_cache(m)]
+        if not pooled or backend_cls is None:
+            return
+        # Recorded in the pod log so a later device run can compare the
+        # resolved backend against a run without the pooled caches. The
+        # assertion below cannot see the case where the pooled cache displaces
+        # one *sibling* backend with another (a vision tower's
+        # PallasAttentionBackend vs the text MLA's), so the log is the part
+        # that makes that visible at all.
+        first = next(iter(layers), None)
+        logger.info(
+            "glm5_next kpool: %d pooled indexer caches present; "
+            "_find_non_ssm_backend resolved to %s, first registered layer is "
+            "%s (%s)", len(pooled),
+            getattr(backend_cls, "__name__", backend_cls), first,
+            type(layers[first]).__name__ if first is not None else None)
+        siblings = {
+            m.get_attn_backend()
+            for m in layers.values()
+            if isinstance(m, (Attention, MLAAttention))
+        }
+        if not siblings:
+            return
+        pooled_backends = {m.get_attn_backend() for m in pooled}
+        if backend_cls in pooled_backends and not (pooled_backends & siblings):
+            raise ValueError(
+                "glm5_next kpool: the pooled indexer K cache registered "
+                f"before the model's real attention layers, so {backend_cls} "
+                "(its backend) is what _find_non_ssm_backend returns and "
+                "therefore what decides cache_config.block_size and "
+                "attn_page_size_bytes for the whole model. The attention "
+                "layers' own backends are "
+                f"{sorted(s.__name__ for s in siblings)}. "
+                "Make Glm5NextIndexerKCache.get_attn_backend return the same "
+                "class as its MLA sibling, or the pooled cache silently "
+                "repaginates every KDA and MLA layer.")
+
+    def _pad_pooled_spec_to_uniform_page(self, layer_name: str,
+                                         spec: KVCacheSpec,
+                                         attn_module) -> KVCacheSpec:
+        """Declare the pooled page as the model's uniform page. Do not resize
+        the cache.
+
+        This is the other half of the exemption. Skipping
+        `_normalize_one_spec` is right -- that function would size the page
+        from `block_size` rather than `storage_block_size` and over-count it
+        by `compress_ratio` -- but it left the pooled spec reporting its true
+        1024-byte page next to the `_hybrid_uniform_page_size_bytes` every
+        other spec carries. vLLM's `unify_kv_cache_spec_page_size`
+        (`kv_cache_utils.py:1070-1130` @ v0.27.0) then makes them uniform the
+        only way it can for an `MLAAttentionSpec`: it multiplies `block_size`
+        by `max_page // this_page`. Measured on the tiny fixture, that is
+        863232 // 1024 == 843, taking `block_size` 16 -> 13488 -- a spec that
+        still constructs, still validates, and now describes a completely
+        different pagination from the one the writer and the kernel use.
+
+        Padding is exactly the trick the rest of this runner already plays for
+        mamba: `_update_attention_page_size_padded` builds
+        `P = num_attn_groups*attn_page + num_mamba_groups*mamba_unpadded +
+        num_pooled_groups*pooled_page` and every layer *declares* P while the
+        TPU allocates its real size. The pooled group is already a term in
+        that sum -- it just was not declaring it. So the allocation is
+        unchanged (`geometry.cache_shape(num_blocks)`, 1024 B/block), the
+        block-count arithmetic is unchanged (the shared-tensor loop sums the
+        TPU-actual sizes, which is what makes them add back up to P), and the
+        only thing that moves is what vLLM is told.
+
+        `None` means the hybrid page was never computed -- a model with no
+        mamba layers, or a CPU-side spec query before
+        `_update_attention_page_size_padded` ran. Leave the spec alone there:
+        with nothing larger in the dict there is nothing to unify against.
+        """
+        target = self._hybrid_uniform_page_size_bytes
+        if target is None:
+            return spec
+        target = int(target)
+        real = int(getattr(spec, "real_page_size_bytes", 0))
+        if real >= target:
+            return spec
+        logger.info(
+            "%s: declaring page_size_padded=%d (true pooled page %d B/block, "
+            "which is what is actually allocated) so vLLM's "
+            "unify_kv_cache_spec_page_size does not rewrite block_size=%d to "
+            "%d.", layer_name, target, real, spec.block_size,
+            spec.block_size * (target // max(real, 1)))
+        return dataclasses.replace(spec, page_size_padded=target)
+
+    @staticmethod
+    def _assert_pooled_page_size_survived_grouping(layer_name: str,
+                                                   spec: KVCacheSpec,
+                                                   attn_module) -> int:
+        """The pooled spec must still describe the geometry it was derived at.
+
+        **Exempting the pooled spec from the LOCAL normalizer does not exempt
+        it from vLLM's own `unify_kv_cache_spec_page_size`.** `exempt_layers`
+        in `normalize_kv_cache_specs_for_tpu` only skips
+        `_normalize_one_spec`; vLLM then runs `get_kv_cache_groups`
+        (`kv_cache_utils.py` @ v0.27.0), which sees a 1024-byte pooled page
+        next to the ~2.25 MB `_hybrid_uniform_page_size_bytes` every other
+        spec carries, and unifies them. For an `MLAAttentionSpec` whose page
+        divides the maximum it does that by **multiplying `block_size` by the
+        ratio** -- a spec that still constructs, still validates, and now
+        reports `real_page_size_bytes == max_page_size`.
+
+        Two silent consequences, both downstream of this method's callers:
+
+        * the shared-tensor loop sums `spec.real_page_size_bytes` to get
+          `total_group_page_size`, so a pooled layer would contribute
+          2254848 instead of 1024 and `num_blocks =
+          tensor_size // total_group_page_size` shrinks for *every* layer in
+          the group -- block ids past the new leading dim are then clipped by
+          JAX's indexed writes, not raised on;
+        * the pooled cache itself is allocated from
+          `geometry.cache_shape(num_blocks)`, i.e. from the *geometry*, so the
+          spec and the allocation would silently describe different objects.
+
+        So: compare the post-unify spec against the geometry the writer and
+        the kernel both use, and fail here -- at allocation, with both numbers
+        -- rather than several layers later.
+
+        Returns the geometry's bytes per block, so the caller can use the
+        checked number rather than re-reading either side.
+        """
+        derived = int(attn_module.geometry.page_bytes)
+        spec_block_size = int(getattr(spec, "block_size", -1))
+        geom_block_size = int(attn_module.geometry.block_size)
+        # The UNPADDED page, not `real_page_size_bytes`. Since
+        # `_pad_pooled_spec_to_uniform_page` declares the model's uniform page
+        # on this spec -- so vLLM has nothing to unify -- `real_page_size_bytes`
+        # is now legitimately the uniform page and comparing it to the
+        # geometry would fail on a correct build. What must still hold is the
+        # pagination itself: the same `block_size`, and therefore the same
+        # true bytes per block, which is what the writer, the kernel and
+        # `geometry.cache_shape` all address through.
+        try:
+            actual = int(
+                dataclasses.replace(spec,
+                                    page_size_padded=None).page_size_bytes)
+        except Exception:  # noqa: BLE001
+            actual = int(getattr(spec, "page_size_bytes", -1))
+        if actual == derived and spec_block_size == geom_block_size:
+            return derived
+        raise ValueError(
+            f"glm5_next kpool: the pooled indexer spec for {layer_name} no "
+            f"longer matches the geometry it was derived at. The spec reports "
+            f"block_size={spec_block_size}, "
+            f"unpadded page_size_bytes={actual} "
+            f"(real_page_size_bytes="
+            f"{int(getattr(spec, 'real_page_size_bytes', -1))}); the geometry "
+            f"says block_size={geom_block_size}, page_bytes={derived} "
+            f"({attn_module.geometry.describe()}). This is what vLLM's "
+            "`unify_kv_cache_spec_page_size` does to a spec whose page is "
+            "smaller than the model's maximum: it multiplies `block_size` by "
+            "`max_page // this_page` so every group reports one page size. "
+            "Exempting the layer from `normalize_kv_cache_specs_for_tpu` does "
+            "not exempt it from that. Left unchecked it shrinks `num_blocks` "
+            "for every layer sharing the KVCacheTensor and leaves the pooled "
+            "cache -- which is allocated from the geometry, not from the spec "
+            "-- describing a different object than the one vLLM budgeted. "
+            "The fix is `_pad_pooled_spec_to_uniform_page`, which declares "
+            "the model's uniform page on this spec so there is nothing left "
+            "to unify; if that ran and this still fires, the uniform page "
+            "moved between the spec query and grouping. Fix the "
+            "spec/geometry pair; do not relax this check.")
 
     def _build_attention_metadata(
         self,
@@ -1568,6 +1926,102 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_config.kv_cache_groups,
             runner_only_attn_layers,
         )
+
+    def _report_kv_cache_allocation(self, kv_cache_config: KVCacheConfig,
+                                    kv_caches: dict) -> None:
+        """Planned vs allocated bytes per block, for every cache.
+
+        `_update_mamba_page_size_padded` now budgets three terms --
+        `num_attn_groups * attn_page + num_mamba_groups * mamba_unpadded +
+        num_pooled_groups * pooled_page`. The third one was missing, and a
+        pooled cache was therefore a *guaranteed* overrun of exactly its own
+        page: this check is fail-closed for any model owning one, so GLM-5.3
+        would have refused to boot inside `initialize_kv_cache` the moment
+        a pooled cache was instantiated -- on a real device job, after the
+        queue wait. The budget is widened rather than the check relaxed,
+        because vLLM derives `num_blocks` from that budget and an overrun is
+        multiplied by `num_blocks`.
+
+        Two comparisons are made, not one. The per-group one is per *block*
+        and is close to vacuous in the layout that will actually occur, since
+        the uniform page **is** the per-group sum by construction. The
+        whole-allocation one -- total bytes on device against
+        `sum(t.size for t in kv_cache_tensors)` -- is the one that can see a
+        wrong `num_blocks`.
+
+        The sparse MLA split `(nope, rope)` cache was also suspected of
+        an overrun, "10240 allocated against a budgeted 16 x 576 = 9216".
+        Measured, that one is **not** real: nothing budgets
+        `block_size * head_size`.
+        `PallasMLAttentionBackend.get_kv_cache_page_size_bytes` goes through
+        `get_kv_cache_shape`, which pads the minor axis to a 128 multiple
+        (576 -> 640) and packs by dtype, so at fp8 the budget is 10240 and
+        the split allocation is 10240 exactly. Pinned by
+        `tests/runner/test_glm5_next_kv_accounting.py`.
+
+        Raises only for models that own a pooled indexer cache: the other TPU
+        models have shipped with whatever discrepancy they have, and turning
+        that into a boot failure is not this change's to do. For them this is
+        a debug-level table plus one warning line -- and note that under
+        `VLLM_TPU_BLOCK_MAJOR_KV` the per-layer values are strided *views*
+        into one bundle, so the sum over-counts and the warning may be a
+        false alarm. That layout is refused for hybrid models, so it never
+        co-occurs with a pooled cache.
+        """
+        tensor_groups = [
+            list(t.shared_by) for t in kv_cache_config.kv_cache_tensors
+        ]
+        # The whole-allocation comparison's right-hand side: the bytes vLLM
+        # itself decided to hand out. Independent of `planned`, and the only
+        # one of the two that is sensitive to `num_blocks`.
+        tensor_sizes = [int(t.size) for t in kv_cache_config.kv_cache_tensors]
+        planned = self._hybrid_uniform_page_size_bytes
+        has_pooled = any(
+            is_compressed_indexer_cache(m) for m in self.vllm_config.
+            compilation_config.static_forward_context.values())
+        if has_pooled:
+            # Fail closed. This model only exists after this change, so there
+            # is no shipped behaviour to preserve. Importing the GLM tree is
+            # free here -- `has_pooled` is only true if it is already loaded.
+            logger.info(
+                "%s",
+                _kpool_indexer_module().assert_kv_cache_allocation_within_plan(
+                    kv_caches=kv_caches,
+                    tensor_groups=tensor_groups,
+                    planned_page_size_bytes=planned,
+                    tensor_sizes=tensor_sizes,
+                ))
+            return
+        try:
+            # Inside the try on purpose: this is the *other* models' path, and
+            # the report helpers live in the GLM model tree, so importing them
+            # must not be able to turn a debug table into a boot failure for
+            # Qwen or DeepSeek-V4.
+            report, overruns = _kpool_indexer_module(
+            ).kv_cache_allocation_report(
+                kv_caches=kv_caches,
+                tensor_groups=tensor_groups,
+                planned_page_size_bytes=planned,
+                # Printed, never raised on, for models this change does not
+                # own: under VLLM_TPU_BLOCK_MAJOR_KV the per-layer tensors are
+                # strided views into one bundle and the sum over-counts.
+                tensor_sizes=tensor_sizes,
+            )
+        except Exception:  # pragma: no cover - reporting must not break boot
+            logger.exception(
+                "KV cache accounting report failed; allocation itself is "
+                "unaffected.")
+            return
+        logger.debug("%s", report)
+        if overruns:
+            logger.warning(
+                "KV cache allocation exceeds the planned page size "
+                "(%s B/block) for %d KVCacheTensor(s): %s. num_blocks was "
+                "derived from the budget, so the overrun is multiplied by "
+                "num_blocks. (Under VLLM_TPU_BLOCK_MAJOR_KV the per-layer "
+                "tensors are strided views into one bundle and this sum "
+                "over-counts.)", planned, len(overruns),
+                [list(names) for names, _ in overruns])
 
     def _add_shared_kv_cache_aliases(
             self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -1771,7 +2225,9 @@ class TPUModelRunner(GPUModelRunner):
 
         The fix: set every layer's reported `page_size_padded` equal to the
         full per-`shared_by` footprint — `num_attn_groups × attn_page +
-        num_mamba_groups × mamba_unpadded`, where `attn_page` is the
+        num_mamba_groups × mamba_unpadded + num_pooled_groups × pooled_page`
+        (the third term is 0 for every model without a GLM-5.3 pooled indexer
+        K cache), where `attn_page` is the
         TPU-actual per-block bytes (from `get_attention_page_size_bytes`,
         which accounts for dtype packing like fp8) and `mamba_unpadded` is
         the natural `prod(shape) × dtype_size`. vLLM then computes a
@@ -1843,8 +2299,46 @@ class TPUModelRunner(GPUModelRunner):
         # allocator landed.
         num_attn = len(attn_modules)
         num_mamba = len(mamba_modules)
-        min_count = min(num_attn, num_mamba)
-        max_count = max(num_attn, num_mamba)
+
+        # The pooled indexer K caches (GLM-5.3 kpool) are a THIRD bucket.
+        # They are neither `Attention`/`MLAAttention` nor `MambaBase`, so
+        # neither list above sees them -- and vLLM's own bucketing
+        # (`_get_kv_cache_groups_uniform_page_size`, which buckets by *spec*)
+        # very much does: 11 MLA + 34 mamba + 11 pooled becomes 6 groups, and
+        # every `KVCacheTensor` is then `shared_by` one layer from each,
+        # pooled layer included. Leaving them out of the budget is not a
+        # rounding error, it is a guaranteed overrun of exactly
+        # `num_pooled_groups * pooled_page` per block, which
+        # `assert_kv_cache_allocation_within_plan` is fail-closed on -- i.e.
+        # GLM-5.3 would refuse to boot inside `initialize_kv_cache` the moment
+        # a pooled cache is instantiated. Count them here instead.
+        pooled_modules = [
+            m for m in layers.values() if is_compressed_indexer_cache(m)
+        ]
+        pooled_page_sizes = {
+            int(m.geometry.page_bytes)
+            for m in pooled_modules
+        }
+        if len(pooled_page_sizes) > 1:
+            raise ValueError(
+                "glm5_next kpool: pooled indexer caches disagree about their "
+                f"page size ({sorted(pooled_page_sizes)}). Every DSA layer's "
+                "cache is derived from the same block_size / index_kpool / "
+                "index_head_dim, so a disagreement means two different "
+                "geometries are live and one group's budget is wrong.")
+        num_pooled = len(pooled_modules)
+        pooled_page_size_bytes = (pooled_page_sizes.pop()
+                                  if pooled_page_sizes else 0)
+
+        # vLLM takes min/max over *every* bucket, so the pooled bucket has to
+        # be in the list when it exists. Omitting it keeps today's numbers
+        # unchanged for every model without a pooled cache (the list is then
+        # exactly the old pair).
+        bucket_counts = [num_attn, num_mamba]
+        if num_pooled:
+            bucket_counts.append(num_pooled)
+        min_count = min(bucket_counts)
+        max_count = max(bucket_counts)
 
         # Match vLLM exactly: float comparison, no int() truncation (matters
         # at e.g. min=3, max=4, where 4 < 4.5 but 4 < int(4.5)==4 differs).
@@ -1855,18 +2349,23 @@ class TPUModelRunner(GPUModelRunner):
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
         num_mamba_groups = (num_mamba + group_size - 1) // group_size
+        num_pooled_groups = (num_pooled + group_size - 1) // group_size
 
-        uniform_page_size_bytes = (num_attn_groups * attn_page_size_bytes +
-                                   num_mamba_groups * unpadded_mamba_page_size)
+        uniform_page_size_bytes = (
+            num_attn_groups * attn_page_size_bytes +
+            num_mamba_groups * unpadded_mamba_page_size +
+            num_pooled_groups * pooled_page_size_bytes)
 
         logger.info(
             "Hybrid KV cache: padding every layer spec to %d bytes "
             "(num_attn_groups=%d × attn_page=%d + "
-            "num_mamba_groups=%d × mamba_unpadded=%d). This makes vLLM's "
+            "num_mamba_groups=%d × mamba_unpadded=%d + "
+            "num_pooled_groups=%d × pooled_page=%d). This makes vLLM's "
             "num_blocks match per-layer TPU allocation when mamba layers "
             "cannot be truly shared.", uniform_page_size_bytes,
             num_attn_groups, attn_page_size_bytes, num_mamba_groups,
-            unpadded_mamba_page_size)
+            unpadded_mamba_page_size, num_pooled_groups,
+            pooled_page_size_bytes)
 
         self._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
         self.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
@@ -1879,8 +2378,12 @@ class TPUModelRunner(GPUModelRunner):
         # `num_gpu_blocks_override` to the (larger) attention block count and
         # sets `_mamba_num_blocks`.
         self._maybe_set_compact_mamba_num_blocks_override(
-            attn_page_size_bytes, int(unpadded_mamba_page_size),
-            num_attn_groups, num_mamba_groups, group_size)
+            attn_page_size_bytes,
+            int(unpadded_mamba_page_size),
+            num_attn_groups,
+            num_mamba_groups,
+            group_size,
+            per_block_extra_bytes=num_pooled_groups * pooled_page_size_bytes)
 
         # Fallback (compact sizing skipped, e.g. CPU-only tests or a
         # user-pinned num_gpu_blocks_override): pin vLLM's num_blocks via the two-step
@@ -1916,9 +2419,14 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config)
 
     def _maybe_set_compact_mamba_num_blocks_override(
-            self, attn_page_size_bytes: int,
-            unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
-            num_mamba_groups: int, group_size: int) -> None:
+            self,
+            attn_page_size_bytes: int,
+            unpadded_mamba_page_size_bytes: int,
+            num_attn_groups: int,
+            num_mamba_groups: int,
+            group_size: int,
+            *,
+            per_block_extra_bytes: int = 0) -> None:
         """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
         `cache_config.num_gpu_blocks_override` so the freed HBM grows the
         attention pool.
@@ -1961,6 +2469,17 @@ class TPUModelRunner(GPUModelRunner):
             group_size: # KVCacheTensors vLLM allocates (= layers per
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
+            per_block_extra_bytes: bytes per *attention* block, per
+                KVCacheTensor, consumed by groups that are neither attention
+                nor mamba and that are sized with the attention block count.
+                Today that is GLM-5.3's pooled indexer K caches
+                (`num_pooled_groups × geometry.page_bytes`); 0 for every other
+                model, which leaves the arithmetic below byte-identical to
+                what it was. Omitting it would over-size
+                `num_gpu_blocks_override` by the pooled fraction of the
+                per-block cost -- ~10% of the attention pool at GLM's
+                `attn_page=10240`, `pooled_page=1024` -- which lands as an OOM
+                rather than as a warning.
 
         On success: sets `cache_config.num_gpu_blocks_override` (attention
         block count) and `_mamba_num_blocks`. Raises when the KV budget cannot
@@ -2005,8 +2524,9 @@ class TPUModelRunner(GPUModelRunner):
                 f"per-tensor KV budget is {avail_per_tensor} B. Raise "
                 f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
-        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
-                                                    attn_page_size_bytes)
+        per_attn_block_bytes = (num_attn_groups * attn_page_size_bytes +
+                                int(per_block_extra_bytes))
+        attn_num_blocks = attn_per_tensor_avail // per_attn_block_bytes
         if attn_num_blocks <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: no attention blocks "
@@ -2023,12 +2543,14 @@ class TPUModelRunner(GPUModelRunner):
                       attn_page_size_bytes)
         mamba_bytes = (group_size * num_mamba_groups * mamba_num_blocks *
                        unpadded_mamba_page_size_bytes)
+        extra_bytes = group_size * attn_num_blocks * int(per_block_extra_bytes)
         logger.info(
             "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
-            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.",
-            attn_num_blocks, mamba_num_blocks, attn_bytes / (2**30),
-            mamba_bytes / (2**30), (attn_bytes + mamba_bytes) / (2**30),
+            "mamba=%.2f GiB; other-groups=%.2f GiB; total=%.2f GiB / "
+            "avail=%.2f GiB.", attn_num_blocks, mamba_num_blocks,
+            attn_bytes / (2**30), mamba_bytes / (2**30), extra_bytes / (2**30),
+            (attn_bytes + mamba_bytes + extra_bytes) / (2**30),
             avail / (2**30))
 
     def _init_mamba_slot_pool(self, mamba_num_blocks: int) -> None:
@@ -2107,6 +2629,81 @@ class TPUModelRunner(GPUModelRunner):
                 self._mamba_slot_by_req_id[req_id] = slot
             indices[i] = slot
         return indices.to(self.device, non_blocking=True)
+
+    def _detect_kpool_state(self) -> bool:
+        """Whether any module owns a kpool pending ring.
+
+        Duck-typed on an attribute rather than `isinstance`, deliberately:
+        importing `models/vllm/glm5_next/indexer.py` from the runner would
+        pull transformers' GLM config into every model's import path, and the
+        MTP draft head's indexer lives in a different module again. The
+        attribute is set in one place (`Glm5NextKpoolIndexer.__init__`), so
+        the two cannot drift the way a growing isinstance tuple would.
+        """
+        models = [self.model]
+        drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+        if drafter_model is not None:
+            models.append(drafter_model)
+        found = False
+        for model in models:
+            if model is None:
+                continue
+            for module in model.modules():
+                if not getattr(module, "kpool_needs_state_indices", False):
+                    continue
+                found = True
+                # Tie the two independent derivations of `max_num_reqs + 1`
+                # together at the one point both are visible: the pool's,
+                # from the runner's `max_num_reqs`, and the ring's, from
+                # `derive_pending_state_geometry`. Off by one and the scatter
+                # is silently dropped and the gather silently clamped.
+                geometry = getattr(module, "pending_geometry", None)
+                if geometry is not None:
+                    assert_pool_matches_ring(
+                        self._kpool_slot_pool,
+                        ring_num_slots=int(geometry.num_slots),
+                        where=f"load_model: {type(module).__name__}")
+        return found
+
+    def _build_kpool_state_indices(self, start_index: int, num_reqs: int,
+                                   target_num_reqs: int) -> torch.Tensor:
+        """Build the device `kpool_state_indices` for the current chunk.
+
+        A three-line wrapper on purpose: every decision the mapping makes
+        (req_id keying, slot-0 sentinel, freeing departed requests, the
+        DP-dummy clamp) is in `runner/kpool_slots.py`, which is importable on
+        the CPU rung. This module is not — a pre-existing
+        `ModelOptNvFp4LinearMethod` rebase drift — so logic left here is logic
+        no test can reach.
+        """
+        view = self._kpool_slot_pool.build_state_indices(
+            self.input_batch.req_ids,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            target_num_reqs=target_num_reqs,
+            out=self.kpool_state_indices_cpu,
+            live_req_ids=self.input_batch.req_id_to_index.keys(),
+        )
+        # Unconditional. It is O(num_reqs) pure Python over at most
+        # `max_num_reqs` ints, once per chunk, against a 45-layer forward, so
+        # the cost is not measurable -- and what it catches is a live request
+        # handed the null sentinel, which produces a wrong pooled key with no
+        # NaN and no shape error. A detector that is off by default is off in
+        # exactly the run that needs it. Its device twin is
+        # `DIAG_SLOT_OUT_OF_RANGE` / `DIAG_SLOT_DUPLICATES` inside
+        # `kpool_write`.
+        num_live = max(
+            0,
+            min(num_reqs,
+                len(self.input_batch.req_ids) - start_index, target_num_reqs))
+        assert_slot_indices_sane(
+            view.tolist(),
+            num_slots=self._kpool_slot_pool.num_slots,
+            num_live=num_live,
+            where=(f"_build_kpool_state_indices(start_index={start_index},"
+                   f" num_reqs={num_reqs},"
+                   f" target_num_reqs={target_num_reqs})"))
+        return view.to(self.device, non_blocking=True)
 
     def _build_mamba_copy_plan(
         self,
@@ -3207,6 +3804,14 @@ class TPUModelRunner(GPUModelRunner):
             start_index, num_reqs, target_num_reqs)
                                if self._has_mamba_state else None)
 
+        # GLM-5.3 kpool: the pending ring's per-request slot. A *separate*
+        # stride-1 pool from the mamba one above — see
+        # AttentionMetadata.kpool_state_indices for why substituting is an
+        # out-of-bounds read rather than an approximation.
+        kpool_state_indices = (self._build_kpool_state_indices(
+            start_index, num_reqs, target_num_reqs)
+                               if self._has_kpool_state else None)
+
         # Spec decode with mamba layers: the GDN kernel's windowed segment
         # covers 1-token decodes AND speculative verify windows (the batch is
         # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
@@ -3243,6 +3848,7 @@ class TPUModelRunner(GPUModelRunner):
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
             mamba_request_distribution=mamba_request_distribution,
+            kpool_state_indices=kpool_state_indices,
             # Unified pool + spec decode: the mamba group builders append
             # their per-request state block ids here for the post-sampling
             # read-offset scatter.
@@ -4494,6 +5100,19 @@ class TPUModelRunner(GPUModelRunner):
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
 
+        # GLM-5.3 kpool: does any layer own a pending ring? Decided here
+        # rather than in `initialize_kv_cache` because the ring is allocated
+        # in the indexer's constructor (so the memory profile sees it) and the
+        # slot pool needs no KV-cache config at all. The drafter's model, if
+        # any, is loaded just above, so both stacks are visible.
+        self._has_kpool_state = self._detect_kpool_state()
+        if self._has_kpool_state:
+            self._kpool_slot_pool.reset()
+            logger.info(
+                "glm5_next kpool: pending-ring slot pool active, %d slots "
+                "(max_num_reqs=%d, slot 0 = null sentinel).",
+                self._kpool_slot_pool.num_slots, self.max_num_reqs)
+
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
 
@@ -4648,6 +5267,27 @@ class TPUModelRunner(GPUModelRunner):
             # dummy runs compile the same GDN program signature — including
             # the two distributions being views of one [6] base tensor (see
             # _combined_request_distribution_cpu for why).
+            # Dummy kpool ring slots: 1, 2, 3, ... -- DISTINCT and NON-ZERO,
+            # unlike the mamba dummy right above, which is all zeros.
+            #
+            # The dummy run gives its sequences a real query length, so they
+            # are *live* as far as `kpool_write` is concerned, and a live
+            # sequence on slot 0 is precisely what `DIAG_SLOT_OUT_OF_RANGE`
+            # exists to refuse: slot 0 is the null sentinel that every padded
+            # token also writes, so a live request parked there has its rows
+            # clobbered every step. All-zeros here made the counter fire
+            # `slot_out_of_range=16` on the real checkpoint (16 = the
+            # dummy bucket's live
+            # sequence count) -- the counter was right and the dummy was
+            # wrong. `1 + arange(num_reqs)` is in range by construction
+            # because `num_slots == max_num_reqs + 1 >= num_reqs + 1`, and it
+            # is duplicate-free, so it also exercises the traced program with
+            # the same slot *distribution* a real step has.
+            dummy_kpool_state_indices = None
+            if self._has_kpool_state:
+                dummy_kpool_state_indices = torch.clamp(
+                    torch.arange(1, num_reqs + 1, dtype=torch.int32),
+                    max=self._kpool_slot_pool.num_slots - 1).to(self.device)
             dummy_mamba_request_distribution = None
             if self.mamba_slot_read_offsets is not None:
                 combined_device = torch.tensor([actual_num_reqs] * 6,
@@ -4667,6 +5307,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
+                kpool_state_indices=dummy_kpool_state_indices,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
             slot_mappings = self.empty_slot_mappings
@@ -6298,6 +6939,26 @@ class TPUModelRunner(GPUModelRunner):
                     if isinstance(spec, MambaSpec):
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
+                    elif is_compressed_indexer_cache(
+                            pooled_module := self.vllm_config.
+                            compilation_config.static_forward_context.get(
+                                name)):
+                        # Compressed page: `storage_block_size` records, not
+                        # `block_size` of them. Asking PallasAttentionBackend
+                        # for this page would over-count it by
+                        # `compress_ratio` (and by the K/V factor it does not
+                        # have), and `num_blocks` here is
+                        # `tensor_size // total_group_page_size` -- so an
+                        # over-count silently *shrinks* every layer in the
+                        # group, clipping block ids past the new leading dim.
+                        #
+                        # `spec` here is the POST-UNIFY spec, so read it
+                        # through the check rather than directly: vLLM's
+                        # `unify_kv_cache_spec_page_size` rewrites exactly this
+                        # number, and the over-count above is what it produces.
+                        total_group_page_size += (
+                            self._assert_pooled_page_size_survived_grouping(
+                                name, spec, pooled_module))
                     elif isinstance(spec, AttentionSpec):
                         total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
                             spec.block_size,
@@ -6309,21 +6970,26 @@ class TPUModelRunner(GPUModelRunner):
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
                 # A block id above `kv_cache_config.num_blocks` can never be
-                # produced -- that is the count vLLM's block manager hands out
-                # and the width the block tables are built at -- so rows past
-                # it are unaddressable for EVERY layer type.
+                # produced -- that is the count vLLM's block manager hands
+                # out and the width the block tables are built at -- so rows
+                # past it are unaddressable for EVERY layer type, not just
+                # the pooled one.
                 #
-                # The quotient above can exceed it, because vLLM gives every
-                # KVCacheTensor the same `size` while `shared_by` varies, and
-                # the divisor is the sum over `shared_by`. Measured on one
-                # hybrid model at TP=8, where all eleven tensors were
-                # 840549186560 B: eight tensors shared by six layers each took
-                # 4.04 GiB, the ninth (shared by four) took 4.04 GiB, and the
-                # tenth (shared by two) wanted 8.22 GiB -- double, purely
-                # because fewer layers divided the same size. `used` had
-                # climbed to 81.097 GiB against a cap of 87.159, leaving
-                # 6.062 GiB for an 8 GiB request, and the worker was killed
-                # with no Python traceback and no allocator error.
+                # This is not hypothetical. vLLM gives every KVCacheTensor the
+                # same `size` (840549186560 B at TP=8) but a varying
+                # `shared_by`, and the quotient above divides by the sum over
+                # `shared_by`. Measured on this model, tracing HBM per tensor:
+                #
+                #   tensor 0-7  shared_by=6   +4.04 GiB each
+                #   tensor 8    shared_by=4   +4.04 GiB
+                #   tensor 9    shared_by=2   +8.22 GiB   <- doubles
+                #
+                # `used` climbed 38.401 -> 81.097 GiB against cap=87.159, so
+                # the eleventh tensor had 6.062 GiB of cap left and needed
+                # ~8 GiB. The worker was killed with no Python traceback and
+                # no allocator error. Clamping the pooled branch alone was not
+                # enough -- the attention caches in those same tail tensors
+                # are what actually inflate.
                 capped = min(num_blocks, kv_cache_config.num_blocks)
                 if capped != num_blocks:
                     logger.warning_once(
@@ -6360,6 +7026,106 @@ class TPUModelRunner(GPUModelRunner):
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
                     attn_module = (self.vllm_config.compilation_config.
                                    static_forward_context.get(layer_name))
+                    if is_compressed_indexer_cache(attn_module):
+                        # GLM-5.3 kpool pooled indexer K cache: one packed
+                        # uint8 record per *pool*, in the same 4-D layout
+                        # `_initialize_ds_v4_kv_cache` uses at :5912 and
+                        # `streamindex_topk` unpacks at :745. Must precede the
+                        # `use_sparse` and generic-MLA branches below, both of
+                        # which would size the page from `block_size` and hand
+                        # the kernel a cache `compress_ratio` times too large
+                        # -- with every index still in range.
+                        #
+                        # The shape comes from the geometry and `num_blocks`
+                        # came from the spec, so the two must still agree:
+                        # vLLM's `unify_kv_cache_spec_page_size` rewrites the
+                        # spec's `block_size` after this runner's exemption has
+                        # had its say. This is the single-`shared_by` path,
+                        # where the loop above never looked at the spec at all.
+                        page_bytes = (
+                            self._assert_pooled_page_size_survived_grouping(
+                                layer_name, kv_cache_spec, attn_module))
+                        # THE BLOCK COUNT IS THE BLOCK TABLE'S, NOT THE
+                        # TENSOR'S. The pooled cache is addressed by the
+                        # *attention* block table -- pool `i` lives in the
+                        # page of raw token `index_kpool * i` -- so a block id
+                        # it can ever be handed is bounded by
+                        # `kv_cache_config.num_blocks`. Rows past that are
+                        # unaddressable by construction.
+                        #
+                        # Taking `num_blocks` from the shared-tensor loop
+                        # instead over-allocates by `page_size_padded //
+                        # pooled_page`: that loop divides the tensor size by
+                        # the sum of TPU-*actual* per-block bytes, which for
+                        # a pooled layer is 1024, while vLLM sized the tensor
+                        # from the *declared* uniform page (2255872 B at the
+                        # real checkpoint). Measured: it tried to
+                        # allocate 19.09 GiB for one layer against 13.65 GiB
+                        # free, ~53x the
+                        # 3.91 GiB the runner's own planner had budgeted for
+                        # all eleven pooled groups together.
+                        # NOT `min(...)`, and NOT the group-derived count.
+                        # `kv_cache_config.num_blocks` is what
+                        # `num_gpu_blocks_override` pinned and therefore what
+                        # the block table's ids range over, so it is both the
+                        # ceiling and the FLOOR. Measured, the group-derived
+                        # count is wrong in both directions at once:
+                        #     layers 3..31 -> 367599   (5006 SHORT of 372605)
+                        #     layer 35     -> 721942   (~2x over)
+                        #     layer 39     -> 20020702 (~54x over)
+                        # A `min` clamps the two over-shooting layers and
+                        # silently accepts the eight short ones -- and short
+                        # is the dangerous direction, because a block id in
+                        # [367599, 372605) is dropped on the write and clamped
+                        # on the read by JAX's indexed ops, with no error and
+                        # a byte-zero pooled record that scores exactly 0
+                        # through the ReLU. Take the block table's number.
+                        pooled_num_blocks = int(kv_cache_config.num_blocks)
+                        shape = attn_module.geometry.cache_shape(
+                            pooled_num_blocks)
+                        # `device=` rather than `.to(self.device)`: the
+                        # host-staging form allocates the whole cache in
+                        # container RAM first, and eleven of these across
+                        # eight workers is ~31 GiB of host memory on top of
+                        # what the attention caches already stage. A
+                        # worker SIGKILLed with no Python traceback one minute
+                        # after its last pooled allocation is what that looks
+                        # like from inside.
+                        kv_caches[layer_name] = torch.zeros(shape,
+                                                            dtype=torch.uint8,
+                                                            device=self.device)
+                        logger.info(
+                            "Allocated pooled indexer K cache %s: shape=%s "
+                            "(%d B/block, %.3f GiB, %d blocks)", layer_name,
+                            shape, page_bytes,
+                            pooled_num_blocks * page_bytes / 2**30,
+                            pooled_num_blocks)
+                        # The shared-tensor loop's `num_blocks` is MEANINGLESS
+                        # for a pooled layer, and printing it next to the real
+                        # one -- as this line used to, labelled "IGNORED" --
+                        # left a wrong number in the log for the next reader to
+                        # trip over. It is `tensor_size // sum(TPU-actual
+                        # per-block bytes over shared_by)`, but vLLM sized that
+                        # tensor from the pooled spec's *declared* uniform page
+                        # (2255872 B) while the sum uses the pooled layer's
+                        # actual 1024 B. The quotient therefore scales with how
+                        # many layers happen to share the tensor and spans 54x
+                        # across layers in one run (229905 / 451520 / 12521422
+                        # at TP=8). Say that once, with the numbers, rather
+                        # than emitting it eleven times as decoration.
+                        if num_blocks != pooled_num_blocks:
+                            logger.warning_once(
+                                "glm5_next kpool: the shared-tensor block "
+                                "count (%d) does not apply to pooled layers "
+                                "and is not used; %d (the block table's) is. "
+                                "The quotient is tensor_size // sum(TPU-actual "
+                                "per-block bytes), and vLLM sized the tensor "
+                                "from the pooled spec's DECLARED uniform page "
+                                "instead, so it varies with the group's "
+                                "composition rather than meaning anything. "
+                                "Only the block-table count bounds a block id.",
+                                num_blocks, pooled_num_blocks)
+                        continue
                     if getattr(attn_module, "use_sparse", False):
                         # Split (nope, rope) cache in uint8 dtype
                         # (expected by `dsa_gather`).
@@ -6419,6 +7185,8 @@ class TPUModelRunner(GPUModelRunner):
                         kv_caches[layer_name] = tpu_kv_cache
                 else:
                     raise NotImplementedError
+
+        self._report_kv_cache_allocation(kv_cache_config, kv_caches)
 
         self._add_shared_kv_cache_aliases(kv_caches)
 

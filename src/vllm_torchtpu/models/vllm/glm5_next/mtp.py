@@ -56,9 +56,12 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
 from vllm_torchtpu.models.vllm.glm5_next.attention import Glm5NextMLAAttention
+from vllm_torchtpu.models.vllm.glm5_next.indexer import (
+    assert_indexer_weights_loaded, indexer_parameter_names)
 from vllm_torchtpu.models.vllm.glm5_next.model import (
     Glm5NextForCausalLM, _check_context_within_dense_mla_bound,
-    as_text_vllm_config, text_config_of)
+    as_text_vllm_config, assert_indexer_enablement_uniform,
+    collect_indexer_enablement, text_config_of)
 
 logger = init_logger(__name__)
 
@@ -273,11 +276,25 @@ class Glm5NextMTP(nn.Module):
         # class -- so the same soundness bound applies to it, and for the same
         # reason: dense MLA without an indexer is exact only at or below
         # `index_topk`.
-        _check_context_within_dense_mla_bound(vllm_config, text_config)
+        from vllm_torchtpu.models.vllm.glm5_next.attention import \
+            kpool_indexer_enabled
+        indexer_enabled = kpool_indexer_enabled()
+        _check_context_within_dense_mla_bound(vllm_config,
+                                              text_config,
+                                              indexer_enabled=indexer_enabled)
 
         self.model = Glm5NextMultiTokenPredictor(vllm_config=vllm_config,
                                                  prefix=maybe_prefix(
                                                      prefix, "model"))
+
+        # Same guard as `Glm5NextForCausalLM.__init__`, and needed here for a
+        # sharper reason: this module reads the kill switch twice by
+        # independent routes -- once above for the bound, once inside the
+        # layer it builds -- and nothing else ties the two answers together.
+        # A draft head that went dense while the target went sparse is a
+        # collapsed acceptance rate and no error.
+        assert_indexer_enablement_uniform(
+            collect_indexer_enablement(self.model), indexer_enabled)
 
         # Prefix `lm_head`, not `model.layers.45.shared_head.head`: the
         # checkpoint has no such tensor, this head is loaded from the
@@ -290,6 +307,9 @@ class Glm5NextMTP(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(text_config.vocab_size)
+
+        # See `Glm5NextForCausalLM.__init__` and `_rewrite_layer_name`.
+        self._has_indexer_params = bool(indexer_parameter_names(self))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -329,10 +349,18 @@ class Glm5NextMTP(nn.Module):
             return name
         if name == "model.embed_tokens.weight":
             return name
-        # Layer 45 carries its own complete seven-tensor indexer block in
-        # the checkpoint (shard 2, all BF16). This build runs the draft's
-        # full-attention block densely, so there is nowhere to put them.
-        if ".indexer." in name:
+        # `getattr`, because `test_glm5_next_mtp.py` drives this mapper
+        # against a stand-in that carries only the layer index -- constructing
+        # a real `Glm5NextMTP` needs a distributed group and a 288-expert MoE.
+        if ".indexer." in name and not getattr(self, "_has_indexer_params",
+                                               False):
+            # Dropped only while the draft head has no indexer to put them
+            # in. Making this skip unconditional would be a trap: the draft
+            # head would stay dense after the target went sparse, and the only
+            # symptom would be a collapsed acceptance rate. Layer 45 carries
+            # its own complete seven-tensor indexer block in the checkpoint
+            # (shard 2, all BF16), so once an indexer is built the names must
+            # reach it -- and `load_weights` asserts they did.
             return None
 
         prefix = f"model.layers.{self.model.mtp_start_layer_idx}."
@@ -401,4 +429,5 @@ class Glm5NextMTP(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded.add(name)
 
+        assert_indexer_weights_loaded(self, loaded)
         return loaded

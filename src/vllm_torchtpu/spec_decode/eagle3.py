@@ -834,6 +834,17 @@ class Eagle3Proposer:
         mamba_state_indices = (runner._build_mamba_state_indices(
             chunk.start_index, num_reqs, kernel_num_reqs)
                                if runner._has_mamba_state else None)
+        # The draft forward needs the kpool ring slot for exactly the same
+        # reason the target does: a draft layer's indexer completes pools from
+        # tokens the current step does not contain, so it reads the pending
+        # ring, and the ring is addressed per request. Omitting it does not
+        # degrade anything -- the indexer refuses outright, because the only
+        # other per-request slot vector to hand (`mamba_state_indices`) is an
+        # attention-pool block id under unified-align and substituting it is an
+        # out-of-bounds read rather than an approximation.
+        kpool_state_indices = (runner._build_kpool_state_indices(
+            chunk.start_index, num_reqs, kernel_num_reqs)
+                               if runner._has_kpool_state else None)
         saved_ctx = runner._attn_metadata_builder_ctx
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -843,6 +854,7 @@ class Eagle3Proposer:
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
             mamba_state_indices=mamba_state_indices,
+            kpool_state_indices=kpool_state_indices,
             # None for real chunks; the EP-DP dummy-run pairing sets fixed
             # positions so the block-table build uses the zeroed-table branch
             # instead of slicing the real (idle-rank) block table.

@@ -28,9 +28,10 @@ this repo, so this module is mostly composition:
 * The mHC machinery is DeepSeek-V4's, except the final collapse -- see
   ``layers.py:mhc_collapse_head_mean``.
 
-The full-attention layers run as dense causal MLA, which is exact only up to
-``index_topk`` tokens of context; :func:`_check_context_within_dense_mla_bound`
-refuses to build past that rather than generating fluent nonsense.
+The full-attention layers normally carry a kpool sparse indexer. Without
+one they run as dense causal MLA, which is exact only up to ``index_topk``
+tokens of context; :func:`_check_context_within_dense_mla_bound` refuses to
+build past that rather than generating fluent nonsense.
 
 Design notes: ``docs/models/glm5-3-flash.md``.
 """
@@ -56,6 +57,8 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
 from vllm_torchtpu.models.vllm.glm5_next.attention import Glm5NextMLAAttention
+from vllm_torchtpu.models.vllm.glm5_next.indexer import (
+    assert_indexer_weights_loaded, indexer_parameter_names)
 from vllm_torchtpu.models.vllm.glm5_next.layers import mhc_collapse_head_mean
 from vllm_torchtpu.models.vllm.kimi_k3.attention import (KimiDeltaAttention,
                                                          kda_state_dtype)
@@ -118,41 +121,125 @@ def is_linear_attention_layer(text_config, layer_idx: int) -> bool:
 _ALLOW_UNSOUND_CONTEXT = "VLLM_TORCHTPU_GLM5_ALLOW_LONG_CONTEXT"
 
 
-def _check_context_within_dense_mla_bound(vllm_config, text_config) -> None:
+def _check_context_within_dense_mla_bound(vllm_config,
+                                          text_config,
+                                          *,
+                                          indexer_enabled: bool
+                                          | None = None) -> None:
     """Refuse a context length where this build is silently wrong.
 
-    GLM-5.3-Flash's full-attention layers are meant to run behind a sparse
-    indexer that pools ``index_kpool`` consecutive keys and takes a top-k over
-    pools. Running them as dense causal MLA instead is *exact* only while that
-    top-k would have selected everything: a query at position ``p`` has
+    The bound belongs to the *dense substitution*, not to the model. Running
+    the full-attention layers as dense causal MLA is exact only while the
+    indexer would have selected every causal token, which holds when
+    ``max_model_len <= index_topk``: a query at position ``p`` has
     ``floor((p+1)/index_kpool)`` candidate pools against a budget of
-    ``index_topk // index_kpool``, so up to ``index_topk`` tokens of context
-    the two compute the same thing. Once the prompt outgrows that, the
+    ``index_topk // index_kpool``. Once the prompt outgrows that, the
     reference model attends sparsely and a dense build does not.
+
+    With the kpool indexer built, longer contexts are *legal* and the bound
+    does not apply. With it off -- the kill switch, an unsupported config, a
+    fallback -- they are still silently wrong, and that is the case this
+    function exists for. Deleting it along with the cap would remove the only
+    thing standing between "the indexer got turned off for a baseline
+    measurement" and "the baseline measurement is fluent nonsense".
+
+    Args:
+        indexer_enabled: ``None`` asks the same resolver the attention layers
+            will use, so the guard and the layers cannot disagree about the
+            env. :func:`assert_indexer_enablement_uniform` re-checks that
+            against the layers actually built.
 
     The failure is silent -- plausible tokens, wrong attention -- so it is
     worth an exception rather than a warning. Raising at construction also
     catches it before a 328 GB checkpoint load.
     """
+    if indexer_enabled is None:
+        from vllm_torchtpu.models.vllm.glm5_next.attention import \
+            kpool_indexer_enabled
+        indexer_enabled = kpool_indexer_enabled()
+
     index_topk = getattr(text_config, "index_topk", None)
     max_len = getattr(vllm_config.model_config, "max_model_len", None)
     if not index_topk or not max_len or max_len <= index_topk:
         return
+    if indexer_enabled:
+        # Legal, and the point of the whole exercise. Logged rather than
+        # silent: this is the one line that says the long-context run is
+        # relying on the indexer being correct rather than on the identity.
+        logger.info(
+            "glm5_next: max_model_len=%d exceeds index_topk=%d; the kpool "
+            "indexer is built, so the full-attention layers select sparsely "
+            "and this is sound. (Dense-MLA builds are refused past %d.)",
+            max_len, index_topk, index_topk)
+        return
     if os.environ.get(_ALLOW_UNSOUND_CONTEXT) == "1":
         logger.warning(
-            "glm5_next: max_model_len=%d exceeds index_topk=%d, so the "
-            "full-attention layers will attend densely where the reference "
-            "attends sparsely. Output beyond %d tokens is WRONG. Continuing "
-            "because %s=1.", max_len, index_topk, index_topk,
+            "glm5_next: max_model_len=%d exceeds index_topk=%d with the kpool "
+            "indexer OFF, so the full-attention layers will attend densely "
+            "where the reference attends sparsely. Output beyond %d tokens is "
+            "WRONG. Continuing because %s=1.", max_len, index_topk, index_topk,
             _ALLOW_UNSOUND_CONTEXT)
         return
+    from vllm_torchtpu.models.vllm.glm5_next.attention import KPOOL_INDEXER_ENV
     raise ValueError(
-        f"glm5_next: max_model_len={max_len} exceeds index_topk={index_topk}, "
-        "so the full-attention layers run as dense causal MLA -- exact only "
-        f"at or below {index_topk} tokens, and fluent-but-wrong above it. "
-        f"Lower max_model_len to {index_topk}, or set "
-        f"{_ALLOW_UNSOUND_CONTEXT}=1 if you are measuring performance and do "
-        "not care that the output is wrong.")
+        f"glm5_next: max_model_len={max_len} exceeds index_topk={index_topk} "
+        "and the kpool indexer is NOT built, so the full-attention layers run "
+        f"as dense causal MLA -- exact only at or below {index_topk} tokens, "
+        "and fluent-but-wrong above it. Either build the indexer (unset "
+        f"{KPOOL_INDEXER_ENV}, or set it to 1), lower max_model_len to "
+        f"{index_topk}, or set {_ALLOW_UNSOUND_CONTEXT}=1 if you are "
+        "measuring performance and do not care that the output is wrong.")
+
+
+def collect_indexer_enablement(module) -> dict[str, bool]:
+    """``{prefix: indexer_enabled}`` for every built ``Glm5NextMLAAttention``.
+
+    Walks the module tree rather than the config so it reports what exists,
+    not what was intended.
+    """
+    return {
+        (getattr(sub, "prefix", None) or name): bool(sub.indexer_enabled)
+        for name, sub in module.named_modules()
+        if isinstance(sub, Glm5NextMLAAttention)
+    }
+
+
+def assert_indexer_enablement_uniform(per_layer: dict[str, bool],
+                                      assumed: bool) -> None:
+    """Every DSA layer agrees with itself, and with the context-bound guard.
+
+    Two failure shapes, both silent, both cheap to exclude:
+
+    * a **mixed** stack -- some layers sparse, some dense -- reads as a model
+      that retrieves on 6 of its 11 full-attention layers. Nothing raises;
+      the KV caches are per-layer, the shapes all work, and the only symptom
+      is worse-than-expected long-context accuracy.
+    * a stack that disagrees with :func:`_check_context_within_dense_mla_bound`
+      means the bound was evaluated against a different answer than the one
+      the layers got, which is exactly how a dense build slips past a guard
+      that was written to catch it.
+    """
+    if not per_layer:
+        return
+    values = set(per_layer.values())
+    if len(values) > 1:
+        sparse = sorted(n for n, v in per_layer.items() if v)
+        dense = sorted(n for n, v in per_layer.items() if not v)
+        raise ValueError(
+            "glm5_next: the full-attention stack is mixed -- "
+            f"{len(sparse)} layer(s) with a kpool indexer and {len(dense)} "
+            f"without. sparse={sparse[:4]}, dense={dense[:4]}. Every DSA "
+            "layer must make the same choice; a partial stack retrieves on "
+            "some layers and not others, with no error and no shape "
+            "mismatch.")
+    actual = values.pop()
+    if actual != assumed:
+        raise ValueError(
+            "glm5_next: the dense-MLA context bound was evaluated assuming "
+            f"indexer_enabled={assumed}, but the {len(per_layer)} DSA layers "
+            f"were built with indexer_enabled={actual}. The guard and the "
+            "model disagree, so whichever of the two is right, the other is "
+            "not protecting anything.")
 
 
 def _is_sparse_mlp_layer(text_config, layer_idx: int) -> bool:
@@ -376,10 +463,20 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
         import sys
         sys.setrecursionlimit(50000)
 
-        _check_context_within_dense_mla_bound(vllm_config, text_config)
+        from vllm_torchtpu.models.vllm.glm5_next.attention import \
+            kpool_indexer_enabled
+        indexer_enabled = kpool_indexer_enabled()
+        _check_context_within_dense_mla_bound(vllm_config,
+                                              text_config,
+                                              indexer_enabled=indexer_enabled)
 
         self.model = Glm5NextModel(vllm_config=vllm_config,
                                    prefix=maybe_prefix(prefix, "model"))
+
+        # The bound above was evaluated against a *prediction* of how the
+        # layers would be built; this is the layers themselves.
+        assert_indexer_enablement_uniform(
+            collect_indexer_enablement(self.model), indexer_enabled)
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -391,6 +488,12 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(text_config.vocab_size)
+
+        # Whether any attention layer actually carries kpool indexer
+        # parameters. Read once here rather than per weight name: it is a walk
+        # over ~1e4 parameter paths and `_should_skip` runs per checkpoint
+        # tensor. See `_should_skip`.
+        self._has_indexer_params = bool(indexer_parameter_names(self))
 
     # --- hybrid (Mamba-style) cache declarations -------------------------
     #
@@ -505,13 +608,16 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
         match = re.search(r"\.layers\.(\d+)\.", name)
         if match and int(match.group(1)) >= self.config.num_hidden_layers:
             return True
-        # The checkpoint's sparse-indexer tensors, seven per DSA layer. This
-        # build runs those layers as dense MLA, so there is no module to put
-        # them in. Skipped explicitly rather than left to fall through
-        # `params_dict.get(name) is None`: the outcome is the same but the
-        # reason is not recorded anywhere.
+        # The checkpoint's sparse-indexer tensors, seven per DSA layer.
+        # Skipped only while nothing in the tree can hold them -- i.e. when
+        # the indexer is switched off and these layers run as dense MLA.
+        # Keying on the built module tree rather than on a constant means the
+        # skip cannot outlive the reason for it; letting the names fall
+        # through `params_dict.get(name) is None` instead would have the same
+        # effect with no record of why. `load_weights` then asserts every
+        # built indexer parameter really was filled.
         if ".indexer." in name:
-            return True
+            return not self._has_indexer_params
         return False
 
     def load_weights(self, weights):
@@ -572,4 +678,5 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     weight_loader(param, loaded_weight)
                     loaded.add(name)
 
+        assert_indexer_weights_loaded(self, loaded)
         return loaded

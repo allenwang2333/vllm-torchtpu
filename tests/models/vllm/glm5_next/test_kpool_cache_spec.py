@@ -588,3 +588,61 @@ def test_is_pooled_indexer_cache_is_narrow():
     assert not is_pooled_indexer_cache(None)
     assert not is_pooled_indexer_cache(torch.nn.Linear(2, 2))
     assert not is_pooled_indexer_cache(object())
+
+
+# --- source-level tripwire for the runner wiring --------------------------
+
+
+def test_runner_still_wires_the_pooled_cache_branch():
+    """A *source* check, and only because the runner will not import here.
+
+    This is the weakest test in the file and it is here for one reason: the
+    critique's finding is that `get_kv_cache_spec`'s module loop ends in a
+    bare `else: continue`, so a cache module with no branch is dropped in
+    silence. The runtime tripwire for that is
+    `TPUModelRunner._assert_pooled_indexer_caches_have_specs`, which cannot
+    be called from the CPU rung (`vllm_torchtpu.runner.tpu_runner` fails to
+    import -- see this module's docstring). Until the CPU stub is deep enough
+    to import it, this at least fails if someone deletes the branch, the
+    exemption or the assertion.
+
+    Substrings, not an AST walk, deliberately: the point is only "these three
+    edits are still present", and a structural matcher here would encode the
+    loop's shape and break on any refactor of it.
+    """
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parents[4] / "src" /
+              "vllm_torchtpu" / "runner" / "tpu_runner.py").read_text()
+
+    required = {
+        "the spec-producing branch":
+        "elif is_compressed_indexer_cache(attn_module):",
+        "the normalizer exemption":
+        "exempt_layers=ds_v4_layers | compressed_indexer_layers,",
+        "the was-it-really-allocated tripwire":
+        "self._assert_pooled_indexer_caches_have_specs(",
+        "the packed allocation branch": "attn_module.geometry.cache_shape(",
+        # The pooled cache must be sized by the BLOCK TABLE's block count, not
+        # by the shared-tensor loop's `tensor_size // sum(per-block bytes)`.
+        # Those differ once the pooled spec declares the model's uniform page:
+        # the loop divides by the TPU-actual 1024 B while vLLM sized the
+        # tensor from the declared 2255872 B. Measured, that asked for
+        # 19.09 GiB on one layer against 13.65 GiB free -- ~53x the
+        # 3.91 GiB the runner's own planner had budgeted for all eleven.
+        "the block-table block count for the pooled cache":
+        "pooled_num_blocks = int(kv_cache_config.num_blocks)",
+        # Host staging is what runs the container out of memory: eleven
+        # pooled caches x eight workers is ~31 GiB of RAM before the copy,
+        # and the worker is SIGKILLed with no Python traceback.
+        "the pooled cache allocated straight on device":
+        "kv_caches[layer_name] = torch.zeros(shape,",
+        "the planned-vs-allocated check": "self._report_kv_cache_allocation(",
+    }
+    missing = [what for what, text in required.items() if text not in source]
+    assert not missing, (
+        f"tpu_runner.py no longer contains {missing}. A pooled indexer cache "
+        "with no spec branch is never allocated and nothing reports it: its "
+        "records read back byte-zero, score exactly 0 through the ReLU at "
+        "streamindex_topk.py:333, always rank last, and the DSA layers "
+        "degrade to a recency window with fluent output.")

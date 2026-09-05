@@ -478,3 +478,55 @@ def test_no_fusion_rule_captures_an_indexer_tensor_on_the_way_past():
     for name in ckpt_names:
         for needle in fusion_substrings + expert_substrings:
             assert needle not in name, f"{needle!r} captures {name!r}"
+
+
+# --- the conditional indexer skip in both weight loaders -------------------
+
+
+def test_target_loader_skips_indexer_names_only_while_nothing_holds_them():
+    from vllm_torchtpu.models.vllm.glm5_next.model import Glm5NextForCausalLM
+
+    name = "model.layers.3.self_attn.indexer.wk.weight"
+    stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(num_hidden_layers=45),
+        _has_indexer_params=False)
+    assert Glm5NextForCausalLM._should_skip(stub, name) is True
+    stub._has_indexer_params = True
+    assert Glm5NextForCausalLM._should_skip(stub, name) is False
+
+
+def test_target_loader_still_skips_vision_and_layer_45():
+    from vllm_torchtpu.models.vllm.glm5_next.model import Glm5NextForCausalLM
+
+    stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(num_hidden_layers=45),
+        _has_indexer_params=True)
+    skip = lambda n: Glm5NextForCausalLM._should_skip(stub, n)  # noqa: E731
+    assert skip("model.visual.blocks.0.attn.qkv.weight")
+    assert skip("model.layers.45.self_attn.indexer.wk.weight")
+    assert not skip("model.layers.43.self_attn.indexer.wk.weight")
+
+
+def test_mtp_loader_routes_layer_45_indexer_names_into_the_block():
+    """Leaving the MTP skip unconditional keeps the draft head dense.
+
+    The only symptom would be a collapsed acceptance rate, which is
+    indistinguishable from the draft simply being a bad predictor. Layer 45
+    ships its own complete seven-tensor indexer block (shard 2, all BF16).
+    """
+    from vllm_torchtpu.models.vllm.glm5_next.mtp import Glm5NextMTP
+
+    stub = types.SimpleNamespace(
+        model=types.SimpleNamespace(mtp_start_layer_idx=REAL_MTP_LAYER),
+        _has_indexer_params=True)
+    ckpt = ("model.language_model.layers.45.self_attn.indexer.wk.weight")
+    assert Glm5NextMTP._rewrite_layer_name(
+        stub,
+        ckpt) == ("model.layers.45.mtp_block.self_attn.indexer.wk.weight")
+    # ... and layers 3..43 still belong to the target model, not the draft.
+    assert Glm5NextMTP._rewrite_layer_name(
+        stub,
+        "model.language_model.layers.43.self_attn.indexer.wk.weight") is None
+
+    stub._has_indexer_params = False
+    assert Glm5NextMTP._rewrite_layer_name(stub, ckpt) is None

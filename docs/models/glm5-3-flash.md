@@ -11,7 +11,11 @@ Line numbers rot; the symbol names around them are the durable part.
 
 Companion pages:
 
+* [`glm5-3-flash-kpool.md`](glm5-3-flash-kpool.md) — the sparse pooled
+  indexer, which is what makes a context longer than `index_topk` sound.
 * [`glm5-3-flash-mtp.md`](glm5-3-flash-mtp.md) — the MTP draft head.
+* [`../glm5-3-flash-kpool-pending-state.md`](../glm5-3-flash-kpool-pending-state.md)
+  — where the kpool pending-pool state lives, and the rejected alternatives.
 
 ## The model
 
@@ -66,6 +70,9 @@ the PV matmul that dominates decode is untouched. Teaching the kernel
 `r_dim = 0` means editing at least five sites inside a 2600-line Pallas kernel
 where the failure mode is a DMA-semaphore hang rather than an error.
 
+On the sparse path the slab narrows to 64, making `head_size` 576; see the
+kpool page for why that is a separate knob from the indexer switch.
+
 ## Submodules are named exactly as the checkpoint names them
 
 `self_attn`, `mlp`, `input_layernorm`, `post_attention_layernorm` — not
@@ -110,8 +117,8 @@ DeepSeek-V4 takes the first — `layers.py:mhc_collapse_head_mean`, pinned by
 
 ## The dense-MLA context bound
 
-The DSA layers run as dense causal MLA, and that is *exact* only up to
-`index_topk` (2048) tokens: a query at position `p`
+With the kpool indexer switched off, the DSA layers run as dense causal MLA.
+That is *exact* only up to `index_topk` (2048) tokens: a query at position `p`
 has `floor((p+1)/index_kpool)` candidate pools against a budget of
 `index_topk // index_kpool`, so the pooled top-k would have selected
 everything and the union is exactly `[0, p]`. Past that the reference attends
@@ -133,10 +140,14 @@ Several test suites are green-by-skip without their inputs. To run them:
    installed package; it stops being necessary the day `glm5_next` ships in a
    transformers release. That one variable is the only spelling — the scripts
    and the suites both read it. Affected:
-   `test_glm5_next_mm_sizing.py`, `test_glm5_next_vision_parity.py`, and
-   `scripts/glm5_next/`.
+   `tests/models/vllm/glm5_next/test_kpool_oracle.py` (67 reference
+   assertions), `test_glm5_next_mm_sizing.py`, `test_glm5_next_vision_parity.py`,
+   and `scripts/glm5_next/`.
 2. **The tiny fixture.** `scripts/glm5_next/build_tiny_fixture.py` writes a
-   tiny random GLM-5.3-Flash checkpoint; `GLM5_NEXT_TINY` names where.
+   tiny random GLM-5.3-Flash checkpoint; `GLM5_NEXT_TINY` names where. Build
+   it with `--index-topk 64` for the kpool suites — at the default,
+   `index_topk` exceeds the validation sequence length and the pooled top-k is
+   the identity, so a completely wrong selection still scores green.
 3. **The oracles.** `scripts/glm5_next/dump_reference.py` and
    `dump_vision_reference.py` capture the fp32 HF references that
    `test_glm5_next_kda_parity.py` and `test_glm5_next_vision_parity.py` diff
@@ -153,6 +164,7 @@ CPU, reproducible from this tree:
 | --- | --- |
 | KDA layers match the fp32 HF reference to rel 5e-7 (all 6 KDA layers of the tiny fixture) | `tests/kernels/test_glm5_next_kda_parity.py` |
 | the vision tower matches transformers stage by stage, fp32 ~1e-6 and bf16 within its noise floor | `tests/models/vllm/test_glm5_next_vision_parity.py` |
+| the kpool oracle matches the real `Glm5NextTextIndexer` | `tests/models/vllm/glm5_next/test_kpool_oracle.py` |
 
 On device, and **not reproducible from this tree** — these were run through an
 out-of-tree job recipe and their probe scripts are not part of the patch:
@@ -164,7 +176,13 @@ out-of-tree job recipe and their probe scripts are not part of the patch:
 | 328 GB FP8 checkpoint loads from 62 shards and generates coherent greedy text | real checkpoint, TP=8 |
 | image → text answers correctly about a synthetic image | real checkpoint, TP=8 |
 | MTP at 75% acceptance, tokens identical to a no-spec run | real checkpoint, TP=8 |
+| needle recalled at 5944 tokens across three prefill chunks | real checkpoint, TP=8, kpool on |
+| one performance datapoint: 4.29 s generation against 1034 s engine init, of which 764 s is compilation | real checkpoint, TP=8 |
 
 ## Known limitations
 
+* Prefix caching is refused while the kpool indexer is on.
+* The FP8 KV-cache dtype is required on the sparse path and refused
+  otherwise, at construction.
 * MTP requires `SPEC_WARMUP=0`; see the MTP page.
+* Only one performance datapoint exists, and engine init dominates it.
