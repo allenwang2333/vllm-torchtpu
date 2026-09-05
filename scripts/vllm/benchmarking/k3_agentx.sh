@@ -55,6 +55,7 @@ mkdir -p "$RESULTS_DIR"
 # tails 200 lines, which the loader's progress bars fill with blanks) and
 # record what the results dir holds, so a startup death is diagnosable from
 # the job log alone even when the artifact copy-back comes up empty.
+SCRATCH=""
 # shellcheck disable=SC2317  # invoked via trap
 cleanup() {
     echo "[k3-agentx] cleanup"
@@ -68,6 +69,8 @@ cleanup() {
         tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
     fi
     echo "[k3-agentx] results dir:"; find "$RESULTS_DIR" -maxdepth 2 2>/dev/null | head -30
+    echo "[k3-agentx] disk at exit:"; df -h / /tmp /perf_eval_results 2>/dev/null
+    case "$SCRATCH" in /perf_eval_results/*) rm -rf "$SCRATCH" ;; esac
 }
 trap cleanup EXIT INT TERM
 
@@ -84,13 +87,31 @@ fi
 
 echo "[k3-agentx] config=$CONFIG_NAME conc=$CONC max_model_len=$MAX_MODEL_LEN max_num_seqs=$MAX_NUM_SEQS duration=$DURATION fast=$FAST apc=$APC ix_ref=$IX_REF"
 echo "[k3-agentx] host: $(nproc) cpus, $(free -g | awk '/Mem:/{print $2}') GB RAM, python $(python3 --version 2>&1), uv $(uv --version 2>&1 || echo missing)"
+echo "[k3-agentx] disk (container view):"; df -h / /tmp /root/.cache /perf_eval_results /dev/shm 2>/dev/null
+# The pod hosts' root disks are small (build 3: the head ran out of space
+# during XLA compilation). Put everything the client needs -- the InferenceX
+# checkout, the aiperf venv, the HF dataset cache -- on whichever candidate
+# mount has the most free space, and remove it again on exit when it lives
+# under the artifact-collected /perf_eval_results tree.
+SCRATCH=""
+best=0
+for cand in /perf_eval_results /root/.cache /tmp /dev/shm; do
+    [ -d "$cand" ] || continue
+    avail=$(df -Pk "$cand" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$avail" ] || continue
+    if [ "$avail" -gt "$best" ]; then best=$avail; SCRATCH="$cand"; fi
+done
+SCRATCH="$SCRATCH/.k3_agentx_scratch"
+mkdir -p "$SCRATCH"
+echo "[k3-agentx] scratch=$SCRATCH (avail $((best / 1024 / 1024)) GiB)"
+export TMPDIR="$SCRATCH/tmp"; mkdir -p "$TMPDIR"
 
 # ---------------------------------------------------------------- InferenceX
 # The official orchestration (benchmarks/benchmark_lib.sh) owns the aiperf
 # venv, the trace corpus download, the exact aiperf argv and the result
 # aggregation; reuse it verbatim so the numbers are produced the way the
 # dashboard produces them.
-IX_DIR=/tmp/InferenceX
+IX_DIR="$SCRATCH/InferenceX"
 if [ ! -d "$IX_DIR/utils/aiperf/src" ]; then
     rm -rf "$IX_DIR"
     git clone --depth 1 --branch "$IX_REF" --recurse-submodules --shallow-submodules \
@@ -157,7 +178,10 @@ sanity_probe
 
 # ------------------------------------------------------------- aiperf replay
 export INFMAX_CONTAINER_WORKSPACE="$IX_DIR"
-export AIPERF_RUNTIME_DIR=/tmp/inferencex-agentic
+export AIPERF_RUNTIME_DIR="$SCRATCH/inferencex-agentic"
+# Client-only: the trace corpus download lands here (the server is already up
+# and keeps whatever HF_HOME it was launched with).
+export HF_HOME="$SCRATCH/hf_home"
 # The image ships python 3.12; let uv reuse it instead of downloading 3.11.
 export AIPERF_PYTHON_VERSION="${AIPERF_PYTHON_VERSION:-3.12}"
 export KV_OFFLOADING=none
