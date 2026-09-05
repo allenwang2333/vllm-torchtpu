@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_DSA_CHUNK_BY_BUCKET: bool = False
+    TPU_SCTOPK_EMIT_PAIRS: bool = False
+    TPU_SCTOPK_PAYLOAD_STAGE2: bool = False
 
 
 def env_with_choices(
@@ -407,6 +409,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Off keeps the shipping behaviour exactly.
     "TPU_DSA_CHUNK_BY_BUCKET":
     env_bool("TPU_DSA_CHUNK_BY_BUCKET", default=False),
+
+    # Two-stage `sparsecore_topk` only. Have stage 1 emit each winner's score
+    # beside its index, which deletes stage 2's gather back into the full
+    # score row -- a second full read of the same bytes stage 1 already read.
+    # Inert on the single-stage path (`_pick_partition` == 1), which is what
+    # GLM-5.2 runs at `--max-model-len=9216`. Off keeps shipping behaviour.
+    "TPU_SCTOPK_EMIT_PAIRS":
+    env_bool("TPU_SCTOPK_EMIT_PAIRS", default=False),
+
+    # Two-stage `sparsecore_topk` only. Carry the original column index as a
+    # stage-2 payload instead of gathering it back from the slot table. Same
+    # reachability caveat as TPU_SCTOPK_EMIT_PAIRS; the two compose.
+    "TPU_SCTOPK_PAYLOAD_STAGE2":
+    env_bool("TPU_SCTOPK_PAYLOAD_STAGE2", default=False),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
