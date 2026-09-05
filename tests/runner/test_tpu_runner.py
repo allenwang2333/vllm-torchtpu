@@ -380,6 +380,7 @@ class TestStartStopPhasedProfiling:
             monkeypatch,
             additional_config={
                 "phased_profiler_decode_only_kv_len_threshold": 128,
+                "phased_profiler_prefill_only_kv_len_threshold": 4096,
             },
             max_iterations=20,
             delay_iterations=3,
@@ -396,6 +397,7 @@ class TestStartStopPhasedProfiling:
             num_steps_to_profile_for=20,
             num_decode_steps_to_skip=3,
             decode_kv_len_threshold=128,
+            prefill_kv_len_threshold=4096,
             standard_opts={
                 'host_tracer_level': 2,
                 'device_tracer_level': 1,
@@ -1286,6 +1288,159 @@ class TestTPURunner:
         assert self.runner.mrope_positions.cpu.shape == (
             3, self.runner.max_num_tokens + 1)
         assert self.runner.mrope_positions.np.dtype == np.int32
+
+    def test_initialize_kv_cache_block_major(self):
+        """Verifies that block-major initialization allocates a single shared bundle backing all layer views."""
+        num_blocks = 4
+        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact uniform tiling.
+        per_layer_shape = (16, 4, 1, 128)
+        # FullAttentionSpec.real_page_size_bytes for (16, 2, 128, bf16) is
+        # block_size * (k+v) * head_size * itemsize = 16 * 4 * 128 * 2 = 16384.
+        per_layer_bytes = 16384
+        per_layer_size = per_layer_bytes * num_blocks
+
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=per_layer_bytes,
+                                      indexes_kv_by_block_stride=True)
+        layer_names = ["attn.0", "attn.1", "attn.2"]
+        # Uniform KV cache group representing all layers of a dense model.
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=attn_spec)
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(size=per_layer_size, shared_by=[n])
+                for n in layer_names
+            ],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.kv_caches = []
+        # The block-major topology gates read parallel_config (PCP/PP).
+        self.runner.parallel_config = self.runner.vllm_config.parallel_config
+
+        mock_input_batch = MagicMock()
+        mock_block_tables = []
+        for _ in kv_cache_groups:
+            mock_bt = MagicMock()
+            mock_bt.max_num_blocks_per_req = 1
+            mock_bt.get_cpu_tensor.return_value = torch.zeros(
+                (1, 1), dtype=torch.int32)
+            mock_block_tables.append(mock_bt)
+        mock_input_batch.block_table = mock_block_tables
+        self.runner.input_batch = mock_input_batch
+
+        cross_layer_connector = MagicMock()
+        cross_layer_connector.prefer_cross_layer_blocks = True
+        with patch(
+                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                return_value=(num_blocks, ) + per_layer_shape), patch(
+                    'vllm_torchtpu.utils.tpu_bind_kv_cache') as mock_bind, \
+             patch('vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                   return_value=False), \
+             patch('vllm.v1.worker.kv_connector_model_runner_mixin.'
+                   'has_kv_transfer_group', return_value=True), \
+             patch('vllm.v1.worker.kv_connector_model_runner_mixin.'
+                   'get_kv_transfer_group',
+                   return_value=cross_layer_connector), \
+             patch('vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV', True):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and layer index mappings.
+        assert isinstance(self.runner._kv_cache_bundle, torch.Tensor)
+        expected_bundle_shape = ((num_blocks, len(layer_names)) +
+                                 per_layer_shape)
+        assert tuple(
+            self.runner._kv_cache_bundle.shape) == expected_bundle_shape
+        assert self.runner._kv_cache_bundle.dtype == torch.bfloat16
+        assert self.runner._kv_cache_bundle_layer_index == {
+            "attn.0": 0,
+            "attn.1": 1,
+            "attn.2": 2,
+        }
+
+        # Verify that bound per-layer views alias the underlying bundle storage via strided slices.
+        created = mock_bind.call_args[0][0]
+        for idx, name in enumerate(layer_names):
+            view = created[name]
+            assert isinstance(view, torch.Tensor)
+            assert tuple(view.shape) == (num_blocks, ) + per_layer_shape
+            # Storage aliasing: same underlying buffer as the bundle.
+            assert (view.untyped_storage().data_ptr() ==
+                    self.runner._kv_cache_bundle.untyped_storage().data_ptr())
+
+        # Verify that mutating a per-layer strided view modifies the bundle in-place while isolating other layers.
+        target = 1
+        created[layer_names[target]].fill_(7)
+        assert torch.all(self.runner._kv_cache_bundle[:, target] == 7), (
+            "write through per-layer view did not mutate bundle storage")
+        # Other layers untouched.
+        for idx, name in enumerate(layer_names):
+            if idx == target:
+                continue
+            assert torch.all(self.runner._kv_cache_bundle[:, idx] == 0), (
+                f"layer {idx} disturbed by write to layer {target}")
+
+    def test_initialize_kv_cache_block_major_rejects_mamba(self):
+        """Verifies that standard dense block-major initialization fails closed on unsupported multi-group configurations."""
+        attn_spec = FullAttentionSpec(block_size=16,
+                                      num_kv_heads=2,
+                                      head_size=128,
+                                      dtype=torch.bfloat16,
+                                      page_size_padded=16384)
+        mamba_spec = MambaSpec(block_size=16,
+                               shapes=[(4, 128)],
+                               dtypes=[torch.bfloat16],
+                               page_size_padded=16384)
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec),
+            KVCacheGroupSpec(layer_names=["mamba.0"],
+                             kv_cache_spec=mamba_spec),
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(size=16384, shared_by=["attn.0"]),
+                KVCacheTensor(size=16384, shared_by=["mamba.0"]),
+            ],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.kv_caches = []
+
+        mock_input_batch = MagicMock()
+        mock_block_tables = []
+        for _ in kv_cache_groups:
+            mock_bt = MagicMock()
+            mock_bt.max_num_blocks_per_req = 1
+            mock_bt.get_cpu_tensor.return_value = torch.zeros(
+                (1, 1), dtype=torch.int32)
+            mock_block_tables.append(mock_bt)
+        mock_input_batch.block_table = mock_block_tables
+        self.runner.input_batch = mock_input_batch
+        self.runner._mamba_num_blocks = None
+
+        with patch(
+                'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape',
+                return_value=(1, 16, 2, 1, 128)
+        ), patch('vllm_torchtpu.utils.tpu_bind_kv_cache'), patch(
+                'vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group',
+                return_value=False), patch(
+                    'vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV',
+                    True), pytest.raises(NotImplementedError,
+                                         match="hybrid attention"):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        assert self.runner._kv_cache_bundle is None
+        assert self.runner._kv_cache_bundle_layer_index == {}
 
     def test_initialize_kv_cache_multi_group(self):
         """Multi-group initialize_kv_cache: verify the three new behaviors
@@ -2753,3 +2908,49 @@ class TestBuildAttentionMetadataForLayers:
 
         assert out == {}
         group.metadata_builders[0].build.assert_not_called()
+
+
+class _FakeTpuEvent:
+    instances: list["_FakeTpuEvent"] = []
+
+    def __init__(self):
+        self.recorded = False
+        self.synchronized = 0
+        _FakeTpuEvent.instances.append(self)
+
+    def record(self):
+        self.recorded = True
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+class TestInputStagingFence:
+    """A chunk records a fence after uploading from the reusable host staging
+    tensors; the next chunk synchronizes on it before rewriting them, once."""
+
+    def test_record_then_wait_synchronizes_once(self, monkeypatch):
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            raising=False)
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._record_input_staging_fence(runner)
+        fence = runner._input_staging_fence
+        assert fence is _FakeTpuEvent.instances[-1]
+        assert fence.recorded
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+        assert runner._input_staging_fence is None
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert fence.synchronized == 1
+
+    def test_wait_without_fence_is_noop(self, monkeypatch):
+        monkeypatch.setattr(torch,
+                            "tpu",
+                            SimpleNamespace(Event=_FakeTpuEvent),
+                            raising=False)
+        runner = SimpleNamespace(_input_staging_fence=None)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._input_staging_fence is None

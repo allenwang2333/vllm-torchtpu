@@ -94,6 +94,7 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
     # Upstream vLLM must count them in the block-aligned split boundary.
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
+        block_size=16,
         use_eagle=False,
         mamba_partial_cache_hit=False,
         hash_block_size=16,
@@ -350,9 +351,27 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="unified KV pool"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
+    @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_decode_bench_allows_hybrid_apc_without_pool(
+            self, mock_prepare_env, mock_apply_patches, vllm_config):
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.model_config.architecture = "KimiK3ForConditionalGeneration"
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.kv_transfer_config = MagicMock(
+            kv_connector="DecodeBenchConnector")
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         "connector_name",
-        ["TPUConnector", "TPURaidenConnector", "TPUMultiConnector"],
+        [
+            "DecodeBenchConnector", "TPUConnector", "TPURaidenConnector",
+            "TPUMultiConnector"
+        ],
     )
     @patch("vllm_torchtpu.platforms.tpu_platform.apply_tpu_patches")
     @patch(
@@ -420,7 +439,8 @@ class TestTpuPlatform:
             # rejected earlier, by its own gate, and would mask this one.
             vllm_config.cache_config.mamba_cache_mode = "align"
         vllm_config.kv_transfer_config = MagicMock()
-        vllm_config.kv_transfer_config.kv_connector = "OffloadingConnector"
+        vllm_config.kv_transfer_config.kv_connector = (
+            "TPURaidenOffloadingConnector")
 
         if pool_env:
             monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")

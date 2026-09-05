@@ -343,6 +343,7 @@ def apply_tpu_patches() -> None:
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_no_ep_tp_scope,
+                               _patch_moe_runner_fused_output_is_reduced,
                                _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
@@ -351,9 +352,9 @@ def apply_tpu_patches() -> None:
     from vllm_torchtpu.layers.vllm.custom_ops import _register_custom_ops
 
     from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes  # isort: skip
+    from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size  # isort: skip
     from vllm_torchtpu import _patch_vllm_kimi_kda_layer_counts  # isort: skip
     from vllm_torchtpu import _patch_vllm_offloading_config_build  # isort: skip
-    from vllm_torchtpu import _patch_vllm_offloading_connector_spec  # isort: skip
     from vllm_torchtpu import _patch_expert_map_host_lookup  # isort: skip
     _register_custom_ops()
     tpu_plugin._patch_vllm_pcp_v2_validation()
@@ -362,6 +363,7 @@ def apply_tpu_patches() -> None:
     _patch_vllm_tpu_group_custom_ops()
     _patch_default_moe_runner_select_forward()
     _patch_moe_explicit_pcp_collectives()
+    _patch_moe_runner_fused_output_is_reduced()
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
@@ -369,16 +371,18 @@ def apply_tpu_patches() -> None:
     _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
+    _patch_vllm_mamba_split_scheduler_block_size()
     _patch_vllm_offloading_config_build()
-    _patch_vllm_offloading_connector_spec()
     _patch_vllm_kimi_kda_layer_counts()
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
+    tpu_plugin._patch_vllm_vocab_parallel_embedding()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
     from vllm_torchtpu import (  # isort: skip
         _patch_dflash_bypass_v2_runner_check, _patch_disable_dp_ubatch,
         _patch_multiproc_worker_global_rank_env,
         _patch_vllm_compile_prefix_isolation, _patch_vllm_config_triton_tpu,
+        _patch_vllm_force_v1_runner_tpu,
         _patch_vllm_merge_multimodal_embeddings, _patch_vllm_piecewise_backend)
     _patch_disable_dp_ubatch()
     _patch_multiproc_worker_global_rank_env()
@@ -386,6 +390,7 @@ def apply_tpu_patches() -> None:
     _patch_vllm_piecewise_backend()
     _patch_vllm_compile_prefix_isolation()
     _patch_vllm_merge_multimodal_embeddings()
+    _patch_vllm_force_v1_runner_tpu()
     _patch_dflash_bypass_v2_runner_check()
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import \
@@ -644,7 +649,8 @@ class TpuPlatform(Platform):
         "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
         "TORCHINDUCTOR_AUTOGRAD_CACHE", "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY", "TPU_KERNEL_ITER_MODE",
-        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK"
+        "TPU_KERNEL_RELOAD_MODULES", "TPU_MOE_ROUTER_TOPK",
+        "MOE_FUSED_EP_V2_SHARDED_PLAN"
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -852,7 +858,7 @@ class TpuPlatform(Platform):
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
-                "Pathways is not supported by torchtpu-vllm. "
+                "Pathways is not supported by vllm-torchtpu. "
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
@@ -951,10 +957,14 @@ class TpuPlatform(Platform):
                 raise NotImplementedError(
                     f"Async scheduling with speculative method '{method}' is "
                     "not supported on TPU; Run with async_scheduling=False.")
-        # Hybrid (attention + Mamba) models with prefix caching enabled need
-        # the pool's align-mode mamba state seed copies; other cache modes
-        # must be rejected up front instead of failing partway through warmup.
-        if is_hybrid and cache_config.enable_prefix_caching:
+        # Real hybrid prefix hits need pooled Mamba state seed copies.
+        # DecodeBench installs synthetic state for each request instead.
+        transfer_config = vllm_config.kv_transfer_config
+        is_decode_bench = (transfer_config is not None
+                           and transfer_config.kv_connector
+                           == "DecodeBenchConnector")
+        if (is_hybrid and cache_config.enable_prefix_caching
+                and not is_decode_bench):
             if cache_config.mamba_cache_mode != "align":
                 raise NotImplementedError(
                     "Prefix caching on hybrid Mamba models requires "
@@ -1100,10 +1110,10 @@ class TpuPlatform(Platform):
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             _TPU_SUPPORTED_KV_CONNECTORS = {
+                "DecodeBenchConnector",
                 "TPUConnector",
                 "TPURaidenConnector",
                 "TPUMultiConnector",
-                "OffloadingConnector",
                 "TPURaidenOffloadingConnector",
             }
             assert kv_transfer_config.kv_connector in \
@@ -1113,8 +1123,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (kv_transfer_config.kv_connector
-                                    in ("OffloadingConnector",
-                                        "TPURaidenOffloadingConnector")
+                                    == "TPURaidenOffloadingConnector"
                                     and is_hybrid)
             if (is_hybrid_offloading
                     and not unified_kv_layout_enabled(vllm_config)):

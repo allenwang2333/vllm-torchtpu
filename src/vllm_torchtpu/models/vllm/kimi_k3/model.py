@@ -18,8 +18,7 @@ from vllm.model_executor.layers.fused_moe import \
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFunc, MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator)
+    MambaStateCopyFunc, MambaStateCopyFuncCalculator)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.compressed_tensors import \
     compressed_tensors
@@ -48,7 +47,8 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu.utils import synchronize_tensors
 
-from .attention import KimiDeltaAttention, MultiHeadLatentAttention
+from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
+                        kda_state_dtype)
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
@@ -292,15 +292,24 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
                        hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def process_weights_after_loading(self) -> None:
+        """Fold every AttentionResidual's norm and projection weights.
+
+        The generic loader hook fires per module only for attention layers,
+        so the residuals are folded from here instead.
+        """
+        for module in self.modules():
+            if isinstance(module, AttentionResidual):
+                module.process_weights_after_loading()
+
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-        )
+        # Same helper the layer uses. vLLM sizes the cache from here and
+        # allocates from get_state_dtype, so the two cannot diverge.
+        return kda_state_dtype(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(
@@ -609,6 +618,10 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsMultiModal,
                        **kwargs: object) -> torch.Tensor | None:
         del kwargs
         return self.language_model.compute_logits(hidden_states)
+
+    def process_weights_after_loading(self) -> None:
+        # The language model walks its own AttentionResidual modules.
+        self.language_model.process_weights_after_loading()
 
     @classmethod
     def get_mamba_state_dtype_from_config(

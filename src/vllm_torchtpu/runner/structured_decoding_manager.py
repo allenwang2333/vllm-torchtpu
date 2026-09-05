@@ -9,6 +9,8 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 
+from vllm_torchtpu.tracing.annotation import TraceAnnotation
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
 
@@ -30,10 +32,12 @@ class StructuredDecodingManager:
                                                       dtype=torch.bool,
                                                       device="cpu",
                                                       pin_memory=PIN_MEMORY)
+        self.device = runner.device
+        # Pre-allocate directly on device to avoid repeated host-to-device transfers every step
         self.structured_decode_arange = torch.arange(0,
                                                      32,
-                                                     device="cpu",
-                                                     pin_memory=PIN_MEMORY)
+                                                     dtype=torch.int32,
+                                                     device=self.device)
         # Only needed with speculative decoding:
         # one row per draft position of the chunk's target_logits, which is
         # padded to a num-tokens bucket (up to max_num_reqs * (1 + K) rows).
@@ -101,7 +105,7 @@ class StructuredDecodingManager:
             self.require_structured_out_cpu[:padded_num_reqs].to(
                 logits.device),
             self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
-            self.structured_decode_arange.to(logits.device),
+            self.structured_decode_arange,
         )
 
     def prepare_spec_structured_decoding_input(
@@ -185,7 +189,7 @@ class StructuredDecodingManager:
                 bonus_logits.device),
             self.grammar_bitmask_cpu[:padded_bonus_rows].to(
                 bonus_logits.device),
-            self.structured_decode_arange.to(bonus_logits.device),
+            self.structured_decode_arange,
         )
 
     def mask_logits(
@@ -196,9 +200,21 @@ class StructuredDecodingManager:
         cur_end_idx: int,
     ) -> torch.Tensor:
         """Applies the grammar bitmask to one non-spec chunk's logits."""
-        require_sd, bitmask, arange = self.prepare_structured_decoding_input(
-            logits, grammar_output, cur_start_idx, cur_end_idx)
-        return self.structured_decode(require_sd, bitmask, logits, arange)
+        num_reqs = cur_end_idx - cur_start_idx
+        padded_num_reqs = logits.shape[0]
+        with TraceAnnotation("SD:PrepareInput",
+                             num_reqs=num_reqs,
+                             padded_num_reqs=padded_num_reqs,
+                             cur_start_idx=cur_start_idx,
+                             cur_end_idx=cur_end_idx):
+            require_sd, bitmask, arange = self.prepare_structured_decoding_input(
+                logits, grammar_output, cur_start_idx, cur_end_idx)
+        with TraceAnnotation("SD:MaskLogits",
+                             num_reqs=num_reqs,
+                             padded_num_reqs=padded_num_reqs,
+                             cur_start_idx=cur_start_idx,
+                             cur_end_idx=cur_end_idx):
+            return self.structured_decode(require_sd, bitmask, logits, arange)
 
     def mask_spec_logits(
         self,
@@ -215,18 +231,34 @@ class StructuredDecodingManager:
         `target_logits` passes as None for non-draft chunks (when `md` is None),
         where only the bonus applies.
         """
-        (require_target, target_bitmask, require_bonus, bonus_bitmask,
-         arange) = self.prepare_spec_structured_decoding_input(
-             target_logits, bonus_logits, grammar_output,
-             scheduled_spec_decode_tokens, draft_lengths_cpu, cur_start_idx,
-             cur_end_idx)
-        if target_logits is not None:
-            target_logits = self.structured_decode(require_target,
-                                                   target_bitmask,
-                                                   target_logits, arange)
-        bonus_logits = self.structured_decode(require_bonus, bonus_bitmask,
-                                              bonus_logits, arange)
-        return target_logits, bonus_logits
+        num_reqs = cur_end_idx - cur_start_idx
+        num_target_rows = target_logits.shape[
+            0] if target_logits is not None else 0
+        num_bonus_rows = bonus_logits.shape[0]
+        with TraceAnnotation("SD:PrepareSpecInput",
+                             num_reqs=num_reqs,
+                             num_target_rows=num_target_rows,
+                             num_bonus_rows=num_bonus_rows,
+                             cur_start_idx=cur_start_idx,
+                             cur_end_idx=cur_end_idx):
+            (require_target, target_bitmask, require_bonus, bonus_bitmask,
+             arange) = self.prepare_spec_structured_decoding_input(
+                 target_logits, bonus_logits, grammar_output,
+                 scheduled_spec_decode_tokens, draft_lengths_cpu,
+                 cur_start_idx, cur_end_idx)
+        with TraceAnnotation("SD:MaskSpecLogits",
+                             num_reqs=num_reqs,
+                             num_target_rows=num_target_rows,
+                             num_bonus_rows=num_bonus_rows,
+                             cur_start_idx=cur_start_idx,
+                             cur_end_idx=cur_end_idx):
+            if target_logits is not None:
+                target_logits = self.structured_decode(require_target,
+                                                       target_bitmask,
+                                                       target_logits, arange)
+            bonus_logits = self.structured_decode(require_bonus, bonus_bitmask,
+                                                  bonus_logits, arange)
+            return target_logits, bonus_logits
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def structured_decode(

@@ -19,10 +19,12 @@ import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
+from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.common.utils import update_sparse_mla_kv_cache
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
@@ -36,6 +38,10 @@ MAX_ALLOWED_PAGE_INDICES_N = (
 # Selection happens per attention layer via the `use_batched_rpa` flag plumbed
 # from `PallasAttentionBackendImpl` / `PallasBatchedRPAAttentionBackendImpl`.
 #
+if envs.USE_BATCHED_RPA_SEQ_ON_LANE and not envs.USE_BATCHED_RPA_LONGCTX:
+    raise ValueError(
+        "USE_BATCHED_RPA_SEQ_ON_LANE requires USE_BATCHED_RPA_LONGCTX=1.")
+
 # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
 if envs.USE_BATCHED_RPA_LONGCTX:
     import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched
@@ -411,6 +417,108 @@ def sharded_ragged_paged_attention(
     )(*args)
 
 
+def attention_bundled(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    attention_metadata: AttentionMetadata,
+    mesh: Mesh,
+    head_dim_original: int | None = None,
+    attention_chunk_size: int | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+    use_causal_mask: bool = True,
+) -> Tuple[jax.Array, jax.Array]:
+    """Dispatches ragged paged attention over the bundled block-major KV cache across the TPU mesh.
+
+    Args:
+        kv_cache_bundle: Full-model KV cache bundle of shape `[num_pages, num_layers, ...]`.
+        layer_idx: Dynamic scalar integer tensor specifying the target layer's bundle index.
+        q: Query tensor of shape `[num_tokens, num_heads, head_dim]`.
+        k: Key tensor of shape `[num_tokens, num_kv_heads, head_dim]`.
+        v: Value tensor of shape `[num_tokens, num_kv_heads, head_dim]`.
+        attention_metadata: Metadata containing sequence lengths, block tables, and batch bounds.
+        mesh: TPU device mesh for Tensor Parallelism (TP).
+        head_dim_original: Unpadded head dimension, if different from q.shape[-1].
+        attention_chunk_size: Optional sliding window / chunk size.
+        q_scale: Optional FP8 query scale.
+        k_scale: Optional FP8 key scale.
+        v_scale: Optional FP8 value scale.
+        sm_scale: Softmax temperature scale.
+        soft_cap: Optional attention logits soft-capping threshold.
+        use_causal_mask: Whether to apply lower-triangular causal masking.
+
+    Returns:
+        A tuple of (new_bundle, output), where new_bundle aliases the input bundle in-place
+        and output is the computed attention result tensor.
+    """
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import \
+        ragged_paged_attention_bundled
+
+    if head_dim_original is None:
+        head_dim_original = q.shape[-1]
+    md = attention_metadata
+    if sm_scale is None:
+        sm_scale = head_dim_original**-0.5
+
+    def _run(q, k, v, kv_cache_bundle, layer_idx, seq_lens, block_tables,
+             query_start_loc, request_distribution):
+        output, new_bundle = ragged_paged_attention_bundled(
+            q,
+            k,
+            v,
+            kv_cache_bundle,
+            layer_idx,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sm_scale=sm_scale,
+            sliding_window=attention_chunk_size,
+            soft_cap=soft_cap,
+            use_causal_mask=use_causal_mask,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale)
+        return new_bundle, output
+
+    # Shard across KV heads along the TPU "model" axis (Tensor Parallelism):
+    # - Dense bundle (6D): [num_pages, num_layers, page_size, num_kv_heads, p, head_dim] -> shard dim 3.
+    # The layer dimension (dim 1) remains unsharded.
+    # Query, Key, and Value shard on the head dimension (dim 1); metadata is replicated; layer_idx is a scalar.
+    qkv_spec = P(None, "model", None)
+    bundle_spec = P(None, None, None, "model", None, None)
+    data_spec = P(None)
+    in_specs = (
+        qkv_spec,  # q
+        qkv_spec,  # k
+        qkv_spec,  # v
+        bundle_spec,  # kv_cache_bundle (num_layers dim unsharded)
+        P(),  # layer_idx (replicated scalar)
+        data_spec,  # seq_lens
+        data_spec,  # block_tables
+        data_spec,  # query_start_loc
+        data_spec,  # request_distribution
+    )
+    args = (q, k, v, kv_cache_bundle, layer_idx, md.seq_lens, md.block_tables,
+            md.query_start_loc, md.request_distribution)
+
+    # Output partition specs mirror (new_bundle, output).
+    out_specs = (bundle_spec, qkv_spec)
+    return shard_map.shard_map(
+        _run,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_rep=False,
+    )(*args)
+
+
 def attention(
     kv_cache: jax.Array,
     q: jax.Array,
@@ -637,6 +745,8 @@ def sparse_mla_attention(
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
         mesh: Mesh,
+        nope_spec: SparseMLAKVCacheSpec,
+        rope_spec: SparseMLAKVCacheSpec,
         sm_scale: float | None = None,
         k_scale: float | None = None
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -647,14 +757,16 @@ def sparse_mla_attention(
       q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
-      kv_cache_nope: Paged uint8 nope cache in dsa_gather's tiled layout (`[num_blocks, block_size, tile_subrows, lane_bytes]`)
-      kv_cache_rope: Paged uint8 rope cache in dsa_gather's tiled layout (`[num_blocks, block_size // tile_subrows, tile_subrows, lane_bytes]`)
+      kv_cache_nope: Paged nope cache, shaped and typed by `nope_spec`.
+      kv_cache_rope: Paged rope cache, shaped and typed by `rope_spec`.
       topk_indices: Indexer output specifying tokens to gather (`[num_tokens, topk]`).
       seq_lens: Per-sequence total KV length including the tokens being inserted in this step (`[num_seqs]`).
       block_tables: Flattened per-sequence-padded page table (`[num_seqs * pages_per_seq]`).
       query_start_loc: Cumulative new-token counts (`[num_seqs + 1]`).
       request_distribution: Tensor of (decode_end, prefill_end, num_seqs) indexing bounds.
       mesh: Target sharding mesh.
+      nope_spec: Layout descriptor the nope cache was allocated from.
+      rope_spec: Layout descriptor the rope cache was allocated from.
       sm_scale: Softmax temperature scale.
       k_scale: Dequantization scale for fp8 keys.
 
@@ -675,6 +787,19 @@ def sparse_mla_attention(
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
     """
+    # dsa_gather moves one (`TILE_SUBROWS`, `TILE_LANE_BYTES`) uint8 tile of
+    # nope and one `TILE_LANE_BYTES`-byte lane row of rope per token; other
+    # head dims don't fit its address arithmetic.
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    tile_subrows = dsa_gather.TILE_SUBROWS
+    lane_bytes = dsa_gather.TILE_LANE_BYTES
+    assert (
+        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes), (
+            "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+            f"head dimension to be {tile_subrows * lane_bytes} and the fp8 "
+            f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+            f"{rope_dim}")
+
     in_specs = (
         P(None, None, None),  # ql_nope
         P(None, None, None),  # q_pe
@@ -702,8 +827,15 @@ def sparse_mla_attention(
                                            query_start_loc_,
                                            request_distribution_):
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
-            kv_cache_nope, kv_cache_rope, kv_c_normed, k_pe, seq_lens_,
-            block_tables_, query_start_loc_)
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec)
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         output = sparse_mla_ragged_paged_attention(

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -103,6 +104,11 @@ def _make_runner(*,
     runner.arange_np = np.arange(max_num_tokens, dtype=np.int64)
     runner._request_distribution_cpu = torch.zeros(3, dtype=torch.int32)
     runner._decode_device_cache_key = None
+    # The staging-tensor fence is recorded by execute_model; these tests
+    # call _prepare_inputs directly, so the wait must find an empty fence.
+    runner._input_staging_fence = None
+    runner._wait_input_staging_fence = types.MethodType(
+        TPUModelRunner._wait_input_staging_fence, runner)
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
@@ -116,6 +122,8 @@ def _make_runner(*,
     # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
     runner._mamba_ckpt_window = 1
     runner._unified_kv_layout = False
+    # Default to layer-major KV cache (None bundle) for PCP integration layout tests.
+    runner._kv_cache_bundle = None
     # Bind the real seed-copy collector; an empty copy plan makes it a no-op
     # (no mamba align mode in these layout tests).
     runner._mamba_copy_plan = []

@@ -275,7 +275,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         worker_metadata: List[RayWorkerMetaData] = []
         driver_ip = get_ip()
-        # For torchtpu-vllm, we always use 1 TPU per worker similar to Multiprocexecutor
+        # For vllm-torchtpu, we always use 1 TPU per worker similar to Multiprocexecutor
         num_tpu_per_worker = 1.0
         for rank, bundle_id in enumerate(bundle_indices):
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -469,8 +469,11 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             # (Standard HF downloads do not overwrite `model`, allowing workers to pull normally).
             # Since workers on remote nodes cannot access the Leader's filesystem, we create a
             # worker-specific config copy and restore the original GCS URI from `model_weights`.
-            # This allows each worker to independently invoke `maybe_pull_model_tokenizer_for_runai`
-            # and stream the model from GCS.
+            # ModelConfig.__post_init__ does not re-run on the worker, so nothing pulls
+            # automatically from this state: TPUWorker.__init__ calls
+            # vllm_torchtpu.worker.runai_repull.ensure_runai_aux_files, which recognises the
+            # restored-URI state, invokes `maybe_pull_model_tokenizer_for_runai` under a
+            # per-host lock, and rewrites model/tokenizer/model_weights as the Leader did.
             if (node_id != driver_node_id and self.vllm_config.model_config
                     and self.vllm_config.model_config.model_weights):
                 worker_vllm_config = copy.deepcopy(self.vllm_config)

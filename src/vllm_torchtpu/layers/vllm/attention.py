@@ -21,10 +21,12 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
-from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
+                                                      KVCacheType,
+                                                      SparseMLAKVCacheSpec)
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
-    attention, mla_attention, ragged_paged_attention,
+    attention, attention_bundled, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_kv
@@ -263,6 +265,64 @@ def _pallas_rpa_kernel_local(
     )
 
 
+def _pallas_rpa_kernel_default_bundled(
+    kv_cache_bundle: jax.Array,
+    layer_idx: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+    use_causal_mask: bool = True,
+) -> tuple[jax.Array, jax.Array]:
+    """Default bundled Pallas RPA kernel entry for block-major execution.
+
+    Invoked when `VllmModelWrapperContext.kv_cache_bundle` is set. Matches the
+    standard kernel entry point interface, taking the full KV cache bundle as the
+    first argument and a dynamic int32 scalar layer_idx as the second argument.
+    """
+    if sinks is not None:
+        # Attention sinks are unsupported in the bundled block-major kernel path.
+        raise NotImplementedError(
+            "VLLM_TPU_BLOCK_MAJOR_KV=1: attention sinks are not supported "
+            "by the bundled RPA path")
+    metadata = AttentionMetadata(
+        input_positions=None,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        request_distribution=request_distribution,
+    )
+    new_bundle, outputs = attention_bundled(
+        kv_cache_bundle,
+        layer_idx,
+        query,
+        key,
+        value,
+        metadata,
+        mesh,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        attention_chunk_size=sliding_window,
+        sm_scale=sm_scale,
+        soft_cap=soft_cap,
+        use_causal_mask=use_causal_mask,
+    )
+    return new_bundle, outputs
+
+
 def _pallas_rpa_kernel_batched(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -476,6 +536,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     ) -> tuple[int, ...]:
         is_auto = (isinstance(cache_dtype_str, str)
                    and cache_dtype_str.lower().strip() == "auto")
+        if is_auto and envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            raise ValueError(
+                "USE_BATCHED_RPA_SEQ_ON_LANE does not support cache_dtype='auto'."
+            )
         if not envs.USE_BATCHED_RPA_LONGCTX or head_size == 64 or is_auto:
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size,
@@ -532,6 +596,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
 
+    # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
+    # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
+    # collisions with layer-major ops in the shared registry.
+    _kernel_entry_bundled: ClassVar = staticmethod(
+        _pallas_rpa_kernel_default_bundled)
+    _kernel_op_prefix_bundled: ClassVar[str] = "pallas::rpa_kernel_bundled"
+
+    # Class-level registry of bundled kernel instances. Layers sharing identical
+    # configurations reuse a single custom op, emitting one shared OpOverload node
+    # across the FX graph rather than duplicating JAX tracing and MLIR compilation.
+    _bundled_kernel_registry: ClassVar[dict] = {}
+
     def __init__(
         self,
         num_heads: int,
@@ -582,6 +658,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
+        # Block-major bundled kernel and pre-allocated layer index. Initialized by
+        # setup_bundled() after bundle allocation and prior to torch.compile tracing.
+        # During profile_run, ctx.kv_cache_bundle is None and forward falls back to
+        # standard execution.
+        self.rpa_kernel_bundled = None
+        self._bundle_layer_idx_tensor: torch.Tensor | None = None
 
     @classmethod
     def _allocate_kernel_instance_id(cls) -> int:
@@ -735,6 +817,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
         unsupported_features = []
+        if envs.USE_BATCHED_RPA_SEQ_ON_LANE:
+            unsupported_features.append("USE_BATCHED_RPA_SEQ_ON_LANE")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:
@@ -753,6 +837,107 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         pcp_mesh = get_pcp_streaming_mesh()
         return pcp_mesh, pcp_mesh, PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
+
+    def _build_bundled_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ):
+        """Constructs and caches the bundled RPA custom op via `pallas.jax_op`.
+
+        Uses in-place buffer donation on the full bundle (arg 0) with a dynamic
+        `layer_idx` scalar. Layers sharing identical kernel configurations reuse
+        the cached op via `_bundled_kernel_registry`.
+        """
+        # Fail closed when the layer-major kernel is overridden (e.g. subclass
+        # ClassVar like batched RPA, or per-instance rebinds like single-device
+        # local kernels) without a corresponding bundled counterpart, preventing
+        # silent fallback to default kernels. Read via `self` to detect instance overrides.
+        if (self._kernel_entry is not PallasAttentionBackendImpl._kernel_entry
+                and self._kernel_entry_bundled
+                is PallasAttentionBackendImpl._kernel_entry_bundled):
+            raise NotImplementedError(
+                "VLLM_TPU_BLOCK_MAJOR_KV=1: "
+                f"{type(self).__name__} overrides the layer-major RPA "
+                "kernel but has no bundled variant; refusing to fall "
+                "back to the default bundled kernel.")
+        ctx = get_vllm_model_wrapper_context()
+        mesh = ctx.mesh
+        registry_key = (self._kernel_op_prefix_bundled, self.sliding_window,
+                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
+                        k_scale, v_scale, self.use_causal_mask)
+        existing = self._bundled_kernel_registry.get(registry_key)
+        if existing is not None:
+            return existing
+
+        kernel_instance_id = self._allocate_kernel_instance_id()
+        op_name = f"{self._kernel_op_prefix_bundled}_{kernel_instance_id}"
+        wrapped_fn = functools.partial(
+            self._kernel_entry_bundled,
+            mesh=mesh,
+            sliding_window=self.sliding_window,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sm_scale=self.scale,
+            soft_cap=self.logits_soft_cap,
+            use_causal_mask=self.use_causal_mask,
+        )
+
+        # Eager kernel iteration mode runs without JAX tracing; omit donation
+        # to prevent prematurely releasing the buffer needed for copy_ writeback.
+        bundled_donate_argnums = (None if envs.TPU_KERNEL_ITER_MODE else (0, ))
+        rpa_kernel_op = pallas.jax_op(
+            op_name,
+            wrapped_fn,
+            donate_argnums=bundled_donate_argnums,
+        )
+
+        def _fake_rpa_op(kv_cache_bundle: torch.Tensor,
+                         layer_idx: torch.Tensor, query: torch.Tensor, *args,
+                         **kwargs):
+            return (torch.empty_like(kv_cache_bundle), torch.empty_like(query))
+
+        rpa_kernel_op.register_fake(_fake_rpa_op)
+
+        def rpa_kernel_bundled_impl(kv_cache_bundle, *args, **kwargs):
+            new_bundle, output = rpa_kernel_op(kv_cache_bundle, *args,
+                                               **kwargs)
+            if new_bundle.shape != kv_cache_bundle.shape:
+                raise RuntimeError(
+                    "Bundled RPA kernel returned an incompatible bundle "
+                    f"shape: expected {tuple(kv_cache_bundle.shape)}, got "
+                    f"{tuple(new_bundle.shape)}.")
+            # In-place writeback: XLA aliases the donated input buffer to the op
+            # output, compiling the copy_ operation into an in-place HBM update.
+            kv_cache_bundle.copy_(new_bundle)
+            return output
+
+        self._bundled_kernel_registry[registry_key] = rpa_kernel_bundled_impl
+        return rpa_kernel_bundled_impl
+
+    def setup_bundled(self, layer_idx: int, bundle_device: torch.device,
+                      layer: "AttentionLayer") -> None:
+        """Initializes the bundled kernel and pre-allocates the layer index tensor.
+
+        Called by the TPU runner immediately after bundle allocation and BEFORE
+        `torch.compile` traces `capture_model`. Mesh, sliding window, and scaling
+        parameters are bound into the compiled op.
+        """
+        q_scale = k_scale = v_scale = None
+        if self.kv_cache_quantized_dtype:
+            k_scale_value = layer._k_scale_float
+            v_scale_value = layer._v_scale_float
+            if k_scale_value != 0.0 and v_scale_value != 0.0:
+                k_scale = k_scale_value
+                v_scale = v_scale_value
+        # Pre-allocate layer index tensor on device to avoid per-step Host-to-Device copies.
+        self._bundle_layer_idx_tensor = torch.tensor(int(layer_idx),
+                                                     dtype=torch.int32,
+                                                     device=bundle_device)
+        self.rpa_kernel_bundled = self._build_bundled_kernel(
+            q_scale, k_scale, v_scale)
 
     def initialize_kernel(self, layer: AttentionLayer) -> None:
         """Pre-build the RPA kernel before torch.compile traces the model.
@@ -877,7 +1062,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        pool_head_dim = kv_cache.shape[-1]
+        if (isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+                and envs.USE_BATCHED_RPA_SEQ_ON_LANE):
+            pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
+        else:
+            pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
             query = torch.nn.functional.pad(query, (0, pad_size))
@@ -924,25 +1113,50 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # # Mark kv_cache avaliable for donation
         # pallas.set_buffer_donor_(kv_cache, True)
 
-        # Call the operator
-        outputs = rpa_kernel(
-            kv_cache,
-            query,
-            key,
-            value,
-            attn_metadata.seq_lens,
-            attn_metadata.block_tables,
-            attn_metadata.query_start_loc,
-            attn_metadata.request_distribution,
-            sink,
-        )
+        # Block-major execution path: when a KV cache bundle is mounted on the context,
+        # route through the bundled RPA kernel. The per-layer `kv_cache` argument
+        # passed by vLLM (a strided view) is bypassed in favor of direct, in-place
+        # updates to the full bundle. During profile_run, `ctx.kv_cache_bundle` is None;
+        # Dynamo guards on this check trigger retracing once the bundle is initialized.
+        if ctx.kv_cache_bundle is not None:
+            if use_pcp_streaming or skip_kv_update:
+                raise NotImplementedError(
+                    "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA path does "
+                    "not support PCP streaming or KV sharing")
+            outputs = self.rpa_kernel_bundled(
+                ctx.kv_cache_bundle,
+                self._bundle_layer_idx_tensor,
+                query,
+                key,
+                value,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                sink,
+            )
+        else:
+            # Call the operator
+            outputs = rpa_kernel(
+                kv_cache,
+                query,
+                key,
+                value,
+                attn_metadata.seq_lens,
+                attn_metadata.block_tables,
+                attn_metadata.query_start_loc,
+                attn_metadata.request_distribution,
+                sink,
+            )
 
         # Drop the padding added above so callers see the layer's own width.
         if outputs.shape[-1] > self.head_size:
             outputs = outputs[..., :self.head_size]
         # TODO (geyuhao) ideally we don't want this
         if not torch.compiler.is_compiling():
-            synchronize_tensors(kv_cache, wait=False)
+            synchronize_tensors(ctx.kv_cache_bundle if ctx.kv_cache_bundle
+                                is not None else kv_cache,
+                                wait=False)
 
         if query_dim == 2:
             outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
@@ -1050,27 +1264,34 @@ class PallasMLAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
-    def get_sparse_kv_cache_shapes(
+    def get_sparse_kv_cache_specs(
         num_blocks: int,
         block_size: int,
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Native (nope, rope) cache shapes: the kernel's paged fp8 shapes,
-        nope regrouped into dsa_gather's lane-row tiles."""
-        from vllm_torchtpu.kernels.mla.sparse import dsa_gather
-
+    ) -> tuple[SparseMLAKVCacheSpec, SparseMLAKVCacheSpec]:
+        """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
-        lane_bytes = dsa_gather.TILE_LANE_BYTES
-        kv_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        kv_packing = get_dtype_packing(kv_dtype)
-        rope_shape = sparse_mla_kernel.get_kv_cache_shape(
-            num_blocks, block_size, rope_dim, kv_dtype, kv_packing)
-        nope_shape = sparse_mla_kernel.get_kv_cache_shape(
-            num_blocks, block_size, head_size - rope_dim, kv_dtype, kv_packing)
-        num_pages, page_size_div, kv_packing, nope_dim = nope_shape
-        return ((num_pages, page_size_div * kv_packing, nope_dim // lane_bytes,
-                 lane_bytes), rope_shape)
+        kv_packing = get_dtype_packing(
+            _resolve_kv_cache_dtype(cache_dtype_str))
+        return (
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.NOPE,
+                KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
+                num_blocks,
+                block_size,
+                head_size - rope_dim,
+                kv_packing,
+            ),
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT),
+                num_blocks,
+                block_size,
+                rope_dim,
+                kv_packing,
+            ),
+        )
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
@@ -1315,6 +1536,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -1328,6 +1550,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc,
                 request_distribution,
                 vllm_context.mesh,
+                nope_spec,
+                rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
             )
