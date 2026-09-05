@@ -47,7 +47,7 @@ run_variant() {
         --nnodes="$NNODES" --nproc-per-node="$NPROC" --node-rank="$NODE_RANK" \
         --master-addr="$MASTER_ADDR" --master-port="$port" \
         "$SCRIPT" --warmups 10 --iterations "$ITER" \
-        --profile-dir "$OUT/$name/profile" "$@" \
+        --profile-dir "$OUT/$name/profile" --hlo-dump-dir "$OUT/$name/hlo" "$@" \
         2>&1 | tee "$OUT/$name/node${NODE_RANK}.log"
     local rc="${PIPESTATUS[0]}"
     grep -h "TORCHTPU_ALL_REDUCE_RESULT" "$OUT/$name/node${NODE_RANK}.log" \
