@@ -13,6 +13,8 @@ _GLM5_NEXT_MODEL = ("vllm_torchtpu.models.vllm.glm5_next:"
 # therefore torchvision, which the text-only path must not have to pay for.
 _GLM5_NEXT_MM_MODEL = ("vllm_torchtpu.models.vllm.glm5_next.multimodal:"
                        "Glm5NextForConditionalGeneration")
+_GLM5_NEXT_MTP = ("vllm_torchtpu.models.vllm.glm5_next:"
+                  "Glm5NextMTP")
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -38,4 +40,26 @@ def register_models() -> None:
     ModelRegistry.register_model("Glm5NextForCausalLM", _GLM5_NEXT_MODEL)
     ModelRegistry.register_model("Glm5NextForConditionalGeneration",
                                  _GLM5_NEXT_MM_MODEL)
+    # MTP draft head. vLLM's speculative config rewrites the draft's
+    # `architectures` before the registry is consulted, so the name it asks
+    # for is the one spec_patch writes there (`Glm5NextMTPModel`, following
+    # the Glm4Moe convention); the class name is registered too so an
+    # explicit --speculative-config also resolves.
+    ModelRegistry.register_model("Glm5NextMTPModel", _GLM5_NEXT_MTP)
+    ModelRegistry.register_model("Glm5NextMTP", _GLM5_NEXT_MTP)
+    # Teach an unpatched vLLM that glm5_next has an MTP draft head. Must run
+    # before a SpeculativeConfig is built, which platform init precedes;
+    # idempotent, and importing the module applies it again in the spawned
+    # EngineCore child.
+    #
+    # `glm5_next_spec_patch`, NOT `glm5_next.spec_patch`, and the distinction
+    # is the point: this line is on every model's boot path, and importing a
+    # submodule runs its parent package first. The package spelling would
+    # execute eleven GLM modules plus the DeepSeek-V4 kernels in every Qwen
+    # and DeepSeek-V4 process, and would make an import error anywhere in
+    # GLM's tree their boot failure too. `tpu_runner.py`'s
+    # `is_compressed_indexer_cache` documents that hazard and answers it
+    # without importing anything; this has to agree with it.
+    from vllm_torchtpu.models.vllm import glm5_next_spec_patch
+    glm5_next_spec_patch.install()
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config

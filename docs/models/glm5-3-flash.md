@@ -9,6 +9,10 @@ the revisions this tree is pinned to: vLLM `v0.27.0`, per
 `glm5_next` transformers overlay described under "Running the parity suites".
 Line numbers rot; the symbol names around them are the durable part.
 
+Companion pages:
+
+* [`glm5-3-flash-mtp.md`](glm5-3-flash-mtp.md) — the MTP draft head.
+
 ## The model
 
 Structurally DeepSeek-V4 — multi-hyper-connection residual manifold,
@@ -18,7 +22,7 @@ shipped FP8 checkpoint is 328 GB and runs at TP=8.
 
 | | |
 | --- | --- |
-| layers | 45 |
+| layers | 45 (+1 MTP draft layer at index 45) |
 | attention | 34 KDA (linear) + 11 DSA (MLA) |
 | `qk_rope_head_dim` | 0 — NoPE |
 | `kv_lora_rank` | 512 |
@@ -159,3 +163,8 @@ out-of-tree job recipe and their probe scripts are not part of the patch:
 | 189/189 parameters loaded, 0 missing, 0 unmapped | tiny fixture |
 | 328 GB FP8 checkpoint loads from 62 shards and generates coherent greedy text | real checkpoint, TP=8 |
 | image → text answers correctly about a synthetic image | real checkpoint, TP=8 |
+| MTP at 75% acceptance, tokens identical to a no-spec run | real checkpoint, TP=8 |
+
+## Known limitations
+
+* MTP requires `SPEC_WARMUP=0`; see the MTP page.

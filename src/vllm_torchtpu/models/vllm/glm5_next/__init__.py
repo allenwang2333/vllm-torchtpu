@@ -18,11 +18,13 @@ from vllm_torchtpu.models.vllm.glm5_next.layers import mhc_collapse_head_mean
 from vllm_torchtpu.models.vllm.glm5_next.model import (Glm5NextDecoderLayer,
                                                        Glm5NextForCausalLM,
                                                        Glm5NextModel)
+from vllm_torchtpu.models.vllm.glm5_next.mtp import Glm5NextMTP
 
 __all__ = [
     "Glm5NextDecoderLayer",
     "Glm5NextForCausalLM",
     "Glm5NextMLAAttention",
+    "Glm5NextMTP",
     "Glm5NextModel",
     "mhc_collapse_head_mean",
 ]
