@@ -53,6 +53,9 @@ from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta, ReqId, SendMeta, TPUConnectorMetadata)
+from vllm_torchtpu.distributed.kv_transfer.raiden.transfer_plan import (
+    Dsv4Pool, TransferGroup, dsv4_pool_pages, group_window_tokens,
+    plan_transfer_groups, recycled_transfer_pages)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 # zmq/shm transport pieces: used only by the zmq-stack workers below
@@ -124,223 +127,6 @@ def _select_committed_mamba_blocks(
             f"blocks={len(block_ids)}, required={required_blocks}")
         committed_blocks.append(int(block_ids[-required_blocks]))
     return committed_blocks
-
-
-@dataclass(frozen=True)
-class _Stage3TransferGroup:
-    """One paged KV cache group Stage 3 moves, and the size of its pages.
-
-    A cache group is the set of layers the scheduler pages together: one
-    request gets one block table per group, and every layer in the group
-    reads the same page numbers.
-    """
-
-    cache_group_index: int
-    page_tokens: int
-    window_tokens: Optional[int] = None
-
-
-# vLLM reserves block 0 as the null block and points every freed sliding-window
-# entry at it, so a transfer range containing it is a range whose KV is gone.
-_STAGE3_NULL_BLOCK_ID = 0
-
-
-def _stage3_skipped_window_pages(*, num_tokens: int, page_tokens: int,
-                                 window_tokens: Optional[int]) -> int:
-    """Leading pages of a sliding-window block table that hold no live KV.
-
-    vLLM's `SlidingWindowManager` frees every page that falls out of the
-    window and writes the null block over its entry, so the table starts with
-    a run of one repeated ID. Transferring those pages would hand Raiden a
-    destination block list with duplicates, which it rejects, and would move
-    bytes the decode replica cannot read anyway.
-
-    Mirrors `SlidingWindowManager.get_num_skipped_tokens` and
-    `SingleTypeKVCacheManager.remove_skipped_blocks`. Both peers derive the
-    count from the same request length and page geometry, so they trim the
-    same pages and the surviving pages stay paired.
-    """
-    if not window_tokens:
-        return 0
-    skipped_tokens = max(0, int(num_tokens) - int(window_tokens) + 1)
-    return skipped_tokens // int(page_tokens)
-
-
-def _stage3_trim_window_pages(
-    block_ids: Sequence[int],
-    *,
-    num_tokens: int,
-    page_tokens: int,
-    window_tokens: Optional[int],
-    group_label: str,
-) -> list[int]:
-    """`block_ids` without the dead prefix a sliding window leaves.
-
-    A windowed group's block table still has one entry per page of the whole
-    request, but the allocator has already freed the pages that fell behind
-    the window and points them at the null block. Those entries are dropped here.
-    """
-    ids = [int(block_id) for block_id in block_ids]
-    skipped = min(
-        _stage3_skipped_window_pages(num_tokens=num_tokens,
-                                     page_tokens=page_tokens,
-                                     window_tokens=window_tokens), len(ids))
-    if not skipped:
-        return ids
-    dropped, kept = ids[:skipped], ids[skipped:]
-    # Out-of-window pages hold nothing the consumer can attend to, so dropping
-    # them is right either way, but the allocator normally has already written
-    # the null block over all of them. A varied prefix means this arithmetic
-    # and vLLM's have drifted apart, which is worth seeing before it turns
-    # into a silent mis-transfer.
-    if len(set(dropped)) != 1:
-        logger.warning(
-            "Stage-3 sliding-window trim dropped pages that are not all the "
-            "null block: group=%s, dropped=%s, num_tokens=%d, page_tokens=%d, "
-            "window=%s", group_label, dropped, num_tokens, page_tokens,
-            window_tokens)
-    if len(set(kept)) != len(kept):
-        raise ValueError(
-            "Stage-3 sliding-window block table still repeats a page after "
-            f"trimming: group={group_label}, kept={kept}, ids={ids}, "
-            f"skipped={skipped}, "
-            f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
-            f"window={window_tokens}")
-    return kept
-
-
-def _stage3_recycled_transfer_pages(
-    block_ids: Sequence[int],
-    *,
-    num_tokens: int,
-    page_tokens: int,
-    window_tokens: Optional[int],
-) -> int:
-    """How many pages this group would transfer that the allocator already freed.
-
-    Both peers derive their skip from `num_tokens`, the transfer prefix, but the
-    allocator freed pages against wherever the producer actually got to. Those
-    two agree only while the producer stops at the handoff token. Let it run one
-    page further and it has recycled a page the send still lists, which arrives
-    as the null block: `num_tokens=374` with a 16-token page and an 8-token
-    window skips 22 pages while the allocator freed 23, so page 22 goes over the
-    wire dead. Let it run far enough and two dead pages collide, which is a
-    duplicate destination that Raiden rejects outright.
-
-    Counting the null blocks left in the range beats re-deriving the allocator's
-    position, because it reads what the block table actually says rather than
-    assuming the two formulas line up.
-    """
-    skipped = _stage3_skipped_window_pages(num_tokens=num_tokens,
-                                           page_tokens=page_tokens,
-                                           window_tokens=window_tokens)
-    return sum(1 for block_id in tuple(block_ids)[skipped:]
-               if int(block_id) == _STAGE3_NULL_BLOCK_ID)
-
-
-def _stage3_group_window_tokens(group_spec: Any) -> Optional[int]:
-    """The sliding window of a cache group, or None if it is full attention.
-
-    DSv4 hands its groups over as `UniformTypeKVCacheSpecs`, which carries no
-    `sliding_window` of its own; the layers under it are uniform by
-    construction, so any one of them answers for the group.
-    """
-    specs = getattr(group_spec, "kv_cache_specs", None)
-    if specs:
-        group_spec = next(iter(specs.values()))
-    window = getattr(group_spec, "sliding_window", None)
-    return int(window) if window else None
-
-
-def _stage3_transfer_groups(
-    kv_cache_groups: Sequence[Any],
-    *,
-    multi_group: bool,
-) -> tuple[_Stage3TransferGroup, ...]:
-    """The KV cache groups whose pages Stage 3 transfers, in group order.
-
-    Mamba groups are excluded: their state rides the state-class tags and is
-    addressed one committed checkpoint at a time, not as a page range.
-
-    ``page_tokens`` travels with the group index because DeepSeek-V4's groups
-    page at different sizes -- its SWA group's block is an eighth of the CSA
-    group's -- so a single connector-wide page size cannot validate them all.
-
-    ``multi_group`` says which plan this is, and it is exact in both
-    directions. Qwen3.5 and GLM have one such group and must have one. DSv4
-    has several by construction, because the whole reason it needs its own
-    admission path is that its groups disagree about page geometry; a
-    single-group DSv4 plan would mean the scheduler sends no per-group block
-    tables while the worker's DSv4 path requires them, and the transfer would
-    fail at runtime rather than here.
-    """
-    groups = tuple(
-        _Stage3TransferGroup(cache_group_index=index,
-                             page_tokens=int(group.kv_cache_spec.block_size),
-                             window_tokens=_stage3_group_window_tokens(
-                                 group.kv_cache_spec))
-        for index, group in enumerate(kv_cache_groups)
-        if not isinstance(group.kv_cache_spec, MambaSpec))
-    if not groups:
-        raise ValueError(
-            "Stage-3 resharding requires at least one non-Mamba KV cache "
-            f"group, got {len(tuple(kv_cache_groups))} group(s)")
-    if not multi_group and len(groups) != 1:
-        raise ValueError("Stage-3 Qwen3.5 resharding requires exactly one "
-                         f"full-attention KV cache group, got "
-                         f"{[group.cache_group_index for group in groups]}")
-    if multi_group and len(groups) < 2:
-        raise ValueError(
-            "Stage-3 DSv4 resharding expects several KV cache groups paging "
-            "at different sizes, got "
-            f"{[group.cache_group_index for group in groups]}. A model with "
-            "one group does not need DSv4 admission; run it without "
-            "TPU_RAIDEN_DSV4_ADMISSION=1")
-    return groups
-
-
-@dataclass(frozen=True)
-class _Stage3Dsv4Pool:
-    """One tag in the DSv4 transfer plan, and the geometry to move it."""
-
-    # Pool tag, e.g. `dsv4.csa.nope.g0`. The `.g0` suffix names the kv cache
-    # group whose block table addresses these bytes.
-    tag: str
-    # Which block table to read, as an index into `SendMeta.group_block_ids`.
-    # That list skips Mamba groups, so this is not a kv-cache-group index.
-    # Tags of one group share a position: `dsv4.csa.nope.g0` and
-    # `dsv4.csa.rope.g0` do, because a CSA layer's two arrays page together.
-    plan_position: int
-    page_tokens: int
-    live_bytes_per_block: int
-    # `live_bytes_per_block // row_bytes` is rows per page, which is not
-    # `page_tokens`: each DSv4 role packs a different number of tokens into a
-    # row, four for CSA NoPE and sixteen for RoPE.
-    row_bytes: int
-    # None for full attention.
-    window_tokens: Optional[int] = None
-
-
-def _stage3_dsv4_pool_pages(
-    pool: _Stage3Dsv4Pool,
-    block_ids: Sequence[int],
-    num_tokens: int,
-) -> tuple[list[int], int]:
-    """The pages one DSv4 pool actually transfers, and the tokens they hold.
-
-    A windowed group's block table opens with null blocks standing in for
-    pages the allocator already freed, so both the pages and the token count
-    they would account for come off the front together. Producer and consumer
-    call this with the same pool geometry and the same request length, which
-    is what keeps their page lists aligned index for index.
-    """
-    trimmed = _stage3_trim_window_pages(block_ids,
-                                        num_tokens=num_tokens,
-                                        page_tokens=pool.page_tokens,
-                                        window_tokens=pool.window_tokens,
-                                        group_label=pool.tag)
-    dropped_pages = len(block_ids) - len(trimmed)
-    return trimmed, int(num_tokens) - dropped_pages * int(pool.page_tokens)
 
 
 @dataclass
@@ -567,9 +353,9 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config)
         self.use_raiden = use_raiden
         self._stage3_fa_group_index = 0
-        self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
+        self._stage3_transfer_groups: tuple[TransferGroup, ...] = ()
         if use_raiden and _use_raiden_stage3_transport():
-            self._stage3_transfer_groups = _stage3_transfer_groups(
+            self._stage3_transfer_groups = plan_transfer_groups(
                 kv_cache_config.kv_cache_groups,
                 multi_group=_use_raiden_dsv4_admission())
             self._stage3_fa_group_index = (
@@ -1157,7 +943,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self._stage3_finished_sends: OrderedDict[str, tuple[int, tuple[
             int, ...], int, dict[str, Any]]] = OrderedDict()
         self._stage3_fa_group_index = 0
-        self._stage3_transfer_groups: tuple[_Stage3TransferGroup, ...] = ()
+        self._stage3_transfer_groups: tuple[TransferGroup, ...] = ()
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
         # Get DP rank and TP size from config and stagger kv_port and side_channel_port
@@ -1367,10 +1153,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # Every planned group must be present before any of them is read; a
         # missing one means the decode allocation and the admitted manifest
         # disagree about the group layout.
-        for transfer_group in (
-                self._stage3_transfer_groups or (_Stage3TransferGroup(
-                    cache_group_index=self._stage3_fa_group_index,
-                    page_tokens=self.block_size), )):
+        for transfer_group in (self._stage3_transfer_groups or (TransferGroup(
+                cache_group_index=self._stage3_fa_group_index,
+                page_tokens=self.block_size), )):
             if transfer_group.cache_group_index >= len(grouped_block_ids):
                 raise ValueError(
                     "Stage-3 FA KV cache group is absent from decode "
@@ -1638,7 +1423,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             recycled: list[tuple[int, int]] = []
             for group, ids in zip(self._stage3_transfer_groups,
                                   normalized_group_block_ids):
-                dead = _stage3_recycled_transfer_pages(
+                dead = recycled_transfer_pages(
                     ids,
                     num_tokens=num_tokens,
                     page_tokens=group.page_tokens,
@@ -1845,7 +1630,7 @@ class TPURaidenConnectorWorker:
         self._stage3_state_group_count = 0
         # DSv4: the admitted pool tags in wire order, each with the kv-cache
         # group whose block table addresses it and its page geometry.
-        self._stage3_dsv4_plan: tuple[_Stage3Dsv4Pool, ...] = ()
+        self._stage3_dsv4_plan: tuple[Dsv4Pool, ...] = ()
         self._stage3_dsv4_group_count = 0
         # GDN state-class sibling transfers: derived source req_id -> base
         # destination req_id; destination -> derived ids still pending; FA
@@ -2321,21 +2106,21 @@ class TPURaidenConnectorWorker:
 
     def _measure_dsv4_pool_plan(
             self, manifest: Any,
-            kv_cache_groups: Sequence[Any]) -> tuple[_Stage3Dsv4Pool, ...]:
-        """Builds one `_Stage3Dsv4Pool` per DSv4 tag in the manifest.
+            kv_cache_groups: Sequence[Any]) -> tuple[Dsv4Pool, ...]:
+        """Builds one `Dsv4Pool` per DSv4 tag in the manifest.
 
         The worker has no scheduler to inherit the transfer-group plan from,
         so it recomputes one here. The two must agree: `plan_position`
         indexes the block tables the scheduler sends.
         """
-        transfer_groups = _stage3_transfer_groups(kv_cache_groups,
-                                                  multi_group=True)
+        transfer_groups = plan_transfer_groups(kv_cache_groups,
+                                               multi_group=True)
         plan_position_by_group = {
             group.cache_group_index: position
             for position, group in enumerate(transfer_groups)
         }
         geometry = manifest.geometry_by_tag()
-        pools: list[_Stage3Dsv4Pool] = []
+        pools: list[Dsv4Pool] = []
         seen: set[str] = set()
         for pool in manifest.pools:
             tag = str(pool.tag)
@@ -2351,7 +2136,7 @@ class TPURaidenConnectorWorker:
                     f"{[g.cache_group_index for g in transfer_groups]}")
             (region, ) = pool.regions
             pools.append(
-                _Stage3Dsv4Pool(
+                Dsv4Pool(
                     tag=tag,
                     plan_position=position,
                     page_tokens=int(
@@ -2359,7 +2144,7 @@ class TPURaidenConnectorWorker:
                     live_bytes_per_block=int(
                         geometry[tag]["live_bytes_per_block"]),
                     row_bytes=int(region.unit_bytes),
-                    window_tokens=_stage3_group_window_tokens(
+                    window_tokens=group_window_tokens(
                         kv_cache_groups[group_index].kv_cache_spec),
                 ))
         if not pools:
@@ -3264,7 +3049,7 @@ class TPURaidenConnectorWorker:
             group_blocks = self._stage3_dsv4_group_blocks(req_meta)
             pool_spans = []
             for pool in self._stage3_dsv4_plan:
-                pool_blocks, pool_tokens = _stage3_dsv4_pool_pages(
+                pool_blocks, pool_tokens = dsv4_pool_pages(
                     pool, group_blocks[pool.plan_position], num_tokens)
                 pool_spans.append(
                     lower_dsv4_row_spans(
@@ -3785,7 +3570,7 @@ class TPURaidenConnectorWorker:
                 dst_blocks = []
                 dst_counts = []
                 for pool in self._stage3_dsv4_plan:
-                    pages, _ = _stage3_dsv4_pool_pages(
+                    pages, _ = dsv4_pool_pages(
                         pool, group_blocks[pool.plan_position], num_tokens)
                     transfer_tags.append(pool.tag)
                     dst_blocks.extend(pages)

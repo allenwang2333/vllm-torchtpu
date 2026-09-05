@@ -34,7 +34,7 @@ The relationship is many-to-many in both directions:
 
 Stage 3 was built for one cache group with one page size, and it refused to
 start on anything else, with the error *"requires exactly one full-attention KV
-cache group"* (`tpu_connector.py:283-287`, base commit `293a4737`). DSv4 breaks
+cache group"* (`transfer_plan.py:186-190`, base commit `293a4737`). DSv4 breaks
 that twice over.
 
 ### 2a. Six groups, six page sizes, six windows
@@ -100,13 +100,15 @@ byte range and a list of integers.
 ## 3. The plumbing that was added
 
 **Each cache group gets its own transfer record.** Stage 3 used to hold a single
-page size for the whole model. It now builds one `_Stage3TransferGroup` per
-group, carrying that group's index, page size and window
-(`tpu_connector.py:125-137`, `:251-296`):
+page size for the whole model. It now builds one `TransferGroup` per group,
+carrying that group's index, page size and window. The page arithmetic in this
+section lives in `transfer_plan.py`, apart from the connector, because both
+peers have to run the identical formula and it is worth being able to read it
+without the transport around it (`transfer_plan.py:29-42`, `:155-199`):
 
 ```python
 @dataclass(frozen=True)
-class _Stage3TransferGroup:
+class TransferGroup:
     cache_group_index: int
     page_tokens: int
     window_tokens: Optional[int] = None
@@ -125,8 +127,9 @@ the pages really would collide. Better to die at startup than corrupt KV
 quietly.
 
 **Per-group block tables on the wire:** `group_block_ids: list[list[int]]`
-threaded through the send metadata (`tpu_connector.py:598-613`). One list per
-group instead of one flat list for the model:
+carried on the send metadata (`connector_metadata.py:36`) and filled in at
+`tpu_connector.py:440-470`. One list per group instead of one flat list for
+the model:
 
 ```
   BEFORE: one group, so one of everything.
@@ -150,10 +153,10 @@ only through row N's tag, so a page number is never interpreted against a group
 that does not own it. The tables have different lengths because the groups have
 different page sizes, all describing the same request.
 
-That is where most of the PR's 2712 lines go: every place that handled one group
-now loops over six, and each of those places exists twice, once where the
-producer registers what it is sending and once where the consumer works out
-where it lands.
+That is where most of the PR goes: every place that handled one group now loops
+over six, and each of those places exists twice, once where the producer
+registers what it is sending and once where the consumer works out where it
+lands.
 
 ## 4. Sliding window
 
@@ -184,19 +187,19 @@ Those nulls are all page 0, so shipping them hands Raiden one destination named
 request riding on it.
 
 So the connector drops the dead prefix using the allocator's own formula
-(`_stage3_skipped_window_pages`, `tpu_connector.py:144-163`, trim at
-`:165-205`). Producer and consumer both run it on the same request length and
-page geometry, which keeps their page lists paired entry for entry. Each group
-carries its own `window_tokens` in `_Stage3TransferGroup`. DSv4 wraps its groups
-in `UniformTypeKVCacheSpecs`, which has no `sliding_window`, so
-`_stage3_group_window_tokens` (`:237-248`) unwraps it and asks a layer.
+(`skipped_window_pages`, `transfer_plan.py:48-67`, trim at `:69-110`).
+Producer and consumer both run it on the same request length and page
+geometry, which keeps their page lists paired entry for entry. Each group
+carries its own `window_tokens` in `TransferGroup`. DSv4 wraps its groups in
+`UniformTypeKVCacheSpecs`, which has no `sliding_window`, so
+`group_window_tokens` (`:141-152`) unwraps it and asks a layer.
 
 ### 4c. The two numbers have to be one number
 
 The allocator frees against `num_computed_tokens`, how far the producer ran.
 The connector skips against `num_tokens`, the transfer prefix, which is one
 token shorter because the last prompt token is withheld for the decode replica
-to recompute (`:1393-1410`). One token is enough to cross a page boundary:
+to recompute (`:1348-1366`). One token is enough to cross a page boundary:
 
 ```
   prompt 375, computed 375, num_tokens 374
@@ -211,7 +214,7 @@ on one request in sixteen.
 The fix is to stop the producer where the handoff stops. It drops the final
 prompt token from its own request before prefill, so it computes N-1 and
 `num_computed_tokens` really is N-1 (`_maybe_truncate_prompt_for_handoff`,
-`:779-810`). Both formulas then read 374 and cannot disagree. Nothing on the
+`:636-667`). Both formulas then read 374 and cannot disagree. Nothing on the
 wire moves, because `num_tokens` was 374 either way. The decode replica runs
 that same formula on that same 374, so it frees the pages the producer skipped
 and expects exactly what arrived. The two sides match by construction, not by
@@ -220,7 +223,7 @@ separate arithmetic landing on the same answer.
 Mamba needed this first, for its own reason: its state advances every token, so
 a producer running to N ships h(N) and the decode replica advances the
 recurrence twice. The trigger was keyed to Mamba groups, and
-`_stage3_truncates_prompt` (`:1085-1096`) widens it to any group with a window.
+`_stage3_truncates_prompt` (`:960-969`) widens it to any group with a window.
 
 ### 4d. When prefill runs past the handoff
 
@@ -230,7 +233,7 @@ window slides forward, the pages it was going to send get recycled, and by
 `request_finished` there is nothing left to transfer.
 
 The connector catches that by counting how many pages in the range are the null
-block (`_stage3_recycled_transfer_pages`, `:208-235`) and drops the send, so the
+block (`recycled_transfer_pages`, `transfer_plan.py:112-139`) and drops the send, so the
 decode replica prefills the request itself. Slower, but correct. Without it two
 recycled pages arrive as page 0 twice, one destination named by two sources,
 which Raiden rejects and which takes the engine down with it. That rejection is
