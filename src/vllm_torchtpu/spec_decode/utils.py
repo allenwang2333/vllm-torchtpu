@@ -1,4 +1,5 @@
 import contextlib
+import gc
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -144,6 +145,49 @@ def populate_draft_embed_from_target(draft_model: torch.nn.Module,
         "%d x %d per worker.", org_vocab, dim)
 
 
+def release_replaced_draft_module(orphan: torch.nn.Module | None,
+                                  replacement: Any) -> None:
+    """Free the draft submodule that sharing just replaced, deterministically.
+
+    ``maybe_share_embeddings`` / ``maybe_share_lm_head`` rebind
+    ``draft_model.model.embed_tokens`` and ``draft_model.lm_head`` to the
+    target's, dropping the last *named* reference to the copies the draft just
+    built and loaded from the checkpoint. Refcounting does not reclaim those:
+    ``set_weight_attrs`` stores the module's own bound ``weight_loader`` on its
+    ``Parameter``, so module -> ``_parameters`` -> weight -> bound method ->
+    module is a reference cycle, and the HBM comes back only when the cyclic
+    collector happens to run.
+
+    Nondeterministic release is worse than merely wasteful here, because HBM is
+    measured moments later by a *live* ``torch.accelerator.get_memory_info``
+    query (``utils.compute_hbm_budget`` <-
+    ``TPUModelRunner._available_kv_cache_hbm``). Ranks that collected size a
+    larger KV pool than ranks that did not, and the executor rejects the whole
+    run:
+
+        ValueError: [kv-sizing] workers disagree on the compact-mamba
+        attention block count by 1291 blocks (min=167614, max=168905,
+        tolerance=838)
+
+    Seen on GLM-5.3-Flash MTP at TP=8: six ranks reported 48.02 GiB free and
+    two 48.31 GiB. The 0.29 GiB gap is exactly the orphan -- ``embed_tokens``
+    plus ``lm_head`` at ``154880/8 x 4096`` bf16 = 302.5 MiB per rank.
+
+    Clearing the module's ``_parameters`` is what makes this deterministic;
+    the ``gc.collect()`` afterwards only cleans up the now-garbage module
+    shell. Relying on the collector alone would leave the release at the mercy
+    of GC thresholds, which is the bug.
+    """
+    # `is` and not `==`: when the draft already holds the target's module
+    # (tp=1 aliasing), the "orphan" is the tensor still in use and clearing it
+    # would delete the target's embedding.
+    if orphan is None or orphan is replacement:
+        return
+    for name in list(orphan._parameters):
+        orphan._parameters[name] = None
+    gc.collect()
+
+
 def maybe_share_embeddings(draft_model: torch.nn.Module,
                            target_model: torch.nn.Module,
                            tp_layout_matches: bool,
@@ -172,7 +216,9 @@ def maybe_share_embeddings(draft_model: torch.nn.Module,
             logger.info(
                 "Sharing the target's embed_tokens with the draft using the same TP layout."
             )
+            orphan = getattr(draft_model.model, "embed_tokens", None)
             draft_model.model.embed_tokens = target_embed
+            release_replaced_draft_module(orphan, target_embed)
         else:
             logger.info(
                 "Populating draft's own embed_tokens with a host-gathered copy of target embedding."
@@ -232,12 +278,16 @@ def maybe_share_lm_head(draft_model: torch.nn.Module,
                 "Sharing the target's lm_head with the draft using the same TP layout."
             )
             if hasattr(draft_model, "lm_head"):
+                orphan = draft_model.lm_head
                 draft_model.lm_head = target_lm_head
             elif hasattr(draft_model, "model") and hasattr(
                     draft_model.model, "lm_head"):
+                orphan = draft_model.model.lm_head
                 draft_model.model.lm_head = target_lm_head
             else:
+                orphan = None
                 draft_model.lm_head = target_lm_head
+            release_replaced_draft_module(orphan, target_lm_head)
         elif materialize_if_mismatched:
             logger.info("Populating draft's own lm_head with a host-gathered, "
                         "per-worker replicated copy of the target lm_head.")
