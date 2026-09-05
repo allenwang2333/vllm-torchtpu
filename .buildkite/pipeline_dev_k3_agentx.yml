@@ -26,6 +26,7 @@ steps:
 
   - label: "K3 AgentX conc 4 ctx 128k, no prefix caching (TPU v7x-32)"
     key: k3_agentx_noapc
+    skip: "build 6 done; ctx sweep first"
     depends_on:
       - build_docker
       - k3_agentx_apc
@@ -39,5 +40,20 @@ steps:
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
       - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx --conc 4 --max-model-len 131072 --fast 1 --apc 0"
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "K3 context sweep 8k/32k/64k/112k bs=1 (TPU v7x-32)"
+    key: k3_ctxsweep
+    depends_on: build_docker
+    timeout_in_minutes: 300
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ctxsweep.sh --config kimi-k3-tp32-ep-agentx-ctxsweep --results-dir /perf_eval_results/k3-ctxsweep"
     artifact_paths:
       - "perf_eval_results/**/*"
