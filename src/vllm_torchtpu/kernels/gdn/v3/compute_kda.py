@@ -358,58 +358,91 @@ def chunked_kda(
         out_list.append(out.swapaxes(0, 1))
         state_list.append(state)
     out = jnp.stack(out_list, axis=0)
-    # The caller expects one state per window position. KDA rejects
-    # speculative decoding, so `window_size` is always 1 and the only
-    # checkpoint is the end-of-tile state.
+    # The caller expects one state per window position, and the chunked solve
+    # produces only an end-of-chunk state. That is fine because this path runs
+    # exclusively in PER_SEQ mode, where `window_size` is 1; a verify window
+    # goes through `recurrent_kda` instead (see `config.use_recurrent`). The
+    # GDN chunked path has the same shape and the same reason.
     state = jnp.stack(state_list, axis=0)[:, jnp.newaxis]
     return out, state
 
 
 def recurrent_kda_per_seq(
-    q_curr: jax.Array,  # (num_kq_heads, kq_head_dim)
-    k_curr: jax.Array,  # (num_kq_heads, kq_head_dim)
-    v_curr: jax.Array,  # (num_v_heads, v_head_dim)
-    gating_curr: jax.Array,  # (num_v_heads, kq_head_dim)
-    beta_curr: jax.Array,  # (num_v_heads, 1)
+    q_compact: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
+    k_compact: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
+    v_compact: jax.Array,  # (num_v_heads, chunk, v_head_dim)
+    gating: jax.Array,  # (num_v_heads, chunk, kq_head_dim)
+    beta: jax.Array,  # (num_v_heads, chunk, 1)
     state: jax.Array,  # (num_v_heads, kq_head_dim, v_head_dim)
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    # Repeat Q and K for GQA
-    q_heads = jnp.repeat(q_curr, cfgs.v_per_kq_head,
-                         axis=0)[:, None, :]  # (num_v_heads, 1, kq_head_dim)
-    k_heads = jnp.repeat(k_curr, cfgs.v_per_kq_head,
-                         axis=0)[:, None, :]  # (num_v_heads, 1, kq_head_dim)
-    k_heads_t = compute_gdn.fused_transpose_broadcast(
-        k_heads, src_dim=2, dst_dim=1)  # (num_v_heads, kq_head_dim, 1)
+    """KDA recurrence over a tile, keeping one state per window position.
 
-    v_heads = v_curr[:, None, :]  # (num_v_heads, 1, v_head_dim)
-    beta_heads = beta_curr[:, None]  # (num_v_heads, 1, 1)
-    gating_decay = gating_curr[..., None]  # (num_v_heads, kq_head_dim, 1)
+    Returns ``(out, state)`` where ``state`` stacks the post-token state of the
+    last ``cfgs.window_size`` positions -- ``[window_size, num_v_heads,
+    kq_head_dim, v_head_dim]``. With ``window_size == 1`` that is just the
+    final state, which is the non-speculative case.
 
-    state_updated = state * gating_decay
+    Speculative decode needs the per-position states so a rejected draft can be
+    rolled back by *selecting* the checkpoint of the last accepted token, never
+    by recomputing. That is why a verify window runs here rather than through
+    ``chunked_kda``: the chunked solve only ever produces an end-of-chunk state
+    (as does its GDN counterpart -- see ``compute_gdn.chunked_gdn``).
+    """
+    out_list = []
+    state_list = []
+    for c_idx in range(cfgs.chunk_size):
+        q_curr = q_compact[:, c_idx]  # (num_kq_heads, kq_head_dim)
+        k_curr = k_compact[:, c_idx]
+        v_curr = v_compact[:, c_idx]  # (num_v_heads, v_head_dim)
+        beta_curr = beta[:, c_idx]  # (num_v_heads, 1)
+        # Indexed before the trailing broadcast, not after: KDA's gate is
+        # per-channel, so this is (num_v_heads, kq_head_dim) where GDN's is
+        # (num_v_heads, 1).
+        gating_curr = gating[:, c_idx]  # (num_v_heads, kq_head_dim)
 
-    contract_dk = (((2, ), (1, )), ((0, ), (0, )))
-    v_updated = jax.lax.dot(
-        k_heads,
-        state_updated,
-        dimension_numbers=contract_dk,
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
+        # Repeat Q and K for GQA
+        q_heads = jnp.repeat(q_curr, cfgs.v_per_kq_head, axis=0)[:, None, :]
+        k_heads = jnp.repeat(k_curr, cfgs.v_per_kq_head, axis=0)[:, None, :]
+        k_heads_t = compute_gdn.fused_transpose_broadcast(
+            k_heads, src_dim=2, dst_dim=1)  # (num_v_heads, kq_head_dim, 1)
 
-    v_diff = v_heads - v_updated
-    v_new = beta_heads * v_diff
+        v_heads = v_curr[:, None, :]  # (num_v_heads, 1, v_head_dim)
+        beta_heads = beta_curr[:, None]  # (num_v_heads, 1, 1)
+        gating_decay = gating_curr[..., None]  # (num_v_heads, kq_head_dim, 1)
 
-    state_new = k_heads_t * v_new
-    state = state_updated + state_new
+        state_updated = state * gating_decay
 
-    out = jax.lax.dot(
-        q_heads,
-        state,
-        dimension_numbers=contract_dk,
-        preferred_element_type=jnp.float32,
-    ).astype(cfgs.dtypes.compute)
+        contract_dk = (((2, ), (1, )), ((0, ), (0, )))
+        v_updated = jax.lax.dot(
+            k_heads,
+            state_updated,
+            dimension_numbers=contract_dk,
+            preferred_element_type=jnp.float32,
+        ).astype(cfgs.dtypes.compute)
 
-    return out[:, 0, :], state
+        v_diff = v_heads - v_updated
+        v_new = beta_heads * v_diff
+
+        state_new = k_heads_t * v_new
+        state = state_updated + state_new
+
+        out = jax.lax.dot(
+            q_heads,
+            state,
+            dimension_numbers=contract_dk,
+            preferred_element_type=jnp.float32,
+        ).astype(cfgs.dtypes.compute)
+
+        out_list.append(out[:, 0, :])
+        # Positions past `real_sizes` are masked by the caller, so the state
+        # stops changing there and trailing checkpoints repeat the last real
+        # token's state. Checkpoints of earlier positions are dead code the
+        # compiler drops.
+        if c_idx >= cfgs.chunk_size - cfgs.window_size:
+            state_list.append(state)
+
+    return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
 def recurrent_kda(
@@ -426,33 +459,45 @@ def recurrent_kda(
 ) -> tuple[jax.Array, jax.Array]:
 
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
-    valid_seq_mask = (real_sizes[:, None, None] > 0).astype(mask_dtype)
+    # Per *position*, not per sequence. A verify window is one tile whose
+    # positions are separate tokens, and a partially-accepted window has
+    # `real_sizes < window_size`. The old whole-sequence mask
+    # (`real_sizes > 0`) would leave padded positions live and let them keep
+    # advancing the recurrence past the last real token -- silently, since the
+    # shapes are unchanged.
+    iota = jax.lax.broadcasted_iota(
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2)
+    mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
 
-    # squeeze unnecessary axis
-    q = q_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    k = k_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    v = v_compact[:, :, 0, 0, :].astype(cfg.dtypes.compute)
-    a = a_compact[:, :, 0, 0, :].astype(jnp.float32)
-
-    # Beta: [seqs, num_v_heads, 1]
-    b = b_compact[:, 0, 0, 0, :cfg.num_v_heads, None].astype(jnp.float32)
-
-    q = jnp.where(valid_seq_mask, q, 0.0)
-    k = jnp.where(valid_seq_mask, k, 0.0)
-    v = jnp.where(valid_seq_mask, v, 0.0)
+    # Keep the chunk axis; only the vestigial unit axis is squeezed.
+    q = jnp.where(mask, q_compact.astype(cfg.dtypes.compute), 0.0)[:, :, :, 0]
+    k = jnp.where(mask, k_compact.astype(cfg.dtypes.compute), 0.0)[:, :, :, 0]
+    v = jnp.where(mask, v_compact.astype(cfg.dtypes.compute), 0.0)[:, :, :, 0]
+    a = a_compact[:, :, :, 0].astype(jnp.float32)
 
     q = _l2_norm_f32(q) * (cfg.kq_head_dim**-0.5)
     k = _l2_norm_f32(k)
 
-    # Delta rule step-size beta in [0, 1]
-    beta = jnp.where(valid_seq_mask, jax.nn.sigmoid(b), 0.0)
+    # Beta: [seqs, num_v_heads, chunk, 1]. `b_compact` is
+    # (seqs, 1, chunk, 1, lanes) with the heads on the lane axis.
+    b = b_compact[:, 0, :, 0, :cfg.num_v_heads].astype(jnp.float32)
+    b = jnp.swapaxes(b, 1, 2)[..., None]
 
-    a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1).astype(jnp.float32)
-    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads,
+    # [seqs, 1, chunk, 1] against [seqs, num_v_heads, chunk, *]
+    pos_mask = mask[:, :, :, :, 0]
+    # Delta rule step-size beta in [0, 1]
+    beta = jnp.where(pos_mask, jax.nn.sigmoid(b), 0.0)
+
+    a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1, 1).astype(jnp.float32)
+    dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1,
                                   cfg.kq_head_dim).astype(jnp.float32)
     gating_log = activate_gate(a, a_log_kda, dt_bias_kda, cfg)
-    gating_log = jnp.where(valid_seq_mask, gating_log, 0.0)
-    gating_decay = jnp.exp(gating_log)  # [seqs, num_v_heads, kq_head_dim]
+    # Masked to 0 so the decay `exp(0) == 1`, i.e. an invalid position leaves
+    # the state untouched rather than shrinking it. Note this masks the
+    # *activated* log-gate: masking the raw `a` instead would still decay,
+    # because `activate_gate(0)` is not 0.
+    gating_log = jnp.where(pos_mask, gating_log, 0.0)
+    gating_decay = jnp.exp(gating_log)  # [seqs, num_v_heads, chunk, kq_dim]
 
     out_list = []
     new_state_list = []
@@ -466,10 +511,11 @@ def recurrent_kda(
             state_prev[idx],
             cfg,
         )
-        out_list.append(out[None, :])
+        out_list.append(out)
         new_state_list.append(state)
 
     out = jnp.stack(out_list, axis=0)
-    # One state per window position; see `chunked_kda`.
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)[:, jnp.newaxis]
+    # [seqs, window_size, num_v_heads, kq_head_dim, v_head_dim]; the per-seq
+    # call already carries the window axis.
+    new_recurrent_state = jnp.stack(new_state_list, axis=0)
     return out, new_recurrent_state

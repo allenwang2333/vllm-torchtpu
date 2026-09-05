@@ -345,11 +345,11 @@ class KdaAttentionV3Test(parameterized.TestCase):
             overrides=dict(gate_lower_bound=0.0),
             error=ValueError,
         ),
-        dict(
-            testcase_name="speculative_decoding",
-            overrides=dict(num_spec_tokens=1),
-            error=NotImplementedError,
-        ),
+        # `num_spec_tokens > 0` used to be rejected here. It is now supported:
+        # `recurrent_kda` keeps one state checkpoint per window position, which
+        # is what lets a rejected draft be rolled back by selecting the last
+        # accepted token's checkpoint. See
+        # tests/kernels/test_kda_spec_checkpoints.py.
     )
     def test_rejects(self, overrides, error):
         """The entry point's guards, which all fail silently if dropped."""

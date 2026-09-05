@@ -453,13 +453,6 @@ def fused_conv1d_gdn(
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
-    if is_kda and num_spec_tokens > 0:
-        # The KDA compute path returns a single end-of-tile state, not one
-        # checkpoint per window position, so it cannot roll back rejected
-        # draft tokens.
-        raise NotImplementedError(
-            "KDA does not support speculative decoding yet "
-            f"(num_spec_tokens={num_spec_tokens}).")
     if gate_lower_bound is not None:
         if not is_kda:
             raise ValueError("gate_lower_bound only applies to KDA; got "
