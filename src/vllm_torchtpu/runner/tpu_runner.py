@@ -1280,9 +1280,7 @@ class TPUModelRunner(GPUModelRunner):
                     # enables the memory saving of cross-layer kv sharing, allowing
                     # a given amount of memory to accommodate longer context lengths
                     # or enable more requests to be processed simultaneously.
-                    normalized_layer_name = layer_name.replace(
-                        "draft_model.model.layers.", "draft_model.layers.")
-                    self.shared_kv_cache_layers[normalized_layer_name] = kv_tgt_layer
+                    self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                     continue
 
                 if attn_module.attn_type == AttentionType.DECODER:
@@ -1374,21 +1372,33 @@ class TPUModelRunner(GPUModelRunner):
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
-        
-        # Force Gemma-4 MTP KV cache sharing aliases directly into the spec
-        if self._is_async_drafter and hasattr(self.drafter, "draft_model") and self.drafter.draft_model is not None:
-            if not hasattr(self, "shared_kv_cache_layers") or self.shared_kv_cache_layers is None:
-                self.shared_kv_cache_layers = {}
-            for draft_idx, layer in enumerate(self.drafter.draft_model.model.layers):
-                if hasattr(layer, "self_attn") and getattr(layer.self_attn, "attn", None) is not None:
-                    attn = layer.self_attn.attn
-                    if getattr(attn, "kv_sharing_target_layer_name", None) is not None:
-                        target_layer_name = attn.kv_sharing_target_layer_name
-                        draft_layer_name = f"draft_model.layers.{draft_idx}.self_attn.attn"
-                        
-                        self.shared_kv_cache_layers[draft_layer_name] = target_layer_name
-                        kv_cache_spec.pop(draft_layer_name, None)
-                        logger.info("[TPU KV SPEC CHECK] Registered draft layer alias (and omitted from spec): %s -> %s", draft_layer_name, target_layer_name)
+
+        # Cross-model KV sharing (Gemma-4-style MTP) rides the same path as
+        # within-model sharing. The drafter is loaded before `get_kv_cache_spec`
+        # runs, so its `Attention` modules are already in the static forward
+        # context with `kv_sharing_target_layer_name` set and the loop above has
+        # registered them. Verify that rather than re-registering: a draft layer
+        # reaching this point unregistered would be allocated its own KV cache
+        # and would silently write there instead of into the target's.
+        if (self._is_async_drafter
+                and getattr(self.drafter, "draft_model", None) is not None):
+            for draft_idx, layer in enumerate(
+                    self.drafter.draft_model.model.layers):
+                attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+                if attn is None or attn.kv_sharing_target_layer_name is None:
+                    continue
+                name = f"draft_model.layers.{draft_idx}.self_attn.attn"
+                target = attn.kv_sharing_target_layer_name
+                if self.shared_kv_cache_layers.get(name) != target:
+                    raise RuntimeError(
+                        f"Draft layer {name} declares KV sharing with {target} "
+                        "but was not registered as a shared layer. It would be "
+                        "given its own KV cache and write there instead of the "
+                        "target's.")
+                if name in kv_cache_spec:
+                    raise RuntimeError(
+                        f"Draft layer {name} shares KV with {target} but still "
+                        "has its own KVCacheSpec.")
 
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
@@ -2703,41 +2713,6 @@ class TPUModelRunner(GPUModelRunner):
                 f"{n_placeholder} optimistic placeholders -- output_token_ids "
                 "rollback would drop the wrong elements")
 
-            # --- DIAGNOSTIC LOG START ---
-            try:
-                try:
-                    from vllm.distributed import get_tensor_model_parallel_rank
-                    is_driver = getattr(self, "is_driver_worker", True) and (get_tensor_model_parallel_rank() == 0)
-                except Exception:
-                    is_driver = getattr(self, "is_driver_worker", True)
-                
-                if is_driver:
-                    num_draft = pre_num_draft_per_req.get(pre_req_idx, 0) if pre_num_draft_per_req else 0
-                    if num_draft > 0 and req_id in self.input_batch.req_id_to_index:
-                        req_idx = self.input_batch.req_id_to_index[req_id]
-                        draft_token_ids = self.input_batch.token_ids_cpu[req_idx, seq_len : seq_len + num_draft].tolist()
-                        tokens_no_spec_before = int(self.input_batch.num_tokens_no_spec[req_idx])
-                        tokens_no_spec_after = tokens_no_spec_before - n_placeholder + len(sampled_ids)
-
-                        logger.info("This is the entirety of draft_token_ids for req_id %s: %s", req_id, draft_token_ids)
-                        
-                        for d_idx, d_token_id in enumerate(draft_token_ids):
-                            t_token_id = sampled_ids[d_idx] if d_idx < len(sampled_ids) else None
-                            status = "ACCEPT" if d_token_id == t_token_id else "REJECT"
-                            logger.info(
-                                "[DIAG] REJECTION EVENT | Req: %s | StepIndex: %d | DraftToken: %d | TargetToken: %s | Status: %s | "
-                                "SeqLen Before: %d | SeqLen After: %d | "
-                                "num_tokens_no_spec Before: %d | num_tokens_no_spec After: %d | "
-                                "req_state.num_computed_tokens: %d",
-                                req_id, seq_len + d_idx, d_token_id, t_token_id, status,
-                                seq_len + n_placeholder, seq_len + len(sampled_ids),
-                                tokens_no_spec_before, tokens_no_spec_after,
-                                req_state.num_computed_tokens
-                            )
-            except Exception as e:
-                logger.error("[DIAG] Error during rejection logging: %s", e)
-            # --- DIAGNOSTIC LOG END ---
-
             del req_state.output_token_ids[-n_placeholder:]
             req_state.output_token_ids.extend(sampled_ids)
 
@@ -3635,15 +3610,6 @@ class TPUModelRunner(GPUModelRunner):
                 spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
                     input_ids, spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices)
-                if getattr(self, "is_driver", True):
-                    try:
-                        logger.info(
-                            "[DIAG ASYNC EXTRACT] raw draft_token_ids from device: %s | shape: %s",
-                            spec_decode_metadata.draft_token_ids.cpu().tolist()[:10],
-                            list(spec_decode_metadata.draft_token_ids.shape),
-                        )
-                    except Exception as e:
-                        logger.warning("[DIAG ASYNC EXTRACT] Failed to log draft_token_ids: %s", e)
             draft_input_ids_src = input_ids
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
@@ -4044,25 +4010,6 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_p,
                     all_greedy=False).view(-1)
         if all_greedy:
-            # Safe diagnostic logging on Rank 0 to inspect rejection sampler inputs
-            try:
-                from vllm.distributed import get_tensor_model_parallel_rank
-                is_rank0 = (get_tensor_model_parallel_rank() == 0)
-            except Exception:
-                is_rank0 = True
-            if is_rank0:
-                try:
-                    logger.info(
-                        "[TPU DIAG REJECT] DRAFT TOKENS: %s | TARGET ARGMAX: %s | DRAFT LENGTHS: %s | SEGMENT IDS: %s | GROUP INDICES: %s",
-                        md.draft_token_ids.cpu().tolist()[:10],
-                        target_logits.argmax(dim=-1).cpu().tolist()[:10],
-                        md.draft_lengths.cpu().tolist()[:10],
-                        md.segment_ids.cpu().tolist()[:10],
-                        md.group_indices.cpu().tolist()[:10],
-                    )
-                except Exception as e:
-                    logger.warning("[TPU DIAG REJECT] Failed to log rejection inputs: %s", e)
-
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
@@ -5874,12 +5821,7 @@ class TPUModelRunner(GPUModelRunner):
             self._update_hybrid_attention_mamba_layout(kv_caches,
                                                        kernel_block_sizes)
 
-        for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
-        ):
-            logger.info("[TPU KV ALIAS CHECK] Aliasing %s -> %s", layer_name, target_layer_name)
-            logger.debug("%s reuses KV cache of %s", layer_name,
-                         target_layer_name)
-            kv_caches[layer_name] = kv_caches[target_layer_name]
+        self._add_shared_kv_cache_aliases(kv_caches)
 
         if self._unified_kv_layout:
             # Flush the pool zero-fill before any compiled execution. PJRT
@@ -6476,12 +6418,6 @@ class TPUModelRunner(GPUModelRunner):
         #     pallas.set_buffer_donor_(kv_cache, True)
 
         # Reset kv_caches list (tpu_bind_kv_cache expects empty list)
-        if hasattr(self, "shared_kv_cache_layers") and self.shared_kv_cache_layers:
-            for draft_layer, target_layer in self.shared_kv_cache_layers.items():
-                if target_layer in kv_caches:
-                    kv_caches[draft_layer] = kv_caches[target_layer]
-                    logger.info("[TPU KV ALIAS CHECK] Bound physical cache: %s -> %s", draft_layer, target_layer)
-
         self.kv_caches = []
 
         # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names

@@ -16,11 +16,13 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.attention_metadata import \
     AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              _force_draft_tp1,
                                              maybe_share_embeddings,
@@ -122,6 +124,12 @@ class Eagle3Proposer:
         # load_model by diffing the global attention-layer registry before
         # vs after the draft model loads.
         self._draft_attn_layer_names: set[str] | None = None
+        # True once load_model has wired this draft's attention layers to read
+        # the target's KV cache (cross-model KV sharing, Gemma-4-style MTP).
+        # Resolved from the draft model's own declaration, NOT from
+        # speculative_config.method: `mtp` also covers DeepSeek-V4 MTP, whose
+        # draft owns its KV cache. Drives `advance_draft_positions`.
+        self._draft_kv_shared: bool = False
         # Populated per-step by the runner with the per-chunk draft inputs
         # (token ids, positions, attn ctx, aux hidden states) captured
         # during the target verify forward.
@@ -132,6 +140,18 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+
+    @property
+    def advance_draft_positions(self) -> bool:
+        """Whether each propose step advances the draft's positions/seq_lens.
+
+        A draft that owns its KV cache (eagle3, DeepSeek-V4 MTP) appends one
+        token per step, so both advance by 1. A cross-model KV-sharing draft
+        (Gemma-4 MTP) is Q-only: it writes no KV slots, and every step re-reads
+        the same target prefix with only the query changing, so both stay
+        fixed. Mirrors `Gemma4Speculator.advance_draft_positions` upstream.
+        """
+        return not self._draft_kv_shared
 
     def load_model(self, target_model) -> None:
         """Load the draft model and share embeddings/lm_head with target.
@@ -179,12 +199,42 @@ class Eagle3Proposer:
         if self.speculative_config.method == "mtp":
             self._setup_gemma4_kv_sharing(target_model, target_attn_layer_names)
 
+    def _validate_kv_sharing_supported(self) -> None:
+        """Fail closed on TPU paths that cannot honour `skip_kv_update`.
+
+        A cross-model KV-sharing draft is only safe when the attention impl
+        actually skips the KV write — otherwise its zeroed dummy K/V lands in
+        the target's cache. Two TPU paths reject `skip_kv_update` when the
+        kernel is built (`PallasAttentionBackendImpl._validate_pcp_streaming_
+        support`, and the bundled block-major RPA); surface them here so the
+        failure is a startup error instead of silent corruption or a
+        mid-serving raise.
+        """
+        if envs.VLLM_TPU_BLOCK_MAJOR_KV:
+            raise NotImplementedError(
+                "Cross-model KV-sharing speculative decoding (Gemma-4 MTP) "
+                "requires skip_kv_update, which the block-major KV bundle "
+                "does not implement. Unset VLLM_TPU_BLOCK_MAJOR_KV.")
+        if PcpStaticSupportValidator.from_vllm_config(self.vllm_config).enabled:
+            raise NotImplementedError(
+                "Cross-model KV-sharing speculative decoding (Gemma-4 MTP) "
+                "requires skip_kv_update, which PCP streaming attention does "
+                "not support.")
+
     def _setup_gemma4_kv_sharing(
         self,
         target_model,
         target_attn_layer_names: set[str],
     ) -> None:
-        """Wire draft layers to share KV with the target model."""
+        """Wire Q-only draft layers to read the target model's KV cache.
+
+        Only draft layers that declare `is_kv_shared_layer` participate, so
+        this is a silent no-op for an MTP draft that owns its KV cache
+        (DeepSeek-V4). When any layer is wired, `self._draft_kv_shared` is set
+        and every declaring layer must resolve to a target — a partially wired
+        draft would write dummy K/V into the target's cache through its
+        unwired layers, so an unresolvable layer raises rather than warns.
+        """
         from collections import defaultdict
         draft_config = self.draft_model.config
         draft_text_config = draft_config.get_text_config()
@@ -194,6 +244,18 @@ class Eagle3Proposer:
 
         if not (hasattr(self.draft_model, "model") and hasattr(self.draft_model.model, "layers")):
             return
+
+        # The draft model declares whether its attention reads the target's
+        # cache; `speculative_config.method` cannot distinguish Gemma-4 MTP
+        # from DeepSeek-V4 MTP.
+        shared_layers = [(idx, layer)
+                         for idx, layer in enumerate(
+                             self.draft_model.model.layers)
+                         if getattr(getattr(layer, "self_attn", None),
+                                    "is_kv_shared_layer", False)]
+        if not shared_layers:
+            return
+        self._validate_kv_sharing_supported()
 
         target_num_kv_shared = getattr(target_text_config, "num_kv_shared_layers", 0)
         num_non_shared = len(target_layer_types) - target_num_kv_shared
@@ -209,12 +271,13 @@ class Eagle3Proposer:
                 break
 
         draft_layer_types = getattr(draft_text_config, "layer_types", [])
-        for draft_idx, layer in enumerate(self.draft_model.model.layers):
-            if not hasattr(layer, "self_attn"):
-                continue
+        for draft_idx, layer in shared_layers:
             attn = getattr(layer.self_attn, "attn", None)
             if attn is None:
-                continue
+                raise RuntimeError(
+                    f"Draft layer {draft_idx} declares is_kv_shared_layer but "
+                    "exposes no self_attn.attn to wire; cannot guarantee it "
+                    "will not write into the target's KV cache.")
 
             draft_layer_type = (
                 draft_layer_types[draft_idx]
@@ -223,22 +286,27 @@ class Eagle3Proposer:
             )
             candidates = type_to_target_indices.get(draft_layer_type, [])
             if not candidates:
-                logger.warning(
-                    "No target layer of type '%s' for draft layer %d",
-                    draft_layer_type,
-                    draft_idx,
-                )
-                continue
+                raise RuntimeError(
+                    f"No target layer of type '{draft_layer_type}' to share KV "
+                    f"with for draft layer {draft_idx}. Leaving it unwired "
+                    "would let it write dummy K/V into the target's cache.")
 
             # MTP layers share the LAST target layer of the matching attention type
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
+            # Set BOTH: the module attribute is what get_kv_cache_spec reads to
+            # skip allocating a cache for this layer, while the Pallas impl
+            # derives `skip_kv_update` from its OWN copy (see
+            # PallasAttentionBackendImpl.initialize_kernel / forward). Setting
+            # only the module attr leaves the impl writing zeroed dummy K/V
+            # over the target's real entries.
             attn.kv_sharing_target_layer_name = target_layer_name
-
-            if not hasattr(self.runner, "shared_kv_cache_layers") or self.runner.shared_kv_cache_layers is None:
-                self.runner.shared_kv_cache_layers = {}
-            draft_layer_name = f"draft_model.layers.{draft_idx}.self_attn.attn"
-            self.runner.shared_kv_cache_layers[draft_layer_name] = target_layer_name
+            impl = getattr(attn, "impl", None)
+            if impl is None:
+                raise RuntimeError(
+                    f"Draft attention layer {draft_idx} has no `impl`; cannot "
+                    "enable skip_kv_update for cross-model KV sharing.")
+            impl.kv_sharing_target_layer_name = target_layer_name
 
             logger.info(
                 "Gemma4 MTP (TPU): draft layer %d (%s) -> %s",
@@ -246,6 +314,10 @@ class Eagle3Proposer:
                 draft_layer_type,
                 target_layer_name,
             )
+
+        # Only now that every declaring layer is wired: the propose loop reads
+        # this to freeze positions/seq_lens across draft steps.
+        self._draft_kv_shared = True
 
     def _load_draft_model(self) -> None:
         logger.info(f"Loading {self.speculative_config.method} draft model...")
@@ -296,28 +368,7 @@ class Eagle3Proposer:
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
-        out = self._draft_propose_token_compiled(hidden)
-
-        # Safe diagnostic logging on Rank 0
-        try:
-            from vllm.distributed import get_tensor_model_parallel_rank
-            is_rank0 = (get_tensor_model_parallel_rank() == 0)
-        except Exception:
-            is_rank0 = True
-
-        if is_rank0:
-            try:
-                # Lightweight non-blocking scalar checks
-                logger.info(
-                    "[TPU DIAG] HIDDEN: shape=%s | sum=%.4f | TOKENS: %s",
-                    list(hidden.shape),
-                    hidden.sum().item(),
-                    out.cpu().tolist()[:10],
-                )
-            except Exception as e:
-                logger.warning("[TPU DIAG] Could not log propose tokens: %s", e)
-
-        return out
+        return self._draft_propose_token_compiled(hidden)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
@@ -365,10 +416,6 @@ class Eagle3Proposer:
         # from the per-context re-fusion. torch.cat((ids[1:], ids[-1:])) is
         # value-identical to clone()+[:-1]=ids[1:] (last slot keeps its own
         # value), and index_put is the functional twin of ids[idx] = val.
-        if getattr(self, "speculative_config", None) is not None and self.speculative_config.method == "mtp":
-            return input_ids.index_put((last_token_indices, ),
-                                     next_token_ids.to(input_ids.dtype))
-                                     
         shifted = input_ids
         if input_ids.shape[0] > 1:
             shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
@@ -551,7 +598,7 @@ class Eagle3Proposer:
                                  device=runner.device))
             for step in range(1, K):
                 for ci, chunk in enumerate(chunks):
-                    if self.speculative_config.method != "mtp":
+                    if self.advance_draft_positions:
                         loop_positions[ci] = loop_positions[ci] + 1
                     # Prev step's [p] tokens feed directly — already bucketed.
                     loop_input_ids = draft_tokens_per_chunk[ci][-1]
@@ -561,7 +608,8 @@ class Eagle3Proposer:
                         positions=loop_positions[ci],
                         target_hidden_states=loop_hidden[ci],
                         step_idx=step,
-                        seq_lens_delta=0 if self.speculative_config.method == "mtp" else step,
+                        seq_lens_delta=(step
+                                        if self.advance_draft_positions else 0),
                         num_rejected_np=(None if is_async else
                                          rejected_per_chunk[ci]),
                         num_tokens_padded=padded_nr_per_chunk[ci],
@@ -924,32 +972,6 @@ class Eagle3Proposer:
         effective_num_tokens = (num_tokens_padded
                                 if num_tokens_padded else num_tokens)
 
-        # --- DIAGNOSTIC LOG START ---
-        try:
-            try:
-                from vllm.distributed import get_tensor_model_parallel_rank
-                is_driver = getattr(runner, "is_driver_worker", True) and (get_tensor_model_parallel_rank() == 0)
-            except Exception:
-                is_driver = getattr(runner, "is_driver_worker", True)
-
-            if is_driver:
-                start = chunk.start_index
-                req_ids = runner.input_batch.req_ids[start:start + num_reqs]
-                for i, req_id in enumerate(req_ids):
-                    if req_id in runner.input_batch.req_id_to_index:
-                        req_idx = runner.input_batch.req_id_to_index[req_id]
-                        cpu_seq_len = int(runner.input_batch.num_tokens_no_spec[req_idx])
-                        if step_idx >= 1:
-                            cpu_seq_len += step_idx
-                        logger.info(
-                            "[DIAG] DRAFT METADATA | Req: %s | DraftStep: %d | Chunk: %d | "
-                            "CPU calculated seq_len: %d",
-                            req_id, step_idx, chunk.start_index, cpu_seq_len
-                        )
-        except Exception as e:
-            logger.error("[DIAG] Error during draft metadata logging: %s", e)
-        # --- DIAGNOSTIC LOG END ---
-
         mamba_state_indices = (runner._build_mamba_state_indices(
             chunk.start_index, num_reqs, kernel_num_reqs)
                                if runner._has_mamba_state else None)
@@ -986,35 +1008,24 @@ class Eagle3Proposer:
             "draft attn layer names were not captured during load_model")
         result = dict(per_layer_attn_metadata)
 
-        # Explicitly alias draft layer names to their corresponding target layer metadata
-        static_fwd_ctx = get_layers_from_vllm_config(runner.vllm_config, AttentionLayerBase)
-        for name in self._draft_attn_layer_names:
-            layer_module = static_fwd_ctx.get(name)
-            if layer_module is not None:
-                target_name = getattr(layer_module, "kv_sharing_target_layer_name", None)
-                if target_name is not None:
-                    if target_name in result:
-                        result[name] = result[target_name]
-                    else:
-                        logger.warning(
-                            "Target layer name '%s' for draft layer '%s' "
-                            "not found in attention metadata results.",
-                            target_name, name
-                        )
-                else:
-                    if per_layer_attn_metadata:
-                        result[name] = next(iter(per_layer_attn_metadata.values()))
+        # Draft layers sharing the target's KV cache were added to the target's
+        # KV cache group by `add_kv_sharing_layers_to_kv_cache_groups`, so
+        # `_build_attention_metadata` has already emitted an entry for each of
+        # them. Verify rather than re-alias: a missing entry means the layer
+        # never joined a group, and aliasing it to an arbitrary entry would hide
+        # that behind a plausible-looking forward.
+        missing = [
+            name for name in self._draft_attn_layer_names if name not in result
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Draft attention layers {missing} have no attention metadata; "
+                "they were not added to a KV cache group. Check that "
+                "get_kv_cache_spec registered them in shared_kv_cache_layers.")
 
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
 
-        try:
-            from vllm.distributed import get_tensor_model_parallel_rank
-            if get_tensor_model_parallel_rank() == 0:
-                logger.info("[TPU DIAG] result metadata keys: %s", list(result.keys()))
-        except Exception:
-            pass
-        
         return result
 
     @staticmethod
@@ -1063,24 +1074,6 @@ class Eagle3Proposer:
         )
 
         num_tokens = input_ids.shape[0]
-
-        if self.speculative_config.method == "mtp": # and step_idx == 0:
-            # The target model output its valid hidden state at the verified slot (last_token_indices - 1).
-            # The draft model evaluates at last_token_indices. We must copy the state forward 
-            # so the MTP pre_projection doesn't concatenate with zeros!
-            num_reqs = chunk.num_reqs
-            if num_rejected_np is None:
-                num_rejected_out = torch.zeros(num_reqs, dtype=torch.int32, device=target_hidden_states.device)
-            else:
-                num_rejected_out = torch.from_numpy(num_rejected_np).to(target_hidden_states.device)
-            qsl_end = chunk.attn_ctx.query_start_loc[1:num_reqs + 1].to(torch.int64)
-            last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
-
-            target_hidden_states = target_hidden_states.clone()
-            valid_hidden_states = target_hidden_states[last_token_indices - 1]
-            target_hidden_states.index_copy_(0, last_token_indices, valid_hidden_states)
-            
-            logger.debug("[TPU DIAG] Copied hidden states from verified slot to draft slot for MTP.")
 
         kwargs = {
             "input_ids": input_ids,
@@ -1413,7 +1406,10 @@ class Eagle3Proposer:
                     positions=loop_positions,
                     target_hidden_states=loop_hidden,
                     step_idx=step,
-                    seq_lens_delta=step,
+                    # Mirror the real loop so the dummy traces the same
+                    # metadata program the peer ranks' propose emits.
+                    seq_lens_delta=(step
+                                    if self.advance_draft_positions else 0),
                     num_rejected_np=None,
                     num_tokens_padded=p,
                     loop_query_start_loc=loop_qsl,
