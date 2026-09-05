@@ -46,6 +46,87 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
+# ---------------------------------------------------------------------------
+# Causality convention
+#
+# Compressed row `j` is visible to raw query position `p` iff
+#
+#     j * compression_ratio + causal_row_offset <= p
+#
+# The three sites that need this predicate -- the Pallas causal mask, the
+# top-k row length, and the early-exit fast path -- all derive it from the two
+# helpers below, so they cannot drift apart. Two of those sites want an
+# inclusive max *index* and one wants a *count*; keeping the index defined as
+# `count - 1` is what keeps that distinction from being restated (and gotten
+# wrong) three times.
+# ---------------------------------------------------------------------------
+
+
+def _assert_causal_row_offset(causal_row_offset: int, compression_ratio: int):
+    """Structural guard: only offsets *inside* a compressed row are meaningful.
+
+      * ``0``   -- a row is visible as soon as the query enters it. This is the
+                   historical behaviour of this kernel, and what DeepSeek-V4
+                   CSA and GLM-5.2 DSA run in production today.
+      * ``r-1`` -- a row is visible only once its *last* token is visible. This
+                   is GLM-5.3 kpool's pool rule (``index_kpool - 1 == 3``), and
+                   also what upstream vLLM computes for DeepSeek-V4 (see the
+                   note at the mask site in ``kernel``).
+
+    This guard is what makes "compression_ratio 1 admits only offset 0" true by
+    *construction*. Do not replace it with a ``compression_ratio == 1 ->
+    causal_row_offset = 0`` clamp: at ratio 1 the offset is emphatically not a
+    no-op for other values -- the count is ``p + 1 - off``, which moves with
+    ``off`` at every value -- so a clamp would bury a silent ratio-dependent
+    special case inside a kernel shared by three production models.
+
+    ``ValueError`` rather than ``assert``, matching the sibling configuration
+    guards in this series: ``python -O`` deletes ``assert``, and what it would
+    delete here is the only thing between an out-of-range offset and a causal
+    mask that admits rows the query cannot see -- which is fluent output, not
+    an error.
+    """
+    if not 0 <= causal_row_offset < compression_ratio:
+        raise ValueError(
+            "causal_row_offset must satisfy 0 <= causal_row_offset <"
+            f" compression_ratio; got causal_row_offset={causal_row_offset},"
+            f" compression_ratio={compression_ratio}")
+
+
+def _visible_compressed_rows(token_pos, compression_ratio: int,
+                             causal_row_offset: int):
+    """COUNT of compressed rows visible to raw position ``token_pos``.
+
+    ``|{ j >= 0 : j * compression_ratio + causal_row_offset <= token_pos }|``,
+    written as ``(token_pos + r - off) // r`` so no negative intermediate is
+    formed. Unclamped -- callers cap it with ``kv_len`` and with the width of
+    the score row. At ``causal_row_offset == 0`` floor division makes this
+    exactly the historical ``token_pos // compression_ratio + 1``, for every
+    integer ``token_pos``.
+    """
+    return (token_pos + compression_ratio -
+            causal_row_offset) // compression_ratio
+
+
+def _last_visible_compressed_row(token_pos, compression_ratio: int,
+                                 causal_row_offset: int):
+    """INCLUSIVE MAX INDEX of the compressed rows visible to ``token_pos``.
+
+    The index form -- the count *minus one*, not the count. It is derived from
+    `_visible_compressed_rows` on purpose: writing the two forms out
+    independently is precisely how a draft of this change ended up returning
+    one row too many from the early-exit path at the default offset, which is a
+    future-token leak in a shipping model with every returned id still valid
+    and in range.
+
+    ``-1`` ("nothing is visible yet") is a legal result: the causal mask
+    compares it against ``k_span >= 0``, and the fast path compares it against
+    ``s_idx >= 0``, so both select nothing.
+    """
+    return _visible_compressed_rows(token_pos, compression_ratio,
+                                    causal_row_offset) - 1
+
+
 class MlaCase(Enum):
     """Represents the different cases for MLA."""
 
@@ -85,6 +166,7 @@ def kernel(
     sems,  # Shape: [4, 2, seq_batch_size], Memory: Semaphore
     *,
     compression_ratio: int,
+    causal_row_offset: int,
     static_q_len: int,
     bkv_p: int,
     bq_sz: int,
@@ -365,11 +447,35 @@ def kernel(
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
+            # Inclusive max visible compressed row per query token; feeds the
+            # `causal_mask` in `compute_scores`. The row-length fed to the
+            # top-k (`_effective_row_lengths`) must agree with this by exactly
+            # one (count == index + 1) or every query silently gains or loses a
+            # candidate row -- which the short-sequence regime hides, because
+            # there top-k selects everything visible either way.
+            #
+            # Note for anyone comparing against upstream vLLM: upstream
+            # computes `(pos + 1) // compress_ratio` for DeepSeek-V4 as well
+            # (`vllm/v1/attention/backends/mla/indexer.py:360-361`,
+            # `vllm/models/deepseek_v4/attention.py:82`), i.e. the
+            # `causal_row_offset = compression_ratio - 1` convention. Defaulting
+            # to 0 here therefore *preserves* a pre-existing DSv4 off-by-one --
+            # benign for pure-decode rows because `kv_len = seq_len // ratio`
+            # clamps it away at the last row, a live future-token leak for
+            # `q_len > 1` rows. Documented and deliberately not fixed here: the
+            # one-line repair is to pass `causal_row_offset=compression_ratio-1`
+            # at `custom_ops/deepseek_v4/deepseek_v4_indexer.py`, but that
+            # changes a shipping model's selected key sets on every prefill row
+            # and needs to be measured against DSv4's own baseline rather than
+            # ridden in on an unrelated change. See
+            # `docs/dsv4-streamindex-causal-off-by-one.md`.
             bq_pos_compressed_vec = []
             for batch_idx in range(seq_batch_size):
                 q_pos = (seq_lens[batch_idx] - q_lens[batch_idx] +
                          bq_idx * bq_sz + jnp.arange(bq_sz, dtype=jnp.int32))
-                bq_pos_compressed_vec.append(q_pos // compression_ratio)
+                bq_pos_compressed_vec.append(
+                    _last_visible_compressed_row(q_pos, compression_ratio,
+                                                 causal_row_offset))
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
@@ -486,8 +592,15 @@ def _effective_row_lengths(
     num_tokens: int,
     num_positions: int,
     compression_ratio: int,
+    causal_row_offset: int = 0,
 ) -> jax.Array:  # i32[num_tokens]
-    """Visible compressed KV positions per token row of the score matrix."""
+    """Visible compressed KV positions per token row of the score matrix.
+
+    A *count*, not an index -- `sparsecore_topk` takes row lengths. It must
+    stay one greater than the Pallas mask's inclusive max index for the same
+    token; both come from the shared helpers above so they cannot disagree.
+    """
+    _assert_causal_row_offset(causal_row_offset, compression_ratio)
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -501,9 +614,50 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    visible = jnp.minimum(
+        kv_len,
+        _visible_compressed_rows(token_pos, compression_ratio,
+                                 causal_row_offset))
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
+
+
+def _fast_path_max_valid_idx(
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    num_tokens: int,
+    compression_ratio: int,
+    causal_row_offset: int = 0,
+) -> jax.Array:  # i32[num_tokens]
+    """Inclusive max visible compressed row per token, for the early-exit path.
+
+    Lifted out of `streamindex_topk._fast_path` so it is reachable on the CPU
+    backend: the closure itself is only callable through the `jax.lax.cond`
+    whose other branch is the `pallas_call`, so tracing it traces the TPU
+    kernel too.
+
+    An **index**, matching the Pallas mask. Writing the count here instead
+    would, at the default offset, hand every query one extra in-range key id --
+    silent, because the `seq_len // ratio - 1` clamp hides it at the final
+    position and there is no assert, no NaN and no shape error, just each
+    query attending one token into its own future.
+    """
+    _assert_causal_row_offset(causal_row_offset, compression_ratio)
+    token_idx = jnp.arange(num_tokens)
+    seq_idx = jnp.minimum(
+        jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+        seq_lens.shape[0] - 1,
+    )
+    seq_len = seq_lens[seq_idx]
+    q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
+    q_start = cu_q_lens[seq_idx]
+    q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
+    max_valid_idx = jnp.minimum(
+        seq_len // compression_ratio - 1,
+        _last_visible_compressed_row(q_abs_pos, compression_ratio,
+                                     causal_row_offset),
+    )
+    return jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
 
 
 @functools.partial(
@@ -511,6 +665,7 @@ def _effective_row_lengths(
     static_argnames=(
         "k",
         "compression_ratio",
+        "causal_row_offset",
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
@@ -530,6 +685,7 @@ def streamindex_topk(
     *,
     k: int,
     compression_ratio: int,
+    causal_row_offset: int = 0,
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
@@ -551,6 +707,13 @@ def streamindex_topk(
       k is also the total number of sequences.
     k: Number of top-K elements to retrieve.
     compression_ratio: KV cache compression ratio.
+    causal_row_offset: which token of a compressed row must be visible before
+      the row becomes a candidate -- compressed row `j` is visible to raw query
+      position `p` iff `j * compression_ratio + causal_row_offset <= p`. Must
+      lie in `[0, compression_ratio)`. Defaults to 0, which is the historical
+      behaviour of this kernel bit-for-bit (DeepSeek-V4 CSA, GLM-5.2 DSA);
+      `compression_ratio - 1` is the "row's last token must be visible" rule
+      GLM-5.3 kpool needs. See `_assert_causal_row_offset`.
     num_kv_pages_per_block: number of kv pages to be processed in one block in
       the pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
     num_queries_per_block: number of queries to be processed in one block in the
@@ -565,6 +728,8 @@ def streamindex_topk(
   """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv` along the width dimension, keeping HBM transactions fused.
+
+    _assert_causal_row_offset(causal_row_offset, compression_ratio)
 
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         raise ValueError(
@@ -701,10 +866,16 @@ def streamindex_topk(
         )
 
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
+        if causal_row_offset:
+            # Suffixed only when non-default, so DeepSeek-V4 / GLM-5.2 profiles
+            # keep the scope names they have always had while a kpool profile
+            # is distinguishable at a glance.
+            scope_name += f"-off_{causal_row_offset}"
         pallas_kernel = jax.named_scope(scope_name)(pl.pallas_call(
             functools.partial(
                 kernel,
                 compression_ratio=compression_ratio,
+                causal_row_offset=causal_row_offset,
                 static_q_len=static_q_len,
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
@@ -827,6 +998,7 @@ def streamindex_topk(
             num_tokens=q.shape[0],
             num_positions=scores_to_reduce.shape[1],
             compression_ratio=compression_ratio,
+            causal_row_offset=causal_row_offset,
         )
         topk_idxs = sparsecore_topk(
             scores_to_reduce,
@@ -838,20 +1010,13 @@ def streamindex_topk(
         return topk_idxs[:q.shape[0], :k]
 
     def _fast_path(_):
-        token_idx = jnp.arange(q.shape[0])
-        seq_idx = jnp.minimum(
-            jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
-            seq_lens.shape[0] - 1,
+        max_valid_idx = _fast_path_max_valid_idx(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            num_tokens=q.shape[0],
+            compression_ratio=compression_ratio,
+            causal_row_offset=causal_row_offset,
         )
-        seq_len = seq_lens[seq_idx]
-        q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
-        q_start = cu_q_lens[seq_idx]
-        q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
-        max_valid_idx = jnp.minimum(
-            seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
-        )
-        max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 

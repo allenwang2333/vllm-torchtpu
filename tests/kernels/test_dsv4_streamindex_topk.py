@@ -13,6 +13,10 @@
 # limitations under the License.
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
+import ast
+import inspect
+import pathlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,6 +28,13 @@ try:
 except ImportError:
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
         streamindex_topk
+
+# The `causal_row_offset` internals. Imported unconditionally and by their real
+# names: a guarded import that skipped these tests when the symbol moved would
+# hide exactly the regression they exist to catch.
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    _effective_row_lengths, _fast_path_max_valid_idx,
+    _last_visible_compressed_row, _visible_compressed_rows)
 
 
 # =====================================================================
@@ -593,8 +604,19 @@ def _ee_inputs(q_lens, seq_lens, seed):
     }
 
 
-def _ee_both_paths(q_lens, seq_lens, k, seed=11):
-    """Run the same batch with the flag off and on."""
+def _ee_both_paths(q_lens,
+                   seq_lens,
+                   k,
+                   seed=11,
+                   compression_ratio=1,
+                   causal_row_offset=0):
+    """Run the same batch with the flag off and on.
+
+    ``compression_ratio`` / ``causal_row_offset`` default to the values the
+    four tests below were written against, so those tests are unchanged; the
+    parameters exist for the ratio-2 / ratio-4 cases further down, which are
+    the geometries the fast path has never been covered at.
+    """
     inputs = _ee_inputs(q_lens, seq_lens, seed)
 
     def run(enable_early_exit):
@@ -604,7 +626,8 @@ def _ee_both_paths(q_lens, seq_lens, k, seed=11):
                 for name, value in inputs.items()
             },
                              k=k,
-                             compression_ratio=1,
+                             compression_ratio=compression_ratio,
+                             causal_row_offset=causal_row_offset,
                              num_kv_pages_per_block=_EE_BKV_P,
                              num_queries_per_block=_EE_BQ_SZ,
                              enable_early_exit=enable_early_exit))
@@ -728,6 +751,538 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
     # positions 60..63, so they keep 61..64 positions respectively.
     kept = [int(np.count_nonzero(row >= 0)) for row in early]
     assert kept == [61, 62, 63, 64], kept
+
+
+# =====================================================================
+# causal_row_offset
+# =====================================================================
+# `causal_row_offset` generalises one predicate: compressed row `j` is visible
+# to raw query position `p` iff `j * compression_ratio + causal_row_offset <=
+# p`. Offset 0 is what this kernel has always done (a row is visible as soon as
+# the query enters it); offset `compression_ratio - 1` is GLM-5.3 kpool's rule
+# (a pool is a candidate only once its *last* token is visible).
+#
+# Two production models -- DeepSeek-V4 CSA and GLM-5.2 DSA -- run this file
+# today, so the load-bearing claim is not "the offset works" but "offset 0
+# changed nothing". The tests below pin that three ways: against frozen copies
+# of the pre-change arithmetic, against a from-the-predicate brute force, and
+# by asserting neither existing call site passes the argument at all.
+#
+# There is deliberately no "the offset is a no-op at ratio 1 for every value"
+# test. That claim is algebraically false -- see
+# `test_offset_is_not_a_no_op_at_ratio_one` -- and ratio 1 is safe only because
+# the structural guard admits nothing but 0 there.
+
+
+def _pre_change_effective_row_lengths(
+    seq_lens,
+    cu_q_lens,
+    distribution,
+    num_tokens,
+    num_positions,
+    compression_ratio,
+):
+    """Verbatim `_effective_row_lengths` as of the commit before this change.
+
+    Frozen on purpose. It is the only artifact that can prove `offset=0`
+    changed nothing, so it must never be "kept in sync" with the kernel -- if
+    a future edit makes this disagree at offset 0, the disagreement *is* the
+    regression.
+    """
+    max_num_seqs = seq_lens.shape[0]
+    num_seqs = distribution[2]
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1:max_num_seqs + 1]
+    seq_mask = jnp.where(
+        jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False)
+    seq_ids = jnp.sum(seq_mask, axis=1)
+
+    q_start = cu_q_lens[seq_ids]
+    q_len = cu_q_lens[seq_ids + 1] - q_start
+    seq_len = seq_lens[seq_ids]
+    token_pos = seq_len - q_len + (token_ids - q_start)
+    kv_len = seq_len // compression_ratio
+    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    valid = token_ids < cu_q_lens[num_seqs]
+    return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
+
+
+def _pre_change_fast_path_max_valid_idx(seq_lens, cu_q_lens, num_tokens,
+                                        compression_ratio):
+    """Verbatim index arithmetic from the pre-change `_fast_path` closure.
+
+    Same contract as above: frozen, never updated. This is the delicate
+    site: it is an inclusive max *index*, and rewriting it in the count form
+    would, at offset 0, hand every query one extra in-range key id with no
+    assert, no NaN and no shape error.
+    """
+    token_idx = jnp.arange(num_tokens)
+    seq_idx = jnp.minimum(
+        jnp.searchsorted(cu_q_lens[1:], token_idx, side="right"),
+        seq_lens.shape[0] - 1,
+    )
+    seq_len = seq_lens[seq_idx]
+    q_len = cu_q_lens[seq_idx + 1] - cu_q_lens[seq_idx]
+    q_start = cu_q_lens[seq_idx]
+    q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
+    max_valid_idx = jnp.minimum(
+        seq_len // compression_ratio - 1,
+        q_abs_pos // compression_ratio,
+    )
+    return jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
+
+
+def _brute_force_visible_rows(token_pos, compression_ratio, causal_row_offset):
+    """Enumerate the predicate. No division, no closed form."""
+    return sum(1 for j in range(token_pos // compression_ratio + 2)
+               if j * compression_ratio + causal_row_offset <= token_pos)
+
+
+def _random_offset_batch(rng, allow_multi_token):
+    """A plausible `(seq_lens, cu_q_lens, distribution)` triple.
+
+    Decode-only sequences lead the batch, as `distribution` requires; both
+    arrays carry the trailing padding the runner passes; `num_tokens` overruns
+    the real token count so the padded-row path is exercised too.
+    """
+    max_num_seqs = int(rng.integers(1, 6))
+    num_seqs = int(rng.integers(1, max_num_seqs + 1))
+    num_decodes = int(rng.integers(0, num_seqs +
+                                   1)) if allow_multi_token else num_seqs
+
+    q_lens, seq_lens = [], []
+    for i in range(num_seqs):
+        q_len = 1 if i < num_decodes else int(rng.integers(2, 9))
+        # Mix small and large so every residue mod compression_ratio and both
+        # sides of the `kv_len` clamp show up across trials.
+        span = int(rng.integers(0, 64)) if rng.random() < 0.5 else int(
+            rng.integers(0, 4096))
+        q_lens.append(q_len)
+        seq_lens.append(q_len + span)
+
+    total = int(sum(q_lens))
+    cu = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    cu_q_lens = np.full(max_num_seqs + 1, total, dtype=np.int32)
+    cu_q_lens[:num_seqs + 1] = cu
+    padded_seq_lens = np.zeros(max_num_seqs, dtype=np.int32)
+    padded_seq_lens[:num_seqs] = seq_lens
+
+    return {
+        "seq_lens":
+        jnp.asarray(padded_seq_lens),
+        "cu_q_lens":
+        jnp.asarray(cu_q_lens),
+        "distribution":
+        jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
+        "num_tokens":
+        total + int(rng.integers(0, 5)),
+        "num_positions":
+        int(rng.choice([128, 1024, 4096, 65536])),
+        "q_lens":
+        q_lens,
+        "seq_lens_list":
+        seq_lens,
+    }
+
+
+@pytest.mark.parametrize("compression_ratio", [1, 2, 3, 4, 8, 128])
+def test_visible_row_count_matches_the_predicate(compression_ratio):
+    """The count form, against a from-the-definition enumeration."""
+    offsets = range(compression_ratio) if compression_ratio <= 8 else (0, 1,
+                                                                       63, 127)
+    for causal_row_offset in offsets:
+        for token_pos in range(0, 260):
+            assert int(
+                _visible_compressed_rows(
+                    token_pos, compression_ratio,
+                    causal_row_offset)) == _brute_force_visible_rows(
+                        token_pos, compression_ratio,
+                        causal_row_offset), (token_pos, compression_ratio,
+                                             causal_row_offset)
+
+
+@pytest.mark.parametrize("compression_ratio", [1, 2, 3, 4, 8, 128])
+def test_last_visible_row_is_an_index_not_a_count(compression_ratio):
+    """Count and index are one apart, and nothing downstream notices.
+
+    The count form differs from the index form by exactly one, and every value
+    either produces is a legal in-range row id -- so nothing downstream can
+    tell them apart. The only thing that can is the defining predicate: the
+    returned row must itself be visible, and the next row must not be.
+    """
+    offsets = range(compression_ratio) if compression_ratio <= 8 else (0, 1,
+                                                                       63, 127)
+    for causal_row_offset in offsets:
+        for token_pos in range(0, 260):
+            idx = int(
+                _last_visible_compressed_row(token_pos, compression_ratio,
+                                             causal_row_offset))
+            count = _brute_force_visible_rows(token_pos, compression_ratio,
+                                              causal_row_offset)
+            assert idx == count - 1, (token_pos, compression_ratio,
+                                      causal_row_offset, idx, count)
+            if idx >= 0:
+                assert idx * compression_ratio + causal_row_offset <= token_pos, (
+                    f"row {idx} is not visible to position {token_pos} at "
+                    f"ratio {compression_ratio} offset {causal_row_offset} -- "
+                    "this is the count form masquerading as the index form")
+            else:
+                assert idx == -1, idx
+            assert (
+                (idx + 1) * compression_ratio + causal_row_offset
+                > token_pos), (
+                    f"row {idx + 1} is visible to position {token_pos}, so "
+                    f"{idx} is not the last visible row")
+
+
+@pytest.mark.parametrize("compression_ratio", [1, 2, 3, 4, 128])
+def test_mask_row_index_at_offset_zero_is_bit_identical(compression_ratio):
+    """Site `:372`: the Pallas causal mask. `offset=0` must be `q_pos // r`."""
+    q_pos = jnp.arange(0, 4096, dtype=jnp.int32)
+    np.testing.assert_array_equal(
+        np.asarray(_last_visible_compressed_row(q_pos, compression_ratio, 0)),
+        np.asarray(q_pos // compression_ratio),
+    )
+
+
+@pytest.mark.parametrize("compression_ratio", [1, 4, 128])
+def test_effective_row_lengths_at_offset_zero_is_bit_identical(
+        compression_ratio):
+    """Site `:504`: the top-k row length, against the frozen pre-change copy.
+
+    This is the real DeepSeek-V4 protection -- array equality over randomized
+    `(seq_lens, cu_q_lens, distribution)`, not a claim about ratio 1.
+    """
+    rng = np.random.default_rng(0xC5A0 + compression_ratio)
+    for trial in range(200):
+        case = _random_offset_batch(rng, allow_multi_token=True)
+        kwargs = {
+            key: case[key]
+            for key in ("seq_lens", "cu_q_lens", "distribution", "num_tokens",
+                        "num_positions")
+        }
+        expected = _pre_change_effective_row_lengths(
+            compression_ratio=compression_ratio, **kwargs)
+        actual = _effective_row_lengths(compression_ratio=compression_ratio,
+                                        causal_row_offset=0,
+                                        **kwargs)
+        np.testing.assert_array_equal(
+            np.asarray(actual), np.asarray(expected),
+            f"trial {trial}: offset 0 is not bit-identical to the pre-change "
+            f"row lengths at ratio {compression_ratio}")
+
+
+@pytest.mark.parametrize("compression_ratio", [1, 2, 4, 128])
+def test_fast_path_max_valid_idx_at_offset_zero_is_bit_identical(
+        compression_ratio):
+    """Site `:850-853`: the early-exit path, against the frozen pre-change copy.
+
+    Ratios 2 and 4 with `q_len > 1` rows are the specific configuration the
+    count-vs-index defect shows up in and that this file has never covered:
+    at the final position of a sequence the `seq_len // r - 1` clamp hides the
+    extra row, so only a mid-sequence multi-token row exposes it.
+    """
+    rng = np.random.default_rng(0xFA57 + compression_ratio)
+    for trial in range(200):
+        case = _random_offset_batch(rng, allow_multi_token=True)
+        kwargs = {
+            key: case[key]
+            for key in ("seq_lens", "cu_q_lens", "num_tokens")
+        }
+        expected = _pre_change_fast_path_max_valid_idx(
+            compression_ratio=compression_ratio, **kwargs)
+        actual = _fast_path_max_valid_idx(compression_ratio=compression_ratio,
+                                          causal_row_offset=0,
+                                          **kwargs)
+        np.testing.assert_array_equal(
+            np.asarray(actual), np.asarray(expected),
+            f"trial {trial}: offset 0 is not bit-identical to the pre-change "
+            f"fast path at ratio {compression_ratio}")
+
+
+@pytest.mark.parametrize(
+    "compression_ratio, causal_row_offset",
+    [(1, 1), (1, -1), (1, 3), (4, 4), (4, 5), (4, -1), (128, 128)],
+)
+def test_causal_row_offset_outside_a_row_is_rejected(compression_ratio,
+                                                     causal_row_offset):
+    """The structural guard, at every entry point that takes the offset.
+
+    `(1, 1)` is the important row: it is what makes "ratio 1 admits only offset
+    0" true by construction rather than by an algebraic claim that happens to
+    be false. The forbidden repair is a `compression_ratio == 1 ->
+    causal_row_offset = 0` clamp inside the kernel, which would be a silent
+    ratio-dependent special case in a file shared by three models.
+    """
+    case = _random_offset_batch(np.random.default_rng(1), False)
+
+    with pytest.raises(ValueError, match="causal_row_offset"):
+        _effective_row_lengths(
+            seq_lens=case["seq_lens"],
+            cu_q_lens=case["cu_q_lens"],
+            distribution=case["distribution"],
+            num_tokens=case["num_tokens"],
+            num_positions=case["num_positions"],
+            compression_ratio=compression_ratio,
+            causal_row_offset=causal_row_offset,
+        )
+
+    with pytest.raises(ValueError, match="causal_row_offset"):
+        _fast_path_max_valid_idx(
+            seq_lens=case["seq_lens"],
+            cu_q_lens=case["cu_q_lens"],
+            num_tokens=case["num_tokens"],
+            compression_ratio=compression_ratio,
+            causal_row_offset=causal_row_offset,
+        )
+
+
+@pytest.mark.parametrize("compression_ratio, causal_row_offset", [(1, 1),
+                                                                  (4, 4),
+                                                                  (4, -1)])
+def test_streamindex_topk_rejects_an_out_of_range_offset(
+        compression_ratio, causal_row_offset):
+    """The guard fires at trace time, before any TPU lowering.
+
+    It also pins that `causal_row_offset` is a *static* argument: were it
+    traced, `0 <= causal_row_offset` would raise jax's
+    `TracerBoolConversionError`, not a `ValueError`.
+    """
+    with pytest.raises(ValueError, match="causal_row_offset"):
+        streamindex_topk(
+            jnp.zeros((4, 4, 128), jnp.float32),
+            jnp.zeros((4, 4), jnp.float32),
+            jnp.zeros((8, 32, 4, 256), jnp.uint8),
+            jnp.asarray([64], jnp.int32),
+            jnp.arange(8, dtype=jnp.int32),
+            jnp.asarray([0, 4], jnp.int32),
+            jnp.asarray([0, 0, 1], jnp.int32),
+            k=128,
+            compression_ratio=compression_ratio,
+            causal_row_offset=causal_row_offset,
+            num_kv_pages_per_block=1,
+            num_queries_per_block=4,
+        )
+
+
+def test_offset_is_not_a_no_op_at_ratio_one():
+    """Pins the false claim that motivated the structural guard.
+
+    An earlier draft of this work asserted "the offset is a no-op at ratio 1
+    for every value" and proposed to protect GLM-5.2 DSA with it. At ratio 1
+    the visible-row count is `p + 1 - off`, which moves with `off` at every
+    value. The arithmetic below is what would happen if the guard were removed
+    or clamped -- it is here so nobody re-derives the false claim.
+    """
+    positions = jnp.arange(64, dtype=jnp.int32)
+    at_zero = np.asarray(_visible_compressed_rows(positions, 1, 0))
+    at_one = np.asarray(_visible_compressed_rows(positions, 1, 1))
+    np.testing.assert_array_equal(at_zero, np.arange(1, 65))
+    np.testing.assert_array_equal(at_one, np.arange(0, 64))
+    assert not np.array_equal(at_zero, at_one)
+
+
+@pytest.mark.parametrize("seq_len", [12, 13, 14, 15, 16, 2047, 2048, 2049])
+def test_glm_pool_rule_at_ratio_four_offset_three(seq_len):
+    """Offset `r - 1` is GLM's `floor((p + 1) / index_kpool)` pool count.
+
+    One whole-sequence prefill, so every position `p` in the sequence is a
+    query row. `L % 4 != 0` is deliberately in the parameter list: at
+    `L % 4 == 0` the last pool is complete and an off-by-one at the tail
+    cannot fire.
+    """
+    compression_ratio, causal_row_offset = 4, 3
+    cu_q_lens = jnp.asarray([0, seq_len], jnp.int32)
+    row_lengths = np.asarray(
+        _effective_row_lengths(
+            seq_lens=jnp.asarray([seq_len], jnp.int32),
+            cu_q_lens=cu_q_lens,
+            distribution=jnp.asarray([0, 0, 1], jnp.int32),
+            num_tokens=seq_len,
+            num_positions=1 << 20,
+            compression_ratio=compression_ratio,
+            causal_row_offset=causal_row_offset,
+        ))
+    expected = np.asarray([
+        min(seq_len // compression_ratio, (p + 1) // compression_ratio)
+        for p in range(seq_len)
+    ])
+    np.testing.assert_array_equal(row_lengths, expected)
+
+    # And the corresponding index form, which the Pallas mask uses. It is not
+    # clamped by `kv_len` -- the kernel's separate `valid_mask` does that -- so
+    # it is `floor((p + 1) / 4) - 1` outright, and `-1` for p in 0..2 where no
+    # pool is complete yet.
+    positions = jnp.arange(seq_len, dtype=jnp.int32)
+    np.testing.assert_array_equal(
+        np.asarray(
+            _last_visible_compressed_row(positions, compression_ratio,
+                                         causal_row_offset)),
+        np.asarray([(p + 1) // compression_ratio - 1 for p in range(seq_len)]),
+    )
+
+
+@pytest.mark.parametrize(
+    "compression_ratio, causal_row_offset",
+    [(1, 0), (2, 0), (2, 1), (4, 0), (4, 3), (128, 0), (128, 127)],
+)
+def test_mask_and_row_length_carry_the_same_offset(compression_ratio,
+                                                   causal_row_offset):
+    """The Pallas mask and the top-k row length must differ by exactly one.
+
+    `streamindex_topk` masks with `bq_pos_compressed` (an inclusive index) and
+    selects with `_effective_row_lengths` (a count). Rewriting only one of them
+    changes the candidate set by exactly one row per query -- and every short
+    sequence hides it, because there top-k keeps everything visible either way.
+    The token positions here are recomputed from the batch spec rather than
+    from the kernel's own sequence-id search, so this is not the implementation
+    checking itself.
+    """
+    rng = np.random.default_rng(0x17 + compression_ratio + causal_row_offset)
+    for trial in range(100):
+        case = _random_offset_batch(rng, allow_multi_token=True)
+        row_lengths = np.asarray(
+            _effective_row_lengths(
+                seq_lens=case["seq_lens"],
+                cu_q_lens=case["cu_q_lens"],
+                distribution=case["distribution"],
+                num_tokens=case["num_tokens"],
+                num_positions=case["num_positions"],
+                compression_ratio=compression_ratio,
+                causal_row_offset=causal_row_offset,
+            ))
+
+        expected = []
+        for q_len, seq_len in zip(case["q_lens"], case["seq_lens_list"]):
+            kv_len = seq_len // compression_ratio
+            for i in range(q_len):
+                token_pos = seq_len - q_len + i
+                mask_idx = int(
+                    _last_visible_compressed_row(token_pos, compression_ratio,
+                                                 causal_row_offset))
+                expected.append(
+                    min(kv_len, mask_idx + 1, case["num_positions"]))
+        # Padded token rows carry no candidates at all.
+        expected.extend([0] * (case["num_tokens"] - len(expected)))
+
+        np.testing.assert_array_equal(
+            row_lengths, np.asarray(expected, dtype=row_lengths.dtype),
+            f"trial {trial}: row length disagrees with the mask index at "
+            f"ratio {compression_ratio} offset {causal_row_offset}")
+
+
+def test_causal_row_offset_defaults_to_zero():
+    """Nobody has to pass it, and the default is the historical convention."""
+    assert inspect.signature(
+        streamindex_topk).parameters["causal_row_offset"].default == 0
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py",
+        "src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4/"
+        "deepseek_v4_indexer.py",
+    ],
+)
+def test_existing_call_sites_pass_no_causal_row_offset(relative_path):
+    """GLM-5.2 DSA and DeepSeek-V4 CSA must keep the default, silently.
+
+    Parsed rather than imported: these modules need `torch_tpu` at import
+    time, and the question is purely syntactic. Finding zero calls is a
+    failure, so a rename cannot make this pass vacuously.
+    """
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    source = (repo_root / relative_path).read_text()
+    tree = ast.parse(source)
+
+    calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call) and (
+            (isinstance(node.func, ast.Name) and node.func.id ==
+             "streamindex_topk") or (isinstance(node.func, ast.Attribute)
+                                     and node.func.attr == "streamindex_topk"))
+    ]
+    assert calls, f"no streamindex_topk call found in {relative_path}"
+    for call in calls:
+        passed = {kw.arg for kw in call.keywords}
+        assert "causal_row_offset" not in passed, (
+            f"{relative_path}:{call.lineno} now passes causal_row_offset; "
+            "DeepSeek-V4 CSA and GLM-5.2 DSA are supposed to stay on the "
+            "default 0 convention")
+
+
+# ---------------------------------------------------------------------------
+# Early exit at compression_ratio != 1 (device only).
+#
+# `_ee_both_paths` above hard-coded ratio 1, so all four early-exit tests are
+# ratio-1 only and "the DSv4 file stays green" does not by itself protect the
+# fast path's index arithmetic. These are the missing cases: `q_len > 1` rows
+# at ratio 2 and 4, at offset 0 (DeepSeek-V4 bit-identity) and at offset
+# `r - 1` (GLM's pool rule). They need a TPU, and ride into the device job.
+# ---------------------------------------------------------------------------
+
+
+def _ee_expected_counts(q_lens, seq_lens, compression_ratio,
+                        causal_row_offset):
+    """Visible compressed rows per query token, straight from the predicate."""
+    counts = []
+    for q_len, seq_len in zip(q_lens, seq_lens):
+        kv_len = seq_len // compression_ratio
+        for i in range(q_len):
+            token_pos = seq_len - q_len + i
+            visible = (0 if token_pos < causal_row_offset else
+                       (token_pos - causal_row_offset) // compression_ratio +
+                       1)
+            counts.append(min(kv_len, visible))
+    return counts
+
+
+@pytest.mark.parametrize(
+    "compression_ratio, causal_row_offset",
+    [(2, 0), (2, 1), (4, 0), (4, 3)],
+)
+def test_streamindex_topk_early_exit_at_compression_ratio(
+        compression_ratio, causal_row_offset):
+    """Fast path vs scoring path with a multi-token row and a real ratio.
+
+    `max(seq_lens) // compression_ratio <= k` so the shortcut is taken, and the
+    whole batch fits under k so the expected index set is closed-form -- the
+    check does not depend on score arithmetic at all. Offset 0 is the
+    DeepSeek-V4 convention; offset `r - 1` is GLM's, where a query at position
+    `p` may only see pools whose last token is at or before `p`.
+    """
+    q_lens = (1, 1, 5)
+    # Under `k * compression_ratio` so the shortcut triggers, and deliberately
+    # not multiples of the ratio: at a ratio-aligned final position the two
+    # conventions agree, which is exactly how this off-by-one stays hidden.
+    k = 512
+    seq_lens = (64 * compression_ratio + 1, 200 * compression_ratio + 3,
+                480 * compression_ratio - 2)
+    assert max(seq_lens) // compression_ratio <= k, "test setup: not short"
+    assert _ee_expected_counts(
+        q_lens, seq_lens, compression_ratio, 0) != _ee_expected_counts(
+            q_lens, seq_lens, compression_ratio,
+            compression_ratio - 1), ("test setup: the two conventions agree "
+                                     "on every row, so this proves nothing")
+
+    baseline, early = _ee_both_paths(q_lens,
+                                     seq_lens,
+                                     k,
+                                     compression_ratio=compression_ratio,
+                                     causal_row_offset=causal_row_offset)
+
+    expected = _ee_expected_counts(q_lens, seq_lens, compression_ratio,
+                                   causal_row_offset)
+    for token, n_visible in enumerate(expected):
+        row = early[token]
+        np.testing.assert_array_equal(
+            np.sort(row[row >= 0]), np.arange(n_visible),
+            f"token {token}: early exit did not report exactly the visible "
+            f"rows at ratio {compression_ratio} offset {causal_row_offset}")
+        assert np.all(row[n_visible:] < 0), (
+            f"token {token}: -1 padding is not a suffix: {row}")
+
+    _ee_assert_same_selection(early, baseline)
 
 
 def main(argv):
