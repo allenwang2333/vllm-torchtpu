@@ -55,7 +55,6 @@ mkdir -p "$RESULTS_DIR"
 # tails 200 lines, which the loader's progress bars fill with blanks) and
 # record what the results dir holds, so a startup death is diagnosable from
 # the job log alone even when the artifact copy-back comes up empty.
-SCRATCH=""
 # shellcheck disable=SC2317  # invoked via trap
 cleanup() {
     echo "[k3-agentx] cleanup"
@@ -69,8 +68,16 @@ cleanup() {
         tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
     fi
     echo "[k3-agentx] results dir:"; find "$RESULTS_DIR" -maxdepth 2 2>/dev/null | head -30
-    echo "[k3-agentx] disk at exit:"; df -h / /tmp /perf_eval_results 2>/dev/null
-    case "$SCRATCH" in /perf_eval_results/*) rm -rf "$SCRATCH" ;; esac
+    echo "[k3-agentx] disk at exit:"; df -h / /tmp /perf_eval_results /dev/shm 2>/dev/null
+    rm -rf /dev/shm/.k3_agentx_scratch
+    # The multihost wrapper's artifact copy-back has come up empty for this
+    # step (builds 3/5 uploaded only Ray logs), so push the results dir to
+    # GCS as well; the aiperf per-request exports can be a few hundred MB.
+    if command -v gsutil >/dev/null 2>&1; then
+        gcs_dst="gs://cuiq-inference-test/k3/agentx/${BUILDKITE_BUILD_NUMBER:-local}/$(basename "$RESULTS_DIR")"
+        echo "[k3-agentx] uploading results to $gcs_dst"
+        gsutil -q -m cp -r "$RESULTS_DIR" "$(dirname "$gcs_dst")/" 2>&1 | tail -3 || echo "[k3-agentx] WARNING: GCS upload failed"
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -89,22 +96,21 @@ echo "[k3-agentx] config=$CONFIG_NAME conc=$CONC max_model_len=$MAX_MODEL_LEN ma
 echo "[k3-agentx] host: $(nproc) cpus, $(free -g | awk '/Mem:/{print $2}') GB RAM, python $(python3 --version 2>&1), uv $(uv --version 2>&1 || echo missing)"
 echo "[k3-agentx] disk (container view):"; df -h / /tmp /root/.cache /perf_eval_results /dev/shm 2>/dev/null
 # The pod hosts' root disks are small (build 3: the head ran out of space
-# during XLA compilation). Put everything the client needs -- the InferenceX
-# checkout, the aiperf venv, the HF dataset cache -- on whichever candidate
-# mount has the most free space, and remove it again on exit when it lives
-# under the artifact-collected /perf_eval_results tree.
-SCRATCH=""
-best=0
-for cand in /perf_eval_results /root/.cache /tmp /dev/shm; do
-    [ -d "$cand" ] || continue
-    avail=$(df -Pk "$cand" 2>/dev/null | awk 'NR==2{print $4}')
-    [ -n "$avail" ] || continue
-    if [ "$avail" -gt "$best" ]; then best=$avail; SCRATCH="$cand"; fi
-done
-SCRATCH="$SCRATCH/.k3_agentx_scratch"
-mkdir -p "$SCRATCH"
-echo "[k3-agentx] scratch=$SCRATCH (avail $((best / 1024 / 1024)) GiB)"
-export TMPDIR="$SCRATCH/tmp"; mkdir -p "$TMPDIR"
+# during XLA compilation) and /dev/shm (128 GiB tmpfs) is mounted noexec
+# (build 5: the aiperf venv's entry points died with EACCES there). So the
+# venv lives on the root disk and everything that is data only -- the HF
+# corpus cache, uv's download cache, TMPDIR -- goes to /dev/shm when it has
+# room, else next to the venv.
+SCRATCH=/tmp/.k3_agentx_scratch
+DATA_SCRATCH="$SCRATCH"
+shm_avail=$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
+if [ -n "${shm_avail:-}" ] && [ "$shm_avail" -gt $((20 * 1024 * 1024)) ]; then
+    DATA_SCRATCH=/dev/shm/.k3_agentx_scratch
+fi
+mkdir -p "$SCRATCH" "$DATA_SCRATCH"
+echo "[k3-agentx] scratch=$SCRATCH data_scratch=$DATA_SCRATCH"
+export TMPDIR="$DATA_SCRATCH/tmp"; mkdir -p "$TMPDIR"
+export AIPERF_UV_CACHE_DIR="$DATA_SCRATCH/uv-cache"
 
 # ---------------------------------------------------------------- InferenceX
 # The official orchestration (benchmarks/benchmark_lib.sh) owns the aiperf
@@ -181,7 +187,7 @@ export INFMAX_CONTAINER_WORKSPACE="$IX_DIR"
 export AIPERF_RUNTIME_DIR="$SCRATCH/inferencex-agentic"
 # Client-only: the trace corpus download lands here (the server is already up
 # and keeps whatever HF_HOME it was launched with).
-export HF_HOME="$SCRATCH/hf_home"
+export HF_HOME="$DATA_SCRATCH/hf_home"
 # The image ships python 3.12; let uv reuse it instead of downloading 3.11.
 export AIPERF_PYTHON_VERSION="${AIPERF_PYTHON_VERSION:-3.12}"
 export KV_OFFLOADING=none
