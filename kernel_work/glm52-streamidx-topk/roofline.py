@@ -28,7 +28,14 @@ def cdiv(a, b):
 
 
 def model(name, *, psz, pages_per_seq, T, R, D, seqlen, qlen=1, bkv_p=2):
-    n, bkv_sz, P = pages_per_seq * psz, psz * bkv_p, R - D
+    # n is the PADDED score width, not pages_per_seq*psz. streamindex_topk.py
+    # :602-605 sets num_sublanes_total from align_to(pages_per_seq, bkv_p), so
+    # an odd page count rounds up: at (A) 9 pages -> 10, n = 10240, not 9216.
+    # This was 11.1% low here and in shapes.py/report.md. It matters because n
+    # is what the -inf fill and the SparseCore read are sized by, and because
+    # `p` and the second-pass branch below are decided against it.
+    bkv_sz, P = psz * bkv_p, R - D
+    n = cdiv(pages_per_seq, bkv_p) * bkv_p * psz
     nbkv = max(1, cdiv(seqlen, bkv_sz))
     nbq = max(1, cdiv(qlen, 128)) if P else 1
 
@@ -55,7 +62,7 @@ def model(name, *, psz, pages_per_seq, T, R, D, seqlen, qlen=1, bkv_p=2):
                 bound="mem" if mem_a / BW > flops / (FP8 * eff) else "mxu")
 
 
-A = dict(psz=1024, pages_per_seq=9)     # (A) 8k1k  : block_size 1024 -> n=9216
+A = dict(psz=1024, pages_per_seq=9)     # (A) 8k1k  : block_size 1024 -> n=10240
 B = dict(psz=512, pages_per_seq=2048)   # (B) AgentX: block_size 512  -> n=1048576
 
 rows = [
@@ -91,8 +98,19 @@ rows = [
 # mechanism and the term is run-ORDER, not run-to-run randomness.
 # Consequence: a difference under ~3% is not resolvable by comparing two rows
 # in sequence, and no cross-JOB comparison here is worth anything at that size.
-# The A-D16-8k > A-D32-8k inversion (278.7 vs 264.8) is inside this band and is
-# NOT established; the D64 row is well outside it and is.
+#
+# The A-D16-8k > A-D32-8k inversion (278.7 vs 264.8) is 5.3%, just outside that
+# band, and it has an exact mechanism -- so unlike a bare 5% gap it does not
+# rest on the drift argument at all. sparsecore_topk.py:_pick_partition has a
+# second loop that only ever RAISES p, with no check that raising it buys
+# anything. At b=16, max_p = 32//16 = 2 and n//2 = 5120 clears both guards, so
+# p goes to 2. But 16 rows at p=1 is already 16 of 32 subcores -- one wave --
+# and 32 units is still one wave, so the wave count does not move. What p=2
+# does buy is the `p > 1` second-pass merge: a second dispatch plus two XLA
+# gathers. At b=32 and b=64, max_p collapses to 1 and no second pass happens.
+# That is why the D16 row is slower than the D32 row rather than noise being
+# read as a result, and it is the basis for the E-series candidate that
+# suppresses the second loop (Δ time −9.0% at A-D16-8k, 0 elsewhere).
 # (full, sparsecore_topk alone or None, job, block-to-block spread)
 MEASURED = {
     "A-D64-8k":     (363.2, 189.5, "j-284a8842", 0.091),

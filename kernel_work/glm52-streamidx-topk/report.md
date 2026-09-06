@@ -61,13 +61,24 @@ and no `input_partition_specs` (`mla_attention_op.py:126-128`), in contrast to i
 which passes a full `P(...)` tuple. **A single-die instrument is the correct instrument for both
 deployments.**
 
+> **Correction, applied after step 2 wave 2.** This section originally gave `n` at (A) as 9216,
+> `pages_per_seq * page_size`. That is wrong: `streamindex_topk.py:602-605` sizes the score buffer
+> from `align_to(pages_per_seq, bkv_p) * page_size`, and with `bkv_p = 2` the 9 pages round up to
+> 10, so **`n` = 10240** — 11.1% wider than `max_model_len`, and a top slice of 1024 columns that
+> no request can ever reach. The figure propagated into `roofline.py` and `shapes.py`; all three
+> are now corrected. It does not change step 1's verdict — every row still reads
+> `STRUCTURAL - proceed`, with `floor/meas` between 1.7% and 8.0% — but it does size two of the
+> candidates, since `n` is what the `-inf` fill and the SparseCore read are dimensioned by, and
+> `bkv_p ∈ {1, 3, 9}` divides 9 exactly and removes the pad for free.
+
 |  | (A) 8k1k | (B) AgentX |
 |---|---|---|
 | `max_model_len` | 9216 | 1048576 |
 | `--block-size` in recipe | *absent* | 256 |
 | **effective `block_size`** | **1024** (`get_page_size` -> 1024) | **512** (raised from 256 by `TpuPlatform.update_block_size_for_backend`) |
 | `pages_per_seq` | 9 | 2048 |
-| **`n` = score-row width** | **9216** | **1048576** |
+| **`n` = score-row width** | **10240** | **1048576** |
+| ↳ `n` vs `max_model_len` | **+11.1% pad** — `align_to(9, bkv_p=2) = 10` | none — `align_to(2048, 2) = 2048` |
 | `cache_kv` | `(nb, 256, 4, 256)` u8 | `(nb, 128, 4, 256)` u8 |
 | `max_num_seqs` / `seq_lens.shape` | 64 | 64 |
 | token ladder `T` | `{16,32,64,128,256,512,1024}` | same |
@@ -369,7 +380,7 @@ incumbent's own printed values — the re-run is in flight. **Step 3 cannot begi
 passes on the incumbent**; until it does, there is no correctness evidence for anything here.
 
 The other failure was `A-D64-14k`, an unreachable row I put in the table: `seqlen=14336` exceeds
-`pages_per_seq * page_size = 9216`. The sampler's ISL range at (A) is `[1638, 14746]`, but
+what (A) can admit. The sampler's ISL range at (A) is `[1638, 14746]`, but
 `max_model_len=9216` caps what the server admits. `check_reachable` caught it, which is that
 guard's whole purpose; the row is now `A-D64-9k`. It cost `A-D32-8k` and `A-D16-8k`, which died
 with the shard and are being re-measured.
@@ -382,7 +393,17 @@ Ranked by measured share, not modelled bytes:
    dominant term at every shape, and the cause of the largest number in the sweep.
 2. **The group-max over `seq_batch_size`** (Finding 3) — a measured 2.8x on mixed-length batches.
 3. **The scoring pass, still 5.7-16x above its own bandwidth model** — `B-D1-1M` spends 701.3 us
-   scoring where the model says 93.1 us, which is 685 ns per KV block against 69 ns of DMA. Whether
-   that is per-grid-step fixed cost (register item 5) or something else is unattributed, and
-   attributing it is a step-2 probe.
+   scoring where the model says 93.1 us, i.e. 685 ns per KV block against 69 ns of DMA.
+
+   > **Retracted as a framing, after step 2 area 3.** Calling the 685 ns "unattributed" overstates
+   > the mystery: `bytes/BW` is not a floor for an iteration unless a per-step fixed cost is
+   > quoted alongside it, and at `B-D1-1M` the bytes are only 13% of the step. Against the
+   > `512 ns + bytes/3.48e12` grid-step model the measured per-iteration cost lands at 1.00-1.09x —
+   > i.e. essentially *predicted*, not anomalous, by a model fitted on unrelated data. So the
+   > scoring pass is iteration-count-bound rather than harbouring an unexplained term, and the
+   > lever is fewer, wider iterations rather than a hunt. The one genuine open question left is
+   > narrower and is what the step-2 probe actually asks: whether the fixed cost is per
+   > **iteration** (then widening `bkv_p` pays) or per **`make_async_copy`** (then it does not,
+   > and coalescing pages is the lever instead). 685 ns over 2 copies is ~340 ns/copy, close
+   > enough to the 512 ns term that the two readings are not separable from this row alone.
 4. Levers 1 and 2 from section 3, demoted: together they address <= 10% of measured time.

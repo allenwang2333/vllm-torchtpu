@@ -7,7 +7,12 @@ benchmark a shape production never sees.
 
   (A) 8k1k   vllm-torchtpu-glm-5.2-ix-8k1k.yaml
              max_model_len 9216, no --block-size -> effective 1024
-             pages_per_seq 9,    n = 9216
+             pages_per_seq 9,    n = 10240
+             n is align_to(pages_per_seq, bkv_p)*page_size, NOT
+             pages_per_seq*page_size -- streamindex_topk.py:602-605 rounds 9
+             pages up to 10 because bkv_p=2, so the score row is 11.1% wider
+             than max_model_len. The pad is (A)-only; at (B) align_to(2048,2)
+             is 2048 and there is none.
   (B) AgentX glm-5.2-agentx-multihost-nondisagg.yaml
              max_model_len 1048576, --block-size 256 raised to 512 by
              TpuPlatform.update_block_size_for_backend
@@ -41,7 +46,9 @@ ROWS = {
     "A-D64-8k":    dict(**A, T=64, R=64, D=64, seqlen=8192),
     # 9216 is the ceiling, not 14746: --random-range-ratio 0.8 makes the
     # sampler's ISL range [1638, 14746], but max_model_len=9216 caps what the
-    # server admits, and n = pages_per_seq*page_size = 9216 caps the kernel.
+    # server admits. Note the kernel's own cap is looser -- n = 10240 -- so
+    # max_model_len is what binds here, and the top 1024 score columns are
+    # padding no request can ever reach.
     "A-D64-9k":    dict(**A, T=64, R=64, D=64, seqlen=9216),
     "A-D63-8k":    dict(**A, T=64, R=63, D=63, seqlen=8192),
     "A-D32-8k":    dict(**A, T=32, R=32, D=32, seqlen=8192),
