@@ -24,6 +24,7 @@ SPEC_TOKENS=7
 SPEC_AL=3.84
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC=8
+MOE_REQUANT=0         # 0 = W4A16 (default gmm_v2 path); 512 = W4A8 (fp8 activations)
 PORT=8000
 
 while [[ $# -gt 0 ]]; do
@@ -42,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --spec-al)       SPEC_AL="$2"; shift 2 ;;
         --gsm8k-limit)   GSM8K_LIMIT="$2"; shift 2 ;;
         --gsm8k-conc)    GSM8K_CONC="$2"; shift 2 ;;
+        --moe-requant)   MOE_REQUANT="$2"; shift 2 ;;
         *) echo "[k3-sweep] unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -90,13 +92,19 @@ if [ "$APC" = "1" ]; then
 else
     export ENABLE_PREFIX_CACHING=false
 fi
+if [ "$MOE_REQUANT" != "0" ]; then
+    # Same knob the DeepSeek-V4 configs export: fp4 weights re-blocked at load,
+    # fp8 e4m3 activations in the MoE GEMM (W4A8). TPU twin of the GPU b12x arm.
+    export MOE_REQUANTIZE_WEIGHT_DTYPE=fp4
+    export MOE_REQUANTIZE_BLOCK_SIZE="$MOE_REQUANT"
+fi
 if [ "$SPEC" = "dspark" ]; then
     # Synthetic acceptance, as InferenceX pins it (golden AL per draft length).
     export ASYNC_SCHEDULING=false
     export EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--speculative-config {\"method\":\"dspark\",\"model\":\"Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":$SPEC_TOKENS,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":$SPEC_AL}"
 fi
 
-echo "[k3-sweep] config=$CONFIG_NAME concs=${CONCS[*]} max_num_seqs=$MAX_NUM_SEQS ctx=$MAX_MODEL_LEN kv=$KV_DTYPE apc=$APC spec=$SPEC/$SPEC_TOKENS/$SPEC_AL duration=$DURATION fast=$FAST gsm8k_limit=$GSM8K_LIMIT ix_ref=$IX_REF"
+echo "[k3-sweep] config=$CONFIG_NAME concs=${CONCS[*]} max_num_seqs=$MAX_NUM_SEQS ctx=$MAX_MODEL_LEN kv=$KV_DTYPE apc=$APC spec=$SPEC/$SPEC_TOKENS/$SPEC_AL moe_requant=$MOE_REQUANT duration=$DURATION fast=$FAST gsm8k_limit=$GSM8K_LIMIT ix_ref=$IX_REF"
 echo "[k3-sweep] host: $(nproc) cpus, $(free -g | awk '/Mem:/{print $2}') GB RAM, python $(python3 --version 2>&1), uv $(uv --version 2>&1 || echo missing)"
 echo "[k3-sweep] disk (container view):"; df -h / /tmp /root/.cache /perf_eval_results /dev/shm 2>/dev/null
 
@@ -251,7 +259,7 @@ resolve_trace_source            # aiperf venv + corpus download (HF, public)
 UV_CACHE_DIR="$AIPERF_UV_CACHE_DIR" "$AIPERF_UV_BIN" pip install --python "$AIPERF_PYTHON" -q blobfile tiktoken \
     || echo "[k3-sweep] WARNING: blobfile install failed"
 
-BASE_RESULT_FILENAME="agentx_k3_tpu7x-32_ctx${MAX_MODEL_LEN}_kv${KV_DTYPE}_apc${APC}_spec${SPEC}"
+BASE_RESULT_FILENAME="agentx_k3_tpu7x-32_ctx${MAX_MODEL_LEN}_kv${KV_DTYPE}_apc${APC}_spec${SPEC}_rq${MOE_REQUANT}"
 declare -a DONE_CONCS=()
 for idx in "${!CONCS[@]}"; do
     c="${CONCS[$idx]}"
