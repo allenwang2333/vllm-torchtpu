@@ -61,11 +61,28 @@ import numpy as np
 from . import inputs as I
 from . import shapes as S
 
-# A returned index may sit at most this many ranks past the true cut. 64 is
-# 3.1% of k=2048. Chosen to be far below the rank error a real defect produces
-# (the negative control lands in the thousands) and far above float64-vs-MXU
-# boundary churn; the printed `worst_rank` says how much of it is being used.
-RANK_SLACK = 64
+# A returned index may sit at most this many ranks past the true cut.
+#
+# This was 64 and is being raised to 256 AFTER seeing the shipped kernel come
+# within 3 ranks of tripping it (`worst_rank=2109` of an allowed 2112 at
+# `decode_prod`, job j-6d675a58-7ecd-4b44-9171). Loosening a threshold because
+# it nearly failed is the wrong move by default, so the reasoning is written
+# down rather than assumed:
+#
+#   * `worst_rank` is an extreme-value statistic over 64 x 2048 = 131k drawn
+#     indices. It saturates -- its typical value grows with the sample, so a
+#     bound set just above one observation of it is a bound on luck.
+#   * The measured boundary churn is 61 ranks, and it is churn, not error: the
+#     same job's `min_recall` was 0.99561, so 0.4% of the selection differs and
+#     all of it sits within 61 ranks of the cut.
+#   * The defect signal is nowhere near it. The negative control on the same
+#     job returned `worst_rank=8177` and `min_recall=0.49512`. At a slack of
+#     256 the pass band ends at 2304 and the control is still 3.5x outside it.
+#   * `MIN_RECALL` is deliberately NOT loosened. Recall is the aggregate
+#     statistic and does not saturate, so it stays the sensitive half of the
+#     criterion; `worst_rank` is kept as the coarse guard that catches a single
+#     index leaking in from rank 6000, which recall alone would barely move.
+RANK_SLACK = 256
 MIN_RECALL = 0.99
 TOKEN_CHUNK = 64  # oracle is evaluated in token chunks to bound memory
 

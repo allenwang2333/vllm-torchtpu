@@ -60,12 +60,37 @@ WARMUP = 3
 REPS = 10
 INNER = 20
 
+# Cap on the bytes the `inner` in-flight calls may have outstanding at once.
+# `_time` dispatches `inner` calls without blocking, so at a large regime the
+# runtime can have many executions queued, each with its own multi-hundred-MB
+# scores temporary. `mixed_64k` moves 276.8 MB of scores per call; 20 of those
+# in flight is 5.5 GB of allocator pressure that the served graph never sees,
+# and the first sweep measured 231% spread there against 0.57% at decode. This
+# bounds the queue instead of the call count -- see `_inner_for`.
+INFLIGHT_BUDGET_BYTES = 1.5e9
+MIN_INNER = 3
+
 
 def _median_spread(times_s):
     """Return (median_ms, spread_pct) where spread is (max-min)/median."""
     med = statistics.median(times_s)
     spread = (max(times_s) - min(times_s)) / med * 100.0 if med else float("nan")
     return med * 1e3, spread
+
+
+def _inner_for(regime: S.Regime) -> int:
+    """How many calls to dispatch back to back before blocking.
+
+    Amortizing host dispatch is the point of `inner`, but it must not turn into
+    an allocator benchmark. Scale it down so the outstanding scores temporaries
+    stay under `INFLIGHT_BUDGET_BYTES`, with a floor of `MIN_INNER` so the
+    biggest regimes still amortize something. Returned in the JSON row as
+    `inner` so a comparison across regimes can see it changed.
+    """
+    per_call = S.scores_bytes(regime.num_tokens, regime.max_model_len)
+    if per_call <= 0:
+        return INNER
+    return max(MIN_INNER, min(INNER, int(INFLIGHT_BUDGET_BYTES // per_call)))
 
 
 def _time(fn, *args, reps=REPS, warmup=WARMUP, inner=INNER):
@@ -117,7 +142,9 @@ def run_regime(impl, regime: S.Regime, *, early_exit: bool, reps=REPS,
     call_args = (d["q"], d["indexer_weights"], d["cache_kv"], d["seq_lens"],
                  d["page_indices"], d["cu_q_lens"], d["distribution"])
 
-    full_ms, full_spread = _median_spread(_time(call, *call_args, reps=reps))
+    inner = _inner_for(regime)
+    full_ms, full_spread = _median_spread(
+        _time(call, *call_args, reps=reps, inner=inner))
 
     row = dict(
         regime=regime.name,
@@ -130,6 +157,8 @@ def run_regime(impl, regime: S.Regime, *, early_exit: bool, reps=REPS,
         num_sublanes_total=S.num_sublanes_total(regime.max_model_len),
         scores_MB=S.scores_bytes(regime.num_tokens, regime.max_model_len) / 1e6,
         early_exit=early_exit,
+        inner=inner,
+        reps=reps,
         full_ms=full_ms,
         full_spread_pct=full_spread,
     )
@@ -153,7 +182,7 @@ def run_regime(impl, regime: S.Regime, *, early_exit: bool, reps=REPS,
             lambda s, r: sparsecore_topk(
                 s, k, row_lengths=r, write_empty_rows=True))
         topk_ms, topk_spread = _median_spread(
-            _time(topk_fn, scores, row_lengths, reps=reps))
+            _time(topk_fn, scores, row_lengths, reps=reps, inner=inner))
         # CONTROL ARM -- not a result on its own. See the module docstring.
         row["_control_topk_only_ms"] = topk_ms
         row["_control_topk_spread_pct"] = topk_spread
@@ -194,7 +223,8 @@ def main(argv=None):
             print(json.dumps(row), flush=True)
 
     print("\n=== summary (median ms/call, single TensorCore) ===")
-    hdr = f"{'regime':<14}{'ee':<7}{'nbq':>5}{'nbkv':>6}{'scoresMB':>10}{'full_ms':>10}{'spread%':>9}"
+    hdr = (f"{'regime':<14}{'ee':<7}{'nbq':>5}{'nbkv':>6}{'scoresMB':>10}"
+           f"{'inner':>7}{'full_ms':>10}{'spread%':>9}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -202,8 +232,8 @@ def main(argv=None):
             print(f"{r['regime']:<14}{str(r['early_exit']):<7}  ERROR {r['error'][:60]}")
             continue
         print(f"{r['regime']:<14}{str(r['early_exit']):<7}{r['num_bq']:>5}"
-              f"{r['num_bkv']:>6}{r['scores_MB']:>10.1f}{r['full_ms']:>10.3f}"
-              f"{r['full_spread_pct']:>9.2f}")
+              f"{r['num_bkv']:>6}{r['scores_MB']:>10.1f}{r['inner']:>7}"
+              f"{r['full_ms']:>10.3f}{r['full_spread_pct']:>9.2f}")
 
     if a.json:
         with open(a.json, "w") as f:
