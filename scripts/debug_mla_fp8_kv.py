@@ -38,8 +38,14 @@ def run_case(tokens, prefix, dtype, scale):
     outputs = []
     cache_errors = []
     for _ in range(3):
+        # The public kernel donates its cache input. Each repetition must
+        # start from a fresh device buffer with the same host-side contents.
+        fresh_cache = jnp.array(initial / scale, dtype=dtype,
+                                copy=True).reshape(pages, page // packing,
+                                                   packing, 640)
+        call_args = (*args[:4], fresh_cache, *args[5:])
         out, updated = mla_ragged_paged_attention(
-            *args,
+            *call_args,
             sm_scale=0.125,
             k_scale=scale,
             v_scale=scale,
