@@ -13,7 +13,7 @@
 # limitations under the License.
 """Insert-layout tests for the sparse-MLA KV cache writers.
 
-Pure jnp scatter, no Pallas: these run on CPU.
+Runs on CPU using the reference scatter and on TPU using the native writer.
 """
 
 import jax
@@ -73,7 +73,7 @@ def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
 
 
 class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
-    """Insert-layout unit test; pure jnp scatter, runs on CPU too."""
+    """Insert-layout unit test for both CPU and TPU implementations."""
 
     @parameterized.named_parameters(
         dict(testcase_name="nope_sc_rope_tc",

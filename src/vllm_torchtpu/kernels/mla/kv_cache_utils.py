@@ -21,6 +21,7 @@ from torch_tpu._internal.pallas import pallas
 
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
+from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_update
 
 _WORD_BYTES = 4
 
@@ -201,6 +202,34 @@ def update_sparse_mla_kv_cache(
     page = jnp.where(valid, block_tables_2d[seq_id, pos // page_size],
                      OOB_PAGE)
     slot = pos % page_size
+
+    # The native gather ABI can be updated without reformatting either cache.
+    # Pack only this step's values; the DMA kernel aliases the persistent inputs.
+    if (nope_spec.layout is KVCacheLayout.SPARSECORE
+            and rope_spec.layout is KVCacheLayout.SPARSECORE
+            and nope_spec.head_dim == 512 and rope_spec.head_dim == 128):
+
+        def native(nope, rope, kv, pe, page, slot):
+            kv_u8 = jax.lax.bitcast_convert_type(kv, jnp.uint8)
+            kv_u8 = jnp.pad(kv_u8, ((0, 0), (0, 512 - kv_u8.shape[-1])))
+            pe_u8 = jax.lax.bitcast_convert_type(pe, jnp.uint8)
+            pe_u8 = jnp.pad(pe_u8, ((0, 0), (0, 128 - pe_u8.shape[-1])))
+            return native_sc_cache_update.update_cache(
+                nope, rope, _pack4(kv_u8.reshape(num_tokens, 4, 128)),
+                _pack4(pe_u8.reshape(num_tokens, 4, 32)), page, slot)
+
+        def reference(nope, rope, kv, pe, page, slot):
+            return (_scatter_rows(nope, nope_spec, kv, page, slot),
+                    _scatter_rows(rope, rope_spec, pe, page, slot))
+
+        return jax.lax.platform_dependent(kv_cache_nope,
+                                          kv_cache_rope,
+                                          kv_c_normed,
+                                          k_pe,
+                                          page,
+                                          slot,
+                                          tpu=native,
+                                          default=reference)
 
     return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
             _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))

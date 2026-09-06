@@ -44,11 +44,14 @@ def kernel(body,
            cost_estimate=None,
            debug=False,
            name=None,
-           metadata=None):
+           metadata=None,
+           input_output_aliases=None):
     """Near drop-in for ``pl.kernel`` that lowers via ``core_map``.
 
     Differs in that ``out_shape`` is renamed to ``out_type`` and
     ``scratch_shapes`` (list) is renamed to ``scratch_types`` (dict).
+    ``input_output_aliases`` maps operand indices to output indices, reusing
+    the input Ref so partial writes preserve untouched input contents.
     """
     single_output = not isinstance(out_type, (tuple, list))
     out_types = (out_type, ) if single_output else out_type
@@ -56,7 +59,13 @@ def kernel(body,
     @api.jit
     def run(*operands):
         arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
-        out_refs = tree_util.tree_map(_empty_out_ref, out_types)
+        aliases = {
+            out: arg
+            for arg, out in (input_output_aliases or {}).items()
+        }
+        out_refs = tuple(
+            arg_refs[aliases[i]] if i in aliases else _empty_out_ref(out)
+            for i, out in enumerate(out_types))
 
         @pl_core.core_map(
             mesh,
