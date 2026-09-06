@@ -30,6 +30,7 @@ def child(case, tile):
     page_size = int(os.getenv("TUNER_PAGE_SIZE", "256"))
     max_seqs = int(os.getenv("TUNER_MAX_SEQS", "32"))
     pages_per_seq = 32768 // page_size
+    cast_probs = os.getenv("TUNER_CAST_PROBS", "1") == "1"
     assert c <= max_seqs and page_size % packing == 0
     rows = []
     for context in (128, 512, 1000):
@@ -98,7 +99,7 @@ def child(case, tile):
                 decode_batch_size=split if window == 1 else 1,
                 vmem_limit_bytes=60 * 1024 * 1024,
                 s_dtype=jnp.bfloat16,
-                p_same_dtype_as_v=True)
+                p_same_dtype_as_v=cast_probs)
 
         started = time.perf_counter()
         output, cache = invoke(cache)
@@ -183,7 +184,7 @@ def child(case, tile):
                 decode_batch_size=split if window == 1 else 1,
                 vmem_limit_bytes=60 * 1024 * 1024,
                 s_dtype=jnp.bfloat16,
-                p_same_dtype_as_v=True)
+                p_same_dtype_as_v=cast_probs)
 
         golden_cache = jnp.asarray(expected_cache, kv_dtype)
         # The MLA entrypoint donates cache_kv. Keep the original state alive
@@ -249,6 +250,7 @@ def child(case, tile):
                  variant=str(tile),
                  timing="host_dispatch_plus_synchronized_kernel",
                  kv_dtype=dtype_name,
+                 p_same_dtype_as_v=cast_probs,
                  page_size=page_size,
                  heads=3,
                  max_num_seqs=max_seqs,
