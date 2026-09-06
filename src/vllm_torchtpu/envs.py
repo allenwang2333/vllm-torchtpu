@@ -48,6 +48,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    MIXED_Q_SPLIT: int = 1
+    MIXED_NUM_QUERIES_PER_BLOCK: int = 16
+    MIXED_NUM_KV_PAGES_PER_BLOCK: int = 1
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
@@ -371,6 +374,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
+    "MIXED_Q_SPLIT":
+    lambda: int(os.getenv("MIXED_Q_SPLIT", "1")),
+    "MIXED_NUM_QUERIES_PER_BLOCK":
+    lambda: int(os.getenv("MIXED_NUM_QUERIES_PER_BLOCK", "16")),
+    "MIXED_NUM_KV_PAGES_PER_BLOCK":
+    lambda: int(os.getenv("MIXED_NUM_KV_PAGES_PER_BLOCK", "1")),
     # Bucket padding gap for TPU compile sizes
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.getenv("VLLM_TPU_BUCKET_PADDING_GAP", "0")),
