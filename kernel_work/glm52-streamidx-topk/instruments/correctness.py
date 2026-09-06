@@ -69,14 +69,24 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
 # `--negative-control` deliberately corrupts the selection and asserts these
 # thresholds FAIL, so the gate is a discriminator rather than an assertion.
 #
-# MEASURED, j-470d481e-4a6d-477c-9e37, --negative-control on the incumbent:
-# churn separates cleanly -- drop-block 15.9-27.7%, tail-swap 0.391% at every
-# case, a 41x gap with TOL_CHURN sitting inside it. Deficit does NOT, at this
-# tolerance: drop-block reached only 0.04605 at dec-B-2x8k, UNDER the 0.05
-# tolerance, so on that case churn is the only thing catching a kernel that
-# skips a KV block. Both arms are printed with their separation window on
-# every --negative-control run; retune from those two endpoints, not by feel.
-TOL_DEFICIT = 0.05    # fraction of the top-to-cut score range
+# Both are now set from MEASURED endpoints, j-b0c4901b-5df9-4718-8c3c, the
+# first --negative-control run to pass. Each threshold sits at the geometric
+# centre of the window between the weakest damaged case (must fail) and the
+# worst acceptable case (must pass):
+#
+#   deficit  window (0.00486, 0.04605)  9.5x   -> 0.015, 3.1x either side
+#   churn    window (0.00439, 0.15869)  36.2x  -> 0.03,  6.8x / 5.3x
+#
+# TOL_DEFICIT was 0.05 and that was OUTSIDE its window: drop-block reached
+# only 0.04605 at dec-B-2x8k, so a kernel skipping a KV block slid under the
+# threshold there and only churn caught it. The gate passed while running on
+# one metric, which is exactly the state a negative control exists to expose
+# -- a damage mode perturbing deficit but not churn would have gone through.
+#
+# The ceilings are the max over everything that must pass INCLUDING the
+# undamaged incumbent, which for deficit (0.00486) is above the tail-swap arm
+# (0.00249). Retune from the separation block the control prints, not by feel.
+TOL_DEFICIT = 0.015   # fraction of the top-to-cut score range
 TOL_CHURN = 0.03      # fraction of the true top-k missing (~61 of 2048)
 
 NSWAP = 8             # near-ties exchanged by the tail-swap arm
@@ -296,7 +306,7 @@ def run_case(name, verbose=True, corrupt="", stats=None):
     return fails
 
 
-def negative_control(names):
+def negative_control(names, clean=()):
     """Show the gate is a discriminator, not an assertion.
 
     Runs the incumbent, then damages its output two ways and checks that the
@@ -329,12 +339,21 @@ def negative_control(names):
     # j-470d481e is why this is printed: the deficit arms OVERLAPPED there
     # (0.04605 vs 0.05061) and reading it off the table was the only way to
     # find out.
+    #
+    # The ceiling is the max over EVERYTHING that must pass, which includes
+    # the undamaged incumbent -- not just tail-swap. j-b0c4901b showed why:
+    # tail-swap's deficit ceiling (0.00249) came out BELOW the undamaged one
+    # (0.00486), because exchanging the 8 worst selected for the true
+    # next-best raises the minimum score. Reading the window off tail-swap
+    # alone would have put the floor of the admissible range under the
+    # incumbent's own error and red-lighted a correct kernel.
     print("\n-- separation (must-fail floor vs must-pass ceiling) --", flush=True)
+    ok = list(swap) + [(f"{n}/undamaged", d, c) for n, d, c in clean]
     for label, tol, i in (("deficit", TOL_DEFICIT, 1), ("churn", TOL_CHURN, 2)):
         lo = min(s[i] for s in drop)      # weakest damaged case
-        hi = max(s[i] for s in swap)      # worst acceptable case
+        hi = max(s[i] for s in ok)        # worst case that must still pass
         lo_n = min(drop, key=lambda s: s[i])[0]
-        hi_n = max(swap, key=lambda s: s[i])[0]
+        hi_n = max(ok, key=lambda s: s[i])[0]
         if hi < lo:
             print(f"  {label:8} SEPARATES: any tol in ({hi:.5f}, {lo:.5f}) "
                   f"works, ratio {lo / max(hi, 1e-9):.1f}x  "
@@ -362,13 +381,13 @@ def main():
                          "from boundary near-ties, then exit")
     a = ap.parse_args()
     names = [a.case] if a.case else list(CASES)
-    allf = []
+    allf, clean = [], []
     for n in names:
-        allf += run_case(n)
+        allf += run_case(n, stats=clean)
     print(f"\n{len(names) - len(set(f.split()[0] for f in allf))}/{len(names)} "
           f"cases passed, {len(allf)} assertion failures")
     if a.negative_control:
-        allf += negative_control(names)
+        allf += negative_control(names, clean)
     sys.exit(1 if allf else 0)
 
 

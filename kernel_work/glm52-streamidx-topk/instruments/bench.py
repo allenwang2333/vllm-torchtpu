@@ -46,6 +46,72 @@ def timeit(fn, iters=20, warmup=5, blocks=2):
     return res
 
 
+def interleaved(arms, repeats=5, iters=20, warmup=5, ref=None):
+    """Time several arms ADJACENTLY, `repeats` times, and difference in pairs.
+
+    `arms` is [(name, fn), ...]. Every arm is compiled and warmed first, then
+    each repeat times every arm back to back in list order. The point is the
+    run-ORDER drift this block has measured twice (roofline.py:86-95, and
+    j-470d481e): 3-9% between two runs of the same shape minutes apart, larger
+    than the block-to-block spread inside one run. Two arms measured in
+    separate jobs, or in separate phases of one job, cannot resolve anything
+    under that. Two arms measured microseconds apart, five times over, can --
+    the drift is common-mode and cancels in the per-repeat difference.
+
+    So the statistic reported is the PAIRED difference: delta is computed
+    inside each repeat against `ref`, and it is the median of those five
+    deltas that is the result. The spread of the five is printed beside it and
+    is what says whether the effect is resolvable. An effect smaller than that
+    spread is not a result.
+
+    Never form a delta between arms measured in different repeats, and never
+    subtract two independently drifting quantities to get a third (full - sc
+    moved 2.6x across three measurements of one shape in j-470d481e).
+    """
+    for _, fn in arms:
+        jax.block_until_ready(fn())
+    for _ in range(warmup):
+        for _, fn in arms:
+            jax.block_until_ready(fn())
+
+    per_repeat = {name: [] for name, _ in arms}
+    for r in range(repeats):
+        for name, fn in arms:
+            ts = []
+            for _ in range(iters):
+                t0 = time.perf_counter()
+                out = fn()
+                jax.block_until_ready(out)
+                ts.append((time.perf_counter() - t0) * 1e6)
+            per_repeat[name].append(float(np.median(ts)))
+        line = "  ".join(f"{nm}={per_repeat[nm][-1]:.1f}" for nm, _ in arms)
+        print(f"  repeat {r}: {line}", flush=True)
+
+    ref = ref if ref is not None else arms[0][0]
+    print(f"\n  {'arm':28} {'med us':>10} {'across-repeat':>14} "
+          f"{'paired d time %':>16} {'d spread':>10}", flush=True)
+    out = {}
+    for name, _ in arms:
+        v = np.array(per_repeat[name])
+        drift = (v.max() - v.min()) / np.median(v)
+        if name == ref:
+            print(f"  {name:28} {np.median(v):10.1f} {drift:13.1%} "
+                  f"{'--':>16} {'--':>10}", flush=True)
+            out[name] = dict(us=per_repeat[name], median=float(np.median(v)),
+                             drift=float(drift), delta_pct=None,
+                             delta_spread_pct=None)
+            continue
+        d = 100.0 * (v - np.array(per_repeat[ref])) / np.array(per_repeat[ref])
+        print(f"  {name:28} {np.median(v):10.1f} {drift:13.1%} "
+              f"{np.median(d):>+15.1f}% {d.max()-d.min():9.1f}pt", flush=True)
+        out[name] = dict(us=per_repeat[name], median=float(np.median(v)),
+                         drift=float(drift), delta_pct=float(np.median(d)),
+                         delta_spread_pct=float(d.max() - d.min()))
+    print(f"  (paired d time % is vs {ref}, computed inside each repeat then "
+          f"medianed; negative is faster)", flush=True)
+    return out
+
+
 def synth_scores(T, n, lens_live, seed=1):
     """A score matrix with the distribution the kernel actually produces.
 
