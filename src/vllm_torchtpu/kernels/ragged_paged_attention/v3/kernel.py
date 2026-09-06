@@ -489,8 +489,6 @@ def _ragged_paged_attention_kernel_loop(
             jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(int_ty)
         k_span = processed_kv_len_int + lax.broadcasted_iota(
             int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(
-            int_ty, v.shape, 0)
 
         mask = None
         if apply_causal_mask:
@@ -499,7 +497,6 @@ def _ragged_paged_attention_kernel_loop(
 
         if not skip_block_kv_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
         if sliding_window is not None:
             mask = mask_and(mask, q_span < k_span + sliding_window)
