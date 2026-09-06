@@ -1,0 +1,372 @@
+--- src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py	2026-09-06 00:06:23.669822492 +0000
++++ kernel_work/streamindex_topk/variants/right-size/streamindex_topk_rs.py	2026-09-06 02:56:10.503514064 +0000
+@@ -11,7 +11,41 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""TPU-Friendly StreamIndex Top-K kernel."""
++"""TPU-Friendly StreamIndex Top-K kernel -- VARIANT B, "Right-Size".
++
++Step-3 variant of `src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py`
++for `measurement_and_design.md` section 4 (Option B). Only the TensorCore half
++is built here: section 4.6 forbids touching `sparsecore_topk.py` before a test
++exists for it, and nothing in this file does.
++
++What changes, and nothing else does:
++
++1.  `num_sublanes_total` is sized from a caller-supplied **static bucket on the
++    batch's real KV length** (`kv_len_bucket`) instead of from `max_model_len`
++    via `pages_per_seq`. With `kv_len_bucket=None` this file is the incumbent.
++2.  The kernel's out-DMA becomes a **masked partial-block store**: the final
++    `bkv` slab writes only the sublanes that fall inside the buffer. Both the
++    full-width and the tail extents are compile-time constants and the choice
++    between them is a `pl.when` on the block index, so no DMA carries a traced
++    extent. `num_bkv` is clamped to the number of slabs the buffer holds, so a
++    `kv_len` above the bucket truncates the scan rather than writing past the
++    end of the buffer.
++3.  The `jnp.full(..., -inf)` scores prefill is **deleted**. The first band
++    allocates its own Pallas output instead of aliasing an XLA-initialised
++    one; the two later bands still alias onto it. Nothing initialises the
++    lanes no band writes.
++
++Why (3) is safe -- and this is the claim the poison arm tests, not an
++assertion the code may rely on: `_topk_kernel` in `sparsecore_topk.py` gates
++every candidate on `valid = (j < i_hi) & ...` with
++`i_hi = min(slice_len, row_lengths[row])` (:151-155, :171). Positions at or
++past a row's `row_lengths` are read by the resident DMA but can never be
++*selected*. The kernel writes `align_to(kv_len, bkv_sz)` positions per row,
++which is >= that row's `row_lengths`, so the region the prefill used to cover
++is exactly the region selection cannot reach. The `-inf` the causal/validity
++mask writes *inside* a written slab is unchanged and stays load-bearing
++(design section 4.1, area 6) -- only the redundant prefill goes.
++"""
+ 
+ import enum
+ import functools
+@@ -70,6 +104,7 @@
+     start_end_seq_idx_ref,  # Shape: [2], Memory: SMEM
+     sem_ids_ref,  # Shape: [3], Memory: SMEM
+     bo_sz_ref,  # Shape: [2], Memory: SMEM
++    bo_partial_ref,  # Shape: [2], Memory: SMEM -- 1 if that out-DMA was a tail
+     # Input
+     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
+     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
+@@ -107,6 +142,19 @@
+     bkv_sz = bkv_sz_per_kv_packing * kv_packing
+     num_sublanes_bkv = bkv_sz // 128
+ 
++    # RIGHT-SIZE. The scores buffer may now be narrower than a whole number of
++    # `bkv` slabs, so the last slab is partial. Both extents are static: the
++    # store is full width for block indices < `n_full_slabs`, `n_tail_sublanes`
++    # wide at exactly `n_full_slabs`, and there is no block after that because
++    # `num_bkv` is clamped to `max_bkv` below. When the width happens to be a
++    # multiple of the slab (every one of step 1's five regimes -- kv_len 8192
++    # and 65536 are both multiples of bkv_sz=2048) `n_tail_sublanes` is 0, the
++    # tail branch is not emitted at all, and this is the incumbent's store.
++    num_sublanes_total = scores_hbm_ref.shape[1]
++    n_full_slabs = num_sublanes_total // num_sublanes_bkv
++    n_tail_sublanes = num_sublanes_total - n_full_slabs * num_sublanes_bkv
++    max_bkv = cdiv(num_sublanes_total, num_sublanes_bkv)
++
+     start_seq_idx = start_end_seq_idx_ref[0]
+     end_seq_idx = start_end_seq_idx_ref[1]
+     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * seq_batch_size
+@@ -126,12 +174,38 @@
+         kv_lens.append(kv_len)
+ 
+     def wait_send_scores(bo_sem_idx):
++        # The semaphore is credited with the bytes the DMA actually moved, so
++        # the wait has to name the same extent the start named. Which branch
++        # ran is recorded in SMEM rather than recomputed, because `bkv_idx` is
++        # long gone by the time the wait for that buffer comes round.
+         old_sz = bo_sz_ref[bo_sem_idx]
+ 
+-        @pl.when(old_sz >= 0)
++        if not n_tail_sublanes:
++            # Byte-for-byte the incumbent's wait. When the buffer is a whole
++            # number of slabs -- every one of step 1's five regimes -- nothing
++            # about the out-DMA changes, not even the scalar predicate.
++            @pl.when(old_sz >= 0)
++            def _():
++                dst = scores_block_x2_ref.at[bo_sem_idx,
++                                             pl.ds(0, seq_batch_size * old_sz),
++                                             pl.ds(0, num_sublanes_bkv)]
++                _async_copy(dst, dst, sems.at[2, bo_sem_idx, 0], wait=True)
++            return
++
++        old_partial = bo_partial_ref[bo_sem_idx]
++
++        @pl.when((old_sz >= 0) & (old_partial == 0))
+         def _():
+             dst = scores_block_x2_ref.at[bo_sem_idx,
+-                                         pl.ds(0, seq_batch_size * old_sz)]
++                                         pl.ds(0, seq_batch_size * old_sz),
++                                         pl.ds(0, num_sublanes_bkv)]
++            _async_copy(dst, dst, sems.at[2, bo_sem_idx, 0], wait=True)
++
++        @pl.when((old_sz >= 0) & (old_partial == 1))
++        def _():
++            dst = scores_block_x2_ref.at[bo_sem_idx,
++                                         pl.ds(0, seq_batch_size * old_sz),
++                                         pl.ds(0, n_tail_sublanes)]
+             _async_copy(dst, dst, sems.at[2, bo_sem_idx, 0], wait=True)
+ 
+     def start_send_scores(bo_sem_idx, sz, token_start, bkv_idx):
+@@ -139,16 +213,58 @@
+         # entire batch.
+         bo_sz_ref[bo_sem_idx] = sz
+         sublane_start = bkv_idx * num_sublanes_bkv
+-        _async_copy(
+-            scores_block_x2_ref.at[bo_sem_idx,
+-                                   pl.ds(0, seq_batch_size * sz)],
+-            scores_hbm_ref.at[
+-                pl.ds(token_start, seq_batch_size * sz),
+-                pl.ds(sublane_start, num_sublanes_bkv),
+-            ],
+-            sems.at[2, bo_sem_idx, 0],
+-            wait=False,
+-        )
++
++        if not n_tail_sublanes:
++            # Byte-for-byte the incumbent's store. `bo_partial_ref` is not even
++            # written, so at the five step-1 regimes the only difference from
++            # the shipped kernel is the width of the buffer it writes into.
++            _async_copy(
++                scores_block_x2_ref.at[bo_sem_idx,
++                                       pl.ds(0, seq_batch_size * sz),
++                                       pl.ds(0, num_sublanes_bkv)],
++                scores_hbm_ref.at[
++                    pl.ds(token_start, seq_batch_size * sz),
++                    pl.ds(sublane_start, num_sublanes_bkv),
++                ],
++                sems.at[2, bo_sem_idx, 0],
++                wait=False,
++            )
++            return
++
++        is_tail = bkv_idx == n_full_slabs
++        bo_partial_ref[bo_sem_idx] = is_tail.astype(jnp.int32)
++
++        @pl.when(jnp.logical_not(is_tail))
++        def _():
++            _async_copy(
++                scores_block_x2_ref.at[bo_sem_idx,
++                                       pl.ds(0, seq_batch_size * sz),
++                                       pl.ds(0, num_sublanes_bkv)],
++                scores_hbm_ref.at[
++                    pl.ds(token_start, seq_batch_size * sz),
++                    pl.ds(sublane_start, num_sublanes_bkv),
++                ],
++                sems.at[2, bo_sem_idx, 0],
++                wait=False,
++            )
++
++        @pl.when(is_tail)
++        def _():
++            # The destination offset is written as the static constant rather
++            # than as `sublane_start`, which is only equal to it: a traced
++            # offset the compiler cannot prove aligned is the one thing that
++            # reliably fails to lower (references/hardware-facts.md).
++            _async_copy(
++                scores_block_x2_ref.at[bo_sem_idx,
++                                       pl.ds(0, seq_batch_size * sz),
++                                       pl.ds(0, n_tail_sublanes)],
++                scores_hbm_ref.at[
++                    pl.ds(token_start, seq_batch_size * sz),
++                    pl.ds(n_full_slabs * num_sublanes_bkv, n_tail_sublanes),
++                ],
++                sems.at[2, bo_sem_idx, 0],
++                wait=False,
++            )
+ 
+     def _async_copy(src, dst, sem, wait):
+         cp = pltpu.make_async_copy(src, dst, sem)
+@@ -274,6 +390,13 @@
+     def process():
+         kv_len_max = jnp.max(jnp.stack(kv_lens))
+         num_bkv = jnp.maximum(1, cdiv(kv_len_max, bkv_sz))
++        # A `kv_len` above the caller's bucket truncates the scan instead of
++        # storing past the end of the buffer. `_effective_row_lengths` already
++        # clamps `row_lengths` to the buffer width, so the two agree and the
++        # result is an exact top-k over the first `num_sublanes_total * 128`
++        # positions -- the same degradation the incumbent shows when a sequence
++        # exceeds `max_model_len`.
++        num_bkv = jnp.minimum(num_bkv, max_bkv)
+         if static_q_len is None:
+             assert seq_batch_size == 1
+             num_bq = jnp.maximum(1, cdiv(q_lens[0], bq_sz))
+@@ -516,6 +639,8 @@
+         "vmem_limit_bytes",
+         "decode_req_batch_size",
+         "enable_early_exit",
++        "kv_len_bucket",
++        "poison_fill",
+     ),
+ )
+ def streamindex_topk(
+@@ -535,6 +660,8 @@
+     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+     decode_req_batch_size: int = 4,
+     enable_early_exit: bool = False,
++    kv_len_bucket: int | None = None,
++    poison_fill: float | None = None,
+ ) -> jax.Array:
+     """StreamIndex Top-K retrieval.
+ 
+@@ -559,6 +686,18 @@
+     enable_early_exit: whether to enable early exit using jax.lax.cond when k >=
+       kv_len for all sequences in the batch. Defaults to False.
+     decode_req_batch_size: maximum decode batch size per iteration.
++    kv_len_bucket: RIGHT-SIZE. A static upper bound on `max(seq_lens) //
++      compression_ratio` for this call. When given, the scores buffer is sized
++      from it rather than from `pages_per_seq` (i.e. from `max_model_len`), and
++      the `-inf` prefill is dropped. It must be a *bucket*, not the exact
++      length, or every distinct batch triggers a recompile; and it must be an
++      upper bound, or the scan is truncated to the buffer (see `max_bkv` in the
++      kernel body). `None` reproduces the incumbent exactly.
++    poison_fill: TEST HOOK, not for production. Reinstates the aliased
++      initialisation with this value instead of `-inf`. Used to prove that no
++      consumer reads a lane the kernel does not write: a large positive poison
++      that changes no margin cannot have been selected. Ignored unless
++      `kv_len_bucket` is set.
+ 
+   Returns:
+     Top-K indices (in compressed space).
+@@ -600,9 +739,23 @@
+                 f"bkv_sz ({page_size} * {bkv_p} = {bkv_sz}) must be a multiple"
+                 " of 128.")
+ 
+-    num_sublanes_total = max(
+-        align_to(pages_per_seq, bkv_p) * page_size // 128
+-        for bkv_p in num_kv_pages_per_blocks)
++    if kv_len_bucket is None:
++        # Incumbent: `align_to(pages_per_seq, bkv_p)` over the whole tuple, and
++        # `pages_per_seq` comes from `max_model_len`. Slot 1 is read by no
++        # executing band and still participates in the `max`
++        # (measurement_and_design.md section 2.4).
++        num_sublanes_total = max(
++            align_to(pages_per_seq, bkv_p) * page_size // 128
++            for bkv_p in num_kv_pages_per_blocks)
++    else:
++        # RIGHT-SIZE. Exactly the live positions, rounded up to one sublane of
++        # 128 -- not up to a page and not up to a `bkv` slab. The masked store
++        # in the kernel body is what makes the un-rounded width legal, and the
++        # `max` over the tuple goes with the rounding: raising any `bkv_p` no
++        # longer widens the buffer for every band, which is the coupling that
++        # made Option E cost mixed anything (section 4.2).
++        live_positions = min(kv_len_bucket, pages_per_seq * page_size)
++        num_sublanes_total = max(cdiv(live_positions, 128), cdiv(k, 128))
+ 
+     def run_scores_kernel(
+         q,
+@@ -642,13 +795,21 @@
+         # end_seq_idx - start_seq_idx % seq_batch_size == 0.
+         grid = ((end_seq_idx - start_seq_idx) // seq_batch_size, )
+ 
++        # RIGHT-SIZE. `scores_init is None` is the deleted `-inf` prefill: this
++        # band takes no scores input and Pallas hands it a fresh, uninitialised
++        # HBM output. Later bands alias onto that buffer as before, so the
++        # chain still accumulates -- what is gone is the XLA fill that used to
++        # write the whole thing before the kernel overwrote 80-97% of it.
++        aliased = scores_init is not None
+         in_specs = [
+             pl.BlockSpec(memory_space=pltpu.HBM),  # q
+             pl.BlockSpec(memory_space=pltpu.HBM),  # prepared_indexer_weights
+             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
+-            pl.BlockSpec(
+-                memory_space=pltpu.HBM),  # scores_init (aliased to out)
+         ]
++        if aliased:
++            in_specs.append(
++                pl.BlockSpec(
++                    memory_space=pltpu.HBM))  # scores_init (aliased to out)
+         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # scores
+ 
+         bkv_double_buf = pltpu.VMEM(
+@@ -698,12 +859,27 @@
+             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
+             jnp.zeros((3, ), jnp.int32),  # (bq, bkv, bo) sem indices
+             jnp.full((2, ), -1, jnp.int32),  # in-flight out DMA row counts
++            jnp.zeros((2, ), jnp.int32),  # 1 if that out DMA was the tail slab
+         )
+ 
++        # A Pallas body is a flat positional list, so dropping the aliased
++        # `scores_init` operand would silently shift every ref after it --
++        # including the output and all four scratch buffers. `kernel` never
++        # reads `scores_in_hbm_ref` (it exists only to name the alias), so the
++        # un-aliased case splices a `None` back into that slot rather than
++        # maintaining a second signature.
++        n_before_scores_in = len(scalar_prefetches) + 3
++
++        def _body(*refs, **static):
++            if aliased:
++                return kernel(*refs, **static)
++            return kernel(*refs[:n_before_scores_in], None,
++                          *refs[n_before_scores_in:], **static)
++
+         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
+         pallas_kernel = jax.named_scope(scope_name)(pl.pallas_call(
+             functools.partial(
+-                kernel,
++                _body,
+                 compression_ratio=compression_ratio,
+                 static_q_len=static_q_len,
+                 bq_sz=bq_sz,
+@@ -726,27 +902,42 @@
+                 shape=(q.shape[0], num_sublanes_total, 128),
+                 dtype=out_dtype,
+             ),
+-            input_output_aliases={len(scalar_prefetches) + 3: 0},
++            input_output_aliases=({
++                len(scalar_prefetches) + 3: 0
++            } if aliased else {}),
+             name=scope_name,
+         ))
+-        return pallas_kernel(
+-            *scalar_prefetches,
+-            q,
+-            prepared_indexer_weights,
+-            cache_kv,
+-            scores_init,
+-        )
++        operands = [q, prepared_indexer_weights, cache_kv]
++        if aliased:
++            operands.append(scores_init)
++        return pallas_kernel(*scalar_prefetches, *operands)
+ 
+     def _common_path(_):
+         out_dtype = jnp.float32
+ 
+-        # Pre-fill the output with -inf and alias it, so masked / unwritten
+-        # columns are already -inf.
+-        scores_init = jnp.full(
+-            (q.shape[0], num_sublanes_total, 128),
+-            -jnp.inf,
+-            dtype=out_dtype,
+-        )
++        if kv_len_bucket is None:
++            # Incumbent: pre-fill the output with -inf and alias it, so masked
++            # / unwritten columns are already -inf.
++            scores_init = jnp.full(
++                (q.shape[0], num_sublanes_total, 128),
++                -jnp.inf,
++                dtype=out_dtype,
++            )
++        elif poison_fill is not None:
++            # TEST HOOK. Same aliasing as the incumbent, but the value is a
++            # large positive rather than -inf. Any lane the kernel does not
++            # write and something downstream nevertheless reads will now be the
++            # largest score in its row and will be selected. Margins identical
++            # to the un-poisoned run therefore prove no such lane is read; this
++            # is a strict test, not an approximation (design section 4.4).
++            scores_init = jnp.full(
++                (q.shape[0], num_sublanes_total, 128),
++                poison_fill,
++                dtype=out_dtype,
++            )
++        else:
++            # RIGHT-SIZE: no fill at all. The first band allocates.
++            scores_init = None
+ 
+         # TODO: we shall sort the sequences by length, so that multiple decode
+         # sequences in one batch have similar lengths to reduce waste of compute.
