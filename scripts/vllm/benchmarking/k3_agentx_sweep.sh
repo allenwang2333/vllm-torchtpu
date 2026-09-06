@@ -228,6 +228,10 @@ export AGENTIC_OUTPUT_DIR="$RESULTS_DIR"
 export ENABLE_AGENTX_POWER=0
 export AIPERF_EXPERIMENTAL_FAST="$FAST"
 export AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
+# Build 9: at conc 8 the warmup drain (default grace 1800 s) timed out because a
+# single ~70k-token turn takes >30 min on the prefill-bound engine; give it 2 h.
+export AGENTIC_WARMUP_GRACE_PERIOD="${AGENTIC_WARMUP_GRACE_PERIOD:-7200}"
+export AIPERF_DRAIN_TIMEOUT_SECONDS="${AIPERF_DRAIN_TIMEOUT_SECONDS:-3600}"
 
 source "$IX_DIR/benchmarks/benchmark_lib.sh"
 resolve_trace_source            # aiperf venv + corpus download (HF, public)
