@@ -23,7 +23,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
-                                                       get_tuned_params)
+                                                       get_tuned_params,
+                                                       tuned_params_mapping)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -678,6 +679,26 @@ def mla_attention(q_TNA: jax.Array,
             pages_per_seq=block_tables.shape[0] // max_num_seqs,
         )
         mixed_tuned = get_tuned_params(mixed_key)
+
+        # Prefer measured decode entries for the actual local layout. Keep
+        # legacy lookup unchanged when no exact entry has been integrated.
+        exact_decode_key = TuningKey(
+            case="batched_decode",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=q.shape[1],
+            actual_lkv_dim=q.shape[-1],
+            actual_r_dim=actual_r_dim,
+            q_dtype=jnp.dtype(q.dtype).name,
+            kv_dtype=kv_dtype_str,
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=kv_packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=block_tables.shape[0] // max_num_seqs,
+        )
+        if exact_decode_key in tuned_params_mapping:
+            decode_tuned = get_tuned_params(exact_decode_key)
+            logger.info("MLA exact decode tuning hit: %s -> %s",
+                        exact_decode_key, decode_tuned)
 
         num_kv_pages_per_blocks = (
             decode_tuned.num_kv_pages_per_block,
