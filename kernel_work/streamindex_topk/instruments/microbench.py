@@ -51,12 +51,14 @@ import time
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from . import inputs as I
 from . import shapes as S
 
 WARMUP = 3
 REPS = 10
+INNER = 20
 
 
 def _median_spread(times_s):
@@ -66,16 +68,32 @@ def _median_spread(times_s):
     return med * 1e3, spread
 
 
-def _time(fn, *args, reps=REPS, warmup=WARMUP):
-    """Time a device call. Blocks on the result -- a timing that forgets to
-    block times dispatch, which reads as an implausibly good number."""
+def _time(fn, *args, reps=REPS, warmup=WARMUP, inner=INNER):
+    """Time a jitted device call, amortizing host dispatch over `inner` calls.
+
+    `fn` must already be `jax.jit`-wrapped. Each rep dispatches `inner` calls
+    back to back and blocks ONCE at the end, then divides. Blocking after every
+    single call instead measures host dispatch round-trip as well as device
+    time, and at these sizes that is most of the number: the first version of
+    this file blocked per call and reported 342 us for a decode call whose
+    Pallas scope the production profile shows at 76.42 us. Dispatch is real
+    cost in a Python benchmark loop and is not real cost in the served graph,
+    so it must not be inside the yardstick.
+
+    Blocking once at the end is still an honest device measurement -- the TPU
+    executes the queue serially, so what gets overlapped is host work, not
+    device work.
+    """
+    jax.block_until_ready(fn(*args))  # compile
     for _ in range(warmup):
         jax.block_until_ready(fn(*args))
     ts = []
     for _ in range(reps):
         t0 = time.perf_counter()
-        jax.block_until_ready(fn(*args))
-        ts.append(time.perf_counter() - t0)
+        for _ in range(inner):
+            out = fn(*args)
+        jax.block_until_ready(out)
+        ts.append((time.perf_counter() - t0) / inner)
     return ts
 
 
@@ -87,24 +105,19 @@ def run_regime(impl, regime: S.Regime, *, early_exit: bool, reps=REPS,
     d = I.build(regime)
     k = S.INDEX_TOPK
 
-    def call():
-        return impl.streamindex_topk(
-            d["q"],
-            d["indexer_weights"],
-            d["cache_kv"],
-            d["seq_lens"],
-            d["page_indices"],
-            d["cu_q_lens"],
-            d["distribution"],
-            k=k,
-            compression_ratio=S.COMPRESSION_RATIO,
-            num_kv_pages_per_block=S.NUM_KV_PAGES_PER_BLOCK,
-            num_queries_per_block=S.NUM_QUERIES_PER_BLOCK,
-            decode_req_batch_size=S.DECODE_REQ_BATCH_SIZE,
-            enable_early_exit=early_exit,
-        )
+    call = jax.jit(lambda q, w, c, s, p, cu, dist: impl.streamindex_topk(
+        q, w, c, s, p, cu, dist,
+        k=k,
+        compression_ratio=S.COMPRESSION_RATIO,
+        num_kv_pages_per_block=S.NUM_KV_PAGES_PER_BLOCK,
+        num_queries_per_block=S.NUM_QUERIES_PER_BLOCK,
+        decode_req_batch_size=S.DECODE_REQ_BATCH_SIZE,
+        enable_early_exit=early_exit,
+    ))
+    call_args = (d["q"], d["indexer_weights"], d["cache_kv"], d["seq_lens"],
+                 d["page_indices"], d["cu_q_lens"], d["distribution"])
 
-    full_ms, full_spread = _median_spread(_time(call, reps=reps))
+    full_ms, full_spread = _median_spread(_time(call, *call_args, reps=reps))
 
     row = dict(
         regime=regime.name,
@@ -123,9 +136,19 @@ def run_regime(impl, regime: S.Regime, *, early_exit: bool, reps=REPS,
 
     if measure_topk:
         width = S.num_sublanes_total(regime.max_model_len) * 128
-        scores = jnp.zeros((regime.num_tokens, width), jnp.float32)
-        row_lengths = jnp.full((regime.num_tokens, ),
-                               min(regime.kv_len, width), jnp.int32)
+        # The scores tensor must look like a real one. A `jnp.zeros` buffer --
+        # what this file used first -- makes every element a tie, and
+        # sparsecore_topk on all-ties is pathological: it measured 3.49 ms at
+        # `mixed_32k` with a 2266% spread, larger than the whole call it was
+        # supposed to be a component of. Random normals in the live columns and
+        # -inf in the padding is the distribution the kernel actually emits.
+        rng = np.random.default_rng(1234)
+        live = min(regime.kv_len, width)
+        arr = np.full((regime.num_tokens, width), -np.inf, dtype=np.float32)
+        arr[:, :live] = (rng.standard_normal((regime.num_tokens, live)) * 10.0
+                         ).astype(np.float32)
+        scores = jnp.asarray(arr)
+        row_lengths = jnp.full((regime.num_tokens, ), live, jnp.int32)
         topk_fn = jax.jit(
             lambda s, r: sparsecore_topk(
                 s, k, row_lengths=r, write_empty_rows=True))
