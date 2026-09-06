@@ -254,8 +254,18 @@ for idx in "${!CONCS[@]}"; do
     fi
     echo "[k3-sweep] replay cmd: $REPLAY_CMD"
     T0=$(date +%s)
-    run_agentic_replay_and_write_outputs "$RESULT_DIR"
-    echo "[k3-sweep] conc $c: replay+aggregate rc=$? wall=$(( $(date +%s) - T0 )) s"
+    # Build 9: after a warmup-drain timeout aiperf hung in its own shutdown for
+    # hours. Hard cap = warmup grace + window + 30 min slack; on expiry kill the
+    # whole process group so the sweep moves on to the next point.
+    REPLAY_CAP=$(( AGENTIC_WARMUP_GRACE_PERIOD + DURATION + 1800 ))
+    ( run_agentic_replay_and_write_outputs "$RESULT_DIR" ) &
+    replay_pid=$!
+    ( sleep "$REPLAY_CAP"; echo "[k3-sweep] conc $c: HARD TIMEOUT after ${REPLAY_CAP}s, killing aiperf"; pkill -TERM -P "$replay_pid" 2>/dev/null; sleep 20; pkill -KILL -f "aiperf profile" 2>/dev/null; kill -KILL "$replay_pid" 2>/dev/null ) &
+    watchdog_pid=$!
+    wait "$replay_pid"; rc=$?
+    kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null
+    pkill -KILL -f "aiperf profile" 2>/dev/null   # never leave a client behind between points
+    echo "[k3-sweep] conc $c: replay+aggregate rc=$rc wall=$(( $(date +%s) - T0 )) s"
     DONE_CONCS+=("$c")
     if [ "$idx" -lt $(( ${#CONCS[@]} - 1 )) ]; then wait_server_idle; fi
 done
