@@ -277,24 +277,107 @@ cross-job.
 
 ---
 
+## 5b. Variant A — Narrow Record: reader blocked, **writer wins 3.4×**
+
+`variants/narrow-record/`, committed `11efd4ef`. `measured (j-ce74a9f2-a4cd-40cb-9e87)`,
+`JobStatus: Failed`, 2/4 shards `rc=0` — shards 2 and 3 red from a single cause, and shard 3
+completed the writer probe before dying.
+
+### The reader side did not compile
+
+Mosaic rejected the scale-plane DMA at `streamindex_topk_narrow.py:245`:
+
+```
+Offsets along tiled dimensions must be aligned to tiles. Failed to verify that the index at
+dimension 0 is divisible by the tile dimension 32.
+  %766 = "tpu.memref_slice"(%arg10, %755, %21) : (memref<576x1024xi8,
+  #tpu.tiled<(32,128)(4,1),[8,1]>, ...) -> memref<1x1024xi8, ...>
+```
+
+Mosaic tiles the **last two** dims, so a `u8[num_pages, 1024]` scale plane is tiled on its *leading*
+axis and a one-row per-page slice is illegal. `tpu.assume_multiple` does not apply — the page index
+genuinely is not a multiple of 32. 576 and 390 pages give the same error. **A's modelled 13.42% at
+`decode_prod` and 8.36% at `decode_64k` remain `modelled`: neither confirmed nor refuted.** No
+correctness margins were obtained and the MXU operand types are **not confirmed** — P1's native-fp8
+finding stands for the incumbent only.
+
+The incumbent arms in that job are clean and worth keeping: `decode_prod` 0.166819 ms (0.644%),
+`decode_64k` 0.201013 (0.602%), `mixed_prod` 0.666106 (2.064%), `mixed_64k` 4.797339 (1.111%), with
+every drift-control delta inside its own spread (+0.17 / −0.11 / +0.77 / +0.06%) and all four
+tracking step 1's figures.
+
+A retry is authorised: re-declare the scale plane as `u8[num_pages, page_size//128, 128]` so the page
+axis is untiled and the `(8,128)` tile is exactly one page of scales. e8m0 is exact in both bf16 and
+f32, so widening for the reader's regroup keeps A bit-exact.
+
+### The writer side is `measured`, and it closes the last ranking defect — in the opposite direction
+
+Pure XLA at the production cache size (`u8[415,256,4,256]`, 424,960 positions), index arithmetic
+copied verbatim from `mla_attention_op.py:103-104`. **Negative is faster.**
+
+| T | `W0_today_wide` ms | spread % | `W12_split_both` ms | spread % | Δ time % | speedup × |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.842139 | 0.59 | 0.247234 | 1.91 | **−70.64** | **3.406** |
+| 64 | 0.059036 | 22.92 | 0.080732 | 35.70 | +36.75 | 0.731 |
+
+The wide scatter moves bytes at 258 GB/s against the split writer's 527, paying the same 1.98×
+amplification on the write side that the reader pays.
+
+**The T=64 row cannot support a conclusion** and must not be read as a decode-side regression: every
+arm sits within 0.01–0.04 ms of the donated-noop floor of 0.041–0.048 ms, with spreads comparable to
+the effect.
+
+**This closes design doc §9.4 item 2, and inverts it.** That item named the writer-side scatter as
+one of four `unmodelled` terms deciding the ranking, and §9.1 placed A at rank 3 *specifically*
+because of it — *"the row that decides whether A is net positive … is `unmodelled` and lives in a
+file this exercise does not own"* — with the note that if the writer's owner were engaged, A moves to
+rank 1 outright. The strike test's best case was the term being **zero**. It is not zero: it is a
+second win of 70.64% on the T=1024 row, which is the prefill/mixed path, which carries 85.7–87.9% of
+indexer time (§2). **A is rank-1 material the moment its reader compiles.**
+
+### Carried regardless of whether A ships
+
+Today's writer leaves **~70% of its prefill time on the table**. That turns
+`measurement_and_design.md` §11 item 1 from a profile reading (~291 µs per indexer layer, off an
+earlier prefill profile) into a measured **3.406×** with a named job. It is not a
+`streamindex_topk` edit — it is `mla_attention_op.py:103-104` — and it is filed as a carried item in
+its own right, not as a footnote to A.
+
+**One coupling to state plainly, because the two numbers invite the wrong reading:** the split writer
+is not independently shippable. It writes a format only a split reader can consume, so the 3.406×
+cannot be banked while A's reader is blocked. What the writer probe establishes is that A's format
+change is *cheap on both sides*, not that there is a free win sitting in the writer today.
+
+---
+
 ## 6. Ranking as it stands
 
 Not final — A, B, C, F and A1 are in flight, and F or A1 landing would rewrite the top of it.
 
 | rank | option | standing | why it moved from step 2 |
 | ---: | --- | --- | --- |
-| **1** | **B — Right-Size** | in flight | mixed carries 85.7–87.9% of indexer time (§2), and B's prize is mixed- and confound-shape-only. Design doc §9.2's own stated consequence. |
-| **2** | **A — Narrow Record** | in flight | unchanged in substance; rises as E falls. Its decode prize is now worth only ~13% of face value at the A/B shape. |
+| **1** | **A — Narrow Record** | **writer measured, reader blocked; retry authorised** | its blocking `unmodelled` term came back a **win** (3.406×), not a cost (§5b). Design doc §9.1: struck, "A moves to rank 1 outright". Contingent entirely on the reader compiling. |
+| **2** | **B — Right-Size** | in flight | mixed carries 85.7–87.9% of indexer time (§2), and B's prize is mixed- and confound-shape-only. Design doc §9.2's own stated consequence. |
 | **3** | **E — Retune** | **measured** | fell from joint rank 1. Net at the A/B is −0.84% to +0.90%, sign unresolved (§1.3). |
 | **4** | **C — Half-Width Key** | in flight | §7.5 predicts the confirmed VPU result makes C *actively worse*, since a 16-bit key adds a VPU-side encode on the bottleneck unit. |
 | **5** | **D — No Round Trip** | **dead** | priced at 8.96× its threshold (§3). Not built. |
 | **?** | **F — MXU head sum** | in flight | targets 52.5% of the inner step; exact. Not in step 2. |
 | **?** | **A1 — Drop the ReLU** | in flight, gated | targets ~85% of the inner step; an approximation, and expected to fail its gate. Not in step 2. |
 
-**Two of step 2's four `unmodelled` ranking defects are closed** — item 1 (TC-side top-k, §3) and
-item 3 (the mixed residual, §4). Item 4 (the decode:mixed split, §2) is `modelled` rather than
-`measured` but is settled well past the precision the ranking needs. Item 2 — the writer-side scatter
-cost that decides A — is with A's agent.
+**All four of step 2's `unmodelled` ranking defects are now closed** — item 1 (TC-side top-k, §3),
+item 2 (writer-side scatter, §5b), item 3 (the mixed residual, §4) and item 4 (the decode:mixed
+split, §2). Item 4 is `modelled` rather than `measured`, but it is settled well past the precision
+the ranking needs; an instrumented dispatch to make it `measured` is an open shard.
+
+Three of the four moved the ranking, and **two moved it against the direction step 2 guessed**: the
+writer-side term was assumed to be a cost and is a win, and the TensorCore top-k was the one term
+that could have promoted D and instead buried it. The fourth — the VPU residual — confirmed, and in
+confirming it pointed at a term (§4.1) that none of the five options addresses.
+
+That is worth stating as a result about the *process* rather than about the kernel: every option in
+`measurement_and_design.md` was ranked on bytes, buffers or boundaries, and the measurement says the
+dominant cost is arithmetic on a saturated unit. The two candidates now most likely to matter, F and
+A1, exist only because a strike test was run on a hypothesis the document itself rated poorly.
 
 ## 7. The question above all of these
 
