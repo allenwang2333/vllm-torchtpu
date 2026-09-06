@@ -1230,6 +1230,20 @@ class TPUModelRunner(GPUModelRunner):
         block_size = self.vllm_config.cache_config.block_size
         cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
+        layer_kv_cache_dtypes: dict[str, torch.dtype] = {}
+
+        def _layer_cache_dtype(module: AttentionLayerBase) -> torch.dtype:
+            configured = getattr(module, "kv_cache_dtype", cache_dtype_str)
+            if isinstance(configured, torch.dtype):
+                resolved = configured
+            elif configured == "auto":
+                resolved = (TPU_STR_DTYPE_TO_TORCH_DTYPE[self.dtype]
+                            if isinstance(self.dtype, str) else self.dtype)
+            else:
+                resolved = TPU_STR_DTYPE_TO_TORCH_DTYPE[configured]
+            layer_kv_cache_dtypes[layer_name] = resolved
+            return resolved
+
         has_attention = any(
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
         has_mamba = any(isinstance(m, MambaBase) for m in layers.values())
@@ -1260,6 +1274,7 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
+                layer_cache_dtype = _layer_cache_dtype(attn_module)
                 if (kv_tgt_layer :=
                         attn_module.kv_sharing_target_layer_name) is not None:
                     if kv_tgt_layer not in layers:
@@ -1303,7 +1318,7 @@ class TPUModelRunner(GPUModelRunner):
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
-                        self.kv_cache_dtype,
+                        layer_cache_dtype,
                     )
                     page_size_padded = (
                         self._hybrid_uniform_page_size_bytes
@@ -1312,14 +1327,14 @@ class TPUModelRunner(GPUModelRunner):
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
-                            self.kv_cache_dtype,
+                            layer_cache_dtype,
                         ))
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
-                            dtype=self.kv_cache_dtype,
+                            dtype=layer_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
                             indexes_kv_by_block_stride=True,
@@ -1329,7 +1344,7 @@ class TPUModelRunner(GPUModelRunner):
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
-                            dtype=self.kv_cache_dtype,
+                            dtype=layer_cache_dtype,
                             page_size_padded=page_size_padded,
                             indexes_kv_by_block_stride=True,
                         )
@@ -1348,6 +1363,9 @@ class TPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
+                layer_cache_dtype = _layer_cache_dtype(attn_module)
+                layer_cache_dtype_str = getattr(attn_module, "kv_cache_dtype",
+                                                cache_dtype_str)
                 page_size_padded = (
                     self._hybrid_uniform_page_size_bytes
                     if self._hybrid_uniform_page_size_bytes is not None else
@@ -1355,14 +1373,14 @@ class TPUModelRunner(GPUModelRunner):
                         block_size,
                         1,
                         attn_module.head_size,
-                        self.kv_cache_dtype,
+                        layer_cache_dtype,
                     ))
                 kv_cache_spec[layer_name] = MLAAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=attn_module.head_size,
-                    dtype=self.kv_cache_dtype,
-                    cache_dtype_str=cache_dtype_str,
+                    dtype=layer_cache_dtype,
+                    cache_dtype_str=layer_cache_dtype_str,
                     page_size_padded=page_size_padded,
                     indexes_kv_by_block_stride=True,
                 )
@@ -1383,6 +1401,7 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
+            layer_kv_cache_dtypes=layer_kv_cache_dtypes,
             attention_backend=backend_cls,
         )
 
@@ -5845,8 +5864,16 @@ class TPUModelRunner(GPUModelRunner):
             # makes every donated pool parameter fall back to a fresh
             # pool-sized output copy (a 2x-pool transient that OOMs at high
             # gpu_memory_utilization).
-            if self.kv_cache_raw_tensors:
-                synchronize_tensors(self.kv_cache_raw_tensors)
+            sync_tensors: list[torch.Tensor] = []
+            seen_tensors: set[int] = set()
+            for cache in kv_caches.values():
+                tensors = [cache] if isinstance(cache, torch.Tensor) else cache
+                for tensor in tensors:
+                    if id(tensor) not in seen_tensors:
+                        seen_tensors.add(id(tensor))
+                        sync_tensors.append(tensor)
+            if sync_tensors:
+                synchronize_tensors(sync_tensors)
             # Same rule for the seed-copy program: compile it while the pools
             # are quiescent, before any dummy forward leaves writes pending.
             self._precompile_mamba_state_seed_copies()

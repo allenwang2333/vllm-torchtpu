@@ -104,6 +104,7 @@ def _pool_attention_geometry(
     kv_cache_config: KVCacheConfig,
     attn_groups: Sequence[Sequence[AttentionGroup]],
     kernel_block_size_by_gid: dict[int, int],
+    cache_dtype: str | torch.dtype,
 ) -> tuple[AttentionSpec, Any, int] | None:
     """(attention spec, backend, kernel block size) of the unified pool,
     or None when the config has no hybrid attention+mamba sharing."""
@@ -112,6 +113,7 @@ def _pool_attention_geometry(
         for group in kv_cache_config.kv_cache_groups)
     if not has_mamba:
         return None
+    candidates: list[tuple[AttentionSpec, Any, int]] = []
     for group_list in attn_groups:
         for group in group_list:
             spec = group.kv_cache_spec
@@ -119,8 +121,11 @@ def _pool_attention_geometry(
                     spec, EncoderOnlyAttentionSpec):
                 kernel_block_size = kernel_block_size_by_gid.get(
                     group.kv_cache_group_id, spec.block_size)
-                return spec, group.backend, kernel_block_size
-    return None
+                candidate = spec, group.backend, kernel_block_size
+                if spec.dtype == cache_dtype:
+                    return candidate
+                candidates.append(candidate)
+    return candidates[0] if candidates else None
 
 
 def allocate_raw_kv_cache_tensors(
@@ -131,6 +136,12 @@ def allocate_raw_kv_cache_tensors(
 ) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
     layer_to_raw: dict[str, torch.Tensor] = {}
     raw_tensors: list[torch.Tensor] = []
+    mixed_attention_dtypes = {
+        group.kv_cache_spec.dtype
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, AttentionSpec)
+    }
+    mixed_precision = len(mixed_attention_dtypes) > 1
     pool_page_bytes = max(group.kv_cache_spec.page_size_bytes
                           for group in kv_cache_config.kv_cache_groups)
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -141,9 +152,14 @@ def allocate_raw_kv_cache_tensors(
         assert spec.block_size % kernel_block_size == 0, (spec.block_size,
                                                           kernel_block_size)
         split = spec.block_size // kernel_block_size
-        assert kv_cache_tensor.size % pool_page_bytes == 0, (
-            kv_cache_tensor.size, pool_page_bytes)
-        num_blocks = kv_cache_tensor.size // pool_page_bytes
+        if mixed_precision:
+            num_blocks = kv_cache_config.num_blocks
+            assert kv_cache_tensor.size % num_blocks == 0, (
+                kv_cache_tensor.size, num_blocks)
+        else:
+            assert kv_cache_tensor.size % pool_page_bytes == 0, (
+                kv_cache_tensor.size, pool_page_bytes)
+            num_blocks = kv_cache_tensor.size // pool_page_bytes
         shape = attn_backend.get_kv_cache_shape(
             num_blocks * split,
             kernel_block_size,
@@ -157,8 +173,14 @@ def allocate_raw_kv_cache_tensors(
             raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
         fa_page_bytes = (raw.numel() * raw.element_size() //
                          (num_blocks * split))
-        assert fa_page_bytes * split == pool_page_bytes, (fa_page_bytes, split,
-                                                          pool_page_bytes)
+        if mixed_precision:
+            assert fa_page_bytes * split < pool_page_bytes, (fa_page_bytes,
+                                                             split,
+                                                             pool_page_bytes)
+        else:
+            assert fa_page_bytes * split == pool_page_bytes, (fa_page_bytes,
+                                                              split,
+                                                              pool_page_bytes)
         raw_tensors.append(raw)
         for layer_name in kv_cache_tensor.shared_by:
             layer_to_raw[layer_name] = raw
@@ -272,13 +294,14 @@ def materialize_kv_cache_tensors(
                         attn_backend=group.backend,
                         num_blocks=num_blocks,
                         kernel_block_size=kernel_block_size,
-                        cache_dtype=cache_dtype,
+                        cache_dtype=spec.dtype,
                         device=device,
                     )
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
 
     pool_geometry = _pool_attention_geometry(kv_cache_config, attn_groups,
-                                             kernel_block_size_by_gid)
+                                             kernel_block_size_by_gid,
+                                             cache_dtype)
     if pool_geometry is None:
         raise ValueError("unified hybrid KV layout requires an attention pool")
     layer_to_raw, raw_tensors = allocate_raw_kv_cache_tensors(
@@ -288,9 +311,11 @@ def materialize_kv_cache_tensors(
         cache_dtype=cache_dtype)
     kv_caches: dict[str, LayerKVCache] = {}
 
-    # Every layer sharing a hybrid buffer holds the exact same pool object.
-    # This preserves the native attention layout and gives torch.compile one
-    # persistent graph input instead of per-layer typed aliases or clones.
+    pool_dtype = pool_geometry[0].dtype
+    # Target attention and Mamba layers share the unified typed pool. An
+    # attention group with another dtype receives a dedicated side tensor:
+    # unlike CUDA's byte buffers, TPU arrays cannot expose differently typed
+    # aliases of the same storage.
     for group_list in attn_groups:
         for group in group_list:
             gid = group.kv_cache_group_id
@@ -302,7 +327,17 @@ def materialize_kv_cache_tensors(
                 if isinstance(spec, MambaSpec):
                     kv_caches[layer_name] = [raw]
                 elif isinstance(spec, AttentionSpec):
-                    kv_caches[layer_name] = raw
+                    if spec.dtype == pool_dtype:
+                        kv_caches[layer_name] = raw
+                    else:
+                        kv_caches[layer_name] = make_attention_cache_tensor(
+                            spec=spec,
+                            attn_backend=group.backend,
+                            num_blocks=kv_cache_config.num_blocks,
+                            kernel_block_size=kernel_block_size_by_gid[gid],
+                            cache_dtype=spec.dtype,
+                            device=device,
+                        )
                 else:
                     raise NotImplementedError(
                         f"Unsupported KV cache spec: {type(spec)!r}")

@@ -273,6 +273,53 @@ def test_hybrid_specs_pad_attention_when_mamba_is_larger() -> None:
     assert normalized["mamba"].page_size_padded == 1000000
 
 
+def test_hybrid_mixed_attention_dtype_reserves_typed_side_pool() -> None:
+    target_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=None,
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=None,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=[(64, )],
+        dtypes=[torch.bfloat16],
+        page_size_padded=None,
+    )
+
+    target_page = normalize_kv_cache_specs_for_tpu(
+        {"target": target_spec}, torch.float8_e4m3fn)["target"].page_size_bytes
+    draft_page = normalize_kv_cache_specs_for_tpu(
+        {"draft": draft_spec}, torch.bfloat16)["draft"].page_size_bytes
+    normalized = normalize_kv_cache_specs_for_tpu(
+        {
+            "target": target_spec,
+            "draft": draft_spec,
+            "mamba": mamba_spec,
+        },
+        torch.float8_e4m3fn,
+        enable_unified_kv_layout=True,
+        layer_kv_cache_dtypes={
+            "target": torch.float8_e4m3fn,
+            "draft": torch.bfloat16,
+        },
+    )
+
+    expected_page = max(target_page, mamba_spec.page_size_bytes) + draft_page
+    assert normalized["target"].dtype == torch.float8_e4m3fn
+    assert normalized["draft"].dtype == torch.bfloat16
+    assert all(spec.page_size_bytes == expected_page
+               for spec in normalized.values())
+
+
 def test_exempt_layers_pass_through_untouched_under_unified_layout() -> None:
     # DeepSeek-V4 custom packed specs where page_size_padded < real_page_size_bytes.
     # If spec.page_size_bytes is called on such an AttentionSpec, it asserts:

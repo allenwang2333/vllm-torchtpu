@@ -1,4 +1,5 @@
 import math
+from collections.abc import Mapping
 from dataclasses import replace
 
 import torch
@@ -16,6 +17,7 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
+    layer_kv_cache_dtypes: Mapping[str, str | torch.dtype] | None = None,
     attention_backend: type[AttentionBackend] | None = None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
@@ -31,7 +33,7 @@ def normalize_kv_cache_specs_for_tpu(
             continue
         normalized[layer_name] = _normalize_one_spec(
             spec,
-            kv_cache_dtype,
+            (layer_kv_cache_dtypes or {}).get(layer_name, kv_cache_dtype),
             attention_backend=attention_backend,
         )
     if enable_unified_kv_layout:
@@ -40,9 +42,30 @@ def normalize_kv_cache_specs_for_tpu(
             for k, v in normalized.items() if k not in exempt
         }
         if _has_hybrid_attention_and_mamba(non_exempt_specs):
+            detached_layers = {
+                layer_name
+                for layer_name, layer_dtype in (
+                    layer_kv_cache_dtypes or {}).items()
+                if layer_dtype != kv_cache_dtype
+            }
+            base_specs = [
+                spec for layer_name, spec in non_exempt_specs.items()
+                if layer_name not in detached_layers
+            ]
+            detached_specs = [
+                spec for layer_name, spec in non_exempt_specs.items()
+                if layer_name in detached_layers
+            ]
             page_size = max(
-                _required_page_size_bytes(spec)
-                for spec in non_exempt_specs.values())
+                _required_page_size_bytes(spec) for spec in base_specs)
+            if detached_specs:
+                # GPU workers can reinterpret one byte buffer using multiple
+                # dtypes. TPU arrays are strongly typed, so mixed-precision
+                # attention groups need a side pool. Account for that pool in
+                # the manager page size so num_blocks still fits the profiled
+                # HBM budget.
+                page_size += max(
+                    _required_page_size_bytes(spec) for spec in detached_specs)
             normalized = {
                 layer_name: (spec if layer_name in exempt else _pad_page_size(
                     spec, page_size))

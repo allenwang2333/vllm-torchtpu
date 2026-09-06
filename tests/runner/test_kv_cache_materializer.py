@@ -274,6 +274,68 @@ def test_hybrid_materializes_one_attention_shaped_pool(attn_dtype):
     assert materialized.kv_caches["model.layers.1.mamba"] == [pool]
 
 
+def test_hybrid_mixed_dtype_materializes_bf16_attention_side_pool():
+    num_blocks = 4
+    fp8_page = 16 * 2 * 2 * 8 * torch.float8_e4m3fn.itemsize
+    bf16_page = 16 * 2 * 2 * 8 * torch.bfloat16.itemsize
+    manager_page = fp8_page + bf16_page
+    target_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=manager_page,
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=8,
+        dtype=torch.bfloat16,
+        page_size_padded=manager_page,
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((2, 8), (2, 4, 8)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=manager_page,
+    )
+    names = ("model.layers.0.self_attn", "draft.layers.0.self_attn",
+             "model.layers.1.mamba")
+    cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(size=manager_page * num_blocks,
+                          shared_by=list(names))
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[names[0]],
+                             kv_cache_spec=target_spec),
+            KVCacheGroupSpec(layer_names=[names[1]], kv_cache_spec=draft_spec),
+            KVCacheGroupSpec(layer_names=[names[2]], kv_cache_spec=mamba_spec),
+        ],
+    )
+
+    materialized = materialize_kv_cache_tensors(
+        kv_cache_config=cfg,
+        attn_groups=make_attention_groups(cfg),
+        kernel_block_sizes=[16, 16, 16],
+        device=torch.device("cpu"),
+        cache_dtype=torch.float8_e4m3fn,
+    )
+
+    target_cache = materialized.kv_caches[names[0]]
+    draft_cache = materialized.kv_caches[names[1]]
+    mamba_cache = materialized.kv_caches[names[2]]
+    assert len(materialized.raw_tensors) == 1
+    assert target_cache is materialized.raw_tensors[0]
+    assert target_cache.dtype == torch.float8_e4m3fn
+    assert draft_cache.dtype == torch.bfloat16
+    assert draft_cache is not target_cache
+    assert mamba_cache == [target_cache]
+    assert target_cache.nbytes + draft_cache.nbytes == (
+        cfg.kv_cache_tensors[0].size)
+
+
 def test_hybrid_materialization_builds_raiden_logical_regions():
     cfg = make_hybrid_config(num_blocks=4, attn_dtype=torch.bfloat16)
     materialized = materialize_kv_cache_tensors(
