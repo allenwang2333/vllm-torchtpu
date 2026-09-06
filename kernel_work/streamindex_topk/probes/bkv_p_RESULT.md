@@ -25,10 +25,23 @@ Sign convention: every percentage is a change in **time**, `(new − old)/old`. 
 ## Terms
 
 - **`bkv_p`** — `num_kv_pages_per_block`, the number of 1024-position KV pages a single inner
-  `(bq, bkv)` iteration loads and scores. It is a **3-tuple**, `(decode, mixed, prefill)`, selected
-  per band by which of the three `pallas_call`s runs (`streamindex_topk.py:757/775/793`). Shipped
-  value `(2, 2, 2)` (`mla_attention_op.py:119`). It is a static argument, so changing it is a
-  one-line change and a recompile, not a kernel edit.
+  `(bq, bkv)` iteration loads and scores. It is a **3-tuple**, and **slot 1 is dead**: the kernel
+  makes three `pallas_call`s and they read slots **`[0]`, `[0]`, `[2]`** — twice `case=MlaCase.DECODE`
+  (the batched path and the remainder path) and once `case=MlaCase.MIXED`
+  (`streamindex_topk.py:765/783/801`). Shipped value `(2, 2, 2)` (`mla_attention_op.py:119`). It is a
+  static argument, so changing it is a one-line change and a recompile, not a kernel edit.
+
+  **An earlier revision of this file called the slots `(decode, mixed, prefill)`. That is wrong**,
+  and `report.md`'s `(DECODE, PREFILL, MIXED)` is right. No measurement in this document moves —
+  every arm run here has slots 1 and 2 equal, so nothing that executed was mislabelled — but one
+  design fact does, and it is the more interesting half of this probe:
+
+  **Slot 1 is read by no executing band and still participates in the `max` that sets the scores
+  buffer width.** It can therefore only ever make the buffer wider, never narrower, and it does so
+  for a band that does not exist. That makes `(4,2,4)` and `(4,4,4)` identical in everything that
+  runs, and it means any future tuple should pin slot 1 to the minimum rather than carry it along
+  with the others out of symmetry. It is also a small standing bug in the incumbent's `(2,2,2)`
+  only in the sense that it costs nothing there; it starts costing as soon as any slot is raised.
 - **`subl`** — `num_sublanes_total`, the width of the f32 scores buffer in 128-column sublanes.
   **It is a `max` over all three tuple entries** (`streamindex_topk.py:603-605`), because one
   buffer serves all three launches. This is the coupling the whole document turns on.
@@ -131,6 +144,15 @@ Separately, `mixed_prod`'s baseline reproduced across jobs: 0.66799 ms at 5.00% 
 `j-98399433`, 0.66669 ms at 1.68% here, agreeing to 0.20%. The earlier 5.00% was the outlier, and
 the conclusions the first job could not support are now measurable.
 
+**One arm from the first job is not in the table above and belongs on the record.** `j-98399433`
+measured `mixed_prod` at **`(8,8,8)`**: 128 sublanes, 67.11 MB, `full_ms`
+**`0.7138704473618418`**, spread 2.06%, which is 6.87% slower than *that job's* baseline of
+0.6679872225504369. It is kept out of the main table because it was taken against a different
+baseline in a different job, and mixing the two would produce a delta that cannot be re-derived
+from the two absolute times in its own row. Read against this job's baseline it is 7.08% slower.
+Either way it is the worst mixed arm measured and it does not change any conclusion — but a reader
+comparing the two jobs would otherwise find a row that had silently vanished.
+
 ## Correctness
 
 Float64 oracle, rank criterion (`RANK_SLACK=256`, `MIN_RECALL=0.99`). From `j-98399433` shard 2:
@@ -201,9 +223,11 @@ Five things it is not, and none should be elided when this is quoted:
    production shape.
 3. **`bkv_p_mixed = 4` is not correctness-checked**, per the gap noted above. `(4,4,4)` may not be
    proposed until it is.
-4. **`bkv_p=8` is dominated at `decode_prod` but wins at `decode_64k`.** There is no single best
-   scalar; the choice interacts with advertised context length. `(8,8,8)` and `(8,4,4)` were not
-   measured, so the long-context optimum is bracketed rather than found.
+4. **`bkv_p=8` is dominated at `decode_prod` but wins at `decode_64k`, and is not value-checked.**
+   There is no single best scalar; the choice interacts with advertised context length. Correctness
+   has been established at 4 and never at 8, and `(8,4,4)` — the arm that would take the extra 2.5
+   points at `decode_64k` while leaving mixed at the cheaper band — was not measured. So the
+   long-context optimum is bracketed rather than found. Both gaps are one shard of one job.
 5. **The mixed rows are inside noise, and "inside noise" is not "zero".** Four separate mixed
    arms all landed on the slower side of shipped (+1.61 to +5.11), which is weak evidence that the
    true effect is a small cost rather than nothing. It does not change the recommendation — a

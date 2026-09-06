@@ -120,6 +120,111 @@ trap 1 still fires because the skip check reads the config's 9216 rather than th
 Whichever route: **read `BENCH_CMD` and `VLLM_SERVER_CMD` back from `cdk job recipe` and quote the
 read-back**, not the command as sent.
 
+## The smoke run — measured, and it sizes the A/B
+
+**Job `j-7a8ba86c-dca3-4141-82e7`**, `JobStatus: Succeeded`, recipe `vllm-torchtpu-generic-bench-2node`,
+image `…/vllm-torchtpu-annyan_google_com:13617694` (= `origin/main` `13617694`, the baseline arm's
+image — it is servable, and no rebuild is needed for the A/B). `~/cloud-devkit` at `4c6383f`, dirty
+only with a pre-existing untracked file that was not touched.
+
+**It boots at 66560.** No KV-capacity refusal, all 16 engines up, 8/8 requests succeeded. That was
+the single finding that could have invalidated the whole plan, and it is now closed.
+
+### Model resolution — the open question in § Route, answered
+
+**`MODEL_ID` must be set.** Left unset the generic recipe sets `MODEL_PATH=""` and skips the GCS
+copy entirely (`generic-bench-2node.yaml:151-165`), leaving `vllm serve zai-org/GLM-5.2-FP8` to pull
+**703.74 GiB from HF Hub on both hosts**. The settled form, taken from a prior *Succeeded* GLM-5.2
+job on this exact recipe (`j-8d43bb89-8bac-4197-883e`) rather than from reading the YAML:
+
+- `MODEL_ID=zai-org/GLM-5.2-FP8`, `MODEL_GCS_PREFIX` left at its default `gs://cloud-devkit/ckpt/hf`
+  — the checkpoint is there and complete (149 objects, 755,663,674,511 B, within 1.6 KB of the
+  `gs://tpu-commons-ci/glm/` copy this file previously named, which is therefore not needed)
+- serve `${MODEL_PATH} --served-model-name=${MODEL_ID}`, which keeps the served id as
+  `zai-org/GLM-5.2-FP8` so `BENCH_CMD` needs no change
+- prefix the server command with `export VLLM_ENGINE_READY_TIMEOUT_S=14400 &&`, and pass
+  `SERVER_WAIT_TIMEOUT=14400`, `RAY_WAIT_TIMEOUT=7200`. **These are load-bearing, not padding** —
+  see the wall-clock below. The generic recipe does not set `VLLM_ENGINE_READY_TIMEOUT_S` at all
+  and its default would very likely not have held.
+
+### KV cache, and what it permits — this is the deliverable
+
+Identical on all 16 `EngineCore_DP*`:
+
+```
+GPU KV cache size: 424,960 tokens
+Maximum concurrency for 66,560 tokens per request: 6.38x
+Memory statistics | total_hbm_limit_gb=94.74GiB | total_hbm_limit_cap_gb=85.26GiB | total_hbm_used_gb=63.35GiB | total_hbm_avail_gb=21.91GiB
+Using KV cache block size: 1024
+```
+
+This build prints no `# GPU blocks` line; `GPU KV cache size` plus `Maximum concurrency` is all
+there is. The arithmetic:
+
+- per engine `424,960 / 1024 = 415` KV blocks; one request at ISL 65536 + OSL 1024 peaks at exactly
+  `66,560 / 1024 = 65` blocks, so `415 / 65 = 6.38` — matching vLLM's own figure
+- **6 whole sequences per engine**, 390 blocks used, 25 spare
+- **ceiling 6 × 16 = 96 concurrent** across DP=16. `6.38 × 16 = 102` is *not* the answer: a sequence
+  cannot span engines, so the per-engine floor is taken first
+- cross-check: `21.91 GiB / 424,960 tokens = 55,360 B/token`, ≈ 96 layers × 576 B/token/layer of
+  fp8 MLA latent+rope. The two independent numbers agree.
+
+**`--max-num-seqs=64` per engine is far above the KV limit of 6, so KV is the binding constraint,
+not `max-num-seqs`.** Leave `--max-num-seqs` alone; it is not the knob.
+
+**Settled for the A/B: `--max-concurrency=64`, `--num-prompts=192`.** 64 is 4 per engine at 62% KV
+occupancy. The ceiling of 96 is 100% occupancy with zero headroom, and with
+`--no-enable-prefix-caching` any DP imbalance there turns into preemption and a full recompute of a
+65k prefill — a risk not worth taking on a run with **no replication to absorb a bad arm**.
+`num_prompts` is a multiple of 16 so the DP engines finish level, and 192 gives three waves of 64
+rather than the two that 128 would, so start-up and tail effects are a smaller share. `modelled`,
+from the smoke's throughput; it is a planning figure, not a measurement.
+
+### Wall-clock — budget ~45 minutes of startup per arm, every time
+
+| phase | duration |
+| --- | --- |
+| checkpoint copy from GCS (both nodes, ~2 s skew) | **~783 s** (13m03s) |
+| vLLM weight load off local NVMe | 37.7–57.8 s per worker |
+| Torch/Mosaic compile, cold cache | **~28 min — the dominant term** |
+| job create → `/health` green | **2,675 s = 44m35s** |
+| 8 prompts at concurrency 4 | 187.3 s |
+| total job | 49m22s |
+
+**The compile cache does not persist**, so every arm pays the ~28 minutes again:
+`compile_prefix isolation: DeepseekV2Model has no self.prefix; using non-deterministic fallback
+_tpu_instance_0 (its on-disk compile cache will not persist across restarts)`. Budget each arm at
+roughly 45 min fixed plus its benchmark, and **run the two arms concurrently on separate slices** —
+four 16-chip slices were free, and the caller explicitly asked for parallelism.
+
+That parallelism has a cost worth stating in the report: the two arms then run on **different
+physical slices**, and with one run per arm there is no replication to separate a slice-to-slice
+difference from a kernel difference. Running them sequentially would not fix it either — different
+pods, and a ~45 min gap. It is a limitation of the one-run-per-arm design, not of the parallelism.
+
+### The smoke's own numbers, for the record and nothing else
+
+`ENABLE_XPROF=0`, so a single pass, the block after `bench-start-event: name=benchmark`.
+**8 prompts at concurrency 4 is not a performance result and must not be quoted as one** — only 4
+of the 16 DP engines were ever busy.
+
+```
+Successful requests: 8      Failed requests: 0      Benchmark duration (s): 187.30
+Total input tokens: 524288  Total generated tokens: 8192
+Median TTFT (ms): 49928.76  Median TPOT (ms): 42.59  Median ITL (ms): 42.52  Median E2EL (ms): 93649.65
+```
+
+**The bench really ran at 65536**, confirmed four ways, the last being arithmetic on the output
+rather than an echo of the input: the recipe read-back; the bench container's parsed
+`Namespace(random_input_len=65536, …)`; `Sampling input_len from [65536, 65536]`; and
+`Total input tokens: 524288 = 8 × 65,536` exactly with `Total generated tokens: 8192 = 8 × 1,024`
+exactly. Trap 1 did not fire. Zero `preempt` matches in the server log.
+
+One warning that will recur on every run and is benign: `safetensors_load_strategy='prefetch' …
+checkpoint total size (703.74 GiB) exceeds 90% of available RAM (124.73 GiB)`. It did not OOM —
+prefetch degrades to a partial page-cache warm and weights still loaded in 38–58 s. Also
+`/root/.cache` is 70% full at 704 G of a 1024 Gi PVC: room for this checkpoint, not for a second.
+
 ## The shape, and the one thing that is not settled
 
 Take the shape from `instruments/shapes.py:229-236`, which already carries it as the arm this A/B
@@ -127,17 +232,14 @@ targets: **ISL 65536, OSL 1024, `max_model_len` 66560**. That is exact — 65536
 it satisfies the harness's `ISL + OSL ≤ max_model_len` rule with nothing to spare, which is what
 trap 1 punishes.
 
-**Concurrency and `num_prompts` are open and must be measured, not chosen.** The microbenchmark's
-own ladder (64 sequences at 9216, 12 at 33792, 6 at 66560) is a bound on the *instrument's* host
-memory and says nothing about what the server will hold. Run a short smoke — a handful of prompts
-at a low concurrency — read what vLLM reports for KV cache blocks, and size the real run from that.
-With one run per arm there is no replication to absorb a failed arm, so the smoke is not optional.
+**Concurrency and `num_prompts` were open and have now been measured** — see § The smoke run.
+`--max-concurrency=64`, `--num-prompts=192`. The reasoning this section originally carried, that a
+64k arm might not be longer in wall-clock than the nightly, has been replaced by the smoke and
+should not be quoted: the fixed startup alone is ~45 minutes.
 
-Order of magnitude, for planning only: the default run is 2048 × 9216 ≈ 18.9 M tokens. Sixty-four
-prompts at 66560 is ≈ 4.3 M, so a long-context arm of that size is not obviously longer in
-wall-clock than the nightly. DSA keeps attention at `k = 2048` regardless of context, so prefill
-should stay closer to linear than a dense model's would. **All of that is reasoning, not a
-measurement**, and the smoke replaces it.
+One prediction the smoke did *not* contradict, kept because it still bounds expectations: DSA holds
+attention at `k = 2048` regardless of context, so prefill scales closer to linearly than a dense
+model's would. Still `modelled`, and the A/B measures it.
 
 ## A confound this exercise created and must not hide
 
