@@ -134,7 +134,10 @@ arm:
 | `mixed_64k` | (4,2,2) | 544 | 4.789508902467787 | 4.875155910849572 | 0.86 | +1.79 |
 | `mixed_64k` | (4,4,4) | 544 | 4.789508902467787 | 4.86955470405519 | 1.71 | +1.67 |
 
-All `measured (j-3aa755dd-900b-4f31-9fa3)`. No `(8,8,8)` arm exists — see §10.
+All `measured (j-3aa755dd-900b-4f31-9fa3)`. A `(8,8,8)` arm does exist, in the *other* job, and is
+7.08% slower at `mixed_prod` read against this job's baseline — the worst mixed arm measured. It is
+kept out of this table because it was taken against a different baseline in a different job; see
+§10 item 1 and `probes/bkv_p_RESULT.md`.
 
 **The mechanism is the coupling, not VMEM.** `num_sublanes_total` is a `max` over the whole tuple
 (`streamindex_topk.py:603-605`), so raising *any* slot widens the scores buffer for *every* band.
@@ -926,12 +929,22 @@ gap is not yet attributable, and 80% is a default rather than a measured constan
 
 Three items, none of which changes a conclusion.
 
-1. **The dispatch to this wave quoted a mixed regression of `+6.87%` at `(8,8,8)`.** No such row
-   exists. `probes/bkv_p_RESULT.md` contains no `(8,8,8)` arm and states explicitly that
-   *"`(8,8,8)` and `(8,4,4)` were not measured, so the long-context optimum is bracketed rather than
-   found."* **No number for that tuple appears anywhere in this document**, and none should be
-   quoted until an arm runs. The conclusion it was offered to support — that mixed regresses at
-   raised tuples — is carried by the four arms that *were* measured (+1.61 to +5.11).
+1. ~~**The dispatch to this wave quoted a mixed regression of `+6.87%` at `(8,8,8)`.** No such row
+   exists.~~ **Withdrawn — this document was wrong, and the probe record has been corrected.** The
+   arm was real. `j-98399433` measured `mixed_prod` at `(8,8,8)`: 128 sublanes, 67.11 MB, `full_ms`
+   `0.7138704473618418` at 2.06% spread, **6.87% slower** than that job's own baseline of
+   `0.6679872225504369`. It had been dropped from `bkv_p_RESULT.md` when that file's mixed table was
+   replaced wholesale by the second job's, and the caveat then written — that `(8,8,8)` was never
+   measured — was a consequence of the drop rather than a fact. Both are now fixed:
+   `probes/bkv_p_RESULT.md` carries the arm as a **cross-job note rather than a table row**, because
+   its delta is against a different baseline in a different job and mixing the two would produce a
+   number that cannot be re-derived from the two absolute times in its own row. Read against
+   `j-3aa755dd`'s baseline it is **7.08% slower**.
+
+   Nothing downstream moves. `(8,8,8)` is the worst mixed arm measured either way, which strengthens
+   rather than weakens the conclusion it was offered for — mixed regresses at every raised tuple, now
+   across five arms (+1.61 to +7.08) instead of four. What was genuinely never measured is
+   **`(8,4,4)`**, and that is the arm step 3's first job carries.
 2. **The tuple slot order in `bkv_p_RESULT.md`'s terms section is wrong.** §2.4. No measurement
    moves; one design fact does.
 3. **`bkv_p = 8` is not value-checked.** P5′ verified `(4,4,4)` bit-identically and is explicit that
