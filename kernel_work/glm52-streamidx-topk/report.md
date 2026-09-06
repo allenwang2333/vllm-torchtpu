@@ -370,14 +370,37 @@ the more useful gate:
   `-1`-filled padding rows
 - the selection is judged on **deficit** (how far below the true k-th score the worst selected
   element reaches, as a fraction of the top-to-cut range) and **churn** (what fraction of the true
-  top-k is missing). Both discriminate a near-tie from a kernel that skipped a KV block by orders
-  of magnitude: boundary swaps moved scores by 0.3% of the range, while dropping one of the four KV
-  blocks at 8k context would lose ~25% of the true top-k.
+  top-k is missing). Both discriminate a near-tie from a kernel that skipped a KV block by an order
+  of magnitude — **measured**, `j-ae538ec1`: boundary swaps reach deficit `0.00173–0.00249` and
+  churn `0.29–0.39%`, while dropping one KV block reaches deficit `0.046–0.160` and churn
+  `15.9–27.7%`. The tightest case on both metrics is `dec-B-2x8k`, and it is the one that sets how
+  tight the thresholds can be.
 - both numbers print on every run whether or not they trip, so a regression is a number moving
 
-Thresholds start at `TOL_DEFICIT=0.05`, `TOL_CHURN=0.005` and are calibrated against the
-incumbent's own printed values — the re-run is in flight. **Step 3 cannot begin until this gate
-passes on the incumbent**; until it does, there is no correctness evidence for anything here.
+**Resolved — the gate passes and is a discriminator.** Final thresholds are `TOL_DEFICIT=0.015`,
+`TOL_CHURN=0.03`, both set from measured endpoints rather than from the incumbent's margin alone.
+`j-ae538ec1-d606-48f4-8c11` (`Succeeded`, exit 0): `negative control: PASS`, 5/5 undamaged pass,
+`drop-block` fails 5/5, `tail-swap` passes 5/5. **Step 3 is unblocked**, and this is the named job
+the correctness requirement asks for.
+
+Getting there took three iterations, and two of the three failures are worth recording because
+each would have produced a *confident wrong answer* rather than an error:
+
+1. `_corrupt` refilled from the lowest-*numbered* unselected positions — a uniform draw from the
+   rejected set, which is neither failure being modelled. It made `tail-swap`, the arm that must
+   pass, look like a catastrophe. Both arms now damage the row **by true score**, since a skipped
+   block and a boundary tie are both defined in score order.
+2. The tolerance was **outside its own separating window**. `drop-block` reaches only `0.04605` at
+   `dec-B-2x8k`, so at `TOL_DEFICIT=0.05` a kernel skipping a KV block slid under the threshold and
+   only `churn` caught it — the gate passed while running on one of its two metrics. This is
+   invisible to a passing gate and is exactly what a negative control is for.
+3. The separation tool read its must-pass ceiling off `tail-swap` alone, but tail-swap's deficit
+   ceiling (`0.00249`) is *below* the undamaged incumbent's (`0.00486`) — swapping the 8 worst
+   selected for the true next-best **raises** the minimum score. That window would have opened
+   below the incumbent's own error and red-lighted a correct kernel.
+
+The general lesson for step 3: a correctness gate that has never been shown to fail is an
+assertion, not a check, and the interesting failures are the ones where it stays green.
 
 The other failure was `A-D64-14k`, an unreachable row I put in the table: `seqlen=14336` exceeds
 what (A) can admit. The sampler's ISL range at (A) is `[1638, 14746]`, but
