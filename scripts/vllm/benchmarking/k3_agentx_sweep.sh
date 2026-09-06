@@ -302,7 +302,7 @@ WANT = [("out tok/s per chip", "output_tput_tps"), ("requests ok", "num_requests
         ("TTFT p50 s", "request_metrics.latency.ttft.p50"), ("TTFT p90 s", "request_metrics.latency.ttft.p90"),
         ("TPOT p50 s", "request_metrics.latency.tpot.p50"), ("P90 intvty", "request_metrics.latency.intvty.p90"),
         ("P90 E2E-norm intvty", "request_metrics.latency.e2e_norm_intvty.p90"),
-        ("e2el p50 s", "request_metrics.latency.e2el.p50"), ("cache hit (theory)", "theoretical_cache_hit_rate")]
+        ("e2el p50 s", "request_metrics.latency.e2el.p50"), ("cache hit (theory)", "request_metrics.cache.theoretical_cache_hit_rate"), ("KV used", "server_metrics.kv_cache.gpu_usage_pct")]
 def get(d, path):
     for k in path.split("."):
         if not isinstance(d, dict) or k not in d: return None
