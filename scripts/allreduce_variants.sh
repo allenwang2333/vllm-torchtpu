@@ -11,10 +11,25 @@
 # moves on. Rank 0 (this host when NODE_RANK=0) writes the xplane profile.
 set -uo pipefail
 
-NODE_RANK="${NODE_RANK:?}"
-NNODES="${NNODES:?}"
-MASTER_ADDR="${MASTER_ADDR:?}"
-NPROC="${NPROC_PER_NODE:-8}"
+# Multi-host (run_multihost.sh --backend torchrun exports NNODES/NODE_RANK/
+# MASTER_ADDR/NPROC_PER_NODE + the mesh env) or single-host (run_in_docker.sh:
+# nothing exported; the torch_tpu single-host launcher supplies the mesh env
+# and every local device joins one --standalone rendezvous).
+if [ -z "${NNODES:-}" ] || [ "${NNODES}" = "1" ]; then
+    eval "$(python3 -m torch_tpu._internal.distributed.launchers.singlehost_wrapper 2>/dev/null \
+        | grep -E '^(TORCH_TPU_TOPOLOGY|TORCH_TPU_SLICEBUILDER_ADDRESSES|WORLD_SIZE)=')"
+    export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES
+    SINGLE_HOST=1
+    NNODES=1
+    NODE_RANK=0
+    MASTER_ADDR=127.0.0.1
+    NPROC="${WORLD_SIZE:?singlehost_wrapper did not report WORLD_SIZE}"
+else
+    SINGLE_HOST=0
+    NODE_RANK="${NODE_RANK:?}"
+    MASTER_ADDR="${MASTER_ADDR:?}"
+    NPROC="${NPROC_PER_NODE:-8}"
+fi
 OUT="${ALLREDUCE_OUT:-/perf_eval_results/allreduce}"
 SCRIPT=/root/torchtpu-vllm/scripts/benchmark_torchtpu_all_reduce_112m.py
 ITER="${ALLREDUCE_ITERATIONS:-100}"
@@ -30,7 +45,7 @@ TT_SERVING_FLAGS="--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_c
 FORCE_TC_FLAGS="--xla_tpu_use_dynamic_smem_negotiation=true --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=1073741824 --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1073741824"
 SC_HIER_FLAGS="$TT_SERVING_FLAGS --xla_tpu_enable_sparse_core_hierarchical_all_reduce=true"
 
-echo "[allreduce] node=$NODE_RANK/$NNODES master=$MASTER_ADDR nproc=$NPROC topology=${TORCH_TPU_TOPOLOGY:-unset} variants=${VARIANTS:-all}"
+echo "[allreduce] node=$NODE_RANK/$NNODES single_host=$SINGLE_HOST master=$MASTER_ADDR nproc=$NPROC topology=${TORCH_TPU_TOPOLOGY:-unset} variants=${VARIANTS:-all}"
 echo "[allreduce] slicebuilder=${TORCH_TPU_SLICEBUILDER_ADDRESSES:-unset}"
 python3 -c "import torch, torch_tpu; print('[allreduce] torch', torch.__version__)" 2>/dev/null | grep allreduce || true
 pip show torch-tpu 2>/dev/null | grep -i '^Version' | sed 's/^/[allreduce] torch-tpu /' || true
@@ -43,10 +58,15 @@ run_variant() {
     mkdir -p "$OUT/$name"
     echo "=== [allreduce] variant=$name node=$NODE_RANK port=$port"
     echo "=== [allreduce] LIBTPU_INIT_ARGS='$libtpu' args='$*'"
-    LIBTPU_INIT_ARGS="$libtpu" python3 -m torch.distributed.run \
-        --nnodes="$NNODES" --nproc-per-node="$NPROC" --node-rank="$NODE_RANK" \
-        --master-addr="$MASTER_ADDR" --master-port="$port" \
-        "$SCRIPT" --warmups 10 --iterations "$ITER" \
+    local launch
+    if [ "$SINGLE_HOST" = "1" ]; then
+        launch=(--standalone --nproc-per-node="$NPROC")
+    else
+        launch=(--nnodes="$NNODES" --nproc-per-node="$NPROC" --node-rank="$NODE_RANK"
+                --master-addr="$MASTER_ADDR" --master-port="$port")
+    fi
+    LIBTPU_INIT_ARGS="$libtpu" python3 -m torch.distributed.run "${launch[@]}" \
+        "$SCRIPT" --warmups 10 --iterations "$ITER" --expected-world-size 0 \
         --profile-dir "$OUT/$name/profile" --hlo-dump-dir "$OUT/$name/hlo" "$@" \
         2>&1 | tee "$OUT/$name/node${NODE_RANK}.log"
     local rc="${PIPESTATUS[0]}"

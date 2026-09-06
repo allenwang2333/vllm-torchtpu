@@ -62,7 +62,14 @@ run_torchrun_multihost() {
   # Same lookup the executors use; falls back to the v7x dual-device map
   # entry for 32 devices if the platform module can't be imported here.
   local topology
-  topology="${TORCH_TPU_TOPOLOGY:-$(python3 -c "from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology as g; print(g(${total_devices}, 'tpu7x'))" 2>/dev/null || echo "2,2,4,2")}"
+  local fallback
+  case "${total_devices}" in
+    16) fallback="2,2,2,2" ;;
+    32) fallback="2,2,4,2" ;;
+    64) fallback="2,4,4,2" ;;
+    *) fallback="2,2,4,2" ;;
+  esac
+  topology="${TORCH_TPU_TOPOLOGY:-$(python3 -c "from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology as g; print(g(${total_devices}, 'tpu7x'))" 2>/dev/null || echo "${fallback}")}"
   echo "torchrun backend: hosts=${NUM_HOSTS} nproc=${nproc} devices=${total_devices} topology=${topology}"
   echo "torchrun backend: slicebuilder=${sb_csv}"
 
