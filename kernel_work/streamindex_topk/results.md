@@ -1004,18 +1004,130 @@ function. F would have removed the first and is not exact. E1 and E2 remain, bot
 exercise and it should be stated in `final_report.md` rather than buried under two wins that come
 from elsewhere in the kernel.
 
-## 7. The question above all of these
+## 7. The question above all of these — **answered: not resolvable end to end**
 
-`report.md` § "Why long context" establishes that at the checked-in production shape this block is
+`report.md` § "Why long context" established that at the checked-in production shape this block is
 **2.69% of the decode step and 1.02% of the prefill step** against an end-to-end `spread_pct` of
-**2.77%**, so a 20% kernel win is ~0.5% end to end and would need ~190 runs per arm to resolve —
-*"the block is not measurable end to end at that shape, and saying so is part of the result."*
+**2.77%**, so a 20% kernel win is ~0.5% end to end. The A/B was to be run at long context on the
+expectation that the indexer's share grows there — its cost is O(resident KV positions) while the
+sparse-MLA it feeds saturates at `k = 2048`.
 
-The A/B is being run at long context because the indexer's cost is O(resident KV positions) while
-the sparse-MLA it feeds saturates at `k = 2048`, so its share should grow. **That expectation has
-never been measured.** A profiled baseline run at the A/B shape is in flight to settle it. If the
-share is still low single digits, no kernel change in this document is resolvable in the
-one-run-per-arm A/B, and that is the finding — reached before two four-hour runs rather than after.
+**A profiled baseline at the A/B shape has now measured it: the share barely moved, and the
+expectation was wrong for a reason `report.md` had already written down.**
+
+`measured (j-074e570b-13e3-4ab7-bb0c)`, `JobStatus = Succeeded`, GLM-5.2-FP8, ISL 65536 / OSL 1024,
+`max_model_len` 66560, concurrency 64, `num_prompts` 192, DP=16, 2-node, `ENABLE_XPROF=1`. Shape
+verified from the client rather than the recipe: `Total input tokens: 12582912 = 192 × 65536`
+exactly, `Total generated tokens: 196608 = 192 × 1024` exactly. Numbers below are from the **clean**
+pass (after `bench-start-event: name=benchmark`), not the profiled pass — which ran 27.9% slower.
+
+### 7.1 The share, at the representative step
+
+Only `decode_only` is representative. **Both prefill captures landed on chunks 1–6 of 64** — the
+phased profiler fires at the start of the run, and resident KV there is ≤ 5115 of 65536, which is
+precisely the quantity indexer cost is proportional to. Each retained one device step. So every
+mixed/prefill figure below is a **floor**, not a measurement of long context.
+
+| | decode step (50.110 ms/step) | mixed step (650.169 ms, early chunks) |
+| --- | ---: | ---: |
+| `StreamIdxTC*` — **the kernel this exercise changes** | **3.07%** | **0.256%** |
+| `sparsecore_topk` | 2.478% | 1.239% |
+| **whole indexer block (`conditional`)** | **10.13%** | **4.61%** |
+
+**3.07% against the production shape's 2.69%.** The scoring kernel barely moved, and that
+**confirms `report.md`'s own counterweight**: decode indexer cost is set by resident tokens per
+rank, which is HBM-capped, not by `max_model_len`. A second dump pooling both TensorCores gave
+2.79%; call it 2.8–3.1%.
+
+**The decisive ratio is inside the block, not the block's size.** In a mixed step the Pallas kernel
+is **5.5% of its own `conditional`**. The other 94.5% is fixed-size data movement — the `:104`
+relayout (§7.3), the fully-exposed SparseCore wait, the gather — **none of which a scoring-kernel
+edit touches.**
+
+### 7.2 The arithmetic that ends the A/B
+
+**No `spread_pct` exists at this shape**, and an n=1 run cannot establish one. The 2.77% is borrowed
+from a sibling experiment at ISL 8192 (n=4, hours apart), and its own history is the warning: the
+first estimate at that shape was 0.40% from n=3 taken 58 s apart — a **7× underestimate**. Using
+2.77% is therefore already generous to the change.
+
+At one run per arm the standard error of the difference is `σ√2 = 3.92%`, so the **smallest
+resolvable end-to-end effect is ≈ 8%**. Against that:
+
+| what improves | end-to-end effect | runs per arm to resolve |
+| --- | ---: | ---: |
+| the scoring kernels only (what the candidate does) | 0.21–0.70% | **250–2700** |
+| the entire indexer block (which nothing here does) | 1.32–1.79% | 38–69 |
+| *for scale:* deleting the indexer block outright | 6–8% | still at the threshold |
+
+At 2.5–4 h a run, none of these is purchasable. **The one-run-per-arm A/B cannot distinguish the
+composed candidate from the incumbent, and would not have been able to distinguish a candidate four
+times better.** Judge the candidate on its microbenchmark and its correctness job — it has both.
+
+This is the outcome the section was written to reach, and reaching it cost one baseline run rather
+than two full arms.
+
+### 7.3 What the profile found instead — and it is Option A's writer
+
+The largest indexer-adjacent cost in prefill is **not the kernel**. It is the relayout triad at
+`mla_attention_op.py:104` — reshape-in, `scatter_fusion`, reshape-out — which is
+`measured (j-074e570b)`:
+
+| phase | per indexer layer | × 21 layers | share of device time |
+| --- | ---: | ---: | ---: |
+| `prefill_only` | 773.48 µs | 34.033 ms | **2.72%** |
+| `prefill_heavy` | 774.81 µs | 16.272 ms | **2.50%** |
+
+That is **9.8× the entire `StreamIdxTC` kernel cost in the same step**, and the 290.18 µs
+reshape-out reproduces an earlier ~291 µs to the microsecond. Two things sharpen it: it is a
+**108.79 MB round trip to write 256 KB — 415× write amplification** — and it is **paid on the
+early-exit fast path too**, appearing in full in a `prefill_only` step where the scoring kernel
+never executed at all. It is absent in decode, where XLA keeps the `[415,256,4,256]` layout and the
+scatter costs 2.694 µs/call.
+
+**Option A's writer change targets exactly this line**, and is `measured` 3.342× faster at
+`T = 1024` (§5b-v2). If it carries that ratio to the triad — `assumed`, since the probe measured a
+standalone store and not the triad in situ — it removes 70.1% of 2.50–2.72%, i.e. **1.75–1.91% of
+device time**, `modelled`. That is **2.5–9× the whole scoring-kernel prize** computed in §7.2, and
+it lands on prefill, which is where TTFT comes from. **This inverts the exercise's ranking at the
+end-to-end level**: B is the largest kernel win and A's writer is the largest *deployment* win.
+
+The claim needs one measurement to stop being `modelled` — the triad, in situ, before and after A's
+writer — and that is a `/preflight-check`-shaped question, not another kernel exercise.
+
+### 7.4 Three carried findings from the same profile
+
+1. **SparseCore is near saturated** — SC-0 busy is 94.7% of the decode step and 96.6% of the mixed
+   step, and its `async-done` is TC-blocking with **zero overlap**. Any future candidate that wins
+   by moving work *onto* SparseCore will not get it free. This retro-justifies §4.6's deferral.
+2. **The decode:mixed split of §2 is not reproduced by the capture.** Weighting the measured
+   per-step figures gives 41.7% / 58.3% as captured, or 30.2% / 69.8% `modelled` under a late-chunk
+   extrapolation, against §2's `modelled` 12–14% / 86–88%. The **direction** holds — mixed is a
+   minority of invocations and a majority of indexer time — but the magnitude does not, and the
+   early-chunk capture biases the comparison against mixed. §2 stays `modelled`; a re-capture with
+   `delay_iterations` past chunk 40 is the one run that would settle it, and is the highest-value
+   follow-up this profile leaves.
+3. **21 of 78 layers is by design, not truncation.** The model config gives
+   `indexer_types = Counter({'shared': 57, 'full': 21})`, `index_topk_freq = 4`; 57 layers reuse the
+   selection.
+
+### 7.5 Baseline numbers, for the record
+
+Clean pass, `j-074e570b-13e3-4ab7-bb0c`, 192/192 successful, 0 failed, 0 preemptions:
+
+| metric | value |
+| --- | ---: |
+| output token throughput | 165.00 tok/s |
+| total token throughput | 10725.09 tok/s |
+| median / P99 ITL | 51.96 / 792.29 ms |
+| median / P99 TTFT | 93600.87 / 243723.45 ms |
+| median / P99 TPOT | 265.49 / 352.48 ms |
+| median / P99 E2EL | 367635.69 / 505903.41 ms |
+
+Where decode time actually goes, for whoever optimizes this model next: `gmm_v2` 17.99% + 9.74%,
+`reduce-scatter` 10.57%, **indexer `conditional` 10.13%**, `fusion` 9.04%, `sc_ragged_gather_v2`
+6.96%, `all_gather` 6.59%, **`MLA` only 5.36%**. MoE plus its communication is ≈56% of the decode
+step. In `prefill_heavy`, fully-exposed collectives are 32.6% — the largest single bucket.
 
 ---
 
