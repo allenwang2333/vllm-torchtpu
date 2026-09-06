@@ -1,8 +1,11 @@
 # The end-to-end A/B: what it takes to stand up a long-context GLM-5.2 run
 
-Reconnaissance only. **Nothing here has been run.** This file exists so the finding survives the
-session — the kernel work is hours away from needing it, and the checkout facts below are not
-recoverable from the exercise's other documents.
+Written as reconnaissance, and now partly executed. This file exists so the finding survives the
+session — the checkout facts below are not recoverable from the exercise's other documents.
+
+**Status.** The route is settled (see § Route) and the smoke run of step 3 has been submitted. The
+shapes, traps and the confound are unchanged and still unverified against hardware. Nothing in the
+A/B itself has been run.
 
 Scope: the caller asked for an end-to-end benchmark of GLM-5.2 comparing the incumbent
 `streamindex_topk` against whatever this exercise produces, **at a long-context shape** and at
@@ -79,23 +82,38 @@ empirically, not derived. Do not put a guessed number in a recipe.
    `run_eval_flow.sh` would be **scored against the 8k baseline**. This A/B must not go through the
    regression path at all; it is a direct comparison of two arms measured in this session.
 
-## Route
+## Route — **resolved, use the generic 2-node recipe**
 
-**Copy the CDK JobSet, do not touch the repo.**
-`~/cloud-devkit/recipes/experimental/multihost/torchtpu/vllm-torchtpu-glm-5.2-v7x-16/vllm-torchtpu-glm-5.2-benchmark.yml`
-is fully hardcoded with no templating — `--max-model-len=9216` at `:128`, `--random-input-len=8192`
-at `:230` — and it lives **outside** the `vllm-torchtpu` repo, so copying and editing it touches
-neither deny-listed directory.
+This section originally recommended copying the hardcoded JobSet, because the local `~/cloud-devkit`
+had only the single-node generic recipe. **The `git pull` this section told the next session to try
+was run, and it settles the question in favour of the better route.** `~/cloud-devkit` moved
+`c4e1d4e` → `4c6383f`, and **`vllm-torchtpu-generic-bench-2node` is now registered**
+(`recipes.yml:484-487`, `k8s_file: recipes/experimental/torchtpu-vllm-generic/generic-bench-2node.yaml`).
 
-The alternative, the `vllm-torchtpu-generic-bench` recipe that takes `VLLM_SERVER_CMD` and
-`BENCH_CMD` as job arguments, is cleaner but the local `~/cloud-devkit` checkout has only the
-**single-node 4-chip** variant registered (`recipes.yml:422-425`, topology `2x2x1`). GLM-5.2 at
-DP=16 needs the 2-node one. Try `git -C ~/cloud-devkit pull` first; if the 2-node generic recipe
-appears, prefer it, because passing the commands as arguments means `cdk job recipe` reads them
-back verbatim and there is no edited YAML to misquote.
+Use it. It takes `VLLM_SERVER_CMD`, `BENCH_CMD`, `DOCKER_IMAGE`, `MODEL_ID`, `MODEL_GCS_PREFIX`,
+`SERVER_PORT` (default 8000), `SERVER_WAIT_TIMEOUT` (default 7200) and `ENABLE_XPROF` as **job
+arguments**, so `cdk job recipe` reads both commands back verbatim and **no YAML is edited at all** —
+neither in the repo nor in a copy. That removes the whole class of failure where a misquoted edit
+silently benchmarks a different shape. It appends `--host` itself (`generic-bench-2node.yaml:337`),
+so `BENCH_CMD` must not carry one.
 
-Do **not** use the third route — `EXTRA_SERVE_ARGS` / `EXTRA_BENCH_ARGS` appended to a direct
-`run_benchmarks.sh` invocation. They do win on argparse last-occurrence, but
+Two things to carry over rather than rediscover:
+
+- The known-good GLM-5.2 serve line is in the *old* route's YAML at
+  `vllm-torchtpu-glm-5.2-benchmark.yml:126-142`. Take it verbatim and change only `--max-model-len`
+  and the port. Flags that look irrelevant to a random-dataset benchmark — the tool-call and
+  reasoning parsers — are cheaper to keep than to justify dropping.
+- The generic recipe resolves weights through `MODEL_ID` / `MODEL_GCS_PREFIX` (default
+  `gs://cloud-devkit/ckpt/hf`) and exports `MODEL_PATH`; the old GLM recipe resolves from HF by
+  name. These are **different mechanisms**, and whether the generic one finds `zai-org/GLM-5.2-FP8`
+  with `MODEL_ID` unset must be checked by reading both YAMLs before submitting, not discovered by
+  losing a slice. A checkpoint exists at `gs://tpu-commons-ci/glm/GLM-5.2-FP8/`.
+
+The third route — `EXTRA_SERVE_ARGS` / `EXTRA_BENCH_ARGS` on a direct `run_benchmarks.sh`
+invocation — remains rejected, for the reasons below.
+
+`EXTRA_SERVE_ARGS` / `EXTRA_BENCH_ARGS` appended to a direct
+`run_benchmarks.sh` invocation do win on argparse last-occurrence, but
 `.buildkite/scripts/run_multihost.sh:185-205` does not forward them into the containers, and
 trap 1 still fires because the skip check reads the config's 9216 rather than the override.
 
