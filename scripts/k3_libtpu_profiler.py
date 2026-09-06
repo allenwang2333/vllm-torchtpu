@@ -120,6 +120,45 @@ def call(api, name, args):
         raise RuntimeError(f"Profiler {name}: {text}")
 
 
+def protobuf_payload(data):
+    """Remove only a trailing C terminator after complete protobuf fields."""
+
+    def varint(pos):
+        value = 0
+        for shift in range(0, 70, 7):
+            if pos >= len(data):
+                raise ValueError("Truncated profiler protobuf varint")
+            byte = data[pos]
+            pos += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value, pos
+        raise ValueError("Oversized profiler protobuf varint")
+
+    pos = 0
+    while pos < len(data):
+        start = pos
+        tag, pos = varint(pos)
+        if tag == 0 and start == len(data) - 1:
+            print("LIBTPU_PROFILE_C_TERMINATOR_REMOVED", 1, flush=True)
+            return data[:-1]
+        if tag >> 3 == 0:
+            raise ValueError("Invalid profiler protobuf field zero")
+        wire = tag & 7
+        if wire == 0:
+            _, pos = varint(pos)
+        elif wire in (1, 5):
+            pos += 8 if wire == 1 else 4
+        elif wire == 2:
+            size, pos = varint(pos)
+            pos += size
+        else:
+            raise ValueError(f"Unsupported profiler protobuf wire type {wire}")
+        if pos > len(data):
+            raise ValueError("Truncated profiler protobuf field")
+    return data
+
+
 @contextlib.contextmanager
 def trace(directory):
     distribution = importlib.metadata.distribution("libtpu")
@@ -159,7 +198,8 @@ def trace(directory):
             call(api, "collect_data", collect)
             if collect.buffer_size_in_bytes > size:
                 raise RuntimeError("Profiler buffer grew during collection")
-        payload = ct.string_at(collect.buffer, collect.buffer_size_in_bytes)
+        payload = protobuf_payload(
+            ct.string_at(collect.buffer, collect.buffer_size_in_bytes))
         timestamp = datetime.datetime.now(
             datetime.timezone.utc).strftime("%Y_%m_%d_%H_%M_%S")
         folder = Path(directory) / "plugins" / "profile" / timestamp
