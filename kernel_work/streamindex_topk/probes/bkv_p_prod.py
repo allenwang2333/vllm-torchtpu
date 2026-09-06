@@ -208,7 +208,10 @@ def correctness(impl, regime_names, ladder, negative_control):
                     n, failures, st = TC.run(
                         impl, regime, negative_control=negative_control)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[{name} bkv_p={bkv_p}] ERROR {exc!r}")
+                    # `bkv_p` is not bound in this scope -- the ladder item is
+                    # `tup`. The old spelling turned any arm failure into a
+                    # NameError that swallowed the real error string.
+                    print(f"[{name} tuple={tup}] ERROR {exc!r}")
                     rc = 1
                     continue
             margin = (f"worst_rank={st['worst_rank_seen']} of allowed "
