@@ -61,6 +61,8 @@ B = dict(psz=512, pages_per_seq=2048)   # (B) AgentX: block_size 512  -> n=10485
 rows = [
     model("A-D64-8k", **A, T=64, R=64, D=64, seqlen=8192),
     model("A-D64-9k", **A, T=64, R=64, D=64, seqlen=9216),
+    model("A-D32-8k", **A, T=32, R=32, D=32, seqlen=8192),
+    model("A-D16-8k", **A, T=16, R=16, D=16, seqlen=8192),
     model("A-P1024-8k", **A, T=1024, R=1, D=0, seqlen=8192, qlen=1024),
     model("A-P512-8k", **A, T=512, R=1, D=0, seqlen=8192, qlen=512),
     model("B-D4-256k", **B, T=16, R=4, D=4, seqlen=262144),
@@ -76,17 +78,25 @@ rows = [
 #   j-284a8842-3db6-44e0-ba49  (JobStatus Failed: 2 of 4 shards; the two bench
 #                               shards below are the rc=0 ones)
 #   j-59d0b337-9c4d-4dc0-aa7e  (JobStatus Succeeded, 4/4)
+#   j-31ca6c31-a430-4463-8dbf  (JobStatus Succeeded, 4/4) -- supersedes the two
+#       A-P rows above, which it re-ran WITH --decompose. The full-op medians
+#       agree to 1.0%/1.1%, so the sc split is being attached to a reproduced
+#       measurement, not a fresh one.
 # (full, sparsecore_topk alone or None, job, block-to-block spread)
 MEASURED = {
     "A-D64-8k":     (363.2, 189.5, "j-284a8842", 0.091),
-    "A-P1024-8k":   (832.9, None, "j-284a8842", 0.006),
-    "A-P512-8k":    (573.1, None, "j-284a8842", 0.032),
+    "A-D64-9k":     (365.1, 183.6, "j-31ca6c31", 0.010),
+    "A-D32-8k":     (264.8, 175.6, "j-31ca6c31", 0.019),
+    "A-D16-8k":     (278.7, 200.5, "j-31ca6c31", 0.019),
+    "A-P1024-8k":   (841.6, 556.8, "j-31ca6c31", 0.008),
+    "A-P512-8k":    (579.4, 352.1, "j-31ca6c31", 0.001),
     "B-D4-256k":    (1117.9, 795.9, "j-284a8842", 0.007),
     "B-D4-512k":    (1394.4, 832.1, "j-59d0b337", 0.002),
     "B-D4-1M":      (1826.7, 823.5, "j-284a8842", 0.003),
     "B-D1-1M":      (1481.9, 780.6, "j-59d0b337", 0.003),
     "B-D16-256k":   (2048.8, 1012.8, "j-59d0b337", 0.005),
     "B-P1024-256k": (50916.8, None, "j-59d0b337", 0.005),
+    "B-P1024-1M":   (66958.7, None, "j-31ca6c31", 0.000),
 }
 
 MB = 1 << 20

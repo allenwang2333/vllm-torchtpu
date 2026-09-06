@@ -50,14 +50,26 @@ from shapes import (BKV_P, BQ_SZ, CR, DECODE_REQ_BATCH_SIZE, DH, H, K, S,  # noq
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     streamindex_topk  # noqa: E402
 
-# Thresholds for the two tolerance-carrying properties. Starting values, to be
-# calibrated against the incumbent's printed numbers -- both are printed every
-# run precisely so the calibration is a measurement and not a guess. The gap
-# they must straddle is wide: boundary swaps on the incumbent moved scores by
-# <= 0.005 on a ~2.1 range (0.3% of it), while dropping one KV block of the
-# four at 8k context would lose ~25% of the true top-k.
+# Thresholds for the two tolerance-carrying properties. CALIBRATED, not guessed:
+# both numbers below sit between two measured quantities, and both are printed
+# on every run so a future recalibration is also a measurement.
+#
+#   incumbent, all 5 cases  (j-31ca6c31-a430-4463-8dbf):
+#       worst deficit 0.00486   worst churn 0.439%
+#   a kernel that drops one KV block at (A):  bkv_sz = 2048, n = 9216, so one
+#       block is ~22% of the live range; at a 22-25% selection rate that costs
+#       ~20% of the true top-k.  [modelled -- see the negative control below]
+#
+# So the discriminating gap is 0.44% against ~20%, a factor of 45. Both
+# thresholds are placed near the geometric centre of their gap rather than
+# hard against the incumbent: TOL_CHURN=0.03 is 6.8x above the incumbent's
+# worst and 6.7x below a dropped block. The earlier 0.005 left pre-1x8k with
+# 12% margin, which would have red-lighted candidates for reordering ties.
+#
+# `--negative-control` deliberately corrupts the selection and asserts these
+# thresholds FAIL, so the gate is a discriminator rather than an assertion.
 TOL_DEFICIT = 0.05    # fraction of the top-to-cut score range
-TOL_CHURN = 0.005     # fraction of the true top-k missing (~10 of 2048)
+TOL_CHURN = 0.03      # fraction of the true top-k missing (~61 of 2048)
 
 # Production geometry, shrunk only in the number of sequences/tokens so a f32
 # reference is tractable. page_size, head dim, head count and k are the real
@@ -137,13 +149,52 @@ def reference_scores(m, seq_id, tok):
     return np.where(j <= pos, s, -np.inf)
 
 
-def run_case(name, verbose=True):
+def _corrupt(idx, m, mode):
+    """Damage a correct result the way a wrong kernel would, so the thresholds
+    can be shown to fire. Used only by --negative-control.
+
+    `drop-block` is the failure this gate exists to catch: a kernel whose KV
+    walk misses one block returns k indices, all unique, all in range -- every
+    structural property still holds. Only deficit and churn can see it.
+    """
+    out = idx.copy()
+    n_live = int(m["cu"][m["R"]])
+    for tok in range(n_live):
+        row = out[tok]
+        sel = row[row >= 0]
+        if not sel.size:
+            continue
+        if mode == "drop-block":
+            # Blank one bkv-sized band and refill from just past the cut, which
+            # is what a skipped block looks like: the winners inside the band
+            # are replaced by the next-best candidates outside it.
+            bkv_sz = m["psz"] * BKV_P[0]
+            lo = (len(sel) // 2 // bkv_sz) * bkv_sz
+            hi = lo + bkv_sz
+            keep = sel[(sel < lo) | (sel >= hi)]
+            L = m["lens"][tok if m["qlen"] == 1 else 0]
+            pool = np.setdiff1d(np.arange(min(L, m["psz"] * m["pps"])), sel)
+            row[:] = -1
+            take = np.concatenate([keep, pool[: len(sel) - len(keep)]])
+            row[: len(take)] = take
+        elif mode == "tail-swap":
+            # The benign failure: exchange the worst few selected for the
+            # next few rejected. Must NOT trip the gate.
+            L = m["lens"][tok if m["qlen"] == 1 else 0]
+            pool = np.setdiff1d(np.arange(min(L, m["psz"] * m["pps"])), sel)
+            row[len(sel) - 8: len(sel)] = pool[:8]
+    return out
+
+
+def run_case(name, verbose=True, corrupt=""):
     c = CASES[name]
     args, m = build_case(c)
     idx = np.asarray(streamindex_topk(
         *args, k=K, compression_ratio=CR, num_kv_pages_per_block=BKV_P,
         num_queries_per_block=BQ_SZ, vmem_limit_bytes=VMEM_LIMIT,
         decode_req_batch_size=DECODE_REQ_BATCH_SIZE, enable_early_exit=True))
+    if corrupt:
+        idx = _corrupt(idx, m, corrupt)
 
     fails = []
     n_live = int(m["cu"][m["R"]])
@@ -199,15 +250,50 @@ def run_case(name, verbose=True):
         print(f"[{st}] {name:14} R={m['R']} qlen={m['qlen']} lens={m['lens']} "
               f"live_rows={n_live}  worst_deficit={worst_def:.5f} "
               f"(tol {TOL_DEFICIT})  worst_churn={worst_churn:.3%} "
-              f"(tol {TOL_CHURN:.0%})", flush=True)
+              f"(tol {TOL_CHURN:.1%})", flush=True)
         for f in fails[:6]:
             print(f"        {f}", flush=True)
     return fails
 
 
+def negative_control(names):
+    """Show the gate is a discriminator, not an assertion.
+
+    Runs the incumbent, then damages its output two ways and checks that the
+    thresholds separate them. Exits non-zero unless BOTH hold:
+      drop-block  -> must FAIL every case (the gate catches a wrong kernel)
+      tail-swap   -> must PASS every case (the gate tolerates near-ties)
+    A gate that cannot do both is not evidence about a candidate, and this is
+    the run that establishes it. See CLAUDE.md: "would this check have failed
+    if the change were wrong?"
+    """
+    bad = []
+    print("=== negative control ===", flush=True)
+    print("-- drop-block: a kernel whose KV walk misses one block. MUST FAIL --",
+          flush=True)
+    for n in names:
+        if not run_case(n, corrupt="drop-block"):
+            bad.append(f"{n}: drop-block was NOT caught -- the gate is blind "
+                       f"to the failure it exists to catch")
+    print("-- tail-swap: 8 boundary near-ties exchanged. MUST PASS --",
+          flush=True)
+    for n in names:
+        f = run_case(n, corrupt="tail-swap")
+        if f:
+            bad.append(f"{n}: tail-swap was rejected -- the gate is too tight "
+                       f"and will red-light correct candidates")
+    print(f"\nnegative control: {'PASS' if not bad else 'FAIL'}", flush=True)
+    for b in bad:
+        print(f"  {b}", flush=True)
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", default="")
+    ap.add_argument("--negative-control", action="store_true",
+                    help="prove the thresholds separate a dropped KV block "
+                         "from boundary near-ties, then exit")
     a = ap.parse_args()
     names = [a.case] if a.case else list(CASES)
     allf = []
@@ -215,6 +301,8 @@ def main():
         allf += run_case(n)
     print(f"\n{len(names) - len(set(f.split()[0] for f in allf))}/{len(names)} "
           f"cases passed, {len(allf)} assertion failures")
+    if a.negative_control:
+        allf += negative_control(names)
     sys.exit(1 if allf else 0)
 
 
