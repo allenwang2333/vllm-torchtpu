@@ -82,6 +82,17 @@ rows = [
 #       A-P rows above, which it re-ran WITH --decompose. The full-op medians
 #       agree to 1.0%/1.1%, so the sc split is being attached to a reproduced
 #       measurement, not a fresh one.
+#
+# DRIFT: the `spread` column below is block-to-block WITHIN one row, and it
+# understates the noise. j-f90148cb-4f1b-4252-aece ran A-D16-8k twice in one
+# job, separated by two other rows, and got 287.5 then 278.5 us -- 3.2% apart,
+# against that row's own 1.9% and 1.3% block-to-block spreads. `built in` also
+# fell 7.3s -> 4.3s between them, so a warm compile cache is the likely
+# mechanism and the term is run-ORDER, not run-to-run randomness.
+# Consequence: a difference under ~3% is not resolvable by comparing two rows
+# in sequence, and no cross-JOB comparison here is worth anything at that size.
+# The A-D16-8k > A-D32-8k inversion (278.7 vs 264.8) is inside this band and is
+# NOT established; the D64 row is well outside it and is.
 # (full, sparsecore_topk alone or None, job, block-to-block spread)
 MEASURED = {
     "A-D64-8k":     (363.2, 189.5, "j-284a8842", 0.091),

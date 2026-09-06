@@ -156,33 +156,45 @@ def _corrupt(idx, m, mode):
     `drop-block` is the failure this gate exists to catch: a kernel whose KV
     walk misses one block returns k indices, all unique, all in range -- every
     structural property still holds. Only deficit and churn can see it.
+
+    Both arms damage the row *by true score*, not by index. An earlier version
+    refilled from `pool[:n]` -- the lowest-numbered unselected positions -- and
+    that is not either failure: it draws uniformly from the rejected set, so it
+    made `tail-swap` (which must pass) look like a catastrophe. A skipped block
+    and a boundary tie are both defined in score order, so both need `ref`.
     """
     out = idx.copy()
-    n_live = int(m["cu"][m["R"]])
-    for tok in range(n_live):
-        row = out[tok]
-        sel = row[row >= 0]
-        if not sel.size:
-            continue
-        if mode == "drop-block":
-            # Blank one bkv-sized band and refill from just past the cut, which
-            # is what a skipped block looks like: the winners inside the band
-            # are replaced by the next-best candidates outside it.
-            bkv_sz = m["psz"] * BKV_P[0]
-            lo = (len(sel) // 2 // bkv_sz) * bkv_sz
-            hi = lo + bkv_sz
-            keep = sel[(sel < lo) | (sel >= hi)]
-            L = m["lens"][tok if m["qlen"] == 1 else 0]
-            pool = np.setdiff1d(np.arange(min(L, m["psz"] * m["pps"])), sel)
+    for seq_id in range(m["R"]):
+        for tok in range(int(m["cu"][seq_id]), int(m["cu"][seq_id + 1])):
+            row = out[tok]
+            sel = row[row >= 0]
+            if not sel.size:
+                continue
+            ref = reference_scores(m, seq_id, tok)
+            order = np.argsort(-ref, kind="stable")       # best first
+            if mode == "drop-block":
+                # A kernel whose KV walk misses one block still returns the
+                # best k it saw -- so blank a bkv-sized band and re-select the
+                # top-k over what remains, in score order.
+                bkv_sz = m["psz"] * BKV_P[0]
+                lo = (len(sel) // 2 // bkv_sz) * bkv_sz
+                hi = lo + bkv_sz
+                cand = order[(order < lo) | (order >= hi)]
+                cand = cand[np.isfinite(ref[cand])]
+                take = cand[: len(sel)]
+            elif mode == "tail-swap":
+                # The benign failure: exchange the worst few selected for the
+                # *next-best* rejected -- the near-ties straddling the cut.
+                # Must NOT trip the gate.
+                # `sel` is in the kernel's arbitrary emission order, so the
+                # worst few have to be found by score, not by position.
+                live = order[np.isfinite(ref[order])]
+                nxt = live[len(sel): len(sel) + 8]
+                keep = sel[np.argsort(-ref[sel], kind="stable")][
+                    : max(0, len(sel) - len(nxt))]
+                take = np.concatenate([keep, nxt])
             row[:] = -1
-            take = np.concatenate([keep, pool[: len(sel) - len(keep)]])
             row[: len(take)] = take
-        elif mode == "tail-swap":
-            # The benign failure: exchange the worst few selected for the
-            # next few rejected. Must NOT trip the gate.
-            L = m["lens"][tok if m["qlen"] == 1 else 0]
-            pool = np.setdiff1d(np.arange(min(L, m["psz"] * m["pps"])), sel)
-            row[len(sel) - 8: len(sel)] = pool[:8]
     return out
 
 
