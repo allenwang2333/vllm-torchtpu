@@ -713,6 +713,9 @@ def mla_attention(q_TNA: jax.Array,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            # Keep softmax probabilities in their compute dtype when KV
+            # storage is FP8; do not add FP8 rounding to the P @ V input.
+            p_same_dtype_as_v=kv_dtype_str != "float8_e4m3fn",
             use_causal_mask=use_causal_mask)
 
         # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
