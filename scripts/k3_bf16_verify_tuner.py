@@ -38,7 +38,7 @@ def child(case, tile):
         # Disjoint, low, non-null pages per request; KV lengths differ so
         # verification covers page boundaries and ragged cached prefixes.
         lengths = [context - i % 7 for i in range(c)]
-        stride = (context + 255) // 256
+        stride = (context + window + 255) // 256
         cache = random((1 + c * stride, 128, 2, 640))
         table = np.full((32, 128), -1, np.int32)
         for i in range(c):
@@ -102,6 +102,93 @@ def child(case, tile):
         cache_ok = np.array_equal(
             np.asarray(cache, np.float32)[..., :576],
             expected_cache[..., :576])
+        if not cache_ok:
+            observed = np.asarray(cache, np.float32).reshape(-1, 256, 640)
+            diff = np.argwhere(observed[..., :576] != flat_cache[..., :576])
+            counts = {}
+            examples = []
+            for page, offset, channel in diff:
+                seq = (int(page) - 1) // stride
+                pos = ((int(page) - 1) % stride) * 256 + int(offset)
+                if page == 0:
+                    kind = "null_page"
+                elif pos < lengths[seq] - window:
+                    kind = "valid_prefix"
+                elif pos < lengths[seq]:
+                    kind = "new_valid_kv"
+                else:
+                    kind = "unused_tail"
+                counts[kind] = counts.get(kind, 0) + 1
+                if len(examples) < 24:
+                    examples.append(
+                        dict(page=int(page),
+                             offset=int(offset),
+                             seq=seq,
+                             pos=pos,
+                             channel=int(channel),
+                             kind=kind,
+                             expected=float(flat_cache[page, offset, channel]),
+                             actual=float(observed[page, offset, channel])))
+            print("KV_DIAGNOSTIC",
+                  json.dumps(
+                      dict(context=context,
+                           case=case,
+                           tile=tile,
+                           counts=counts,
+                           differing_positions=np.unique(diff[:, :2],
+                                                         axis=0).tolist(),
+                           examples=examples)),
+                  flush=True)
+        if os.getenv("TUNER_DIAG") == "1":
+            # Read the written window as PREFIX in the next verify, instead
+            # of overwriting it again. Compare against the canonical cache.
+            next_lens = jnp.asarray([n + window
+                                     for n in lengths] + [0] * (32 - c),
+                                    jnp.int32)
+
+            def readback(kv):
+                return mla_ragged_paged_attention(
+                    ql_nope=q,
+                    q_pe=qr,
+                    new_kv_c=new,
+                    new_k_pe=new_r,
+                    cache_kv=kv,
+                    kv_lens=next_lens,
+                    page_indices=ids,
+                    cu_q_lens=cu,
+                    distribution=distribution,
+                    num_kv_pages_per_block=(3, 1, pages),
+                    num_queries_per_block=(1, 16, bq),
+                    mixed_q_split=split,
+                    vmem_limit_bytes=60 * 1024 * 1024,
+                    s_dtype=jnp.bfloat16,
+                    p_same_dtype_as_v=True)
+
+            golden_cache = jnp.asarray(expected_cache, jnp.bfloat16)
+            got_next, _ = readback(cache)
+            want_next, _ = readback(golden_cache)
+            jax.block_until_ready((got_next, want_next))
+            next_error = float(
+                np.max(
+                    np.abs(
+                        np.asarray(got_next, np.float32)[:, :c * window] -
+                        np.asarray(want_next, np.float32)[:, :c * window])))
+            print("READBACK_DIAGNOSTIC",
+                  json.dumps(
+                      dict(context=context,
+                           case=case,
+                           tile=tile,
+                           original_output_error=error,
+                           cache_exact=cache_ok,
+                           next_output_max_abs_error=next_error)),
+                  flush=True)
+            rows.append(
+                dict(context=context,
+                     cache_exact=cache_ok,
+                     original_output_error=error,
+                     next_output_max_abs_error=next_error,
+                     status="diagnostic_only"))
+            continue
         correct = bool(
             np.isfinite(actual).all() and cache_ok
             and np.allclose(actual, expected, atol=0.005, rtol=0.03))
