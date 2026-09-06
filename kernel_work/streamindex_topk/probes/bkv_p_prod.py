@@ -100,15 +100,46 @@ class bkv_p_set:
         return False
 
 
-def sweep(impl, regime_names, reps, decode_only):
+class tuple_set:
+    """Rebind `shapes.NUM_KV_PAGES_PER_BLOCK` to an explicit 3-tuple.
+
+    `bkv_p_set` varies one scalar and derives the tuple. That is not enough to
+    price the real candidate, because the three bands are COUPLED: entry [0]
+    serves decode, [1] and [2] serve mixed/prefill, but `num_sublanes_total` is
+    a `max` over all three (`streamindex_topk.py:603-605`) since one scores
+    buffer serves all three `pallas_call`s. So raising the decode band alone
+    still widens the buffer for mixed, which pays the width with none of the
+    step saving. That asymmetric arm is the one a deployment would actually
+    ship, and it needs the tuple stated outright rather than derived.
+    """
+
+    def __init__(self, tup):
+        self.old = S.NUM_KV_PAGES_PER_BLOCK
+        self.new = tuple(int(x) for x in tup)
+
+    def __enter__(self):
+        S.NUM_KV_PAGES_PER_BLOCK = self.new
+        return self.new
+
+    def __exit__(self, *exc):
+        S.NUM_KV_PAGES_PER_BLOCK = self.old
+        return False
+
+
+def sweep(impl, regime_names, reps, decode_only, tuples=None):
     rows = []
     for name in regime_names:
         regime = S.REGIMES_BY_NAME[name]
-        for bkv_p in LADDER:
+        arms = ([("tuple", t) for t in tuples] if tuples
+                else [("scalar", b) for b in LADDER])
+        for kind, arg in arms:
+            bkv_p = arg if kind == "scalar" else arg[0]
             try:
-                with bkv_p_set(bkv_p, decode_only) as tup:
-                    r = MB.run_regime(impl, regime, early_exit=False,
-                                      reps=reps, measure_topk=False)
+                ctx = (bkv_p_set(arg, decode_only) if kind == "scalar"
+                       else tuple_set(arg))
+                with ctx as tup:
+                        r = MB.run_regime(impl, regime, early_exit=False,
+                                          reps=reps, measure_topk=False)
                 r["bkv_p"] = bkv_p
                 r["bkv_tuple"] = list(tup)
                 # The confound, reported alongside every row so no reader has
@@ -127,32 +158,41 @@ def sweep(impl, regime_names, reps, decode_only):
                 r["sublanes_at_this_bkv_p"] = subl
                 r["scores_MB"] = regime.num_tokens * subl * 128 * 4 / 1e6
             except Exception as exc:  # noqa: BLE001
-                r = dict(regime=name, bkv_p=bkv_p, error=repr(exc)[:400])
+                r = dict(regime=name, bkv_p=bkv_p,
+                         bkv_tuple=list(arg) if kind == "tuple" else [arg]*3,
+                         error=repr(exc)[:400])
             rows.append(r)
             print(json.dumps(r), flush=True)
 
     print("\n=== bkv_p at PRODUCTION shapes (median ms/call, 1 TensorCore) ===")
-    hdr = (f"{'regime':<14}{'bkv_p':>6}{'subl':>6}{'scoresMB':>10}"
-           f"{'inner':>7}{'full_ms':>10}{'spread%':>9}{'d time %':>10}")
+    hdr = (f"{'regime':<14}{'tuple':>10}{'subl':>6}{'scoresMB':>10}"
+           f"{'num_bkv':>9}{'full_ms':>10}{'spread%':>9}{'d time %':>10}")
     print(hdr)
     print("-" * len(hdr))
     for name in regime_names:
         base = next((r["full_ms"] for r in rows
-                     if r.get("regime") == name and r.get("bkv_p") == 2
+                     if r.get("regime") == name
+                     and tuple(r.get("bkv_tuple") or ()) == S.NUM_KV_PAGES_PER_BLOCK
                      and "error" not in r), None)
         for r in [x for x in rows if x.get("regime") == name]:
             if "error" in r:
-                print(f"{name:<14}{r['bkv_p']:>6}  ERROR {r['error'][:60]}")
+                print(f"{name:<14}{str(r.get('bkv_tuple')):>10}  ERROR "
+                      f"{r['error'][:60]}")
                 continue
             dt = ((r["full_ms"] - base) / base * 100.0) if base else float("nan")
-            print(f"{name:<14}{r['bkv_p']:>6}"
+            tstr = ",".join(str(x) for x in r["bkv_tuple"])
+            print(f"{name:<14}{tstr:>10}"
                   f"{r['sublanes_at_this_bkv_p']:>6}{r['scores_MB']:>10.1f}"
-                  f"{r['inner']:>7}{r['full_ms']:>10.4f}"
+                  f"{r['num_bkv']:>9}{r['full_ms']:>10.4f}"
                   f"{r['full_spread_pct']:>9.2f}{dt:>10.2f}")
-    print("\n`d time %` is against bkv_p=2, the shipped value. Negative is "
-          "faster. `subl` is num_sublanes_total -- it MOVES with bkv_p here "
-          "(80/96/128 at max_model_len=9216), which is the confound this run "
-          "exists to price, not a defect.")
+    print(f"\n`d time %` is against {S.NUM_KV_PAGES_PER_BLOCK}, the shipped "
+          "tuple (mla_attention_op.py:119). Negative is faster. `tuple` is "
+          "num_kv_pages_per_block = (decode, mixed, prefill) band. `subl` is "
+          "num_sublanes_total, a MAX over all three entries -- so it moves "
+          "with the LARGEST band even for a regime that does not use that "
+          "band. That coupling is what this run exists to price, not a "
+          "defect. `num_bkv` is the inner iteration count for THIS regime's "
+          "band.")
     return rows
 
 
@@ -160,8 +200,10 @@ def correctness(impl, regime_names, ladder, negative_control):
     rc = 0
     for name in regime_names:
         regime = S.REGIMES_BY_NAME[name]
-        for bkv_p in ladder:
-            with bkv_p_set(bkv_p) as tup:
+        for item in ladder:
+            ctx = (tuple_set(item) if isinstance(item, tuple)
+                   else bkv_p_set(item))
+            with ctx as tup:
                 try:
                     n, failures, st = TC.run(
                         impl, regime, negative_control=negative_control)
@@ -172,7 +214,7 @@ def correctness(impl, regime_names, ladder, negative_control):
             margin = (f"worst_rank={st['worst_rank_seen']} of allowed "
                       f"{S.INDEX_TOPK + TC.RANK_SLACK}, min_recall="
                       f"{st['min_recall']:.5f} of required {TC.MIN_RECALL}")
-            tag = f"[{name} bkv_p={bkv_p} tuple={tup}]"
+            tag = f"[{name} tuple={tup}]"
             if negative_control:
                 if failures:
                     print(f"{tag} NEGATIVE CONTROL OK -- fired on "
@@ -204,6 +246,11 @@ def main(argv=None):
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--ladder", default="4,8",
                     help="bkv_p values for the correctness modes")
+    ap.add_argument("--tuples", default="",
+                    help="explicit num_kv_pages_per_block arms, e.g. "
+                         "'2,2,2;4,2,2;4,4,4'. Overrides the scalar ladder. "
+                         "Needed because the three bands share one scores "
+                         "buffer sized by max(tuple).")
     ap.add_argument("--all-bands", action="store_true",
                     help="move all three entries of num_kv_pages_per_block, "
                          "not just the decode band")
@@ -216,14 +263,17 @@ def main(argv=None):
     print(f"shipped NUM_KV_PAGES_PER_BLOCK = {S.NUM_KV_PAGES_PER_BLOCK}; "
           f"mode={a.mode}; regimes={names}", flush=True)
 
+    tuples = ([tuple(int(v) for v in t.split(",")) for t in a.tuples.split(";")]
+              if a.tuples else None)
     if a.mode == "sweep":
-        rows = sweep(impl, names, a.reps, not a.all_bands)
+        rows = sweep(impl, names, a.reps, not a.all_bands, tuples)
         if a.json:
             with open(a.json, "w") as f:
                 json.dump(rows, f, indent=2)
         return 0
 
-    ladder = [int(x) for x in a.ladder.split(",") if x]
+    ladder = (tuples if tuples
+              else [int(x) for x in a.ladder.split(",") if x])
     return correctness(impl, names, ladder,
                        negative_control=(a.mode == "control"))
 
