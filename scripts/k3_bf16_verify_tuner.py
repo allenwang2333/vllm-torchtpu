@@ -254,7 +254,7 @@ def child(case, tile):
             samples.append((time.perf_counter_ns() - started) / 1e6)
         trace_dir = os.getenv("TUNER_TRACE_DIR")
         if trace_dir and context == 1000:
-            trace_backend = os.getenv("TUNER_PROFILE_BACKEND", "jax")
+            trace_backend = os.getenv("TUNER_PROFILE_BACKEND", "libtpu")
             # A run-local marker lets an ongoing sweep preserve correctness
             # results when the independently versioned profiler ABI is broken.
             # Deferred captures are NOT evidence that a candidate is ready.
