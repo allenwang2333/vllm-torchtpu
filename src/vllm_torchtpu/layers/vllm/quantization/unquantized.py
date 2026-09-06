@@ -51,6 +51,7 @@ from vllm.model_executor.utils import replace_parameter
 
 from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
+from vllm_torchtpu.layers.common.quantization import should_quantize_on_load
 from vllm_torchtpu.layers.vllm import moe_routing
 from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
                                                  get_fused_moe_activation,
@@ -169,6 +170,20 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, LinearBase):
+            # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
+            # kv_b_proj.weight and quantizes them separately after loading.
+            if should_quantize_on_load(
+                    prefix) and "kv_b_proj" not in prefix.split("."):
+                from vllm_torchtpu.layers.vllm.quantization.fp8 import (
+                    VllmFp8Config, VllmFp8LinearMethodTPU)
+                fp8_config = VllmFp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+                return VllmFp8LinearMethodTPU(fp8_config,
+                                              self.get_linear_config(layer),
+                                              prefix=prefix)
+
             # TPU-native dense linear: canonical (k, n) weight layout so the
             # forward pass is (m, k) @ (k, n) rather than vLLM's
             # (m, k) @ (n, k).T.
