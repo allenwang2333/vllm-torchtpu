@@ -272,7 +272,7 @@ def materialize_kv_cache_tensors(
                         attn_backend=group.backend,
                         num_blocks=num_blocks,
                         kernel_block_size=kernel_block_size,
-                        cache_dtype=cache_dtype,
+                        cache_dtype=spec.dtype,
                         device=device,
                     )
         return MaterializedKVCache(kv_caches=kv_caches, raw_tensors=[])
@@ -288,9 +288,6 @@ def materialize_kv_cache_tensors(
         cache_dtype=cache_dtype)
     kv_caches: dict[str, LayerKVCache] = {}
 
-    # Every layer sharing a hybrid buffer holds the exact same pool object.
-    # This preserves the native attention layout and gives torch.compile one
-    # persistent graph input instead of per-layer typed aliases or clones.
     for group_list in attn_groups:
         for group in group_list:
             gid = group.kv_cache_group_id
