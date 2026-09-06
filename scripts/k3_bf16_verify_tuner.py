@@ -172,7 +172,10 @@ def child(case, tile):
                 p_same_dtype_as_v=True)
 
         golden_cache = jnp.asarray(expected_cache, jnp.bfloat16)
-        got_next, _ = readback(cache)
+        # The MLA entrypoint donates cache_kv. Keep the original state alive
+        # for timing; the readback probe owns a separate device allocation.
+        probe_cache = cache.copy()
+        got_next, _ = readback(probe_cache)
         want_next, _ = readback(golden_cache)
         jax.block_until_ready((got_next, want_next))
         next_error = float(
@@ -196,6 +199,8 @@ def child(case, tile):
             raise RuntimeError(
                 f"reference mismatch: error={error} KV={cache_valid} next_error={next_error}"
             )
+        if cache.is_deleted():
+            raise RuntimeError("Readback probe invalidated the timing cache")
         for _ in range(3):
             output, cache = invoke(cache)
             jax.block_until_ready((output, cache))
