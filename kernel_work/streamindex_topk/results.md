@@ -51,7 +51,12 @@ fallen sharply** — not because the kernel measurement moved, but because two t
 same process on the same chip across all four regimes — a pairing no prior job had. Median ms per
 full call, single chip. **Negative is faster.**
 
-| regime | incumbent (2,2,2) ms | variant (4,2,4) ms | Δ time % | speedup × |
+**`pooled`** means the arithmetic mean of the two replicate arms of that kind in this job, per
+`variants/retune/RESULTS.md` §3.1 — not a single arm. The distinction matters on the one row where
+it does not hold: †`decode_64k`'s incumbent is the **first arm alone**, because its
+`incumbent-repeat` was excluded (below).
+
+| regime | incumbent (2,2,2) ms, **pooled** | variant (4,2,4) ms, **pooled** | Δ time % | speedup × |
 | --- | ---: | ---: | ---: | ---: |
 | `decode_prod` | 0.16582267 | 0.15299875 | −7.73 | 1.0838 |
 | `decode_64k` † | 0.19944237 | 0.17761440 | −10.94 | 1.1229 |
@@ -117,13 +122,27 @@ tokens. Prefill balance `1021M = 65536R → M = 64.1881R`; decode balance
 `4(N−M)+3M = 1023R → 4N = 1087.1881R → N = 271.7970R`; `M/N = 0.236168`. Cross-check on slot
 lifetime: `4N/R = 1087.19 = 64.19 + 1023`. ✓
 
-| band | share of invocations | share of **time** |
+| band | share of **steps** | share of **time** |
 | --- | ---: | ---: |
-| DECODE | 80.9% | **12.1–14.3%** |
-| MIXED | 19.1% | **85.7–87.9%** |
+| DECODE | 76.4% | **12.1–14.3%** |
+| MIXED | 23.6% | **85.7–87.9%** |
+
+`share of steps` is the fraction of engine steps of each kind; `share of time` is that fraction
+weighted by the per-call time of the corresponding regime. The two columns are now on the same
+denominator, which they were not. `N` is the **total** step count and `M` the mixed count — the
+cross-check above only closes on that reading — so the decode-only share is
+`(N−M)/N = 1 − 0.236168 = 76.4%`, not the `M/(N+M) = 19.1%` complement an earlier revision printed
+in this column.
+
+**Only the step column changes.** The time bracket was already computed on `(N−M)/N`, so
+12.1–14.3% / 85.7–87.9% stands unaltered, and everything weighted by it downstream — A's
+0.93–1.10% in §5b-v2, E's breakeven in §1.3, §6's ranking — is unaffected. Had the 80.9/19.1
+weights been used for time as well, the bracket would read 15.2–17.9% / 82.1–84.8%; they were not.
 
 The time bracket comes from `decode_64k` at 0.20202844752930105 ms against `mixed_64k` at 4.76284 ms
-(high) and 3.91366 ms (low — mean `num_bkv` over the 64 prefill chunks is exactly 16.5 of 32).
+(high) and 3.91366 ms (low — mean `num_bkv` over the 64 prefill chunks is exactly 16.5 of 32):
+`0.7638 × 0.20203` against `0.2362 × 4.76284` gives 12.1%, and against `0.2362 × 3.91366` gives
+14.3%.
 
 **Consequence, in the design doc's own §9.2 words: mixed dominates, so "B is rank 1 outright, with A
 second", and E is near zero.** §9.1's printed `E ≈ B` tie does not survive.
@@ -205,6 +224,22 @@ The output store inside the first bundle is only ~0.35 µs, so **the head reduct
 single largest thing in the step — and not one of options A, B, C, D or E touches it.** Every option
 in `measurement_and_design.md` moves bytes, sizes buffers, or relocates selection. The dominant term
 is arithmetic on a saturated unit sitting next to an idle one.
+
+> **The three shares in this table are `modelled`, not `measured`, and the split is not stable.**
+> Two caveats found later, both of which the table's layout hides:
+>
+> 1. The 3.858 µs is a two-point fit whose upper point is the `full` row above — the row §4 itself
+>    declares unusable at **550.56% spread**. The same table shows the fit is non-linear. An
+>    equally consistent reading of the surviving points gives 65.6% rather than 52.5%, so treat
+>    52.5% as one end of a 52–66% bracket.
+> 2. §8.2's NUM_HEADS ladder measured the bundle's cost as **essentially constant in `NUM_HEADS`**
+>    and its absolute size as **arm-dependent by up to 2.7×**. So the bundle is not per-head
+>    reduction arithmetic — it is store plus a fixed per-step cost — and a single share figure for
+>    it does not transfer between arms.
+>
+> Both apply wherever this split is reused: §4.1, §4.3, §5d, §6 and §8.2. Neither changes the
+> qualitative finding, which is what §4.1 is for — the head-sum bundle is the largest term in the
+> step under every reading — but no candidate should be sized against 52.5% as if it were measured.
 
 ### 4.2 A correction to the decider's own reading of this
 
@@ -373,9 +408,18 @@ magnitude being the noise floor for an arm-to-arm comparison.
 **The two decode rows are real; the two mixed rows are not conclusions.** In both, the spread equals
 or dwarfs the effect. That is the finding that matters, because mixed carries 85.7–87.9% of indexer
 time at the A/B shape (§2). Taking the mixed rows as zero — which is what their spreads license —
-**A's reader is worth ≈1.3–1.5% of indexer time**; taking them at face value gives 2.5–2.7%. The
+**A's reader is worth ≈0.93–1.10% of indexer time**; taking them at face value gives 1.2–1.4%. The
 defensible number is the lower one. A's reader was always a decode optimization: in mixed, top-k
 dominates the call.
+
+> **Both figures must be built from the `_64k` rows, not the `_prod` rows.** The weights
+> 12.1–14.3% decode / 85.7–87.9% mixed are derived entirely from the A/B shape
+> (`max_model_len = 66560`), so the per-phase delta they multiply has to come from the same shape.
+> That is `decode_64k`'s −7.66%, giving 0.121 × 7.66 = 0.93% to 0.143 × 7.66 = 1.10%. An earlier
+> revision of this section multiplied `decode_prod`'s −10.45% — a `max_model_len = 9216` shape —
+> by those same A/B-derived weights, and overstated A's contribution by ≈1.4× (to "1.3–1.5%" and
+> "2.5–2.7%"). Mixing a delta measured at one deployment shape with a share derived at another is
+> the specific error; the numbers above are the corrected ones.
 
 **This demotes A's reader from the rank-1 expectation step 2 set for it, and the demotion is a
 denominator effect, not a failure of the change.** The mechanism works exactly as designed — the
@@ -434,11 +478,17 @@ identical count and opcode mix to the incumbent. HBM operands `memref<576x256x4x
 A and B **touch different code and different phases**. B is the indexer kernel's scores buffer on the
 mixed band; A's reader is the indexer's scoring half on the decode band; A's writer is
 `mla_attention_op.py`, which B does not touch at all. Their measured wins are therefore not competing
-for the same time, and step 4 should compose them rather than choose. A's writer saving — 0.592 ms
-per prefill call — is the second-largest absolute number in the exercise after B's confound row.
+for the same time, and step 4 should compose them rather than choose. A's writer saving — **3.342×
+at `T = 1024`** — is the largest ratio in the exercise after B's confound row.
 
-**Still not run:** `/critical-review` on any of these numbers. Required before A is called
-`accepted`.
+> Quote the writer as a **ratio**, never as its absolute 0.592 ms difference. `writer_probe.py`
+> measures a standalone store in isolation, and its own header says the absolutes drift between
+> jobs while the ratio does not: v1 and v2 gave 3.406× and 3.342× (agreeing) off absolute pairs
+> that do not. The 0.592 ms is not a per-call saving that can be added to an end-to-end budget.
+
+`/critical-review` has since run on §5b-v2 and §5c (see §9). It corrected the reader's weighted
+contribution — the figure above — and raised no objection to A's bit-exactness. A stays
+`provisional` until the composed step-4 candidate carries a named correctness job.
 
 ---
 
@@ -508,11 +558,26 @@ in sublanes:
 The incumbent's 1.92 ms intercept **is** the `max_model_len` tax; B's is 0.16 ms. A 65536-token
 prefill in 1024-token chunks has a mean live context of ≈ 33280 tokens, w ≈ 260:
 
+`mean w` is the mean over the 64 chunks of the **bucketed** static width in sublanes (tokens / 128)
+that B would allocate; the incumbent's width does not bucket, so its column is constant. Negative is
+faster.
+
 | bucketing of the shipped static width | mean w | B ms | incumbent ms | Δ time % |
 | --- | ---: | ---: | ---: | ---: |
 | exact `kv_len` (what was measured — a **ceiling**, not shippable) | 260 | 1.983 | 3.376 | **−41.3** |
-| 8192-token granularity (8 buckets) | 292 | 2.207 | 3.376 | −34.6 |
-| powers of two (4 buckets) | ~346 | 2.585 | 3.376 | −23.4 |
+| 8192-token granularity (8 buckets) | 288 | 2.179 | 3.376 | −35.5 |
+| powers of two (7 buckets) | 341 | 2.550 | 3.376 | −24.5 |
+
+Each `mean w` is derived rather than read off, so the derivation is here to be checked. Chunk *i*
+of 64 has `kv_len = 1024·i`.
+*Exact:* mean `kv_len` = 1024·(1+…+64)/64 = 33280 tokens → w = 260.
+*8192-granularity:* eight chunks map to each of 8192…65536, mean = 8192·(1+…+8)/8 = 36864 → w = 288.
+*Powers of two:* buckets 1024, 2048, 4096, 8192, 16384, 32768, 65536 take 1, 1, 2, 4, 8, 16 and 32
+chunks respectively; mean = 2796544/64 = 43696 → w = 341.4.
+
+> An earlier revision of this table used 292 and ~346, which no derivation reproduces. The
+> corrected values move both rows **in B's favour** by under 1.2 points, so nothing downstream
+> changes sign; the row that matters is superseded outright by §8.3 in any case.
 
 > **Superseded — see §8.3.** A six-rung ladder measured both arms directly
 > (`j-59bbfd2f-e408-4a75-a155`). The three figures above are **conservative**: the measured
@@ -538,8 +603,33 @@ reproducing `worst_rank`/`min_recall` to the digit. The risk B carries is a *rea
 lane*, since it deletes the `-1` fill — and the test was designed for that risk specifically. The
 **poison arm** reinstates the aliased prefill as `+1e30` instead of `-inf`, so an unwritten lane
 would **seize** the top-k rather than perturb it, and it comes back bit-identical to the clean arm at
-all six regimes. That is decisive, not probabilistic. All five negative controls FAILED as required
-(ranks 7968–62644 against 2304).
+all six regimes. All five negative controls FAILED as required (ranks 7968–62644 against 2304).
+
+> ### ⚠️ CRITICAL — the poison arm could not have failed, and it does not cover what B ships
+>
+> `/critical-review` found this evidence hollow on the one risk it was built for.
+> `variants/right-size/run_correctness.py:121-122` binds `kv_len_bucket = r.kv_len` in **every**
+> arm. With bucket == `kv_len` the written width exactly covers the allocated buffer, so at all
+> eight shapes ever run there are **zero unwritten lanes** and the `+1e30` poison is 100%
+> overwritten before selection reads it. "Bit-identical to the clean arm" was guaranteed by the
+> configuration, not earned by the kernel. The paragraph above claimed this was "decisive"; it is
+> not, and that word is withdrawn.
+>
+> The configuration where unwritten lanes exist is `bucket > kv_len` — which is **what B ships
+> under any bucket ladder**, and therefore under every row of the bucketing table above. It has
+> only ever run perf-only, in `probes/followup1/bucket_ladder.py:249` with `measure_topk=False`,
+> no oracle and no index-set comparison. The two rungs that do run it (kv 24576 → bucket 32768,
+> 64 unwritten sublanes; kv 49152 → bucket 65536, 128 unwritten) are **exactly the two rungs the
+> −30.2% pow2 figure in §8.3 and §6 rests on**.
+>
+> What the existing runs *do* establish stands: bit-identical index sets against the incumbent at
+> six regimes, the masked-store tail at `kv_len = 8000`, and `run_sc_coverage.py`'s 12/12. Those
+> cover B's arithmetic. They do not cover the deleted fill.
+>
+> **Disposition: B is `provisional`, not `accepted`, and the end-to-end arms are gated on a
+> re-run** of `run_correctness.py` with the bucket strictly greater than `kv_len` at all four arms
+> against the existing float64 oracle. That job is minutes on the existing image against hours of
+> TPU time for the e2e pair. Result to be recorded here when it returns.
 
 The masked partial-block store lowered first time, but note it needs a *static* destination offset,
 and it is **not emitted at any of the six perf regimes** — all six have `kv_len` a multiple of
@@ -585,7 +675,7 @@ computes a different function rather than a perturbation of the same one. It was
 | `mixed_64k` | 65536 | 1024 of 1024 | 57391 | 24.9× | 0.39844 |
 | `decode_64k` | 65536 | 6 of 6 | 40939 | 17.8× | 0.50293 |
 
-Not one row of 3138 passed, and it degrades monotonically with S — mean recall 0.737 → 0.582 →
+Not one row of 3142 passed, and it degrades monotonically with S — mean recall 0.737 → 0.582 →
 0.520 — so it is worst exactly where the A/B lives. Roughly half the returned set is wrong at long
 context. An oracle self-reference arm was perfect at every regime (`worst_rank = 2048`,
 `min_recall = 1.00000`), so the plumbing is sound and this is the function, not the harness.
@@ -614,7 +704,7 @@ overturns it.
 ### The consequence that outranks the verdict
 
 **The 85% of the MIXED inner step now has no candidate.** A1 was the only proposal that removed both
-the relu chain (32.7%) and the head-sum bundle (52.5%). The exact routes left are E1, E2 and F, and
+the relu chain (32.7%) and the head-sum bundle (52.5%, `modelled` — see §4.1's caveat; the bracket is 52–66% and arm-dependent). The exact routes left are E1, E2 and F, and
 only F touches the head sum. §7.5 item 1 resolves to **not inserted**.
 
 Two things A1 hands forward, both cheap and both now scheduled:
@@ -643,6 +733,14 @@ instrument that prices C's ceiling.
 **Every arm is slower.** §7.5 predicted exactly this: under the confirmed VPU hypothesis a 16-bit key
 adds a VPU-side encode on the unit that is already the bottleneck, so C spends time on the critical
 path to save bytes off it.
+
+> **This job carried no drift control**, so the four deltas are read against within-arm `spread %`
+> — the yardstick §1.2 establishes is too *lenient* for an arm-to-arm delta. The two rows that
+> would need a drift bound to be conclusive are `decode_64k` (+0.91% against 0.70–0.76% spread)
+> and `mixed_64k` (+1.20% against ~1.1%). It does not change C's disposition: the verdict rests
+> on the **ceiling** — C's best case is ≤ 2.53% and it is slower on every arm including the two
+> that clear their spread by 2–4×. A drift control could move the two marginal rows toward zero;
+> it cannot make a ≤ 2.53% prize worth building.
 
 **C's ceiling, priced against a measured rate.** The `mixed_64k` cast arm is genuinely
 bandwidth-bound — 415.2 MB / 0.16817 ms = **2.469 TB/s measured**. Dividing the bytes C removes by
@@ -707,7 +805,7 @@ another — an assumption this document has been making since §1 without eviden
 `j-ace83e22-c472-4463-b41d`, `JobStatus = Succeeded`, 4/4 shards `rc=0`. `variants/mxu-head-sum/`.
 
 F was the option this document opened in §4.3 after the VPU hypothesis was confirmed: move the
-3.858 µs head-sum bundle (52.5% of the inner step) onto an MXU measured to be idle, as a
+3.858 µs head-sum bundle (52.5% of the inner step, `modelled` — §4.1's caveat) onto an MXU measured to be idle, as a
 block-diagonal ones-matmul that keeps the ReLU and is therefore **exact by reassociation**, bounded
 at 2.46e-06 relative. It also overturned §2.5's rejection of E6/H, on the grounds that "3.1% MXU
 fill" is the wrong criterion when the unit is idle.
@@ -782,17 +880,23 @@ producer-side change, and it goes to that owner with both gates named, not into 
 
 ## 6. Ranking as it stands
 
-**Every option is now resolved.** A four-shard follow-up probe (A2's gate, the `NUM_HEADS` ladder,
-B's bucket ladder, the `(8,4,4)` re-run) is still in flight, but it sharpens the two survivors rather
-than adding a candidate.
+**Every option is now resolved.** The four-shard follow-up probe (A2's gate, the `NUM_HEADS` ladder,
+B's bucket ladder, the `(8,4,4)` re-run) has since returned — see §8 — and it sharpened the two
+survivors rather than adding a candidate.
+
+> **This ranking is unchanged by `/critical-review`, but two of its cells are.** B's correctness
+> claim below is withdrawn (see §5c's ⚠️ block: the poison arm could not have failed, and B is
+> `provisional` pending a re-run at `bucket > kv_len`), and A's weighted contribution is
+> 0.93–1.10%, not the 1.3–1.5% an earlier revision gave it. Neither reorders anything: B's win is
+> 20–40× A's on the band that carries the time, and no third candidate is close to either.
 
 **A and B are not competing.** They land on different phases and, for the writer, different files.
 The ranking below orders them by size of measured win, but step 4 composes rather than chooses.
 
 | rank | option | standing | why it moved from step 2 |
 | ---: | --- | --- | --- |
-| **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Strongest correctness evidence in the exercise. |
-| **2** | **A — Narrow Record** | **both halves measured, correct, bit-exact** | writer 3.342× at `T=1024` on the dominant phase; reader 10.45% / 7.66% faster but **decode-only**, worth ≈1.3–1.5% of indexer time once weighted (§5b-v2). Design doc §9.1's "A moves to rank 1 outright" was earned on the writer term and then **undone by the phase weighting** — the reader lands on 12.1–14.3% of the time. MXU operands confirmed native fp8. |
+| **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Correctness **incomplete** — see the ⚠️ block in §5c; the evidence does not cover the configuration B ships in. |
+| **2** | **A — Narrow Record** | **both halves measured, correct, bit-exact** | writer 3.342× at `T=1024` on the dominant phase; reader 10.45% / 7.66% faster but **decode-only**, worth **0.93–1.10%** of indexer time once weighted (§5b-v2). Design doc §9.1's "A moves to rank 1 outright" was earned on the writer term and then **undone by the phase weighting** — the reader lands on 12.1–14.3% of the time. MXU operands confirmed native fp8. |
 | **3** | **E — Retune** | **measured** | fell from joint rank 1. Net at the A/B is −0.84% to +0.90%, sign unresolved (§1.3). |
 | **4** | **C — Half-Width Key** | **dead** | measured **slower at all four regimes** (+0.91 to +4.93%) against a ceiling of ≤ 2.53% (§5e). §7.5's prediction held exactly. Its accuracy objection dissolved — fp16 is free — but the perf case never existed. |
 | **5** | **D — No Round Trip** | **dead** | priced at 8.96× its threshold (§3). Not built. |
@@ -827,8 +931,9 @@ SparseCore for D, the MXU's issue path for F. §4 established that the inner ste
 this document then opened two options on the strength of it; both are now dead, and F is dead
 *because* the corollary drawn from §4 — spare MACs mean spare MXU — was false.
 
-So the honest state of the 8.42 µs inner step is that **the 52.5% head-sum bundle and the 32.7% relu
-chain have no live candidate between them.** A1 would have removed both and computes the wrong
+So the honest state of the 8.42 µs inner step is that **the head-sum bundle and the relu chain have no live
+candidate between them** — together 85% of the step on §4.1's `modelled` split, more on the
+alternative reading that section now brackets. A1 would have removed both and computes the wrong
 function. F would have removed the first and is not exact. E1 and E2 remain, both unpriced, and the
 `NUM_HEADS` ladder now in flight is the prerequisite for pricing either. That is a real limit on this
 exercise and it should be stated in `final_report.md` rather than buried under two wins that come
@@ -865,7 +970,7 @@ one-run-per-arm A/B, and that is the finding — reached before two four-hour ru
 | `mixed_64k` | 1024 | 1024 | 65286 | 0.20215 | FIRED | OK |
 | `decode_64k` | 6 | 6 | 64614 | 0.43750 | FIRED | OK |
 
-3138 of 3138 rows bad — the same total A1 failed, and recall misses by 2–5×. The self-reference arm
+3142 of 3142 rows bad — the same total A1 failed, and recall misses by 2–5×. The self-reference arm
 returned `worst_rank = 2048, min_recall = 1.00000` everywhere, so the gate was live.
 
 **A2 was expected to be a much smaller change than A1 and is not.** Clamping `w ← max(w, 0)` zeroes
@@ -982,3 +1087,34 @@ to ship it — its buffer is 128 sublanes against 80.
 `mla_attention_op.py` as the production path and verified it against **profiled scope names**, not
 just the source, so `(2, 2, 2)` is the right incumbent and every `bkv_p` measurement here is against
 the right baseline. Recorded because the discrepancy is invisible until you look for it.
+
+---
+
+## 9. `/critical-review` of §5b-v2 and §5c
+
+Run in a clean context on the two survivors, before the end-to-end arms rather than after them,
+with the seven `cdk job recipe` read-backs pasted in verbatim (`/tmp/review_artifacts/`).
+
+**Verdict: `PLAUSIBLE-UNCONFIRMED`.** Both wins reproduce arithmetically from the raw shard logs.
+Neither is `accepted`, and B's is gated.
+
+| # | severity | finding | where it is now recorded | state |
+| ---: | --- | --- | --- | --- |
+| 1 | **CRITICAL** | B's poison arm **could not have failed** — `run_correctness.py:121-122` binds `kv_len_bucket = r.kv_len` in every arm, so zero lanes are unwritten at all eight shapes ever run. The shipping configuration (`bucket > kv_len`) has only run perf-only, and the two rungs that ran it are the two the −30.2% pow2 figure rests on. | §5c ⚠️ block | **gate job dispatched**; B held at `provisional` |
+| 2 | major | A's weighted contribution overstated ≈1.4× — `decode_prod`'s −10.45% (a `max_model_len = 9216` shape) multiplied by A/B-derived phase weights. A/B-consistent is `decode_64k`'s −7.66%. | §5b-v2, §6 | **fixed** — 0.93–1.10%, face value 1.2–1.4% |
+| 3 | major | §4.1's 52.5/32.7/14.8 split is `modelled` from a two-point fit whose upper point §4 itself declares unusable (550.56% spread), through a fit the same table shows non-linear. §8.2 additionally found the bundle arm-dependent to 2.7×, and that correction was never propagated. | §4.1 block, propagated to §5d, §5f, §6 | **fixed** — bracketed 52–66%, tagged `modelled` |
+| 4 | minor | §5c's `mean w` inputs (292, ~346) match no derivation. | §5c | **fixed** — 288 and 341, derivations shown; both move in B's favour by < 1.2 pt |
+| 5 | minor | §2's two columns are on different denominators — steps at `M/(N+M)`, time at `(N−M)/N`. | §2 | **fixed** — steps corrected to 76.4/23.6; the **time** bracket was already consistent and is unchanged |
+| 6 | minor | A1/A2's row count is 3142 (64+1024+1024+1024+6), not 3138. | §5d, §8.1 | **fixed** |
+| 7 | minor | §5b quotes the writer's absolute 0.592 ms against `writer_probe.py`'s own warning that absolutes drift and ratios do not. | §5b-v2 | **fixed** — quote 3.342× |
+| 8 | minor | C's job carried no drift control, so two of its four rows are read against the lenient yardstick. | §5e | **noted**; C's verdict rests on the ceiling, not the deltas |
+
+**What the review did not find.** It reproduced B's `mixed_confound` 3.725× and `mixed_64k` −21.72%
+from the shard logs, confirmed the `RUN_CMD` read-backs match what the tables claim was run, and
+raised no objection to A's bit-exactness argument or to the fp8 lowering evidence. Finding 1 is
+about the *test*, not about the kernel: nothing here says B is wrong, only that the evidence
+offered does not cover the risk B carries.
+
+**Standing rule this exercise leaves with.** A correctness test whose configuration guarantees its
+own pass is worse than no test, because it is spent. The tell is that the harness binds the very
+parameter the risk is a function of. That is a `references/` promotion.
