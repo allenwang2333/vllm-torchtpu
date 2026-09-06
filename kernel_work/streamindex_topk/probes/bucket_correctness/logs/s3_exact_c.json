@@ -1,0 +1,111 @@
+[
+  {
+    "regime": "bc_c_decode",
+    "arm": "incumbent",
+    "bucket": 49152,
+    "kv_len": 49152,
+    "max_model_len": 66560,
+    "rows_checked": 6,
+    "n_failures": 0,
+    "worst_rank": 2111,
+    "allowed_rank": 2304,
+    "min_recall": 0.99462890625,
+    "required_recall": 0.99,
+    "max_index_returned": 49151,
+    "verdict": "PASS",
+    "first_failure": null,
+    "measured_unwritten_sublanes": 0
+  },
+  {
+    "regime": "bc_c_decode",
+    "arm": "right_size",
+    "bucket": 49152,
+    "kv_len": 49152,
+    "max_model_len": 66560,
+    "rows_checked": 6,
+    "n_failures": 0,
+    "worst_rank": 2111,
+    "allowed_rank": 2304,
+    "min_recall": 0.99462890625,
+    "required_recall": 0.99,
+    "max_index_returned": 49151,
+    "verdict": "PASS",
+    "first_failure": null,
+    "vs_incumbent": {
+      "rows_differing": 0,
+      "rows_total": 6,
+      "worst_symmetric_difference": 0,
+      "worst_row": null
+    },
+    "measured_unwritten_sublanes": 0
+  },
+  {
+    "regime": "bc_c_decode",
+    "arm": "poison",
+    "bucket": 49152,
+    "kv_len": 49152,
+    "max_model_len": 66560,
+    "rows_checked": 6,
+    "n_failures": 0,
+    "worst_rank": 2111,
+    "allowed_rank": 2304,
+    "min_recall": 0.99462890625,
+    "required_recall": 0.99,
+    "max_index_returned": 49151,
+    "verdict": "PASS",
+    "first_failure": null,
+    "vs_incumbent": {
+      "rows_differing": 0,
+      "rows_total": 6,
+      "worst_symmetric_difference": 0,
+      "worst_row": null
+    },
+    "measured_unwritten_sublanes": 0
+  },
+  {
+    "regime": "bc_c_decode",
+    "arm": "lanecount",
+    "bucket": 49152,
+    "kv_len": 49152,
+    "scores_cols": 49152,
+    "sublanes_total": 384,
+    "sublanes_unwritten_measured": 0,
+    "sublanes_written_measured": 384,
+    "first_unwritten_sublane": null,
+    "last_unwritten_sublane": null,
+    "poison_cells_remaining": 0,
+    "poison_cells_below_kv_len": 0,
+    "sublanes_unwritten_predicted": 0,
+    "agrees_with_prediction": true,
+    "verdict": "PASS",
+    "measured_unwritten_sublanes": 0
+  },
+  {
+    "regime": "bc_c_decode",
+    "arm": "neg_control",
+    "bucket": 49152,
+    "kv_len": 49152,
+    "max_model_len": 66560,
+    "rows_checked": 6,
+    "n_failures": 6,
+    "worst_rank": 46215,
+    "allowed_rank": 2304,
+    "min_recall": 0.30322265625,
+    "required_recall": 0.99,
+    "max_index_returned": 49151,
+    "verdict": "FAIL",
+    "first_failure": "row 0: worst_rank=46087 (allowed 2304), recall=0.30322 (min 0.99), 1427 of 2048 indices outside the true top-2048",
+    "vs_incumbent": {
+      "rows_differing": 6,
+      "rows_total": 6,
+      "worst_symmetric_difference": 2862,
+      "worst_row": [
+        0,
+        2048,
+        2048,
+        2862
+      ]
+    },
+    "measured_unwritten_sublanes": 0
+  }
+]

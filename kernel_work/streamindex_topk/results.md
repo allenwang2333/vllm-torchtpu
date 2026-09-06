@@ -626,10 +626,9 @@ all six regimes. All five negative controls FAILED as required (ranks 7968–626
 > six regimes, the masked-store tail at `kv_len = 8000`, and `run_sc_coverage.py`'s 12/12. Those
 > cover B's arithmetic. They do not cover the deleted fill.
 >
-> **Disposition: B is `provisional`, not `accepted`, and the end-to-end arms are gated on a
-> re-run** of `run_correctness.py` with the bucket strictly greater than `kv_len` at all four arms
-> against the existing float64 oracle. That job is minutes on the existing image against hours of
-> TPU time for the e2e pair. Result to be recorded here when it returns.
+> **Disposition: the gate ran, and B passed it.** See §5c-gate immediately below. B is correct in
+> the configuration it ships in; the withdrawal above applies to the *evidence*, which is now
+> replaced, not to the kernel.
 
 The masked partial-block store lowered first time, but note it needs a *static* destination offset,
 and it is **not emitted at any of the six perf regimes** — all six have `kv_len` a multiple of
@@ -640,6 +639,72 @@ both B and C). It does now: `run_sc_coverage.py` drives it against a numpy oracl
 `(b, n, live, ragged, P)` combinations the two arms produce, padded with `+1e30` **and not `-inf`**,
 so it passes only if the `row_lengths` bound actually holds — which an `-inf`-padded test could not
 tell you. All 12 PASS. That closes a carried item, independently of whether B ships.
+
+### 5c-gate. B at `bucket > kv_len` — **PASS**, with lanes that were genuinely unwritten
+
+`measured (j-6454262e-acd2-4371-b3ba)`, `JobStatus = Succeeded`, 4/4 shards `rc=0`, 2m25s, on the
+existing image — no rebuild. `probes/bucket_correctness/`. HEAD `d81670d2`; `instruments/` verified
+byte-identical on the pod (`shapes.py` md5 `8a9ac175495e73cf7b812cf6c6bda614`).
+
+The unwritten count is **measured, not predicted**: a shim in the variant module's namespace counts
+how many 128-column sublanes of the *actual device buffer* still hold the value it was pre-filled
+with. The analytic prediction agreed at all 14 regime runs, so the parenthesised numbers below are
+a cross-check rather than the source.
+
+| shape | bucket | alloc | written | **unwritten** | poison vs clean | oracle `worst_rank` / `min_recall` | set diff vs incumbent |
+| --- | ---: | ---: | ---: | ---: | --- | --- | ---: |
+| kv 24576 decode | 32768 | 256 | 192 | **64** | identical, PASS | 2082 / 0.99561 | 0 of 6 |
+| kv 24576 mixed | 32768 | 256 | 192 | **64** | identical, PASS | 2124 / 0.99316 | 0 of 1024 |
+| kv 8000 decode | 16384 | 128 | 64 | **64** | identical, PASS | 2073 / 0.99609 | 0 of 6 |
+| kv 8000 mixed | 16384 | 128 | 64 | **64** | identical, PASS | 2101 / 0.99414 | 0 of 1024 |
+| kv 49152 decode | 65536 | 512 | 384 | **128** | identical, PASS | 2111 / 0.99463 | 0 of 6 |
+| kv 49152 mixed | 65536 | 512 | 384 | **128** | identical, PASS | 2158 / 0.99219 | 0 of 1024 |
+| kv 8000 decode | 9216 † | 72 | 64 | **8** | identical, PASS | 2073 / 0.99609 | 0 of 6 |
+| kv 8000 mixed | 9216 † | 72 | 64 | **8** | identical, PASS | 2101 / 0.99414 | 0 of 1024 |
+| *control:* kv 24576 / 8000 / 49152, both bands | = `kv_len` | | | **0** | identical, PASS | as §5c | 0 |
+
+Allowed rank 2304, required recall 0.99, at every row. † bucket 9216 is deliberately not a multiple
+of `bkv_sz = 2048`, so B's masked partial-block store is *compiled in* (`n_tail_sublanes = 8`) while
+unwritten lanes exist.
+
+**Two negative controls, and the second is the one this job exists for.** `neg_control` (half the
+query heads zeroed) went RED at all 14 runs — `bc_a_decode` gives `worst_rank = 23786` against 2304,
+`min_recall = 0.41797`, 6 of 6 rows differing. `neg_control_unwritten` runs **the same poisoned
+buffer through the same oracle with only the reachability gate removed** — the shim drops
+`row_lengths` so selection may reach the unwritten lanes — and it went RED at every shape that has
+them, with `index out of range` on row 0 and a `max_index_returned` that names the poison exactly:
+26623 at bucket 32768 (= 24576 + 2048), 10239 at 16384, 51199 at 65536, 9215 at 9216. That is what
+makes the PASS non-vacuous: the identical buffer, with one gate removed, is caught immediately.
+
+The script also asserts `poison_cells_below_kv_len == 0` at every shape — measured 0 everywhere, so
+there are no holes *inside* the region selection can reach.
+
+**The review's claim is now confirmed empirically as well as by reading.** At `bucket == kv_len` the
+measured unwritten count is **0** at all six control runs. The original test could not have failed.
+
+Four refinements the gate produced, all of which correct something stated above or in the dispatch:
+
+1. **The masked partial-block store and unwritten lanes are structurally mutually exclusive**, so
+   "the tail store fires on both bands under a bucket ladder" — which §5c implies and the dispatch
+   asserted — is false. `num_bkv = min(cdiv(kv_len, bkv_sz), max_bkv)`, so the tail *executes* only
+   when it lands on the last slab, which is exactly the case where written == allocated. Whenever
+   unwritten lanes exist the tail branch is dead code. Shape `bc_d` (bucket 9216) is as close as one
+   shape gets: tail emitted, tail not executed, 8 unwritten lanes. The masked store is therefore
+   exercised only by the `bucket == kv_len` arms — which did run it, at kv 8000, on both bands, PASS.
+   This is good news for B, not bad: the two risks cannot compound.
+2. **kv 8000 / bucket 16384 is 64 written and 64 unwritten**, not the 63/65 the dispatch predicted.
+   At 16384 the buffer is a whole number of `bkv` slabs, so the fourth slab stores its full 16
+   sublanes. The 63-sublane geometry exists only at `bucket == 8000`.
+3. **A pow2 ladder would not generate that row at all** — `pow2_bucket(8000) = 8192` gives 0
+   unwritten. Reaching it needed an explicit override to a coarser ladder (`BUCKET_OVERRIDE` in the
+   script). It is the worst case in the set: bucket = 2.05× live, half the buffer unwritten.
+4. **The zero-margin case passes.** kv 24576 / bucket 32768 decode has every row's `visible` exactly
+   `kv_len`, last written position 24575, selection stopping one position before the first unwritten
+   lane. That is the tightest configuration the design admits.
+
+**Consequence: B carries a named correctness job covering the configuration it ships in.** What is
+still not covered is unchanged from §5c — the SparseCore source half, end-to-end accuracy, and
+bucket widths other than those measured. No timing was taken here.
 
 ### Two corrections B makes to the design document
 
@@ -884,9 +949,9 @@ producer-side change, and it goes to that owner with both gates named, not into 
 B's bucket ladder, the `(8,4,4)` re-run) has since returned — see §8 — and it sharpened the two
 survivors rather than adding a candidate.
 
-> **This ranking is unchanged by `/critical-review`, but two of its cells are.** B's correctness
-> claim below is withdrawn (see §5c's ⚠️ block: the poison arm could not have failed, and B is
-> `provisional` pending a re-run at `bucket > kv_len`), and A's weighted contribution is
+> **This ranking is unchanged by `/critical-review`, but two of its cells are.** B's original
+> correctness claim was withdrawn — §5c's poison arm could not have failed — and **replaced** by
+> `j-6454262e-acd2-4371-b3ba`, which passed at `bucket > kv_len` (§5c-gate). A's contribution is
 > 0.93–1.10%, not the 1.3–1.5% an earlier revision gave it. Neither reorders anything: B's win is
 > 20–40× A's on the band that carries the time, and no third candidate is close to either.
 
@@ -895,7 +960,7 @@ The ranking below orders them by size of measured win, but step 4 composes rathe
 
 | rank | option | standing | why it moved from step 2 |
 | ---: | --- | --- | --- |
-| **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Correctness **incomplete** — see the ⚠️ block in §5c; the evidence does not cover the configuration B ships in. |
+| **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Correctness now covers the shipping configuration — §5c's evidence was hollow, and `j-6454262e-acd2-4371-b3ba` replaced it (§5c-gate). |
 | **2** | **A — Narrow Record** | **both halves measured, correct, bit-exact** | writer 3.342× at `T=1024` on the dominant phase; reader 10.45% / 7.66% faster but **decode-only**, worth **0.93–1.10%** of indexer time once weighted (§5b-v2). Design doc §9.1's "A moves to rank 1 outright" was earned on the writer term and then **undone by the phase weighting** — the reader lands on 12.1–14.3% of the time. MXU operands confirmed native fp8. |
 | **3** | **E — Retune** | **measured** | fell from joint rank 1. Net at the A/B is −0.84% to +0.90%, sign unresolved (§1.3). |
 | **4** | **C — Half-Width Key** | **dead** | measured **slower at all four regimes** (+0.91 to +4.93%) against a ceiling of ≤ 2.53% (§5e). §7.5's prediction held exactly. Its accuracy objection dissolved — fp16 is free — but the perf case never existed. |
@@ -1100,7 +1165,7 @@ Neither is `accepted`, and B's is gated.
 
 | # | severity | finding | where it is now recorded | state |
 | ---: | --- | --- | --- | --- |
-| 1 | **CRITICAL** | B's poison arm **could not have failed** — `run_correctness.py:121-122` binds `kv_len_bucket = r.kv_len` in every arm, so zero lanes are unwritten at all eight shapes ever run. The shipping configuration (`bucket > kv_len`) has only run perf-only, and the two rungs that ran it are the two the −30.2% pow2 figure rests on. | §5c ⚠️ block | **gate job dispatched**; B held at `provisional` |
+| 1 | **CRITICAL** | B's poison arm **could not have failed** — `run_correctness.py:121-122` binds `kv_len_bucket = r.kv_len` in every arm, so zero lanes are unwritten at all eight shapes ever run. The shipping configuration (`bucket > kv_len`) has only run perf-only, and the two rungs that ran it are the two the −30.2% pow2 figure rests on. | §5c ⚠️ block, §5c-gate | **resolved** — `j-6454262e-acd2-4371-b3ba` re-ran the oracle with 64/64/128/8 empirically-counted unwritten sublanes on both bands: **PASS**, bit-identical to the incumbent, both controls RED |
 | 2 | major | A's weighted contribution overstated ≈1.4× — `decode_prod`'s −10.45% (a `max_model_len = 9216` shape) multiplied by A/B-derived phase weights. A/B-consistent is `decode_64k`'s −7.66%. | §5b-v2, §6 | **fixed** — 0.93–1.10%, face value 1.2–1.4% |
 | 3 | major | §4.1's 52.5/32.7/14.8 split is `modelled` from a two-point fit whose upper point §4 itself declares unusable (550.56% spread), through a fit the same table shows non-linear. §8.2 additionally found the bundle arm-dependent to 2.7×, and that correction was never propagated. | §4.1 block, propagated to §5d, §5f, §6 | **fixed** — bracketed 52–66%, tagged `modelled` |
 | 4 | minor | §5c's `mean w` inputs (292, ~346) match no derivation. | §5c | **fixed** — 288 and 341, derivations shown; both move in B's favour by < 1.2 pt |
