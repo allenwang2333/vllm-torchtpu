@@ -50,42 +50,40 @@ from shapes import (BKV_P, BQ_SZ, CR, DECODE_REQ_BATCH_SIZE, DH, H, K, S,  # noq
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     streamindex_topk  # noqa: E402
 
-# Thresholds for the two tolerance-carrying properties. CALIBRATED, not guessed:
-# both numbers below sit between two measured quantities, and both are printed
-# on every run so a future recalibration is also a measurement.
+# Thresholds for the two tolerance-carrying properties. Both are set from
+# MEASURED endpoints, not guessed, and both are re-derived and printed on every
+# --negative-control run, so a future recalibration is also a measurement.
 #
-#   incumbent, all 5 cases  (j-31ca6c31-a430-4463-8dbf):
-#       worst deficit 0.00486   worst churn 0.439%
-#   a kernel that drops one KV block at (A):  bkv_sz = 2048, n = 9216, so one
-#       block is ~22% of the live range; at a 22-25% selection rate that costs
-#       ~20% of the true top-k.  [modelled -- see the negative control below]
+# Each sits at the geometric centre of the window between the weakest damaged
+# case (must FAIL) and the worst acceptable case (must PASS):
 #
-# So the discriminating gap is 0.44% against ~20%, a factor of 45. Both
-# thresholds are placed near the geometric centre of their gap rather than
-# hard against the incumbent: TOL_CHURN=0.03 is 6.8x above the incumbent's
-# worst and 6.7x below a dropped block. The earlier 0.005 left pre-1x8k with
-# 12% margin, which would have red-lighted candidates for reordering ties.
+#   deficit  window (0.00486, 0.04605)  9.5x   -> 0.015, 3.1x either side
+#   churn    window (0.00439, 0.15869)  36.1x  -> 0.03,  6.8x / 5.3x
+#
+# Both windows are floored by dec-B-2x8k and ceilinged by pre-1x8k undamaged.
+# Confirmed load-bearing on hardware: j-ae538ec1-d606-48f4-8c11 (Succeeded,
+# exit 0) prints `tol=... is INSIDE that window -- load-bearing` for BOTH,
+# with drop-block failing 5/5 and tail-swap passing 5/5.
 #
 # `--negative-control` deliberately corrupts the selection and asserts these
 # thresholds FAIL, so the gate is a discriminator rather than an assertion.
+# Two things it caught that a passing gate did not, both worth keeping in mind
+# before anyone retunes these by feel:
 #
-# Both are now set from MEASURED endpoints, j-b0c4901b-5df9-4718-8c3c, the
-# first --negative-control run to pass. Each threshold sits at the geometric
-# centre of the window between the weakest damaged case (must fail) and the
-# worst acceptable case (must pass):
+# 1. TOL_DEFICIT was 0.05, and that was OUTSIDE its window. drop-block reaches
+#    only 0.04605 at dec-B-2x8k, so a kernel skipping a KV block slid under the
+#    threshold there and ONLY churn caught it (j-b0c4901b-5df9-4718-8c3c). The
+#    gate passed while running on one of its two metrics -- exactly the state a
+#    negative control exists to expose, since a damage mode that perturbed
+#    deficit but not churn would have gone straight through.
+# 2. The ceiling is the max over everything that must pass INCLUDING the
+#    undamaged incumbent, not over the tail-swap arm alone. For deficit the
+#    undamaged ceiling (0.00486) is ABOVE tail-swap's (0.00249), because
+#    exchanging the 8 worst selected for the true next-best RAISES the minimum
+#    score. Reading the window off tail-swap would have opened it below the
+#    incumbent's own error and red-lighted a correct kernel.
 #
-#   deficit  window (0.00486, 0.04605)  9.5x   -> 0.015, 3.1x either side
-#   churn    window (0.00439, 0.15869)  36.2x  -> 0.03,  6.8x / 5.3x
-#
-# TOL_DEFICIT was 0.05 and that was OUTSIDE its window: drop-block reached
-# only 0.04605 at dec-B-2x8k, so a kernel skipping a KV block slid under the
-# threshold there and only churn caught it. The gate passed while running on
-# one metric, which is exactly the state a negative control exists to expose
-# -- a damage mode perturbing deficit but not churn would have gone through.
-#
-# The ceilings are the max over everything that must pass INCLUDING the
-# undamaged incumbent, which for deficit (0.00486) is above the tail-swap arm
-# (0.00249). Retune from the separation block the control prints, not by feel.
+# Retune from the separation block the control prints, never by feel.
 TOL_DEFICIT = 0.015   # fraction of the top-to-cut score range
 TOL_CHURN = 0.03      # fraction of the true top-k missing (~61 of 2048)
 
