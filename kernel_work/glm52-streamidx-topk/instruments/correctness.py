@@ -68,8 +68,18 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
 #
 # `--negative-control` deliberately corrupts the selection and asserts these
 # thresholds FAIL, so the gate is a discriminator rather than an assertion.
+#
+# MEASURED, j-470d481e-4a6d-477c-9e37, --negative-control on the incumbent:
+# churn separates cleanly -- drop-block 15.9-27.7%, tail-swap 0.391% at every
+# case, a 41x gap with TOL_CHURN sitting inside it. Deficit does NOT, at this
+# tolerance: drop-block reached only 0.04605 at dec-B-2x8k, UNDER the 0.05
+# tolerance, so on that case churn is the only thing catching a kernel that
+# skips a KV block. Both arms are printed with their separation window on
+# every --negative-control run; retune from those two endpoints, not by feel.
 TOL_DEFICIT = 0.05    # fraction of the top-to-cut score range
 TOL_CHURN = 0.03      # fraction of the true top-k missing (~61 of 2048)
+
+NSWAP = 8             # near-ties exchanged by the tail-swap arm
 
 # Production geometry, shrunk only in the number of sequences/tokens so a f32
 # reference is tractable. page_size, head dim, head count and k are the real
@@ -188,17 +198,33 @@ def _corrupt(idx, m, mode):
                 # Must NOT trip the gate.
                 # `sel` is in the kernel's arbitrary emission order, so the
                 # worst few have to be found by score, not by position.
+                #
+                # The rejected pool is taken as a set difference, not as
+                # `live[len(sel):]`. The incumbent's own selection is not
+                # exactly the true top-k (0.44% churn at pre-1x8k), so the
+                # rank-based slice overlaps `sel` and the swap emitted
+                # DUPLICATE indices -- j-470d481e failed pre-1x8k on exactly
+                # that, with deficit and churn both far inside tolerance.
                 live = order[np.isfinite(ref[order])]
-                nxt = live[len(sel): len(sel) + 8]
+                rej = live[~np.isin(live, sel)]
+                # A row with almost nothing rejected has no boundary for ties
+                # to straddle. At dec-ragged tok3, L=2049 against k=2048, the
+                # single reject is the row's WORST score, and swapping it in
+                # models no kernel that could exist -- it drove deficit to
+                # 0.05061 in j-470d481e and red-lighted an arm that must pass.
+                # A correct-but-different kernel returns the same set here.
+                if len(rej) < 4 * NSWAP:
+                    continue
+                nxt = rej[:NSWAP]
                 keep = sel[np.argsort(-ref[sel], kind="stable")][
-                    : max(0, len(sel) - len(nxt))]
+                    : len(sel) - NSWAP]
                 take = np.concatenate([keep, nxt])
             row[:] = -1
             row[: len(take)] = take
     return out
 
 
-def run_case(name, verbose=True, corrupt=""):
+def run_case(name, verbose=True, corrupt="", stats=None):
     c = CASES[name]
     args, m = build_case(c)
     idx = np.asarray(streamindex_topk(
@@ -265,6 +291,8 @@ def run_case(name, verbose=True, corrupt=""):
               f"(tol {TOL_CHURN:.1%})", flush=True)
         for f in fails[:6]:
             print(f"        {f}", flush=True)
+    if stats is not None:
+        stats.append((name, worst_def, worst_churn))
     return fails
 
 
@@ -279,21 +307,47 @@ def negative_control(names):
     the run that establishes it. See CLAUDE.md: "would this check have failed
     if the change were wrong?"
     """
-    bad = []
+    bad, drop, swap = [], [], []
     print("=== negative control ===", flush=True)
     print("-- drop-block: a kernel whose KV walk misses one block. MUST FAIL --",
           flush=True)
     for n in names:
-        if not run_case(n, corrupt="drop-block"):
+        if not run_case(n, corrupt="drop-block", stats=drop):
             bad.append(f"{n}: drop-block was NOT caught -- the gate is blind "
                        f"to the failure it exists to catch")
-    print("-- tail-swap: 8 boundary near-ties exchanged. MUST PASS --",
+    print(f"-- tail-swap: {NSWAP} boundary near-ties exchanged. MUST PASS --",
           flush=True)
     for n in names:
-        f = run_case(n, corrupt="tail-swap")
+        f = run_case(n, corrupt="tail-swap", stats=swap)
         if f:
             bad.append(f"{n}: tail-swap was rejected -- the gate is too tight "
                        f"and will red-light correct candidates")
+
+    # Separation, computed rather than eyeballed. A threshold is only a
+    # discriminator if it fits strictly between the two arms; report the
+    # window so the next recalibration is arithmetic on measured endpoints.
+    # j-470d481e is why this is printed: the deficit arms OVERLAPPED there
+    # (0.04605 vs 0.05061) and reading it off the table was the only way to
+    # find out.
+    print("\n-- separation (must-fail floor vs must-pass ceiling) --", flush=True)
+    for label, tol, i in (("deficit", TOL_DEFICIT, 1), ("churn", TOL_CHURN, 2)):
+        lo = min(s[i] for s in drop)      # weakest damaged case
+        hi = max(s[i] for s in swap)      # worst acceptable case
+        lo_n = min(drop, key=lambda s: s[i])[0]
+        hi_n = max(swap, key=lambda s: s[i])[0]
+        if hi < lo:
+            print(f"  {label:8} SEPARATES: any tol in ({hi:.5f}, {lo:.5f}) "
+                  f"works, ratio {lo / max(hi, 1e-9):.1f}x  "
+                  f"[floor {lo_n}, ceiling {hi_n}]", flush=True)
+            inside = hi < tol < lo
+            print(f"           tol={tol} is {'INSIDE' if inside else 'OUTSIDE'} "
+                  f"that window -- {'load-bearing' if inside else 'NOT a discriminator at this tol'}",
+                  flush=True)
+        else:
+            print(f"  {label:8} OVERLAPS: damaged floor {lo:.5f} ({lo_n}) is "
+                  f"below acceptable ceiling {hi:.5f} ({hi_n}) -- no threshold "
+                  f"on this metric separates", flush=True)
+
     print(f"\nnegative control: {'PASS' if not bad else 'FAIL'}", flush=True)
     for b in bad:
         print(f"  {b}", flush=True)
