@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Isolated BF16 MLA verify tuning; no serving defaults are modified.
+
+Uses the same MLA v2 entrypoint as mla_mixed_prefill_tuner.py, but generates
+multi-request verify inputs, padded metadata, and nontrivial cached prefixes.
+"""
+import argparse
+import itertools
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def child(case, tile):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
+
+    c, window, tokens = case
+    bq, pages, split = tile
+    rows = []
+    for context in (128, 512, 1000):
+        rng = np.random.default_rng(980406)
+
+        def random(shape):
+            return jnp.asarray(rng.normal(0, 0.2, shape), jnp.bfloat16)
+
+        q = random((3, tokens, 512))
+        qr = random((tokens, 3, 64))
+        new = random((tokens, 512))
+        new_r = random((tokens, 64))
+        # Disjoint, low, non-null pages per request; KV lengths differ so
+        # verification covers page boundaries and ragged cached prefixes.
+        lengths = [context - i % 7 for i in range(c)]
+        stride = (context + 255) // 256
+        cache = random((1 + c * stride, 128, 2, 640))
+        table = np.full((32, 128), -1, np.int32)
+        for i in range(c):
+            table[i, :stride] = np.arange(1 + i * stride, 1 + (i + 1) * stride)
+        cu = jnp.asarray([i * window
+                          for i in range(c + 1)] + [c * window] * (32 - c),
+                         jnp.int32)
+        lens = jnp.asarray(lengths + [0] * (32 - c), jnp.int32)
+        ids = jnp.asarray(table.flatten())
+        distribution = jnp.asarray([0, 0, c], jnp.int32)
+
+        # FP32 dense causal reference from the exact BF16 inputs. Updating
+        # only the logical tail also gives an exact reference for KV writes.
+        expected_cache = np.asarray(cache, np.float32).copy()
+        flat_cache = expected_cache.reshape(-1, 256, 640)
+        qh, qrh = np.asarray(q, np.float32), np.asarray(qr, np.float32)
+        nh, nrh = np.asarray(new, np.float32), np.asarray(new_r, np.float32)
+        expected = np.zeros((3, c * window, 512), np.float32)
+        for i, length in enumerate(lengths):
+            start = i * window
+            for j in range(window):
+                pos = length - window + j
+                page = table[i, pos // 256]
+                flat_cache[page, pos % 256, :512] = nh[start + j]
+                flat_cache[page, pos % 256, 512:576] = nrh[start + j]
+            kv = flat_cache[table[i, :stride]].reshape(-1, 640)[:length]
+            for j in range(window):
+                end = length - window + j + 1
+                scores = (qh[:, start + j] @ kv[:end, :512].T +
+                          qrh[start + j] @ kv[:end, 512:576].T)
+                prob = np.exp(scores - scores.max(axis=-1, keepdims=True))
+                prob /= prob.sum(axis=-1, keepdims=True)
+                expected[:, start + j] = prob @ kv[:end, :512]
+
+        def invoke(kv):
+            return mla_ragged_paged_attention(
+                ql_nope=q,
+                q_pe=qr,
+                new_kv_c=new,
+                new_k_pe=new_r,
+                cache_kv=kv,
+                kv_lens=lens,
+                page_indices=ids,
+                cu_q_lens=cu,
+                distribution=distribution,
+                num_kv_pages_per_block=(3, 1, pages),
+                num_queries_per_block=(1, 16, bq),
+                mixed_q_split=split,
+                vmem_limit_bytes=60 * 1024 * 1024,
+                s_dtype=jnp.bfloat16,
+                p_same_dtype_as_v=True)
+
+        started = time.perf_counter()
+        output, cache = invoke(cache)
+        jax.block_until_ready((output, cache))
+        compile_s = time.perf_counter() - started
+        actual = np.asarray(output, np.float32)[:, :c * window]
+        error = float(np.max(np.abs(actual - expected)))
+        # Ignore unused aligned RoPE lanes, but check all valid KV channels,
+        # including prefixes, other requests and the untouched null page.
+        cache_ok = np.array_equal(
+            np.asarray(cache, np.float32)[..., :576],
+            expected_cache[..., :576])
+        correct = bool(
+            np.isfinite(actual).all() and cache_ok
+            and np.allclose(actual, expected, atol=0.005, rtol=0.03))
+        if not correct:
+            raise RuntimeError(
+                f"reference mismatch: error={error} KV={cache_ok}")
+        for _ in range(3):
+            output, cache = invoke(cache)
+            jax.block_until_ready((output, cache))
+        samples = []
+        for _ in range(20):
+            started = time.perf_counter_ns()
+            output, cache = invoke(cache)
+            jax.block_until_ready((output, cache))
+            samples.append((time.perf_counter_ns() - started) / 1e6)
+        trace_dir = os.getenv("TUNER_TRACE_DIR")
+        if trace_dir and context == 1000:
+            with jax.profiler.trace(trace_dir):
+                for _ in range(15):
+                    output, cache = invoke(cache)
+                    jax.block_until_ready((output, cache))
+        rows.append(
+            dict(concurrency=c,
+                 verify_tokens=window,
+                 tokens=tokens,
+                 kv_len=context,
+                 bq=bq,
+                 bkvp=pages,
+                 q_split=split,
+                 latency_ms=statistics.median(samples),
+                 samples_ms=samples,
+                 compile_s=compile_s,
+                 max_abs_error=error,
+                 cache_exact=cache_ok,
+                 status="success",
+                 variant=str(tile),
+                 timing="host_dispatch_plus_synchronized_kernel",
+                 kv_dtype="bfloat16",
+                 page_size=256,
+                 heads=3,
+                 max_num_seqs=32,
+                 pages_per_seq=128))
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--case", type=json.loads)
+    parser.add_argument("--tile", type=json.loads)
+    args = parser.parse_args()
+    if args.case is not None:
+        rows = child(args.case, args.tile)
+        args.output.write_text(json.dumps(rows))
+        return
+    root = args.output
+    root.mkdir(parents=True, exist_ok=True)
+    buckets = [8, 16, 32, 48, 64, 96, 128, 192, 256, 512]
+    # Include the production fallback (BQ16, BKVP1, split1) as baseline.
+    tiles = [(16, 1, 1)] + [
+        t for t in itertools.product((8, 16, 32), (1, 2, 4), (1, ))
+        if t != (16, 1, 1)
+    ] + [(16, 2, 2), (32, 4, 2), (48, 4, 3)]
+    all_rows = []
+    for window in (6, 8):
+        for c in (1, 2, 4, 8, 16, 32):
+            tokens = next(t for t in buckets if t >= c * window)
+            for tile in tiles:
+                path = root / f"w{window}-c{c}-tile{'-'.join(map(str, tile))}.json"
+                cmd = [
+                    sys.executable, __file__, "--case",
+                    json.dumps([c, window, tokens]), "--tile",
+                    json.dumps(tile), "--output",
+                    str(path)
+                ]
+                print("TUNE_START", window, c, tile, flush=True)
+                try:
+                    result = subprocess.run(cmd, check=False, timeout=600)
+                    if result.returncode or not path.exists():
+                        raise RuntimeError(f"child exit={result.returncode}")
+                    rows = json.loads(path.read_text())
+                except (RuntimeError, subprocess.TimeoutExpired) as error:
+                    rows = [
+                        dict(concurrency=c,
+                             verify_tokens=window,
+                             tokens=tokens,
+                             tile=tile,
+                             status="error",
+                             error=str(error))
+                    ]
+                with (root / "metrics.jsonl").open("a") as out:
+                    for row in rows:
+                        out.write(json.dumps(row) + "\n")
+                        print("TUNE_RESULT", json.dumps(row), flush=True)
+                all_rows.extend(rows)
+                if tile == (16, 1, 1) and any(r["status"] != "success"
+                                              for r in rows):
+                    raise RuntimeError("Baseline failed; stop before tuning")
+    winners = []
+    for window in (6, 8):
+        for c in (1, 2, 4, 8, 16, 32):
+            valid = [
+                r for r in all_rows if r["status"] == "success"
+                and r["verify_tokens"] == window and r["concurrency"] == c
+            ]
+            ranked = []
+            for tile in tiles:
+                subset = [
+                    r for r in valid
+                    if (r["bq"], r["bkvp"], r["q_split"]) == tile
+                ]
+                if len(subset) == 3:
+                    ranked.append((statistics.fmean(r["latency_ms"]
+                                                    for r in subset), tile))
+            ranked.sort()
+            if not ranked or not any(t == (16, 1, 1) for _, t in ranked):
+                raise RuntimeError(
+                    f"missing valid baseline/candidate: {window=} {c=}")
+            baseline = next(ms for ms, t in ranked if t == (16, 1, 1))
+            winners.append(
+                dict(verify_tokens=window,
+                     concurrency=c,
+                     baseline_ms=baseline,
+                     best_ms=ranked[0][0],
+                     best_tile=ranked[0][1],
+                     speedup=baseline / ranked[0][0]))
+    (root / "summary.json").write_text(json.dumps(winners, indent=2))
+    print("TUNE_COMPLETE", json.dumps(winners), flush=True)
+    for winner in winners:
+        c, window = winner["concurrency"], winner["verify_tokens"]
+        tokens = next(t for t in buckets if t >= c * window)
+        for variant, tile in (("baseline", (16, 1, 1)), ("candidate",
+                                                         winner["best_tile"])):
+            trace_dir = root.parent / "profiling" / "xprof" / (
+                f"w{window}-c{c}-{variant}")
+            env = dict(os.environ, TUNER_TRACE_DIR=str(trace_dir))
+            subprocess.run([
+                sys.executable, __file__, "--case",
+                json.dumps([c, window, tokens]), "--tile",
+                json.dumps(tile), "--output",
+                str(root / f"w{window}-c{c}-{variant}-recheck.json")
+            ],
+                           env=env,
+                           check=True,
+                           timeout=600)
+
+
+if __name__ == "__main__":
+    main()
