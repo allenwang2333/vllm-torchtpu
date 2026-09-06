@@ -350,19 +350,198 @@ change is *cheap on both sides*, not that there is a free win sitting in the wri
 
 ---
 
+## 5c. Variant B — Right-Size: **the largest measured win in the exercise**
+
+`j-d9502595-54a2-45bc-947b`, `JobStatus = Succeeded`, 4/4 shards `rc=0`. Both arms in one process
+through the read-only `instruments/microbench.run_regime`. Commits `9bc5f5cd` (variant), `36aedcdc`
+(the sixth regime, as an instrument addition), `a8197f38` (`RESULTS.md`).
+
+**What B changes.** The incumbent sizes its scores buffer from `max_model_len`; B sizes it from a
+static `kv_len_bucket` and deletes the `-1` fill that went with it. Nothing else.
+
+Negative `Δ time %` is faster. `cols` is the scores-buffer width in columns, incumbent → B.
+
+| regime | `cols` inc → B | incumbent ms (sp%) | B ms (sp%) | Δ time % | speedup × |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `decode_prod` | 10240 → 8192 | 0.16805 (0.75) | 0.16747 (0.69) | −0.35 | 1.003 |
+| `decode_64k` | 67584 → 65536 | 0.20305 (0.53) | 0.20014 (0.50) | −1.43 | 1.015 |
+| `mixed_prod` | 10240 → 8192 | 0.67118 (2.53) | 0.65050 (1.79) | −3.08 | 1.032 |
+| `mixed_64k` | 67584 → 65536 | 4.78598 (1.15) | 3.74624 (1.12) | −21.72 | 1.278 |
+| **`mixed_confound`** | 67584 → 8192 | 2.27933 (1.85) | 0.61196 (0.59) | **−73.15** | **3.725** |
+
+`decode_prod` and `mixed_prod` **cannot support a conclusion** — the effect is at or below the spread
+of the arms it is a difference of. `decode_64k` is weak (2–3× spread). Only `mixed_64k` and the
+confound are decisive, and both are on the band that carries 85.7–87.9% of indexer time (§2).
+
+### Why the confound is a legitimate regime and not a shape picked to flatter B
+
+All five step-1 regimes run `kv_len` within one page of `max_model_len` by construction, so the
+incumbent's buffer is already within 3–8% of the live width in every one of them and **B's entire
+prize has no room to be measured at any of them**. That is why §4.3(b) quoted `≤ −5.40%`: it had no
+shape, and normalised against `mixed_64k`'s call as a deliberate upper-bound denominator. Design
+§12 item 4 sanctions exactly one sixth regime for this. Verified before folding this in:
+`instruments/` is untouched by both B commits and `shapes.py` has not changed since step 1 created
+it (`b3d2a0ec`), so the five-regime yardstick did not move under the variant that is measured
+against it.
+
+The confound is `max_model_len = 66560` with an 8k live context — a 64k-capable deployment serving a
+short batch. §8.1 records that as the *common* case, not the corner: mean live fraction ≈ 50%, and
+the first sixteen chunks of a 64k prompt below 25%.
+
+### The mechanism, which is not the one the design assumed
+
+The design ranked B on **bytes**. 1554.5 of the confound's 1667.4 µs delta lands in
+`sparsecore_topk`, against a `modelled` 0.7–0.9 ms for the whole term: narrowing `n` flips
+`_pick_partition` from **P = 2 to P = 1** and collapses the two-stage top-k into one stage. The byte
+saving is the small half — `mixed_64k` moves 3% fewer bytes and is 21.72% faster. B is a
+**threshold** effect at `MAX_SLICE_WORDS = 65536`, not a proportional one.
+
+This is what makes B robust rather than fragile, and it is worth being explicit because the
+threshold reads at first like the caveat that kills it. At the A/B, `max_model_len = 66560` puts the
+incumbent's width at 67584 — *just* above the threshold, so the incumbent pays two stages on **every
+prefill chunk regardless of how short the live context is**. Every bucket B could plausibly ship
+lands at or under 65536 and therefore keeps P = 1.
+
+### What B is worth at the A/B shape — `modelled`, from two measured points
+
+Both incumbent points sit in one partition regime (P = 2, 528 sublanes) and both B points in the
+other (P = 1), so a linear fit within each is the right form. Fitting time against live width `w`
+in sublanes:
+
+| arm | fit (ms) | from |
+| --- | --- | --- |
+| incumbent | `1.92125 + 0.005595·w` | `mixed_confound` 2.27933 @ w=64, `mixed_64k` 4.78598 @ w=512 |
+| B | `0.16422 + 0.006996·w` | `mixed_confound` 0.61196 @ w=64, `mixed_64k` 3.74624 @ w=512 |
+
+The incumbent's 1.92 ms intercept **is** the `max_model_len` tax; B's is 0.16 ms. A 65536-token
+prefill in 1024-token chunks has a mean live context of ≈ 33280 tokens, w ≈ 260:
+
+| bucketing of the shipped static width | mean w | B ms | incumbent ms | Δ time % |
+| --- | ---: | ---: | ---: | ---: |
+| exact `kv_len` (what was measured — a **ceiling**, not shippable) | 260 | 1.983 | 3.376 | **−41.3** |
+| 8192-token granularity (8 buckets) | 292 | 2.207 | 3.376 | −34.6 |
+| powers of two (4 buckets) | ~346 | 2.585 | 3.376 | −23.4 |
+
+**B survives bucketing** — coarsening the ladder costs only the byte term, because every bucket
+≤ 65536 keeps the P = 1 collapse, which is the large half. That inverts B's most serious caveat: its
+own `RESULTS.md` correctly flags the measured prize as a ceiling because the driver passes the exact
+`kv_len`, and the arithmetic above says the floor under that ceiling is still a 23% prefill win.
+
+Two honest limits on this table. The linearity is **untested** — two points cannot test the form
+they were fitted with, and B's fitted slope coming out *steeper* than the incumbent's (0.006996 vs
+0.005595) is unexplained and mildly suspicious. And the bucket count itself is `assumed`: the
+recompile cost of the extra jit cache entries and the plumbing that computes the bucket at the call
+site are both unmeasured (`RESULTS.md` caveat 9).
+
+### Correctness — the strongest evidence in the exercise
+
+B's index **sets** are identical to the incumbent's on every row at all six regimes (`set_diff = 0`),
+reproducing `worst_rank`/`min_recall` to the digit. The risk B carries is a *reachable unwritten
+lane*, since it deletes the `-1` fill — and the test was designed for that risk specifically. The
+**poison arm** reinstates the aliased prefill as `+1e30` instead of `-inf`, so an unwritten lane
+would **seize** the top-k rather than perturb it, and it comes back bit-identical to the clean arm at
+all six regimes. That is decisive, not probabilistic. All five negative controls FAILED as required
+(ranks 7968–62644 against 2304).
+
+The masked partial-block store lowered first time, but note it needs a *static* destination offset,
+and it is **not emitted at any of the six perf regimes** — all six have `kv_len` a multiple of
+`bkv_sz`. Two correctness-only shapes at `kv_len = 8000` exist for it.
+
+**`sparsecore_topk` had no test at all** (`measurement_and_design.md` §11 item 4, a precondition for
+both B and C). It does now: `run_sc_coverage.py` drives it against a numpy oracle at all 12
+`(b, n, live, ragged, P)` combinations the two arms produce, padded with `+1e30` **and not `-inf`**,
+so it passes only if the `row_lengths` bound actually holds — which an `-inf`-padded test could not
+tell you. All 12 PASS. That closes a carried item, independently of whether B ships.
+
+### Two corrections B makes to the design document
+
+1. **§4.3(b)'s `≤ −5.40%` bound is wrong by 13.5×**, in B's favour, and it was wrong by
+   construction — it used `mixed_64k` as the denominator because no confound regime existed.
+2. **The design's "TC subtotal 257.0 µs" double-counts the SparseCore read** — its 486.53 MB line is
+   labelled "TC write *+ SC read*". The genuine TC term is the deleted fill alone: 93.2 µs
+   `modelled` against a 112.9 µs measured residual. The TC roofline was fine; the subtotal was not.
+
+Consequence for §4.6, which deferred B's SparseCore half: **the prize attributed to that half is
+already collected, and exceeded, by the TC half.** Its expected value needs re-deriving before
+anyone spends on it — this is a reason not to build it, not a reason to build it sooner.
+
+**Not covered:** B's SparseCore source half (not attempted, `sparsecore_topk.py` unmodified);
+end-to-end accuracy; bucket boundaries other than the six widths measured. The `mixed_prod` row of
+the `sparsecore_topk` component table is unusable (885.74% incumbent spread against a 6.41% effect)
+and is reported, not ranked.
+
+---
+
+## 5d. Option A1 — Drop the ReLU: **gate failed, no kernel written**
+
+`j-5acf2993-b56b-4a38-9abe`, `JobStatus = Succeeded`, 4/4 shards `rc=0`, 94 s. Commit `35ea3bcc`.
+
+The area-6 sheet required A1 to be evaluated for accuracy **before** any perf number, because it
+computes a different function rather than a perturbation of the same one. It was, and it failed.
+
+| regime | S | rows bad | `worst_rank` (allowed 2304) | over by | `min_recall` (req 0.99) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `decode_prod` | 8192 | 64 of 64 | 7873 | 3.42× | 0.69189 |
+| `mixed_prod` | 8192 | 1024 of 1024 | 7777 | 3.37× | 0.67578 |
+| `mixed_32k` | 32768 | 1024 of 1024 | 30832 | 13.4× | 0.48047 |
+| `mixed_64k` | 65536 | 1024 of 1024 | 57391 | 24.9× | 0.39844 |
+| `decode_64k` | 65536 | 6 of 6 | 40939 | 17.8× | 0.50293 |
+
+Not one row of 3138 passed, and it degrades monotonically with S — mean recall 0.737 → 0.582 →
+0.520 — so it is worst exactly where the A/B lives. Roughly half the returned set is wrong at long
+context. An oracle self-reference arm was perfect at every regime (`worst_rank = 2048`,
+`min_recall = 1.00000`), so the plumbing is sound and this is the function, not the harness.
+
+**The gate ran against the *idealised* A1** — exact float64 arithmetic, exact top-k, visibility mask
+lifted off the float64 ReLU oracle. That is what makes this cheap and final: the failure rules out
+**every** A1 kernel, at any precision, so no kernel had to be written to reject it. It reuses
+`instruments/test_correctness.py`'s `oracle_scores` and `check` unmodified.
+
+**The dataflow claim A1 rested on is true; the ranking claim is not.** The head-axis collapse
+`Σ_h w_h(q_h·kv) == (Σ_h w_h q_h)·kv` verified to 6.5e-16 relative. A1 does not die on the algebra —
+it dies because the collapsed form is a poor *ranker*, Pearson 0.679 against the true score. That
+distinction matters for **F**, which uses the same reassociation but keeps the ReLU and is therefore
+exact; nothing here touches F.
+
+**A3, the designated fallback: do not build it.** The sweep found the shortlist width `M` that
+passes needs `M/S = 0.5` at both 32k and 64k. That is not a shortlist — it is a selection problem of
+the same order as the one it was meant to cheapen, and A3 would run selection twice. The surviving
+fraction is also quoted in MACs, which shard 3 established is the wrong currency: the MXU is 14.8%
+of the step and doubling its FLOPs costs +2.18%, so the prize was the 85% VPU tail, which A3 merely
+scales by `M/S` while adding an unpriced top-`M`-of-`S` pass at a width where a single
+compare-and-count pass alone measures 232.31 µs `measured (j-b54e9716-3db5-4f1f-b8d4)`. This one is
+judgement, not measurement, and it is falsifiable: a top-`M`-of-`S` priced far below 232 µs
+overturns it.
+
+### The consequence that outranks the verdict
+
+**The 85% of the MIXED inner step now has no candidate.** A1 was the only proposal that removed both
+the relu chain (32.7%) and the head-sum bundle (52.5%). The exact routes left are E1, E2 and F, and
+only F touches the head sum. §7.5 item 1 resolves to **not inserted**.
+
+Two things A1 hands forward, both cheap and both now scheduled:
+
+1. **`a1_gate.py` is reusable and costs one shard (94 s).** It gates any rescoring against the
+   float64 ReLU oracle on all five regimes, with a control and a self-check, without a kernel.
+2. **Row A2 — clamp `w ← max(w, 0)` — has never been gated**, and it is a one-line change to the
+   surrogate that makes **E1's precondition true by construction**. E1 is the measured-but-
+   disqualified 13.70% in §11. If A2 passes, E1 stops being disqualified.
+
+---
+
 ## 6. Ranking as it stands
 
-Not final — A, B, C, F and A1 are in flight, and F or A1 landing would rewrite the top of it.
+Not final — C, F and A's reader retry are in flight.
 
 | rank | option | standing | why it moved from step 2 |
 | ---: | --- | --- | --- |
-| **1** | **A — Narrow Record** | **writer measured, reader blocked; retry authorised** | its blocking `unmodelled` term came back a **win** (3.406×), not a cost (§5b). Design doc §9.1: struck, "A moves to rank 1 outright". Contingent entirely on the reader compiling. |
-| **2** | **B — Right-Size** | in flight | mixed carries 85.7–87.9% of indexer time (§2), and B's prize is mixed- and confound-shape-only. Design doc §9.2's own stated consequence. |
+| **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Strongest correctness evidence in the exercise. |
+| **2** | **A — Narrow Record** | **writer measured, reader blocked; retry in flight** | its blocking `unmodelled` term came back a **win** (3.406×), not a cost (§5b). Design doc §9.1's "A moves to rank 1 outright" is earned on that term alone — but it is contingent entirely on the reader compiling, and B is not contingent on anything. |
 | **3** | **E — Retune** | **measured** | fell from joint rank 1. Net at the A/B is −0.84% to +0.90%, sign unresolved (§1.3). |
 | **4** | **C — Half-Width Key** | in flight | §7.5 predicts the confirmed VPU result makes C *actively worse*, since a 16-bit key adds a VPU-side encode on the bottleneck unit. |
 | **5** | **D — No Round Trip** | **dead** | priced at 8.96× its threshold (§3). Not built. |
-| **?** | **F — MXU head sum** | in flight | targets 52.5% of the inner step; exact. Not in step 2. |
-| **?** | **A1 — Drop the ReLU** | in flight, gated | targets ~85% of the inner step; an approximation, and expected to fail its gate. Not in step 2. |
+| **6** | **A1 — Drop the ReLU** | **dead** | gate failed on all five regimes, worst at long context (§5d). Ruled out at the idealised limit, so no kernel exists that rescues it. A3 fallback also rejected. Not in step 2. |
+| **?** | **F — MXU head sum** | in flight | targets the 52.5% head-sum bundle; **exact**, and A1's failure does not touch it — A1 died as a ranker, not on the reassociation F uses. Not in step 2. |
 
 **All four of step 2's `unmodelled` ranking defects are now closed** — item 1 (TC-side top-k, §3),
 item 2 (writer-side scatter, §5b), item 3 (the mixed residual, §4) and item 4 (the decode:mixed
