@@ -5,6 +5,7 @@ Uses the same MLA v2 entrypoint as mla_mixed_prefill_tuner.py, but generates
 multi-request verify inputs, padded metadata, and nontrivial cached prefixes.
 """
 import argparse
+import contextlib
 import itertools
 import json
 import os
@@ -13,6 +14,25 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+@contextlib.contextmanager
+def trace_kernel(directory, backend):
+    if backend == "torch_tpu":
+        from torch_tpu._internal.profiler import _impl
+
+        _impl.start_trace(directory, worker_rank="rank0")
+        try:
+            yield
+        finally:
+            _impl.stop_trace()
+    elif backend == "jax":
+        import jax
+
+        with jax.profiler.trace(directory):
+            yield
+    else:
+        raise ValueError(f"Unsupported profiler backend: {backend}")
 
 
 def child(case, tile):
@@ -229,10 +249,33 @@ def child(case, tile):
             samples.append((time.perf_counter_ns() - started) / 1e6)
         trace_dir = os.getenv("TUNER_TRACE_DIR")
         if trace_dir and context == 1000:
-            with jax.profiler.trace(trace_dir):
-                for _ in range(15):
-                    output, cache = invoke(cache)
-                    jax.block_until_ready((output, cache))
+            trace_backend = os.getenv("TUNER_PROFILE_BACKEND", "jax")
+            # A run-local marker lets an ongoing sweep preserve correctness
+            # results when the independently versioned profiler ABI is broken.
+            # Deferred captures are NOT evidence that a candidate is ready.
+            defer_file = Path("/tmp/tpu_logs/k3-defer-jax-profile")
+            if trace_backend == "jax" and defer_file.exists():
+                destination = Path(trace_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                deferred = dict(status="deferred",
+                                reason=defer_file.read_text(),
+                                case=case,
+                                tile=tile)
+                (destination / "profile-deferred.json").write_text(
+                    json.dumps(deferred, indent=2))
+                print("PROFILE_DEFERRED", json.dumps(deferred), flush=True)
+            else:
+                with trace_kernel(trace_dir, trace_backend):
+                    for _ in range(15):
+                        output, cache = invoke(cache)
+                        jax.block_until_ready((output, cache))
+                print("PROFILE_CAPTURED",
+                      json.dumps(
+                          dict(backend=trace_backend,
+                               directory=trace_dir,
+                               calls=15,
+                               device_events_verified=False)),
+                      flush=True)
         rows.append(
             dict(concurrency=c,
                  verify_tokens=window,
