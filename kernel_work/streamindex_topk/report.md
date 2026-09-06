@@ -474,6 +474,24 @@ the first probe step 2 owes.
 55% is squarely inside the 50–80% band the skill calls a kernel's worth of headroom. **The roofline
 gate passes and the exercise continues.**
 
+> **Amendment, after step 2 challenged this floor and measured it
+> [verified: j-e8eaacd3-6be4-4cdf-95a2].** The floor above divides bytes by a rate and carries no
+> per-step fixed term. `references/03-pipelining.md` prescribes one — `Σ_steps [512 ns +
+> bytes_step / 3.48e12]` — and two wave-1 sheets flagged that this table omits it. Applied at this
+> kernel's *inner* `lax.fori_loop` iteration (64 of them) it gives a 71.3 µs floor and **93%
+> achieved**, which would have failed the gate and ended the exercise.
+>
+> Measured: a per-inner-iteration fixed cost of **≈500 ns is real** (two shards, 2× different batch
+> sizes, agreeing rung for rung), so the term does transfer to a hand-rolled loop. But it **is not a
+> floor term**, because the step count is a design parameter — `bkv_p` is a static argument, and
+> changing it made decode **9.64% faster**, which cannot happen below a floor. A floor is taken over
+> valid implementations, so it uses the smallest feasible step count; at `bkv_p=8` the inner-step
+> count collapses to the grid-step count, giving **46.8 µs and 61%**.
+>
+> **The corrected reading is 55–61%, depending on whether the grid-step fixed term is counted. The
+> verdict in this section stands.** Options in step 2 may use either bound as the denominator, but
+> must say which. Full working in `probes/step_cost_RESULT.md`.
+
 Mixed is further from its floor than decode, not closer. The floor here prices only the TensorCore
 side, so the denominator is `scoring ms by difference` rather than `full ms`:
 
