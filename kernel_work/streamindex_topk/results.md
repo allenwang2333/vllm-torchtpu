@@ -514,6 +514,12 @@ prefill in 1024-token chunks has a mean live context of ≈ 33280 tokens, w ≈ 
 | 8192-token granularity (8 buckets) | 292 | 2.207 | 3.376 | −34.6 |
 | powers of two (4 buckets) | ~346 | 2.585 | 3.376 | −23.4 |
 
+> **Superseded — see §8.3.** A six-rung ladder measured both arms directly
+> (`j-59bbfd2f-e408-4a75-a155`). The three figures above are **conservative**: the measured
+> equivalents are **−46.2 / −40.9 / −30.2**. The direction of the error is the safe one, so nothing
+> downstream is invalidated, but quote §8.3's numbers and not these. The suspicion recorded below
+> about B's slope was correct and **mis-attributed** — B is the well-behaved arm.
+
 **B survives bucketing** — coarsening the ladder costs only the byte term, because every bucket
 ≤ 65536 keeps the P = 1 collapse, which is the large half. That inverts B's most serious caveat: its
 own `RESULTS.md` correctly flags the measured prize as a ceiling because the driver passes the exact
@@ -840,3 +846,139 @@ the sparse-MLA it feeds saturates at `k = 2048`, so its share should grow. **Tha
 never been measured.** A profiled baseline run at the A/B shape is in flight to settle it. If the
 share is still low single digits, no kernel change in this document is resolvable in the
 one-run-per-arm A/B, and that is the finding — reached before two four-hour runs rather than after.
+
+---
+
+## 8. Follow-up probe — four questions, one job
+
+`j-59bbfd2f-e408-4a75-a155`, `JobStatus = Succeeded`, 4/4 shards `rc=0`. Commits `3dc5932d`
+(probes), `642dadc6` (`RESULTS.md`, raw shard logs, per-shard JSON), under `probes/followup1/`.
+`instruments/` byte-identical throughout.
+
+### 8.1 A2 — the `w` clamp: **FAIL at all five regimes. E1 stays disqualified.**
+
+| regime | rows | bad | worst_rank / 2304 | min_recall / 0.99 | control | self-ref |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| `decode_prod` | 64 | 64 | 8190 | 0.47656 | FIRED | OK |
+| `mixed_prod` | 1024 | 1024 | 8175 | 0.44141 | FIRED | OK |
+| `mixed_32k` | 1024 | 1024 | 32677 | 0.21973 | FIRED | OK |
+| `mixed_64k` | 1024 | 1024 | 65286 | 0.20215 | FIRED | OK |
+| `decode_64k` | 6 | 6 | 64614 | 0.43750 | FIRED | OK |
+
+3138 of 3138 rows bad — the same total A1 failed, and recall misses by 2–5×. The self-reference arm
+returned `worst_rank = 2048, min_recall = 1.00000` everywhere, so the gate was live.
+
+**A2 was expected to be a much smaller change than A1 and is not.** Clamping `w ← max(w, 0)` zeroes
+roughly 16 of 32 heads per token, which is close to the negative control's own mutation. **E1's
+13.70% stays unusable.**
+
+**The obvious objection, checked at the source rather than assumed.** The gate's inputs draw
+`w ~ uniform(-1.5, 1.5)`, so ~50% are negative — which could have made this an artefact of a
+synthetic generator rather than a fact about the model. It is not. In production
+(`deepseek_v4_indexer.py:81`) `weights = indexer_weights * softmax_scale * (n_head**-0.5) *
+q_scales`; the last three factors are non-negative, so the sign is entirely `indexer_weights`'s, and
+that is `self.indexer.weights_proj(hidden_states)` (`models/vllm/deepseek_v4/attention.py:397`) — a
+**raw linear projection with no softmax, sigmoid or ReLU on it**. Nothing in the architecture
+constrains its sign, so a symmetric draw is a fair model and the burden is on E1 to prove
+non-negativity, which nothing supplies. *Caveat:* this is read off the architecture, not off trained
+weights; the empirical distribution under a real checkpoint is `unmodelled`. It does not change the
+verdict, because an unconstrained projection is not a guarantee.
+
+### 8.2 The `NUM_HEADS` ladder: **the head-sum term is constant in `NUM_HEADS`, not linear**
+
+`t(H) = a·H + b` in µs per inner step, `H ∈ {4, 8, 16, 32, 64}`:
+
+| series | a (µs/head) | b (µs) | R² | at H=32, linear share | dominates |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `bcast_sum` (no matmul) | −0.000205 | 1.5370 | 0.011 | — | **constant** |
+| `mxu_sum_mxu_removed` | +0.001056 | 3.0144 | 0.009 | 1.1% | **constant** |
+| `mxu_sum_raw` | +0.038438 | 2.8803 | 0.905 | 29.9% | constant |
+| `mxu_full` | +0.097370 | 3.5882 | 0.986 | 46.5% | constant |
+
+The **ordering** is the finding. `a` is non-trivial only in the arms that retain a matmul whose FLOPs
+are themselves ∝ H; remove the matmul and `a` collapses 36–92× and R² collapses to noise. The five
+`bcast_sum` medians span 7.2% while H grows 16×.
+
+**This invalidates the premise this probe was run on**, which was mine. §4.1 identified the 3.858 µs
+head-sum bundle as the largest term and I treated it as per-head reduction *arithmetic*. It is not:
+it lives in `b` — the store of the reduced result plus fixed per-step cost. **Any option priced on
+"do less per-head reduction work" is over-priced, and that is E1, E2 and F.** All three move down,
+and F is already dead for an unrelated reason.
+
+Two caveats kept rather than buried: the `bcast` arm hit **300.57% spread** at H=8, so its
+*coefficient* is unquotable (the qualitative conclusion survives only because a linear term would
+have to be enormous to hide inside a 7.2% span), and the MXU-removed intercept rests on a two-point
+K slope implying 1861–3891 Tops/s, at or above fp8 peak. Also: **3.858 µs is arm-dependent to 2.7×**
+(1.53 µs `bcast/sum` against 4.13 µs `mxu/sum` at H=32), so any downstream estimate quoting it needs
+that error bar.
+
+### 8.3 Option B: linearity is **half** real, and §5c under-stated the prize
+
+Six rungs, both arms, `max_model_len = 66560`:
+
+| arm | refit | R² | residuals |
+| --- | --- | ---: | --- |
+| B | `t = 0.14745 + 0.007103·w` | **0.99990** | ≤ 2.1% |
+| incumbent | `t = 2.32604 + 0.005338·w` | 0.88555 | to +12.1%, systematic arch |
+
+**B is linear; the incumbent is not.** The incumbent's local slope is ≈0.0100 ms/sublane below
+w=256 and 0.001526 then 0.003032 above — an unexplained **6.7× kink between w=256 and w=384**.
+
+So §5c's flagged suspicion — that B's fitted slope came out steeper than the incumbent's — was
+**correct and mis-attributed.** B has one slope everywhere; the incumbent has no single slope, and
+§5c's two anchors happened to land one on each side of the kink. All four §5c anchors reproduced
+within ~1% before any refit.
+
+**Bucketing, measured rather than modelled.** Only two rungs distinguish the ladders. Cost of
+coarsening (positive = slower): `kv 24576 →` pow2 32768 is **+2.25%** (1.49414 → 1.52770 ms);
+`kv 49152 →` pow2 65536 is +1.16% (2.88717 → 2.92069 ms), which is at or below the 1.29–2.67% arm
+spreads and **cannot alone support a conclusion**. Against B's 34–58% prize at those rungs the §5c
+claim holds. Revised chunk-averaged prize, `modelled` by interpolation between measured rungs:
+
+| ladder | §5c published | **measured-rung revision** |
+| --- | ---: | ---: |
+| exact `kv_len` | −41.3 | **−46.2** |
+| 8192-granularity | −34.6 | **−40.9** |
+| powers of two | −23.4 | **−30.2** |
+
+**The P claim is confirmed by direct read-back**, not inferred from timing: shimming
+`impl.sparsecore_topk` to record the real `(b, n, k)` and interrogate the real `_pick_partition`
+gives **incumbent P = [2]** at n=67584 at every rung and **B P = [1]** at all six buckets
+(8192…65536), with `MAX_SLICE_WORDS = 65536` and `b = 1024 ≥ 32 ⇒ max_p = 1`.
+
+### 8.4 `(8,4,4)` at `mixed_prod`: usable now, and a **slowdown**
+
+The 491.23% spread **did not reproduce** — the same `run_regime` path at reps=40 gives 8.00%, and
+both published medians reproduce within 0.7%. The published median was fine; only its range was
+poisoned, by a single outlier block (0.82235 against a 0.67238 median).
+
+60 alternating paired blocks, one input build, both arms compiled once:
+
+| old ms (2,2,2) | new ms (8,4,4) | Δ time % | speedup × |
+| ---: | ---: | ---: | ---: |
+| 0.67238 | 0.70413 | **+4.72** | 0.9549 |
+
+Paired per-block median +4.52%, IQR [+3.91, +5.61], bootstrap 95% CI **[+4.23, +5.09]**, **59 of 60
+blocks agree on the sign**. **USABLE: `(8,4,4)` is 4.2–4.7% slower at `mixed_prod`.** Not a proposal
+to ship it — its buffer is 128 sublanes against 80.
+
+### 8.5 Two process findings
+
+1. **The 491% spread was not a property of the arm.** Other anomalous-spread rows in
+   `j-b54e9716-3db5-4f1f-b8d4` — the `mxu/full/K=128` row at 550.56%, E's `decode_64k` drift control
+   at 111.72%, F's two `CONTROL` arms at 10629% and 116% — were each discarded as unusable. At least
+   one of them was a single outlier block in an otherwise clean arm. **Discarding on range is
+   discarding information**; paired per-block statistics recovered this one at no extra hardware cost.
+2. **The branch moved under the probe.** The dispatch named HEAD `eb994645`; the actual HEAD at
+   commit time was `54e80686`, and the `--map-dir` tarball carried a working tree dirty in several
+   `variants/*` files from concurrent agents. Immaterial here — shard 2's imports are clean files and
+   its anchors reproduce §5c within 1% — but running many variant agents against one branch makes
+   *what was measured* a question that has to be answered per job rather than assumed.
+
+### 8.6 A second call site, so nobody later fixes the wrong one
+
+`streamindex_topk` has two callers with **different tuples**: `mla_attention_op.py:118` uses
+`(2, 2, 2)` and `deepseek_v4_indexer.py:93` uses `(3, 2, 2)`. `report.md` established
+`mla_attention_op.py` as the production path and verified it against **profiled scope names**, not
+just the source, so `(2, 2, 2)` is the right incumbent and every `bkv_p` measurement here is against
+the right baseline. Recorded because the discrepancy is invisible until you look for it.
