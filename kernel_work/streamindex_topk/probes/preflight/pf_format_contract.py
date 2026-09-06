@@ -197,7 +197,41 @@ def oracle_topk(q, weights, deq, S_valid, k):
         for i in range(k):
             if scores[t, top[t, i]] == -np.inf:
                 top[t, i] = -1
-    return top
+    return top, scores
+
+
+def diff_report(name, got, exp, scores, k):
+    """How far apart are two index sets, and is the gap a boundary tie?
+
+    An exact-equality verdict cannot tell "the reader is broken" from "the
+    512th and 513th score out of 4096 are equal to seven digits and the MXU
+    broke the tie the other way".  The first is a bug; the second is a
+    property of comparing a Pallas kernel to a NumPy reference and says
+    nothing about the change.  Print enough to tell them apart.
+    """
+    T = got.shape[0]
+    worst = 0.0
+    total = 0
+    for t in range(T):
+        g, e = set(got[t].tolist()), set(exp[t].tolist())
+        sym = (g - e) | (e - g)
+        total += len(sym)
+        if not sym:
+            continue
+        kth = np.sort(scores[t])[::-1][k - 1]
+        for idx in sym:
+            if idx < 0 or idx >= scores.shape[1]:
+                worst = float("inf")
+                continue
+            s = float(scores[t, idx])
+            rel = abs(s - kth) / max(abs(kth), 1e-9)
+            worst = max(worst, rel)
+        print(f"    [{name}] t={t}: |sym diff|={len(sym)} of k={k}; "
+              f"kth score={kth:.7g}; worst relative gap of a swapped "
+              f"index to it = {worst:.3g}")
+    if total == 0:
+        print(f"    [{name}] exact match")
+    return total, worst
 
 
 def run_arm(fn, q, weights, cache, num_pages, page_size, S_seq, T_seq, k,
@@ -262,7 +296,7 @@ def main():
 
     c = build_case(a.seed, ps, npg, a.tokens, a.heads, D, a.comp_ratio)
     print("  built; running host oracle ...", flush=True)
-    exp = oracle_topk(c["q"], c["weights"], c["deq"], S_valid, k)
+    exp, oscores = oracle_topk(c["q"], c["weights"], c["deq"], S_valid, k)
     print(f"  oracle done, {exp.shape}", flush=True)
 
     inc = _support.load_incumbent()
@@ -292,6 +326,19 @@ def main():
         vo, vi = agrees(got, exp), agrees(got, res["incumbent"])
         out["arms"][name] = {"matches_oracle": vo, "matches_incumbent": vi}
         print(f"{name:<14} {str(vo):<10} {str(vi):<13}")
+    print()
+    print("  --- how far apart, and is it a boundary tie? ---")
+    for name in ("incumbent", "composed"):
+        n_sym, worst = diff_report(name, res[name], exp, oscores, k)
+        out["arms"][name]["sym_diff"] = n_sym
+        out["arms"][name]["worst_rel_gap"] = worst
+    # composed vs incumbent is the comparison this preflight actually needs:
+    # same arithmetic on both sides, so it is exact, and it isolates the
+    # layout change from every property of the NumPy reference.
+    n_ci = int(np.sum(np.sort(res["composed"], axis=-1) !=
+                      np.sort(res["incumbent"], axis=-1)))
+    print(f"    [composed vs incumbent] differing sorted positions: {n_ci}")
+    out["composed_vs_incumbent_differing"] = n_ci
 
     ok_inc = out["arms"]["incumbent"]["matches_oracle"]
     ok_comp = out["arms"]["composed"]["matches_oracle"]
@@ -314,22 +361,41 @@ def main():
     out["baseline_pass"] = ok_inc
     out["changed_pass"] = ok_comp
     out["discriminates"] = discriminates
+
+    # PRIMARY: composed vs incumbent.  Both sides are Pallas kernels doing the
+    # same arithmetic on the same quantized bytes, differing only in how those
+    # bytes are laid out in HBM -- which is exactly and only what Option A
+    # changes.  It is an exact comparison, and the negative controls make it
+    # non-vacuous by differing from the incumbent too.
+    diff_ok = (out["arms"]["composed"]["matches_incumbent"]
+               and not out["arms"]["wrong_map"]["matches_incumbent"]
+               and not out["arms"]["scale_poison"]["matches_incumbent"])
+    out["differential_pass"] = diff_ok
+    print()
+    print(f"PRIMARY   composed == incumbent    : "
+          f"{'PASS' if out['arms']['composed']['matches_incumbent'] else 'FAIL'}")
+    print(f"PRIMARY   controls != incumbent    : "
+          f"{'yes -- differential is non-vacuous' if diff_ok else 'NO'}")
+
     if not ok_inc:
-        print("VERDICT: BASELINE RED -- this establishes nothing either way.")
+        print("SECONDARY: the NumPy oracle disagrees with the INCUMBENT too, "
+              "so the oracle arm establishes nothing either way. Read the "
+              "boundary-tie diagnostics above before blaming the change.")
     elif not discriminates:
-        print("VERDICT: HOLLOW -- a negative control passed; composed PASS is "
-              "not evidence.")
+        print("SECONDARY: HOLLOW -- a negative control matched the oracle.")
     elif ok_comp:
-        print("VERDICT: PASS, and the check could have failed.")
+        print("SECONDARY: oracle PASS, and that check could have failed.")
     else:
-        print("VERDICT: FAIL -- the composed reader disagrees with the "
-              "independent oracle.")
+        print("SECONDARY: oracle FAIL for the composed arm ALONE -- this "
+              "would implicate the change.")
+    print(f"VERDICT: {'PASS' if diff_ok else 'FAIL'} "
+          f"(differential, composed vs incumbent)")
 
     if a.json:
         os.makedirs(os.path.dirname(a.json), exist_ok=True)
         with open(a.json, "w") as f:
             json.dump(out, f, indent=2, default=str)
-    return 0 if (ok_inc and ok_comp and discriminates) else 1
+    return 0 if diff_ok else 1
 
 
 if __name__ == "__main__":

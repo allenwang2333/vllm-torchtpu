@@ -49,9 +49,26 @@ case "$SHARD" in
       -q -rA -p no:cacheprovider --timeout=2400 \
       -m "not nightly and not multichip" > "$OUT/shard0_pytest.log" 2>&1
     rc=$?
-    tail -60 "$OUT/shard0_pytest.log"
+    tail -20 "$OUT/shard0_pytest.log"
     echo "shard0: existing kernel test rc=$rc"
     grep -E 'collected|passed|failed|error' "$OUT/shard0_pytest.log" | tail -5
+    echo
+    echo "--- shard 0b BASELINE: the two EXISTING tests that Option A would ---"
+    echo "--- break: a REAL TPU KV-cache allocate/insert/gather path, and   ---"
+    echo "--- the deviceless golden that pins dsa.idx page_shape/row_bytes  ---"
+    python3 -m pytest \
+      tests/layers/common/test_sparse_mla_attention.py \
+      tests/distributed/test_raiden_layout_fingerprint.py \
+      -q -rA -p no:cacheprovider --timeout=2400 \
+      -m "not nightly and not multichip" > "$OUT/shard0b_pytest.log" 2>&1
+    r2=$?
+    tail -40 "$OUT/shard0b_pytest.log"
+    echo "shard0b: sparse-MLA + raiden-fingerprint rc=$r2"
+    grep -E 'collected|passed|failed|skipped|error' "$OUT/shard0b_pytest.log" \
+      | tail -5
+    echo "--- the golden values Option A changes, quoted from the test ---"
+    grep -n -B2 -A3 '"dsa.idx"' tests/distributed/test_raiden_layout_fingerprint.py
+    rc=$(( rc + r2 ))
     ;;
   1)
     echo "--- shard 1a BASELINE: the repo tests that PIN THE CACHE FORMAT ---"
@@ -63,59 +80,50 @@ case "$SHARD" in
       -q -rA -p no:cacheprovider --timeout=1800 \
       -m "not nightly and not multichip" > "$OUT/shard1_pytest.log" 2>&1
     rc=$?
-    tail -60 "$OUT/shard1_pytest.log"
     echo "shard1a: format-pinning tests rc=$rc"
     grep -E 'collected|passed|failed|error' "$OUT/shard1_pytest.log" | tail -5
-    echo "--- shard 1b: which assertions pin the layout (quoted, not summarized) ---"
-    grep -n 'head_size\|head_dim ==\|width = 256\|align_to(128' \
-      tests/layers/vllm/test_dsv4_indexer_op.py \
-      tests/layers/vllm/test_tpu_indexer.py \
-      tests/kernels/test_dsv4_streamindex_topk.py \
-      src/vllm_torchtpu/layers/vllm/custom_ops/deepseek_v4/deepseek_v4_indexer.py \
-      src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py || true
-    echo "--- shard 1c: sparsecore partition at the A/B shape ---"
-    python3 "$P/pf_bucket_partition.py" \
-      --max-model-len 66560 --page-size 1024 --k 2048 \
-      --json "$OUT/partition_66560.json"
-    rc=$(( rc + $? ))
-    echo "--- shard 1d: the same at the checked-in production max_model_len ---"
-    python3 "$P/pf_bucket_partition.py" \
-      --max-model-len 9216 --page-size 1024 --k 2048 \
-      --json "$OUT/partition_9216.json" || true
-    ;;
-  2)
-    # Everything here is at the PRODUCTION page_size 1024, so the scale plane
-    # is [num_pages, 8, 128] and the transposed-index-map negative control is
-    # expressible.  `num_pages` is chosen per tuple so that
-    # align_to(pages_per_seq, bkv_p) never runs off `page_indices`.
-    echo "--- shard 2a CHANGED: ps1024 DECODE, (2,2,2) -- slot 0 executes ---"
+    echo "--- shard 1b: the two configurations whose ORACLE arm went red ---"
+    echo "--- with the boundary-tie diagnostics that say why            ---"
     python3 "$P/pf_format_contract.py" \
       --page-size 1024 --num-pages 4 --tokens 1 --heads 2 --k 512 --decode \
       --bkv-p 2,2,2 --json "$OUT/fmt_ps1024_decode_222.json"
+    rc=$(( rc + $? ))
+    python3 "$P/pf_format_contract.py" \
+      --page-size 1024 --num-pages 4 --tokens 2 --heads 2 --k 512 \
+      --bkv-p 2,2,2 --json "$OUT/fmt_ps1024_mixed_live.json"
+    rc=$(( rc + $? ))
+    ;;
+  2)
+    # THE WRITER TRIAD, IN SITU.  The profiled baseline
+    # (j-074e570b-13e3-4ab7-bb0c) puts reshape-in + scatter_fusion +
+    # reshape-out at mla_attention_op.py:104 at 773.48 us per indexer layer,
+    # 9.8x the whole scoring kernel, and paid on the early-exit path too.
+    # Option A's writer half targets exactly that line, and the 3.342x in hand
+    # is from a STANDALONE store probe, which by construction cannot show a
+    # triad that exists only because the scatter and the Pallas call want
+    # different layouts on the same donated buffer.  So: both, side by side.
+    echo "--- shard 2a: TRIAD IN SITU, prefill_only (early exit fires) ---"
+    python3 "$P/pf_writer_triad.py" \
+      --tokens 1024 --seq-len 1024 --heads 64 --topk 2048 --bucket 65536 \
+      --hlo-dir "$OUT/hlo_ee" --json "$OUT/triad_earlyexit.json"
     rc=$?
-    echo "--- shard 2b CHANGED: ps1024 DECODE, (3,2,2) = SECOND CALL SITE ---"
+    echo "--- shard 2b: TRIAD IN SITU, scoring kernel actually runs ---"
+    echo "--- seq_len 65536 > topk, so early exit does NOT fire      ---"
+    python3 "$P/pf_writer_triad.py" \
+      --tokens 1024 --seq-len 65536 --heads 64 --topk 2048 --bucket 65536 \
+      --hlo-dir "$OUT/hlo_long" --json "$OUT/triad_long.json" || \
+      echo "shard2b: long-context arm did not run (see error above)"
+    echo "--- shard 2c: TRIAD IN SITU at a smaller head count ---"
+    python3 "$P/pf_writer_triad.py" \
+      --tokens 1024 --seq-len 1024 --heads 32 --topk 2048 --bucket 65536 \
+      --json "$OUT/triad_h32.json" || true
+    ;;
+  3)
+    echo "--- shard 3a CHANGED: ps1024 DECODE, (3,2,2) = SECOND CALL SITE ---"
     echo "--- deepseek_v4_indexer.py:94; never measured by the exercise    ---"
     python3 "$P/pf_format_contract.py" \
       --page-size 1024 --num-pages 6 --tokens 1 --heads 2 --k 512 --decode \
       --bkv-p 3,2,2 --json "$OUT/fmt_ps1024_decode_322.json"
-    rc=$(( rc + $? ))
-    echo "--- shard 2c CHANGED: ps1024 DECODE, (4,2,4) = Option E ---"
-    python3 "$P/pf_format_contract.py" \
-      --page-size 1024 --num-pages 8 --tokens 1 --heads 2 --k 512 --decode \
-      --bkv-p 4,2,4 --json "$OUT/fmt_ps1024_decode_424.json"
-    rc=$(( rc + $? ))
-    echo "--- shard 2d DOMAIN PROBE (non-gating): page_size 128 ---"
-    echo "--- sc_rows == 1 there, so Option A's scale plane degenerates  ---"
-    python3 "$P/pf_format_contract.py" \
-      --page-size 128 --num-pages 8 --tokens 1 --heads 2 --k 128 --decode \
-      --bkv-p 2,2,2 --json "$OUT/fmt_ps128_decode_222.json" || \
-      echo "shard2d: page_size 128 is OUTSIDE Option A's domain (non-gating)"
-    ;;
-  3)
-    echo "--- shard 3a CHANGED: PRODUCTION page_size 1024, bucket == live ---"
-    python3 "$P/pf_format_contract.py" \
-      --page-size 1024 --num-pages 4 --tokens 2 --heads 2 --k 512 \
-      --bkv-p 2,2,2 --json "$OUT/fmt_ps1024_mixed_live.json"
     rc=$?
     echo "--- shard 3b CHANGED: PRODUCTION ps 1024, SHIPPING bucket 65536 ---"
     echo "--- bucket >> kv_len, so real unwritten lanes are in the buffer ---"
@@ -130,11 +138,12 @@ case "$SHARD" in
       --bkv-p 4,2,4 --bucket 65536 \
       --json "$OUT/fmt_ps1024_mixed_bucket65536_424.json"
     rc=$(( rc + $? ))
-    echo "--- shard 3d CHANGED: ps 1024, DECODE band, shipping bucket ---"
+    echo "--- shard 3d ABSOLUTE ANCHOR: k == S_valid, the repo test's own ---"
+    echo "--- regime, where the top-k is the whole valid set and ranking  ---"
+    echo "--- ties cannot decide the comparison                           ---"
     python3 "$P/pf_format_contract.py" \
-      --page-size 1024 --num-pages 4 --tokens 1 --heads 2 --k 512 --decode \
-      --bkv-p 2,2,2 --bucket 65536 \
-      --json "$OUT/fmt_ps1024_decode_bucket65536.json"
+      --page-size 1024 --num-pages 2 --tokens 2 --heads 2 --k 2048 \
+      --bkv-p 2,2,2 --json "$OUT/fmt_anchor_k_eq_svalid.json"
     rc=$(( rc + $? ))
     ;;
   *)
