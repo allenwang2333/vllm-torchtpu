@@ -132,6 +132,45 @@ are not always materialised — Mosaic tiles them on the MIXED path (a tile pric
 compiles and runs) but not on the decode path (a config declaring 65.03 MiB was refused at 85.00M,
 within 4% of declared + temps). Screen on declared scratch; report the temps; do not assume either.
 
+**7. Every (B) shape runs at `p = 16`, `C = 32 768` — not `p = 4`, `C = 8 192`.**
+`measured (j-3eeda36d-4994-4242-906c)`. The body reads the partition count off
+`_pick_partition(b, n, k)` with `n = 262 144`, giving `p_min = cdiv(n, MAX_SLICE_WORDS) = 4`. That is
+wrong about what `n` *is*: the score row is `pages_per_seq × page_size`, so **`N = 1 048 576` at
+every (B) row regardless of sequence length**, and sequence length only sets `row_lengths`. `p = 16`
+follows. `A-D16-8k` is `p = 2, C = 4096`; **`A-D64-8k` is `p = 1`, so the two-stage path is not
+entered at all** — any per-shape "result" there is structural, and a zero index-set symdiff at that
+shape is trivially true rather than evidence.
+
+Two consequences the body does not carry. Every candidate-array term is **4× larger** than §7 and
+§11 price it. And at a 256k sequence in a 1M-wide row only 4 of the 16 slices hold live data, so the
+stage-2 candidate array is **75% padding** — 491 520 of 524 288 stage-1 slots empty at B-D4-256k,
+25 165 824 of 33 554 432 at B-P1024-256k. That is a ranking input the body never had. It is carried
+as a variant proposal (adapt `_pick_partition` to `row_lengths` rather than to `n`), not folded in
+here, and it is **`unmodelled`** — nothing has measured what recovering it is worth.
+
+**8. The seam gather is worth far more than §11 ranks it, and the fix is to delete it, not cheapen
+it.** `measured (j-70f24ae2-d7d2-451e-902b, confirming j-d5447757-ed12-44a3-bc7f)`. Having stage 1
+emit `(index, key)` pairs, so stage 2 consumes the compact `b × C` candidates directly, removes the
+`take_along_axis` against the full `[B, N]` scores: **−26.3% at B-D1-1M, −34.4% at B-D4-256k,
+−16.9% at B-P1024-256k** on the whole op, at spreads of 4.7, 4.0 and 1.0pt, with index-set symdiff 0
+at every shape. It recovers 91–110% of the independently probed cost of the gather it deletes.
+
+The body's alternative — rewriting the same gather in flat-index form — is refuted *as a gather
+optimization*: measured on its own it makes the gather **2.7–28.5% slower** and wins nothing at the
+selector level, while winning 3.5–5.1% at the full level through a mechanism nobody identified. That
+full-level win is `unmodelled`, and it is **subsumed**: relative to the flat form, the pair-emitting
+version's full-level advantage equals its selector-level advantage diluted by the selector's share
+of the op — predicted −23.7/−31.4/−12.87% against measured −23.7/−31.4/−12.6%. The two do not stack,
+and under the pair-emitting seam there is no gather left to optimize.
+
+**9. "Selector wins do not reach the op" is false as stated.** A probe adding ~3.2 ms of selector
+DMA at B-P1024-256k cost the full op nothing, which bounds the absorbable slack *below* at 3.2 ms
+and was over-read into a general claim. Item 8 refutes the general form at the same shape: a −13.8%
+selector improvement produced −16.9% at the full level, better than 1:1
+`measured (j-70f24ae2-d7d2-451e-902b)`. Both readings are true — a few ms is absorbed, and beyond
+that the selector is on the critical path. Do not retire a selector candidate on either arithmetic;
+measure it at the full level.
+
 ---
 
 ## 1. Measurement record
