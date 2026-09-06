@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated BF16 MLA verify tuning; no serving defaults are modified.
+"""Isolated MLA decode/verify tuning; no serving defaults are modified.
 
 Uses the same MLA v2 entrypoint as mla_mixed_prefill_tuner.py, but generates
 multi-request verify inputs, padded metadata, and nontrivial cached prefixes.
@@ -24,36 +24,44 @@ def child(case, tile):
 
     c, window, tokens = case
     bq, pages, split = tile
+    dtype_name = os.getenv("TUNER_KV_DTYPE", "bfloat16")
+    kv_dtype = {"bfloat16": jnp.bfloat16, "fp8": jnp.float8_e4m3fn}[dtype_name]
+    packing = 2 if dtype_name == "bfloat16" else 4
+    page_size = int(os.getenv("TUNER_PAGE_SIZE", "256"))
+    max_seqs = int(os.getenv("TUNER_MAX_SEQS", "32"))
+    pages_per_seq = 32768 // page_size
+    assert c <= max_seqs and page_size % packing == 0
     rows = []
     for context in (128, 512, 1000):
         rng = np.random.default_rng(980406)
 
-        def random(shape):
-            return jnp.asarray(rng.normal(0, 0.2, shape), jnp.bfloat16)
+        def random(shape, dtype=jnp.bfloat16):
+            return jnp.asarray(rng.normal(0, 0.2, shape), dtype)
 
         q = random((3, tokens, 512))
         qr = random((tokens, 3, 64))
-        new = random((tokens, 512))
-        new_r = random((tokens, 64))
+        new = random((tokens, 512), kv_dtype)
+        new_r = random((tokens, 64), kv_dtype)
         # Disjoint, low, non-null pages per request; KV lengths differ so
         # verification covers page boundaries and ragged cached prefixes.
         lengths = [context - i % 7 for i in range(c)]
-        stride = (context + window + 255) // 256
-        cache = random((1 + c * stride, 128, 2, 640))
-        table = np.full((32, 128), -1, np.int32)
+        stride = (context + window + page_size - 1) // page_size
+        cache = random((1 + c * stride, page_size // packing, packing, 640),
+                       kv_dtype)
+        table = np.full((max_seqs, pages_per_seq), -1, np.int32)
         for i in range(c):
             table[i, :stride] = np.arange(1 + i * stride, 1 + (i + 1) * stride)
-        cu = jnp.asarray([i * window
-                          for i in range(c + 1)] + [c * window] * (32 - c),
-                         jnp.int32)
-        lens = jnp.asarray(lengths + [0] * (32 - c), jnp.int32)
+        cu = jnp.asarray([i * window for i in range(c + 1)] + [c * window] *
+                         (max_seqs - c), jnp.int32)
+        lens = jnp.asarray(lengths + [0] * (max_seqs - c), jnp.int32)
         ids = jnp.asarray(table.flatten())
-        distribution = jnp.asarray([0, 0, c], jnp.int32)
+        distribution = jnp.asarray([c, c, c] if window == 1 else [0, 0, c],
+                                   jnp.int32)
 
-        # FP32 dense causal reference from the exact BF16 inputs. Updating
+        # FP32 dense causal reference from the exact quantized inputs. Updating
         # only the logical tail also gives an exact reference for KV writes.
         expected_cache = np.asarray(cache, np.float32).copy()
-        flat_cache = expected_cache.reshape(-1, 256, 640)
+        flat_cache = expected_cache.reshape(-1, page_size, 640)
         qh, qrh = np.asarray(q, np.float32), np.asarray(qr, np.float32)
         nh, nrh = np.asarray(new, np.float32), np.asarray(new_r, np.float32)
         expected = np.zeros((3, c * window, 512), np.float32)
@@ -61,9 +69,9 @@ def child(case, tile):
             start = i * window
             for j in range(window):
                 pos = length - window + j
-                page = table[i, pos // 256]
-                flat_cache[page, pos % 256, :512] = nh[start + j]
-                flat_cache[page, pos % 256, 512:576] = nrh[start + j]
+                page = table[i, pos // page_size]
+                flat_cache[page, pos % page_size, :512] = nh[start + j]
+                flat_cache[page, pos % page_size, 512:576] = nrh[start + j]
             kv = flat_cache[table[i, :stride]].reshape(-1, 640)[:length]
             for j in range(window):
                 end = length - window + j + 1
@@ -84,9 +92,10 @@ def child(case, tile):
                 page_indices=ids,
                 cu_q_lens=cu,
                 distribution=distribution,
-                num_kv_pages_per_block=(3, 1, pages),
+                num_kv_pages_per_block=(pages if window == 1 else 3, 1, pages),
                 num_queries_per_block=(1, 16, bq),
-                mixed_q_split=split,
+                mixed_q_split=split if window != 1 else 1,
+                decode_batch_size=split if window == 1 else 1,
                 vmem_limit_bytes=60 * 1024 * 1024,
                 s_dtype=jnp.bfloat16,
                 p_same_dtype_as_v=True)
@@ -102,23 +111,26 @@ def child(case, tile):
         cache_ok = np.array_equal(
             np.asarray(cache, np.float32)[..., :576],
             expected_cache[..., :576])
-        # Only the final unused lane of a BF16 packed pair may differ.
+        # Only unused lanes in the final KV packed word may differ.
         # Null pages, valid KV, and every other unused position stay exact.
-        observed = np.asarray(cache, np.float32).reshape(-1, 256, 640)
+        observed = np.asarray(cache, np.float32).reshape(-1, page_size, 640)
         strict_positions = np.ones(observed.shape[:2], dtype=bool)
         for i, length in enumerate(lengths):
-            if length % 2:
-                strict_positions[table[i, length // 256], length % 256] = False
+            for pos in range(length,
+                             ((length + packing - 1) // packing) * packing):
+                strict_positions[table[i, pos // page_size],
+                                 pos % page_size] = False
         cache_valid = np.array_equal(observed[..., :576][strict_positions],
                                      flat_cache[..., :576][strict_positions])
         if not cache_ok:
-            observed = np.asarray(cache, np.float32).reshape(-1, 256, 640)
+            observed = np.asarray(cache,
+                                  np.float32).reshape(-1, page_size, 640)
             diff = np.argwhere(observed[..., :576] != flat_cache[..., :576])
             counts = {}
             examples = []
             for page, offset, channel in diff:
                 seq = (int(page) - 1) // stride
-                pos = ((int(page) - 1) % stride) * 256 + int(offset)
+                pos = ((int(page) - 1) % stride) * page_size + int(offset)
                 if page == 0:
                     kind = "null_page"
                 elif pos < lengths[seq] - window:
@@ -150,7 +162,8 @@ def child(case, tile):
                   flush=True)
         # Read the written window as PREFIX in the next verify, instead
         # of overwriting it again. Compare against the canonical cache.
-        next_lens = jnp.asarray([n + window for n in lengths] + [0] * (32 - c),
+        next_lens = jnp.asarray([n + window
+                                 for n in lengths] + [0] * (max_seqs - c),
                                 jnp.int32)
 
         def readback(kv):
@@ -164,14 +177,15 @@ def child(case, tile):
                 page_indices=ids,
                 cu_q_lens=cu,
                 distribution=distribution,
-                num_kv_pages_per_block=(3, 1, pages),
+                num_kv_pages_per_block=(pages if window == 1 else 3, 1, pages),
                 num_queries_per_block=(1, 16, bq),
-                mixed_q_split=split,
+                mixed_q_split=split if window != 1 else 1,
+                decode_batch_size=split if window == 1 else 1,
                 vmem_limit_bytes=60 * 1024 * 1024,
                 s_dtype=jnp.bfloat16,
                 p_same_dtype_as_v=True)
 
-        golden_cache = jnp.asarray(expected_cache, jnp.bfloat16)
+        golden_cache = jnp.asarray(expected_cache, kv_dtype)
         # The MLA entrypoint donates cache_kv. Keep the original state alive
         # for timing; the readback probe owns a separate device allocation.
         probe_cache = cache.copy()
@@ -234,12 +248,25 @@ def child(case, tile):
                  status="success",
                  variant=str(tile),
                  timing="host_dispatch_plus_synchronized_kernel",
-                 kv_dtype="bfloat16",
-                 page_size=256,
+                 kv_dtype=dtype_name,
+                 page_size=page_size,
                  heads=3,
-                 max_num_seqs=32,
-                 pages_per_seq=128))
+                 max_num_seqs=max_seqs,
+                 pages_per_seq=pages_per_seq))
     return rows
+
+
+def candidate_tiles(window):
+    if window == 1:
+        # Match serving fallback, then vary page tile and decode batch.
+        baseline = (1, 3, 4)
+        return [baseline] + [(1, pages, batch) for pages in (1, 2, 3, 4, 8, 16)
+                             for batch in (1, 2, 4, 8)
+                             if (1, pages, batch) != baseline]
+    return [(16, 1, 1)] + [
+        t for t in itertools.product((8, 16, 32), (1, 2, 4), (1, ))
+        if t != (16, 1, 1)
+    ] + [(16, 2, 2), (32, 4, 2), (48, 4, 3)]
 
 
 def main():
@@ -254,15 +281,16 @@ def main():
         return
     root = args.output
     root.mkdir(parents=True, exist_ok=True)
-    buckets = [8, 16, 32, 48, 64, 96, 128, 192, 256, 512]
-    # Include the production fallback (BQ16, BKVP1, split1) as baseline.
-    tiles = [(16, 1, 1)] + [
-        t for t in itertools.product((8, 16, 32), (1, 2, 4), (1, ))
-        if t != (16, 1, 1)
-    ] + [(16, 2, 2), (32, 4, 2), (48, 4, 3)]
+    buckets = json.loads(
+        os.getenv("TUNER_BUCKETS", "[8,16,32,48,64,96,128,192,256,512]"))
+    windows = json.loads(os.getenv("TUNER_WINDOWS", "[6,8]"))
+    concurrencies = json.loads(
+        os.getenv("TUNER_CONCURRENCIES", "[1,2,4,8,16,32]"))
     all_rows = []
-    for window in (6, 8):
-        for c in (1, 2, 4, 8, 16, 32):
+    for window in windows:
+        tiles = candidate_tiles(window)
+        baseline_tile = tiles[0]
+        for c in concurrencies:
             tokens = next(t for t in buckets if t >= c * window)
             for tile in tiles:
                 path = root / f"w{window}-c{c}-tile{'-'.join(map(str, tile))}.json"
@@ -292,12 +320,14 @@ def main():
                         out.write(json.dumps(row) + "\n")
                         print("TUNE_RESULT", json.dumps(row), flush=True)
                 all_rows.extend(rows)
-                if tile == (16, 1, 1) and any(r["status"] != "success"
-                                              for r in rows):
+                if tile == baseline_tile and any(r["status"] != "success"
+                                                 for r in rows):
                     raise RuntimeError("Baseline failed; stop before tuning")
     winners = []
-    for window in (6, 8):
-        for c in (1, 2, 4, 8, 16, 32):
+    for window in windows:
+        tiles = candidate_tiles(window)
+        baseline_tile = tiles[0]
+        for c in concurrencies:
             valid = [
                 r for r in all_rows if r["status"] == "success"
                 and r["verify_tokens"] == window and r["concurrency"] == c
@@ -312,10 +342,10 @@ def main():
                     ranked.append((statistics.fmean(r["latency_ms"]
                                                     for r in subset), tile))
             ranked.sort()
-            if not ranked or not any(t == (16, 1, 1) for _, t in ranked):
+            if not ranked or not any(t == baseline_tile for _, t in ranked):
                 raise RuntimeError(
                     f"missing valid baseline/candidate: {window=} {c=}")
-            baseline = next(ms for ms, t in ranked if t == (16, 1, 1))
+            baseline = next(ms for ms, t in ranked if t == baseline_tile)
             winners.append(
                 dict(verify_tokens=window,
                      concurrency=c,
@@ -328,8 +358,8 @@ def main():
     for winner in winners:
         c, window = winner["concurrency"], winner["verify_tokens"]
         tokens = next(t for t in buckets if t >= c * window)
-        for variant, tile in (("baseline", (16, 1, 1)), ("candidate",
-                                                         winner["best_tile"])):
+        for variant, tile in (("baseline", candidate_tiles(window)[0]),
+                              ("candidate", winner["best_tile"])):
             trace_dir = root.parent / "profiling" / "xprof" / (
                 f"w{window}-c{c}-{variant}")
             env = dict(os.environ, TUNER_TRACE_DIR=str(trace_dir))
