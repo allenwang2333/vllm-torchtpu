@@ -1,0 +1,24 @@
+--- a/src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py
++++ b/src/vllm_torchtpu/layers/vllm/custom_ops/mla_attention_op.py
+@@ -116,7 +116,20 @@
+                 compression_ratio=1,
+                 # The following parameters are tuned based on microbenchmark
+                 # results.
+-                num_kv_pages_per_block=(2, 2, 2),
++                #
++                # Slot order is (DECODE, PREFILL, MIXED) -- see MlaCase in
++                # streamindex_topk.py:49 and the three call sites at
++                # streamindex_topk.py:765/783/801, which read slots [0], [0]
++                # and [2].  Slot 1 is read by no invocation that executes for
++                # GLM-5.2 (mla_attention_op.py:183 builds distribution so the
++                # PREFILL-only band spans zero sequences), but it DOES take
++                # part in the `max` that sets num_sublanes_total
++                # (streamindex_topk.py:603-605), because one scores buffer
++                # serves all three launches.  Raising it can therefore only
++                # widen that buffer, for a band that never runs -- so it is
++                # pinned at the minimum rather than carried along with the
++                # other two.
++                num_kv_pages_per_block=(4, 2, 4),
+                 num_queries_per_block=(1, 128, 128),
+                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+             )
