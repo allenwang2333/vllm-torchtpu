@@ -18,7 +18,12 @@ from pathlib import Path
 
 @contextlib.contextmanager
 def trace_kernel(directory, backend):
-    if backend == "torch_tpu":
+    if backend == "libtpu":
+        from k3_libtpu_profiler import trace
+
+        with trace(directory):
+            yield
+    elif backend == "torch_tpu":
         from torch_tpu._internal.profiler import _impl
 
         _impl.start_trace(directory, worker_rank="rank0")
