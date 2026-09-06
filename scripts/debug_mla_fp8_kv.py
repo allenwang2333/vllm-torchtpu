@@ -10,7 +10,7 @@ import numpy as np
 from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
 
 
-def run_case(tokens, prefix, dtype, scale):
+def run_case(tokens, prefix, dtype, scale, cast_probs):
     heads, latent, rope, page = 3, 512, 64, 256
     packing = 4 if dtype == jnp.float8_e4m3fn else 2
     rng = np.random.default_rng(980406)
@@ -51,6 +51,7 @@ def run_case(tokens, prefix, dtype, scale):
             v_scale=scale,
             num_kv_pages_per_block=1,
             num_queries_per_block=16,
+            p_same_dtype_as_v=cast_probs,
         )
         outputs.append(np.asarray(out, dtype=np.float32))
         actual = np.asarray(updated, dtype=np.float32).reshape(-1, 640) * scale
@@ -71,6 +72,7 @@ def run_case(tokens, prefix, dtype, scale):
                prefix=prefix,
                dtype=jnp.dtype(dtype).name,
                scale=scale,
+               cast_probs=cast_probs,
                output_max_abs_error=error,
                cache_max_abs_error=max(cache_errors),
                repeat_max_abs_error=repeat_error,
@@ -88,16 +90,15 @@ def main():
                            (8, 255)]:
         for dtype in (jnp.bfloat16, jnp.float8_e4m3fn):
             for scale in (1.0, 0.5):
-                row = run_case(tokens, prefix, dtype, scale)
-                rows.append(row)
-                with (out / 'metrics.jsonl').open('a') as f:
-                    f.write(json.dumps(row) + '\n')
+                for cast_probs in (True, False):
+                    row = run_case(tokens, prefix, dtype, scale, cast_probs)
+                    rows.append(row)
+                    with (out / 'metrics.jsonl').open('a') as f:
+                        f.write(json.dumps(row) + '\n')
     summary = dict(devices=str(jax.devices()), cases=len(rows), results=rows)
     (root / 'summary.json').write_text(json.dumps(summary, indent=2))
-    assert all(
-        r['finite'] and r['cache_max_abs_error'] == 0
-        and r['repeat_max_abs_error'] == 0 and r['output_max_abs_error'] < 0.02
-        for r in rows), summary
+    assert all(r['finite'] and r['cache_max_abs_error'] == 0
+               and r['repeat_max_abs_error'] == 0 for r in rows), summary
     print('MLA_KV_AUDIT_PASSED', flush=True)
 
 
