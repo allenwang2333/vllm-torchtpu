@@ -1,0 +1,280 @@
+--- src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py	2026-09-06 00:06:23.669822492 +0000
++++ kernel_work/streamindex_topk/variants/narrow-record/streamindex_topk_narrow.py	2026-09-06 02:42:49.725304495 +0000
+@@ -11,7 +11,43 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-"""TPU-Friendly StreamIndex Top-K kernel."""
++"""TPU-Friendly StreamIndex Top-K kernel -- VARIANT A, "Narrow Record".
++
++Step-3 variant of `measurement_and_design.md` section 3 (Option A). The ONLY
++change against `src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py` is
++the *format of the compressed-KV cache* and the reads that consume it. The
++arithmetic, the loop nest, the grid, the block sizes and the store are
++untouched, so this variant is bit-exact against the incumbent by construction.
++
++The format
++----------
++Incumbent, one array:
++
++    cache_kv  u8[num_pages, page_size//kv_packing, kv_packing, 256]
++              byte   0..127  the 128 fp8 (e4m3) key values
++              byte     128   the single e8m0 block scale
++              byte 129..255  padding -- never read, always transferred
++
++Variant, two arrays:
++
++    cache_val    u8[num_pages, page_size//kv_packing, kv_packing, 128]
++                 the 128 fp8 key values, and nothing else
++    cache_scale  u8[num_pages, page_size]
++                 the e8m0 scale for position `p` of page `g` at [g, p]
++
++129 used bytes per compressed position instead of 256, so the indexer read of
++this array falls by 49.6%. The scale plane is stored LANE-MAJOR (a whole page
++of 1024 scales along the minor axis) so that the in-VMEM `[bkv_sz, 1] -> [1,
++bkv_sz]` transpose the incumbent pays inside `load_bkv` disappears: the DMA
++lands the scales in exactly the layout `compute_scores` multiplies by.
++
++`cache_kv` is passed as a two-tuple `(cache_val, cache_scale)` so that the
++public signature -- and therefore the read-only instruments -- is unchanged.
++
++The writer side is NOT implemented here. Producing this format is a change to
++`mla_attention_op.py:103-104` and to the cache allocator; its cost is measured
++separately by `writer_probe.py` and reported as its own, un-netted number.
++"""
+ 
+ import enum
+ import functools
+@@ -73,16 +109,18 @@
+     # Input
+     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
+     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
+-    cache_kv_hbm_ref,  # Shape: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim], Memory: HBM
++    cache_kv_hbm_ref,  # Shape: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim=128], Memory: HBM
++    cache_scale_hbm_ref,  # Shape: [total_num_pages, page_size], Memory: HBM
+     scores_in_hbm_ref,  # Shape: [max_num_tokens, num_sublanes_total, 128], Memory: HBM (aliased to output)
+     # Output
+     scores_hbm_ref,  # Shape: [max_num_tokens, num_sublanes_total, 128], Memory: HBM
+     # Scratch
+-    bkv_x2_ref,  # Shape: [2, seq_batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim], Memory: VMEM
++    bkv_x2_ref,  # Shape: [2, seq_batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim=128], Memory: VMEM
++    bkv_scale_x2_ref,  # Shape: [2, seq_batch_size, 1, bkv_sz], Memory: VMEM
+     bq_x2_ref,  # Shape: [2, seq_batch_size, bq_sz, num_q_heads, head_dim], Memory: VMEM
+     bq_weights_x2_ref,  # Shape: [2, seq_batch_size, bq_sz, num_q_heads], Memory: VMEM
+     scores_block_x2_ref,  # Shape: [2, seq_batch_size * bq_sz, num_sublanes_bkv, 128], Memory: VMEM
+-    sems,  # Shape: [4, 2, seq_batch_size], Memory: Semaphore
++    sems,  # Shape: [5, 2, seq_batch_size], Memory: Semaphore
+     *,
+     compression_ratio: int,
+     static_q_len: int,
+@@ -103,6 +141,7 @@
+ 
+     pages_per_seq = num_page_indices // max_num_seqs
+ 
++    page_size = page_size_per_kv_packing * kv_packing
+     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
+     bkv_sz = bkv_sz_per_kv_packing * kv_packing
+     num_sublanes_bkv = bkv_sz // 128
+@@ -167,7 +206,9 @@
+ 
+         for batch_idx in range(seq_batch_size):
+             sem = sems.at[0, bkv_sem_idx, batch_idx]
++            scale_sem = sems.at[4, bkv_sem_idx, batch_idx]
+             bkv_vmem_ref = bkv_x2_ref.at[bkv_sem_idx, batch_idx]
++            bkv_scale_vmem_ref = bkv_scale_x2_ref.at[bkv_sem_idx, batch_idx]
+ 
+             kv_p_start = bkv_idx * bkv_p
+             page_indices_offset = (seq_idx +
+@@ -178,8 +219,9 @@
+                     sz_per_kv_packing = page_size_per_kv_packing
+                     page_idx = jnp.minimum(page_indices_offset + i,
+                                            num_page_indices - 1)
++                    raw_page = page_indices_ref[page_idx]
+                     safe_page_offset = jnp.minimum(
+-                        page_indices_ref[page_idx] * page_size_per_kv_packing,
++                        raw_page * page_size_per_kv_packing,
+                         jnp.maximum(0,
+                                     max_hbm_pages - page_size_per_kv_packing),
+                     )
+@@ -192,10 +234,28 @@
+                         sem,
+                         wait=False,
+                     )
++
++                    # NARROW RECORD: the scale plane is a second, 128x smaller
++                    # array. One DMA per page lands page `i`'s 1024 scales at
++                    # lane offset i*page_size of a [1, bkv_sz] VMEM row --
++                    # already the layout `compute_scores` wants, so no
++                    # transpose is needed on the compute side.
++                    safe_scale_page = jnp.minimum(
++                        jnp.maximum(raw_page, 0), total_num_pages - 1)
++                    _async_copy(
++                        cache_scale_hbm_ref.at[pl.ds(safe_scale_page, 1)],
++                        bkv_scale_vmem_ref.at[pl.ds(0, 1),
++                                              pl.ds(i * page_size, page_size)],
++                        scale_sem,
++                        wait=False,
++                    )
+             else:
+                 dma_bkv_sz = bkv_p * page_size_per_kv_packing
+                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
+                 _async_copy(src=dst_kv, dst=dst_kv, sem=sem, wait=True)
++                dst_sc = bkv_scale_vmem_ref.at[pl.ds(0, 1),
++                                               pl.ds(0, bkv_p * page_size)]
++                _async_copy(src=dst_sc, dst=dst_sc, sem=scale_sem, wait=True)
+ 
+     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
+         for batch_idx in range(seq_batch_size):
+@@ -261,11 +321,14 @@
+             bkv = bkv_x2_ref.at[bkv_sem_idx,
+                                 batch_idx, :bkv_sz_per_kv_packing][...]
+ 
++            # NARROW RECORD: the DMA landed exactly the 128 value bytes, so
++            # there is no slice-and-recombine here any more. The `[:, :128]`
++            # slice and the `[:, 128:129].T` transpose both disappear.
+             flat_bkv = bkv.reshape(-1, bkv.shape[-1])
+-            fp8_val = flat_bkv[:, :head_dim]
+-            fp8_val = pltpu.bitcast(fp8_val, jnp.float8_e4m3fn)
+-            scale_val = pltpu.bitcast(flat_bkv[:, head_dim:head_dim + 1].T,
+-                                      jnp.float8_e8m0fnu).astype(jnp.bfloat16)
++            fp8_val = pltpu.bitcast(flat_bkv, jnp.float8_e4m3fn)
++            raw_scale = bkv_scale_x2_ref.at[bkv_sem_idx, batch_idx][...]
++            scale_val = pltpu.bitcast(
++                raw_scale, jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+ 
+             bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
+             bkv_scales.append(scale_val)
+@@ -521,8 +584,8 @@
+ def streamindex_topk(
+     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
+     indexer_weights: jax.Array,  # [max_num_tokens, actual_num_q_heads]
+-    cache_kv: jax.
+-    Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, head_dim]
++    cache_kv: tuple,  # (u8[num_pages, page_size//kv_packing, kv_packing, 128],
++    #                  u8[num_pages, page_size])
+     seq_lens: jax.Array,  # i32[max_num_seqs]
+     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+@@ -541,7 +604,7 @@
+   Args:
+     q: concatenated all sequences' queries.
+     indexer_weights: concatenated all sequences' indexer weights.
+-    cache_kv: the current kv cache.
++    cache_kv: the current kv cache, as the two-tuple (values, scales).
+     seq_lens: the length of each sequence in the kv cache (uncompressed).
+     page_indices: flattened page indices look-up table by (seq_id, page_id).
+     cu_q_lens: the cumulative sum of the effective query lengths. Similar to
+@@ -563,8 +626,8 @@
+   Returns:
+     Top-K indices (in compressed space).
+   """
+-    # Scale factors for the FP8 index cache format are packed directly inside
+-    # `cache_kv` along the width dimension, keeping HBM transactions fused.
++    # NARROW RECORD: scale factors live in their OWN array, not inside the
++    # value record. That is the whole change; see the module docstring.
+ 
+     if num_kv_pages_per_block is None or num_queries_per_block is None:
+         raise ValueError(
+@@ -588,8 +651,13 @@
+     prepared_indexer_weights = prepare_index_weights(indexer_weights,
+                                                      original_dtype)
+     q = prepare_q_inputs(q)
+-    lkv_dim = cache_kv.shape[-1]
+-    _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
++    # NARROW RECORD: `cache_kv` arrives as the two-tuple
++    #   (u8[num_pages, page_size//kv_packing, kv_packing, 128],
++    #    u8[num_pages, page_size])
++    # so that the public signature is unchanged.
++    cache_val, cache_scale = cache_kv
++    lkv_dim = cache_val.shape[-1]
++    _, page_size_per_kv_packing, kv_packing, _ = cache_val.shape
+     page_size = page_size_per_kv_packing * kv_packing
+     pages_per_seq = page_indices.shape[0] // max_num_seqs
+ 
+@@ -608,6 +676,7 @@
+         q,
+         prepared_indexer_weights,
+         cache_kv,
++        cache_scale,
+         scores_init,
+         seq_lens,
+         page_indices,
+@@ -645,7 +714,8 @@
+         in_specs = [
+             pl.BlockSpec(memory_space=pltpu.HBM),  # q
+             pl.BlockSpec(memory_space=pltpu.HBM),  # prepared_indexer_weights
+-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
++            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv (values only)
++            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_scale
+             pl.BlockSpec(
+                 memory_space=pltpu.HBM),  # scores_init (aliased to out)
+         ]
+@@ -683,12 +753,20 @@
+         bo_scores_double_buf = pltpu.VMEM(
+             (2, seq_batch_size * bq_sz, num_sublanes_bkv, 128), out_dtype)
+ 
++        # NARROW RECORD: one extra, tiny double buffer for the scale plane,
++        # laid out [2, seq_batch_size, 1, bkv_sz] so it is already lane-major.
++        bkv_scale_double_buf = pltpu.VMEM(
++            (2, seq_batch_size, 1, bkv_sz),
++            cache_scale.dtype,
++        )
++
+         scratch_shapes = [
+             bkv_double_buf,
++            bkv_scale_double_buf,
+             bq_double_bufq,
+             bq_weights_double_buf,
+             bo_scores_double_buf,
+-            pltpu.SemaphoreType.DMA((4, 2, seq_batch_size)),
++            pltpu.SemaphoreType.DMA((5, 2, seq_batch_size)),
+         ]
+ 
+         scalar_prefetches = (
+@@ -726,7 +804,7 @@
+                 shape=(q.shape[0], num_sublanes_total, 128),
+                 dtype=out_dtype,
+             ),
+-            input_output_aliases={len(scalar_prefetches) + 3: 0},
++            input_output_aliases={len(scalar_prefetches) + 4: 0},
+             name=scope_name,
+         ))
+         return pallas_kernel(
+@@ -734,6 +812,7 @@
+             q,
+             prepared_indexer_weights,
+             cache_kv,
++            cache_scale,
+             scores_init,
+         )
+ 
+@@ -757,7 +836,8 @@
+         scores = run_scores_kernel(
+             q,
+             prepared_indexer_weights,
+-            cache_kv,
++            cache_val,
++            cache_scale,
+             scores_init,
+             seq_lens,
+             page_indices,
+@@ -775,7 +855,8 @@
+         scores = run_scores_kernel(
+             q,
+             prepared_indexer_weights,
+-            cache_kv,
++            cache_val,
++            cache_scale,
+             scores,
+             seq_lens,
+             page_indices,
+@@ -793,7 +874,8 @@
+         scores = run_scores_kernel(
+             q,
+             prepared_indexer_weights,
+-            cache_kv,
++            cache_val,
++            cache_scale,
+             scores,
+             seq_lens,
+             page_indices,
