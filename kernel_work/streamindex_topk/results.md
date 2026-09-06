@@ -529,16 +529,91 @@ Two things A1 hands forward, both cheap and both now scheduled:
 
 ---
 
+## 5e. Option C — Half-Width Key: **do not build.** The accuracy objection dissolves; the perf case does not
+
+`j-ec4de538-453c-4956-b523`, `JobStatus = Succeeded`. Commit `19af7bc5`. Negative is faster.
+`bf16out` is C's TensorCore half only; `cast` isolates the widen C would *not* pay, and is the
+instrument that prices C's ceiling.
+
+| regime | scores MB | incumbent ms (sp%) | `bf16out` ms (sp%) | Δ time % | speedup × |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `decode_prod` | 2.6 | 0.16760 (0.43) | 0.17134 (0.61) | +2.23 | 0.978 |
+| `decode_64k` | 1.6 | 0.20059 (0.76) | 0.20242 (0.70) | +0.91 | 0.991 |
+| `mixed_prod` | 41.9 | 0.67109 (1.93) | 0.70419 (2.44) | +4.93 | 0.953 |
+| `mixed_64k` | 276.8 | 4.78892 (1.07) | 4.84624 (1.18) | +1.20 | 0.988 |
+
+**Every arm is slower.** §7.5 predicted exactly this: under the confirmed VPU hypothesis a 16-bit key
+adds a VPU-side encode on the unit that is already the bottleneck, so C spends time on the critical
+path to save bytes off it.
+
+**C's ceiling, priced against a measured rate.** The `mixed_64k` cast arm is genuinely
+bandwidth-bound — 415.2 MB / 0.16817 ms = **2.469 TB/s measured**. Dividing the bytes C removes by
+that rate gives a best case of **0.63% / 0.33% / 2.53% / 2.34%** across the four regimes, and that
+ceiling charges nothing for the pack/unpack C would have to add. An independent decomposition at
+`mixed_64k` gives 2.3% ± 1.6%, agreeing with the ceiling rather than sharpening it. The decode cast
+arms are *not* bandwidth-bound (0.07–0.10 TB/s, a fixed ≈36 µs dispatch floor — hence their 11–18%
+spreads), so the decomposition is correctly reported only at `mixed_64k`.
+
+So C's entire prize is ≤ 2.5% and its measured cost is +1.2 to +4.9%. There is no version of the
+bucket arithmetic that rescues that.
+
+### The accuracy objection was wrong, and the finding outlives the option
+
+Step 2 held that a 16-bit key would cost rank quality. Measured (`j-7f77a816-5968-4ebd-80c3`), the
+choice of 16-bit format decides it entirely, and **fp16 is not bf16**:
+
+| format | `decode_64k` worst_rank / min_recall | mean index-set movement vs f32 (of k=2048) |
+| --- | --- | --- |
+| f32 (incumbent) | 2105 / 0.99512 | — |
+| bf16 | **2170 / 0.99170** | 9.2 |
+| **f16p** | **2105 / 0.99512** | **1.0 (0.049%), max 3** |
+| m4 (negative control) | **FAIL** 2577 / 0.94482 | 53.7 |
+
+bf16 passes but eats **two thirds of the recall margin** at `decode_64k` (0.00512 → 0.00170 above the
+0.99 floor). fp16 with its 10 mantissa bits is indistinguishable from f32 everywhere. The control
+fired on every arm. Range was checked rather than assumed — `max|s| = 209.91`, zero overflow, zero
+subnormal — though that is a property of the instrument's synthetic inputs, not of production
+weights, which is why the recommendation stays the precision-only key with the f32 exponent retained.
+
+**This is a `references/` promotion, not a C result:** for a key that feeds a top-k, 16 bits is fine
+and the mantissa is what matters. Any future option narrowing this key should use fp16 and should
+not re-litigate the accuracy question.
+
+### Three things C hands forward
+
+1. **A second, independent `sparsecore_topk` test** (`j-9d6276c2-8eaa-4dc6-9bef`, 28 pass / 0 fail,
+   `p ∈ [1,2,4,8,32]`, five corruptions all caught). B built one too (§5c). The carried precondition
+   is now covered **twice over by two independent implementations that agree** — worth landing
+   regardless of C, and worth consolidating rather than shipping both.
+2. **Two invalidated jobs whose causes are platform facts**, both now guarded by loud controls and
+   both `references/` material: the jaxpr memo in `jax._src.linear_util` **survives
+   `f.clear_cache()`** and needs `jax.clear_caches()`; and **`--xla_allow_excess_precision` defaults
+   true**, which silently deletes a bf16 round trip — narrowing has to be integer bit-masking. Any
+   precision experiment on this stack that does neither is measuring nothing, quietly.
+3. **An independent confirmation of the VPU hypothesis.** The scores buffer is at most ≈4.8% of the
+   `mixed_64k` kernel by the most generous accounting, so 95% of the mixed band is not scores
+   traffic. C's agent did not run the strike test and correctly declined to claim the inference.
+
+### A cross-job check on the incumbent, which nobody set out to run
+
+Three variant jobs measured the untouched incumbent at `mixed_64k` in three separate sessions:
+**4.78415** (E, `j-ce9a19a4`), **4.78598** (B, `j-d9502595`), **4.78892** (C, `j-ec4de538`). Spread
+across jobs is **0.10%**, well inside every arm's within-job spread. The baseline is stable across
+jobs, which is what licenses comparing a delta measured in one job against a delta measured in
+another — an assumption this document has been making since §1 without evidence. It now has some.
+
+---
+
 ## 6. Ranking as it stands
 
-Not final — C, F and A's reader retry are in flight.
+Not final — F and A's reader retry are in flight.
 
 | rank | option | standing | why it moved from step 2 |
 | ---: | --- | --- | --- |
 | **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Strongest correctness evidence in the exercise. |
 | **2** | **A — Narrow Record** | **writer measured, reader blocked; retry in flight** | its blocking `unmodelled` term came back a **win** (3.406×), not a cost (§5b). Design doc §9.1's "A moves to rank 1 outright" is earned on that term alone — but it is contingent entirely on the reader compiling, and B is not contingent on anything. |
 | **3** | **E — Retune** | **measured** | fell from joint rank 1. Net at the A/B is −0.84% to +0.90%, sign unresolved (§1.3). |
-| **4** | **C — Half-Width Key** | in flight | §7.5 predicts the confirmed VPU result makes C *actively worse*, since a 16-bit key adds a VPU-side encode on the bottleneck unit. |
+| **4** | **C — Half-Width Key** | **dead** | measured **slower at all four regimes** (+0.91 to +4.93%) against a ceiling of ≤ 2.53% (§5e). §7.5's prediction held exactly. Its accuracy objection dissolved — fp16 is free — but the perf case never existed. |
 | **5** | **D — No Round Trip** | **dead** | priced at 8.96× its threshold (§3). Not built. |
 | **6** | **A1 — Drop the ReLU** | **dead** | gate failed on all five regimes, worst at long context (§5d). Ruled out at the idealised limit, so no kernel exists that rescues it. A3 fallback also rejected. Not in step 2. |
 | **?** | **F — MXU head sum** | in flight | targets the 52.5% head-sum bundle; **exact**, and A1's failure does not touch it — A1 died as a ranker, not on the reassociation F uses. Not in step 2. |
