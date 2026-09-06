@@ -41,7 +41,8 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    static_kv_len_bucket, streamindex_topk)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
@@ -68,6 +69,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
+        # RIGHT-SIZE. One static bucket for the whole deployment, resolved
+        # HERE, at op-build time, and closed over by the traced function below
+        # so it never appears in the op's signature. It must not vary per step:
+        # the backbone is Dynamo-traced once with guards dropped, so a Python
+        # int reaching the custom op freezes at its first-traced value.
+        # `self.max_model_len` is `SparseAttnIndexer.__init__`'s parameter,
+        # which upstream fills from `vllm_config.model_config.max_model_len`,
+        # and it is set by the `super().__init__` above.
+        kv_len_bucket = static_kv_len_bucket(self.max_model_len)
 
         def _streamidx_topk_jax(
                 q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -116,9 +126,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 # The following parameters are tuned based on microbenchmark
                 # results.
-                num_kv_pages_per_block=(2, 2, 2),
+                num_kv_pages_per_block=(4, 2, 4),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                # `compression_ratio` is 1 above, so `max_model_len` bounds
+                # `max(seq_lens) // compression_ratio` directly.
+                kv_len_bucket=kv_len_bucket,
             )
             return cache_kv, topk_indices
 
