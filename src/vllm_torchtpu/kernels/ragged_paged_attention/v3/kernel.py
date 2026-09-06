@@ -462,12 +462,19 @@ def _ragged_paged_attention_kernel_loop(
 
         s = jnp.matmul(q, k.T,
                        preferred_element_type=jnp.float32).astype(out_dtype)
-        s *= sm_scale
-        if k_scale is not None:
-            s *= k_scale
-        if q_scale is not None:
-            s *= q_scale
-        if soft_cap is not None:
+        if soft_cap is None:
+            total_scale_log2 = sm_scale * 1.4426950408889634
+            if k_scale is not None:
+                total_scale_log2 *= k_scale
+            if q_scale is not None:
+                total_scale_log2 *= q_scale
+            s *= total_scale_log2
+        else:
+            s *= sm_scale
+            if k_scale is not None:
+                s *= k_scale
+            if q_scale is not None:
+                s *= q_scale
             s = soft_cap * jnp.tanh(s / soft_cap)
 
         max_kv_len = pages_per_seq * page_size
@@ -504,12 +511,17 @@ def _ragged_paged_attention_kernel_loop(
         m_prev = m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr
-        # Shift m_curr by -ln(256.0) so p is scaled by 256.0 for FP8 precision with 0 VPU mul overhead
-        m_shifted = m_curr - 5.54517744 if v.dtype == jnp.float8_e4m3fn else m_curr
-        p = jnp.exp(s - broadcast_minor(m_shifted, s.shape))
+        if soft_cap is None:
+            # s is in base-2 log scale: shift m_curr by -log2(256.0) = -8.0 and use hardware exp2 (1 VPU instruction)
+            m_shifted = m_curr - 8.0 if v.dtype == jnp.float8_e4m3fn else m_curr
+            p = jax.lax.exp2(s - broadcast_minor(m_shifted, s.shape))
+            exp_m_diff = jax.lax.exp2(m_prev - m_curr)
+        else:
+            m_shifted = m_curr - 5.54517744 if v.dtype == jnp.float8_e4m3fn else m_curr
+            p = jnp.exp(s - broadcast_minor(m_shifted, s.shape))
+            exp_m_diff = jnp.exp(m_prev - m_curr)
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
         l_prev = l_ref[...]
         l_ref[...] = exp_m_diff * l_prev + p_rowsum
 
