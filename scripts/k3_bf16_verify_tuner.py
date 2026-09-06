@@ -163,11 +163,7 @@ def child(case, tile):
                   flush=True)
         # Read the written window as PREFIX in the next verify, instead
         # of overwriting it again. Compare against the canonical cache.
-        next_lens = jnp.asarray([n + window
-                                 for n in lengths] + [0] * (max_seqs - c),
-                                jnp.int32)
-
-        def readback(kv):
+        def readback(kv, next_lens):
             return mla_ragged_paged_attention(
                 ql_nope=q,
                 q_pe=qr,
@@ -186,18 +182,24 @@ def child(case, tile):
                 s_dtype=jnp.bfloat16,
                 p_same_dtype_as_v=cast_probs)
 
-        golden_cache = jnp.asarray(expected_cache, kv_dtype)
-        # The MLA entrypoint donates cache_kv. Keep the original state alive
-        # for timing; the readback probe owns a separate device allocation.
-        probe_cache = cache.copy()
-        got_next, _ = readback(probe_cache)
-        want_next, _ = readback(golden_cache)
-        jax.block_until_ready((got_next, want_next))
-        next_error = float(
-            np.max(
-                np.abs(
-                    np.asarray(got_next, np.float32)[:, :c * window] -
-                    np.asarray(want_next, np.float32)[:, :c * window])))
+        readback_errors = {}
+        for advance in range(1, window + 1):
+            # Keep accepted prefix entries while replacing rejected suffixes.
+            next_lens = jnp.asarray([n + advance
+                                     for n in lengths] + [0] * (max_seqs - c),
+                                    jnp.int32)
+            golden_cache = jnp.asarray(expected_cache, kv_dtype)
+            # The kernel donates the probe, never the later timing buffer.
+            probe_cache = cache.copy()
+            got_next, _ = readback(probe_cache, next_lens)
+            want_next, _ = readback(golden_cache, next_lens)
+            jax.block_until_ready((got_next, want_next))
+            readback_errors[advance] = float(
+                np.max(
+                    np.abs(
+                        np.asarray(got_next, np.float32)[:, :c * window] -
+                        np.asarray(want_next, np.float32)[:, :c * window])))
+        next_error = float(np.max(list(readback_errors.values())))
         print("READBACK_DIAGNOSTIC",
               json.dumps(
                   dict(context=context,
@@ -246,6 +248,7 @@ def child(case, tile):
                  cache_exact=cache_ok,
                  cache_valid=cache_valid,
                  next_output_max_abs_error=next_error,
+                 readback_errors_by_advance=readback_errors,
                  status="success",
                  variant=str(tile),
                  timing="host_dispatch_plus_synchronized_kernel",
