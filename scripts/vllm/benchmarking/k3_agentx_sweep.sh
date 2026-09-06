@@ -142,6 +142,18 @@ fi
 
 server_alive() { curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null; }
 
+# Build 9 was cancelled and the exit-trap upload never ran: save every point as
+# soon as it is written, not only at exit.
+GCS_ROOT="gs://cuiq-inference-test/k3/agentx/${BUILDKITE_BUILD_NUMBER:-local}"
+save_now() {   # save_now <path> [<path>...]
+    command -v gsutil >/dev/null 2>&1 || return 0
+    for x in "$@"; do
+        [ -e "$x" ] || continue
+        gsutil -q -m cp -r "$x" "$GCS_ROOT/$(basename "$RESULTS_DIR")/" 2>&1 | tail -2 || echo "[k3-sweep] WARNING: upload of $x failed"
+    done
+    echo "[k3-sweep] saved to $GCS_ROOT/$(basename "$RESULTS_DIR")/: $*"
+}
+
 # Engine drain between points: vllm:num_requests_running + waiting == 0, 3 polls.
 wait_server_idle() {
     local timeout="${AIPERF_DRAIN_TIMEOUT_SECONDS:-1800}" t0 idle=0 n
@@ -208,6 +220,7 @@ for f in glob.glob(sys.argv[1] + "/**/results_*.json", recursive=True):
     r = next(iter(json.load(open(f))["results"].values()), {})
     print("[k3-sweep] GSM8K:", {k: round(v, 4) for k, v in r.items() if isinstance(v, (int, float)) and "exact_match" in k})
 PYEOF
+    save_now "$EVAL_DIR" "$RESULTS_DIR/server.log" "$RESULTS_DIR/config.json"
     wait_server_idle
 fi
 
@@ -266,6 +279,7 @@ for idx in "${!CONCS[@]}"; do
     kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null
     pkill -KILL -f "aiperf profile" 2>/dev/null   # never leave a client behind between points
     echo "[k3-sweep] conc $c: replay+aggregate rc=$rc wall=$(( $(date +%s) - T0 )) s"
+    save_now "$RESULT_DIR" "$AGENTIC_OUTPUT_DIR/$RESULT_FILENAME.json" "$RESULTS_DIR/server.log"
     DONE_CONCS+=("$c")
     if [ "$idx" -lt $(( ${#CONCS[@]} - 1 )) ]; then wait_server_idle; fi
 done
