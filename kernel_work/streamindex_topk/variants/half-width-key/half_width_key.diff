@@ -1,0 +1,17 @@
+This is the diff of the arm that was MEASURED (`impl_bf16out.py`), which is
+option C's TensorCore half only. Option C itself was not built -- see
+RESULTS.md "What was not built and why". Do not mistake this one-liner for C:
+on its own it moves MORE bytes than the incumbent, not fewer, and it is a
+price probe, not a candidate.
+
+`impl_bf16out.py` applies this substitution to the installed source at import
+time via `_load.py`, which asserts the anchor matches exactly once, so the arm
+tracks HEAD instead of a frozen copy. Line numbers below are from
+streamindex_topk.py at HEAD 950974c2 (866 lines).
+
+--- a/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py
++++ b/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py
+@@ -740,7 +740,7 @@
+     def _common_path(_):
+-        out_dtype = jnp.float32
++        out_dtype = jnp.bfloat16  # HALF-WIDTH KEY (option C, TC half)
