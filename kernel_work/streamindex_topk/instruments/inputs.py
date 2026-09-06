@@ -135,6 +135,7 @@ def build(regime: S.Regime, seed: int = 0, *, with_dequant: bool = False):
     if regime.phase == "decode":
         q_lens = np.ones(num_seqs, dtype=np.int32)
         num_decodes = num_seqs
+        active_seqs = num_seqs
     else:
         # One prefill sequence carrying the whole chunk. This is the shape the
         # profile shows (StreamIdxTC-m-bq_128-bkvp_2 at f8e4m3fn[1024,32,128]),
@@ -142,6 +143,7 @@ def build(regime: S.Regime, seed: int = 0, *, with_dequant: bool = False):
         q_lens = np.zeros(num_seqs, dtype=np.int32)
         q_lens[0] = num_tokens
         num_decodes = 0
+        active_seqs = 1
 
     seq_lens = np.full(num_seqs, regime.kv_len, dtype=np.int32)
     cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
@@ -149,8 +151,20 @@ def build(regime: S.Regime, seed: int = 0, *, with_dequant: bool = False):
     # contiguous block table would measure a DMA pattern that never occurs.
     block_table = rng.permutation(num_pages).reshape(num_seqs, pps)
     page_indices = block_table.reshape(-1).astype(np.int32)
-    # mla_attention_op.py:183 -- the prefill-only band is empty by construction.
-    distribution = np.array([num_decodes, num_decodes, num_seqs],
+    # `distribution` is [num_decodes, num_decodes, num_seqs_in_batch], and the
+    # third entry is the REAL sequence count, not the padded lane count -- the
+    # bands at streamindex_topk.py:755-808 are
+    #   DECODE batched   [0, floor(d[0]/4)*4)
+    #   DECODE remainder [floor(d[0]/4)*4, d[1])
+    #   MIXED            [d[1], d[2])
+    # so passing `num_seqs` here for a mixed batch would make MIXED loop over
+    # `num_seqs - 1` sequences with q_len == 0. Those are NOT free: `num_bq =
+    # max(1, cdiv(0, bq_sz))` is 1, so each empty sequence still runs a full
+    # sweep of `num_bkv` KV blocks. The first build of this file did exactly
+    # that and inflated mixed KV traffic 64-fold.
+    # mla_attention_op.py:183 -- the prefill-only band is empty by construction,
+    # entry [1] equals entry [0].
+    distribution = np.array([num_decodes, num_decodes, active_seqs],
                             dtype=np.int32)
 
     keys = rng.standard_normal(
