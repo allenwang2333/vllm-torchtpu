@@ -84,27 +84,32 @@ case "$SHARD" in
       --json "$OUT/partition_9216.json" || true
     ;;
   2)
-    echo "--- shard 2a CHANGED: format contract, mixed band, (2,2,2) prod ---"
+    # Everything here is at the PRODUCTION page_size 1024, so the scale plane
+    # is [num_pages, 8, 128] and the transposed-index-map negative control is
+    # expressible.  `num_pages` is chosen per tuple so that
+    # align_to(pages_per_seq, bkv_p) never runs off `page_indices`.
+    echo "--- shard 2a CHANGED: ps1024 DECODE, (2,2,2) -- slot 0 executes ---"
     python3 "$P/pf_format_contract.py" \
-      --page-size 128 --num-pages 8 --tokens 4 --heads 2 --k 128 \
-      --bkv-p 2,2,2 --json "$OUT/fmt_ps128_mixed_222.json"
+      --page-size 1024 --num-pages 4 --tokens 1 --heads 2 --k 512 --decode \
+      --bkv-p 2,2,2 --json "$OUT/fmt_ps1024_decode_222.json"
     rc=$?
-    echo "--- shard 2b CHANGED: DECODE band, (2,2,2) -- slot 0 executes ---"
-    python3 "$P/pf_format_contract.py" \
-      --page-size 128 --num-pages 8 --tokens 1 --heads 2 --k 128 --decode \
-      --bkv-p 2,2,2 --json "$OUT/fmt_ps128_decode_222.json"
-    rc=$(( rc + $? ))
-    echo "--- shard 2c CHANGED: DECODE band, (3,2,2) = THE SECOND CALL SITE ---"
+    echo "--- shard 2b CHANGED: ps1024 DECODE, (3,2,2) = SECOND CALL SITE ---"
     echo "--- deepseek_v4_indexer.py:94; never measured by the exercise    ---"
     python3 "$P/pf_format_contract.py" \
-      --page-size 128 --num-pages 9 --tokens 1 --heads 2 --k 128 --decode \
-      --bkv-p 3,2,2 --json "$OUT/fmt_ps128_decode_322.json"
+      --page-size 1024 --num-pages 6 --tokens 1 --heads 2 --k 512 --decode \
+      --bkv-p 3,2,2 --json "$OUT/fmt_ps1024_decode_322.json"
     rc=$(( rc + $? ))
-    echo "--- shard 2d CHANGED: DECODE band, (4,2,4) = Option E ---"
+    echo "--- shard 2c CHANGED: ps1024 DECODE, (4,2,4) = Option E ---"
+    python3 "$P/pf_format_contract.py" \
+      --page-size 1024 --num-pages 8 --tokens 1 --heads 2 --k 512 --decode \
+      --bkv-p 4,2,4 --json "$OUT/fmt_ps1024_decode_424.json"
+    rc=$(( rc + $? ))
+    echo "--- shard 2d DOMAIN PROBE (non-gating): page_size 128 ---"
+    echo "--- sc_rows == 1 there, so Option A's scale plane degenerates  ---"
     python3 "$P/pf_format_contract.py" \
       --page-size 128 --num-pages 8 --tokens 1 --heads 2 --k 128 --decode \
-      --bkv-p 4,2,4 --json "$OUT/fmt_ps128_decode_424.json"
-    rc=$(( rc + $? ))
+      --bkv-p 2,2,2 --json "$OUT/fmt_ps128_decode_222.json" || \
+      echo "shard2d: page_size 128 is OUTSIDE Option A's domain (non-gating)"
     ;;
   3)
     echo "--- shard 3a CHANGED: PRODUCTION page_size 1024, bucket == live ---"
@@ -121,7 +126,7 @@ case "$SHARD" in
     rc=$(( rc + $? ))
     echo "--- shard 3c CHANGED: ps 1024, bucket 65536, Option E (4,2,4) ---"
     python3 "$P/pf_format_contract.py" \
-      --page-size 1024 --num-pages 4 --tokens 2 --heads 2 --k 512 \
+      --page-size 1024 --num-pages 8 --tokens 2 --heads 2 --k 512 \
       --bkv-p 4,2,4 --bucket 65536 \
       --json "$OUT/fmt_ps1024_mixed_bucket65536_424.json"
     rc=$(( rc + $? ))

@@ -114,8 +114,12 @@ def build_case(seed, page_size, num_pages, T_seq, H_I, D, comp_ratio):
     q_fp8, scale = quantize_fp8_ue8m0(flat, 128)         # [N, D], [N]
     q_bytes = np.asarray(_to_byte_lane(q_fp8))           # u8[N, 128]
     scale_bytes = np.asarray(_to_byte_lane(scale.reshape(-1, 1)))  # u8[N, 1]
-    deq = (np.asarray(q_fp8).astype(np.float32) *
-           np.asarray(scale.astype(jnp.float32))[:, None])
+    # `scale` is [N, D // 128] == [N, 1]; broadcasting against q_fp8's [N, D]
+    # needs it left at rank 2, not promoted to rank 3.
+    sc_f32 = np.asarray(scale.astype(jnp.float32)).reshape(-1, 1)
+    assert sc_f32.shape == (N_TOTAL := q_bytes.shape[0], 1), sc_f32.shape
+    deq = np.asarray(q_fp8).astype(np.float32) * sc_f32
+    assert deq.shape == (N_TOTAL, D), deq.shape
     deq = deq.reshape(num_pages, page_size, D)
 
     N = num_pages * page_size
@@ -146,12 +150,32 @@ def build_case(seed, page_size, num_pages, T_seq, H_I, D, comp_ratio):
         # THE BUG: row-major transposed within the page.
         wrong[p, s % sc_rows, s // sc_rows] = scale_bytes[i, 0]
 
+    # One exponent step (a factor of two, since e8m0 is a bare exponent) on the
+    # first 64 scales.  A single byte would be a weak control: it has to move
+    # one position of `S_valid` across the top-k boundary to be seen at all.
     poison = good.copy()
-    # One exponent step on a single scale byte, at a position the oracle scores.
-    poison[0, 0, 3] = np.uint8((int(poison[0, 0, 3]) + 1) % 256)
+    n_pois = 0
+    for i in range(min(64, N)):
+        p, s = divmod(i, page_size)
+        poison[p, s // 128, s % 128] = np.uint8(
+            (int(good[p, s // 128, s % 128]) + 1) % 256)
+        n_pois += 1
+    print(f"  poisoned {n_pois} scale bytes (+1 exponent = x2)")
+
+    # At sc_rows == 1 the index map [p, s//128, s%128] and its transpose
+    # [p, s%1, s//1] are the SAME map, so `wrong` is not a perturbation at all.
+    # Say so, rather than let it be scored as a negative control that "passed":
+    # that would report HOLLOW for a reason about the probe's geometry rather
+    # than about the kernel.
+    wrong_degenerate = bool(np.array_equal(wrong, good))
+    if wrong_degenerate:
+        print(f"  NOTE: sc_rows={sc_rows}, so the transposed scale index map "
+              f"is identical to the correct one at this page_size; the "
+              f"wrong_map control is inexpressible here.")
 
     return dict(q=q, weights=weights, deq=deq, packed=packed, val=val,
                 scale_good=good, scale_wrong=wrong, scale_poison=poison,
+                wrong_degenerate=wrong_degenerate,
                 page_size=page_size, num_pages=num_pages,
                 comp_ratio=comp_ratio)
 
@@ -271,19 +295,22 @@ def main():
 
     ok_inc = out["arms"]["incumbent"]["matches_oracle"]
     ok_comp = out["arms"]["composed"]["matches_oracle"]
+    wrong_deg = c["wrong_degenerate"]
     neg_wrong = not out["arms"]["wrong_map"]["matches_oracle"]
     neg_pois = not out["arms"]["scale_poison"]["matches_oracle"]
+    out["wrong_map_degenerate"] = wrong_deg
 
     print()
     print(f"BASELINE  (incumbent vs oracle)   : {'PASS' if ok_inc else 'FAIL'}")
     print(f"CHANGED   (composed  vs oracle)   : "
           f"{'PASS' if ok_comp else 'FAIL'}")
     print(f"NEG CTRL  wrong scale index map   : "
-          f"{'FAILS as required' if neg_wrong else 'PASSED -- VACUOUS'}")
-    print(f"NEG CTRL  one poisoned scale byte : "
+          + ("N/A -- inexpressible at sc_rows==1" if wrong_deg else
+             ('FAILS as required' if neg_wrong else 'PASSED -- VACUOUS')))
+    print(f"NEG CTRL  poisoned scale bytes    : "
           f"{'FAILS as required' if neg_pois else 'PASSED -- VACUOUS'}")
 
-    discriminates = neg_wrong and neg_pois
+    discriminates = neg_pois and (wrong_deg or neg_wrong)
     out["baseline_pass"] = ok_inc
     out["changed_pass"] = ok_comp
     out["discriminates"] = discriminates
