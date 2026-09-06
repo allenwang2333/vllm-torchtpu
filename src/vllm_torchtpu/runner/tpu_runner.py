@@ -1229,6 +1229,8 @@ class TPUModelRunner(GPUModelRunner):
         backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
         layer_kv_cache_dtypes: dict[str, torch.dtype] = {}
+        logger.info("MIXED_KV_AUDIT unified=%s target_dtype=%s source=%s",
+                    self._unified_kv_layout, self.kv_cache_dtype, __file__)
 
         has_attention = any(
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
@@ -6527,6 +6529,15 @@ class TPUModelRunner(GPUModelRunner):
                     raise NotImplementedError
 
         self._add_shared_kv_cache_aliases(kv_caches)
+
+        for layer_name, cache in kv_caches.items():
+            spec = _per_layer_spec(layer_name)
+            if isinstance(spec, AttentionSpec):
+                logger.info(
+                    "MIXED_KV_AUDIT layer=%s spec_dtype=%s cache_dtype=%s shape=%s",
+                    layer_name, spec.dtype, cache.dtype, tuple(cache.shape))
+                assert cache.dtype == spec.dtype, (layer_name, cache.dtype,
+                                                   spec.dtype)
 
         # Mark KV cache buffers as donation candidates outside torch.compile
         # regions to avoid Dynamo tracing through pybind calls.
