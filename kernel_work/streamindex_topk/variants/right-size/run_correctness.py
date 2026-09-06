@@ -228,7 +228,20 @@ def main(argv=None):
     if a.json:
         with open(a.json, "w") as f:
             json.dump(rows, f, indent=2, default=str)
-    return 0
+
+    # Exit non-zero on a red result so the shard's rc means something. A
+    # `neg_control` that PASSES is red: it means the criterion is vacuous.
+    red = 0
+    for r in rows:
+        if "error" in r:
+            red += 1
+        elif r["arm"] == "neg_control":
+            red += (r["verdict"] != "FAIL")
+        else:
+            red += (r["verdict"] != "PASS")
+    if red:
+        print(f"\n{red} RED result(s).")
+    return 1 if red else 0
 
 
 if __name__ == "__main__":

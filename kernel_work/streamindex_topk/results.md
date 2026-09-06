@@ -696,10 +696,89 @@ another — an assumption this document has been making since §1 without eviden
 
 ---
 
+## 5f. Option F — head sum on the idle MXU: **rejected, and the premise failed in a dimension nobody modelled**
+
+`j-ace83e22-c472-4463-b41d`, `JobStatus = Succeeded`, 4/4 shards `rc=0`. `variants/mxu-head-sum/`.
+
+F was the option this document opened in §4.3 after the VPU hypothesis was confirmed: move the
+3.858 µs head-sum bundle (52.5% of the inner step) onto an MXU measured to be idle, as a
+block-diagonal ones-matmul that keeps the ReLU and is therefore **exact by reassociation**, bounded
+at 2.46e-06 relative. It also overturned §2.5's rejection of E6/H, on the grounds that "3.1% MXU
+fill" is the wrong criterion when the unit is idle.
+
+Negative is faster. `drift Δ %` is the drift control (§0.3).
+
+| regime | incumbent ms | variant ms | Δ time % | drift Δ % | readable |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `decode_prod` | 0.16693462 | 0.16812285 | +0.71 | −0.41 | yes |
+| `decode_64k` | 0.20087782 | 0.20724762 | +3.17 | +0.14 | yes |
+| `mixed_prod` | 0.67006801 | 0.71251987 | +6.34 | −0.33 | yes |
+| `mixed_64k` | 4.79921508 | 5.15369731 | **+7.39** | −0.19 | yes |
+
+Slower at every regime, worst on the dominant band, and every row is outside its drift control.
+
+### It is also not exact, which was its entire justification
+
+Four of five correctness margins are **not bit-identical** to the incumbent: 2109/0.99512,
+2098/0.99512, 2105/0.99365, 2146/0.99268, 2170/0.99072. All ten runs PASS and every negative control
+fired, so F is not *incorrect* — but a reassociation bounded at 2.46e-06 must be bit-identical, and
+these are not. The cause was found rather than tolerated: **the head-sum matmul is emitted bf16**,
+confirmed three ways — 1024 `bf16` vmatmul bundles in the lowering where the incumbent has zero, an
+`f32 DEFAULT` arm whose numerics are *identical* to the bf16 arm (2.457e-03), and an `f32 HIGHEST`
+arm that is the only one inside the 2.46e-06 bound and costs +244.35%.
+
+So the exact version of F exists and is 3.4× slower than the incumbent. There is no configuration in
+which F is both exact and fast.
+
+### The mechanism, which is the durable result here
+
+| impl | vmatmul | bf16 | f8 | bf16 weight pushes |
+| --- | ---: | ---: | ---: | ---: |
+| incumbent | 1024 | 0 | 1024 | 0 (16 `vmatpush3.f8e4m3` per MXU) |
+| F | 2048 | 1024 | 1024 | 1024 `vmatpush1.bf16` per MXU, ×2 |
+
+**2.0 weight pushes per matmul, against 0.031 for the scoring matmul — a 64× worse ratio.** The
+reduction matmul is **push-bound, not MAC-bound**. Scoring pushes one weight tile and streams many
+activation tiles through it; F's ones-matrix has to be pushed for essentially every matmul it feeds,
+so it occupies the MXU's issue path while barely touching its MACs.
+
+The K-ladder confirms both halves of this: it stayed **flat** under F (−0.48%, inside drift), so the
+MAC pipeline really was idle and **stayed** idle. §4's finding that the MXU has spare MACs was
+correct. The inference drawn from it — that spare MACs mean spare MXU — was not. That is a
+`references/` promotion and it generalises well beyond this kernel: **MXU headroom measured in MACs
+is not MXU capacity; for a reduction expressed as a matmul, check pushes-per-matmul.**
+
+Step-level accounting: incumbent 7.276 → 8.968 µs, +23.26% against a target of ~3.5–4. Net +1.692 µs
+accounted as ones-matrix construction 0.529 µs (avoidable — a reference arm with it hoisted is still
++16.00%), bf16 issue/push serialisation, and an `f32→bf16` cast of the whole score tensor landing
+back **on the VPU**, against ≤3.5 µs of VPU rotate-tree removed. Honest gap: both `CONTROL` arms came
+back at 10629% and 116% spread and are unusable, so the prize term is `modelled` from shard 3 rather
+than measured in this job.
+
+Two formulations were ruled out analytically without a probe, correctly: folding the head axis into
+the existing einsum (the ReLU sits *between* the contractions, so the head axis must be materialised
+— which is exactly what makes F exact and A1 an approximation), and a bf16×2 split-float (≈4 VPU
+ops/vreg to split, against the 2.25 ops/vreg it would replace).
+
+### One carried item, and it is not F
+
+`W_BD` — fold `w` **into** the block-diagonal matrix — measures **14.38% faster (bf16) and 27.17%
+faster (fp8) at the step level**, and it wins *despite* the MXU reduction rather than because of it:
+it deletes the VPU `w`-multiply, worth −2.210 µs against the reference arm. It needs no sign
+guarantee on `w`, so it survives where E1 needs A2's gate.
+
+It is **not a result yet**, and the agent was right not to present it as one. Two gates: `W_BD`'s
+construction cost is `unmodelled` and is producer-side, and **neither arm's numerics pass the §7
+gate** — F3's top-1% relative error is 2.188, which is the classic hollow-win shape. Route: it is a
+producer-side change, and it goes to that owner with both gates named, not into step 4's composition.
+
+---
+
 ## 6. Ranking as it stands
 
-Not final — F is in flight, and a four-shard follow-up probe (A2's gate, the `NUM_HEADS` ladder, B's
-bucket ladder, the `(8,4,4)` re-run) is in flight behind it.
+**Every option is now resolved.** A four-shard follow-up probe (A2's gate, the `NUM_HEADS` ladder,
+B's bucket ladder, the `(8,4,4)` re-run) is still in flight, but it sharpens the two survivors rather
+than adding a candidate.
 
 **A and B are not competing.** They land on different phases and, for the writer, different files.
 The ranking below orders them by size of measured win, but step 4 composes rather than chooses.
@@ -712,7 +791,7 @@ The ranking below orders them by size of measured win, but step 4 composes rathe
 | **4** | **C — Half-Width Key** | **dead** | measured **slower at all four regimes** (+0.91 to +4.93%) against a ceiling of ≤ 2.53% (§5e). §7.5's prediction held exactly. Its accuracy objection dissolved — fp16 is free — but the perf case never existed. |
 | **5** | **D — No Round Trip** | **dead** | priced at 8.96× its threshold (§3). Not built. |
 | **6** | **A1 — Drop the ReLU** | **dead** | gate failed on all five regimes, worst at long context (§5d). Ruled out at the idealised limit, so no kernel exists that rescues it. A3 fallback also rejected. Not in step 2. |
-| **?** | **F — MXU head sum** | in flight | targets the 52.5% head-sum bundle; **exact**, and A1's failure does not touch it — A1 died as a ranker, not on the reassociation F uses. Not in step 2. |
+| **7** | **F — MXU head sum** | **dead** | slower at all four regimes (+0.71 to +7.39%), outside drift, **and not exact** — the reduction lowers to bf16, and the exact `f32 HIGHEST` form costs +244% (§5f). The MXU's MACs were idle and stayed idle; its *issue path* was not. Not in step 2. |
 
 **All four of step 2's `unmodelled` ranking defects are now closed** — item 1 (TC-side top-k, §3),
 item 2 (writer-side scatter, §5b), item 3 (the mixed residual, §4) and item 4 (the decode:mixed
@@ -726,8 +805,28 @@ confirming it pointed at a term (§4.1) that none of the five options addresses.
 
 That is worth stating as a result about the *process* rather than about the kernel: every option in
 `measurement_and_design.md` was ranked on bytes, buffers or boundaries, and the measurement says the
-dominant cost is arithmetic on a saturated unit. The two candidates now most likely to matter, F and
-A1, exist only because a strike test was run on a hypothesis the document itself rated poorly.
+dominant cost is arithmetic on a saturated unit.
+
+### Two survivors of seven, and one target with nothing left aimed at it
+
+**Five of the seven options are dead, and all five died on measurement rather than on argument** —
+three of them (D, A1, and F's exact form) without a shippable kernel ever being written, which is
+most of what step 3 was for. What survives is **B**, whose prize the design bounded 13.5× too low,
+and **A**, whose prize the design put in the wrong half of the change.
+
+The pattern across all seven is one thing: **every option that tried to move bytes lost, and the two
+that won moved neither.** B deletes a partition stage; A's writer deletes an amplification factor.
+C, D and F each traded work onto a unit that turned out not to have room — the VPU for C, the
+SparseCore for D, the MXU's issue path for F. §4 established that the inner step is VPU-bound and
+this document then opened two options on the strength of it; both are now dead, and F is dead
+*because* the corollary drawn from §4 — spare MACs mean spare MXU — was false.
+
+So the honest state of the 8.42 µs inner step is that **the 52.5% head-sum bundle and the 32.7% relu
+chain have no live candidate between them.** A1 would have removed both and computes the wrong
+function. F would have removed the first and is not exact. E1 and E2 remain, both unpriced, and the
+`NUM_HEADS` ladder now in flight is the prerequisite for pricing either. That is a real limit on this
+exercise and it should be stated in `final_report.md` rather than buried under two wins that come
+from elsewhere in the kernel.
 
 ## 7. The question above all of these
 

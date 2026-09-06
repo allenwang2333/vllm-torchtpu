@@ -126,7 +126,7 @@ def main(argv=None):
     if a.json:
         with open(a.json, "w") as f:
             json.dump(rows, f, indent=2)
-    return 0
+    return 1 if any("error" in r for r in rows) else 0
 
 
 if __name__ == "__main__":

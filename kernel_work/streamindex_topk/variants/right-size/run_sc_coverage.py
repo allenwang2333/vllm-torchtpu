@@ -193,7 +193,11 @@ def main(argv=None):
     if a.json:
         with open(a.json, "w") as f:
             json.dump(rows, f, indent=2, default=str)
-    return 0
+
+    red = sum(1 for r in rows if r.get("verdict") != "PASS")
+    if red:
+        print(f"\n{red} RED case(s).")
+    return 1 if red else 0
 
 
 if __name__ == "__main__":
