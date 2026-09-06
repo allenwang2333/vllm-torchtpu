@@ -38,6 +38,8 @@ from typing import Tuple
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
+
 # MXFP4 block size as stored in checkpoints
 MXFP4_BLOCK_SIZE = 32
 
@@ -212,6 +214,13 @@ def dequantize_tensor(
 
     tensor = (tensor_q.to(torch.float32) * scale).to(out_dtype)
     return tensor.reshape(orig_shape)
+
+
+def should_quantize_on_load(prefix: str) -> bool:
+    """Return True if prefix matches any dot-bounded pattern in QUANTIZE_ON_LOAD_PREFIXES."""
+    padded = f".{prefix}."
+    return any(f".{p.strip('.')}." in padded
+               for p in envs.QUANTIZE_ON_LOAD_PREFIXES)
 
 
 def quantize_tensor(
