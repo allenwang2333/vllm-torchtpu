@@ -297,28 +297,26 @@ echo "[k3-sweep] ===== summary (ctx=$MAX_MODEL_LEN kv=$KV_DTYPE apc=$APC spec=$S
 python3 - "$RESULTS_DIR" "$BASE_RESULT_FILENAME" "${DONE_CONCS[@]}" << 'PYEOF'
 import json, os, sys
 root, base, concs = sys.argv[1], sys.argv[2], sys.argv[3:]
-WANT = ["output_tput_per_gpu", "output_tput_tps", "p90_intvty", "p90_full_response_intvty",
-        "p90_e2e_norm_intvty", "mean_ttft", "p90_ttft", "mean_tpot", "mean_input_tokens",
-        "mean_output_tokens_actual", "total_requests_completed", "theoretical_cache_hit_rate"]
-def find(o, key, out):
-    if isinstance(o, dict):
-        for k, v in o.items():
-            if k == key and isinstance(v, (int, float)): out.append(v)
-            find(v, key, out)
-    elif isinstance(o, list):
-        for v in o: find(v, key, out)
-print("| conc | " + " | ".join(WANT) + " |")
+# Dotted paths as written by InferenceX's process_agentic_result.py (build 10 JSON).
+WANT = [("out tok/s per chip", "output_tput_tps"), ("requests ok", "num_requests_successful"),
+        ("TTFT p50 s", "request_metrics.latency.ttft.p50"), ("TTFT p90 s", "request_metrics.latency.ttft.p90"),
+        ("TPOT p50 s", "request_metrics.latency.tpot.p50"), ("P90 intvty", "request_metrics.latency.intvty.p90"),
+        ("P90 E2E-norm intvty", "request_metrics.latency.e2e_norm_intvty.p90"),
+        ("e2el p50 s", "request_metrics.latency.e2el.p50"), ("cache hit (theory)", "theoretical_cache_hit_rate")]
+def get(d, path):
+    for k in path.split("."):
+        if not isinstance(d, dict) or k not in d: return None
+        d = d[k]
+    return d if isinstance(d, (int, float)) else None
+print("| conc | " + " | ".join(n for n, _ in WANT) + " |")
 print("|" + "---|" * (len(WANT) + 1))
 for c in concs:
     f = os.path.join(root, f"{base}_c{c}.json")
     if not os.path.exists(f):
         print(f"| {c} | (no aggregate: {os.path.basename(f)}) |"); continue
-    d = json.load(open(f)); row = []
-    for k in WANT:
-        vals = []; find(d, k, vals)
-        row.append(f"{vals[0]:.4g}" if vals else "-")
+    d = json.load(open(f))
+    row = [(f"{v:.4g}" if (v := get(d, k)) is not None else "-") for _, k in WANT]
     print(f"| {c} | " + " | ".join(row) + " |")
-    errs = []; find(d, "error_categories", errs)
 PYEOF
 echo "[k3-sweep] B300 reference (out tok/s/chip @ P90 intvty): c1 15.1@203, c2 18.6@133, c4 23.4@121, c8 40.6@64, c16 58.4@32, c24 66.3@22, c48 75.7@12.5, c70 87.6@7.9"
 exit 0
