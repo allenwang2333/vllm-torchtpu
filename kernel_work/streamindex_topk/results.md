@@ -277,7 +277,11 @@ cross-job.
 
 ---
 
-## 5b. Variant A — Narrow Record: reader blocked, **writer wins 3.4×**
+## 5b. Variant A — Narrow Record: **both halves now measured** — writer 3.3×, reader decode-only
+
+**Read §5b-v2 below for the settled result.** This first part records the v1 job, whose reader did
+not compile; it is kept because its incumbent arms and its writer number are both reproduced by v2
+and the Mosaic diagnosis is a `references/` promotion.
 
 `variants/narrow-record/`, committed `11efd4ef`. `measured (j-ce74a9f2-a4cd-40cb-9e87)`,
 `JobStatus: Failed`, 2/4 shards `rc=0` — shards 2 and 3 red from a single cause, and shard 3
@@ -347,6 +351,94 @@ its own right, not as a footnote to A.
 is not independently shippable. It writes a format only a split reader can consume, so the 3.406×
 cannot be banked while A's reader is blocked. What the writer probe establishes is that A's format
 change is *cheap on both sides*, not that there is a free win sitting in the writer today.
+
+---
+
+## 5b-v2. Variant A, second build: the reader compiles, and it is a **decode** optimization
+
+`j-c2e7edde-deee-4592-b81d`, `JobStatus = Succeeded`, 4/4 shards `rc=0`. Commit `6b14ae8a`. The
+authorised relayout — scale plane as `u8[num_pages, page_size//128, 128]`, so the page axis is
+untiled and the `(8,128)` tile is exactly one page of scales — lowered without complaint.
+
+Negative is faster. `drift %` is the drift-control delta (§0.3): two arms of identical code, its
+magnitude being the noise floor for an arm-to-arm comparison.
+
+| regime | incumbent ms (sp%) | variant ms (sp%) | Δ time % | speedup × | drift % | conclusive? |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `decode_prod` | 0.166699 (0.59) | 0.149275 (0.79) | **−10.45** | 1.117 | +0.00 | yes, 13× spread |
+| `decode_64k` | 0.202102 (2.44) | 0.186629 (0.47) | **−7.66** | 1.083 | −1.07 | yes, 3.1× spread |
+| `mixed_prod` | 0.675440 (2.51) | 0.665794 (1.61) | −1.43 | 1.014 | −0.07 | **no** |
+| `mixed_64k` | 4.788465 (1.11) | 4.771312 (1.52) | −0.36 | 1.004 | +0.50 | **no** |
+
+**The two decode rows are real; the two mixed rows are not conclusions.** In both, the spread equals
+or dwarfs the effect. That is the finding that matters, because mixed carries 85.7–87.9% of indexer
+time at the A/B shape (§2). Taking the mixed rows as zero — which is what their spreads license —
+**A's reader is worth ≈1.3–1.5% of indexer time**; taking them at face value gives 2.5–2.7%. The
+defensible number is the lower one. A's reader was always a decode optimization: in mixed, top-k
+dominates the call.
+
+**This demotes A's reader from the rank-1 expectation step 2 set for it, and the demotion is a
+denominator effect, not a failure of the change.** The mechanism works exactly as designed — the
+*scoring* half improves 16.58% and 13.66% on the decode rows while the top-k control is unchanged,
+and VMEM went **down** (3.699 / 2.184 / 0.599 MiB against the incumbent's 4.195 / 4.168 / 1.095), not
+up as the design feared. The change is simply aimed at a phase that is 12.1–14.3% of the time.
+
+Modelled −13.42 / −8.36 / −0.42 / −0.47 against measured −10.45 / −7.66 / −1.43 / −0.36.
+`decode_64k` lands within 0.7 points. `decode_prod` delivers 78% of its modelled prize and **the
+shortfall is unexplained**; the regroup that replaced the incumbent's transpose is the suspect and is
+`unmodelled`.
+
+### The writer reproduces, and the 3-D form is free
+
+| T | `W0` ms (sp%) | `W12b` ms (sp%) | Δ time % | speedup × |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.844617 (0.83) | 0.252724 (3.81) | **−70.08** | **3.342** |
+
+v1 gave −70.64 / 3.406× on a separate job; the two agree. The **3-D form costs nothing over the 2-D
+one** (0.252724 vs 0.251830, inside both spreads), so the reader's tiling requirement imposes no
+writer penalty — that caveat, opened by the Mosaic rejection, is closed.
+
+`T = 1024` is the prefill path, so **unlike the reader win, the writer win lands on the dominant
+phase.** The `T = 64` row is not resolvable on this instrument — every arm within 0.02 ms of a
+0.054–0.059 ms noop floor, spreads 16–50%, and the two builds disagreeing by more than either effect
+(+36.75 vs +16.58). No number is quoted for it, and v1's +36.75 should not be either.
+
+### Correctness — bit-exact, which is the only acceptable outcome here
+
+`0 of 131072`, `0 of 12288`, `0 of 2097152` index elements differ; 2,240,512 compared. Oracle margins
+**bit-identical to the incumbent's**: `decode_prod` 2109 / 0.99561, `decode_64k` 2105 / 0.99512,
+`mixed_prod` 2098 / 0.99512. Negative controls fired on every row (8177 / 0.49512 on 64 of 64;
+8159 / 0.42578 on 1024 of 1024).
+
+A is bit-exact **by construction**, and the argument is worth stating because it is what makes the
+bit-exact result the expected one rather than a lucky one: e8m0 is a bare 8-bit exponent, and both
+bf16 and f32 have 8 exponent bits, so both widens are exact and the regroup moves bytes without
+touching a value.
+
+### MXU operand types — confirmed native fp8, from the lowering
+
+This was load-bearing and unconfirmed: widening scales to f32 could have dragged the matmul operands
+to bf16 and cost the 1.69–1.86× fp8 rate. It did not.
+
+```
+tpu.matmul : vector<4096x128xf8E4M3FN>, vector<2048x128xf8E4M3FN>,
+             vector<4096x2048xf32> -> vector<4096x2048xf32>
+```
+
+Character-for-character P1's incumbent signature. 1064 `vmatmul` bundles, **bf16 = 0**, f8 = 1064 —
+identical count and opcode mix to the incumbent. HBM operands `memref<576x256x4x128xi8>` and
+`memref<576x8x128xi8>` confirm the split reached the compiler.
+
+### What A is worth, and why it does not simply rank behind B
+
+A and B **touch different code and different phases**. B is the indexer kernel's scores buffer on the
+mixed band; A's reader is the indexer's scoring half on the decode band; A's writer is
+`mla_attention_op.py`, which B does not touch at all. Their measured wins are therefore not competing
+for the same time, and step 4 should compose them rather than choose. A's writer saving — 0.592 ms
+per prefill call — is the second-largest absolute number in the exercise after B's confound row.
+
+**Still not run:** `/critical-review` on any of these numbers. Required before A is called
+`accepted`.
 
 ---
 
@@ -606,12 +698,16 @@ another — an assumption this document has been making since §1 without eviden
 
 ## 6. Ranking as it stands
 
-Not final — F and A's reader retry are in flight.
+Not final — F is in flight, and a four-shard follow-up probe (A2's gate, the `NUM_HEADS` ladder, B's
+bucket ladder, the `(8,4,4)` re-run) is in flight behind it.
+
+**A and B are not competing.** They land on different phases and, for the writer, different files.
+The ranking below orders them by size of measured win, but step 4 composes rather than chooses.
 
 | rank | option | standing | why it moved from step 2 |
 | ---: | --- | --- | --- |
 | **1** | **B — Right-Size** | **measured, correct, shippable** | 21.72% faster at `mixed_64k` and 3.725× at the confound (§5c), on the band carrying 85.7–87.9% of indexer time. Its `≤ −5.40%` design bound was 13.5× low **by construction**. Survives bucketing (≥ 23% `modelled`) because the prize is the P=2→P=1 threshold, not bytes. Strongest correctness evidence in the exercise. |
-| **2** | **A — Narrow Record** | **writer measured, reader blocked; retry in flight** | its blocking `unmodelled` term came back a **win** (3.406×), not a cost (§5b). Design doc §9.1's "A moves to rank 1 outright" is earned on that term alone — but it is contingent entirely on the reader compiling, and B is not contingent on anything. |
+| **2** | **A — Narrow Record** | **both halves measured, correct, bit-exact** | writer 3.342× at `T=1024` on the dominant phase; reader 10.45% / 7.66% faster but **decode-only**, worth ≈1.3–1.5% of indexer time once weighted (§5b-v2). Design doc §9.1's "A moves to rank 1 outright" was earned on the writer term and then **undone by the phase weighting** — the reader lands on 12.1–14.3% of the time. MXU operands confirmed native fp8. |
 | **3** | **E — Retune** | **measured** | fell from joint rank 1. Net at the A/B is −0.84% to +0.90%, sign unresolved (§1.3). |
 | **4** | **C — Half-Width Key** | **dead** | measured **slower at all four regimes** (+0.91 to +4.93%) against a ceiling of ≤ 2.53% (§5e). §7.5's prediction held exactly. Its accuracy objection dissolved — fp16 is free — but the perf case never existed. |
 | **5** | **D — No Round Trip** | **dead** | priced at 8.96× its threshold (§3). Not built. |
