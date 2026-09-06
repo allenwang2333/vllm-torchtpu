@@ -249,8 +249,15 @@ def main():
           f"KiB of payload")
     print(f"  seqs        = {S} x seq_len {a.seq_len}, pages/seq "
           f"{a.pages_per_seq}, topk {a.topk}, heads {a.heads}")
-    print(f"  early exit  = True, seq_len {a.seq_len} <= topk {a.topk} "
-          f"-> scoring kernel skipped, triad still paid", flush=True)
+    a_bytes = nb * bs_pk * kvp * D + nb * (block_size // 128) * 128
+    ee_fires = a.seq_len <= a.topk
+    print(f"  enable_early_exit=True and seq_len {a.seq_len} "
+          f"{'<=' if ee_fires else '>'} topk {a.topk}, so the scoring kernel "
+          f"{'is SKIPPED at run time -- the writer is what is being timed'
+             if ee_fires else 'RUNS -- the writer is timed together with it'}")
+    print(f"  buffer ratio incumbent/A = {big_bytes / a_bytes:.3f}x  "
+          f"(the write is 415x amplified, so a size ratio is the ceiling on "
+          f"the writer win)", flush=True)
 
     rng = np.random.default_rng(7)
     q_bytes = jnp.asarray(rng.integers(0, 255, (T, a.heads, D), dtype=np.uint8))
@@ -264,9 +271,14 @@ def main():
     cu_q_lens = jnp.asarray(np.arange(S + 1, dtype=np.int32) * q_per)
     distribution = jnp.asarray([0, 0, S], dtype=jnp.int32)
 
-    cache_inc = jnp.zeros((nb, bs_pk, kvp, lkv), jnp.uint8)
-    cache_a = (jnp.zeros((nb, bs_pk, kvp, D), jnp.uint8),
-               jnp.zeros((nb, block_size // 128, 128), jnp.uint8))
+    def fresh(kind):
+        # A donated buffer is DELETED by the call that consumes it, so every
+        # arm needs its own.  Sharing one across arms is what made the two
+        # `_store` arms die with "Array has been deleted" the first time.
+        if kind == "inc":
+            return jnp.zeros((nb, bs_pk, kvp, lkv), jnp.uint8)
+        return (jnp.zeros((nb, bs_pk, kvp, D), jnp.uint8),
+                jnp.zeros((nb, block_size // 128, 128), jnp.uint8))
 
     inc_mod = _support.load_incumbent()
     comp_mod = _support.load_composed()
@@ -277,22 +289,22 @@ def main():
     bucket = a.bucket
 
     arms = {}
-    for name, cache, fn in (
-        ("inc_full", cache_inc,
+    for name, kind, fn in (
+        ("inc_full", "inc",
          build_incumbent(inc_mod.streamindex_topk, a.topk, 1, bkv_p, bq,
                          True, False)),
-        ("a_full", cache_a,
+        ("a_full", "a",
          build_option_a(comp_mod.streamindex_topk, a.topk, 1, bkv_p, bq,
                         True, bucket, False)),
-        ("inc_store", cache_inc,
+        ("inc_store", "inc",
          build_incumbent(inc_mod.streamindex_topk, a.topk, 1, bkv_p, bq,
                          True, True)),
-        ("a_store", cache_a,
+        ("a_store", "a",
          build_option_a(comp_mod.streamindex_topk, a.topk, 1, bkv_p, bq,
                         True, bucket, True)),
     ):
-        args = (q_bytes, weights, cache, k_packed, seq_lens, page_indices,
-                cu_q_lens, distribution)
+        args = (q_bytes, weights, fresh(kind), k_packed, seq_lens,
+                page_indices, cu_q_lens, distribution)
         print(f"\n--- {name}: compiling ---", flush=True)
         try:
             text = fn.lower(*args).compile().as_text()
