@@ -177,6 +177,40 @@ this exercise is the scoring half. (Those numbers are quoted from the log, not m
 were taken at the production shape on this hardware and they are the reason for a routing decision,
 not a component of any floor below.)
 
+### Amendment, after measuring: the selection half is bigger than this section assumed
+
+The routing above is still right — the scoring kernel is untouched and has 55% headroom, and the
+log's rejections stand. But it was written before the control arm produced a number, and the number
+says the selection half is **not a small remainder**:
+
+| regime | `full ms` | selection (`topk ctrl`) | selection share |
+| --- | ---: | ---: | ---: |
+| `decode_prod` | 0.16701 | 0.05562 | 33% |
+| `decode_64k` | 0.20116 | 0.08615 | 43% |
+| `mixed_prod` | 0.66911 | 0.39960 | **60%** |
+
+Within a call the two are serialized — `sparsecore_topk` consumes the scoring kernel's output — so
+these shares are Amdahl fractions on the call, and **the share grows with context**. At
+`mixed_prod` a scoring-only win of 30% is 12% of the call, not 30%.
+
+This is in tension with the long-context A/B and step 2 must carry it: the regime the end-to-end
+comparison targets is the regime where a scoring-only win is most diluted. It does *not* reopen the
+log's rejected proposals — those swapped the selection *algorithm*, and `sparsecore_topk` beat
+them. It does mean "the whole top-k is at its floor" is a conclusion about algorithm choice, not a
+measured floor for `sparsecore_topk` itself, and this exercise has not established one. No
+SparseCore rate appears in the roofline below.
+
+**A specific, testable suspicion for step 2.** `_common_path` builds `scores_to_reduce` at width
+`num_sublanes_total × 128`, and `num_sublanes_total` (`streamindex_topk.py:603-605`) is derived from
+**`max_model_len`, not from the batch's actual KV length**. Raising `max_model_len` to 64k therefore
+widens that buffer to 67584 columns for every call, including short decodes. Whether
+`sparsecore_topk` costs O(padded width) or O(`row_lengths`) decides whether that is free. The
+measurement here cannot separate them — from `decode_prod` to `decode_64k` the width grew 6.6× and
+the live row length grew 8× together, and the control went up 1.55×. A probe that holds
+`max_model_len` at 64k and varies the actual KV length settles it. If the cost follows the padded
+width, it is both an optimization and a **confound for the end-to-end A/B**, because standing up a
+long-context config changes this cost for every request in the run.
+
 ## Why long context
 
 At the checked-in production shape the block is small: 2.69% of the decode step and roughly 1.02%
@@ -316,8 +350,50 @@ pre-`fb94c998` `inputs.py`, which passed `distribution[2] = max_num_seqs` for a 
 made the MIXED band loop over 63 sequences with `q_len == 0`. Those are not free — `num_bq =
 max(1, cdiv(0, bq_sz))` is 1, so each empty sequence still sweeps every KV block — and the rows
 therefore moved 64× the KV they should have. Production passes the real batch sequence count
-(`mla_attention_op.py:183`). The re-run is a separate job and its rows are appended below when it
-lands.
+(`mla_attention_op.py:183`).
+
+### Mixed, re-run on the corrected inputs
+
+Job **`j-5f8f4a08-20b4-4fa0-bfc3`**, `Succeeded`, 4/4 shards rc=0. Same image. `inner` is the
+number of calls dispatched before blocking, scaled down at large regimes to bound the outstanding
+allocation (commit `f77d6696`); it is in the table because it differs across rows.
+
+| regime | `inner` | `full ms` | `spread %` | `topk ctrl ms` | ctrl `spread %` | `scoring ms by diff` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mixed_prod` | 20 | **0.66911** | 2.84 | 0.39960 | 1.16 | 0.26951 |
+| `mixed_prod`, early-exit on | 20 | 0.66696 | 1.93 | 0.39845 | 0.27 | 0.26852 |
+| `mixed_32k` | 10 | **2.00536** | 1.52 | 1.21032 | **514.8** | 0.79504 ⚠ |
+| `mixed_64k` | 5 | **4.76284** | 1.13 | 3.00969 | **133.1** | 1.75316 ⚠ |
+
+The void rows were 3.28× / 1.55× / 1.19× the corrected ones at `mixed_prod` / `mixed_32k` /
+`mixed_64k`. The inflation shrinks with KV length, as it should: at 64k the scores round trip
+dominates and is untouched by a spurious KV re-read, and that batch has only 6 sequences to
+duplicate rather than 64.
+
+**The `full ms` spreads are fixed** — 68% and 231% became 1.52% and 1.13%. Two changes landed
+between the sweeps though, the `distribution` fix and the `inner` bound, so **which one fixed the
+spread is confounded and this exercise will not find out.** The numbers are usable either way.
+
+**⚠ The two long-KV `scoring by difference` figures are not usable.** The control arm's own spread
+is 514.8% and 133.1% there, so those differences are taken against a median that is not a stable
+quantity. `mixed_prod`'s control is clean at 1.16% and its 0.26951 ms difference is trustworthy.
+The instability tracks KV length rather than the harness — `mixed_prod` is clean on both arms — and
+it is worst exactly where `inner` is smallest, so the control arm averages least where it is
+noisiest. **`full ms` is unaffected and is what variants are ranked by**; the control is a
+diagnostic, not the yardstick. Diagnosing it belongs to step 2, if step 2 needs the attribution.
+
+### Mixed correctness
+
+Same job, shard 3, `mixed_prod`, 1024 rows:
+
+| | result | worst_rank | min_recall |
+| --- | --- | ---: | ---: |
+| `mixed_prod` | **PASS** | 2098 | 0.99512 |
+| `mixed_prod`, **negative control** | **fired** — 1024/1024 rows bad | 8159 | 0.42578 |
+
+Worth stating plainly: at `worst_rank=2098` this row would have passed under the **old**
+`RANK_SLACK` of 64 as well (allowed 2112). The widening at `f77d6696` did not rescue a failing
+measurement.
 
 ### The cross-check against the profile
 
@@ -398,6 +474,20 @@ the first probe step 2 owes.
 55% is squarely inside the 50–80% band the skill calls a kernel's worth of headroom. **The roofline
 gate passes and the exercise continues.**
 
+Mixed is further from its floor than decode, not closer. The floor here prices only the TensorCore
+side, so the denominator is `scoring ms by difference` rather than `full ms`:
+
+| regime | scoring µs | floor bf16 | achieved | floor fp8 | achieved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `mixed_prod` | 269.5 | 77.0 | **29%** | 38.5 | **14%** |
+| `mixed_32k` ⚠ | 795.0 | 307.9 | 39% | 153.9 | 19% |
+| `mixed_64k` ⚠ | 1753.2 | 615.8 | 35% | 307.9 | 18% |
+
+⚠ marks the two rows whose subtrahend has a 514.8% / 133.1% control spread behind it. Only
+`mixed_prod` is settled, and at 29% of even the *pessimistic* bf16 floor it is well below decode's
+55%. Whatever accounts for that gap is not in the model — the VPU tail is the first suspect and
+carries no price at all (below).
+
 Two caveats on that fraction, neither of which moves it out of the band:
 
 - The scopes are not identical — `hbm_id` counts the scores read-back and the output write, which
@@ -457,14 +547,25 @@ Named so a measured time exceeding the floor is not mistaken for a modelling fai
 
 ## What step 2 inherits
 
-1. **The gate passes at 55%.** There is a kernel's worth of headroom at decode.
+1. **The gate passes.** Decode is at 55% of its modelled floor and mixed at 29% — a kernel's worth
+   of headroom at decode, and more than that at mixed.
 2. **Decode's headroom is HBM, and it is padding** — 129 of 256 bytes. Acting on it crosses into
    the cache format and its writer.
 3. **Mixed's headroom is the f32 scores round trip**, 276.8 MB × 3 at `mixed_64k`, not the KV.
-4. **First probe: does the `float8_e4m3fn` einsum lower to a native fp8 MXU pass or promote to
-   bf16?** It decides whether the mixed regimes are MXU- or HBM-bound, and the two answers point at
+4. **The selection half is 33–60% of the call and grows with context**, so a scoring-only win is
+   diluted most in exactly the regime the end-to-end A/B targets. This does not reopen the log's
+   rejected algorithm swaps; it does mean no floor has been established for `sparsecore_topk`.
+5. **Probe: does the `float8_e4m3fn` einsum lower to a native fp8 MXU pass or promote to bf16?**
+   It decides whether the mixed regimes are MXU- or HBM-bound, and the two answers point at
    different designs.
-5. **Second probe: what does the VPU tail actually cost?** It is unpriced and it is large.
-6. **Carried, not designed:** the `lax.cond` at L859-865 is pure overhead at long context (2.77% at
-   `decode_prod`, suggestive only), and `jnp.max(seq_lens)` over the whole batch means one long
-   sequence puts every sequence on the common path.
+6. **Probe: does `sparsecore_topk` cost O(padded width) or O(`row_lengths`)?** `num_sublanes_total`
+   comes from `max_model_len`, so the answer decides whether a long-context config taxes every
+   short request — an optimization if yes, and a confound for the A/B either way.
+7. **Probe: what does the VPU tail actually cost?** It is unpriced, it is large, and it is the
+   leading suspect for mixed sitting at 29%.
+8. **Carried, not designed:** the `lax.cond` at L859-865 is pure overhead at long context (2.77% at
+   `decode_prod`, suggestive only — and 0.32% *faster* at `mixed_prod`, which is inside the spread
+   and so says nothing), and `jnp.max(seq_lens)` over the whole batch means one long sequence puts
+   every sequence on the common path.
+9. **A harness defect to fix if the attribution is needed:** the control arm's 514.8% / 133.1%
+   spread at long KV. `full ms` is clean and is the yardstick, so this does not block ranking.
