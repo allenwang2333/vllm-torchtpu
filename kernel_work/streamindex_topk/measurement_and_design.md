@@ -947,11 +947,26 @@ Three items, none of which changes a conclusion.
    **`(8,4,4)`**, and that is the arm step 3's first job carries.
 2. **The tuple slot order in `bkv_p_RESULT.md`'s terms section is wrong.** §2.4. No measurement
    moves; one design fact does.
-3. **`bkv_p = 8` is not value-checked.** P5′ verified `(4,4,4)` bit-identically and is explicit that
-   it did not verify 8. Option E takes 4, not 8, and at `decode_prod` that costs nothing — 4 and 8
-   are tied there (0.15264 vs 0.15270 against 1.3–1.4% spreads). At `decode_64k`, 8 is 2.5 points
-   better and **that arm is unverified**; if step 3 wants it, P5′'s own advice applies: attach
-   `--tuples 8,8,8` to whatever job runs next, since the shard rides along free.
+3. ~~**`bkv_p = 8` is not value-checked.**~~ **Overstated — corrected.** `j-98399433` shard 2 ran
+   `(8,2,2)` at `decode_prod` and it PASSed at `worst_rank=2109 / min_recall=0.99561`, **bit-for-bit
+   the shipped kernel's own margins** from `j-6d675a58-7ecd-4b44-9171`. So `bkv_p = 8` *in the
+   DECODE slot* is value-checked, at one regime, to the strongest standard available. P5′ is what
+   did not verify 8 — it verified `(4,4,4)` — and this document read that as the whole record.
+
+   State the gap exactly, because it is narrower than "unverified" and it decides whether the
+   largest measured decode win in the exercise is reachable: what is unchecked is **8 at
+   `decode_64k`**, and **8 in the MIXED slot at any regime**. Option E takes 4, not 8, and at
+   `decode_prod` that costs nothing — 4 and 8 are tied there (0.15264 vs 0.15270 against 1.3–1.4%
+   spreads). At `decode_64k` 8 is 2.5 points better and **that arm is unverified**, which is the one
+   shard worth attaching to whatever job runs next.
+
+   A caution on which 8-arm to attach, since the obvious one is wrong. `num_sublanes_total` is a
+   `max` over the whole tuple, so **there is no tuple that gives decode 8 without mixed paying the
+   width** — `(8,2,2)` still takes `subl` to 128 and costs `mixed_prod` 5.11%. Raising the MIXED
+   slot as well only adds to that: `(8,8,8)` is 7.08% slower at `mixed_prod`, the worst arm measured.
+   The arm to run is therefore `(8,2,2)`, not `(8,2,8)` or `(8,8,8)`, and its cost at mixed is a
+   width cost that **only Option B's masked store can remove**. This is the same coupling as §4.2,
+   one slot further along.
 
 One further observation, offered as an inconsistency rather than an error: `combined.md` refers to
 "nine constraint sheets" where the skill prescribes eight briefers. The directory does hold nine
