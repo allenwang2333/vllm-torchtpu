@@ -75,13 +75,31 @@ def cdiv(a, b):
     return -(-a // b)
 
 
+def padded_n(psz, pps):
+    """The score-row width the kernel actually allocates.
+
+    NOT `pps * psz`. streamindex_topk.py:602-605 takes
+    `max(align_to(pages_per_seq, bkv_p) * page_size // 128 for bkv_p in ...)`,
+    so an odd page count rounds up: at (A) 9 pages with bkv_p=2 give 10240, not
+    9216. Use this anywhere the SCORE extent is meant; use `pps * psz` only
+    where `max_model_len` is meant, which is what caps admission and is a
+    different (smaller) number.
+
+    The distinction is load-bearing rather than cosmetic. A probe that builds a
+    scores array from the wrong one measures a 10% narrow slice, and since the
+    SparseCore cost is driven by that extent, it under-reports by roughly the
+    same margin -- which is how the P-P16 SC-alone arms came out at n=9216.
+    """
+    return max(cdiv(pps, bkv_p) * bkv_p for bkv_p in BKV_P) * psz
+
+
 def check_reachable(name, r):
     """Re-assert the legality ladder. Raises on a shape production cannot reach."""
     psz, pps, T = r["psz"], r["pages_per_seq"], r["T"]
     qlen = r.get("qlen", 1)
     assert T in TOKEN_LADDER, f"{name}: T={T} not on _get_token_paddings ladder"
     assert psz * BKV_P[0] % 128 == 0, f"{name}: page_size*bkv_p not a 128 multiple"
-    assert (pps * psz) % 16 == 0, f"{name}: n not a multiple of LANES"
+    assert padded_n(psz, pps) % 16 == 0, f"{name}: n not a multiple of LANES"
     assert K % 16 == 0 and 0 < K <= 4096, f"{name}: k off ladder"
     assert r["R"] <= S and r["D"] <= r["R"], f"{name}: R/D out of range"
     assert r["D"] * 1 + (r["R"] - r["D"]) * qlen <= T, f"{name}: tokens exceed T"
@@ -181,7 +199,13 @@ def build(name, seed=0):
                   num_queries_per_block=BQ_SZ, vmem_limit_bytes=VMEM_LIMIT,
                   decode_req_batch_size=DECODE_REQ_BATCH_SIZE,
                   enable_early_exit=True)
-    meta = dict(name=name, n=pps * psz, num_blocks=num_blocks,
+    # `n` and `score_bytes` are the PADDED extent (see padded_n) -- the score
+    # buffer the kernel allocates and the SparseCore reads. `max_model_len` is
+    # reported separately because it is a different, smaller number at (A) and
+    # the two were previously conflated.
+    n_pad = padded_n(psz, pps)
+    meta = dict(name=name, n=n_pad, max_model_len=pps * psz,
+                num_blocks=num_blocks,
                 cache_bytes=num_blocks * (psz // 4) * 4 * 256,
-                score_bytes=T * pps * psz * 4, lens=lens, **r)
+                score_bytes=T * n_pad * 4, lens=lens, **r)
     return args, kwargs, meta

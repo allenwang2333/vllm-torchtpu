@@ -109,8 +109,21 @@ rows = [
 # does buy is the `p > 1` second-pass merge: a second dispatch plus two XLA
 # gathers. At b=32 and b=64, max_p collapses to 1 and no second pass happens.
 # That is why the D16 row is slower than the D32 row rather than noise being
-# read as a result, and it is the basis for the E-series candidate that
-# suppresses the second loop (Δ time −9.0% at A-D16-8k, 0 elsewhere).
+# read as a result.
+#
+# MEASURED, j-cefba169-8b6e-4fc6-80f6 (probe P-P16): suppressing the growth
+# branch is Δ time -13.7% on the full op at A-D16 (5/5 repeats negative, worst
+# -12.9%, spread 5.5 pt) and -16.8% on SparseCore alone, with byte-identical
+# selected sets. The -9.0% this comment first carried was modelled and too
+# small -- it lies outside the measured range. The full-op saving (35.8 us) and
+# the SC-alone saving (34.7 us) agree to 1.1 us, so the whole win is
+# SparseCore-side: it is the second dispatch and its two XLA gathers, a term
+# the M1 cost model does not contain at all.
+# Caveat on the absolutes: the SC-alone arms were built at n=9216 through the
+# shapes.py bug fixed alongside this, so their microseconds describe a slice
+# 10% narrower than production. p=2 at both widths, so the branch under test is
+# the right one and the percentage stands; the us figures are a slight
+# under-report.
 # (full, sparsecore_topk alone or None, job, block-to-block spread)
 MEASURED = {
     "A-D64-8k":     (363.2, 189.5, "j-284a8842", 0.091),
