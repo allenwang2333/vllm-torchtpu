@@ -1228,7 +1228,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         block_size = self.vllm_config.cache_config.block_size
-        layer_kv_cache_dtypes: dict[str, torch.dtype] = {}
+        cache_dtype_str = self.vllm_config.cache_config.cache_dtype
 
         has_attention = any(
             isinstance(m, (Attention, MLAAttention)) for m in layers.values())
@@ -1260,9 +1260,6 @@ class TPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
             # Classic Attention path
             elif isinstance(attn_module, Attention):
-                layer_cache_dtype, _ = self._resolve_layer_kv_cache_dtype(
-                    attn_module)
-                layer_kv_cache_dtypes[layer_name] = layer_cache_dtype
                 if (kv_tgt_layer :=
                         attn_module.kv_sharing_target_layer_name) is not None:
                     if kv_tgt_layer not in layers:
@@ -1306,7 +1303,7 @@ class TPUModelRunner(GPUModelRunner):
                         block_size,
                         attn_module.num_kv_heads,
                         attn_module.head_size,
-                        layer_cache_dtype,
+                        self.kv_cache_dtype,
                     )
                     page_size_padded = (
                         self._hybrid_uniform_page_size_bytes
@@ -1315,14 +1312,14 @@ class TPUModelRunner(GPUModelRunner):
                             block_size,
                             attn_module.num_kv_heads,
                             attn_module.head_size,
-                            layer_cache_dtype,
+                            self.kv_cache_dtype,
                         ))
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
-                            dtype=layer_cache_dtype,
+                            dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
                             indexes_kv_by_block_stride=True,
@@ -1332,7 +1329,7 @@ class TPUModelRunner(GPUModelRunner):
                             block_size=block_size,
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
-                            dtype=layer_cache_dtype,
+                            dtype=self.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             indexes_kv_by_block_stride=True,
                         )
@@ -1351,9 +1348,6 @@ class TPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
-                layer_cache_dtype, layer_cache_dtype_str = (
-                    self._resolve_layer_kv_cache_dtype(attn_module))
-                layer_kv_cache_dtypes[layer_name] = layer_cache_dtype
                 page_size_padded = (
                     self._hybrid_uniform_page_size_bytes
                     if self._hybrid_uniform_page_size_bytes is not None else
@@ -1361,14 +1355,14 @@ class TPUModelRunner(GPUModelRunner):
                         block_size,
                         1,
                         attn_module.head_size,
-                        layer_cache_dtype,
+                        self.kv_cache_dtype,
                     ))
                 kv_cache_spec[layer_name] = MLAAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=attn_module.head_size,
-                    dtype=layer_cache_dtype,
-                    cache_dtype_str=layer_cache_dtype_str,
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,
                     indexes_kv_by_block_stride=True,
                 )
@@ -1389,30 +1383,8 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_dtype,
             enable_unified_kv_layout=self._unified_kv_layout,
             exempt_layers=ds_v4_layers,
-            layer_kv_cache_dtypes=layer_kv_cache_dtypes,
             attention_backend=backend_cls,
         )
-
-    def _resolve_layer_kv_cache_dtype(
-            self, module: AttentionLayerBase) -> tuple[torch.dtype, str]:
-        """Resolve per-layer target/draft cache precision."""
-        default = self.vllm_config.cache_config.cache_dtype
-        configured = getattr(module, "kv_cache_dtype", default)
-        # Mocks and third-party layers may expose a non-value descriptor.
-        if not isinstance(configured, (str, torch.dtype)):
-            configured = default
-
-        if isinstance(configured, torch.dtype):
-            resolved = configured
-            cache_dtype_str = default
-        elif configured == "auto":
-            resolved = (TPU_STR_DTYPE_TO_TORCH_DTYPE[self.dtype] if isinstance(
-                self.dtype, str) else self.dtype)
-            cache_dtype_str = configured
-        else:
-            resolved = TPU_STR_DTYPE_TO_TORCH_DTYPE[configured]
-            cache_dtype_str = configured
-        return resolved, cache_dtype_str
 
     def _build_attention_metadata(
         self,
@@ -1730,22 +1702,20 @@ class TPUModelRunner(GPUModelRunner):
         backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
         for m in layers.values():
             if isinstance(m, Attention):
-                layer_cache_dtype, _ = self._resolve_layer_kv_cache_dtype(m)
                 attn_page_sizes.add(
                     backend_cls.get_kv_cache_page_size_bytes(
                         block_size,
                         m.num_kv_heads,
                         m.head_size,
-                        layer_cache_dtype,
+                        self.kv_cache_dtype,
                     ))
             elif isinstance(m, MLAAttention):
-                layer_cache_dtype, _ = self._resolve_layer_kv_cache_dtype(m)
                 attn_page_sizes.add(
                     PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
                         block_size,
                         1,
                         m.head_size,
-                        layer_cache_dtype,
+                        self.kv_cache_dtype,
                     ))
 
         if not attn_page_sizes:
@@ -1790,12 +1760,14 @@ class TPUModelRunner(GPUModelRunner):
         slot (corrupted state → gibberish generation).
 
         The fix: set every layer's reported `page_size_padded` equal to the
-        full per-`shared_by` footprint. Each merge-compatible attention or
-        mamba bucket contributes its TPU-actual page bytes; mixed target and
-        draft dtypes therefore contribute separate terms. vLLM then computes
-        a smaller `num_blocks` that exactly matches what we allocate per layer
-        on the TPU side. HBM usage is unchanged; only the block-ID accounting
-        lines up.
+        full per-`shared_by` footprint — `num_attn_groups × attn_page +
+        num_mamba_groups × mamba_unpadded`, where `attn_page` is the
+        TPU-actual per-block bytes (from `get_attention_page_size_bytes`,
+        which accounts for dtype packing like fp8) and `mamba_unpadded` is
+        the natural `prod(shape) × dtype_size`. vLLM then computes a
+        smaller `num_blocks` that exactly matches what we allocate per layer
+        on the TPU side. HBM usage is unchanged; only the block-ID
+        accounting lines up.
 
         Args:
             layers: A dictionary mapping layer names to their corresponding
@@ -1808,7 +1780,13 @@ class TPUModelRunner(GPUModelRunner):
         if not attn_modules:
             return
 
+        first_attn_module = attn_modules[0]
+        num_kv_heads = first_attn_module.num_kv_heads if isinstance(
+            first_attn_module, Attention) else 1
         attention_backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
+            self.block_size, num_kv_heads, first_attn_module.head_size,
+            self.kv_cache_dtype)
 
         mamba_modules = [
             m for m in layers.values() if isinstance(m, MambaBase)
@@ -1818,23 +1796,21 @@ class TPUModelRunner(GPUModelRunner):
             # page size as a no-op default (vLLM's platform interface sets
             # this too when it detects hybrid). No layer duplication will
             # happen without mamba layers, so no block-ID mismatch to fix.
-            first_attn_module = attn_modules[0]
-            first_attn_dtype, _ = self._resolve_layer_kv_cache_dtype(
-                first_attn_module)
-            num_kv_heads = (first_attn_module.num_kv_heads if isinstance(
-                first_attn_module, Attention) else 1)
-            attn_page_size_bytes = (
-                attention_backend.get_kv_cache_page_size_bytes(
-                    self.block_size, num_kv_heads, first_attn_module.head_size,
-                    first_attn_dtype))
             self.cache_config.mamba_page_size_padded = attn_page_size_bytes
             return
 
-        # Derive vLLM's kv-cache group layout. Target FP8 MLA and draft BF16
-        # MLA are distinct buckets even though both use MLA. vLLM splits each
-        # merge-compatible spec bucket into equal-sized groups, then allocates
-        # `group_size` KVCacheTensors. Each tensor is shared by one layer from
-        # every resulting group.
+        # Compute the unpadded mamba page size from an actual mamba module's
+        # spec (shapes × dtype-size), ignoring any existing padding.
+        first_mamba_spec = mamba_modules[0].get_kv_cache_spec(self.vllm_config)
+        assert isinstance(first_mamba_spec, MambaSpec)
+        unpadded_mamba_page_size = dataclasses.replace(
+            first_mamba_spec, page_size_padded=None).page_size_bytes
+
+        # Derive vLLM's kv-cache group layout. vLLM splits each type into
+        # equal-sized groups of `group_size` layers, then allocates
+        # `group_size` `KVCacheTensor`s, each `shared_by` one layer from
+        # every group — so each tensor covers `num_attn_groups +
+        # num_mamba_groups` layers.
         #
         # Choosing `group_size` trades off padding vs. number of groups:
         #   * group_size = max_count → fewer groups (often 1 per type),
@@ -1855,80 +1831,10 @@ class TPUModelRunner(GPUModelRunner):
         # spec creation depends on padding). Keep in sync if that
         # heuristic ever changes — it has been stable since the hybrid
         # allocator landed.
-        bucket_specs: list[list[KVCacheSpec]] = []
-        bucket_counts: list[int] = []
-        bucket_page_sizes: list[int] = []
-        bucket_is_mamba: list[bool] = []
-        # Temporary specs use the same large padded page. This mirrors the
-        # final specs while allowing merge() to classify them before the real
-        # uniform page size is known.
-        placeholder_page_size = 1 << 60
-
-        def _add_bucket(spec: KVCacheSpec, page_size: int,
-                        is_mamba: bool) -> None:
-            for i, specs in enumerate(bucket_specs):
-                try:
-                    type(specs[0]).merge([*specs, spec])
-                except (AssertionError, ValueError):
-                    continue
-                assert bucket_page_sizes[i] == page_size
-                bucket_specs[i].append(spec)
-                bucket_counts[i] += 1
-                return
-            bucket_specs.append([spec])
-            bucket_counts.append(1)
-            bucket_page_sizes.append(page_size)
-            bucket_is_mamba.append(is_mamba)
-
-        for module in attn_modules:
-            layer_dtype, layer_dtype_str = (
-                self._resolve_layer_kv_cache_dtype(module))
-            num_kv_heads = (module.num_kv_heads if isinstance(
-                module, Attention) else 1)
-            page_size = attention_backend.get_kv_cache_page_size_bytes(
-                self.block_size, num_kv_heads, module.head_size, layer_dtype)
-            if isinstance(module, MLAAttention):
-                spec: KVCacheSpec = MLAAttentionSpec(
-                    block_size=self.block_size,
-                    num_kv_heads=1,
-                    head_size=module.head_size,
-                    dtype=layer_dtype,
-                    cache_dtype_str=layer_dtype_str,
-                    page_size_padded=placeholder_page_size,
-                    indexes_kv_by_block_stride=True,
-                )
-            elif module.sliding_window is not None:
-                spec = SlidingWindowSpec(
-                    block_size=self.block_size,
-                    num_kv_heads=module.num_kv_heads,
-                    head_size=module.head_size,
-                    dtype=layer_dtype,
-                    page_size_padded=placeholder_page_size,
-                    sliding_window=module.sliding_window,
-                    indexes_kv_by_block_stride=True,
-                )
-            else:
-                spec = FullAttentionSpec(
-                    block_size=self.block_size,
-                    num_kv_heads=module.num_kv_heads,
-                    head_size=module.head_size,
-                    dtype=layer_dtype,
-                    page_size_padded=placeholder_page_size,
-                    indexes_kv_by_block_stride=True,
-                )
-            _add_bucket(spec, page_size, False)
-
-        for module in mamba_modules:
-            mamba_spec = module.get_kv_cache_spec(self.vllm_config)
-            assert isinstance(mamba_spec, MambaSpec)
-            natural_spec = dataclasses.replace(mamba_spec,
-                                               page_size_padded=None)
-            grouping_spec = dataclasses.replace(
-                natural_spec, page_size_padded=placeholder_page_size)
-            _add_bucket(grouping_spec, natural_spec.page_size_bytes, True)
-
-        min_count = min(bucket_counts)
-        max_count = max(bucket_counts)
+        num_attn = len(attn_modules)
+        num_mamba = len(mamba_modules)
+        min_count = min(num_attn, num_mamba)
+        max_count = max(num_attn, num_mamba)
 
         # Match vLLM exactly: float comparison, no int() truncation (matters
         # at e.g. min=3, max=4, where 4 < 4.5 but 4 < int(4.5)==4 differs).
@@ -1937,29 +1843,20 @@ class TPUModelRunner(GPUModelRunner):
         else:
             group_size = min_count
 
-        bucket_group_counts = [
-            cdiv(count, group_size) for count in bucket_counts
-        ]
-        attention_bytes_per_block_per_tensor = sum(
-            num_groups * page_size for num_groups, page_size, is_mamba in zip(
-                bucket_group_counts, bucket_page_sizes, bucket_is_mamba)
-            if not is_mamba)
-        mamba_bytes_per_slot_per_tensor = sum(
-            num_groups * page_size for num_groups, page_size, is_mamba in zip(
-                bucket_group_counts, bucket_page_sizes, bucket_is_mamba)
-            if is_mamba)
-        uniform_page_size_bytes = (attention_bytes_per_block_per_tensor +
-                                   mamba_bytes_per_slot_per_tensor)
+        num_attn_groups = (num_attn + group_size - 1) // group_size
+        num_mamba_groups = (num_mamba + group_size - 1) // group_size
+
+        uniform_page_size_bytes = (num_attn_groups * attn_page_size_bytes +
+                                   num_mamba_groups * unpadded_mamba_page_size)
 
         logger.info(
             "Hybrid KV cache: padding every layer spec to %d bytes "
-            "(attention=%d B/block + mamba=%d B/slot across %d cache "
-            "groups, group_size=%d). This makes vLLM's "
+            "(num_attn_groups=%d × attn_page=%d + "
+            "num_mamba_groups=%d × mamba_unpadded=%d). This makes vLLM's "
             "num_blocks match per-layer TPU allocation when mamba layers "
             "cannot be truly shared.", uniform_page_size_bytes,
-            attention_bytes_per_block_per_tensor,
-            mamba_bytes_per_slot_per_tensor, sum(bucket_group_counts),
-            group_size)
+            num_attn_groups, attn_page_size_bytes, num_mamba_groups,
+            unpadded_mamba_page_size)
 
         self._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
         self.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
@@ -1972,8 +1869,8 @@ class TPUModelRunner(GPUModelRunner):
         # `num_gpu_blocks_override` to the (larger) attention block count and
         # sets `_mamba_num_blocks`.
         self._maybe_set_compact_mamba_num_blocks_override(
-            attention_bytes_per_block_per_tensor,
-            mamba_bytes_per_slot_per_tensor, group_size)
+            attn_page_size_bytes, int(unpadded_mamba_page_size),
+            num_attn_groups, num_mamba_groups, group_size)
 
         # Fallback (compact sizing skipped, e.g. CPU-only tests or a
         # user-pinned num_gpu_blocks_override): pin vLLM's num_blocks via the two-step
@@ -1985,9 +1882,9 @@ class TPUModelRunner(GPUModelRunner):
         # group_size × uniform bytes is enough to push past the budget against
         # imprecision in vLLM's `avail` estimate.
         if self._mamba_num_blocks is None:
-            self._maybe_set_num_blocks_override(
-                attention_bytes_per_block_per_tensor,
-                int(uniform_page_size_bytes), group_size)
+            self._maybe_set_num_blocks_override(attn_page_size_bytes,
+                                                int(uniform_page_size_bytes),
+                                                group_size)
 
     def _available_kv_cache_hbm(self) -> int:
         """KV-cache HBM budget for the block-count override paths.
@@ -2009,8 +1906,9 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config)
 
     def _maybe_set_compact_mamba_num_blocks_override(
-            self, attention_bytes_per_block_per_tensor: int,
-            mamba_bytes_per_slot_per_tensor: int, group_size: int) -> None:
+            self, attn_page_size_bytes: int,
+            unpadded_mamba_page_size_bytes: int, num_attn_groups: int,
+            num_mamba_groups: int, group_size: int) -> None:
         """Cap mamba layers at `max_num_reqs + 1` recurrent slots and pin
         `cache_config.num_gpu_blocks_override` so the freed HBM grows the
         attention pool.
@@ -2031,12 +1929,12 @@ class TPUModelRunner(GPUModelRunner):
 
         Sizing math
         -----------
-        vLLM allocates `group_size` KVCacheTensors, each shared across one
-        layer from every attention and mamba cache group.
+        vLLM allocates `group_size` KVCacheTensors, each shared across
+        `num_attn_groups` attention layers + `num_mamba_groups` mamba layers.
         With per-tensor budget `B = avail / group_size` and
         `N_mamba = max_num_reqs + 1`,
-            N_attn = floor((B - N_mamba × mamba_bytes_per_slot_per_tensor)
-                            / attention_bytes_per_block_per_tensor).
+            N_attn = floor((B - num_mamba_groups × N_mamba × mamba_unpadded)
+                            / (num_attn_groups × attn_page)).
 
         We do NOT round to a sharding divisor: our single-process
         TP layout does not shard the mamba/attention block (leading) dim — TP
@@ -2044,11 +1942,12 @@ class TPUModelRunner(GPUModelRunner):
         count is valid.
 
         Args:
-            attention_bytes_per_block_per_tensor: Sum of TPU-actual attention
-                page bytes represented in each KVCacheTensor. Mixed target and
-                draft dtypes contribute separate terms.
-            mamba_bytes_per_slot_per_tensor: Sum of natural mamba state bytes
-                represented in each KVCacheTensor.
+            attn_page_size_bytes: TPU-actual bytes per block per attention
+                layer (accounts for dtype packing like fp8).
+            unpadded_mamba_page_size_bytes: bytes per slot per mamba layer
+                (`prod(shape) × dtype_size`, no padding).
+            num_attn_groups: # attention layers backed by each KVCacheTensor.
+            num_mamba_groups: # mamba layers backed by each KVCacheTensor.
             group_size: # KVCacheTensors vLLM allocates (= layers per
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
@@ -2081,7 +1980,8 @@ class TPUModelRunner(GPUModelRunner):
         mamba_num_blocks = self.max_num_reqs * self._mamba_slot_stride + 1
 
         avail_per_tensor = avail // group_size
-        mamba_per_tensor = (mamba_num_blocks * mamba_bytes_per_slot_per_tensor)
+        mamba_per_tensor = (num_mamba_groups * mamba_num_blocks *
+                            unpadded_mamba_page_size_bytes)
         # Falling back to the uniform layout here would pad every block to the
         # mamba page and silently shrink the pool by ~50x, which surfaces as a
         # throughput collapse rather than a misconfiguration. Fail loudly.
@@ -2090,13 +1990,13 @@ class TPUModelRunner(GPUModelRunner):
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: mamba slots alone need "
                 f"{mamba_per_tensor} B per KVCacheTensor (mamba_num_blocks="
-                f"{mamba_num_blocks} x mamba_bytes_per_slot_per_tensor="
-                f"{mamba_bytes_per_slot_per_tensor}), but the "
+                f"{mamba_num_blocks} x num_mamba_groups={num_mamba_groups} x "
+                f"mamba_unpadded={unpadded_mamba_page_size_bytes}), but the "
                 f"per-tensor KV budget is {avail_per_tensor} B. Raise "
                 f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
-        attn_num_blocks = (attn_per_tensor_avail //
-                           attention_bytes_per_block_per_tensor)
+        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
+                                                    attn_page_size_bytes)
         if attn_num_blocks <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: no attention blocks "
@@ -2107,12 +2007,12 @@ class TPUModelRunner(GPUModelRunner):
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self._mamba_num_blocks = int(mamba_num_blocks)
 
-        # Total HBM = group_size KVCacheTensors, each holding all attention
-        # groups' blocks plus all mamba groups' compact recurrent slots.
-        attn_bytes = (group_size * attn_num_blocks *
-                      attention_bytes_per_block_per_tensor)
-        mamba_bytes = (group_size * mamba_num_blocks *
-                       mamba_bytes_per_slot_per_tensor)
+        # Total HBM = group_size KVCacheTensors, each holding num_attn_groups
+        # attention blocks + num_mamba_groups mamba slots.
+        attn_bytes = (group_size * num_attn_groups * attn_num_blocks *
+                      attn_page_size_bytes)
+        mamba_bytes = (group_size * num_mamba_groups * mamba_num_blocks *
+                       unpadded_mamba_page_size_bytes)
         logger.info(
             "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
@@ -2502,16 +2402,16 @@ class TPUModelRunner(GPUModelRunner):
             copy_mamba_state_blocks(raws, src_t, dst_t)
         self._pending_mamba_state_copies.clear()
 
-    def _maybe_set_num_blocks_override(
-            self, attention_bytes_per_block_per_tensor: int,
-            uniform_page_size_bytes: int, group_size: int) -> None:
+    def _maybe_set_num_blocks_override(self, attn_page_size_bytes: int,
+                                       uniform_page_size_bytes: int,
+                                       group_size: int) -> None:
         """Pin `cache_config.num_gpu_blocks_override` to the two-step
         flooring value that keeps peak HBM within the user-set
         `gpu_memory_utilization` budget at high utilization.
 
         Formula:
-          `num_blocks_attn = floor(avail / (attn_bytes × group_size))`
-          `num_blocks_tpu  = floor(attn_bytes × num_blocks_attn / uniform)`
+          `num_blocks_attn = floor(avail / (attn_page × group_size))`
+          `num_blocks_tpu  = floor(attn_page × num_blocks_attn / uniform)`
 
         The two-step flooring can land 1 block lower than vLLM's
         single-step `floor(avail / (uniform × group_size))`. Since
@@ -2528,8 +2428,9 @@ class TPUModelRunner(GPUModelRunner):
         Skipped only if the user has explicitly set `num_gpu_blocks_override`.
 
         Args:
-            attention_bytes_per_block_per_tensor: TPU-actual bytes per block
-                for all attention cache groups represented by one tensor.
+            attn_page_size_bytes: TPU-actual bytes per block for one
+                attention layer, from `get_attention_page_size_bytes`
+                (accounts for dtype packing like fp8).
             uniform_page_size_bytes: bytes per block for one `KVCacheTensor`
                 shared across `num_attn_groups + num_mamba_groups` layers
                 (the `_hybrid_uniform_page_size_bytes` value set above).
@@ -2548,12 +2449,10 @@ class TPUModelRunner(GPUModelRunner):
         if avail <= 0:
             return
 
-        naive_vllm_num_blocks = (
-            avail // (attention_bytes_per_block_per_tensor * group_size))
+        naive_vllm_num_blocks = avail // (attn_page_size_bytes * group_size)
         if naive_vllm_num_blocks <= 0:
             return
-        naive_tensor_size = (attention_bytes_per_block_per_tensor *
-                             naive_vllm_num_blocks)
+        naive_tensor_size = attn_page_size_bytes * naive_vllm_num_blocks
         num_blocks_tpu = naive_tensor_size // uniform_page_size_bytes
         if num_blocks_tpu <= 0:
             return

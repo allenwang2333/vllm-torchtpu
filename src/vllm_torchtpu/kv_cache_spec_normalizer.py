@@ -1,5 +1,4 @@
 import math
-from collections.abc import Mapping
 from dataclasses import replace
 
 import torch
@@ -17,7 +16,6 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
-    layer_kv_cache_dtypes: Mapping[str, str | torch.dtype] | None = None,
     attention_backend: type[AttentionBackend] | None = None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
@@ -33,7 +31,7 @@ def normalize_kv_cache_specs_for_tpu(
             continue
         normalized[layer_name] = _normalize_one_spec(
             spec,
-            (layer_kv_cache_dtypes or {}).get(layer_name, kv_cache_dtype),
+            kv_cache_dtype,
             attention_backend=attention_backend,
         )
     if enable_unified_kv_layout:
@@ -42,29 +40,6 @@ def normalize_kv_cache_specs_for_tpu(
             for k, v in normalized.items() if k not in exempt
         }
         if _has_hybrid_attention_and_mamba(non_exempt_specs):
-            # TPU arrays are strongly typed; this runtime doesn't support
-            # mixed precision attention buckets in unified HMA layout.
-            if layer_kv_cache_dtypes is not None:
-                layer_dtypes = {
-                    layer_dtype
-                    if isinstance(layer_dtype, str) else str(layer_dtype)
-                    for layer_name, layer_dtype in
-                    layer_kv_cache_dtypes.items()
-                    if layer_name not in exempt and isinstance(
-                        non_exempt_specs.get(layer_name), AttentionSpec)
-                }
-                if len(layer_dtypes) > 1:
-                    raise ValueError(
-                        "Unified KV cache layout with mixed attention dtypes is "
-                        "not supported on TPU.")
-            if len({
-                    v.dtype
-                    for v in non_exempt_specs.values()
-                    if isinstance(v, AttentionSpec)
-            }) > 1:
-                raise ValueError(
-                    "Unified KV cache layout with mixed attention dtypes is not "
-                    "supported on TPU.")
             page_size = max(
                 _required_page_size_bytes(spec)
                 for spec in non_exempt_specs.values())
