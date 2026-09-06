@@ -32,14 +32,51 @@ Variant, two arrays:
 
     cache_val    u8[num_pages, page_size//kv_packing, kv_packing, 128]
                  the 128 fp8 key values, and nothing else
-    cache_scale  u8[num_pages, page_size]
-                 the e8m0 scale for position `p` of page `g` at [g, p]
+    cache_scale  u8[num_pages, page_size // 128, 128]
+                 the e8m0 scale for position `p` of page `g` at
+                 [g, p // 128, p % 128]
 
 129 used bytes per compressed position instead of 256, so the indexer read of
-this array falls by 49.6%. The scale plane is stored LANE-MAJOR (a whole page
-of 1024 scales along the minor axis) so that the in-VMEM `[bkv_sz, 1] -> [1,
-bkv_sz]` transpose the incumbent pays inside `load_bkv` disappears: the DMA
-lands the scales in exactly the layout `compute_scores` multiplies by.
+this array falls by 49.6%.
+
+WHY THE SCALE PLANE IS DECLARED THREE-DIMENSIONAL
+-------------------------------------------------
+`[num_pages, page_size // 128, 128]` holds exactly the same bytes in exactly
+the same order as `[num_pages, page_size]` would. The declaration is not
+cosmetic: Mosaic tiles the LAST TWO dimensions of an HBM memref, so a 2-D
+`[num_pages, 1024]` plane is tiled on its *page* axis and the reader's
+one-page DMA is a one-row slice of a tiled dimension, which is rejected:
+
+    Offsets along tiled dimensions must be aligned to tiles. Failed to verify
+    that the index at dimension 0 is divisible by the tile dimension 32.
+      %766 = "tpu.memref_slice"(...) : (memref<576x1024xi8,
+             #tpu.tiled<(32,128)(4,1),[8,1]>, #tpu.memory_space<hbm>>, i32,
+             i32) -> memref<1x1024xi8, ...>
+
+    -- job j-ce74a9f2-a4cd-40cb-9e87, the first build of this variant.
+
+`tpu.assume_multiple` does NOT apply: the page index genuinely is not a
+multiple of 32, so suppressing the check would produce wrong data. With the
+3-D declaration the page axis is untiled and the tiled `(8, 128)` pair is
+exactly one page of 1024 scales, so the per-page DMA is a whole number of
+tiles and moves 1024 B with no padding.
+
+The cost is that the scales land in VMEM as `[bkv_p, 8, 128]` and
+`compute_scores` wants `[1, bkv_sz]`, so `load_bkv` regroups. It widens
+e8m0 -> f32 BEFORE the regroup, so the relayout is on an f32 `(8,128)` tile
+rather than on a packed 8-bit one. THIS IS BIT-EXACT: e8m0 is a bare
+power-of-two exponent, and bf16 and f32 have the same 8 exponent bits, so
+both represent every e8m0 value exactly and neither rounds. The incumbent
+widens to bf16 and then promotes to f32 in the multiply against the f32
+`s_summed`; this variant widens straight to f32. Same value, same product,
+so the variant remains bit-exact against the incumbent by construction even
+after the relayout.
+
+The incumbent's `[bkv_sz, 1] -> [1, bkv_sz]` transpose (2048 sublanes to
+2048 lanes) is replaced by this `[bkv_p, 8, 128] -> [1, bkv_sz]` regroup
+(16 sublanes to 2048 lanes), so the compute side should be no worse. Whether
+Mosaic accepts the regroup at all is `unmodelled` -- it is what this build
+finds out.
 
 `cache_kv` is passed as a two-tuple `(cache_val, cache_scale)` so that the
 public signature -- and therefore the read-only instruments -- is unchanged.
@@ -110,13 +147,13 @@ def kernel(
     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
     cache_kv_hbm_ref,  # Shape: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim=128], Memory: HBM
-    cache_scale_hbm_ref,  # Shape: [total_num_pages, page_size], Memory: HBM
+    cache_scale_hbm_ref,  # Shape: [total_num_pages, page_size//128, 128], HBM
     scores_in_hbm_ref,  # Shape: [max_num_tokens, num_sublanes_total, 128], Memory: HBM (aliased to output)
     # Output
     scores_hbm_ref,  # Shape: [max_num_tokens, num_sublanes_total, 128], Memory: HBM
     # Scratch
     bkv_x2_ref,  # Shape: [2, seq_batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim=128], Memory: VMEM
-    bkv_scale_x2_ref,  # Shape: [2, seq_batch_size, 1, bkv_sz], Memory: VMEM
+    bkv_scale_x2_ref,  # Shape: [2, seq_batch_size, bkv_p, 8, 128], VMEM
     bq_x2_ref,  # Shape: [2, seq_batch_size, bq_sz, num_q_heads, head_dim], Memory: VMEM
     bq_weights_x2_ref,  # Shape: [2, seq_batch_size, bq_sz, num_q_heads], Memory: VMEM
     scores_block_x2_ref,  # Shape: [2, seq_batch_size * bq_sz, num_sublanes_bkv, 128], Memory: VMEM
@@ -235,17 +272,18 @@ def kernel(
                         wait=False,
                     )
 
-                    # NARROW RECORD: the scale plane is a second, 128x smaller
-                    # array. One DMA per page lands page `i`'s 1024 scales at
-                    # lane offset i*page_size of a [1, bkv_sz] VMEM row --
-                    # already the layout `compute_scores` wants, so no
-                    # transpose is needed on the compute side.
+                    # NARROW RECORD: the scale plane is a second, 128x
+                    # smaller array. One DMA per page moves that page's whole
+                    # (8, 128) scale tile -- 1024 B, a whole number of tiles,
+                    # no padding -- into slot `i` of the VMEM buffer. Slicing
+                    # dimension 0 is legal precisely because the 3-D
+                    # declaration leaves the page axis untiled; see the module
+                    # docstring for the 2-D form Mosaic rejected.
                     safe_scale_page = jnp.minimum(
                         jnp.maximum(raw_page, 0), total_num_pages - 1)
                     _async_copy(
                         cache_scale_hbm_ref.at[pl.ds(safe_scale_page, 1)],
-                        bkv_scale_vmem_ref.at[pl.ds(0, 1),
-                                              pl.ds(i * page_size, page_size)],
+                        bkv_scale_vmem_ref.at[pl.ds(i, 1)],
                         scale_sem,
                         wait=False,
                     )
@@ -253,8 +291,7 @@ def kernel(
                 dma_bkv_sz = bkv_p * page_size_per_kv_packing
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
                 _async_copy(src=dst_kv, dst=dst_kv, sem=sem, wait=True)
-                dst_sc = bkv_scale_vmem_ref.at[pl.ds(0, 1),
-                                               pl.ds(0, bkv_p * page_size)]
+                dst_sc = bkv_scale_vmem_ref.at[pl.ds(0, bkv_p)]
                 _async_copy(src=dst_sc, dst=dst_sc, sem=scale_sem, wait=True)
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
@@ -326,9 +363,16 @@ def kernel(
             # slice and the `[:, 128:129].T` transpose both disappear.
             flat_bkv = bkv.reshape(-1, bkv.shape[-1])
             fp8_val = pltpu.bitcast(flat_bkv, jnp.float8_e4m3fn)
+            # [bkv_p, 8, 128] u8 -> e8m0 -> f32 -> [1, bkv_sz].
+            # The widen happens BEFORE the regroup so the relayout runs on an
+            # f32 (8,128) tile rather than a packed 8-bit one. e8m0 is a bare
+            # exponent and f32 has the same 8 exponent bits, so the widen is
+            # exact and the variant stays bit-identical to the incumbent (which
+            # widens to bf16 -- also exact -- and promotes in the multiply).
             raw_scale = bkv_scale_x2_ref.at[bkv_sem_idx, batch_idx][...]
             scale_val = pltpu.bitcast(
-                raw_scale, jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+                raw_scale, jnp.float8_e8m0fnu).astype(jnp.float32).reshape(
+                    1, bkv_sz)
 
             bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
             bkv_scales.append(scale_val)
@@ -756,7 +800,7 @@ def streamindex_topk(
         # NARROW RECORD: one extra, tiny double buffer for the scale plane,
         # laid out [2, seq_batch_size, 1, bkv_sz] so it is already lane-major.
         bkv_scale_double_buf = pltpu.VMEM(
-            (2, seq_batch_size, 1, bkv_sz),
+            (2, seq_batch_size, bkv_p, page_size // 128, 128),
             cache_scale.dtype,
         )
 

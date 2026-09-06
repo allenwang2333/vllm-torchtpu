@@ -116,7 +116,10 @@ def main(argv=None):
           f"{n_pos*wide/1e6:.2f} MB", flush=True)
     print(f"  val    u8[{npages},{pspp},{kvp},{narrow}] = "
           f"{n_pos*narrow/1e6:.2f} MB", flush=True)
-    print(f"  scale  u8[{npages},{page_size}] = {n_pos/1e6:.2f} MB", flush=True)
+    print(f"  scale  u8[{npages},{page_size}] = {n_pos/1e6:.2f} MB "
+          f"(2-D form, W2/W12)", flush=True)
+    print(f"  scale  u8[{npages},{page_size//128},128] = {n_pos/1e6:.2f} MB "
+          f"(3-D form the reader needs, W2b/W12b)", flush=True)
 
     rng = np.random.default_rng(0)
     wide_cache = jnp.asarray(
@@ -125,6 +128,14 @@ def main(argv=None):
         rng.integers(0, 256, (npages, pspp, kvp, narrow), dtype=np.uint8))
     scale_cache = jnp.asarray(
         rng.integers(0, 256, (npages, page_size), dtype=np.uint8))
+    # The 3-D scale plane the reader's tiling actually requires. Same bytes,
+    # same order, same total size -- only the declared shape differs, so the
+    # writer pays one extra integer op splitting `slot` into (slot//128,
+    # slot%128). W2b/W12b price that; W2/W12 keep the 2-D form so the number
+    # already reported for job j-ce74a9f2-a4cd-40cb-9e87 reproduces in the
+    # same job as its replacement rather than across two jobs.
+    scale_cache3 = jnp.asarray(
+        rng.integers(0, 256, (npages, page_size // 128, 128), dtype=np.uint8))
 
     # --- the index arithmetic, verbatim from mla_attention_op.py:93-104 ----
     def indices(k_rows, cu_q_lens, seq_lens, page_indices):
@@ -187,10 +198,22 @@ def main(argv=None):
             sc = sc.at[page, slot].set(ks_)
             return vc, sc
 
+        def w2b_fn(cache, ks_, cu_, sl_, pi_):
+            page, slot = indices(ks_.shape[0], cu_, sl_, pi_)
+            return cache.at[page, slot // 128, slot % 128].set(ks_)
+
+        def w12b_fn(vc, sc, kv_, ks_, cu_, sl_, pi_):
+            page, slot = indices(kv_.shape[0], cu_, sl_, pi_)
+            vc = vc.at[page, slot // kvp, slot % kvp].set(kv_)
+            sc = sc.at[page, slot // 128, slot % 128].set(ks_)
+            return vc, sc
+
         _w0 = jax.jit(w0_fn, donate_argnums=(0,))
         _w1 = jax.jit(w1_fn, donate_argnums=(0,))
         _w2 = jax.jit(w2_fn, donate_argnums=(0,))
         _w12 = jax.jit(w12_fn, donate_argnums=(0, 1))
+        _w2b = jax.jit(w2b_fn, donate_argnums=(0,))
+        _w12b = jax.jit(w12b_fn, donate_argnums=(0, 1))
 
         n0 = jax.jit(lambda c: c.at[0, 0, 0, 0].set(1), donate_argnums=(0,))
         n1 = jax.jit(lambda c: c.at[0, 0, 0, 0].set(1), donate_argnums=(0,))
@@ -239,20 +262,48 @@ def main(argv=None):
         w12 = rec("W12_split_both", *_median_spread(ts),
                   nbytes=n_pos * (narrow + 1))
 
+        # --- the same two scatters against the 3-D scale plane -------------
+        scale_cache3, ts = _time_chain(_w2b, scale_cache3, k_scale, cu_j,
+                                       sl_j, pi_j)
+        w2b = rec("W2b_scale_only_3d", *_median_spread(ts), nbytes=n_pos)
+
+        pair = (val_cache, scale_cache3)
+        pair = _jax.block_until_ready(_w12b(*pair, k_val, k_scale, cu_j, sl_j,
+                                            pi_j))
+        for _ in range(WARMUP):
+            pair = _jax.block_until_ready(
+                _w12b(*pair, k_val, k_scale, cu_j, sl_j, pi_j))
+        ts = []
+        for _ in range(REPS):
+            t0 = time.perf_counter()
+            for _ in range(INNER):
+                pair = _w12b(*pair, k_val, k_scale, cu_j, sl_j, pi_j)
+            _jax.block_until_ready(pair)
+            ts.append((time.perf_counter() - t0) / INNER)
+        val_cache, scale_cache3 = pair
+        w12b = rec("W12b_split_both_3d", *_median_spread(ts),
+                   nbytes=n_pos * (narrow + 1))
+
         d = dict(kind="writer_summary", num_tokens=T,
                  w0_ms=w0["ms"], w12_ms=w12["ms"],
                  w1_ms=w1["ms"], w2_ms=w2["ms"],
                  sum_w1_w2_ms=w1["ms"] + w2["ms"],
+                 w2b_ms=w2b["ms"], w12b_ms=w12b["ms"],
                  delta_time_pct=(w12["ms"] - w0["ms"]) / w0["ms"] * 100.0,
-                 speedup_x=w0["ms"] / w12["ms"])
+                 speedup_x=w0["ms"] / w12["ms"],
+                 delta_time_pct_3d=(w12b["ms"] - w0["ms"]) / w0["ms"] * 100.0,
+                 speedup_x_3d=w0["ms"] / w12b["ms"])
         rows.append(d)
         print(json.dumps(d), flush=True)
 
     print("\n=== writer-side scatter, production cache size ===")
     print("delta_time% = (W12 - W0)/W0; NEGATIVE IS FASTER. This number is "
           "NOT netted against the reader-side win.")
+    print("W12 uses the 2-D scale plane (reproduces j-ce74a9f2); W12b uses "
+          "the 3-D plane the reader needs. Same bytes either way.")
     hdr = (f"{'T':>6}{'W0_ms':>10}{'W1_ms':>10}{'W2_ms':>10}{'W12_ms':>10}"
-           f"{'dtime%':>9}{'speedup':>9}")
+           f"{'dtime%':>9}{'spdup':>8}{'W12b_ms':>10}{'dtime%_3d':>11}"
+           f"{'spdup_3d':>10}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
@@ -260,7 +311,9 @@ def main(argv=None):
             continue
         print(f"{r['num_tokens']:>6}{r['w0_ms']:>10.4f}{r['w1_ms']:>10.4f}"
               f"{r['w2_ms']:>10.4f}{r['w12_ms']:>10.4f}"
-              f"{r['delta_time_pct']:>9.2f}{r['speedup_x']:>9.3f}")
+              f"{r['delta_time_pct']:>9.2f}{r['speedup_x']:>8.3f}"
+              f"{r['w12b_ms']:>10.4f}{r['delta_time_pct_3d']:>11.2f}"
+              f"{r['speedup_x_3d']:>10.3f}")
 
     if a.json:
         with open(a.json, "w") as f:

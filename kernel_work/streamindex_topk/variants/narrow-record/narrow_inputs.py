@@ -28,7 +28,8 @@ Record derivation, from `mla_attention_op.py:230-231` and
 `streamindex_topk.py:265-268`:
 
     cache_kv[g, i, j, 0:128]  -> cache_val[g, i, j, 0:128]   the fp8 values
-    cache_kv[g, i, j, 128]    -> cache_scale[g, i*4 + j]      the e8m0 scale
+    cache_kv[g, i, j, 128]    -> cache_scale[g, p // 128, p % 128]  where
+                                 p = i*kv_packing + j        the e8m0 scale
     cache_kv[g, i, j, 129:]   -> dropped. This is the 49.6% that never had to
                                  cross HBM.
 
@@ -36,6 +37,13 @@ Record derivation, from `mla_attention_op.py:230-231` and
 builds the cache as `rec.reshape(num_pages, page_size // kv_packing,
 kv_packing, width)` from a `[num_pages, page_size, width]` array in position
 order, so the flattened `(i, j)` pair is exactly the position.
+
+The scale plane's trailing `(page_size // 128, 128)` split is a pure reshape of
+the position axis -- same bytes, same order -- and exists so that Mosaic tiles
+the last two dimensions into exactly one page of scales, leaving the page axis
+untiled and the reader's per-page DMA tile-aligned. The 2-D
+`[num_pages, page_size]` form is what job j-ce74a9f2-a4cd-40cb-9e87 rejected;
+see the kernel's module docstring.
 """
 
 import contextlib
@@ -48,10 +56,12 @@ from kernel_work.streamindex_topk.instruments import shapes as S
 
 
 def split_cache(cache_kv):
-    """(u8[np, pspp, kvp, 256]) -> (u8[np, pspp, kvp, 128], u8[np, page_size]).
+    """(u8[np,pspp,kvp,256]) -> (u8[np,pspp,kvp,128], u8[np,page_size//128,128]).
 
-    Returns the value plane and the LANE-MAJOR scale plane. `cache_scale[g, p]`
-    is the e8m0 scale byte of compressed position `p` of page `g`.
+    Returns the value plane and the scale plane. `cache_scale[g, p//128, p%128]`
+    is the e8m0 scale byte of compressed position `p` of page `g` -- the same
+    bytes in the same order a flat `[num_pages, page_size]` plane would hold,
+    reshaped so that Mosaic's `(8, 128)` HBM tile is exactly one page.
     """
     a = np.asarray(cache_kv)
     num_pages, pspp, kvp, width = a.shape
@@ -59,8 +69,13 @@ def split_cache(cache_kv):
         raise AssertionError(
             f"expected the shipped record width {S.LKV_DIM}, got {width}")
     hd = S.INDEX_HEAD_DIM
+    page_size = pspp * kvp
+    if page_size % 128:
+        raise AssertionError(
+            f"page_size {page_size} is not a multiple of the 128-lane tile")
     val = np.ascontiguousarray(a[..., :hd])
-    scale = np.ascontiguousarray(a[..., hd].reshape(num_pages, pspp * kvp))
+    scale = np.ascontiguousarray(
+        a[..., hd].reshape(num_pages, page_size // 128, 128))
     pad = a[..., hd + 1:]
     if pad.size and pad.any():
         raise AssertionError(
