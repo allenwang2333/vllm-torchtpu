@@ -191,17 +191,21 @@ if [ "$GSM8K_LIMIT" -gt 0 ]; then
     echo "[k3-sweep] ===== GSM8K limit=$GSM8K_LIMIT num_concurrent=$GSM8K_CONC ====="
     EVAL_DIR="$RESULTS_DIR/gsm8k"; mkdir -p "$EVAL_DIR"
     T0=$(date +%s)
-    lm_eval --tasks gsm8k --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
-        --model local-chat-completions \
-        --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,num_concurrent=$GSM8K_CONC" \
-        --apply_chat_template --fewshot_as_multiturn true \
-        --gen_kwargs '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}' \
+    # The server runs --reasoning-parser kimi_k3 (as the B300 recipe does), so the
+    # answer arrives in reasoning_content; stock lm_eval reads only content and
+    # scores 0 (build 9). InferenceX's sitecustomize patch + gsm8k.yaml handle it.
+    PATCH_DIR=$(mktemp -d); cp "$IX_DIR/utils/evals/patches/lm_eval_sitecustomize.py" "$PATCH_DIR/sitecustomize.py"
+    PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}" OPENAI_API_KEY=EMPTY \
+    lm_eval --tasks "$IX_DIR/utils/evals/gsm8k.yaml" --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
+        --model local-chat-completions --apply_chat_template --log_samples \
+        --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$GSM8K_CONC,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
+        --gen_kwargs "max_tokens=4096,temperature=0,top_p=1" \
         --output_path "$EVAL_DIR" 2>&1 | tail -25
     echo "[k3-sweep] gsm8k wall $(( $(date +%s) - T0 )) s"
     python3 - "$EVAL_DIR" << 'PYEOF'
 import glob, json, sys
 for f in glob.glob(sys.argv[1] + "/**/results_*.json", recursive=True):
-    r = json.load(open(f))["results"].get("gsm8k", {})
+    r = next(iter(json.load(open(f))["results"].values()), {})
     print("[k3-sweep] GSM8K:", {k: round(v, 4) for k, v in r.items() if isinstance(v, (int, float)) and "exact_match" in k})
 PYEOF
     wait_server_idle
