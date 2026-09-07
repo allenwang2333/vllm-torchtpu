@@ -11,7 +11,9 @@ TENSOR_PARALLELISM=32
 DATA_PARALLELISM=1
 ENABLE_EP=true
 QUANTIZATION=""
-ISL_OSL_CONFIGS="8192:256 32768:256 65536:256 114688:256"
+# run_benchmarks.sh presets ISL_OSL_CONFIGS="512:512" before sourcing this file, so the
+# override must use a different name.
+ISL_OSL_CONFIGS="${K3_ISL_OSL_OVERRIDE:-8192:256 32768:256 65536:256 114688:256}"
 CONCURRENCY_OPTIONS="1"
 NUM_PROMPTS=2
 RANDOM_RANGE_RATIO="0.0"
@@ -26,7 +28,7 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 ENABLE_PREFIX_CACHING=false
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
+EXTRA_SERVE_ARGS="${K3_EXTRA_SERVE_ARGS:+$K3_EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
 
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"

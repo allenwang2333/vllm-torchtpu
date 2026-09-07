@@ -12,6 +12,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --config)      CONFIG_NAME="$2"; shift 2 ;;
         --results-dir) RESULTS_DIR="$2"; shift 2 ;;
+        --max-model-len) export MAX_MODEL_LEN="$2"; shift 2 ;;
+        --kv)            export KV_CACHE_DTYPE="$2"; shift 2 ;;
+        --isl-osl)       export K3_ISL_OSL_OVERRIDE="$2"; shift 2 ;;
+        --extra-serve-args) export K3_EXTRA_SERVE_ARGS="$2"; shift 2 ;;
         *) echo "[k3-ctxsweep] unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -34,7 +38,7 @@ cleanup() {
     fi
 }
 trap cleanup EXIT INT TERM
-echo "[k3-ctxsweep] config=$CONFIG_NAME results=$RESULTS_DIR"; df -h / /tmp 2>/dev/null
+echo "[k3-ctxsweep] config=$CONFIG_NAME results=$RESULTS_DIR max_model_len=${MAX_MODEL_LEN:-config} kv=${KV_CACHE_DTYPE:-config} isl_osl=${K3_ISL_OSL_OVERRIDE:-config} extra=${K3_EXTRA_SERVE_ARGS:-}"; df -h / /tmp 2>/dev/null
 bash "$SCRIPT_DIR/cleanup_server.sh"
 "$SCRIPT_DIR/run_benchmarks.sh" --config "$CONFIG_NAME" --results-dir "$RESULTS_DIR"
 rc=$?
