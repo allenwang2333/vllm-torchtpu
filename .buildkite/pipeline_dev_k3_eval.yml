@@ -1,0 +1,24 @@
+# [branch-local] Kimi-K3 nightly step with MMLU evals, for baseline calibration.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_eval.yml.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "Perf/Eval: kimi-k3-tp32-ep with MMLU evals, eval conc 16 (TPU v7x-32)"
+    key: k3_eval
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "1"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval --eval-concurrency 16 --results-dir /perf_eval_results/kimi-k3-tp32-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
