@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 
 Enum = enum.Enum
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+PCP_AXIS_NAME = "pcp"
+DCP_AXIS_NAME = "dcp"
 
 
 def cdiv(a, b):
@@ -44,6 +46,91 @@ def get_dtype_bitwidth(dtype):
 def get_dtype_packing(dtype):
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits
+
+
+# --------------------------------------------------------------------------- #
+# PCP (prefill context parallel) compressed-coordinate helpers.
+#
+# PCP shards the KV cache chunk-interleaved over `interleave_size` *uncompressed*
+# tokens (see kernels/experimental/pcp_streaming_rpa/schedule.py). The indexer
+# stores one compressed row per `compression_ratio` tokens, so the chunk width in
+# compressed space is `interleave_c = interleave_size // compression_ratio` and
+# global compressed position `g` is owned by rank `(g // interleave_c) % pcp_size`.
+#
+# `pcp_rank` is a traced i32 scalar throughout, so a single compiled program
+# serves every rank; only `pcp_size` and `interleave_c` are static.
+# --------------------------------------------------------------------------- #
+
+
+def pcp_local_to_global(local_idx, pcp_rank, pcp_size: int, interleave_c: int):
+    """Map a rank-local compressed index to its global compressed position.
+
+    Monotonic in `local_idx`, so the l-th position this rank owns is exactly
+    ``pcp_local_to_global(l, ...)``. That is what lets the kernel keep using a
+    plain ``global_pos < kv_len`` test as the local bounds check.
+    """
+    if pcp_size == 1:
+        return local_idx
+    cycle_c = pcp_size * interleave_c
+    return ((local_idx // interleave_c) * cycle_c + pcp_rank * interleave_c +
+            local_idx % interleave_c)
+
+
+def pcp_owner_rank(global_idx, pcp_size: int, interleave_c: int):
+    """Which rank owns global compressed position `global_idx`."""
+    if pcp_size == 1:
+        return jnp.zeros_like(global_idx)
+    return (global_idx // interleave_c) % pcp_size
+
+
+def pcp_global_to_local(global_idx, pcp_size: int, interleave_c: int):
+    """Inverse of `pcp_local_to_global`, evaluated on the owning rank.
+
+    Takes no rank argument, and does not need one: the owner is recoverable
+    from `global_idx` alone (`pcp_owner_rank`), and once the owner is fixed the
+    local index is the same arithmetic everywhere. That is what lets the DCP
+    merge convert a winner to the coordinate space of whichever rank holds it
+    without being on that rank.
+    """
+    if pcp_size == 1:
+        return global_idx
+    cycle_c = pcp_size * interleave_c
+    return (global_idx // cycle_c) * interleave_c + global_idx % interleave_c
+
+
+def pcp_local_length(global_len, pcp_rank, pcp_size: int, interleave_c: int):
+    """Count compressed positions ``< global_len`` owned by `pcp_rank`.
+
+    Mirrors ``_local_page_valid_len`` in pcp_streaming_rpa/schedule.py.
+    """
+    if pcp_size == 1:
+        return global_len
+    cycle_c = pcp_size * interleave_c
+    full = global_len // cycle_c
+    rem = global_len - full * cycle_c
+    return full * interleave_c + jnp.clip(rem - pcp_rank * interleave_c, 0,
+                                          interleave_c)
+
+
+def pcp_rank_as_data(pcp_axis_name: str, pcp_size: int):
+    """This shard's index along `pcp_axis_name`, without `lax.axis_index`.
+
+    `lax.axis_index` is the obvious spelling, but it lowers to `partition-id`,
+    which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
+    through its `jax.export` bridge ("partitionId instruction is not supported
+    for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
+    a replicated iota says the same thing with an instruction the partitioner
+    accepts: every device splits `[0..pcp_size)` into single elements and
+    keeps the chunks addressed to it, so device `r` receives `r` from each
+    peer and every lane of the result is `r`.
+
+    Same trick as `pcp_streaming_rpa/wrapper.py`'s
+    `_select_replicated_shard_for_pcp_rank`, on an iota rather than real data.
+    Must be called from inside a `shard_map` body.
+    """
+    ranks = jnp.arange(pcp_size, dtype=jnp.int32)
+    exchanged = lax.all_to_all(ranks, pcp_axis_name, 0, 0, tiled=True)
+    return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
 
 
 class MlaCase(Enum):
@@ -863,3 +950,407 @@ def streamindex_topk(
         _common_path,
         None,
     )
+
+
+def streamindex_topk_pcp(
+    q: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim]
+    indexer_weights: jax.Array,  # [padded_num_tokens, num_q_heads]
+    cache_kv: jax.Array,  # sharded on axis 0 over the PCP axis
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * virtual_pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    token_order: jax.Array,  # i64/i32[padded_num_tokens]
+    *,
+    mesh,
+    k: int,
+    compression_ratio: int,
+    pcp_size: int,
+    interleave_size: int,
+    num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
+    num_queries_per_block: tuple[int, int, int] | int | None = None,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    decode_req_batch_size: int = 4,
+    pcp_axis_name: str = PCP_AXIS_NAME,
+) -> jax.Array:
+    """StreamIndex top-k over a PCP-sharded compressed KV cache.
+
+    Top-k over a sharded KV axis is a global reduction, so each rank scores
+    every query token against its own shard, and the per-rank winners are then
+    merged. The merge is a set union, not an accumulation: PCP *partitions* the
+    KV positions, so no two ranks hold a partial score for the same position.
+    It is exact because a global winner is beaten by at most `k - 1` positions
+    overall, hence by at most `k - 1` on its owning rank, so it always survives
+    that rank's local top-k.
+
+    Q is replicated rather than sharded because it is O(num_tokens) and does not
+    grow with context, whereas ring-streaming the KV would move O(context) per
+    layer. The candidate exchange is an all-to-all rather than an all-gather:
+    query tokens are PCP-sharded too, so rank `r` only needs to send rank `r'`
+    the candidates belonging to `r'`'s tokens -- a factor of `pcp_size` less
+    traffic. At 1M context / `pcp_size=16` / `k=2048` that is the difference
+    between ~268MB and ~17MB per layer.
+
+    This is the cross-rank analogue of `sparsecore_topk`'s own two-stage
+    subcore merge (sparsecore_topk.py:415-457), and the structural analogue of
+    the LSE output the DCP attention kernels return for their merge.
+
+    Args:
+      q, indexer_weights: replicated, in natural request-major token order.
+      cache_kv: this rank's shard of the compressed KV cache.
+      page_indices: replicated *virtual* page ordinals. A virtual page spans
+        `page_size * pcp_size` compressed positions, of which each rank holds
+        `page_size`; the same ordinal therefore resolves against every rank's
+        own shard, as in pcp_streaming_rpa/schedule.py.
+      token_order: `token_order` from `build_pcp_rank_major_token_order`,
+        mapping a rank-major packed slot to its natural token index (-1 pads).
+      mesh: mesh containing `pcp_axis_name`.
+
+    Returns:
+      i32[padded_num_tokens // pcp_size, k] global compressed positions for this
+      rank's own query tokens, in rank-major packed order. `-1` pads.
+    """
+    if pcp_size <= 1:
+        raise ValueError(
+            f"streamindex_topk_pcp requires pcp_size > 1, got {pcp_size}; "
+            "use streamindex_topk for the unsharded case.")
+    if pcp_axis_name not in mesh.axis_names:
+        raise ValueError(
+            f"mesh {mesh.axis_names} has no {pcp_axis_name!r} axis.")
+    if mesh.shape[pcp_axis_name] != pcp_size:
+        raise ValueError(f"pcp_size={pcp_size} does not match mesh axis "
+                         f"{pcp_axis_name!r}={mesh.shape[pcp_axis_name]}.")
+    if q.shape[0] % pcp_size != 0:
+        raise ValueError(
+            f"padded_num_tokens={q.shape[0]} must be divisible by "
+            f"pcp_size={pcp_size}.")
+    if token_order.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"token_order has {token_order.shape[0]} entries but q has "
+            f"{q.shape[0]} tokens.")
+
+    def _local(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
+               distribution, token_order):
+        pcp_rank = pcp_rank_as_data(pcp_axis_name, pcp_size)
+
+        # A virtual page ordinal resolves to a physical block within this rank's
+        # own shard; `cache_kv.shape[0]` is the local block count inside
+        # shard_map. Mirrors schedule.py's `jnp.mod(block_tables, ...)`.
+        local_page_indices = jnp.mod(page_indices,
+                                     jnp.int32(cache_kv.shape[0]))
+
+        idxs, scores = streamindex_topk(
+            q,
+            indexer_weights,
+            cache_kv,
+            seq_lens,
+            local_page_indices,
+            cu_q_lens,
+            distribution,
+            k=k,
+            compression_ratio=compression_ratio,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+            decode_req_batch_size=decode_req_batch_size,
+            enable_early_exit=False,
+            pcp_size=pcp_size,
+            pcp_rank=pcp_rank,
+            interleave_size=interleave_size,
+            return_scores=True,
+        )
+
+        # Natural request-major -> PCP rank-major packed order, so that the
+        # all-to-all's contiguous split along axis 0 delivers each rank exactly
+        # the tokens it owns.
+        keep = (token_order >= 0)[:, None]
+        take = jnp.maximum(token_order, 0).astype(jnp.int32)
+        idxs = jnp.where(keep, jnp.take(idxs, take, axis=0), -1)
+        scores = jnp.where(keep, jnp.take(scores, take, axis=0), -jnp.inf)
+
+        # [T, k] -> [T // pcp_size, pcp_size * k].
+        idxs = lax.all_to_all(idxs, pcp_axis_name, 0, 1, tiled=True)
+        scores = lax.all_to_all(scores, pcp_axis_name, 0, 1, tiled=True)
+
+        # Stage 2. Full width as the row length: -inf entries (unfilled local
+        # slots, padding tokens) are never selected, so they need no masking.
+        slots = sparsecore_topk(
+            scores,
+            k,
+            row_lengths=jnp.full((scores.shape[0], ),
+                                 scores.shape[1],
+                                 dtype=jnp.int32),
+            write_empty_rows=True,
+        )
+        merged = jnp.take_along_axis(idxs, jnp.maximum(slots, 0), axis=1)
+        return jnp.where(slots >= 0, merged, -1)
+
+    replicated = P()
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            replicated,  # q
+            replicated,  # indexer_weights
+            P(pcp_axis_name),  # cache_kv
+            replicated,  # seq_lens
+            replicated,  # page_indices
+            replicated,  # cu_q_lens
+            replicated,  # distribution
+            replicated,  # token_order
+        ),
+        out_specs=P(pcp_axis_name),
+        check_vma=False,
+    )(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
+      distribution, token_order)
+
+
+def dcp_topk_capacity(k: int, dcp_size: int) -> int:
+    """Per-rank list width for `streamindex_topk_dcp`: 2x the mean occupancy.
+
+    Mean occupancy is `k / dcp_size`, so headroom has to scale with the shard
+    count rather than be a fixed width -- a constant that is generous at
+    `dcp_size=16` is a hard truncation at `dcp_size=2`.
+
+    2x is not arbitrary. `m_r = |topk & shard_r|` was swept over run-clustered
+    winners (attention sinks, a local window, and contiguous runs of length L)
+    and the spread turns out to be governed by the run length against the cycle
+    width `interleave_size * dcp_size`, not by clustering as such: runs much
+    longer than the cycle spread almost perfectly. At `interleave_size=4` --
+    which is also the floor forced by `dsa_gather.TILE_SUBROWS` -- the worst
+    `m_r` observed over all L with `k=2048, dcp_size=16` was 199 against a mean
+    of 128, so 256 leaves 1.29x. Winners correlated with `position mod
+    (interleave_size * dcp_size)` could still concentrate arbitrarily, which is
+    why `streamindex_topk_dcp` reports `dropped` instead of trusting this.
+    """
+    if dcp_size <= 1:
+        return k
+    return min(k, 2 * k // dcp_size)
+
+
+def _partition_winners_by_owner(merged, dcp_size: int, interleave_c: int,
+                                capacity: int):
+    """Compact a token's global top-k list into one padded list per owner rank.
+
+    Args:
+      merged: i32[num_rows, k] global compressed positions in `sparsecore_topk`
+        order, `-1` padded.
+      dcp_size, interleave_c: the shard layout.
+      capacity: static width of each owner's list.
+
+    Returns:
+      `(lists, dropped)` where `lists` is i32[num_rows, dcp_size, capacity] of
+      *rank-local* indices (`-1` padded) and `dropped` counts entries that did
+      not fit `capacity`.
+    """
+    num_rows, _ = merged.shape
+    valid = merged >= 0
+    owner = jnp.where(valid,
+                      pcp_owner_rank(merged, dcp_size, interleave_c), -1)
+    local = pcp_global_to_local(jnp.maximum(merged, 0), dcp_size, interleave_c)
+
+    rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
+    # One dump column past the end absorbs everything that is masked off or
+    # overflows, and is sliced away below.
+    out = jnp.full((num_rows, dcp_size, capacity + 1), -1, jnp.int32)
+    dropped = jnp.zeros((), jnp.int32)
+    for r in range(dcp_size):
+        mine = owner == r
+        # Exclusive count of this rank's earlier winners, i.e. its slot.
+        # `sparsecore_topk` returns each row unsorted, so this order carries no
+        # score information and truncating at `capacity` sheds an arbitrary
+        # subset, not the weakest entries. That is precisely why `dropped` is
+        # returned instead of being swallowed: any overflow at all is a sizing
+        # bug, not graceful degradation.
+        slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
+        keep = jnp.logical_and(mine, slot < capacity)
+        dropped = dropped + jnp.sum(jnp.logical_and(mine, ~keep))
+        out = out.at[rows, r,
+                     jnp.where(keep, slot, capacity)].set(
+                         jnp.where(keep, local, -1))
+    return out[:, :, :capacity], dropped
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "mesh",
+        "k",
+        "compression_ratio",
+        "dcp_size",
+        "interleave_size",
+        "capacity",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+        "decode_req_batch_size",
+        "dcp_axis_name",
+    ),
+)
+def streamindex_topk_dcp(
+    q: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim], replicated
+    indexer_weights: jax.Array,  # [padded_num_tokens, num_q_heads], replicated
+    cache_kv: jax.Array,  # sharded on axis 0 over the DCP axis
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * virtual_pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    *,
+    mesh,
+    k: int,
+    compression_ratio: int,
+    dcp_size: int,
+    interleave_size: int,
+    capacity: int,
+    num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
+    num_queries_per_block: tuple[int, int, int] | int | None = None,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    decode_req_batch_size: int = 4,
+    dcp_axis_name: str = DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array]:
+    """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
+
+    The DCP twin of `streamindex_topk_pcp`. Same three-stage core -- score
+    locally, all-to-all the candidates, merge with `sparsecore_topk` -- and
+    exact for the same reason: DCP *partitions* the KV positions, so a global
+    winner is beaten by at most `k - 1` positions overall and therefore by at
+    most `k - 1` on its owner, and always survives that rank's local top-k.
+
+    What differs is the query axis. Under PCP queries are sharded, so each rank
+    wants the merged list for *its own* tokens and the exchange ends there.
+    Under DCP queries are replicated and the KV is sharded, which inverts the
+    question: every rank needs, for *every* token, the slice of that token's
+    global top-k that it happens to hold. So the merge does not stop at the
+    merged list -- it partitions each list by owning rank and sends the pieces
+    home.
+
+    Both halves of that are nearly free. After the first all-to-all the
+    candidate axis is a concatenation over source ranks, so `slots // k` *is*
+    the owning rank; no ownership scan is needed. And the return exchange is a
+    second all-to-all of the already-compacted `capacity`-wide lists, which
+    costs `capacity * 4` bytes per token -- against `k * 4` bytes per token to
+    all-gather the merged list and have every rank redo the same compaction.
+    At `k=2048, capacity=256` that is 1KB/token instead of 8KB/token, with the
+    compaction done once instead of `dcp_size` times.
+
+    Args:
+      q, indexer_weights: replicated, in natural request-major token order.
+        There is no rank-major packing here -- with replicated queries the
+        split of tokens across merge ranks is arbitrary, so it is a plain
+        contiguous split and needs no permutation tables.
+      cache_kv: this rank's shard of the compressed KV cache.
+      page_indices: replicated *virtual* page ordinals, resolved against each
+        rank's own shard exactly as in `streamindex_topk_pcp`.
+      capacity: static per-rank list width. Sized above `k / dcp_size` to
+        absorb clustering; see `dropped` for what a too-small value costs.
+      mesh: mesh containing `dcp_axis_name`.
+
+    Returns:
+      `(local_topk, dropped)`.
+      `local_topk` is i32[padded_num_tokens, capacity] of this rank's own
+      *local* cache indices for every token, `-1` padded, sharded over
+      `dcp_axis_name` (global leading dim `dcp_size * padded_num_tokens`).
+      Callers derive per-token counts from the `-1` padding; a row that is all
+      `-1` means this rank owns none of that token's top-k, which the attention
+      side must mask out of the LSE merge rather than attend over.
+      `dropped` is i32[dcp_size], the number of winners that did not fit
+      `capacity` on each rank. `sparsecore_topk` rows are unsorted, so an
+      overflow discards an arbitrary subset of real winners rather than the
+      weakest ones -- there is no graceful degradation here, and a non-zero
+      `dropped` means the result is no longer the exact global top-k. Callers
+      must treat it as a sizing failure.
+    """
+    if dcp_size <= 1:
+        raise ValueError(
+            f"streamindex_topk_dcp requires dcp_size > 1, got {dcp_size}; "
+            "use streamindex_topk for the unsharded case.")
+    if dcp_axis_name not in mesh.axis_names:
+        raise ValueError(
+            f"mesh {mesh.axis_names} has no {dcp_axis_name!r} axis.")
+    if mesh.shape[dcp_axis_name] != dcp_size:
+        raise ValueError(f"dcp_size={dcp_size} does not match mesh axis "
+                         f"{dcp_axis_name!r}={mesh.shape[dcp_axis_name]}.")
+    if q.shape[0] % dcp_size != 0:
+        raise ValueError(
+            f"padded_num_tokens={q.shape[0]} must be divisible by "
+            f"dcp_size={dcp_size}.")
+    if capacity > k:
+        raise ValueError(
+            f"capacity={capacity} exceeds k={k}; a single rank can never own "
+            "more than the whole top-k list.")
+    interleave_c = interleave_size // compression_ratio
+
+    def _local(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
+               distribution):
+        dcp_rank = pcp_rank_as_data(dcp_axis_name, dcp_size)
+        local_page_indices = jnp.mod(page_indices,
+                                     jnp.int32(cache_kv.shape[0]))
+
+        idxs, scores = streamindex_topk(
+            q,
+            indexer_weights,
+            cache_kv,
+            seq_lens,
+            local_page_indices,
+            cu_q_lens,
+            distribution,
+            k=k,
+            compression_ratio=compression_ratio,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+            decode_req_batch_size=decode_req_batch_size,
+            enable_early_exit=False,
+            pcp_size=dcp_size,
+            pcp_rank=dcp_rank,
+            interleave_size=interleave_size,
+            return_scores=True,
+        )
+
+        # Stage 1. [T, k] -> [T // dcp, dcp * k]; the candidate axis is now a
+        # concatenation over source ranks, in source order.
+        idxs = lax.all_to_all(idxs, dcp_axis_name, 0, 1, tiled=True)
+        scores = lax.all_to_all(scores, dcp_axis_name, 0, 1, tiled=True)
+
+        # Stage 2. Full width as the row length: -inf entries (unfilled local
+        # slots, padding tokens) are never selected, so they need no masking.
+        slots = sparsecore_topk(
+            scores,
+            k,
+            row_lengths=jnp.full((scores.shape[0], ),
+                                 scores.shape[1],
+                                 dtype=jnp.int32),
+            write_empty_rows=True,
+        )
+        merged = jnp.take_along_axis(idxs, jnp.maximum(slots, 0), axis=1)
+        merged = jnp.where(slots >= 0, merged, -1)
+
+        # Stage 3. Split each merged list by owner and send the pieces home.
+        # [T // dcp, dcp, capacity] -> [T, capacity], the inverse of stage 1's
+        # exchange, so tokens come back in their original order.
+        lists, dropped = _partition_winners_by_owner(merged, dcp_size,
+                                                     interleave_c, capacity)
+        local_topk = lax.all_to_all(lists.reshape(lists.shape[0], -1),
+                                    dcp_axis_name,
+                                    1,
+                                    0,
+                                    tiled=True)
+        return local_topk, jnp.reshape(dropped, (1, ))
+
+    replicated = P()
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(
+            replicated,  # q
+            replicated,  # indexer_weights
+            P(dcp_axis_name),  # cache_kv
+            replicated,  # seq_lens
+            replicated,  # page_indices
+            replicated,  # cu_q_lens
+            replicated,  # distribution
+        ),
+        out_specs=(P(dcp_axis_name), P(dcp_axis_name)),
+        check_vma=False,
+    )(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
+      distribution)
