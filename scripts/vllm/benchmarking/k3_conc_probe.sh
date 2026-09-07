@@ -66,12 +66,16 @@ IFS=',' read -r -a CONCS <<< "$CONC_LIST"
 for n in "${CONCS[@]}"; do
     server_alive || { log "FATAL: server dead before N=$n"; FAIL=1; break; }
     pre0=$(k3_engine_counters)
+    log_lines0=$(wc -l < "$RESULTS_DIR/server.log" 2>/dev/null || echo 0)
     python3 "$SCRIPT_DIR/conc_probe.py" --base-url "http://127.0.0.1:$PORT" --model "$MODEL" --conc-list "$n" \
         --max-tokens "$MAX_TOKENS" --out "$RESULTS_DIR/probe_n${n}.json" 2>&1 | tee "$RESULTS_DIR/probe_n${n}.log"
     rc=${PIPESTATUS[0]}
     [ "$rc" -ne 0 ] && FAIL=1
+    # Second reading of the peak batch, from the engine's own 10 s stats lines
+    # written during this point ("Running: X reqs").
+    peak_log=$(tail -n +"$((log_lines0 + 1))" "$RESULTS_DIR/server.log" 2>/dev/null | tr '\r' '\n' | grep -oE 'Running: [0-9]+ reqs' | grep -oE '[0-9]+' | sort -n | tail -1)
     if server_alive; then
-        log "N=$n done rc=$rc; engine before=[$pre0] after=[$(k3_engine_counters)]"
+        log "N=$n done rc=$rc; engine before=[$pre0] after=[$(k3_engine_counters)]; peak Running in server.log during the point: ${peak_log:-n/a}"
     else
         log "N=$n: SERVER DIED during or after the burst (rc=$rc)"
         FAIL=1; break
