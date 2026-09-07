@@ -7,11 +7,11 @@
 #
 #   k3_conc_probe.sh --results-dir DIR [--config kimi-k3-tp32-ep-concsweep]
 #       [--conc-list 128,160,192,256] [--ctx 16384] [--max-num-seqs 256]
-#       [--max-tokens 300] [--env KEY=VAL]... [--extra-serve-args "..."]
+#       [--max-tokens 1500] [--env KEY=VAL]... [--extra-serve-args "..."]
 #       [--gcs-root gs://bucket/prefix] [--port 8000]
 set -uo pipefail
 CONFIG_NAME="kimi-k3-tp32-ep-concsweep"
-RESULTS_DIR=""; CONC_LIST="128,160,192,256"; MAX_TOKENS=300; PORT="${PORT:-8000}"; GCS_ARG=""
+RESULTS_DIR=""; CONC_LIST="128,160,192,256"; MAX_TOKENS=1500; PORT="${PORT:-8000}"; GCS_ARG=""
 export K3_SWEEP_CTX="${K3_SWEEP_CTX:-16384}" K3_SWEEP_MAX_NUM_SEQS="${K3_SWEEP_MAX_NUM_SEQS:-256}"
 ENVS=()
 while [[ $# -gt 0 ]]; do

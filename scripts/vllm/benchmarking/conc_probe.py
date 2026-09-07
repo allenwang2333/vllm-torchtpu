@@ -36,10 +36,13 @@ import time
 
 import aiohttp
 
-PROMPT = ("Count from 1 to 40, one number per line, nothing else. "
-          "After 40 write the single word DONE.")
+# A long, checkable reply: the batch only tests N sequences at once if every
+# request is still decoding while the others are admitted, so the reply must
+# run for tens of seconds (300 lines, ~1200 tokens).
+PROMPT = ("Count from 1 to 300, one number per line, nothing else. "
+          "After 300 write the single word DONE.")
 GARBAGE_RE = re.compile(r"[一-鿿぀-ヿ]|&nbsp|<span|(\b\w+\b)(?:\s+\1\b){3,}")
-NUMBERS_RE = re.compile(r"\b(\d{1,2})\b")
+NUMBERS_RE = re.compile(r"\b(\d{1,3})\b")
 
 
 def classify(text: str) -> str:
@@ -48,10 +51,9 @@ def classify(text: str) -> str:
     if GARBAGE_RE.search(text):
         return "garbage"
     nums = [int(x) for x in NUMBERS_RE.findall(text)]
-    if "DONE" in text and nums[:40] == list(range(1, 41)):
-        return "ok"
-    # counted correctly but ran out of tokens before DONE: still a sane reply
-    if nums[:20] == list(range(1, 21)):
+    # Sane reply: the first 40 numbers count up (the tail may be cut by
+    # max_tokens). Anything else is a wrong or corrupted reply.
+    if nums[:40] == list(range(1, 41)):
         return "ok"
     return "wrong"
 
@@ -93,7 +95,7 @@ async def sample_metrics(session, metrics_url, stop, out):
                     peak_waiting = max(peak_waiting, int(float(line.rsplit(" ", 1)[1])))
         except Exception:  # noqa: BLE001
             pass
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
     out["peak_running"] = peak_running
     out["peak_waiting"] = peak_waiting
 
@@ -121,7 +123,7 @@ def main():
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
     ap.add_argument("--model", required=True)
     ap.add_argument("--conc-list", default="128,160,192,256")
-    ap.add_argument("--max-tokens", type=int, default=300)
+    ap.add_argument("--max-tokens", type=int, default=1500)
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     summary = []
@@ -135,7 +137,8 @@ def main():
             break
         c = res["counts"]
         bad = sum(v for k, v in c.items() if k != "ok")
-        print(f"[conc-probe] N={n}: wall={res['wall_s']}s peak_running={res.get('peak_running')} "
+        reached = "yes" if (res.get("peak_running") or 0) >= 0.9 * n else "NO"
+        print(f"[conc-probe] N={n}: batch_reached={reached} wall={res['wall_s']}s peak_running={res.get('peak_running')} "
               f"peak_waiting={res.get('peak_waiting')} ok={c.get('ok',0)} wrong={c.get('wrong',0)} "
               f"garbage={c.get('garbage',0)} empty={c.get('empty',0)} error={c.get('error',0)}", flush=True)
         for s in res["samples"]:
