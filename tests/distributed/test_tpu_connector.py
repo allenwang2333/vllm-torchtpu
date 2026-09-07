@@ -31,7 +31,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3LoadMeta, _Stage3RegisteredSend, _select_committed_mamba_blocks,
+    _Stage3LoadMeta, _Stage3RegisteredSend, _admit_latency_ms,
+    _request_arrival_time, _select_committed_mamba_blocks,
     stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
@@ -4047,3 +4048,115 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
+
+
+class TestStage3AdmissionLatency(unittest.TestCase):
+    """The connector reports decode-side admission time next to transfer time.
+
+    The post-prefill window splits into three parts: admission before the
+    Stage-3 load starts, the reshard itself, and the first decode step after
+    it. Only the reshard was ever measured, as reshard_e2e_latency_ms.
+    Publishing admission as decode_admit_ms on the same event makes the third
+    part derivable by subtraction, which is the whole point of the field.
+    """
+
+    def test_arrival_time_reads_a_real_stamp(self):
+        assert _request_arrival_time(
+            SimpleNamespace(arrival_time=1234.5)) == 1234.5
+
+    def test_arrival_time_degrades_rather_than_raising(self):
+        # A MagicMock attribute is the common case across this suite and a
+        # request predating the field is the real-world one. Both must report
+        # nothing, because no caller is allowed to fail over a log field.
+        assert _request_arrival_time(MagicMock()) == 0.0
+        assert _request_arrival_time(SimpleNamespace()) == 0.0
+        assert _request_arrival_time(SimpleNamespace(arrival_time=0.0)) == 0.0
+        assert _request_arrival_time(SimpleNamespace(arrival_time=-1.0)) == 0.0
+
+    def test_admit_latency_measures_a_real_gap(self):
+        latency = _admit_latency_ms(time.time() - 0.05)
+        assert latency is not None
+        assert 40.0 <= latency <= 5000.0
+
+    def test_admit_latency_suppresses_unusable_values(self):
+        assert _admit_latency_ms(0.0) is None
+        # The stamp comes from the API server process and the comparison from
+        # the worker, so a clock step can invert them. A handful of negatives
+        # would quietly drag down the median this field exists to measure, so
+        # report nothing instead.
+        assert _admit_latency_ms(time.time() + 60.0) is None
+
+    def test_scheduler_carries_arrival_time_into_the_load(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=16)
+        consumer._stage3_fa_group_index = 0
+        req = MagicMock()
+        req.request_id = "admit-consumer"
+        req.arrival_time = 4321.0
+        req.kv_transfer_params = {
+            "req_id": "admit-producer",
+            "uuid": 77,
+            "num_tokens": 16,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 1,
+        }
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([200], )
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            consumer.update_state_after_alloc(req, blocks, 16)
+
+        assert consumer.reqs_to_load[req.request_id].arrival_time == 4321.0
+
+    @staticmethod
+    def _drive_one_load(arrival_time):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._raiden_work_unit = MagicMock()
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        worker._raiden_transfer_engine = engine
+        worker._stage3_source_facades[
+            "prefill-controller.test:27000"] = MagicMock()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-admit"] = _Stage3LoadMeta(
+            uuid=1234,
+            source_req_id="src-admit",
+            local_block_ids=[7, 8],
+            num_tokens=2048,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+            arrival_time=arrival_time,
+        )
+
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker,
+                          "_raiden_hbm_memory_type",
+                          MagicMock(return_value=3)):
+            worker._submit_stage3_loads(meta, MagicMock())
+            _flush_stage3_submits(worker)
+        return worker
+
+    def test_worker_records_admission_when_the_stamp_is_present(self):
+        worker = self._drive_one_load(time.time() - 0.05)
+        recorded = worker._stage3_admit_ms["dst-admit"]
+        assert recorded is not None
+        assert recorded >= 40.0
+
+    def test_worker_records_nothing_when_the_stamp_is_absent(self):
+        worker = self._drive_one_load(0.0)
+        assert worker._stage3_admit_ms["dst-admit"] is None

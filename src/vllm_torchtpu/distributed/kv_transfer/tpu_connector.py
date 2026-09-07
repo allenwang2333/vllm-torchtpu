@@ -162,6 +162,41 @@ class _Stage3LoadMeta:
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
     release_only: bool = False
+    # Decode-side wall clock from Request.arrival_time, stamped in the API
+    # server before tokenization. It rides along so the worker can report how
+    # long admission took without a second log stream to join against. The
+    # transfer never reads it; 0.0 means "not available, do not report".
+    arrival_time: float = 0.0
+
+
+def _request_arrival_time(request: "Request") -> float:
+    """Wall clock for when the decode API server first saw this request.
+
+    vLLM stamps ``Request.arrival_time`` with ``time.time()`` in the API
+    server process before it tokenizes, so the gap between that stamp and the
+    worker's own clock covers the whole admission path: tokenization, the IPC
+    hop to the engine core, the scheduler queue and block allocation. Nothing
+    but reporting depends on it, so a request that lacks the attribute or
+    carries a nonsense value degrades to 0.0 instead of raising.
+    """
+    value = getattr(request, "arrival_time", None)
+    if not isinstance(value, (int, float)) or value <= 0.0:
+        return 0.0
+    return float(value)
+
+
+def _admit_latency_ms(arrival_time: float) -> Optional[float]:
+    """Milliseconds from API-server arrival to the start of the Stage-3 load.
+
+    The two ends are read in different processes, so although both run on the
+    decode host a clock step can put them out of order. A negative result is
+    reported as nothing at all rather than as a number, because a handful of
+    negatives would quietly drag down the median this exists to measure.
+    """
+    if arrival_time <= 0.0:
+        return None
+    elapsed_ms = (time.time() - arrival_time) * 1000.0
+    return elapsed_ms if elapsed_ms >= 0.0 else None
 
 
 @dataclass
@@ -1195,6 +1230,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_parallelism=src_parallelism,
             mamba_state_block_ids=mamba_state_block_ids,
             skip_tokens=skip_tokens,
+            arrival_time=_request_arrival_time(request),
         )
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
@@ -1251,6 +1287,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_data_replica_idx=int(params.get("src_data_replica_idx", -1)),
             src_parallelism=int(params.get("src_parallelism", 0) or 0),
             release_only=True,
+            arrival_time=_request_arrival_time(request),
         )
         logger.info(
             "TPURaidenConnectorScheduler full prefix hit req_id=%s "
@@ -1480,6 +1517,9 @@ class TPURaidenConnectorWorker:
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
         self._stage3_load_start_times: dict[str, float] = {}
+        # Admission latency per request, computed once when the load starts
+        # and popped when the receiver reports. Reporting only.
+        self._stage3_admit_ms: dict[str, Optional[float]] = {}
         self._legacy_registered_sends: set[str] = set()
         self._legacy_submitted_loads: set[str] = set()
         # Consumer-side facades for the producers' controllers, keyed by
@@ -3049,6 +3089,8 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
             self._stage3_load_start_times[
                 destination_req_id] = time.perf_counter()
+            self._stage3_admit_ms[destination_req_id] = _admit_latency_ms(
+                req_meta.arrival_time)
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
             now = time.perf_counter()
@@ -3683,6 +3725,7 @@ class TPURaidenConnectorWorker:
                     latency_ms = None
                     if start_time is not None:
                         latency_ms = (time.perf_counter() - start_time) * 1000
+                    admit_ms = self._stage3_admit_ms.pop(req_id, None)
                     logger.info(
                         "%s",
                         json.dumps(
@@ -3693,6 +3736,7 @@ class TPURaidenConnectorWorker:
                                 "uuid": uuid,
                                 "num_tokens": num_tokens,
                                 "reshard_e2e_latency_ms": latency_ms,
+                                "decode_admit_ms": admit_ms,
                             },
                             sort_keys=True,
                         ),
