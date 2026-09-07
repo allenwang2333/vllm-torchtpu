@@ -96,3 +96,6 @@ EVAL_CHAT_TEMPLATE_KWARGS='{"thinking": false}'
 # K3's custom chat template does not continue a trailing assistant message, so the
 # fewshot-as-multiturn / continue_final_message eval form scores 0 on every task.
 EVAL_DISABLE_MULTITURN_ARGS=true
+# mmlu_llama scores by continuing the assistant message "The best answer is", which
+# K3's template cannot do; mmlu_pro extracts the letter from a plain reply.
+LM_EVAL_TASKS="mmlu_pro"

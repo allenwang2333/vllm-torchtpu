@@ -238,6 +238,7 @@ BENCH_ARGS+=(--port "$PORT")
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
 MMLU_PRO_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("mmlu_pro_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
+LM_EVAL_TASKS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_tasks", "mmlu_llama mmlu_pro"))' "$RESULTS_DIR/config.json")
 EVAL_DISABLE_MULTITURN_ARGS=$(python3 -c 'import json, sys; print(str(json.load(open(sys.argv[1])).get("eval_disable_multiturn_args", False)).lower())' "$RESULTS_DIR/config.json")
 EVAL_CHAT_TEMPLATE_KWARGS=$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1])).get("eval_chat_template_kwargs", {"enable_thinking": False})))' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
@@ -261,8 +262,9 @@ fi
 # 4. Run lm_eval
 # ========================================================
 if [ "$RUN_LM_EVAL" = "1" ]; then
-    run_lm_eval "mmlu_llama"
-    run_lm_eval "mmlu_pro"
+    for lm_task in $LM_EVAL_TASKS; do
+        run_lm_eval "$lm_task"
+    done
 fi
 
 # ========================================================
