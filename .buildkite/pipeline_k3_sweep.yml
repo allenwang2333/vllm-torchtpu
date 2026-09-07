@@ -67,9 +67,22 @@
 #   Runtime at the defaults: ~25 min boot + ~30 min per concurrency (fast mode).
 #
 # Knobs are baked into the commands at upload time because run_multihost.sh
-# forwards only an allowlist of env vars into the containers.
+# forwards only an allowlist of env vars into the containers. Knob values are
+# spliced into this file as text before it is parsed, so they must not contain
+# double quotes or `$` (a value that does breaks the upload, loudly).
+# K3_EXTRA_SERVE_ARGS is appended after the config's own flags, so it can
+# override any of them (vLLM takes the last occurrence of a flag); JSON-valued
+# flags cannot be passed through it because of the quoting rule above.
 
 steps:
+  - label: "K3_SWEEP must be eval, perf or both"
+    key: k3_sweep_bad_selector
+    if: 'build.env("K3_SWEEP") != null && build.env("K3_SWEEP") != "eval" && build.env("K3_SWEEP") != "perf" && build.env("K3_SWEEP") != "both"'
+    agents:
+      queue: cpu_64_core
+    commands:
+      - "echo 'K3_SWEEP=${K3_SWEEP:-} is not one of eval, perf, both; nothing was run' && exit 1"
+
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
@@ -79,7 +92,7 @@ steps:
 
   - label: "K3 eval sweep: accuracy vs concurrency ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} ctx ${K3_SWEEP_CTX:-16384} max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256} (TPU v7x-32)"
     key: k3_eval_conc_sweep
-    if: build.env("K3_SWEEP") == null || build.env("K3_SWEEP") == "eval" || build.env("K3_SWEEP") == "both"
+    if: 'build.env("K3_SWEEP") == null || build.env("K3_SWEEP") == "eval" || build.env("K3_SWEEP") == "both"'
     depends_on: build_docker
     timeout_in_minutes: 420
     agents:
@@ -95,7 +108,7 @@ steps:
 
   - label: "K3 perf sweep: AgentX conc ${K3_CONC_LIST:-1,2,4,8} ctx ${K3_CTX:-131072} kv ${K3_KV:-fp8} apc ${K3_APC:-0} spec ${K3_SPEC:-none} fast ${K3_FAST:-1} rq ${K3_MOE_REQUANT:-0} (TPU v7x-32)"
     key: k3_agentx_sweep
-    if: build.env("K3_SWEEP") == "perf" || build.env("K3_SWEEP") == "both"
+    if: 'build.env("K3_SWEEP") == "perf" || build.env("K3_SWEEP") == "both"'
     depends_on: build_docker
     timeout_in_minutes: 600
     agents:

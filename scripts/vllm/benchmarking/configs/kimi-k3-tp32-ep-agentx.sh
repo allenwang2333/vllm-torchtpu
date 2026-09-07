@@ -12,16 +12,19 @@
 #   - throughput regime: MAX_NUM_SEQS = 2 x max concurrency (driver),
 #     batched tokens 8192, gpu-memory-utilization 0.85 (0.7 leaves ~3 GiB/rank
 #     of KV, far too little for concurrent 128k contexts)
-#   - --block-size 256: 3 to 8.5x faster prefill and flat decode at long
-#     context versus the 16-token default (#837), correct on GSM8K at every
-#     concurrency
+#   - --block-size 256: with the 16-token default, prefill at 100k+ context is
+#     3 to 8.5x slower and decode slows with context (#837); 256 is correct on
+#     GSM8K at every concurrency
 #   - tool-call + reasoning parsers so the chat endpoint accepts the
 #     tool_calls / tool-result messages in the Claude Code traces
-#   - compile_sizes: decode pads to 16 (max-num-seqs <= 16); prefill chunks
-#     are 8192 with remainders padded up to 1024/2048/4096
+#   - compile_sizes: a decode step carries up to MAX_NUM_SEQS tokens and is
+#     padded up to the next bucket, so the decode buckets follow MAX_NUM_SEQS
+#     (16 covers <= 8 sequences at 2 x concurrency; 32..512 are added as
+#     needed). Prefill chunks are 8192 with remainders padded to 1024/2048/4096.
 #   - the built-in harness bench is a 4-prompt 8k/1k warmup; the replay is
 #     driven by k3_agentx_sweep.sh against the kept-alive server
-# K3_EXTRA_SERVE_ARGS (driver --extra-serve-args) is prepended for experiments.
+# K3_EXTRA_SERVE_ARGS (driver --extra-serve-args) is appended LAST, so it can
+# override any flag set here (vLLM takes the last occurrence of a flag).
 MODEL="moonshotai/Kimi-K3"
 MODEL_URI="${MODEL_URI:-gs://tpu-commons-ci/moonshootai/kimi/k3}"
 TENSOR_PARALLELISM=32
@@ -47,7 +50,14 @@ ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
 APC_ARGS=""
 if [ "$ENABLE_PREFIX_CACHING" = "true" ]; then APC_ARGS="--mamba-cache-mode align "; fi
 
-EXTRA_SERVE_ARGS="${K3_EXTRA_SERVE_ARGS:+$K3_EXTRA_SERVE_ARGS }${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 ${APC_ARGS}--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
+# Decode buckets: 16, then each of 32..512 that MAX_NUM_SEQS reaches.
+K3_COMPILE_SIZES="16"
+for _s in 32 64 128 256 512; do
+    [ "$MAX_NUM_SEQS" -ge "$_s" ] && K3_COMPILE_SIZES="$K3_COMPILE_SIZES,$_s"
+done
+K3_COMPILE_SIZES="$K3_COMPILE_SIZES,1024,2048,4096,8192"
+
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 ${APC_ARGS}--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[$K3_COMPILE_SIZES]}${K3_EXTRA_SERVE_ARGS:+ $K3_EXTRA_SERVE_ARGS}"
 
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
