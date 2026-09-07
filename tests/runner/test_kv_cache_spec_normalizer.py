@@ -325,8 +325,17 @@ def test_unified_layout_rejects_mixed_attention_dtypes() -> None:
     with pytest.raises(ValueError, match="mixed attention dtypes"):
         normalize_kv_cache_specs_for_tpu(
             {
-                "target": target_spec,
-                "draft": draft_spec,
+                "target":
+                target_spec,
+                "draft":
+                draft_spec,
+                "kda":
+                MambaSpec(
+                    block_size=16,
+                    shapes=[(2, 8)],
+                    dtypes=[torch.bfloat16],
+                    page_size_padded=256,
+                ),
             },
             torch.float8_e4m3fn,
             enable_unified_kv_layout=True,
