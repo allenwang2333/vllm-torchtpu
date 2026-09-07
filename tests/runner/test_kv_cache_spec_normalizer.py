@@ -1,3 +1,4 @@
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, MambaSpec,
                                         MLAAttentionSpec)
@@ -271,6 +272,69 @@ def test_hybrid_specs_pad_attention_when_mamba_is_larger() -> None:
     assert normalized["attn"].page_size_padded == 1000000
     assert normalized["mamba"].page_size_bytes == 1000000
     assert normalized["mamba"].page_size_padded == 1000000
+
+
+def test_hybrid_specs_accept_layer_specific_dtype_without_unified_layout(
+) -> None:
+    target_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=None,
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=None,
+    )
+
+    normalized = normalize_kv_cache_specs_for_tpu(
+        {
+            "target": target_spec,
+            "draft": draft_spec,
+        },
+        torch.float8_e4m3fn,
+        layer_kv_cache_dtypes={
+            "target": torch.float8_e4m3fn,
+            "draft": torch.bfloat16,
+        },
+    )
+
+    assert normalized["target"].dtype == torch.float8_e4m3fn
+    assert normalized["draft"].dtype == torch.bfloat16
+
+
+def test_unified_layout_rejects_mixed_attention_dtypes() -> None:
+    target_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        page_size_padded=None,
+    )
+    draft_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        page_size_padded=None,
+    )
+    with pytest.raises(ValueError, match="mixed attention dtypes"):
+        normalize_kv_cache_specs_for_tpu(
+            {
+                "target": target_spec,
+                "draft": draft_spec,
+            },
+            torch.float8_e4m3fn,
+            enable_unified_kv_layout=True,
+            layer_kv_cache_dtypes={
+                "target": torch.float8_e4m3fn,
+                "draft": torch.bfloat16,
+            },
+        )
 
 
 def test_exempt_layers_pass_through_untouched_under_unified_layout() -> None:

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.compilation.backends import set_model_tag
-from vllm.config import (VllmConfig, get_layers_from_vllm_config,
+from vllm.config import (VllmConfig, get_layers_from_vllm_config, replace,
                          set_current_vllm_config)
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -199,6 +199,11 @@ class DFlashProposer:
         draft_tp1_ctx = (_force_draft_tp1() if self._draft_replicated else
                          contextlib.nullcontext())
         draft_vllm_config = copy.copy(self.vllm_config)
+        if self.speculative_config.kv_cache_dtype is not None:
+            draft_vllm_config.cache_config = replace(
+                self.vllm_config.cache_config,
+                cache_dtype=self.speculative_config.kv_cache_dtype,
+            )
         draft_model_config = copy.copy(
             self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"

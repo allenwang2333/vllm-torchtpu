@@ -659,6 +659,7 @@ def mla_attention(q_TNA: jax.Array,
             actual_lkv_dim=qk_nope_head_dim,
             actual_r_dim=actual_r_dim,
             kv_dtype=kv_dtype_str,
+            p_same_dtype_as_v=False,
         )
         decode_tuned = get_tuned_params(decode_key)
 
@@ -676,6 +677,7 @@ def mla_attention(q_TNA: jax.Array,
             kv_packing=kv_packing,
             max_num_seqs=max_num_seqs,
             pages_per_seq=block_tables.shape[0] // max_num_seqs,
+            p_same_dtype_as_v=False,
         )
         mixed_tuned = get_tuned_params(mixed_key)
 
@@ -710,6 +712,7 @@ def mla_attention(q_TNA: jax.Array,
                                  mixed_tuned.vmem_limit_bytes),
             decode_batch_size=decode_tuned.decode_batch_size,
             mixed_q_split=mixed_tuned.q_split,
+            p_same_dtype_as_v=False,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,

@@ -1462,6 +1462,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            logger.info(
+                "K3 mixed-KV audit: layer=%s configured_kv=%s actual_kv=%s "
+                "cache_shape=%s p_same_dtype_as_v=False", layer.layer_name,
+                getattr(layer, "kv_cache_dtype", None), kv_cache.dtype,
+                kv_cache.shape)
             metadata = AttentionMetadata(
                 input_positions=None,
                 block_tables=block_tables,

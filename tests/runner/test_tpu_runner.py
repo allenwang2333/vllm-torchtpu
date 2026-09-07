@@ -583,6 +583,8 @@ class TestTPURunner:
         # Bind the actual methods to our mock
         self.runner._update_mamba_page_size_padded = TPUModelRunner._update_mamba_page_size_padded.__get__(
             self.runner)
+        self.runner._resolve_layer_kv_cache_dtype = (
+            TPUModelRunner._resolve_layer_kv_cache_dtype.__get__(self.runner))
         self.runner._maybe_set_num_blocks_override = TPUModelRunner._maybe_set_num_blocks_override.__get__(
             self.runner)
         self.runner._maybe_set_compact_mamba_num_blocks_override = (
@@ -658,6 +660,49 @@ class TestTPURunner:
         mock_mem_info.assert_called_once()
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
+
+    @patch.object(TpuPlatform,
+                  '_find_non_ssm_backend',
+                  return_value=PallasMLAttentionBackend)
+    @patch(
+        'vllm_torchtpu.runner.tpu_runner.PallasMLAttentionBackend.get_kv_cache_page_size_bytes'
+    )
+    @patch('vllm_torchtpu.utils.torch.accelerator.get_memory_info',
+           return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024))
+    def test_update_mamba_page_size_padded_mixed_mla_dtypes(
+            self, mock_mem_info, mock_get_page_size,
+            mock_find_non_ssm_backend):
+
+        def page_size(_block_size, _num_kv_heads, _head_size, dtype):
+            return 4096 if dtype == torch.float8_e4m3fn else 8192
+
+        mock_get_page_size.side_effect = page_size
+        layers = {}
+        for i in range(2):
+            target_mla = MagicMock(spec=MLAAttention)
+            target_mla.num_kv_heads = 1
+            target_mla.head_size = 512
+            target_mla.kv_cache_dtype = 'fp8'
+            layers[f'target_mla_{i}'] = target_mla
+
+        draft_mla = MagicMock(spec=MLAAttention)
+        draft_mla.num_kv_heads = 1
+        draft_mla.head_size = 512
+        draft_mla.kv_cache_dtype = 'auto'
+        layers['draft_mla'] = draft_mla
+        for i in range(3):
+            layers[f'mamba_{i}'] = DummyMamba()
+
+        self.runner._update_mamba_page_size_padded(layers)
+
+        # vLLM forms three buckets: 2 target FP8 MLA, 1 draft BF16 MLA, and
+        # 3 mamba. group_size=1, so one tensor represents all six layers.
+        # attention = 2 * 4096 + 1 * 8192 = 16384 B/block
+        # mamba = 3 * 66560 = 199680 B/slot
+        assert self.runner._hybrid_uniform_page_size_bytes == 216064
+        assert self.runner.cache_config.mamba_page_size_padded == 216064
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override == 589616
 
     @patch(
         'vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes',
