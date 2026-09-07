@@ -56,6 +56,11 @@ class _FakeGroup:
         w = w / torch.where(denom > 0, denom, torch.ones_like(denom))
         return (self._outputs * w.unsqueeze(-1)).sum(0).to(tensor.dtype)
 
+    def reduce_scatter(self, tensor, dim=-1):
+        total = self.all_reduce(tensor)
+        width = total.shape[dim] // self.world_size
+        return total.narrow(dim, self.rank_in_group * width, width)
+
 
 def _merge_as_rank(outputs, lses, rank, monkeypatch):
     group = _FakeGroup(outputs, lses, rank)
@@ -158,6 +163,78 @@ def test_merge_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: None)
     out = torch.ones(2, 3, 4)
     assert dcp.merge_lse_partials(out, torch.zeros(2, 3)) is out
+
+
+class _HeadGatherGroup:
+    """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
+
+    def __init__(self, per_rank, rank):
+        self.world_size = len(per_rank)
+        self.rank_in_group = rank
+        self._per_rank = per_rank
+
+    def all_gather(self, tensor, dim=0):
+        assert dim == 1
+        assert tensor.shape == self._per_rank[self.rank_in_group].shape
+        return torch.cat(list(self._per_rank), dim=1)
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
+    """The gather/scatter pair only lines up if block `r` belongs to rank `r`.
+
+    `merge_lse_partials_scatter_heads` hands block `r` back to rank `r`, and
+    `W_UV` downstream is that rank's TP head slice, so anything else silently
+    applies the wrong up-projection.
+    """
+    rng = np.random.default_rng(31)
+    per_rank = torch.from_numpy(
+        rng.standard_normal((4, 6, 3, 8)).astype(np.float32))
+    monkeypatch.setattr(dcp, "get_dcp_group",
+                        lambda: _HeadGatherGroup(per_rank, rank))
+
+    got = dcp.all_gather_heads(per_rank[rank])
+    assert got.shape == (6, 12, 8)
+    np.testing.assert_array_equal(got[:, rank * 3:(rank + 1) * 3].numpy(),
+                                  per_rank[rank].numpy())
+
+
+def test_head_gather_is_a_noop_without_a_group(monkeypatch):
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: None)
+    q = torch.ones(2, 3, 4)
+    assert dcp.all_gather_heads(q) is q
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_scatter_merge_is_the_all_reduce_merge_narrowed(rank, monkeypatch):
+    """The two merges must agree; only the head axis they leave behind differs.
+
+    Every rank attended with all `dcp_size * heads` heads, so the whole-context
+    answer is the same tensor either way -- the scatter just drops the
+    `dcp_size - 1` head blocks whose `W_UV` lives on another rank.
+    """
+    dcp_size, local_heads = 4, 3
+    outputs, lses = _partials(np.random.default_rng(77),
+                              dcp_size,
+                              heads=dcp_size * local_heads)
+    group = _FakeGroup(outputs, lses, rank)
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: group)
+
+    whole = dcp.merge_lse_partials(outputs[rank], lses[rank])
+    mine = dcp.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
+
+    assert mine.shape == (outputs.shape[1], local_heads, outputs.shape[3])
+    np.testing.assert_allclose(
+        mine.numpy(),
+        whole[:, rank * local_heads:(rank + 1) * local_heads].numpy(),
+        rtol=1e-6,
+        atol=1e-6)
+
+
+def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: None)
+    out = torch.ones(2, 3, 4)
+    assert dcp.merge_lse_partials_scatter_heads(out, torch.zeros(2, 3)) is out
 
 
 def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
