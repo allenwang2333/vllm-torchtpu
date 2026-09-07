@@ -77,14 +77,16 @@ wait_server_idle() {
 }
 
 # k3_check_disk [min_free_gb] : fail before the 30-min boot when the results
-# mount or the container root has less than min_free_gb free (a full pod disk
-# otherwise surfaces as "No space left on device" from the smoke bench).
+# mount or the container root has less than min_free_gb free. The boot itself
+# writes tens of GB (compile caches, Ray logs), so the floor is 50 GB: a pod
+# that passed a 10 GB check still died with "No space left on device" mid-boot.
 k3_check_disk() {
-    local min_gb="${1:-10}" d free ok=0
+    local min_gb="${1:-50}" d free ok=0
     for d in "$RESULTS_DIR" /tmp /; do
         [ -d "$d" ] || continue
         free=$(df -BG --output=avail "$d" 2>/dev/null | tail -1 | tr -dc '0-9')
         [ -n "$free" ] || continue
+        log "disk: ${free} GB free on $d"
         if [ "$free" -lt "$min_gb" ]; then
             log "FATAL: only ${free} GB free on $d (need ${min_gb} GB); the pod's disk needs cleaning (docker image prune, old results) before this sweep can run"
             df -h "$d" 2>/dev/null || true
@@ -99,7 +101,7 @@ k3_check_disk() {
 # up). Returns 1 with a FATAL line when the boot or the smoke bench fails.
 k3_boot_server() {
     local config="$1" t0 rc
-    k3_check_disk 10 || return 1
+    k3_check_disk 50 || return 1
     bash "$K3_SWEEP_SCRIPT_DIR/cleanup_server.sh"
     t0=$(date +%s)
     "$K3_SWEEP_SCRIPT_DIR/run_benchmarks.sh" --config "$config" --results-dir "$RESULTS_DIR" --keep-alive --port "$PORT"
