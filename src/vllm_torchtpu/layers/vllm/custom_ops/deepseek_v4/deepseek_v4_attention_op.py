@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend, DeepseekV4SWACache)
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import \
     mla_ragged_paged_attention
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import \
@@ -217,8 +218,10 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        gather_and_attention_chunk_size=64,
+        gather_and_attention_chunk_size=envs.TPU_DSV4_CSA_GATHER_CHUNK_SIZE,
         attention_kernel_batch_size=16,
+        attention_shared_kv_capacity=envs.TPU_DSV4_CSA_SHARED_KV_CAPACITY,
+        attention_shared_kv_group_size=envs.TPU_DSV4_CSA_SHARED_KV_GROUP_SIZE,
     )
     return output, updated_sw_cache
 

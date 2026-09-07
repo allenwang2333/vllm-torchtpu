@@ -48,6 +48,9 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
+    TPU_DSV4_CSA_GATHER_CHUNK_SIZE: int = 64
+    TPU_DSV4_CSA_SHARED_KV_CAPACITY: int = 0
+    TPU_DSV4_CSA_SHARED_KV_GROUP_SIZE: int = 4
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
@@ -193,6 +196,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_ROPE_LAYOUT":
     env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
                      ["sparsecore", "tensorcore"]),
+    # Query tokens per DeepSeek-V4 CSA gather/attention chunk. Set before
+    # service startup/JAX tracing; attention still processes 16 tokens per batch.
+    "TPU_DSV4_CSA_GATHER_CHUNK_SIZE":
+    lambda: int(
+        env_with_choices("TPU_DSV4_CSA_GATHER_CHUNK_SIZE", "64",
+                         ["64", "128", "256"])() or "64"),
+    # Experimental grouped shared-KV CSA; set before tracing. Off by default.
+    "TPU_DSV4_CSA_SHARED_KV_GROUP_SIZE":
+    lambda: int(
+        env_with_choices("TPU_DSV4_CSA_SHARED_KV_GROUP_SIZE", "4", ["4", "8"])
+        () or "4"),
+    "TPU_DSV4_CSA_SHARED_KV_CAPACITY":
+    lambda: int(
+        env_with_choices("TPU_DSV4_CSA_SHARED_KV_CAPACITY", "0",
+                         ["0", "1024", "1280", "1536", "2048"])() or "0"),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),

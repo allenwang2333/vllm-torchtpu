@@ -21,7 +21,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import (csa_gather,
+                                                              shared_kv)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -602,6 +603,83 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+def _shared_attention_kernel(q_ref, nope_ref, rope_ref, membership_ref,
+                             sinks_ref, swa_acc_ref, swa_l_ref, swa_m_ref,
+                             out_ref, *, group_size, sm_scale):
+    """Process query groups against their shared KV sets and membership masks."""
+    capacity = rope_ref.shape[1]
+    heads = q_ref.shape[1]
+    scale_matrix = _make_dsv4_fp8_scale_expand_matrix()
+    for group in range(q_ref.shape[0] // group_size):
+        rows = pl.ds(group * group_size, group_size)
+        nope = nope_ref[group].reshape(capacity, 512)
+        kv = jnp.concatenate(
+            [_dequant_dsv4_fp8(nope, scale_matrix), rope_ref[group]], axis=1)
+        out_ref[rows] = shared_kv.shared_attention(
+            q_ref[rows],
+            kv,
+            (((membership_ref[group] >> jnp.arange(group_size,
+                                                   dtype=jnp.int32)[:, None])
+              & 1) if membership_ref.shape[1] == 1 else membership_ref[group]),
+            swa_acc_ref[rows],
+            swa_l_ref[rows, :heads],
+            swa_m_ref[rows, :heads],
+            sinks_ref[...],
+            sm_scale=sm_scale)
+
+
+def _run_shared_attention(q,
+                          nope,
+                          rope,
+                          membership,
+                          sinks,
+                          swa_acc,
+                          swa_l,
+                          swa_m,
+                          *,
+                          group_size,
+                          batch_size,
+                          sm_scale,
+                          vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+                          interpret=False):
+    """Gathered shared KV input; `interpret` supports CPU kernel validation."""
+    tokens, heads, dim = q.shape
+    groups_per_batch = batch_size // group_size
+    capacity = rope.shape[1]
+    q_spec = pl.BlockSpec((batch_size, heads, dim), lambda b: (b, 0, 0))
+    stats_spec = pl.BlockSpec((None, batch_size, swa_l.shape[1]), lambda b:
+                              (b, 0, 0))
+    swa_l = swa_l.reshape(tokens // batch_size, batch_size, -1)
+    swa_m = swa_m.reshape(tokens // batch_size, batch_size, -1)
+    return pl.pallas_call(
+        functools.partial(_shared_attention_kernel,
+                          group_size=group_size,
+                          sm_scale=sm_scale),
+        grid=(tokens // batch_size, ),
+        in_specs=[
+            q_spec,
+            pl.BlockSpec((groups_per_batch, capacity, 4, 128), lambda b:
+                         (b, 0, 0, 0)),
+            pl.BlockSpec((groups_per_batch, capacity, 64), lambda b:
+                         (b, 0, 0)),
+            pl.BlockSpec((groups_per_batch, membership.shape[1], capacity),
+                         lambda b: (b, 0, 0)),
+            pl.BlockSpec((heads, ), lambda b: (0, )),
+            q_spec,
+            stats_spec,
+            stats_spec,
+        ],
+        out_specs=q_spec,
+        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", ),
+            vmem_limit_bytes=vmem_limit_bytes),
+        interpret=interpret,
+        name=
+        f"SparseMLASharedKV-qkt_{group_size}-cap_{capacity}-bz_{batch_size}",
+    )(q, nope, rope, membership, sinks, swa_acc, swa_l, swa_m)
+
+
 # Main Attention kernel for DeepSeek V4 CSA (gather and attention)
 # Note that the compressed kv tokens of current batch (current forward pass)
 # have been written to the `cache_kv` by the compressor module before calling
@@ -611,6 +689,9 @@ def prepare_outputs(
     static_argnames=(
         "sm_scale",
         "attention_kernel_batch_size",
+        "attention_shared_kv_capacity",
+        "attention_shared_kv_group_size",
+        "attention_shared_kv_min_queries",
         "gather_and_attention_chunk_size",
         "vmem_limit_bytes",
     ),
@@ -632,6 +713,9 @@ def sparse_ragged_paged_attention(
     # Kernel optimization params.
     gather_and_attention_chunk_size: int = 64,
     attention_kernel_batch_size: int = 16,
+    attention_shared_kv_capacity: int = 0,
+    attention_shared_kv_group_size: int = 4,
+    attention_shared_kv_min_queries: int = 256,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
@@ -650,10 +734,24 @@ def sparse_ragged_paged_attention(
       k is also the total number of sequences.
     sm_scale: the softmax scale which will be applied to the Q@K^T.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
+    attention_shared_kv_capacity: opt-in maximum union capacity for shared
+      query groups. Zero preserves the original path. An overflowing group sends
+      the entire call through the original path, without dropping keys. When
+      possible, use a smaller 1024/1280-entry buffer below this maximum.
+    attention_shared_kv_group_size: number of queries sharing a KV union, 4 or 8.
+    attention_shared_kv_min_queries: skip sharing for smaller padded query
+      batches. Defaults to 256 because small-batch overhead can erase savings.
 
   Returns:
     The output of attention.
   """
+    if attention_shared_kv_group_size not in (4, 8):
+        raise ValueError("Shared KV group size must be 4 or 8")
+    if attention_shared_kv_capacity < 0 or attention_shared_kv_capacity % 128:
+        raise ValueError(
+            "Shared KV capacity must be zero or a multiple of 128")
+    if attention_shared_kv_min_queries < 0:
+        raise ValueError("Shared KV minimum query count must be nonnegative")
     # The cache is DSV4 FP8 format.
     # nope_cache contains 448 fp8 + 7 fp8 scales,
     # rope_cache contains 64 bf16
@@ -831,62 +929,122 @@ def sparse_ragged_paged_attention(
     assert page_ids.shape == (q.shape[0], topk)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
-    for i in range(num_chunks):
-        start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-        chunk_size = end_pos - start_pos
-        indices = (page_ids[start_pos:end_pos, ...] * page_size +
-                   token_offset[start_pos:end_pos, ...]).reshape(-1)
+    shared_group_size = attention_shared_kv_group_size
 
-        # For prefilling of short sequences (or early in the sequence), there are
-        # very few number of KVs in the sequence, so different qs' selected topk
-        # would have large overlap. This causes gather read hotspotting. We've seen
-        # 30%+ performance degradation compared to the no-duplicate-indices case.
-        #
-        # TODO: we could consider let the caller (tpu-runner) to sort the sequences
-        # based on their lengths. For the sequences-segment below certain length,
-        # we use a different kernel (dense attention and mask), for the rest of
-        # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
-            cache_kv_nope,
-            cache_kv_rope,
-            indices,
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(
-            chunk_size, -1, 128)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk, -1)
-        # We treat each query token as a one independent sequence, attend to their
-        # respective gathered kv tokens in the `gathered_kv_buffer`.
-        # -1 in topk_indices is padded elements at the end of each row.
-        # Batching
-        kernel_batch_size = _largest_divisor(chunk_size,
-                                             attention_kernel_batch_size)
-        assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (cdiv(
-            jnp.minimum(
-                cu_q_lens[distribution[2]],
-                end_pos,
-            ) - start_pos,
-            kernel_batch_size,
-        ) * kernel_batch_size)
-        q = run_mla_kernel(
-            q,
-            gathered_nope_buffer,
-            gathered_rope_buffer,
-            kv_lens,
-            attention_sinks,
-            swa_accumution,
-            swa_l,
-            swa_m,
-            start_seq_idx=start_pos,
-            end_seq_idx=batch_end,
-            num_valid_tokens=cu_q_lens[distribution[2]],
-            kernel_batch_size=kernel_batch_size,
-        )
+    def independent_path(q):
+        for i in range(num_chunks):
+            start_pos = i * gather_and_attention_chunk_size
+            end_pos = min(start_pos + gather_and_attention_chunk_size,
+                          q.shape[0])
+            chunk_size = end_pos - start_pos
+            indices = (page_ids[start_pos:end_pos, ...] * page_size +
+                       token_offset[start_pos:end_pos, ...]).reshape(-1)
+
+            # For prefilling of short sequences (or early in the sequence), there are
+            # very few number of KVs in the sequence, so different qs' selected topk
+            # would have large overlap. This causes gather read hotspotting. We've seen
+            # 30%+ performance degradation compared to the no-duplicate-indices case.
+            #
+            # TODO: we could consider let the caller (tpu-runner) to sort the sequences
+            # based on their lengths. For the sequences-segment below certain length,
+            # we use a different kernel (dense attention and mask), for the rest of
+            # sequences, we use this gather-and-attention kernel.
+            gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
+                cache_kv_nope,
+                cache_kv_rope,
+                indices,
+            )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                chunk_size, -1, 128)
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                chunk_size, topk, -1)
+            # We treat each query token as a one independent sequence, attend to their
+            # respective gathered kv tokens in the `gathered_kv_buffer`.
+            # -1 in topk_indices is padded elements at the end of each row.
+            # Batching
+            kernel_batch_size = _largest_divisor(chunk_size,
+                                                 attention_kernel_batch_size)
+            assert chunk_size % kernel_batch_size == 0
+            # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
+            # steps, so `batch_end - start_pos` MUST be a multiple of
+            # `kernel_batch_size`.
+            batch_end = start_pos + (cdiv(
+                jnp.minimum(
+                    cu_q_lens[distribution[2]],
+                    end_pos,
+                ) - start_pos,
+                kernel_batch_size,
+            ) * kernel_batch_size)
+            q = run_mla_kernel(
+                q,
+                gathered_nope_buffer,
+                gathered_rope_buffer,
+                kv_lens,
+                attention_sinks,
+                swa_accumution,
+                swa_l,
+                swa_m,
+                start_seq_idx=start_pos,
+                end_seq_idx=batch_end,
+                num_valid_tokens=cu_q_lens[distribution[2]],
+                kernel_batch_size=kernel_batch_size,
+            )
+        return q
+
+    can_share = (q.shape[0] >= attention_shared_kv_min_queries
+                 and shared_group_size > 1 and
+                 0 < attention_shared_kv_capacity < shared_group_size * topk
+                 and q.shape[0] % shared_group_size == 0)
+    if can_share:
+        valid_queries = jnp.arange(q.shape[0]) < cu_q_lens[distribution[2]]
+        physical = page_ids * page_size + token_offset
+        *prepared, lengths = shared_kv.prepare_shared_kv_indices(
+            jnp.where((topk_indices >= 0) & valid_queries[:, None], physical,
+                      -1),
+            group_size=shared_group_size)
+
+        def shared_path(q_input, *, capacity):
+            union, membership = shared_kv.pack_shared_kv_indices(
+                *prepared,
+                group_size=shared_group_size,
+                capacity=capacity,
+                rotate=True,
+                padding_modulus=total_num_pages * page_size)
+            nope, rope = csa_gather.csa_gather(cache_kv_nope, cache_kv_rope,
+                                               union.reshape(-1))
+            groups = q.shape[0] // shared_group_size
+            result = _run_shared_attention(q_input,
+                                           nope.reshape(
+                                               groups, capacity, 4, 128),
+                                           rope.reshape(groups, capacity, 64),
+                                           membership,
+                                           attention_sinks,
+                                           swa_accumution,
+                                           swa_l,
+                                           swa_m,
+                                           group_size=shared_group_size,
+                                           batch_size=shared_group_size,
+                                           sm_scale=sm_scale,
+                                           vmem_limit_bytes=vmem_limit_bytes)
+            return jnp.where(valid_queries[:, None, None], result, q_input)
+
+        capacities = tuple(c for c in (1024, 1280, 1536)
+                           if c < attention_shared_kv_capacity) + (
+                               attention_shared_kv_capacity, )
+        if len(capacities) == 1:
+            q = lax.cond(
+                jnp.all(lengths <= capacities[0]),
+                functools.partial(shared_path, capacity=capacities[0]),
+                independent_path, q)
+        else:
+            maximum = jnp.max(lengths)
+            choice = sum((maximum > c).astype(jnp.int32) for c in capacities)
+            branches = tuple(
+                functools.partial(shared_path, capacity=c)
+                for c in capacities) + (independent_path, )
+            q = lax.switch(choice, branches, q)
+    else:
+        q = independent_path(q)
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
