@@ -1297,6 +1297,59 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ),
 }
 
+# Kimi-K3 TP32, page-size 16, Block5 verify (six queries/request).
+# Three independent device captures per candidate, 15 calls/capture, KV
+# context 1000; correctness also checked at contexts 128 and 512.
+# Decode C4/C8 share token bucket 8. FP8 C1 keeps the baseline because
+# changing its decode batch size produced no meaningful device-time gain.
+# Exact metadata capacities are intentional; do not reuse for other layouts.
+# Rows: KV dtype, path, token bucket, metadata capacity, BQ, KV pages, split.
+_K3_PAGE16_DEVICE_TILES = (
+    ("bfloat16", "batched_decode", 1, 8, 1, 3, 4),
+    ("bfloat16", "batched_decode", 2, 8, 1, 3, 1),
+    ("bfloat16", "batched_decode", 8, 8, 1, 16, 1),
+    ("bfloat16", "batched_decode", 16, 32, 1, 16, 2),
+    ("bfloat16", "batched_decode", 32, 32, 1, 16, 8),
+    ("bfloat16", "mixed", 8, 8, 16, 2, 2),
+    ("bfloat16", "mixed", 16, 8, 32, 2, 1),
+    ("bfloat16", "mixed", 32, 8, 16, 4, 1),
+    ("bfloat16", "mixed", 48, 8, 8, 4, 1),
+    ("bfloat16", "mixed", 96, 32, 16, 4, 1),
+    ("bfloat16", "mixed", 192, 32, 16, 4, 1),
+    ("float8_e4m3fn", "batched_decode", 1, 8, 1, 3, 4),
+    ("float8_e4m3fn", "batched_decode", 2, 8, 1, 8, 4),
+    ("float8_e4m3fn", "batched_decode", 8, 8, 1, 8, 4),
+    ("float8_e4m3fn", "batched_decode", 16, 32, 1, 16, 2),
+    ("float8_e4m3fn", "batched_decode", 32, 32, 1, 16, 1),
+    ("float8_e4m3fn", "mixed", 8, 8, 16, 2, 2),
+    ("float8_e4m3fn", "mixed", 16, 8, 8, 4, 1),
+    ("float8_e4m3fn", "mixed", 32, 8, 16, 4, 1),
+    ("float8_e4m3fn", "mixed", 48, 8, 16, 4, 1),
+    ("float8_e4m3fn", "mixed", 96, 32, 16, 4, 1),
+    ("float8_e4m3fn", "mixed", 192, 32, 8, 4, 1),
+)
+for _dtype, _case, _tokens, _seqs, _bq, _pages, _split in _K3_PAGE16_DEVICE_TILES:
+    _packing = 2 if _dtype == "bfloat16" else 4
+    tuned_params_mapping[TuningKey(
+        case=_case,
+        max_num_tokens=_tokens,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype=_dtype,
+        q_dtype="bfloat16",
+        page_size_per_kv_packing=16 // _packing,
+        kv_packing=_packing,
+        max_num_seqs=_seqs,
+        pages_per_seq=2048,
+    )] = TunableParams(
+        num_kv_pages_per_block=_pages,
+        num_queries_per_block=_bq,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=_split if _case == "batched_decode" else 1,
+        q_split=_split if _case == "mixed" else 1,
+    )
+
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
