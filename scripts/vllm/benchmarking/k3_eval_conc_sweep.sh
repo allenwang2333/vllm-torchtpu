@@ -5,18 +5,23 @@
 # (local-chat-completions, plain chat, thinking off). Engine drained between
 # points. Every point is uploaded as soon as it is scored.
 #
-#   k3_eval_conc_sweep.sh --results-dir DIR [--conc-list 1,2,4,...]
-#                         [--tasks mmlu_pro,gsm8k] [--gsm8k-limit 128]
-#                         [--mmlu-limit 10] [--ctx 16384] [--max-num-seqs 256]
-#                         [--port 8000] [--gcs-root gs://bucket/prefix]
+#   k3_eval_conc_sweep.sh --results-dir DIR [--config NAME]
+#                         [--conc-list 1,2,4,...] [--tasks mmlu_pro,gsm8k]
+#                         [--gsm8k-limit 128] [--mmlu-limit 10]
+#                         [--ctx 16384] [--max-num-seqs 256] [--port 8000]
+#                         [--gcs-root gs://bucket/prefix]
 #
 # Results (per-point lm_eval output, samples, summary.md) land in --results-dir,
 # which the pipeline uploads as Buildkite artifacts; --gcs-root additionally
 # copies each point to <gcs-root>/<build number>/ as soon as it is scored.
 #
 # Question counts grow with concurrency so that the requested concurrency is
-# really reached: gsm8k limit = max(--gsm8k-limit, 2*conc); mmlu_pro limit
-# (per subject, 14 subjects) = max(--mmlu-limit, ceil(2*conc/14)).
+# really reached (k3_sweep_summary.py question-limit): gsm8k limit =
+# max(--gsm8k-limit, 2*conc); mmlu_pro limit (per subject, 14 subjects) =
+# max(--mmlu-limit, ceil(2*conc/14)).
+#
+# Exit status: 1 if the server failed to boot, died, or any lm_eval run
+# returned non-zero; the summary table shows rc per point either way.
 set -uo pipefail
 
 CONFIG_NAME="kimi-k3-tp32-ep-concsweep"
@@ -26,127 +31,86 @@ TASKS="mmlu_pro,gsm8k"
 GSM8K_LIMIT=128
 MMLU_LIMIT=10
 PORT="${PORT:-8000}"
+GCS_ARG=""
+# K3's chat template names its thinking switch "thinking" (it ignores
+# enable_thinking); off keeps every answer inside the task's token budget.
 TEMPLATE_KWARGS='{"thinking": false}'
-GCS_ROOT=""
 export K3_SWEEP_CTX="${K3_SWEEP_CTX:-16384}"
 export K3_SWEEP_MAX_NUM_SEQS="${K3_SWEEP_MAX_NUM_SEQS:-256}"
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --results-dir) RESULTS_DIR="$2"; shift 2 ;;
-        --conc-list)   CONC_LIST="$2"; shift 2 ;;
-        --tasks)       TASKS="$2"; shift 2 ;;
-        --gsm8k-limit) GSM8K_LIMIT="$2"; shift 2 ;;
-        --mmlu-limit)  MMLU_LIMIT="$2"; shift 2 ;;
-        --ctx)         export K3_SWEEP_CTX="$2"; shift 2 ;;
+        --results-dir)  RESULTS_DIR="$2"; shift 2 ;;
+        --config)       CONFIG_NAME="$2"; shift 2 ;;
+        --conc-list)    CONC_LIST="$2"; shift 2 ;;
+        --tasks)        TASKS="$2"; shift 2 ;;
+        --gsm8k-limit)  GSM8K_LIMIT="$2"; shift 2 ;;
+        --mmlu-limit)   MMLU_LIMIT="$2"; shift 2 ;;
+        --ctx)          export K3_SWEEP_CTX="$2"; shift 2 ;;
         --max-num-seqs) export K3_SWEEP_MAX_NUM_SEQS="$2"; shift 2 ;;
-        --port)        PORT="$2"; shift 2 ;;
-        --gcs-root)    GCS_ROOT="$2"; shift 2 ;;
-        --config)      CONFIG_NAME="$2"; shift 2 ;;
-        *) echo "Unknown argument: $1"; exit 1 ;;
+        --port)         PORT="$2"; shift 2 ;;
+        --gcs-root)     GCS_ARG="$2"; shift 2 ;;
+        *) echo "[k3-eval-sweep] unknown argument: $1"; exit 1 ;;
     esac
 done
-[ -n "$RESULTS_DIR" ] || { echo "ERROR: --results-dir is required"; exit 1; }
+[ -n "$RESULTS_DIR" ] || { echo "[k3-eval-sweep] ERROR: --results-dir is required"; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+K3_SWEEP_TAG="k3-eval-sweep"
+# shellcheck source=scripts/vllm/benchmarking/k3_sweep_lib.sh
+source "$SCRIPT_DIR/k3_sweep_lib.sh"
+SUMMARY_PY="$SCRIPT_DIR/k3_sweep_summary.py"
+
+k3_check_conc_list "$CONC_LIST" || exit 1
 IFS=',' read -r -a CONCS <<< "$CONC_LIST"
 IFS=',' read -r -a TASK_LIST <<< "$TASKS"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for task in "${TASK_LIST[@]}"; do
+    python3 "$SUMMARY_PY" question-limit --task "$task" --conc 1 --gsm8k-limit "$GSM8K_LIMIT" --mmlu-limit "$MMLU_LIMIT" >/dev/null \
+        || { log "ERROR: unsupported task '$task' (supported: mmlu_pro, gsm8k)"; exit 1; }
+done
 mkdir -p "$RESULTS_DIR"
 SUMMARY="$RESULTS_DIR/summary.md"
-[ -n "$GCS_ROOT" ] && GCS_ROOT="${GCS_ROOT%/}/${BUILDKITE_BUILD_NUMBER:-local}"
+k3_set_gcs_root "$GCS_ARG"
 
-log() { echo "[k3-concsweep] $*"; }
-
+SUMMARY_PRINTED=0
 cleanup() {
     log "cleanup"
     bash "$SCRIPT_DIR/cleanup_server.sh"
-    if [ -f "$RESULTS_DIR/server.log" ]; then
-        log "===== server.log: error context ====="
-        tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' \
-            | grep -v -E 'ActorHandle|ray_executor_v2.py:566|Failed to kill|client_mode_hook|auto_init_hook|_raylet|ray/_private' \
-            | grep -n -E -B3 -A25 'Traceback|Error|Exception|Killed|OOM|halt' | tail -120 | cut -c1-400
-        log "===== server.log: last 30 non-blank lines ====="
-        tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -30 | cut -c1-300
-    fi
-    [ -f "$SUMMARY" ] && { log "===== summary ====="; cat "$SUMMARY"; }
+    k3_dump_server_log_context
+    if [ -f "$SUMMARY" ] && [ "$SUMMARY_PRINTED" = "0" ]; then log "===== summary (partial) ====="; cat "$SUMMARY"; fi
     if [ -n "$GCS_ROOT" ] && command -v gsutil >/dev/null 2>&1; then
-        log "uploading results to $GCS_ROOT"
-        gsutil -q -m cp -r "$RESULTS_DIR" "$GCS_ROOT/" 2>&1 | tail -3 || log "WARNING: GCS upload failed"
+        log "uploading $RESULTS_DIR to $GCS_ROOT"
+        gsutil -q -m cp -r "$RESULTS_DIR" "$GCS_ROOT/" 2>&1 | tail -3 || log "WARNING: GCS upload to $GCS_ROOT failed"
     fi
 }
 trap cleanup EXIT INT TERM
 
-save_now() {
-    [ -n "$GCS_ROOT" ] && command -v gsutil >/dev/null 2>&1 || return 0
-    for x in "$@"; do
-        [ -e "$x" ] || continue
-        gsutil -q -m cp -r "$x" "$GCS_ROOT/$(basename "$RESULTS_DIR")/" 2>&1 | tail -2 || log "WARNING: upload of $x failed"
-    done
-}
-
-server_alive() { curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null; }
-
-# Engine drain between points: vllm:num_requests_running + waiting == 0, 3 polls.
-wait_server_idle() {
-    local timeout=1800 t0 idle=0 n
-    t0=$(date +%s)
-    while [ $(( $(date +%s) - t0 )) -lt "$timeout" ]; do
-        n=$(curl -s "http://127.0.0.1:$PORT/metrics" | awk '/^vllm:num_requests_(running|waiting)/{s+=$NF} END{print s+0}')
-        if [ "${n%.*}" = "0" ]; then idle=$((idle+1)); [ "$idle" -ge 3 ] && return 0; else idle=0; fi
-        sleep 10
-    done
-    log "WARNING: engine did not drain within ${timeout}s"; return 1
-}
-
 # ---------------------------------------------------------------- boot
 log "===== boot: config=$CONFIG_NAME concs=${CONCS[*]} tasks=${TASK_LIST[*]} gsm8k_limit>=$GSM8K_LIMIT mmlu_limit>=$MMLU_LIMIT ctx=$K3_SWEEP_CTX max_num_seqs=$K3_SWEEP_MAX_NUM_SEQS ====="
-bash "$SCRIPT_DIR/cleanup_server.sh"
-T_BOOT=$(date +%s)
-"$SCRIPT_DIR/run_benchmarks.sh" --config "$CONFIG_NAME" --results-dir "$RESULTS_DIR" --keep-alive --port "$PORT" \
-    || { log "FATAL: server boot / smoke bench failed"; exit 1; }
-server_alive || { log "FATAL: server not answering after boot"; exit 1; }
-log "server up after $(( $(date +%s) - T_BOOT )) s"
-MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
+k3_boot_server "$CONFIG_NAME" || exit 1
+MODEL=$(k3_config_json_get model)
 save_now "$RESULTS_DIR/config.json"
 
 {
     echo "# K3 accuracy vs eval concurrency (build ${BUILDKITE_BUILD_NUMBER:-local}, config $CONFIG_NAME, ctx $K3_SWEEP_CTX, max-num-seqs $K3_SWEEP_MAX_NUM_SEQS, thinking off, plain chat)"
     echo
-    echo "| conc | task | questions | metric | score | stderr | wall s | errors |"
+    echo "| conc | task | questions | metric | score | stderr | wall s | lm_eval rc / log errors |"
     echo "|---|---|---|---|---|---|---|---|"
 } > "$SUMMARY"
 
 # ---------------------------------------------------------------- sweep
-score_of() {   # score_of <output_dir> <task> -> "metric score stderr"
-    python3 - "$1" "$2" << 'PY'
-import glob, json, os, sys
-d, task = sys.argv[1], sys.argv[2]
-files = sorted(glob.glob(os.path.join(d, "**", "results_*.json"), recursive=True), key=os.path.getmtime)
-if not files:
-    print("none nan nan"); sys.exit()
-r = json.load(open(files[-1]))["results"][task]
-for k in ("exact_match,custom-extract", "exact_match,flexible-extract", "exact_match,strict-match"):
-    if k in r:
-        print(k, r[k], r.get(k.replace("exact_match", "exact_match_stderr"), float("nan")))
-        break
-else:
-    print("none nan nan")
-PY
-}
-
 FAIL=0
 for c in "${CONCS[@]}"; do
     for task in "${TASK_LIST[@]}"; do
+        read -r limit n_q <<< "$(python3 "$SUMMARY_PY" question-limit --task "$task" --conc "$c" --gsm8k-limit "$GSM8K_LIMIT" --mmlu-limit "$MMLU_LIMIT")"
         if [ "$task" = "gsm8k" ]; then
-            limit=$GSM8K_LIMIT; [ $((2*c)) -gt "$limit" ] && limit=$((2*c))
-            n_q=$limit
+            # gsm8k's default max_gen_toks (256) cuts K3's worked answers short.
             gen_kwargs="{\"chat_template_kwargs\": $TEMPLATE_KWARGS, \"max_gen_toks\": 1024}"
         else
-            limit=$MMLU_LIMIT; [ $(( (2*c + 13) / 14 )) -gt "$limit" ] && limit=$(( (2*c + 13) / 14 ))
-            n_q=$((limit * 14))
             gen_kwargs="{\"chat_template_kwargs\": $TEMPLATE_KWARGS}"
         fi
         out="$RESULTS_DIR/${task}_c${c}"; mkdir -p "$out"
-        log "===== conc=$c task=$task limit=$limit (~$n_q questions) ====="
-        server_alive || { log "FATAL: server died before conc=$c $task"; FAIL=1; break 2; }
+        log "===== conc=$c task=$task limit=$limit ($n_q questions) ====="
+        if ! server_alive; then log "FATAL: server died before conc=$c $task"; FAIL=1; break 2; fi
         T0=$(date +%s)
         lm_eval --tasks "$task" --seed "0,1234,None,1234" --output_path "$out" --log_samples --limit "$limit" \
             --model local-chat-completions \
@@ -155,16 +119,21 @@ for c in "${CONCS[@]}"; do
         rc=$?
         wall=$(( $(date +%s) - T0 ))
         errs=$(grep -c -iE 'error|exception|timed out' "$out/lm_eval.log" || true)
-        read -r metric score stderr <<< "$(score_of "$out" "$task")"
+        read -r metric score stderr <<< "$(python3 "$SUMMARY_PY" lm-eval-score --output-dir "$out" --task "$task")"
         log "conc=$c task=$task rc=$rc $metric=$score ±$stderr wall=${wall}s log-errors=$errs"
-        [ "$rc" -ne 0 ] && { log "lm_eval failed; last 40 log lines:"; tail -40 "$out/lm_eval.log" | cut -c1-300; }
-        echo "| $c | $task | $n_q | $metric | $score | $stderr | $wall | rc=$rc/$errs |" >> "$SUMMARY"
+        if [ "$rc" -ne 0 ]; then
+            FAIL=1
+            log "ERROR: lm_eval failed for conc=$c task=$task (rc=$rc); last 40 lines of $out/lm_eval.log:"
+            tail -40 "$out/lm_eval.log" | cut -c1-300
+        fi
+        echo "| $c | $task | $n_q | $metric | $score | $stderr | $wall | rc=$rc / $errs |" >> "$SUMMARY"
         save_now "$out" "$SUMMARY"
         wait_server_idle || true
     done
 done
 
 log "===== summary ====="
-cat "$SUMMARY"
-server_alive || { log "server is DEAD at the end of the sweep"; FAIL=1; }
+cat "$SUMMARY"; SUMMARY_PRINTED=1
+server_alive || { log "ERROR: server is dead at the end of the sweep"; FAIL=1; }
+[ "$FAIL" = "0" ] || log "sweep finished with failures (see rc column); exiting 1"
 exit $FAIL
