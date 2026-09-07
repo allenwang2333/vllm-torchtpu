@@ -516,6 +516,7 @@ def _effective_row_lengths(
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "enable_early_exit",
+        "emit_pairs",
     ),
 )
 def streamindex_topk(
@@ -535,6 +536,7 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     enable_early_exit: bool = False,
+    emit_pairs: bool = False,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -559,6 +561,9 @@ def streamindex_topk(
     enable_early_exit: whether to enable early exit using jax.lax.cond when k >=
       kv_len for all sequences in the batch. Defaults to False.
     decode_req_batch_size: maximum decode batch size per iteration.
+    emit_pairs: forwarded to `sparsecore_topk`. Only affects the two-stage
+      path, which needs `_pick_partition(...) > 1`; a no-op otherwise.
+      Defaults to False.
 
   Returns:
     Top-K indices (in compressed space).
@@ -833,6 +838,7 @@ def streamindex_topk(
             k,
             row_lengths=eff_row_lengths,
             write_empty_rows=True,
+            emit_pairs=emit_pairs,
         )
 
         return topk_idxs[:q.shape[0], :k]
