@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
@@ -55,6 +56,12 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+# Two-stage `sparsecore_topk` formulation, forwarded through
+# `streamindex_topk`. Read once at import so the value is baked into the
+# traced program rather than re-read per call. See `envs.py` for when it is
+# reachable at all.
+SCTOPK_EMIT_PAIRS = envs.TPU_SCTOPK_EMIT_PAIRS
 
 
 @SparseAttnIndexer.register_oot
@@ -119,6 +126,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                emit_pairs=SCTOPK_EMIT_PAIRS,
             )
             return cache_kv, topk_indices
 

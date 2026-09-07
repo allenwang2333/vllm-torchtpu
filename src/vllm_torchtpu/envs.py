@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_SCTOPK_EMIT_PAIRS: bool = False
 
 
 def env_with_choices(
@@ -459,6 +460,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Have stage 1 of the two-stage SparseCore top-k emit each winner's score
+    # next to its index, so stage 2 does not gather those scores back out of
+    # the full score rows. Same indices, bit for bit. Only reachable when the
+    # DSA indexer takes the two-stage path (partition factor > 1).
+    "TPU_SCTOPK_EMIT_PAIRS":
+    env_bool("TPU_SCTOPK_EMIT_PAIRS", default=False),
 }
 
 
