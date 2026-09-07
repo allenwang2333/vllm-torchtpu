@@ -16,10 +16,12 @@
 Run inside the Ray head container that run_multihost.sh brings up. Schedules
 one task per alive Ray node; each task initializes JAX in single-host mode
 (so hosts do not need to rendezvous with each other) and reports the chips
-it can see. Passes when every host reports the expected number of chips.
+it can see. Passes when every host reports the expected number of devices.
+On tpu7x each chip has 2 TensorCores and JAX lists each core as a device, so
+a 4-chip host reports 8 devices.
 
 Usage (from the head container, repo root):
-    python3 .buildkite/scripts/tpu_slice_smoke.py [--hosts 4] [--chips-per-host 4]
+    python3 .buildkite/scripts/tpu_slice_smoke.py [--hosts 4] [--devices-per-host 8]
 """
 import argparse
 import sys
@@ -30,7 +32,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 @ray.remote(num_cpus=1)
-def probe(chips_per_host: int):
+def probe(devices_per_host: int):
     import os
     import socket
 
@@ -54,14 +56,14 @@ def probe(chips_per_host: int):
         "devices": [str(d) for d in devs],
         "kind": devs[0].device_kind if devs else None,
         "init_s": round(time.time() - t0, 1),
-        "ok": len(devs) == chips_per_host,
+        "ok": len(devs) == devices_per_host,
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hosts", type=int, default=4)
-    ap.add_argument("--chips-per-host", type=int, default=4)
+    ap.add_argument("--devices-per-host", type=int, default=8)
     ap.add_argument("--timeout", type=int, default=900)
     args = ap.parse_args()
 
@@ -73,7 +75,7 @@ def main() -> int:
 
     refs = [
         probe.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=n["NodeID"], soft=False)).remote(args.chips_per_host)
+            node_id=n["NodeID"], soft=False)).remote(args.devices_per_host)
         for n in nodes
     ]
     results = ray.get(refs, timeout=args.timeout)
@@ -90,7 +92,7 @@ def main() -> int:
 
     total = sum(r["n_devices"] for r in results)
     print(f"[tpu-slice-smoke] hosts={len(nodes)}/{args.hosts} "
-          f"chips={total}/{args.hosts * args.chips_per_host} "
+          f"devices={total}/{args.hosts * args.devices_per_host} "
           f"-> {'PASS' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 

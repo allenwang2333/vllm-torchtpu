@@ -14,7 +14,8 @@
 
 # tpu7x-32 fleet smoke: one basic job per agent on tpu_v7x_32_queue.
 # Each job brings up the Ray cluster across the 4 hosts of its slice and
-# checks every host can see its 4 chips (jax.devices()).
+# checks every host can see its 4 chips (jax.devices() reports 8 devices per
+# host on tpu7x: 2 TensorCores per chip).
 
 steps:
 
@@ -35,7 +36,7 @@ steps:
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh python3 .buildkite/scripts/tpu_slice_smoke.py --hosts 4 --chips-per-host 4"
+      - "bash .buildkite/scripts/run_multihost.sh python3 .buildkite/scripts/tpu_slice_smoke.py --hosts 4 --devices-per-host 8"
     artifact_paths:
       - "perf_eval_results/**/*"
 
@@ -49,7 +50,7 @@ steps:
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh python3 .buildkite/scripts/tpu_slice_smoke.py --hosts 4 --chips-per-host 4"
+      - "bash .buildkite/scripts/run_multihost.sh python3 .buildkite/scripts/tpu_slice_smoke.py --hosts 4 --devices-per-host 8"
     artifact_paths:
       - "perf_eval_results/**/*"
 
@@ -62,6 +63,6 @@ steps:
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh python3 .buildkite/scripts/tpu_slice_smoke.py --hosts 4 --chips-per-host 4"
+      - "bash .buildkite/scripts/run_multihost.sh python3 .buildkite/scripts/tpu_slice_smoke.py --hosts 4 --devices-per-host 8"
     artifact_paths:
       - "perf_eval_results/**/*"
