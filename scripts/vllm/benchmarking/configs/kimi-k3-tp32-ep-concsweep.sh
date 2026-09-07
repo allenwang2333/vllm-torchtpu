@@ -15,4 +15,9 @@ NUM_PROMPTS=2
 
 # Decode steps carry up to MAX_NUM_SEQS tokens; the nightly's [1,8,8192] buckets
 # would pad every such step to 8192 tokens. Give the sweep matching buckets.
+_before="$EXTRA_SERVE_ARGS"
 EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed 's/"compile_sizes":\[1,8,8192\]/"compile_sizes":[1,8,16,32,64,128,256,1024,2048,4096,8192]/')
+if [ "$EXTRA_SERVE_ARGS" = "$_before" ]; then
+    echo "ERROR: kimi-k3-tp32-ep-concsweep.sh: the nightly config no longer sets compile_sizes [1,8,8192]; update the substitution above" >&2
+    return 1
+fi
