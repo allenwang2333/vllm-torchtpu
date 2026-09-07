@@ -17,8 +17,11 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import (get_or_create_dcp_mesh,
+                                           merge_lse_partials)
 from vllm_torchtpu.distributed.pcp import get_pcp_group_layout
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import PCP_AXIS_NAME
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (DCP_AXIS_NAME,
+                                                                PCP_AXIS_NAME)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
@@ -26,6 +29,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
                                                       SparseMLAKVCacheSpec)
+from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, attention_bundled, mla_attention, ragged_paged_attention,
@@ -81,6 +85,32 @@ _SPARSE_MLA_PCP_OUTPUT_PARTITION_SPECS = (
     _PCP_REPLICATED,  # updated nope cache
     _PCP_REPLICATED,  # updated rope cache
     _PCP_SHARDED,  # attention output, this rank's tokens
+)
+
+# The DCP specs, and note they are the *inverse* of the PCP ones almost
+# everywhere: PCP shards queries and replicates the cache, DCP shards the cache
+# by KV position and replicates the queries. Same reason for module scope.
+_DCP_SHARDED = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
+    _DCP_SHARDED,  # kv_cache_nope, this rank's position shard
+    _DCP_SHARDED,  # kv_cache_rope
+    _PCP_REPLICATED,  # ql_nope
+    _PCP_REPLICATED,  # q_pe
+    _PCP_REPLICATED,  # kv_c_normed -- no all-gather: every rank already has it
+    _PCP_REPLICATED,  # k_pe
+    # This rank's slice of every token's global top-k, already local indices.
+    # Sharded, so the global leading dim is `dcp_size * num_tokens`.
+    _DCP_SHARDED,  # local_topk_indices
+    _PCP_REPLICATED,  # seq_lens
+    _PCP_REPLICATED,  # block_tables (virtual page ordinals)
+    _PCP_REPLICATED,  # query_start_loc
+    _PCP_REPLICATED,  # request_distribution
+)
+_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
+    _DCP_SHARDED,  # updated nope cache
+    _DCP_SHARDED,  # updated rope cache
+    _DCP_SHARDED,  # partial attention output over this rank's KV positions
+    _DCP_SHARDED,  # matching log-sum-exps, `-inf` where this rank owns nothing
 )
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
@@ -1464,6 +1494,36 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             # Dynamo can trace and that emits no `partition-id`.
             self.pcp_rank = get_pcp_group_layout().rank_in_group
 
+        # The DCP axis, resolved here for the same reasons. The indexer refuses
+        # pcp>1 and dcp>1 together (see `VllmTPUSparseAttnIndexer.__init__`);
+        # this path would silently produce a wrong answer in that case rather
+        # than a bad one, so it refuses too.
+        dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+        self.dcp_size = dcp_size if isinstance(dcp_size,
+                                               int) and dcp_size > 1 else 1
+        self.dcp_interleave_size = getattr(parallel_config,
+                                           "cp_kv_cache_interleave_size", 1)
+        self._dcp_mesh = None
+        if self.dcp_size > 1:
+            if self.pcp_size > 1:
+                raise NotImplementedError(
+                    f"pcp_size={self.pcp_size} and dcp_size={self.dcp_size} "
+                    "are both >1; sparse MLA has one KV-position interleave, "
+                    "not two.")
+            # Checked here rather than inside the traced op so the failure
+            # lands at model build with somewhere to go. vLLM defaults this to
+            # 1, which `dsa_gather` cannot use: it packs 4 rope tokens per
+            # tile, so an interleave finer than TILE_SUBROWS puts one tile's
+            # tokens on different ranks.
+            if self.dcp_interleave_size % dsa_gather.TILE_SUBROWS:
+                raise ValueError(
+                    "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
+                    f"a multiple of {dsa_gather.TILE_SUBROWS} "
+                    f"(dsa_gather.TILE_SUBROWS), got "
+                    f"{self.dcp_interleave_size}. 4 is also the best value for "
+                    "load balance across the shards; see `dcp_topk_capacity`.")
+            self._dcp_mesh = get_or_create_dcp_mesh()
+
     def _get_kv_scales(
             self,
             layer: Any) -> tuple[float | None, float | None, float | None]:
@@ -1768,6 +1828,116 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_pcp_impl
 
+    def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int,
+                                 interleave_size: int):
+        """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
+
+        Simpler than the PCP variant, and for the same reason the DCP indexer
+        op is: the queries are replicated, so nothing arrives rank-major and
+        there is no permutation to undo. `kv_c_normed`/`k_pe` in particular
+        need no all-gather -- they are computed from a replicated residual
+        stream, so every rank already holds every row and only its *write mask*
+        differs.
+
+        The op returns unmerged partials. Combining them is one log-sum-exp
+        reduction over the DCP group, and it is deliberately left to the torch
+        caller (`distributed.dcp.merge_lse_partials`): it needs no Pallas, and
+        keeping it out of the exported module avoids the export path's
+        constraints on how collectives inside `pallas.jax_op` are launched.
+        """
+        from vllm_torchtpu.layers.common.attention_interface import \
+            sparse_mla_attention_dcp
+
+        # Resolved in __init__: this builder runs inside the traced forward.
+        mesh = self._dcp_mesh
+
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def sparse_mla_attention_core_tpu_dcp(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+
+        def _fake_outputs(kv_cache_nope, kv_cache_rope, ql_nope, *rest):
+            # Local shapes off the local inputs, keeping the token dim symbolic
+            # -- see `pcp_streaming_jax_op`. The output is `ql_nope`'s shape
+            # (the kernel's rope tail is dropped before it returns) and the
+            # log-sum-exps are one f32 per (token, head).
+            del rest
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty_like(ql_nope),
+                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
+            )
+
+        op_name = ("pallas::sparse_mla_attention_dcp_"
+                   f"{layer.layer_name.replace('.', '_')}")
+        sparse_mla_jax_op = pcp_streaming_jax_op(
+            op_name,
+            sparse_mla_attention_core_tpu_dcp,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+            output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+            fake_outputs=_fake_outputs,
+        )
+
+        def sparse_mla_dcp_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor],
+            ql_nope: torch.Tensor,
+            q_pe: torch.Tensor,
+            kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            local_topk_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, outputs, lse = sparse_mla_jax_op(
+                nope_cache, rope_cache, ql_nope, q_pe, kv_c_normed, k_pe,
+                local_topk_indices, seq_lens, block_tables, query_start_loc,
+                request_distribution)
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return outputs, lse
+
+        return sparse_mla_dcp_impl
+
     def forward(
         self,
         layer: Any,
@@ -1834,7 +2004,31 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         "sparse MLA layers use a native (nope, rope) split "
                         f"cache; got {type(kv_cache)}")
             pcp_size = self.pcp_size
-            if pcp_size > 1:
+            if self.dcp_size > 1:
+                # Built eagerly in `process_weights_after_loading`, same
+                # tracing constraint as the PCP op.
+                assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
+                    "DCP sparse MLA op was never built; "
+                    "`process_weights_after_loading` must run first.")
+                # `topk_indices` here is not global positions: the DCP indexer
+                # already resolved each token's global top-k into this rank's
+                # own local cache indices, `-1` where it owns nothing.
+                partial, lse = layer.sparse_mla_dcp_op(
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    topk_indices,
+                    attn_metadata.seq_lens,
+                    attn_metadata.block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                )
+                # The one collective DCP costs. Outside the exported op on
+                # purpose -- see `_build_sparse_mla_dcp_op`.
+                outputs = merge_lse_partials(partial, lse)
+            elif pcp_size > 1:
                 # Built eagerly in `process_weights_after_loading`: none of
                 # `pcp_streaming_jax_op` is Dynamo-traceable, so it cannot be
                 # constructed from inside this (compiled) forward.

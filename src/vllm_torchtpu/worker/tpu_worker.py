@@ -391,6 +391,15 @@ class TPUWorker(WorkerBase):
                 pipeline_model_parallel_size=self.parallel_config.
                 pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
+                # Forwarded explicitly: the parameter defaults to 1, so
+                # omitting it does not disable DCP loudly -- it builds
+                # `dcp_size` groups of one rank each and every consumer then
+                # reads `get_dcp_group().world_size == 1` while
+                # `parallel_config.decode_context_parallel_size` still says
+                # otherwise. vLLM's own GPU worker passes all four sizes
+                # (`v1/worker/gpu_worker.py`); this one had drifted.
+                decode_context_model_parallel_size=self.parallel_config.
+                decode_context_parallel_size,
             )
         # The patch above substitutes rank lists on the way in; this reads the
         # built groups back, so a patch that silently stopped applying fails
