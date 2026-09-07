@@ -28,7 +28,7 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 ENABLE_PREFIX_CACHING=false
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
+EXTRA_SERVE_ARGS="${K3_EXTRA_SERVE_ARGS:+$K3_EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
 
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"

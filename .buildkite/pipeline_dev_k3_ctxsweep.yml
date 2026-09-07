@@ -8,7 +8,7 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: "K3 ctx sweep ${K3_ISL_OSL:-8192:256 32768:256 65536:256 114688:256} mml ${K3_CTX:-131072} kv ${K3_KV:-fp8} (TPU v7x-32)"
+  - label: "K3 ctx sweep ${K3_ISL_OSL:-8192:256 32768:256 65536:256 114688:256} mml ${K3_CTX:-131072} kv ${K3_KV:-fp8} extra ${K3_EXTRA_SERVE_ARGS:-none} (TPU v7x-32)"
     key: k3_ctxsweep
     depends_on: build_docker
     timeout_in_minutes: 300
@@ -19,6 +19,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ctxsweep.sh --config kimi-k3-tp32-ep-agentx-ctxsweep --results-dir /perf_eval_results/k3-ctxsweep --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --isl-osl \"${K3_ISL_OSL:-8192:256 32768:256 65536:256 114688:256}\""
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_ctxsweep.sh --config kimi-k3-tp32-ep-agentx-ctxsweep --results-dir /perf_eval_results/k3-ctxsweep --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --isl-osl \"${K3_ISL_OSL:-8192:256 32768:256 65536:256 114688:256}\" --extra-serve-args \"${K3_EXTRA_SERVE_ARGS:-}\""
     artifact_paths:
       - "perf_eval_results/**/*"
