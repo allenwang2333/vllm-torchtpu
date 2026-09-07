@@ -295,6 +295,7 @@ for idx in "${!CONCS[@]}"; do
     fi
     log "replay cmd: $REPLAY_CMD"
     T0=$(date +%s)
+    pre0=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
     # aiperf can hang in its own shutdown after a warmup-drain timeout, so each
     # point runs under a hard cap (warmup grace + window + 30 min). On expiry
     # every aiperf process is killed and the point is marked HARD_TIMEOUT.
@@ -311,7 +312,8 @@ for idx in "${!CONCS[@]}"; do
     pkill -P "$watchdog_pid" 2>/dev/null   # the watchdog's sleep
     kill "$watchdog_pid" 2>/dev/null; wait "$watchdog_pid" 2>/dev/null
     pkill -KILL -f "aiperf" 2>/dev/null   # never leave a client behind between points
-    log "conc $c: replay+aggregate rc=$rc wall=$(( $(date +%s) - T0 )) s"
+    pre1=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
+    log "conc $c: replay+aggregate rc=$rc wall=$(( $(date +%s) - T0 )) s engine-preemptions=$(( ${pre1:-0} - ${pre0:-0} )) (a preempted request resumes from its saved state; K3 keeps a KDA recurrent state per sequence, so a non-zero count is worth checking against output quality)"
     if [ ! -f "$AGENTIC_OUTPUT_DIR/$RESULT_FILENAME.json" ]; then
         FAIL=1
         log "ERROR: conc $c produced no aggregate ($RESULT_FILENAME.json); $([ -f "$RESULT_DIR/HARD_TIMEOUT" ] && echo 'hard timeout' || echo 'client or aggregation failed, see the replay log above')"
