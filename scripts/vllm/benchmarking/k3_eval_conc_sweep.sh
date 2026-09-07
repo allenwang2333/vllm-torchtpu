@@ -93,8 +93,8 @@ save_now "$RESULTS_DIR/config.json"
 {
     echo "# K3 accuracy vs eval concurrency (build ${BUILDKITE_BUILD_NUMBER:-local}, config $CONFIG_NAME, ctx $K3_SWEEP_CTX, max-num-seqs $K3_SWEEP_MAX_NUM_SEQS, thinking off, plain chat)"
     echo
-    echo "| conc | task | questions | metric | score | stderr | wall s | lm_eval rc / log errors |"
-    echo "|---|---|---|---|---|---|---|---|"
+    echo "| conc | task | questions | metric | score | stderr | wall s | lm_eval rc / log errors | engine preemptions during point |"
+    echo "|---|---|---|---|---|---|---|---|---|"
 } > "$SUMMARY"
 
 # ---------------------------------------------------------------- sweep
@@ -112,6 +112,7 @@ for c in "${CONCS[@]}"; do
         log "===== conc=$c task=$task limit=$limit ($n_q questions) ====="
         if ! server_alive; then log "FATAL: server died before conc=$c $task"; FAIL=1; break 2; fi
         T0=$(date +%s)
+        pre0=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
         lm_eval --tasks "$task" --seed "0,1234,None,1234" --output_path "$out" --log_samples --limit "$limit" \
             --model local-chat-completions \
             --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,num_concurrent=$c,max_retries=3,timeout=3600" \
@@ -120,13 +121,15 @@ for c in "${CONCS[@]}"; do
         wall=$(( $(date +%s) - T0 ))
         errs=$(grep -c -iE 'error|exception|timed out' "$out/lm_eval.log" || true)
         read -r metric score stderr <<< "$(python3 "$SUMMARY_PY" lm-eval-score --output-dir "$out" --task "$task")"
-        log "conc=$c task=$task rc=$rc $metric=$score ±$stderr wall=${wall}s log-errors=$errs"
+        pre1=$(k3_engine_counters | sed -E 's/preemptions=([0-9]+).*/\1/')
+        preempt=$(( ${pre1:-0} - ${pre0:-0} ))
+        log "conc=$c task=$task rc=$rc $metric=$score ±$stderr wall=${wall}s log-errors=$errs engine-preemptions=$preempt"
         if [ "$rc" -ne 0 ]; then
             FAIL=1
             log "ERROR: lm_eval failed for conc=$c task=$task (rc=$rc); last 40 lines of $out/lm_eval.log:"
             tail -40 "$out/lm_eval.log" | cut -c1-300
         fi
-        echo "| $c | $task | $n_q | $metric | $score | $stderr | $wall | rc=$rc / $errs |" >> "$SUMMARY"
+        echo "| $c | $task | $n_q | $metric | $score | $stderr | $wall | rc=$rc / $errs | $preempt |" >> "$SUMMARY"
         save_now "$out" "$SUMMARY"
         wait_server_idle || true
     done
