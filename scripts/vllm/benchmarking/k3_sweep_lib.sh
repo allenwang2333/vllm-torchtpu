@@ -48,6 +48,16 @@ k3_engine_queue_depth() {
         | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
 }
 
+# Cumulative engine counters from /metrics that explain a bad point:
+# preemptions (a preempted request is re-prefilled from its KV state) and
+# finished requests. Printed as "preemptions=N finished=M".
+k3_engine_counters() {
+    curl -s "http://127.0.0.1:$PORT/metrics" | awk '
+        /^vllm:num_preemptions_total( |\{)/ {p+=$NF}
+        /^vllm:request_success_total( |\{)/ {f+=$NF}
+        END {printf "preemptions=%d finished=%d\n", p, f}'
+}
+
 # wait_server_idle [timeout_s]: return when running+waiting has been 0 on 3
 # polls 10 s apart, so the next point starts on a drained engine.
 wait_server_idle() {
