@@ -146,17 +146,23 @@ steps:
           RUN_ROOT: "/perf_eval_results/glm52_fp4_offload_ci"
           SERVED_MODEL_NAME: "nvidia/GLM-5.2-NVFP4"
         commands:
-          # Not a models--<org>--<name> hub snapshot but a plain checkpoint
-          # directory, so it lands at <hub root>/GLM-5.2-NVFP4 and is served
-          # by path below rather than by HF id.
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4/"
+          # Deliberately NOT staged with stage_model_snapshot.sh. At ~433 GiB
+          # this checkpoint does not fit a tpu7x-8 agent's disk alongside what
+          # else lives there: the staging copy died at 123/174 files with
+          # ENOSPC and the rig never started. Nightly hid that behind a warm
+          # per-agent cache; pre-merge means every agent would need its own
+          # copy, so the step streams from GCS instead and stages nothing.
+          #
           # MODEL is not on run_in_docker.sh's forwarding list, and the rig
-          # defaults it to the HF id, which would re-download the checkpoint;
-          # hand it the staged copy's in-container path (HF_HOME is mounted at
-          # /local_hf_cache) instead.
+          # defaults it to the HF id, which would download the checkpoint;
+          # hand it the bucket URI. A gs:// MODEL makes the rig serve with
+          # --load-format runai_streamer (runai-model-streamer[gcs] is a
+          # pyproject dependency). The bucket is a plain checkpoint directory
+          # with config.json at its root, not a models--<org>--<name> hub
+          # snapshot, so it needs no snapshots/ subdirectory resolution.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env MODEL=/local_hf_cache/hub/GLM-5.2-NVFP4
+            env MODEL=gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4
             bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
         artifact_paths:
           - "perf_eval_results/**/*"

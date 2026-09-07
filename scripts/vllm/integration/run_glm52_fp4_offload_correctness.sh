@@ -122,6 +122,23 @@ print(s.getsockname()[1])
 s.close()' 2>/dev/null || echo 8123)}"
 MODEL="${MODEL:-nvidia/GLM-5.2-NVFP4}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-nvidia/GLM-5.2-NVFP4}"
+# How the 47 shards reach the engine, keyed off the MODEL scheme the way
+# run_qwen35_gpc_correctness.sh does it.
+#
+# gs:// streams through runai rather than landing on a disk first. Staging this
+# checkpoint is what the pre-merge step cannot afford: at ~433 GiB it exhausted
+# a tpu7x-8 agent's disk 123 files in, and the rig never started. runai is
+# already a dependency for exactly this (pyproject.toml: "Stream gs://
+# checkpoints via --load-format runai_streamer").
+#
+# A local path keeps the recipes' prefetch strategy. The two are alternatives,
+# not additions: safetensors_load_strategy is read only by vLLM's default
+# loader, and RunaiModelStreamerLoader never consults it, so passing prefetch
+# alongside runai would be silently inert.
+LOAD_FORMAT_ARGS=(--safetensors-load-strategy=prefetch)
+if [[ "${MODEL}" == gs://* ]]; then
+  LOAD_FORMAT_ARGS=(--load-format runai_streamer)
+fi
 # DP 8 / TP 1, with every request pinned to one rank (see serve() below).
 DP_SIZE="${DP_SIZE:-8}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -176,10 +193,12 @@ KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"
 #   parser flags            carried over as the recipes set them. They only
 #                           shape how the chat response is split; the smoke
 #                           gates on token_ids, which is upstream of that.
-#   --safetensors-load-strategy=prefetch
-#                           both recipes; on 47 shards it is the difference
-#                           between a load that streams and one that stalls
-#                           per shard.
+#   weight loading         both recipes pass
+#                           --safetensors-load-strategy=prefetch, which on 47
+#                           shards is the difference between a load that
+#                           streams and one that stalls per shard. Kept for a
+#                           local MODEL only; a gs:// MODEL streams through
+#                           runai instead. See LOAD_FORMAT_ARGS above.
 #
 # What the rig overrides, and why it has to:
 #   --enable-prefix-caching  the recipes serve with --no-enable-prefix-caching.
@@ -211,7 +230,7 @@ serve() {
     --tool-call-parser=glm47 \
     --enable-auto-tool-choice \
     --reasoning-parser=glm45 \
-    --safetensors-load-strategy=prefetch \
+    "${LOAD_FORMAT_ARGS[@]}" \
     --gpu-memory-utilization="${GPU_MEM_UTIL}" \
     --enable-prefix-caching \
     --enable-prompt-tokens-details \
