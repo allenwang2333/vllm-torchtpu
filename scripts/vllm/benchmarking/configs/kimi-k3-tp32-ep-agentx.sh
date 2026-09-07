@@ -19,8 +19,8 @@
 #     tool_calls / tool-result messages in the Claude Code traces
 #   - compile_sizes: a decode step carries up to MAX_NUM_SEQS tokens and is
 #     padded up to the next bucket, so the decode buckets follow MAX_NUM_SEQS
-#     (16 covers <= 8 sequences at 2 x concurrency; 32..512 are added as
-#     needed). Prefill chunks are 8192 with remainders padded to 1024/2048/4096.
+#     (16 covers up to 16 sequences; 32..512 are added up to the first bucket
+#     that holds MAX_NUM_SEQS). Prefill chunks are 8192 with remainders padded to 1024/2048/4096.
 #   - the built-in harness bench is a 4-prompt 8k/1k warmup; the replay is
 #     driven by k3_agentx_sweep.sh against the kept-alive server
 # K3_EXTRA_SERVE_ARGS (driver --extra-serve-args) is appended LAST, so it can
@@ -50,11 +50,15 @@ ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
 APC_ARGS=""
 if [ "$ENABLE_PREFIX_CACHING" = "true" ]; then APC_ARGS="--mamba-cache-mode align "; fi
 
-# Decode buckets: 16, then each of 32..512 that MAX_NUM_SEQS reaches.
+# Decode buckets: 16, then 32, 64, ... up to the first one that holds
+# MAX_NUM_SEQS tokens (a decode step of 48 sequences needs the 64 bucket).
 K3_COMPILE_SIZES="16"
-for _s in 32 64 128 256 512; do
-    [ "$MAX_NUM_SEQS" -ge "$_s" ] && K3_COMPILE_SIZES="$K3_COMPILE_SIZES,$_s"
-done
+if [ "$MAX_NUM_SEQS" -gt 16 ]; then
+    for _s in 32 64 128 256 512; do
+        K3_COMPILE_SIZES="$K3_COMPILE_SIZES,$_s"
+        [ "$_s" -ge "$MAX_NUM_SEQS" ] && break
+    done
+fi
 K3_COMPILE_SIZES="$K3_COMPILE_SIZES,1024,2048,4096,8192"
 
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} --block-size 256 ${APC_ARGS}--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[$K3_COMPILE_SIZES]}${K3_EXTRA_SERVE_ARGS:+ $K3_EXTRA_SERVE_ARGS}"
