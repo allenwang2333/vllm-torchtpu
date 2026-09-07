@@ -19,8 +19,9 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import (get_or_create_dcp_mesh,
-                                           merge_lse_partials)
+from vllm_torchtpu.distributed.dcp import (all_gather_heads,
+                                           get_or_create_dcp_mesh,
+                                           merge_lse_partials_scatter_heads)
 from vllm_torchtpu.distributed.pcp import get_pcp_group_layout
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (DCP_AXIS_NAME,
                                                                 PCP_AXIS_NAME)
@@ -1937,7 +1938,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         The op returns unmerged partials. Combining them is one log-sum-exp
         reduction over the DCP group, and it is deliberately left to the torch
-        caller (`distributed.dcp.merge_lse_partials`): it needs no Pallas, and
+        caller (`distributed.dcp.merge_lse_partials_scatter_heads`), which also
+        narrows the head axis back down: it needs no Pallas, and
         keeping it out of the exported module avoids the export path's
         constraints on how collectives inside `pallas.jax_op` are launched.
         """
@@ -2106,13 +2108,22 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first.")
+                # DCP re-spends `dcp_size` of TP's ways on positions instead of
+                # heads, so attention runs at `tp // dcp` head sharding: every
+                # rank attends with the whole DCP group's heads over its own
+                # KV shard, and the head axis is scattered back after the
+                # merge. Skipping this does not merely lose parallelism -- the
+                # merge would combine rank `r`'s heads with rank `r'`'s as
+                # though they were the same head.
+                ql_nope_dcp = all_gather_heads(ql_nope_flat)
+                q_pe_dcp = all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
                 partial, lse = layer.sparse_mla_dcp_op(
                     kv_cache,
-                    ql_nope_flat,
-                    q_pe_flat,
+                    ql_nope_dcp,
+                    q_pe_dcp,
                     kv_c_normed_flat,
                     k_pe_flat,
                     topk_indices,
@@ -2121,9 +2132,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
-                # The one collective DCP costs. Outside the exported op on
-                # purpose -- see `_build_sparse_mla_dcp_op`.
-                outputs = merge_lse_partials(partial, lse)
+                # The collectives DCP costs. Outside the exported op on
+                # purpose -- see `_build_sparse_mla_dcp_op`. The scatter undoes
+                # the head all-gather above, so `outputs` is back to
+                # `layer.num_heads` and `W_UV` below needs no change.
+                outputs = merge_lse_partials_scatter_heads(partial, lse)
             elif pcp_size > 1:
                 # Built eagerly in `process_weights_after_loading`: none of
                 # `pcp_streaming_jax_op` is Dynamo-traceable, so it cannot be
