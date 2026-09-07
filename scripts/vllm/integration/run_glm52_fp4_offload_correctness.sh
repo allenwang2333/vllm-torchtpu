@@ -215,6 +215,21 @@ KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"
 #                            throughput (64 seqs, async) and would not be.
 #   --kv-transfer-config     the offload connector, in place of the recipes'
 #                            disagg TPURaidenConnector.
+#   --api-server-count=1     vLLM defaults this to the DP size, and 8 API
+#                            server processes each build their own VllmConfig
+#                            concurrently. On a gs:// MODEL that is a data
+#                            race: ObjectStorageModel names its mirror dir
+#                            from a hash of the URL alone, so all 8 share
+#                            /root/.cache/vllm/assets/model_streamer/<hash>,
+#                            and runai's pull_files downloads straight to the
+#                            final path with no lock and no atomic rename.
+#                            One process truncates hf_quant_config.json while
+#                            another is in get_quant_config's json.load of it
+#                            (weight_utils.py), which surfaces as a VllmConfig
+#                            pydantic error, "Expecting value: line 1 column 1
+#                            (char 0)", and a dead API server. One frontend
+#                            costs this rig nothing: --max-num-seqs=1, one
+#                            request at a time, all pinned to dp rank 0.
 
 serve() {
   exec "${VLLM_BIN}" serve "${MODEL}" \
@@ -234,6 +249,7 @@ serve() {
     --gpu-memory-utilization="${GPU_MEM_UTIL}" \
     --enable-prefix-caching \
     --enable-prompt-tokens-details \
+    --api-server-count=1 \
     --port "${PORT}" \
     --kv-transfer-config "$KVT"
 }
