@@ -41,7 +41,12 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME, PCP_AXIS_NAME, dcp_topk_capacity, pcp_rank_as_data,
+    streamindex_topk, streamindex_topk_dcp, streamindex_topk_pcp)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+    get_pcp_streaming_mesh, pcp_streaming_jax_op, pcp_to_request_major)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
@@ -57,6 +62,87 @@ from vllm_torchtpu.utils import synchronize_tensors
 STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
+def _pcp_scatter_indexer_k(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    mesh,
+    pcp_size: int,
+    interleave_size: int,
+    axis_name: str = PCP_AXIS_NAME,
+) -> jax.Array:
+    """Scatter this step's indexer K rows into the CP-sharded K cache.
+
+    Unlike the sparse-MLA nope/rope caches, the indexer cache stays sharded:
+    the top-k merge in `streamindex_topk_pcp` is exact over a *partition* of
+    the KV positions. So each rank writes only the rows it owns, and ownership
+    follows the same interleave the reader assumes -- a virtual page spans
+    `page_size * pcp_size` positions and rank `r` holds the `interleave_size`
+    -sized chunks at offset `r * interleave_size` within each
+    `pcp_size * interleave_size` cycle (schedule.py's
+    `_local_page_global_start`). Rows owned by another rank are dropped by
+    aiming them at an out-of-bounds page, the same trick the unsharded scatter
+    uses for padding.
+
+    `k_packed` must already be in request-major order, since the positions
+    come from `cu_q_lens`/`seq_lens`.
+
+    `axis_name`/`pcp_size` name the axis the cache is split over. DCP reuses
+    this verbatim with `axis_name="dcp"`: the two axes shard the indexer cache
+    by exactly the same rule, and they differ only in whether the *queries*
+    were also split -- which this function never touches, since it takes
+    `k_packed` already replicated and request-major either way.
+    """
+
+    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
+        rank = pcp_rank_as_data(axis_name, pcp_size)
+        _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+        page_size = block_size_per_kv_packing * kv_packing
+        k_packed = jnp.pad(k_packed,
+                           ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+
+        tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+        seq_id = jnp.searchsorted(cu_q_lens[1:], tok,
+                                  side="right").astype(jnp.int32)
+        q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+        pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+
+        virtual_page_size = jnp.int32(page_size * pcp_size)
+        cycle = jnp.int32(pcp_size * interleave_size)
+        interleave = jnp.int32(interleave_size)
+        virtual_page = pos // virtual_page_size
+        offset = pos % virtual_page_size
+        owner = (offset % cycle) // interleave
+        slot = (offset // cycle) * interleave + (offset % interleave)
+
+        # Virtual ordinal -> physical block in this rank's own shard, exactly
+        # as `streamindex_topk_pcp` resolves it on the read side.
+        local_page_indices = jnp.mod(page_indices,
+                                     jnp.int32(cache_kv.shape[0]))
+
+        valid = jnp.logical_and(tok < cu_q_lens[-1], owner == rank)
+        page = jnp.where(
+            valid,
+            local_page_indices.reshape(seq_lens.shape[0], -1)[seq_id,
+                                                              virtual_page],
+            jnp.int32(2**30))
+        return cache_kv.at[page, slot // kv_packing,
+                           slot % kv_packing].set(k_packed)
+
+    replicated = jax.sharding.PartitionSpec()
+    sharded = jax.sharding.PartitionSpec(axis_name)
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(sharded, replicated, replicated, replicated, replicated),
+        out_specs=sharded,
+        check_vma=False,
+    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
@@ -65,6 +151,42 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
+
+        # Same reason for the PCP twin, which is why it is built here even
+        # though only the PCP branch of `forward_oot` ever calls it. The PCP
+        # process group already exists by model-construction time.
+        parallel_config = getattr(get_current_vllm_config_or_none(),
+                                  "parallel_config", None)
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        pcp_size = pcp_size if isinstance(pcp_size, int) else 1
+        self.topk_op_pcp = None
+        if pcp_size > 1:
+            self.topk_op_pcp = self._build_streamidx_pcp_op(
+                pcp_size, parallel_config.cp_kv_cache_interleave_size)
+
+        # And the DCP twin, same reasoning. PCP and DCP are built from separate
+        # groups and are not exclusive in principle, but nothing here has been
+        # validated with both live at once, so refuse the combination rather
+        # than silently running two interleaves over one cache.
+        dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+        dcp_size = dcp_size if isinstance(dcp_size, int) else 1
+        self.topk_op_dcp = None
+        self.dcp_size = dcp_size
+        self.dcp_capacity = dcp_topk_capacity(self.topk_tokens, dcp_size)
+        if dcp_size > 1:
+            if pcp_size > 1:
+                raise NotImplementedError(
+                    f"pcp_size={pcp_size} and dcp_size={dcp_size} are both >1; "
+                    "the sparse indexer shards its K cache by position on "
+                    "whichever axis it is given and has no layout for two at "
+                    "once.")
+            self.topk_op_dcp = self._build_streamidx_dcp_op(
+                dcp_size, parallel_config.cp_kv_cache_interleave_size)
+            # A device-side accumulator, so the overflow count is observable
+            # without a per-step host sync on the decode path. Non-zero after a
+            # run means `dcp_capacity` was too small and the top-k stopped
+            # being exact; see `streamindex_topk_dcp`.
+            self.dcp_dropped = torch.zeros((1, ), dtype=torch.int32)
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
@@ -143,6 +265,245 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         self._streamidx_op = op
         return op
 
+    def _build_streamidx_pcp_op(self, pcp_size: int, interleave_size: int):
+        """The PCP twin of `_build_streamidx_op`.
+
+        Built lazily rather than in __init__ because the PCP mesh needs the
+        distributed group, which does not exist yet at layer construction.
+        """
+        topk = self.topk_tokens
+        mesh = get_pcp_streaming_mesh()
+
+        def _streamidx_topk_pcp_jax(
+            q_bytes: jax.Array,  # local packed slice, uint8 view of fp8 q
+            weights: jax.Array,  # local packed slice
+            cache_kv: jax.Array,  # this rank's shard
+            k_packed: jax.Array,  # local packed slice
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,  # global
+            distribution: jax.Array,
+            packed_to_request_major: jax.Array,
+            request_major_to_packed: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            # Both tables are allocated for the largest token bucket, since
+            # the traced graph carries one static length for them; the live
+            # permutation is exactly their first `q_bytes.shape[0]` entries.
+            num_global_tokens = q_bytes.shape[0]
+            packed_to_request_major = (
+                packed_to_request_major[:num_global_tokens])
+            request_major_to_packed = (
+                request_major_to_packed[:num_global_tokens])
+
+            # The three token-major inputs are declared PCP-sharded, so JAX
+            # has already assembled them into the global packed buffer here;
+            # only the order still has to be undone.
+            q_bytes = pcp_to_request_major(q_bytes,
+                                           request_major_to_packed,
+                                           mesh=mesh)
+            weights = pcp_to_request_major(weights,
+                                           request_major_to_packed,
+                                           mesh=mesh)
+            k_packed = pcp_to_request_major(k_packed,
+                                            request_major_to_packed,
+                                            mesh=mesh)
+
+            cache_kv = _pcp_scatter_indexer_k(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                mesh=mesh,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
+
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            topk_indices = streamindex_topk_pcp(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                packed_to_request_major,
+                mesh=mesh,
+                k=topk,
+                compression_ratio=1,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 128, 128),
+            )
+            return cache_kv, topk_indices
+
+        def _fake_outputs(q_bytes, weights, cache_kv, k_packed, seq_lens,
+                          page_indices, cu_q_lens, distribution,
+                          packed_to_request_major, request_major_to_packed):
+            # Local shapes, straight off the local inputs, so the token dim
+            # stays symbolic -- see `pcp_streaming_jax_op`. The cache comes
+            # back unchanged in shape, and `streamindex_topk_pcp` returns one
+            # row of `topk` global positions per query token this rank owns.
+            del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
+                 distribution, packed_to_request_major,
+                 request_major_to_packed)
+            return (
+                torch.empty_like(cache_kv),
+                q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
+            )
+
+        replicated = jax.sharding.PartitionSpec()
+        sharded = jax.sharding.PartitionSpec(PCP_AXIS_NAME)
+        op_name = ("pallas::streamidx_topk_pcp_"
+                   f"{self.k_cache.prefix.replace('.', '_')}")
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            _streamidx_topk_pcp_jax,
+            donate_argnums=(2, ),
+            mesh=mesh,
+            input_partition_specs=(
+                sharded,  # q_bytes
+                sharded,  # weights
+                sharded,  # cache_kv
+                sharded,  # k_packed
+                replicated,  # seq_lens
+                replicated,  # page_indices
+                replicated,  # cu_q_lens
+                replicated,  # distribution
+                replicated,  # packed_to_request_major
+                replicated,  # request_major_to_packed
+            ),
+            output_partition_specs=(
+                sharded,  # new cache_kv
+                sharded,  # topk_indices, this rank's own query tokens
+            ),
+            fake_outputs=_fake_outputs,
+        )
+
+        def op(*args):
+            new_cache, topk_indices = jax_op(*args)
+            args[2].copy_(new_cache)
+            return topk_indices
+
+        return op
+
+    def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
+        """The DCP twin of `_build_streamidx_op`.
+
+        Shorter than the PCP twin, and the reason is the whole difference
+        between the two axes: DCP shards the KV cache and leaves the *queries*
+        replicated, so there is no rank-major token packing to undo. Every
+        token-major input arrives already in request-major order and stays
+        replicated across the op boundary. Only the cache is split.
+
+        The output is the inverse of the PCP op's, too. PCP hands each rank the
+        merged global list for its own tokens; DCP hands each rank, for *every*
+        token, the slice of that token's global top-k it physically holds --
+        already converted to local cache indices, `capacity` wide.
+        """
+        topk = self.topk_tokens
+        capacity = self.dcp_capacity
+        mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
+
+        def _streamidx_topk_dcp_jax(
+            q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
+            weights: jax.Array,  # replicated
+            cache_kv: jax.Array,  # this rank's position shard
+            k_packed: jax.Array,  # replicated
+            seq_lens: jax.Array,
+            page_indices: jax.Array,  # virtual page ordinals
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            # `_pcp_scatter_indexer_k` pads the packed fp8+scale rows out to
+            # the cache's 128-lane width itself.
+            cache_kv = _pcp_scatter_indexer_k(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                mesh=mesh,
+                pcp_size=dcp_size,
+                interleave_size=interleave_size,
+                axis_name=DCP_AXIS_NAME,
+            )
+
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            local_topk, dropped = streamindex_topk_dcp(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                mesh=mesh,
+                k=topk,
+                compression_ratio=1,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                capacity=capacity,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 128, 128),
+            )
+            return cache_kv, local_topk, dropped
+
+        def _fake_outputs(q_bytes, weights, cache_kv, k_packed, seq_lens,
+                          page_indices, cu_q_lens, distribution):
+            # Local shapes off the local inputs, keeping the token dim
+            # symbolic -- see `pcp_streaming_jax_op` on why the default rule
+            # cannot. `q_bytes` is replicated here, so its leading dim is
+            # already the local (and global) token count.
+            del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
+                 distribution)
+            return (
+                torch.empty_like(cache_kv),
+                q_bytes.new_empty((q_bytes.shape[0], capacity),
+                                  dtype=torch.int32),
+                q_bytes.new_empty((1, ), dtype=torch.int32),
+            )
+
+        replicated = jax.sharding.PartitionSpec()
+        sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+        op_name = ("pallas::streamidx_topk_dcp_"
+                   f"{self.k_cache.prefix.replace('.', '_')}")
+        # Reuses the PCP export wrapper verbatim: nothing in it is PCP-specific
+        # once the mesh and the specs are arguments, and the reason it exists --
+        # `jax_placeholders` specializing the dynamic token dim while scaling
+        # sharded dims to global size -- applies identically here.
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            _streamidx_topk_dcp_jax,
+            donate_argnums=(2, ),
+            mesh=mesh,
+            input_partition_specs=(
+                replicated,  # q_bytes
+                replicated,  # weights
+                sharded,  # cache_kv
+                replicated,  # k_packed
+                replicated,  # seq_lens
+                replicated,  # page_indices
+                replicated,  # cu_q_lens
+                replicated,  # distribution
+            ),
+            output_partition_specs=(
+                sharded,  # new cache_kv
+                sharded,  # local_topk: [num_tokens, capacity] per rank
+                sharded,  # dropped: one count per rank
+            ),
+            fake_outputs=_fake_outputs,
+        )
+
+        def op(*args):
+            new_cache, local_topk, dropped = jax_op(*args)
+            args[2].copy_(new_cache)
+            return local_topk, dropped
+
+        return op
+
     def forward_oot(
         self,
         hidden_states: torch.Tensor,
@@ -182,21 +543,69 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         rd = metadata.request_distribution
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
-        topk_indices = self.topk_op(
-            q_values.view(torch.uint8),
-            weights,
-            kv_cache,
-            k_quant_packed,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-        )
+        if self.topk_op_dcp is not None:
+            # No permutation tables: DCP replicates the queries, so the token
+            # inputs are already the whole batch in request-major order. What
+            # comes back is *not* global positions but this rank's own local
+            # cache indices, `dcp_capacity` wide -- the attention side consumes
+            # them directly and merges across ranks by log-sum-exp.
+            topk_indices, dropped = self.topk_op_dcp(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+            # Device-side accumulate; reading it would cost a sync per step.
+            self.dcp_dropped += dropped.to(self.dcp_dropped.device)
+        elif self.topk_op_pcp is None:
+            topk_indices = self.topk_op(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+        else:
+            # `cu_q_lens` stays the *global* query_start_loc here: the token
+            # inputs are the rank-local slices of one rank-major packed
+            # buffer, and the op's first act is to reassemble and un-permute
+            # them back to the request-major order those offsets describe.
+            packed_to_request_major = metadata.pcp_packed_to_request_major
+            request_major_to_packed = metadata.pcp_request_major_to_packed
+            assert (packed_to_request_major is not None
+                    and request_major_to_packed is not None), (
+                        "PCP indexer needs the runner's token permutations; "
+                        "the sequence layout did not supply them.")
+            topk_indices = self.topk_op_pcp(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                packed_to_request_major,
+                request_major_to_packed,
+            )
 
         self.topk_indices_buffer[:hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        self.topk_indices_buffer[:num_out, :self.
-                                 topk_tokens] = topk_indices[:num_out]
+        # Width off the result rather than `topk_tokens`: under DCP each rank
+        # returns only the `dcp_capacity`-wide slice of the list it owns, and
+        # the buffer is sized to match (see `DeepseekV4Model.__init__`). A
+        # `topk_tokens`-wide buffer would be correct but would hand the sparse
+        # attention kernel `dcp_size`x the gather it needs, which is the entire
+        # cost being optimised here.
+        width = topk_indices.shape[1]
+        self.topk_indices_buffer[:num_out, :width] = topk_indices[:num_out]
         return self.topk_indices_buffer
 
 
@@ -421,6 +830,24 @@ class VllmTPUMLAAttention(MLAAttention):
                                               k_scale=k_scale,
                                               v_scale=v_scale)
         self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
+
+        # The PCP twin must be built here and never lazily from `forward`:
+        # `pcp_streaming_jax_op` runs `inspect.signature` and builds
+        # PartitionSpecs, none of which Dynamo can trace. Like the op above it
+        # reads `layer.mla_kv_spec` only inside the jax callable, so it is fine
+        # that `initialize_kv_cache` has not run yet.
+        pcp_size = getattr(self.impl, "pcp_size", 1)
+        self.sparse_mla_pcp_op = None
+        if pcp_size > 1:
+            self.sparse_mla_pcp_op = self.impl._build_sparse_mla_pcp_op(
+                self, pcp_size)
+
+        # And the DCP twin, eagerly for the same reason.
+        dcp_size = getattr(self.impl, "dcp_size", 1)
+        self.sparse_mla_dcp_op = None
+        if dcp_size > 1:
+            self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
+                self, dcp_size, self.impl.dcp_interleave_size)
 
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],
