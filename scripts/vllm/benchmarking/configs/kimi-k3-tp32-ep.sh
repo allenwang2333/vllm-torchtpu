@@ -91,3 +91,5 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --e
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
+# K3's chat template takes "thinking" (default on); "enable_thinking" is ignored.
+EVAL_CHAT_TEMPLATE_KWARGS='{"thinking": false}'
