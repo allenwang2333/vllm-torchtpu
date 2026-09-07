@@ -48,9 +48,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IFS=',' read -r -a CONCS <<< "$CONC_LIST"
+if [ "$CONC_LIST" = "none" ]; then CONCS=(); else IFS=',' read -r -a CONCS <<< "$CONC_LIST"; fi
+IFS=',' read -r -a GSM8K_CONCS <<< "$GSM8K_CONC"
 MAX_CONC=1
-for c in "${CONCS[@]}"; do
+for c in "${CONCS[@]}" "${GSM8K_CONCS[@]}"; do
     [[ "$c" =~ ^[1-9][0-9]*$ ]] || { echo "[k3-sweep] bad concurrency '$c'"; exit 1; }
     [ "$c" -gt "$MAX_CONC" ] && MAX_CONC=$c
 done
@@ -207,7 +208,7 @@ JSON
 sanity_probe
 
 # ---- (1) GSM8K on the fresh server (before any ignore_eos load) -------------
-IFS=',' read -r -a GSM8K_CONCS <<< "$GSM8K_CONC"
+declare -a GSM8K_ROWS=()
 for gc in "${GSM8K_CONCS[@]}"; do
     [ "$GSM8K_LIMIT" -gt 0 ] || break
     echo "[k3-sweep] ===== GSM8K limit=$GSM8K_LIMIT num_concurrent=$gc ====="
@@ -229,10 +230,21 @@ import glob, json, sys
 for f in glob.glob(sys.argv[1] + "/**/results_*.json", recursive=True):
     r = next(iter(json.load(open(f))["results"].values()), {})
     print("[k3-sweep] GSM8K conc " + sys.argv[2] + ":", {k: round(v, 4) for k, v in r.items() if isinstance(v, (int, float)) and "exact_match" in k})
+    sm = r.get("exact_match,strict-match"); fl = r.get("exact_match,flexible-extract")
+    open(sys.argv[1] + "/row.txt", "w").write(f"| {sys.argv[2]} | {sm} | {fl} |")
 PYEOF
+    [ -f "$EVAL_DIR/row.txt" ] && GSM8K_ROWS+=("$(cat "$EVAL_DIR/row.txt")")
     save_now "$EVAL_DIR" "$RESULTS_DIR/server.log" "$RESULTS_DIR/config.json"
     wait_server_idle
 done
+
+if [ "${#CONCS[@]}" -eq 0 ]; then
+    echo "[k3-sweep] ===== GSM8K summary (limit $GSM8K_LIMIT, ctx $MAX_MODEL_LEN, kv $KV_DTYPE, moe_requant $MOE_REQUANT) ====="
+    echo "| eval concurrency | strict-match | flexible-extract |"; echo "|---|---|---|"
+    printf '%s\n' "${GSM8K_ROWS[@]}"
+    echo "[k3-sweep] no replay concurrencies requested (--conc-list none); done."
+    exit 0
+fi
 
 # ---- (2) AgentX replay, one concurrency at a time, ascending ----------------
 export INFMAX_CONTAINER_WORKSPACE="$IX_DIR"
