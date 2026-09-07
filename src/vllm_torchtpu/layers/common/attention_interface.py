@@ -18,10 +18,12 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import PCP_AXIS_NAME
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME, PCP_AXIS_NAME, pcp_rank_as_data)
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
+    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache,
+    update_sparse_mla_kv_cache_dcp)
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
@@ -948,3 +950,217 @@ def sparse_mla_attention(
                               else global_query_start_loc,
                               request_distribution)
     return new_kv_cache_nope, new_kv_cache_rope, output
+
+
+def merge_dcp_lse_partials(outputs: jax.Array,
+                           lses: jax.Array) -> jax.Array:
+    """Combine per-rank sparse-MLA partials into the whole-context result.
+
+    With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
+    exact global result is `o = sum_r softmax_r(lse) * o_r`. This is the whole
+    reason DCP does not need a ring: the partial state `(m, l, l*o)` forms a
+    commutative monoid, so the shards can be combined in any order by a single
+    reduction instead of rotated past each other.
+
+    Args:
+      outputs: `[dcp_size, num_tokens, num_heads, v_dim]` per-rank outputs.
+      lses: `[dcp_size, num_tokens, num_heads]` matching log-sum-exps.
+        Non-finite entries mark ranks that own none of that token's top-k;
+        `sparse_mla_attention_dcp` sets them, because such a rank is still fed
+        a dummy key (the kernel requires `kv_len >= 1`) and returns a real but
+        meaningless softmax that must not be weighted in.
+
+    Returns:
+      `[num_tokens, num_heads, v_dim]` in f32. Tokens no rank contributed to
+      -- padding rows -- come back as zeros rather than NaN.
+    """
+    lses = lses.astype(jnp.float32)
+    shift = jnp.max(lses, axis=0, keepdims=True)
+    # A token with no contributor anywhere would give inf - inf; pin the shift
+    # to 0 there and let the all-zero denominator carry the result to zero.
+    all_empty = ~jnp.isfinite(shift)
+    weights = jnp.exp(lses - jnp.where(all_empty, 0.0, shift))
+    weights = jnp.where(jnp.isfinite(lses), weights, 0.0)
+    denom = jnp.sum(weights, axis=0, keepdims=True)
+    weights = jnp.where(denom > 0, weights / jnp.where(denom > 0, denom, 1.0),
+                        0.0)
+    return jnp.sum(weights[..., None] * outputs.astype(jnp.float32), axis=0)
+
+
+def sparse_mla_attention_dcp(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    local_topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    dcp_axis_name: str = DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Sparse MLA attention over a DCP position-sharded latent cache.
+
+    Every spec here is the inverse of the PCP path's, because the two split
+    orthogonal axes. PCP shards *queries* and replicates the cache; DCP shards
+    the *cache* by KV position and replicates the queries. Concretely:
+    `ql_nope`/`q_pe` go from sharded to replicated, both caches from replicated
+    to sharded, and the `kv_c_normed`/`k_pe` all-gather PCP needs disappears
+    rather than moving -- the latents are computed from a replicated residual
+    stream, so every rank already holds every row and only masks its write.
+
+    Why DCP and not PCP for long-context GLM-5.2: PCP replicates weights across
+    its axis, which an FP8 GLM-5.2 cannot afford on 16 chips, and it does not
+    shard the cache at all -- at 1M tokens the latent cache is ~45 GB per
+    sequence and does not fit next to the weights. DCP keeps the full weight
+    sharding and re-partitions only attention. The gain it buys is gather
+    bandwidth: `num_kv_heads=1` means top-k indices are per-token, so under
+    plain TP every rank gathers the *same* 640 B rows, once per rank. Sharding
+    the positions removes that redundancy for the cost of one LSE merge.
+
+    This returns partials rather than the merged result. The merge is a single
+    reduction over `dcp_axis_name` (see `merge_dcp_lse_partials`) and is left
+    to the caller so it can run outside this exported op, where the
+    torch->JAX export path places no constraints on collectives.
+
+    Args:
+      ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
+      kv_c_normed, k_pe: this step's latents, replicated and identical on every
+        rank; the write mask, not the data, is what differs per rank.
+      kv_cache_nope, kv_cache_rope: this rank's position shards.
+      local_topk_indices: `streamindex_topk_dcp` output -- this rank's slice of
+        every token's global top-k, already in *rank-local* cache coordinates,
+        `-1` padded, sharded over `dcp_axis_name` with a global leading
+        dimension of `dcp_size * num_tokens`.
+      seq_lens, block_tables, query_start_loc, request_distribution: global
+        sequence coordinates, replicated. `block_tables` holds virtual page
+        ordinals, resolved per rank exactly as on the indexer side.
+      dcp_size, interleave_size: the shard layout.
+
+    Returns:
+      `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
+      `[dcp_size * num_tokens, num_heads, lkv_dim]` and `lse` is
+      `[dcp_size * num_tokens, num_heads]`, both sharded over `dcp_axis_name`
+      and both *partial*: reshape to `[dcp_size, num_tokens, ...]` and pass to
+      `merge_dcp_lse_partials`. `lse` is `-inf` wherever a rank owns none of a
+      token's top-k, which is what makes that merge a plain softmax with no
+      separate count channel.
+    """
+    if dcp_size <= 1:
+        raise ValueError(
+            f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
+            "use sparse_mla_attention for the unsharded case.")
+    if dcp_axis_name not in mesh.axis_names:
+        raise ValueError(f"dcp_size={dcp_size} requires a mesh with a "
+                         f"{dcp_axis_name!r} axis, got {mesh.axis_names}.")
+    if mesh.shape[dcp_axis_name] != dcp_size:
+        raise ValueError(
+            f"dcp_size={dcp_size} does not match mesh axis "
+            f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+    num_tokens = ql_nope.shape[0]
+    if local_topk_indices.shape[0] != dcp_size * num_tokens:
+        raise ValueError(
+            "local_topk_indices must carry one row per (rank, token): "
+            f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
+            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}.")
+
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    tile_subrows, lane_bytes = dsa_gather.TILE_SUBROWS, dsa_gather.TILE_LANE_BYTES
+    assert (
+        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes), (
+            "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+            f"head dimension to be {tile_subrows * lane_bytes} and the fp8 "
+            f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+            f"{rope_dim}")
+
+    replicated_3d = P(None, None, None)
+    in_specs = (
+        replicated_3d,  # ql_nope
+        replicated_3d,  # q_pe
+        P(None, None),  # kv_c_normed
+        P(None, None),  # k_pe
+        P(dcp_axis_name),  # kv_cache_nope
+        P(dcp_axis_name),  # kv_cache_rope
+        P(dcp_axis_name, None),  # local_topk_indices
+        P(None),  # seq_lens
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
+    )
+    out_specs = (
+        P(dcp_axis_name),  # nope cache shard
+        P(dcp_axis_name),  # rope cache shard
+        P(dcp_axis_name, None, None),  # partial output
+        P(dcp_axis_name, None),  # partial lse
+    )
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+
+    def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
+               topk_idx, seq_lens_, block_tables_, query_start_loc_,
+               request_distribution_):
+        dcp_rank = pcp_rank_as_data(dcp_axis_name, dcp_size)
+        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            dcp_rank,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size)
+
+        # A rank owning none of a token's top-k still has to be handed one
+        # valid entry: the kernel derives `kv_len` from the `-1` tail and
+        # requires `kv_len >= 1`. Position 0 always exists, so it is the
+        # cheapest dummy; the softmax it produces is real but meaningless, and
+        # `owns` below is what keeps it out of the merge.
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(
+            jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # Virtual page ordinal -> physical block in this rank's own shard, the
+        # same resolution the scatter above and `streamindex_topk_dcp` use.
+        local_block_tables = jnp.mod(block_tables_,
+                                     jnp.int32(nope_spec.num_pages))
+        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+            q,
+            kv_cache_nope,
+            kv_cache_rope,
+            topk_idx,
+            local_block_tables,
+            query_start_loc_,
+            request_distribution_,
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+            return_lse=True,
+        )
+        lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        # Drop the rope tail: only the nope part is the MLA value (P @ latent).
+        return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]],
+                lse)
+
+    return jax.jit(
+        shard_map.shard_map(_local,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
+                                              kv_cache_nope, kv_cache_rope,
+                                              local_topk_indices, seq_lens,
+                                              block_tables, query_start_loc,
+                                              request_distribution)

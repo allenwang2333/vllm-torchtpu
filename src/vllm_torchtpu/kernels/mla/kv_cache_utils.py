@@ -153,3 +153,110 @@ def update_sparse_mla_kv_cache(
 
     return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
             _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))
+
+
+def update_sparse_mla_kv_cache_dcp(
+        kv_cache_nope: jax.Array,
+        kv_cache_rope: jax.Array,
+        kv_c_normed: jax.Array,
+        k_pe: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+        *,
+        nope_spec: SparseMLAKVCacheSpec,
+        rope_spec: SparseMLAKVCacheSpec,
+        dcp_size: int,
+        interleave_size: int) -> tuple[jax.Array, jax.Array]:
+    """Scatter this step's MLA latents into a DCP position-sharded cache.
+
+    The DCP twin of `update_sparse_mla_kv_cache`, and the reason DCP is cheap:
+    under PCP the cache is replicated, so every rank must be handed *every*
+    rank's new rows and the caller pays an all-gather to do it. Under DCP the
+    queries are replicated, so `kv_c_normed`/`k_pe` are computed from a
+    residual stream every rank already holds -- the rows are local to begin
+    with and each rank simply masks its write down to the positions it owns.
+    The all-gather disappears entirely rather than moving.
+
+    Ownership follows the same interleave the readers assume, so the indexer
+    cache (`_pcp_scatter_indexer_k`), the latent cache written here, and the
+    top-k coordinates from `streamindex_topk_dcp` are all in one space: a
+    virtual page spans `page_size * dcp_size` positions, and rank `r` holds the
+    `interleave_size`-sized chunks at offset `r * interleave_size` within each
+    `dcp_size * interleave_size` cycle. That identity is what lets a global
+    top-k index be handed to a rank as a plain local cache index.
+
+    Rows owned by another rank are dropped by aiming them at an out-of-bounds
+    page -- the same trick the unsharded scatter uses for padding, and it is
+    why this needs no collective and no branch.
+
+    Must be called from inside a `shard_map`; `dcp_rank` is this shard's index
+    along the DCP axis as traced data (see `pcp_rank_as_data`), so one compiled
+    program serves every rank.
+
+    Args:
+      kv_cache_nope, kv_cache_rope: this rank's shards, shaped by the specs.
+      kv_c_normed, k_pe: this step's rows, in request-major order. Identical on
+        every rank; the mask, not the data, is what differs.
+      seq_lens, block_tables, query_start_loc: global sequence coordinates,
+        replicated. `block_tables` holds *virtual* page ordinals.
+      dcp_rank: i32 scalar, this shard's DCP index.
+      dcp_size, interleave_size: the shard layout.
+
+    Returns:
+      The updated (nope, rope) shards, same shapes/dtypes as the inputs.
+    """
+    assert kv_c_normed.dtype == jnp.float8_e4m3fn, (
+        "sparse MLA kernel requires --kv-cache-dtype fp8 (got "
+        f"{kv_c_normed.dtype})")
+    assert kv_cache_nope.shape == nope_spec.shape, (
+        f"nope cache {kv_cache_nope.shape} does not match its spec "
+        f"{nope_spec.shape}")
+    assert kv_cache_rope.shape == rope_spec.shape, (
+        f"rope cache {kv_cache_rope.shape} does not match its spec "
+        f"{rope_spec.shape}")
+    assert nope_spec.page_size == rope_spec.page_size, (
+        "nope and rope caches must share a page size for the DCP interleave "
+        f"to address both, got {nope_spec.page_size} and {rope_spec.page_size}")
+    if interleave_size % dsa_gather.TILE_SUBROWS:
+        raise ValueError(
+            f"interleave_size={interleave_size} must be a multiple of "
+            f"dsa_gather.TILE_SUBROWS={dsa_gather.TILE_SUBROWS}, or a rope "
+            "tile would straddle two ranks.")
+    if nope_spec.page_size % interleave_size:
+        raise ValueError(
+            f"interleave_size={interleave_size} must divide "
+            f"page_size={nope_spec.page_size}. Otherwise an interleave chunk "
+            "straddles a page boundary and the local index a reader derives "
+            "from `pcp_global_to_local` stops agreeing with the (page, slot) "
+            "written here.")
+
+    num_tokens = kv_c_normed.shape[0]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_id = jnp.searchsorted(query_start_loc[1:], tok,
+                              side="right").astype(jnp.int32)
+    q_len = query_start_loc[seq_id + 1] - query_start_loc[seq_id]
+    pos = seq_lens[seq_id] - q_len + (tok - query_start_loc[seq_id])
+
+    page_size = nope_spec.page_size
+    virtual_page_size = jnp.int32(page_size * dcp_size)
+    cycle = jnp.int32(dcp_size * interleave_size)
+    interleave = jnp.int32(interleave_size)
+    virtual_page = pos // virtual_page_size
+    offset = pos % virtual_page_size
+    owner = (offset % cycle) // interleave
+    slot = (offset // cycle) * interleave + (offset % interleave)
+
+    # Virtual ordinal -> physical block in this rank's own shard, exactly as
+    # `streamindex_topk_dcp` resolves it on the read side.
+    local_block_tables = jnp.mod(block_tables,
+                                 jnp.int32(nope_spec.num_pages)).reshape(
+                                     seq_lens.shape[0], -1)
+
+    OOB_PAGE = jnp.int32(2**30)
+    valid = jnp.logical_and(tok < query_start_loc[-1], owner == dcp_rank)
+    page = jnp.where(valid, local_block_tables[seq_id, virtual_page], OOB_PAGE)
+
+    return (_scatter_rows(kv_cache_nope, nope_spec, kv_c_normed, page, slot),
+            _scatter_rows(kv_cache_rope, rope_spec, k_pe, page, slot))
