@@ -4,7 +4,8 @@
 # Knobs (build env, baked in at upload): K3_PROBE_QUEUE (tpu_v7x_32_queue |
 # tpu_v7x_8_queue), K3_PROBE_CONFIG, K3_PROBE_CONC_LIST, K3_PROBE_CTX,
 # K3_PROBE_MNS, K3_PROBE_MAX_TOKENS, K3_PROBE_ENV (space-separated KEY=VAL),
-# K3_PROBE_EXTRA_SERVE_ARGS, K3_PROBE_GCS_ROOT. No quotes or $ in values.
+# K3_PROBE_EXTRA_SERVE_ARGS, K3_PROBE_GCS_ROOT, K3_PROBE_HOST (pod agent hostname tag;
+# the stable pod has no hostname tag and a full disk). No quotes or $ in values.
 steps:
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
@@ -20,6 +21,7 @@ steps:
     timeout_in_minutes: 240
     agents:
       queue: "tpu_v7x_32_queue"
+      hostname: "${K3_PROBE_HOST:-tpu7x-32-ci-1-cicd-us-central1-c}"
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
