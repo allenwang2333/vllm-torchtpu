@@ -392,6 +392,10 @@ class PallasAttentionBackend(AttentionBackend):
         return PallasAttentionBackendImpl
 
     @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [256]
+
+    @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
