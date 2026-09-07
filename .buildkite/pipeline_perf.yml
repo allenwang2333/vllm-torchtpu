@@ -269,7 +269,9 @@ steps:
       # completes in about an hour. To validate or recalibrate, run this
       # step from a branch-local dev yml (see pipeline_dev.yml) and feed
       # two runs' perf_eval_results to check_regression.py --calibrate.
-      - label: "Perf: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
+      # Eval concurrency is capped at 16: K3 output is wrong at 32+ concurrent
+      # requests on the batched path (truncation at 32, garbage at 64/128).
+      - label: "Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
         key: "perf_nightly_kimi_k3_tp32_ep"
         if: 'build.env("NIGHTLY") == "1"'
         timeout_in_minutes: 420
@@ -280,6 +282,6 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"
         commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --results-dir /perf_eval_results/kimi-k3-tp32-ep"
+          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval --eval-concurrency 16 --results-dir /perf_eval_results/kimi-k3-tp32-ep"
         artifact_paths:
           - "perf_eval_results/**/*"

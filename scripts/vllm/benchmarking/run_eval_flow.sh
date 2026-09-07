@@ -9,6 +9,7 @@ RESULTS_DIR=""
 RUN_LM_EVAL=0
 RUN_CODE_EVAL=0
 RUN_MM_EVAL=0
+EVAL_CONCURRENCY=128
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
 
@@ -35,6 +36,10 @@ while [[ $# -gt 0 ]]; do
             RUN_MM_EVAL=1
             shift
             ;;
+        --eval-concurrency)
+            EVAL_CONCURRENCY="$2"
+            shift 2
+            ;;
         --host)
             HOST="$2"
             START_SERVER=0
@@ -51,7 +56,7 @@ while [[ $# -gt 0 ]]; do
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--eval-concurrency N] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -109,7 +114,7 @@ run_lm_eval() {
             lm_eval_args+=(
                 --include_path "$SCRIPT_DIR/lm_eval_tasks"
                 --model local-chat-completions
-                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=$EVAL_CONCURRENCY"
                 --apply_chat_template
                 --gen_kwargs '{"chat_template_kwargs": {"enable_thinking": false}}'
                 --confirm_run_unsafe_code
@@ -119,7 +124,7 @@ run_lm_eval() {
             lm_eval_args+=(
                 --limit 100
                 --model local-chat-completions
-                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=128"
+                --model_args "model=$MODEL,base_url=http://$HOST:$PORT/v1/chat/completions,num_concurrent=$EVAL_CONCURRENCY"
                 --apply_chat_template
             )
             if [ "$task" = "mmlu_pro" ] && [ "$MMLU_PRO_DISABLE_MULTITURN_ARGS" = "true" ]; then
