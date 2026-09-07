@@ -1,0 +1,29 @@
+# [branch-local] Issue #841: Kimi-K3 accuracy vs lm_eval client concurrency on
+# the v7x-32 pod. One server boot, mmlu_pro + gsm8k at conc 1 -> ... -> 256.
+# Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_concsweep.yml.
+# Knobs via build env, baked into the command at upload time (run_multihost.sh
+# forwards only BUILDKITE_* + an allowlist into the containers): K3_SWEEP_CONC_LIST,
+# K3_SWEEP_TASKS, K3_SWEEP_GSM8K_LIMIT, K3_SWEEP_MMLU_LIMIT, K3_SWEEP_CTX,
+# K3_SWEEP_MAX_NUM_SEQS.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "K3 eval conc sweep ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} ctx ${K3_SWEEP_CTX:-16384} mns ${K3_SWEEP_MAX_NUM_SEQS:-256} (TPU v7x-32)"
+    key: k3_conc_sweep
+    depends_on: build_docker
+    timeout_in_minutes: 420
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "0"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_eval_conc_sweep.sh --results-dir /perf_eval_results/k3-conc-sweep --conc-list ${K3_SWEEP_CONC_LIST:-1,2,4,8,16,32,64,128,256} --tasks ${K3_SWEEP_TASKS:-mmlu_pro,gsm8k} --gsm8k-limit ${K3_SWEEP_GSM8K_LIMIT:-128} --mmlu-limit ${K3_SWEEP_MMLU_LIMIT:-10} --ctx ${K3_SWEEP_CTX:-16384} --max-num-seqs ${K3_SWEEP_MAX_NUM_SEQS:-256}"
+    artifact_paths:
+      - "perf_eval_results/**/*"
