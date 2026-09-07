@@ -157,12 +157,24 @@ steps:
           # defaults it to the HF id, which would download the checkpoint;
           # hand it the bucket URI. A gs:// MODEL makes the rig serve with
           # --load-format runai_streamer (runai-model-streamer[gcs] is a
-          # pyproject dependency). The bucket is a plain checkpoint directory
+          # pyproject dependency). The prefix is a plain checkpoint directory
           # with config.json at its root, not a models--<org>--<name> hub
           # snapshot, so it needs no snapshots/ subdirectory resolution.
+          #
+          # It is a copy of gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4,
+          # and the copy is what makes streaming work at all. runai's GCS
+          # backend resolves a prefix through storage.Client.get_bucket()
+          # (runai_model_streamer_gcs/files/files.py), a bucket-metadata GET
+          # needing storage.buckets.get. The agent SA has only object-level
+          # access to cloud-devkit -- enough for the gcloud staging copy that
+          # ENOSPC'd above, not for get_bucket, which 403'd before a single
+          # weight moved. On tpu-commons-ci the same SA is covered by the
+          # bucket's projectEditor/projectViewer legacy bindings, so
+          # get_bucket resolves. Sibling of the GLM-5.2-FP8 prefix already
+          # there.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env MODEL=gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4
+            env MODEL=gs://tpu-commons-ci/glm/GLM-5.2-NVFP4
             bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
         artifact_paths:
           - "perf_eval_results/**/*"
