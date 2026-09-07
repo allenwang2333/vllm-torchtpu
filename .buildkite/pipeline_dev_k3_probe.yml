@@ -27,7 +27,7 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-kimi-k3-tp32-ep-concsweep} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-16384} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-300} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
+      - "bash .buildkite/scripts/run_multihost.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-kimi-k3-tp32-ep-concsweep} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-16384} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-1500} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
     artifact_paths:
       - "perf_eval_results/**/*"
 
@@ -43,6 +43,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "7200"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_in_docker.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-deepseek-v2-tp8-ep-probe} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-8192} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-300} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
+      - "bash .buildkite/scripts/run_in_docker.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-deepseek-v2-tp8-ep-probe} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-8192} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-1500} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
     artifact_paths:
       - "perf_eval_results/**/*"
