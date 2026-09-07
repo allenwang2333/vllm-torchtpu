@@ -22,3 +22,6 @@ if [ "$EXTRA_SERVE_ARGS" = "$_before" ]; then
     echo "ERROR: kimi-k3-tp32-ep-concsweep.sh: the nightly config no longer sets compile_sizes [1,8,8192]; update the substitution above" >&2
     return 1
 fi
+
+# Extra serve flags for probes, appended last so they override the flags above.
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS}${K3_EXTRA_SERVE_ARGS:+ $K3_EXTRA_SERVE_ARGS}"
