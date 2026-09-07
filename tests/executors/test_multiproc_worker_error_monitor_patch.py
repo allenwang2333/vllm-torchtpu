@@ -12,12 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
 
-from vllm_torchtpu import _patch_multiproc_worker_error_monitor
+from vllm_torchtpu import (_patch_multiproc_worker_error_monitor,
+                           _patch_multiproc_worker_global_rank_env)
 
 
-def test_worker_error_monitor_patch_idempotent():
+def test_worker_error_monitor_patch_flag_disabled(monkeypatch):
+    monkeypatch.setenv("TPU_ENABLE_WORKER_ERROR_MONITOR", "0")
+    if hasattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch"):
+        delattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch")
+    _patch_multiproc_worker_error_monitor()
+    assert not getattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch",
+                       False)
+
+
+def test_worker_error_monitor_patch_idempotent(monkeypatch):
+    monkeypatch.setenv("TPU_ENABLE_WORKER_ERROR_MONITOR", "1")
     _patch_multiproc_worker_error_monitor()
     assert getattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch", False)
     _patch_multiproc_worker_error_monitor()
+    assert getattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch", False)
+
+
+def test_worker_error_monitor_and_global_rank_env_composition(monkeypatch):
+    monkeypatch.setenv("TPU_ENABLE_WORKER_ERROR_MONITOR", "1")
+    _patch_multiproc_worker_global_rank_env()
+    assert getattr(WorkerProc, "_tpu_global_rank_env_patch", False)
+    _patch_multiproc_worker_error_monitor()
+    assert getattr(MultiprocExecutor, "_tpu_worker_error_monitor_patch", False)
+    assert getattr(WorkerProc, "_tpu_global_rank_env_patch", False)

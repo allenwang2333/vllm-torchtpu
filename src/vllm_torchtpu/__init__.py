@@ -769,12 +769,11 @@ def _multiproc_execute_worker_rpc(self, rpc_request):
         if hasattr(e, "add_note"):
             e.add_note(traceback.format_exc())
         logger.exception("WorkerProc hit an exception.")
-        if output_rank is not None and self.rank != output_rank:
-            if getattr(self, "error_writer", None) is not None:
-                try:
-                    self.error_writer.send((str(e), traceback.format_exc()))
-                except Exception:
-                    pass
+        if getattr(self, "error_writer", None) is not None:
+            try:
+                self.error_writer.send((str(e), traceback.format_exc()))
+            except Exception:
+                pass
         if output_rank is None or self.rank == output_rank:
             self.handle_output(e)
 
@@ -899,6 +898,9 @@ def _patch_multiproc_worker_error_monitor() -> None:
     via _spin_condition cancellation, eliminating collective deadlock without
     altering the shared-memory reading sequence or adding hot-path polling overhead.
     """
+    if not envs.TPU_ENABLE_WORKER_ERROR_MONITOR:
+        return
+
     from vllm.v1.executor.multiproc_executor import (MultiprocExecutor,
                                                      WorkerProc)
 
@@ -910,6 +912,9 @@ def _patch_multiproc_worker_error_monitor() -> None:
     if not hasattr(WorkerProc, "_tpu_orig_wait_for_response_handle_ready"):
         WorkerProc._tpu_orig_wait_for_response_handle_ready = (
             WorkerProc.wait_for_response_handle_ready)
+
+    was_rank_env_patched = getattr(WorkerProc, "_tpu_global_rank_env_patch",
+                                   False)
 
     WorkerProc.make_worker_process = staticmethod(
         _multiproc_make_worker_process)
@@ -923,9 +928,46 @@ def _patch_multiproc_worker_error_monitor() -> None:
     logger.info(
         "Applied TPU patch: MultiprocExecutor worker error monitor thread.")
 
+    if was_rank_env_patched:
+        WorkerProc._tpu_global_rank_env_patch = False
+        _patch_multiproc_worker_global_rank_env()
+
 
 def _patch_multiproc_worker_global_rank_env() -> None:
-    _patch_multiproc_worker_error_monitor()
+    """Set TorchTPU binding env on spawned workers before torch_tpu import.
+
+    Native vLLM DP passes per-engine rank/local_rank to workers and computes
+    global torch.distributed rank later from ParallelConfig. TorchTPU currently
+    reads RANK/LOCAL_RANK/WORLD_SIZE earlier for physical chip/PjRt binding, so
+    this shim exposes the unified single-host DP*TP slice to TorchTPU without
+    changing the worker rank arguments passed through vLLM.
+    """
+    import os as _os
+
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+
+    from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+
+    if getattr(WorkerProc, "_tpu_global_rank_env_patch", False):
+        return
+    _orig = WorkerProc.make_worker_process
+
+    def _wrapped(vllm_config, local_rank, rank, *args, **kwargs):
+        pc = vllm_config.parallel_config
+        binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
+        _os.environ.update(binding.as_env())
+        logger.info(
+            "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
+            "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
+            "(rank=%d local_rank=%d dp_rank=%d dp_size=%d offset=%d "
+            "init_local_rank=%d)", binding.rank, binding.local_rank,
+            binding.world_size, binding.local_world_size, rank, local_rank,
+            binding.dp_rank, binding.dp_size, binding.local_rank_offset,
+            binding.init_local_rank)
+        return _orig(vllm_config, local_rank, rank, *args, **kwargs)
+
+    WorkerProc.make_worker_process = staticmethod(_wrapped)
+    WorkerProc._tpu_global_rank_env_patch = True
     logger.info("Applied TPU patch: MultiprocExecutor worker binding env.")
 
 
