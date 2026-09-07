@@ -138,6 +138,9 @@ EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 # so a config can tell "unset" from "forced by the operator".
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-}"
 MMLU_PRO_DISABLE_MULTITURN_ARGS=false
+# Apply the plain-chat eval args (no fewshot_as_multiturn / continue_final_message)
+# to every lm_eval task, not only mmlu_pro.
+EVAL_DISABLE_MULTITURN_ARGS=false
 # Chat-template kwargs passed to lm_eval (JSON). Kimi-K3 names its switch
 # "thinking", not "enable_thinking".
 EVAL_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}'
@@ -529,6 +532,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "profile_gcs_dir": $profile_gcs_dir_json,
     "timestamp": "$TIMESTAMP",
     "mmlu_pro_disable_multiturn_args": $MMLU_PRO_DISABLE_MULTITURN_ARGS,
+    "eval_disable_multiturn_args": $EVAL_DISABLE_MULTITURN_ARGS,
     "eval_chat_template_kwargs": $EVAL_CHAT_TEMPLATE_KWARGS,
     "perf_tolerance": $PERF_TOLERANCE,
     "eval_tolerance": $EVAL_TOLERANCE

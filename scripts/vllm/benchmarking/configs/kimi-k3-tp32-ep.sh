@@ -93,3 +93,6 @@ BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"
 # K3's chat template takes "thinking" (default on); "enable_thinking" is ignored.
 EVAL_CHAT_TEMPLATE_KWARGS='{"thinking": false}'
+# K3's custom chat template does not continue a trailing assistant message, so the
+# fewshot-as-multiturn / continue_final_message eval form scores 0 on every task.
+EVAL_DISABLE_MULTITURN_ARGS=true
