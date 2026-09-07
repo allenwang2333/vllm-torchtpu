@@ -47,7 +47,7 @@ ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
 APC_ARGS=""
 if [ "$ENABLE_PREFIX_CACHING" = "true" ]; then APC_ARGS="--mamba-cache-mode align "; fi
 
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} ${APC_ARGS}--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
+EXTRA_SERVE_ARGS="${K3_EXTRA_SERVE_ARGS:+$K3_EXTRA_SERVE_ARGS }${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--trust-remote-code --enable-ep-weight-filter --language-model-only --limit-mm-per-prompt {\"image\":0,\"video\":0} --model-loader-extra-config {\"memory_limit\":17179869184} ${APC_ARGS}--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --compilation-config {\"compile_sizes\":[16,1024,2048,4096,8192]}"
 
 BENCHMARK_TEMPERATURE="0"
 EVAL_TOLERANCE="0.025"

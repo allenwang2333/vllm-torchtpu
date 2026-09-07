@@ -44,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --gsm8k-limit)   GSM8K_LIMIT="$2"; shift 2 ;;
         --gsm8k-conc)    GSM8K_CONC="$2"; shift 2 ;;
         --moe-requant)   MOE_REQUANT="$2"; shift 2 ;;
+        --extra-serve-args) export K3_EXTRA_SERVE_ARGS="$2"; shift 2 ;;
         *) echo "[k3-sweep] unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -105,7 +106,7 @@ if [ "$SPEC" = "dspark" ]; then
     export EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--speculative-config {\"method\":\"dspark\",\"model\":\"Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":$SPEC_TOKENS,\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":$SPEC_AL}"
 fi
 
-echo "[k3-sweep] config=$CONFIG_NAME concs=${CONCS[*]} max_num_seqs=$MAX_NUM_SEQS ctx=$MAX_MODEL_LEN kv=$KV_DTYPE apc=$APC spec=$SPEC/$SPEC_TOKENS/$SPEC_AL moe_requant=$MOE_REQUANT duration=$DURATION fast=$FAST gsm8k_limit=$GSM8K_LIMIT ix_ref=$IX_REF"
+echo "[k3-sweep] config=$CONFIG_NAME concs=${CONCS[*]} max_num_seqs=$MAX_NUM_SEQS ctx=$MAX_MODEL_LEN kv=$KV_DTYPE apc=$APC spec=$SPEC/$SPEC_TOKENS/$SPEC_AL moe_requant=$MOE_REQUANT extra=${K3_EXTRA_SERVE_ARGS:-} duration=$DURATION fast=$FAST gsm8k_limit=$GSM8K_LIMIT ix_ref=$IX_REF"
 echo "[k3-sweep] host: $(nproc) cpus, $(free -g | awk '/Mem:/{print $2}') GB RAM, python $(python3 --version 2>&1), uv $(uv --version 2>&1 || echo missing)"
 echo "[k3-sweep] disk (container view):"; df -h / /tmp /root/.cache /perf_eval_results /dev/shm 2>/dev/null
 
