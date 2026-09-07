@@ -23,6 +23,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --moe-requant ${K3_MOE_REQUANT:-0}"
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/k3_agentx_sweep.sh --config kimi-k3-tp32-ep-agentx --results-dir /perf_eval_results/k3-agentx-sweep --conc-list ${K3_CONC_LIST:-1,2,4,8} --max-model-len ${K3_CTX:-131072} --kv ${K3_KV:-fp8} --apc ${K3_APC:-0} --spec ${K3_SPEC:-none} --fast ${K3_FAST:-1} --gsm8k-limit ${K3_GSM8K_LIMIT:-100} --moe-requant ${K3_MOE_REQUANT:-0} --gsm8k-conc ${K3_GSM8K_CONC:-8}"
     artifact_paths:
       - "perf_eval_results/**/*"

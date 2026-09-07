@@ -23,7 +23,7 @@ SPEC="none"            # none | dspark  (dspark needs PR #702 in the branch)
 SPEC_TOKENS=7
 SPEC_AL=3.84
 GSM8K_LIMIT=100        # 0 = skip
-GSM8K_CONC=8
+GSM8K_CONC="8"        # comma list allowed, e.g. 8,16,32: one GSM8K run per value, fresh-server order
 MOE_REQUANT=0         # 0 = W4A16 (default gmm_v2 path); 512 = W4A8 (fp8 activations)
 PORT=8000
 
@@ -207,9 +207,11 @@ JSON
 sanity_probe
 
 # ---- (1) GSM8K on the fresh server (before any ignore_eos load) -------------
-if [ "$GSM8K_LIMIT" -gt 0 ]; then
-    echo "[k3-sweep] ===== GSM8K limit=$GSM8K_LIMIT num_concurrent=$GSM8K_CONC ====="
-    EVAL_DIR="$RESULTS_DIR/gsm8k"; mkdir -p "$EVAL_DIR"
+IFS=',' read -r -a GSM8K_CONCS <<< "$GSM8K_CONC"
+for gc in "${GSM8K_CONCS[@]}"; do
+    [ "$GSM8K_LIMIT" -gt 0 ] || break
+    echo "[k3-sweep] ===== GSM8K limit=$GSM8K_LIMIT num_concurrent=$gc ====="
+    EVAL_DIR="$RESULTS_DIR/gsm8k_c$gc"; mkdir -p "$EVAL_DIR"
     T0=$(date +%s)
     # The server runs --reasoning-parser kimi_k3 (as the B300 recipe does), so the
     # answer arrives in reasoning_content; stock lm_eval reads only content and
@@ -218,19 +220,19 @@ if [ "$GSM8K_LIMIT" -gt 0 ]; then
     PYTHONPATH="$PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}" OPENAI_API_KEY=EMPTY \
     lm_eval --tasks "$IX_DIR/utils/evals/gsm8k.yaml" --limit "$GSM8K_LIMIT" --seed "0,1234,None,1234" \
         --model local-chat-completions --apply_chat_template --log_samples \
-        --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$GSM8K_CONC,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
+        --model_args "model=$MODEL,base_url=http://127.0.0.1:$PORT/v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=$gc,timeout=1800,tokenized_requests=False,max_length=$MAX_MODEL_LEN" \
         --gen_kwargs "max_tokens=4096,temperature=0,top_p=1" \
         --output_path "$EVAL_DIR" 2>&1 | tail -25
     echo "[k3-sweep] gsm8k wall $(( $(date +%s) - T0 )) s"
-    python3 - "$EVAL_DIR" << 'PYEOF'
+    python3 - "$EVAL_DIR" "$gc" << 'PYEOF'
 import glob, json, sys
 for f in glob.glob(sys.argv[1] + "/**/results_*.json", recursive=True):
     r = next(iter(json.load(open(f))["results"].values()), {})
-    print("[k3-sweep] GSM8K:", {k: round(v, 4) for k, v in r.items() if isinstance(v, (int, float)) and "exact_match" in k})
+    print("[k3-sweep] GSM8K conc " + sys.argv[2] + ":", {k: round(v, 4) for k, v in r.items() if isinstance(v, (int, float)) and "exact_match" in k})
 PYEOF
     save_now "$EVAL_DIR" "$RESULTS_DIR/server.log" "$RESULTS_DIR/config.json"
     wait_server_idle
-fi
+done
 
 # ---- (2) AgentX replay, one concurrency at a time, ascending ----------------
 export INFMAX_CONTAINER_WORKSPACE="$IX_DIR"
