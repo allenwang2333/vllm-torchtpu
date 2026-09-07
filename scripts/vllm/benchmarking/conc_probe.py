@@ -105,7 +105,10 @@ async def probe(base_url, model, n, max_tokens):
     metrics_url = f"{base_url}/metrics"
     stop = asyncio.Event()
     peaks = {}
-    async with aiohttp.ClientSession() as session:
+    # aiohttp's default connector allows 100 concurrent connections per
+    # session, which silently caps the batch the server can see; lift it.
+    connector = aiohttp.TCPConnector(limit=0)
+    async with aiohttp.ClientSession(connector=connector) as session:
         sampler = asyncio.create_task(sample_metrics(session, metrics_url, stop, peaks))
         t0 = time.perf_counter()
         results = await asyncio.gather(*(one_request(session, url, model, max_tokens, i) for i in range(n)))
