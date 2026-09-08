@@ -16,10 +16,12 @@
 
 For each N in --conc-list, fire N identical chat requests at once, wait for
 all of them, and classify every reply: ok (the expected count-up is present),
-corrupt (CJK / HTML entities / a token repeated over and over / non-ASCII
-soup: what a broken KV or state looks like), offtask (coherent text that does
-not count, i.e. the model ignored the task: a quality issue, not corruption),
-empty, or error (HTTP / transport). Only corrupt, empty and error fail the run.
+diverged (the count starts correctly and then stops being the expected
+text: the reply ran past the one correct answer), corrupt (CJK / HTML
+entities / a token repeated over and over / non-ASCII soup), offtask
+(coherent text that never counts, i.e. the model ignored the task: a quality
+issue, not corruption), empty, or error (HTTP / transport). diverged, corrupt,
+empty and error fail the run; offtask does not.
 While the burst runs, /metrics is sampled so the peak number of running
 requests is known. One line per N on stdout; a JSON summary in --out.
 
@@ -62,10 +64,14 @@ def classify(text: str) -> str:
     if GARBAGE_RE.search(text) or REPEAT_RE.search(text):
         return "corrupt"
     nums = [int(x) for x in NUMBERS_RE.findall(text)]
-    # Sane reply: the first 40 numbers count up (the tail may be cut by
-    # max_tokens).
-    if nums[:40] == list(range(1, 41)):
+    # ok = the whole task: 1..300 in order and then DONE. At temperature 0
+    # every correct reply is the same ~600 tokens and ends with finish_reason
+    # "stop"; a reply that counts for a while and then drifts runs to
+    # max_tokens instead, so the first numbers alone are not enough.
+    if nums == list(range(1, 301)) and "DONE" in text:
         return "ok"
+    if nums[:40] == list(range(1, 41)):
+        return "diverged"
     non_ascii = sum(ord(ch) > 127 for ch in text) / len(text)
     if non_ascii > 0.05 or len(WORD_RE.findall(text)) < 20:
         return "corrupt"
@@ -116,7 +122,7 @@ async def one_request(session, url, model, max_tokens, idx, pad_words):
             return {
                 "idx": idx,
                 "cls": cls,
-                "text": text if cls != "ok" else text[:300],
+                "text": text,
                 "finish": body["choices"][0].get("finish_reason"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "s": time.perf_counter() - t0
@@ -213,15 +219,15 @@ def main():
             break
         c = res["counts"]
         bad = sum(v for k, v in c.items()
-                  if k in ("corrupt", "empty", "error"))
+                  if k in ("diverged", "corrupt", "empty", "error"))
         reached = "yes" if (res.get("peak_running") or 0) >= 0.9 * n else "NO"
         print(
             f"[conc-probe] N={n} pad_words={a.prompt_pad_words}: batch_reached={reached} wall={res['wall_s']}s peak_running={res.get('peak_running')} "
-            f"peak_waiting={res.get('peak_waiting')} ok={c.get('ok',0)} corrupt={c.get('corrupt',0)} "
-            f"empty={c.get('empty',0)} error={c.get('error',0)} offtask={c.get('offtask',0)}",
+            f"peak_waiting={res.get('peak_waiting')} ok={c.get('ok',0)} diverged={c.get('diverged',0)} "
+            f"corrupt={c.get('corrupt',0)} empty={c.get('empty',0)} error={c.get('error',0)} offtask={c.get('offtask',0)}",
             flush=True)
         for s in res["samples"]:
-            if s["cls"] in ("corrupt", "offtask", "empty"):
+            if s["cls"] in ("diverged", "corrupt", "offtask", "empty"):
                 print(
                     f"[conc-probe]   example {s['cls']} (finish={s.get('finish')}, tokens={s.get('completion_tokens')}): {s.get('text','')[:160]!r}",
                     flush=True)
