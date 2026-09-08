@@ -1,0 +1,11 @@
+# Free disk space on every host of a TPU pod: report, prune docker leftovers and
+# stale /tmp, report again. Trigger with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_pod_disk_clean.yml
+# and POD_QUEUE (default tpu_v7x_32_queue); the queue's idle agent runs it.
+steps:
+  - label: "Pod disk cleanup on ${POD_QUEUE:-tpu_v7x_32_queue}"
+    key: pod_disk_clean
+    timeout_in_minutes: 40
+    agents:
+      queue: "${POD_QUEUE:-tpu_v7x_32_queue}"
+    commands:
+      - bash .buildkite/scripts/pod_disk_clean.sh
