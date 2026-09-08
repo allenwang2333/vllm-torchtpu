@@ -80,17 +80,6 @@ mkdir -p "${TMPDIR}" "${VLLM_CACHE_ROOT}" || exit 1
 # quant_algo=NVFP4, group_size=16), so vLLM detects it as modelopt_fp4 and
 # there is nothing to requantize the dtype of -- only the block to widen.
 export MOE_REQUANTIZE_BLOCK_SIZE=512
-# Take the EP MoE token movement off SparseCore. Under investigation, not a
-# settled default: at DP8/NVFP4 the warmup _dummy_run at num_tokens=512 halted
-# SparseCore with a UserFatal on 2 of 8 ranks (0x0x0_SC2, error type
-# UserFatal, reported against the HLO module
-# tt_jit_layernorm_L62C0_fused_add_rms_norm_mul -- but a fused module is named
-# for its root op's source line, and SparseCore does not run rms_norm, it runs
-# the MoE ragged gather + gather-reduce). USE_MOE_SPARSE_CORE=0 falls back to
-# the pre-#193 plain-JAX path, which envs.py documents as functionally
-# equivalent with valid-mask gating unchanged, so it is safe as a default and
-# tells us whether those kernels are the culprit. Revisit once the SparseCore
-# path boots this config.
 export USE_MOE_SPARSE_CORE=0
 export PJRT_DEVICE=TPU
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0
