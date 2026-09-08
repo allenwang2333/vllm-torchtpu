@@ -1,5 +1,8 @@
 import functools
+import json
 import math
+import os
+from dataclasses import asdict, replace
 from typing import Any, Callable, Optional, Tuple
 
 import jax
@@ -25,12 +28,14 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
-                                                       get_tuned_params)
+                                                       get_tuned_params,
+                                                       tuned_params_mapping)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
 
 logger = init_logger(__name__)
+_MLA_AUDITED_KEYS = set()
 
 MAX_ALLOWED_PAGE_INDICES_N = (
     128 * 1024
@@ -666,7 +671,6 @@ def mla_attention(q_TNA: jax.Array,
             actual_r_dim=actual_r_dim,
             kv_dtype=kv_dtype_str,
         )
-        decode_tuned = get_tuned_params(decode_key)
 
         _, page_size_per_kv_packing, kv_packing, _ = cache.shape
         max_num_seqs = seq_lens.shape[0]
@@ -684,6 +688,30 @@ def mla_attention(q_TNA: jax.Array,
             pages_per_seq=block_tables.shape[0] // max_num_seqs,
         )
         mixed_tuned = get_tuned_params(mixed_key)
+        exact_decode_key = replace(mixed_key, case="batched_decode")
+        if (os.getenv("K3_TEST_EXACT_DECODE_KEY") == "1"
+                and exact_decode_key in tuned_params_mapping):
+            decode_key = exact_decode_key
+        decode_tuned = get_tuned_params(decode_key)
+        audit_key = (mixed_key, decode_key)
+        if (os.getenv("K3_TEST_MLA_AUDIT") == "1"
+                and audit_key not in _MLA_AUDITED_KEYS):
+            _MLA_AUDITED_KEYS.add(audit_key)
+            logger.info(
+                "MLA_LOOKUP_AUDIT %s",
+                json.dumps(
+                    {
+                        "actual_decode_key": asdict(exact_decode_key),
+                        "selected_decode_key": asdict(decode_key),
+                        "decode_exact_selected": decode_key
+                        == exact_decode_key,
+                        "decode_hit": decode_key in tuned_params_mapping,
+                        "decode_params": asdict(decode_tuned),
+                        "mixed_key": asdict(mixed_key),
+                        "mixed_hit": mixed_key in tuned_params_mapping,
+                        "mixed_params": asdict(mixed_tuned),
+                    },
+                    sort_keys=True))
 
         num_kv_pages_per_blocks = (
             decode_tuned.num_kv_pages_per_block,
