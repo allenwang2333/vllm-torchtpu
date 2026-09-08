@@ -54,6 +54,23 @@ def _call_durs_ps(plane, line_name, event_name=None):
     return [d for _, d in sorted(evs)]
 
 
+def wallclock_time(fn, inputs, *, reps, warmup):
+    """Per-call latency (ms) without the profiler: `reps` back-to-back calls
+    with one block_until_ready at the end, averaged (dispatch overlaps, so this
+    tracks device time closely for ms-scale calls). Used when the JAX profiler
+    plugin is unusable in the image (MMRS_WALLCLOCK=1)."""
+    import time
+    for _ in range(warmup):
+        fn(*inputs)
+    jax.block_until_ready(fn(*inputs))
+    t0 = time.perf_counter()
+    out = None
+    for _ in range(reps):
+        out = fn(*inputs)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t0) / reps * 1e3
+
+
 def device_time(fn, inputs, *, reps, warmup, save_dir=None):
     """Median per-call kernel latency (ms) from the JAX profiler: `barrier-cores`
     (the collective's cross-core wait) is a sub-span of each call's module, so
@@ -61,6 +78,8 @@ def device_time(fn, inputs, *, reps, warmup, save_dir=None):
     — this cancels the sync jitter the wait absorbs. Traces `reps` calls into
     save_dir if given (kept for inspection), else a temp dir; module time and
     barrier span are read from the /device:TPU:0 plane."""
+    if os.environ.get("MMRS_WALLCLOCK"):
+        return wallclock_time(fn, inputs, reps=reps, warmup=warmup)
     for _ in range(warmup):
         fn(*inputs)
     jax.block_until_ready(fn(*inputs))

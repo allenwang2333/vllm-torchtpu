@@ -12,12 +12,15 @@ cd /root/torchtpu-vllm
 # the slice through the TPU VM metadata server; the tt container env disables
 # that lookup (torch_tpu does not need it), so re-enable it for this JAX run.
 unset TPU_SKIP_MDS_QUERY
+# The JAX profiler plugin in this image crashes (PLUGIN_Profiler_Api size
+# mismatch), so time the calls by wall clock instead of an xprof trace.
+export MMRS_WALLCLOCK=1
 python -c "import jax; jax.distributed.initialize(); print('[mmrs] jax dist ok:', jax.process_index(), '/', jax.process_count(), jax.device_count(), 'devices')" 2>&1 | grep "\[mmrs\]" || echo "[mmrs] jax.distributed.initialize probe failed"
 echo "[mmrs] node=${NODE_RANK:-?} host=$(hostname) k=${MMRS_K:-7168} n=${MMRS_N:-28672} m=${MMRS_M:-1024,2048,4096,8192}"
 python -c "import jax; print('[mmrs] jax', jax.__version__)" 2>/dev/null || true
 timeout 2400 python scripts/benchmarking/kernels/benchmark_matmul_reduce_scatter.py \
     --k "${MMRS_K:-7168}" --n "${MMRS_N:-28672}" --m "${MMRS_M:-1024,2048,4096,8192}" \
-    --reps "${MMRS_REPS:-20}" --warmup 5 --profile-dir "$OUT/profile" \
+    --reps "${MMRS_REPS:-20}" --warmup 5 \
     2>&1 | tee "$OUT/node${NODE_RANK:-0}.log"
 echo "[mmrs] node=${NODE_RANK:-?} rc=${PIPESTATUS[0]}"
 exit 0
