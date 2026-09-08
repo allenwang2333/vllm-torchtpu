@@ -3,7 +3,7 @@
 # Select with DEV_PIPELINE_FILE=.buildkite/pipeline_dev_k3_probe.yml.
 # Knobs (build env, baked in at upload): K3_PROBE_QUEUE (tpu_v7x_32_queue |
 # tpu_v7x_8_queue), K3_PROBE_CONFIG, K3_PROBE_CONC_LIST, K3_PROBE_CTX,
-# K3_PROBE_MNS, K3_PROBE_MAX_TOKENS, K3_PROBE_ENV (space-separated KEY=VAL),
+# K3_PROBE_MNS, K3_PROBE_MAX_TOKENS, K3_PROBE_PAD_WORDS (filler words per prompt), K3_PROBE_ENV (space-separated KEY=VAL),
 # K3_PROBE_EXTRA_SERVE_ARGS, K3_PROBE_GCS_ROOT, K3_PROBE_HOST / K3_PROBE_HOST8 (agent hostname tag for the pod / 8-chip step;
 # the stable pod has no hostname tag and a full disk). No quotes or $ in values.
 steps:
@@ -27,7 +27,7 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_multihost.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-kimi-k3-tp32-ep-concsweep} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-16384} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-1500} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
+      - "bash .buildkite/scripts/run_multihost.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-kimi-k3-tp32-ep-concsweep} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-16384} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-1500} --prompt-pad-words ${K3_PROBE_PAD_WORDS:-0} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
     artifact_paths:
       - "perf_eval_results/**/*"
 
@@ -44,6 +44,6 @@ steps:
       VLLM_ENGINE_READY_TIMEOUT_S: "7200"
       BENCHMARK_WARMUP_RUNS: "0"
     commands:
-      - "bash .buildkite/scripts/run_in_docker.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-deepseek-v2-tp8-ep-probe} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-8192} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-1500} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
+      - "bash .buildkite/scripts/run_in_docker.sh bash -c 'ENVARGS=\"\"; for kv in ${K3_PROBE_ENV:-}; do ENVARGS=\"$$ENVARGS --env $$kv\"; done; bash ./scripts/vllm/benchmarking/k3_conc_probe.sh --results-dir /perf_eval_results/k3-conc-probe --config ${K3_PROBE_CONFIG:-deepseek-v2-tp8-ep-probe} --conc-list ${K3_PROBE_CONC_LIST:-128,160,192,256} --ctx ${K3_PROBE_CTX:-8192} --max-num-seqs ${K3_PROBE_MNS:-256} --max-tokens ${K3_PROBE_MAX_TOKENS:-1500} --prompt-pad-words ${K3_PROBE_PAD_WORDS:-0} $$ENVARGS --extra-serve-args \"${K3_PROBE_EXTRA_SERVE_ARGS:-}\" --gcs-root \"${K3_PROBE_GCS_ROOT:-}\"'"
     artifact_paths:
       - "perf_eval_results/**/*"
