@@ -167,6 +167,24 @@ want rs_8256 && run_variant rs_8256 30251 "" --mode rs_only --tokens 8256 || tru
 want rs_8256_pad_flag && run_variant rs_8256_pad_flag 30252 "$RS_PAD_FLAG" --mode rs_only --tokens 8256 || true
 want rs_ag_8256_pad_flag && run_variant rs_ag_8256_pad_flag 30253 "$RS_PAD_FLAG" --mode rs_ag --tokens 8256 || true
 
+# 22+. Reduce-scatter strategy flags still on `auto` in the flag dump: does any
+#    of them switch the SparseCore reduce-scatter from the 2-color ring to the
+#    n-dimension strategy? 8448 rows = multiple of 3 x 32 x 8 (264-row shards).
+ND="--xla_tpu_enable_sparse_core_collective_offload_nd_reduce_scatter=true"
+PAD="--xla_tpu_enable_sparse_core_reduce_scatter_padding=true"
+PADTHR="--xla_tpu_padding_overhead_threshold_with_copy_for_reduce_scatter=0.5"
+DEC3D="--xla_tpu_enable_3d_reduce_scatter_decomposer=true"
+RSV2="--xla_tpu_enable_sparse_core_reduce_scatter_v2=true"
+SHPAD="--xla_tpu_enable_internal_shard_padding_for_1d_reduce_scatter=true"
+want rs_nd && run_variant rs_nd 30260 "$ND" --mode rs_only || true
+want rs_nd_pad && run_variant rs_nd_pad 30261 "$ND $PAD $PADTHR" --mode rs_only || true
+want rs_3ddec && run_variant rs_3ddec 30262 "$DEC3D $PAD" --mode rs_only || true
+want rs_v2 && run_variant rs_v2 30263 "$RSV2" --mode rs_only || true
+want rs_shpad && run_variant rs_shpad 30264 "$SHPAD $PAD" --mode rs_only || true
+want rs_8448 && run_variant rs_8448 30265 "" --mode rs_only --tokens 8448 || true
+want rs_8448_nd_pad && run_variant rs_8448_nd_pad 30266 "$ND $PAD $PADTHR" --mode rs_only --tokens 8448 || true
+want rs_allflags && run_variant rs_allflags 30267 "$ND $PAD $PADTHR $DEC3D $RSV2 $SHPAD" --mode rs_only || true
+
 echo "[allreduce] node=$NODE_RANK all variants done"
 if [ "$NODE_RANK" = "0" ]; then
     echo "[allreduce] ===== SUMMARY (rank 0) ====="
