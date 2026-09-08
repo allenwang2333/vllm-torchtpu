@@ -32,6 +32,7 @@ from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.kernels.gdn.v3_1 import wrapper as gdn_v3_1_wrapper
 from vllm_torchtpu.layers.common.utils import \
     reorder_concatenated_tensor_for_sharding
 from vllm_torchtpu.utils import get_mesh_shape_product
@@ -806,6 +807,31 @@ def run_jax_gdn_attention_pooled_local(
     in place through a `v3_state_source` copy-plan — the model kernels'
     math is unmodified either way.
     """
+
+    if tpu_envs.TPU_GDN_VERSION == "v3_1":
+        recurrent_state, output = gdn_v3_1_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            b=b,
+            a=a,
+            states=recurrent_state,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=A_log,
+            dt_bias=dt_bias,
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_dtype=jnp.bfloat16.dtype,
+            recurrent_dtype=recurrent_state_dtype,
+            manager_block_tokens=pool_block_tokens,
+        )
+        return recurrent_state, output
 
     conv_dim = conv_weight.shape[0]
     # Fused conv+GDN kernel: both state regions stream directly
