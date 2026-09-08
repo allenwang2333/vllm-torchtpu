@@ -83,17 +83,20 @@ run_torchrun_multihost() {
   )
   local cmd="bash /root/torchtpu-vllm/${runner} ${runner_args}"
 
+  local worker_results="torchrun_results_${BUILDKITE_BUILD_NUMBER:-$$}"
   local worker_idx=0
   for ip in "${WORKER_IPS_ARRAY[@]}"; do
     worker_idx=$((worker_idx + 1))
     echo "--- Starting torchrun node ${worker_idx} on ${ip}"
-    ssh_retry "${SSH_USER}@${ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home"
+    # Per-build results dir on the worker (files inside are root-owned, so a
+    # fresh name per build instead of rm), mounted at the head's path.
+    ssh_retry "${SSH_USER}@${ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home ~/${worker_results}"
     base64 < "${RUN_CLUSTER_MP}" > /tmp/run_cluster_mp.b64
     ssh_retry "${SSH_USER}@${ip}" "base64 -d > ~/multihost/run_cluster_mp.sh" < /tmp/run_cluster_mp.b64
     # shellcheck disable=SC2029
     (
       ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" \
-        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster_mp.sh '${IMAGE_TAG}' \"\$HOME/hf_home\" '${cmd}' ${CONTAINER_ENV_COMMON[*]} ${mesh_env[*]} -e NODE_RANK=${worker_idx}" \
+        "docker rm -f node >/dev/null 2>&1 || true; bash ~/multihost/run_cluster_mp.sh '${IMAGE_TAG}' \"\$HOME/hf_home\" '${cmd}' ${CONTAINER_ENV_COMMON[*]} ${mesh_env[*]} -v \$HOME/${worker_results}:/perf_eval_results -e NODE_RANK=${worker_idx}" \
         > "perf_eval_results/torchrun_node${worker_idx}.log" 2>&1
       echo "torchrun node ${worker_idx} exited $?"
     ) &
@@ -107,6 +110,12 @@ run_torchrun_multihost() {
   set -e
   echo "--- head done (exit ${EXIT_CODE}); waiting for worker nodes"
   wait
+  echo "--- gathering worker results into perf_eval_results/"
+  for ip in "${WORKER_IPS_ARRAY[@]}"; do
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "cd ~/${worker_results} && tar cf - ." \
+      | tar xf - -C perf_eval_results/ || echo "no results gathered from ${ip}"
+  done
   cp "${MULTIHOST_RUN_LOG}" perf_eval_results/torchrun_node0.log 2>/dev/null || true
   return "${EXIT_CODE}"
 }

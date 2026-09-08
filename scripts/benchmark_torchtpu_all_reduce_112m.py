@@ -2,6 +2,7 @@
 """Self-contained TorchTPU benchmark for a 112-MiB TP32 all-reduce.
 The default local tensor is BF16 ``[8192, 7168]``:
     8192 * 7168 * 2 = 117,440,512 bytes = 112 MiB
+Every rank writes an XPlane trace under --profile-dir/rank_<rank>.
 The timed interval contains a compiled clone, all-reduce, trivial consumer,
 and an explicit TPU synchronization. Use the optional XPlane trace to isolate
 the physical collective kernel from those API-boundary costs.
@@ -296,39 +297,35 @@ def main() -> None:
                   f"dtype={args.dtype} " + json.dumps(verify), flush=True)
 
         if args.profile_dir is not None:
-            # Every peer must execute the profiled collective. Rank 0 alone
-            # records a trace; the final tiny collective keeps peers alive
-            # while rank 0 serializes it.
-            if rank == 0:
-                import torch.profiler
-                from torch_tpu._internal.profiler import TpuProfilerConfig
+            # Every rank records its own trace (profile_dir/rank_<rank>); the
+            # final tiny collective keeps all peers alive until every rank has
+            # serialized its trace.
+            import torch.profiler
+            from torch_tpu._internal.profiler import TpuProfilerConfig
 
-                rank_dir = args.profile_dir / "rank_0"
-                rank_dir.mkdir(parents=True, exist_ok=True)
-                handler = torch.profiler.tensorboard_trace_handler(
-                    str(rank_dir), use_gzip=True)
-                config = TpuProfilerConfig(
-                    run_dir=str(rank_dir),
-                    host_tracer_level=2,
-                    device_tracer_level=1,
-                    python_tracer_level=1,
-                    experimental_options={
-                        "tpu_trace_mode": "TRACE_COMPUTE",
-                        "tpu_num_sparse_cores_to_trace": 1,
-                        "tpu_num_sparse_core_tiles_to_trace": 1,
-                    },
-                )
-                with torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.PrivateUse1,
-                        ],
-                        on_trace_ready=handler,
-                        experimental_config=config,
-                ):
-                    output = compiled(source)
-                    synchronize(output)
-            else:
+            rank_dir = args.profile_dir / f"rank_{rank}"
+            rank_dir.mkdir(parents=True, exist_ok=True)
+            handler = torch.profiler.tensorboard_trace_handler(
+                str(rank_dir), use_gzip=True)
+            config = TpuProfilerConfig(
+                run_dir=str(rank_dir),
+                host_tracer_level=2,
+                device_tracer_level=1,
+                python_tracer_level=1,
+                experimental_options={
+                    "tpu_trace_mode": "TRACE_COMPUTE",
+                    "tpu_num_sparse_cores_to_trace": 1,
+                    "tpu_num_sparse_core_tiles_to_trace": 1,
+                },
+            )
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.PrivateUse1,
+                ],
+                on_trace_ready=handler,
+                experimental_config=config,
+            ):
                 output = compiled(source)
                 synchronize(output)
 
