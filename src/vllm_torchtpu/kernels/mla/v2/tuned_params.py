@@ -1435,14 +1435,24 @@ _K3_PAGE16_DEVICE_TILES = (
     ("float8_e4m3fn", "batched_decode", 1, 8, 1, 3, 4),
     ("float8_e4m3fn", "batched_decode", 2, 8, 1, 8, 4),
     ("float8_e4m3fn", "batched_decode", 8, 8, 1, 8, 4),
-    ("float8_e4m3fn", "batched_decode", 16, 32, 1, 16, 2),
-    ("float8_e4m3fn", "batched_decode", 32, 32, 1, 16, 1),
     ("float8_e4m3fn", "mixed", 8, 8, 16, 2, 2),
     ("float8_e4m3fn", "mixed", 16, 8, 8, 4, 1),
     ("float8_e4m3fn", "mixed", 32, 8, 16, 4, 1),
     ("float8_e4m3fn", "mixed", 48, 8, 16, 4, 1),
-    ("float8_e4m3fn", "mixed", 96, 32, 16, 4, 1),
-    ("float8_e4m3fn", "mixed", 192, 32, 8, 4, 1),
+    # FP8 retune: TP32 local shapes, metadata capacity 32, KV context 1000.
+    # Three device captures of 15 calls; correctness at 128/512/1000/4096.
+    ("float8_e4m3fn", "batched_decode", 1, 32, 1, 16, 1),
+    ("float8_e4m3fn", "batched_decode", 2, 32, 1, 16, 1),
+    ("float8_e4m3fn", "batched_decode", 4, 32, 1, 16, 1),
+    ("float8_e4m3fn", "batched_decode", 8, 32, 1, 16, 2),
+    ("float8_e4m3fn", "batched_decode", 16, 32, 1, 16, 2),
+    ("float8_e4m3fn", "batched_decode", 32, 32, 1, 16, 2),
+    ("float8_e4m3fn", "mixed", 8, 32, 16, 16, 1),
+    ("float8_e4m3fn", "mixed", 16, 32, 16, 16, 1),
+    ("float8_e4m3fn", "mixed", 32, 32, 16, 16, 1),
+    ("float8_e4m3fn", "mixed", 48, 32, 16, 16, 1),
+    ("float8_e4m3fn", "mixed", 96, 32, 16, 16, 1),
+    ("float8_e4m3fn", "mixed", 192, 32, 16, 16, 1),
 )
 for _dtype, _case, _tokens, _seqs, _bq, _pages, _split in _K3_PAGE16_DEVICE_TILES:
     _packing = 2 if _dtype == "bfloat16" else 4
