@@ -16,8 +16,10 @@
 
 For each N in --conc-list, fire N identical chat requests at once, wait for
 all of them, and classify every reply: ok (the expected count-up is present),
-wrong (complete but not the expected text), garbage (CJK / HTML entities /
-word repeats in an English answer), empty, or error (HTTP / transport).
+corrupt (CJK / HTML entities / a token repeated over and over / non-ASCII
+soup: what a broken KV or state looks like), offtask (coherent text that does
+not count, i.e. the model ignored the task: a quality issue, not corruption),
+empty, or error (HTTP / transport). Only corrupt, empty and error fail the run.
 While the burst runs, /metrics is sampled so the peak number of running
 requests is known. One line per N on stdout; a JSON summary in --out.
 
@@ -43,23 +45,31 @@ PROMPT = ("Count from 1 to 300, one number per line, nothing else. "
           "After 300 write the single word DONE.")
 # Filler to make the prompt long (more KV pages per sequence). Plain prose
 # that gives the model nothing to do; --prompt-pad-words copies of it.
-FILLER = ("The archive room held ledgers from every season, each page dated and "
-          "signed, and the clerk read them in order without comment. ")
-GARBAGE_RE = re.compile(r"[一-鿿぀-ヿ]|&nbsp|<span|(\b\w+\b)(?:\s+\1\b){3,}")
+FILLER = (
+    "The archive room held ledgers from every season, each page dated and "
+    "signed, and the clerk read them in order without comment. ")
+GARBAGE_RE = re.compile(r"[一-鿿぀-ヿ]|&nbsp|<span")
+# The same short token six or more times in a row, with or without spaces
+# (".disk.disk.disk", "кал кал кал").
+REPEAT_RE = re.compile(r"(\S{2,12})(?:\s*\1){5,}")
 NUMBERS_RE = re.compile(r"\b(\d{1,3})\b")
+WORD_RE = re.compile(r"[A-Za-z']+")
 
 
 def classify(text: str) -> str:
     if not text or not text.strip():
         return "empty"
-    if GARBAGE_RE.search(text):
-        return "garbage"
+    if GARBAGE_RE.search(text) or REPEAT_RE.search(text):
+        return "corrupt"
     nums = [int(x) for x in NUMBERS_RE.findall(text)]
     # Sane reply: the first 40 numbers count up (the tail may be cut by
-    # max_tokens). Anything else is a wrong or corrupted reply.
+    # max_tokens).
     if nums[:40] == list(range(1, 41)):
         return "ok"
-    return "wrong"
+    non_ascii = sum(ord(ch) > 127 for ch in text) / len(text)
+    if non_ascii > 0.05 or len(WORD_RE.findall(text)) < 20:
+        return "corrupt"
+    return "offtask"
 
 
 def build_prompt(idx: int, pad_words: int) -> str:
@@ -75,26 +85,49 @@ def build_prompt(idx: int, pad_words: int) -> str:
 async def one_request(session, url, model, max_tokens, idx, pad_words):
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": build_prompt(idx, pad_words)}],
+        "messages": [{
+            "role": "user",
+            "content": build_prompt(idx, pad_words)
+        }],
         "max_tokens": max_tokens,
         "temperature": 0,
-        "chat_template_kwargs": {"thinking": False},
+        "chat_template_kwargs": {
+            "thinking": False
+        },
     }
     t0 = time.perf_counter()
     try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=1800)) as r:
+        async with session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=1800)) as r:
             body = await r.json()
             if r.status != 200:
-                return {"idx": idx, "cls": "error", "detail": f"HTTP {r.status}: {json.dumps(body)[:200]}", "s": time.perf_counter() - t0}
+                return {
+                    "idx": idx,
+                    "cls": "error",
+                    "detail": f"HTTP {r.status}: {json.dumps(body)[:200]}",
+                    "s": time.perf_counter() - t0
+                }
             msg = body["choices"][0]["message"]
             text = msg.get("content") or ""
             usage = body.get("usage") or {}
             cls = classify(text)
             # keep the whole reply when it is not ok, so the corruption point is visible
-            return {"idx": idx, "cls": cls, "text": text if cls != "ok" else text[:300], "finish": body["choices"][0].get("finish_reason"),
-                    "completion_tokens": usage.get("completion_tokens"), "s": time.perf_counter() - t0}
+            return {
+                "idx": idx,
+                "cls": cls,
+                "text": text if cls != "ok" else text[:300],
+                "finish": body["choices"][0].get("finish_reason"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "s": time.perf_counter() - t0
+            }
     except Exception as e:  # noqa: BLE001 - any transport failure is a data point
-        return {"idx": idx, "cls": "error", "detail": f"{type(e).__name__}: {e}"[:200], "s": time.perf_counter() - t0}
+        return {
+            "idx": idx,
+            "cls": "error",
+            "detail": f"{type(e).__name__}: {e}"[:200],
+            "s": time.perf_counter() - t0
+        }
 
 
 async def sample_metrics(session, metrics_url, stop, out):
@@ -102,13 +135,18 @@ async def sample_metrics(session, metrics_url, stop, out):
     peak_waiting = 0
     while not stop.is_set():
         try:
-            async with session.get(metrics_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            async with session.get(
+                    metrics_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                 txt = await r.text()
             for line in txt.splitlines():
                 if line.startswith("vllm:num_requests_running"):
-                    peak_running = max(peak_running, int(float(line.rsplit(" ", 1)[1])))
-                elif line.startswith("vllm:num_requests_waiting") and not line.startswith("vllm:num_requests_waiting_by"):
-                    peak_waiting = max(peak_waiting, int(float(line.rsplit(" ", 1)[1])))
+                    peak_running = max(peak_running,
+                                       int(float(line.rsplit(" ", 1)[1])))
+                elif line.startswith(
+                        "vllm:num_requests_waiting"
+                ) and not line.startswith("vllm:num_requests_waiting_by"):
+                    peak_waiting = max(peak_waiting,
+                                       int(float(line.rsplit(" ", 1)[1])))
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(0.5)
@@ -125,56 +163,81 @@ async def probe(base_url, model, n, max_tokens, pad_words):
     # session, which silently caps the batch the server can see; lift it.
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
-        sampler = asyncio.create_task(sample_metrics(session, metrics_url, stop, peaks))
+        sampler = asyncio.create_task(
+            sample_metrics(session, metrics_url, stop, peaks))
         t0 = time.perf_counter()
-        results = await asyncio.gather(*(one_request(session, url, model, max_tokens, i, pad_words) for i in range(n)))
+        results = await asyncio.gather(
+            *(one_request(session, url, model, max_tokens, i, pad_words)
+              for i in range(n)))
         wall = time.perf_counter() - t0
         stop.set()
         await sampler
     counts = {}
     for r in results:
         counts[r["cls"]] = counts.get(r["cls"], 0) + 1
-    return {"conc": n, "wall_s": round(wall, 1), "counts": counts, **peaks, "samples": results}
+    return {
+        "conc": n,
+        "wall_s": round(wall, 1),
+        "counts": counts,
+        **peaks, "samples": results
+    }
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
     ap.add_argument("--model", required=True)
     ap.add_argument("--conc-list", default="128,160,192,256")
     ap.add_argument("--max-tokens", type=int, default=1500)
-    ap.add_argument("--prompt-pad-words", type=int, default=0,
-                    help="filler words prepended to every prompt (~1.3 tokens each)")
+    ap.add_argument(
+        "--prompt-pad-words",
+        type=int,
+        default=0,
+        help="filler words prepended to every prompt (~1.3 tokens each)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     summary = []
     rc = 0
     for n in [int(x) for x in a.conc_list.split(",") if x]:
         try:
-            res = asyncio.run(probe(a.base_url, a.model, n, a.max_tokens, a.prompt_pad_words))
+            res = asyncio.run(
+                probe(a.base_url, a.model, n, a.max_tokens,
+                      a.prompt_pad_words))
         except Exception as e:  # noqa: BLE001
-            print(f"[conc-probe] N={n}: probe itself failed: {type(e).__name__}: {e}", flush=True)
+            print(
+                f"[conc-probe] N={n}: probe itself failed: {type(e).__name__}: {e}",
+                flush=True)
             rc = 1
             break
         c = res["counts"]
-        bad = sum(v for k, v in c.items() if k != "ok")
+        bad = sum(v for k, v in c.items()
+                  if k in ("corrupt", "empty", "error"))
         reached = "yes" if (res.get("peak_running") or 0) >= 0.9 * n else "NO"
-        print(f"[conc-probe] N={n} pad_words={a.prompt_pad_words}: batch_reached={reached} wall={res['wall_s']}s peak_running={res.get('peak_running')} "
-              f"peak_waiting={res.get('peak_waiting')} ok={c.get('ok',0)} wrong={c.get('wrong',0)} "
-              f"garbage={c.get('garbage',0)} empty={c.get('empty',0)} error={c.get('error',0)}", flush=True)
+        print(
+            f"[conc-probe] N={n} pad_words={a.prompt_pad_words}: batch_reached={reached} wall={res['wall_s']}s peak_running={res.get('peak_running')} "
+            f"peak_waiting={res.get('peak_waiting')} ok={c.get('ok',0)} corrupt={c.get('corrupt',0)} "
+            f"empty={c.get('empty',0)} error={c.get('error',0)} offtask={c.get('offtask',0)}",
+            flush=True)
         for s in res["samples"]:
-            if s["cls"] in ("garbage", "wrong", "empty"):
-                print(f"[conc-probe]   example {s['cls']} (finish={s.get('finish')}, tokens={s.get('completion_tokens')}): {s.get('text','')[:160]!r}", flush=True)
+            if s["cls"] in ("corrupt", "offtask", "empty"):
+                print(
+                    f"[conc-probe]   example {s['cls']} (finish={s.get('finish')}, tokens={s.get('completion_tokens')}): {s.get('text','')[:160]!r}",
+                    flush=True)
                 break
         for s in res["samples"]:
             if s["cls"] == "error":
-                print(f"[conc-probe]   example error: {s['detail']}", flush=True)
+                print(f"[conc-probe]   example error: {s['detail']}",
+                      flush=True)
                 break
         summary.append(res)
         if bad:
             rc = 1
         if c.get("error", 0) == n:
-            print("[conc-probe] every request failed; server is probably dead, stopping", flush=True)
+            print(
+                "[conc-probe] every request failed; server is probably dead, stopping",
+                flush=True)
             break
     if a.out:
         with open(a.out, "w") as f:
