@@ -7,11 +7,11 @@
 #
 #   k3_conc_probe.sh --results-dir DIR [--config kimi-k3-tp32-ep-concsweep]
 #       [--conc-list 128,160,192,256] [--ctx 16384] [--max-num-seqs 256]
-#       [--max-tokens 1500] [--env KEY=VAL]... [--extra-serve-args "..."]
+#       [--max-tokens 1500] [--prompt-pad-words 0] [--env KEY=VAL]... [--extra-serve-args "..."]
 #       [--gcs-root gs://bucket/prefix] [--port 8000]
 set -uo pipefail
 CONFIG_NAME="kimi-k3-tp32-ep-concsweep"
-RESULTS_DIR=""; CONC_LIST="128,160,192,256"; MAX_TOKENS=1500; PORT="${PORT:-8000}"; GCS_ARG=""
+RESULTS_DIR=""; CONC_LIST="128,160,192,256"; MAX_TOKENS=1500; PAD_WORDS=0; PORT="${PORT:-8000}"; GCS_ARG=""
 export K3_SWEEP_CTX="${K3_SWEEP_CTX:-16384}" K3_SWEEP_MAX_NUM_SEQS="${K3_SWEEP_MAX_NUM_SEQS:-256}"
 ENVS=()
 while [[ $# -gt 0 ]]; do
@@ -22,6 +22,7 @@ while [[ $# -gt 0 ]]; do
         --ctx) export K3_SWEEP_CTX="$2"; shift 2 ;;
         --max-num-seqs) export K3_SWEEP_MAX_NUM_SEQS="$2"; shift 2 ;;
         --max-tokens) MAX_TOKENS="$2"; shift 2 ;;
+        --prompt-pad-words) PAD_WORDS="$2"; shift 2 ;;
         --env) ENVS+=("$2"); shift 2 ;;
         --extra-serve-args) export K3_EXTRA_SERVE_ARGS="$2"; shift 2 ;;
         --gcs-root) GCS_ARG="$2"; shift 2 ;;
@@ -55,7 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-log "===== boot: config=$CONFIG_NAME concs=$CONC_LIST ctx=$K3_SWEEP_CTX max_num_seqs=$K3_SWEEP_MAX_NUM_SEQS max_tokens=$MAX_TOKENS env=[${ENVS[*]:-}] extra=[${K3_EXTRA_SERVE_ARGS:-}] ====="
+log "===== boot: config=$CONFIG_NAME concs=$CONC_LIST ctx=$K3_SWEEP_CTX max_num_seqs=$K3_SWEEP_MAX_NUM_SEQS max_tokens=$MAX_TOKENS pad_words=$PAD_WORDS env=[${ENVS[*]:-}] extra=[${K3_EXTRA_SERVE_ARGS:-}] ====="
 k3_boot_server "$CONFIG_NAME" || exit 1
 MODEL=$(k3_config_json_get model)
 save_now "$RESULTS_DIR/config.json"
@@ -68,7 +69,7 @@ for n in "${CONCS[@]}"; do
     pre0=$(k3_engine_counters)
     log_lines0=$(wc -l < "$RESULTS_DIR/server.log" 2>/dev/null || echo 0)
     python3 "$SCRIPT_DIR/conc_probe.py" --base-url "http://127.0.0.1:$PORT" --model "$MODEL" --conc-list "$n" \
-        --max-tokens "$MAX_TOKENS" --out "$RESULTS_DIR/probe_n${n}.json" 2>&1 | tee "$RESULTS_DIR/probe_n${n}.log"
+        --max-tokens "$MAX_TOKENS" --prompt-pad-words "$PAD_WORDS" --out "$RESULTS_DIR/probe_n${n}.json" 2>&1 | tee "$RESULTS_DIR/probe_n${n}.log"
     rc=${PIPESTATUS[0]}
     [ "$rc" -ne 0 ] && FAIL=1
     # Second reading of the peak batch, from the engine's own 10 s stats lines
