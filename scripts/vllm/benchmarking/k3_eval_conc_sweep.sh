@@ -72,6 +72,7 @@ SUMMARY="$RESULTS_DIR/summary.md"
 k3_set_gcs_root "$GCS_ARG"
 
 SUMMARY_PRINTED=0
+# shellcheck disable=SC2317  # run by the EXIT trap
 cleanup() {
     log "cleanup"
     bash "$SCRIPT_DIR/cleanup_server.sh"
