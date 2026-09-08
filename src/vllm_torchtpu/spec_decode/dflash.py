@@ -189,8 +189,7 @@ class DFlashProposer:
                 attn_impl = attn_obj.impl
                 if isinstance(attn_impl, PallasAttentionBackendImpl):
                     attn_impl.layer_idx = i
-                    use_causal = layer_causal_list[i]
-                    attn_impl.use_causal_mask = use_causal
+                    attn_impl.use_causal_mask = layer_causal_list[i]
                     attn_impl.initialize_kernel(attn_obj)
 
     def _load_draft_model(self) -> None:
@@ -574,19 +573,8 @@ class DFlashProposer:
                         sync=True,
                     )
 
-                # The draft model only runs speculation on decode steps, so it never processes
-                # more tokens than the max batch size * speculation block size.
-                # It also never receives less than one complete query block.
-                # Compiling such a bucket would create zero requests in
-                # _dflash_forward_and_sample and eventually hand an empty
-                # leading dimension to the TP logits all-gather.  Keep the
-                # smaller bucket for the context-KV update above: that path
-                # legitimately processes short prompt/verify chunks.
-                if num_tokens < block_size or num_tokens > max_draft_tokens:
-                    if num_tokens < block_size:
-                        logger.info(
-                            "Skipping DFlash draft-forward bucket %d: "
-                            "query block size is %d.", num_tokens, block_size)
+                # Context-KV updates allow short chunks; draft forward needs a full block.
+                if not block_size <= num_tokens <= max_draft_tokens:
                     continue
 
                 self._dummy_draft_forward(num_tokens=num_tokens,
