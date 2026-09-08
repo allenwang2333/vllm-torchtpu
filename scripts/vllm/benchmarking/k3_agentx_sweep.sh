@@ -40,7 +40,7 @@ CONC_LIST="1,2,4,8"
 MAX_MODEL_LEN_ARG=131072
 DURATION=1800
 FAST=1
-IX_REF="9acf24caaf31d9ecc5067742d6d1415967b308ed"   # InferenceX main @ 2026-09-07 (aiperf 754356e)
+IX_REF="main"          # InferenceX git ref; pass --ix-ref <commit> to pin a run (e.g. 9acf24c = 2026-09-07, aiperf 754356e)
 APC=0
 KV_DTYPE="fp8"
 SPEC="none"            # none | dspark  (dspark needs PR #702 in the branch)
