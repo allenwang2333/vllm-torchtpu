@@ -30,8 +30,11 @@ def _config(**kwargs):
         data_parallel_size=kwargs.pop("dp", 1),
         nnodes=kwargs.pop("nnodes", 1),
         pipeline_parallel_size=kwargs.pop("pp", 1),
+        enable_expert_parallel=kwargs.pop("ep", False),
+        enable_eplb=kwargs.pop("eplb", False),
     )
-    return SimpleNamespace(parallel_config=parallel)
+    model = SimpleNamespace(is_moe=kwargs.pop("moe", False))
+    return SimpleNamespace(parallel_config=parallel, model_config=model)
 
 
 # --- resolve_pcp_topology_order: not applicable -> None --------------------
@@ -39,11 +42,6 @@ def _config(**kwargs):
 
 def test_no_order_when_pcp_is_disabled():
     assert order_mod.resolve_pcp_topology_order(_config(pcp=1)) is None
-
-
-def test_no_order_when_multiple_nodes():
-    """A ring crossing hosts needs multi-slice ordering over DCN."""
-    assert order_mod.resolve_pcp_topology_order(_config(nnodes=2)) is None
 
 
 # --- resolve_pcp_topology_order: faults raise ------------------------------
@@ -132,6 +130,105 @@ def test_matches_the_order_measured_on_hardware(monkeypatch):
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
     assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
+
+
+def test_multihost_matches_custom_op_runtime_partition_order(monkeypatch):
+    """PCP8 TP2 mapping measured on a two-host TPU7x-16 slice."""
+    rank_to_device_id = {
+        0: 0,
+        1: 1,
+        2: 4,
+        3: 5,
+        4: 6,
+        5: 7,
+        6: 2,
+        7: 3,
+        8: 8,
+        9: 9,
+        10: 12,
+        11: 13,
+        12: 14,
+        13: 15,
+        14: 10,
+        15: 11,
+    }
+    monkeypatch.setattr(order_mod, "_collect_world_rank_to_device_id",
+                        lambda: rank_to_device_id)
+
+    got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=2, nnodes=2))
+
+    assert got == {
+        "pcp": [
+            [0, 6, 2, 4, 8, 14, 10, 12],
+            [1, 7, 3, 5, 9, 15, 11, 13],
+        ],
+        "tp": [
+            [0, 1],
+            [6, 7],
+            [2, 3],
+            [4, 5],
+            [8, 9],
+            [14, 15],
+            [10, 11],
+            [12, 13],
+        ],
+    }
+
+
+def test_expert_groups_follow_flattened_pcp_tp_order(monkeypatch):
+    rank_to_device_id = {
+        0: 0,
+        1: 1,
+        2: 4,
+        3: 5,
+        4: 6,
+        5: 7,
+        6: 2,
+        7: 3,
+    }
+    monkeypatch.setattr(order_mod, "_collect_world_rank_to_device_id",
+                        lambda: rank_to_device_id)
+
+    got = order_mod.resolve_pcp_topology_order(
+        _config(pcp=4, tp=2, nnodes=2, moe=True, ep=True, eplb=True))
+
+    flat = [0, 1, 6, 7, 2, 3, 4, 5]
+    assert got["ep"] == [flat]
+    assert got["eplb"] == [flat]
+    pcp_rank = {
+        rank: index
+        for lane in got["pcp"]
+        for index, rank in enumerate(lane)
+    }
+    tp_rank = {
+        rank: index
+        for lane in got["tp"]
+        for index, rank in enumerate(lane)
+    }
+    assert [pcp_rank[rank] * 2 + tp_rank[rank]
+            for rank in flat] == list(range(8))
+
+
+@pytest.mark.parametrize(
+    "mapping, match",
+    [
+        ({
+            rank: rank
+            for rank in range(15)
+        }, "missing_ranks"),
+        ({
+            rank: rank // 2
+            for rank in range(16)
+        }, "duplicate global device"),
+    ],
+)
+def test_multihost_rejects_invalid_rank_to_device_mapping(
+        monkeypatch, mapping, match):
+    monkeypatch.setattr(order_mod, "_collect_world_rank_to_device_id",
+                        lambda: mapping)
+
+    with pytest.raises(RuntimeError, match=match):
+        order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=2, nnodes=2))
 
 
 # --- pcp_topology_order ----------------------------------------------------
@@ -323,13 +420,14 @@ def test_context_manager_replaces_both_axes():
 # --- verify_pcp_topology_order ---------------------------------------------
 
 
-def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None):
+def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None, ep=None, eplb=None):
     """Point the verifier at synthetic groups without a live torch world."""
     import torch.distributed as dist
     from vllm.distributed import parallel_state
 
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
-    for name, ranks in (("get_pcp_group", pcp), ("get_tp_group", tp)):
+    for name, ranks in (("get_pcp_group", pcp), ("get_tp_group", tp),
+                        ("get_ep_group", ep), ("get_eplb_group", eplb)):
         monkeypatch.setattr(parallel_state,
                             name,
                             lambda ranks=ranks: SimpleNamespace(ranks=ranks),
@@ -357,6 +455,16 @@ def test_verify_accepts_the_order_it_asked_for(monkeypatch):
     order_mod.verify_pcp_topology_order({
         "pcp": [[0, 1, 6, 7, 4, 5, 2, 3]],
         "tp": [[r] for r in range(8)],
+    })
+
+
+def test_verify_accepts_aligned_expert_groups(monkeypatch):
+    flat = [0, 1, 6, 7, 2, 3, 4, 5]
+    _patch_groups(monkeypatch, rank=6, ep=flat, eplb=flat)
+
+    order_mod.verify_pcp_topology_order({
+        "ep": [flat],
+        "eplb": [flat],
     })
 
 
@@ -391,7 +499,7 @@ def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
     _patch_groups(monkeypatch, rank=0, pcp=[0, 1])
 
     with pytest.raises(RuntimeError, match="No group accessor"):
-        order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})
+        order_mod.verify_pcp_topology_order({"unknown": [[0, 1]]})
 
 
 @pytest.mark.parametrize("field", [

@@ -14,10 +14,11 @@ logical label and a group may span hosts.
 
 Why this runs after startup rather than before it: choosing chips requires
 knowing which PCI index yields which coordinates, and that is only observable
-by opening a chip -- which is the choice itself. ``topology_aware_mesh`` needs
-open chips and an initialised process group, so it can only answer once
-placement is already fixed. Reordering data is the one lever still available
-at that point.
+by opening a chip -- which is the choice itself. On one host,
+``topology_aware_mesh`` needs open chips and an initialised process group. On
+multiple hosts, every worker must first report the global device id it opened.
+Both answers are therefore available only once placement is fixed. Reordering
+the logical groups is the one lever still available at that point.
 
 Both the PCP and TP groups come from the same mesh, and they replace vLLM's
 arithmetic layout rather than being reconciled with it. ``mesh[d, :, t]`` is a
@@ -29,9 +30,11 @@ two differ TP partners land at different ring positions -- holding different
 sequence chunks while the TP all-reduce combines partials computed over
 different tokens. Taking both axes from one mesh makes that unrepresentable.
 
-Only ``tp``, ``pcp`` and (degenerately) ``dp``/``pp`` exist at the supported
-scope, and at ``dp == 1, pp == 1`` the DP and PP groups are singletons and the
-EP group is the whole world, so no other group constrains this layout.
+At the supported ``dp == 1, pp == 1`` scope, DP and PP groups are singletons.
+For an MoE model using expert parallelism, vLLM derives ``ep_rank`` by
+flattening ``(pcp_rank, tp_rank)``. The EP group (and EPLB group when enabled)
+must therefore use the same flattened mesh order as PCP and TP; otherwise
+expert ownership and the communication group's rank disagree.
 
 """
 
@@ -46,12 +49,60 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _collect_world_rank_to_device_id() -> dict[int, int]:
+    """Collect the physical TPU device selected by every world rank."""
+    from vllm.distributed.parallel_state import get_world_group
+
+    from vllm_torchtpu.distributed.mesh_utils import (
+        _collect_rank_to_device_id, _get_current_global_rank,
+        _get_tpu_global_device_id)
+
+    world_group = get_world_group()
+    return _collect_rank_to_device_id(world_group, _get_current_global_rank(),
+                                      _get_tpu_global_device_id())
+
+
+def _multihost_runtime_rank_mesh(
+        mesh_shape: tuple[int, int, int]) -> numpy.ndarray:
+    """Return world ranks in TorchTPU custom-op partition order.
+
+    A multi-host Mosaic custom op assigns its flattened partitions in
+    increasing global-device-id order.  vLLM assigns ``(pcp, tp)`` coordinates
+    from world-rank arithmetic, while process-to-device binding is not required
+    to preserve that order.  Build the logical rank mesh from the observed
+    binding so vLLM's coordinates describe the partitions the custom op will
+    actually execute.
+    """
+    expected_world_size = int(numpy.prod(mesh_shape))
+    expected_ranks = set(range(expected_world_size))
+    rank_to_device_id = _collect_world_rank_to_device_id()
+    actual_ranks = set(rank_to_device_id)
+    if actual_ranks != expected_ranks:
+        missing = sorted(expected_ranks - actual_ranks)
+        extra = sorted(actual_ranks - expected_ranks)
+        raise RuntimeError(
+            "Multi-host PCP device mapping does not cover the model-parallel "
+            f"world exactly once: missing_ranks={missing}, "
+            f"extra_ranks={extra}, gathered={rank_to_device_id}.")
+
+    device_ids = list(rank_to_device_id.values())
+    if len(set(device_ids)) != expected_world_size:
+        raise RuntimeError(
+            "Multi-host PCP device mapping contains duplicate global device "
+            f"ids: gathered={rank_to_device_id}.")
+
+    ranks_in_runtime_order = sorted(expected_ranks,
+                                    key=rank_to_device_id.__getitem__)
+    return numpy.asarray(ranks_in_runtime_order).reshape(mesh_shape)
+
+
 def resolve_pcp_topology_order(
         vllm_config) -> dict[str, list[list[int]]] | None:
     """Groups to build for each axis, or ``None`` if PCP does not apply.
 
-    Returns ``{"pcp": rings, "tp": lanes}`` -- the ``group_ranks`` vLLM
-    should build for each ``group_name``, taken from the topology mesh.
+    Returns the ``group_ranks`` vLLM should build for each affected
+    ``group_name``, taken from one topology mesh. PCP and TP are always
+    present; EP and EPLB are included when expert parallelism uses them.
 
     ``None`` means only one thing: this configuration does not use topology
     ordering at all. Anything that goes *wrong* raises, because a silent
@@ -65,16 +116,7 @@ def resolve_pcp_topology_order(
     if pcp_size <= 1:
         return None
 
-    # Multi-host workers already have a global rank order spanning the slice.
-    # topology_aware_mesh can currently inspect only a single host, so retain
-    # that global order instead of trying to derive a partial mesh locally.
     nnodes = int(parallel_config.nnodes)
-    if nnodes > 1:
-        logger.info(
-            "Topology aware mesh not applied: nnodes=%d. Topology aware "
-            "mesh is currently only supported for single host", nnodes)
-        return None
-
     dp_size = int(parallel_config.data_parallel_size)
     tp_size = int(parallel_config.tensor_parallel_size)
     pp_size = int(parallel_config.pipeline_parallel_size)
@@ -109,20 +151,30 @@ def resolve_pcp_topology_order(
     # highest-bandwidth link, which on v7 is the intra-chip core axis.
     mesh_shape = (dp_size, pcp_size, tp_size)
 
-    import torch
-
-    from vllm_torchtpu import envs as tpu_envs
-    if not tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH:
+    if nnodes > 1:
+        mesh = _multihost_runtime_rank_mesh(mesh_shape)
         logger.info(
-            "Topology aware mesh not applied: TPU_PCP_TOPOLOGY_AWARE_MESH=0 "
-            "(device-order PCP/TP layout).")
-        return None
-    if not hasattr(torch.tpu, "topology_aware_mesh"):
-        raise RuntimeError(
-            "torch.tpu.topology_aware_mesh is not available in the installed "
-            "torch_tpu (needs >= 0.1.1.dev20260813160135); set "
-            "TPU_PCP_TOPOLOGY_AWARE_MESH=0 to use the device-order layout.")
-    mesh = torch.tpu.topology_aware_mesh(mesh_shape)
+            "Multi-host runtime mesh | nnodes=%d | rank_to_device order=%s",
+            nnodes,
+            numpy.asarray(mesh).reshape(-1).tolist(),
+        )
+    else:
+        import torch
+
+        from vllm_torchtpu import envs as tpu_envs
+        if not tpu_envs.TPU_PCP_TOPOLOGY_AWARE_MESH:
+            logger.info("Topology aware mesh not applied: "
+                        "TPU_PCP_TOPOLOGY_AWARE_MESH=0 "
+                        "(device-order PCP/TP layout).")
+            return None
+        if not hasattr(torch.tpu, "topology_aware_mesh"):
+            raise RuntimeError(
+                "torch.tpu.topology_aware_mesh is not available in the "
+                "installed torch_tpu (needs >= "
+                "0.1.1.dev20260813160135); set "
+                "TPU_PCP_TOPOLOGY_AWARE_MESH=0 to use the device-order "
+                "layout.")
+        mesh = torch.tpu.topology_aware_mesh(mesh_shape)
 
     # Keyed by vLLM group_name so the caller can look up the groups for the
     # axis it is building. A ring is mesh[d, :, t] -- reading down the pcp
@@ -134,6 +186,14 @@ def resolve_pcp_topology_order(
         "tp": [[int(r) for r in lane]
                for lane in numpy.asarray(mesh).reshape(-1, tp_size)],
     }
+    model_config = getattr(vllm_config, "model_config", None)
+    uses_ep = (bool(getattr(model_config, "is_moe", False)) and bool(
+        getattr(parallel_config, "enable_expert_parallel", False)))
+    if uses_ep:
+        flat_mesh = [int(r) for r in numpy.asarray(mesh).reshape(-1)]
+        group_ranks_by_name["ep"] = [flat_mesh]
+        if bool(getattr(parallel_config, "enable_eplb", False)):
+            group_ranks_by_name["eplb"] = [flat_mesh]
 
     # topology_aware_mesh promises a permutation of the global ranks. If it is
     # not one, some rank is missing or duplicated and the groups we build from
@@ -160,11 +220,10 @@ def pcp_topology_order(
 
     Patches ``init_model_parallel_group`` for the duration rather than
     permanently, so nothing is left installed for later callers to trip over.
-    Only the axes present in ``group_ranks_by_name`` are replaced -- today
-    ``pcp`` and ``tp``. Every other group, including ``dp``, ``pp`` and
-    ``ep``, goes through the original function untouched; at the supported
-    scope those are singletons or the whole world, so they cannot conflict
-    with this layout.
+    Only the axes present in ``group_ranks_by_name`` are replaced. PCP and TP
+    always come from the same mesh. MoE expert parallelism also supplies EP
+    and, when enabled, EPLB from that mesh's flattened order. Every other group
+    goes through the original function untouched.
 
     ``group_ranks_by_name`` is ``None`` only when topology aware mesh does
     not apply to this configuration. The patch is still installed in that
@@ -262,9 +321,15 @@ def verify_pcp_topology_order(
         return
 
     import torch.distributed as dist
-    from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
+    from vllm.distributed.parallel_state import (get_ep_group, get_eplb_group,
+                                                 get_pcp_group, get_tp_group)
 
-    getters = {"pcp": get_pcp_group, "tp": get_tp_group}
+    getters = {
+        "pcp": get_pcp_group,
+        "tp": get_tp_group,
+        "ep": get_ep_group,
+        "eplb": get_eplb_group,
+    }
     my_rank = int(dist.get_rank())
 
     for axis, wanted in group_ranks_by_name.items():
