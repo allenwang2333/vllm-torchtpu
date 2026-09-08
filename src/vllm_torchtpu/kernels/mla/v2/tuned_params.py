@@ -1339,26 +1339,6 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         num_queries_per_block=16,
         vmem_limit_bytes=62914560,
     ),
-    # Kimi-K3 mixed prefill on TPU v7x-8 with TP8, BF16, and 4K tokens.
-    TuningKey(
-        case="mixed",
-        max_num_tokens=4096,
-        actual_num_q_heads=12,
-        actual_lkv_dim=512,
-        actual_r_dim=64,
-        kv_dtype="bfloat16",
-        q_dtype="bfloat16",
-        page_size_per_kv_packing=128,
-        kv_packing=2,
-        max_num_seqs=8,
-        pages_per_seq=128,
-    ):
-    TunableParams(
-        q_split=1,
-        num_kv_pages_per_block=4,
-        num_queries_per_block=256,
-        vmem_limit_bytes=62914560,
-    ),
     # Kimi-K3 mixed prefill on TPU v7x with TP32, FP8 KV, 8K tokens,
     # and 16-token KV cache pages.
     TuningKey(
@@ -1416,22 +1396,10 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 # Kimi-K3 TP32, page-size 16, Block5 verify (six queries/request).
 # Three independent device captures per candidate, 15 calls/capture, KV
 # context 1000; correctness also checked at contexts 128 and 512.
-# Decode C4/C8 share token bucket 8. FP8 C1 keeps the baseline because
-# changing its decode batch size produced no meaningful device-time gain.
+# Capacity-8 decode C4/C8 share token bucket 8; C1 keeps its baseline.
 # Exact metadata capacities are intentional; do not reuse for other layouts.
 # Rows: KV dtype, path, token bucket, metadata capacity, BQ, KV pages, split.
 _K3_PAGE16_DEVICE_TILES = (
-    ("bfloat16", "batched_decode", 1, 8, 1, 3, 4),
-    ("bfloat16", "batched_decode", 2, 8, 1, 3, 1),
-    ("bfloat16", "batched_decode", 8, 8, 1, 16, 1),
-    ("bfloat16", "batched_decode", 16, 32, 1, 16, 2),
-    ("bfloat16", "batched_decode", 32, 32, 1, 16, 8),
-    ("bfloat16", "mixed", 8, 8, 16, 2, 2),
-    ("bfloat16", "mixed", 16, 8, 32, 2, 1),
-    ("bfloat16", "mixed", 32, 8, 16, 4, 1),
-    ("bfloat16", "mixed", 48, 8, 8, 4, 1),
-    ("bfloat16", "mixed", 96, 32, 16, 4, 1),
-    ("bfloat16", "mixed", 192, 32, 16, 4, 1),
     ("float8_e4m3fn", "batched_decode", 1, 8, 1, 3, 4),
     ("float8_e4m3fn", "batched_decode", 2, 8, 1, 8, 4),
     ("float8_e4m3fn", "batched_decode", 8, 8, 1, 8, 4),
@@ -1455,7 +1423,6 @@ _K3_PAGE16_DEVICE_TILES = (
     ("float8_e4m3fn", "mixed", 192, 32, 16, 16, 1),
 )
 for _dtype, _case, _tokens, _seqs, _bq, _pages, _split in _K3_PAGE16_DEVICE_TILES:
-    _packing = 2 if _dtype == "bfloat16" else 4
     tuned_params_mapping[TuningKey(
         case=_case,
         max_num_tokens=_tokens,
@@ -1464,8 +1431,8 @@ for _dtype, _case, _tokens, _seqs, _bq, _pages, _split in _K3_PAGE16_DEVICE_TILE
         actual_r_dim=64,
         kv_dtype=_dtype,
         q_dtype="bfloat16",
-        page_size_per_kv_packing=16 // _packing,
-        kv_packing=_packing,
+        page_size_per_kv_packing=4,
+        kv_packing=4,
         max_num_seqs=_seqs,
         pages_per_seq=2048,
     )] = TunableParams(
