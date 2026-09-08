@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 import jax
 import torch
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
