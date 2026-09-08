@@ -80,6 +80,18 @@ mkdir -p "${TMPDIR}" "${VLLM_CACHE_ROOT}" || exit 1
 # quant_algo=NVFP4, group_size=16), so vLLM detects it as modelopt_fp4 and
 # there is nothing to requantize the dtype of -- only the block to widen.
 export MOE_REQUANTIZE_BLOCK_SIZE=512
+# Take the EP MoE token movement off SparseCore. Under investigation, not a
+# settled default: at DP8/NVFP4 the warmup _dummy_run at num_tokens=512 halted
+# SparseCore with a UserFatal on 2 of 8 ranks (0x0x0_SC2, error type
+# UserFatal, reported against the HLO module
+# tt_jit_layernorm_L62C0_fused_add_rms_norm_mul -- but a fused module is named
+# for its root op's source line, and SparseCore does not run rms_norm, it runs
+# the MoE ragged gather + gather-reduce). USE_MOE_SPARSE_CORE=0 falls back to
+# the pre-#193 plain-JAX path, which envs.py documents as functionally
+# equivalent with valid-mask gating unchanged, so it is safe as a default and
+# tells us whether those kernels are the culprit. Revisit once the SparseCore
+# path boots this config.
+export USE_MOE_SPARSE_CORE=0
 export PJRT_DEVICE=TPU
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
@@ -193,6 +205,15 @@ KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"
 #   parser flags            carried over as the recipes set them. They only
 #                           shape how the chat response is split; the smoke
 #                           gates on token_ids, which is upstream of that.
+#   --enable-ep-weight-filter
+#                           the FP8 v7x-16 recipe passes it and this rig had
+#                           been missing it. It matters more here than there:
+#                           model_loader_patches.py hooks
+#                           RunaiModelStreamerLoader so that with the filter on
+#                           each rank streams only its local experts, and
+#                           without it all 8 ranks pulled the whole ~465 GB
+#                           from GCS and discarded what EP had not assigned
+#                           them.
 #   weight loading         both recipes pass
 #                           --safetensors-load-strategy=prefetch, which on 47
 #                           shards is the difference between a load that
@@ -237,6 +258,7 @@ serve() {
     --data-parallel-size="${DP_SIZE}" \
     --tensor-parallel-size="${TP_SIZE}" \
     --enable-expert-parallel \
+    --enable-ep-weight-filter \
     --max-model-len="${MAX_MODEL_LEN}" \
     --max-num-batched-tokens=1024 \
     --max-num-seqs=1 \
