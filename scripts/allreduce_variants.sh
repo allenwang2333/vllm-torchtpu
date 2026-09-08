@@ -158,6 +158,15 @@ want rs_ag_devid && run_variant rs_ag_devid 30241 "" --mode rs_ag --group-order 
 want rs_ag_topo && run_variant rs_ag_topo 30242 "" --mode rs_ag --topology-aware || true
 want ar_snake && run_variant ar_snake 30243 "" --group-order "explicit:$SNAKE_RANKS" || true
 
+# 18+. Does XLA's 3-D ("n-dimension") reduce-scatter strategy fire with padding
+#    allowed (--xla_tpu_enable_sparse_core_reduce_scatter_padding=true) and/or a
+#    scatter dimension divisible by 3 x 32 (8256 rows instead of 8192)?
+RS_PAD_FLAG="--xla_tpu_enable_sparse_core_reduce_scatter_padding=true"
+want rs_pad_flag && run_variant rs_pad_flag 30250 "$RS_PAD_FLAG" --mode rs_only || true
+want rs_8256 && run_variant rs_8256 30251 "" --mode rs_only --tokens 8256 || true
+want rs_8256_pad_flag && run_variant rs_8256_pad_flag 30252 "$RS_PAD_FLAG" --mode rs_only --tokens 8256 || true
+want rs_ag_8256_pad_flag && run_variant rs_ag_8256_pad_flag 30253 "$RS_PAD_FLAG" --mode rs_ag --tokens 8256 || true
+
 echo "[allreduce] node=$NODE_RANK all variants done"
 if [ "$NODE_RANK" = "0" ]; then
     echo "[allreduce] ===== SUMMARY (rank 0) ====="
