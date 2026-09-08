@@ -918,8 +918,6 @@ def test_moe_gmm_onehot_combine_skip_padded_tokens_zeroes_nan(monkeypatch):
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
 
 
-@pytest.mark.parametrize("num_tokens,topk", [(1, 4), (3, 2), (256, 8),
-                                             (257, 8)])
 def test_fused_permute_gmm_matches_materialised_path(monkeypatch):
     """The fused dispatch only changes how GMM1 reads its LHS.
 
