@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 
