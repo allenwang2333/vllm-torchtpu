@@ -243,7 +243,7 @@ def update_sparse_mla_kv_cache_dcp(
     why this needs no collective and no branch.
 
     Must be called from inside a `shard_map`; `dcp_rank` is this shard's index
-    along the DCP axis as traced data (see `pcp_rank_as_data`), so one compiled
+    along the DCP axis as traced data (see `cp_rank_as_data`), so one compiled
     program serves every rank.
 
     Args:
@@ -280,7 +280,7 @@ def update_sparse_mla_kv_cache_dcp(
             f"interleave_size={interleave_size} must divide "
             f"page_size={nope_spec.page_size}. Otherwise an interleave chunk "
             "straddles a page boundary and the local index a reader derives "
-            "from `pcp_global_to_local` stops agreeing with the (page, slot) "
+            "from `cp_global_to_local` stops agreeing with the (page, slot) "
             "written here.")
 
     num_tokens = kv_c_normed.shape[0]
