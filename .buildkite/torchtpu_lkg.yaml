@@ -1,0 +1,29 @@
+# ==============================================================================
+# Buildkite Automated Torch-TPU Holographic LKG Manifest
+# Automatically updated by .buildkite/pipeline_uprev_torchtpu.yml
+# ==============================================================================
+
+current_lkg:
+  status: "VERIFIED_PASS"
+  verified_at: "2026-08-27T12:43:57Z"
+  components:
+    torch_tpu: "0.1.1.dev20260813160135"
+    tpu_raiden_torch: "0.0.1.dev20260827124357"
+    torch: "2.13.0"
+    torchvision: "0.28.0"
+    libtpu: "0.0.44.1"
+  test_coverage_summary:
+    tpu_runner: PASS
+    speculative_decoding: PASS
+    multichip_collectives: PASS
+    disagg_pcp4_dp4: PASS
+    offline_inference_smoke: PASS
+
+# Rolling buffer of previous stable checkpoints for instant rollback
+stable_history:
+  - date: "2026-08-27"
+    torch_tpu: "0.1.1.dev20260813160135"
+    tpu_raiden_torch: "0.0.1.dev20260827124357"
+  - date: "2026-08-13"
+    torch_tpu: "0.1.1.dev20260813160135"
+    tpu_raiden_torch: "0.0.1.dev20260813160135"

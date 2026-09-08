@@ -82,7 +82,7 @@ steps:
               --max-num-batched-tokens 256 \
               --max-tokens 32
 
-  - label: ":white_check_mark: Record Torch-TPU LKG"
+  - label: ":white_check_mark: Record Torch-TPU Holographic LKG"
     key: "record_torchtpu_lkg"
     depends_on:
       - "uprev_test_tpu_runner"
@@ -93,11 +93,4 @@ steps:
     agents:
       queue: cpu_64_core
     commands:
-      - |
-        echo "--- All critical uprev tests passed!"
-        TORCH_TPU_VER=$$(buildkite-agent meta-data get "TORCH_TPU_VERSION" 2>/dev/null || echo "unknown")
-        echo "Verified Stable Torch-TPU Version: $${TORCH_TPU_VER}"
-        if [ "$${TORCH_TPU_VER}" != "unknown" ]; then
-          echo "$${TORCH_TPU_VER}" > .buildkite/torchtpu_lkg.version
-          buildkite-agent annotate ":white_check_mark: All critical tests passed! Verified stable LKG: **torch-tpu==$${TORCH_TPU_VER}**" --style "success" || true
-        fi
+      - bash .buildkite/scripts/record_torchtpu_lkg.sh
