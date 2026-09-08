@@ -51,7 +51,8 @@ _SCORE_KEYS = (
 
 # (column title, dotted path into the InferenceX aggregate JSON)
 AGENTX_COLUMNS = (
-    ("out tok/s per chip", "request_metrics.throughput.per_gpu.output_tput_tps"),
+    ("out tok/s per chip",
+     "request_metrics.throughput.per_gpu.output_tput_tps"),
     ("out tok/s total", "request_metrics.throughput.output.tokens_per_second"),
     ("requests ok", "num_requests_successful"),
     ("TTFT p50 s", "request_metrics.latency.ttft.p50"),
@@ -60,8 +61,7 @@ AGENTX_COLUMNS = (
     ("P90 intvty", "request_metrics.latency.intvty.p90"),
     ("P90 E2E-norm intvty", "request_metrics.latency.e2e_norm_intvty.p90"),
     ("e2el p50 s", "request_metrics.latency.e2el.p50"),
-    ("cache hit (theory)",
-     "request_metrics.cache.theoretical_cache_hit_rate"),
+    ("cache hit (theory)", "request_metrics.cache.theoretical_cache_hit_rate"),
     ("KV used", "server_metrics.kv_cache.gpu_usage_pct"),
 )
 
@@ -72,7 +72,8 @@ def dotted_get(d: Any, path: str) -> float | None:
         if not isinstance(d, dict) or key not in d:
             return None
         d = d[key]
-    return d if isinstance(d, (int, float)) and not isinstance(d, bool) else None
+    return d if isinstance(d,
+                           (int, float)) and not isinstance(d, bool) else None
 
 
 def newest_results_file(output_dir: str) -> str | None:
@@ -96,7 +97,8 @@ def lm_eval_score(output_dir: str, task: str) -> tuple[str, float, float]:
             stderr = r.get(key.replace("exact_match", "exact_match_stderr"),
                            float("nan"))
             return key, float(r[key]), float(stderr)
-    raise KeyError(f"no exact_match metric for {task!r} in {path}: {sorted(r)}")
+    raise KeyError(
+        f"no exact_match metric for {task!r} in {path}: {sorted(r)}")
 
 
 def question_limit(task: str, conc: int, gsm8k_limit: int,
@@ -127,8 +129,10 @@ def gsm8k_row(output_dir: str, conc: int) -> str:
 
 
 def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
-    lines = ["| conc | " + " | ".join(t for t, _ in AGENTX_COLUMNS) + " |",
-             "|" + "---|" * (len(AGENTX_COLUMNS) + 1)]
+    lines = [
+        "| conc | " + " | ".join(t for t, _ in AGENTX_COLUMNS) + " |",
+        "|" + "---|" * (len(AGENTX_COLUMNS) + 1)
+    ]
     for c in concs:
         path = os.path.join(results_dir, f"{base}_c{c}.json")
         timed_out = os.path.exists(
@@ -136,7 +140,8 @@ def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
         if not os.path.exists(path):
             why = "hard timeout, " if timed_out else ""
             lines.append(
-                f"| {c} | (no aggregate: {why}{os.path.basename(path)} missing) |")
+                f"| {c} | (no aggregate: {why}{os.path.basename(path)} missing) |"
+            )
             continue
         with open(path) as f:
             d = json.load(f)
@@ -149,8 +154,9 @@ def agentx_table(results_dir: str, base: str, concs: list[int]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("lm-eval-score")
     s.add_argument("--output-dir", required=True)
@@ -173,8 +179,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             metric, score, stderr = lm_eval_score(a.output_dir, a.task)
         except (OSError, KeyError, ValueError, json.JSONDecodeError) as e:
-            print(f"[k3-sweep-summary] ERROR: cannot score {a.task} from "
-                  f"{a.output_dir}: {e}", file=sys.stderr)
+            print(
+                f"[k3-sweep-summary] ERROR: cannot score {a.task} from "
+                f"{a.output_dir}: {e}",
+                file=sys.stderr)
             print("none nan nan")
             return 0
         print(f"{metric} {score} {stderr}")
