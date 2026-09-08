@@ -181,6 +181,10 @@ def estimate_vmem_bytes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
         rhs += 2 * pl.cdiv(tile_k, rhs_cfgs.quant_block_size) * tile_n * 4
     if rhs_cfgs.has_bias:
         rhs += 2 * tile_n * 4
+    if rhs_cfgs.should_dequantize_before_matmul:
+        # inner_kernel hoists the dequantized rhs out of the k loop, so it is
+        # live across the whole n loop.
+        rhs += tile_k * tile_n * lhs_bytes
     rhs *= fuse_factor
 
     acc_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
@@ -356,6 +360,19 @@ class Config:
         out_bytes = jnp.dtype(self.gmm.out_dtype).itemsize
         return min(ZERO_TILE_TARGET_BYTES // self.num_lanes // out_bytes,
                    self.dims.size_m)
+
+    @property
+    def estimated_vmem_bytes(self) -> int:
+        """`estimate_vmem_bytes` at the tile the fit already chose."""
+        return estimate_vmem_bytes(self.dims,
+                                   self.gmm.lhs_cfgs,
+                                   self.gmm.rhs_cfgs,
+                                   self.tiles.tile_m,
+                                   self.tiles.tile_n,
+                                   2 if self.gmm.fuse_act is not None else 1,
+                                   tuning=self.tuning,
+                                   num_lanes=self.num_lanes,
+                                   num_sublanes=self.num_sublanes)
 
     @property
     def out_shape(self) -> jax.ShapeDtypeStruct:

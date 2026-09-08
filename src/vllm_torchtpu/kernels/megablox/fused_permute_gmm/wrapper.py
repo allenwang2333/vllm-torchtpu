@@ -41,8 +41,11 @@ from vllm_torchtpu.kernels.megablox import gmm_v2
 from vllm_torchtpu.kernels.megablox.fused_permute_gmm import (config, kernel,
                                                               memory_ref)
 
-# gmm_v2's default share of VMEM handed to the compiler.
+# gmm_v2's default share of VMEM handed to the tile fit.
 VMEM_LIMIT_FRACTION = 0.9
+# Headroom the compiler gets over this call's estimated footprint. Above the
+# floor the limit is a codegen knob, not a budget.
+VMEM_SLACK_BYTES = 12 << 20
 
 
 def _blocked_pool(lhs: jax.Array, lanes: int) -> jax.Array:
@@ -176,6 +179,10 @@ def fused_permute_gmm(
         rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     rhs_weights = gmm_v2.WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
+    # The fit already chose the tile against `vmem_limit_bytes`, so the
+    # compiler only needs to cover what that tile costs.
+    compiler_limit = min(cfg.estimated_vmem_bytes + VMEM_SLACK_BYTES,
+                         vmem_limit_bytes)
     out = pl.pallas_call(
         functools.partial(kernel.kernel_main, cfg=cfg),
         out_shape=cfg.out_shape,
@@ -191,7 +198,7 @@ def fused_permute_gmm(
             scratch_shapes=[memory_ref.ScratchRef.create_scratch_types(cfg)],
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=vmem_limit_bytes,
+            vmem_limit_bytes=compiler_limit,
             disable_bounds_checks=True,
         ),
         name=cfg.kernel_name,
