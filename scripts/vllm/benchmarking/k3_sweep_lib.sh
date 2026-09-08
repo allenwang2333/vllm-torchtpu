@@ -60,6 +60,7 @@ k3_engine_counters() {
 
 # wait_server_idle [timeout_s]: return when running+waiting has been 0 on 3
 # polls 10 s apart, so the next point starts on a drained engine.
+# shellcheck disable=SC2120  # the timeout argument is optional
 wait_server_idle() {
     local timeout="${1:-1800}" t0 idle=0 n
     t0=$(date +%s)

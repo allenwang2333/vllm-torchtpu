@@ -5,6 +5,7 @@
 # size and serve flags as kimi-k3-tp32-ep, but max-num-seqs high enough that
 # lm_eval's num_concurrent up to 256 is really served concurrently.
 # Knobs (build env): K3_SWEEP_CTX (default 16384), K3_SWEEP_MAX_NUM_SEQS (256).
+# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-tp32-ep.sh"
 
 MAX_MODEL_LEN="${K3_SWEEP_CTX:-16384}"

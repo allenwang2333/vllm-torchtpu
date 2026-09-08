@@ -91,6 +91,7 @@ SUMMARY_PY="$SCRIPT_DIR/k3_sweep_summary.py"
 mkdir -p "$RESULTS_DIR"
 k3_set_gcs_root "$GCS_ARG"
 
+# shellcheck disable=SC2317  # run by the EXIT trap
 cleanup() {
     log "cleanup"
     bash "$SCRIPT_DIR/cleanup_server.sh"
@@ -149,10 +150,12 @@ if [ ! -d "$IX_DIR/utils/aiperf/src" ]; then
     rm -rf "$IX_DIR"
     if [[ "$IX_REF" =~ ^[0-9a-f]{7,40}$ ]]; then
         # A commit cannot be cloned with --branch: fetch just that commit.
-        git init -q "$IX_DIR" && git -C "$IX_DIR" fetch -q --depth 1 "$IX_URL" "$IX_REF" \
-            && git -C "$IX_DIR" checkout -q FETCH_HEAD \
-            && git -C "$IX_DIR" submodule update -q --init --depth 1 --recursive \
-            || { log "FATAL: cannot fetch InferenceX commit $IX_REF from $IX_URL"; exit 1; }
+        if ! { git init -q "$IX_DIR" \
+                && git -C "$IX_DIR" fetch -q --depth 1 "$IX_URL" "$IX_REF" \
+                && git -C "$IX_DIR" checkout -q FETCH_HEAD \
+                && git -C "$IX_DIR" submodule update -q --init --depth 1 --recursive; }; then
+            log "FATAL: cannot fetch InferenceX commit $IX_REF from $IX_URL"; exit 1
+        fi
     else
         git clone -q --depth 1 --branch "$IX_REF" --recurse-submodules --shallow-submodules "$IX_URL" "$IX_DIR" \
             || { log "FATAL: cannot clone InferenceX branch/tag $IX_REF from $IX_URL"; exit 1; }
@@ -274,6 +277,7 @@ export AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-3
 export AGENTIC_WARMUP_GRACE_PERIOD="${AGENTIC_WARMUP_GRACE_PERIOD:-7200}"
 export AIPERF_DRAIN_TIMEOUT_SECONDS="${AIPERF_DRAIN_TIMEOUT_SECONDS:-3600}"
 
+# shellcheck source=/dev/null  # lives in the InferenceX checkout
 source "$IX_DIR/benchmarks/benchmark_lib.sh"
 resolve_trace_source            # aiperf venv + corpus download (HF, public)
 UV_CACHE_DIR="$AIPERF_UV_CACHE_DIR" "$AIPERF_UV_BIN" pip install --python "$AIPERF_PYTHON" -q blobfile tiktoken \
