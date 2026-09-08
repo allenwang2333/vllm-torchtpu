@@ -66,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --spec)          SPEC="$2"; shift 2 ;;
         --spec-tokens)   SPEC_TOKENS="$2"; shift 2 ;;
         --spec-al)       SPEC_AL="$2"; shift 2 ;;
+        --draft-buckets) export K3_SMALL_BUCKETS="$2"; shift 2 ;;
         --gsm8k-limit)   GSM8K_LIMIT="$2"; shift 2 ;;
         --gsm8k-conc)    GSM8K_CONC="$2"; shift 2 ;;
         --moe-requant)   MOE_REQUANT="$2"; shift 2 ;;

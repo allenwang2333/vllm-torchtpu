@@ -53,10 +53,12 @@ if [ "$ENABLE_PREFIX_CACHING" = "true" ]; then APC_ARGS="--mamba-cache-mode alig
 # Decode buckets: 16, then 32, 64, ... up to the first one that holds
 # MAX_NUM_SEQS tokens (a decode step of 48 sequences needs the 64 bucket).
 K3_COMPILE_SIZES="16"
-if [ "$MAX_NUM_SEQS" -gt 16 ]; then
+# K3_SMALL_BUCKETS=1 (test branch): always add 32..512 so a DSpark draft forward
+# (max_num_seqs x (K+1) tokens) pads to a small bucket, not to 1024 (PR #702).
+if [ "$MAX_NUM_SEQS" -gt 16 ] || [ "${K3_SMALL_BUCKETS:-0}" = "1" ]; then
     for _s in 32 64 128 256 512; do
         K3_COMPILE_SIZES="$K3_COMPILE_SIZES,$_s"
-        [ "$_s" -ge "$MAX_NUM_SEQS" ] && break
+        [ "${K3_SMALL_BUCKETS:-0}" != "1" ] && [ "$_s" -ge "$MAX_NUM_SEQS" ] && break
     done
 fi
 K3_COMPILE_SIZES="$K3_COMPILE_SIZES,1024,2048,4096,8192"
