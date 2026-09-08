@@ -23,7 +23,9 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
-                                                       get_tuned_params)
+                                                       get_tuned_params,
+                                                       make_mla_tuning_key,
+                                                       tuned_params_mapping)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -652,7 +654,7 @@ def mla_attention(q_TNA: jax.Array,
             x in str(cache.dtype).lower()
             for x in ("fp8", "e4m3")) else "bfloat16"
 
-        decode_key = TuningKey(
+        legacy_decode_key = TuningKey(
             case="batched_decode",
             max_num_tokens=max_num_tokens,
             actual_num_q_heads=num_attention_heads,
@@ -660,7 +662,13 @@ def mla_attention(q_TNA: jax.Array,
             actual_r_dim=actual_r_dim,
             kv_dtype=kv_dtype_str,
         )
-        decode_tuned = get_tuned_params(decode_key)
+        decode_key = make_mla_tuning_key("batched_decode", q.shape,
+                                         jnp.dtype(q.dtype).name, cache.shape,
+                                         kv_dtype_str, seq_lens.shape[0],
+                                         block_tables.shape[0], actual_r_dim)
+        decode_tuned = get_tuned_params(
+            decode_key if decode_key in
+            tuned_params_mapping else legacy_decode_key)
 
         _, page_size_per_kv_packing, kv_packing, _ = cache.shape
         max_num_seqs = seq_lens.shape[0]

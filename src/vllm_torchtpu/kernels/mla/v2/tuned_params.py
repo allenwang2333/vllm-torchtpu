@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass
 
 from vllm_torchtpu.logger import init_logger
@@ -1467,8 +1468,29 @@ for _dtype, _case, _tokens, _seqs, _bq, _pages, _split in _K3_PAGE16_DEVICE_TILE
     )
 
 
+def make_mla_tuning_key(case, q_shape, q_dtype, cache_shape, kv_dtype,
+                        max_num_seqs, block_table_size, rope_dim):
+    """Build the exact serving key from token-major, local-shard shapes."""
+    return TuningKey(
+        case=case,
+        max_num_tokens=q_shape[0],
+        actual_num_q_heads=q_shape[1],
+        actual_lkv_dim=q_shape[2],
+        actual_r_dim=rope_dim,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        page_size_per_kv_packing=cache_shape[1],
+        kv_packing=cache_shape[2],
+        max_num_seqs=max_num_seqs,
+        pages_per_seq=block_table_size // max_num_seqs,
+    )
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
+        if os.getenv("TPU_MLA_LOG_TUNING_KEYS") == "1":
+            logger.info("MLA_TUNING_HIT key=%s params=%s", tuning_key,
+                        tuned_params_mapping[tuning_key])
         return tuned_params_mapping[tuning_key]
     else:
         logger.warning(
