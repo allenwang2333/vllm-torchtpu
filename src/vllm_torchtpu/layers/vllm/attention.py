@@ -22,9 +22,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (all_gather_heads,
                                            get_or_create_dcp_mesh,
                                            merge_lse_partials_scatter_heads)
-from vllm_torchtpu.distributed.pcp import get_pcp_group_layout
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (DCP_AXIS_NAME,
-                                                                PCP_AXIS_NAME)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -70,33 +68,6 @@ TPU_HEAD_SIZE_ALIGNMENT = 128
 # is not traceable (`nb_func.__call__`). Same reason
 # `PCP_STREAMING_RPA_INPUT_PARTITION_SPECS` is a constant.
 _PCP_REPLICATED = jax.sharding.PartitionSpec()
-_PCP_SHARDED = jax.sharding.PartitionSpec(PCP_AXIS_NAME)
-_SPARSE_MLA_PCP_INPUT_PARTITION_SPECS = (
-    _PCP_REPLICATED,  # kv_cache_nope
-    _PCP_REPLICATED,  # kv_cache_rope
-    _PCP_SHARDED,  # ql_nope
-    _PCP_SHARDED,  # q_pe
-    _PCP_SHARDED,  # kv_c_normed (packed token order)
-    _PCP_SHARDED,  # k_pe (packed token order)
-    _PCP_SHARDED,  # topk_indices
-    _PCP_REPLICATED,  # seq_lens
-    _PCP_REPLICATED,  # block_tables
-    _PCP_REPLICATED,  # query_start_loc (global, request-major)
-    # local_query_start_loc: the global array is [pcp_size, num_seqs + 1] and
-    # `sparse_mla_attention` declares it P(pcp, None), so it must be *sharded*
-    # here too. Declaring it replicated instead makes shard_map extract row
-    # `rank` itself, which lowers to `dynamic-slice(iota, partition-id)` --
-    # and XLA's SPMD partitioner rejects `partition-id`. Each rank therefore
-    # passes only its own row.
-    _PCP_SHARDED,  # local_query_start_loc [1, num_seqs + 1] per rank
-    _PCP_REPLICATED,  # request_distribution
-    _PCP_REPLICATED,  # request_major_to_packed
-)
-_SPARSE_MLA_PCP_OUTPUT_PARTITION_SPECS = (
-    _PCP_REPLICATED,  # updated nope cache
-    _PCP_REPLICATED,  # updated rope cache
-    _PCP_SHARDED,  # attention output, this rank's tokens
-)
 
 # The DCP specs, and note they are the *inverse* of the PCP ones almost
 # everywhere: PCP shards queries and replicates the cache, DCP shards the cache
@@ -1568,33 +1539,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
 
-        # Resolved once here rather than per forward: the layer is built
-        # inside the vLLM config context, and PCP size cannot change after
-        # that. `> 1` selects the query-sharded sparse-MLA path.
+        # Resolved once here rather than per forward: the layer is built inside
+        # the vLLM config context, and the parallel sizes cannot change after
+        # that. The mesh in particular must not be built in the (lazy,
+        # dynamo-traced) op builder -- it bottoms out in the pybind
+        # `tpu_distributed.global_device_id()`, which Dynamo refuses to trace.
+        # The DCP process group already exists by model-construction time; the
+        # DSA indexer builds its own DCP op from the same mesh.
         parallel_config = getattr(get_current_vllm_config_or_none(),
                                   "parallel_config", None)
-        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-        self.pcp_size = pcp_size if isinstance(pcp_size,
-                                               int) and pcp_size > 1 else 1
-
-        # The mesh must be resolved here and not in the (lazy, dynamo-traced)
-        # op builder: `get_pcp_streaming_mesh` bottoms out in the pybind
-        # `tpu_distributed.global_device_id()`, which Dynamo refuses to trace.
-        # The PCP process group already exists by model-construction time --
-        # the DSA indexer builds its own PCP op from the same mesh here too.
-        self._pcp_mesh = None
-        self.pcp_rank = 0
-        if self.pcp_size > 1:
-            self._pcp_mesh = get_pcp_streaming_mesh()
-            # A plain Python int, so slicing this rank's row out of the
-            # runner's stacked query_start_loc stays a static slice that
-            # Dynamo can trace and that emits no `partition-id`.
-            self.pcp_rank = get_pcp_group_layout().rank_in_group
-
-        # The DCP axis, resolved here for the same reasons. The indexer refuses
-        # pcp>1 and dcp>1 together (see `VllmTPUSparseAttnIndexer.__init__`);
-        # this path would silently produce a wrong answer in that case rather
-        # than a bad one, so it refuses too.
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         self.dcp_size = dcp_size if isinstance(dcp_size,
                                                int) and dcp_size > 1 else 1
@@ -1602,10 +1555,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                            "cp_kv_cache_interleave_size", 1)
         self._dcp_mesh = None
         if self.dcp_size > 1:
-            if self.pcp_size > 1:
+            # The indexer refuses pcp>1 and dcp>1 together (see
+            # `VllmTPUSparseAttnIndexer.__init__`); this path would silently
+            # produce a wrong answer in that case rather than a bad one, so it
+            # refuses too. Two interleaves over one cache is not a thing.
+            pcp_size = getattr(parallel_config,
+                               "prefill_context_parallel_size", 1)
+            if isinstance(pcp_size, int) and pcp_size > 1:
                 raise NotImplementedError(
-                    f"pcp_size={self.pcp_size} and dcp_size={self.dcp_size} "
-                    "are both >1; sparse MLA has one KV-position interleave, "
+                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
+                    "both >1; sparse MLA has one KV-position interleave, "
                     "not two.")
             # Checked here rather than inside the traced op so the failure
             # lands at model build with somewhere to go. vLLM defaults this to
@@ -1807,124 +1766,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_impl
 
-    def _build_sparse_mla_pcp_op(self, layer: Any, pcp_size: int):
-        """PCP variant of `_build_sparse_mla_op` (design C: shard queries only).
-
-        Everything token-major on the query side (`ql_nope`, `q_pe`,
-        `topk_indices`, the output) arrives as this rank's slice of the
-        runner's rank-major packed buffer and is declared PCP-sharded. The
-        two KV caches stay replicated, which is what makes the result
-        bit-identical to the unsharded path.
-
-        `kv_c_normed`/`k_pe` are the exception: they are *inputs* on the KV
-        side but are produced token-major, so they come in PCP-sharded and are
-        un-permuted here, at jit level, back into request-major order -- the
-        order `query_start_loc` describes and the cache write needs. Declaring
-        them sharded is the all-gather; no torch-level collective is involved.
-        """
-        from vllm_torchtpu.layers.common.attention_interface import \
-            sparse_mla_attention
-
-        # Resolved in __init__: this builder runs inside the traced forward.
-        mesh = self._pcp_mesh
-
-        k_scale = None
-        if layer.kv_cache_quantized_dtype is not None:
-            _, k_scale, _ = self._get_kv_scales(layer)
-
-        def sparse_mla_attention_core_tpu_pcp(
-            kv_cache_nope: jax.Array,
-            kv_cache_rope: jax.Array,
-            ql_nope: jax.Array,
-            q_pe: jax.Array,
-            kv_c_normed: jax.Array,
-            k_pe: jax.Array,
-            topk_indices: jax.Array,
-            seq_lens: jax.Array,
-            block_tables: jax.Array,
-            query_start_loc: jax.Array,
-            local_query_start_loc: jax.Array,
-            request_distribution: jax.Array,
-            request_major_to_packed: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            nope_spec, rope_spec = layer.mla_kv_spec
-            # The table is allocated for the largest token bucket, since the
-            # traced graph carries one static length for it; the live
-            # permutation is its first `kv_c_normed.shape[0]` entries.
-            request_major_to_packed = (
-                request_major_to_packed[:kv_c_normed.shape[0]])
-            # The replicated cache write indexes these by the global
-            # query_start_loc, so they have to leave packed order.
-            kv_c_normed = pcp_to_request_major(kv_c_normed,
-                                               request_major_to_packed,
-                                               mesh=mesh)
-            k_pe = pcp_to_request_major(k_pe,
-                                        request_major_to_packed,
-                                        mesh=mesh)
-            return sparse_mla_attention(
-                ql_nope,
-                q_pe,
-                kv_c_normed,
-                k_pe,
-                kv_cache_nope,
-                kv_cache_rope,
-                topk_indices,
-                seq_lens,
-                block_tables,
-                local_query_start_loc,
-                request_distribution,
-                mesh,
-                nope_spec,
-                rope_spec,
-                sm_scale=layer.scale,
-                k_scale=k_scale,
-                pcp_size=pcp_size,
-                global_query_start_loc=query_start_loc,
-            )
-
-        def _fake_outputs(kv_cache_nope, kv_cache_rope, ql_nope, *rest):
-            # Local shapes, straight off the local inputs, so the token dim
-            # stays symbolic -- see `pcp_streaming_jax_op`. Both caches are
-            # returned unchanged in shape, and the attention output is
-            # `[tokens, heads, lkv_dim]`, i.e. `ql_nope` exactly (the kernel's
-            # rope tail is dropped before it is returned).
-            del rest
-            return (torch.empty_like(kv_cache_nope),
-                    torch.empty_like(kv_cache_rope), torch.empty_like(ql_nope))
-
-        op_name = ("pallas::sparse_mla_attention_pcp_"
-                   f"{layer.layer_name.replace('.', '_')}")
-        sparse_mla_jax_op = pcp_streaming_jax_op(
-            op_name,
-            sparse_mla_attention_core_tpu_pcp,
-            donate_argnums=(0, 1),
-            mesh=mesh,
-            input_partition_specs=_SPARSE_MLA_PCP_INPUT_PARTITION_SPECS,
-            output_partition_specs=_SPARSE_MLA_PCP_OUTPUT_PARTITION_SPECS,
-            fake_outputs=_fake_outputs,
-        )
-
-        def sparse_mla_pcp_impl(
-                kv_cache: tuple[torch.Tensor, torch.Tensor],
-                ql_nope: torch.Tensor, q_pe: torch.Tensor,
-                kv_c_normed: torch.Tensor, k_pe: torch.Tensor,
-                topk_indices: torch.Tensor, seq_lens: torch.Tensor,
-                block_tables: torch.Tensor, query_start_loc: torch.Tensor,
-                local_query_start_loc: torch.Tensor,
-                request_distribution: torch.Tensor,
-                request_major_to_packed: torch.Tensor) -> torch.Tensor:
-            nope_cache, rope_cache = kv_cache
-            new_nope, new_rope, outputs = sparse_mla_jax_op(
-                nope_cache, rope_cache, ql_nope, q_pe, kv_c_normed, k_pe,
-                topk_indices, seq_lens, block_tables, query_start_loc,
-                local_query_start_loc, request_distribution,
-                request_major_to_packed)
-            nope_cache.copy_(new_nope)
-            rope_cache.copy_(new_rope)
-            return outputs
-
-        return sparse_mla_pcp_impl
-
     def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int,
                                  interleave_size: int):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
@@ -2101,7 +1942,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     and len(kv_cache) == 2), (
                         "sparse MLA layers use a native (nope, rope) split "
                         f"cache; got {type(kv_cache)}")
-            pcp_size = self.pcp_size
             if self.dcp_size > 1:
                 # Built eagerly in `process_weights_after_loading`, same
                 # tracing constraint as the PCP op.
@@ -2137,26 +1977,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # the head all-gather above, so `outputs` is back to
                 # `layer.num_heads` and `W_UV` below needs no change.
                 outputs = merge_lse_partials_scatter_heads(partial, lse)
-            elif pcp_size > 1:
-                # Built eagerly in `process_weights_after_loading`: none of
-                # `pcp_streaming_jax_op` is Dynamo-traceable, so it cannot be
-                # constructed from inside this (compiled) forward.
-                assert getattr(layer, "sparse_mla_pcp_op", None) is not None, (
-                    "PCP sparse MLA op was never built; "
-                    "`process_weights_after_loading` must run first.")
+            else:
+                if (not hasattr(layer, "sparse_mla_op")
+                        or layer.sparse_mla_op is None):
+                    layer.sparse_mla_op = self._build_sparse_mla_op(layer)
 
-            outputs = layer.sparse_mla_op(
-                kv_cache,
-                ql_nope_flat,
-                q_pe_flat,
-                kv_c_normed_flat,
-                k_pe_flat,
-                topk_indices,
-                attn_metadata.seq_lens,
-                attn_metadata.block_tables,
-                attn_metadata.query_start_loc,
-                attn_metadata.request_distribution,
-            )
+                outputs = layer.sparse_mla_op(
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    topk_indices,
+                    attn_metadata.seq_lens,
+                    attn_metadata.block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                )
         else:
             if not hasattr(layer, "mla_op") or layer.mla_op is None:
                 layer.mla_op = self._build_mla_op(layer,

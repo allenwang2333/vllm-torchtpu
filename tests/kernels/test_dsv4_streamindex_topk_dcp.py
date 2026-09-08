@@ -28,14 +28,14 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, _partition_winners_by_owner, pcp_global_to_local,
-    pcp_local_to_global, pcp_owner_rank, streamindex_topk,
+    DCP_AXIS_NAME, _partition_winners_by_owner, cp_global_to_local,
+    cp_local_to_global, cp_owner_rank, streamindex_topk,
     streamindex_topk_dcp)
 
 P = jax.sharding.PartitionSpec
 
 # ===================================================================== #
-# Coordinate algebra. `pcp_local_to_global` is already covered by the PCP
+# Coordinate algebra. `cp_local_to_global` is already covered by the PCP
 # tests; what is new here is the *inverse*, which DCP needs in order to
 # hand a rank a position in that rank's own coordinate space while
 # running on some other rank.
@@ -49,10 +49,10 @@ def test_global_to_local_inverts_local_to_global(dcp_size, interleave_c):
     """Round-trip on every rank, over several interleave cycles."""
     for rank in range(dcp_size):
         for local in range(3 * interleave_c * dcp_size):
-            g = int(pcp_local_to_global(local, rank, dcp_size, interleave_c))
-            assert int(pcp_owner_rank(jnp.int32(g), dcp_size,
+            g = int(cp_local_to_global(local, rank, dcp_size, interleave_c))
+            assert int(cp_owner_rank(jnp.int32(g), dcp_size,
                                       interleave_c)) == rank
-            assert int(pcp_global_to_local(jnp.int32(g), dcp_size,
+            assert int(cp_global_to_local(jnp.int32(g), dcp_size,
                                            interleave_c)) == local
 
 
@@ -66,12 +66,12 @@ def test_global_to_local_needs_no_rank_argument(dcp_size, interleave_c):
     """
     n = 5 * dcp_size * interleave_c + 3
     gs = jnp.arange(n, dtype=jnp.int32)
-    owners = np.asarray(pcp_owner_rank(gs, dcp_size, interleave_c))
-    locals_ = np.asarray(pcp_global_to_local(gs, dcp_size, interleave_c))
+    owners = np.asarray(cp_owner_rank(gs, dcp_size, interleave_c))
+    locals_ = np.asarray(cp_global_to_local(gs, dcp_size, interleave_c))
     assert len(set(zip(owners.tolist(), locals_.tolist()))) == n
     for g in range(n):
         assert int(
-            pcp_local_to_global(int(locals_[g]), int(owners[g]), dcp_size,
+            cp_local_to_global(int(locals_[g]), int(owners[g]), dcp_size,
                                 interleave_c)) == g
 
 
@@ -107,7 +107,7 @@ def test_partition_is_lossless_when_capacity_suffices(dcp_size, interleave_c):
             row = lists[t, r]
             for local in row[row >= 0].tolist():
                 g = int(
-                    pcp_local_to_global(local, r, dcp_size, interleave_c))
+                    cp_local_to_global(local, r, dcp_size, interleave_c))
                 # A rank must only ever be handed positions it actually owns.
                 assert (g // interleave_c) % dcp_size == r
                 got.add(g)
@@ -301,7 +301,7 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
         for r in range(dcp_size):
             row = local_topk[r, t]
             for local in row[row >= 0].tolist():
-                got.add(int(pcp_local_to_global(local, r, dcp_size, 1)))
+                got.add(int(cp_local_to_global(local, r, dcp_size, 1)))
         want = set(reference[t][reference[t] >= 0].tolist())
         assert got == want, (f"token {t}: {len(want - got)} missing, "
                              f"{len(got - want)} spurious")
@@ -354,7 +354,7 @@ def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
 
     for t in range(Q_LEN):
         globals_ = [
-            int(pcp_local_to_global(local, r, dcp_size, 1))
+            int(cp_local_to_global(local, r, dcp_size, 1))
             for r in range(dcp_size) for local in
             local_topk[r, t][local_topk[r, t] >= 0].tolist()
         ]
