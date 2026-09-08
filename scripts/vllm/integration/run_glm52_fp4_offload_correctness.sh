@@ -80,7 +80,6 @@ mkdir -p "${TMPDIR}" "${VLLM_CACHE_ROOT}" || exit 1
 # quant_algo=NVFP4, group_size=16), so vLLM detects it as modelopt_fp4 and
 # there is nothing to requantize the dtype of -- only the block to widen.
 export MOE_REQUANTIZE_BLOCK_SIZE=512
-export USE_MOE_SPARSE_CORE=0
 export PJRT_DEVICE=TPU
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
@@ -159,6 +158,7 @@ RAIDEN_CONTROLLER_PORT="${RAIDEN_CONTROLLER_PORT:-27901}"
 # which is one whole prefix-cache block: the smoke would drop every rung of
 # its ladder and exit with nothing measured.
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-9216}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-256}"
 RUN_ROOT="${RUN_ROOT:-${SCRATCH_ROOT}/glm52_fp4_offload_ci}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 # ~465 GB of weights, then a cold-cache compile; leave headroom.
@@ -249,7 +249,7 @@ serve() {
     --enable-expert-parallel \
     --enable-ep-weight-filter \
     --max-model-len="${MAX_MODEL_LEN}" \
-    --max-num-batched-tokens=1024 \
+    --max-num-batched-tokens="${MAX_NUM_BATCHED_TOKENS}" \
     --max-num-seqs=1 \
     --no-async-scheduling \
     --kv-cache-dtype=fp8 \
