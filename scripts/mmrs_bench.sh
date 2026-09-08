@@ -18,9 +18,18 @@ export MMRS_WALLCLOCK=1
 python -c "import jax; jax.distributed.initialize(); print('[mmrs] jax dist ok:', jax.process_index(), '/', jax.process_count(), jax.device_count(), 'devices')" 2>&1 | grep "\[mmrs\]" || echo "[mmrs] jax.distributed.initialize probe failed"
 echo "[mmrs] node=${NODE_RANK:-?} host=$(hostname) k=${MMRS_K:-7168} n=${MMRS_N:-28672} m=${MMRS_M:-1024,2048,4096,8192}"
 python -c "import jax; print('[mmrs] jax', jax.__version__)" 2>/dev/null || true
-timeout 2400 python scripts/benchmarking/kernels/benchmark_matmul_reduce_scatter.py \
-    --k "${MMRS_K:-7168}" --n "${MMRS_N:-28672}" --m "${MMRS_M:-1024,2048,4096,8192}" \
+# Sweep 1: Woosuk's hidden size (k = 7168) with an output block that divides it.
+echo "[mmrs] sweep k=7168 bk_out=1792"
+MMRS_BK_OUT=1792 timeout 1200 python scripts/benchmarking/kernels/benchmark_matmul_reduce_scatter.py \
+    --k 7168 --n "${MMRS_N:-28672}" --m "${MMRS_M:-1024,2048,4096,8192}" \
     --reps "${MMRS_REPS:-20}" --warmup 5 \
-    2>&1 | tee "$OUT/node${NODE_RANK:-0}.log"
-echo "[mmrs] node=${NODE_RANK:-?} rc=${PIPESTATUS[0]}"
+    2>&1 | tee "$OUT/node${NODE_RANK:-0}_k7168.log"
+echo "[mmrs] node=${NODE_RANK:-?} sweep k=7168 rc=${PIPESTATUS[0]}"
+# Sweep 2: the PR's own shape (k = 8192, default blocks) as a sanity point.
+echo "[mmrs] sweep k=8192 default blocks"
+timeout 1200 python scripts/benchmarking/kernels/benchmark_matmul_reduce_scatter.py \
+    --k 8192 --n "${MMRS_N:-28672}" --m "${MMRS_M:-1024,2048,4096,8192}" \
+    --reps "${MMRS_REPS:-20}" --warmup 5 \
+    2>&1 | tee "$OUT/node${NODE_RANK:-0}_k8192.log"
+echo "[mmrs] node=${NODE_RANK:-?} sweep k=8192 rc=${PIPESTATUS[0]}"
 exit 0

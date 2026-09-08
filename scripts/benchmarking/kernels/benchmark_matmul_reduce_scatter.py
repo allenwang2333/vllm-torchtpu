@@ -26,6 +26,7 @@ Run on a TPU host, or on every host of a multi-host slice:
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -113,10 +114,16 @@ def build_xla_shard_map(mesh, inputs):
 
 def build_ring_kernel(mesh, inputs):
     """The fused ring kernel, on the single-hop order it is embedded in."""
+    # MMRS_BK_OUT overrides the output-column block (must divide k); the
+    # default 2048 does not divide k = 7168.
+    extra = {}
+    if os.environ.get("MMRS_BK_OUT"):
+        extra["bk_out"] = int(os.environ["MMRS_BK_OUT"])
     fn = jax.jit(
         functools.partial(matmul_reduce_scatter.matmul_reduce_scatter,
                           mesh=mesh,
-                          axis_name=AXIS))
+                          axis_name=AXIS,
+                          **extra))
     return fn.lower(*inputs).compile()
 
 
