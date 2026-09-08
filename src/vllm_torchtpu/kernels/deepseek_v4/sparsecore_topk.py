@@ -429,24 +429,31 @@ def _pick_partition(b: int, n: int, k: int) -> int:
 
 
 @functools.partial(jax.jit,
-                   static_argnames=("k", "write_empty_rows", "emit_pairs"))
+                   static_argnames=("k", "write_empty_rows",
+                                    "_reference_stage2_gather"))
 def sparsecore_topk(
     scores: jax.Array,  # f32[b, n]
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
     *,
     write_empty_rows: bool = True,
-    emit_pairs: bool = False,
+    _reference_stage2_gather: bool = False,
 ) -> jax.Array:  # i32[b, k]
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
   Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
   all 32 subcores in parallel without inter-core barrier overhead.
 
-  `emit_pairs` selects an equivalent formulation of the two-stage path that
-  has stage 1 emit each winner's score alongside its index, so that stage 2
-  does not have to gather those scores back out of `scores`. It returns the
-  same indices bit for bit and is ignored on the single-stage path.
+  On the two-stage path stage 1 emits each winner's score alongside its index,
+  so stage 2 does not gather those scores back out of `scores`. Stage 1 has
+  already read every one of them.
+
+  `_reference_stage2_gather` is a test seam, not a tuning knob. It selects the
+  earlier formulation, which performs that gather. The two return the same
+  indices bit for bit; the differential test in
+  `tests/kernels/test_dsv4_sparsecore_topk.py` is what establishes that, and it
+  is the reason this branch is still here. No production caller sets it --
+  `streamindex_topk` does not expose it.
   """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -482,7 +489,16 @@ def sparsecore_topk(
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0,
                          n_p).reshape(b * p)
 
-    if emit_pairs:
+    if _reference_stage2_gather:
+        # Test-seam formulation: stage 1 returns indices only, and stage 2's
+        # scores are gathered back below. `cand_scores = None` is what couples
+        # the two halves, so neither can be changed without the other.
+        cand_scores = None
+        local_indices = _sc_topk_direct(scores_p,
+                                        k_p,
+                                        lengths_p,
+                                        write_empty=True).reshape(b, p, k_p)
+    else:
         local_slots, cand_scores = _sc_topk_direct(scores_p,
                                                    k_p,
                                                    lengths_p,
@@ -490,11 +506,6 @@ def sparsecore_topk(
                                                    emit_keys=True)
         local_indices = local_slots.reshape(b, p, k_p)
         cand_scores = cand_scores.reshape(b, p * k_p)
-    else:
-        local_indices = _sc_topk_direct(scores_p,
-                                        k_p,
-                                        lengths_p,
-                                        write_empty=True).reshape(b, p, k_p)
 
     # Map local indices to global column indices
     global_cand_indices = jnp.where(
@@ -503,9 +514,8 @@ def sparsecore_topk(
         offsets[None, :, None] + local_indices,
     ).reshape(b, p * k_p)
 
-    if not emit_pairs:
-        # Gather candidate scores for Stage 2. The gather `emit_pairs` exists
-        # to delete: stage 1 has already read every one of these scores.
+    if cand_scores is None:
+        # The gather the shipped path deletes. Reached only from the test seam.
         safe_cand_indices = jnp.maximum(global_cand_indices, 0)
         cand_scores = jnp.take_along_axis(scores, safe_cand_indices, axis=1)
         cand_scores = jnp.where(global_cand_indices >= 0, cand_scores,
