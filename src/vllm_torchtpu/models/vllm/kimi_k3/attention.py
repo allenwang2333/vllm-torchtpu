@@ -488,6 +488,21 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
         )
         self.kv_cache = None
+        # Experimental T=1 fused o_proj+all-reduce path
+        # (TPU_FUSED_OUT_PROJ_ALLREDUCE): the KDA op prefetches the o_proj
+        # weight HBM->VMEM under the decode kernel and the matmul+reduction
+        # consume that buffer via the fused op. The prefetch only exists on
+        # the unfused KDA path, and the ordinal is assigned by the runner
+        # (initialize_fused_oproj) after weights load, before torch.compile.
+        from vllm_torchtpu import envs as _envs
+
+        # The prefetch rides both KDA paths (decode_kda_wprefetch on the
+        # unfused path, outer_kernel_wpf on the fused core).
+        self._fused_oproj_wanted = bool(_envs.TPU_FUSED_OUT_PROJ_ALLREDUCE)
+        self._kda_wpf = self._fused_oproj_wanted
+        self._fused_oproj_entry = None
+        self._fused_oproj_ordinal = 0
+        self._w_o_pinned = None
         # The dispatched op owns the short convolution as well: the fused decode
         # kernel it routes decode rows to does the convolution itself, so it
         # cannot be fed by a separate convolution op.
@@ -496,6 +511,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
+            w_prefetch=self._kda_wpf,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -552,6 +568,38 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         out.copy_(fused)
         self.conv_weight_fused = out
 
+    def initialize_fused_oproj(self) -> bool:
+        """Arm the experimental fused o_proj+all-reduce for this KDA layer.
+
+        Same construction-time rules as the low-latency all-reduce
+        (initialize_llar): called by the runner after the process groups and
+        weights exist, before torch.compile -- the op registration, rank
+        gather, and workspace allocation cannot happen in a traced forward.
+        Also makes the layout-pinned copy of the o_proj weight that the KDA
+        kernel prefetches (docs/llar_out_proj_op.md, "VMEM chaining").
+        """
+        if not (self._fused_oproj_wanted and self._kda_wpf):
+            return False
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        from vllm_torchtpu.distributed.fused_out_proj_all_reduce import \
+            get_fused_out_proj_entry
+
+        if not isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+            return False
+        self._fused_oproj_entry = get_fused_out_proj_entry(
+            self.o_proj.output_size, self.o_proj.input_size_per_partition,
+            self.o_proj.weight.dtype)
+        if self._fused_oproj_entry is None:
+            return False
+        from torch_tpu._internal.device_utils.annotations import (
+            LayoutContext, TpuLayout)
+        with LayoutContext(
+                TpuLayout(minor_to_major=[1, 0], tiles=[[8, 128], [2, 1]])):
+            self._w_o_pinned = torch.empty_like(self.o_proj.weight)
+        self._w_o_pinned.copy_(self.o_proj.weight)
+        return True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -583,6 +631,32 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             output = torch.zeros_like(query)
         else:
             sconv_cache, recurrent_cache = self.kv_cache
+            if self._fused_oproj_entry is not None:
+                # Experimental T=1 path: the KDA op prefetches the o_proj
+                # weight HBM->VMEM under the decode kernel and returns it as
+                # wv; the fused op consumes that buffer and falls back to
+                # matmul + ring all-reduce for T != 1 payloads.
+                output, wv = self.dispatched_kda_op(
+                    mixed_qkv,
+                    raw_gate,
+                    beta,
+                    output_gate,
+                    sconv_cache,
+                    recurrent_cache,
+                    self.conv_weight_fused,
+                    self.A_log,
+                    self.dt_bias,
+                    self.o_norm.weight,
+                    metadata.query_start_loc,
+                    metadata.mamba_state_indices,
+                    metadata.seq_lens,
+                    metadata.request_distribution,
+                    self._w_o_pinned,
+                )
+                op, rs, ag = self._fused_oproj_entry
+                return op(output.flatten(1), wv, rs, ag,
+                          self._fused_oproj_ordinal % 2,
+                          1 if self._fused_oproj_ordinal == 0 else 0)
             output = self.dispatched_kda_op(
                 mixed_qkv,
                 raw_gate,

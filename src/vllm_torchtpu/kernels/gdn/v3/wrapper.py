@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -305,6 +306,109 @@ def outer_kernel(
     _run()
 
 
+def outer_kernel_wpf(
+    # Inputs.
+    metadata_ref: memory_ref.MetadataRef,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    conv_state_ref: jax.Array,
+    recurrent_state_ref: jax.Array,
+    in_act_ref: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    w_o_ref: jax.Array,  # [k_shard, width] o_proj weight, raw HBM ref
+    # Outputs.
+    out_ref: jax.Array,
+    conv_state_out_ref: jax.Array,
+    recurrent_state_out_ref: jax.Array,
+    wv_ref: jax.Array,  # [k_shard, width] VMEM -- the prefetched weight
+    # Scratches.
+    carry_conv_scratch_ref: jax.Array | None,
+    carry_recurrent_scratch_ref: jax.Array | None,
+    pf_sem,
+    *,
+    cfg: config.GDNConfig,
+):
+    """outer_kernel plus an o_proj weight prefetch for the layer's fused
+    o_proj+AR op.
+
+    The w_o DMA starts before the pipeline and is waited only after it, so
+    the transfer hides under the attention work (measured: +0.25 us exposed
+    for 3.2 MiB on an 8.6 us kernel -- docs/llar_out_proj_op.md, "In-kernel
+    prefetch"). The wait is NOT optional: kernel exit does not drain
+    outstanding DMAs, and an unawaited semaphore is a hard runtime fault
+    (jobs 537/558).
+
+    w_o must arrive as a raw HBM operand -- marked with
+    pltpu.with_memory_space_constraint(w, pltpu.HBM) at the call boundary
+    and layout-pinned -- or libtpu inserts a staging hop ahead of the
+    kernel.
+    """
+    pf = pltpu.make_async_copy(src_ref=w_o_ref, dst_ref=wv_ref, sem=pf_sem)
+    pf.start()
+    outer_kernel(
+        metadata_ref,
+        qkv_ref,
+        b_ref,
+        a_ref,
+        conv_state_ref,
+        recurrent_state_ref,
+        in_act_ref,
+        weights_ref,
+        out_ref,
+        conv_state_out_ref,
+        recurrent_state_out_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+    pf.wait()
+
+
+def outer_kernel_wpf_late(
+    metadata_ref: memory_ref.MetadataRef,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    conv_state_ref: jax.Array,
+    recurrent_state_ref: jax.Array,
+    in_act_ref: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    w_o_ref: jax.Array,
+    out_ref: jax.Array,
+    conv_state_out_ref: jax.Array,
+    recurrent_state_out_ref: jax.Array,
+    wv_ref: jax.Array,
+    carry_conv_scratch_ref: jax.Array | None,
+    carry_recurrent_scratch_ref: jax.Array | None,
+    pf_sem,
+    *,
+    cfg: config.GDNConfig,
+):
+    """outer_kernel_wpf with the prefetch issued AFTER the pipeline: the
+    w_o HBM read does not contend with the kernel own transfers, but no
+    longer overlaps the compute either. Experimental A/B."""
+    outer_kernel(
+        metadata_ref,
+        qkv_ref,
+        b_ref,
+        a_ref,
+        conv_state_ref,
+        recurrent_state_ref,
+        in_act_ref,
+        weights_ref,
+        out_ref,
+        conv_state_out_ref,
+        recurrent_state_out_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+    pf = pltpu.make_async_copy(src_ref=w_o_ref, dst_ref=wv_ref, sem=pf_sem)
+    pf.start()
+    pf.wait()
+
+
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state", "state_source"),
     static_argnames=(
@@ -321,6 +425,7 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "wpf_late",
     ),
 )
 def fused_conv1d_gdn(
@@ -339,6 +444,7 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    w_o_prefetch: jax.Array | None = None,  # [k_shard, width] o_proj weight
     *,
     n_kq: int,
     n_v: int,
@@ -350,6 +456,7 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
+    wpf_late: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -570,7 +677,9 @@ def fused_conv1d_gdn(
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        prefetch_w: bool = False,
+        prefetch_late: bool = False,
+    ) -> tuple:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
         if mode == config.GDNMode.PER_SEQ:
@@ -649,29 +758,20 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        return pl.pallas_call(
-            functools.partial(outer_kernel, cfg=cfg),
-            out_shape=(out_shape, in_conv_state, in_recurrent_state),
-            in_specs=(
-                metadata_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                None if pooled else hbm_spec,
-                in_out_spec,
-                weights_spec,
-            ),
-            out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
-            input_output_aliases=input_output_aliases,
-            compiler_params=pltpu.CompilerParams(
-                disable_bounds_checks=True,
-                vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
-            ),
-            name=cfg.get_kernel_name(),
-            metadata=cfg.get_metadata(),
-        )(
+        # The o_proj prefetch rides the kernel as an extra HBM input and a
+        # VMEM output. The operand is HBM-marked at the call boundary so
+        # libtpu does not stage it ahead of the kernel.
+        in_specs_list = [
+            metadata_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            None if pooled else hbm_spec,
+            in_out_spec,
+            weights_spec,
+        ]
+        call_args = [
             metadata_obj,
             qkv,
             b,
@@ -680,8 +780,53 @@ def fused_conv1d_gdn(
             in_recurrent_state,
             in_act,
             weights,
-        )
+        ]
+        if prefetch_w:
+            in_specs_list.append(hbm_spec)
+            # The HBM mark keeps XLA from staging w_o ahead of the kernel --
+            # but with this kernel's input/output aliasing the mark also
+            # clobbers the wv output's VMEM color (measured: wv lands in
+            # HBM and the consumer restages, making the prefetch pointless).
+            # VLLM_TORCHTPU_GDN_WPF_HBM_MARK=0 leaves the operand unmarked so
+            # the output keeps its body-driven VMEM color; A/B'd in
+            # scripts/k3/kda_wpf_llo_bench.py.
+            w_o_arg = w_o_prefetch
+            if os.environ.get("VLLM_TORCHTPU_GDN_WPF_HBM_MARK", "1") == "1":
+                w_o_arg = pltpu.with_memory_space_constraint(
+                    w_o_arg, pltpu.HBM)
+            call_args.append(w_o_arg)
+        out_shape_t = (out_shape, in_conv_state, in_recurrent_state)
+        out_specs_t = (hbm_spec, hbm_spec, None if pooled else hbm_spec)
+        scratch = cfg.get_scratch_shape_dict()
+        # Only the wpf kernel takes the extra scratch (a None entry would
+        # still be passed to outer_kernel as an unexpected pf_sem kwarg).
+        if prefetch_w:
+            scratch["pf_sem"] = pltpu.SemaphoreType.DMA
+        if prefetch_w:
+            out_shape_t = out_shape_t + (jax.ShapeDtypeStruct(
+                w_o_prefetch.shape, w_o_prefetch.dtype), )
+            out_specs_t = out_specs_t + (vmem_spec, )
 
+        _kernel_fn = (outer_kernel if not prefetch_w else outer_kernel_wpf_late
+                      if prefetch_late else outer_kernel_wpf)
+        return pl.pallas_call(
+            functools.partial(_kernel_fn, cfg=cfg),
+            out_shape=out_shape_t,
+            in_specs=tuple(in_specs_list),
+            out_specs=out_specs_t,
+            scratch_shapes=scratch,
+            input_output_aliases=input_output_aliases,
+            compiler_params=pltpu.CompilerParams(
+                disable_bounds_checks=True,
+                vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+            ),
+            name=cfg.get_kernel_name(),
+            metadata=cfg.get_metadata(),
+        )(*call_args)
+
+    if w_o_prefetch is not None and pooled:
+        raise NotImplementedError(
+            "w_o_prefetch is only implemented on the non-pooled path.")
     if pooled:
         out_act, out_source, _ = call_kernel(state_source, None, None,
                                              config.GDNMode.BATCHED)
@@ -691,9 +836,20 @@ def fused_conv1d_gdn(
         return out_source, out_act
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`
-    # tokens, or plain 1-token decodes without speculative decoding.
-    out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
+    # tokens, or plain 1-token decodes without speculative decoding. The
+    # o_proj weight prefetch rides the FIRST call only.
+    if w_o_prefetch is not None:
+        out_act, out_conv_state, out_recurrent_state, wv = call_kernel(
+            conv_state,
+            recurrent_state,
+            None,
+            config.GDNMode.BATCHED,
+            prefetch_w=True,
+            prefetch_late=wpf_late)
+    else:
+        wv = None
+        out_act, out_conv_state, out_recurrent_state = call_kernel(
+            conv_state, recurrent_state, None, config.GDNMode.BATCHED)
     out_act, out_conv_state, out_recurrent_state = call_kernel(
         out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
 
@@ -702,4 +858,6 @@ def fused_conv1d_gdn(
     out_conv_state = out_conv_state.reshape(conv_state_shape)
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
+    if w_o_prefetch is not None:
+        return (out_conv_state, out_recurrent_state), out_act, wv
     return (out_conv_state, out_recurrent_state), out_act

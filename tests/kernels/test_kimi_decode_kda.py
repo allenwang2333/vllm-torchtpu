@@ -129,6 +129,44 @@ def _call(inputs, *, lower_bound=None, **kwargs):
     )
 
 
+def test_decode_kda_wprefetch_matches_decode_kda() -> None:
+    """The prefetch variant: same outputs, plus wv == w_o bit-exactly.
+
+    The o_proj weight prefetch is a pure async DMA, so wv must be a bitwise
+    copy and the attention outputs must be bitwise identical to decode_kda.
+    """
+    from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda_wprefetch
+
+    inputs = _build(1, 1, seed=3)
+    w_o = jnp.asarray(
+        np.random.default_rng(7).standard_normal((1024, 256)) * 0.2,
+        jnp.bfloat16)
+
+    out_ref, conv_ref, pool_ref = _call(inputs, lower_bound=-5.0)
+
+    query_lens = inputs["query_start_loc"][1:] - inputs["query_start_loc"][:-1]
+    has_initial_state = inputs["seq_lens"] > query_lens
+    out, conv_state, pool, wv = decode_kda_wprefetch(
+        inputs["mixed_qkv"],
+        inputs["raw_gate"].reshape(inputs["bucket"], HEADS, HEAD_DIM),
+        inputs["beta"],
+        inputs["conv_state"],
+        inputs["conv_weight"],
+        inputs["pool"],
+        inputs["a_log"],
+        inputs["dt_bias"].reshape(HEADS, HEAD_DIM),
+        inputs["state_indices"],
+        has_initial_state,
+        w_o,
+        lower_bound=-5.0,
+    )
+
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(out_ref))
+    np.testing.assert_array_equal(np.asarray(conv_state), np.asarray(conv_ref))
+    np.testing.assert_array_equal(np.asarray(pool), np.asarray(pool_ref))
+    np.testing.assert_array_equal(np.asarray(wv), np.asarray(w_o))
+
+
 # ---------------------------------------------------------------------------
 # Reference
 # ---------------------------------------------------------------------------

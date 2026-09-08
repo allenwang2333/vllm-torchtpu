@@ -24,7 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3.compute_gdn import fused_transpose_broadcast
 
-__all__ = ["decode_kda"]
+__all__ = ["decode_kda", "decode_kda_wprefetch"]
 
 _L2_EPS = 1e-6
 
@@ -188,6 +188,213 @@ def _kernel(
     out_ref[0] = out.astype(out_ref.dtype)
     conv_state_out_ref[0] = new_stored_conv.astype(conv_state_out_ref.dtype)
     state_out_ref[0] = new_stored.astype(state_out_ref.dtype)
+
+
+def _kernel_wprefetch(
+    # Scalar prefetch.
+    state_indices_ref,  # [num_seqs] int32
+    has_initial_state_ref,  # [num_seqs] int32
+    # Inputs.
+    mixed_qkv_ref,
+    g_ref,
+    beta_ref,
+    conv_state_ref,
+    conv_weight_ref,
+    a_log_ref,
+    dt_bias_ref,
+    state_ref,
+    w_o_ref,  # [width, k_shard] o_proj weight, raw HBM ref
+    # Outputs.
+    out_ref,
+    conv_state_out_ref,
+    state_out_ref,
+    wv_ref,  # [width, k_shard] VMEM -- the prefetched weight
+    # Scratch.
+    pf_sem,
+    **kwargs,
+):
+    """_kernel plus an o_proj-weight prefetch for the NEXT op in the layer.
+
+    The w_o DMA is started before any compute and waited only at the very
+    end, so the transfer hides under the attention work (measured: a 3.2 MiB
+    copy exposes +0.25 us on an 8.6 us kernel -- docs/llar_out_proj_op.md,
+    "In-kernel prefetch"). The wait is NOT optional: kernel exit does not
+    drain outstanding DMAs (job 537).
+
+    w_o must arrive as a raw HBM operand -- mark it with
+    pltpu.with_memory_space_constraint(w, pltpu.HBM) at the call site and
+    pin its layout, or libtpu inserts a staging hop (and, unpinned, an
+    HBM->VMEM->HBM retile roundtrip) ahead of the kernel.
+    """
+    pf = pltpu.make_async_copy(src_ref=w_o_ref, dst_ref=wv_ref, sem=pf_sem)
+    pf.start()
+    _kernel(
+        state_indices_ref,
+        has_initial_state_ref,
+        mixed_qkv_ref,
+        g_ref,
+        beta_ref,
+        conv_state_ref,
+        conv_weight_ref,
+        a_log_ref,
+        dt_bias_ref,
+        state_ref,
+        out_ref,
+        conv_state_out_ref,
+        state_out_ref,
+        **kwargs,
+    )
+    pf.wait()
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("lower_bound", "compute_dtype", "scale",
+                     "conv_state_dim_first", "state_transposed"),
+)
+def decode_kda_wprefetch(
+    mixed_qkv: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    conv_state: jax.Array,
+    conv_weight: jax.Array,
+    state: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array | None,
+    state_indices: jax.Array,
+    has_initial_state: jax.Array,
+    w_o: jax.Array,  # [width, k_shard] o_proj weight shard, HBM-marked
+    *,
+    lower_bound: float | None = None,
+    compute_dtype: jnp.dtype = jnp.float32,
+    scale: float | None = None,
+    conv_state_dim_first: bool = False,
+    state_transposed: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """decode_kda + o_proj weight prefetch. See _kernel_wprefetch.
+
+    Returns ``(out, conv_state, state, wv)`` where ``wv`` is the prefetched
+    weight as a VMEM-resident value for the layer's fused o_proj+AR kernel.
+    """
+    num_seqs, n_v, d_k = g.shape
+    if w_o.dtype != mixed_qkv.dtype:
+        raise ValueError(f"w_o dtype {w_o.dtype} != activation dtype "
+                         f"{mixed_qkv.dtype}")
+
+    a_log_2d = a_log.reshape(n_v, 1)
+
+    conv_state_shape = conv_state.shape
+    kernel_size = conv_weight.shape[0]
+    state_len = kernel_size - 1
+    d_v = state.shape[-1]
+    if scale is None:
+        scale = d_k**-0.5
+    if dt_bias is None:
+        dt_bias = jnp.zeros((n_v, d_k), dtype=jnp.float32)
+    dt_bias = dt_bias.reshape(n_v, d_k)
+
+    kernel = functools.partial(
+        _kernel_wprefetch,
+        n_v=n_v,
+        d_k=d_k,
+        kernel_size=kernel_size,
+        lower_bound=lower_bound,
+        compute_dtype=jnp.dtype(compute_dtype),
+        scale=float(scale),
+        state_transposed=bool(state_transposed),
+    )
+
+    if conv_state.ndim != 5:
+        if conv_state_dim_first:
+            conv_state = jnp.swapaxes(conv_state, 1, 2)
+        conv_state = conv_state.reshape(conv_state.shape[0], state_len, 3, n_v,
+                                        d_k)
+    mixed_qkv = mixed_qkv.reshape(num_seqs, 3, n_v, d_k)
+
+    def seq_map(s, si, hi):
+        return (s, 0, 0)
+
+    width, k_shard = w_o.shape
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=2,
+        grid=(num_seqs, ),
+        in_specs=[
+            pl.BlockSpec((1, 3, n_v, d_k), lambda s, si, hi: (s, 0, 0, 0)),
+            pl.BlockSpec((1, n_v, d_k), seq_map),
+            pl.BlockSpec((1, n_v, 1), seq_map),
+            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
+                         (si[s], 0, 0, 0, 0)),
+            pl.BlockSpec((kernel_size, 3, n_v, d_k), lambda s, si, hi:
+                         (0, 0, 0, 0)),
+            pl.BlockSpec((n_v, 1), lambda s, si, hi: (0, 0)),
+            pl.BlockSpec((n_v, d_k), lambda s, si, hi: (0, 0)),
+            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
+                         (si[s], 0, 0, 0)),
+            # w_o: resident, raw HBM ref (whole-tensor trivial block -- the
+            # only HBM form the lowering supports). The HBM marking happens
+            # at the call boundary (with_memory_space_constraint), not here.
+            pl.BlockSpec((width, k_shard),
+                         lambda s, si, hi: (0, 0),
+                         memory_space=pltpu.HBM),
+        ],
+        out_specs=[
+            pl.BlockSpec((1, n_v, d_v), seq_map),
+            pl.BlockSpec((1, state_len, 3, n_v, d_k), lambda s, si, hi:
+                         (si[s], 0, 0, 0, 0)),
+            pl.BlockSpec((1, n_v, d_k, d_v), lambda s, si, hi:
+                         (si[s], 0, 0, 0)),
+            # wv: the prefetched weight, staged to VMEM by the in-kernel DMA
+            # and handed to the fused o_proj op without leaving VMEM.
+            pl.BlockSpec((width, k_shard),
+                         lambda s, si, hi: (0, 0),
+                         memory_space=pltpu.VMEM),
+        ],
+        scratch_shapes=[pltpu.SemaphoreType.DMA],
+    )
+
+    out_shapes = [
+        jax.ShapeDtypeStruct((num_seqs, n_v, d_v), mixed_qkv.dtype),
+        jax.ShapeDtypeStruct(conv_state.shape, conv_state.dtype),
+        jax.ShapeDtypeStruct(state.shape, state.dtype),
+        jax.ShapeDtypeStruct((width, k_shard), w_o.dtype),
+    ]
+
+    # Alias both state pools in->out. Operand order is (scalar prefetch...,
+    # mixed_qkv, g, beta, conv_state, conv_weight, a_log, dt_bias, state,
+    # w_o); w_o is NOT aliased.
+    out, conv_state, state, wv = pl.pallas_call(
+        kernel,
+        grid_spec=grid_spec,
+        out_shape=out_shapes,
+        input_output_aliases={
+            5: 1,
+            9: 2
+        },
+        name="kda_decode_fused_conv_recurrent_wpf",
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary", ),
+            vmem_limit_bytes=int(0.9 *
+                                 pltpu.get_tpu_info().vmem_capacity_bytes),
+        ),
+    )(
+        state_indices.astype(jnp.int32),
+        has_initial_state.astype(jnp.int32),
+        mixed_qkv,
+        g,
+        beta.reshape(num_seqs, n_v, 1),
+        conv_state,
+        conv_weight,
+        a_log_2d,
+        dt_bias,
+        state,
+        pltpu.with_memory_space_constraint(w_o, pltpu.HBM),
+    )
+    if len(conv_state_shape) != 5:
+        conv_state = conv_state.reshape(conv_state.shape[0], state_len,
+                                        conv_state_shape[-1])
+        if conv_state_dim_first:
+            conv_state = jnp.swapaxes(conv_state, 1, 2)
+    return out, conv_state.reshape(conv_state_shape), state, wv
 
 
 @functools.partial(

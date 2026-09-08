@@ -637,6 +637,9 @@ class _ConvWeight(nn.Module):
 def test_kda_forward_dispatches_to_both_custom_ops() -> None:
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
+    # Not under test here: the fused o_proj+AR path (TPU_FUSED_OUT_PROJ_
+    # ALLREDUCE) reads this attribute; None means the stock o_proj runs.
+    layer._fused_oproj_entry = None
     layer.fused_qkvb_proj = _Projection(14)
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None
@@ -729,6 +732,9 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     monkeypatch.setattr(kimi_custom_ops.pallas, "jax_op", jax_op)
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
+    # Not under test here: the fused o_proj+AR path (TPU_FUSED_OUT_PROJ_
+    # ALLREDUCE) reads this attribute; None means the stock o_proj runs.
+    layer._fused_oproj_entry = None
     layer.fused_qkvb_proj = _Projection(14)
     layer.fused_fa_ga_proj = _Projection(4)
     layer.f_a_proj = None

@@ -4429,6 +4429,12 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
+        if envs.TPU_FUSED_OUT_PROJ_ALLREDUCE:
+            # Pin the KDA g_proj weights to the layout their projection
+            # fusion wants; otherwise XLA's layout assignment leaves them
+            # at the default and a relayout copy per layer per step
+            # materializes (docs/llar_out_proj_op.md).
+            runner_utils.pin_kda_gate_weight_layout(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
@@ -4551,6 +4557,24 @@ class TPUModelRunner(GPUModelRunner):
                     logger.info(
                         "Initialized the low-latency all-reduce op for %d "
                         "out-proj layers.", llar_layers)
+
+                # Arm the experimental fused o_proj+all-reduce on KDA layers
+                # (TPU_FUSED_OUT_PROJ_ALLREDUCE): the KDA kernel prefetches
+                # the o_proj weight and the fused op consumes that buffer.
+                # Same ordinal rule as the llar op: modules() order ==
+                # execution order, and the workspace slot rotation keys on it.
+                from vllm_torchtpu.models.vllm.kimi_k3.attention import \
+                    KimiDeltaAttention
+                fo_layers = 0
+                for module in self.model.modules():
+                    if isinstance(module, KimiDeltaAttention) \
+                            and module.initialize_fused_oproj():
+                        module._fused_oproj_ordinal = fo_layers
+                        fo_layers += 1
+                if fo_layers:
+                    logger.info(
+                        "Initialized the fused o_proj+all-reduce op for %d "
+                        "KDA layers.", fo_layers)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)

@@ -333,6 +333,75 @@ class KdaAttentionV3Test(parameterized.TestCase):
                                    rtol=2e-2,
                                    atol=1e-2)
 
+    def test_wpf_prefetch_matches_and_chains(self):
+        """w_o_prefetch: identical attention outputs + wv == w_o bit-exactly.
+
+        The prefetch is a pure async DMA riding the kernel, so the attention
+        outputs must be unchanged and the VMEM output a bitwise copy.
+        """
+        n_kq = n_v = 4
+        d_k = d_v = 128
+        kernel_size = 4
+        max_reqs = 2
+        q_loc = jnp.array([0, 1, 2], dtype=jnp.int32)
+        distribution = jnp.array([2, 2, 2], dtype=jnp.int32)
+        num_tokens = 2
+        state_indices = jnp.arange(1, max_reqs + 1)
+        num_blocks = max_reqs + 1
+        dim_size = 2 * n_kq * d_k + n_v * d_v
+
+        rngs = iter(jax.random.split(jax.random.key(0), 9))
+        qkv = jax.random.normal(next(rngs), (num_tokens, dim_size))
+        b = jax.random.normal(next(rngs), (num_tokens, n_v))
+        a = jax.random.normal(next(rngs), (num_tokens, n_v * d_k))
+        conv_state = jax.random.normal(
+            next(rngs), (num_blocks, kernel_size - 1, dim_size)) * 0.1
+        recurrent_state = jax.random.normal(next(rngs),
+                                            (num_blocks, n_v, d_k, d_v)) * 0.05
+        conv_weight = jax.random.normal(next(rngs), (dim_size, 1, kernel_size))
+        a_log = jax.random.normal(next(rngs), (n_v, ))
+        dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
+        w_o = jax.random.normal(next(rngs), (256, 1024))
+
+        kwargs = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            conv_weight=conv_weight,
+            conv_bias=None,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=jnp.ones((max_reqs, ), dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            attention_mode=config.AttentionMode.KDA,
+            gate_lower_bound=-5.0,
+        )
+        jitted = jax.jit(
+            wrapper.fused_conv1d_gdn,
+            static_argnames=[
+                "n_kq", "n_v", "d_k", "d_v", "kernel_size", "attention_mode",
+                "gate_lower_bound"
+            ],
+        )
+        (ref_conv, ref_pool), ref_out = jitted(**kwargs)
+        (conv, pool), out, wv = jitted(**kwargs, w_o_prefetch=w_o)
+
+        np.testing.assert_allclose(np.asarray(out, np.float64),
+                                   np.asarray(ref_out, np.float64),
+                                   rtol=2e-2,
+                                   atol=5e-3)
+        np.testing.assert_array_equal(np.asarray(wv), np.asarray(w_o))
+        np.testing.assert_array_equal(np.asarray(pool), np.asarray(ref_pool))
+
     @parameterized.named_parameters(
         dict(
             testcase_name="bound_under_gdn",

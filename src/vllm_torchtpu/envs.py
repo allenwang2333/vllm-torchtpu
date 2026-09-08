@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_LOW_LATENCY_ALLREDUCE: bool = False
     TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE: str = ""
+    TPU_FUSED_OUT_PROJ_ALLREDUCE: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -385,6 +386,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # by default.
     "TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE":
     lambda: os.environ.get("TPU_LOW_LATENCY_ALLREDUCE_MAX_BATCH_SIZE", ""),
+    # Route T=1 o_proj + reduce through the fused two-shot kernel
+    # (kernels/collectives/fused_out_proj_all_reduce.py) instead of the
+    # stock matmul + all-reduce. Same compile-cache-key constraints as the
+    # low-latency all-reduce flag above.
+    "TPU_FUSED_OUT_PROJ_ALLREDUCE":
+    env_bool("TPU_FUSED_OUT_PROJ_ALLREDUCE"),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK":

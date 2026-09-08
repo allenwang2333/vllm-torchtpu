@@ -95,6 +95,10 @@ if [[ "${ENABLE_PREFIX_CACHING}" == "1" && "${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
 fi
 export TPU_LOW_LATENCY_ALLREDUCE="${TPU_LOW_LATENCY_ALLREDUCE:-0}"
 export TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT="${TPU_LOW_LATENCY_ALLREDUCE_TWO_SHOT:-0}"
+# Experimental T=1 fused o_proj+all-reduce with the KDA-kernel weight
+# prefetch; requires VLLM_TORCHTPU_KDA_FUSED=0 (the fused KDA core takes no
+# extra operands). Pinned here so an arm's value comes from the job record.
+export TPU_FUSED_OUT_PROJ_ALLREDUCE="${TPU_FUSED_OUT_PROJ_ALLREDUCE:-0}"
 LOG_DIR="${KIMI_K3_LOG_ROOT:-${REPO_DIR}/results/kimi-k3-verify-${SLURM_JOB_ID}}"
 # Set PROFILE_DIR to make /start_profile work. Both halves are required and
 # neither can be turned on after the server is up: the phased profiler is read
@@ -154,6 +158,8 @@ MODEL_DIR="models--${MODEL//\//--}"
 # node-local and the four copies differ.
 REQUIRED_SNAPSHOT_FILES="${REQUIRED_SNAPSHOT_FILES:-config.json configuration_kimi_k3.py modeling_kimi_k3.py modeling_kimi_linear.py kimi_k3_processor.py kimi_k3_vision_processing.py media_utils.py encoding_k3.py tokenization_kimi.py tokenizer_config.json tiktoken.model model.safetensors.index.json}"
 all_hosts_have() {
+  # shellcheck disable=SC2016  # single quotes are deliberate: the body runs
+  # under bash -c on each remote node; only the spliced expansions are local.
   srun --overlap -N4 -n4 --ntasks-per-node=1 \
     bash -c '
       snap=$(ls -d "'"$1"'/'"${MODEL_DIR}"'/snapshots/"*/ 2>/dev/null | head -1)
@@ -196,6 +202,10 @@ _LLAR_TAG=""
 _POOL_TAG=""
 [[ "${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}" == "1" ]] && _POOL_TAG="-pool"
 [[ "${ENABLE_PREFIX_CACHING}" == "1" ]] && _POOL_TAG="${_POOL_TAG}-apc"
+# Same hazard, fifth flag: the fused o_proj+AR arm adds the KDA weight-prefetch
+# operand and workspace tensors to the graph -- give it its own tree too.
+_FOP_TAG=""
+[[ "${TPU_FUSED_OUT_PROJ_ALLREDUCE:-0}" == "1" ]] && _FOP_TAG="-fused-oproj"
 # Same hazard again: fused vs unfused KDA produces different graphs, so the
 # unfused arm gets its own tree. Fused is the code's default and keeps the
 # untagged path so existing caches stay usable.
@@ -205,7 +215,7 @@ _KDA_TAG=""
 # a non-default COMPILE_SIZES gets its own cache tree too.
 _SIZES_TAG=""
 [[ "${COMPILE_SIZES}" != "2,16,512" ]] && _SIZES_TAG="-cs$(echo "${COMPILE_SIZES}" | tr ', ' '--')"
-export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}${_POOL_TAG}${_KDA_TAG}${_SIZES_TAG}}"
+export VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-/mnt/scratch/users/${RUN_USER}/vllm-xla-cache/kimi-k3${_LLAR_TAG}${_POOL_TAG}${_KDA_TAG}${_FOP_TAG}${_SIZES_TAG}}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-runtime}"
 export VLLM_CONFIG_ROOT="${VLLM_CONFIG_ROOT:-${VLLM_XLA_CACHE_PATH}/vllm-config}"
 # torch_tpu >= 0.1.1.dev20260813 reads the non-INTERNAL names; the INTERNAL

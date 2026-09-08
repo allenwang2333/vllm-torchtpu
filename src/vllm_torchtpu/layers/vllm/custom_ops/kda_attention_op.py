@@ -17,7 +17,8 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
 from vllm_torchtpu.kernels.kimi_k3 import chunk_kda
-from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
+from vllm_torchtpu.kernels.kimi_k3.decode_kda import (decode_kda,
+                                                      decode_kda_wprefetch)
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import \
     _layout_supported as _mega_kda_layout_supported
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
@@ -352,8 +353,16 @@ def _get_kda_prefill_kernel() -> str:
     return kernel
 
 
-def _build_fused_core(lower_bound: float | None, eps: float):
+def _build_fused_core(lower_bound: float | None,
+                      eps: float,
+                      w_prefetch: bool = False,
+                      wpf_late: bool = False):
     """The same op, on the fused conv1d + GDN v3 kernel.
+
+    With ``w_prefetch`` the op takes the o_proj weight as a 15th
+    operand and returns the kernel-prefetched VMEM buffer as a 4th
+    output (experimental T=1 fused o_proj+AR path).
+
 
     One Pallas call replaces the four-stage manual pipeline: the fused kernel
     owns the convolution, silu, q/k L2-norm, the gate activation, beta's
@@ -365,22 +374,24 @@ def _build_fused_core(lower_bound: float | None, eps: float):
     notion of the output gate.
     """
 
-    def fused_core(
-        mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
-        raw_gate: jax.Array,  # [T, H * D]
-        beta: jax.Array,  # [T, H]
-        output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # [num_slots, K - 1, 3, H, D]
-        recurrent_state: jax.Array,  # [num_slots, H, K, V]
-        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
-        a_log: jax.Array,  # [H]
-        dt_bias: jax.Array,  # [H * D]
-        norm_weight: jax.Array,  # [D]
-        query_start_loc: jax.Array,  # [N + 1]
-        state_indices: jax.Array,  # [N]
-        seq_lens: jax.Array,  # [N]
-        distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def _fused_core_body(
+            mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+            raw_gate: jax.Array,  # [T, H * D]
+            beta: jax.Array,  # [T, H]
+            output_gate: jax.Array,  # [T, H * D]
+            conv_state: jax.Array,  # [num_slots, K - 1, 3, H, D]
+            recurrent_state: jax.Array,  # [num_slots, H, K, V]
+            conv_weight: jax.
+        Array,  # [kernel_size, 3, H, D], fused at load time
+            a_log: jax.Array,  # [H]
+            dt_bias: jax.Array,  # [H * D]
+            norm_weight: jax.Array,  # [D]
+            query_start_loc: jax.Array,  # [N + 1]
+            state_indices: jax.Array,  # [N]
+            seq_lens: jax.Array,  # [N]
+            distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+            w_o: jax.Array | None,  # [k_shard, width] o_proj weight (wpf only)
+    ):
         num_tokens, _, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
@@ -393,7 +404,7 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
 
-        (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
+        gdn_out = gdn_wrapper.fused_conv1d_gdn(
             qkv=mixed_qkv,
             # Raw: the kernel applies sigmoid to `b` and the gate activation
             # to `a` itself.
@@ -418,12 +429,54 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             kernel_size=kernel_size,
             attention_mode=gdn_config.AttentionMode.KDA,
             gate_lower_bound=lower_bound,
+            w_o_prefetch=w_o,
+            wpf_late=wpf_late,
         )
+        if w_o is None:
+            (new_conv_state, new_pool), out = gdn_out
+            wv = None
+        else:
+            (new_conv_state, new_pool), out, wv = gdn_out
 
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(output, output_gate, norm_weight, eps,
                                     mixed_qkv.dtype)
-        return output, new_conv_state, new_pool
+        if w_o is None:
+            return output, new_conv_state, new_pool
+        return output, new_conv_state, new_pool, wv
+
+    # pallas.jax_op verifies annotations and rejects a defaulted None
+    # operand, so the two arities get two wrappers around the shared body.
+    if w_prefetch:
+
+        def fused_core(
+            mixed_qkv: jax.Array, raw_gate: jax.Array, beta: jax.Array,
+            output_gate: jax.Array, conv_state: jax.Array,
+            recurrent_state: jax.Array, conv_weight: jax.Array,
+            a_log: jax.Array, dt_bias: jax.Array, norm_weight: jax.Array,
+            query_start_loc: jax.Array, state_indices: jax.Array,
+            seq_lens: jax.Array, distribution: jax.Array, w_o: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _fused_core_body(mixed_qkv, raw_gate, beta, output_gate,
+                                    conv_state, recurrent_state, conv_weight,
+                                    a_log, dt_bias, norm_weight,
+                                    query_start_loc, state_indices, seq_lens,
+                                    distribution, w_o)
+    else:
+
+        def fused_core(
+                mixed_qkv: jax.Array, raw_gate: jax.Array, beta: jax.Array,
+                output_gate: jax.Array, conv_state: jax.Array,
+                recurrent_state: jax.Array, conv_weight: jax.Array,
+                a_log: jax.Array, dt_bias: jax.Array, norm_weight: jax.Array,
+                query_start_loc: jax.Array, state_indices: jax.Array,
+                seq_lens: jax.Array, distribution: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _fused_core_body(mixed_qkv, raw_gate, beta, output_gate,
+                                    conv_state, recurrent_state, conv_weight,
+                                    a_log, dt_bias, norm_weight,
+                                    query_start_loc, state_indices, seq_lens,
+                                    distribution, None)
 
     return fused_core
 
@@ -434,32 +487,50 @@ def build_kimi_dispatched_kda_op(
     lower_bound: float | None,
     eps: float,
     state_dim_first: bool,
+    w_prefetch: bool = False,
 ):
     """Build the KDA op that sends decode rows to the fused decode kernel.
 
     Takes the *pre-convolution* projection output and owns both caches, because
     ``decode_kda`` fuses the convolution into the recurrence and so cannot be fed
     by a separate convolution op the way the chunked kernel is.
+
+    ``w_prefetch`` (experimental, T=1 decode): the op takes the layer's o_proj
+    weight as a 15th operand and the kernel prefetches it HBM->VMEM under the
+    attention compute (decode_kda_wprefetch on the unfused path,
+    outer_kernel_wpf on the fused core), returning the staged buffer as a 4th
+    output ``wv`` for the fused o_proj+AR op. The production op
+    (w_prefetch=False) is byte-identical to before.
     """
     prefill_kernel = _get_kda_prefill_kernel()
     use_mega_prefill = prefill_kernel == "mega"
+    use_fused = _use_fused_kda()
+    # Both paths support the prefetch: unfused via decode_kda_wprefetch,
+    # fused via outer_kernel_wpf (kernels/gdn/v3/wrapper.py).
+    use_wpf = w_prefetch
+    # Experimental A/B (not cache-keyed; the op name carries it): issue the
+    # prefetch DMA after the kernel's own transfers instead of at entry.
+    wpf_late = use_wpf and os.environ.get("VLLM_TORCHTPU_KDA_WPF_LATE",
+                                          "0") == "1"
 
-    def dispatched_core(
-        mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
-        raw_gate: jax.Array,  # [T, H * D]
-        beta: jax.Array,  # [T, H]
-        output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # paged short-convolution cache
-        recurrent_state: jax.Array,  # [num_slots, H, K, V]
-        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
-        a_log: jax.Array,  # [H]
-        dt_bias: jax.Array,  # [H * D]
-        norm_weight: jax.Array,  # [D]
-        query_start_loc: jax.Array,  # [N + 1]
-        state_indices: jax.Array,  # [N]
-        seq_lens: jax.Array,  # [N]
-        distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def _dispatched_core_body(
+            mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+            raw_gate: jax.Array,  # [T, H * D]
+            beta: jax.Array,  # [T, H]
+            output_gate: jax.Array,  # [T, H * D]
+            conv_state: jax.Array,  # paged short-convolution cache
+            recurrent_state: jax.Array,  # [num_slots, H, K, V]
+            conv_weight: jax.
+        Array,  # [kernel_size, 3, H, D], fused at load time
+            a_log: jax.Array,  # [H]
+            dt_bias: jax.Array,  # [H * D]
+            norm_weight: jax.Array,  # [D]
+            query_start_loc: jax.Array,  # [N + 1]
+            state_indices: jax.Array,  # [N]
+            seq_lens: jax.Array,  # [N]
+            distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+            w_o: jax.Array | None,  # [width, k_shard] o_proj weight (wpf only)
+    ):
         num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
             mixed_qkv, raw_gate, beta, output_gate, recurrent_state, a_log,
             dt_bias, norm_weight, query_start_loc, state_indices, seq_lens)
@@ -481,7 +552,10 @@ def build_kimi_dispatched_kda_op(
                                           total_tokens)
 
         # --- decode segment: fused convolution + recurrence ---------------
-        decode_out, conv_after_decode, pool_after_decode = decode_kda(
+        # With the o_proj prefetch armed (w_o is not None), the decode kernel
+        # also stages the o_proj weight HBM->VMEM under its compute and
+        # returns it as wv; see decode_kda_wprefetch.
+        _decode_args = (
             _match_rows(mixed_qkv, num_seqs),
             _match_rows(raw_gate, num_seqs).reshape(num_seqs, num_heads,
                                                     head_dim),
@@ -493,11 +567,23 @@ def build_kimi_dispatched_kda_op(
             dt_bias.reshape(num_heads, head_dim),
             _null_out_non_decode(state_indices, decode_end),
             has_initial_state,
-            lower_bound=lower_bound,
-            # The pool is [slots, H, K, V], which is the layout the recurrence
-            # indexes as state[k, v]; no in-kernel swap.
-            state_transposed=False,
         )
+        if w_o is None:
+            decode_out, conv_after_decode, pool_after_decode = decode_kda(
+                *_decode_args,
+                lower_bound=lower_bound,
+                # The pool is [slots, H, K, V], which is the layout the
+                # recurrence indexes as state[k, v]; no in-kernel swap.
+                state_transposed=False,
+            )
+        else:
+            (decode_out, conv_after_decode, pool_after_decode,
+             wv) = decode_kda_wprefetch(
+                 *_decode_args,
+                 w_o,
+                 lower_bound=lower_bound,
+                 state_transposed=False,
+             )
 
         # --- prefill/mixed segment: convolution, then the chunked kernel ---
         # Guarded, because a decode-only step pays dearly for it otherwise.
@@ -645,14 +731,60 @@ def build_kimi_dispatched_kda_op(
         output = _gated_output_norm(output, output_gate, norm_weight, eps,
                                     activation_dtype)
 
-        return output, conv_after_prefill, new_pool
+        if w_o is None:
+            return output, conv_after_prefill, new_pool
+        return output, conv_after_prefill, new_pool, wv
+
+    # The op's signature is fixed at build time: the wpf variant takes the
+    # o_proj weight as a 15th operand and returns wv as a 4th output. (The
+    # annotations are not decorative: pallas.jax_op rejects unannotated
+    # signatures, and a MISSING return annotation fails its check too --
+    # inspect.Signature.empty is not None.)
+    if use_wpf:
+
+        def dispatched_core(
+            mixed_qkv: jax.Array, raw_gate: jax.Array, beta: jax.Array,
+            output_gate: jax.Array, conv_state: jax.Array,
+            recurrent_state: jax.Array, conv_weight: jax.Array,
+            a_log: jax.Array, dt_bias: jax.Array, norm_weight: jax.Array,
+            query_start_loc: jax.Array, state_indices: jax.Array,
+            seq_lens: jax.Array, distribution: jax.Array, w_o: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _dispatched_core_body(mixed_qkv, raw_gate, beta,
+                                         output_gate, conv_state,
+                                         recurrent_state, conv_weight, a_log,
+                                         dt_bias, norm_weight, query_start_loc,
+                                         state_indices, seq_lens, distribution,
+                                         w_o)
+    else:
+
+        def dispatched_core(
+                mixed_qkv: jax.Array, raw_gate: jax.Array, beta: jax.Array,
+                output_gate: jax.Array, conv_state: jax.Array,
+                recurrent_state: jax.Array, conv_weight: jax.Array,
+                a_log: jax.Array, dt_bias: jax.Array, norm_weight: jax.Array,
+                query_start_loc: jax.Array, state_indices: jax.Array,
+                seq_lens: jax.Array, distribution: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _dispatched_core_body(mixed_qkv, raw_gate, beta,
+                                         output_gate, conv_state,
+                                         recurrent_state, conv_weight, a_log,
+                                         dt_bias, norm_weight, query_start_loc,
+                                         state_indices, seq_lens, distribution,
+                                         None)
 
     # The fused core replaces the whole op, prefill included, so it overrides
     # the chunked/mega selection rather than composing with it.
-    use_fused = _use_fused_kda()
     variant = "fused" if use_fused else prefill_kernel
-    core = _build_fused_core(lower_bound,
-                             eps) if use_fused else dispatched_core
+    if use_wpf:
+        # The operand list changes with the wpf variant, and vLLM's compile
+        # cache does not key on it, so it goes in the op name.
+        variant = f"{variant}_wpf"
+        if wpf_late:
+            variant = f"{variant}late"
+    core = _build_fused_core(
+        lower_bound, eps, w_prefetch=use_wpf,
+        wpf_late=wpf_late) if use_fused else dispatched_core
 
     if use_fused and prefill_kernel != "chunked":
         logger.warning(
@@ -677,10 +809,59 @@ def build_kimi_dispatched_kda_op(
         output = torch.empty((mixed_qkv.size(0), num_heads, head_dim),
                              dtype=mixed_qkv.dtype,
                              device=mixed_qkv.device)
-        return (output, torch.empty_like(conv_state),
-                torch.empty_like(recurrent_state))
+        outs = [
+            output,
+            torch.empty_like(conv_state),
+            torch.empty_like(recurrent_state)
+        ]
+        if use_wpf:
+            # wv: the prefetched o_proj weight buffer, same shape as w_o.
+            outs.append(torch.empty_like(args[-1]))
+        return tuple(outs)
 
     dispatched_op.register_fake(_fake_dispatched)
+
+    if use_wpf:
+
+        def dispatched_impl(
+            mixed_qkv: torch.Tensor,
+            raw_gate: torch.Tensor,
+            beta: torch.Tensor,
+            output_gate: torch.Tensor,
+            conv_state: torch.Tensor,
+            recurrent_state: torch.Tensor,
+            conv_weight: torch.Tensor,
+            a_log: torch.Tensor,
+            dt_bias: torch.Tensor,
+            norm_weight: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            state_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            distribution: torch.Tensor,
+            w_o: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            output, new_conv_state, new_pool, wv = dispatched_op(
+                mixed_qkv,
+                raw_gate,
+                beta,
+                output_gate,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                a_log,
+                dt_bias,
+                norm_weight,
+                query_start_loc,
+                state_indices,
+                seq_lens,
+                distribution,
+                w_o,
+            )
+            conv_state.copy_(new_conv_state)
+            recurrent_state.copy_(new_pool)
+            return output, wv
+
+        return dispatched_impl
 
     def dispatched_impl(
         mixed_qkv: torch.Tensor,

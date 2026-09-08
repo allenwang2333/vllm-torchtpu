@@ -449,6 +449,54 @@ def relayout_hash_tables(model: torch.nn.Module):
     logger.info("Row-major relayouted %d hash tables", num_changed)
 
 
+def pin_kda_gate_weight_layout(model: torch.nn.Module):
+    """Re-materialize every KDA g_proj weight as {0,1:T(16,128)(2,1)}.
+
+    With the fused o_proj+all-reduce op in the graph
+    (TPU_FUSED_OUT_PROJ_ALLREDUCE), XLA's global layout assignment leaves
+    the per-KDA-layer gate projection weight (bf16[7168,384], a standalone
+    XLA parameter) at the default {1,0:T(8,128)(2,1)} while its
+    conv-fusion consumer wants {0,1:T(16,128)(2,1)}; the mismatch
+    materializes one ~7.3 us relayout copy per KDA layer per step (~0.46
+    ms/step over 69 layers -- see docs/llar_out_proj_op.md, "The data
+    formatting term"). Re-materializing the weight in the fusion's layout
+    turns the HBM->VMEM staging into a pure DMA. g_proj is the only
+    bf16[7168,384] entry tensor in the model (w_o is [384,7168] and q/k/v
+    are merged into [7168,1155]), so the (dtype, shape)-keyed entry pin
+    cannot collide with the fused op's w_o layout.
+    """
+    from torch_tpu._internal.device_utils.annotations import (LayoutContext,
+                                                              TpuLayout)
+
+    layout = TpuLayout(minor_to_major=[0, 1], tiles=[[16, 128], [2, 1]])
+    num_changed = 0
+    for name, module in model.named_modules():
+        if type(module).__name__ != "KimiDeltaAttention":
+            continue
+        g_proj = getattr(module, "g_proj", None)
+        weight = getattr(g_proj, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            continue
+        # LayoutContext hooks host->device transfers only, so the tensor
+        # makes one round trip through the host (same as _to_row_major).
+        host = weight.data.cpu()
+        with LayoutContext(layout):
+            device_tensor = host.to(weight.device)
+        weight.data = device_tensor
+        _PINNED_ENTRY_LAYOUTS[(device_tensor.dtype,
+                               tuple(device_tensor.shape))] = [0, 1]
+        num_changed += 1
+        logger.info(
+            "Pinned KDA gate weight %s.g_proj.weight to "
+            "{0,1:T(16,128)(2,1)} (shape %s)", name,
+            tuple(device_tensor.shape))
+
+    if num_changed:
+        _install_entry_layout_pin()
+    logger.info("Pinned %d KDA gate weights to {0,1:T(16,128)(2,1)}",
+                num_changed)
+
+
 def _install_entry_layout_pin() -> None:
     """Make the compiler pin entry layouts for buffers in the registry. """
     global _entry_pin_installed
