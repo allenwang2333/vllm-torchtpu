@@ -118,11 +118,12 @@ def _signal_round(sem, my_id, num_devices: int):
         )
 
 
-def _fused_out_proj_ar_kernel(x_ref, w_ref, rs_ref, ag_ref, o_ref,
-                              payload_vmem, recv_vmem, red_vmem, asm_vmem,
-                              local_sem, send_sem, recv_sem, arr1, arr2, *,
+def _fused_out_proj_ar_kernel(x_ref, w_ref, resid_ref, fw_ref, rs_ref, ag_ref,
+                              o_ref, inv_ref, score_ref, payload_vmem,
+                              recv_vmem, red_vmem, asm_vmem, local_sem,
+                              send_sem, recv_sem, arr1, arr2, *,
                               num_devices: int, axis_name: str, tiles: int,
-                              slot: int, barrier_first: int,
+                              slot: int, barrier_first: int, eps: float,
                               steady_signals: bool):
     my_id = lax.axis_index(axis_name)
 
@@ -179,7 +180,11 @@ def _fused_out_proj_ar_kernel(x_ref, w_ref, rs_ref, ag_ref, o_ref,
 
     # Owners reduce their tile. The local stage copy is the only DMA inside
     # a conditional -- remote DMA inside pl.when deadlocks on this stack
-    # (probe job 485), local is fine.
+    # (probe job 485), local is fine. The owner also adds its tile's slice of
+    # the residual stream: the residual is replicated across ranks, so the
+    # add is exact and rides the owner-reduce instead of the assembly tail
+    # (bench job 790; ref indexing by my_id -- an array dynamic_slice is
+    # unimplemented in this lowering).
     @pl.when(my_id < tiles)
     def _():
         stage = pltpu.make_async_copy(src_ref=rs_ref.at[slot],
@@ -190,7 +195,7 @@ def _fused_out_proj_ar_kernel(x_ref, w_ref, rs_ref, ag_ref, o_ref,
         red = payload_vmem[my_id]
         for j in range(num_devices):
             red = red + recv_vmem[j]
-        red_vmem[...] = red
+        red_vmem[...] = red + resid_ref[my_id]
 
     # Phase 2 -- all-gather. Fully uniform: no remote DMA inside a
     # conditional. Ownerless ranks broadcast their (garbage) red_vmem into
@@ -230,11 +235,24 @@ def _fused_out_proj_ar_kernel(x_ref, w_ref, rs_ref, ag_ref, o_ref,
     # global layout assignment and materialized the [7168,384] MoE
     # weight-staging transposes (the Batch W contagion term, ~16 ms/window,
     # jobs 581/593). A boring [1, width] result doesn't propagate.
-    o_ref[...] = asm_vmem[...].reshape(o_ref.shape)
+    #
+    # Tail epilogue (bench jobs 787/790): the AttentionResidual prefix
+    # branch that follows the AR in the model -- inv_rms and the folded
+    # score -- needs only (hidden, fw), so both reduces ride the assembly.
+    # hidden already carries the residual (owner-side add above).
+    hidden = asm_vmem[...]
+    h32 = hidden.astype(jnp.float32)
+    inv = lax.rsqrt(jnp.sum(h32 * h32) / (tiles * PACK * LANES) + eps)
+    inv_ref[...] = jnp.broadcast_to(inv, (1, ))
+    score = jnp.sum(h32 * fw_ref[...].astype(jnp.float32))
+    score_ref[...] = jnp.broadcast_to(score * inv, (1, ))
+    o_ref[...] = hidden.reshape(o_ref.shape)
 
 
 def fused_out_proj_all_reduce(x: jax.Array,
                               w: jax.Array,
+                              resid: jax.Array,
+                              fw: jax.Array,
                               rs: jax.Array,
                               ag: jax.Array,
                               *,
@@ -242,16 +260,27 @@ def fused_out_proj_all_reduce(x: jax.Array,
                               barrier_first: int,
                               axis_name: str,
                               num_devices: int,
+                              eps: float = 1e-5,
                               collective_id: int = 0,
                               has_side_effects: bool = True,
-                              steady_signals: bool = False) -> jax.Array:
-    """o_proj partial + two-shot all-reduce in one custom call. T=1 only.
+                              steady_signals: bool = False) -> tuple:
+    """o_proj partial + AR + AttentionResidual prefix stats. T=1 only.
 
     ``x`` is this rank's activation shard ``[1, k_shard]``; ``w`` is this
     rank's row-parallel weight shard ``[k_shard, width]`` -- contracting dim
     FIRST, the layout the torch_tpu RowParallelLinear actually stores
-    (measured on device). Returns the reduced ``[1, width]`` payload,
-    identical on every rank.
+    (measured on device). ``resid`` is the replicated residual stream and
+    ``fw`` the AttentionResidual folded scorer weight (f32), both packed
+    ``[tiles, PACK, LANES]`` (a free logical reshape of [1, width] / [width]
+    at the callsite) so the owner can ref-index its tile by ``my_id``.
+
+    Returns ``(hidden, inv_rms, score)``: ``hidden = AR(partials) + resid``
+    ([1, width], identical on every rank), ``inv_rms = rsqrt(mean(hidden**2)
+    + eps)`` and ``score = (hidden . fw) * inv_rms`` (the AttentionResidual
+    prefix-branch statistics -- the softmax and weighted sum stay in XLA;
+    bench jobs 787/790). At K3 block-boundary layers the caller passes a
+    zeros residual, which reproduces the model's ``prefix_sum = attn_out``
+    exactly (bf16 x + 0 == x).
 
     ``rs``/``ag`` are caller-owned persistent scratch (see
     ``make_fused_out_proj_workspace``), mutated in place through the input
@@ -280,7 +309,7 @@ def fused_out_proj_all_reduce(x: jax.Array,
     steady_barrier=False.
     """
     if num_devices < 2:
-        return x  # caller handles; kept for signature symmetry
+        raise ValueError("fused_out_proj_all_reduce requires num_devices >= 2")
     if x.ndim != 2 or x.shape[0] != 1:
         raise ValueError(
             f"fused_out_proj_all_reduce is T=1 only: x must be [1, k_shard], "
@@ -299,6 +328,12 @@ def fused_out_proj_all_reduce(x: jax.Array,
                          "implemented")
     if slot not in (0, 1):
         raise ValueError(f"slot must be 0 or 1, got {slot}")
+    if tuple(resid.shape) != (tiles, PACK, LANES):
+        raise ValueError(f"resid must be packed {(tiles, PACK, LANES)}, got "
+                         f"{resid.shape}")
+    if tuple(fw.shape) != (tiles, PACK, LANES) or fw.dtype != jnp.float32:
+        raise ValueError(f"fw must be f32 packed {(tiles, PACK, LANES)}, got "
+                         f"{fw.shape} {fw.dtype}")
     expected_rs = (2, num_devices, PACK, LANES)
     expected_ag = (2, tiles + 1, PACK, LANES)
     if tuple(rs.shape) != expected_rs:
@@ -312,17 +347,26 @@ def fused_out_proj_all_reduce(x: jax.Array,
                                tiles=tiles,
                                slot=slot,
                                barrier_first=barrier_first,
+                               eps=eps,
                                steady_signals=steady_signals)
-    (out, ) = pl.pallas_call(
+    out, inv, score = pl.pallas_call(
         kernel,
-        out_shape=(jax.ShapeDtypeStruct((1, width), x.dtype), ),
+        out_shape=(jax.ShapeDtypeStruct(
+            (1, width), x.dtype), jax.ShapeDtypeStruct(
+                (1, ), jnp.float32), jax.ShapeDtypeStruct((1, ), jnp.float32)),
         in_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
             pl.BlockSpec(memory_space=pltpu.VMEM),
             pl.BlockSpec(memory_space=pltpu.VMEM),
             pl.BlockSpec(memory_space=pl.ANY),
             pl.BlockSpec(memory_space=pl.ANY),
         ],
-        out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+        out_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ],
         scratch_shapes=[
             pltpu.VMEM((tiles, PACK, LANES), x.dtype),
             pltpu.VMEM((num_devices, PACK, LANES), x.dtype),
@@ -338,8 +382,8 @@ def fused_out_proj_all_reduce(x: jax.Array,
             collective_id=collective_id if barrier_first else None,
             has_side_effects=has_side_effects,
             disable_semaphore_checks=True),
-    )(x, w, rs, ag)
-    return out
+    )(x, w, resid, fw, rs, ag)
+    return out, inv, score
 
 
 def make_fused_out_proj_workspace(width: int, dtype,

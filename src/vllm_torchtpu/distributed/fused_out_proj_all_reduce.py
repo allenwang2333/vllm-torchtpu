@@ -10,9 +10,10 @@ distributed/low_latency_all_reduce.py's module docstring for the full
 post-mortems):
 
 * ONE opaque custom op whose signature never changes --
-  ``fused_out_proj_ar_<width>(x, w, rs, ag, slot, barrier_first)`` -- so
-  dynamo never sees a branch on the token count. T=1 is the only wired
-  bucket, so there is one workspace pair, not a list.
+  ``fused_out_proj_ar_<width>(x, w, resid, fw, rs, ag, slot,
+  barrier_first) -> (hidden, inv_rms, score)`` -- so dynamo never sees a
+  branch on the token count. T=1 is the only wired bucket, so there is one
+  workspace pair, not a list.
 * ``slot`` alternates per layer and ``barrier_first`` is set on the first
   layer of every execution; both are compile-time properties of the
   callsite, baked into per-variant inner ops because static args cannot
@@ -20,11 +21,10 @@ post-mortems):
 * The workspaces are per-call scratch, fully rewritten before every read;
   they are arguments (not captures) and are never written back.
 
-Integration status: the op expects bf16 weight shards. K3's o_proj weights
-are compressed-tensors quantized, so wiring this into the model needs an
-in-kernel dequant (or a bf16 weight copy) that does not exist yet -- this
-module is built and unit-tested but nothing calls get_fused_out_proj_entry
-yet. TPU_FUSED_OUT_PROJ_ALLREDUCE gates it and stays default-off.
+The kernel's tail computes the AttentionResidual prefix-branch stats
+(inv_rms, folded score) for the layer's mlp_res -- see the kernel module
+docstring and docs/llar_out_proj_op.md (jobs 787/790). T=1 is wired into
+KimiDeltaAttention behind TPU_FUSED_OUT_PROJ_ALLREDUCE (default-off).
 """
 
 import torch
@@ -51,47 +51,53 @@ def _replicated_spec():
 
 
 def _build_fused_fn(mesh, num_devices: int, collective_id: int, slot: int,
-                    barrier_first: int):
+                    barrier_first: int, eps: float):
     """The shard_map-wrapped JAX fn for one (slot, barrier_first) variant.
 
-    Signature is fixed -- ``(x, w, rs, ag)`` with x the [1, k_shard]
-    activation shard and w the [width, k_shard] weight shard. The only
-    non-custom-call op in the body is the packed [tiles, 2, 128] -> [1,
-    width] reshape of the result (a small relayout copy; the two layouts
-    tile differently). slot/barrier_first must be baked into the closure:
-    torch_tpu's jax_placeholders zips operands with partition specs and
-    silently drops trailing static args.
+    Signature is fixed -- ``(x, w, resid, fw, rs, ag)`` with x the
+    [1, k_shard] activation shard, w the [width, k_shard] weight shard,
+    resid the [1, width] residual stream and fw the [width] f32 folded
+    AttentionResidual scorer weight. The only non-custom-call ops in the
+    body are the free logical reshapes packing resid/fw to [tiles, 2, 128]
+    (the owner ref-indexes its tile by rank id). slot/barrier_first must be
+    baked into the closure: torch_tpu's jax_placeholders zips operands with
+    partition specs and silently drops trailing static args.
     """
     import jax
 
-    from vllm_torchtpu.kernels.collectives.fused_out_proj_all_reduce import \
-        fused_out_proj_all_reduce
+    from vllm_torchtpu.kernels.collectives.fused_out_proj_all_reduce import (
+        LANES, PACK, fused_out_proj_all_reduce)
 
     _REPLICATED = _replicated_spec()
 
-    def _fn(x: jax.Array, w: jax.Array, rs: jax.Array,
-            ag: jax.Array) -> jax.Array:
+    def _fn(x: jax.Array, w: jax.Array, resid: jax.Array, fw: jax.Array,
+            rs: jax.Array,
+            ag: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
 
-        def body(x, w, rs, ag):
+        def body(x, w, resid, fw, rs, ag):
             # The kernel returns the natural [1, width] layout directly --
             # see the kernel's assembly comment for why the packed form
             # must not cross the custom-call boundary (layout contagion).
+            tiles = w.shape[1] // (PACK * LANES)
             return fused_out_proj_all_reduce(x,
                                              w,
+                                             resid.reshape(tiles, PACK, LANES),
+                                             fw.reshape(tiles, PACK, LANES),
                                              rs,
                                              ag,
                                              slot=slot,
                                              barrier_first=barrier_first,
                                              axis_name="tp",
                                              num_devices=num_devices,
+                                             eps=eps,
                                              collective_id=collective_id,
                                              has_side_effects=False)
 
         return jax.shard_map(body,
                              mesh=mesh,
-                             in_specs=(_REPLICATED, ) * 4,
-                             out_specs=_REPLICATED,
-                             check_vma=False)(x, w, rs, ag)
+                             in_specs=(_REPLICATED, ) * 6,
+                             out_specs=(_REPLICATED, ) * 3,
+                             check_vma=False)(x, w, resid, fw, rs, ag)
 
     return _fn
 
@@ -100,10 +106,13 @@ def _build_fused_fn(mesh, num_devices: int, collective_id: int, slot: int,
 _ENTRIES: dict[tuple, tuple | None] = {}
 
 
-def get_fused_out_proj_entry(width: int, k_shard: int, dtype: torch.dtype):
+def get_fused_out_proj_entry(width: int,
+                             k_shard: int,
+                             dtype: torch.dtype,
+                             eps: float = 1e-5):
     """The shared fused o_proj+reduce op for this TP group, or None.
 
-    One entry per (width, k_shard, dtype). Returns None -- meaning the
+    One entry per (width, k_shard, dtype, eps). Returns None -- meaning the
     caller keeps the stock matmul + all-reduce -- when the flag is off, the
     group is trivial, the mesh cannot be built, or the shape fails the
     kernel's constraints (width must be a multiple of 256 with
@@ -126,13 +135,13 @@ def get_fused_out_proj_entry(width: int, k_shard: int, dtype: torch.dtype):
     if communicator is None or int(getattr(communicator, "world_size", 1)) < 2:
         return None
 
-    key = (width, k_shard, dtype, str(communicator.device))
+    key = (width, k_shard, dtype, eps, str(communicator.device))
     if key in _ENTRIES:
         return _ENTRIES[key]
 
     entry = None
     try:
-        entry = _build_entry(communicator, width, k_shard, dtype)
+        entry = _build_entry(communicator, width, k_shard, dtype, eps)
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "Could not build the fused out-proj all-reduce for width %d "
@@ -142,8 +151,8 @@ def get_fused_out_proj_entry(width: int, k_shard: int, dtype: torch.dtype):
     return entry
 
 
-def _build_entry(communicator, width: int, k_shard: int,
-                 dtype: torch.dtype) -> tuple | None:
+def _build_entry(communicator, width: int, k_shard: int, dtype: torch.dtype,
+                 eps: float) -> tuple | None:
     """Build the opaque op and its workspace pair for (width, k_shard)."""
     import torch.distributed as dist
 
@@ -171,28 +180,34 @@ def _build_entry(communicator, width: int, k_shard: int,
     inner_map = {}
     for slot, first in ((0, 1), (0, 0), (1, 0)):
         fn = _build_fused_fn(mesh, num_devices, _COLLECTIVE_ID_BASE, slot,
-                             first)
+                             first, eps)
         inner_map[(slot, first)] = sharded_jax_op(
             f"vllm_torchtpu::fused_out_proj_ar_{width}_{k_shard}_"
             f"s{slot}f{first}",
             fn,
             mesh=mesh,
-            input_partition_specs=(_REPLICATED, ) * 4,
-            output_partition_specs=_REPLICATED,
+            input_partition_specs=(_REPLICATED, ) * 6,
+            output_partition_specs=(_REPLICATED, ) * 3,
         )
 
     device = torch.device("tpu")
     rs = torch.zeros((2, num_devices, PACK, LANES), dtype=dtype, device=device)
     ag = torch.zeros((2, tiles + 1, PACK, LANES), dtype=dtype, device=device)
 
-    def xla_fallback(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    def xla_fallback(x: torch.Tensor, w: torch.Tensor, resid: torch.Tensor,
+                     fw: torch.Tensor) -> tuple:
         # Off the wired bucket: stock path, byte-for-byte what
-        # RowParallelLinear would have done. x @ w is the partial from this
-        # rank's shards (w is [k_shard, width], contracting dim first -- the
-        # torch_tpu RowParallelLinear layout); the ring reduction sums them.
+        # RowParallelLinear would have done, plus the epilogue in torch.
+        # x @ w is the partial from this rank's shards (w is [k_shard,
+        # width], contracting dim first -- the torch_tpu RowParallelLinear
+        # layout); the ring reduction sums them.
         out = torch.matmul(x, w)
         dist.all_reduce(out, group=communicator.device_group)
-        return out
+        hidden = out + resid
+        h32 = hidden.float()
+        inv = torch.rsqrt(h32.pow(2).mean(-1, keepdim=True) + eps)
+        score = (h32 * fw.float()).sum(-1, keepdim=True) * inv
+        return hidden, inv.squeeze(-1), score.squeeze(-1)
 
     op = _build_outer_op(f"vllm_torchtpu::fused_out_proj_ar_{width}_{k_shard}",
                          inner_map,
@@ -201,8 +216,9 @@ def _build_entry(communicator, width: int, k_shard: int,
 
     logger.info(
         "Fused out-proj all-reduce: T=1 o_proj reduces at width %d take the "
-        "fused two-shot kernel (%d devices); other token counts keep the "
-        "stock path inside the same op.", width, num_devices)
+        "fused two-shot kernel with the AttentionResidual prefix stats fused "
+        "(%d devices); other token counts keep the stock path inside the "
+        "same op.", width, num_devices)
     return op, rs, ag
 
 
@@ -225,13 +241,26 @@ def _build_outer_op(name: str, inner_map: dict, xla_fallback, *, width: int):
     breaks the compiled artifact's output count.
     """
 
-    def _impl(x: torch.Tensor, w: torch.Tensor, rs: torch.Tensor,
-              ag: torch.Tensor, slot: int, barrier_first: int) -> torch.Tensor:
+    def _impl(
+            x: torch.Tensor, w: torch.Tensor, resid: torch.Tensor,
+            fw: torch.Tensor, rs: torch.Tensor, ag: torch.Tensor, slot: int,
+            barrier_first: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.shape[0] == 1:
-            return inner_map[(slot, barrier_first)](x, w, rs, ag)
-        return xla_fallback(x, w)
+            return inner_map[(slot, barrier_first)](x, w, resid, fw, rs, ag)
+        return xla_fallback(x, w, resid, fw)
+
+    def _fake(x, w, resid, fw, rs, ag, slot, barrier_first):
+        return (torch.empty((x.shape[0], width),
+                            dtype=x.dtype,
+                            device=x.device),
+                torch.empty((x.shape[0], ),
+                            dtype=torch.float32,
+                            device=x.device),
+                torch.empty((x.shape[0], ),
+                            dtype=torch.float32,
+                            device=x.device))
 
     op = torch.library.custom_op(name, _impl, mutates_args=())
-    op.register_fake(lambda x, w, rs, ag, slot, barrier_first: torch.empty(
-        (x.shape[0], width), dtype=x.dtype, device=x.device))
+    op.register_fake(_fake)
     return op

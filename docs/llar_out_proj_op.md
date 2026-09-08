@@ -812,6 +812,7 @@ full arm (593: nosig fused op + fused-core prefetch, mark=0) is
 | 593 arm3 (nosig, mark=0) | 16.65 ms |
 | 596 arm4 (arm3 + natural [1,7168] op result) | 16.24 ms |
 | 784 arm5 (arm4 + g_proj layout pin) | 16.09 ms |
+| 831 arm6 (arm5 + AttentionResidual tail fusion) | 15.86 ms |
 
 Per-category (592 -> 593, same profiled window): all-reduce 114.3 -> 104.1
 ms (-2001 o_proj ARs, the KDA layers), custom-call 54.2 -> 50.3, data
@@ -926,3 +927,138 @@ contention.
 original justification: off the critical path, absorbed in IDLE,
 anticorrelates with TPOT across arms. Even so, removal bought ~0.15
 ms/step of TPOT (16.24 -> 16.09), so "free" was overstating it.
+
+## Fusing the post-AR epilogue (residual add + RMSNorm) into the op -- job 787
+
+What sits between the fused op's AR result and the next layer's
+projections in the compiled graph (arm5 trace): one multiply_reduce
+kLoop fusion (residual add + f32 sumsq, ~1.6 us) plus a scalar
+mul/add/rsqrt chain; the gamma scale is already inlined into the
+projection fusions, which consume (hidden, rsqrt) -- so the op only needs
+to output those two to be a drop-in replacement.
+
+Microbench (fused_oproj_bench.py, job 787, device us/call from rank0
+traces; wall-clock is dispatch-bound at ~50-70 and only relative):
+
+| variant | device us/call |
+|---------|----------------|
+| baseline (shipped nosig op) | 15.6-15.8 |
+| baselinexlaep (op + XLA epilogue, today's model path) | op 15.6 + epilogue ~2.0 (multiply_reduce 1.79 + scalar chain) |
+| tailfuse (epilogue at assembly) | 16.3-16.6 |
+| tailowner (residual add moved into the owner-reduce) | 16.3-16.6 |
+
+Numerics: all variants pass (max rel err 0.0148, same as baseline).
+
+Readings:
+
+- The in-kernel epilogue costs +0.6-0.8 us/call vs +2.0 us/call for the
+  XLA path -- a ~1.3 us/call device-time win, plus two op boundaries off
+  the serial chain (the e2e-relevant part at T=1; bench wall-clock
+  71.5 -> 70.6 understates it because bench dispatch dominates).
+- tailowner == tailfuse: moving the residual add into the owner-reduce is
+  not measurable at this size -- the [2,128] add is noise either way.
+- The "overlap the norm partials with the phase-2 sends" variant is NOT
+  worth building: the epilogue is only ~0.7 us in-kernel, and any
+  transport for the 28 f32 partials (31 extra tiny sends, or a widened
+  payload with bit-split f32-in-bf16) costs more than that. Per-tile
+  arrival processing is blocked by arrival-order opacity under nosig.
+  Overlap does not pay at this payload size; the straight tail fusion is
+  the right design.
+
+### What the ops after the multiply_reduce fusion are (K3 AttentionResidual)
+
+K3 sets attn_res_block_size=12: every decoder layer runs TWO
+AttentionResidual modules (self_attention_res before input_layernorm,
+mlp_res after attention; models/vllm/kimi_k3/layers.py:85). Reading
+fused_computation.3622 (the multiply_reduce_fusion body that consumes the
+fused op's output): the fusion computes hidden = AR_out + residual, then
+TWO reduces over it -- sumsq(hidden) (the "sum"+"mean" the trace shows)
+and score_dot = sum(hidden * w_folded) where w_folded = norm.weight *
+proj.weight (AttentionResidual's folded [7168] scorer) -- plus the scalar
+chain (x(1/7168), +eps, rsqrt -> inv_rms) and mul = score_dot * inv_rms
+(the "mul"). The "2 softmax ops" are maximum() scalars (XLA names them
+softmax.*): the max-subtract of the tiny softmax over the [1, K+1] block
+scores that weights the per-block residual snapshots against the current
+prefix. The [1,2] pad/pack and broadcast_divide fusions are the rest of
+that softmax.
+
+Measured size of the whole small-op region (arm5 decode trace, per step
+over 93 layers): multiply_reduce 729 us + score pad/pack 86 +
+broadcast_divide 136 + bitcast glue 113 ~= 1.06 ms/step of device busy
+time, PLUS the per-op boundary latency that matters more at T=1 (~10 such
+ops per layer).
+
+Fusibility: sumsq, score_dot, and the residual add all depend ONLY on
+(AR_out, residual, folded_weight) -- all three ride the op's tail. The
+block-side stats (block_residuals) do not depend on the AR and can overlap
+it; the score softmax + weighted sum must stay in XLA. Boundary condition
+to respect at integration: XLA currently reassociates the residual adds
+ACROSS the layer boundary (the fusion consuming our AR also consumes the
+previous layer's MoE/shared-expert ARs); folding the add into the opaque
+op removes that freedom -- value-identical per element, but bf16 add order
+changes, so the canary must be re-verified.
+
+Job 790 bench (adds the score-dot; BENCH_VARIANTS=baseline,
+baselinexlaep2,tailfuse,tailscore; device us/call, rank0 traces):
+
+| variant | device us/call |
+|---------|----------------|
+| baseline | 15.63 |
+| baselinexlaep2 (XLA epilogue incl. score-dot) | 15.63 + 2.03 (multiply_reduce) + scalar chain |
+| tailfuse (resid+sumsq+rsqrt in-kernel) | 16.38 |
+| tailscore (+ score-dot and score*inv in-kernel) | 16.39 |
+
+The second reduce is FREE (16.39 vs 16.38 -- idle VPU cycles during the
+epilogue). Net: +0.76 us/call in-kernel replaces >=2.0 us of XLA fusions
+plus their scalar chain and ~3 op boundaries per KDA layer. (The stray
+0.9 us `reduce` in the tail-variant traces is a bench artifact -- XLA
+lowering the callsite's resid reshape -- not the design.)
+
+Integration plan (next): the shipped op gains two replicated inputs --
+the residual ([1,width]) and the mlp_res folded scorer weight (f32
+[width]) -- and three outputs: hidden = AR + residual [1,width], the
+inv_rms rsqrt scalar, and the folded AttentionResidual prefix score; the
+model's `residual + hidden` and the mlp_res prefix-branch reduces are
+bypassed on the fused path. The post_attention_layernorm itself stays in
+XLA (it normalizes the mlp_res weighted-sum OUTPUT, which depends on the
+block scores). Canary risk: the sumsq/score reduction orders differ from
+XLA's (per-tile in-kernel vs XLA's tree) and the residual-add
+reassociation freedom is removed -- f32/bf16-ulp-level differences; arm
+canaries have tolerated the bf16 reduce-order change, so likely fine,
+verify on device.
+
+### Integration (arm6) + the score-check false alarm (jobs 791-802)
+
+Integrated: the shipped op takes (x, w, resid, fw, rs, ag) and returns
+(hidden, inv_rms, score); the model layer (KimiDecoderLayer) passes the
+prefix_sum residual and mlp_res.folded_weight in, skips its own residual
+add, and calls mlp_res.forward_with_prefix_stats (blocks stats + softmax +
+weighted sum stay in XLA). Block-boundary layers (prefix_sum is None)
+pass a zeros residual, reproducing `prefix_sum = attn_out` exactly (bf16
+x + 0 == x). The op's T!=1 fallback computes the same triple in torch.
+
+Jobs 791-794 chased a deterministic ~4.3x-wrong score at barrier_first=1
+calls: hidden and inv_rms exact, score wrong, and ONLY on call 0. Read-fw-
+early (794), collective_id 8 vs 0 (792), and an output-slot swap (796) all
+changed nothing; a bare sum(fw) probe kernel with the entry barrier was
+clean (795). Job 800's mode bisect then showed mode=0 failing with AND
+without the barrier -- i.e. not barrier-related at all. Root cause: call 0
+is the only unperturbed input (x + 0), and its score-dot reference happens
+to land near zero (want 0.093 with ~85-magnitude terms); the dot is
+cancellation-heavy, so bf16-level noise in hidden gives ~0.3 ABSOLUTE
+error -> rel err 3.31. The other calls' wants are ~50-90, so they pass.
+No kernel bug. Lesson: relative-error checks on cancellation-heavy scalars
+need an absolute floor sized to the dot's magnitude scale; both
+fused_out_proj_ar_check.py and fused_oproj_bench.py now floor the score
+tolerance at 1% of sqrt(sum((hid*fw)^2)).
+
+arm6 e2e (job 831, canary byte-identical): TPOT 16.09 -> 15.86 ms (-0.23
+ms/step). Device time barely moves (multiply_reduce -27 us/step, exactly
+one fusion per KDA layer removed: 467 -> 398/step; fused op unchanged at
+16.16 us/call -- the in-kernel epilogue hides under e2e contention); the
+win is the dependency-chain shortening, as predicted. g_proj relayouts
+still zero. Two integration bugs worth remembering: torch's infer_schema
+rejects a bare `-> tuple` return annotation on the sharded_jax_op fn
+(subscripted tuple[...] is fine), and the no-metadata warmup path must
+honor the 3-tuple contract when the layer is armed. Remaining gap to
+production (15.45) is the T=1-vs-T=2 bucket cost.

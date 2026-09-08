@@ -340,6 +340,184 @@ def _oneshot_kernel(x_ref, w_ref, ag_ref, o_ref, payload_vmem, recv_vmem,
     o_ref[...] = red.reshape(o_ref.shape)
 
 
+def _tail_epilogue_kernel(x_ref, w_ref, resid_ref, fw_ref, rs_ref, ag_ref,
+                          o_ref, rsqrt_ref, score_ref, payload_vmem, recv_vmem,
+                          red_vmem, asm_vmem, local_sem, send_sem, recv_sem,
+                          arr1, arr2, *, num_devices, axis_name, tiles, slot,
+                          barrier_first, eps, variant):
+    """The shipped (nosig) kernel with the residual-add + RMSNorm epilogue
+    fused into the tail.
+
+    The model path today is: op -> XLA multiply_reduce fusion (residual add
+    + sumsq) -> scalar rsqrt chain -> consumers apply gamma inline. This
+    kernel replaces all of that with (hidden=AR+residual, rsqrt) outputs.
+
+    variant switches:
+      tailfuse  -- residual add + sumsq + rsqrt at assembly (sequential
+                   tail after the exchange completes).
+      tailowner -- the residual add moves into the owner reduce (the
+                   residual stream is replicated, so the owner adds its own
+                   tile's slice; exact and off the assembly critical path);
+                   sumsq+rsqrt still at assembly.
+    """
+    my_id = lax.axis_index(axis_name)
+
+    if barrier_first:
+        _full_barrier(my_id, num_devices)
+
+    acc = jax.lax.dot_general(x_ref[...],
+                              w_ref[...],
+                              dimension_numbers=(((1, ), (0, )), ((), ())),
+                              preferred_element_type=jnp.float32)
+    payload_vmem[...] = acc.astype(o_ref.dtype).reshape(payload_vmem.shape)
+
+    copies = []
+    for i in range(1, num_devices):
+        dst = lax.rem(my_id + i, num_devices)
+        tile = lax.rem(dst, tiles)
+        copy = pltpu.make_async_remote_copy(
+            src_ref=payload_vmem.at[tile],
+            dst_ref=rs_ref.at[slot, my_id],
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            device_id=(dst, ),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        copy.start()
+        copies.append(copy)
+    for copy in copies:
+        copy.wait()
+    # nosig: sender-side waits prove delivery; slot rotation + barrier_first
+    # give cross-call safety (same protocol as the shipped kernel).
+
+    @pl.when(my_id < tiles)
+    def _():
+        stage = pltpu.make_async_copy(src_ref=rs_ref.at[slot, 0:num_devices],
+                                      dst_ref=recv_vmem,
+                                      sem=local_sem)
+        stage.start()
+        stage.wait()
+        red = payload_vmem[my_id]
+        for j in range(num_devices):
+            red = red + recv_vmem[j]
+        if "tailowner" in variant or "tailscore" in variant:
+            # The residual stream is replicated across ranks, so the owner
+            # adds its tile's slice here -- exact, and off the assembly
+            # critical path. Ref indexing by my_id (NOT an array slice --
+            # dynamic_slice on a value is unimplemented in this lowering).
+            red = red + resid_ref[my_id]
+        red_vmem[...] = red
+
+    out_slot = lax.min(my_id, tiles)
+    local = pltpu.make_async_copy(src_ref=red_vmem,
+                                  dst_ref=ag_ref.at[slot, out_slot],
+                                  sem=local_sem)
+    local.start()
+    copies = []
+    for i in range(1, num_devices):
+        copy = pltpu.make_async_remote_copy(
+            src_ref=red_vmem,
+            dst_ref=ag_ref.at[slot, out_slot],
+            send_sem=send_sem,
+            recv_sem=recv_sem,
+            device_id=(lax.rem(my_id + i, num_devices), ),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        copy.start()
+        copies.append(copy)
+    local.wait()
+    for copy in copies:
+        copy.wait()
+
+    stage = pltpu.make_async_copy(src_ref=ag_ref.at[slot, 0:tiles],
+                                  dst_ref=asm_vmem,
+                                  sem=local_sem)
+    stage.start()
+    stage.wait()
+    hidden = asm_vmem[...]
+    if "tailowner" not in variant and "tailscore" not in variant:
+        hidden = hidden + resid_ref[...]
+    h32 = hidden.astype(jnp.float32)
+    inv = lax.rsqrt(jnp.sum(h32 * h32) / (tiles * PACK * LANES) + eps)
+    rsqrt_ref[...] = jnp.broadcast_to(inv, (1, ))
+    if "tailscore" in variant:
+        # AttentionResidual prefix score: (hidden . w_folded) * inv_rms,
+        # folded all the way (one less scalar op outside).
+        score = jnp.sum(h32 * fw_ref[...].astype(jnp.float32))
+        score_ref[...] = jnp.broadcast_to(score * inv, (1, ))
+    else:
+        score_ref[...] = jnp.zeros((1, ), jnp.float32)
+    o_ref[...] = hidden.reshape(o_ref.shape)
+
+
+def fused_tail_variant(x,
+                       w,
+                       resid,
+                       fw,
+                       rs,
+                       ag,
+                       *,
+                       slot,
+                       barrier_first,
+                       axis_name,
+                       num_devices,
+                       variant,
+                       eps=1e-5):
+    """fused_out_proj_all_reduce + fused residual/RMSNorm tail.
+
+    ``resid`` is the replicated residual stream, packed
+    [tiles, PACK, LANES] (a free logical reshape of [1, width] at the
+    callsite) so the owner can ref-index its tile by my_id.
+
+    Returns (hidden, rsqrt): hidden = AR(o_proj partials) + residual,
+    rsqrt = lax.rsqrt(mean(hidden^2) + eps) as f32[1] -- the two values the
+    model's projection fusions consume (they apply gamma inline).
+    """
+    kernel = functools.partial(_tail_epilogue_kernel,
+                               num_devices=num_devices,
+                               axis_name=axis_name,
+                               tiles=TILES,
+                               slot=slot,
+                               barrier_first=barrier_first,
+                               eps=eps,
+                               variant=variant)
+    out, rsqrt, score = pl.pallas_call(
+        kernel,
+        out_shape=(jax.ShapeDtypeStruct(
+            (1, WIDTH), x.dtype), jax.ShapeDtypeStruct(
+                (1, ), jnp.float32), jax.ShapeDtypeStruct((1, ), jnp.float32)),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((TILES, PACK, LANES), x.dtype),
+            pltpu.VMEM((NUM_DEVICES, PACK, LANES), x.dtype),
+            pltpu.VMEM((PACK, LANES), x.dtype),
+            pltpu.VMEM((TILES, PACK, LANES), x.dtype),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.REGULAR,
+            pltpu.SemaphoreType.REGULAR,
+        ],
+        compiler_params=pltpu.CompilerParams(
+            collective_id=8 if barrier_first else None,
+            has_side_effects=False,
+            disable_semaphore_checks=True),
+    )(x, w, resid, fw, rs, ag)
+    return out, rsqrt, score
+
+
 def fused_oneshot(x, w, ag, *, slot, barrier_first, axis_name, num_devices):
     (out, ) = pl.pallas_call(
         functools.partial(_oneshot_kernel,
@@ -421,18 +599,20 @@ def main() -> int:
         "BENCH_VARIANTS",
         "baseline,directout,treereduce,pipehalf,combo").split(",")
     timing_only = {"dotonly", "rsonly"}
+    # Variants whose fn returns (hidden, rsqrt, score) triples.
+    tail_variants = {"tailfuse", "tailowner", "tailscore"}
 
     def make_fn(variant):
         if variant == "combo":
             variant = "pipehalf,treereduce,directout"
 
-        def fn(x, w, rs, ag):
+        def fn(x, w, resid, fw, rs, ag):
 
-            def body(xl, wl, rs, ag):
+            def body(xl, wl, residl, fwl, rs, ag):
                 outs = []
                 for k in range(CALLS):
                     xk = xl + jnp.asarray(k, xl.dtype)
-                    if variant == "baseline":
+                    if variant == "baseline" or variant == "baselinexlaep2":
                         out = fused_out_proj_all_reduce(
                             xk,
                             wl,
@@ -443,6 +623,18 @@ def main() -> int:
                             axis_name="tp",
                             num_devices=NUM_DEVICES,
                             has_side_effects=False)
+                        if variant == "baselinexlaep2":
+                            # Today's model path: the epilogue as JAX ops,
+                            # which XLA lowers to a multiply_reduce fusion +
+                            # scalar rsqrt chain per layer -- INCLUDING the
+                            # AttentionResidual score-dot + score*inv mul.
+                            h = out + residl
+                            h32 = h.astype(jnp.float32)
+                            inv = lax.rsqrt(jnp.sum(h32 * h32) / WIDTH + 1e-5)
+                            score = jnp.sum(h32 * fwl) * inv
+                            outs.append((h, jnp.asarray([inv], jnp.float32),
+                                         jnp.asarray([score], jnp.float32)))
+                            continue
                     elif variant == "oneshot":
                         out = fused_oneshot(xk,
                                             wl,
@@ -459,6 +651,21 @@ def main() -> int:
                                 dimension_numbers=(((1, ), (0, )), ((), ())),
                                 preferred_element_type=jnp.float32).astype(
                                     xl.dtype), "tp")
+                    elif variant in tail_variants:
+                        out, rs_val, score = fused_tail_variant(
+                            xk,
+                            wl,
+                            residl.reshape(TILES, PACK, LANES),
+                            fwl.reshape(TILES, PACK, LANES),
+                            rs,
+                            ag,
+                            slot=k % 2,
+                            barrier_first=1 if k == 0 else 0,
+                            axis_name="tp",
+                            num_devices=NUM_DEVICES,
+                            variant=variant)
+                        outs.append((out, rs_val, score))
+                        continue
                     else:
                         out = fused_variant(xk,
                                             wl,
@@ -472,18 +679,22 @@ def main() -> int:
                     outs.append(out.reshape(1, WIDTH))
                 return outs
 
+            is_tail = variant in tail_variants or variant == "baselinexlaep2"
             return jax.shard_map(body,
                                  mesh=mesh,
-                                 in_specs=(P(None, "tp"), P("tp",
-                                                            None), P(), P()),
-                                 out_specs=[P()] * CALLS,
-                                 check_vma=False)(x, w, rs, ag)
+                                 in_specs=(P(None, "tp"), P("tp", None), P(),
+                                           P(), P(), P()),
+                                 out_specs=[(P(), P(), P())] *
+                                 CALLS if is_tail else [P()] * CALLS,
+                                 check_vma=False)(x, w, resid, fw, rs, ag)
 
         return fn
 
     # x: [1, 12288] global, sharded along the contracting dim -> [1, 384]
     # per rank. w: [12288, 7168] global (contracting-dim first, the model's
-    # layout), sharded along dim 0 -> [384, 7168] per rank.
+    # layout), sharded along dim 0 -> [384, 7168] per rank. resid: the
+    # residual stream, [1, 7168] replicated (it is AR output upstream, so
+    # every rank holds the same values).
     x = jax.jit(
         lambda: jax.random.normal(jax.random.key(3),
                                   (1, K_SHARD * NUM_DEVICES), jnp.bfloat16),
@@ -491,6 +702,13 @@ def main() -> int:
     w = jax.jit(lambda: jax.random.normal(jax.random.key(1), (
         K_SHARD * NUM_DEVICES, WIDTH), jnp.bfloat16),
                 out_shardings=NamedSharding(mesh, P("tp", None)))()
+    resid = jax.jit(lambda: jax.random.normal(jax.random.key(5),
+                                              (1, WIDTH), jnp.bfloat16),
+                    out_shardings=NamedSharding(mesh, P()))()
+    # The AttentionResidual folded scorer weight (f32, replicated).
+    fw = jax.jit(lambda: jax.random.normal(jax.random.key(7),
+                                           (1, WIDTH), jnp.float32),
+                 out_shardings=NamedSharding(mesh, P()))()
 
     def make_ws(rs_slots):
         return jax.jit(lambda:
@@ -518,11 +736,28 @@ def main() -> int:
                 out_shardings=NamedSharding(mesh, P()))(x, w)
         for k in range(CALLS)
     ]
+    # Tail-variant references: hidden = AR + resid (f32), its rsqrt, and the
+    # AttentionResidual prefix score (hidden . fw) * inv_rms.
+    wants_hid = [(wt + resid.astype(jnp.float32)) for wt in wants]
+    wants_rs = [lax.rsqrt(jnp.sum(h * h) / WIDTH + 1e-5) for h in wants_hid]
+    wants_score = [
+        jnp.sum(h * fw) * inv for h, inv in zip(wants_hid, wants_rs)
+    ]
 
     def check_body(out, want):
         err = jnp.max(jnp.abs(out.astype(jnp.float32) - want))
         scale = jnp.max(jnp.abs(want))
         return lax.pmax(err / jnp.maximum(scale, 1e-6), "tp")
+
+    def check_rs_body(out, want):
+        err = jnp.abs(out[0] - want) / jnp.maximum(jnp.abs(want), 1e-12)
+        return lax.pmax(err, "tp")
+
+    def check_score_body(out, want, scale):
+        # Cancellation-heavy dot: absolute noise floor ~O(1%) of the dot
+        # magnitude scale (see fused_out_proj_ar_check.py).
+        return lax.pmax(
+            jnp.abs(out[0] - want) / (jnp.abs(want) + 0.01 * scale), "tp")
 
     checker = jax.jit(
         jax.shard_map(check_body,
@@ -530,10 +765,23 @@ def main() -> int:
                       in_specs=(P(), P()),
                       out_specs=P(),
                       check_vma=False))
+    rs_checker = jax.jit(
+        jax.shard_map(check_rs_body,
+                      mesh=mesh,
+                      in_specs=(P(), P()),
+                      out_specs=P(),
+                      check_vma=False))
+    score_checker = jax.jit(
+        jax.shard_map(check_score_body,
+                      mesh=mesh,
+                      in_specs=(P(), P(), P()),
+                      out_specs=P(),
+                      check_vma=False))
+    wants_scale = [jnp.sqrt(jnp.sum((h * fw)**2)) for h in wants_hid]
 
     prof_root = os.environ.get("BENCH_PROFILE")
     for name in chosen:
-        if name == "baseline":
+        if name == "baseline" or name == "baselinexlaep2":
             rs, ag = rs_ship, ag_ship
         elif name in ("oneshot", "xla"):
             rs, ag = rs_ship, ag_os
@@ -541,12 +789,28 @@ def main() -> int:
             rs, ag = rs_var, ag_var
         fn = jax.jit(make_fn(name))
         t0 = time.time()
-        compiled = fn.lower(x, w, rs, ag).compile()
+        compiled = fn.lower(x, w, resid, fw, rs, ag).compile()
         _stamp(rank, f"{name}: lowered+compiled in {time.time() - t0:.1f}s")
-        outs = compiled(x, w, rs, ag)
+        outs = compiled(x, w, resid, fw, rs, ag)
         jax.block_until_ready(outs)
         if name in timing_only:
             _stamp(rank, f"{name}: (timing only, numerics n/a)")
+        elif name in tail_variants or name == "baselinexlaep2":
+            worst = 0.0
+            for k in range(CALLS):
+                hid_out, rs_out, score_out = outs[k]
+                rel = float(checker(hid_out, wants_hid[k]))
+                rel_rs = float(rs_checker(rs_out, wants_rs[k]))
+                if name != "tailfuse" and name != "tailowner":
+                    rel_sc = float(
+                        score_checker(score_out, wants_score[k],
+                                      wants_scale[k]))
+                    worst = max(worst, rel_sc)
+                worst = max(worst, rel, rel_rs)
+            _stamp(
+                rank,
+                f"{name}: max rel err (hidden & rsqrt & score) = {worst:.3g}")
+            ok = ok and worst < 0.05
         else:
             worst = 0.0
             for k in range(CALLS):
@@ -556,11 +820,11 @@ def main() -> int:
             ok = ok and worst < 0.05
 
         for _ in range(5):
-            outs = compiled(x, w, rs, ag)
+            outs = compiled(x, w, resid, fw, rs, ag)
         jax.block_until_ready(outs)
         t0 = time.time()
         for _ in range(50):
-            outs = compiled(x, w, rs, ag)
+            outs = compiled(x, w, resid, fw, rs, ag)
         jax.block_until_ready(outs)
         _stamp(
             rank, f"{name}: {(time.time() - t0) / 50 / CALLS * 1e6:.2f} "
@@ -571,7 +835,7 @@ def main() -> int:
             tdir = os.path.join(prof_root, f"{name}/rank{rank}")
             profiler.start_trace(tdir)
             for _ in range(30):
-                outs = compiled(x, w, rs, ag)
+                outs = compiled(x, w, resid, fw, rs, ag)
             jax.block_until_ready(outs)
             profiler.stop_trace()
             _stamp(rank, f"{name}: trace captured -> {tdir}")

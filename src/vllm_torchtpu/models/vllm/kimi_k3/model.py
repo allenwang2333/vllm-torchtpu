@@ -145,9 +145,27 @@ class KimiDecoderLayer(nn.Module):
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
-        prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
-        hidden_states = self.mlp_res(prefix_sum, block_residuals)
+        if getattr(self.self_attn, "_fused_oproj_entry", None) is not None:
+            # Fused o_proj+AR tail path (KDA, TPU_FUSED_OUT_PROJ_ALLREDUCE):
+            # the op adds the residual stream in-kernel and returns
+            # (prefix_sum', inv_rms, score); the mlp_res prefix branch is
+            # precomputed. At block-boundary layers prefix_sum is None (the
+            # model assigns rather than adds) -- a zeros residual reproduces
+            # that exactly (bf16 x + 0 == x).
+            resid = (torch.zeros_like(hidden_states)
+                     if prefix_sum is None else prefix_sum)
+            hidden, inv_prefix, score_prefix = self.self_attn(
+                positions,
+                hidden_states,
+                residual=resid,
+                scorer_weight=self.mlp_res.folded_weight)
+            prefix_sum = hidden
+            hidden_states = self.mlp_res.forward_with_prefix_stats(
+                prefix_sum, block_residuals, inv_prefix, score_prefix)
+        else:
+            hidden_states = self.self_attn(positions, hidden_states)
+            prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
+            hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(hidden_states)

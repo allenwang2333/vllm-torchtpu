@@ -503,6 +503,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self._fused_oproj_entry = None
         self._fused_oproj_ordinal = 0
         self._w_o_pinned = None
+        # The fused op's tail epilogue (residual add + AttentionResidual
+        # prefix stats) needs the rms eps at arming time.
+        self._rms_eps = config.rms_norm_eps
         # The dispatched op owns the short convolution as well: the fused decode
         # kernel it routes decode rows to does the convolution itself, so it
         # cannot be fed by a separate convolution op.
@@ -589,7 +592,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             return False
         self._fused_oproj_entry = get_fused_out_proj_entry(
             self.o_proj.output_size, self.o_proj.input_size_per_partition,
-            self.o_proj.weight.dtype)
+            self.o_proj.weight.dtype, self._rms_eps)
         if self._fused_oproj_entry is None:
             return False
         from torch_tpu._internal.device_utils.annotations import (
@@ -604,6 +607,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        scorer_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del positions
         projected, _ = self.fused_qkvb_proj(hidden_states)
@@ -629,13 +634,28 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if (metadata is None or self.kv_cache is None
                 or self.kv_cache[0].numel() == 0):
             output = torch.zeros_like(query)
+            if self._fused_oproj_entry is not None:
+                # Keep the (hidden, inv_rms, score) contract on the
+                # no-metadata path (eager warmup / KV-cache sizing):
+                # attention output is zero, so hidden = 0 + residual.
+                assert residual is not None and scorer_weight is not None
+                hidden = self.o_proj(output)[0] + residual
+                h32 = hidden.float()
+                inv = torch.rsqrt(h32.pow(2).mean(-1) + self._rms_eps)
+                score = (h32 * scorer_weight).sum(-1) * inv
+                return hidden, inv, score
         else:
             sconv_cache, recurrent_cache = self.kv_cache
             if self._fused_oproj_entry is not None:
                 # Experimental T=1 path: the KDA op prefetches the o_proj
                 # weight HBM->VMEM under the decode kernel and returns it as
                 # wv; the fused op consumes that buffer and falls back to
-                # matmul + ring all-reduce for T != 1 payloads.
+                # matmul + ring all-reduce for T != 1 payloads. The op's tail
+                # also folds the residual add and the mlp_res prefix-branch
+                # stats (inv_rms, folded score), so it returns
+                # (hidden = prefix_sum', inv_rms, score) -- the layer skips
+                # its own residual add and prefix-stat reduces.
+                assert residual is not None and scorer_weight is not None
                 output, wv = self.dispatched_kda_op(
                     mixed_qkv,
                     raw_gate,
@@ -654,25 +674,49 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                     self._w_o_pinned,
                 )
                 op, rs, ag = self._fused_oproj_entry
-                return op(output.flatten(1), wv, rs, ag,
-                          self._fused_oproj_ordinal % 2,
+                return op(output.flatten(1), wv, residual, scorer_weight, rs,
+                          ag, self._fused_oproj_ordinal % 2,
                           1 if self._fused_oproj_ordinal == 0 else 0)
-            output = self.dispatched_kda_op(
-                mixed_qkv,
-                raw_gate,
-                beta,
-                output_gate,
-                sconv_cache,
-                recurrent_cache,
-                self.conv_weight_fused,
-                self.A_log,
-                self.dt_bias,
-                self.o_norm.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-                metadata.request_distribution,
-            ).flatten(1)
+            if self._kda_wpf:
+                # The dispatched op was built with the weight-prefetch
+                # operand (a 15th input and a 4th, wv, output); the fused
+                # o_proj+AR entry failed to arm, so this is the stock path
+                # and wv goes unused -- but the operand list must still
+                # match the built signature.
+                output = self.dispatched_kda_op(
+                    mixed_qkv,
+                    raw_gate,
+                    beta,
+                    output_gate,
+                    sconv_cache,
+                    recurrent_cache,
+                    self.conv_weight_fused,
+                    self.A_log,
+                    self.dt_bias,
+                    self.o_norm.weight,
+                    metadata.query_start_loc,
+                    metadata.mamba_state_indices,
+                    metadata.seq_lens,
+                    metadata.request_distribution,
+                    self.o_proj.weight,
+                )[0].flatten(1)
+            else:
+                output = self.dispatched_kda_op(
+                    mixed_qkv,
+                    raw_gate,
+                    beta,
+                    output_gate,
+                    sconv_cache,
+                    recurrent_cache,
+                    self.conv_weight_fused,
+                    self.A_log,
+                    self.dt_bias,
+                    self.o_norm.weight,
+                    metadata.query_start_loc,
+                    metadata.mamba_state_indices,
+                    metadata.seq_lens,
+                    metadata.request_distribution,
+                ).flatten(1)
 
         output, _ = self.o_proj(output)
         return output

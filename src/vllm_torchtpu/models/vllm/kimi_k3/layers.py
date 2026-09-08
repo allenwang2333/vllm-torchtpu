@@ -127,3 +127,31 @@ class AttentionResidual(nn.Module):
         out = (probabilities[..., :-1].unsqueeze(-1) * v_blocks).sum(dim=-2)
         out = out + probabilities[..., -1].unsqueeze(-1) * v_prefix
         return out.to(block_residuals.dtype)
+
+    def forward_with_prefix_stats(
+        self,
+        prefix_sum: torch.Tensor,
+        block_residuals: torch.Tensor,
+        inv_prefix: torch.Tensor,
+        score_prefix: torch.Tensor,
+    ) -> torch.Tensor:
+        """``forward`` with the prefix-branch statistics precomputed.
+
+        The fused o_proj+all-reduce op's tail computes
+        inv_prefix = rsqrt(mean(prefix_sum**2) + eps) and
+        score_prefix = (prefix_sum . folded_weight) * inv_prefix in-kernel
+        (docs/llar_out_proj_op.md, jobs 787/790); this skips the prefix
+        reduces here and keeps the block-side stats, softmax, and weighted
+        sum identical to ``forward``.
+        """
+        v_blocks = block_residuals.float()
+        v_prefix = prefix_sum.float()
+        w = self.folded_weight
+        inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
+        scores = torch.cat(
+            ((v_blocks * w).sum(-1) * inv_blocks, score_prefix.unsqueeze(-1)),
+            dim=-1)  # [T, K]
+        probabilities = scores.softmax(dim=-1)
+        out = (probabilities[..., :-1].unsqueeze(-1) * v_blocks).sum(dim=-2)
+        out = out + probabilities[..., -1].unsqueeze(-1) * v_prefix
+        return out.to(block_residuals.dtype)
