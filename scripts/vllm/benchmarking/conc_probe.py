@@ -41,6 +41,10 @@ import aiohttp
 # run for tens of seconds (300 lines, ~1200 tokens).
 PROMPT = ("Count from 1 to 300, one number per line, nothing else. "
           "After 300 write the single word DONE.")
+# Filler to make the prompt long (more KV pages per sequence). Plain prose
+# that gives the model nothing to do; --prompt-pad-words copies of it.
+FILLER = ("The archive room held ledgers from every season, each page dated and "
+          "signed, and the clerk read them in order without comment. ")
 GARBAGE_RE = re.compile(r"[一-鿿぀-ヿ]|&nbsp|<span|(\b\w+\b)(?:\s+\1\b){3,}")
 NUMBERS_RE = re.compile(r"\b(\d{1,3})\b")
 
@@ -58,10 +62,20 @@ def classify(text: str) -> str:
     return "wrong"
 
 
-async def one_request(session, url, model, max_tokens, idx):
+def build_prompt(idx: int, pad_words: int) -> str:
+    if pad_words <= 0:
+        return f"{PROMPT} (request {idx})"
+    words = FILLER.split()
+    reps = pad_words // len(words) + 1
+    filler = " ".join((words * reps)[:pad_words])
+    return (f"Background text for request {idx} (ignore it):\n{filler}\n\n"
+            f"Now the task: {PROMPT}")
+
+
+async def one_request(session, url, model, max_tokens, idx, pad_words):
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": f"{PROMPT} (request {idx})"}],
+        "messages": [{"role": "user", "content": build_prompt(idx, pad_words)}],
         "max_tokens": max_tokens,
         "temperature": 0,
         "chat_template_kwargs": {"thinking": False},
@@ -100,7 +114,7 @@ async def sample_metrics(session, metrics_url, stop, out):
     out["peak_waiting"] = peak_waiting
 
 
-async def probe(base_url, model, n, max_tokens):
+async def probe(base_url, model, n, max_tokens, pad_words):
     url = f"{base_url}/v1/chat/completions"
     metrics_url = f"{base_url}/metrics"
     stop = asyncio.Event()
@@ -111,7 +125,7 @@ async def probe(base_url, model, n, max_tokens):
     async with aiohttp.ClientSession(connector=connector) as session:
         sampler = asyncio.create_task(sample_metrics(session, metrics_url, stop, peaks))
         t0 = time.perf_counter()
-        results = await asyncio.gather(*(one_request(session, url, model, max_tokens, i) for i in range(n)))
+        results = await asyncio.gather(*(one_request(session, url, model, max_tokens, i, pad_words) for i in range(n)))
         wall = time.perf_counter() - t0
         stop.set()
         await sampler
@@ -127,13 +141,15 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--conc-list", default="128,160,192,256")
     ap.add_argument("--max-tokens", type=int, default=1500)
+    ap.add_argument("--prompt-pad-words", type=int, default=0,
+                    help="filler words prepended to every prompt (~1.3 tokens each)")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
     summary = []
     rc = 0
     for n in [int(x) for x in a.conc_list.split(",") if x]:
         try:
-            res = asyncio.run(probe(a.base_url, a.model, n, a.max_tokens))
+            res = asyncio.run(probe(a.base_url, a.model, n, a.max_tokens, a.prompt_pad_words))
         except Exception as e:  # noqa: BLE001
             print(f"[conc-probe] N={n}: probe itself failed: {type(e).__name__}: {e}", flush=True)
             rc = 1
@@ -141,7 +157,7 @@ def main():
         c = res["counts"]
         bad = sum(v for k, v in c.items() if k != "ok")
         reached = "yes" if (res.get("peak_running") or 0) >= 0.9 * n else "NO"
-        print(f"[conc-probe] N={n}: batch_reached={reached} wall={res['wall_s']}s peak_running={res.get('peak_running')} "
+        print(f"[conc-probe] N={n} pad_words={a.prompt_pad_words}: batch_reached={reached} wall={res['wall_s']}s peak_running={res.get('peak_running')} "
               f"peak_waiting={res.get('peak_waiting')} ok={c.get('ok',0)} wrong={c.get('wrong',0)} "
               f"garbage={c.get('garbage',0)} empty={c.get('empty',0)} error={c.get('error',0)}", flush=True)
         for s in res["samples"]:
