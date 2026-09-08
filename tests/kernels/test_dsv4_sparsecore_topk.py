@@ -155,11 +155,12 @@ def _scores(kind: str, b: int, n: int, rng: np.random.Generator) -> np.ndarray:
                             dtype=np.int8).astype(np.float32)
     if kind == "all_negative":
         # Every score strictly negative, and that is the whole point.
-        # `monotone_key` is the identity for non-negative floats, so
-        # `emit_pairs` -- which recovers a score by re-applying the involution
-        # at emit time -- is only doing anything at all when a *winner* is
-        # negative. Under every other `kind` here the winners are positive and
-        # a kernel that dropped the involution entirely would still pass.
+        # `monotone_key` is the identity for non-negative floats, so the
+        # emit-pairs path -- which recovers a score by re-applying the
+        # involution at emit time -- is only doing anything at all when a
+        # *winner* is negative. Under every other `kind` here the winners are
+        # positive and a kernel that dropped the involution entirely would
+        # still pass.
         # Continuous and offset off zero, so the row is tie-free and the
         # selection stays non-degenerate.
         return (-np.abs(rng.standard_normal(
@@ -281,33 +282,38 @@ TWO_STAGE_SHAPES = [p for p in SHAPES if p.values[3] > 1]
 @pytest.mark.parametrize("kind", ["random", "heavy_ties", "all_negative"])
 def test_emit_pairs_is_bit_identical_to_the_incumbent(b, n, k, expected_p,
                                                       kind):
-    """`emit_pairs` may not change the answer, not even a tie-break.
+    """The shipped path may not change the answer, not even a tie-break.
 
-    This is a stronger assertion than re-running `_mismatch` under the flag,
-    and a much cheaper one -- the reference sort dominates that helper's cost.
-    It is also the assertion that matches what the flag claims to be: a
+    This is a stronger assertion than re-running `_mismatch` on the shipped
+    path, and a much cheaper one -- the reference sort dominates that helper's
+    cost. It is also the assertion that matches what the change claims to be: a
     reformulation that moves a value out of an XLA gather and into the kernel
     that already had it, not a different selection rule.
+
+    Note the polarity: `_reference_stage2_gather=True` is now the *baseline*
+    and the default is what ships. This test is the reason that seam still
+    exists -- delete it and nothing establishes bit-identity any more, because
+    `_mismatch` compares score multisets and so cannot see a tie-break change.
 
     `heavy_ties` is here because that is where a reformulation is most likely
     to differ without being *wrong* -- and it still must not, because the two
     paths visit candidates in the same order.
 
-    `all_negative` is here because without it this test cannot fail for
-    `emit_pairs`. `monotone_key` is the identity on non-negative floats, so
-    under `random` and `heavy_ties` -- whose winners are the top 2048 of a
-    distribution centred at or above zero -- a kernel that dropped the
-    involution altogether stays bit-identical. Measured: mutating
-    `monotone_key` to the identity left the whole file green.
+    `all_negative` is here because without it this test cannot fail.
+    `monotone_key` is the identity on non-negative floats, so under `random`
+    and `heavy_ties` -- whose winners are the top 2048 of a distribution
+    centred at or above zero -- a kernel that dropped the involution altogether
+    stays bit-identical. Measured: mutating `monotone_key` to the identity left
+    the whole file green.
     """
     assert _pick_partition(b, n, k) == expected_p > 1, (
-        "this test is meaningless on the single-stage path, where the flag "
-        "is a no-op")
+        "this test is meaningless on the single-stage path, where the two "
+        "formulations are the same code")
     rng = np.random.default_rng(SEED)
     scores = _scores(kind, b, n, rng)
     row_lengths = np.full(b, n, np.int32)
 
-    base = _run(scores, k, row_lengths)
+    base = _run(scores, k, row_lengths, _reference_stage2_gather=True)
     if kind == "all_negative":
         # Non-vacuity, asserted rather than assumed: the case earns its place
         # only if the winners really are negative *and* the selection is a
@@ -322,22 +328,25 @@ def test_emit_pairs_is_bit_identical_to_the_incumbent(b, n, k, expected_p,
             f"{int((won >= 0).sum())} of {won.size} winners are non-negative, "
             f"so `monotone_key` is the identity for them and this case does "
             f"not exercise the involution it exists to exercise")
-    got = _run(scores, k, row_lengths, emit_pairs=True)
+    got = _run(scores, k, row_lengths)
     n_diff = int((base != got).sum())
     assert n_diff == 0, (
-        f"emit_pairs differs from the incumbent in {n_diff} of {base.size} "
-        f"entries; first at {np.argwhere(base != got)[0]}")
+        f"the shipped path differs from the incumbent in {n_diff} of "
+        f"{base.size} entries; first at {np.argwhere(base != got)[0]}")
 
 
 @pytest.mark.parametrize("b,n,k,expected_p", TWO_STAGE_SHAPES)
 def test_emit_pairs_survives_ragged_rows(b, n, k, expected_p):
-    """Ragged lengths against the reference, not just against the incumbent.
+    """Ragged lengths, against the reference *and* against the incumbent.
 
-    Bit-identity to the incumbent would still hold if both were wrong in the
-    same way, and the ragged case is where the padding convention the flag
-    touches actually differs: `emit_pairs` has to write `-inf` into the pad
-    slots that `fill_body` fills with `-1`, or a padded candidate can outrank
-    a real one in stage 2.
+    The ragged case is where the padding convention actually differs between
+    the two formulations: the shipped path has to write `-inf` into the pad
+    slots that `fill_body` fills with `-1`, or a padded candidate can outrank a
+    real one in stage 2. So it gets both assertions, and neither is redundant.
+    Bit-identity alone would still hold if both paths were wrong in the same
+    way; `_mismatch` alone compares score multisets and cannot see a tie-break
+    difference. Full-row bit-identity is the test above -- this is the only
+    place the two formulations are compared under ragged rows.
     """
     n_p = n // expected_p
     rng = np.random.default_rng(SEED)
@@ -348,8 +357,15 @@ def test_emit_pairs_survives_ragged_rows(b, n, k, expected_p):
                   3 * n_p, n - 1, n)
     })
     row_lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
-    idx = _run(scores, k, row_lengths, emit_pairs=True)
+    idx = _run(scores, k, row_lengths)
     assert _mismatch(scores, idx, k, row_lengths) is None
+
+    base = _run(scores, k, row_lengths, _reference_stage2_gather=True)
+    n_diff = int((base != idx).sum())
+    assert n_diff == 0, (
+        f"the shipped path differs from the incumbent on ragged rows in "
+        f"{n_diff} of {base.size} entries; first at "
+        f"{np.argwhere(base != idx)[0]}")
 
 
 @pytest.mark.parametrize("corruption",
