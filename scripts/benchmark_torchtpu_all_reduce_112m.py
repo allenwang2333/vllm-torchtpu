@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--topology-aware", action="store_true")
     parser.add_argument(
+        "--group-order",
+        help="explicit:<ranks joined by '-'>: build the collective group from "
+        "torch ranks in exactly this order (dist.new_group with "
+        "sort_ranks=False), e.g. a single-hop ring over the chip grid",
+    )
+    parser.add_argument(
         "--topology-mesh-shape",
         help="comma-separated logical mesh shape; default is 1,1,WORLD_SIZE",
     )
@@ -159,6 +165,15 @@ def main() -> None:
                 "for the reduce-scatter modes")
         if args.width % args.chunks and args.split_dim == 1:
             raise ValueError("width must be divisible by chunks")
+
+        if args.group_order:
+            if group is not None:
+                raise ValueError("--group-order and --topology-aware are exclusive")
+            group_ranks = [int(v) for v in args.group_order.split(":", 1)[1].split("-")]
+            if sorted(group_ranks) != list(range(world_size)):
+                raise ValueError(f"--group-order is not a rank permutation: {group_ranks}")
+            group = dist.new_group(group_ranks, backend="tpu_dist", sort_ranks=False)
+            mesh_shape = ("explicit", )
 
         # Initialize PJRT and verify that the selected process group works
         # before paying the compilation cost of the large operation.
@@ -347,6 +362,7 @@ def main() -> None:
             "chunk_mib": message_bytes / args.chunks / (1 << 20),
             "split_dim": args.split_dim,
             "topology_aware": args.topology_aware,
+            "group_order": args.group_order,
             "topology_mesh_shape": mesh_shape,
             "group_ranks": group_ranks,
             "warmups": args.warmups,

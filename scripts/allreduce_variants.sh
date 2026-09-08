@@ -148,6 +148,16 @@ for m in all_reduce rs_ag rs_only ag_only; do
     port=$((port + 1))
 done
 
+# 14+. Group device order on the torch path (rank r sits on device R[r], see
+#    the baseline HLO replica_groups): snake = single-hop Hamiltonian ring over
+#    the 2x2x4 chip grid (PR 332 build_ring_mesh), devid = plain device-id order.
+SNAKE_RANKS="8-9-0-1-24-25-16-17-18-19-26-27-2-3-10-11-12-13-4-5-28-29-20-21-22-23-30-31-6-7-14-15"
+DEVID_RANKS="8-9-14-15-10-11-12-13-0-1-6-7-2-3-4-5-24-25-30-31-26-27-28-29-16-17-22-23-18-19-20-21"
+want rs_ag_snake && run_variant rs_ag_snake 30240 "" --mode rs_ag --group-order "explicit:$SNAKE_RANKS" || true
+want rs_ag_devid && run_variant rs_ag_devid 30241 "" --mode rs_ag --group-order "explicit:$DEVID_RANKS" || true
+want rs_ag_topo && run_variant rs_ag_topo 30242 "" --mode rs_ag --topology-aware || true
+want ar_snake && run_variant ar_snake 30243 "" --group-order "explicit:$SNAKE_RANKS" || true
+
 echo "[allreduce] node=$NODE_RANK all variants done"
 if [ "$NODE_RANK" = "0" ]; then
     echo "[allreduce] ===== SUMMARY (rank 0) ====="
