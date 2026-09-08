@@ -140,13 +140,6 @@ fi
 
 echo "--- Starting Buildkite Bootstrap"
 
-if [[ "${UPREV_TORCH_TPU:-0}" == "1" ]]; then
-  echo "--- :pipeline: Uploading Torch-TPU Uprev Pipeline"
-  upload_with_priority .buildkite/pipeline_uprev_torchtpu.yml "$JOB_PRIORITY"
-  echo "--- Buildkite Bootstrap Finished (Uprev Mode)"
-  exit 0
-fi
-
 # Since Buildkite prepends uploaded steps (inserts in reverse order),
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.

@@ -32,15 +32,9 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 
-UPREV_TORCH_TPU="${UPREV_TORCH_TPU:-0}"
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-
-if [ "${UPREV_TORCH_TPU}" = "1" ]; then
-  IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}-uprev"
-else
-  IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
-fi
+IMAGE_TAG="${IMAGE_TAG:-${IMAGE_REPO}:${COMMIT_HASH}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
