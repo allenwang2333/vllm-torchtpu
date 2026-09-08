@@ -89,7 +89,9 @@ async def one_request(session, url, model, max_tokens, idx, pad_words):
             msg = body["choices"][0]["message"]
             text = msg.get("content") or ""
             usage = body.get("usage") or {}
-            return {"idx": idx, "cls": classify(text), "text": text[:300], "finish": body["choices"][0].get("finish_reason"),
+            cls = classify(text)
+            # keep the whole reply when it is not ok, so the corruption point is visible
+            return {"idx": idx, "cls": cls, "text": text if cls != "ok" else text[:300], "finish": body["choices"][0].get("finish_reason"),
                     "completion_tokens": usage.get("completion_tokens"), "s": time.perf_counter() - t0}
     except Exception as e:  # noqa: BLE001 - any transport failure is a data point
         return {"idx": idx, "cls": "error", "detail": f"{type(e).__name__}: {e}"[:200], "s": time.perf_counter() - t0}
