@@ -84,7 +84,7 @@ class Tuning:
         tile_align: the granularity `gather_tiling` rounds its estimate to.
         tile_m_min: the smallest tile it returns, so a skewed routing still gets
             one a group fits in.
-        tile_m_max: the largest, which is what bounds the ring's VMEM.
+        tile_m_max: the largest it returns, before the VMEM fit shrinks it.
         smem_index_fraction: the share of SMEM the index table may take. The
             scalar-prefetch cliff sat just above it, at 45.8%, on v7x.
         smem_capacity_bytes: None resolves it off the device where it is read,
@@ -236,10 +236,12 @@ def gather_tile_sizes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
                         dims.size_group,
                         tuning=tuning)
     pick = tuning.tile_m or law
-    if pick % sublane:
-        raise ValueError(f"tile_m={pick} is not a multiple of the lhs sublane "
-                         f"block {sublane}")
+    # Guard the clamp, not the law's output: a pool shorter than one tile never
+    # runs the latter. Even, because the LHS build pairs rows into u32 words.
     tile_m = min(pick, gmm_v2.align_to(dims.size_m, sublane))
+    if tile_m % sublane or tile_m % 2:
+        raise ValueError(f"tile_m={tile_m} must be even and a multiple of the "
+                         f"lhs sublane block {sublane}")
     size_n_per_rhs = dims.size_n // fuse_factor
     num_n_tiles = 1
     tile_n = gmm_v2.align_to(size_n_per_rhs, lanes)

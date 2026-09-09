@@ -225,6 +225,32 @@ def test_fused_permute_gmm_handles_unaligned_row_counts(num_tokens, topk):
     case.assert_bitwise(out, case.materialized())
 
 
+@pytest.mark.parametrize("num_tokens,topk", [(6, 2), (7, 2)])
+def test_fused_permute_gmm_accepts_a_pool_shorter_than_the_tile_law(
+        num_tokens, topk):
+    """A pool below the tile floor runs at its own row count, as gmm_v2 does.
+
+    The law's floor exceeds such a pool and the clamp takes it back down to the
+    sublane block, which is `size_m` itself there; guarding the pre-clamp value
+    instead rejected the shape naming a tile the caller never set.
+    """
+    _require_tpu()
+    case = Case.round_robin(num_tokens, topk, num_groups=2, seed=41)
+    case.assert_bitwise(case.fused(), case.materialized())
+
+
+def test_fused_permute_gmm_declines_an_odd_pool_shorter_than_the_block():
+    """An odd row count below the sublane block is declined at the tile.
+
+    The LHS build pairs rows into u32 words and so yields an even count; an odd
+    tile reaches the dot as a shape mismatch, which the guard says here instead.
+    """
+    _require_tpu()
+    case = Case.round_robin(13, 1, num_groups=1, seed=42)
+    with pytest.raises(ValueError, match="must be even"):
+        case.fused()
+
+
 def test_fused_permute_gmm_accepts_a_blocked_pool():
     """The pool may arrive already blocked as [t, K // 128, 128].
 
