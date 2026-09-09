@@ -8,6 +8,11 @@ import torch
 
 def is_trace_annotation_enabled() -> bool:
     """Checks whether PyTorch Kineto profiler session is active."""
+    try:
+        if torch.compiler.is_compiling():
+            return False
+    except Exception:
+        pass
     return torch.autograd._profiler_enabled()
 
 

@@ -118,6 +118,7 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.observability import (
     dump_every_n_steps,
     dump_moe_observability,
+    dump_step_collectives,
     log_batch_stats,
     log_hbm_checkpoint,
     register_layer_moe_buffer,
@@ -3544,6 +3545,16 @@ class TPUModelRunner(GPUModelRunner):
         if self.batch_counter <= 5 or self.batch_counter % dump_every_n_steps() == 0:
             log_hbm_checkpoint("pre_forward", device=self.device)
 
+        # Log 5: Collective semantic tags (pre_forward)
+        dump_step_collectives(
+            step_id=self.batch_counter,
+            phase=phase,
+            actual_tokens=scheduler_output.total_num_scheduled_tokens,
+            bucketed_tokens=padded_total_tokens,
+            model_config=self.model_config,
+            parallel_config=self.parallel_config,
+        )
+
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
@@ -3819,7 +3830,13 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         # Observability: Dump MoE routing / EP stats and post-forward HBM checkpoint
-        dump_moe_observability(step_id=self.batch_counter, phase=phase)
+        dump_moe_observability(
+            step_id=self.batch_counter,
+            phase=phase,
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_experts=getattr(self.model_config, "num_experts", 256),
+            ep_ranks=getattr(self.parallel_config, "expert_parallel_size", 32),
+        )
         if self.batch_counter <= 5 or self.batch_counter % dump_every_n_steps() == 0:
             log_hbm_checkpoint("post_forward", device=self.device)
 
