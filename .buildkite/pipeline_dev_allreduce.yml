@@ -53,5 +53,13 @@ steps:
         else
           echo "GCS upload to $$dest failed; artifacts still carry everything"
         fi
+    # Buildkite caps artifacts at 5000 files per job; the all-rank HLO dumps
+    # exceed that, so only results, logs, traces and rank-0 HLO go to Buildkite.
+    # The full tree is in the GCS dest above.
     artifact_paths:
-      - "perf_eval_results/**/*"
+      - "perf_eval_results/allreduce/summary.txt"
+      - "perf_eval_results/allreduce/*/*.jsonl"
+      - "perf_eval_results/allreduce/*/*.log"
+      - "perf_eval_results/allreduce/*/*.txt"
+      - "perf_eval_results/allreduce/*/profile/**/*.xplane.pb"
+      - "perf_eval_results/allreduce/*/hlo/rank_0/*reduce_then_consume*"
