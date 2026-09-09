@@ -36,7 +36,7 @@ steps:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       # Space-separated variant names from scripts/allreduce_variants.sh;
       # empty runs the whole matrix.
-      ALLREDUCE_VARIANTS: "baseline sc_hierarchical_ar"
+      ALLREDUCE_VARIANTS: "libtpu==0.0.47 baseline sc_hierarchical_ar ar_hier_both rs_only rs_nd rs_nd_pad rs_3ddec rs_8448_nd_pad rs_allflags rs_hier rs_hier_nd_pad rs_ag rs_ag_hier"
     commands:
       - "bash .buildkite/scripts/run_multihost.sh --backend torchrun scripts/allreduce_variants.sh $${ALLREDUCE_VARIANTS:-}"
       - |
@@ -47,7 +47,7 @@ steps:
         find "$$out" -path '*/hlo/*' -name '*reduce_then_consume*after_optimizations.txt' | sed 's/^/  /' || true
         echo "--- xplane traces (all ranks)"
         find "$$out" -name '*.xplane.pb' | sed 's/^/  /' || true
-        dest="gs://cuiq-inference-test/woosuk1/build-$${BUILDKITE_BUILD_NUMBER}-hierar-clean44"
+        dest="gs://cuiq-inference-test/woosuk1/build-$${BUILDKITE_BUILD_NUMBER}-flags-clean47"
         if gcloud storage cp -r perf_eval_results/* "$$dest/"; then
           echo "uploaded to $$dest"
         else
