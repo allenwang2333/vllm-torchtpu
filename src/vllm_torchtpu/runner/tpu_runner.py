@@ -1379,6 +1379,35 @@ class TPUModelRunner(GPUModelRunner):
         # that the shared layer was not itself allocated one) is enforced later
         # against the concrete KVCacheConfig in
         # `_maybe_add_kv_sharing_layers_to_kv_cache_groups`.
+
+        # Cross-model KV sharing (Gemma-4-style MTP) rides the same path as
+        # within-model sharing. The drafter is loaded before `get_kv_cache_spec`
+        # runs, so its `Attention` modules are already in the static forward
+        # context with `kv_sharing_target_layer_name` set and the loop above has
+        # registered them. Verify that rather than re-registering: a draft layer
+        # reaching this point unregistered would be allocated its own KV cache
+        # and would silently write there instead of into the target's.
+        drafter = getattr(self, "drafter", None)
+        if (self._is_async_drafter
+                and getattr(drafter, "draft_model", None) is not None):
+            for draft_idx, layer in enumerate(
+                    drafter.draft_model.model.layers):
+                attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+                if attn is None or attn.kv_sharing_target_layer_name is None:
+                    continue
+                name = f"draft_model.layers.{draft_idx}.self_attn.attn"
+                target = attn.kv_sharing_target_layer_name
+                if self.shared_kv_cache_layers.get(name) != target:
+                    raise RuntimeError(
+                        f"Draft layer {name} declares KV sharing with {target} "
+                        "but was not registered as a shared layer. It would be "
+                        "given its own KV cache and write there instead of the "
+                        "target's.")
+                if name in kv_cache_spec:
+                    raise RuntimeError(
+                        f"Draft layer {name} shares KV with {target} but still "
+                        "has its own KVCacheSpec.")
+
         return normalize_kv_cache_specs_for_tpu(
             kv_cache_spec,
             self.kv_cache_dtype,
@@ -3707,6 +3736,12 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
+                if self.speculative_config is not None or getattr(
+                        self, "_pcp_mtp_k1_enabled", False):
+                    hidden_states = sequence_layout_planner.finalize_hidden_states(
+                        hidden_states,
+                        layout_plan,
+                    )
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -5833,11 +5868,7 @@ class TPUModelRunner(GPUModelRunner):
             self._update_hybrid_attention_mamba_layout(kv_caches,
                                                        kernel_block_sizes)
 
-        for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
-        ):
-            logger.debug("%s reuses KV cache of %s", layer_name,
-                         target_layer_name)
-            kv_caches[layer_name] = kv_caches[target_layer_name]
+        self._add_shared_kv_cache_aliases(kv_caches)
 
         if self._unified_kv_layout:
             # Flush the pool zero-fill before any compiled execution. PJRT
