@@ -37,9 +37,11 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    KVCacheLayout, KVCacheType, SparseMLAKVCacheSpec,
+    update_sparse_mla_kv_cache)
 from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
-from vllm_torchtpu.layers.common.utils import update_sparse_mla_kv_cache
 
 LKV_DIM = 512
 ROPE_DIM = 64
@@ -52,16 +54,19 @@ TOTAL_PAGES = 64
 # of the parity test get a token count that is a multiple of it.
 TOKEN_PAD = 16
 
+KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
+NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
+                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
+                                        PAGE_SIZE, LKV_DIM, KV_PACKING)
+ROPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.ROPE,
+                                        KVCacheLayout.TENSORCORE, TOTAL_PAGES,
+                                        PAGE_SIZE, ROPE_DIM, KV_PACKING)
+
 
 def _empty_caches():
     """Zeroed uint8 (nope, rope) caches in the native split sparse layout."""
-    nope_shape, rope_shape = (sparse_mla_kernel.get_kv_cache_shape(
-        TOTAL_PAGES, PAGE_SIZE, dim, jnp.float8_e4m3fn)
-                              for dim in (LKV_DIM, ROPE_DIM))
-    blocks, ps_div, kv_packing, nope_dim = nope_shape
-    lane = rope_shape[-1]
-    return (jnp.zeros((blocks, ps_div * kv_packing, nope_dim // lane, lane),
-                      jnp.uint8), jnp.zeros(rope_shape, jnp.uint8))
+    return (jnp.zeros(NOPE_SPEC.shape, NOPE_SPEC.jax_dtype),
+            jnp.zeros(ROPE_SPEC.shape, ROPE_SPEC.jax_dtype))
 
 
 def _quantize_fp8(x: np.ndarray, k_scale: float) -> jax.Array:
@@ -115,9 +120,15 @@ class MaskedDenseTestBase(parameterized.TestCase):
             starts = np.zeros(len(seq_lens) + 1, np.int32)
             starts[s + 1:] = seq_len
             nope_cache, rope_cache = update_sparse_mla_kv_cache(
-                nope_cache, rope_cache, kv_c_fp8, k_pe_fp8,
-                jnp.asarray(per_seq_lens), block_tables,
-                jnp.asarray(starts, jnp.int32))
+                nope_cache,
+                rope_cache,
+                kv_c_fp8,
+                k_pe_fp8,
+                jnp.asarray(per_seq_lens),
+                block_tables,
+                jnp.asarray(starts, jnp.int32),
+                nope_spec=NOPE_SPEC,
+                rope_spec=ROPE_SPEC)
         return (nope_cache, rope_cache), kv_c_deq, k_pe_deq
 
     def _random_queries(self, num_tokens):
@@ -208,6 +219,31 @@ class MaskedDenseTestBase(parameterized.TestCase):
         # bf16 queries and fp8 keys: ~2e-2 is the fp8 rounding floor, matching
         # the sparse kernel's own functional test.
         np.testing.assert_allclose(got, expected[valid], rtol=2e-2, atol=2e-2)
+
+
+class MaskedDenseCacheSetupTest(parameterized.TestCase):
+    """Validate test-cache setup without needing the TPU attention kernels."""
+
+    def test_fill_cache_preserves_selected_pages_and_fp8_values(self):
+        helper = MaskedDenseTestBase()
+        helper.rng = np.random.default_rng(1234)
+        seq_lens, k_scale = [3, 5], 0.5
+        block_tables = helper._block_tables(len(seq_lens))
+        (nope, rope), expected_nope, expected_rope = helper._fill_cache(
+            seq_lens, block_tables, k_scale)
+        self.assertEqual(nope.shape, (TOTAL_PAGES, PAGE_SIZE, 4, 128))
+        self.assertEqual(rope.shape, (TOTAL_PAGES, PAGE_SIZE // 4, 4, 128))
+        for cache, expected, dim in ((nope, expected_nope, LKV_DIM),
+                                     (rope, expected_rope, ROPE_DIM)):
+            rows = cache.reshape(TOTAL_PAGES, PAGE_SIZE, -1)
+            values = jax.lax.bitcast_convert_type(
+                rows, jnp.float8_e4m3fn).astype(jnp.float32) * k_scale
+            for seq, length in enumerate(seq_lens):
+                page = int(block_tables[seq * PAGES_PER_SEQ])
+                np.testing.assert_array_equal(
+                    np.asarray(values[page, :length, :dim]), expected[seq])
+                np.testing.assert_array_equal(np.asarray(rows[page, length:]),
+                                              0)
 
 
 class MaskedDenseMlaTest(MaskedDenseTestBase):

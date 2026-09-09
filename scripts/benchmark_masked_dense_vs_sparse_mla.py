@@ -56,11 +56,12 @@ from jax.sharding import PartitionSpec as P
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch  # noqa: E402
+from vllm_torchtpu.kernels.mla import \
+    kv_cache_utils as mla_kv_cache  # noqa: E402
 from vllm_torchtpu.kernels.mla.masked_dense import csa_mask  # noqa: E402
 from vllm_torchtpu.kernels.mla.masked_dense import \
     kernel as masked_dense  # noqa: E402
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse  # noqa: E402
-from vllm_torchtpu.layers.common import utils as attention_utils  # noqa: E402
 
 # GLM-5.2-FP8, read off the checkpoint config.
 LKV_DIM = 512  # kv_lora_rank
@@ -221,8 +222,25 @@ def _build_wrapper(enable_dispatch: bool):
 
     def integrated(ql_nope, q_pe, kv_c_normed, k_pe, nope, rope, topk,
                    seq_lens, pages, starts, distribution):
-        nope, rope = attention_utils.update_sparse_mla_kv_cache(
-            nope, rope, kv_c_normed, k_pe, seq_lens, pages, starts)
+        kv_packing = sparse.get_dtype_packing(kv_c_normed.dtype)
+        nope_spec = mla_kv_cache.SparseMLAKVCacheSpec.create(
+            mla_kv_cache.KVCacheType.NOPE,
+            mla_kv_cache.KVCacheLayout.TENSORCORE, nope.shape[0], PAGE_SIZE,
+            LKV_DIM, kv_packing)
+        rope_spec = mla_kv_cache.SparseMLAKVCacheSpec.create(
+            mla_kv_cache.KVCacheType.ROPE,
+            mla_kv_cache.KVCacheLayout.TENSORCORE, rope.shape[0], PAGE_SIZE,
+            ROPE_DIM, kv_packing)
+        nope, rope = mla_kv_cache.update_sparse_mla_kv_cache(
+            nope,
+            rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens,
+            pages,
+            starts,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec)
         q = jnp.concatenate((ql_nope, q_pe), axis=-1)
 
         def gather(_):
