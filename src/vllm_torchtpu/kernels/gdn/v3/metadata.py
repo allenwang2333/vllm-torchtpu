@@ -20,6 +20,48 @@ from vllm_torchtpu.kernels import varlen_tiles
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
+def prepare_single_seq_metadata(
+    cfg: config.GDNConfig,
+    inputs: memory_ref.SingleSeqMetadataInputs,
+    scratch_ref: jax.Array,
+) -> memory_ref.MetadataRef:
+    """Initialize scalar metadata inside Pallas for a one-sequence prefill.
+
+    For valid sequence bounds, start_seq is either 0 or 1. Rotating the two
+    query endpoints by start_seq therefore only requires a scalar selection;
+    the one-element sequence and state arrays are invariant under rotation.
+    Mask the query length before computing both the tile count and carry-in,
+    just as the generic planner does for empty sequence ranges.
+    """
+    start_seq = inputs.distribution[0]
+    end_seq = inputs.distribution[2]
+    query_begin = inputs.query_start_loc[0]
+    query_end = inputs.query_start_loc[1]
+    rotated_begin = jnp.where(start_seq == 0, query_begin, query_end)
+    rotated_end = jnp.where(start_seq == 0, query_end, query_begin)
+    query_len = jnp.where(end_seq > start_seq, rotated_end - rotated_begin, 0)
+
+    scratch_ref[0] = rotated_begin
+    scratch_ref[1] = rotated_end
+    scratch_ref[2] = pl.cdiv(query_len, cfg.chunk_size)
+    scratch_ref[3] = ((inputs.seq_lens[0] - query_len) > 0).astype(jnp.int32)
+
+    def indexer(field):
+        return memory_ref.SingleSeqIndexer(scratch_ref, field, cfg.chunk_size)
+
+    return memory_ref.MetadataRef(
+        num_tiles=indexer("num_tiles"),
+        p_id_to_s_idx=indexer("s_idx"),
+        p_id_to_r_base=indexer("r_base"),
+        p_id_to_r_size=indexer("r_size"),
+        p_id_is_first_tile=indexer("is_first_tile"),
+        p_id_is_last_tile=indexer("is_last_tile"),
+        s_idx_has_initial_state=indexer("has_initial_state"),
+        s_idx_to_state_indices=inputs.state_indices,
+        s_idx_to_read_offset=inputs.read_offsets,
+    )
+
+
 def compute_batched_seq_metadata(
     cfg: config.GDNConfig,
     seq_lens: jax.Array,

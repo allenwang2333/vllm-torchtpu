@@ -68,13 +68,64 @@ class SmemWrapper:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class SingleSeqMetadataInputs:
+    """Unplanned SMEM inputs for the single-sequence prefill specialization."""
+
+    query_start_loc: Any
+    seq_lens: Any
+    distribution: Any
+    state_indices: Any
+    read_offsets: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class SingleSeqIndexer:
+    """Compute metadata from four SMEM scalars instead of per-tile tables.
+
+    ``data`` holds query begin, query end, tile count and the initial-state
+    flag, in that order. All indexers share this scratch, which is initialized
+    before allocating the pipeline buffers and remains invariant in the loop.
+    Only active tile indices are consumed by the pipeline.
+    """
+
+    data: Any
+    field: str = dataclasses.field(metadata=dict(static=True))
+    chunk_size: int = dataclasses.field(metadata=dict(static=True))
+
+    def __getitem__(self, indices):
+        if self.field == "num_tiles":
+            return self.data[2]
+        if self.field == "has_initial_state":
+            return self.data[3] != 0
+
+        p_id, seq_in_tile = indices
+        assert seq_in_tile == 0
+        if self.field == "s_idx":
+            return jnp.int32(0)
+        if self.field == "is_first_tile":
+            return p_id == 0
+        if self.field == "is_last_tile":
+            return p_id == self.data[2] - 1
+
+        r_base = self.data[0] + p_id * self.chunk_size
+        if self.field == "r_base":
+            return r_base
+        if self.field == "r_size":
+            return jnp.minimum(self.data[1] - r_base, self.chunk_size)
+        raise ValueError(
+            f"Unknown single-sequence metadata field: {self.field}")
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class MetadataRef:
     num_tiles: Any
-    p_id_to_s_idx: SmemWrapper
-    p_id_to_r_base: SmemWrapper
-    p_id_to_r_size: SmemWrapper
-    p_id_is_first_tile: SmemWrapper
-    p_id_is_last_tile: SmemWrapper
+    p_id_to_s_idx: SmemWrapper | SingleSeqIndexer
+    p_id_to_r_base: SmemWrapper | SingleSeqIndexer
+    p_id_to_r_size: SmemWrapper | SingleSeqIndexer
+    p_id_is_first_tile: SmemWrapper | SingleSeqIndexer
+    p_id_is_last_tile: SmemWrapper | SingleSeqIndexer
     s_idx_has_initial_state: Any
     s_idx_to_state_indices: Any
     # Per-sequence state read offset for speculative decoding: the initial

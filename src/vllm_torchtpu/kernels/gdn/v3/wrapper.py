@@ -221,7 +221,7 @@ def inner_kernel(
 
 def outer_kernel(
     # Inputs.
-    metadata_ref: memory_ref.MetadataRef,
+    metadata_ref: memory_ref.MetadataRef | memory_ref.SingleSeqMetadataInputs,
     qkv_ref: jax.Array,
     b_ref: jax.Array,
     a_ref: jax.Array,
@@ -238,9 +238,15 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    single_seq_metadata_scratch_ref: jax.Array | None = None,
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
     del conv_state_out_ref, recurrent_state_out_ref
+
+    if isinstance(metadata_ref, memory_ref.SingleSeqMetadataInputs):
+        assert single_seq_metadata_scratch_ref is not None
+        metadata_ref = metadata.prepare_single_seq_metadata(
+            cfg, metadata_ref, single_seq_metadata_scratch_ref)
 
     if cfg.state_plan is not None:
         # Both state regions stream from the single external source ref,
@@ -618,6 +624,21 @@ def fused_conv1d_gdn(
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
             )
+        elif (pooled and cfg.attention_mode == config.AttentionMode.GDN
+              and cfg.batch_size == 2048 and num_seqs == 1
+              and seq_lens.shape == (1, ) and cfg.chunk_size == 64
+              and cfg.window_size == 1
+              and (n_kq, n_v, d_k, d_v) == (2, 8, 128, 128)
+              and ckpt_indices is None):
+            # This bucket needs at most 32 tiles. Pass the original small
+            # arrays to SMEM and derive tile addresses in the pipeline.
+            metadata_obj = memory_ref.SingleSeqMetadataInputs(
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                distribution=distribution,
+                state_indices=state_indices,
+                read_offsets=read_offsets,
+            )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
                 cfg=cfg,
@@ -631,15 +652,20 @@ def fused_conv1d_gdn(
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+        scratch_shapes = cfg.get_scratch_shape_dict()
+        if isinstance(metadata_obj, memory_ref.SingleSeqMetadataInputs):
+            scratch_shapes["single_seq_metadata_scratch_ref"] = pltpu.SMEM(
+                (4, ), jnp.int32)
 
         # Step 7: Handle case where write needs to be done in existing out.
         # Flat aliasing indices account for the absent recurrent-state
         # input in source mode (None contributes no leaves).
         in_out_spec = None
         num_state_inputs = 1 if pooled else 2
-        input_output_aliases = {len(metadata_obj) + 3: 1}
+        num_metadata_inputs = len(jax.tree_util.tree_leaves(metadata_obj))
+        input_output_aliases = {num_metadata_inputs + 3: 1}
         if not pooled:
-            input_output_aliases[len(metadata_obj) + 4] = 2
+            input_output_aliases[num_metadata_inputs + 4] = 2
         out_shape = cfg.get_out_shape()
 
         if in_act is None and zero_initialize_out:
@@ -647,7 +673,8 @@ def fused_conv1d_gdn(
         if in_act is not None:
             out_shape = in_act
             in_out_spec = hbm_spec
-            input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
+            input_output_aliases[num_metadata_inputs + 3 +
+                                 num_state_inputs] = 0
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -663,7 +690,7 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=scratch_shapes,
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
