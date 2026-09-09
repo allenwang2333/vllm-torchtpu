@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hlo-dump-dir",
         type=Path,
-        help="rank 0 sets XLA_FLAGS=--xla_dump_to=<dir>/rank_0 "
+        help="every rank sets XLA_FLAGS=--xla_dump_to=<dir>/rank_<RANK> "
         "--xla_dump_hlo_as_text before libtpu loads",
     )
     return parser.parse_args()
@@ -98,9 +98,11 @@ def percentile(values: list[float], fraction: float) -> float:
 def main() -> None:
     args = parse_args()
 
-    if args.hlo_dump_dir is not None and os.environ.get("RANK", "0") == "0":
-        # Must be in the environment before torch_tpu loads libtpu.
-        dump_dir = args.hlo_dump_dir / "rank_0"
+    if args.hlo_dump_dir is not None:
+        # Every rank dumps, so per-rank compiled plans can be compared and no
+        # rank runs with a different environment. Must be set before torch_tpu
+        # loads libtpu.
+        dump_dir = args.hlo_dump_dir / f"rank_{os.environ.get('RANK', '0')}"
         dump_dir.mkdir(parents=True, exist_ok=True)
         os.environ["XLA_FLAGS"] = (
             os.environ.get("XLA_FLAGS", "") +

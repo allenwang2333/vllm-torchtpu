@@ -80,6 +80,17 @@ run_variant() {
         launch=(--nnodes="$NNODES" --nproc-per-node="$NPROC" --node-rank="$NODE_RANK"
                 --master-addr="$MASTER_ADDR" --master-port="$port")
     fi
+    # torch_tpu keeps a tier-2 compiled-program cache in /dev/shm that outlives
+    # the process. A later variant with the same HLO but different
+    # LIBTPU_INIT_ARGS would reuse the earlier executable, so each variant
+    # starts from an empty cache and runs with the cache disabled.
+    if [ -d /dev/shm/torch_tpu_cache ]; then
+        echo "[allreduce] /dev/shm/torch_tpu_cache present before $name: $(du -sh /dev/shm/torch_tpu_cache 2>/dev/null | cut -f1) $(find /dev/shm/torch_tpu_cache -type f 2>/dev/null | wc -l) files"
+    else
+        echo "[allreduce] /dev/shm/torch_tpu_cache absent before $name"
+    fi
+    rm -rf /dev/shm/torch_tpu_cache
+    TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled \
     LIBTPU_INIT_ARGS="$libtpu" python3 -m torch.distributed.run "${launch[@]}" \
         "$SCRIPT" --warmups 10 --iterations "$ITER" --expected-world-size 0 \
         --profile-dir "$OUT/$name/profile" --hlo-dump-dir "$OUT/$name/hlo" "$@" \
