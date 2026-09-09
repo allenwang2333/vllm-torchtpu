@@ -812,12 +812,12 @@ class DFlashProposer:
         else:
             target_hidden = hidden_states
 
-        # MLA-native K3 drafts own their latent-KV projection and cache
-        # insertion.  Keep the proposer generic: standard Qwen/Gemma drafts
-        # continue through the fused full-K/V path below.
-        if hasattr(self.draft_model, "precompute_and_store_context_kv"):
-            return self.draft_model.precompute_and_store_context_kv(
-                target_hidden, positions, draft_md_tuple)
+        # Only opt into TPU-specific hooks; upstream methods with a similar
+        # name may call GPU custom ops. Other drafts use the TPU path below.
+        tpu_precompute = getattr(self.draft_model,
+                                 "tpu_precompute_and_store_context_kv", None)
+        if callable(tpu_precompute):
+            return tpu_precompute(target_hidden, positions, draft_md_tuple)
 
         # Collapse the concatenated aux hidden states to the draft's width.
         # `combine_hidden_states` is the modern spelling; bare `fc` is what

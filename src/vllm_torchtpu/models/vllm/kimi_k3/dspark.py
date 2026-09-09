@@ -287,7 +287,7 @@ class K3DSparkForCausalLM(nn.Module):
             for layer in self.model.layers
         ]
 
-    def precompute_and_store_context_kv(
+    def tpu_precompute_and_store_context_kv(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,

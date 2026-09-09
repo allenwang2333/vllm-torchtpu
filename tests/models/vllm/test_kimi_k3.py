@@ -471,9 +471,10 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args) -> None:
+        def __init__(self, *args, non_causal_multi_token_decode=False) -> None:
             super().__init__()
             self.mla_modules = args[8]
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
         def forward(self, positions, hidden_states):
             return hidden_states
@@ -513,6 +514,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     assert layer.q_proj is not None
     assert layer.kv_a_proj_with_mqa is not None
     assert layer.fused_qkv_a_proj is None
+    assert layer.mla_attn.non_causal_multi_token_decode is False
     hidden_states = torch.randn(2, config.hidden_size)
     torch.testing.assert_close(
         layer(torch.arange(2), hidden_states),
@@ -536,9 +538,10 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args) -> None:
+        def __init__(self, *args, non_causal_multi_token_decode=False) -> None:
             super().__init__()
             self.mla_modules = args[8]
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
     monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
                         FakeMLAWrapper)
@@ -573,6 +576,7 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
     assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
     assert layer.g_proj is None
     assert layer.mla_attn.mla_modules.gate_is_fused is True
+    assert layer.mla_attn.non_causal_multi_token_decode is False
 
 
 @pytest.mark.parametrize("use_parameter_hook", [False, True],
