@@ -189,6 +189,7 @@ python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --short-pd-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}" \
   2>&1 | tee "${RUN_DIR}/logs/correctness.log"
 
 if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then

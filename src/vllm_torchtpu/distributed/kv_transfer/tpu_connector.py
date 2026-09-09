@@ -1292,8 +1292,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
-        if not _use_raiden_glm_admission():
-            # The interleave minimum applies to PCP sources only.
+        if (not _use_raiden_glm_admission()
+                and not self._stage3_mamba_group_indices):
+            # Retain the short-prefix bypass for FA-only PCP sources.
+            # Hybrid ranks have GDN state to send even without FA tokens.
             interleave_size = int(
                 getattr(parallel_config, "cp_kv_cache_interleave_size", 256)
                 or 256)
@@ -2482,11 +2484,10 @@ class TPURaidenConnectorWorker:
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
             )
-            if not local_ids:
-                # This PCP rank owns no physical page for the request. It has
-                # nevertheless published an empty D5 entry so controller
-                # lookup sees the complete source unit set, and is terminal
-                # immediately: there is no native transfer to wait for.
+            if not pool_spans:
+                # Only a rank with neither FA nor GDN payload can finish
+                # immediately. Its empty D5 entry still participates in
+                # lookup of the complete source unit set.
                 self._stage3_send_outcomes.setdefault(req_id, "done")
             logger.info(
                 "%s",

@@ -28,11 +28,11 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
-    LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
-    TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
-    TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3LoadMeta, _Stage3RegisteredSend, _select_committed_mamba_blocks,
-    stage3_fa_raiden_id_fields)
+    LoadMeta, SendMeta, TPUConnector, TPUConnectorMetadata,
+    TPUConnectorScheduler, TPUConnectorWorker, TPURaidenConnector,
+    TPURaidenConnectorScheduler, TPURaidenConnectorWorker, _CoordRecvEntry,
+    _CoordSendEntry, _Stage3LoadMeta, _Stage3RegisteredSend,
+    _select_committed_mamba_blocks, stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -882,6 +882,59 @@ class TestTPURaidenConnectorScheduler:
 
         assert delay
         assert meta.reqs_to_send[req.request_id].mamba_state_block_ids == [11]
+
+    @pytest.mark.parametrize(
+        ("hybrid", "prompt_tokens", "expected_delay"),
+        ((True, 1, False), (True, 2, True), (True, 3, True),
+         (True, 2048, True), (False, 3, False), (False, 2048, False),
+         (False, 2049, True)),
+    )
+    def test_stage3_short_request_transfer_is_hybrid_only(
+            self, hybrid, prompt_tokens, expected_delay):
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=768,
+                                          pcp_size=8)
+        producer.vllm_config.parallel_config.cp_kv_cache_interleave_size = 256
+        consumer = _make_raiden_scheduler(block_size=4608)
+        if hybrid:
+            producer._stage3_mamba_group_indices = [1]
+            consumer._stage3_mamba_group_indices = [1]
+        req = SimpleNamespace(request_id="short",
+                              prompt_token_ids=[0] * prompt_tokens,
+                              _all_token_ids=[0] * prompt_tokens,
+                              num_prompt_tokens=prompt_tokens,
+                              kv_transfer_params=None,
+                              status=RequestStatus.FINISHED_LENGTH_CAPPED)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                   "prefill-controller.test:27000"), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8), \
+             patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
+                   return_value=False):
+            producer.on_new_request(req)
+            req.num_computed_tokens = req.num_prompt_tokens
+            delay, params = producer.request_finished(
+                req, [100], mamba_block_ids=[[17]] if hybrid else None)
+            assert delay is expected_delay
+            if not expected_delay:
+                assert params == {}
+                assert producer.build_connector_meta().reqs_to_send == {}
+                return
+
+            send = producer.build_connector_meta().reqs_to_send[req.request_id]
+            assert send.num_tokens == params["num_tokens"] == prompt_tokens - 1
+            assert send.local_block_ids == [100]
+            assert send.mamba_state_block_ids == ([17] if hybrid else None)
+            req.kv_transfer_params = params
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 0)
+            assert (matched, is_async) == (prompt_tokens - 1, True)
+            blocks = MagicMock()
+            blocks.get_block_ids.return_value = ([200], [27])
+            consumer.update_state_after_alloc(req, blocks, matched)
+            load = consumer.build_connector_meta().reqs_to_load[req.request_id]
+            assert load.num_tokens == prompt_tokens - 1
+            assert load.local_block_ids == [200]
+            assert load.mamba_state_block_ids == ([27] if hybrid else None)
 
     @pytest.mark.parametrize("num_computed_tokens", (65_023, 65_024))
     def test_v3_stage3_finish_keeps_partial_page_and_exact_token_count(
@@ -2012,7 +2065,7 @@ class TestTPURaidenConnectorWorker:
             parallelism=8,
         )
 
-    @pytest.mark.parametrize("transfer_rank", (0, 3, 7))
+    @pytest.mark.parametrize("transfer_rank", range(8))
     def test_stage3_gdn_registration_declares_every_pcp_head_shard(
             self, transfer_rank):
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
@@ -2041,7 +2094,9 @@ class TestTPURaidenConnectorWorker:
                                      tp_size=1,
                                      is_producer=True,
                                      dp_size=1,
-                                     pcp_size=8)
+                                     pcp_size=8,
+                                     interleave_size=256,
+                                     block_size=768)
         worker._raiden_manifest = manifest
         worker._raiden_layout_fingerprint_payload = {
             "minor_to_major": [4, 3, 2, 1, 0],
@@ -2073,6 +2128,44 @@ class TestTPURaidenConnectorWorker:
         assert ssm.declared_bytes == 4096
         assert ssm.spans == (PoolByteSpan(0, 0, 0, transfer_rank * 4096,
                                           4096), )
+
+        # A two-token prefix leaves ranks 1-7 with state but no FA bytes.
+        # Every rank must keep that state pinned until native completion.
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], []), (["short"], [], [])]
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill-controller.test:27000"
+        worker._local_raiden_transfer_rank = MagicMock(
+            return_value=transfer_rank)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["short"] = SendMeta(uuid=123,
+                                              local_block_ids=[11],
+                                              num_tokens=2,
+                                              expiration_time=1e20,
+                                              mamba_state_block_ids=[17])
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8):
+            worker.process_send_load(meta)
+            registration = facade.register_request_blocks_calls[0]
+            assert registration["block_ids"] == ([11]
+                                                 if transfer_rank == 0 else [])
+            payloads = registration["pool_spans"]
+            assert payloads[-2:] == registrations
+            fa_bytes = sum(p.declared_bytes for p in payloads if p.tag == "fa")
+            assert fa_bytes == (2048 if transfer_rank == 0 else 0)
+            assert worker.get_finished() == (set(), set())
+            assert facade.complete_request_blocks_calls == []
+            assert worker.get_finished() == ({"short"}, set())
+            assert facade.complete_request_blocks_calls == [{
+                "req_id":
+                "short",
+                "uuid":
+                123,
+                "unit":
+                worker._raiden_work_unit,
+            }]
+            assert worker.get_finished() == (set(), set())
 
     def test_v3_stage3_producer_registers_rank_stripe_and_releases_on_done(
             self):
@@ -2254,11 +2347,12 @@ class TestTPURaidenConnectorWorker:
         assert facade.cancel_request_blocks_calls == []
 
     @pytest.mark.parametrize(
-        ("transfer_rank", "expected_ids"),
-        ((0, [77]), (1, [77]), (2, [77]), (7, [77])),
+        ("transfer_rank", "num_tokens", "expected_ids"),
+        ((0, 4097, [77]), (1, 4097, [77]), (2, 4097, [77]), (7, 4097, [77]),
+         (7, 2, [])),
     )
     def test_v3_stage3_partial_pcp_group_registers_rank_prefix(
-            self, transfer_rank, expected_ids):
+            self, transfer_rank, num_tokens, expected_ids):
         worker = _make_raiden_worker(tp_rank=0,
                                      tp_size=1,
                                      is_producer=True,
@@ -2275,12 +2369,11 @@ class TestTPURaidenConnectorWorker:
         worker._local_raiden_transfer_rank = MagicMock(
             return_value=transfer_rank)
         meta = TPUConnectorMetadata()
-        # 4,097 logical tokens span two complete 2,048-token interleave cycles
-        # plus rank 0's first token in cycle 2. Every PCP rank therefore owns
-        # live bytes in the shared scheduler block.
+        # Long prefixes cover every rank; a two-token FA-only prefix leaves
+        # rank 7 empty and must still complete without a native transfer.
         meta.reqs_to_send["partial"] = MagicMock(uuid=4321,
                                                  local_block_ids=[77],
-                                                 num_tokens=4097,
+                                                 num_tokens=num_tokens,
                                                  expiration_time=1e20)
 
         with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
