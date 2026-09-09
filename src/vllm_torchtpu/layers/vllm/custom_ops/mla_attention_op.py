@@ -43,8 +43,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, dcp_topk_capacity, cp_rank_as_data, streamindex_topk,
-    streamindex_topk_dcp)
+    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
@@ -161,7 +160,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         dcp_size = dcp_size if isinstance(dcp_size, int) else 1
         self.topk_op_dcp = None
         self.dcp_size = dcp_size
-        self.dcp_capacity = dcp_topk_capacity(self.topk_tokens, dcp_size)
         if dcp_size > 1:
             if pcp_size > 1:
                 raise NotImplementedError(
@@ -171,11 +169,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     "once.")
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size)
-            # A device-side accumulator, so the overflow count is observable
-            # without a per-step host sync on the decode path. Non-zero after a
-            # run means `dcp_capacity` was too small and the top-k stopped
-            # being exact; see `streamindex_topk_dcp`.
-            self.dcp_dropped = torch.zeros((1, ), dtype=torch.int32)
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
@@ -266,10 +259,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         The output is the inverse of the PCP op's, too. PCP hands each rank the
         merged global list for its own tokens; DCP hands each rank, for *every*
         token, the slice of that token's global top-k it physically holds --
-        already converted to local cache indices, `capacity` wide.
+        already converted to local cache indices, left-packed into a `topk`-wide
+        row that averages `topk / dcp_size` real entries.
         """
         topk = self.topk_tokens
-        capacity = self.dcp_capacity
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
 
         def _streamidx_topk_dcp_jax(
@@ -281,7 +274,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices: jax.Array,  # virtual page ordinals
             cu_q_lens: jax.Array,
             distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        ) -> tuple[jax.Array, jax.Array]:
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
             # the cache's 128-lane width itself.
             cache_kv = _cp_scatter_indexer_k(
@@ -297,7 +290,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            local_topk, dropped = streamindex_topk_dcp(
+            local_topk = streamindex_topk_dcp(
                 q,
                 weights,
                 cache_kv,
@@ -310,11 +303,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                capacity=capacity,
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
             )
-            return cache_kv, local_topk, dropped
+            return cache_kv, local_topk
 
         def _fake_outputs(q_bytes, weights, cache_kv, k_packed, seq_lens,
                           page_indices, cu_q_lens, distribution):
@@ -326,9 +318,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                  distribution)
             return (
                 torch.empty_like(cache_kv),
-                q_bytes.new_empty((q_bytes.shape[0], capacity),
-                                  dtype=torch.int32),
-                q_bytes.new_empty((1, ), dtype=torch.int32),
+                q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
             )
 
         replicated = jax.sharding.PartitionSpec()
@@ -356,16 +346,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             ),
             output_partition_specs=(
                 sharded,  # new cache_kv
-                sharded,  # local_topk: [num_tokens, capacity] per rank
-                sharded,  # dropped: one count per rank
+                sharded,  # local_topk: [num_tokens, topk] per rank
             ),
             fake_outputs=_fake_outputs,
         )
 
         def op(*args):
-            new_cache, local_topk, dropped = jax_op(*args)
+            new_cache, local_topk = jax_op(*args)
             args[2].copy_(new_cache)
-            return local_topk, dropped
+            return local_topk
 
         return op
 
@@ -412,9 +401,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             # No permutation tables: DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
             # comes back is *not* global positions but this rank's own local
-            # cache indices, `dcp_capacity` wide -- the attention side consumes
-            # them directly and merges across ranks by log-sum-exp.
-            topk_indices, dropped = self.topk_op_dcp(
+            # cache indices, left-packed and `-1` padded -- the attention side
+            # consumes them directly and merges across ranks by log-sum-exp.
+            topk_indices = self.topk_op_dcp(
                 q_values.view(torch.uint8),
                 weights,
                 kv_cache,
@@ -424,8 +413,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cu_q_lens,
                 distribution,
             )
-            # Device-side accumulate; reading it would cost a sync per step.
-            self.dcp_dropped += dropped.to(self.dcp_dropped.device)
         else:
             topk_indices = self.topk_op(
                 q_values.view(torch.uint8),
@@ -440,12 +427,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         self.topk_indices_buffer[:hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        # Width off the result rather than `topk_tokens`: under DCP each rank
-        # returns only the `dcp_capacity`-wide slice of the list it owns, and
-        # the buffer is sized to match (see `DeepseekV4Model.__init__`). A
-        # `topk_tokens`-wide buffer would be correct but would hand the sparse
-        # attention kernel `dcp_size`x the gather it needs, which is the entire
-        # cost being optimised here.
+        # Both branches return `topk_tokens`-wide rows, matching the buffer.
+        # Under DCP the row is the slice of the global list this rank owns,
+        # left-packed, so it is only `1 / dcp_size` full on average -- the
+        # attention side must bound its gather by the per-row count rather than
+        # by this width, or it pays `dcp_size`x more than it needs to.
         width = topk_indices.shape[1]
         self.topk_indices_buffer[:num_out, :width] = topk_indices[:num_out]
         return self.topk_indices_buffer

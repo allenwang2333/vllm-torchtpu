@@ -1577,7 +1577,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     f"a multiple of {dsa_gather.TILE_SUBROWS} "
                     f"(dsa_gather.TILE_SUBROWS), got "
                     f"{self.dcp_interleave_size}. 4 is also the best value for "
-                    "load balance across the shards; see `dcp_topk_capacity`.")
+                    "top-k load balance across the shards -- coarser cycles "
+                    "let a contiguous run of winners land on fewer ranks.")
             self._dcp_mesh = get_or_create_dcp_mesh()
 
     def _get_kv_scales(

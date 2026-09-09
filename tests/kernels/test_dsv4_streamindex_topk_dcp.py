@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, _partition_winners_by_owner, cp_global_to_local,
+    DCP_AXIS_NAME, _select_owned_winners, cp_global_to_local,
     cp_local_to_global, cp_owner_rank, streamindex_topk,
     streamindex_topk_dcp)
 
@@ -76,16 +76,26 @@ def test_global_to_local_needs_no_rank_argument(dcp_size, interleave_c):
 
 
 # ===================================================================== #
-# The partition step, on its own. This is where a global top-k list is
-# split into one padded per-owner list, and where capacity overflow is
-# either reported or silently corrupts the result.
+# The owner filter, on its own. Every rank runs this over the same
+# all-gathered list with a different rank id, so the `dcp_size` results
+# have to be a partition of that list -- nothing kept twice, nothing lost,
+# and no width at which it starts dropping winners.
 # ===================================================================== #
+
+
+def _filter_all_ranks(merged, dcp_size, interleave_c):
+    """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
+    return np.stack([
+        np.asarray(
+            _select_owned_winners(jnp.asarray(merged), dcp_size, interleave_c,
+                                  jnp.int32(r))) for r in range(dcp_size)
+    ])
 
 
 @pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4),
                                                    (8, 64)])
-def test_partition_is_lossless_when_capacity_suffices(dcp_size, interleave_c):
-    """Reassembling the per-owner lists recovers the input set exactly."""
+def test_owner_filters_partition_the_list(dcp_size, interleave_c):
+    """Unioning what each rank keeps recovers the input set exactly."""
     rng = np.random.default_rng(20260906)
     num_rows, k, span = 16, 128, 4096
     merged = np.stack([
@@ -95,39 +105,44 @@ def test_partition_is_lossless_when_capacity_suffices(dcp_size, interleave_c):
     # A ragged tail, to exercise the `-1` padding of the input as well.
     merged[0, -5:] = -1
 
-    lists, dropped = _partition_winners_by_owner(jnp.asarray(merged), dcp_size,
-                                                 interleave_c, capacity=k)
-    lists = np.asarray(lists)
-    assert int(dropped) == 0
+    lists = _filter_all_ranks(merged, dcp_size, interleave_c)
+    assert lists.shape == (dcp_size, num_rows, k)
 
     for t in range(num_rows):
         want = set(merged[t][merged[t] >= 0].tolist())
-        got = set()
+        got = []
         for r in range(dcp_size):
-            row = lists[t, r]
+            row = lists[r, t]
             for local in row[row >= 0].tolist():
-                g = int(
-                    cp_local_to_global(local, r, dcp_size, interleave_c))
-                # A rank must only ever be handed positions it actually owns.
+                g = int(cp_local_to_global(local, r, dcp_size, interleave_c))
+                # A rank must only ever keep positions it actually owns.
                 assert (g // interleave_c) % dcp_size == r
-                got.add(g)
-        assert got == want
-        assert len(got) == int((merged[t] >= 0).sum())
+                got.append(g)
+        # Multiplicity, not just set equality: the LSE merge double-counts a
+        # position delivered to two ranks.
+        assert len(got) == len(set(got))
+        assert set(got) == want
 
 
-def test_partition_reports_overflow_rather_than_hiding_it():
-    """Undersized capacity must surface as a count, not a quiet truncation."""
-    dcp_size, interleave_c, capacity = 4, 1, 3
-    # All 16 positions on one row; with interleave_c=1 each rank owns 4 of
-    # them, so every rank overflows a capacity of 3 by exactly one.
-    merged = jnp.arange(16, dtype=jnp.int32)[None, :]
-    lists, dropped = _partition_winners_by_owner(merged, dcp_size,
-                                                 interleave_c, capacity)
-    assert int(dropped) == dcp_size
-    assert int((np.asarray(lists) >= 0).sum()) == dcp_size * capacity
+def test_a_rank_owning_every_winner_loses_nothing():
+    """The property the capacity-bounded all-to-all could not offer.
+
+    Ownership is data-dependent -- winners correlated with
+    `position mod (interleave_size * dcp_size)` can all land on one rank -- so
+    any per-rank width below `k` is a bet. `k` is not a bet: a rank owning the
+    whole list still fits it.
+    """
+    dcp_size, interleave_c, k = 4, 1, 16
+    # interleave_c=1: every multiple of dcp_size is owned by rank 0.
+    merged = jnp.arange(0, k * dcp_size, dcp_size, dtype=jnp.int32)[None, :]
+    lists = _filter_all_ranks(np.asarray(merged), dcp_size, interleave_c)
+    assert (lists[0, 0] >= 0).sum() == k
+    assert sorted(lists[0, 0].tolist()) == list(range(k))
+    for r in (1, 2, 3):
+        assert (lists[r, 0] == -1).all()
 
 
-def test_partition_leaves_unowned_ranks_empty():
+def test_unowned_rank_gets_an_all_minus_one_row():
     """A rank owning none of a token's winners gets an all -1 row.
 
     The attention side keys its LSE mask off exactly this, so it has to be
@@ -135,11 +150,10 @@ def test_partition_leaves_unowned_ranks_empty():
     """
     # interleave_c=1, dcp_size=4: these are all owned by rank 1.
     merged = jnp.asarray([[1, 5, 9, 13]], jnp.int32)
-    lists = np.asarray(
-        _partition_winners_by_owner(merged, 4, 1, capacity=8)[0])
-    assert (lists[0, 1] >= 0).sum() == 4
+    lists = _filter_all_ranks(np.asarray(merged), 4, 1)
+    assert (lists[1, 0] >= 0).sum() == 4
     for r in (0, 2, 3):
-        assert (lists[0, r] == -1).all()
+        assert (lists[r, 0] == -1).all()
 
 
 # ===================================================================== #
@@ -153,7 +167,7 @@ def _mesh(size):
 
 def _dcp_kwargs(**over):
     kw = dict(mesh=None, k=16, compression_ratio=1, dcp_size=2,
-              interleave_size=1, capacity=8)
+              interleave_size=1)
     kw.update(over)
     return kw
 
@@ -179,14 +193,6 @@ def test_dcp_size_one_is_rejected():
                              **_dcp_kwargs(mesh=mesh, dcp_size=1))
 
 
-def test_capacity_above_k_is_rejected():
-    if len(jax.devices()) < 2:
-        pytest.skip("needs 2 devices")
-    with pytest.raises(ValueError, match="exceeds k"):
-        streamindex_topk_dcp(*_dummy_args(),
-                             **_dcp_kwargs(mesh=_mesh(2), k=16, capacity=32))
-
-
 def test_token_count_must_divide_over_the_dcp_axis():
     if len(jax.devices()) < 4:
         pytest.skip("needs 4 devices")
@@ -202,16 +208,6 @@ def test_token_count_must_divide_over_the_dcp_axis():
 H_IDX, D_IDX, K = 32, 128, 2048
 Q_LEN, KV_LEN, PAGE_SIZE = 256, 32768, 1024
 WIDTH = 256
-
-
-def _capacity(dcp_size):
-    """2x the `k / dcp_size` mean occupancy, capped at `k`.
-
-    Headroom has to scale with the shard count, not be a constant: mean
-    occupancy is `k / dcp_size`, so a fixed width that is generous at
-    dcp_size=8 is a hard truncation at dcp_size=2.
-    """
-    return min(K, 2 * K // dcp_size)
 
 
 def _global_records(kv_len, seed=7):
@@ -238,7 +234,6 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
     devices = jax.devices()
     if len(devices) < dcp_size:
         pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
-    capacity = _capacity(dcp_size)
 
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(0))
@@ -275,25 +270,21 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
     shards = jax.device_put(shards,
                             jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
 
-    local_topk, dropped = jax.jit(
+    local_topk = jax.jit(
         functools.partial(streamindex_topk_dcp,
                           mesh=mesh,
                           k=K,
                           compression_ratio=1,
                           dcp_size=dcp_size,
                           interleave_size=1,
-                          capacity=capacity,
                           num_kv_pages_per_block=2,
                           num_queries_per_block=128))(
                               q, weights, shards, seq_lens,
                               jnp.arange(vpages, dtype=jnp.int32), cu_q_lens,
                               distribution)
 
-    assert int(np.asarray(dropped).sum()) == 0, (
-        f"capacity {capacity} overflowed: {np.asarray(dropped).tolist()}")
-
     # Global leading dim is dcp_size * Q_LEN, rank-major.
-    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, capacity)
+    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
     assert local_topk.max() < KV_LEN // dcp_size, "a rank got a foreign index"
 
     for t in range(Q_LEN):
@@ -317,7 +308,6 @@ def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
     devices = jax.devices()
     if len(devices) < dcp_size:
         pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
-    capacity = _capacity(dcp_size)
 
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(3))
@@ -335,14 +325,13 @@ def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
     shards = jax.device_put(shards,
                             jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
 
-    local_topk, _ = jax.jit(
+    local_topk = jax.jit(
         functools.partial(streamindex_topk_dcp,
                           mesh=mesh,
                           k=K,
                           compression_ratio=1,
                           dcp_size=dcp_size,
                           interleave_size=1,
-                          capacity=capacity,
                           num_kv_pages_per_block=2,
                           num_queries_per_block=128))(
                               q, weights, shards,
@@ -350,7 +339,7 @@ def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
                               jnp.arange(vpages, dtype=jnp.int32),
                               jnp.array([0, Q_LEN], jnp.int32),
                               jnp.array([0, 0, 1], jnp.int32))
-    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, capacity)
+    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
 
     for t in range(Q_LEN):
         globals_ = [
