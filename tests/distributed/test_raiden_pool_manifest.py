@@ -403,7 +403,7 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops(
                for entry in manifest.pools)
     ssm_bytes = 8 * 64 * 32 * ssm_itemsize
     assert (conv.base_offset_bytes, conv.dtype_tag,
-            conv.live_bytes_per_block) == (ssm_bytes, "bfloat16", 2 * 768 * 2)
+            conv.live_bytes_per_block) == (ssm_bytes, "float32", 2 * 768 * 4)
     assert (ssm.base_offset_bytes, ssm.dtype_tag,
             ssm.live_bytes_per_block) == (0, ssm_dtype.removeprefix("torch."),
                                           ssm_bytes)
@@ -446,15 +446,15 @@ def test_unified_pool_views_are_kernel_tied_not_spec_tied():
                                               gdn_geometry=geometry)
 
     drifted = build(shapes=((2, 1, 768), (8, 64, 32)),
-                    dtypes=("torch.float32", "torch.float32"))
+                    dtypes=("torch.bfloat16", "torch.float32"))
     matching = build(shapes=((2, 768), (8, 64, 32)),
-                     dtypes=("torch.bfloat16", "torch.float32"))
+                     dtypes=("torch.float32", "torch.float32"))
     assert drifted.pool_dicts() == matching.pool_dicts()
 
     conv, ssm = drifted.pools
     ssm_bytes = 8 * 64 * 32 * 4
     assert (conv.dtype_tag, conv.base_offset_bytes,
-            conv.live_bytes_per_block) == ("bfloat16", ssm_bytes, 2 * 768 * 2)
+            conv.live_bytes_per_block) == ("float32", ssm_bytes, 2 * 768 * 4)
     assert (ssm.dtype_tag, ssm.base_offset_bytes,
             ssm.live_bytes_per_block) == ("float32", 0, ssm_bytes)
 
@@ -497,7 +497,7 @@ def test_unified_pool_conv_region_matches_kernel_state_plan():
                                               gdn_geometry=geometry)
 
     conv, ssm = manifest.pools
-    assert conv.live_bytes_per_block == conv_bytes == 73_728
+    assert conv.live_bytes_per_block == conv_bytes == 147_456
     assert ssm.live_bytes_per_block == ssm_bytes == 4_194_304
     # The conv view starts exactly where the kernel's token plan places the
     # conv region (right after the SSM tokens).

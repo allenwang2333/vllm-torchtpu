@@ -38,7 +38,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import typed_ldst
-from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
+from vllm_torchtpu.kernels.gdn.v3 import legacy_unified
 
 
 def _pool_geometry(pool):
@@ -464,7 +464,7 @@ def v3_state_source(
         d_v: int,
         kernel_size: int,
         recurrent_state_dtype: jnp.dtype = jnp.float32,
-        qk_pair_layout: bool = False) -> gdn_v3_config.StateSourcePlan:
+        qk_pair_layout: bool = False) -> legacy_unified.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
     pipeline — the exact bytes ``gather_region``/``scatter_region`` move
@@ -520,7 +520,7 @@ def v3_state_source(
     # one full-width carrier row. The logical state must contain a whole number
     # of carrier rows.
     assert ssm_elements % ssm_out_lanes == 0, (ssm_elements, ssm_out_lanes)
-    ssm = gdn_v3_config.StateRegion(
+    ssm = legacy_unified.StateRegion(
         kb0=0,
         nblocks=ssm_nblocks,
         row0=0,
@@ -550,7 +550,7 @@ def v3_state_source(
     if qk_pair_layout:
         conv_rows_perm = _conv_qk_pair_rows_perm(kernel_size - 1, conv_dim,
                                                  n_v, d_v, lanes)
-    conv = gdn_v3_config.StateRegion(
+    conv = legacy_unified.StateRegion(
         kb0=kb0,
         nblocks=1,
         row0=row0,
@@ -561,6 +561,6 @@ def v3_state_source(
         rows_perm=conv_rows_perm,
     )
 
-    return gdn_v3_config.StateSourcePlan(stride=split,
-                                         conv=conv,
-                                         recurrent=ssm)
+    return legacy_unified.StateSourcePlan(stride=split,
+                                          conv=conv,
+                                          recurrent=ssm)

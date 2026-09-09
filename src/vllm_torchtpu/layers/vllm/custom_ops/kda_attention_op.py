@@ -402,8 +402,7 @@ def _build_fused_core(lower_bound: float | None, eps: float):
             # to `a` itself.
             b=beta,
             a=raw_gate,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight_flat,
             # Kimi's short convolution is bias-free.
             conv_bias=None,

@@ -238,11 +238,11 @@ def test_kimi_linear_padded_ssm_fit(vllm_config):
             model_cls=FakeKimiLinearModel)
 
     # SSM: ceil(262144 / 2560) = 103 rows (1536 B of padding in the last
-    # row); conv: pow2(ceil(9216 / 2560)) = 4 rows; the fit floor 107 beats
+    # row); conv: pow2(ceil(18432 / 2560)) = 8 rows; the fit floor 111 beats
     # the backend minimum of 64 and the input block size of 16.
-    assert vllm_config.cache_config.block_size == 107
-    assert vllm_config.cache_config.mamba_block_size == 107
-    assert vllm_config.cache_config.mamba_page_size_padded == 107 * 2560
+    assert vllm_config.cache_config.block_size == 111
+    assert vllm_config.cache_config.mamba_block_size == 111
+    assert vllm_config.cache_config.mamba_page_size_padded == 111 * 2560
 
 
 def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
@@ -262,8 +262,8 @@ def test_fit_has_no_fixed_16_token_alignment(vllm_config):
             backend_cls=FakePlainAttentionBackend,
             model_cls=FakeCompactMambaModel)
 
-    assert vllm_config.cache_config.block_size == 257
-    assert vllm_config.cache_config.mamba_page_size_padded == 257 * 1024
+    assert vllm_config.cache_config.block_size == 258
+    assert vllm_config.cache_config.mamba_page_size_padded == 258 * 1024
 
 
 def test_user_block_size_below_fit_is_promoted(vllm_config):

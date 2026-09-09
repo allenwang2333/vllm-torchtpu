@@ -24,9 +24,11 @@ POOLED_GDN_ARCHITECTURES = frozenset({
 # These are torch dtype *names*, not torch.dtype objects: this module is
 # imported by the JAX kernel path and by deviceless tests, so it must stay
 # importable without torch.
-DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
+DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.float32"
 DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
 _ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
+
+GRANULE_BYTES = 512
 
 
 def pooled_gdn_state_dtypes(
@@ -98,6 +100,18 @@ class PooledGDNStateLayout:
     def required_bytes(self) -> int:
         return self.required_tokens * self.token_bytes
 
+    @property
+    def granules_per_token(self) -> int:
+        return self.token_bytes // GRANULE_BYTES
+
+    @property
+    def ssm_granules(self) -> int:
+        return self.ssm_tokens * self.granules_per_token
+
+    @property
+    def conv_granules(self) -> int:
+        return self.conv_tokens * self.granules_per_token
+
 
 def derive_pooled_gdn_state_layout(
     *,
@@ -112,6 +126,9 @@ def derive_pooled_gdn_state_layout(
     """
     if min(ssm_bytes, conv_bytes, token_bytes) <= 0:
         raise ValueError("pooled GDN byte sizes must be positive")
+    if token_bytes % GRANULE_BYTES != 0:
+        raise ValueError("pooled GDN token rows must be a whole number of "
+                         f"{GRANULE_BYTES}-byte granules, got {token_bytes}")
 
     ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
     conv_tokens = 1
