@@ -1369,67 +1369,152 @@ def _patch_vllm_structured_jump_decoding() -> None:
             self._is_terminated = matcher.is_terminated()
             return jump_tokens
 
+        def peek_jump_forward_tokens(self, max_tokens: int = 32) -> list[int]:
+            if getattr(self, "_is_terminated", False):
+                return []
+            tokenizer = getattr(self, "tokenizer", None)
+            if tokenizer is None:
+                return []
+            matcher = getattr(self, "matcher", None)
+            if matcher is None or not hasattr(matcher,
+                                              "find_jump_forward_string"):
+                return []
+            try:
+                jump_str = matcher.find_jump_forward_string()
+            except Exception:
+                return []
+            if not jump_str:
+                return []
+            try:
+                tokens = tokenizer.encode(jump_str, add_special_tokens=False)
+            except Exception:
+                return []
+            if not tokens:
+                return []
+            candidate_tokens = tokens[:min(max_tokens, 128)]
+            accepted_count = 0
+            for t in candidate_tokens:
+                if matcher.accept_token(t):
+                    accepted_count += 1
+                else:
+                    break
+            if accepted_count > 0:
+                matcher.rollback(accepted_count)
+                return candidate_tokens[:accepted_count]
+            return []
+
         backend_xgrammar.XgrammarGrammar.try_jump_forward = try_jump_forward
+        backend_xgrammar.XgrammarGrammar.peek_jump_forward_tokens = (
+            peek_jump_forward_tokens)
 
-        # 3. Patch Scheduler.update_from_output to append jump tokens and propagate them
-        from vllm.v1.core.sched.scheduler import Scheduler, check_stop
+        # 3. Patch Scheduler to propose jump tokens into speculative verification graph
+        from vllm.v1.core.sched.scheduler import Scheduler
 
-        orig_update_from_output = Scheduler.update_from_output
-
-        def patched_update_from_output(self, scheduler_output,
-                                       model_runner_output):
-            engine_core_outputs = orig_update_from_output(
-                self, scheduler_output, model_runner_output)
-
-            # Check for jump decoding on active structured output requests
-            for req_id in scheduler_output.num_scheduled_tokens:
+        def patched_update_draft_token_ids(self, draft_token_ids) -> None:
+            for req_id, spec_token_ids in zip(
+                    draft_token_ids.req_ids,
+                    draft_token_ids.draft_token_ids,
+            ):
                 request = self.requests.get(req_id)
                 if request is None or request.is_finished():
                     continue
-                struct_req = request.structured_output_request
-                if struct_req is None or struct_req.grammar is None:
+
+                if request.is_prefill_chunk:
+                    if request.spec_token_ids:
+                        request.spec_token_ids = []
                     continue
-                grammar = struct_req.grammar
-                if hasattr(grammar, "try_jump_forward"):
-                    jump_tokens = grammar.try_jump_forward()
-                    if jump_tokens:
-                        logger.info(
-                            "⚡ [JumpDecoding SUCCESS] Fast-Forward Triggered! "
-                            "Request: %s -> Jumping %d Tokens: %s",
-                            req_id,
-                            len(jump_tokens),
-                            jump_tokens,
-                        )
-                        jump_stopped = False
-                        valid_jump_tokens = []
-                        for output_token_id in jump_tokens:
-                            request.append_output_token_ids(output_token_id)
-                            valid_jump_tokens.append(output_token_id)
-                            jump_stopped = check_stop(request,
-                                                      self.max_model_len)
-                            if jump_stopped:
-                                break
 
-                        if jump_stopped:
-                            finished = self._handle_stopped_request(request)
-                            if finished:
-                                self._free_request(request)
+                if self.structured_output_manager.should_advance(request):
+                    metadata = request.structured_output_request
+                    grammar = getattr(metadata, "grammar", None)
+                    if grammar is not None and hasattr(
+                            grammar, "peek_jump_forward_tokens"):
+                        max_k = getattr(self, "num_spec_tokens",
+                                        0) or len(spec_token_ids) or 5
+                        remaining = max(
+                            0, request.max_tokens -
+                            len(request.output_token_ids) - 1)
+                        max_k = min(max_k, remaining)
+                        jump_tokens = (grammar.peek_jump_forward_tokens(
+                            max_tokens=max_k) if max_k > 0 else [])
+                        if jump_tokens:
+                            spec_token_ids = jump_tokens
+                        else:
+                            spec_token_ids = metadata.grammar.validate_tokens(
+                                spec_token_ids)
+                    else:
+                        spec_token_ids = metadata.grammar.validate_tokens(
+                            spec_token_ids)
+                request.spec_token_ids = spec_token_ids
 
-                        for client_outs in engine_core_outputs.values():
-                            for out in client_outs.outputs:
-                                if out.request_id == req_id:
-                                    out.new_token_ids.extend(valid_jump_tokens)
-                                    if jump_stopped:
-                                        out.finish_reason = (
-                                            request.get_finished_reason())
-                                    break
-            return engine_core_outputs
+            processed_req_ids = set(draft_token_ids.req_ids)
+            for request in self.running:
+                if (request.request_id in processed_req_ids
+                        or request.is_finished() or request.is_prefill_chunk):
+                    continue
+                if self.structured_output_manager.should_advance(request):
+                    metadata = request.structured_output_request
+                    grammar = getattr(metadata, "grammar", None)
+                    if grammar is not None and hasattr(
+                            grammar, "peek_jump_forward_tokens"):
+                        max_k = getattr(self, "num_spec_tokens", 0) or 5
+                        remaining = max(
+                            0, request.max_tokens -
+                            len(request.output_token_ids) - 1)
+                        max_k = min(max_k, remaining)
+                        jump_tokens = (grammar.peek_jump_forward_tokens(
+                            max_tokens=max_k) if max_k > 0 else [])
+                        if jump_tokens:
+                            request.spec_token_ids = jump_tokens
 
-        Scheduler.update_from_output = patched_update_from_output
+        def patched_update_draft_token_ids_in_output(self, draft_token_ids,
+                                                     scheduler_output) -> None:
+            num_invalid_spec_tokens = {}
+            sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+            for req_id, spec_token_ids in zip(
+                    draft_token_ids.req_ids,
+                    draft_token_ids.draft_token_ids,
+            ):
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+
+                placeholder_spec_tokens = sched_spec_tokens.get(req_id)
+                if not placeholder_spec_tokens:
+                    continue
+
+                orig_num_spec_tokens = len(placeholder_spec_tokens)
+                del spec_token_ids[orig_num_spec_tokens:]
+                if self.structured_output_manager.should_advance(request):
+                    metadata = request.structured_output_request
+                    grammar = getattr(metadata, "grammar", None)
+                    if grammar is not None and hasattr(
+                            grammar, "peek_jump_forward_tokens"):
+                        max_k = orig_num_spec_tokens
+                        jump_tokens = (grammar.peek_jump_forward_tokens(
+                            max_tokens=max_k) if max_k > 0 else [])
+                        if jump_tokens:
+                            spec_token_ids = jump_tokens
+                        else:
+                            spec_token_ids = metadata.grammar.validate_tokens(
+                                spec_token_ids)
+                    else:
+                        spec_token_ids = metadata.grammar.validate_tokens(
+                            spec_token_ids)
+                num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
+                if num_invalid_tokens:
+                    spec_token_ids.extend([-1] * num_invalid_tokens)
+                    num_invalid_spec_tokens[req_id] = num_invalid_tokens
+                sched_spec_tokens[req_id] = spec_token_ids
+            scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+        Scheduler.update_draft_token_ids = patched_update_draft_token_ids
+        Scheduler.update_draft_token_ids_in_output = (
+            patched_update_draft_token_ids_in_output)
 
         backend_xgrammar._tpu_jump_decoding_patched = True
         logger.info(
-            "Applied TPU patch: structured jump decoding scheduler integration."
+            "Applied TPU patch: structured jump decoding speculative verification integration."
         )
     except Exception as e:
         logger.warning("Failed to patch structured jump decoding: %s", e)
