@@ -37,8 +37,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.gdn.v3 import (config, memory_ref, pcp_metadata,
-                                          wrapper)
+from vllm_torchtpu.kernels.gdn.v3 import (config, legacy_unified, memory_ref,
+                                          pcp_metadata, wrapper)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1125,7 +1125,7 @@ def _scatter_compact_state_updates(
     num_active_seqs: jax.Array,
     *,
     state_stride: int,
-    region: config.StateRegion,
+    region: legacy_unified.StateRegion,
 ) -> jax.Array:
     """Apply raw per-sequence state tiles to a donated unified pool.
 
@@ -1204,7 +1204,7 @@ def fused_qkvz_projection_pcp_gdn(
     comm_chunk_size: int,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
-    state_plan: config.StateSourcePlan,
+    state_plan: legacy_unified.StateSourcePlan,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
