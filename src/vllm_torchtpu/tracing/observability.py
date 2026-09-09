@@ -45,10 +45,18 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 logger = logging.getLogger("vllm_torchtpu.observability")
 
-# Configure TorchDynamo to ignore logging calls during compilation to avoid graph breaks
+# Configure TorchDynamo to ignore logging calls during compilation if supported
 try:
     import torch._dynamo.config
-    torch._dynamo.config.ignore_logging_functions = True
+    if hasattr(torch._dynamo.config, "ignore_logging_functions"):
+        funcs = torch._dynamo.config.ignore_logging_functions
+        if isinstance(funcs, (set, list, tuple)):
+            torch._dynamo.config.ignore_logging_functions = set(funcs) | {
+                logging.Logger.info,
+                logging.Logger.warning,
+                logging.Logger.debug,
+                logging.Logger.error,
+            }
 except Exception:
     pass
 
