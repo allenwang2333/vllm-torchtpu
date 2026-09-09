@@ -50,10 +50,10 @@ else:
     import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.layers.vllm.cp_attention import (
-    build_dcp_kernels as _build_dcp_kernels,
-    forward_with_dcp as _forward_with_dcp,
-)
+from vllm_torchtpu.layers.vllm.cp_attention import \
+    build_dcp_kernels as _build_dcp_kernels
+from vllm_torchtpu.layers.vllm.cp_attention import \
+    forward_with_dcp as _forward_with_dcp
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -1035,24 +1035,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             return
 
-        dcp_configured = (parallel_config is not None and
-                          getattr(parallel_config,
-                                  'decode_context_parallel_size', 1) > 1)
+        dcp_configured = (parallel_config is not None and getattr(
+            parallel_config, 'decode_context_parallel_size', 1) > 1)
         if dcp_configured:
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
                 self.dcp_rank = int(dcp_group.rank_in_group)
                 self.rpa_dcp_cache_kernel, self.rpa_dcp_new_kernel = (
-                    _build_dcp_kernels(
-                        sliding_window=self.sliding_window,
-                        sm_scale=self.scale,
-                        logits_soft_cap=self.logits_soft_cap,
-                        q_scale=q_scale,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                        cp_group_size=self.dcp_world_size,
-                        cp_rank=self.dcp_rank))
+                    _build_dcp_kernels(sliding_window=self.sliding_window,
+                                       sm_scale=self.scale,
+                                       logits_soft_cap=self.logits_soft_cap,
+                                       q_scale=q_scale,
+                                       k_scale=k_scale,
+                                       v_scale=v_scale,
+                                       cp_group_size=self.dcp_world_size,
+                                       cp_rank=self.dcp_rank))
             return
 
         self.rpa_kernel = self._build_rpa_kernel(q_scale,
@@ -1173,8 +1171,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 raise NotImplementedError(
                     "DCP attention does not support attention sinks or "
                     "the bundled KV cache path.")
-            outputs = self._run_dcp_forward(layer, query, key, value,
-                                            kv_cache, attn_metadata)
+            outputs = self._run_dcp_forward(layer, query, key, value, kv_cache,
+                                            attn_metadata)
             if outputs.shape[-1] > self.head_size:
                 outputs = outputs[..., :self.head_size]
             if query_dim == 2:

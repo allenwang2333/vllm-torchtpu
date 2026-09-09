@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """DCP (Decode Context Parallelism) attention: kernel building and forward
 orchestration, on top of batched_rpa_longctx's schedule_cp.CPMetadataComputer.
 Process-group access lives in distributed/dcp.py.
@@ -38,16 +37,16 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
-    configs as _rpa_longctx_configs,
-    wrapper as _rpa_longctx_wrapper,
-)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
+    configs as _rpa_longctx_configs
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
+    wrapper as _rpa_longctx_wrapper
 from vllm_torchtpu.utils import synchronize_tensors
-
 
 # ---------------------------------------------------------------------------
 # LSE-weighted combination
 # ---------------------------------------------------------------------------
+
 
 def lse_weighted_combine(
     out_a: torch.Tensor,
@@ -72,7 +71,8 @@ def lse_weighted_combine(
     out_a = torch.nan_to_num(out_a, nan=0.0, posinf=0.0, neginf=0.0)
     out_b = torch.nan_to_num(out_b, nan=0.0, posinf=0.0, neginf=0.0)
     norm_safe = torch.where(norm > 0, norm, torch.ones_like(norm))
-    out = (ea.unsqueeze(-1) * out_a + eb.unsqueeze(-1) * out_b) / norm_safe.unsqueeze(-1)
+    out = (ea.unsqueeze(-1) * out_a +
+           eb.unsqueeze(-1) * out_b) / norm_safe.unsqueeze(-1)
     lse_out = torch.where(m_finite, m + torch.log(norm_safe), m)
     return out, lse_out
 
@@ -109,6 +109,7 @@ def dcp_allgather_lse_combine(
 # ---------------------------------------------------------------------------
 # DCP kernel entry functions (for pallas.jax_op)
 # ---------------------------------------------------------------------------
+
 
 def _pallas_rpa_kernel_dcp(
     kv_cache: jax.Array,
@@ -181,7 +182,9 @@ def _alloc_instance_id() -> int:
 
 
 def _fake_dcp(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
-    lse = torch.empty(query.shape[0], query.shape[1], dtype=query.dtype,
+    lse = torch.empty(query.shape[0],
+                      query.shape[1],
+                      dtype=query.dtype,
                       device=query.device)
     return torch.empty_like(kv_cache), torch.empty_like(query), lse
 
@@ -196,7 +199,10 @@ def _build_dcp_kernel_op(op_name: str, fn):
     The kv_cache.copy_ below keeps the caller's tensor validly bound to
     that (possibly aliased) result and compiles to a no-op for CACHE_ONLY.
     """
-    op = pallas.jax_op(op_name, fn, donate_argnums=(0, ), mesh=None,
+    op = pallas.jax_op(op_name,
+                       fn,
+                       donate_argnums=(0, ),
+                       mesh=None,
                        input_partition_specs=None)
     op.register_fake(_fake_dcp)
 
@@ -226,8 +232,8 @@ def build_dcp_kernels(
                  query_start_loc, request_distribution, q_scale, k_scale,
                  v_scale) -> (output [T,H,D], lse [T,H])``
     """
-    base_key = (sliding_window, sm_scale, logits_soft_cap,
-                q_scale, k_scale, v_scale, cp_group_size, cp_rank)
+    base_key = (sliding_window, sm_scale, logits_soft_cap, q_scale, k_scale,
+                v_scale, cp_group_size, cp_rank)
     cache_key = ("dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
 
@@ -257,7 +263,8 @@ def build_dcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            attention_scope=_rpa_longctx_configs.AttentionScope.NEW_TOKENS_ONLY,
+            attention_scope=_rpa_longctx_configs.AttentionScope.
+            NEW_TOKENS_ONLY,
         )
         cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
             f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn)
@@ -268,6 +275,7 @@ def build_dcp_kernels(
 # ---------------------------------------------------------------------------
 # Top-level DCP forward
 # ---------------------------------------------------------------------------
+
 
 def forward_with_dcp(
     *,
@@ -294,7 +302,8 @@ def forward_with_dcp(
     """
     dcp_group = get_dcp_group()
     if dcp_group is None:
-        raise RuntimeError("DCP group not initialized; cannot run DCP attention.")
+        raise RuntimeError(
+            "DCP group not initialized; cannot run DCP attention.")
 
     q_scale = None
     k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
@@ -346,8 +355,8 @@ def forward_with_dcp(
 
     new_output, new_lse = new_kernel(kv_cache, query, *shared_args)
 
-    output, _ = lse_weighted_combine(combined_output, combined_lse,
-                                     new_output, new_lse)
+    output, _ = lse_weighted_combine(combined_output, combined_lse, new_output,
+                                     new_lse)
 
     if not torch.compiler.is_compiling():
         synchronize_tensors(kv_cache, wait=False)

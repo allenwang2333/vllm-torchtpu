@@ -35,11 +35,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    kernel,
-                                                                    schedule,
-                                                                    schedule_cp,
-                                                                    utils)
+from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (
+    configs, kernel, schedule, schedule_cp, utils)
 
 
 def prepare_inputs(

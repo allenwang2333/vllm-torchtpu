@@ -11,22 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Context Parallel (CP) DMA schedule computation for Batched RPA."""
 
 import dataclasses
-import functools
 from collections.abc import Sequence
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
-                                                                    schedule,
-                                                                    utils)
+                                                                    schedule)
 
 
 @jax.tree_util.register_dataclass
@@ -65,15 +60,14 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     """Context Parallel (CP) metadata scheduler: overrides only k_loop and schema."""
 
     @classmethod
-    def get_rpa_schedule(
-        cls, cfgs: configs.RpaConfigs, multiplier: int = 1
-    ) -> schedule.RpaSchedule:
+    def get_rpa_schedule(cls,
+                         cfgs: configs.RpaConfigs,
+                         multiplier: int = 1) -> schedule.RpaSchedule:
         """Returns the RpaSchedule shape/dtype struct with CP-specific DMA struct."""
-        dma_kv_new_struct_cls = (
-            HeadAlongSublaneDmaNewCP
-            if cfgs.serve.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
-            else schedule.SeqAlongLaneDmaNew
-        )
+        dma_kv_new_struct_cls = (HeadAlongSublaneDmaNewCP
+                                 if cfgs.serve.kv_layout
+                                 == configs.KVLayout.HEAD_ALONG_SUBLANE else
+                                 schedule.SeqAlongLaneDmaNew)
         return schedule.RpaSchedule.create_shape_dtype(
             cfgs,
             dma_kv_new_struct_cls=dma_kv_new_struct_cls,
@@ -81,14 +75,14 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         )
 
     def __init__(
-        self,
-        schedule: schedule.RpaSchedule,
-        schedule_hbm_ref: schedule.RpaSchedule,
-        dma_sem: jax.Ref,
-        *,
-        cfgs: configs.RpaConfigs,
-        extra_refs: Sequence[jax.Ref] = (),
-        **kwargs,
+            self,
+            schedule: schedule.RpaSchedule,
+            schedule_hbm_ref: schedule.RpaSchedule,
+            dma_sem: jax.Ref,
+            *,
+            cfgs: configs.RpaConfigs,
+            extra_refs: Sequence[jax.Ref] = (),
+            **kwargs,
     ):
         super().__init__(
             schedule=schedule,
@@ -193,9 +187,8 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                     0,
                 )
                 fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
-                new_page_start = (
-                    hbm_token_idx_base - new_tok_offset
-                ) + i * cfgs.serve.page_size
+                new_page_start = (hbm_token_idx_base -
+                                  new_tok_offset) + i * cfgs.serve.page_size
                 fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
                 p_idx = jnp.minimum(
                     (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
@@ -204,8 +197,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 local_slot = p_idx // cp_group_size
                 dst_hbm = s_idx * cfgs.serve.pages_per_seq + local_slot
                 wb_val = jnp.where(
-                    (dma_sz > 0) & (p_idx % cp_group_size == self.rank), 1, 0
-                )
+                    (dma_sz > 0) & (p_idx % cp_group_size == self.rank), 1, 0)
                 dma_entry.fetch_hbm[...] = new_page_start
                 dma_entry.fetch_vmem[...] = fetch_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
@@ -219,13 +211,10 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 )
                 p_off = tok_idx & cfgs.serve.page_size_mask
                 local_slot = p_idx // cp_group_size
-                dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + local_slot)
-                    << cfgs.serve.page_size_log2
-                ) | p_off
-                wb_val = jnp.where(
-                    p_idx % cp_group_size == self.rank, dma_sz, jnp.int32(0)
-                )
+                dst_hbm = ((s_idx * cfgs.serve.pages_per_seq + local_slot) <<
+                           cfgs.serve.page_size_log2) | p_off
+                wb_val = jnp.where(p_idx % cp_group_size == self.rank, dma_sz,
+                                   jnp.int32(0))
                 dma_entry.fetch_hbm[...] = src_hbm
                 dma_entry.fetch_vmem[...] = dst_vmem
                 dma_entry.wb_hbm[...] = dst_hbm
