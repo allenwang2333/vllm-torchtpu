@@ -15,15 +15,16 @@
 
 import pytest
 import torch
-import torch.nn as nn
 from vllm import ir
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_torchtpu.layers.vllm.custom_ops import \
-    force_process_weights_after_loading
 from vllm_torchtpu.layers.vllm.custom_ops.layernorm_op import \
     WeightPreprocessedGemmaRMSNorm
+
+HIDDEN_SIZE = 256
+EPS = 1e-6
 
 
 @pytest.fixture
@@ -34,107 +35,107 @@ def vllm_cpu_config():
         yield config
 
 
+def _load(norm: WeightPreprocessedGemmaRMSNorm,
+          checkpoint_weight: torch.Tensor) -> None:
+    """Load a weight the way vLLM's model loaders do.
+
+    Every Gemma loader resolves the parameter's own hook first and only falls
+    back to `default_weight_loader`; see `AutoWeightsLoader._load_param` in
+    vllm/model_executor/models/utils.py and gemma4's `load_weights`. Going
+    through `getattr` here rather than calling the fold directly is what makes
+    this a test of the integration and not just of the arithmetic.
+    """
+    param = norm.weight
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, checkpoint_weight)
+
+
 def test_registration():
     """Test that WeightPreprocessedGemmaRMSNorm subclasses GemmaRMSNorm."""
     assert issubclass(WeightPreprocessedGemmaRMSNorm, GemmaRMSNorm)
 
 
-@pytest.mark.parametrize("hidden_size", [256])
-@pytest.mark.parametrize("dtype", [torch.float32])
-def test_process_weights_after_loading(vllm_cpu_config, hidden_size, dtype):
-    """Test process_weights_after_loading computes weight.float() + 1.0."""
-    norm = WeightPreprocessedGemmaRMSNorm(hidden_size)
-    norm.weight.data = torch.randn(hidden_size, dtype=dtype)
+def test_weight_is_fp32_regardless_of_default_dtype(vllm_cpu_config):
+    """The folded weight stays fp32 even when built under a bf16 default.
 
-    assert not hasattr(norm, "processed_weight")
-    norm.process_weights_after_loading(dtype)
+    Models are constructed inside `set_default_torch_dtype(model_config.dtype)`,
+    so the upstream parameter would be bf16 -- too coarse to hold `1 + w` at
+    the precision the per-step `.float()` upcast used to provide.
+    """
+    default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        norm = WeightPreprocessedGemmaRMSNorm(HIDDEN_SIZE)
+    finally:
+        torch.set_default_dtype(default)
 
-    assert hasattr(norm, "processed_weight")
-    assert norm.processed_weight.dtype == torch.float32
-    expected = norm.weight.data.float() + 1.0
-    torch.testing.assert_close(norm.processed_weight, expected)
+    assert norm.weight.dtype == torch.float32
 
 
-@pytest.mark.parametrize("hidden_size", [256])
-@pytest.mark.parametrize("eps", [1e-6])
-def test_forward_without_residual(vllm_cpu_config, hidden_size, eps):
-    """Test forward output without residual matches reference implementation."""
-    norm = WeightPreprocessedGemmaRMSNorm(hidden_size, eps=eps)
-    norm.weight.data = torch.randn(hidden_size)
-    norm.process_weights_after_loading(torch.float32)
+def test_weight_loader_folds_the_implicit_one(vllm_cpu_config):
+    """Loading through the parameter hook stores `1 + w`, upcast to fp32."""
+    norm = WeightPreprocessedGemmaRMSNorm(HIDDEN_SIZE)
+    checkpoint_weight = torch.randn(HIDDEN_SIZE, dtype=torch.bfloat16)
 
-    x = torch.randn(4, 16, hidden_size)
+    _load(norm, checkpoint_weight)
+
+    assert norm.weight.dtype == torch.float32
+    torch.testing.assert_close(norm.weight.data,
+                               checkpoint_weight.float() + 1.0)
+
+
+def test_weight_loader_rejects_shape_mismatch(vllm_cpu_config):
+    """The fold keeps `default_weight_loader`'s shape assertion."""
+    norm = WeightPreprocessedGemmaRMSNorm(HIDDEN_SIZE)
+
+    with pytest.raises(AssertionError):
+        _load(norm, torch.randn(HIDDEN_SIZE + 1))
+
+
+def test_forward_without_residual_matches_upstream(vllm_cpu_config):
+    """Forward matches stock GemmaRMSNorm fed the same checkpoint weight."""
+    checkpoint_weight = torch.randn(HIDDEN_SIZE)
+
+    norm = WeightPreprocessedGemmaRMSNorm(HIDDEN_SIZE, eps=EPS)
+    _load(norm, checkpoint_weight)
+
+    x = torch.randn(4, 16, HIDDEN_SIZE)
     out = norm(x)
 
-    # Reference implementation: ir.ops.rms_norm(x, weight.float() + 1.0, eps)
-    expected_weight = norm.weight.data.float() + 1.0
-    expected_out = ir.ops.rms_norm(x, expected_weight, eps)
-
+    expected_out = ir.ops.rms_norm(x, checkpoint_weight.float() + 1.0, EPS)
     assert out.shape == x.shape
     torch.testing.assert_close(out, expected_out)
 
 
-@pytest.mark.parametrize("hidden_size", [256])
-@pytest.mark.parametrize("eps", [1e-6])
-def test_forward_with_residual(vllm_cpu_config, hidden_size, eps):
-    """Test forward output with residual matches reference implementation."""
-    norm = WeightPreprocessedGemmaRMSNorm(hidden_size, eps=eps)
-    norm.weight.data = torch.randn(hidden_size)
-    norm.process_weights_after_loading(torch.float32)
+def test_forward_with_residual_matches_upstream(vllm_cpu_config):
+    """Residual path matches stock GemmaRMSNorm on the same weight."""
+    checkpoint_weight = torch.randn(HIDDEN_SIZE)
 
-    x = torch.randn(4, 16, hidden_size)
-    residual = torch.randn(4, 16, hidden_size)
+    norm = WeightPreprocessedGemmaRMSNorm(HIDDEN_SIZE, eps=EPS)
+    _load(norm, checkpoint_weight)
+
+    x = torch.randn(4, 16, HIDDEN_SIZE)
+    residual = torch.randn(4, 16, HIDDEN_SIZE)
     out, out_residual = norm(x, residual)
 
-    # Reference implementation: ir.ops.fused_add_rms_norm(x, residual, weight.float() + 1.0, eps)
-    expected_weight = norm.weight.data.float() + 1.0
     expected_out, expected_residual = ir.ops.fused_add_rms_norm(
-        x, residual, expected_weight, eps)
-
+        x, residual,
+        checkpoint_weight.float() + 1.0, EPS)
     assert out.shape == x.shape
     assert out_residual.shape == residual.shape
     torch.testing.assert_close(out, expected_out)
     torch.testing.assert_close(out_residual, expected_residual)
 
 
-def test_forward_before_process_weights_raises_attribute_error(
-        vllm_cpu_config):
-    """Test calling forward before process_weights_after_loading raises AttributeError."""
-    norm = WeightPreprocessedGemmaRMSNorm(64)
-    x = torch.randn(2, 64)
-    with pytest.raises(AttributeError):
-        _ = norm(x)
+def test_forward_needs_no_post_load_pass(vllm_cpu_config):
+    """A freshly constructed norm forwards without any load-time hook.
 
+    The fold lives in the parameter, so there is no second tensor a caller
+    could forget to populate -- the failure mode that made the target and
+    draft load sites each need their own post-load sweep.
+    """
+    norm = WeightPreprocessedGemmaRMSNorm(HIDDEN_SIZE, eps=EPS)
 
-def test_force_process_weights_after_loading(vllm_cpu_config):
-    """Test force_process_weights_after_loading processes all instances in a model."""
+    out = norm(torch.randn(2, HIDDEN_SIZE))
 
-    class DummyModel(nn.Module):
-
-        def __init__(self):
-            super().__init__()
-            self.norm1 = WeightPreprocessedGemmaRMSNorm(64)
-            self.linear = nn.Linear(64, 64)
-            self.sub = nn.Sequential(
-                WeightPreprocessedGemmaRMSNorm(64),
-                nn.Linear(64, 64),
-            )
-
-    model = DummyModel()
-    model.norm1.weight.data.fill_(0.25)
-    model.sub[0].weight.data.fill_(0.75)
-
-    # Verify not processed initially
-    assert not hasattr(model.norm1, "processed_weight")
-    assert not hasattr(model.sub[0], "processed_weight")
-
-    # Run force processing
-    force_process_weights_after_loading(model)
-
-    # Verify both were processed
-    assert hasattr(model.norm1, "processed_weight")
-    assert hasattr(model.sub[0], "processed_weight")
-    torch.testing.assert_close(model.norm1.processed_weight,
-                               torch.full((64, ), 1.25))
-    torch.testing.assert_close(model.sub[0].processed_weight,
-                               torch.full((64, ), 1.75))
+    assert out.shape == (2, HIDDEN_SIZE)

@@ -85,9 +85,6 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
 )
-from vllm_torchtpu.layers.adapter.custom_ops import (
-    force_process_weights_after_loading,
-)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
@@ -4398,10 +4395,6 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
-        # Run process_weights_after_loading for desired custom ops that otherwise
-        # would not be triggered in upstream
-        # vllm.model_executor.model_loader.utils.process_weights_after_loading.
-        force_process_weights_after_loading(model)
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         if self.parallel_config.pipeline_parallel_size > 1:

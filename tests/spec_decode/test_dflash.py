@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -116,64 +115,6 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
         )
         assert draft.lm_head is not target.lm_head
         assert torch.equal(draft.lm_head.weight, target.lm_head.weight)
-
-
-def test_load_draft_model_runs_weight_preprocessing(monkeypatch):
-    """The draft load must run force_process_weights_after_loading, like the
-    target load does.
-
-    WeightPreprocessedGemmaRMSNorm.forward reads `processed_weight`, which only
-    that pass computes, so a draft that skips it raises AttributeError on its
-    first forward rather than at load time.
-    """
-    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
-
-    import vllm_torchtpu.spec_decode.dflash as df
-    from vllm_torchtpu.layers.vllm.custom_ops.layernorm_op import \
-        WeightPreprocessedGemmaRMSNorm
-
-    proposer = _make_proposer(draft_tp=1)
-    proposer.vllm_config.load_config = object()
-
-    # The OOT norm reads the current vLLM config at construction; the load
-    # itself runs with dflash's own config contexts stubbed out below.
-    with set_current_vllm_config(
-            VllmConfig(device_config=DeviceConfig(device="cpu"))):
-        draft_model = torch.nn.Sequential(WeightPreprocessedGemmaRMSNorm(8))
-    draft_model[0].weight.data.fill_(0.25)
-
-    loaded = {}
-
-    class _Loader:
-
-        def load_model(self, *, vllm_config, model_config):
-            loaded["vllm_config"] = vllm_config
-            loaded["model_config"] = model_config
-            return draft_model
-
-    monkeypatch.setattr(df, "get_model_loader", lambda _cfg: _Loader())
-    monkeypatch.setattr(df, "set_model_tag",
-                        lambda _tag: contextlib.nullcontext())
-    monkeypatch.setattr(df, "set_current_vllm_config",
-                        lambda _cfg: contextlib.nullcontext())
-    monkeypatch.setattr(df, "set_vllm_model_wrapper_context",
-                        lambda **_kwargs: contextlib.nullcontext())
-    monkeypatch.setattr(df, "_force_draft_tp1",
-                        lambda: contextlib.nullcontext())
-
-    assert not hasattr(draft_model[0], "processed_weight")
-
-    proposer._load_draft_model()
-
-    assert proposer.draft_model is draft_model
-    # The draft loads under a copied model config tagged as a draft runner.
-    assert loaded["model_config"].runner_type == "draft"
-    assert loaded["model_config"] is not (
-        proposer.speculative_config.draft_model_config)
-    # weight.float() + 1.0, i.e. the preprocessing actually ran on the module
-    # the loader returned.
-    torch.testing.assert_close(draft_model[0].processed_weight,
-                               torch.full((8, ), 1.25))
 
 
 def test_propose_empty_batch():

@@ -23,16 +23,3 @@ from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_atte
 def _register_custom_ops() -> None:
     """Explicitly imported to trigger custom operation registration decorators."""
     pass
-
-
-_OPS_PROCESS_WEIGHTS_AFTER_LOADING = ("WeightPreprocessedGemmaRMSNorm", )
-
-
-def force_process_weights_after_loading(model: nn.Module) -> None:
-    for _, module in model.named_modules():
-        # Defensive check
-        if not hasattr(module, "process_weights_after_loading"):
-            continue
-
-        if module.__class__.__name__ in _OPS_PROCESS_WEIGHTS_AFTER_LOADING:
-            module.process_weights_after_loading(torch.float32)
