@@ -64,14 +64,11 @@ except Exception:
 def is_torch_compiling() -> bool:
     """Check if PyTorch is actively compiling a computation graph (TorchDynamo)."""
     try:
-        if torch.compiler.is_compiling():
-            return True
+        return bool(torch.compiler.is_compiling())
     except Exception:
         pass
     try:
-        import torch._dynamo
-        if torch._dynamo.is_compiling():
-            return True
+        return bool(torch._dynamo.is_compiling())
     except Exception:
         pass
     return False

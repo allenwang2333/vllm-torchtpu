@@ -19,11 +19,6 @@ import vllm.envs as vllm_envs
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.vllm.router_topk import rowmax_select
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.tracing.observability import (
-    record_expert_routing_in_graph,
-    register_layer_moe_buffer,
-    set_current_layer,
-)
 
 logger = init_logger(__name__)
 
@@ -298,13 +293,7 @@ def select_experts(
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
-    res_weights = topk_weights.to(hidden_states.dtype)
-    res_ids = topk_ids.to(torch.int32)
-    if layer is not None:
-        set_current_layer(getattr(layer, "layer_name", getattr(layer, "layer_id", "unknown")))
-        record_expert_routing_in_graph(layer, res_ids, res_weights)
-
-    return res_weights, res_ids
+    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
 
 def get_experts_start(layer) -> int | None:
@@ -341,13 +330,12 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
     collectives and halt the TPU core during warmup. Same class of bug as the
     GDN/PCP rank fix in fa8faaf5 ("Make GDN PCP weight sharding rank-uniform
     in the compiled graph"); same fix shape -- rank-derived values must reach
+    the compiled graph as runtime data, not compile-time constants.
     """
     experts_start = get_experts_start(layer)
     buffer = (torch.tensor(experts_start, dtype=torch.int32, device=device)
               if experts_start is not None else None)
     layer.register_buffer("_experts_start", buffer, persistent=False)
-    register_layer_moe_buffer(layer, num_experts=getattr(layer, "global_num_experts", 256), device=device)
-
 
 
 def validate_linear_ep_placement(layer) -> None:

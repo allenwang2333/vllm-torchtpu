@@ -27,14 +27,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.tracing.observability import (
-    get_current_layer,
-    get_current_phase,
-    trace_collective,
-)
 
 logger = init_logger(__name__)
-
 
 
 def enable_pipelined_collective_and_compute() -> bool:
@@ -173,38 +167,12 @@ def pipelined_fused_moe_gmm(
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="AllGather",
-                tensor=hidden_states,
-                group_size=parallel_size,
-                logical_role="moe_dispatch_hidden_states",
-            ):
-                ag_hidden_states = collective_group.all_gather(hidden_states,
-                                                               dim=0)
-
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="AllGather",
-                tensor=topk_weights,
-                group_size=parallel_size,
-                logical_role="moe_dispatch_topk_weights",
-            ):
-                ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
-                                   if topk_weights is not None else None)
-
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="AllGather",
-                tensor=topk_ids,
-                group_size=parallel_size,
-                logical_role="moe_dispatch_topk_ids",
-            ):
-                ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
-                               if topk_ids is not None else None)
+            ag_hidden_states = collective_group.all_gather(hidden_states,
+                                                           dim=0)
+            ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
+                               if topk_weights is not None else None)
+            ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
+                           if topk_ids is not None else None)
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
@@ -228,15 +196,7 @@ def pipelined_fused_moe_gmm(
         )
 
         if parallel_size > 1:
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="ReduceScatter",
-                tensor=out,
-                group_size=parallel_size,
-                logical_role="moe_combine_output",
-            ):
-                return collective_group.reduce_scatter(out, dim=0)
+            return collective_group.reduce_scatter(out, dim=0)
         return out
 
     _log_active_chunk_pipeline()
@@ -256,75 +216,23 @@ def pipelined_fused_moe_gmm(
     ] if topk_ids is not None else [None] * num_chunks
 
     # Prime pipeline with initial all-gather for chunk 0
-    with trace_collective(
-        layer=get_current_layer(),
-        phase=get_current_phase(),
-        collective_type="AllGather",
-        tensor=hs_slices[0],
-        group_size=parallel_size,
-        logical_role="moe_chunk_0_dispatch_hidden_states",
-    ):
-        ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-
-    with trace_collective(
-        layer=get_current_layer(),
-        phase=get_current_phase(),
-        collective_type="AllGather",
-        tensor=weights_slices[0],
-        group_size=parallel_size,
-        logical_role="moe_chunk_0_dispatch_weights",
-    ):
-        ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
-                      if weights_slices[0] is not None else None)
-
-    with trace_collective(
-        layer=get_current_layer(),
-        phase=get_current_phase(),
-        collective_type="AllGather",
-        tensor=ids_slices[0],
-        group_size=parallel_size,
-        logical_role="moe_chunk_0_dispatch_ids",
-    ):
-        ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
-                      if ids_slices[0] is not None else None)
+    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
+                  if weights_slices[0] is not None else None)
+    ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
+                  if ids_slices[0] is not None else None)
 
     rs_outputs = []
 
     for i in range(num_chunks):
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="AllGather",
-                tensor=hs_slices[i + 1],
-                group_size=parallel_size,
-                logical_role=f"moe_chunk_{i + 1}_dispatch_hidden_states",
-            ):
-                ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="AllGather",
-                tensor=weights_slices[i + 1],
-                group_size=parallel_size,
-                logical_role=f"moe_chunk_{i + 1}_dispatch_weights",
-            ):
-                ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
-                                                          dim=0)
-                              if weights_slices[i + 1] is not None else None)
-
-            with trace_collective(
-                layer=get_current_layer(),
-                phase=get_current_phase(),
-                collective_type="AllGather",
-                tensor=ids_slices[i + 1],
-                group_size=parallel_size,
-                logical_role=f"moe_chunk_{i + 1}_dispatch_ids",
-            ):
-                ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
-                              if ids_slices[i + 1] is not None else None)
+            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
+                                                      dim=0)
+                          if weights_slices[i + 1] is not None else None)
+            ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
+                          if ids_slices[i + 1] is not None else None)
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
@@ -345,17 +253,8 @@ def pipelined_fused_moe_gmm(
         )
 
         # Reduce-scatter partial output for current chunk
-        with trace_collective(
-            layer=get_current_layer(),
-            phase=get_current_phase(),
-            collective_type="ReduceScatter",
-            tensor=out_i,
-            group_size=parallel_size,
-            logical_role=f"moe_chunk_{i}_combine_output",
-        ):
-            rs_i = collective_group.reduce_scatter(out_i, dim=0)
+        rs_i = collective_group.reduce_scatter(out_i, dim=0)
         rs_outputs.append(rs_i)
-
 
         if i + 1 < num_chunks:
             ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
