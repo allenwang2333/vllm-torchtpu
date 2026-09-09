@@ -209,3 +209,11 @@ if [ "$NODE_RANK" = "0" ]; then
     find "$OUT" -name '*.xplane.pb' 2>/dev/null || true
 fi
 exit 0
+
+# --- hierarchical reduce-scatter / all-reduce flags (meant for libtpu >= 0.0.47) ---
+HIER_RS="--xla_tpu_enable_sparse_core_hierarchical_reduce_scatter=true"
+HIER_AR="--xla_tpu_enable_sparse_core_hierarchical_all_reduce=true"
+want rs_hier && run_variant rs_hier 30270 "$HIER_RS" --mode rs_only || true
+want rs_hier_nd_pad && run_variant rs_hier_nd_pad 30271 "$HIER_RS $ND $PAD $PADTHR" --mode rs_only || true
+want rs_ag_hier && run_variant rs_ag_hier 30272 "$HIER_RS" --mode rs_ag || true
+want ar_hier_both && run_variant ar_hier_both 30273 "$HIER_AR $HIER_RS" || true
