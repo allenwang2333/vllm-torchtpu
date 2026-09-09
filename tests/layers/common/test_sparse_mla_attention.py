@@ -564,6 +564,8 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
                 jnp.asarray(starts, jnp.int32),
                 jnp.asarray([num_decode, num_decode, num_seqs], jnp.int32),
                 mesh,
+                NOPE_SPEC,
+                ROPE_SPEC,
                 sm_scale=self.sm_scale,
                 k_scale=self.k_scale,
             )
@@ -629,6 +631,31 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         np.testing.assert_array_equal(
             self._run(q_lens, seq_lens, num_decode, limits),
             self._run(q_lens, seq_lens, num_decode, GATHER_ONLY))
+
+
+class MaskedDenseDispatchSetupTest(parameterized.TestCase):
+    """Exercise the dispatch test's cache setup without a TPU kernel."""
+
+    def test_step_updates_typed_caches(self):
+        case = MaskedDenseDispatchTest()
+        case.k_scale = 1.5
+        case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
+        with mock.patch.object(mla_dispatch,
+                               "ragged_paged_attention",
+                               side_effect=lambda q, *args, **kwargs: q):
+            caches, output = case._step(
+                _empty_pair(), [8], [8], 0, GATHER_ONLY,
+                np.random.default_rng(99),
+                jnp.arange(PAGES_PER_SEQ, dtype=jnp.int32), mesh, 1, 1)
+
+        self.assertEqual(output.shape, (8, NUM_HEADS, LKV_DIM))
+        self.assertTrue(np.any(output))
+        for cache, spec in zip(caches, (NOPE_SPEC, ROPE_SPEC)):
+            self.assertEqual(cache.shape, spec.shape)
+            self.assertEqual(cache.dtype, spec.jax_dtype)
+            self.assertTrue(np.any(np.asarray(cache)))
+            np.testing.assert_array_equal(np.asarray(cache)[1:], 0)
 
 
 class MaskedDenseLimitResolutionTest(parameterized.TestCase):
