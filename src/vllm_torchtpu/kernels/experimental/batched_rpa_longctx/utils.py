@@ -13,10 +13,36 @@
 # limitations under the License.
 """Utility functions for Ragged Paged Attention."""
 
+import logging
+import os
+
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
+from jax._src.pallas.mosaic import tpu_info
+
+logger = logging.getLogger(__name__)
+
+
+def get_static_tpu_geometry(
+    device_kind: str | None = None, ) -> tuple[int, int]:
+    """Returns (num_lanes, num_sublanes) from JAX's static database without querying OS devices."""
+    if device_kind is None:
+        device_kind = os.environ.get("TPU_ACCELERATOR_TYPE")
+
+    chip = (tpu_info.chip_version_from_device_kind(device_kind)
+            if device_kind else None)
+    if chip is None:
+        logger.warning(
+            "Unable to resolve TPU chip version from device_kind=%r; "
+            "defaulting to TPU7x static geometry (128 lanes, 8 sublanes).",
+            device_kind,
+        )
+        chip = tpu_info.ChipVersion.TPU_7X
+
+    info = pltpu.get_tpu_info_for_chip(chip, 1)
+    return info.num_lanes, info.num_sublanes
 
 
 def align_to(a, b):

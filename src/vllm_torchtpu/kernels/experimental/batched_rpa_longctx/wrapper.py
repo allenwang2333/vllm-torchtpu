@@ -146,9 +146,11 @@ def get_kv_cache_shape(
     actual_head_dim,
     kv_dtype,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    device_kind: str | None = None,
 ):
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    num_sublanes = pltpu.get_tpu_info().num_sublanes
+    if kv_layout is None:
+        kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    num_lanes, num_sublanes = utils.get_static_tpu_geometry(device_kind)
     kv_packing = utils.get_dtype_packing(kv_dtype)
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         return (
