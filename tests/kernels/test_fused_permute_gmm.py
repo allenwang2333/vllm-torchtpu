@@ -152,7 +152,7 @@ class Case:
 def _gather_tiles(num_tokens: int, num_groups: int = NUM_GROUPS) -> int:
     """Gm tiles of a routing with `num_tokens * TOPK` rows, by the kernel's law."""
     size_m = num_tokens * TOPK
-    return -(-size_m // gather_tiling(size_m, num_groups))
+    return -(-size_m // gather_tiling(size_m, num_groups, tuning=Tuning()))
 
 
 def _tokens_for_tiles(tiles: int) -> int:

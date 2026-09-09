@@ -23,6 +23,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# VMEM staged per zero-init tile; the fused permute tiles its zero fill to match.
+# TODO(kyuyeunk): Create better heuristics for determining this value.
+ZERO_TILE_TARGET_BYTES = 2 * 1024 * 1024
+
 # Util.
 
 
@@ -1445,9 +1449,6 @@ def gmm_v2(
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     if cfgs.zero_init:
-        # TODO(kyuyeunk): Create better heuristics for determining this value.
-        target_zero_ref_bytes = 2 * 1024 * 1024
-
         # Zero initialization is done by tiling size_m dim where each tile invokes
         # zero initializing DMA for up-to tile_zero_m rows. This means larger
         # tile_zero_m will result in fewer number of tiles and lead to smaller
@@ -1459,7 +1460,7 @@ def gmm_v2(
         # size_n//num_lanes times in a single tile, we can significantly increase
         # tile_zero_m without triggering OOM.
         out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
-        tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
+        tile_zero_m = ZERO_TILE_TARGET_BYTES // num_lanes // out_bytes
         tile_zero_m = min(tile_zero_m, dims.size_m)
 
         scratch_shapes += [

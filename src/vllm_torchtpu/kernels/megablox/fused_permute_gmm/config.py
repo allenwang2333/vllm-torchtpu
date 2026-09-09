@@ -30,17 +30,26 @@ from vllm_torchtpu.kernels.megablox import gmm_v2
 
 # The invariant index table's rows, as the wrapper casts them.
 INDEX_DTYPE = jnp.int32
-# TPU7x SMEM. Stands in for the device when op construction runs before one exists.
-V7X_SMEM_CAPACITY_BYTES = 1 << 20
-# Where a scalar-prefetch operand starts to cliff on v7x. Measured, not derived.
-V7X_SMEM_INDEX_LIMIT_BYTES = 480_000
-# gmm_v2's own zero-init staging budget, kept so both kernels tile the zero fill alike.
-ZERO_TILE_TARGET_BYTES = 2 * 1024 * 1024
-# `gather_tiling`'s law, fitted on v7x at the serving fill; the constants are per-generation.
-TILE_SPREAD_SIGMAS = 2.5  # headroom over the mean so a fat group still fits one tile
-TILE_ALIGN = 32  # the granularity the tile sweep resolved
-TILE_M_MIN = 64  # a skewed routing still gets a tile a group can fit in
-TILE_M_MAX = 512  # gmm_v2's ceiling at this dtype pair
+
+
+@functools.cache
+def _smem_capacity_floor_bytes() -> int:
+    """Least SMEM over the generations this path can run on, which all have a SparseCore."""
+    infos = (pltpu.get_tpu_info_for_chip(v, 1) for v in pltpu.ChipVersion)
+    return min(i.smem_capacity_bytes for i in infos
+               if i.sparse_core is not None)
+
+
+def _smem_capacity_bytes() -> int:
+    """The device's SMEM, or the floor above when op construction precedes a device.
+
+    Never call from a Dynamo-traced region: the accessor is a nanobind call and
+    untraceable there.
+    """
+    try:
+        return int(pltpu.get_tpu_info().smem_capacity_bytes)
+    except Exception:  # noqa: BLE001 -- no device yet, or an unsupported kind
+        return _smem_capacity_floor_bytes()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,8 +58,8 @@ class Tuning:
 
     Every default here was measured on TPU7x for Qwen3.5-397B at the serving
     fill (0.6-12.5% of the padded pool live), so another generation or routing
-    regime wants a re-sweep. The exception is `smem_capacity_bytes`, which
-    `from_device` reads off the device.
+    regime wants a re-sweep. The exception is `smem_capacity_bytes`, a hardware
+    fact rather than a knob, resolved rather than fitted.
 
     Attributes:
         num_slots: VMEM ring buffers for gathered tiles. Must exceed `lookahead`,
@@ -70,8 +79,16 @@ class Tuning:
         ring_pad_slots: lane-blocks of pad per ring row, which takes the LHS
             load's row stride off a power of two, where VMEM banking costs most.
             `ring_chunks` rounds any even value up to a legal row.
-        smem_index_fraction: the share of SMEM the index table may take.
-        smem_capacity_bytes: the device's SMEM; `from_device` reads it.
+        tile_spread_sigmas: `gather_tiling`'s headroom over the mean live rows
+            per group, so a fat group still fits one tile.
+        tile_align: the granularity `gather_tiling` rounds its estimate to.
+        tile_m_min: the smallest tile it returns, so a skewed routing still gets
+            one a group fits in.
+        tile_m_max: the largest, which is what bounds the ring's VMEM.
+        smem_index_fraction: the share of SMEM the index table may take. The
+            scalar-prefetch cliff sat just above it, at 45.8%, on v7x.
+        smem_capacity_bytes: None resolves it off the device where it is read,
+            keeping construction free of the accelerator.
     """
     num_slots: int = 4
     lookahead: int = 3
@@ -79,9 +96,12 @@ class Tuning:
     num_buckets: int = 6
     tile_m: int | None = None
     ring_pad_slots: int = 8
-    smem_index_fraction: float = (V7X_SMEM_INDEX_LIMIT_BYTES /
-                                  V7X_SMEM_CAPACITY_BYTES)
-    smem_capacity_bytes: int = V7X_SMEM_CAPACITY_BYTES
+    tile_spread_sigmas: float = 2.5
+    tile_align: int = 32
+    tile_m_min: int = 64
+    tile_m_max: int = 512
+    smem_index_fraction: float = 0.45
+    smem_capacity_bytes: int | None = None
 
     def __post_init__(self):
         if self.num_slots <= self.lookahead:
@@ -91,24 +111,13 @@ class Tuning:
             raise ValueError("ring_pad_slots must be even: two lane-blocks "
                              "share a u32 sublane")
 
-    @classmethod
-    def from_device(cls, **overrides) -> "Tuning":
-        """The defaults with the SMEM capacity read off the device.
-
-        Op construction can run before a device exists; the v7x value then
-        stands. Never call this from a Dynamo-traced region: the accessor is a
-        nanobind call and untraceable there.
-        """
-        try:
-            capacity = pltpu.get_tpu_info().smem_capacity_bytes
-        except Exception:  # noqa: BLE001 -- no device yet, or an unsupported kind
-            return cls(**overrides)
-        return cls(smem_capacity_bytes=capacity, **overrides)
-
     @property
     def smem_index_limit_bytes(self) -> int:
         """Bytes of SMEM this kernel will spend on the invariant index table."""
-        return int(self.smem_capacity_bytes * self.smem_index_fraction)
+        capacity = self.smem_capacity_bytes
+        if capacity is None:
+            capacity = _smem_capacity_bytes()
+        return int(capacity * self.smem_index_fraction)
 
     @property
     def max_index_rows(self) -> int:
@@ -116,7 +125,7 @@ class Tuning:
         return self.smem_index_limit_bytes // jnp.dtype(INDEX_DTYPE).itemsize
 
 
-def gather_tiling(rows: int, size_group: int) -> int:
+def gather_tiling(rows: int, size_group: int, *, tuning: Tuning) -> int:
     """tile_m for the gather path: mean live rows per group, plus spread.
 
     A gm tile spans one group and the dot runs the height of its bucket, so the
@@ -129,13 +138,14 @@ def gather_tiling(rows: int, size_group: int) -> int:
     the split dots run at reduced MXU height, hence the spread term and floor.
 
     `rows` is the routed row count local to this shard; the caller folds in
-    ep_size.
+    ep_size. `tuning` carries the law's constants.
     """
     live = -(-rows // max(size_group, 1))
     # Ceiling of the spread term; the .999 tolerates float noise below 1e-3.
-    live += int(TILE_SPREAD_SIGMAS * live**0.5 + 0.999)
+    live += int(tuning.tile_spread_sigmas * live**0.5 + 0.999)
     return int(
-        min(TILE_M_MAX, max(TILE_M_MIN, gmm_v2.align_to(live, TILE_ALIGN))))
+        min(tuning.tile_m_max,
+            max(tuning.tile_m_min, gmm_v2.align_to(live, tuning.tile_align))))
 
 
 def ring_chunks(row_chunks: int, pad: int, num_sublanes: int) -> int:
@@ -222,7 +232,9 @@ def gather_tile_sizes(dims: gmm_v2.Dimensions, lhs_cfgs: gmm_v2.InputConfigs,
     lanes = info.num_lanes
     sublane = dims.size_lhs_sublane
     fuse_factor = 2 if fuse_act is not None else 1
-    law = gather_tiling(dims.size_m // max(ep_size, 1), dims.size_group)
+    law = gather_tiling(dims.size_m // max(ep_size, 1),
+                        dims.size_group,
+                        tuning=tuning)
     pick = tuning.tile_m or law
     if pick % sublane:
         raise ValueError(f"tile_m={pick} is not a multiple of the lhs sublane "
@@ -358,8 +370,9 @@ class Config:
     @property
     def zero_tile_rows(self) -> int:
         out_bytes = jnp.dtype(self.gmm.out_dtype).itemsize
-        return min(ZERO_TILE_TARGET_BYTES // self.num_lanes // out_bytes,
-                   self.dims.size_m)
+        return min(
+            gmm_v2.ZERO_TILE_TARGET_BYTES // self.num_lanes // out_bytes,
+            self.dims.size_m)
 
     @property
     def estimated_vmem_bytes(self) -> int:

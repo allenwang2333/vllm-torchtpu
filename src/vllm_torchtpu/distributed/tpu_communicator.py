@@ -22,16 +22,27 @@ from vllm.distributed.parallel_state import get_dp_group
 # The blocked pool's minor dim. Resolved from the device once, at op-build time; the traced
 # path reads the int. `dispatch_router_logits` runs inside the Dynamo-traced region, where a
 # nanobind call is untraceable, so the accessor must never be reached from there.
-_LANES = [128]
+_LANES: list[int] = []
 
 
 def resolve_hardware() -> None:
     """Read the lane count off the device. Call at op-build time, never while tracing."""
+    from jax.experimental.pallas import tpu as pltpu
     try:
-        from jax.experimental.pallas import tpu as pltpu
-        _LANES[0] = pltpu.get_tpu_info().num_lanes
-    except Exception:
-        pass  # no device yet, or an unsupported kind; the default stands
+        _LANES[:] = [pltpu.get_tpu_info().num_lanes]
+        return
+    except Exception:  # noqa: BLE001 -- no device yet, or an unsupported kind
+        pass
+    # Op construction can precede a device. Every generation the compiler knows
+    # has the same lane count, so take that; a future split has to be resolved.
+    lanes = {
+        pltpu.get_tpu_info_for_chip(v, 1).num_lanes
+        for v in pltpu.ChipVersion
+    }
+    if len(lanes) != 1:
+        raise RuntimeError(
+            f"no device and the lane count is not uniform: {lanes}")
+    _LANES[:] = [lanes.pop()]
 
 
 # Side channel for the lane-blocked MoE pool, set by dispatch_router_logits and

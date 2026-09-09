@@ -562,7 +562,7 @@ def fused_moe_func(
     # un-permuted pool per row; outside its envelope the materialised path stands.
     num_lanes = pltpu.get_tpu_info().num_lanes
     use_fpg = (envs.USE_FUSED_PERMUTE_GMM and use_ep and use_sparse_core
-               and num_tokens * topk <= Tuning.from_device().max_index_rows
+               and num_tokens * topk <= Tuning().max_index_rows
                and padded_hidden_size % (2 * num_lanes) == 0
                and hidden_states.dtype.itemsize == 2
                and rhs_quant_dtype is None)  # no packed-carrier bitcast

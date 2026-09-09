@@ -148,7 +148,7 @@ def _build_fused_moe_custom_op(
     # pre-gather blocking on a model that will never consume it.
     fpg_eligible = (envs.USE_FUSED_PERMUTE_GMM and use_ep and use_sparse_core
                     and rhs_quant_dtype is None)
-    tpu_communicator.set_fpg_max_tokens(Tuning.from_device().max_index_rows //
+    tpu_communicator.set_fpg_max_tokens(Tuning().max_index_rows //
                                         topk if fpg_eligible else 0)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)

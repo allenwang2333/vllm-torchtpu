@@ -101,7 +101,7 @@ def fused_permute_gmm(
     Row `i` of the effective LHS is `lhs[gather_indices[i]]`; the output is
     [size_m, size_n] with size_m = gather_indices.shape[0]. `ep_size` is the
     shard count the indices span; it feeds `config.gather_tiling`. `tuning`
-    defaults to `Tuning.from_device()`.
+    defaults to `Tuning()`, whose SMEM capacity is resolved from the device.
 
     `lhs` is the un-permuted pool, either `[size_src, size_k]` or the blocked
     `[size_src, size_k // 128, 128]` the rows are actually read in. The LHS
@@ -112,7 +112,7 @@ def fused_permute_gmm(
     if gather_indices.ndim != 1:
         raise ValueError("gather_indices must be 1-D")
     if tuning is None:
-        tuning = config.Tuning.from_device()
+        tuning = config.Tuning()
 
     info = pltpu.get_tpu_info()
     lanes = info.num_lanes

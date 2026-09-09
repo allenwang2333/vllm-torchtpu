@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
+import functools
 import types
 from unittest.mock import patch
 
@@ -958,8 +959,11 @@ def test_fused_permute_gmm_matches_materialised_path(monkeypatch):
     # this shape needs -- the same gate a too-large token count would trip
     calls.clear()
     monkeypatch.setattr(
-        fused_moe_gmm.Tuning, "from_device",
-        classmethod(lambda cls, **kw: cls(smem_capacity_bytes=0)))
+        fused_moe_gmm, "Tuning",
+        functools.partial(fused_moe_gmm.Tuning, smem_capacity_bytes=0))
+    # Same reason as above: the budget is read at trace time, so a warm cache
+    # would replay the fused program and the assertion would hold vacuously.
+    jax.clear_caches()
     materialised = fused_moe_func(**common)
     assert not calls, "the envelope gate did not send it to the materialised path"
 
