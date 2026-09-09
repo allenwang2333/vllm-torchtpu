@@ -176,6 +176,11 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
     `gmm_v2` with `maybe_quantize_lhs=False`.
     """
 
+    # Written by process_weights_after_loading, read by the monolithic
+    # apply path. Per-layer state: vLLM builds one quant method instance
+    # per MoE layer, so this belongs on the method, not on the layer.
+    _tpu_activation_str: str
+
     def __init__(self, quant_config: 'VllmNvfp4Config', moe_config):
         # Skip ModelOptNvFp4FusedMoE.__init__ (it selects a GPU experts backend).
         FusedMoEMethodBase.__init__(self, moe_config)
@@ -234,7 +239,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
             raise NotImplementedError(
                 "NVFP4 MoE on TPU supports act_and_mul (silu/gelu) layouts; "
                 "swigluoai (interleaved) is not implemented.")
-        layer._tpu_activation_str = activation_str
+        self._tpu_activation_str = activation_str
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the
@@ -347,7 +352,7 @@ class VllmNvfp4MoEMethod(FusedMoEMethodBase):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.

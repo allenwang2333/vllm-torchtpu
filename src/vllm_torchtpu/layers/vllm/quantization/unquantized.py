@@ -193,6 +193,11 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     CUDA-only router.select_experts() path.
     """
 
+    # Written by process_weights_after_loading, read by the monolithic
+    # apply path. Per-layer state: vLLM builds one quant method instance
+    # per MoE layer, so this belongs on the method, not on the layer.
+    _tpu_activation_str: str
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # Parent sets _is_monolithic=False on TPU and skips wiring
@@ -220,7 +225,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Resolve here (outside torch.compile) and stash on the layer.
         activation_str = get_fused_moe_activation(layer.activation,
                                                   layer.moe_config)
-        layer._tpu_activation_str = activation_str
+        self._tpu_activation_str = activation_str
 
         w13_weight = layer.w13_weight.data
         w2_weight = layer.w2_weight.data
@@ -304,7 +309,7 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

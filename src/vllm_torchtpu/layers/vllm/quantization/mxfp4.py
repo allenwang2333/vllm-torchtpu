@@ -165,6 +165,12 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
     Inherits from Mxfp4MoEMethod to reuse its create_weights() method,
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
+
+    # Written by process_weights_after_loading, read by the monolithic
+    # apply path. Per-layer state: vLLM builds one quant method instance
+    # per MoE layer, so this belongs on the method, not on the layer.
+    _tpu_activation_str: str
+
     # Upstream Mxfp4MoEMethod.__init__ defines is_k3_situ_aiter for GPU AITER kernels.
     # Since __init__ is bypassed on TPU, explicitly define it here as False.
     is_k3_situ_aiter: bool = False
@@ -193,7 +199,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
         activation_str = _get_activation_str(layer.activation)
-        layer._tpu_activation_str = activation_str
+        self._tpu_activation_str = activation_str
 
         w13_weight = dequantize_mxfp4_packed(
             layer.w13_weight.data.to("cpu"),
@@ -282,7 +288,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod):
         input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
 
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -456,7 +462,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         activation_str = _get_activation_str(layer.activation)
         if activation_str.lower() in ("silu", "silu_and_mul", "swiglu"):
             activation_str = "silu_and_mul_with_clamp"
-        layer._tpu_activation_str = activation_str
+        self._tpu_activation_str = activation_str
 
         (w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded,
          orig_intermediate) = self._dequantize_and_pad(layer)

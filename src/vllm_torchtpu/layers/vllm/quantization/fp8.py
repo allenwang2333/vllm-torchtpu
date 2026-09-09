@@ -630,6 +630,11 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
     CUDA-only router.select_experts() path.
     """
 
+    # Written by process_weights_after_loading, read by the monolithic
+    # apply path. Per-layer state: vLLM builds one quant method instance
+    # per MoE layer, so this belongs on the method, not on the layer.
+    _tpu_activation_str: str
+
     def __init__(self, quant_config: Fp8Config, moe_config):
         FusedMoEMethodBase.__init__(self, moe_config)
         self.quant_config = quant_config
@@ -774,7 +779,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
 
         activation_str = get_fused_moe_activation(layer.activation,
                                                   layer.moe_config)
-        layer._tpu_activation_str = activation_str
+        self._tpu_activation_str = activation_str
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
         if is_fp8_serialized:
@@ -859,7 +864,7 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
         # The fused EP kernel takes this rank's own tokens and returns this
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,

@@ -32,6 +32,11 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     Accommodates both W4A4 and W4A16.
     """
 
+    # Written by process_weights_after_loading, read by the monolithic
+    # apply path. Per-layer state: vLLM builds one quant method instance
+    # per MoE layer, so this belongs on the method, not on the layer.
+    _tpu_activation_str: str
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -212,7 +217,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         activation_str = get_fused_moe_activation(layer.activation,
                                                   layer.moe_config)
-        layer._tpu_activation_str = activation_str
+        self._tpu_activation_str = activation_str
         use_ep = layer.moe_config.moe_parallel_config.use_ep
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)
@@ -232,7 +237,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        activation_str = layer._tpu_activation_str
+        activation_str = self._tpu_activation_str
 
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
