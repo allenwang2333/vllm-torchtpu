@@ -173,8 +173,26 @@ def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     return build()
 
 
-def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
+def _dense_reference(mesh,
+                     x,
+                     w1,
+                     w2,
+                     w1_scale,
+                     w2_scale,
+                     gating,
+                     *,
+                     topk,
+                     scoring_fn="softmax",
+                     router_bias=None,
+                     routed_scaling_factor=1.0):
     """The plain MoE: softmax, top-k, dense per-expert FFN, weighted sum.
+
+    The three router keywords default to what this file has always done, so
+    the softmax cases are unchanged arithmetic. `router_bias` is the flat [E]
+    `noaux_tc` correction bias: it steers the selection and is kept OUT of the
+    weights, which come from the unbiased score -- and the reference states
+    that here in `lax.top_k` and `take_along_axis` rather than through
+    anything the layer under test also uses.
 
     Every expert is applied to every token in f32 and weighted by the router
     weight of the slots that chose it, which is zero for a token that did
@@ -194,9 +212,18 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
 
     def local(x_g, gating_g, w1_l, w2_l, *scales):
         s1, s2 = scales if scaled else (None, None)
-        scores = jax.nn.softmax(gating_g.astype(jnp.float32), axis=-1)
-        topk_weights, topk_idx = lax.top_k(scores, topk)
+        g32 = gating_g.astype(jnp.float32)
+        scores = (jax.nn.sigmoid(g32) if scoring_fn == "sigmoid" else
+                  jax.nn.softmax(g32, axis=-1))
+        if router_bias is None:
+            topk_weights, topk_idx = lax.top_k(scores, topk)
+        else:
+            _, topk_idx = lax.top_k(
+                scores + jnp.asarray(router_bias, jnp.float32)[None, :], topk)
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         first = lax.axis_index(axis) * g_local
         x32 = x_g.astype(jnp.float32)
 
@@ -331,6 +358,96 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
         topk=SMALL["topk"],
         batch_bound=FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND,
         token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND)
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True])
+def test_noaux_tc_routing_tracks_a_dense_reference(sharded_plan):
+    """The whole layer with GLM-5.2's router: sigmoid scoring, a correction
+    bias that steers the selection without entering the weights, and a routed
+    scaling factor.
+
+    This is the operand plumbing as well as the arithmetic. The bias is the
+    first operand in this bridge that is replicated DATA given a sharded
+    shape -- [EP, E], one identical row per shard -- so a spec that assembled
+    it wrongly would show up here as the wrong experts, and the rotated-expert
+    control below is what makes that visible rather than absorbed by the band.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
+                                               30,
+                                               hidden=SMALL["hidden"],
+                                               inter=SMALL["inter"],
+                                               e_total=SMALL["e_total"],
+                                               weight_format=WeightFormat.FP8)
+    x, gating = _make_inputs(mesh,
+                             31,
+                             tokens=SMALL["tokens"],
+                             hidden=SMALL["hidden"],
+                             e_total=SMALL["e_total"])
+    e_total = SMALL["e_total"]
+    rng = np.random.default_rng(32)
+    # sigma=0.3 against a sigmoid in (0,1) is a bias that really does reorder
+    # the boundary; a bias too small to move anything would let a dropped
+    # operand pass.
+    bias_row = rng.normal(0.0, 0.3, e_total).astype(np.float32)
+    bias = jax.device_put(np.tile(bias_row, (EP, 1)),
+                          NamedSharding(mesh, P(AXIS)))
+    rsf = 2.5
+
+    out = fused_ep_moe_v2(x,
+                          w1,
+                          w2,
+                          w1_scale,
+                          w2_scale,
+                          gating,
+                          bias,
+                          topk=SMALL["topk"],
+                          renormalize=True,
+                          scoring_fn="sigmoid",
+                          routed_scaling_factor=rsf,
+                          mesh=mesh,
+                          capacity=CAPACITY,
+                          weight_format=WeightFormat.FP8,
+                          sharded_plan=sharded_plan)
+    assert out.shape == x.shape and out.dtype == x.dtype
+
+    ref_kw = dict(topk=SMALL["topk"],
+                  scoring_fn="sigmoid",
+                  router_bias=bias_row,
+                  routed_scaling_factor=rsf)
+    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating,
+                            **ref_kw)
+    error = _relative_l2(out, want)
+    assert error < FP8_RELATIVE_BOUND, (
+        f"relative L2 {error:.4f} past the {FP8_RELATIVE_BOUND} band")
+    worst = _worst_token_relative_l2(out, want)
+    assert worst < FP8_TOKEN_BOUND, (
+        f"worst token's relative error {worst:.4f} past "
+        f"{FP8_TOKEN_BOUND}; the batch norm was {error:.4f}")
+
+    # Control 1: the wrong experts. Control 2: the bias silently dropped --
+    # the failure mode an operand-plumbing bug produces, and the one a band
+    # this wide would otherwise absorb.
+    def roll(a):
+        return None if a is None else jnp.roll(a, 1, axis=0)
+
+    rotated = _dense_reference(mesh, x, roll(w1), roll(w2), roll(w1_scale),
+                               roll(w2_scale), gating, **ref_kw)
+    assert _relative_l2(out, rotated) > ROTATED_CONTROL_FACTOR * error
+    unbiased = _dense_reference(mesh,
+                                x,
+                                w1,
+                                w2,
+                                w1_scale,
+                                w2_scale,
+                                gating,
+                                topk=SMALL["topk"],
+                                scoring_fn="sigmoid",
+                                router_bias=None,
+                                routed_scaling_factor=rsf)
+    assert _relative_l2(out, unbiased) > ROTATED_CONTROL_FACTOR * error, (
+        "dropping the correction bias from the reference barely moved it, so "
+        "this test would not notice the kernel dropping it either")
 
 
 def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():

@@ -865,11 +865,16 @@ class VllmFp8MoEMethodTPU(Fp8MoEMethod):
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
         from vllm_torchtpu.layers.vllm.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
+            FUSED_MOE_EP_BIAS_ATTR, fused_moe_ep, fused_moe_ep_supported)
         if fused_moe_ep_supported(self):
+            # The router's correction bias, reshaped once at weight load, or
+            # None for a layer that has none. Read from the attribute prebuild
+            # wrote rather than off the layer directly: whether it is passed
+            # has to match the arity prebuild armed the op with.
             return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
                                 layer.w13_weight_scale_inv,
-                                layer.w2_weight_scale_inv, router_logits)
+                                layer.w2_weight_scale_inv, router_logits,
+                                getattr(layer, FUSED_MOE_EP_BIAS_ATTR, None))
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

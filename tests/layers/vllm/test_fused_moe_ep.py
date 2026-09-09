@@ -19,6 +19,7 @@ it still refuses. None of this needs a TPU: the refusals are decided before any
 op is built, and the one path that does build stops at `_build_op`.
 """
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -105,12 +106,29 @@ def test_arms_on_a_supported_layer():
     assert _prebuild(_layer()) == "op"
 
 
+# Captured at import, before any test patches `_build_op` with a Mock. A spy
+# called from *inside* `_prebuild` sees the Mock, whose signature is
+# `(*args, **kwargs)` and binds every positional into one `args` tuple.
+_BUILD_OP_SIG = inspect.signature(bridge._build_op)
+
+
+def _bound(args):
+    """Name `_build_op`'s positional args instead of counting from the end.
+
+    Counting backwards broke the moment `_build_op` gained trailing
+    parameters; binding to the real signature cannot break that way again.
+    """
+    b = _BUILD_OP_SIG.bind(*args)
+    b.apply_defaults()
+    return b.arguments
+
+
 def test_sharded_plan_flag_reaches_the_built_op():
     seen = []
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
         assert _prebuild(
             _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-1] is True
+    assert seen and _bound(seen[0])["sharded_plan"] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
@@ -119,7 +137,7 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert _prebuild(_layer(),
                      ep_order=order,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-2] == order
+    assert seen and _bound(seen[0])["mesh_expert_order"] == order
 
 
 def test_refused_without_the_env_flag():
@@ -212,17 +230,62 @@ def test_refused_when_the_layer_carries_expert_biases():
 
 @pytest.mark.parametrize("routing", [
     dict(custom_routing_function=lambda **_: None),
-    dict(scoring_func="sigmoid"),
-    dict(e_score_correction_bias=torch.zeros(8)),
+    dict(scoring_func="sqrtsoftplus"),
     dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
     dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
-    dict(routed_scaling_factor=2.5),
 ])
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
-    """The fused path never calls `moe_routing.route`: the kernel scores with
-    a plain softmax and selects top-k itself. Anything else routes tokens to a
-    different set of experts, so it is refused rather than run."""
+    """The fused path never calls `moe_routing.route`; it reimplements the
+    classic top-k branch above the Mosaic kernel. Anything outside that branch
+    routes tokens to a different set of experts, so it is refused."""
     assert _prebuild(_layer(**routing)) is None
+
+
+@pytest.mark.parametrize("routing", [
+    dict(scoring_func="sigmoid"),
+    dict(e_score_correction_bias=torch.zeros(8)),
+    dict(routed_scaling_factor=2.5),
+    dict(scoring_func="sigmoid",
+         e_score_correction_bias=torch.zeros(8),
+         routed_scaling_factor=2.5),
+])
+def test_noaux_tc_routing_is_served(routing):
+    """GLM-5.2's three: sigmoid scoring, a `noaux_tc` correction bias steering
+    the selection, and a routed scaling factor. Each was a refusal until the
+    router grew them. What says the router now MATCHES `moe_routing.route` is
+    `tests/kernels/fused_moe/test_fused_ep_router_equality.py`, on a device;
+    this only says the bridge stopped refusing."""
+    assert _prebuild(_layer(**routing)) == "op"
+
+
+def test_the_correction_bias_is_reshaped_once_at_weight_load():
+    """It is a `[1, E]` per-shard operand, not a per-step reshape and not a
+    constant closed into the op -- every layer's bias differs, and a closed
+    constant would key one export and one compile per MoE layer."""
+    layer = _layer(e_score_correction_bias=torch.arange(8,
+                                                        dtype=torch.bfloat16))
+    assert _prebuild(layer) == "op"
+    buf = getattr(layer, bridge.FUSED_MOE_EP_BIAS_ATTR)
+    assert buf.shape == (1, 8) and buf.dtype is torch.float32
+    np.testing.assert_array_equal(buf[0].numpy(),
+                                  np.arange(8, dtype=np.float32))
+    plain = _layer()
+    assert _prebuild(plain) == "op"
+    assert getattr(plain, bridge.FUSED_MOE_EP_BIAS_ATTR) is None
+
+
+def test_the_op_arity_follows_the_correction_bias():
+    """A layer with a bias must not be served by a seven-operand op built for
+    a layer without one: the two are different closures and different keys."""
+    seen = []
+
+    def spy(*args):
+        seen.append(_bound(args)["has_router_bias"])
+        return "op"
+
+    _prebuild(_layer(), build_op=spy)
+    _prebuild(_layer(e_score_correction_bias=torch.zeros(8)), build_op=spy)
+    assert seen == [False, True]
 
 
 def test_refused_while_the_routing_simulator_is_on():

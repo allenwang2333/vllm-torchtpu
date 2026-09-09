@@ -32,11 +32,25 @@ from jax.experimental import pallas as pl
 NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
 
-def _select_kernel(x_ref, w_ref, i_ref, *, topk, n):
-    """One block of rows: take the top `topk` by repeated max-and-mask."""
+def _select_kernel(*refs, topk, n, has_values):
+    """One block of rows: take the top `topk` by repeated max-and-mask.
+
+    With `has_values` the block carries a second [R, n] operand and the
+    reported weight is that array's entry at the selected column rather than
+    the selection key's own value. That is the `noaux_tc` shape -- select on
+    `score + correction_bias`, weight by the UNBIASED score -- and doing it
+    here rather than with a `take_along_axis` outside keeps the [R, n] gather
+    in VMEM, on a block that is resident anyway.
+    """
+    if has_values:
+        x_ref, v_ref, w_ref, i_ref = refs
+    else:
+        x_ref, w_ref, i_ref = refs
+        v_ref = None
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
     x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
+    v = None if v_ref is None else v_ref[...]
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)  # [R,1] rowmax
@@ -44,29 +58,48 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n):
         # Lowest matching column; non-matching columns fill with the last
         # expert so every index returned is a real expert.
         idx = jnp.min(jnp.where(ismax, iota, n - 1), axis=1)
-        w_ref[:, j] = m[:, 0]
+        sel = iota == idx[:, None]  # exactly one true column per row
+        if v is None:
+            w_ref[:, j] = m[:, 0]
+        else:
+            # A sum, not a max: exactly one lane is live, and adding zeros to
+            # one float is exact in IEEE regardless of the reduction order, so
+            # this returns v[row, idx] bit for bit -- including a NaN or a
+            # value below any sentinel a max would have floored.
+            w_ref[:, j] = jnp.sum(jnp.where(sel, v, 0.0), axis=1)
         i_ref[:, j] = idx.astype(jnp.int32)
-        x = jnp.where(iota == idx[:, None], NEG, x)
+        x = jnp.where(sel, NEG, x)
 
 
-def pallas_select(scores, topk=10, block_rows=256):
-    """Top-k over [R, N] scores -> (weights f32, indices i32) [R, topk]."""
+def pallas_select(scores, topk=10, block_rows=256, values=None):
+    """Top-k over [R, N] scores -> (weights f32, indices i32) [R, topk].
+
+    `values`, when given, is a second [R, N] f32 array the weights are read
+    from at the selected columns; the selection itself still runs on `scores`.
+    """
     R, N = scores.shape
     assert R % block_rows == 0, (R, block_rows)
+    if values is not None:
+        assert values.shape == scores.shape, (values.shape, scores.shape)
     grid = (R // block_rows, )
     out_shapes = (
         jax.ShapeDtypeStruct((R, topk), jnp.float32),
         jax.ShapeDtypeStruct((R, topk), jnp.int32),
     )
-    bs = (pl.BlockSpec((block_rows, N), lambda i: (i, 0)), )
+    row_block = pl.BlockSpec((block_rows, N), lambda i: (i, 0))
+    bs = (row_block, ) if values is None else (row_block, row_block)
     os = (
         pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
         pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
     )
+    operands = (scores, ) if values is None else (scores, values)
     return pl.pallas_call(
-        functools.partial(_select_kernel, topk=topk, n=N),
+        functools.partial(_select_kernel,
+                          topk=topk,
+                          n=N,
+                          has_values=values is not None),
         grid=grid,
         in_specs=list(bs),
         out_specs=list(os),
         out_shape=list(out_shapes),
-    )(scores)
+    )(*operands)
