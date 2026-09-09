@@ -639,7 +639,7 @@ class TpuPlatform(Platform):
 
     supported_quantization: list[str] = [
         "tpu_int8", "compressed-tensors", "awq", "fp8", "mxfp4",
-        "modelopt_fp4", "deepseek_v4_fp8"
+        "modelopt_fp4", "modelopt_mixed", "deepseek_v4_fp8"
     ]
 
     additional_env_vars: list[str] = [
