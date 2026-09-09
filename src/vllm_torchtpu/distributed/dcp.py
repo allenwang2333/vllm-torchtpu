@@ -1,16 +1,23 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """DCP (Decode Context Parallelism) process-group accessors.
 
 Mirrors the role of distributed/pcp.py for PCP: a narrow, safe accessor
 layer every call site shares, rather than each re-deriving group state
 independently.
 
-Unlike PCP and EP, DCP's current kernel design does two separate per-device
-Pallas kernel calls glued by ordinary torch.distributed collectives
-(`GroupCoordinator.all_gather`), not a JAX multi-device mesh fused into one
-kernel invocation. So this file stays a thin group/rank accessor -- there is
-no `PcpGroupLayout` or `get_or_create_*_mesh` equivalent here, because
-nothing in the DCP path needs a JAX mesh or a device-id ordering.
 """
 
 from __future__ import annotations
