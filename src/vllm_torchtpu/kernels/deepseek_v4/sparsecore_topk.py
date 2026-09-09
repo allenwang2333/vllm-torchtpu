@@ -63,36 +63,33 @@ def _cdiv_dyn(x):
     return jnp.right_shift(x + (LANES - 1), 4)
 
 
-def _topk_kernel(
+def _topk_body(
     scores_hbm,  # i32[b * n]                (fp32 score bits)
     lengths_hbm,  # i32[b_pad]
     out_hbm,  # i32[b * k]
-    *rest,
+    keys_hbm,  # i32[b * k], or None
+    resident_vmem,  # i32[slice_len]
+    priv_vmem,  # i32[16 * NUM_BUCKETS + LANES]  (lane-private histograms)
+    glob_vmem,  # i32[NUM_BUCKETS + LANES]  (folded hist, then prefix sum)
+    rowbuf_vmem,  # i32[k + LANES]           (winner indices for one row)
+    keybuf_vmem,  # i32[k + LANES], or None
+    len_vmem,  # i32[b_pad]
+    sems,  # DMA[4]
+    *,
     b: int,
     n: int,
     k: int,
     slice_len: int,
     num_waves: int,
     write_empty: bool,
-    emit_keys: bool = False,
 ):
-    # Pallas passes inputs, then outputs, then scratch, all positionally.
-    # `emit_keys` adds one output ref and one scratch ref part-way through
-    # that sequence, so the tail is unpacked by hand. With `emit_keys=False`
-    # the kernel traces exactly as it did before the option existed.
-    #
-    # keys_hbm is i32[b * k]: the fp32 score bits of each winner, paired slot
-    # for slot with out_hbm, so the caller need not gather the scores back.
-    keys_hbm, rest = (rest[0], rest[1:]) if emit_keys else (None, rest)
-    (
-        resident_vmem,  # i32[slice_len]
-        priv_vmem,  # i32[16 * NUM_BUCKETS + LANES]  (lane-private histograms)
-        glob_vmem,  # i32[NUM_BUCKETS + LANES]  (folded hist, then prefix sum)
-        rowbuf_vmem,  # i32[k + LANES]          (winner indices for one row)
-    ) = rest[:4]
-    rest = rest[4:]
-    keybuf_vmem, rest = (rest[0], rest[1:]) if emit_keys else (None, rest)
-    len_vmem, sems = rest  # i32[b_pad]; DMA[4]
+    # Shared body of the two kernel entry points below. `keys_hbm` is
+    # i32[b * k]: the fp32 score bits of each winner, paired slot for slot with
+    # out_hbm, so the caller need not gather the scores back. It and its VMEM
+    # staging buffer are None on the indices-only variant, which then traces
+    # exactly as it did before the option existed.
+    emit_keys = keys_hbm is not None
+    assert (keybuf_vmem is not None) == emit_keys
 
     num_subcores = 16
     num_sc_cores = 2
@@ -332,6 +329,93 @@ def _topk_kernel(
     lax.fori_loop(0, num_waves, wave_body, 0)
 
 
+# Pallas passes inputs, then outputs, then scratch, all positionally, so the
+# extra key output and its staging buffer land part-way through that sequence
+# rather than at the end. That is one arity per variant, hence one entry point
+# per variant: each spells out the refs it is handed, and both delegate to
+# `_topk_body`.
+def _topk_kernel(
+    scores_hbm,
+    lengths_hbm,
+    out_hbm,
+    resident_vmem,
+    priv_vmem,
+    glob_vmem,
+    rowbuf_vmem,
+    len_vmem,
+    sems,
+    *,
+    b: int,
+    n: int,
+    k: int,
+    slice_len: int,
+    num_waves: int,
+    write_empty: bool,
+):
+    """Indices only."""
+    _topk_body(
+        scores_hbm,
+        lengths_hbm,
+        out_hbm,
+        None,
+        resident_vmem,
+        priv_vmem,
+        glob_vmem,
+        rowbuf_vmem,
+        None,
+        len_vmem,
+        sems,
+        b=b,
+        n=n,
+        k=k,
+        slice_len=slice_len,
+        num_waves=num_waves,
+        write_empty=write_empty,
+    )
+
+
+def _topk_kernel_keys(
+    scores_hbm,
+    lengths_hbm,
+    out_hbm,
+    keys_hbm,
+    resident_vmem,
+    priv_vmem,
+    glob_vmem,
+    rowbuf_vmem,
+    keybuf_vmem,
+    len_vmem,
+    sems,
+    *,
+    b: int,
+    n: int,
+    k: int,
+    slice_len: int,
+    num_waves: int,
+    write_empty: bool,
+):
+    """Indices plus each winner's score."""
+    _topk_body(
+        scores_hbm,
+        lengths_hbm,
+        out_hbm,
+        keys_hbm,
+        resident_vmem,
+        priv_vmem,
+        glob_vmem,
+        rowbuf_vmem,
+        keybuf_vmem,
+        len_vmem,
+        sems,
+        b=b,
+        n=n,
+        k=k,
+        slice_len=slice_len,
+        num_waves=num_waves,
+        write_empty=write_empty,
+    )
+
+
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
@@ -385,14 +469,13 @@ def _sc_topk_direct(
     suffix = "_keys" if emit_keys else ""
     out = pl.kernel(
         functools.partial(
-            _topk_kernel,
+            _topk_kernel_keys if emit_keys else _topk_kernel,
             b=b,
             n=n,
             k=k,
             slice_len=slice_len,
             num_waves=num_waves,
             write_empty=write_empty,
-            emit_keys=emit_keys,
         ),
         out_type=out_type,
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True,
