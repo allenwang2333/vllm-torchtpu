@@ -41,8 +41,6 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
-    dcp_topk_capacity
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_compressor import \
     VllmDeepseekCompressor  # noqa: E501
 from vllm_torchtpu.layers.vllm.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
@@ -260,19 +258,17 @@ class DeepseekV4Model(nn.Module):
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        # Under DCP the indexer returns only the slice of each token's global
-        # top-k that this rank physically holds, already as local cache
-        # indices, so the buffer is `dcp_topk_capacity` wide rather than
-        # `index_topk` wide. Keeping it at full width would be harmless for
-        # correctness (the tail is `-1`) but would hand the sparse attention
-        # kernel a `dcp_size`x oversized gather, which is exactly the cost DCP
-        # exists to cut. `dcp_topk_capacity` returns `index_topk` unchanged at
-        # dcp_size=1, so the non-DCP path is untouched.
+        # `index_topk` wide on every path. Under DCP a row holds only the slice
+        # of that token's global top-k this rank physically owns -- averaging
+        # `index_topk / dcp_size` entries, left-packed with a `-1` tail -- but
+        # ownership is data-dependent and a rank can legally own the whole list,
+        # so the buffer has to be full width. The consequence is that the tail
+        # is usually padding: the sparse attention kernel must bound its gather
+        # by the per-row count, not by this width, or DCP buys nothing on the
+        # attention side.
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
-            dcp_topk_capacity(
-                config.index_topk,
-                vllm_config.parallel_config.decode_context_parallel_size),
+            config.index_topk,
             dtype=torch.int32,
         )
 

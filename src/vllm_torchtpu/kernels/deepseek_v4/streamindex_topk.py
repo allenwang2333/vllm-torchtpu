@@ -1050,70 +1050,44 @@ def streamindex_topk(
     )
 
 
-def dcp_topk_capacity(k: int, dcp_size: int) -> int:
-    """Per-rank list width for `streamindex_topk_dcp`: 2x the mean occupancy.
+def _select_owned_winners(merged, dcp_size: int, interleave_c: int, dcp_rank):
+    """Keep the winners this rank owns, left-packed as rank-local indices.
 
-    Mean occupancy is `k / dcp_size`, so headroom has to scale with the shard
-    count rather than be a fixed width -- a constant that is generous at
-    `dcp_size=16` is a hard truncation at `dcp_size=2`.
-
-    2x is not arbitrary. `m_r = |topk & shard_r|` was swept over run-clustered
-    winners (attention sinks, a local window, and contiguous runs of length L)
-    and the spread turns out to be governed by the run length against the cycle
-    width `interleave_size * dcp_size`, not by clustering as such: runs much
-    longer than the cycle spread almost perfectly. At `interleave_size=4` --
-    which is also the floor forced by `dsa_gather.TILE_SUBROWS` -- the worst
-    `m_r` observed over all L with `k=2048, dcp_size=16` was 199 against a mean
-    of 128, so 256 leaves 1.29x. Winners correlated with `position mod
-    (interleave_size * dcp_size)` could still concentrate arbitrarily, which is
-    why `streamindex_topk_dcp` reports `dropped` instead of trusting this.
-    """
-    if dcp_size <= 1:
-        return k
-    return min(k, 2 * k // dcp_size)
-
-
-def _partition_winners_by_owner(merged, dcp_size: int, interleave_c: int,
-                                capacity: int):
-    """Compact a token's global top-k list into one padded list per owner rank.
+    Run on an all-gathered `merged`, so every rank filters the *same* list with
+    a different `dcp_rank`. `cp_owner_rank` is single-valued and its codomain is
+    exactly `range(dcp_size)`, so the `dcp_size` results are a partition of the
+    global top-k: no winner is kept twice and none is lost. That is an
+    arithmetic identity rather than a property of how full the buffer is, which
+    is why this needs no capacity argument and can never truncate -- a rank owns
+    at most all `k` winners, and the output is `k` wide.
 
     Args:
       merged: i32[num_rows, k] global compressed positions in `sparsecore_topk`
-        order, `-1` padded.
+        order, `-1` padded. Identical on every rank.
       dcp_size, interleave_c: the shard layout.
-      capacity: static width of each owner's list.
+      dcp_rank: i32 scalar, this shard's index along the DCP axis.
 
     Returns:
-      `(lists, dropped)` where `lists` is i32[num_rows, dcp_size, capacity] of
-      *rank-local* indices (`-1` padded) and `dropped` counts entries that did
-      not fit `capacity`.
+      i32[num_rows, k] of *rank-local* cache indices for the winners this rank
+      owns, packed into a prefix and `-1` padded.
     """
-    num_rows, _ = merged.shape
-    valid = merged >= 0
-    owner = jnp.where(valid,
-                      cp_owner_rank(merged, dcp_size, interleave_c), -1)
+    num_rows, width = merged.shape
+    mine = jnp.logical_and(
+        merged >= 0,
+        cp_owner_rank(merged, dcp_size, interleave_c) == dcp_rank)
     local = cp_global_to_local(jnp.maximum(merged, 0), dcp_size, interleave_c)
 
+    # Exclusive count of this rank's earlier winners, i.e. its slot. Bounded by
+    # `width - 1` because at most `width` entries can be `mine`, so unlike the
+    # partitioned form there is no overflow branch to take.
+    slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
     rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
-    # One dump column past the end absorbs everything that is masked off or
-    # overflows, and is sliced away below.
-    out = jnp.full((num_rows, dcp_size, capacity + 1), -1, jnp.int32)
-    dropped = jnp.zeros((), jnp.int32)
-    for r in range(dcp_size):
-        mine = owner == r
-        # Exclusive count of this rank's earlier winners, i.e. its slot.
-        # `sparsecore_topk` returns each row unsorted, so this order carries no
-        # score information and truncating at `capacity` sheds an arbitrary
-        # subset, not the weakest entries. That is precisely why `dropped` is
-        # returned instead of being swallowed: any overflow at all is a sizing
-        # bug, not graceful degradation.
-        slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
-        keep = jnp.logical_and(mine, slot < capacity)
-        dropped = dropped + jnp.sum(jnp.logical_and(mine, ~keep))
-        out = out.at[rows, r,
-                     jnp.where(keep, slot, capacity)].set(
-                         jnp.where(keep, local, -1))
-    return out[:, :, :capacity], dropped
+    # One dump column past the end absorbs the entries owned elsewhere; they all
+    # write `-1`, so the collisions are benign. Sliced away below.
+    out = jnp.full((num_rows, width + 1), -1, jnp.int32)
+    out = out.at[rows, jnp.where(mine, slot, width)].set(
+        jnp.where(mine, local, -1))
+    return out[:, :width]
 
 
 @functools.partial(
@@ -1124,7 +1098,6 @@ def _partition_winners_by_owner(merged, dcp_size: int, interleave_c: int,
         "compression_ratio",
         "dcp_size",
         "interleave_size",
-        "capacity",
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
@@ -1146,13 +1119,12 @@ def streamindex_topk_dcp(
     compression_ratio: int,
     dcp_size: int,
     interleave_size: int,
-    capacity: int,
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     dcp_axis_name: str = DCP_AXIS_NAME,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
     Same three-stage core as the unsharded `streamindex_topk` -- score locally,
@@ -1164,17 +1136,22 @@ def streamindex_topk_dcp(
     What the sharding adds is the return leg. Queries are replicated and the KV
     is sharded, so every rank needs, for *every* token, the slice of that
     token's global top-k that it happens to hold. The merge therefore does not
-    stop at the merged list -- it partitions each list by owning rank and sends
-    the pieces home.
+    stop at the merged list -- it hands every rank the whole list and lets each
+    keep the winners it owns.
 
-    Both halves of that are nearly free. After the first all-to-all the
-    candidate axis is a concatenation over source ranks, so `slots // k` *is*
-    the owning rank; no ownership scan is needed. And the return exchange is a
-    second all-to-all of the already-compacted `capacity`-wide lists, which
-    costs `capacity * 4` bytes per token -- against `k * 4` bytes per token to
-    all-gather the merged list and have every rank redo the same compaction.
-    At `k=2048, capacity=256` that is 1KB/token instead of 8KB/token, with the
-    compaction done once instead of `dcp_size` times.
+    That return leg is an all-gather rather than an all-to-all of pre-split
+    lists, and the difference is exactness. An all-to-all can only carry a
+    static per-rank width, so it has to bet that no rank owns more than that
+    many of any token's winners; the bet is unenforceable, because winners
+    correlated with `position mod (interleave_size * dcp_size)` can concentrate
+    arbitrarily, and losing it silently discards real winners (`sparsecore_topk`
+    rows are unsorted, so the discarded subset is arbitrary rather than the
+    weakest). Filtering an all-gathered list has no such width: `cp_owner_rank`
+    is single-valued and onto `range(dcp_size)`, so the per-rank results are a
+    partition of the global top-k by construction. The price is `k * 4` bytes
+    per token on the wire instead of `capacity * 4`, and the compaction done
+    `dcp_size` times instead of once -- but the compaction is one scatter either
+    way, since filtering for one rank replaces the `dcp_size`-way unrolled split.
 
     Args:
       q, indexer_weights: replicated, in natural request-major token order.
@@ -1184,24 +1161,18 @@ def streamindex_topk_dcp(
       cache_kv: this rank's shard of the compressed KV cache.
       page_indices: replicated *virtual* page ordinals, resolved against each
         rank's own shard by `local = virtual % num_local_pages`.
-      capacity: static per-rank list width. Sized above `k / dcp_size` to
-        absorb clustering; see `dropped` for what a too-small value costs.
       mesh: mesh containing `dcp_axis_name`.
 
     Returns:
-      `(local_topk, dropped)`.
-      `local_topk` is i32[padded_num_tokens, capacity] of this rank's own
-      *local* cache indices for every token, `-1` padded, sharded over
+      i32[padded_num_tokens, k] of this rank's own *local* cache indices for
+      every token, packed into a prefix and `-1` padded, sharded over
       `dcp_axis_name` (global leading dim `dcp_size * padded_num_tokens`).
       Callers derive per-token counts from the `-1` padding; a row that is all
       `-1` means this rank owns none of that token's top-k, which the attention
-      side must mask out of the LSE merge rather than attend over.
-      `dropped` is i32[dcp_size], the number of winners that did not fit
-      `capacity` on each rank. `sparsecore_topk` rows are unsorted, so an
-      overflow discards an arbitrary subset of real winners rather than the
-      weakest ones -- there is no graceful degradation here, and a non-zero
-      `dropped` means the result is no longer the exact global top-k. Callers
-      must treat it as a sizing failure.
+      side must mask out of the LSE merge rather than attend over. Rows are
+      `k` wide but hold `k / dcp_size` entries on average, so a caller that
+      gathers the full width pays `dcp_size`x more than it needs to; the
+      attention side should bound its gather by the per-row count.
     """
     if dcp_size <= 1:
         raise ValueError(
@@ -1217,10 +1188,6 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by "
             f"dcp_size={dcp_size}.")
-    if capacity > k:
-        raise ValueError(
-            f"capacity={capacity} exceeds k={k}; a single rank can never own "
-            "more than the whole top-k list.")
     interleave_c = interleave_size // compression_ratio
 
     def _local(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
@@ -1268,17 +1235,12 @@ def streamindex_topk_dcp(
         merged = jnp.take_along_axis(idxs, jnp.maximum(slots, 0), axis=1)
         merged = jnp.where(slots >= 0, merged, -1)
 
-        # Stage 3. Split each merged list by owner and send the pieces home.
-        # [T // dcp, dcp, capacity] -> [T, capacity], the inverse of stage 1's
-        # exchange, so tokens come back in their original order.
-        lists, dropped = _partition_winners_by_owner(merged, dcp_size,
-                                                     interleave_c, capacity)
-        local_topk = lax.all_to_all(lists.reshape(lists.shape[0], -1),
-                                    dcp_axis_name,
-                                    1,
-                                    0,
-                                    tiled=True)
-        return local_topk, jnp.reshape(dropped, (1, ))
+        # Stage 3. Hand every rank every merged list, then keep what this rank
+        # owns. [T // dcp, k] -> [T, k]; the gather concatenates in axis-index
+        # order, which is exactly the order stage 1 split the tokens in, so
+        # tokens come back in their original order.
+        merged = lax.all_gather(merged, dcp_axis_name, axis=0, tiled=True)
+        return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
 
     replicated = P()
     return jax.shard_map(
@@ -1293,7 +1255,7 @@ def streamindex_topk_dcp(
             replicated,  # cu_q_lens
             replicated,  # distribution
         ),
-        out_specs=(P(dcp_axis_name), P(dcp_axis_name)),
+        out_specs=P(dcp_axis_name),
         check_vma=False,
     )(q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens,
       distribution)
