@@ -18,6 +18,11 @@ import torch
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
 from vllm.distributed.parallel_state import get_dp_group
+from vllm_torchtpu.tracing.observability import (
+    get_current_layer,
+    get_current_phase,
+    trace_collective,
+)
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -35,8 +40,18 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
-    def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
-        return get_dp_group().all_gather(x, dim=0)
+    def _dp_gather(self, x: torch.Tensor, role: str = "dp_gather") -> torch.Tensor:
+        dp = get_dp_group()
+        with trace_collective(
+            layer=get_current_layer(),
+            phase=get_current_phase(),
+            collective_type="AllGather",
+            tensor=x,
+            group_size=dp.world_size,
+            logical_role=role,
+        ):
+            return dp.all_gather(x, dim=0)
+
 
     def dispatch_router_logits(
         self,
@@ -80,4 +95,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states
-        return dp.reduce_scatter(hidden_states, dim=0)
+        with trace_collective(
+            layer=get_current_layer(),
+            phase=get_current_phase(),
+            collective_type="ReduceScatter",
+            tensor=hidden_states,
+            group_size=dp.world_size,
+            logical_role="moe_combine_output",
+        ):
+            return dp.reduce_scatter(hidden_states, dim=0)
+

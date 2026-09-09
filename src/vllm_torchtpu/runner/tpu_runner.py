@@ -115,10 +115,19 @@ from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import (DraftChunkInputs,
                                              normalize_draft_config)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
+from vllm_torchtpu.tracing.observability import (
+    dump_every_n_steps,
+    dump_moe_observability,
+    log_batch_stats,
+    log_hbm_checkpoint,
+    register_layer_moe_buffer,
+    set_current_phase,
+)
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (extract_kv_lens_for_tracing,
                                          extract_request_ids_for_tracing)
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -3491,22 +3500,50 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
+        # 1. Batch stats (Log 1) & Observability
+        self.batch_counter += 1
+        padded_total_tokens = _get_padded_token_len(
+            self.num_tokens_paddings,
+            scheduler_output.total_num_scheduled_tokens)
+        batch_composition_stats = runner_utils.get_batch_composition_stats(
+            batch_id=self.batch_counter,
+            input_batch=self.input_batch,
+            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_reqs=self.input_batch.num_reqs,
+            padded_total_num_scheduled_tokens=padded_total_tokens,
+            scheduler_output=scheduler_output,
+        )
         if self.phase_based_profiler:
-            self.batch_counter += 1
-            padded_total_tokens = _get_padded_token_len(
-                self.num_tokens_paddings,
-                scheduler_output.total_num_scheduled_tokens)
-            batch_composition_stats = runner_utils.get_batch_composition_stats(
-                batch_id=self.batch_counter,
-                input_batch=self.input_batch,
-                total_num_scheduled_tokens=scheduler_output.
-                total_num_scheduled_tokens,
-                num_reqs=self.input_batch.num_reqs,
-                padded_total_num_scheduled_tokens=padded_total_tokens,
-                scheduler_output=scheduler_output,
-            )
             self.phase_based_profiler.step(batch_composition_stats)
+
+        phase = batch_composition_stats.get("phase", "UNKNOWN")
+        set_current_phase(phase)
+
+        kv_lens = extract_kv_lens_for_tracing(
+            self.input_batch.num_computed_tokens_cpu, 0, self.input_batch.num_reqs)
+        avg_kv_len = float(kv_lens.get("avg_kv_len", 0.0))
+        max_kv_len = int(kv_lens.get("max_kv_len", 0))
+        num_prefill = int(batch_composition_stats.get("num_prefill_tokens", 0))
+        num_decode = int(batch_composition_stats.get("num_decode_tokens", 0))
+        padding_tokens = max(0, padded_total_tokens - scheduler_output.total_num_scheduled_tokens)
+
+        # Log 1: Batch stats
+        log_batch_stats(
+            phase=phase,
+            batch_size=self.input_batch.num_reqs,
+            num_prefill=num_prefill,
+            num_decode=num_decode,
+            actual_tokens=scheduler_output.total_num_scheduled_tokens,
+            bucketed_tokens=padded_total_tokens,
+            padding_tokens=padding_tokens,
+            avg_context_len=avg_kv_len,
+            max_context_len=max_kv_len,
+        )
+
+        # Log 6: HBM checkpoint (pre_forward)
+        if self.batch_counter <= 5 or self.batch_counter % dump_every_n_steps() == 0:
+            log_hbm_checkpoint("pre_forward", device=self.device)
+
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
@@ -3780,6 +3817,11 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
         )
+
+        # Observability: Dump MoE routing / EP stats and post-forward HBM checkpoint
+        dump_moe_observability(step_id=self.batch_counter, phase=phase)
+        if self.batch_counter <= 5 or self.batch_counter % dump_every_n_steps() == 0:
+            log_hbm_checkpoint("post_forward", device=self.device)
 
         if self.is_pooling_model:
             return self.sample_tokens(None)
@@ -4534,6 +4576,22 @@ class TPUModelRunner(GPUModelRunner):
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device)
             token_padding.set_padding_state(self._token_padding_state)
+
+        # Register MoE observability buffers for expert load / GMM shape tracking
+        try:
+            for name, module in self.model.named_modules():
+                if hasattr(module, "_expert_load_counts"):
+                    register_layer_moe_buffer(
+                        module,
+                        num_experts=getattr(module, "global_num_experts", 256),
+                        device=self.device,
+                        layer_name=name,
+                    )
+        except Exception as e:
+            logger.debug("Failed to register MoE observability buffers: %s", e)
+
+        # Log 6: HBM checkpoint (after model load)
+        log_hbm_checkpoint("after_model_load", device=self.device)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
@@ -6108,6 +6166,7 @@ class TPUModelRunner(GPUModelRunner):
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: the unified KV block pool "
                     "layout is not supported by the block-major KV bundle")
             self._initialize_unified_kv_cache(kv_cache_config)
+            log_hbm_checkpoint("after_kv_cache_alloc", device=self.device)
             return
         backend_cls = TpuPlatform._find_non_ssm_backend(self.vllm_config)
 
@@ -6514,6 +6573,9 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
+
+        # Log 6: HBM checkpoint (after KV cache allocation)
+        log_hbm_checkpoint("after_kv_cache_alloc", device=self.device)
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
