@@ -110,7 +110,15 @@ def select_experts(gate_l,
     # routed at full weight to expert zero. Mask it explicitly instead.
     row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
     if renormalize:
-        denom = topk_weights.sum(axis=-1, keepdims=True)
+        # Clamped exactly as the reference router clamps it
+        # (`moe_routing.select_experts`, `torch.clamp(..., min=1e-20)`).
+        # `row_routes` does not cover this: a row of sigmoid scores that all
+        # underflowed to exactly 0.0 -- every logit at or below -87.33655 in
+        # float32 -- is entirely FINITE, so the mask passes it through and the
+        # sum it is divided by is exactly zero. The clamp is a no-op on every
+        # row whose weights sum above 1e-20, which is every real row.
+        denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True),
+                            jnp.float32(1e-20))
         topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
     topk_weights = jnp.where(row_routes, topk_weights, 0.0)
     if routed_scaling_factor != 1.0:

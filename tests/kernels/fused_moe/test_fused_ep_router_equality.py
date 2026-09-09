@@ -42,6 +42,8 @@ the last bit of a transcendental and by the tie-break convention -- torch's
 (`router_ops.py`) -- rather than by the routing rule.
 """
 
+import contextlib
+
 import numpy as np
 import pytest
 
@@ -118,6 +120,37 @@ def _fused(logits, bias, *, scoring_fn="sigmoid", rsf=RSF):
     return np.asarray(idx).astype(np.int64), np.asarray(w).astype(np.float64)
 
 
+@contextlib.contextmanager
+def _pallas_interpreted_without_a_tpu():
+    """Let `pallas_select` run on a host, under the Pallas interpreter.
+
+    `pl.pallas_call` refuses every backend but TPU ("Only interpret mode is
+    supported on CPU backend"), which is why the rest of this file needs a
+    device. The degenerate-row check below does not: what it asserts is a
+    float32 property of the router's arithmetic, not anything about the Mosaic
+    lowering, and it is the check least worth gating behind a TPU queue.
+
+    The backend is read here rather than at import: a JAX client built during
+    collection claims the accelerator for the whole process (see
+    `tests/conftest.py::pytest_collection_finish`). On a TPU this is a no-op
+    and the real `pallas_call` runs.
+    """
+    import functools
+
+    import jax
+    from jax.experimental import pallas as pl
+
+    if jax.default_backend() == "tpu":
+        yield
+        return
+    real = pl.pallas_call
+    pl.pallas_call = functools.partial(real, interpret=True)
+    try:
+        yield
+    finally:
+        pl.pallas_call = real
+
+
 # --------------------------------------------------------------- comparison
 def _selection_key(logits, bias, scoring_fn):
     """The key each path sorts on, in float32, formed the same way both do."""
@@ -181,6 +214,27 @@ def _malformed(ids):
 # ------------------------------------------------------------- input classes
 def _logits(rng, scale=1.0, tokens=TOKENS):
     return rng.normal(0.0, scale, (tokens, NUM_EXPERTS)).astype(np.float32)
+
+
+def _dead_row_logits(rng, tokens=TOKENS):
+    """A normal batch with two rows that cannot route, and the clean batch.
+
+    Row 0 is all `-inf`; row 1 is all `-1e30`, a finite logit that is just as
+    dead once `sigmoid` has scored it: the largest float32 whose sigmoid is
+    exactly zero is -87.33655, so both rows score to a vector of exact zeros
+    and their `topk_weights` sum to exactly zero.
+
+    `softmax` reads row 1 differently, and correctly: a CONSTANT row softmaxes
+    to the uniform distribution whatever the constant is, so under softmax
+    that row routes uniformly and only row 0 is dead. Returned alongside the
+    batch it was derived from, so a test can assert the other rows are
+    untouched.
+    """
+    clean = rng.normal(0.0, 1.0, (tokens, NUM_EXPERTS)).astype(np.float32)
+    dead = clean.copy()
+    dead[0] = -np.inf
+    dead[1] = -1e30
+    return dead, clean
 
 
 def _near_tie_logits(rng, gap=1e-4, tokens=TOKENS):
@@ -329,6 +383,72 @@ def test_the_weight_operand_returns_the_value_not_the_key():
     np.testing.assert_array_equal(idx, np.asarray(idx_plain))
 
 
+@pytest.mark.parametrize("scoring_fn", ["sigmoid", "softmax"])
+def test_a_row_that_cannot_route_does_not_poison_the_batch(scoring_fn):
+    """The reference clamps the renormalization denominator; so must this.
+
+    `moe_routing.select_experts` divides by
+    `torch.clamp(topk_weights.sum(-1, keepdim=True), min=1e-20)`. The fused
+    router shipped that division unclamped, guarded only by
+    `jnp.any(jnp.isfinite(scores))` -- and that guard does not cover the
+    sigmoid path, which is the path GLM-5.2-FP8 takes. `sigmoid` of any
+    float32 at or below -87.33655 is exactly 0.0, a perfectly finite number:
+    the mask passes the row through, its eight weights are all zero, and
+    `0/0` returns `[nan x 8]` straight into the combine.
+
+    Every other test in this file drives `rng.normal` logits, where no row
+    ever comes close, so none of them can see this.
+
+    Runs on CPU: the arithmetic is the subject, not the lowering.
+    """
+    rng = _rng()
+    dead, clean = _dead_row_logits(rng)
+    bias = rng.normal(0.0, 0.05, NUM_EXPERTS).astype(np.float32)
+
+    with _pallas_interpreted_without_a_tpu():
+        got_ids, got_w = _fused(dead, bias, scoring_fn=scoring_fn)
+        clean_ids, clean_w = _fused(clean, bias, scoring_fn=scoring_fn)
+
+    assert np.isfinite(got_w).all(), (
+        f"{scoring_fn}: the fused router returned non-finite combine weights "
+        f"for a batch holding a row that cannot route. "
+        f"row0 (all -inf)  = {got_w[0]} "
+        f"row1 (all -1e30) = {got_w[1]} "
+        f"({int((~np.isfinite(got_w)).any(-1).sum())} of {TOKENS} rows "
+        f"affected)")
+
+    # A row that routes nowhere contributes nothing -- it is not silently
+    # routed at full weight to whichever expert the selector happened to name.
+    # Under sigmoid both rows are dead; under softmax the constant row 1 is
+    # legitimately uniform (and is left to the equality tests above), so only
+    # the all `-inf` row is asserted there.
+    dead_rows = 2 if scoring_fn == "sigmoid" else 1
+    zeros = np.zeros((dead_rows, TOPK))
+    np.testing.assert_array_equal(got_w[:dead_rows], zeros)
+    # Only the rows that route are held to distinct ids. A dead row's ids are
+    # unconstrained by design and its weights are zero whatever they say: on
+    # an all-NaN score row `pallas_select` names the lowest expert on every
+    # slot, which `router_ops`'s module docstring already states. Under
+    # softmax that is exactly what row 0 is.
+    assert not _malformed(got_ids[2:]), (
+        f"{scoring_fn}: a dead row made the selector emit malformed ids for "
+        f"rows that do route: {_malformed(got_ids[2:])[:8]}")
+
+    # And the clamp costs the rest of the batch nothing: bit-identical to the
+    # same batch with no dead row in it, weights and indices both.
+    np.testing.assert_array_equal(got_w[2:], clean_w[2:])
+    np.testing.assert_array_equal(got_ids[2:], clean_ids[2:])
+
+    if scoring_fn == "sigmoid":
+        # The guard on this test: show the denominator really is zero, so a
+        # future edit cannot drop the clamp and still pass on the strength of
+        # `row_routes`.
+        s = 1.0 / (1.0 + np.exp(-dead[0].astype(np.float64)))
+        assert np.float32(s.astype(np.float32).sum()) == np.float32(0.0), (
+            "the -inf row's sigmoid scores no longer sum to exactly zero, so "
+            "this test is no longer exercising the unclamped division")
+
+
 if __name__ == "__main__":  # a plain script, for a cdk pod without pytest args
     import sys
     import traceback
@@ -346,6 +466,9 @@ if __name__ == "__main__":  # a plain script, for a cdk pod without pytest args
         ("weight_operand_returns_the_value",
          test_the_weight_operand_returns_the_value_not_the_key),
     ]
+    _dead_row = test_a_row_that_cannot_route_does_not_poison_the_batch
+    cases += [(f"dead_row_does_not_poison_the_batch {s}",
+               lambda s=s: _dead_row(s)) for s in ("sigmoid", "softmax")]
     failed = []
     for label, fn in cases:
         try:
