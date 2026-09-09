@@ -2,7 +2,8 @@
 
 Companion to [coding_guidance.md](coding_guidance.md), which carries the general
 coding rules (R-1.x–R-8.x) and the author checklist. This document carries
-the PR-discipline (§0), performance (§1), and quantization (§2) standards.
+the PR-discipline (§0), performance (§1), and quantization (§2) standards,
+plus a reference reading list (§3).
 Rules here are numbered **PR-\<n\>** (PR discipline), **P-\<n\>**
 (performance), and **Q-\<n\>** (quantization); those IDs cited anywhere in
 the document set refer to the rules below, and R-x.y cited below refers to
@@ -62,7 +63,8 @@ Applies to all optimization work — performance (§1) and quantization
 ### 1.3 Reason at the hardware-resource level
 
 Argue kernel decisions in terms of VREG / VMEM / SMEM / HBM bandwidth / MXU
-dtype throughput / DMA latency:
+dtype throughput / DMA latency. The rules below are the points that come up
+most often in review; for the underlying hardware model, see §3.
 
 - **P-7** VREG lifetime: quantize per-loop-iteration to avoid spills; don't
   materialize zero-init accumulators up front; write results directly to
@@ -142,3 +144,18 @@ dtype throughput / DMA latency:
   hardware preference; emulate missing hardware support at load time; use
   TPU-native stochastic rounding when requantizing at load; never assume
   fp16→bf16 conversion is numerically free — verify.
+
+## 3. Reference / further reading
+
+Background material for the rules above. Read §1 and §2 as the standard this
+repo enforces; read these to understand the hardware and tooling they rest on.
+
+- [How to Scale Your Model — TPUs](https://jax-ml.github.io/scaling-book/tpus/)
+  (JAX scaling book): the TPU hardware model — MXU, VREG/VMEM/HBM hierarchy,
+  bandwidths, roofline arithmetic — behind §1.3, plus the chapters on
+  sharding and collectives behind §1.2 and P-4.
+- [Pallas TPU documentation](https://docs.jax.dev/en/latest/pallas/tpu/index.html):
+  the kernel programming model — grid/BlockSpec, memory spaces, DMA — behind
+  P-7 through P-13.
+- [XProf / TensorBoard profiler guide](https://openxla.org/xprof):
+  how to capture and read the traces P-1 requires.

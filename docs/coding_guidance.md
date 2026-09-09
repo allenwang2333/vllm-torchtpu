@@ -73,7 +73,8 @@ Two meta-principles organize this document set:
 ## 2. Architecture ground rules
 
 vllm-torchtpu is a **vLLM platform plugin, not a fork**. vLLM installs as a
-plain wheel; this repo injects TPU behavior through vLLM's plugin entry points
+plain wheel; this repo injects TPU behavior through vLLM's
+[plugin entry points](https://docs.vllm.ai/en/latest/design/plugin_system/)
 (`vllm.platform_plugins`, `vllm.general_plugins`). Model execution is
 **torch** (`TPUModelRunner` subclasses vLLM's `GPUModelRunner`, running under
 `torch.compile(backend="tpu", fullgraph=True)`); kernels are **JAX/Pallas**,
@@ -442,6 +443,18 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   optimization doc.)
 
 ---
+
+## Reference / further reading
+
+Background material for the rules above.
+
+- [vLLM plugin system](https://docs.vllm.ai/en/latest/design/plugin_system/):
+  the entry points and registration hooks §2 and R-3.5 build on.
+- [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html):
+  the style baseline for R-1.1.
+- [optimization_best_practices.md](optimization_best_practices.md): PR
+  discipline (PR-x), performance (P-x), and quantization (Q-x) rules, and its
+  own reference list for TPU hardware and kernel material.
 
 ## Author checklist (run before sending a PR)
 
