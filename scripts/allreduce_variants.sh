@@ -35,9 +35,24 @@ SCRIPT=/root/torchtpu-vllm/scripts/benchmark_torchtpu_all_reduce_112m.py
 ITER="${ALLREDUCE_ITERATIONS:-100}"
 # Optional variant selection: positional args (from run_multihost.sh) or
 # ALLREDUCE_VARIANTS, space-separated names; empty = run every variant.
-VARIANTS="${*:-${ALLREDUCE_VARIANTS:-}}"
+# A positional arg of the form libtpu==<version> (or libtpu-nightly==...) is a
+# libtpu override: installed with --no-deps in this container before any run,
+# so a newer libtpu can be tested against the image's torch_tpu.
+LIBTPU_SPEC=""
+VARIANT_ARGS=()
+for a in "$@"; do
+    case "$a" in
+        libtpu==*|libtpu-nightly==*) LIBTPU_SPEC="$a" ;;
+        *) VARIANT_ARGS+=("$a") ;;
+    esac
+done
+VARIANTS="${VARIANT_ARGS[*]:-${ALLREDUCE_VARIANTS:-}}"
 want() { [ -z "$VARIANTS" ] || [[ " $VARIANTS " == *" $1 "* ]]; }
 mkdir -p "$OUT"
+if [ -n "$LIBTPU_SPEC" ]; then
+    echo "[allreduce] installing libtpu override: $LIBTPU_SPEC"
+    pip install -q --no-deps "$LIBTPU_SPEC" 2>&1 | tail -3 | sed 's/^/[allreduce] pip: /' || true
+fi
 
 # What vllm_torchtpu/env_override.py injects for tpu7x before libtpu loads
 # (the benchmark script imports torch_tpu directly, bypassing it).
