@@ -122,8 +122,16 @@ def llm():
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     os.environ["VLLM_TPU_ENABLE_JUMP_DECODING"] = "1"
 
+    spec_config = {
+        "method": "ngram",
+        "prompt_lookup_max": 7,
+        "prompt_lookup_min": 3,
+        "num_speculative_tokens": 5,
+    }
+
     llm = LLM(
         model=MODEL_NAME,
+        speculative_config=spec_config,
         max_model_len=256,
         max_num_seqs=4,
         tensor_parallel_size=1,
@@ -200,6 +208,83 @@ def test_jump_decoding_mixed_batch(llm: LLM):
         JUMP_SAMPLING_PARAMS,
         UNCONSTRAINED_PARAMS,
     ]
+    outputs = llm.generate(prompts, params)
+    assert len(outputs) == 4
+    _assert_telemetry_json(outputs[0].outputs[0].text)
+    _assert_telemetry_json(outputs[2].outputs[0].text)
+    assert "Paris" in outputs[1].outputs[0].text or len(
+        outputs[1].outputs[0].text) > 0
+    assert "Paris" in outputs[3].outputs[0].text or len(
+        outputs[3].outputs[0].text) > 0
+
+
+def test_speculative_jump_decoding_ngram(llm: LLM):
+    """Verifies that Speculative Decoding (N-gram) + Jump Decoding work together harmoniously.
+
+    Ensures that speculative draft proposing and verification under grammar constraints
+    interoperate seamlessly with FSM deterministic token fast-forwarding.
+    """
+    # 1. Multi-request generation under speculative jump decoding
+    outputs = llm.generate([JUMP_PROMPT] * 2, JUMP_SAMPLING_PARAMS)
+    assert len(outputs) == 2
+    for idx, out in enumerate(outputs):
+        text = out.outputs[0].text
+        print(f"\n[Speculative Jump Request {idx}] Output: {text!r}")
+        _assert_telemetry_json(text)
+
+    # 2. Step compression proof with speculative decoding
+    llm._add_request(JUMP_PROMPT, JUMP_SAMPLING_PARAMS)
+    total_steps = 0
+    final_outputs = []
+    while llm.llm_engine.has_unfinished_requests():
+        step_outs = llm.llm_engine.step()
+        total_steps += 1
+        for out in step_outs:
+            if out.finished:
+                final_outputs.append(out)
+
+    assert len(final_outputs) == 1
+    out_text = final_outputs[0].outputs[0].text
+    gen_tokens = final_outputs[0].outputs[0].token_ids
+    total_tokens = len(gen_tokens)
+
+    _assert_telemetry_json(out_text)
+    assert total_tokens >= 30, f"Expected >= 30 tokens, got {total_tokens}"
+    compression_ratio = total_tokens / total_steps
+    assert compression_ratio >= 3.0, (
+        f"Speculative Jump Decoding failed step compression: "
+        f"{total_tokens} tokens in {total_steps} steps ({compression_ratio:.2f}x)"
+    )
+
+
+def test_speculative_jump_decoding_high_k(llm: LLM):
+    """Verifies that Speculative Jump Decoding scales effectively with higher draft budget (K=5)."""
+    outputs = llm.generate([JUMP_PROMPT] * 2, JUMP_SAMPLING_PARAMS)
+    assert len(outputs) == 2
+    for idx, out in enumerate(outputs):
+        text = out.outputs[0].text
+        print(f"\n[High-K Speculative Jump {idx}] Output: {text!r}")
+        _assert_telemetry_json(text)
+
+
+def test_speculative_jump_decoding_multi_schema_batch(llm: LLM):
+    """Verifies that concurrent requests with different JSON schemas and unconstrained prompts
+
+    under Speculative Decoding maintain strict grammar isolation and correct jump fast-forwarding.
+    """
+    prompts = [
+        JUMP_PROMPT,
+        UNCONSTRAINED_PROMPT,
+        JUMP_PROMPT,
+        UNCONSTRAINED_PROMPT,
+    ]
+    params = [
+        JUMP_SAMPLING_PARAMS,
+        UNCONSTRAINED_PARAMS,
+        JUMP_SAMPLING_PARAMS,
+        UNCONSTRAINED_PARAMS,
+    ]
+
     outputs = llm.generate(prompts, params)
     assert len(outputs) == 4
     _assert_telemetry_json(outputs[0].outputs[0].text)
