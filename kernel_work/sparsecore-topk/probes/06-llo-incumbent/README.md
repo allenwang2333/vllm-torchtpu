@@ -121,12 +121,23 @@ expected saving is near zero — **not worth a job**, recorded so nobody spends 
 1. **The caller's premise is confirmed and their change targets the right object** — one buffer, no
    overlap possible, and the compiler idling across the transfer. Report §6 upgraded from `modelled`
    to `static`. The −7.18%/−2.02% ceiling is unchanged; only its basis is now firm.
+   ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): the ceiling is **−4.12% / −1.97%**. Q1's structural finding is untouched — the DMA
+   really is exposed — but its *size* was a bandwidth model, and the measured exposed cost is 0.40×
+   it. Q1's own 4-bundle slack reading is the clue: two of those four bundles are `snop`, so the
+   compiler had little to hide and hid little.
 2. **The double buffer fits** — 21.6% of VMEM. This removes the one structural objection to it.
-3. **⛔ The cost model in report §5d is contradicted and the contradiction is open.** A refinement
-   pass has a *sparse* mask and should therefore cost ~35 µs by probe 03's own price sheet, but the
-   fit assigns it 114.3 µs — **3.2× off**, ~150 µs misattributed. Report §5d′ lists three candidate
-   explanations. **Resolving this is step 2's first action**, because under the favoured explanation
-   candidate 1's prize falls from 51.4% to ~15.8% of the kernel.
+3. **✅ The cost model in report §5d is contradicted — and this probe was right.** A refinement pass
+   has a *sparse* mask and should therefore cost ~35 µs by probe 03's own price sheet, but the fit
+   assigned it 114.3 µs — 3.2× off, ~150 µs misattributed.
+   **`probes/07-refinement-fixed-vs-walk` (`j-098b260f-a9f7-4fe5-937c`) settled it in this probe's
+   favour**: a level is **57.196 µs**, of which the `L` walk is **38.004 µs = 1.1876 µs/wave**
+   against probe 03's `scatter_sparse` at 1.1013 µs/wave — **7.8% apart**. The misattributed ~150 µs
+   was in the *base*, not the level: 43 µs of fixed `zero_priv`/`fold_priv` sweep (the explanation
+   this probe favoured, right in kind) and ~81 µs of per-wave cost still unattributed. Candidate 1's
+   prize fell from 51.4% to **18.7%**.
+   **The transferable part**: a machine-code reading overturned a one-parameter fit that had
+   validated out of sample to −0.14%. It could do that because the fit's validation ran along wave
+   count — the axis every confounded term scales on — so it could not fail.
 4. Emit is the only place register pressure exists; schedule quality and LICM are dead ends.
 
 ## Bonus, same-job control

@@ -52,16 +52,29 @@ alone. That is what makes `hist0` (dense by construction — every valid word in
 single most expensive pass in the kernel at 116.4 µs, 25.8% of the whole thing.
 
 The refinement pass is the interesting one, and this probe does **not** measure it directly: it is a
-sparse scatter over a full walk. Report §5d fits its one free parameter against the measured total
-and gets **114.3 µs — 0.98× a dense scatter, 3.24× `scatter_sparse`**, validated out of sample at
-`b=64` to −0.14%. So a refinement pass costs nearly what a *dense* one costs despite touching almost
-nothing: **the cost is the traversal of all `L` words, not the updates.**
+sparse scatter over a full walk.
+
+> ⛔ **RETRACTED, and this probe was the wronged party.** This paragraph used to read: report §5d
+> fits one free parameter and gets **114.3 µs — 0.98× a dense scatter, 3.24× `scatter_sparse`**, so
+> "a refinement pass costs nearly what a *dense* one costs despite touching almost nothing."
+> **`probes/07-refinement-fixed-vs-walk` (`j-098b260f-a9f7-4fe5-937c`) measured it directly: the
+> refinement `L` walk is 1.1876 µs/wave against this probe's `scatter_sparse` at 1.1013 µs/wave —
+> 7.8% apart.** The price sheet below was right; the fit that used it was not. A refinement walk is
+> a sparse scatter and costs a sparse scatter's price.
 
 ## Decided
 
-This is the price sheet every step-2 candidate is costed against. Two things follow immediately:
+This is the price sheet every step-2 candidate is costed against, and probe 07 vindicated it.
 
-- `addupdate_scatter` is **77.2%** of the shipping prefill kernel, against the DMA's 7.4%. The
-  ranking in report §9 is this number.
+- ⛔ SUPERSEDED by `probes/08` (`j-300d4690`) **and by the ρ derivation**: at the shipping ρ = 0.40005 this is **22.2%**, and the
+  fixed V4 sweeps — which do *not* scale with ρ — overtake it at **42.2%**. The price sheet itself
+  stands; only its share of the kernel moved.
+- `addupdate_scatter` is **44.2%** of the shipping prefill kernel (`hist0` 25.6% + refinement walk
+  18.7%), against the DMA's 7.4%. ⛔ **This line previously read 77.2%** — that figure came from the
+  retracted fit, not from this probe.
 - Candidate 1 (compact L0's straddling bucket once, so refinement walks `cnt` instead of `L`)
-  targets 51.4% of the kernel and is ranked above the caller's mechanism.
+  targets **18.7%** of the kernel. ⛔ **Previously 51.4%.** It is now ranked *below* `hist0`'s dense
+  scatter, and the caller's DMA mechanism at 7.4% is unchanged in absolute terms.
+- **The one number in this file to distrust is not on the price sheet**: it is the sentence that
+  imported §5d's fitted parameter and presented it beside four measured slopes as though it were
+  one of them.

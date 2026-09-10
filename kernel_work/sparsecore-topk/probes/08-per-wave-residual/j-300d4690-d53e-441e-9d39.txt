@@ -1,0 +1,146 @@
+SUBJECT_PATH=/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+MAP_GATE_OK
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789058014.470864      10 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-300d4690-d53e-441e-9d39-tpu-job-0-0 devices=8 kind=TPU7x
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+subject: /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+  timing harness: FROZEN INSTRUMENT /root/probe08/glm_dsa_block_bench.py (md5 08375d7068365e1a776c58fef09cd6d0)
+  arm B      drops=-                              src_md5=fd46ef14b38fd7781885e73d0ca33965
+  arm -dma   drops=dma                            src_md5=0cf4c6696bb86a2e3b7ec137cf985745
+  arm -cvt   drops=cvt                            src_md5=605cbae4060d8764c37cb0dd661a2076
+  arm -hist  drops=hist                           src_md5=1cac6cdcc43f48ab25d6d9dd9e696679
+  arm -sweep drops=sweep                          src_md5=14d8cda3e15094cac10a5f68ac9e0488
+  arm -emit  drops=emit                           src_md5=422be5707b39f4292ca73743d136bbc7
+  arm -alld  drops=dma,cvt,hist,sweep,emit        src_md5=ea5bbde05129ae7f325a1f4a09bcede4
+  arm -alls  drops=dma,cvt,hist,sweep,emit        src_md5=d67bc26366f451a1a4d8c9a07e5b3f7b
+  arm P3T    drops=-                              src_md5=1b353ce29c32d5e5fcc1bf965387b7b5
+  arm R1     drops=-                              src_md5=817ba385e2f64c16930092ee4b478cf1
+
+=== b=1024 n=10240 k=2048 P=1 waves=32 SINGLE-STAGE ===
+  patch evidence B     :  1024/1024 rows match B
+  patch evidence -dma  :     0/1024 rows match B
+  patch evidence -cvt  :  1024/1024 rows match B
+  patch evidence -hist :     0/1024 rows match B
+  patch evidence -sweep:     0/1024 rows match B
+  patch evidence -emit :     0/1024 rows match B
+  patch evidence -alld :     0/1024 rows match B
+  patch evidence -alls :     0/1024 rows match B
+  patch evidence P3T   :  1024/1024 rows match B
+  patch evidence R1    :  1024/1024 rows match B
+
+  *** D5 GATE: plsc.addupdate_scatter with 16 lanes colliding on one address is EXACT -- the 16x replication is REMOVABLE (1024/1024 rows) ***
+
+  !! -cvt reproduces B exactly -- the pass was NOT removed. Its delta is not a cost.
+  B        us_median=   327.166  us=   326.692  hostbound=  1.0%  suspect=False
+  -dma     us_median=   313.697  us=   313.302  hostbound=  1.1%  suspect=False
+  -cvt     us_median=   347.658  us=   346.709  hostbound=  1.1%  suspect=False
+  -hist    us_median=   188.860  us=   188.361  hostbound=  1.4%  suspect=False
+  -sweep   us_median=   175.842  us=   175.491  hostbound=  1.6%  suspect=False
+  -emit    us_median=   243.146  us=   241.816  hostbound=  1.7%  suspect=False
+  -alld    us_median=   101.584  us=    94.006  hostbound=  9.6%  suspect=False
+  -alls    us_median=   101.917  us=   101.149  hostbound=  2.8%  suspect=False
+  P3T      us_median=   327.347  us=   326.224  hostbound=  1.1%  suspect=False
+  R1       us_median=   314.971  us=   314.492  hostbound=  1.0%  suspect=False
+  X2       us_median=   326.462  us=   322.948  hostbound=  0.9%  suspect=False
+  X4       us_median=   373.373  us=   369.379  hostbound=  0.8%  suspect=False
+  N1       us_median=    20.751  us=    18.105  hostbound= 18.5%  suspect=False
+  N2       us_median=    40.944  us=    35.900  hostbound= 12.3%  suspect=False
+  N4       us_median=    81.071  us=    70.549  hostbound=  9.4%  suspect=False
+  #null_a  us_median=    19.894  us=    17.907  hostbound= 16.9%  suspect=False
+  #null_b  us_median=    19.365  us=    15.971  hostbound= 25.6%  suspect=False
+
+  --- per-wave residual, b=1024 (32 waves) ---
+  B (base, no levels)              327.166
+    - dma                           13.469   ( 0.4209 us/wave)
+    - cvt                          -20.492   (-0.6404 us/wave)
+    - hist                         138.306   ( 4.3221 us/wave)
+    - sweep                        151.324   ( 4.7289 us/wave)
+    - emit                          84.020   ( 2.6256 us/wave)
+    sum of the five                366.628
+  -alld (loops entered, bound 0)   101.584   ( 3.1745 us/wave)
+  -alls (loops gone)               101.917   ( 3.1849 us/wave)
+  parallel_loop entry (d - s)       -0.333   <- M3
+  additivity check                -141.045   (B - sum - alld; 0 if the five are independent)
+  score DMA, total                  13.469   <- M2. hardware_map stage C prices its BANDWIDTH at 33.43; any excess is exposed LATENCY
+
+  --- launch, b=1024 ---
+  per extra kernel launch           -0.704  (from X4:     15.402)
+  per extra trivial-op launch       20.193  (from N4:     20.107)
+  SC program load = k - n          -20.897   <- D4
+
+  --- skipped levels, b=1024 ---
+  P3T (3 levels, all skipped)      327.347
+  per skipped level                  0.060   (probes/07 §4: ~3.8 would close the 2.231-vs-2.03 gap)
+
+  --- D5, b=1024 ---
+  R1 (replication factor 1)        314.971  vs B    327.166  -> -3.73% [EXACT]
+
+  null floor                        19.630  (two nulls differ by 0.529 us)
+  cross-job control: B=327.166 vs probes/07 L0=327.023  -> +0.04% (same arm, different job)
+
+=== b=64 n=10240 k=2048 P=1 waves=2 SINGLE-STAGE ===
+  patch evidence B     :    64/64 rows match B
+  patch evidence -dma  :    32/64 rows match B
+  patch evidence -cvt  :    64/64 rows match B
+  patch evidence -hist :     0/64 rows match B
+  patch evidence -sweep:     0/64 rows match B
+  patch evidence -emit :     0/64 rows match B
+  patch evidence -alld :     0/64 rows match B
+  patch evidence -alls :     0/64 rows match B
+  patch evidence P3T   :    64/64 rows match B
+  !! -cvt reproduces B exactly -- the pass was NOT removed. Its delta is not a cost.
+  patch evidence R1    :    64/64 rows match B
+
+  *** D5 GATE: plsc.addupdate_scatter with 16 lanes colliding on one address is EXACT -- the 16x replication is REMOVABLE (64/64 rows) ***
+
+  B        us_median=    41.005  us=    39.868  hostbound=  7.2%  suspect=False
+  -dma     us_median=    40.196  us=    39.308  hostbound=  6.7%  suspect=False
+  -cvt     us_median=    42.511  us=    41.720  hostbound=  5.8%  suspect=False
+  -hist    us_median=    34.526  us=    33.138  hostbound=  9.2%  suspect=False
+  -sweep   us_median=    34.068  us=    32.944  hostbound=  8.8%  suspect=False
+  -emit    us_median=    35.514  us=    34.815  hostbound=  7.7%  suspect=False
+  -alld    us_median=    26.344  us=    24.844  hostbound= 13.5%  suspect=False
+  -alls    us_median=    25.968  us=    25.649  hostbound= 10.4%  suspect=False
+  P3T      us_median=    41.015  us=    40.653  hostbound=  5.8%  suspect=False
+  R1       us_median=    40.240  us=    39.250  hostbound=  7.3%  suspect=False
+  X2       us_median=    65.184  us=    64.248  hostbound=  4.7%  suspect=False
+  N1       us_median=    20.569  us=    15.790  hostbound= 25.7%  suspect=False
+  N2       us_median=    38.964  us=    32.991  hostbound= 15.6%  suspect=False
+  N4       us_median=    77.254  us=    64.737  hostbound= 13.5%  suspect=False
+  #null_a  us_median=    20.247  us=    17.498  hostbound= 19.1%  suspect=False
+  #null_b  us_median=    19.030  us=    15.410  hostbound= 27.4%  suspect=False
+
+  --- per-wave residual, b=64 (2 waves) ---
+  B (base, no levels)               41.005
+    - dma                            0.809   ( 0.4043 us/wave)
+    - cvt                           -1.507   (-0.7533 us/wave)
+    - hist                           6.479   ( 3.2395 us/wave)
+    - sweep                          6.937   ( 3.4685 us/wave)
+    - emit                           5.491   ( 2.7454 us/wave)
+    sum of the five                 18.209
+  -alld (loops entered, bound 0)    26.344   (13.1720 us/wave)
+  -alls (loops gone)                25.968   (12.9841 us/wave)
+  parallel_loop entry (d - s)        0.376   <- M3
+  additivity check                  -3.549   (B - sum - alld; 0 if the five are independent)
+  score DMA, total                   0.809   <- M2. hardware_map stage C prices its BANDWIDTH at 33.43; any excess is exposed LATENCY
+
+  --- launch, b=64 ---
+  per extra kernel launch           24.180  (from X4:        nan)
+  per extra trivial-op launch       18.395  (from N4:     18.895)
+  SC program load = k - n            5.785   <- D4
+
+  --- skipped levels, b=64 ---
+  P3T (3 levels, all skipped)       41.015
+  per skipped level                  0.003   (probes/07 §4: ~3.8 would close the 2.231-vs-2.03 gap)
+
+  --- D5, b=64 ---
+  R1 (replication factor 1)         40.240  vs B     41.005  -> -1.86% [EXACT]
+
+  null floor                        19.638  (two nulls differ by 1.217 us)
+  cross-job control: B=41.005 vs probes/07 L0=41.104  -> -0.24% (same arm, different job)
+
+wrote /cdk-outputs/outputs/j-300d4690-d53e-441e-9d39-tpu-job-0/j-300d4690-d53e-441e-9d39-tpu-job-0-0-wnmjr/command-container/probe08/per_wave_residual.json

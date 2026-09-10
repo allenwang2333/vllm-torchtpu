@@ -448,7 +448,13 @@ whole call (`max resid ≤0.62%`, four-null spread 0.46%):
 | `scatter_mid` (1/16 density) | 36.492 | 1.77× |
 | **`scatter` (dense `addupdate_scatter`)** | **116.350** | **5.65×** |
 
-### 5d. The cost model, fitted with one parameter and validated out of sample
+### 5d. The cost model, fitted with one parameter — and superseded by measurement
+
+> ⛔ **Superseded.** `probes/07-refinement-fixed-vs-walk` (`j-098b260f-a9f7-4fe5-937c`) measured the
+> refinement level directly. **The fit below is 2.00× too high on the per-level cost.** It is kept
+> in full because how it failed is the most transferable thing in this report — see §5d′, which is
+> now the resolution rather than the contradiction, and §5e, which is rebuilt on the measurement.
+> Nothing downstream of here should cite a number from 5d.
 
 The harness ships two candidate models and **both miss**: its `uniform` (4 dense scatters)
 overshoots by +25.9%, its `graded` (3 sparse) undershoots by −28.0%. Neither is the kernel.
@@ -483,7 +489,21 @@ refinement would pass this check identically. What pins the split is probe 03's 
 measured `cvt`/`hist0`/`emit` slopes, which were not fitted to anything here; the single fitted
 parameter is the refinement pass alone.
 
-### 5d′. ⛔ The LLO capture contradicts this fit, and the contradiction is not resolved
+> ⛔ **That caution was correct and still understated the problem, and the paragraph above it is the
+> error.** The −0.14% was not "the strongest evidence in this report"; it was worth nothing. Both the
+> refinement term and the ~81 µs of base overhead the fit had silently swallowed scale with waves, so
+> a wave-count extrapolation cannot distinguish them **by construction**. The check ran along the one
+> axis that could not fail. **An out-of-sample check along the axis the confounded terms both scale
+> on validates nothing** — and it is worse than no check, because it bought confidence in a 2× error.
+> The last sentence is also wrong: probe 03's slopes pin the terms they price, and everything they do
+> *not* price landed in the one free parameter. Measured resolution in §5d′.
+
+### 5d′. The LLO capture contradicted the fit — and the probe settled it in the LLO capture's favour
+
+> ✅ **RESOLVED** by `probes/07-refinement-fixed-vs-walk`, `j-098b260f-a9f7-4fe5-937c`. The
+> contradiction below was real, the favoured explanation was right in kind, and the measured answer
+> is at the end of this section. **The reasoning is kept in full because the machine-code argument
+> that raised the alarm was correct against a fit that had validated out of sample.**
 
 That caution turned out to be the right one to write. `probes/06-llo-incumbent` breaks the fit open,
 and I would rather hand this over live than let it be found in step 3.
@@ -518,16 +538,59 @@ Three candidate explanations, none yet eliminated:
 3. **`scatter_sparse`'s 1/256 density is not the refinement mask's density.** After L0 the matching
    fraction is roughly `cnt/L`, which is data-dependent and not 1/256 by construction.
 
-**Why this is the first thing step 2 does, ahead of any variant.** Candidate 1 is "make the
+**Why this was the first thing step 2 did, ahead of any variant.** Candidate 1 is "make the
 refinement walk proportional to `cnt` instead of `L`". Under explanation 1 that leaves the fixed
 `zero_priv`/`fold_priv` sweep untouched and wins ~35 µs × 2.03 = **15.8% of the kernel, not 51.4%** —
-a 3× reduction in the prize, and enough to reorder it against the launch intercept. The resolving
-probe is cheap and needs no new kernel: time one refinement level with `active_walk` forced to 0
-while keeping `zero_priv`/`fold_priv`/`scan_glob`, and difference it against the full level.
+a 3× reduction in the prize, and enough to reorder it against the launch intercept.
 
-**Until that probe returns, treat §5e's 51.4% refinement row as an upper bound on that region and
-not as a candidate prize.** The three shipping-shape *totals* (451.2 / 51.6 µs) are measured and
-unaffected; it is only the split inside them that is in question.
+#### The answer — `probes/07-refinement-fixed-vs-walk`, `j-098b260f-a9f7-4fe5-937c`
+
+Six arms, each a patched copy of the incumbent `exec`'d into its own module so no arm can be served
+another's cached executable: no levels at all; 1 and 3 levels with `done` pinned False; the same two
+with `active_walk` forced to 0; and the unpatched incumbent. Frozen instrument, 9 interleaved rounds,
+`us_median`, two nulls. **Quote the slopes, not the pairwise differences** — `F1n − L0` reads −4.699
+µs, i.e. negative, because it inherits `L0`'s error, while `(F3n − F1n)/2` never touches `L0`.
+
+| quantity, `us_median` | prefill `b=1024`, 32 waves | decode `b=64`, 2 waves | per wave + intercept |
+| --- | --- | --- | --- |
+| base, no refinement levels | 327.023 µs | 41.104 µs | 9.531 + **22.042** |
+| **one whole level** | **57.196 µs** | 3.899 µs | 1.777 + 0.346 |
+| — fixed `zero_priv`/`fold_priv`/`scan`/`find` sweep | 19.192 µs (**33.6%**) | 1.773 µs (45.5%) | 0.581 + 0.612 |
+| — the `L` walk | **38.004 µs** (66.4%) | 2.126 µs | 1.196 + **−0.266** |
+| incumbent | 454.602 µs | 51.027 µs | 13.453 + 24.122 |
+| implied active levels | 2.231 | **2.545** | — |
+| null floor / spread of two nulls | 27.194 / **1.261** | 27.364 / **0.452** | — |
+
+**Verdicts on the three explanations. (2) wrong** — the level count is 2.2–2.5, not 3.00. **(3)
+wrong** — the refinement mask behaves exactly like `scatter_sparse`'s. **(1) right in kind, wrong in
+magnitude**: the fixed sweeps are real at 19.192 µs/level, a third of a level, but they are only 43
+of the 232 µs the fit had assigned.
+
+**Probe 03's price sheet was right the whole time.** The refinement `L` walk is **1.1876 µs/wave**;
+probe 03's synthetic `scatter_sparse` is **1.1013 µs/wave** — **7.8% apart**, and `ref_body` carries
+four extra integer ops per chunk that the synthetic arm does not. A sparse scatter costs what probe
+03 said a sparse scatter costs, and the ~150 µs was never in the scatter.
+
+**It was in the base.** The fit had one free parameter and one equation, so every term probe 03 had
+not priced was absorbed into the refinement term:
+
+| region | §5d modelled | measured | error |
+| --- | --- | --- | --- |
+| refinement | 232.052 µs (51.4%) | **127.579 µs (28.1%)** | **1.82× too high** |
+| base | 219.174 µs (48.6%) | **327.023 µs (71.9%)** | **1.49× too low** |
+| per level | 114.31 µs | **57.196 µs** | **2.00× too high** |
+
+**Two intercepts agree from unrelated arms.** The base's two-point wave decomposition gives
+**22.042 µs**; §5d's independent DMA-against-waves fit gave **21.349 µs** — 3.2% apart. (⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **both fits agreed on the harness's own per-call `block_until_ready` fence, which both of them contained.** On-device SparseCore program load is zero — one extra launch of this kernel at constant total work costs −0.704 µs. Two independent instruments agreeing is not evidence they measured the kernel; they shared a confound.) And the
+`L`-walk intercept is **−0.266 µs** with the whole-level intercept at **0.346 µs**, both ≈ 0 as a
+purely per-wave term must be. That is the internal check that makes the decomposition readable.
+
+**One thing the probe did not settle.** `implied active levels` reads 2.545 at decode against probe
+05's critical-subcore 2.50 (1.8% — a good confirmation), but 2.231 at prefill against 2.03 (9.9%).
+Do not call that a distribution error yet: **a skipped level is not free** in the incumbent — it
+still enters four `parallel_loop`s at bound 0 and runs the scalar epilogue at 249–265, three times —
+and a ~3.8 µs/level skip overhead would explain the whole gap. One arm settles it (3 levels, `done`
+pinned **True**) and it is not in this probe.
 
 ### 5d″. Two clock-free findings that survive regardless
 
@@ -553,42 +616,71 @@ issue-bound, the expected saving is near zero. **Not worth a job**, recorded so 
 
 ### 5e. Where the time actually goes
 
-**Shipping prefill, `b=1024 n=10240 k=2048 P=1`, measured 451.2 µs:**
+Rebuilt on `probes/07`. Every row is `measured (j-…)` except the two marked, and the residual row is
+named rather than distributed.
+
+**Shipping prefill, `b=1024 n=10240 k=2048 P=1`, incumbent 454.602 µs (`j-098b260f`; 450.260 µs at
+`j-fa60ff2a`, 0.96% apart):**
+
+| | µs | share | basis |
+| --- | --- | --- | --- |
+| launch intercept | 22.04 | 4.85% | measured, `j-098b260f` two-point; 3.2% from §5d's independent 21.349 |
+| **score DMA — what the caller asked about** | **33.43** | **7.35%** | ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): the *exposed* cost is **13.469 µs**, and at the shipping ρ=0.40005 the share is **2.8%** |
+| `cvt` monotone_key | 20.59 | 4.53% | measured, probes/03 |
+| **`hist0` dense `addupdate_scatter`** | **116.35** | **25.59%** | measured, probes/03 |
+| L0's own fixed histogram sweep | 19.19 | 4.22% | measured, probes/07 slope |
+| `emit` | 27.46 | 6.04% | measured, probes/03 |
+| out DMA | 6.69 | 1.47% | **modelled** — 8 KiB against the 40 KiB read's measured slope |
+| **⚠ unattributed per-wave cost** | **81.28** | **17.88%** | **residual, 2.540 µs/wave** |
+| refinement fixed sweeps (×2.231) | 42.81 | 9.42% | measured, probes/07 slope |
+| **refinement `L` walk (×2.231)** | **84.77** | **18.65%** | measured, probes/07 slope |
+| | **454.60** | 100% | |
+
+> **`addupdate_scatter` is 44.2% of the kernel, not 77.2%.** The score DMA is 7.4%, unchanged.
+>
+> ⛔ SUPERSEDED by `probes/08` (`j-300d4690`) **and by the ρ derivation**: at the shipping ρ = 0.40005 `addupdate_scatter` is **22.2%**
+> and the score DMA **2.8%**. The `hist0` and walk rows scale with ρ; the fixed V4 sweeps do not, and
+> they become **42.2%** of the kernel — the largest object in it. `hardware_map.md` stage C′.
+
+**The residual row is the finding, and it is not rounding.** The priced per-wave terms sum to 6.991
+µs/wave against a measured base slope of 9.531 µs/wave — **they explain 73% of it**. At 17.9% of the
+kernel this is larger than the score DMA and comparable to the refinement walk. It is not a design
+question until it has a probe; the plausible mechanisms are per-`parallel_loop` entry cost (the base
+enters ~8 per wave, ~256 per call), the per-wave `pl.when` predicates and scalar prologue, and the
+`fori_loop` itself.
+
+**Shipping decode, `b=64 n=10240 k=2048 P=1`, incumbent 51.027 µs:**
 
 | | µs | share |
 | --- | --- | --- |
-| mesh entry / program load | 21.3 | 4.7% |
-| **score DMA — what the caller asked about** | **33.4** | **7.4%** |
-| `cvt` monotone_key | 20.6 | 4.6% |
-| `hist0` dense `addupdate_scatter` | 116.3 | 25.8% |
-| refinement scatters (×2.03) | 232.1 | 51.4% |
-| `emit` | 27.5 | 6.1% |
-| | **451.1** | model vs 451.226 measured |
-
-> **`addupdate_scatter` is 77.2% of the kernel. The DMA is 7.4%.**
-
-**Shipping decode, `b=64 n=10240 k=2048 P=1`, measured 51.6 µs:**
-
-| | µs | share |
-| --- | --- | --- |
-| **mesh entry / program load** | **21.3** | **41.3%** |
-| score DMA | 2.1 | 4.0% |
-| `cvt` + `hist0` + refinements + `emit` | 28.2 | 54.6% |
+| **launch intercept** | **22.04** | **43.20%** |
+| base per-wave work (2 waves) | 19.06 | 37.36% |
+| refinement fixed sweeps (×2.545) | 4.51 | 8.84% |
+| refinement `L` walk (×2.545) | 5.41 | 10.61% |
 
 At decode the largest single line is **not work at all** — it is the fixed cost of entering the
-kernel, paid once per launch regardless of `b`. Two caveats on that number, both real: the harness's
-paired `REPS_LO`/`REPS_HI` slope is designed to cancel host dispatch, but the measured `dispatch
-floor` on these shards (19.2–27.3 µs/call) is uncomfortably close to the 21.3 µs intercept, so I
-cannot fully separate residual host dispatch from on-device program load; and turning this into an
-e2e claim needs the per-step launch count (§4 unknown 4), which is not established.
+kernel, paid once per launch regardless of `b`, and probe 07's arms put it slightly higher than §5d
+did. Two caveats, both real and both unchanged: the harness's paired `REPS_LO`/`REPS_HI` slope is
+designed to cancel host dispatch, but probe 07's **null arm — a trivial jitted `x + 1.0` that never
+touches the SparseCore — measures 27.19–27.36 µs**, which is *above* the 22.04 µs intercept. So a
+substantial part of what looks like on-device program load may be instrument-side dispatch that the
+slope does not remove, and the two cannot be separated by this instrument at all. Turning the
+intercept into an e2e claim also needs the per-step launch count (§4 unknown 4), which is not
+established. **Treat 22.04 µs as an upper bound on an on-device cost, not as one.**
 
 ### 5f. Verdict
 
 | | |
 | --- | --- |
-| **Is there headroom in this block?** | **Yes, and a lot** — 8.9% of the HBM floor, 77% of time in one primitive. |
-| **Is it in the DMA the caller pointed at?** | **No.** Ceiling below. |
+| **Is there headroom in this block?** | **Yes, and a lot** — 8.9% of the HBM floor, and no single row above 26%. |
+| **Is it in the DMA the caller pointed at?** | **No.** Ceiling in §6. |
 | **Does the process continue?** | **Yes.** The ≥80% "do not write a kernel" refusal does not fire. |
+
+⚠ **The shape of the answer changed at probe 07 and it matters for how step 2 is run.** Before, one
+row was 51.4% and everything else was noise around it, so the exercise had an obvious target. After,
+the largest row is 25.6%, four rows sit between 17% and 19%, and **the top three together are 62%**.
+There is no single win here — a good outcome will be a composition of several, which is what step 4
+is for.
 
 ---
 
@@ -609,10 +701,28 @@ the first wave's load can never be hidden:
 | shape | waves | stage1 | DMA (slope only) | DMA % | **ceiling on the caller's change** |
 | --- | --- | --- | --- | --- | --- |
 | `b=16 n=10240` P=2 | 1 | 33.4 µs | 1.0 µs | 3.1% | **0.00%** (nothing to overlap) |
-| **`b=64 n=10240` P=1 — DECODE** | 2 | 51.6 µs | 2.1 µs | 4.0% | **−2.02%** |
-| **`b=1024 n=10240` P=1 — PREFILL** | 32 | 451.2 µs | 33.4 µs | 7.4% | **−7.18%** |
+| **`b=64 n=10240` P=1 — DECODE** | 2 | 51.6 µs | 2.1 µs | 4.0% | ⛔ **−2.02% → −1.97%** |
+| **`b=1024 n=10240` P=1 — PREFILL** | 32 | 451.2 µs | 33.4 µs | 7.4% | ⛔ **−7.18% → −4.12%** |
 | `b=16 n=133120` P=4 | 2 | 94.4 µs | 4.0 µs | 4.2% | −2.12% |
 | `b=1024 n=133120` P=4 | 128 | 4801.6 µs | 256.1 µs | 5.3% | −5.29% |
+
+> ⛔ **The two shipping rows are superseded — read `probes/08-per-wave-residual/` before quoting this
+> table.** `j-300d4690-d53e-441e-9d39` measured the transfer's *exposed* cost directly, by deleting it:
+> **13.469 µs at b=1024 and 0.809 µs at b=64**, against the 33.4 / 2.1 µs this table derives from a
+> bandwidth-and-slope fit. 41.94 MB in 13.469 µs is 3114 GB/s, above the
+> `sparsecore-hbm-read-bandwidth-2138-gbs` figure — that one was itself a fit carrying a 21.9 µs
+> intercept and does not govern this access pattern.
+>
+> The mechanism for the gap is the more useful half: **`cvt`, the traversal that runs immediately
+> after the transfer, is already absorbing much of its arrival latency** — deleting `cvt` makes the
+> kernel 20.5 µs *slower*. So the double buffer partly competes with an existing mitigation instead of
+> adding to it, and the realised number should be expected below −4.12%, not near it.
+>
+> Two further corrections from the same job, both in the caller's favour to know early: the **21.3 µs
+> launch intercept this section reasons about is the instrument's own per-call dispatch fence, not
+> program load** — launching this kernel one extra time at constant total work costs −0.704 µs — and
+> at the shipping ρ = 0.40005 the score DMA is **2.8%** of the prefill kernel, not 7.4%, because the
+> transfer is static-length while every compute pass is ρ-scaled. `hardware_map.md` stage C′ has both.
 
 These are **ceilings on a perfect implementation**, not predictions. Two things make the realised
 number smaller: the DMA engine writes VMEM while the VPU reads it, and the kernel is scatter-bound
@@ -711,7 +821,7 @@ pristine `b11b6eb6` `src/` mapped over it; `--rounds 9`, paired `REPS_LO=20`/`RE
 median of 9 rounds, arms interleaved and reshuffled per round.
 
 **The null spread is the floor a variant delta has to clear**, and it is not the same at every
-shape: **3.37% at decode** against 0.72% at prefill. A −2.02% decode change — which is the ceiling
+shape: **3.37% at decode** against 0.72% at prefill. A −2.02% decode change (⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **−1.97%**) — which is the ceiling
 on the caller's mechanism (§6) — is **inside the decode null floor**. It cannot be resolved at this
 shape by this instrument, however well implemented. That is a fact about the measurement, not a
 prediction about the change, and step 3 must either measure decode differently (more rounds, or
@@ -789,7 +899,7 @@ this report is at `--ctx 9216` for that reason. Other constants checked: `CSA_TO
 
 | # | probe | question | job | answer | decided |
 | --- | --- | --- | --- | --- | --- |
-| 01 | `decomp-9216` | what is the DMA fraction of the kernel at the **shipping** shapes, measured as a ratio inside one job? | `j-fa60ff2a-c793-4f32-9576` | 3.1% / 4.0% / 7.4% at `b=16/64/1024` once the launch intercept is removed — **not** the 66%/44%/12% the harness gate prints | the caller's mechanism is capped at −7.18% (prefill) / −2.02% (decode) |
+| 01 | `decomp-9216` | what is the DMA fraction of the kernel at the **shipping** shapes, measured as a ratio inside one job? | `j-fa60ff2a-c793-4f32-9576` | 3.1% / 4.0% / 7.4% at `b=16/64/1024` once the launch intercept is removed — **not** the 66%/44%/12% the harness gate prints | the caller's mechanism is capped at −7.18% (prefill) / −2.02% (decode). ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **−4.12% / −1.97%** |
 | 02 | `decomp-128k` | does the stored "5.78% of stage 1 is DMA" reproduce? | same | yes — 5.3% hideable, and the stored 1.9924 µs/wave reproduces at 2.001 | the stored numbers are sound *at the shape they were taken*; they are simply not the shipping shape |
 | 03 | `passes-9216` | what does a VMEM-resident SparseCore pass cost? (no `references/` entry exists) | same | `cvt` 20.589, `emit1` 27.456, sparse scatter 35.243, **dense scatter 116.350** µs/pass | the price sheet for every step-2 candidate; and `addupdate_scatter` is 77% of the kernel |
 | 04 | `bw-9216` | what is the DMA slope at the shipping 40 KiB slice? | same | `21.349 µs + 1.0447 µs/wave`; 1255 GB/s apparent, ≈3113 GB/s asymptotic with ≈0.62 µs/wave fixed | separates hideable transfer from unhideable launch cost — the correction that overturns probe 01's printed gate |
@@ -805,23 +915,30 @@ changed a decision — but the answer was derivable exactly from the kernel's ow
 
 ## 9. Carried to step 2
 
-**Step 2 opens with a probe, not a design.** §5d′ shows the split between `hist0` and the refinement
-levels is off by ~150 µs — a third of the kernel — and candidate 1's prize swings 3× on the answer.
-One arm resolves it: time a refinement level with `active_walk` forced to 0, keeping
-`zero_priv`/`fold_priv`/`scan_glob`, and difference it against the full level. That separates the
-fixed 4096-word histogram sweep from the `L`-word walk, which is the whole question.
+**Step 2 opened with a probe, not a design, and the probe reordered this list.**
+`probes/07-refinement-fixed-vs-walk` (`j-098b260f-a9f7-4fe5-937c`) resolved §5d′: the refinement
+region is **28.1%** of the prefill kernel, not 51.4%, and the ~150 µs that had been assigned to it
+belongs to the base. The table below is the post-probe ranking; the pre-probe one is in this file's
+git history.
 
-Candidates, ranked by measured prize at the shipping prefill shape. **The caller's mechanism is the
-smallest of the three and is the only one whose prize is not in question** — it is measured against
-the DMA slope, which §5d′ does not touch. It is built because it was the explicit ask, it is
-non-zero, and the marginal cost of one more variant is minutes plus one job.
+Candidates, ranked by **measured** prize at the shipping prefill shape (`b=1024`, 454.602 µs).
 
-| # | candidate | mechanism | measured prize (ceiling) | route |
+> ⛔ SUPERSEDED by `probes/08` (`j-300d4690`) **and reordered by the ρ derivation.** The ranking below is a ρ = 1 ranking taken
+> before the regions were measured jointly. `hardware_map.md` stage C′ has the current one: the fixed
+> V4 sweeps 42.2%, the unattributed residual 27.6%, `hist0` 11.5%, the caller's DMA 2.8%.
+**There is no longer a dominant candidate** — the top three are 25.6%, 18.7% and 17.9%, and a good
+outcome composes several.
+
+| # | candidate | mechanism | measured prize (share of the prefill kernel) | route |
 | --- | --- | --- | --- | --- |
-| 1 | **refinement walk** | `ref_body` (227-243) walks all `L` words to test `match` though almost none match after L0. Compacting L0's straddling bucket once would make the ~2.03 refinement passes proportional to `cnt`, not `L` | **⚠ 51.4% of the kernel is an UPPER BOUND on the region, not the prize.** §5d′ puts the walk's own share as low as ~15.8%; the resolving probe runs first | step 2, this skill, **after the probe** |
-| 2 | **decode launch cost** | 21.3 µs of fixed mesh-entry/program-load, = **41.3% of the decode kernel**. Not proportional to work | up to 41.3% at decode, **but** confounded with residual host dispatch (§5e) and needs §4 unknown 4 to become an e2e claim | step 2, with a probe that separates on-device program load from host dispatch **first** |
-| 3 | **pipelined score DMA — the caller's request** | replace the blocking `start()`/`wait()` at 108-111 with `emit_pipeline` or a hand-rolled double buffer | **−7.18% prefill / −2.02% decode.** Premise and headroom both confirmed at machine-code level (§6); prize not affected by §5d′ | step 2, this skill |
-| — | subcore load imbalance | 1.28× at decode from data-dependent early exit with only 2 rows/subcore (§2) | bounded by candidate 1's term | step 2, likely subsumed by 1 |
+| 1 | **`hist0` dense scatter** | 116.35 µs in one `addupdate_scatter` pass whose mask is dense by construction — every valid word increments a bucket | **25.6%**, and **irreducible for a histogram selection**: it is one scatter per element whatever `NUM_BUCKETS` is. Only a different selection algorithm touches it | step 2, as a **second root** in the design graph — not a tuning move |
+| 2 | **refinement walk** | `ref_body` (227-243) walks all `L` words to test `match` though almost none match after L0. Compacting L0's straddling bucket once would make the ~2.23 refinement passes proportional to `cnt`, not `L` | **18.7%** — measured (84.77 µs), down from the 51.4% upper bound. Close to §5d′'s predicted ~15.8% | step 2, this skill |
+| 3 | **⚠ unattributed per-wave cost** | 2.540 µs/wave that no priced term accounts for; the priced terms explain 73% of the base's per-wave slope | **17.9%** (81.28 µs). **New, and larger than the DMA.** Mechanism unknown — `parallel_loop` entry, `pl.when` predicates, `fori_loop` overhead | step 2, **probe first**. Not a design question until it has one |
+| 4 | **the 16× lane-private histogram** (`hardware_map.md` V4) | `addr = lane_iota*256 + bucket` replicates the 256-bucket histogram 16× to avoid intra-vector scatter conflicts, costing a 4096-word zero **and** a 4096-word fold per level, independent of `L` | **13.6%** — 9.4% across the refinement levels plus 4.2% in L0. Newly separated by probe 07 | step 2, this skill — this is the **`mutate` (algebra) edge** the design graph is required to contain |
+| 5 | **pipelined score DMA — the caller's request** | replace the blocking `start()`/`wait()` at 108-111 with `emit_pipeline` or a hand-rolled cross-wave double buffer | ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **2.8% of the kernel at shipping ρ; ceiling −4.12% prefill / −1.97% decode.** Premise and headroom confirmed at machine-code level (§6). **The one prize probe 07 did not move** | step 2, this skill |
+| 6 | **decode launch cost** | 22.04 µs of fixed intercept = **43.2% of the decode kernel**. Not proportional to work | up to 43.2% at decode, **but** probe 07's null arm — a trivial jitted add that never touches the SparseCore — measures **27.19 µs, above the intercept**. So it may be mostly instrument-side dispatch, and this instrument cannot tell | step 2, **only after** a probe that separates on-device program load from host dispatch |
+| — | subcore load imbalance | 1.28× at decode from data-dependent early exit with only 2 rows/subcore (§2) | bounded by the refinement term, now measured at 19.4% of decode — so the imbalance is worth at most ~4% of decode | step 2, likely subsumed by 2 |
+| — | skipped-level overhead | a `done` level still enters four `parallel_loop`s at bound 0 and runs the scalar epilogue, 3× per row | **unmeasured.** ~3.8 µs/level would explain the whole 2.231-vs-2.03 gap in probe 07 | one arm, foldable into candidate 3's probe |
 | — | ~~LICM in `ref_body`~~ | 4 loop-invariant recomputes survive into the body | **rejected without a job**: ~3 of 14 bundles, and the loop is not issue-bound (§5d″) | closed |
 | — | ~~better scheduling / register pressure~~ | — | **rejected without a job**: hot loops run 4.0–4.7 slots/bundle with zero NOPs and zero spills, except emit (§5d″) | closed |
 

@@ -70,5 +70,5 @@ These are not bugs to fix (the file is frozen), they are traps to route around:
   arm, nothing in this file will catch a copy that lands the wrong bytes** — a checksum against the
   blocking arm has to be added by hand, in the variant's own copy.
 - **Decode deltas below ~3.4%**, the null spread at `b=64` (report §7). The caller's mechanism has a
-  −2.02% decode ceiling, i.e. **inside that floor** — decode must be reported as `not resolvable`
+  −2.02% decode ceiling (⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **−1.97%**), i.e. **inside that floor** — decode must be reported as `not resolvable`
   rather than as `no effect` unless step 3 measures it differently.

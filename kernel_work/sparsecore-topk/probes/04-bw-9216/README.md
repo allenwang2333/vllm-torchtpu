@@ -56,7 +56,7 @@ here — a units slip in the print statement; 3113 GB/s is the value.)
 
 - Probe 01's honest hideable DMA fractions (3.1% / 4.0% / 7.4%) are computed with **this slope**,
   not with `dma_only`.
-- Report §6's ceiling table, and therefore the **−7.18% / −2.02%** cap on the caller's mechanism, is
+- ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): the cap is **−4.12% / −1.97%**. Report §6's ceiling table, and therefore the **−7.18% / −2.02%** cap on the caller's mechanism, is
   this number times `(waves−1)/waves`.
 - The 0.62 µs per-wave fixed component is a **second** thing a cross-wave double buffer might hide
   and a streaming pipeline might not; step 2 should not assume the two are the same term.

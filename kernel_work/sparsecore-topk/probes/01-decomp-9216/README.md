@@ -50,6 +50,6 @@ intercept too. Pipelining cannot remove it. Removing it (probe 04's two-point fi
 
 ## Decided
 
-The caller's mechanism is capped at **−7.18% at prefill, −2.02% at decode**, per report §6 — and
+The caller's mechanism is capped at **−7.18% at prefill, −2.02% at decode**, per report §6 (⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **−4.12% / −1.97%**, measured by deleting the transfer rather than fitting its slope) — and
 built anyway, since it is non-zero and explicitly asked for. It is carried as candidate 3 of 3,
 below the refinement walk, and that ranking is stated to the caller rather than buried.

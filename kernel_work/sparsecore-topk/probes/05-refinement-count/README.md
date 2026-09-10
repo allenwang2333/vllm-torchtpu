@@ -53,9 +53,19 @@ Two findings, one of which was not the question:
 
 ## Decided
 
-- Report §5d fits its single free parameter against `crit/row`, giving **114.3 µs per refinement
-  pass = 0.98× a dense scatter**, and validates out of sample at `b=64` to **−0.14%**.
-- Report §9 ranks the refinement walk (51.4% of the kernel) above the caller's DMA mechanism (7.4%).
+- ⛔ **RETRACTED.** This read: report §5d fits its single free parameter against `crit/row`, giving
+  **114.3 µs per refinement pass = 0.98× a dense scatter**, validated out of sample at `b=64` to
+  **−0.14%**. `probes/07-refinement-fixed-vs-walk` measured **57.196 µs per level** — the fit was
+  **2.00× too high**, and the −0.14% out-of-sample check was worthless because it extrapolated along
+  wave count, the one axis the confounded terms both scale on.
+- ⛔ **RETRACTED.** Report §9 no longer ranks the refinement walk above the caller's DMA mechanism at
+  51.4%; the walk is **18.7%** measured, third in the list.
+- ✅ **What this probe got right, and it is the load-bearing half.** Probe 07's `implied active
+  levels` reads **2.545** at decode against this probe's critical-subcore **2.50** — **1.8%**. The
+  host replay of `done` is confirmed on hardware at the shape where the imbalance is largest.
+  Prefill reads 2.231 against 2.03 (9.9%), and the likeliest cause is not this probe but a skipped
+  level not being free in the incumbent (four `parallel_loop`s at bound 0 plus the scalar epilogue,
+  3× per row) — ~3.8 µs/level would close the gap entirely. One arm would settle it.
 
 **Caveat carried forward.** The count is exact *given a distribution*, and the distribution is
 assumed. `uniform` moves the prefill figure 2.03 → 2.25 (11% on half the kernel) and `heavy_ties`
