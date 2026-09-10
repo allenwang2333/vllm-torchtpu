@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DCP-side accessors over `cp_mesh.py`'s shared layout and mesh helpers.
+"""The DCP-side accessors over `mesh_utils.py`'s shared layout/mesh helpers.
 
 Both helpers are one-liners, and both are one-liners whose failure mode is
 silent: a mesh built over the wrong group, or over the right group under the
@@ -13,7 +13,7 @@ question here is what it gets called with.
 
 import pytest
 
-from vllm_torchtpu.distributed import cp_mesh, dcp, pcp
+from vllm_torchtpu.distributed import dcp, mesh_utils, pcp
 
 
 class _FakeGroup:
@@ -70,11 +70,11 @@ def test_layout_describes_the_group_it_is_given(monkeypatch):
     dcp_group = _FakeGroup([0, 1, 2, 3], rank_in_group=2)
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: pcp_group)
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: dcp_group)
-    monkeypatch.setattr(cp_mesh, "_collect_rank_to_device_id",
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id",
                         lambda group, *_: {r: 10 + r
                                            for r in group.ranks})
-    monkeypatch.setattr(cp_mesh, "_get_current_global_rank", lambda: 2)
-    monkeypatch.setattr(cp_mesh, "_get_tpu_global_device_id", lambda: 12)
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 2)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 12)
 
     # The no-argument call is the pre-existing PCP contract, and it still
     # holds -- extracting the shared helper did not change pcp.py's surface.

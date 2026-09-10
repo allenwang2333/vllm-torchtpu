@@ -6,7 +6,8 @@ their process group paired with the TPU device each one sits on, and a
 one-axis JAX mesh laid out in that order. Neither is specific to which axis
 asked -- a layout is just "this group's ranks, in order, and where they live"
 
-Named for `ep_mesh.py`, which plays the same role for expert parallelism.
+`ep_mesh.py` builds its own mesh but takes the rank/device helpers from here
+too, which is why this module is named for the job rather than for an axis.
 """
 
 from __future__ import annotations

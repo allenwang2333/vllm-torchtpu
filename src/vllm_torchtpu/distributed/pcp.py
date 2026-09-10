@@ -6,9 +6,9 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.distributed.cp_mesh import (CpGroupLayout,
-                                               get_cp_group_layout,
-                                               get_or_create_cp_mesh)
+from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
+                                                  get_cp_group_layout,
+                                                  get_or_create_cp_mesh)
 
 PcpGroupLayout = CpGroupLayout
 
