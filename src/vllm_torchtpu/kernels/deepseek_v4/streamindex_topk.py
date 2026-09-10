@@ -1049,11 +1049,16 @@ def streamindex_topk(
     )
 
 
-def _select_owned_winners(merged, dcp_size: int, interleave_c: int, dcp_rank):
+def _select_owned_winners(
+    merged: jax.Array,
+    dcp_size: int,
+    interleave_c: int,
+    dcp_rank: jax.Array | int,
+) -> jax.Array:
     """Keep the winners this rank owns, left-packed as rank-local indices.
 
-    Run on an all-gathered `merged`, so every rank filters the *same* list with
-    a different `dcp_rank`. `cp_owner_rank` is single-valued and its codomain is
+    Every rank filters the *same* `merged` list with a different `dcp_rank`.
+    `cp_owner_rank` is single-valued and its codomain is
     exactly `range(dcp_size)`, so the `dcp_size` results are a partition of the
     global top-k: no winner is kept twice and none is lost. That is an
     arithmetic identity rather than a property of how full the buffer is, which
@@ -1126,37 +1131,48 @@ def streamindex_topk_dcp(
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
-    Same three-stage core as the unsharded `streamindex_topk` -- score locally,
-    all-to-all the candidates, merge with `sparsecore_topk` -- and exact
-    because DCP *partitions* the KV positions: a global winner is beaten by at
-    most `k - 1` positions overall and therefore by at most `k - 1` on its
-    owner, so it always survives that rank's local top-k.
+    Architecture:
+      1. Local scoring. Every rank scores the replicated query tokens against
+         its own KV shard via `streamindex_topk`, giving candidate indices and
+         scores of shape `[T, k]`. This is exact because DCP *partitions* the
+         KV positions: a global winner is beaten by at most `k - 1` positions
+         overall and therefore by at most `k - 1` on its owner rank, so it
+         always survives that rank's local top-k.
+      2. Candidate all-gather. `[T, k] -> [T, dcp_size * k]` along the
+         *candidate* axis, concatenated in source-rank order. The token axis is
+         never partitioned, so every rank ends up holding every token's full
+         candidate set.
+      3. Merge. `sparsecore_topk` over the concatenated scores picks the exact
+         global winners, `[T, dcp_size * k] -> [T, k]`.
+      4. Rank-local filtering. `_select_owned_winners` keeps the winners this
+         rank holds, maps them to shard coordinates and left-packs them.
 
-    What the sharding adds is the return leg. Queries are replicated and the KV
-    is sharded, so every rank needs, for *every* token, the slice of that
-    token's global top-k that it happens to hold. The merge therefore does not
-    stop at the merged list -- it hands every rank the whole list and lets each
-    keep the winners it owns.
+    Steps 2-4 replace an earlier form that all-to-all'd the token axis, merged
+    `[T / dcp_size, dcp_size * k]` once per rank, then all-gathered the merged
+    lists back. Consolidating into a single upfront collective phase drops the
+    barrier between those two collectives and leaves `T` unpartitioned, so no
+    permutation tables or token-count divisibility bookkeeping are needed. It
+    is not free: every rank now merges `dcp_size`x as many rows, and two
+    full-width all-gathers move on the order of `2 * dcp_size / 3` times the
+    bytes that the all-to-all plus the narrow return gather did.
 
-    That return leg is an all-gather rather than an all-to-all of pre-split
-    lists, and the difference is exactness. An all-to-all can only carry a
-    static per-rank width, so it has to bet that no rank owns more than that
-    many of any token's winners; the bet is unenforceable, because winners
-    correlated with `position mod (interleave_size * dcp_size)` can concentrate
-    arbitrarily, and losing it silently discards real winners (`sparsecore_topk`
-    rows are unsorted, so the discarded subset is arbitrary rather than the
-    weakest). Filtering an all-gathered list has no such width: `cp_owner_rank`
-    is single-valued and onto `range(dcp_size)`, so the per-rank results are a
-    partition of the global top-k by construction. The price is `k * 4` bytes
-    per token on the wire instead of `capacity * 4`, and the compaction done
-    `dcp_size` times instead of once -- but the compaction is one scatter either
-    way, since filtering for one rank replaces the `dcp_size`-way unrolled split.
+    Steps 3 and 4 require every rank to produce a bit-identical `merged`. They
+    do -- an all-gather delivers the same concatenation everywhere and
+    `sparsecore_topk` is deterministic -- but that is load-bearing here in a way
+    it was not when a single rank merged each token: were two ranks to break a
+    score tie differently, `_select_owned_winners` would stop partitioning and
+    could duplicate or drop a winner.
+
+    No stage bets on capacity. `cp_owner_rank` is single-valued and onto
+    `range(dcp_size)`, so the per-rank filter results partition the global
+    top-k by construction and nothing has to assume a bound on how many of a
+    token's winners one rank holds. That matters because winners correlated
+    with `position mod (interleave_size * dcp_size)` can concentrate
+    arbitrarily, and `sparsecore_topk` rows are unsorted, so a truncation would
+    discard an arbitrary subset rather than the weakest.
 
     Args:
       q, indexer_weights: replicated, in natural request-major token order.
-        There is no rank-major packing here -- with replicated queries the
-        split of tokens across merge ranks is arbitrary, so it is a plain
-        contiguous split and needs no permutation tables.
       cache_kv: this rank's shard of the compressed KV cache.
       page_indices: replicated *virtual* page ordinals, resolved against each
         rank's own shard by `local = virtual % num_local_pages`.
@@ -1183,6 +1199,10 @@ def streamindex_topk_dcp(
     if mesh.shape[dcp_axis_name] != dcp_size:
         raise ValueError(f"dcp_size={dcp_size} does not match mesh axis "
                          f"{dcp_axis_name!r}={mesh.shape[dcp_axis_name]}.")
+    # The merge no longer splits the token axis, so this is not needed to make
+    # a collective line up. It stays as a caller-contract check: the attention
+    # side pads tokens to a bucket and indexes the returned rows per rank, and
+    # a ragged `T` there is a bug worth catching at the boundary.
     if q.shape[0] % dcp_size != 0:
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by "
@@ -1195,6 +1215,7 @@ def streamindex_topk_dcp(
         local_page_indices = jnp.mod(page_indices,
                                      jnp.int32(cache_kv.shape[0]))
 
+        # Stage 1. Score every (replicated) token against this rank's shard.
         idxs, scores = streamindex_topk(
             q,
             indexer_weights,
@@ -1216,13 +1237,16 @@ def streamindex_topk_dcp(
             return_scores=True,
         )
 
-        # Stage 1. [T, k] -> [T // dcp, dcp * k]; the candidate axis is now a
-        # concatenation over source ranks, in source order.
-        idxs = lax.all_to_all(idxs, dcp_axis_name, 0, 1, tiled=True)
-        scores = lax.all_to_all(scores, dcp_axis_name, 0, 1, tiled=True)
+        # Stage 2. Widen the candidate axis instead of splitting the token
+        # axis: [T, k] -> [T, dcp * k], concatenated in source-rank order. Both
+        # gathers are the only communication in the op.
+        idxs = lax.all_gather(idxs, dcp_axis_name, axis=1, tiled=True)
+        scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
 
-        # Stage 2. Full width as the row length: -inf entries (unfilled local
+        # Stage 3. Full width as the row length: -inf entries (unfilled local
         # slots, padding tokens) are never selected, so they need no masking.
+        # Every rank runs this over identical inputs and so reaches an
+        # identical `merged`, which stage 4 depends on.
         slots = sparsecore_topk(
             scores,
             k,
@@ -1234,11 +1258,7 @@ def streamindex_topk_dcp(
         merged = jnp.take_along_axis(idxs, jnp.maximum(slots, 0), axis=1)
         merged = jnp.where(slots >= 0, merged, -1)
 
-        # Stage 3. Hand every rank every merged list, then keep what this rank
-        # owns. [T // dcp, k] -> [T, k]; the gather concatenates in axis-index
-        # order, which is exactly the order stage 1 split the tokens in, so
-        # tokens come back in their original order.
-        merged = lax.all_gather(merged, dcp_axis_name, axis=0, tiled=True)
+        # Stage 4. Keep what this rank owns.
         return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
 
     replicated = P()
