@@ -66,9 +66,12 @@ sparse scatter over a full walk.
 
 This is the price sheet every step-2 candidate is costed against, and probe 07 vindicated it.
 
-- ⛔ SUPERSEDED by `probes/08` (`j-300d4690`) **and by the ρ derivation**: at the shipping ρ = 0.40005 this is **22.2%**, and the
-  fixed V4 sweeps — which do *not* scale with ρ — overtake it at **42.2%**. The price sheet itself
-  stands; only its share of the kernel moved.
+- ⛔ SUPERSEDED twice. At the shipping ρ = 0.40005 the histogram scatter is **28.4%** of the prefill
+  kernel (`hardware_map.md` stage **C″**) — still the largest *structural* lever, and the second root.
+  The intermediate claim that the fixed V4 sweeps overtake it at 42.2% is **retracted**: `probes/09`
+  prices the sweeps at 8.2%. The price sheet itself stands; only its share of the kernel moved, and
+  ⚠ **the largest object in the kernel is now the D3 residual at 39.8%, which this sheet does not
+  price at all.**
 - `addupdate_scatter` is **44.2%** of the shipping prefill kernel (`hist0` 25.6% + refinement walk
   18.7%), against the DMA's 7.4%. ⛔ **This line previously read 77.2%** — that figure came from the
   retracted fit, not from this probe.

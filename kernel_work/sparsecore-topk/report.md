@@ -631,7 +631,7 @@ named rather than distributed.
 | L0's own fixed histogram sweep | 19.19 | 4.22% | measured, probes/07 slope |
 | `emit` | 27.46 | 6.04% | measured, probes/03 |
 | out DMA | 6.69 | 1.47% | **modelled** — 8 KiB against the 40 KiB read's measured slope |
-| **⚠ unattributed per-wave cost** | **81.28** | **17.88%** | **residual, 2.540 µs/wave** |
+| ⛔ **unattributed cost — RETRACTED as per-wave** | **75.683** | **39.8%** at production ρ | **residual; flat in `num_waves` (0.009 µs/wave, `probes/09`). The "2.540 µs/wave" was a division by 32 and the premise is refuted.** |
 | refinement fixed sweeps (×2.231) | 42.81 | 9.42% | measured, probes/07 slope |
 | **refinement `L` walk (×2.231)** | **84.77** | **18.65%** | measured, probes/07 slope |
 | | **454.60** | 100% | |
@@ -640,7 +640,9 @@ named rather than distributed.
 >
 > ⛔ SUPERSEDED by `probes/08` (`j-300d4690`) **and by the ρ derivation**: at the shipping ρ = 0.40005 `addupdate_scatter` is **22.2%**
 > and the score DMA **2.8%**. The `hist0` and walk rows scale with ρ; the fixed V4 sweeps do not, and
-> they become **42.2%** of the kernel — the largest object in it. `hardware_map.md` stage C′.
+> ⛔ **RETRACTED.** `probes/09` prices the four sweep primitives at **18.866 µs**, not 151.3 — probe 08's
+> arm deleted the sweeps plus all refinement plus most of emit. The sweeps are **8.2%**, not 42.2%,
+> and D13 falls from #1 to 4th. See `hardware_map.md` stage **C″**.
 
 **The residual row is the finding, and it is not rounding.** The priced per-wave terms sum to 6.991
 µs/wave against a measured base slope of 9.531 µs/wave — **they explain 73% of it**. At 17.9% of the
@@ -925,7 +927,8 @@ Candidates, ranked by **measured** prize at the shipping prefill shape (`b=1024`
 
 > ⛔ SUPERSEDED by `probes/08` (`j-300d4690`) **and reordered by the ρ derivation.** The ranking below is a ρ = 1 ranking taken
 > before the regions were measured jointly. `hardware_map.md` stage C′ has the current one: the fixed
-> V4 sweeps 42.2%, the unattributed residual 27.6%, `hist0` 11.5%, the caller's DMA 2.8%.
+> ⛔ **RETRACTED — this is stage C′, superseded by C″.** The sheet in force reads: **residual 39.8%,
+> `hist0` 17.8%, `emit` 17.7%, refinement hist 10.6%, V4 sweeps 8.2%, the caller's DMA 7.1%.**
 **There is no longer a dominant candidate** — the top three are 25.6%, 18.7% and 17.9%, and a good
 outcome composes several.
 
@@ -933,7 +936,7 @@ outcome composes several.
 | --- | --- | --- | --- | --- |
 | 1 | **`hist0` dense scatter** | 116.35 µs in one `addupdate_scatter` pass whose mask is dense by construction — every valid word increments a bucket | **25.6%**, and **irreducible for a histogram selection**: it is one scatter per element whatever `NUM_BUCKETS` is. Only a different selection algorithm touches it | step 2, as a **second root** in the design graph — not a tuning move |
 | 2 | **refinement walk** | `ref_body` (227-243) walks all `L` words to test `match` though almost none match after L0. Compacting L0's straddling bucket once would make the ~2.23 refinement passes proportional to `cnt`, not `L` | **18.7%** — measured (84.77 µs), down from the 51.4% upper bound. Close to §5d′'s predicted ~15.8% | step 2, this skill |
-| 3 | **⚠ unattributed per-wave cost** | 2.540 µs/wave that no priced term accounts for; the priced terms explain 73% of the base's per-wave slope | **17.9%** (81.28 µs). **New, and larger than the DMA.** Mechanism unknown — `parallel_loop` entry, `pl.when` predicates, `fori_loop` overhead | step 2, **probe first**. Not a design question until it has one |
+| 1 | ⚠ **unattributed cost** | 75.683 µs that no priced term accounts for. ⛔ **Not per-wave** — measured flat at 0.009 µs/wave (`probes/09`); it scales with `b` by some other axis | ⚠ **39.8%** at production ρ — **the largest object in the kernel**, and 5.6× the caller's DMA hypothesis. Four mechanisms refuted: per-wave barrier, DMA latency, `parallel_loop` entry, the wave loop itself | `probes/10`, in flight. Still **probe first** |
 | 4 | **the 16× lane-private histogram** (`hardware_map.md` V4) | `addr = lane_iota*256 + bucket` replicates the 256-bucket histogram 16× to avoid intra-vector scatter conflicts, costing a 4096-word zero **and** a 4096-word fold per level, independent of `L` | **13.6%** — 9.4% across the refinement levels plus 4.2% in L0. Newly separated by probe 07 | step 2, this skill — this is the **`mutate` (algebra) edge** the design graph is required to contain |
 | 5 | **pipelined score DMA — the caller's request** | replace the blocking `start()`/`wait()` at 108-111 with `emit_pipeline` or a hand-rolled cross-wave double buffer | ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **2.8% of the kernel at shipping ρ; ceiling −4.12% prefill / −1.97% decode.** Premise and headroom confirmed at machine-code level (§6). **The one prize probe 07 did not move** | step 2, this skill |
 | 6 | **decode launch cost** | 22.04 µs of fixed intercept = **43.2% of the decode kernel**. Not proportional to work | up to 43.2% at decode, **but** probe 07's null arm — a trivial jitted add that never touches the SparseCore — measures **27.19 µs, above the intercept**. So it may be mostly instrument-side dispatch, and this instrument cannot tell | step 2, **only after** a probe that separates on-device program load from host dispatch |

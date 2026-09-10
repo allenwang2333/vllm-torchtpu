@@ -144,10 +144,15 @@ times. A per-level skip overhead of ~3.8 µs would move 2.231 to 2.03 by itself.
    candidate on its own because the mis-fitted refinement term stood above it. It is also
    irreducible for a histogram selection — one scatter per element, whatever `NUM_BUCKETS` is — so
    it is a `mutate`/second-root question for `design.md`, not a tuning one.
-4. **A new candidate, 17.9% of the prefill kernel: ~81 µs of unattributed per-wave cost**
+4. **A new candidate, and it is now the largest object in the kernel: ~81 µs of unattributed cost**
    (2.540 µs/wave against 6.991 µs/wave of priced work — the priced terms explain only 73% of the
-   base's per-wave slope). Larger than the score DMA. It needs its own probe and it is not a design
+   base's slope). Larger than the score DMA. It needs its own probe and it is not a design
    question until it has one.
+   > ⚠ **The "per wave" label is wrong, though the slope is real.** This slope was fitted across
+   > b=64 and b=1024, which moves `b` and `num_waves` together. `probes/09` held `b` fixed and varied
+   > `num_waves` alone: **0.009 µs/wave**. So this is a per-**b** slope, and the wave loop is free.
+   > The term itself survived — de-contaminated it is **75.683 µs, 39.8% of the production prefill
+   > kernel** (`hardware_map.md` stage C″). Probe 07 was right that it was the thing to probe next.
 5. **The 16× lane-private histogram replication (`hardware_map.md` V4) is worth 13.6% of the prefill
    kernel** — 9.4% in the refinement levels plus 4.2% in L0 — and is now a first-class candidate.
 6. `probes/03`'s price sheet is **vindicated** and stays the price sheet. What was wrong was the fit

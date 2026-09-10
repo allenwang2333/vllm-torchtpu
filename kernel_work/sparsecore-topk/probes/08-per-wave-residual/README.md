@@ -1,5 +1,24 @@
 # Probe 08 — `per-wave-residual`: what is the 81 µs that belongs to no op?
 
+> ⛔ **THREE OF THIS PROBE'S CONCLUSIONS ARE RETRACTED by `probes/09` (`j-4e0df30a`).** The measured
+> arm times below are unchanged and still good; the *interpretation* of three of them is not.
+>
+> 1. **`-sweep` = 151.324 is not the sweep's cost.** Zeroing the four sweep bounds sets `total = 0`,
+>    which makes `keep_all` true and exits the refinement loop, and leaves `b_star` garbage, which
+>    collapses emit's mask density. The arm deleted the sweeps **plus all refinement plus most of
+>    emit**. The four primitives cost **18.866 µs**. Everything below about D13, "~92% of the sweep
+>    is chain depth", and D13's promotion to first is **void** — `zero_priv`, a dense 256-bucket
+>    clear, is half the sweep, and D5 already takes it.
+> 2. **The residual is not per-wave.** `probes/09` measured the slope against `num_waves` directly
+>    (0.009 µs/wave) instead of dividing a total by 32. Every "2.561 µs/wave" figure below, and the
+>    M1 prize computed from it, is arithmetic on a quantity that does not exist. De-contaminated of
+>    `fill` and the output DMA the residual is **75.683 µs**.
+> 3. **Super-additivity by 1.625× is retracted.** It was the one overlapping arm in (1). The regions
+>    are additive to 2.3%. **Divide nothing by 1.625.**
+>
+> What stands: D4 closed, D1's score DMA at 13.469 µs, D5 bit-exact, `cvt`'s negative marginal cost,
+> and the skipped-level refutation. The sheet in force is `hardware_map.md` stage **C″**.
+
 **Question.** Stage C's balance sheet left **81.28 µs — 17.9% of the prefill kernel — attributed to
 nothing**, and priced the launch intercept at 22.042 µs against an instrument whose own null reads
 *higher*. Three mechanisms survived the bundle argument (M1 the per-wave `sfence`+`barrier`, M2 score-DMA

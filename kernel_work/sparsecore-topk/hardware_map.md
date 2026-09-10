@@ -11,15 +11,28 @@ a measurement, it cites the section or the probe folder.
 `(new − old)/old` of *time*, so negative is faster. Signed percentages appear only in a `Δ time %`
 column; prose states the direction in words.
 
-**Status.** Stages A–D complete; the stage-D probe wave is running. `probes/08-per-wave-residual/`
-returned (`j-300d4690-d53e-441e-9d39`) and **rewrote most of stage C**: the launch intercept was the
-instrument (D4 closed), the score DMA is 13.469 µs not 33.43 (D1's ceiling −4.12%, not −7.18%), D5's
-gate answered **yes** with a bit-exact −3.73%, and the regions turn out **super-additive by 1.625×**.
-The host ρ derivation then added stage **C′**, which inverts the ranking: at the shipping ρ = 0.40005
-the two fixed V4 sweeps are **42.2%** of the prefill kernel and `hist0` is 11.5%. `probes/09` is in
-flight to split the sweep and de-contaminate D3. Then stage E in `design.md`.
+**Status.** Stages A–D complete; the stage-D probe wave is running. Two probes have returned and
+between them the balance sheet has been rewritten twice.
 
-⚠ **Nothing below that predates `probes/08` should be quoted without checking it against stage C′.**
+`probes/08-per-wave-residual/` (`j-300d4690-d53e-441e-9d39`) closed D4 (the launch intercept was the
+instrument), cut the score DMA to 13.469 µs from a modelled 33.43, and answered D5 **yes** with a
+bit-exact −3.73%. The host ρ derivation then added stage **C′**.
+
+`probes/09-sweep-split/` (`j-4e0df30a-d833-4c1c-825d`) then **retracted three of those headlines**
+and produced stage **C″**, which is the sheet in force:
+
+- The V4 sweeps cost **18.866 µs**, not 151.324. Probe 08's `-sweep` arm deleted the sweeps *plus*
+  all refinement *plus* most of emit. **D13 falls from #1 to 4th** and C′'s "42.2%" is void.
+- **Super-additivity is retracted.** Regions are additive to 2.3%; the 1.625× was that one arm.
+  **Divide nothing by 1.625.**
+- The residual is **flat in `num_waves`** (0.009 µs/wave, measured directly). Probe 08's
+  "2.561 µs/wave" was a division, and the division's premise is refuted.
+- De-contaminated, **D3 is 75.683 µs = 39.8% of the production prefill kernel — the largest single
+  object in it**, with no known mechanism. `probes/10-residual-driver/` is in flight to find what it
+  scales with.
+
+⚠ **The sheet in force is stage C″. Stage C and stage C′ are both superseded — nothing below that
+predates `probes/09` should be quoted without checking it against C″.**
 
 ---
 
@@ -314,12 +327,13 @@ no row at all, and both become stage-D blockers.
    exactly as `probes/03` priced it at 0.30× per masked-off lane. It cannot be tuned; it has to be
    replaced — a second root, D2. ⛔ **"and that is why it is the biggest" is retracted**: it is
    11.5% at production ρ, third. It was the biggest only at the instrument's ρ = 1.
-3. **The V4 sweeps are latency, not bytes** — 1.87× their issue count, from `fold_priv`'s 16-deep
-   accumulate and the two 16-step serial carries. ✅ **Confirmed and now much larger than this stage
-   could see.** `probes/08` deleted all four sweep loops for **151.324 µs**, the biggest single delta
-   in the job, and `R1` — which removes the replication entirely, bit-exactly — recovers only 12.2 of
-   it. So **~92% of the sweep is chain depth, not replication**: D13, not D5, and the fix needs no
-   change to `R`. At production ρ the two sweeps are **42.2%** of the kernel.
+3. **The V4 sweeps are latency, not bytes** — 1.87× their issue count. ⛔ **The rest of this item is
+   RETRACTED by `probes/09`.** The four sweep loops cost **18.866 µs**, not 151.324; probe 08's arm
+   also deleted all refinement and most of emit. And the split runs the other way: **`zero_priv`, a
+   dense 256-bucket clear, is 9.238 of the 18.866**, while the two carried scans are 4.698 together.
+   So the sweep is **not** dominated by chain depth, `R1`'s 12.2 µs recovery is now *most* of the
+   sweep rather than 8% of it, and **D5 and D13 are the same saving**. At production ρ the sweeps are
+   **8.2%** of the kernel, not 42.2%.
 
 ### Full prefill balance sheet at ρ = 1 — 434.97 µs of kernel
 
@@ -336,14 +350,14 @@ The L0 base decomposes **exactly**, which is the check that the decomposition is
 | − harness null | 19.630 | two nulls 0.529 apart |
 | **= L0 kernel** | **307.54** | |
 | of which: joint removable five, `B` − `-alld` | **225.58** | **exact** |
-| of which: residual, `-alld` − null | **81.95** | D3 |
-| 225.58 + 81.95 | 307.53 | ✅ closes to 0.003% |
+| of which: residual, `-alld` − null | ⛔ **81.95 → 75.683** (`probes/09` `A0`; 9.261 was `fill`+outdma) | D3 |
+| 225.58 + 81.95 | 307.53 | ⛔ closed to 0.003% **on a contaminated control**. The de-contaminated form is in stage C″, which closes to 1.62% |
 
 | term | single-arm Δ (**upper bound**) | scales with ρ? | tag |
 | --- | --- | --- | --- |
-| V4 sweep — `zero_priv`+`fold_priv`+`scan_glob`+`find_bucket` | **151.324** | **no** | measured, `probes/08` |
+| V4 sweep — `zero_priv`+`fold_priv`+`scan_glob`+`find_bucket` | ⛔ **151.324 → 18.866** (`probes/09`; this arm also deleted all refinement and most of emit) | **no** | superseded |
 | `hist0` dense scatter | **138.306** | yes | measured, `probes/08` |
-| ⚠ residual, belongs to no op | **81.95** | no (per *wave*) | measured by subtraction — D3 |
+| ⚠ residual, belongs to no op | ⛔ **81.95 → 75.683** | no — and ⛔ **not per wave either** (0.009 µs/wave) | superseded by `probes/09` — D3 |
 | `emit` | 84.020 | yes | measured, `probes/08` |
 | refinement `L` walk × 2.231 | 84.79 | yes | measured, `j-098b260f` |
 | refinement V4 sweep × 2.231 | 42.81 | **no** | measured, `j-098b260f` |
@@ -353,11 +367,15 @@ The L0 base decomposes **exactly**, which is the check that the decomposition is
 
 ### ⚠ Three corrections that govern every candidate from here
 
-1. **The regions are super-additive by 1.625×.** The five single-arm deltas sum to 366.628 against a
-   joint `B` − `-alld` of 225.582. They contend for the tilespmem port and the memory system, so
-   deleting one lets the others expand into the time it freed — the in-kernel form of
-   `freed-device-time-spills-onto-untouched-ops`. **Divide any modelled single-region deletion by
-   1.625 before believing it.** The joint is exact; the rows are upper bounds.
+1. ⛔ **RETRACTED — the regions are additive to 2.3%, not super-additive by 1.625×.** The 366.628
+   sum contained one arm, `-sweep`, that deleted three regions rather than one. Substituting
+   `probes/09`'s clean 18.866 gives a sum of **233.979** against a de-contaminated joint of
+   **228.679** — ratio **1.023**. `emit` independently reproduces across two jobs to 0.23%, so it
+   was never super-additive either. **Divide nothing by 1.625.** What survives is the procedural
+   rule — *always measure the joint arm* — and a sharper reading of the mechanism: the over-count
+   was **arm overlap**, not resource contention. When a bound you zero feeds a downstream scalar
+   (`total` → `keep_all` → the refinement loop, and `b_star` → emit's mask density), the arm deletes
+   far more than its name says.
 2. **`cvt` has a *negative* marginal cost — deleting a whole 640-chunk traversal made the kernel 20.5
    µs slower.** `cvt` is the first consumer of `resident_vmem` after the score DMA and is currently
    absorbing the transfer's arrival latency while doing its own useful work. This is why `-dma` reads
@@ -398,7 +416,12 @@ subcore a representative sample, so `max over subcores ≈ mean` whatever the mi
   run zero refinement levels**, by construction, for every row. The refinement terms therefore carry
   an extra 6/8 on top of ρ.
 
-### Prefill balance sheet at production ρ = 0.40005 — ~297 µs
+### ⛔ SUPERSEDED — Prefill balance sheet at production ρ = 0.40005 — ~297 µs
+
+⛔ **This sheet is void. `probes/09` (`j-4e0df30a`) retracted both of its two largest rows.** The V4
+sweeps are 18.866 µs, not 151.3, so "42.2%" is wrong by 5×; and the 1.625 divisor applied below does
+not exist. **Use stage C″.** The ρ *method* below is correct and carries forward unchanged — only the
+ρ=1 inputs it was fed were wrong.
 
 Walk-bound rows scaled by ρ, refinement additionally by 6/8, then the whole removable block divided
 by the 1.625 super-additivity factor:
@@ -433,37 +456,105 @@ count must re-derive it. The 1.625 factor is measured at ρ=1 and **assumed** to
 
 ---
 
+## Stage C″ — the sheet in force
+
+`probes/09` (`j-4e0df30a`) re-measured the two regions C and C′ had wrong. Full derivation and every
+caveat: `probes/09-sweep-split/README.md`. **Cross-job control passes** — `B` reads 326.782 here
+against probe 08's 327.166 (−0.12%) from a byte-identical source.
+
+### At ρ = 1, b = 1024 — the ledger closes to 1.62%
+
+| term | µs | % of `B` | tag |
+| --- | ---: | ---: | --- |
+| `hist`, all levels | 138.306 | 42.3% | measured (`probes/08` `-hist`) |
+| `emit` | 83.830 | 25.7% | **measured** (`probes/09`, `B − E0`) |
+| **residual (D3)** | **75.683** | **23.2%** | **measured** (`probes/09`, `A0 − null`) |
+| V4 sweeps, all levels | 18.866 | 5.8% | **measured** (`probes/09`, `E0 − E0-swp`) |
+| harness fence (null) | 16.548 | 5.1% | measured — instrument, not kernel |
+| score DMA | 13.469 | 4.1% | measured (`probes/08` `-dma`) |
+| output DMA | 5.872 | 1.8% | **measured** (`probes/09`, `B − -out`) |
+| `cvt` | −20.492 | −6.3% | measured (`probes/08`) — negative, and that is real |
+| **sum** | **332.082** | | |
+| **measured `B`** | **326.782** | | closes to **+1.62%** |
+
+**The regions are additive to 2.3%** (singles 233.979 vs the de-contaminated joint 228.679), and
+`emit` reproduces across two jobs to 0.23%. **No prize is divided by 1.625.**
+
+The sweep splits four ways, additive to 0.2%: `zero_priv` **9.238** · `fold_priv` 4.900 ·
+`scan_glob` 3.498 · `find_bucket` 1.200. Half the sweep is a **dense 256-bucket clear**, not a
+carried scan — the opposite of what D10/D13 assumed.
+
+One split is available without another job: probe 08's `-sweep` = 175.842 leaves
+`hist0 + emit_degenerate + fill_spurious = 84.762`, so **hist0 ≤ 84.76** and refinement hists
+= 53.54. Stage C's independent per-pass derivation put hist0 at 85.12 — **0.4% apart**. Both rows
+are `modelled`, corroborated but not measured.
+
+### At production prefill ρ = 0.40005 — 189.98 µs
+
+Same method as C′: walk-bounded terms × ρ; refinement terms additionally × 6/8 with a conditional
+mean ρ of 0.50005 (`keep_all` fires for all of chunks 0–1); fixed terms unscaled.
+
+| term | µs | **%** | scales with ρ? |
+| --- | ---: | ---: | --- |
+| ⚠ **residual (D3)** | **75.683** | **39.8%** | **no** |
+| `hist0` | 33.91 | 17.8% | yes |
+| `emit` | 33.54 | 17.7% | yes |
+| refinement `hist` | 20.08 | 10.6% | yes, and gated by `keep_all` |
+| V4 sweeps | 15.63 | 8.2% | no, but gated |
+| score DMA | 13.469 | 7.1% | **no — static `slice_len`** |
+| output DMA | 5.872 | 3.1% | no |
+| `cvt` | −8.20 | −4.3% | yes |
+| **total** | **189.98** | 100% | |
+
+**Three things this reorders:**
+
+1. **D3 is the largest object in the kernel at 39.8%** — 5.6× the caller's score-DMA hypothesis, and
+   its mechanism is unknown after four refutations. Everything else is second.
+2. **The histogram is the largest *structural* lever at 28.4%** (hist0 + refinement). That is D2, the
+   second root: a selection that does not scatter into tilespmem.
+3. **The score DMA's prize is 13.469 µs and has not moved.** It reads as 7.1% here rather than C′'s
+   2.8% only because the denominator shrank by 36%. D1 and D8 both cap at that same 13.469, because
+   `cvt` already hides the rest of the transfer.
+
+---
+
 ## Stage D — blockers, each with a fix route
 
-`references/seams.md` read here. Ranked by measured share; the seam pass follows the table.
+`references/seams.md` read here. **Re-ranked against stage C″**; the seam pass follows the table.
 
-| id | blocker | size | fix route | instrument | tag |
+| id | blocker | size (prefill ρ=0.40) | fix route | instrument | tag |
 | --- | --- | --- | --- | --- | --- |
-| **D13** | ⚠ **`fold_priv`'s 16-deep accumulate and the two 16-step carried scans (`scan_glob`, `find_bucket`) are ~139 µs of the sweep's 151.3.** ~135 ns per carried iteration = **235 cycles** for a body of a handful of bundles — pure latency | ⚠ **~38.8%** — **the largest object in the kernel** | block-sum → cumsum the 16 block sums → add back. Depth 16 → 3. Independent of `R` | **probe 09** splits the three, then step-3 variant | measured jointly (`probes/08`); the split is **open** |
-| **D3** | ⚠ **81.95 µs belongs to no op**, confirmed to 0.8% by a second, independent decomposition | **27.6%** prefill | ⛔ **M1, M2 and M3 are all now refuted — see below.** Re-probe before designing | **probe 09** (`A0` family) | measured by subtraction |
-| **D6** | The refinement levels and `emit` each walk all of `L` to touch ~`cnt` and `k` elements respectively | **17.7%** (walk 10.7 + emit 7.0) | one fused pass after L0 that compresses `> b_star` straight to `rowbuf` **and** `== b_star` to a scratch buffer; levels then walk `cnt`, not `L` | step-3 variant | modelled |
-| **D2** | `hist0`'s dense scatter is **irreducible for a histogram** — one `vst.idx.add` per element whatever `NUM_BUCKETS` is | **11.5%** (was 25.6% before ρ) | not a tuning move. A selection that is not a histogram → **second root** in `design.md` | step-3 variant | measured |
-| **D5** | ✅ **ANSWERED AND SHIPPABLE.** `plsc.addupdate_scatter` **does** resolve intra-vector address conflicts: `R1` is **bit-identical, 1024/1024 and 64/64 rows**. V4's 16× replication is not required for correctness | **−3.73% prefill / −1.86% decode, measured** (`probes/08`) | drop the replication: `zero_priv(NB//LANES)`, `addr = bucket`, `fold_priv` over `range(1)` | **step-3 variant, and it is already written** | **measured, bit-exact** |
-| **D8** | ⚠ **The DMA is padded and the compute is ragged.** Op 1 always moves `slice_len`; every compute pass is bounded by `walk_chunks` | **ρ = 0.40005 at prefill — 60% of the bytes moved are never read.** But the DMA is only 2.8%, so the prize is ≤ 1.7% | chunk the DMA to `i_hi` — **the same restructuring D1 needs**, so compose them | step-3 variant, with D1 | ρ **derived**; prize measured |
-| **D1** | The score DMA is 100% exposed (`probes/06` Q1: one `resident` alloca, 3 transfers, 3 waits, two literal `snop`s in the slack) | ⛔ **2.8%**, ceiling **−4.12%** prefill / **−1.97%** decode | the caller's double buffer. `probes/06` Q5 confirms it fits (110.50 KiB of 512) | step-3 variant | **measured** (`probes/08`) |
-| **D14** | At ρ ≤ 0.2 `keep_all` fires for every row, so **prefill chunks 0 and 1 run a full DMA + `cvt` + `hist0` + sweep to discover "keep everything"** — and `i_hi <= k` decides it with no histogram at all | 2 of 8 chunks | `@pl.when(i_hi > k)` around the selection, emit the identity otherwise | ⚠ **gated on step homogeneity** — cost is `max` over subcores, so a mixed batch gains nothing. Unknown | modelled; the gate is `unmodelled` |
-| **D4** | ⛔ **CLOSED — the 22.042 µs intercept was the instrument.** A trivial op's launch costs 20.193 µs against a 19.630 µs null, and launching *this* kernel one extra time at constant total work costs **−0.704**. On-device SC program load is **−20.897**, i.e. zero | ⛔ **0%.** Stage C's "decode is 43.2% launch" is **retracted** | none — it does not exist in production, where the kernel is one op in a fused step with no per-call fence | — | **measured** (`probes/08`) |
+| **D3** | ⚠ **75.683 µs belongs to no op.** De-contaminated of `fill` and the output DMA, and **flat in `num_waves`** (0.009 µs/wave, measured directly) | ⚠ **39.8% — the largest object in the kernel** | ⛔ **four mechanisms refuted — see below.** It grows 7.6× from b=64 to b=1024 by an axis that is not the wave loop | **probe 10** (`A0` at varying `n`, `k`, `b`) — in flight | **measured** (`probes/09`) |
+| **D2** | `hist0`'s dense scatter is **irreducible for a histogram** — one `vst.idx.add` per element whatever `NUM_BUCKETS` is | **28.4%** (hist0 17.8 + refinement 10.6) — **the largest structural lever** | not a tuning move. A selection that is not a histogram → **second root** in `design.md` | step-3 variant | measured |
+| **D6** | The refinement levels and `emit` each walk all of `L` to touch ~`cnt` and `k` elements respectively | **28.2%** (emit 17.7 + refinement hist 10.6) | one fused pass after L0 that compresses `> b_star` straight to `rowbuf` **and** `== b_star` to a scratch buffer; levels then walk `cnt`, not `L` | step-3 variant | modelled |
+| **D5** | ✅ **ANSWERED, SHIPPABLE, AND NOW MECHANICALLY EXPLAINED.** `plsc.addupdate_scatter` resolves intra-vector address conflicts: `R1` is **bit-identical, 1024/1024 and 64/64**. Its 12.195 µs win is **mostly `zero_priv` shrinking 16×** (9.238 of it) — see the ⚠ below | **−6.42% prefill** (12.195 µs of 189.98; the sweeps do not scale with ρ, so it beats the −3.73% measured at ρ=1) | drop the replication: `zero_priv(NB//LANES)`, `addr = bucket`, `fold_priv` over `range(1)` | **step-3 variant, already written** | **measured, bit-exact** |
+| **D1** | The score DMA is 100% exposed (`probes/06` Q1: one `resident` alloca, 3 transfers, 3 waits, two literal `snop`s in the slack) | **7.1%**, ceiling **13.469 µs** — unchanged in µs since `probes/08`; only the denominator moved | the caller's double buffer. `probes/06` Q5 confirms it fits (110.50 KiB of 512) | step-3 variant | **measured** |
+| **D8** | ⚠ **The DMA is padded and the compute is ragged.** Op 1 always moves `slice_len`; every compute pass is bounded by `walk_chunks = cdiv(i_hi,16)` | **60% of prefill bytes are never read** — but the *exposed* cost is the same 13.469 µs, so **D8 and D1 cap at the same prize and do not compose** | chunk the DMA to `i_hi` — the same restructuring D1 needs | step-3 variant, with D1 | ρ **derived**; prize measured |
+| **D13** | ⛔ **DEMOTED from #1 to 4th.** The four sweep primitives cost **18.866 µs**, not 151.3 — probe 08's arm deleted the sweeps *plus* all refinement *plus* most of emit. And the split is the opposite of what was assumed: `zero_priv` (a **dense 256-bucket clear**) is 9.238, while the two carried scans are 4.698 together | **8.2%**, and **D5 already takes 9.238 of it** | `zero_priv` → D5. The residual carried-scan prize is **4.698 µs = 2.5%**: block-sum → cumsum → add back, depth 16 → 3 | step-3 variant, **low priority** | **measured** (`probes/09`), additive to 0.2% |
+| **D10** | `fold_priv` is a 16-deep serial accumulate | **2.6%** (4.900 µs) — was "part of 13.6%" | bucket-major layout `bucket*16 + lane` → a 4-deep lane reduction | ⚠ **largely subsumed by D5**, which sets `R = 1`. Re-price after D5 | measured |
+| **D14** | At ρ ≤ 0.2 `keep_all` fires for every row, so **prefill chunks 0 and 1 run a full DMA + `cvt` + `hist0` + sweep to discover "keep everything"** — and `i_hi <= k` decides it with no histogram at all | 2 of 8 chunks | `@pl.when(i_hi > k)` around the selection, emit the identity otherwise | ⚠ **gated on step homogeneity** — cost is `max` over subcores, so a mixed batch gains nothing | modelled; the gate is `unmodelled` |
+| **D9** | `NUM_BUCKETS = 256` has **never been swept**. It trades fixed-sweep size against level count — and stage C″ shows the fixed side is dominated by `zero_priv`, which is **linear in `NUM_BUCKETS`** | `unmodelled`, but now with a named mechanism | one compile-time constant, three arms | step-3 variant | `unmodelled` |
+| **D4** | ⛔ **CLOSED — the 22.042 µs intercept was the instrument.** A trivial op's launch costs 20.193 µs against a 19.630 µs null; launching *this* kernel one extra time at constant total work costs **−0.704** | ⛔ **0%.** "Decode is 43.2% launch" is **retracted** | none — it does not exist in production, where the kernel is one op in a fused step with no per-call fence | — | **measured** (`probes/08`) |
 | **D7** | **The TensorCore and MXU are idle for 100% of the block**, and the block is 99.8% unoverlapped with its neighbours at prefill | `min(t_TC, t_SC)·(p−1)/p` — `t_TC` **`unmodelled`** | ⚠ `P=1`: there is **no partition loop to reorder** (see the S6 note). The pipeline must be *constructed*, in the attention op | **handoff** | `unmodelled` |
-| **D8** | ⚠ **The DMA is padded and the compute is ragged.** Op 1 always moves `slice_len`; every compute pass is bounded by `walk_chunks = cdiv(i_hi,16)` | `(1−ρ)` × 7.4%, and it re-weights the whole sheet | derive ρ = E[eff_len]/n host-side, then chunk the DMA — **the same restructuring D1 needs** | host derivation, then step 3 | ρ is **`assumed`** |
-| **D9** | `NUM_BUCKETS = 256` has **never been swept**. It trades fixed-sweep size against level count | `unmodelled` | one compile-time constant, three arms | step-3 variant | `unmodelled` |
-| **D10** | `fold_priv` is a **16-deep serial accumulate**; stage C measures the sweeps at 1.87× their issue count | part of D5's 13.6% | bucket-major layout `bucket*16 + lane` turns the chain into a 4-deep lane reduction — **and needs no change to `R`** | step-3 variant, gated on a `plsc` cross-lane reduce existing | modelled |
-| **D13** | `scan_glob` and `find_bucket` are two more **16-step serial carries** over 256 buckets | part of D5's 13.6% | block-sum → cumsum the 16 block sums → add back. Depth 16 → 3 | step-3 variant | modelled |
-| **D11** | Every subcore DMAs all `b_pad` lengths and reads `b/32` of them — 4 KiB for 32 useful words at prefill, 4 KiB for 2 at decode | `assumed` negligible | none proposed | — | **`assumed`, never measured** |
-| **D12** | `emit` is the only hot loop with register spills (9 slots in 26 bundles) and is serial via its `(woff, rank)` carry | 6.0% | **PARKED — strictly dominated by D6**, which deletes the traversal this would optimize | — | measured |
+| **D11** | Every subcore DMAs all `b_pad` lengths and reads `b/32` of them — 4 KiB for 32 useful words at prefill, 4 KiB for 2 at decode | `assumed` negligible — ⚠ **but it is one of the few costs that scales with `b` and not with the wave loop**, so probe 10 may promote it | none proposed | **probe 10 touches this incidentally** | **`assumed`, never measured** |
+| **D12** | `emit` is the only hot loop with register spills (9 slots in 26 bundles) and is serial via its `(woff, rank)` carry | 17.7% — emit is bigger than stage C thought | **PARKED — strictly dominated by D6**, which deletes the traversal this would optimize | — | measured |
 
-### D3: what the 81 µs cannot be
+⚠ **D5 and D13 are the same saving and must not be added.** `R1`'s measured 12.195 µs and
+`zero_priv`'s measured 9.238 µs overlap almost entirely: dropping the 16× replication is *what*
+shrinks the 256-entry clear to 16. Compose them in step 4 and measure the pair, never sum them.
 
-At the calibrated 574 ps/bundle, 2.540 µs per wave is **4,425 bundles**. The entire program is
-**1,168 bundles** (`probes/06` Q4). So the unattributed term is **3.8× the whole kernel's static
-instruction count**, per wave — **it is not instruction issue**, and no amount of scheduling,
-unrolling or hoisting can be its cause. Three mechanisms survive:
+⚠ **D1 and D8 are also the same prize.** Both cap at the 13.469 µs of *exposed* transfer, because
+`cvt` already absorbs the rest. Moving fewer bytes and overlapping the bytes you move cannot both be
+paid for out of one 13.469 µs.
 
-**All three candidate mechanisms are now refuted, and the term survived every one of them.**
+### D3: what the 75.683 µs cannot be
+
+⚠ The per-wave framing this section was originally written in is **void** — see M4. Restated as a
+whole-kernel statement: at the calibrated 574 ps/bundle, 75.683 µs is **131,800 bundles**, against a
+whole program of **1,168 bundles** (`probes/06` Q4). **It is not instruction issue**, and no amount
+of scheduling, unrolling or hoisting can be its cause.
+
+**Four candidate mechanisms have now been refuted, and the term survived every one of them.**
 
 1. ⛔ **M1, the per-wave `sfence`+`barrier` — REFUTED, and for free.** `probes/06`'s Mosaic dump was
    re-read rather than re-captured: the module contains **exactly one `sc_tpu.sfence` and exactly one
@@ -482,18 +573,33 @@ unrolling or hoisting can be its cause. Three mechanisms survive:
    µs**, not the ~3.8 µs that would have closed the 2.231-vs-2.03 gap. That gap is a score-distribution
    mismatch, exactly the caveat `probes/05` carried forward about itself.
 
-**⚠ And the 81.95 is partly an artifact, which `probes/09` must remove before the term is trusted.**
-`fill_bound = jnp.where(out_gate & (total < k), k // LANES, 0)`. Forcing `scan_glob`'s bound to zero
-makes `total = 0`, so **`-alld` runs a 128-iteration-per-wave fill loop that `B` never runs** (in `B`,
-`total = 10240 > k`). Scaling `cvt`'s measured 640-iteration cost gives ~0.13 µs/wave ≈ 4 µs — ~5% of
-the term, so it does not explain it away, but the corrected arm is what the number should come from.
+4. ⛔ **M4, the wave loop itself — REFUTED, and it takes M1's premise with it.** `probes/09` measured
+   the slope against `num_waves` **directly** instead of dividing: `A0_W8` 92.012, `A0_W16` 91.994,
+   `A0` (32 waves) 92.231 — **0.009 µs/wave**. There is no per-wave cost of any kind. Everything
+   above that was expressed "per wave" was an artifact of dividing a total by 32, and the framing at
+   the top of this section — "2.540 µs per wave is 4,425 bundles" — is arithmetic on a quantity that
+   does not exist. **The bundle-count refutation of instruction issue still holds** (75.683 µs total
+   is 131,800 bundles against a 1,168-bundle program), but read it as a whole-kernel statement.
 
-What is left inside `-alld`, and what `probes/09`'s `A0` family isolates: the output DMA, the
-`fill_body` loop, **three dynamic-index `vec_at` loads per wave** (`len_vmem` at `row_c`, `glob_vmem`
-at `b_star` and at `b_star−1`) — which on a 16-lane machine with no sublane axis may not be the cheap
-indexed load they look like — and the scalar prologue/epilogue. **Mechanism: still open.** It is 27.6%
-of the production prefill kernel and it is the second-largest object in the block, so it is worth the
-one job it costs rather than a fourth guess.
+**Where the number now stands.** `probes/09`'s `A0` arm removed the `fill` contamination this section
+predicted: `-alld` 101.492 − `A0` 92.231 = **9.261 µs of fill + output DMA**, of which 5.872 is the
+output DMA and 3.389 the spurious fill. The de-contaminated residual is **75.683 µs**, and it is
+**39.8% of the production prefill kernel — the largest single object in the block.**
+
+**The one live clue.** The residual is flat in `num_waves` yet grows **7.6× from b=64 to b=1024**, a
+16× change in `b`. So it scales with something tied to `b` that the wave loop does not touch. Three
+candidates, which `probes/10-residual-driver/` separates by varying `n`, `k` and `b` independently on
+this same `A0` arm:
+
+- the **input** buffer `scores_hbm`, `b·n` int32 — 41.9 MB at b=1024. A fit gives ~600 GB/s, which is
+  a plausible rate for XLA to touch a buffer the kernel never reads.
+- the **output** buffer `out_hbm`, `b·k` int32 — 8.39 MB. A fit gives ~120 GB/s, low for HBM.
+- a genuine **per-row** cost — which would promote D11 (`vec_at` on `len_vmem`, and the `b_pad`-wide
+  length DMA every subcore performs) from `assumed negligible` to the explanation.
+
+Neither fit is linear on its own across the two points available, so both have a fixed component and
+neither is yet distinguishable. **Mechanism: still open, after four refutations.** At 39.8% it is
+worth the one job rather than a fifth guess.
 
 ### The seam pass
 

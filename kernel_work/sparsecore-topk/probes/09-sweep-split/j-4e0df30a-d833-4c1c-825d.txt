@@ -1,0 +1,132 @@
+SUBJECT_PATH=/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+MAP_GATE_OK
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789058979.503999      11 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-4e0df30a-d833-4c1c-825d-tpu-job-0-0 devices=8 kind=TPU7x
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+subject: /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+  timing harness: FROZEN INSTRUMENT /root/probe09/glm_dsa_block_bench.py (md5 08375d7068365e1a776c58fef09cd6d0)
+  arm B        drops=-                                             src_md5=fd46ef14b38fd7781885e73d0ca33965
+  arm -out     drops=outdma                                        src_md5=258b9e04beeebfa2370800da4d87996b
+  arm E0       drops=emit,fill                                     src_md5=96e55e33f371ac63b4fc59933df923b2
+  arm E0-zero  drops=emit,fill,zero                                src_md5=7fde5d77d1887fe8d2baa6c33660cca2
+  arm E0-fold  drops=emit,fill,fold                                src_md5=25255759f32a1517c2018bba6c8591f3
+  arm E0-scan  drops=emit,fill,scan                                src_md5=8eee96cac66bc546e27a0969bf74c505
+  arm E0-find  drops=emit,fill,find                                src_md5=970657a0e7e8b469baceaa1a53c890cf
+  arm E0-swp   drops=emit,fill,zero,fold,scan,find                 src_md5=d18b8c2cb8a8a5426bcd02dd09c87a32
+  arm -alld    drops=dma,cvt,hist,sweep,emit                       src_md5=ea5bbde05129ae7f325a1f4a09bcede4
+  arm A0       drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_W8    drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=92b0bf3b08c93357acca5f82bd1b1153
+  arm A0_W16   drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=1c9f7cfaf9c64d0143b6ad3b665bf2d7
+
+=== b=1024 n=10240 k=2048 P=1 waves=32 SINGLE-STAGE ===
+  patch evidence B       :  1024/1024 rows match B
+  patch evidence -out    :     0/1024 rows match B
+  patch evidence E0      :     0/1024 rows match B
+  patch evidence E0-zero :     0/1024 rows match B
+  patch evidence E0-fold :     0/1024 rows match B
+  patch evidence E0-scan :     0/1024 rows match B
+  patch evidence E0-find :     0/1024 rows match B
+  patch evidence E0-swp  :     0/1024 rows match B
+  patch evidence -alld   :     0/1024 rows match B
+  patch evidence A0      :     0/1024 rows match B
+  patch evidence A0_W8   :     0/1024 rows match B
+  patch evidence A0_W16  :     0/1024 rows match B
+  B        us_median=   326.782  us=   326.512  hostbound=  0.9%  suspect=False
+  -out     us_median=   320.910  us=   319.679  hostbound=  1.2%  suspect=False
+  E0       us_median=   242.952  us=   242.459  hostbound=  1.3%  suspect=False
+  E0-zero  us_median=   233.714  us=   233.530  hostbound=  1.2%  suspect=False
+  E0-fold  us_median=   238.052  us=   237.750  hostbound=  1.2%  suspect=False
+  E0-scan  us_median=   239.454  us=   239.273  hostbound=  1.2%  suspect=False
+  E0-find  us_median=   241.752  us=   241.275  hostbound=  1.2%  suspect=False
+  E0-swp   us_median=   224.087  us=   223.653  hostbound=  1.3%  suspect=False
+  -alld    us_median=   101.492  us=   100.938  hostbound=  2.7%  suspect=False
+  A0       us_median=    92.231  us=    91.760  hostbound=  2.8%  suspect=False
+  A0_W8    us_median=    92.012  us=    91.596  hostbound=  2.7%  suspect=False
+  A0_W16   us_median=    91.994  us=    91.635  hostbound=  2.6%  suspect=False
+  #null_a  us_median=    15.762  us=    14.855  hostbound= 19.5%  suspect=False
+  #null_b  us_median=    17.333  us=    13.977  hostbound= 26.4%  suspect=False
+
+  --- sweep split, b=1024 ---
+  E0 (emit+fill off)                 242.952
+    - zero_priv                        9.238
+    - fold_priv                        4.900
+    - scan_glob                        3.498
+    - find_bucket                      1.200
+    sum of the four                   18.836
+    E0 - E0-swp (joint, exact)        18.866
+    additivity ratio                   0.998
+
+  --- residual, b=1024 ---
+  -alld (probe 08 control)           101.492   probes/08: 101.584 @b=1024, 26.344 @b=64
+  A0 (fill + outdma also off)         92.231
+    fill+outdma contamination          9.261
+    output DMA alone (B - -out)        5.872
+    A0 - null                         75.683
+
+  --- wave slope on A0, b=1024 ---
+  A0_W8 / A0_W16 / A0                 92.012     91.994     92.231
+    per-wave slope (32-8)              0.009
+    intercept                         91.940
+
+  null floor                          16.548  (two nulls differ by 1.571 us)
+  cross-job control: B=326.782 vs probes/08 327.166 -> -0.12%  |  -alld=101.492 vs probes/08 101.584 -> -0.09%
+
+=== b=64 n=10240 k=2048 P=1 waves=2 SINGLE-STAGE ===
+  patch evidence B       :    64/64 rows match B
+  patch evidence -out    :    64/64 rows match B
+  patch evidence E0      :    32/64 rows match B
+  patch evidence E0-zero :    32/64 rows match B
+  patch evidence E0-fold :    32/64 rows match B
+  patch evidence E0-scan :    32/64 rows match B
+  patch evidence E0-find :    32/64 rows match B
+  patch evidence E0-swp  :    32/64 rows match B
+  patch evidence -alld   :     0/64 rows match B
+  patch evidence A0      :     0/64 rows match B
+  patch evidence A0_W8   :     0/64 rows match B
+  patch evidence A0_W16  :     0/64 rows match B
+  !! -out reproduces B exactly -- the patch was NOT effective. Its delta is not a cost.
+  B        us_median=    40.699  us=    40.094  hostbound=  6.4%  suspect=False
+  -out     us_median=    40.509  us=    39.451  hostbound=  6.9%  suspect=False
+  E0       us_median=    36.114  us=    34.946  hostbound=  6.9%  suspect=False
+  E0-zero  us_median=    35.627  us=    34.455  hostbound=  7.3%  suspect=False
+  E0-fold  us_median=    35.225  us=    34.634  hostbound=  6.8%  suspect=False
+  E0-scan  us_median=    35.777  us=    34.796  hostbound=  7.2%  suspect=False
+  E0-find  us_median=    35.564  us=    34.684  hostbound=  7.4%  suspect=False
+  E0-swp   us_median=    34.440  us=    33.035  hostbound=  8.9%  suspect=False
+  -alld    us_median=    26.833  us=    25.662  hostbound= 11.4%  suspect=False
+  A0       us_median=    25.696  us=    24.772  hostbound= 10.4%  suspect=False
+  A0_W8    us_median=    25.799  us=    24.925  hostbound= 10.0%  suspect=False
+  A0_W16   us_median=    25.997  us=    24.854  hostbound= 11.4%  suspect=False
+  #null_a  us_median=    16.218  us=    15.134  hostbound= 17.7%  suspect=False
+  #null_b  us_median=    15.276  us=    14.448  hostbound= 21.6%  suspect=False
+
+  --- sweep split, b=64 ---
+  E0 (emit+fill off)                  36.114
+    - zero_priv                        0.487
+    - fold_priv                        0.889
+    - scan_glob                        0.336
+    - find_bucket                      0.550
+    sum of the four                    2.262
+    E0 - E0-swp (joint, exact)         1.674
+    additivity ratio                   1.351
+
+  --- residual, b=64 ---
+  -alld (probe 08 control)            26.833   probes/08: 101.584 @b=1024, 26.344 @b=64
+  A0 (fill + outdma also off)         25.696
+    fill+outdma contamination          1.138
+    output DMA alone (B - -out)        0.190
+    A0 - null                          9.949
+
+  --- wave slope on A0, b=64 ---
+  A0_W8 / A0_W16 / A0                 25.799     25.997     25.696
+    per-wave slope (2-8)               0.017
+    intercept                         25.661
+
+  null floor                          15.747  (two nulls differ by 0.942 us)
+  cross-job control: B=40.699 vs probes/08 41.005 -> -0.75%  |  -alld=26.833 vs probes/08 26.344 -> +1.86%
+
+wrote /cdk-outputs/outputs/j-4e0df30a-d833-4c1c-825d-tpu-job-0/j-4e0df30a-d833-4c1c-825d-tpu-job-0-0-8fcwd/command-container/probe09/sweep_split.json
