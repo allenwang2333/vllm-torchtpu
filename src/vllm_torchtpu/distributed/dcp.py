@@ -15,7 +15,8 @@
 
 Mirrors the role of distributed/pcp.py for PCP: a narrow, safe accessor
 layer every call site shares, rather than each re-deriving group state
-independently.
+independently. The layout and mesh construction the two axes have in common
+lives in cp_mesh.py, so neither of these modules imports the other.
 
 """
 
@@ -23,9 +24,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm_torchtpu.distributed.pcp import (PcpGroupLayout,
-                                           get_or_create_pcp_mesh,
-                                           get_pcp_group_layout)
+from vllm_torchtpu.distributed.cp_mesh import (CpGroupLayout,
+                                               get_cp_group_layout,
+                                               get_or_create_cp_mesh)
 
 # The JAX mesh axis the DCP kernels shard the KV cache over. Defined here
 # rather than beside the kernels because the dependency only runs one way:
@@ -54,19 +55,18 @@ def get_dcp_world_size() -> int:
     return 1 if group is None else int(group.world_size)
 
 
-def get_dcp_group_layout() -> PcpGroupLayout:
+def get_dcp_group_layout() -> CpGroupLayout:
     """The DCP group's rank order and the TPU device each rank sits on."""
-    return get_pcp_group_layout(get_dcp_group())
+    return get_cp_group_layout(get_dcp_group())
 
 
 def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     """Build the op-local JAX mesh for the DCP axis.
 
-    Shares `pcp.py`'s implementation because none of it is PCP-specific -- the
-    mesh is just this group's devices in rank order. Under `tp=N, dcp=N` the
-    DCP group covers the same devices as the TP group, and the mesh cache is
-    keyed on the axis name as well as the device ids, so a run with both axes
-    live keeps two distinct meshes rather than aliasing them.
+    Under `tp=N, dcp=N` the DCP group covers the same devices as the TP group,
+    and the mesh cache is keyed on the axis name as well as the device ids, so
+    a run with both CP axes live keeps two distinct meshes rather than
+    aliasing them.
 
     The axis name defaults to `DCP_AXIS_NAME`; the kernels take the same
     constant from here, so a caller that overrides it has to override it in
@@ -74,4 +74,4 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     """
     if axis_name is None:
         axis_name = DCP_AXIS_NAME
-    return get_or_create_pcp_mesh(axis_name=axis_name, group=get_dcp_group())
+    return get_or_create_cp_mesh(axis_name=axis_name, group=get_dcp_group())
