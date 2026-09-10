@@ -16,7 +16,7 @@
 Mirrors the role of distributed/pcp.py for PCP: a narrow, safe accessor
 layer every call site shares, rather than each re-deriving group state
 independently. The layout and mesh construction the two axes have in common
-lives in cp_mesh.py, so neither of these modules imports the other.
+lives in cp_mesh.py.
 
 """
 
@@ -28,11 +28,7 @@ from vllm_torchtpu.distributed.cp_mesh import (CpGroupLayout,
                                                get_cp_group_layout,
                                                get_or_create_cp_mesh)
 
-# The JAX mesh axis the DCP kernels shard the KV cache over. Defined here
-# rather than beside the kernels because the dependency only runs one way:
-# the kernels already import this package, so the mesh built here and the
-# partition specs built there can share one constant without the distributed
-# layer having to reach back into a kernel module.
+# The JAX mesh axis the DCP kernels shard the KV cache over.
 DCP_AXIS_NAME = "dcp"
 
 
