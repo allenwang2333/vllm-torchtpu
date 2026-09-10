@@ -1016,8 +1016,7 @@ def streamindex_topk(
         # Columns are rank-local; callers (and the merge) want global positions.
         global_idxs = jnp.where(
             filled,
-            cp_local_to_global(topk_idxs, cp_rank, cp_size, interleave_c),
-            -1)
+            cp_local_to_global(topk_idxs, cp_rank, cp_size, interleave_c), -1)
         if not return_scores:
             return global_idxs
         return global_idxs, topk_scores
@@ -1085,8 +1084,8 @@ def _select_owned_winners(merged, dcp_size: int, interleave_c: int, dcp_rank):
     # One dump column past the end absorbs the entries owned elsewhere; they all
     # write `-1`, so the collisions are benign. Sliced away below.
     out = jnp.full((num_rows, width + 1), -1, jnp.int32)
-    out = out.at[rows, jnp.where(mine, slot, width)].set(
-        jnp.where(mine, local, -1))
+    out = out.at[rows,
+                 jnp.where(mine, slot, width)].set(jnp.where(mine, local, -1))
     return out[:, :width]
 
 

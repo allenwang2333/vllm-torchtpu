@@ -587,15 +587,17 @@ def sparse_ragged_paged_attention(
     assert num_page_indices % max_num_seqs == 0
 
     def run_mla_kernel(
-        q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-        # [num_tokens, topk * TILE_SUBROWS, TILE_LANE_BYTES] (gathered raw tiles)
+            q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
+            # [num_tokens, topk * TILE_SUBROWS, TILE_LANE_BYTES] (gathered raw tiles)
         cache_kv_nope: jax.Array,
-        cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
-        kv_lens: jax.Array,  # i32[max_num_tokens]
-        start_seq_idx: jax.Array,  # i32
-        end_seq_idx: jax.Array,  # i32
-        kernel_batch_size: int,
-        lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
+            cache_kv_rope: jax.
+        Array,  # [num_tokens, topk, rope_dim] (gathered)
+            kv_lens: jax.Array,  # i32[max_num_tokens]
+            start_seq_idx: jax.Array,  # i32
+            end_seq_idx: jax.Array,  # i32
+            kernel_batch_size: int,
+            lse: jax.Array
+        | None = None,  # f32[max_num_tokens, num_q_heads, 1]
     ):
         batch_size = kernel_batch_size
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)

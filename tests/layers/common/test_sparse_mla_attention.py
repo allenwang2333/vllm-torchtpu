@@ -376,8 +376,8 @@ def _merge_partials(outs: np.ndarray, lses: np.ndarray,
     shift = np.where(all_empty, 0.0, shift)
     weights = np.exp(lses - shift[0])  # [D, T, N]
     denom = weights.sum(0)
-    weights = np.where(denom[None] > 0, weights / np.where(denom == 0, 1,
-                                                           denom)[None], 0.0)
+    weights = np.where(denom[None] > 0,
+                       weights / np.where(denom == 0, 1, denom)[None], 0.0)
     return (weights[..., None] * outs).sum(0)
 
 
@@ -421,12 +421,21 @@ class SparseMlaLseTest(parameterized.TestCase):
         # every assertion below then drives the kernel directly, because
         # `return_lse` is a kernel-level flag.
         nope_cache, rope_cache, _ = attention_interface.sparse_mla_attention(
-            ql_nope, q_pe, kv_c_fp8, k_pe_fp8, *_empty_pair(),
+            ql_nope,
+            q_pe,
+            kv_c_fp8,
+            k_pe_fp8,
+            *_empty_pair(),
             jnp.asarray(topk_rows, jnp.int32),
-            jnp.asarray([DCP_TOKENS], jnp.int32), block_tables,
+            jnp.asarray([DCP_TOKENS], jnp.int32),
+            block_tables,
             jnp.asarray([0, DCP_TOKENS], jnp.int32),
-            jnp.asarray([0, 1, 1], jnp.int32), mesh, NOPE_SPEC, ROPE_SPEC,
-            sm_scale=self.sm_scale, k_scale=self.k_scale)
+            jnp.asarray([0, 1, 1], jnp.int32),
+            mesh,
+            NOPE_SPEC,
+            ROPE_SPEC,
+            sm_scale=self.sm_scale,
+            k_scale=self.k_scale)
 
         return dict(
             q=jnp.concatenate([ql_nope, q_pe], axis=-1),
@@ -496,8 +505,8 @@ class SparseMlaLseTest(parameterized.TestCase):
         so the empty-shard path is exercised too.
         """
         inp = self._prefilled()
-        whole = np.asarray(self._attend(inp, inp["topk_rows"],
-                                        False).astype(jnp.float32))
+        whole = np.asarray(
+            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
 
         shards, counts = _shard_topk_by_owner(inp["topk_rows"], dcp_size,
                                               DCP_INTERLEAVE_C)
@@ -521,8 +530,8 @@ class SparseMlaLseTest(parameterized.TestCase):
         merge has to drop it on `counts`, not on the value of `lse`.
         """
         inp = self._prefilled()
-        whole = np.asarray(self._attend(inp, inp["topk_rows"],
-                                        False).astype(jnp.float32))
+        whole = np.asarray(
+            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
         out, lse = self._attend(inp, inp["topk_rows"], True)
 
         # Two shards: one holds the entire list, the other holds nothing.
@@ -649,7 +658,8 @@ class SparseMlaDcpTest(parameterized.TestCase):
         block_tables = jnp.asarray(
             self.rng.permutation(NOPE_SPEC.num_pages)[:vpages], jnp.int32)
 
-        nope, rope = (jax.device_put(c, sharded) for c in _dcp_caches(dcp_size))
+        nope, rope = (jax.device_put(c, sharded)
+                      for c in _dcp_caches(dcp_size))
         _, _, out, lse = attention_interface.sparse_mla_attention_dcp(
             inp["ql_nope"],
             inp["q_pe"],
@@ -708,7 +718,8 @@ class SparseMlaDcpTest(parameterized.TestCase):
         sharded = jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
         vpages = math.ceil(DCP_SEQ / (PAGE_SIZE * dcp_size))
         block_tables = jnp.arange(vpages, dtype=jnp.int32)
-        nope, rope = (jax.device_put(c, sharded) for c in _dcp_caches(dcp_size))
+        nope, rope = (jax.device_put(c, sharded)
+                      for c in _dcp_caches(dcp_size))
 
         lists, _ = _partition_winners_by_owner(
             jnp.asarray(inp["topk"], jnp.int32), dcp_size, interleave_size,
@@ -717,11 +728,23 @@ class SparseMlaDcpTest(parameterized.TestCase):
             dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
 
         new_nope, _, _, _ = attention_interface.sparse_mla_attention_dcp(
-            inp["ql_nope"], inp["q_pe"], inp["kv_c_fp8"], inp["k_pe_fp8"],
-            nope, rope, jax.device_put(local_topk, sharded), inp["seq_lens"],
-            block_tables, inp["cu_q_lens"], inp["distribution"], mesh,
-            NOPE_SPEC, ROPE_SPEC, sm_scale=self.sm_scale,
-            k_scale=self.k_scale, dcp_size=dcp_size,
+            inp["ql_nope"],
+            inp["q_pe"],
+            inp["kv_c_fp8"],
+            inp["k_pe_fp8"],
+            nope,
+            rope,
+            jax.device_put(local_topk, sharded),
+            inp["seq_lens"],
+            block_tables,
+            inp["cu_q_lens"],
+            inp["distribution"],
+            mesh,
+            NOPE_SPEC,
+            ROPE_SPEC,
+            sm_scale=self.sm_scale,
+            k_scale=self.k_scale,
+            dcp_size=dcp_size,
             interleave_size=interleave_size)
 
         # A written latent row is all-zero with probability ~0, so the
@@ -736,8 +759,8 @@ class SparseMlaDcpTest(parameterized.TestCase):
         expected = np.zeros_like(written)
         for pos in range(DCP_SEQ):
             r = (pos // interleave_size) % dcp_size
-            local = int(cp_global_to_local(jnp.int32(pos), dcp_size,
-                                            interleave_size))
+            local = int(
+                cp_global_to_local(jnp.int32(pos), dcp_size, interleave_size))
             expected[r, local // NOPE_SPEC.page_size,
                      local % NOPE_SPEC.page_size] = True
         np.testing.assert_array_equal(written.sum((1, 2)),

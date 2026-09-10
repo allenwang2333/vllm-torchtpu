@@ -101,7 +101,8 @@ def test_layout_describes_the_group_it_is_given(monkeypatch):
     monkeypatch.setattr(pcp, "get_pcp_group", lambda: pcp_group)
     monkeypatch.setattr(dcp, "get_dcp_group", lambda: dcp_group)
     monkeypatch.setattr(pcp, "_collect_rank_to_device_id",
-                        lambda group, *_: {r: 10 + r for r in group.ranks})
+                        lambda group, *_: {r: 10 + r
+                                           for r in group.ranks})
     monkeypatch.setattr(pcp, "_get_current_global_rank", lambda: 2)
     monkeypatch.setattr(pcp, "_get_tpu_global_device_id", lambda: 12)
 

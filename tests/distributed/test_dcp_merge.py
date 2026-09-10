@@ -110,11 +110,10 @@ def _jax_merge(outputs, lses):
 
 def _partials(rng, dcp_size, tokens=8, heads=4, vdim=16, empty=()):
     outputs = torch.from_numpy(
-        rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(
-            np.float32))
-    lses = torch.from_numpy(
-        (rng.standard_normal((dcp_size, tokens, heads)) * 4).astype(
-            np.float32))
+        rng.standard_normal(
+            (dcp_size, tokens, heads, vdim)).astype(np.float32))
+    lses = torch.from_numpy((rng.standard_normal(
+        (dcp_size, tokens, heads)) * 4).astype(np.float32))
     for rank, token in empty:
         lses[rank, token] = float("-inf")
     return outputs, lses
@@ -124,7 +123,9 @@ def _partials(rng, dcp_size, tokens=8, heads=4, vdim=16, empty=()):
 def test_torch_merge_matches_the_jax_merge(dcp_size, monkeypatch):
     outputs, lses = _partials(np.random.default_rng(20260907), dcp_size)
     got = _merge_as_rank(outputs, lses, 0, monkeypatch).numpy()
-    np.testing.assert_allclose(got, _jax_merge(outputs, lses), rtol=1e-5,
+    np.testing.assert_allclose(got,
+                               _jax_merge(outputs, lses),
+                               rtol=1e-5,
                                atol=1e-5)
 
 
@@ -145,7 +146,9 @@ def test_ranks_owning_nothing_are_excluded(monkeypatch):
     got = _merge_as_rank(outputs, lses, 0, monkeypatch).numpy()
     # Token 3 is owned by rank 0 alone, so the merge must return rank 0's
     # output there verbatim.
-    np.testing.assert_allclose(got[3], outputs[0, 3].numpy(), rtol=1e-6,
+    np.testing.assert_allclose(got[3],
+                               outputs[0, 3].numpy(),
+                               rtol=1e-6,
                                atol=1e-6)
 
 
@@ -224,11 +227,11 @@ def test_scatter_merge_is_the_all_reduce_merge_narrowed(rank, monkeypatch):
     mine = dcp.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
 
     assert mine.shape == (outputs.shape[1], local_heads, outputs.shape[3])
-    np.testing.assert_allclose(
-        mine.numpy(),
-        whole[:, rank * local_heads:(rank + 1) * local_heads].numpy(),
-        rtol=1e-6,
-        atol=1e-6)
+    np.testing.assert_allclose(mine.numpy(),
+                               whole[:, rank * local_heads:(rank + 1) *
+                                     local_heads].numpy(),
+                               rtol=1e-6,
+                               atol=1e-6)
 
 
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
@@ -264,7 +267,7 @@ def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
         outs[r] = np.einsum("tnk,kd->tnd", e / e.sum(-1, keepdims=True),
                             v[r::dcp_size])
 
-    got = _merge_as_rank(torch.from_numpy(outs).float(),
-                         torch.from_numpy(lses).float(), 0,
-                         monkeypatch).numpy()
+    got = _merge_as_rank(
+        torch.from_numpy(outs).float(),
+        torch.from_numpy(lses).float(), 0, monkeypatch).numpy()
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)

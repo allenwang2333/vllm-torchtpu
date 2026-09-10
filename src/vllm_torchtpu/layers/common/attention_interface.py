@@ -18,8 +18,12 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+# yapf: disable
+# isort's wrap and yapf's disagree on this one import, so they rewrite each
+# other forever; pin isort's form and take yapf out of the loop.
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data)
+# yapf: enable
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
@@ -878,8 +882,7 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
-def merge_dcp_lse_partials(outputs: jax.Array,
-                           lses: jax.Array) -> jax.Array:
+def merge_dcp_lse_partials(outputs: jax.Array, lses: jax.Array) -> jax.Array:
     """Combine per-rank sparse-MLA partials into the whole-context result.
 
     With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
