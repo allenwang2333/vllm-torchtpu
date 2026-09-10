@@ -246,12 +246,11 @@ def measured_dsv4_layout_fingerprint(
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted DeepSeek-V4 cache layout.
 
-    Same row-prefix requirement as GLM: the transfer copies raw bytes, so a
-    prefix of rows must be a byte prefix of the page, which only holds for the
-    natural [blocks, rows, packing, width] order. DSv4 differs in that each
-    role has its own page geometry (CSA NoPE one row per token, RoPE and the
-    indexer one per four, HCA two), so rows are recorded per tag rather than
-    checked against a single page_tokens.
+    Same row-prefix requirement as GLM: raw byte copies mean a prefix of rows
+    has to be a byte prefix of the page, which only holds for the natural
+    [blocks, rows, packing, width] order. Each DSv4 role has its own page
+    geometry, so rows are recorded per tag instead of checked against a single
+    page_tokens.
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")

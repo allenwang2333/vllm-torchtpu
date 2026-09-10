@@ -1,26 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Stage 3 must not transfer a sliding-window page the allocator has taken back.
 
-Both peers work out which leading pages of a windowed group are dead from
-``num_tokens``, the transfer prefix. The allocator, meanwhile, freed pages
-against wherever the producer actually stopped. Those two numbers agree only
-while the producer halts at the handoff token.
+Both peers count the dead leading pages of a windowed group from
+``num_tokens``, the transfer prefix, while the allocator freed pages against
+wherever the producer actually stopped. The two agree only while the producer
+halts at the handoff token. Let them drift and the send lists a page pointed at
+the null block: one is a silent hole in the decode replica's window, two are a
+duplicate destination that Raiden rejects by raising out of ``execute_model``
+and taking the engine down with it.
 
-Let them drift and the send lists a page the allocator has already pointed at
-the null block. One dead page arrives as a hole in the decode replica's window
-and nothing complains. Two collide into a duplicate destination, which Raiden
-rejects by raising out of ``execute_model`` on the producer worker, killing the
-engine and every other in-flight request with it.
+``_stage3_truncates_prompt`` removes the drift by prefilling N-1 tokens, so
+both sides read the same number. The dead-page count stays as a guard for what
+truncation cannot reach: a client that hits the prefill port directly and
+generates past the handoff.
 
-``_stage3_truncates_prompt`` is what stops the drift: the producer prefills
-N-1 tokens, so the allocator and the connector read the same number and the
-two page counts cannot disagree. The dead-page count remains as a guard for
-the case truncation cannot reach, a client that hits the prefill port directly
-and generates past the handoff.
-
-The tables below are verbatim ``group_block_ids`` captured from a live
-DP4/DP4 DeepSeek-V4-Flash pair, so the geometry and the null runs are the real
-ones rather than a reconstruction.
+The tables below are verbatim ``group_block_ids`` from a live DP4/DP4
+DeepSeek-V4-Flash pair, so the geometry and the null runs are real.
 
 Deviceless: this is block-table arithmetic and never touches a TPU.
 """
@@ -58,9 +53,9 @@ def test_one_page_of_drift_is_caught_rather_than_shipped_dead():
     """computed=375 against num_tokens=374, which happens on the proxy path.
 
     The allocator freed 23 pages, the connector skips 22, so page 22 is the
-    null block. This one is silent without the check: a single dead page in an
-    8-token window rarely changes the answer, so it survives an accuracy sweep
-    and corrupts the decode replica's state anyway.
+    null block. Without the check this is silent: one dead page in an 8-token
+    window rarely changes the answer, so it survives an accuracy sweep while
+    still corrupting the decode replica's state.
     """
     ids = [0] * 23 + [13]
     assert _stage3_skipped_window_pages(num_tokens=374,

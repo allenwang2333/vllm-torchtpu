@@ -163,12 +163,10 @@ def test_stage3_transfer_groups_rejects_several_groups_by_default():
 def test_stage3_transfer_groups_rejects_a_single_group_dsv4_plan():
     """DSv4 admission on a one-group model is rejected at startup.
 
-    The scheduler only builds per-group block tables when the plan has more
-    than one group, while the worker's DSv4 path requires them for every
-    request. A single-group DSv4 plan makes those two disagree, and without
-    this check the disagreement surfaces as a mid-transfer RuntimeError that
-    takes the engine down. There is no such model today; DSv4 has several
-    groups because its groups page at different sizes.
+    The scheduler builds per-group block tables only when the plan has more
+    than one group, while the worker's DSv4 path needs them for every request.
+    Without this check the disagreement surfaces as a mid-transfer
+    RuntimeError that takes the engine down.
     """
     single = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
     with pytest.raises(ValueError, match="TPU_RAIDEN_DSV4_ADMISSION"):

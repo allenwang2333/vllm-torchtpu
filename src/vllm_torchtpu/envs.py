@@ -265,9 +265,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
     "TPU_RAIDEN_GLM_ADMISSION":
     env_bool("TPU_RAIDEN_GLM_ADMISSION"),
-    # DeepSeek-V4 admits several attention KV cache groups at once (CSA,
-    # indexer, HCA, SWA and the compressor states), unlike every other model
-    # here, which has exactly one.
+    # DeepSeek-V4 admits several attention KV cache groups at once: CSA,
+    # indexer, HCA, SWA and the compressor states. Every other model here has
+    # exactly one.
     "TPU_RAIDEN_DSV4_ADMISSION":
     env_bool("TPU_RAIDEN_DSV4_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
