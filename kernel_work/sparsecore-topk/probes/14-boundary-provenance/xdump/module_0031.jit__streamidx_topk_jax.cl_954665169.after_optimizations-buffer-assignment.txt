@@ -1,0 +1,1051 @@
+BufferAssignment:
+allocation 0: size 512, thread-local:
+ value: <13 and.92 @0> (size=512,offset=0): pred[]{:T(512)}
+allocation 1: size 150994944, parameter 2, shape |u8[576,256,4,256]| at ShapeIndex {}, maybe-live-out:
+ value: <4268 cache_kv.1 @0> (size=150994944,offset=0): u8[576,256,4,256]{3,2,1,0:T(4,128)(4,1)}
+ value: <4380 reshape.306 @0> (size=150994944,offset=0): u8[576,256,4,256]{3,2,1,0:T(4,128)(4,1)}
+allocation 2: size 8388608, maybe-live-out:
+ value: <2944 add.350 @0> (size=512,offset=0): s32[]{:T(128)}
+ value: <4271 copy.23 @0> (size=512,offset=0): s32[]{:T(128)}
+ value: <4363 slice.19 @0> (size=512,offset=0): s32[1]{0:T(128)}
+ value: <4404 bitcast_convert_type.3 @0> (size=8388608,offset=0): f8e4m3fn[1024,64,128]{2,1,0:T(32,128)(4,1)}
+ value: <4414 copy-start.5{0} @0> (size=8388608,offset=0): s32[1024,2048]{1,0:T(8,128)}
+ value: <4419 wide.wide.arg_tuple.12{0} (phi) @0> (size=512,offset=0): s32[]{:T(128)}
+ value: <4425 wide.wide.arg_tuple.0{0} (phi) @0> (size=512,offset=0): s32[]{:T(128)}
+ value: <4432 while.24{0} (phi) @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 3: size 8388608, parameter 0, shape |u8[1024,64,128]| at ShapeIndex {}:
+ value: <4396 q_bytes.1 @0> (size=8388608,offset=0): u8[1024,64,128]{2,1,0:T(32,128)(4,1)}
+allocation 4: size 139264, parameter 3, shape |u8[1024,129]| at ShapeIndex {}:
+ value: <4372 k_packed.1 @0> (size=139264,offset=0): u8[1024,129]{0,1:T(8,128)(4,1)}
+allocation 5: size 131072, parameter 1, shape |bf16[1024,64]| at ShapeIndex {}:
+ value: <4405 weights.1 @0> (size=131072,offset=0): bf16[1024,64]{0,1:T(8,128)(2,1)}
+allocation 6: size 4096, parameter 5, shape |s32[576]| at ShapeIndex {}:
+ value: <4360 page_indices.1 @0> (size=4096,offset=0): s32[576]{0:T(1024)}
+allocation 7: size 512, constant:
+ value: <4270 constant.96 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 8: size 512, parameter 6, shape |s32[65]| at ShapeIndex {}:
+ value: <4274 cu_q_lens.1 @0> (size=512,offset=0): s32[65]{0:T(128)}
+allocation 9: size 512, constant:
+ value: <4276 constant.1554 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 10: size 512, parameter 4, shape |s32[64]| at ShapeIndex {}:
+ value: <4283 seq_lens.1 @0> (size=512,offset=0): s32[64]{0:T(128)}
+allocation 11: size 512, constant:
+ value: <4367 constant.198 @0> (size=512,offset=0): s32[3]{0:T(128)}
+allocation 12: size 512, constant:
+ value: <4369 constant.195 @0> (size=512,offset=0): s32[3]{0:T(128)}
+allocation 13: size 512, constant:
+ value: <4377 constant.151 @0> (size=512,offset=0): u8[]{:T(512)}
+allocation 14: size 512, constant:
+ value: <4384 constant.56 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 15: size 512, constant:
+ value: <4386 constant.75 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 16: size 512, parameter 7, shape |s32[3]| at ShapeIndex {}:
+ value: <4389 distribution.1 @0> (size=512,offset=0): s32[3]{0:T(128)}
+allocation 17: size 512, constant:
+ value: <3959 constant.84 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 18: size 512, constant:
+ value: <3964 constant.1424 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 19: size 512, constant:
+ value: <2075 constant.1426 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 20: size 512, constant:
+ value: <3883 constant.1424..sunk @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 21: size 512, constant:
+ value: <3953 constant.84..sunk @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 22: size 512, constant:
+ value: <4066 constant.63 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 23: size 512, constant:
+ value: <4068 constant.68 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 24: size 512, constant:
+ value: <4071 constant.61 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 25: size 512, constant:
+ value: <4076 constant.102 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 26: size 512, constant:
+ value: <4082 constant.104 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 27: size 512, constant:
+ value: <4088 constant.71 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 28: size 512, constant:
+ value: <4107 constant.70 @0> (size=512,offset=0): s32[1]{0:T(128)}
+allocation 29: size 512, constant:
+ value: <4109 constant.67 @0> (size=512,offset=0): f32[]{:T(128)}
+allocation 30: size 512, constant:
+ value: <4255 constant.59 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 31: size 512, constant:
+ value: <2077 constant.1556 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 32: size 512, constant:
+ value: <2943 constant.1554..sunk @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 33: size 512, constant:
+ value: <3013 constant.96..sunk @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 34: size 512, thread-local:
+ value: <12 rhs.1 @0> (size=512,offset=0): pred[]{:T(512)}
+allocation 35: size 512, thread-local:
+ value: <11 lhs.1 @0> (size=512,offset=0): pred[]{:T(512)}
+allocation 36: size 512, thread-local:
+ value: <10 add.181 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 37: size 512, thread-local:
+ value: <9 rhs @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 38: size 512, thread-local:
+ value: <8 lhs @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 39: size 512, thread-local:
+ value: <1 scatter.3 @0> (size=512,offset=0): u8[]{:T(512)}
+allocation 40: size 512, thread-local:
+ value: <0 scatter.2 @0> (size=512,offset=0): u8[]{:T(512)}
+allocation 41: size 512, thread-local:
+ value: <4 reduce_max.5 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 42: size 512, thread-local:
+ value: <3 reduce_max.4 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 43: size 512, thread-local:
+ value: <2 reduce_max.3 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 44: size 512, thread-local:
+ value: <7 reduce_sum.5 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 45: size 512, thread-local:
+ value: <6 reduce_sum.4 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 46: size 512, thread-local:
+ value: <5 reduce_sum.3 @0> (size=512,offset=0): s32[]{:T(128)}
+allocation 47: size 1024, thread-local:
+ value: <267 add.242 @0> (size=1024,offset=0): pred[]
+allocation 48: size 1024, thread-local:
+ value: <266 rhs.58 @0> (size=1024,offset=0): pred[]
+allocation 49: size 1024, thread-local:
+ value: <265 lhs.58 @0> (size=1024,offset=0): pred[]
+allocation 50: size 1024, thread-local:
+ value: <120 add.193 @0> (size=1024,offset=0): pred[]
+allocation 51: size 32, output shape is |(u8[576,256,4,256], s32[1024,2048])|, maybe-live-out:
+ value: <4416 tuple.440{} @0> (size=32,offset=0): (u8[576,256,4,256]{3,2,1,0:T(4,128)(4,1)}, s32[1024,2048]{1,0:T(8,128)})
+allocation 52: size 1024, thread-local:
+ value: <119 rhs.9 @0> (size=1024,offset=0): pred[]
+allocation 53: size 1024, thread-local:
+ value: <118 lhs.9 @0> (size=1024,offset=0): pred[]
+allocation 54: size 1024, thread-local:
+ value: <123 add.194 @0> (size=1024,offset=0): pred[]
+allocation 55: size 1024, thread-local:
+ value: <122 rhs.10 @0> (size=1024,offset=0): pred[]
+allocation 56: size 1024, thread-local:
+ value: <121 lhs.10 @0> (size=1024,offset=0): pred[]
+allocation 57: size 1024, thread-local:
+ value: <126 add.195 @0> (size=1024,offset=0): pred[]
+allocation 58: size 1024, thread-local:
+ value: <125 rhs.11 @0> (size=1024,offset=0): pred[]
+allocation 59: size 1024, thread-local:
+ value: <124 lhs.11 @0> (size=1024,offset=0): pred[]
+allocation 60: size 1024, thread-local:
+ value: <129 add.196 @0> (size=1024,offset=0): pred[]
+allocation 61: size 1024, thread-local:
+ value: <128 rhs.12 @0> (size=1024,offset=0): pred[]
+allocation 62: size 1024, thread-local:
+ value: <127 lhs.12 @0> (size=1024,offset=0): pred[]
+allocation 63: size 1024, thread-local:
+ value: <132 add.197 @0> (size=1024,offset=0): pred[]
+allocation 64: size 1024, thread-local:
+ value: <131 rhs.13 @0> (size=1024,offset=0): pred[]
+allocation 65: size 1024, thread-local:
+ value: <130 lhs.13 @0> (size=1024,offset=0): pred[]
+allocation 66: size 1024, thread-local:
+ value: <135 add.198 @0> (size=1024,offset=0): pred[]
+allocation 67: size 1024, thread-local:
+ value: <134 rhs.14 @0> (size=1024,offset=0): pred[]
+allocation 68: size 1024, thread-local:
+ value: <133 lhs.14 @0> (size=1024,offset=0): pred[]
+allocation 69: size 1024, thread-local:
+ value: <138 add.199 @0> (size=1024,offset=0): pred[]
+allocation 70: size 1024, thread-local:
+ value: <137 rhs.15 @0> (size=1024,offset=0): pred[]
+allocation 71: size 1024, thread-local:
+ value: <136 lhs.15 @0> (size=1024,offset=0): pred[]
+allocation 72: size 1024, thread-local:
+ value: <141 add.200 @0> (size=1024,offset=0): pred[]
+allocation 73: size 1024, thread-local:
+ value: <140 rhs.16 @0> (size=1024,offset=0): pred[]
+allocation 74: size 1024, thread-local:
+ value: <139 lhs.16 @0> (size=1024,offset=0): pred[]
+allocation 75: size 1024, thread-local:
+ value: <144 add.201 @0> (size=1024,offset=0): pred[]
+allocation 76: size 1024, thread-local:
+ value: <143 rhs.17 @0> (size=1024,offset=0): pred[]
+allocation 77: size 1024, thread-local:
+ value: <142 lhs.17 @0> (size=1024,offset=0): pred[]
+allocation 78: size 1024, thread-local:
+ value: <147 add.202 @0> (size=1024,offset=0): pred[]
+allocation 79: size 1024, thread-local:
+ value: <146 rhs.18 @0> (size=1024,offset=0): pred[]
+allocation 80: size 1024, thread-local:
+ value: <145 lhs.18 @0> (size=1024,offset=0): pred[]
+allocation 81: size 1024, thread-local:
+ value: <150 add.203 @0> (size=1024,offset=0): pred[]
+allocation 82: size 1024, thread-local:
+ value: <149 rhs.19 @0> (size=1024,offset=0): pred[]
+allocation 83: size 1024, thread-local:
+ value: <148 lhs.19 @0> (size=1024,offset=0): pred[]
+allocation 84: size 1024, thread-local:
+ value: <153 add.204 @0> (size=1024,offset=0): pred[]
+allocation 85: size 1024, thread-local:
+ value: <152 rhs.20 @0> (size=1024,offset=0): pred[]
+allocation 86: size 1024, thread-local:
+ value: <151 lhs.20 @0> (size=1024,offset=0): pred[]
+allocation 87: size 1024, thread-local:
+ value: <156 add.205 @0> (size=1024,offset=0): pred[]
+allocation 88: size 1024, thread-local:
+ value: <155 rhs.21 @0> (size=1024,offset=0): pred[]
+allocation 89: size 1024, thread-local:
+ value: <154 lhs.21 @0> (size=1024,offset=0): pred[]
+allocation 90: size 1024, thread-local:
+ value: <97 lhs.2 @0> (size=1024,offset=0): pred[]
+allocation 91: size 1024, thread-local:
+ value: <98 rhs.2 @0> (size=1024,offset=0): pred[]
+allocation 92: size 1024, thread-local:
+ value: <99 add.186 @0> (size=1024,offset=0): pred[]
+allocation 93: size 1024, thread-local:
+ value: <100 lhs.3 @0> (size=1024,offset=0): pred[]
+allocation 94: size 1024, thread-local:
+ value: <101 rhs.3 @0> (size=1024,offset=0): pred[]
+allocation 95: size 1024, thread-local:
+ value: <102 add.187 @0> (size=1024,offset=0): pred[]
+allocation 96: size 1024, thread-local:
+ value: <103 lhs.4 @0> (size=1024,offset=0): pred[]
+allocation 97: size 1024, thread-local:
+ value: <104 rhs.4 @0> (size=1024,offset=0): pred[]
+allocation 98: size 1024, thread-local:
+ value: <105 add.188 @0> (size=1024,offset=0): pred[]
+allocation 99: size 1024, thread-local:
+ value: <106 lhs.5 @0> (size=1024,offset=0): pred[]
+allocation 100: size 1024, thread-local:
+ value: <107 rhs.5 @0> (size=1024,offset=0): pred[]
+allocation 101: size 1024, thread-local:
+ value: <108 add.189 @0> (size=1024,offset=0): pred[]
+allocation 102: size 1024, thread-local:
+ value: <109 lhs.6 @0> (size=1024,offset=0): pred[]
+allocation 103: size 1024, thread-local:
+ value: <110 rhs.6 @0> (size=1024,offset=0): pred[]
+allocation 104: size 1024, thread-local:
+ value: <111 add.190 @0> (size=1024,offset=0): pred[]
+allocation 105: size 1024, thread-local:
+ value: <112 lhs.7 @0> (size=1024,offset=0): pred[]
+allocation 106: size 1024, thread-local:
+ value: <113 rhs.7 @0> (size=1024,offset=0): pred[]
+allocation 107: size 1024, thread-local:
+ value: <114 add.191 @0> (size=1024,offset=0): pred[]
+allocation 108: size 1024, thread-local:
+ value: <115 lhs.8 @0> (size=1024,offset=0): pred[]
+allocation 109: size 1024, thread-local:
+ value: <116 rhs.8 @0> (size=1024,offset=0): pred[]
+allocation 110: size 1024, thread-local:
+ value: <117 add.192 @0> (size=1024,offset=0): pred[]
+allocation 111: size 1024, thread-local:
+ value: <262 lhs.57 @0> (size=1024,offset=0): pred[]
+allocation 112: size 1024, thread-local:
+ value: <263 rhs.57 @0> (size=1024,offset=0): pred[]
+allocation 113: size 1024, thread-local:
+ value: <264 add.241 @0> (size=1024,offset=0): pred[]
+allocation 114: size 1024, thread-local:
+ value: <259 lhs.56 @0> (size=1024,offset=0): pred[]
+allocation 115: size 1024, thread-local:
+ value: <260 rhs.56 @0> (size=1024,offset=0): pred[]
+allocation 116: size 1024, thread-local:
+ value: <261 add.240 @0> (size=1024,offset=0): pred[]
+allocation 117: size 1024, thread-local:
+ value: <256 lhs.55 @0> (size=1024,offset=0): pred[]
+allocation 118: size 1024, thread-local:
+ value: <257 rhs.55 @0> (size=1024,offset=0): pred[]
+allocation 119: size 1024, thread-local:
+ value: <258 add.239 @0> (size=1024,offset=0): pred[]
+allocation 120: size 1024, thread-local:
+ value: <253 lhs.54 @0> (size=1024,offset=0): pred[]
+allocation 121: size 1024, thread-local:
+ value: <254 rhs.54 @0> (size=1024,offset=0): pred[]
+allocation 122: size 1024, thread-local:
+ value: <255 add.238 @0> (size=1024,offset=0): pred[]
+allocation 123: size 1024, thread-local:
+ value: <250 lhs.53 @0> (size=1024,offset=0): pred[]
+allocation 124: size 1024, thread-local:
+ value: <251 rhs.53 @0> (size=1024,offset=0): pred[]
+allocation 125: size 1024, thread-local:
+ value: <252 add.237 @0> (size=1024,offset=0): pred[]
+allocation 126: size 1024, thread-local:
+ value: <247 lhs.52 @0> (size=1024,offset=0): pred[]
+allocation 127: size 1024, thread-local:
+ value: <248 rhs.52 @0> (size=1024,offset=0): pred[]
+allocation 128: size 1024, thread-local:
+ value: <249 add.236 @0> (size=1024,offset=0): pred[]
+allocation 129: size 1024, thread-local:
+ value: <244 lhs.51 @0> (size=1024,offset=0): pred[]
+allocation 130: size 1024, thread-local:
+ value: <245 rhs.51 @0> (size=1024,offset=0): pred[]
+allocation 131: size 1024, thread-local:
+ value: <246 add.235 @0> (size=1024,offset=0): pred[]
+allocation 132: size 1024, thread-local:
+ value: <241 lhs.50 @0> (size=1024,offset=0): pred[]
+allocation 133: size 1024, thread-local:
+ value: <242 rhs.50 @0> (size=1024,offset=0): pred[]
+allocation 134: size 1024, thread-local:
+ value: <243 add.234 @0> (size=1024,offset=0): pred[]
+allocation 135: size 1024, thread-local:
+ value: <238 lhs.49 @0> (size=1024,offset=0): pred[]
+allocation 136: size 1024, thread-local:
+ value: <239 rhs.49 @0> (size=1024,offset=0): pred[]
+allocation 137: size 1024, thread-local:
+ value: <240 add.233 @0> (size=1024,offset=0): pred[]
+allocation 138: size 1024, thread-local:
+ value: <235 lhs.48 @0> (size=1024,offset=0): pred[]
+allocation 139: size 1024, thread-local:
+ value: <236 rhs.48 @0> (size=1024,offset=0): pred[]
+allocation 140: size 1024, thread-local:
+ value: <237 add.232 @0> (size=1024,offset=0): pred[]
+allocation 141: size 1024, thread-local:
+ value: <232 lhs.47 @0> (size=1024,offset=0): pred[]
+allocation 142: size 1024, thread-local:
+ value: <233 rhs.47 @0> (size=1024,offset=0): pred[]
+allocation 143: size 1024, thread-local:
+ value: <234 add.231 @0> (size=1024,offset=0): pred[]
+allocation 144: size 1024, thread-local:
+ value: <229 lhs.46 @0> (size=1024,offset=0): pred[]
+allocation 145: size 1024, thread-local:
+ value: <230 rhs.46 @0> (size=1024,offset=0): pred[]
+allocation 146: size 1024, thread-local:
+ value: <231 add.230 @0> (size=1024,offset=0): pred[]
+allocation 147: size 1024, thread-local:
+ value: <226 lhs.45 @0> (size=1024,offset=0): pred[]
+allocation 148: size 1024, thread-local:
+ value: <227 rhs.45 @0> (size=1024,offset=0): pred[]
+allocation 149: size 1024, thread-local:
+ value: <228 add.229 @0> (size=1024,offset=0): pred[]
+allocation 150: size 1024, thread-local:
+ value: <223 lhs.44 @0> (size=1024,offset=0): pred[]
+allocation 151: size 1024, thread-local:
+ value: <224 rhs.44 @0> (size=1024,offset=0): pred[]
+allocation 152: size 1024, thread-local:
+ value: <225 add.228 @0> (size=1024,offset=0): pred[]
+allocation 153: size 1024, thread-local:
+ value: <220 lhs.43 @0> (size=1024,offset=0): pred[]
+allocation 154: size 1024, thread-local:
+ value: <221 rhs.43 @0> (size=1024,offset=0): pred[]
+allocation 155: size 1024, thread-local:
+ value: <222 add.227 @0> (size=1024,offset=0): pred[]
+allocation 156: size 1024, thread-local:
+ value: <217 lhs.42 @0> (size=1024,offset=0): pred[]
+allocation 157: size 1024, thread-local:
+ value: <218 rhs.42 @0> (size=1024,offset=0): pred[]
+allocation 158: size 1024, thread-local:
+ value: <219 add.226 @0> (size=1024,offset=0): pred[]
+allocation 159: size 1024, thread-local:
+ value: <214 lhs.41 @0> (size=1024,offset=0): pred[]
+allocation 160: size 1024, thread-local:
+ value: <215 rhs.41 @0> (size=1024,offset=0): pred[]
+allocation 161: size 1024, thread-local:
+ value: <216 add.225 @0> (size=1024,offset=0): pred[]
+allocation 162: size 1024, thread-local:
+ value: <211 lhs.40 @0> (size=1024,offset=0): pred[]
+allocation 163: size 1024, thread-local:
+ value: <212 rhs.40 @0> (size=1024,offset=0): pred[]
+allocation 164: size 1024, thread-local:
+ value: <213 add.224 @0> (size=1024,offset=0): pred[]
+allocation 165: size 1024, thread-local:
+ value: <208 lhs.39 @0> (size=1024,offset=0): pred[]
+allocation 166: size 1024, thread-local:
+ value: <209 rhs.39 @0> (size=1024,offset=0): pred[]
+allocation 167: size 1024, thread-local:
+ value: <210 add.223 @0> (size=1024,offset=0): pred[]
+allocation 168: size 1024, thread-local:
+ value: <205 lhs.38 @0> (size=1024,offset=0): pred[]
+allocation 169: size 1024, thread-local:
+ value: <206 rhs.38 @0> (size=1024,offset=0): pred[]
+allocation 170: size 1024, thread-local:
+ value: <207 add.222 @0> (size=1024,offset=0): pred[]
+allocation 171: size 1024, thread-local:
+ value: <202 lhs.37 @0> (size=1024,offset=0): pred[]
+allocation 172: size 1024, thread-local:
+ value: <203 rhs.37 @0> (size=1024,offset=0): pred[]
+allocation 173: size 1024, thread-local:
+ value: <204 add.221 @0> (size=1024,offset=0): pred[]
+allocation 174: size 1024, thread-local:
+ value: <199 lhs.36 @0> (size=1024,offset=0): pred[]
+allocation 175: size 1024, thread-local:
+ value: <200 rhs.36 @0> (size=1024,offset=0): pred[]
+allocation 176: size 1024, thread-local:
+ value: <201 add.220 @0> (size=1024,offset=0): pred[]
+allocation 177: size 1024, thread-local:
+ value: <196 lhs.35 @0> (size=1024,offset=0): pred[]
+allocation 178: size 1024, thread-local:
+ value: <197 rhs.35 @0> (size=1024,offset=0): pred[]
+allocation 179: size 1024, thread-local:
+ value: <198 add.219 @0> (size=1024,offset=0): pred[]
+allocation 180: size 1024, thread-local:
+ value: <193 lhs.34 @0> (size=1024,offset=0): pred[]
+allocation 181: size 1024, thread-local:
+ value: <194 rhs.34 @0> (size=1024,offset=0): pred[]
+allocation 182: size 1024, thread-local:
+ value: <195 add.218 @0> (size=1024,offset=0): pred[]
+allocation 183: size 1024, thread-local:
+ value: <190 lhs.33 @0> (size=1024,offset=0): pred[]
+allocation 184: size 1024, thread-local:
+ value: <191 rhs.33 @0> (size=1024,offset=0): pred[]
+allocation 185: size 1024, thread-local:
+ value: <192 add.217 @0> (size=1024,offset=0): pred[]
+allocation 186: size 1024, thread-local:
+ value: <187 lhs.32 @0> (size=1024,offset=0): pred[]
+allocation 187: size 1024, thread-local:
+ value: <188 rhs.32 @0> (size=1024,offset=0): pred[]
+allocation 188: size 1024, thread-local:
+ value: <189 add.216 @0> (size=1024,offset=0): pred[]
+allocation 189: size 1024, thread-local:
+ value: <184 lhs.31 @0> (size=1024,offset=0): pred[]
+allocation 190: size 1024, thread-local:
+ value: <185 rhs.31 @0> (size=1024,offset=0): pred[]
+allocation 191: size 1024, thread-local:
+ value: <186 add.215 @0> (size=1024,offset=0): pred[]
+allocation 192: size 1024, thread-local:
+ value: <181 lhs.30 @0> (size=1024,offset=0): pred[]
+allocation 193: size 1024, thread-local:
+ value: <182 rhs.30 @0> (size=1024,offset=0): pred[]
+allocation 194: size 1024, thread-local:
+ value: <183 add.214 @0> (size=1024,offset=0): pred[]
+allocation 195: size 1024, thread-local:
+ value: <178 lhs.29 @0> (size=1024,offset=0): pred[]
+allocation 196: size 1024, thread-local:
+ value: <179 rhs.29 @0> (size=1024,offset=0): pred[]
+allocation 197: size 1024, thread-local:
+ value: <180 add.213 @0> (size=1024,offset=0): pred[]
+allocation 198: size 1024, thread-local:
+ value: <175 lhs.28 @0> (size=1024,offset=0): pred[]
+allocation 199: size 1024, thread-local:
+ value: <176 rhs.28 @0> (size=1024,offset=0): pred[]
+allocation 200: size 1024, thread-local:
+ value: <177 add.212 @0> (size=1024,offset=0): pred[]
+allocation 201: size 1024, thread-local:
+ value: <172 lhs.27 @0> (size=1024,offset=0): pred[]
+allocation 202: size 1024, thread-local:
+ value: <173 rhs.27 @0> (size=1024,offset=0): pred[]
+allocation 203: size 1024, thread-local:
+ value: <174 add.211 @0> (size=1024,offset=0): pred[]
+allocation 204: size 1024, thread-local:
+ value: <169 lhs.26 @0> (size=1024,offset=0): pred[]
+allocation 205: size 1024, thread-local:
+ value: <170 rhs.26 @0> (size=1024,offset=0): pred[]
+allocation 206: size 1024, thread-local:
+ value: <171 add.210 @0> (size=1024,offset=0): pred[]
+allocation 207: size 1024, thread-local:
+ value: <166 lhs.25 @0> (size=1024,offset=0): pred[]
+allocation 208: size 1024, thread-local:
+ value: <167 rhs.25 @0> (size=1024,offset=0): pred[]
+allocation 209: size 1024, thread-local:
+ value: <168 add.209 @0> (size=1024,offset=0): pred[]
+allocation 210: size 1024, thread-local:
+ value: <163 lhs.24 @0> (size=1024,offset=0): pred[]
+allocation 211: size 1024, thread-local:
+ value: <164 rhs.24 @0> (size=1024,offset=0): pred[]
+allocation 212: size 1024, thread-local:
+ value: <165 add.208 @0> (size=1024,offset=0): pred[]
+allocation 213: size 1024, thread-local:
+ value: <160 lhs.23 @0> (size=1024,offset=0): pred[]
+allocation 214: size 1024, thread-local:
+ value: <161 rhs.23 @0> (size=1024,offset=0): pred[]
+allocation 215: size 1024, thread-local:
+ value: <162 add.207 @0> (size=1024,offset=0): pred[]
+allocation 216: size 1024, thread-local:
+ value: <157 lhs.22 @0> (size=1024,offset=0): pred[]
+allocation 217: size 1024, thread-local:
+ value: <158 rhs.22 @0> (size=1024,offset=0): pred[]
+allocation 218: size 1024, thread-local:
+ value: <159 add.206 @0> (size=1024,offset=0): pred[]
+allocation 219: size 4, color 8, preallocated-temp:
+ value: <4046 sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start{2} @8> (size=4,offset=0): u32[]{:S(8)}
+allocation 220: size 4608, color 6, preallocated-temp:
+ value: <3014 compare.1549 @6> (size=512,offset=0): pred[]{:T(512)S(6)}
+ value: <3954 compare.1676 @6> (size=512,offset=0): pred[]{:T(512)S(6)}
+ value: <4058 sub.17 @6> (size=512,offset=512): s32[]{:T(128)S(6)}
+ value: <4070 sign.4 @6> (size=512,offset=0): s32[]{:T(128)S(6)}
+ value: <4072 ne.2 @6> (size=512,offset=512): pred[]{:T(512)S(6)}
+ value: <4073 compare.1 @6> (size=512,offset=512): pred[]{:T(512)S(6)}
+ value: <4074 negate.3 @6> (size=512,offset=1536): s32[]{:T(128)S(6)}
+ value: <4075 select.2 @6> (size=512,offset=1536): s32[]{:T(128)S(6)}
+ value: <4077 and.18 @6> (size=512,offset=1024): s32[]{:T(128)S(6)}
+ value: <4078 negate.4 @6> (size=512,offset=2048): s32[]{:T(128)S(6)}
+ value: <4079 select.3 @6> (size=512,offset=2048): s32[]{:T(128)S(6)}
+ value: <4080 ne.3 @6> (size=512,offset=1024): pred[]{:T(512)S(6)}
+ value: <4081 and.2 @6> (size=512,offset=512): pred[]{:T(512)S(6)}
+ value: <4083 shift-right-logical @6> (size=512,offset=1536): s32[]{:T(128)S(6)}
+ value: <4084 negate.6 @6> (size=512,offset=2048): s32[]{:T(128)S(6)}
+ value: <4085 select.5 @6> (size=512,offset=2048): s32[]{:T(128)S(6)}
+ value: <4086 add.7 @6> (size=512,offset=0): s32[]{:T(128)S(6)}
+ value: <4087 select_n.8 @6> (size=512,offset=0): s32[]{:T(128)S(6)}
+ value: <4090 sub.16 @6> (size=512,offset=1024): s32[]{:T(128)S(6)}
+ value: <4092 sign.10 @6> (size=512,offset=2048): s32[]{:T(128)S(6)}
+ value: <4093 ne.10 @6> (size=512,offset=3072): pred[]{:T(512)S(6)}
+ value: <4094 compare.4 @6> (size=512,offset=1536): pred[]{:T(512)S(6)}
+ value: <4095 negate.11 @6> (size=512,offset=3072): s32[]{:T(128)S(6)}
+ value: <4096 select.8 @6> (size=512,offset=3072): s32[]{:T(128)S(6)}
+ value: <4097 and.20 @6> (size=512,offset=3072): s32[]{:T(128)S(6)}
+ value: <4098 negate.12 @6> (size=512,offset=3584): s32[]{:T(128)S(6)}
+ value: <4099 select.9 @6> (size=512,offset=3584): s32[]{:T(128)S(6)}
+ value: <4100 ne.14 @6> (size=512,offset=1536): pred[]{:T(512)S(6)}
+ value: <4101 and.6 @6> (size=512,offset=3072): pred[]{:T(512)S(6)}
+ value: <4102 shift-right-logical.1 @6> (size=512,offset=2560): s32[]{:T(128)S(6)}
+ value: <4103 negate.14 @6> (size=512,offset=4096): s32[]{:T(128)S(6)}
+ value: <4104 select.11 @6> (size=512,offset=4096): s32[]{:T(128)S(6)}
+ value: <4105 add.10 @6> (size=512,offset=2560): s32[]{:T(128)S(6)}
+ value: <4106 select_n.11 @6> (size=512,offset=2560): s32[]{:T(128)S(6)}
+ value: <4254 lt.30 @6> (size=512,offset=0): pred[]{:T(512)S(6)}
+ value: <4256 add.37 @6> (size=512,offset=512): s32[]{:T(128)S(6)}
+ value: <4257 select_n.32 @6> (size=512,offset=512): s32[]{:T(128)S(6)}
+ value: <4387 le.0 @6> (size=512,offset=0): pred[]{:T(512)S(6)}
+allocation 221: size 24, color 2, preallocated-temp:
+ value: <4061 copy-start.4{2} @2> (size=4,offset=4): u32[]{:S(2)}
+ value: <4064 copy-start.1{2} @2> (size=4,offset=8): u32[]{:S(2)}
+ value: <4117 copy-start.2{2} @2> (size=4,offset=4): u32[]{:S(2)}
+ value: <4141 copy-start.10{2} @2> (size=4,offset=8): u32[]{:S(2)}
+ value: <4145 copy-start.9{2} @2> (size=4,offset=12): u32[]{:S(2)}
+ value: <4260 prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start @2> (size=4,offset=0): s32[]{:S(2)}
+ value: <4375 copy-start.6{2} @2> (size=4,offset=0): u32[]{:S(2)}
+ value: <4383 copy-start.3{2} @2> (size=4,offset=0): u32[]{:S(2)}
+ value: <4392 copy-start.8{2} @2> (size=4,offset=4): u32[]{:S(2)}
+ value: <4395 copy-start{2} @2> (size=4,offset=8): u32[]{:S(2)}
+ value: <4399 slice-start{2} @2> (size=4,offset=12): s32[]{:S(2)}
+ value: <4402 slice-start.1{2} @2> (size=4,offset=16): s32[]{:S(2)}
+ value: <4408 copy-start.7{2} @2> (size=4,offset=20): u32[]{:S(2)}
+ value: <4415 copy-start.5{2} @2> (size=4,offset=0): u32[]{:S(2)}
+allocation 222: size 151781632, preallocated-temp:
+ value: <2076 lt.145 @0> (size=512,offset=1605632): pred[]{:T(512)}
+ value: <2078 lt.146 @0> (size=512,offset=1048576): pred[]{:T(512)}
+ value: <2945 fusion.57{} @0> (size=32,offset=150994944): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <2946 fusion.57{0} @0> (size=512,offset=1982464): s32[1]{0:T(128)}
+ value: <2947 fusion.57{1} @0> (size=512,offset=1998848): s32[1]{0:T(128)}
+ value: <2948 fusion.57{2} @0> (size=512,offset=2015232): s32[1]{0:T(128)}
+ value: <2949 fusion.57{3} @0> (size=512,offset=2031616): s32[1]{0:T(128)}
+ value: <2950 fusion.57{4} @0> (size=512,offset=2048000): s32[1]{0:T(128)}
+ value: <2951 fusion.57{5} @0> (size=512,offset=2064384): s32[1]{0:T(128)}
+ value: <2952 fusion.57{6} @0> (size=512,offset=2080768): s32[1]{0:T(128)}
+ value: <2953 fusion.58{} @0> (size=96,offset=151568384): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <2954 fusion.58{0} @0> (size=512,offset=1048576): s32[1]{0:T(128)}
+ value: <2955 fusion.58{1} @0> (size=512,offset=1064960): s32[1]{0:T(128)}
+ value: <2956 fusion.58{2} @0> (size=512,offset=1081344): s32[1]{0:T(128)}
+ value: <2957 fusion.58{3} @0> (size=512,offset=1097728): s32[1]{0:T(128)}
+ value: <2958 fusion.58{4} @0> (size=512,offset=1114112): s32[1]{0:T(128)}
+ value: <2959 fusion.58{5} @0> (size=512,offset=1130496): s32[1]{0:T(128)}
+ value: <2960 fusion.58{6} @0> (size=512,offset=1146880): s32[1]{0:T(128)}
+ value: <2961 fusion.58{7} @0> (size=512,offset=1163264): s32[1]{0:T(128)}
+ value: <2962 fusion.58{8} @0> (size=512,offset=1179648): s32[1]{0:T(128)}
+ value: <2963 fusion.58{9} @0> (size=512,offset=1196032): s32[1]{0:T(128)}
+ value: <2964 fusion.58{10} @0> (size=512,offset=1212416): s32[1]{0:T(128)}
+ value: <2965 fusion.58{11} @0> (size=512,offset=1228800): s32[1]{0:T(128)}
+ value: <2966 fusion.58{12} @0> (size=512,offset=1245184): s32[1]{0:T(128)}
+ value: <2967 fusion.58{13} @0> (size=512,offset=1261568): s32[1]{0:T(128)}
+ value: <2968 fusion.58{14} @0> (size=512,offset=1277952): s32[1]{0:T(128)}
+ value: <2969 fusion.58{15} @0> (size=512,offset=1294336): s32[1]{0:T(128)}
+ value: <2970 fusion.58{16} @0> (size=512,offset=1310720): s32[1]{0:T(128)}
+ value: <2971 fusion.58{17} @0> (size=512,offset=1327104): s32[1]{0:T(128)}
+ value: <2972 fusion.58{18} @0> (size=512,offset=1343488): s32[1]{0:T(128)}
+ value: <2973 fusion.59{} @0> (size=96,offset=151552000): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <2974 fusion.59{0} @0> (size=512,offset=1359872): s32[1]{0:T(128)}
+ value: <2975 fusion.59{1} @0> (size=512,offset=1376256): s32[1]{0:T(128)}
+ value: <2976 fusion.59{2} @0> (size=512,offset=1392640): s32[1]{0:T(128)}
+ value: <2977 fusion.59{3} @0> (size=512,offset=1409024): s32[1]{0:T(128)}
+ value: <2978 fusion.59{4} @0> (size=512,offset=1425408): s32[1]{0:T(128)}
+ value: <2979 fusion.59{5} @0> (size=512,offset=1441792): s32[1]{0:T(128)}
+ value: <2980 fusion.59{6} @0> (size=512,offset=1458176): s32[1]{0:T(128)}
+ value: <2981 fusion.59{7} @0> (size=512,offset=1474560): s32[1]{0:T(128)}
+ value: <2982 fusion.59{8} @0> (size=512,offset=1490944): s32[1]{0:T(128)}
+ value: <2983 fusion.59{9} @0> (size=512,offset=1507328): s32[1]{0:T(128)}
+ value: <2984 fusion.59{10} @0> (size=512,offset=1523712): s32[1]{0:T(128)}
+ value: <2985 fusion.59{11} @0> (size=512,offset=1540096): s32[1]{0:T(128)}
+ value: <2986 fusion.59{12} @0> (size=512,offset=1556480): s32[1]{0:T(128)}
+ value: <2987 fusion.59{13} @0> (size=512,offset=1572864): s32[1]{0:T(128)}
+ value: <2988 fusion.59{14} @0> (size=512,offset=1589248): s32[1]{0:T(128)}
+ value: <2989 fusion.59{15} @0> (size=512,offset=1605632): s32[1]{0:T(128)}
+ value: <2990 fusion.59{16} @0> (size=512,offset=1622016): s32[1]{0:T(128)}
+ value: <2991 fusion.59{17} @0> (size=512,offset=1638400): s32[1]{0:T(128)}
+ value: <2992 fusion.59{18} @0> (size=512,offset=1654784): s32[1]{0:T(128)}
+ value: <2993 fusion.60{} @0> (size=96,offset=151535616): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <2994 fusion.60{0} @0> (size=512,offset=1671168): s32[1]{0:T(128)}
+ value: <2995 fusion.60{1} @0> (size=512,offset=1687552): s32[1]{0:T(128)}
+ value: <2996 fusion.60{2} @0> (size=512,offset=1703936): s32[1]{0:T(128)}
+ value: <2997 fusion.60{3} @0> (size=512,offset=1720320): s32[1]{0:T(128)}
+ value: <2998 fusion.60{4} @0> (size=512,offset=1736704): s32[1]{0:T(128)}
+ value: <2999 fusion.60{5} @0> (size=512,offset=1753088): s32[1]{0:T(128)}
+ value: <3000 fusion.60{6} @0> (size=512,offset=1769472): s32[1]{0:T(128)}
+ value: <3001 fusion.60{7} @0> (size=512,offset=1785856): s32[1]{0:T(128)}
+ value: <3002 fusion.60{8} @0> (size=512,offset=1802240): s32[1]{0:T(128)}
+ value: <3003 fusion.60{9} @0> (size=512,offset=1818624): s32[1]{0:T(128)}
+ value: <3004 fusion.60{10} @0> (size=512,offset=1835008): s32[1]{0:T(128)}
+ value: <3005 fusion.60{11} @0> (size=512,offset=1851392): s32[1]{0:T(128)}
+ value: <3006 fusion.60{12} @0> (size=512,offset=1867776): s32[1]{0:T(128)}
+ value: <3007 fusion.60{13} @0> (size=512,offset=1884160): s32[1]{0:T(128)}
+ value: <3008 fusion.60{14} @0> (size=512,offset=1900544): s32[1]{0:T(128)}
+ value: <3009 fusion.60{15} @0> (size=512,offset=1916928): s32[1]{0:T(128)}
+ value: <3010 fusion.60{16} @0> (size=512,offset=1933312): s32[1]{0:T(128)}
+ value: <3011 fusion.60{17} @0> (size=512,offset=1949696): s32[1]{0:T(128)}
+ value: <3012 fusion.60{18} @0> (size=512,offset=1966080): s32[1]{0:T(128)}
+ value: <3018 tuple.437{} @0> (size=32,offset=151502848): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <3884 add.353 @0> (size=512,offset=1589248): s32[]{:T(128)}
+ value: <3885 fusion.63{} @0> (size=32,offset=151142400): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <3886 fusion.63{0} @0> (size=512,offset=2539520): s32[1]{0:T(128)}
+ value: <3887 fusion.63{1} @0> (size=512,offset=2555904): s32[1]{0:T(128)}
+ value: <3888 fusion.63{2} @0> (size=512,offset=2572288): s32[1]{0:T(128)}
+ value: <3889 fusion.63{3} @0> (size=512,offset=2588672): s32[1]{0:T(128)}
+ value: <3890 fusion.63{4} @0> (size=512,offset=2605056): s32[1]{0:T(128)}
+ value: <3891 fusion.63{5} @0> (size=512,offset=2621440): s32[1]{0:T(128)}
+ value: <3892 fusion.63{6} @0> (size=512,offset=2637824): s32[1]{0:T(128)}
+ value: <3893 fusion.64{} @0> (size=96,offset=151666688): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <3894 fusion.64{0} @0> (size=512,offset=1605632): s32[1]{0:T(128)}
+ value: <3895 fusion.64{1} @0> (size=512,offset=1622016): s32[1]{0:T(128)}
+ value: <3896 fusion.64{2} @0> (size=512,offset=1638400): s32[1]{0:T(128)}
+ value: <3897 fusion.64{3} @0> (size=512,offset=1654784): s32[1]{0:T(128)}
+ value: <3898 fusion.64{4} @0> (size=512,offset=1671168): s32[1]{0:T(128)}
+ value: <3899 fusion.64{5} @0> (size=512,offset=1687552): s32[1]{0:T(128)}
+ value: <3900 fusion.64{6} @0> (size=512,offset=1703936): s32[1]{0:T(128)}
+ value: <3901 fusion.64{7} @0> (size=512,offset=1720320): s32[1]{0:T(128)}
+ value: <3902 fusion.64{8} @0> (size=512,offset=1736704): s32[1]{0:T(128)}
+ value: <3903 fusion.64{9} @0> (size=512,offset=1753088): s32[1]{0:T(128)}
+ value: <3904 fusion.64{10} @0> (size=512,offset=1769472): s32[1]{0:T(128)}
+ value: <3905 fusion.64{11} @0> (size=512,offset=1785856): s32[1]{0:T(128)}
+ value: <3906 fusion.64{12} @0> (size=512,offset=1802240): s32[1]{0:T(128)}
+ value: <3907 fusion.64{13} @0> (size=512,offset=1818624): s32[1]{0:T(128)}
+ value: <3908 fusion.64{14} @0> (size=512,offset=1835008): s32[1]{0:T(128)}
+ value: <3909 fusion.64{15} @0> (size=512,offset=1851392): s32[1]{0:T(128)}
+ value: <3910 fusion.64{16} @0> (size=512,offset=1867776): s32[1]{0:T(128)}
+ value: <3911 fusion.64{17} @0> (size=512,offset=1884160): s32[1]{0:T(128)}
+ value: <3912 fusion.64{18} @0> (size=512,offset=1900544): s32[1]{0:T(128)}
+ value: <3913 fusion.65{} @0> (size=96,offset=151650304): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <3914 fusion.65{0} @0> (size=512,offset=1916928): s32[1]{0:T(128)}
+ value: <3915 fusion.65{1} @0> (size=512,offset=1933312): s32[1]{0:T(128)}
+ value: <3916 fusion.65{2} @0> (size=512,offset=1949696): s32[1]{0:T(128)}
+ value: <3917 fusion.65{3} @0> (size=512,offset=1966080): s32[1]{0:T(128)}
+ value: <3918 fusion.65{4} @0> (size=512,offset=1982464): s32[1]{0:T(128)}
+ value: <3919 fusion.65{5} @0> (size=512,offset=1998848): s32[1]{0:T(128)}
+ value: <3920 fusion.65{6} @0> (size=512,offset=2015232): s32[1]{0:T(128)}
+ value: <3921 fusion.65{7} @0> (size=512,offset=2031616): s32[1]{0:T(128)}
+ value: <3922 fusion.65{8} @0> (size=512,offset=2048000): s32[1]{0:T(128)}
+ value: <3923 fusion.65{9} @0> (size=512,offset=2064384): s32[1]{0:T(128)}
+ value: <3924 fusion.65{10} @0> (size=512,offset=2080768): s32[1]{0:T(128)}
+ value: <3925 fusion.65{11} @0> (size=512,offset=2097152): s32[1]{0:T(128)}
+ value: <3926 fusion.65{12} @0> (size=512,offset=2113536): s32[1]{0:T(128)}
+ value: <3927 fusion.65{13} @0> (size=512,offset=2129920): s32[1]{0:T(128)}
+ value: <3928 fusion.65{14} @0> (size=512,offset=2146304): s32[1]{0:T(128)}
+ value: <3929 fusion.65{15} @0> (size=512,offset=2162688): s32[1]{0:T(128)}
+ value: <3930 fusion.65{16} @0> (size=512,offset=2179072): s32[1]{0:T(128)}
+ value: <3931 fusion.65{17} @0> (size=512,offset=2195456): s32[1]{0:T(128)}
+ value: <3932 fusion.65{18} @0> (size=512,offset=2211840): s32[1]{0:T(128)}
+ value: <3933 fusion.66{} @0> (size=96,offset=151633920): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <3934 fusion.66{0} @0> (size=512,offset=2228224): s32[1]{0:T(128)}
+ value: <3935 fusion.66{1} @0> (size=512,offset=2244608): s32[1]{0:T(128)}
+ value: <3936 fusion.66{2} @0> (size=512,offset=2260992): s32[1]{0:T(128)}
+ value: <3937 fusion.66{3} @0> (size=512,offset=2277376): s32[1]{0:T(128)}
+ value: <3938 fusion.66{4} @0> (size=512,offset=2293760): s32[1]{0:T(128)}
+ value: <3939 fusion.66{5} @0> (size=512,offset=2310144): s32[1]{0:T(128)}
+ value: <3940 fusion.66{6} @0> (size=512,offset=2326528): s32[1]{0:T(128)}
+ value: <3941 fusion.66{7} @0> (size=512,offset=2342912): s32[1]{0:T(128)}
+ value: <3942 fusion.66{8} @0> (size=512,offset=2359296): s32[1]{0:T(128)}
+ value: <3943 fusion.66{9} @0> (size=512,offset=2375680): s32[1]{0:T(128)}
+ value: <3944 fusion.66{10} @0> (size=512,offset=2392064): s32[1]{0:T(128)}
+ value: <3945 fusion.66{11} @0> (size=512,offset=2408448): s32[1]{0:T(128)}
+ value: <3946 fusion.66{12} @0> (size=512,offset=2424832): s32[1]{0:T(128)}
+ value: <3947 fusion.66{13} @0> (size=512,offset=2441216): s32[1]{0:T(128)}
+ value: <3948 fusion.66{14} @0> (size=512,offset=2457600): s32[1]{0:T(128)}
+ value: <3949 fusion.66{15} @0> (size=512,offset=2473984): s32[1]{0:T(128)}
+ value: <3950 fusion.66{16} @0> (size=512,offset=2490368): s32[1]{0:T(128)}
+ value: <3951 fusion.66{17} @0> (size=512,offset=2506752): s32[1]{0:T(128)}
+ value: <3952 fusion.66{18} @0> (size=512,offset=2523136): s32[1]{0:T(128)}
+ value: <3958 tuple.434{} @0> (size=32,offset=151191552): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <3960 copy.14 @0> (size=512,offset=1589248): s32[]{:T(128)}
+ value: <3965 tuple.432{} @0> (size=32,offset=151191552): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <3966 fusion.9{} @0> (size=32,offset=151175168): (s32[1024]{0:T(1024)S(1)}, s32[1024]{0:T(1024)S(1)})
+ value: <3971 fusion.31{} @0> (size=32,offset=151158784): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <3972 fusion.31{0} @0> (size=512,offset=1474560): s32[1]{0:T(128)}
+ value: <3973 fusion.31{1} @0> (size=512,offset=1490944): s32[1]{0:T(128)}
+ value: <3974 fusion.31{2} @0> (size=512,offset=1507328): s32[1]{0:T(128)}
+ value: <3975 fusion.31{3} @0> (size=512,offset=1523712): s32[1]{0:T(128)}
+ value: <3976 fusion.31{4} @0> (size=512,offset=1540096): s32[1]{0:T(128)}
+ value: <3977 fusion.31{5} @0> (size=512,offset=1556480): s32[1]{0:T(128)}
+ value: <3978 fusion.31{6} @0> (size=512,offset=1572864): s32[1]{0:T(128)}
+ value: <3979 fusion.28{} @0> (size=96,offset=151715840): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <3980 fusion.28{0} @0> (size=512,offset=1163264): s32[1]{0:T(128)}
+ value: <3981 fusion.28{1} @0> (size=512,offset=1179648): s32[1]{0:T(128)}
+ value: <3982 fusion.28{2} @0> (size=512,offset=1196032): s32[1]{0:T(128)}
+ value: <3983 fusion.28{3} @0> (size=512,offset=1212416): s32[1]{0:T(128)}
+ value: <3984 fusion.28{4} @0> (size=512,offset=1228800): s32[1]{0:T(128)}
+ value: <3985 fusion.28{5} @0> (size=512,offset=1245184): s32[1]{0:T(128)}
+ value: <3986 fusion.28{6} @0> (size=512,offset=1261568): s32[1]{0:T(128)}
+ value: <3987 fusion.28{7} @0> (size=512,offset=1277952): s32[1]{0:T(128)}
+ value: <3988 fusion.28{8} @0> (size=512,offset=1294336): s32[1]{0:T(128)}
+ value: <3989 fusion.28{9} @0> (size=512,offset=1310720): s32[1]{0:T(128)}
+ value: <3990 fusion.28{10} @0> (size=512,offset=1327104): s32[1]{0:T(128)}
+ value: <3991 fusion.28{11} @0> (size=512,offset=1343488): s32[1]{0:T(128)}
+ value: <3992 fusion.28{12} @0> (size=512,offset=1359872): s32[1]{0:T(128)}
+ value: <3993 fusion.28{13} @0> (size=512,offset=1376256): s32[1]{0:T(128)}
+ value: <3994 fusion.28{14} @0> (size=512,offset=1392640): s32[1]{0:T(128)}
+ value: <3995 fusion.28{15} @0> (size=512,offset=1409024): s32[1]{0:T(128)}
+ value: <3996 fusion.28{16} @0> (size=512,offset=1425408): s32[1]{0:T(128)}
+ value: <3997 fusion.28{17} @0> (size=512,offset=1441792): s32[1]{0:T(128)}
+ value: <3998 fusion.28{18} @0> (size=512,offset=1458176): s32[1]{0:T(128)}
+ value: <3999 fusion.29{} @0> (size=96,offset=151699456): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4000 fusion.29{0} @0> (size=512,offset=540672): s32[1]{0:T(128)}
+ value: <4001 fusion.29{1} @0> (size=512,offset=557056): s32[1]{0:T(128)}
+ value: <4002 fusion.29{2} @0> (size=512,offset=573440): s32[1]{0:T(128)}
+ value: <4003 fusion.29{3} @0> (size=512,offset=589824): s32[1]{0:T(128)}
+ value: <4004 fusion.29{4} @0> (size=512,offset=606208): s32[1]{0:T(128)}
+ value: <4005 fusion.29{5} @0> (size=512,offset=622592): s32[1]{0:T(128)}
+ value: <4006 fusion.29{6} @0> (size=512,offset=638976): s32[1]{0:T(128)}
+ value: <4007 fusion.29{7} @0> (size=512,offset=655360): s32[1]{0:T(128)}
+ value: <4008 fusion.29{8} @0> (size=512,offset=671744): s32[1]{0:T(128)}
+ value: <4009 fusion.29{9} @0> (size=512,offset=688128): s32[1]{0:T(128)}
+ value: <4010 fusion.29{10} @0> (size=512,offset=704512): s32[1]{0:T(128)}
+ value: <4011 fusion.29{11} @0> (size=512,offset=720896): s32[1]{0:T(128)}
+ value: <4012 fusion.29{12} @0> (size=512,offset=737280): s32[1]{0:T(128)}
+ value: <4013 fusion.29{13} @0> (size=512,offset=753664): s32[1]{0:T(128)}
+ value: <4014 fusion.29{14} @0> (size=512,offset=770048): s32[1]{0:T(128)}
+ value: <4015 fusion.29{15} @0> (size=512,offset=786432): s32[1]{0:T(128)}
+ value: <4016 fusion.29{16} @0> (size=512,offset=802816): s32[1]{0:T(128)}
+ value: <4017 fusion.29{17} @0> (size=512,offset=819200): s32[1]{0:T(128)}
+ value: <4018 fusion.29{18} @0> (size=512,offset=835584): s32[1]{0:T(128)}
+ value: <4019 fusion.30{} @0> (size=96,offset=151683072): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4020 fusion.30{0} @0> (size=512,offset=851968): s32[1]{0:T(128)}
+ value: <4021 fusion.30{1} @0> (size=512,offset=868352): s32[1]{0:T(128)}
+ value: <4022 fusion.30{2} @0> (size=512,offset=884736): s32[1]{0:T(128)}
+ value: <4023 fusion.30{3} @0> (size=512,offset=901120): s32[1]{0:T(128)}
+ value: <4024 fusion.30{4} @0> (size=512,offset=917504): s32[1]{0:T(128)}
+ value: <4025 fusion.30{5} @0> (size=512,offset=933888): s32[1]{0:T(128)}
+ value: <4026 fusion.30{6} @0> (size=512,offset=950272): s32[1]{0:T(128)}
+ value: <4027 fusion.30{7} @0> (size=512,offset=966656): s32[1]{0:T(128)}
+ value: <4028 fusion.30{8} @0> (size=512,offset=983040): s32[1]{0:T(128)}
+ value: <4029 fusion.30{9} @0> (size=512,offset=999424): s32[1]{0:T(128)}
+ value: <4030 fusion.30{10} @0> (size=512,offset=1015808): s32[1]{0:T(128)}
+ value: <4031 fusion.30{11} @0> (size=512,offset=1032192): s32[1]{0:T(128)}
+ value: <4032 fusion.30{12} @0> (size=512,offset=1048576): s32[1]{0:T(128)}
+ value: <4033 fusion.30{13} @0> (size=512,offset=1064960): s32[1]{0:T(128)}
+ value: <4034 fusion.30{14} @0> (size=512,offset=1081344): s32[1]{0:T(128)}
+ value: <4035 fusion.30{15} @0> (size=512,offset=1097728): s32[1]{0:T(128)}
+ value: <4036 fusion.30{16} @0> (size=512,offset=1114112): s32[1]{0:T(128)}
+ value: <4037 fusion.30{17} @0> (size=512,offset=1130496): s32[1]{0:T(128)}
+ value: <4038 fusion.30{18} @0> (size=512,offset=1146880): s32[1]{0:T(128)}
+ value: <4039 slice.17 @0> (size=512,offset=1589248): s32[1]{0:T(128)}
+ value: <4042 tuple.439{} @0> (size=32,offset=151224320): (s32[1024,2048]{1,0:T(8,128)S(1)})
+ value: <4043 sc_topk_direct_b1024_n10240_k2048.6 @0> (size=8388608,offset=770048): s32[2097152]{0:T(1024)}
+ value: <4047 fusion.39{} @0> (size=64,offset=151519232): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4048 fusion.39{0} @0> (size=512,offset=704512): s32[1]{0:T(128)}
+ value: <4049 fusion.39{1} @0> (size=512,offset=606208): s32[1]{0:T(128)}
+ value: <4050 fusion.39{2} @0> (size=512,offset=622592): s32[1]{0:T(128)}
+ value: <4051 fusion.39{3} @0> (size=512,offset=638976): s32[1]{0:T(128)}
+ value: <4052 fusion.39{4} @0> (size=512,offset=655360): s32[1]{0:T(128)}
+ value: <4053 fusion.39{5} @0> (size=512,offset=671744): s32[1]{0:T(128)}
+ value: <4054 fusion.39{6} @0> (size=512,offset=720896): s32[1]{0:T(128)}
+ value: <4055 fusion.39{7} @0> (size=512,offset=688128): s32[1]{0:T(128)}
+ value: <4056 fusion.39{8} @0> (size=512,offset=589824): s32[1]{0:T(128)}
+ value: <4057 fusion.39{9} @0> (size=512,offset=573440): s32[1]{0:T(128)}
+ value: <4059 copy-start.4{} @0> (size=32,offset=151126016): (s32[64]{0:T(128)}, s32[64]{0:T(128)S(1)}, u32[]{:S(2)})
+ value: <4060 copy-start.4{0} @0> (size=512,offset=557056): s32[64]{0:T(128)}
+ value: <4062 copy-start.1{} @0> (size=32,offset=151109632): (s32[65]{0:T(128)}, s32[65]{0:T(128)S(1)}, u32[]{:S(2)})
+ value: <4063 copy-start.1{0} @0> (size=512,offset=540672): s32[65]{0:T(128)}
+ value: <4065 slice @0> (size=512,offset=737280): s32[2]{0:T(128)}
+ value: <4067 broadcast.20 @0> (size=512,offset=1736704): s32[3]{0:T(128)}
+ value: <4069 broadcast.19 @0> (size=512,offset=1720320): s32[2]{0:T(128)}
+ value: <4089 mul.1 @0> (size=512,offset=573440): s32[]{:T(128)}
+ value: <4091 pad_add_fusion @0> (size=512,offset=1703936): s32[2]{0:T(128)}
+ value: <4108 pad_add_fusion.1 @0> (size=512,offset=589824): s32[2]{0:T(128)}
+ value: <4110 broadcast.18 @0> (size=41943040,offset=1753088): f32[1024,80,128]{2,1,0:T(8,128)}
+ value: <4111 StreamIdxTC-d-bq_1-bkvp_2.2 @0> (size=41943040,offset=1753088): f32[1024,80,128]{2,1,0:T(8,128)}
+ value: <4112 StreamIdxTC-d-bq_1-bkvp_2.3 @0> (size=41943040,offset=1753088): f32[1024,80,128]{2,1,0:T(8,128)}
+ value: <4113 StreamIdxTC-m-bq_128-bkvp_2.1 @0> (size=41943040,offset=1753088): f32[1024,80,128]{2,1,0:T(8,128)}
+ value: <4114 bitcast_convert_type.4 @0> (size=41943040,offset=43696128): s32[1024,80,128]{2,1,0:T(8,128)}
+ value: <4115 copy-start.2{} @0> (size=32,offset=151093248): (s32[65]{0:T(128)S(1)}, s32[65]{0:T(128)}, u32[]{:S(2)})
+ value: <4118 fusion.38{} @0> (size=96,offset=151617536): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4119 fusion.38{0} @0> (size=512,offset=802816): s32[1]{0:T(128)}
+ value: <4120 fusion.38{1} @0> (size=512,offset=819200): s32[1]{0:T(128)}
+ value: <4121 fusion.38{2} @0> (size=512,offset=835584): s32[1]{0:T(128)}
+ value: <4122 fusion.38{3} @0> (size=512,offset=851968): s32[1]{0:T(128)}
+ value: <4123 fusion.38{4} @0> (size=512,offset=868352): s32[1]{0:T(128)}
+ value: <4124 fusion.38{5} @0> (size=512,offset=884736): s32[1]{0:T(128)}
+ value: <4125 fusion.38{6} @0> (size=512,offset=901120): s32[1]{0:T(128)}
+ value: <4126 fusion.38{7} @0> (size=512,offset=917504): s32[1]{0:T(128)}
+ value: <4127 fusion.38{8} @0> (size=512,offset=933888): s32[1]{0:T(128)}
+ value: <4128 fusion.38{9} @0> (size=512,offset=950272): s32[1]{0:T(128)}
+ value: <4129 fusion.38{10} @0> (size=512,offset=966656): s32[1]{0:T(128)}
+ value: <4130 fusion.38{11} @0> (size=512,offset=983040): s32[1]{0:T(128)}
+ value: <4131 fusion.38{12} @0> (size=512,offset=999424): s32[1]{0:T(128)}
+ value: <4132 fusion.38{13} @0> (size=512,offset=1015808): s32[1]{0:T(128)}
+ value: <4133 fusion.38{14} @0> (size=512,offset=1032192): s32[1]{0:T(128)}
+ value: <4134 fusion.38{15} @0> (size=512,offset=1048576): s32[1]{0:T(128)}
+ value: <4135 fusion.38{16} @0> (size=512,offset=1064960): s32[1]{0:T(128)}
+ value: <4136 fusion.38{17} @0> (size=512,offset=770048): s32[1]{0:T(128)}
+ value: <4137 fusion.38{18} @0> (size=512,offset=786432): s32[1]{0:T(128)}
+ value: <4138 slice.13 @0> (size=512,offset=573440): s32[64]{0:T(128)}
+ value: <4139 copy-start.10{} @0> (size=32,offset=151076864): (s32[64]{0:T(128)S(1)}, s32[64]{0:T(128)}, u32[]{:S(2)})
+ value: <4142 iota_compare_fusion.5 @0> (size=512,offset=753664): pred[64]{0:T(512)(128)(4,1)}
+ value: <4143 copy-start.9{} @0> (size=32,offset=151060480): (pred[64]{0:T(512)(128)(4,1)S(1)}, pred[64]{0:T(512)(128)(4,1)}, u32[]{:S(2)})
+ value: <4147 compare_select_fusion.7{} @0> (size=32,offset=151044096): (s32[1024,1]{0,1:T(1,128)S(1)}, s32[1024,1]{0,1:T(1,128)S(1)}, s32[1024,1]{0,1:T(1,128)S(1)}, s32[1024,1]{0,1:T(1,128)S(1)})
+ value: <4156 compare_reduce_fusion.56{} @0> (size=256,offset=151781376): (pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=5*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=10*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=15*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=20*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=25*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=30*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=35*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=40*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=45*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=50*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)}, /*index=55*/pred[1024]{0:T(1024)(128)(4,1)S(1)}, pred[1024]{0:T(1024)(128)(4,1)S(1)})
+ value: <4214 fusion.36{} @0> (size=96,offset=151601152): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4215 fusion.36{0} @0> (size=512,offset=1081344): s32[1]{0:T(128)}
+ value: <4216 fusion.36{1} @0> (size=512,offset=1097728): s32[1]{0:T(128)}
+ value: <4217 fusion.36{2} @0> (size=512,offset=1114112): s32[1]{0:T(128)}
+ value: <4218 fusion.36{3} @0> (size=512,offset=1130496): s32[1]{0:T(128)}
+ value: <4219 fusion.36{4} @0> (size=512,offset=1146880): s32[1]{0:T(128)}
+ value: <4220 fusion.36{5} @0> (size=512,offset=1163264): s32[1]{0:T(128)}
+ value: <4221 fusion.36{6} @0> (size=512,offset=1179648): s32[1]{0:T(128)}
+ value: <4222 fusion.36{7} @0> (size=512,offset=1196032): s32[1]{0:T(128)}
+ value: <4223 fusion.36{8} @0> (size=512,offset=1212416): s32[1]{0:T(128)}
+ value: <4224 fusion.36{9} @0> (size=512,offset=1228800): s32[1]{0:T(128)}
+ value: <4225 fusion.36{10} @0> (size=512,offset=1245184): s32[1]{0:T(128)}
+ value: <4226 fusion.36{11} @0> (size=512,offset=1261568): s32[1]{0:T(128)}
+ value: <4227 fusion.36{12} @0> (size=512,offset=1277952): s32[1]{0:T(128)}
+ value: <4228 fusion.36{13} @0> (size=512,offset=1294336): s32[1]{0:T(128)}
+ value: <4229 fusion.36{14} @0> (size=512,offset=1310720): s32[1]{0:T(128)}
+ value: <4230 fusion.36{15} @0> (size=512,offset=1327104): s32[1]{0:T(128)}
+ value: <4231 fusion.36{16} @0> (size=512,offset=1343488): s32[1]{0:T(128)}
+ value: <4232 fusion.36{17} @0> (size=512,offset=1359872): s32[1]{0:T(128)}
+ value: <4233 fusion.36{18} @0> (size=512,offset=1376256): s32[1]{0:T(128)}
+ value: <4234 fusion.37{} @0> (size=96,offset=151584768): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4235 fusion.37{0} @0> (size=512,offset=1392640): s32[1]{0:T(128)}
+ value: <4236 fusion.37{1} @0> (size=512,offset=1409024): s32[1]{0:T(128)}
+ value: <4237 fusion.37{2} @0> (size=512,offset=1425408): s32[1]{0:T(128)}
+ value: <4238 fusion.37{3} @0> (size=512,offset=1441792): s32[1]{0:T(128)}
+ value: <4239 fusion.37{4} @0> (size=512,offset=1458176): s32[1]{0:T(128)}
+ value: <4240 fusion.37{5} @0> (size=512,offset=1474560): s32[1]{0:T(128)}
+ value: <4241 fusion.37{6} @0> (size=512,offset=1490944): s32[1]{0:T(128)}
+ value: <4242 fusion.37{7} @0> (size=512,offset=1507328): s32[1]{0:T(128)}
+ value: <4243 fusion.37{8} @0> (size=512,offset=1523712): s32[1]{0:T(128)}
+ value: <4244 fusion.37{9} @0> (size=512,offset=1540096): s32[1]{0:T(128)}
+ value: <4245 fusion.37{10} @0> (size=512,offset=1556480): s32[1]{0:T(128)}
+ value: <4246 fusion.37{11} @0> (size=512,offset=1572864): s32[1]{0:T(128)}
+ value: <4247 fusion.37{12} @0> (size=512,offset=1589248): s32[1]{0:T(128)}
+ value: <4248 fusion.37{13} @0> (size=512,offset=1605632): s32[1]{0:T(128)}
+ value: <4249 fusion.37{14} @0> (size=512,offset=1622016): s32[1]{0:T(128)}
+ value: <4250 fusion.37{15} @0> (size=512,offset=1638400): s32[1]{0:T(128)}
+ value: <4251 fusion.37{16} @0> (size=512,offset=1654784): s32[1]{0:T(128)}
+ value: <4252 fusion.37{17} @0> (size=512,offset=1671168): s32[1]{0:T(128)}
+ value: <4253 fusion.37{18} @0> (size=512,offset=1687552): s32[1]{0:T(128)}
+ value: <4258 dynamic_slice.1 @0> (size=512,offset=737280): s32[1]{0:T(128)}
+ value: <4259 fusion.18 @0> (size=4096,offset=753664): s32[1024]{0:T(1024)}
+ value: <4261 prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start @0> (size=0,offset=0): token[]
+ value: <4262 sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start{} @0> (size=32,offset=151027712): ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})
+ value: <4263 sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start{0} @0> (size=32,offset=151011328): (s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[])
+ value: <4265 tuple.438{} @0> (size=32,offset=151224320): (s32[1024,2048]{1,0:T(8,128)S(1)})
+ value: <4269 reshape.304 @0> (size=150994944,offset=0): u8[589824,256]{1,0:T(8,128)(4,1)}
+ value: <4277 tuple.435{} @0> (size=32,offset=151502848): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4278 fusion.19{} @0> (size=32,offset=151486464): (s32[1024]{0:T(1024)S(1)}, s32[1024]{0:T(1024)S(1)}, s32[1024]{0:T(1024)S(1)})
+ value: <4284 fusion.44{} @0> (size=32,offset=151470080): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4285 fusion.44{0} @0> (size=512,offset=933888): s32[1]{0:T(128)}
+ value: <4286 fusion.44{1} @0> (size=512,offset=950272): s32[1]{0:T(128)}
+ value: <4287 fusion.44{2} @0> (size=512,offset=966656): s32[1]{0:T(128)}
+ value: <4288 fusion.44{3} @0> (size=512,offset=983040): s32[1]{0:T(128)}
+ value: <4289 fusion.44{4} @0> (size=512,offset=999424): s32[1]{0:T(128)}
+ value: <4290 fusion.44{5} @0> (size=512,offset=1015808): s32[1]{0:T(128)}
+ value: <4291 fusion.44{6} @0> (size=512,offset=1032192): s32[1]{0:T(128)}
+ value: <4292 fusion.41{} @0> (size=96,offset=151764992): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4293 fusion.41{0} @0> (size=512,offset=0): s32[1]{0:T(128)}
+ value: <4294 fusion.41{1} @0> (size=512,offset=16384): s32[1]{0:T(128)}
+ value: <4295 fusion.41{2} @0> (size=512,offset=32768): s32[1]{0:T(128)}
+ value: <4296 fusion.41{3} @0> (size=512,offset=49152): s32[1]{0:T(128)}
+ value: <4297 fusion.41{4} @0> (size=512,offset=65536): s32[1]{0:T(128)}
+ value: <4298 fusion.41{5} @0> (size=512,offset=81920): s32[1]{0:T(128)}
+ value: <4299 fusion.41{6} @0> (size=512,offset=98304): s32[1]{0:T(128)}
+ value: <4300 fusion.41{7} @0> (size=512,offset=114688): s32[1]{0:T(128)}
+ value: <4301 fusion.41{8} @0> (size=512,offset=131072): s32[1]{0:T(128)}
+ value: <4302 fusion.41{9} @0> (size=512,offset=147456): s32[1]{0:T(128)}
+ value: <4303 fusion.41{10} @0> (size=512,offset=163840): s32[1]{0:T(128)}
+ value: <4304 fusion.41{11} @0> (size=512,offset=180224): s32[1]{0:T(128)}
+ value: <4305 fusion.41{12} @0> (size=512,offset=196608): s32[1]{0:T(128)}
+ value: <4306 fusion.41{13} @0> (size=512,offset=212992): s32[1]{0:T(128)}
+ value: <4307 fusion.41{14} @0> (size=512,offset=229376): s32[1]{0:T(128)}
+ value: <4308 fusion.41{15} @0> (size=512,offset=245760): s32[1]{0:T(128)}
+ value: <4309 fusion.41{16} @0> (size=512,offset=262144): s32[1]{0:T(128)}
+ value: <4310 fusion.41{17} @0> (size=512,offset=278528): s32[1]{0:T(128)}
+ value: <4311 fusion.41{18} @0> (size=512,offset=294912): s32[1]{0:T(128)}
+ value: <4312 fusion.42{} @0> (size=96,offset=151748608): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4313 fusion.42{0} @0> (size=512,offset=311296): s32[1]{0:T(128)}
+ value: <4314 fusion.42{1} @0> (size=512,offset=327680): s32[1]{0:T(128)}
+ value: <4315 fusion.42{2} @0> (size=512,offset=344064): s32[1]{0:T(128)}
+ value: <4316 fusion.42{3} @0> (size=512,offset=360448): s32[1]{0:T(128)}
+ value: <4317 fusion.42{4} @0> (size=512,offset=376832): s32[1]{0:T(128)}
+ value: <4318 fusion.42{5} @0> (size=512,offset=393216): s32[1]{0:T(128)}
+ value: <4319 fusion.42{6} @0> (size=512,offset=409600): s32[1]{0:T(128)}
+ value: <4320 fusion.42{7} @0> (size=512,offset=425984): s32[1]{0:T(128)}
+ value: <4321 fusion.42{8} @0> (size=512,offset=442368): s32[1]{0:T(128)}
+ value: <4322 fusion.42{9} @0> (size=512,offset=458752): s32[1]{0:T(128)}
+ value: <4323 fusion.42{10} @0> (size=512,offset=475136): s32[1]{0:T(128)}
+ value: <4324 fusion.42{11} @0> (size=512,offset=491520): s32[1]{0:T(128)}
+ value: <4325 fusion.42{12} @0> (size=512,offset=507904): s32[1]{0:T(128)}
+ value: <4326 fusion.42{13} @0> (size=512,offset=524288): s32[1]{0:T(128)}
+ value: <4327 fusion.42{14} @0> (size=512,offset=540672): s32[1]{0:T(128)}
+ value: <4328 fusion.42{15} @0> (size=512,offset=557056): s32[1]{0:T(128)}
+ value: <4329 fusion.42{16} @0> (size=512,offset=573440): s32[1]{0:T(128)}
+ value: <4330 fusion.42{17} @0> (size=512,offset=589824): s32[1]{0:T(128)}
+ value: <4331 fusion.42{18} @0> (size=512,offset=606208): s32[1]{0:T(128)}
+ value: <4332 fusion.43{} @0> (size=96,offset=151732224): (s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=5*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=10*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, /*index=15*/s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)}, s32[1]{0:T(128)})
+ value: <4333 fusion.43{0} @0> (size=512,offset=622592): s32[1]{0:T(128)}
+ value: <4334 fusion.43{1} @0> (size=512,offset=638976): s32[1]{0:T(128)}
+ value: <4335 fusion.43{2} @0> (size=512,offset=655360): s32[1]{0:T(128)}
+ value: <4336 fusion.43{3} @0> (size=512,offset=671744): s32[1]{0:T(128)}
+ value: <4337 fusion.43{4} @0> (size=512,offset=688128): s32[1]{0:T(128)}
+ value: <4338 fusion.43{5} @0> (size=512,offset=704512): s32[1]{0:T(128)}
+ value: <4339 fusion.43{6} @0> (size=512,offset=720896): s32[1]{0:T(128)}
+ value: <4340 fusion.43{7} @0> (size=512,offset=737280): s32[1]{0:T(128)}
+ value: <4341 fusion.43{8} @0> (size=512,offset=753664): s32[1]{0:T(128)}
+ value: <4342 fusion.43{9} @0> (size=512,offset=770048): s32[1]{0:T(128)}
+ value: <4343 fusion.43{10} @0> (size=512,offset=786432): s32[1]{0:T(128)}
+ value: <4344 fusion.43{11} @0> (size=512,offset=802816): s32[1]{0:T(128)}
+ value: <4345 fusion.43{12} @0> (size=512,offset=819200): s32[1]{0:T(128)}
+ value: <4346 fusion.43{13} @0> (size=512,offset=835584): s32[1]{0:T(128)}
+ value: <4347 fusion.43{14} @0> (size=512,offset=851968): s32[1]{0:T(128)}
+ value: <4348 fusion.43{15} @0> (size=512,offset=868352): s32[1]{0:T(128)}
+ value: <4349 fusion.43{16} @0> (size=512,offset=884736): s32[1]{0:T(128)}
+ value: <4350 fusion.43{17} @0> (size=512,offset=901120): s32[1]{0:T(128)}
+ value: <4351 fusion.43{18} @0> (size=512,offset=917504): s32[1]{0:T(128)}
+ value: <4354 fusion.23{} @0> (size=32,offset=151453696): (s32[1024,1]{0,1:T(1,128)S(1)}, s32[1024,1]{0,1:T(1,128)S(1)})
+ value: <4357 compare_select_fusion.14{} @0> (size=32,offset=151437312): (s32[1024,1]{0,1:T(1,128)S(1)}, s32[1024,1]{0,1:T(1,128)S(1)})
+ value: <4364 compare_select_fusion.13{} @0> (size=32,offset=151420928): (s32[1024,1]{0,1:T(1,128)S(1)}, s32[1024,1]{0,1:T(1,128)S(1)})
+ value: <4373 copy-start.6{} @0> (size=32,offset=151404544): (u8[1024,129]{0,1:T(8,128)(4,1)S(1)}, u8[1024,129]{0,1:T(8,128)(4,1)}, u32[]{:S(2)})
+ value: <4379 scatter_fusion @0> (size=150994944,offset=0): u8[589824,256]{1,0:T(8,128)(4,1)}
+ value: <4381 copy-start.3{} @0> (size=32,offset=151388160): (s32[64]{0:T(128)S(1)}, s32[64]{0:T(128)}, u32[]{:S(2)})
+ value: <4385 reduce_max.0 @0> (size=512,offset=524288): s32[]{:T(128)}
+ value: <4388 convert_element_type.13 @0> (size=512,offset=524288): s32[]{:T(128)}
+ value: <4390 copy-start.8{} @0> (size=32,offset=151371776): (s32[3]{0:T(128)S(1)}, s32[3]{0:T(128)}, u32[]{:S(2)})
+ value: <4393 copy-start{} @0> (size=32,offset=151355392): (s32[65]{0:T(128)S(1)}, s32[65]{0:T(128)}, u32[]{:S(2)})
+ value: <4397 slice-start{} @0> (size=32,offset=151339008): ((s8[8388608]{0:T(1024)(128)(4,1)}), s8[4194304]{0:T(1024)(128)(4,1)S(1)}, s32[]{:S(2)})
+ value: <4398 slice-start{0} @0> (size=32,offset=151322624): (s8[8388608]{0:T(1024)(128)(4,1)})
+ value: <4400 slice-start.1{} @0> (size=32,offset=151306240): ((s8[8388608]{0:T(1024)(128)(4,1)}), s8[4194304]{0:T(1024)(128)(4,1)S(1)}, s32[]{:S(2)})
+ value: <4401 slice-start.1{0} @0> (size=32,offset=151289856): (s8[8388608]{0:T(1024)(128)(4,1)})
+ value: <4406 copy-start.7{} @0> (size=32,offset=151273472): (bf16[1024,64]{0,1:T(8,128)(2,1)S(1)}, bf16[1024,64]{0,1:T(8,128)(2,1)}, u32[]{:S(2)})
+ value: <4410 convert_element_type.14 @0> (size=524288,offset=0): f32[1024,64]{1,0:T(8,128)}
+ value: <4411 tuple.445{} @0> (size=32,offset=151257088): (s32[3]{0:T(128)S(1)}, s32[64]{0:T(128)S(1)}, s32[576]{0:T(1024)}, s32[65]{0:T(128)S(1)}, f8e4m3fn[1024,64,128]{2,1,0:T(32,128)(4,1)}, /*index=5*/f32[1024,64]{1,0:T(8,128)}, u8[576,256,4,256]{3,2,1,0:T(4,128)(4,1)})
+ value: <4412 tuple.444{} @0> (size=32,offset=151240704): (s32[65]{0:T(128)S(1)}, s32[64]{0:T(128)S(1)})
+ value: <4413 copy-start.5{} @0> (size=32,offset=151207936): (s32[1024,2048]{1,0:T(8,128)}, s32[1024,2048]{1,0:T(8,128)S(1)}, u32[]{:S(2)})
+ value: <4417 wide.wide.arg_tuple.12{} (phi) @0> (size=32,offset=151502848): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4418 wide.wide.arg_tuple.0{} (phi) @0> (size=32,offset=151502848): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4431 while.24{} (phi) @0> (size=32,offset=151502848): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4438 wide.wide.arg_tuple.10{} (phi) @0> (size=32,offset=151191552): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4439 wide.wide.arg_tuple.1{} (phi) @0> (size=32,offset=151191552): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4440 wide.wide.arg_tuple.10{0} (phi) @0> (size=512,offset=1589248): s32[]{:T(128)}
+ value: <4446 wide.wide.arg_tuple.1{0} (phi) @0> (size=512,offset=1589248): s32[]{:T(128)}
+ value: <4452 while.23{} (phi) @0> (size=32,offset=151191552): (s32[]{:T(128)}, u32[1024]{0:T(1024)S(1)}, u32[1024]{0:T(1024)S(1)}, s32[64]{0:T(128)S(1)}, s32[]{:T(128)}, /*index=5*/s32[]{:T(128)})
+ value: <4453 while.23{0} (phi) @0> (size=512,offset=1589248): s32[]{:T(128)}
+ value: <4459 cond.2.clone{} (phi) @0> (size=32,offset=151224320): (s32[1024,2048]{1,0:T(8,128)S(1)})
+allocation 223: size 0, color 7, preallocated-temp:
+ value: <4044 sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start{} @7> (size=0,offset=0): ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})
+ value: <4045 sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start{0} @7> (size=0,offset=0): (s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)})
+allocation 224: size 67043328, color 1, preallocated-temp:
+ value: <3015 fusion.61 @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <3016 fusion.62 @1> (size=4096,offset=5873664): u32[1024]{0:T(1024)S(1)}
+ value: <3017 copy.31 @1> (size=4096,offset=33558528): u32[1024]{0:T(1024)S(1)}
+ value: <3955 fusion.67 @1> (size=4096,offset=33566720): u32[1024]{0:T(1024)S(1)}
+ value: <3956 fusion.68 @1> (size=4096,offset=5873664): u32[1024]{0:T(1024)S(1)}
+ value: <3957 copy.22 @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <3961 custom-call.2 @1> (size=4096,offset=33566720): u32[1024]{0:T(1024)S(1)}
+ value: <3962 custom-call.3 @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <3963 slice.16 @1> (size=512,offset=33558528): s32[64]{0:T(128)S(1)}
+ value: <3967 fusion.9{0} @1> (size=4096,offset=33566720): s32[1024]{0:T(1024)S(1)}
+ value: <3968 fusion.9{1} @1> (size=4096,offset=33570816): s32[1024]{0:T(1024)S(1)}
+ value: <3969 gather_fusion.1 @1> (size=4096,offset=33566720): s32[1024]{0:T(1024)S(1)}
+ value: <3970 gather_fusion @1> (size=4096,offset=33558528): s32[1024]{0:T(1024)S(1)}
+ value: <4040 fusion.8 @1> (size=4096,offset=22650880): s32[1024]{0:T(1024)S(1)}
+ value: <4041 compare_select_fusion @1> (size=8388608,offset=33562624): s32[1024,2048]{1,0:T(8,128)S(1)}
+ value: <4116 copy-start.2{0} @1> (size=512,offset=33554432): s32[65]{0:T(128)S(1)}
+ value: <4140 copy-start.10{0} @1> (size=512,offset=22654976): s32[64]{0:T(128)S(1)}
+ value: <4144 copy-start.9{0} @1> (size=512,offset=22650880): pred[64]{0:T(512)(128)(4,1)S(1)}
+ value: <4146 convert_reduce_fusion @1> (size=4096,offset=5873664): s32[1024]{0:T(1024)S(1)}
+ value: <4148 compare_select_fusion.7{0} @1> (size=4096,offset=33558528): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4149 compare_select_fusion.7{1} @1> (size=4096,offset=7557120): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4150 compare_select_fusion.7{2} @1> (size=4096,offset=33562624): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4151 compare_select_fusion.7{3} @1> (size=4096,offset=7553024): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4152 broadcast_clamp_fusion @1> (size=4096,offset=33570816): s32[1024]{0:T(1024)S(1)}
+ value: <4153 gather_fusion.2 @1> (size=4096,offset=33566720): s32[1024]{0:T(1024)S(1)}
+ value: <4154 broadcast_clamp_fusion.1 @1> (size=4096,offset=33570816): s32[1024]{0:T(1024)S(1)}
+ value: <4155 gather_fusion.3 @1> (size=4096,offset=33562624): s32[1024]{0:T(1024)S(1)}
+ value: <4157 compare_reduce_fusion.56{0} @1> (size=1024,offset=33574912): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4158 compare_reduce_fusion.56{1} @1> (size=1024,offset=33579008): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4159 compare_reduce_fusion.56{2} @1> (size=1024,offset=33583104): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4160 compare_reduce_fusion.56{3} @1> (size=1024,offset=33587200): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4161 compare_reduce_fusion.56{4} @1> (size=1024,offset=33591296): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4162 compare_reduce_fusion.56{5} @1> (size=1024,offset=33595392): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4163 compare_reduce_fusion.56{6} @1> (size=1024,offset=33599488): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4164 compare_reduce_fusion.56{7} @1> (size=1024,offset=33603584): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4165 compare_reduce_fusion.56{8} @1> (size=1024,offset=33607680): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4166 compare_reduce_fusion.56{9} @1> (size=1024,offset=33611776): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4167 compare_reduce_fusion.56{10} @1> (size=1024,offset=33615872): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4168 compare_reduce_fusion.56{11} @1> (size=1024,offset=33619968): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4169 compare_reduce_fusion.56{12} @1> (size=1024,offset=33624064): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4170 compare_reduce_fusion.56{13} @1> (size=1024,offset=33628160): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4171 compare_reduce_fusion.56{14} @1> (size=1024,offset=33632256): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4172 compare_reduce_fusion.56{15} @1> (size=1024,offset=33636352): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4173 compare_reduce_fusion.56{16} @1> (size=1024,offset=33640448): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4174 compare_reduce_fusion.56{17} @1> (size=1024,offset=33644544): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4175 compare_reduce_fusion.56{18} @1> (size=1024,offset=33648640): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4176 compare_reduce_fusion.56{19} @1> (size=1024,offset=33652736): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4177 compare_reduce_fusion.56{20} @1> (size=1024,offset=33656832): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4178 compare_reduce_fusion.56{21} @1> (size=1024,offset=33660928): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4179 compare_reduce_fusion.56{22} @1> (size=1024,offset=33665024): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4180 compare_reduce_fusion.56{23} @1> (size=1024,offset=33669120): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4181 compare_reduce_fusion.56{24} @1> (size=1024,offset=33673216): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4182 compare_reduce_fusion.56{25} @1> (size=1024,offset=33677312): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4183 compare_reduce_fusion.56{26} @1> (size=1024,offset=33681408): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4184 compare_reduce_fusion.56{27} @1> (size=1024,offset=33685504): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4185 compare_reduce_fusion.56{28} @1> (size=1024,offset=33689600): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4186 compare_reduce_fusion.56{29} @1> (size=1024,offset=33693696): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4187 compare_reduce_fusion.56{30} @1> (size=1024,offset=33697792): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4188 compare_reduce_fusion.56{31} @1> (size=1024,offset=33701888): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4189 compare_reduce_fusion.56{32} @1> (size=1024,offset=33705984): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4190 compare_reduce_fusion.56{33} @1> (size=1024,offset=33710080): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4191 compare_reduce_fusion.56{34} @1> (size=1024,offset=33714176): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4192 compare_reduce_fusion.56{35} @1> (size=1024,offset=33718272): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4193 compare_reduce_fusion.56{36} @1> (size=1024,offset=33722368): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4194 compare_reduce_fusion.56{37} @1> (size=1024,offset=33726464): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4195 compare_reduce_fusion.56{38} @1> (size=1024,offset=33730560): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4196 compare_reduce_fusion.56{39} @1> (size=1024,offset=33734656): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4197 compare_reduce_fusion.56{40} @1> (size=1024,offset=33738752): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4198 compare_reduce_fusion.56{41} @1> (size=1024,offset=33742848): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4199 compare_reduce_fusion.56{42} @1> (size=1024,offset=33746944): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4200 compare_reduce_fusion.56{43} @1> (size=1024,offset=33751040): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4201 compare_reduce_fusion.56{44} @1> (size=1024,offset=33755136): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4202 compare_reduce_fusion.56{45} @1> (size=1024,offset=33759232): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4203 compare_reduce_fusion.56{46} @1> (size=1024,offset=33763328): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4204 compare_reduce_fusion.56{47} @1> (size=1024,offset=33767424): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4205 compare_reduce_fusion.56{48} @1> (size=1024,offset=33771520): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4206 compare_reduce_fusion.56{49} @1> (size=1024,offset=33775616): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4207 compare_reduce_fusion.56{50} @1> (size=1024,offset=33779712): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4208 compare_reduce_fusion.56{51} @1> (size=1024,offset=33783808): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4209 compare_reduce_fusion.56{52} @1> (size=1024,offset=33787904): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4210 compare_reduce_fusion.56{53} @1> (size=1024,offset=33792000): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4211 compare_reduce_fusion.56{54} @1> (size=1024,offset=33796096): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4212 compare_reduce_fusion.56{55} @1> (size=1024,offset=33800192): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4213 compare_reduce_fusion.56{56} @1> (size=1024,offset=33804288): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4264 reshape.1 @1> (size=8388608,offset=33562624): s32[1024,2048]{1,0:T(8,128)S(1)}
+ value: <4266 slice.1058 @1> (size=4194304,offset=33562624): s8[4194304]{0:T(1024)(128)(4,1)S(1)}
+ value: <4267 slice.1060 @1> (size=4194304,offset=37756928): s8[4194304]{0:T(1024)(128)(4,1)S(1)}
+ value: <4272 custom-call.4 @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4273 custom-call.5 @1> (size=4096,offset=33558528): u32[1024]{0:T(1024)S(1)}
+ value: <4275 slice.18 @1> (size=512,offset=33554432): s32[64]{0:T(128)S(1)}
+ value: <4279 fusion.19{0} @1> (size=4096,offset=33570816): s32[1024]{0:T(1024)S(1)}
+ value: <4280 fusion.19{1} @1> (size=4096,offset=33566720): s32[1024]{0:T(1024)S(1)}
+ value: <4281 fusion.19{2} @1> (size=4096,offset=33554432): s32[1024]{0:T(1024)S(1)}
+ value: <4282 gather_fusion.5 @1> (size=4096,offset=33570816): s32[1024]{0:T(1024)S(1)}
+ value: <4352 select_select_fusion.20 @1> (size=4096,offset=33562624): s32[1024]{0:T(1024)S(1)}
+ value: <4353 gather_fusion.4 @1> (size=4096,offset=33558528): s32[1024]{0:T(1024)S(1)}
+ value: <4355 fusion.23{0} @1> (size=4096,offset=33554432): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4356 fusion.23{1} @1> (size=4096,offset=33591296): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4358 compare_select_fusion.14{0} @1> (size=4096,offset=5873664): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4359 compare_select_fusion.14{1} @1> (size=4096,offset=5885952): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4361 reshape.7 @1> (size=32768,offset=33558528): s32[64,9]{1,0:T(8,128)S(1)}
+ value: <4362 gather_fusion.6 @1> (size=4096,offset=33595392): s32[1024]{0:T(1024)S(1)}
+ value: <4365 compare_select_fusion.13{0} @1> (size=4096,offset=5877760): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4366 compare_select_fusion.13{1} @1> (size=4096,offset=5881856): s32[1024,1]{0,1:T(1,128)S(1)}
+ value: <4368 and_reduce_fusion @1> (size=1024,offset=5890048): pred[1024]{0:T(1024)(128)(4,1)S(1)}
+ value: <4370 multiply_reduce_fusion @1> (size=4096,offset=5885952): s32[1024]{0:T(1024)S(1)}
+ value: <4371 broadcast_select_fusion @1> (size=4096,offset=38019072): s32[1024]{0:T(1024)S(1)}
+ value: <4374 copy-start.6{0} @1> (size=139264,offset=33816576): u8[1024,129]{0,1:T(8,128)(4,1)S(1)}
+ value: <4376 copy.10 @1> (size=262144,offset=33554432): u8[1024,129]{1,0:T(8,128)(4,1)S(1)}
+ value: <4378 pad.0.clone @1> (size=262144,offset=37756928): u8[1024,256]{1,0:T(8,128)(4,1)S(1)}
+ value: <4382 copy-start.3{0} @1> (size=512,offset=33558528): s32[64]{0:T(128)S(1)}
+ value: <4391 copy-start.8{0} @1> (size=512,offset=42082304): s32[3]{0:T(128)S(1)}
+ value: <4394 copy-start{0} @1> (size=512,offset=33554432): s32[65]{0:T(128)S(1)}
+ value: <4403 custom-call.20 @1> (size=8388608,offset=33562624): u8[1024,64,128]{2,1,0:T(32,128)(4,1)S(1)}
+ value: <4407 copy-start.7{0} @1> (size=131072,offset=41951232): bf16[1024,64]{0,1:T(8,128)(2,1)S(1)}
+ value: <4409 copy.9 @1> (size=262144,offset=33562624): bf16[1024,64]{1,0:T(8,128)(2,1)S(1)}
+ value: <4420 wide.wide.arg_tuple.12{1} (phi) @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4421 wide.wide.arg_tuple.12{2} (phi) @1> (size=4096,offset=33558528): u32[1024]{0:T(1024)S(1)}
+ value: <4426 wide.wide.arg_tuple.0{1} (phi) @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4427 wide.wide.arg_tuple.0{2} (phi) @1> (size=4096,offset=33558528): u32[1024]{0:T(1024)S(1)}
+ value: <4433 while.24{1} (phi) @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4434 while.24{2} (phi) @1> (size=4096,offset=33558528): u32[1024]{0:T(1024)S(1)}
+ value: <4441 wide.wide.arg_tuple.10{1} (phi) @1> (size=4096,offset=33566720): u32[1024]{0:T(1024)S(1)}
+ value: <4442 wide.wide.arg_tuple.10{2} (phi) @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4447 wide.wide.arg_tuple.1{1} (phi) @1> (size=4096,offset=33566720): u32[1024]{0:T(1024)S(1)}
+ value: <4448 wide.wide.arg_tuple.1{2} (phi) @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4454 while.23{1} (phi) @1> (size=4096,offset=33566720): u32[1024]{0:T(1024)S(1)}
+ value: <4455 while.23{2} (phi) @1> (size=4096,offset=33562624): u32[1024]{0:T(1024)S(1)}
+ value: <4460 cond.2.clone{0} (phi) @1> (size=8388608,offset=33562624): s32[1024,2048]{1,0:T(8,128)S(1)}

@@ -1,0 +1,365 @@
+Memory Space: default (color=0)
+Total bytes: 253483776 (241.74MiB)
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+  144.00MiB(100%);  144.00MiB;            0;                1; u8[576,256,4,256]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+   40.00MiB( 45%);   40.00MiB;      1179648;                4; 4×f32[1024,80,128]
+   80.00MiB( 91%);   40.00MiB;     43122688;                1; s32[1024,80,128]
+   88.00MiB(100%);    8.00MiB;            0;                4; s32[1], s32[2097152], s32[2], token[]
+   88.00MiB(100%);       512B;        16384;                1; s32[1]
+   88.00MiB(100%);       512B;        49152;                1; s32[2]
+   88.00MiB(100%);       512B;        32768;                2; s32[3], s32[]
+   88.00MiB(100%);       512B;      1163264;                1; s32[2]
+   88.00MiB(100%);       512B;      1146880;                1; s32[2]
+   88.00MiB(100%);       512B;       114688;                1; s32[1]
+   88.00MiB(100%);       512B;       131072;                1; s32[1]
+   88.00MiB(100%);       512B;       147456;                1; s32[1]
+   88.00MiB(100%);       512B;       163840;                1; s32[1]
+   88.00MiB(100%);       512B;       180224;                1; s32[1]
+   88.00MiB(100%);       512B;       196608;                1; s32[1]
+   88.01MiB(100%);       512B;       212992;                1; s32[1]
+   88.01MiB(100%);       512B;       229376;                1; s32[1]
+   88.01MiB(100%);       512B;       245760;                1; s32[1]
+   88.01MiB(100%);       512B;       262144;                1; s32[1]
+   88.01MiB(100%);       512B;       278528;                1; s32[1]
+   88.01MiB(100%);       512B;       294912;                1; s32[1]
+   88.01MiB(100%);       512B;       311296;                1; s32[1]
+   88.01MiB(100%);       512B;       327680;                1; s32[1]
+   88.01MiB(100%);       512B;       344064;                1; s32[1]
+   88.01MiB(100%);       512B;       360448;                1; s32[1]
+   88.01MiB(100%);       512B;       376832;                1; s32[1]
+   88.01MiB(100%);       512B;        81920;                1; s32[1]
+   88.01MiB(100%);       512B;        98304;                1; s32[1]
+   88.01MiB(100%);       512B;       475136;                1; s32[1]
+   88.01MiB(100%);       512B;       409600;                1; s32[1]
+   88.01MiB(100%);       512B;       425984;                1; s32[1]
+   88.01MiB(100%);       512B;       442368;                1; s32[1]
+   88.01MiB(100%);       512B;       458752;                1; s32[1]
+   88.01MiB(100%);       512B;       491520;                1; s32[1]
+   88.01MiB(100%);       512B;      1130496;                1; s32[64]
+   88.02MiB(100%);       512B;        65536;                1; pred[64]
+   88.02MiB(100%);       512B;       507904;                1; s32[1]
+   88.02MiB(100%);       512B;       524288;                1; s32[1]
+   88.02MiB(100%);       512B;       540672;                1; s32[1]
+   88.02MiB(100%);       512B;       557056;                1; s32[1]
+   88.02MiB(100%);       512B;       573440;                1; s32[1]
+   88.02MiB(100%);       512B;       589824;                1; s32[1]
+   88.02MiB(100%);       512B;       606208;                1; s32[1]
+   88.02MiB(100%);       512B;       622592;                1; s32[1]
+   88.02MiB(100%);       512B;       638976;                1; s32[1]
+   88.02MiB(100%);       512B;       655360;                1; s32[1]
+   88.02MiB(100%);       512B;       671744;                1; s32[1]
+   88.02MiB(100%);       512B;       688128;                1; s32[1]
+   88.02MiB(100%);       512B;       704512;                1; s32[1]
+   88.02MiB(100%);       512B;       720896;                1; s32[1]
+   88.02MiB(100%);       512B;       737280;                1; s32[1]
+   88.02MiB(100%);       512B;       753664;                1; s32[1]
+  The rest 36 values are less than 5% of the total size and not shown.
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+    8.00MiB(100%);    8.00MiB;            0;                4; f32[1024,64], s32[1024,2048], s32[1024], s32[1]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+    8.00MiB(100%);    8.00MiB;            0;                1; f8e4m3fn[1024,64,128]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+   256.0KiB(100%);   256.0KiB;            0;                1; f32[1024,64]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     4.0KiB(100%);     4.0KiB;            0;                1; s32[576]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     1.0KiB(100%);     1.0KiB;            0;                1; pred[]
+
+
+Memory Space: vmem (color=1)
+Total bytes: 67043328 (63.94MiB)
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+     4.0KiB(  5%);     4.0KiB;      5873664;                1; s32[1024]
+     8.0KiB(  9%);     4.0KiB;     33558528;                1; s32[1024,1]
+    12.0KiB( 14%);     4.0KiB;      7557120;                1; s32[1024,1]
+    16.0KiB( 18%);     4.0KiB;      7553024;                1; s32[1024,1]
+    20.0KiB( 23%);     4.0KiB;     33566720;                1; s32[1024]
+    24.0KiB( 28%);     4.0KiB;     33570816;                2; 2×s32[1024]
+    28.0KiB( 32%);     4.0KiB;     33562624;                2; s32[1024,1], s32[1024]
+    29.0KiB( 34%);     1.0KiB;     33574912;                1; pred[1024]
+    30.0KiB( 35%);     1.0KiB;     33579008;                1; pred[1024]
+    31.0KiB( 36%);     1.0KiB;     33583104;                1; pred[1024]
+    32.0KiB( 37%);     1.0KiB;     33587200;                1; pred[1024]
+    33.0KiB( 38%);     1.0KiB;     33591296;                1; pred[1024]
+    34.0KiB( 39%);     1.0KiB;     33595392;                1; pred[1024]
+    35.0KiB( 40%);     1.0KiB;     33599488;                1; pred[1024]
+    36.0KiB( 42%);     1.0KiB;     33603584;                1; pred[1024]
+    37.0KiB( 43%);     1.0KiB;     33607680;                1; pred[1024]
+    38.0KiB( 44%);     1.0KiB;     33611776;                1; pred[1024]
+    39.0KiB( 45%);     1.0KiB;     33615872;                1; pred[1024]
+    40.0KiB( 46%);     1.0KiB;     33619968;                1; pred[1024]
+    41.0KiB( 47%);     1.0KiB;     33624064;                1; pred[1024]
+    42.0KiB( 49%);     1.0KiB;     33628160;                1; pred[1024]
+    43.0KiB( 50%);     1.0KiB;     33632256;                1; pred[1024]
+    44.0KiB( 51%);     1.0KiB;     33636352;                1; pred[1024]
+    45.0KiB( 52%);     1.0KiB;     33640448;                1; pred[1024]
+    46.0KiB( 53%);     1.0KiB;     33644544;                1; pred[1024]
+    47.0KiB( 54%);     1.0KiB;     33648640;                1; pred[1024]
+    48.0KiB( 55%);     1.0KiB;     33652736;                1; pred[1024]
+    49.0KiB( 57%);     1.0KiB;     33656832;                1; pred[1024]
+    50.0KiB( 58%);     1.0KiB;     33660928;                1; pred[1024]
+    51.0KiB( 59%);     1.0KiB;     33665024;                1; pred[1024]
+    52.0KiB( 60%);     1.0KiB;     33669120;                1; pred[1024]
+    53.0KiB( 61%);     1.0KiB;     33673216;                1; pred[1024]
+    54.0KiB( 62%);     1.0KiB;     33677312;                1; pred[1024]
+    55.0KiB( 64%);     1.0KiB;     33681408;                1; pred[1024]
+    56.0KiB( 65%);     1.0KiB;     33685504;                1; pred[1024]
+    57.0KiB( 66%);     1.0KiB;     33689600;                1; pred[1024]
+    58.0KiB( 67%);     1.0KiB;     33693696;                1; pred[1024]
+    59.0KiB( 68%);     1.0KiB;     33697792;                1; pred[1024]
+    60.0KiB( 69%);     1.0KiB;     33701888;                1; pred[1024]
+    61.0KiB( 71%);     1.0KiB;     33705984;                1; pred[1024]
+    62.0KiB( 72%);     1.0KiB;     33710080;                1; pred[1024]
+    63.0KiB( 73%);     1.0KiB;     33714176;                1; pred[1024]
+    64.0KiB( 74%);     1.0KiB;     33718272;                1; pred[1024]
+    65.0KiB( 75%);     1.0KiB;     33722368;                1; pred[1024]
+    66.0KiB( 76%);     1.0KiB;     33726464;                1; pred[1024]
+    67.0KiB( 77%);     1.0KiB;     33730560;                1; pred[1024]
+    68.0KiB( 79%);     1.0KiB;     33734656;                1; pred[1024]
+    69.0KiB( 80%);     1.0KiB;     33738752;                1; pred[1024]
+    70.0KiB( 81%);     1.0KiB;     33742848;                1; pred[1024]
+    71.0KiB( 82%);     1.0KiB;     33746944;                1; pred[1024]
+    72.0KiB( 83%);     1.0KiB;     33751040;                1; pred[1024]
+    73.0KiB( 84%);     1.0KiB;     33755136;                1; pred[1024]
+    74.0KiB( 86%);     1.0KiB;     33759232;                1; pred[1024]
+    75.0KiB( 87%);     1.0KiB;     33763328;                1; pred[1024]
+    76.0KiB( 88%);     1.0KiB;     33767424;                1; pred[1024]
+    77.0KiB( 89%);     1.0KiB;     33771520;                1; pred[1024]
+    78.0KiB( 90%);     1.0KiB;     33775616;                1; pred[1024]
+    79.0KiB( 91%);     1.0KiB;     33779712;                1; pred[1024]
+    80.0KiB( 92%);     1.0KiB;     33783808;                1; pred[1024]
+    81.0KiB( 94%);     1.0KiB;     33787904;                1; pred[1024]
+    82.0KiB( 95%);     1.0KiB;     33792000;                1; pred[1024]
+    83.0KiB( 96%);     1.0KiB;     33796096;                1; pred[1024]
+  The rest 5 values are less than 5% of the total size and not shown.
+
+
+Memory Space: smem (color=2)
+Total bytes: 16 (16B)
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+         4B( 25%);         4B;            4;                1; u32[]
+         8B( 50%);         4B;            8;                1; u32[]
+        12B( 75%);         4B;           12;                1; u32[]
+        16B(100%);         4B;            0;                1; s32[]
+
+
+Memory Space: color_6 (color=6)
+Total bytes: 4096 (4.0KiB)
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+       512B( 12%);       512B;         1024;                3; pred[], 2×s32[]
+     1.0KiB( 25%);       512B;         2560;                2; pred[], s32[]
+     1.5KiB( 38%);       512B;         3072;                4; 2×pred[], 2×s32[]
+     2.0KiB( 50%);       512B;         3584;                3; 3×s32[]
+     2.5KiB( 62%);       512B;         2048;                7; 7×s32[]
+     3.0KiB( 75%);       512B;         1536;                6; pred[], 5×s32[]
+     3.5KiB( 88%);       512B;            0;                4; pred[], 3×s32[]
+     4.0KiB(100%);       512B;          512;                6; 3×pred[], 3×s32[]
+
+
+Memory Space: color_7 (color=7)
+Total bytes: 0 (0B)
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+         0B(-nan%);         0B;            0;                2; ((s32[10485760], s32[1024]), s32[2097152], u32[]), (s32[10485760], s32[1024])
+
+
+Memory Space: color_8 (color=8)
+Total bytes: 4 (4B)
+  cumulative_size;       size;       offset; used_by_n_values; shapes_list
+  ------------------------------------------------------------
+         4B(100%);         4B;            0;                1; u32[]
+
+

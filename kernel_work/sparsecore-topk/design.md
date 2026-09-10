@@ -100,29 +100,50 @@ branch 0 is `_common_path` and branch 1 is `_fast_path` — which independently 
 branch identification. `_fast_path` (`:840-856`) returns the **identity permutation**, correct
 exactly when there are at most `k` candidates.
 
-⚠ **"Not executed in the captured step" is what is established. "Dead at the benchmark" is not.**
-The predicate is evaluated **per step on that step's batch**. The capture is one 1024-token
-`PREFILL_ONLY` step; the config is exact nominal **8192 in / 1024 out**
-(`glm-5.2-fp8-dp16-ep.sh:36,40,43`), so an 8192-token prompt is **eight** 1024-token chunks and
-`max(seq_lens) <= 2048` holds for about the first two. **A chunked-prefill capture samples the first
-few chunks, and the one it holds is the gated chunk** — a previously-burned trap on this same model,
-not a new observation. Which chunk indices take which branch is `unmodelled`; ⏳ `probes/14` is
-checking the capture's truncated second module for a branch flip.
+⚠ **"Not executed in the captured step" is what is established. "Dead at the benchmark" is not** —
+the negative's scope was corrected after the first return. The predicate is evaluated **per step on
+that step's batch**. The capture is one 1024-token `PREFILL_ONLY` step; the config is exact nominal
+**8192 in / 1024 out** with `RANDOM_RANGE_RATIO="0.0"` and `MAX_NUM_BATCHED_TOKENS=1024`, so an
+8192-token prompt is **eight** 1024-token chunks. `_fast_path:846-849`
+(`q_abs_pos = (seq_len - q_len) + (token_idx - q_start)`) pins `seq_len` as **post-chunk**, which
+fixes the gate to **chunks 0–1**: ✅ **the kernel runs on 6 of the 8 prefill chunks.** **A
+chunked-prefill capture samples the first few chunks, and the one it holds is the gated chunk** — a
+previously-burned trap on this same model, not a new observation.
 
-⛔ **This kills `v6`, and the kill is the cleanest result in the graph.** D14's premise was "prefill
-chunks 0 and 1 of 8 run a full DMA + `cvt` + `hist0` + sweep to discover *keep everything*". They do
-not — the outer `lax.cond` elides the kernel entirely in exactly those chunks, so `v6`'s in-kernel
-`@pl.when(i_hi > k)` proposes a saving already taken one level up. `v6`'s prize survives only for
-**short rows inside a batch that also holds a long sequence** (the gate is a `max` over the batch),
-and a `PREFILL_ONLY` step covering one sequence's chunk has none. ⏳ `probes/14` is pricing that
-residual; expected **REJECTED, prize ≈ 0**.
+⚠ **The flip point is outside the capture, and stays `unmodelled`.** The trace's second module takes
+branch 1 as well — *decided*, not truncated: its `conditional.21` runs `while.297`/`.322`,
+`gather_fusion.40/.41`, while `StreamIdxTC*`, `sc_topk_direct*` and `gather_fusion.42/.43` are absent
+at count zero. A cadence join favours modules 0/4 = batches 2/3 by only a **4%** margin *and*
+contradicts the post-chunk semantics above, so it was **not** resolved on that margin. No capture was
+commissioned.
+
+✅ **The branch mapping is confirmed three ways, including against a challenge.** The objection was
+that branch 1 does 596 µs of real work (7 iterations of `u32[1024]` fusions) and so might be the
+common path. It is not: `_fast_path:841` is `jnp.searchsorted(cu_q_lens[1:], token_idx)` over
+`arange(1024)`, and JAX lowers `searchsorted` as a `ceil(log2(len+1))`-level binary search on a
+**uint32** index. `cu_q_lens` is `s32[65]` → 64 entries → **exactly 7 levels** over 1024 lanes.
+`ceil(log2(64)) = 6` does not match. The expensive thing branch 1 does is the binary search itself.
+
+⛔ **`v6` is rejected — but for this workload, not in general, and the distinction is the finding.**
+D14's premise was "prefill chunks 0 and 1 of 8 run a full DMA + `cvt` + `hist0` + sweep to discover
+*keep everything*". They do not: the outer `lax.cond` elides the kernel in exactly those chunks. The
+set coincidence is **exact** — `k = 2048` is a whole multiple of the 1024 chunk size, so no chunk
+straddles and the `token_pos < 2048` row set *is* the gated chunk set. The escape route — short rows
+inside a batch that also holds a long sequence, since the gate is a `max` — is real in principle
+(`tpu_runner.py:1154-1215` keeps a mixed bucket, which `hardware_map.md:561` already leans on) but is
+**measured shut here**: all 96 `batch_composition_stats_*.json` show `num_reqs: 1`,
+`num_decode_tokens: 0`. ⚠ The operative reason is **not** "`PREFILL_ONLY` steps have uniform rows"
+but the narrower and stronger "**this benchmark schedules one request per step, so no batch can mix
+lengths at all**". And a `prefill_only` window is one the harness *arranged*, so it is not evidence
+about served steady state. **`v6`: prize 0 `measured` in the profiled window, `unmodelled` in
+steady-state serving.**
 
 ✅ **And it hands over a bigger non-kernel number than anything in this graph.** The executed
 `_fast_path` costs **13.851 ms/step, 2.12% of a 655 ms prefill step** — to emit an identity
-permutation. `(1024, 2048) int32 × 21` is 168 MiB of writes, ~105 µs at HBM rate; the measured cost
-is **~130× that**, spent in a `searchsorted` `while` loop and 42 `gather_fusion`s. That is a
-`carried:` handoff, not a kernel variant. ⚠ It applies only to the gated chunks, so weight it by
-their share before quoting an e2e figure.
+permutation plus a mask. `(1024, 2048) int32 × 21` is 168 MiB of writes, ~105 µs at HBM rate; the
+measured cost is **~130× that**, and most of it is the 7-level `searchsorted` binary search. Written
+up as a full `carried:` handoff in §10. ⚠ It is paid only on the **gated chunks, 2 of 8**, and it is
+**not additive with any kernel prize** — the two branches are mutually exclusive.
 
 ⚠ **The caller's stated mechanism is node `v4`, and it is small.** "The DMA is synchronously waited;
 use `emit_pipeline` for double buffering" is a real finding — the transfer is 100% exposed, overlap
@@ -1481,7 +1502,7 @@ prize is ~4× smaller than the number this node carried before the source read.
 | **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. Free: read `StreamIdxTC-*` durations from an existing xprof | no job |
 | `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
-| `v6` keep-all-fastpath | ⛔ **KILLED by `probes/14` — the saving is already taken one level up.** The outer `lax.cond` (`max(seq_lens) <= 2048`) elides the whole kernel in exactly the chunks D14 said would sweep to discover "keep everything". Residual: short rows sharing a batch with a long sequence. ⏳ being priced; expected **REJECTED, prize ≈ 0** | no job |
+| `v6` keep-all-fastpath | ⛔ **REJECTED for this workload by `probes/14`** — the outer `lax.cond` (`max(seq_lens) <= 2048`) elides the kernel in exactly the chunks D14 said would sweep to discover "keep everything", and the set coincidence is *exact* because `k` is a whole multiple of the chunk size. **Prize 0 `measured`** (all 96 `batch_composition_stats_*.json`: `num_reqs: 1`), **`unmodelled` in steady-state serving** — a mixed batch would reopen it | no job |
 | `v10` sample-and-count | ✅ **the blocking rate is CLOSED by `probes/15`.** A count pass is **20.681 µs vs the histogram's 108.217 → 0.191×**, 1.30× better than modelled, and **at the read-only walk floor** — so the bimodality collapses onto the cheap branch. Central **−12.2%**, break-even **8.0 passes** vs a modelled 2.5. What is still open is the **pass count**, which is **host-simulable** | no job |
 
 **`PARKED` versions.**
@@ -1519,6 +1540,28 @@ prize is ~4× smaller than the number this node carried before the source read.
   compiling `streamindex_topk` standalone forces its ROOT to the default entry layout, so this may be
   an artifact of the same class as the input relayout was. **Do not promote it to a handoff until
   that is checked** — the check is free, see below.
+
+- ✅ **NEW `carried:` handoff — `_fast_path`'s `searchsorted`, and it is the largest number this
+  exercise has turned up outside the kernel.** All five things a handoff owes:
+  - **What to change, and where.** `streamindex_topk.py:841` computes
+    `jnp.searchsorted(cu_q_lens[1:], token_idx, side="right")` over `arange(1024)`. JAX lowers that
+    as a `ceil(log2(len+1))`-level binary search on a uint32 index; `cu_q_lens` is `s32[65]`, so it
+    is **7 dependent levels of `u32[1024]` fusions**. The function being computed is "which sequence
+    does this token belong to" against a *monotone cumulative-length* array — a prefix-sum/compare or
+    an iota-and-mask has far cheaper lowerings.
+  - **The prize, and the level it was measured at.** The whole `_fast_path` region is
+    **13.851 ms/prefill step = 2.12% of a 655 ms step**, 659.59 µs × 21 conditionals,
+    `measured (j-ecf4ee85, rank 14)`, and the binary search is most of it. Semantically the branch
+    returns an **identity permutation plus a mask**; `(1024, 2048) int32 × 21` is 168 MiB of writes,
+    ~105 µs at HBM rate, so the region runs at roughly **130×** what its traffic costs.
+  - **The correctness evidence.** None needed for the search itself — same function, cheaper
+    lowering. Any rewrite owes the existing `_fast_path` output as its oracle.
+  - **The constraint that stops it being done here.** It is in the *other* branch of the gate, in
+    `streamindex_topk.py`, not in `sparsecore_topk.py`. It is not a Pallas kernel and not a variant.
+  - **The route.** `/preflight-check`, then the e2e benchmark.
+  - ⚠ **Weight it before quoting an e2e figure.** It is paid only on the **gated chunks — 2 of 8**,
+    and only while `max(seq_lens) <= 2048`. It is *not* additive with any kernel prize: the two
+    branches are mutually exclusive by construction.
 
 **`assumed` numbers the graph depends on.**
 
