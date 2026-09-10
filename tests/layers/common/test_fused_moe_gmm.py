@@ -28,7 +28,13 @@ from vllm_torchtpu.layers.common.fused_moe_gmm import (
     fused_moe_func, moe_gmm, prepare_routed_gmm_inputs)
 
 
-def test_gmm_wrapper_fp4_lhs_quantization_is_opt_in(monkeypatch):
+@pytest.mark.parametrize("block", [16, 64, 512])
+@pytest.mark.parametrize("weight_dtype,quantize_lhs", [
+    (jnp.float4_e2m1fn, False),
+    (jnp.float8_e4m3fn, True),
+])
+def test_gmm_activation_precision_is_independent_of_weight_block(
+        monkeypatch, block, weight_dtype, quantize_lhs):
     calls = []
 
     def fake_gmm_v2(**kwargs):
@@ -36,22 +42,21 @@ def test_gmm_wrapper_fp4_lhs_quantization_is_opt_in(monkeypatch):
         return kwargs["lhs"]
 
     monkeypatch.setattr(fused_moe_gmm, "gmm_v2", fake_gmm_v2)
-    lhs = jnp.ones((2, 8), dtype=jnp.bfloat16)
-    rhs = types.SimpleNamespace(dtype=jnp.float4_e2m1fn)
-    common = dict(
+    lhs = jnp.ones((2, 512), dtype=jnp.bfloat16)
+    rhs = types.SimpleNamespace(dtype=weight_dtype)
+    output = fused_moe_gmm.gmm_wrapper(
         lhs=lhs,
         rhs=rhs,
-        rhs_scale=None,
+        rhs_scale=jnp.ones((1, 512 // block, 1, 128), dtype=jnp.float32),
         rhs_bias=None,
         group_sizes=jnp.array([2], dtype=jnp.int32),
         group_offset=jnp.array([0], dtype=jnp.int32),
     )
 
-    fused_moe_gmm.gmm_wrapper(**common)
-    fused_moe_gmm.gmm_wrapper(**common, quantize_fp4_lhs=True)
-
-    assert calls[0]["maybe_quantize_lhs"] is False
-    assert calls[1]["maybe_quantize_lhs"] is True
+    assert output is lhs
+    assert calls[0]["lhs"].dtype == jnp.bfloat16
+    assert calls[0]["rhs"] is rhs
+    assert calls[0]["maybe_quantize_lhs"] is quantize_lhs
 
 
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
