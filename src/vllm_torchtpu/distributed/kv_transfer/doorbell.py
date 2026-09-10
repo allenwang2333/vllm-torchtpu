@@ -88,7 +88,10 @@ def _make_bell_fn(num_groups: int):
         input_output_aliases={2: 0},
     )
 
-    def bell_fn(announced, doorbells, selector, generation):
+    # The annotations are load-bearing: `pallas.jax_op` reads the signature to
+    # build the torch op schema and rejects a bare parameter.
+    def bell_fn(announced: jax.Array, doorbells: jax.Array,
+                selector: jax.Array, generation: jax.Array) -> jax.Array:
         """Ring one group's bell, ordered after `announced` is written.
 
         The ordering rests on two things. `announced` is a parameter of the

@@ -137,6 +137,33 @@ def test_verify_reads_are_bounded():
     assert len(reads) == 3
 
 
+def test_prebuild_registers_a_torch_op():
+    """`pallas.jax_op` reads the JAX function's signature to build the torch
+    op schema, so an unannotated parameter fails at registration. That happens
+    during KV cache setup on a real worker, long after these tests would have
+    passed, so register once here where it costs nothing."""
+    bells, _ = _cpu_set()
+    bells.prebuild(None, None)
+    assert bells.op is not None
+
+    # Idempotent: both KV cache paths call the initializer.
+    first = bells.op
+    bells.prebuild(None, None)
+    assert bells.op is first
+
+
+def test_prebuild_registers_a_torch_op_under_shard_map():
+    """PCP prefill takes the sharded path, and `shard_map` wraps the function
+    the schema is read from. A one-device CPU mesh is enough to check the
+    annotations survive that wrapper."""
+    from jax.sharding import PartitionSpec
+
+    mesh = jax.make_mesh((1, ), ("x", ), devices=jax.devices("cpu")[:1])
+    bells, _ = _cpu_set()
+    bells.prebuild(mesh, PartitionSpec())
+    assert bells.op is not None
+
+
 def test_generation_starts_below_first_and_rises_once_per_step():
     bells, _ = _cpu_set()
     assert int(bells.generation[0, 0, 0]) == FIRST_GENERATION - 1
