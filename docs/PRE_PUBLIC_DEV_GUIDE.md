@@ -175,7 +175,7 @@ After the PR is merged into `main`:
 1. **Inspect Nightly & Scheduled Build Results (Buildkite):**
    To verify that your change runs successfully in scheduled nightly TPU benchmarks:
    🔗 **Buildkite Dashboard URL:**
-   [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
+   [Buildkite Scheduled Builds](https://buildkite.com/vllm/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build)
 2. **Verify Main Branch CI Runs (GitHub CLI):** Confirm that recent workflow runs on `main` remain green and stable:
 
    ```bash
@@ -214,8 +214,8 @@ After the PR is merged into `main`:
 
 - **Policy:** The `CODEOWNERS Approval` check reports whether every area a PR touches has at least one approval from an owner of that area in [.github/CODEOWNERS](../.github/CODEOWNERS). It resolves ownership with the same matcher as `scripts/find_owners.py`, so its verdict always agrees with what that command tells you to do. (The `Run Approval Gate` check next to it is the job that produces the verdict; it is green whenever the gate managed to run.)
 - **Rationale:** GitHub applies CODEOWNERS automatically only on plans this repository is not on (see Section 1), so an approval from someone who happens to be available today does not mean the people who own the code have seen it. The gate makes that gap visible instead of leaving it to the reviewer's memory.
-- **It is advisory, not enforcing.** Like every other check here, a red gate does not disable the merge button. Treat it as a line item on the Pre-Merge Verification Checklist. Marking it required is a one-click change once branch rulesets become available.
-- **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. A failure names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
+- **It is advisory, not enforcing.** An unmet gate is reported **grey, not red**, so it stays out of the "some checks were not successful" banner and is never confused with a real test failure. Every PR is unmet for the whole window between opening it and being reviewed, and a red X across that window would just train everyone to ignore the check. Treat it as a line item on the Pre-Merge Verification Checklist. Making it block, once branch rulesets become available, takes two changes: set `MISSING_APPROVAL_CONCLUSION: failure` in the workflow, and mark the check required.
+- **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. An unmet gate names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
 - **What counts:**
   - Ownership is read from the **base branch's** CODEOWNERS, matching how GitHub evaluates it: a PR does not get to grant itself ownership of a directory until it merges. The resolver itself runs from the PR, so a change to `scripts/find_owners.py` is exercised by the gate before it lands.
   - Self-approvals are ignored. If you are an area's **only** owner, any other reviewer's approval clears it, so the PR does not deadlock.
@@ -274,7 +274,7 @@ In urgent situations where you must unblock yourself immediately:
 | **Phase 2: Update Outdated Branch** | `gh pr update-branch <PR_NUMBER>` |
 | **Phase 3: Guarded Merge (Approved + Green)** | `[ "$(gh pr view <PR_NUMBER> --json latestReviews \| jq '[.latestReviews[] \| select(.state == "APPROVED")] \| length')" -gt 0 ] && gh pr checks <PR_NUMBER> && gh pr merge <PR_NUMBER> --squash --delete-branch` |
 | **Phase 4: Main Branch CI Check (CLI)** | `gh run list --branch main --limit 5` |
-| **Phase 4: Buildkite Nightly URL** | [Buildkite Scheduled Builds](https://buildkite.com/tpu-commons/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build) |
+| **Phase 4: Buildkite Nightly URL** | [Buildkite Scheduled Builds](https://buildkite.com/vllm/vllm-torchtpu-ci/builds?branch=main&query=Scheduled+build) |
 | **Fix Missing DCO (CLI)** | `git commit --amend --signoff --no-edit && git push origin HEAD --force-with-lease` |
 | **Fix Missing DCO (UI Override)** | Click DCO check details in GitHub PR UI -> Click "Set DCO to PASS" |
 
