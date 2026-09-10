@@ -1,6 +1,9 @@
 # Docker images
 
-This folder contains the Dockerfile used to build the main image variants for vllm-torchtpu.
+This folder contains the Dockerfile and helper scripts used to build the container image variants for `vllm-torchtpu`.
+
+> [!TIP]
+> For the complete user guide and Cloud TPU run instructions, see the official documentation at [`docs/getting_started/docker.md`](../docs/getting_started/docker.md).
 
 ## Pre-built Nightly Images
 
