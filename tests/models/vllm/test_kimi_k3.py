@@ -472,9 +472,13 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args, gate_is_fused) -> None:
+        def __init__(self,
+                     *args,
+                     gate_is_fused,
+                     non_causal_multi_token_decode=False) -> None:
             super().__init__()
             self.mla_modules = args[8]
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
         def forward(self, positions, hidden_states):
             return hidden_states
@@ -514,6 +518,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     assert layer.q_proj is not None
     assert layer.kv_a_proj_with_mqa is not None
     assert layer.fused_qkv_a_proj is None
+    assert layer.mla_attn.non_causal_multi_token_decode is False
     hidden_states = torch.randn(2, config.hidden_size)
     torch.testing.assert_close(
         layer(torch.arange(2), hidden_states),
@@ -537,10 +542,14 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
 
     class FakeMLAWrapper(nn.Module):
 
-        def __init__(self, *args, gate_is_fused) -> None:
+        def __init__(self,
+                     *args,
+                     gate_is_fused,
+                     non_causal_multi_token_decode=False) -> None:
             super().__init__()
             self.mla_modules = args[8]
             self.gate_is_fused = gate_is_fused
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
 
     monkeypatch.setattr(kimi_attention, "MultiHeadLatentAttentionWrapper",
                         FakeMLAWrapper)
@@ -575,6 +584,7 @@ def test_mla_fuses_output_gate_with_lora_a_projections(
     assert layer.fused_qkv_a_proj.output_size == 8 + (8 + 2) + 4 * 4
     assert layer.g_proj is None
     assert layer.mla_attn.gate_is_fused is True
+    assert layer.mla_attn.non_causal_multi_token_decode is False
 
 
 @pytest.mark.parametrize("use_parameter_hook", [False, True],
@@ -673,6 +683,8 @@ def test_kda_forward_dispatches_to_both_custom_ops() -> None:
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=None,
+        mamba_slot_read_offsets=None,
     )
     layer._metadata = lambda: metadata
 
@@ -782,9 +794,12 @@ def test_kda_custom_ops_compile_as_one_full_graph(
             state_indices: torch.Tensor,
             seq_lens: torch.Tensor,
             distribution: torch.Tensor,
+            window_distribution: torch.Tensor,
+            slot_read_offsets: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-            del conv_weight, distribution
+            del conv_weight, distribution, window_distribution
+            del slot_read_offsets
             del query_start_loc, state_indices, seq_lens
             num_heads, head_dim = recurrent_state.shape[1:3]
             output = mixed_qkv[:, :num_heads * head_dim]
@@ -835,6 +850,8 @@ def test_kda_custom_ops_compile_as_one_full_graph(
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=None,
+        mamba_slot_read_offsets=None,
     )
     layer._metadata = lambda: metadata
     hidden_states = torch.ones(2, 4)
