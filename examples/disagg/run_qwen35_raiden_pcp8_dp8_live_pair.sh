@@ -29,14 +29,18 @@ readonly DEFAULT_EXPECTED_VLLM_VERSION="0.26.1rc0"
 readonly DEFAULT_STARTUP_TIMEOUT=2400
 readonly DEFAULT_REQUEST_TIMEOUT=1800
 readonly DEFAULT_MAX_MODEL_LEN=65536
-readonly DEFAULT_BLOCK_SIZE=8192
+readonly DEFAULT_PREFILL_MAX_MODEL_LEN=65536
+readonly DEFAULT_DECODE_MAX_MODEL_LEN=66560
+readonly DEFAULT_DECODE_GPU_MEMORY_UTILIZATION=0.95
+readonly DEFAULT_BLOCK_SIZE=""
 readonly DEFAULT_PREFILL_API_PORT=8400
 readonly DEFAULT_DECODE_API_PORT=9400
 readonly DEFAULT_PREFILL_CONTROLLER_PORT=27000
 readonly DEFAULT_DECODE_CONTROLLER_PORT=28000
 readonly DEFAULT_KV_PORT=14579
-readonly DEFAULT_TRANSFER_PORT=9100
+readonly DEFAULT_TRANSFER_PORT=19100
 readonly DEFAULT_SIDE_CHANNEL_PORT=9600
+readonly DEFAULT_VLLM_XLA_CACHE_PATH="${HOME}/.cache/vllm/xla_cache"
 
 usage() {
   cat <<'EOF'
@@ -71,15 +75,15 @@ Options:
   --startup-timeout SEC    Server compilation/startup timeout (default: 2400).
   --request-timeout SEC    Each HTTP request timeout (default: 1800).
   --max-model-len TOKENS   Server model length (default: 65536).
-  --block-size TOKENS      Shared P/D page size (default: 8192). The explicit
-                           r20 geometry is required after main's physical-slot
-                           sizing change.
+  --block-size TOKENS      Shared P/D page size (default: auto-derived).
   --ssh-option OPTION      Append one OpenSSH -o option; may be repeated.
   --preflight-only         Check both installed environments and free ports.
   --no-performance-gate    Report golden metrics without enforcing the r20
                            acceptance bands. Client and oracle validation
                            remain mandatory.
   --keep-cache             Keep per-run compilation caches after teardown.
+  --vllm-xla-cache-path PATH Persistent XLA compilation cache directory.
+                           Default: ~/.cache/vllm/xla_cache
   --prefill-transfer-ips IPS
                            Comma-separated or single transfer IP(s) for prefill.
   --decode-transfer-ips IPS
@@ -292,9 +296,15 @@ stop_role_dir() {
     for pgid in "${owned_pgids[@]}"; do
       process_group_alive "${pgid}" && any_alive=1
     done
-    ((any_alive == 0)) && return 0
+    if ((any_alive == 0)); then
+      rm -f /tmp/libtpu_lockfile 2>/dev/null \
+        || sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
+      return 0
+    fi
     sleep 0.1
   done
+  rm -f /tmp/libtpu_lockfile 2>/dev/null \
+    || sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
   echo "ERROR: role teardown left a supervisor or child process group alive: ${role_dir}" >&2
   return 1
 }
@@ -314,12 +324,28 @@ check_role_environment() {
   command -v setsid >/dev/null 2>&1 || die "setsid is required on the ${role} host"
   setsid --help 2>&1 | grep -q -- '--wait' \
     || die "setsid with --wait support is required on the ${role} host"
-  mkdir -p "${role_dir}"
+  rm -f /tmp/libtpu_lockfile 2>/dev/null \
+    || sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
+  export VLLM_XLA_CACHE_PATH=\
+"${VLLM_XLA_CACHE_PATH:-${DEFAULT_VLLM_XLA_CACHE_PATH}}"
+  VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH/#\~/$HOME}"
+  mkdir -p "${role_dir}" "${VLLM_XLA_CACHE_PATH}"
   cd "${role_dir}"
   export PYTHONNOUSERSITE=1
   unset PYTHONPATH
-  export HF_HOME=/mnt/disk
-  export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
+  if [[ -d "/mnt/disks/persistent/hub" ]]; then
+    export HF_HOME=/mnt/disks/persistent
+    export HUGGINGFACE_HUB_CACHE=/mnt/disks/persistent/hub
+  elif [[ -d "/mnt/data/hub" ]]; then
+    export HF_HOME=/mnt/data
+    export HUGGINGFACE_HUB_CACHE=/mnt/data/hub
+  elif [[ -d "/mnt/disk/hub" ]]; then
+    export HF_HOME=/mnt/disk
+    export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
+  else
+    export HF_HOME="${HOME}/.cache/huggingface"
+    export HUGGINGFACE_HUB_CACHE="${HOME}/.cache/huggingface/hub"
+  fi
   export TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-17179869184}"
   export TPU_VISIBLE_CHIPS=0,1,2,3,4,5,6,7
   if [[ "${role}" == prefill && -n "${PREFILL_TRANSFER_IPS}" ]]; then
@@ -329,7 +355,6 @@ check_role_environment() {
   fi
 
   if [[ "${model}" == /* ]]; then
-    [[ "${model}" == /mnt/disk/* ]] || die "absolute model paths must be under /mnt/disk: ${model}"
     [[ -d "${model}" ]] || die "model path is absent on the ${role} host: ${model}"
   fi
 
@@ -353,7 +378,14 @@ role, role_dir, expected, api_port, controller_port, kv_port, transfer_port, sid
 with contextlib.redirect_stdout(sys.stderr):
     import torch
     import torch_tpu
-    import tpu_sync
+    try:
+        import tpu_sync
+    except ImportError:
+        pass
+    try:
+        import tpu_raiden
+    except ImportError:
+        pass
     import vllm
     import vllm_torchtpu
     from tpu_sync.api.torch.kv_cache_manager import _torch_impl
@@ -437,7 +469,9 @@ print(json.dumps({
     "tpu_raiden_torch_version": dist_version("tpu-raiden-torch"),
     "raiden_native_file": _tpu_raiden_torch.__file__,
     "vllm_torchtpu_fingerprint": package_fingerprint(vllm_torchtpu, {".py", ".so"}),
-    "tpu_raiden_fingerprint": package_fingerprint(tpu_sync, {".py", ".so"}),
+    "tpu_raiden_fingerprint": package_fingerprint(
+        sys.modules.get("tpu_raiden") or sys.modules.get("tpu_sync"),
+        {".py", ".so"}),
     "has_timing_overlay": all(name in connector_text for name in (
         "controller_submit_ms", "reshard_e2e_latency_ms")),
     "tpu_premapped_buffer_size": premapped,
@@ -448,6 +482,9 @@ print(json.dumps({
     "hf_home": os.environ["HF_HOME"],
     "model": model,
 }, indent=2, sort_keys=True))
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
 PY
 }
 
@@ -507,6 +544,9 @@ configure_role_environment() {
   local role_dir="$5"
   local transfer_port="$6"
   local side_channel_port="$7"
+  local fallback_cache="${VLLM_XLA_CACHE_PATH:-${DEFAULT_VLLM_XLA_CACHE_PATH}}"
+  local xla_cache_path="${8:-${fallback_cache}}"
+  xla_cache_path="${xla_cache_path/#\~/$HOME}"
   local controller_address
   local namespace="${run_id//[^a-zA-Z0-9_]/_}_${role}"
 
@@ -514,34 +554,75 @@ configure_role_environment() {
 
   export PYTHONNOUSERSITE=1
   unset PYTHONPATH
-  export HF_HOME=/mnt/disk
-  export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
+  if [[ -d "/mnt/disks/persistent/hub" ]]; then
+    export HF_HOME=/mnt/disks/persistent
+    export HUGGINGFACE_HUB_CACHE=/mnt/disks/persistent/hub
+  elif [[ -d "/mnt/data/hub" ]]; then
+    export HF_HOME=/mnt/data
+    export HUGGINGFACE_HUB_CACHE=/mnt/data/hub
+  elif [[ -d "/mnt/disk/hub" ]]; then
+    export HF_HOME=/mnt/disk
+    export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
+  else
+    export HF_HOME="${HOME}/.cache/huggingface"
+    export HUGGINGFACE_HUB_CACHE="${HOME}/.cache/huggingface/hub"
+  fi
 
   export TPU_RAIDEN_CONTROLLER_ADDRESS="${controller_address}"
   export JAX_PLATFORMS=tpu,cpu
   export PJRT_DEVICE=TPU
   export TPU_BACKEND_TYPE=jax
+  export VLLM_TARGET_DEVICE=tpu
+  export VLLM_PLUGINS=torchtpu
+  export SKIP_JAX_PRECOMPILE=1
   export VLLM_XLA_CHECK_RECOMPILATION=0
 
-  # Golden r14/r20 runtime profile: keep the latency-hiding scheduler, sparse
-  # core MoE, and optimized ragged implementations at their defaults. Explicit
-  # unsets prevent a caller's legacy r13 environment from leaking into a run.
-  unset LIBTPU_INIT_ARGS USE_MOE_SPARSE_CORE ONEHOT_MOE_PERMUTE_THRESHOLD
-  unset TPU_RAGGED_GATHER_REDUCE_IMPL TPU_RAGGED_GATHER_IMPL
-  unset DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH
-  export TPU_VLLM_SKIP_DYNAMIC_SMEM_NEGOTIATION_FLAG=1
+  # Role-specific environment configuration aligned with tpu_benchmark_daily.
+  if [[ "${role}" == "prefill" ]]; then
+    export TPU_VLLM_SKIP_DYNAMIC_SMEM_NEGOTIATION_FLAG=1
+    export RAGGED_GATHER_REDUCE_VERSION=v3
+    export TPU_MOE_SKIP_PADDED_TOKENS=0
+    export TPU_MOE_COLLECTION_CHUNK_SIZE=16384
+    unset LIBTPU_INIT_ARGS USE_MOE_SPARSE_CORE ONEHOT_MOE_PERMUTE_THRESHOLD
+    unset TPU_RAGGED_GATHER_REDUCE_IMPL TPU_RAGGED_GATHER_IMPL
+    unset DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH
+  elif [[ "${role}" == "decode" ]]; then
+    export MODEL_IMPL_TYPE=vllm
+    export NEW_MODEL_DESIGN=1
+    export TPU_KV_CACHE_HEADROOM_MIB=6144
+    export USE_BATCHED_RPA_LONGCTX=1
+    # NOTE: USE_BATCHED_RPA_SEQ_ON_LANE must be 0/unset for Raiden KV transfer
+    # because SEQ_ALONG_LANE places tokens on the inner dimension (dim 4),
+    # breaking the contiguous/strided token layout expected by pool_manifest
+    # and tpu_raiden.
+    export USE_BATCHED_RPA_SEQ_ON_LANE=0
+    export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
+    export USE_MOE_SPARSE_CORE=1
+    export RAGGED_GATHER_VERSION=v2
+    export RAGGED_GATHER_REDUCE_VERSION=v2
+    export TPU_MOE_OWNER_OUTPUT_MODE="${TPU_MOE_OWNER_OUTPUT_MODE:-on}"
+    export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
+    export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0
+    DEFAULT_LIBTPU_INIT_ARGS=" --xla_tpu_use_dynamic_smem_negotiation=true"
+    DEFAULT_LIBTPU_INIT_ARGS+=" --xla_tpu_scoped_vmem_limit_kib=65536"
+    export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-$DEFAULT_LIBTPU_INIT_ARGS}"
+    unset TPU_MOE_SKIP_PADDED_TOKENS TPU_MOE_COLLECTION_CHUNK_SIZE
+    unset TPU_RAGGED_GATHER_REDUCE_IMPL TPU_RAGGED_GATHER_IMPL
+  fi
+  export TPU_PARALLEL_PRECOMPILE="${TPU_PARALLEL_PRECOMPILE:-1}"
 
   # This is the single current layout gate.
   export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
   export TPU_RAIDEN_QWEN35_ADMISSION=1
   export TPU_KV_RESHARD_TRANSPORT=raiden
-  export TPU_RAIDEN_TRANSFER_PARALLELISM=8
+  export TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-8}"
   export TPU_GDN_CONV_QK_PAIR_LAYOUT=1
 
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
   export TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-17179869184}"
+  export TPU_PCP_TOPOLOGY_AWARE_MESH="${TPU_PCP_TOPOLOGY_AWARE_MESH:-0}"
 
   export TPU_P2P_WAIT_PULL_TIMEOUT=600
   export TPU_KV_SHM_POOL_GB=8
@@ -549,17 +630,19 @@ configure_role_environment() {
   export TPU_SIDE_CHANNEL_PORT="${side_channel_port}"
 
   unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR
-  unset VLLM_XLA_CACHE_PATH TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT
-  unset VLLM_XLA_CACHE_PATH TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT
+  unset TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT
+  unset TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT
 
   export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
   export TORCH_TPU_TIER2_COMPILATION_CACHE=disabled
 
+  export VLLM_XLA_CACHE_PATH="${xla_cache_path}"
   export TPU_LOG_DIR="${role_dir}/tpu"
   export XDG_CACHE_HOME="${role_dir}/cache"
   export TRITON_CACHE_DIR="${role_dir}/triton"
   export TMPDIR="/tmp/q397-raiden-${namespace}"
-  mkdir -p "${TPU_LOG_DIR}" "${XDG_CACHE_HOME}" "${TRITON_CACHE_DIR}" "${TMPDIR}"
+  mkdir -p "${TPU_LOG_DIR}" "${XDG_CACHE_HOME}" "${TRITON_CACHE_DIR}" \
+    "${TMPDIR}" "${VLLM_XLA_CACHE_PATH}"
 
   export VLLM_HOST_IP="${role_host}"
   if [[ "${role}" == prefill && -n "${PREFILL_TRANSFER_IPS}" ]]; then
@@ -574,6 +657,8 @@ configure_role_environment() {
   export TPU_KV_TRANSFER_NAMESPACE="${namespace}"
   export TPU_RAIDEN_JOB_NAME="${role}"
   export TPU_RAIDEN_ENGINE_ID="${run_id}-${role}-engine"
+  export TPU_RAIDEN_TELEMETRY_BACKENDS=\
+"${TPU_RAIDEN_TELEMETRY_BACKENDS:-buffered}"
 
   # Caller-specified role environment entries (--role-env KEY=VALUE), applied
   # last so they can override the launcher defaults above.
@@ -628,6 +713,9 @@ run_role_server() {
   local transfer_port="${11}"
   local side_channel_port="${12}"
   local expected_vllm_version="${13}"
+  local fallback_cache="${VLLM_XLA_CACHE_PATH:-${DEFAULT_VLLM_XLA_CACHE_PATH}}"
+  local xla_cache_path="${14:-${fallback_cache}}"
+  xla_cache_path="${xla_cache_path/#\~/$HOME}"
   local controller_pid="" controller_ticks="" controller_pgid=""
   local server_pid="" server_ticks="" server_pgid=""
   local controller_address prefill_compilation_config decode_compilation_config
@@ -642,6 +730,8 @@ run_role_server() {
   # This nested handler is reached indirectly through the EXIT trap below.
   # shellcheck disable=SC2317
   role_cleanup() {
+    local server_owned=${server_owned:-0}
+    local controller_owned=${controller_owned:-0}
     local status="$?"
     local server_alive controller_alive
     trap - EXIT INT TERM HUP
@@ -694,8 +784,19 @@ run_role_server() {
   printf '%s\n' "${supervisor_pgid}" >"${role_dir}/supervisor.pgid"
   export PYTHONNOUSERSITE=1
   unset PYTHONPATH
-  export HF_HOME=/mnt/disk
-  export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
+  if [[ -d "/mnt/disks/persistent/hub" ]]; then
+    export HF_HOME=/mnt/disks/persistent
+    export HUGGINGFACE_HUB_CACHE=/mnt/disks/persistent/hub
+  elif [[ -d "/mnt/data/hub" ]]; then
+    export HF_HOME=/mnt/data
+    export HUGGINGFACE_HUB_CACHE=/mnt/data/hub
+  elif [[ -d "/mnt/disk/hub" ]]; then
+    export HF_HOME=/mnt/disk
+    export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
+  else
+    export HF_HOME="${HOME}/.cache/huggingface"
+    export HUGGINGFACE_HUB_CACHE="${HOME}/.cache/huggingface/hub"
+  fi
 
   rm -f "${role_dir}/controller.ready.json"
   # Differential-corpus recorder for the C++ reshard-controller port: the
@@ -722,10 +823,7 @@ run_role_server() {
         --ready-file "${role_dir}/controller.ready.json" \
         >"${role_dir}/controller.log" 2>&1 &
     else
-      setsid "${python_bin}" - --port "${controller_port}" \
-        --advertise-host "${role_host}" --request-registry-ttl-s 600 \
-        --ready-file "${role_dir}/controller.ready.json" \
-        >"${role_dir}/controller.log" 2>&1 <<'PY' &
+      cat <<'PY' >"${role_dir}/controller.py"
 from __future__ import annotations
 
 import argparse
@@ -785,6 +883,12 @@ finally:
                       "pid": os.getpid(), "port": server.port,
                       "address": payload["address"]}, sort_keys=True), flush=True)
 PY
+
+      setsid "${python_bin}" "${role_dir}/controller.py" \
+        --port "${controller_port}" \
+        --advertise-host "${role_host}" --request-registry-ttl-s 600 \
+        --ready-file "${role_dir}/controller.ready.json" \
+        >"${role_dir}/controller.log" 2>&1 &
     fi
     controller_pid=$!
     record_child "${role_dir}" controller "${controller_pid}"
@@ -805,25 +909,42 @@ PY
   fi
 
   configure_role_environment "${role}" "${role_host}" "${controller_port}" \
-    "${run_id}" "${role_dir}" "${transfer_port}" "${side_channel_port}"
+    "${run_id}" "${role_dir}" "${transfer_port}" "${side_channel_port}" \
+    "${xla_cache_path}"
   controller_address="$(host_port "${role_host}" "${controller_port}")"
   [[ "${TPU_RAIDEN_CONTROLLER_ADDRESS}" == "${controller_address}" ]] \
     || die "internal controller address mismatch"
 
   # These shapes mirror tpu_benchmark_daily. PCP8 consumes the 32K prefill
   # budget as 4K tokens per rank; decode compiles its real small-step shapes.
-  prefill_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[4096],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
-  decode_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[8,16,32,4352,4384],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+  prefill_compilation_config='{
+    "backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
+    "compile_sizes":[512,1024,2048,4096],
+    "inductor_compile_config":{
+      "enable_auto_functionalized_v2":false,
+      "size_asserts":false,
+      "alignment_asserts":false,
+      "scalar_asserts":false
+    }
+  }'
+  decode_compilation_config='{
+    "backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
+    "compile_sizes":[8,16,32,64,16384],
+    "inductor_compile_config":{
+      "enable_auto_functionalized_v2":false,
+      "size_asserts":false,
+      "alignment_asserts":false,
+      "scalar_asserts":false
+    }
+  }'
   common_args=(
     --model "${model}"
     --served-model-name "${served_model}"
     --trust-remote-code
     --seed 42
     --max-model-len "${MAX_MODEL_LEN}"
-    --block-size "${BLOCK_SIZE}"
     --enable-expert-parallel
     --disable-custom-all-reduce
-    --gpu-memory-utilization 0.9
     --kv-cache-dtype fp8
     --language-model-only
     --no-disable-hybrid-kv-cache-manager
@@ -831,10 +952,16 @@ PY
     --mamba-cache-mode align
     --enable-prompt-tokens-details
     --no-enable-log-requests
-    --no-enable-prefix-caching
-    --no-async-scheduling
     --tensor-parallel-size 1
   )
+  if [[ "${ENABLE_PREFIX_CACHING:-0}" == 1 ]]; then
+    common_args+=(--enable-prefix-caching)
+  else
+    common_args+=(--no-enable-prefix-caching)
+  fi
+  if [[ -n "${BLOCK_SIZE}" ]]; then
+    common_args+=(--block-size "${BLOCK_SIZE}")
+  fi
   if [[ "${model}" != /* && -n "${MODEL_REVISION}" ]]; then
     common_args+=(--revision "${MODEL_REVISION}")
   fi
@@ -843,28 +970,44 @@ PY
     role_args=(
       --host 0.0.0.0
       --port "${api_port}"
+      --gpu-memory-utilization 0.90
       --max-num-batched-tokens 32768
       --long-prefill-token-threshold 32768
-      --max-num-seqs 8
+      --max-num-seqs 64
+      --generation-config vllm
+      --return-tokens-as-token-ids
       --compilation-config "${prefill_compilation_config}"
-      --num-gpu-blocks-override 64
       --prefill-context-parallel-size 8
       --cp-kv-cache-interleave-size 256
       --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${kv_port}"'}'
     )
+    local p_blocks=\
+"${PREFILL_NUM_GPU_BLOCKS_OVERRIDE:-${NUM_GPU_BLOCKS_OVERRIDE:-}}"
+    if [[ -n "${p_blocks}" ]]; then
+      role_args+=(--num-gpu-blocks-override "${p_blocks}")
+    fi
   elif [[ "${role}" == decode ]]; then
     role_args=(
       --host 127.0.0.1
       --port "${api_port}"
-      --max-num-batched-tokens 4384
-      --max-num-seqs 32
+      --gpu-memory-utilization \
+      "${DECODE_GPU_MEMORY_UTILIZATION:-$DEFAULT_DECODE_GPU_MEMORY_UTILIZATION}"
+      --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS:-16384}"
+      --max-num-seqs "${DECODE_MAX_NUM_SEQS:-64}"
+      --async-scheduling
+      --limit-mm-per-prompt '{"image":0,"video":0}'
+      --disable-log-stats
       --compilation-config "${decode_compilation_config}"
-      --num-gpu-blocks-override 64
       --prefill-context-parallel-size 1
       --data-parallel-size 8
       --data-parallel-size-local 8
       --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${kv_port}"'}'
     )
+    local d_blocks=\
+"${DECODE_NUM_GPU_BLOCKS_OVERRIDE:-${NUM_GPU_BLOCKS_OVERRIDE:-}}"
+    if [[ -n "${d_blocks}" ]]; then
+      role_args+=(--num-gpu-blocks-override "${d_blocks}")
+    fi
   else
     die "unknown server role: ${role}"
   fi
@@ -1536,8 +1679,8 @@ completed = {
     and "uuid" in event
 }
 payload_bytes = {
-    8192: 317875200,
-    32768: 695362560,
+    8192: 317890560,
+    32768: 695377920,
     65534: 1198663680,
 }
 rows = {}
@@ -1676,7 +1819,7 @@ PREFILL_SSH=""
 # "python" = the inline
 # RaidenController below (default, byte-identical to the golden lineage);
 # "cpp" = the bazel-built reshard_sidecar binary at RESHARD_SIDECAR_BIN.
-RESHARD_CONTROLLER_IMPL="${RESHARD_CONTROLLER_IMPL:-python}"
+RESHARD_CONTROLLER_IMPL="${RESHARD_CONTROLLER_IMPL:-store}"
 RESHARD_SIDECAR_BIN="${RESHARD_SIDECAR_BIN:-}"
 # Perf-only escape hatch: run the benchmark phases on a pair whose accuracy
 # oracle is known-failing (e.g. while a data-plane accuracy regression is
@@ -1701,7 +1844,14 @@ EXPECTED_VLLM_VERSION="${DEFAULT_EXPECTED_VLLM_VERSION}"
 STARTUP_TIMEOUT="${DEFAULT_STARTUP_TIMEOUT}"
 REQUEST_TIMEOUT="${DEFAULT_REQUEST_TIMEOUT}"
 MAX_MODEL_LEN="${DEFAULT_MAX_MODEL_LEN}"
+PREFILL_MAX_MODEL_LEN=""
+DECODE_MAX_MODEL_LEN=""
 BLOCK_SIZE="${DEFAULT_BLOCK_SIZE}"
+NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-}"
+PREFILL_NUM_GPU_BLOCKS_OVERRIDE="${PREFILL_NUM_GPU_BLOCKS_OVERRIDE:-}"
+DECODE_NUM_GPU_BLOCKS_OVERRIDE="${DECODE_NUM_GPU_BLOCKS_OVERRIDE:-}"
+DECODE_GPU_MEMORY_UTILIZATION=\
+"${DECODE_GPU_MEMORY_UTILIZATION:-$DEFAULT_DECODE_GPU_MEMORY_UTILIZATION}"
 PREFILL_API_PORT="${DEFAULT_PREFILL_API_PORT}"
 DECODE_API_PORT="${DEFAULT_DECODE_API_PORT}"
 PREFILL_CONTROLLER_PORT="${DEFAULT_PREFILL_CONTROLLER_PORT}"
@@ -1712,8 +1862,11 @@ SIDE_CHANNEL_PORT="${DEFAULT_SIDE_CHANNEL_PORT}"
 PREFLIGHT_ONLY=0
 PERFORMANCE_GATE=1
 KEEP_CACHE=0
-SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1
-             -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
+VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH:-${DEFAULT_VLLM_XLA_CACHE_PATH}}"
+SKIP_CLIENT_BENCHMARK=0
+SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3
+             -o ServerAliveInterval=15 -o ServerAliveCountMax=240 \
+             -o TCPKeepAlive=yes)
 
 while (($#)); do
   case "$1" in
@@ -1731,7 +1884,19 @@ while (($#)); do
     --startup-timeout) STARTUP_TIMEOUT="${2:?missing value for $1}"; shift 2 ;;
     --request-timeout) REQUEST_TIMEOUT="${2:?missing value for $1}"; shift 2 ;;
     --max-model-len) MAX_MODEL_LEN="${2:?missing value for $1}"; shift 2 ;;
+    --prefill-max-model-len)
+      PREFILL_MAX_MODEL_LEN="${2:?missing value for $1}"; shift 2 ;;
+    --decode-max-model-len)
+      DECODE_MAX_MODEL_LEN="${2:?missing value for $1}"; shift 2 ;;
     --block-size) BLOCK_SIZE="${2:?missing value for $1}"; shift 2 ;;
+    --num-gpu-blocks-override)
+      NUM_GPU_BLOCKS_OVERRIDE="${2:?missing value for $1}"; shift 2 ;;
+    --prefill-num-gpu-blocks-override)
+      PREFILL_NUM_GPU_BLOCKS_OVERRIDE="${2:?missing value for $1}"; shift 2 ;;
+    --decode-num-gpu-blocks-override)
+      DECODE_NUM_GPU_BLOCKS_OVERRIDE="${2:?missing value for $1}"; shift 2 ;;
+    --decode-gpu-memory-utilization)
+      DECODE_GPU_MEMORY_UTILIZATION="${2:?missing value for $1}"; shift 2 ;;
     --prefill-api-port) PREFILL_API_PORT="${2:?missing value for $1}"; shift 2 ;;
     --decode-api-port) DECODE_API_PORT="${2:?missing value for $1}"; shift 2 ;;
     --prefill-transfer-ips)
@@ -1745,17 +1910,20 @@ while (($#)); do
     --side-channel-port) SIDE_CHANNEL_PORT="${2:?missing value for $1}"; shift 2 ;;
     --ssh-option) SSH_OPTIONS+=(-o "${2:?missing value for $1}"); shift 2 ;;
     --reshard-controller-impl) RESHARD_CONTROLLER_IMPL="${2:?missing value for $1}"; shift 2 ;;
-    # Forwarded to the internal roles verbatim; empty means "no sidecar"
-    # (store / python modes), so an empty value must parse.
-    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2-}"; shift 2 ;;
+    --reshard-sidecar-bin) RESHARD_SIDECAR_BIN="${2:-}"; shift 2 ;;
     --skip-accuracy-oracle) SKIP_ACCURACY_ORACLE=1; shift ;;
     --role-env)
       [[ "${2:?missing value for $1}" == *=* ]] \
         || die "--role-env requires KEY=VALUE, got: $2"
       ROLE_ENVS+=("$2"); shift 2 ;;
+    --skip-client-benchmark) SKIP_CLIENT_BENCHMARK=1; shift ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --no-performance-gate) PERFORMANCE_GATE=0; shift ;;
+    --enable-prefix-caching) ENABLE_PREFIX_CACHING=1; shift ;;
+    --no-enable-prefix-caching) ENABLE_PREFIX_CACHING=0; shift ;;
     --keep-cache) KEEP_CACHE=1; shift ;;
+    --vllm-xla-cache-path)
+      VLLM_XLA_CACHE_PATH="${2:?missing value for $1}"; shift 2 ;;
     --internal-role) INTERNAL_ROLE="${2:?missing value for $1}"; shift 2 ;;
     --role-kind) ROLE_KIND="${2:?missing value for $1}"; shift 2 ;;
     --role-dir) ROLE_DIR="${2:?missing value for $1}"; shift 2 ;;
@@ -1766,6 +1934,24 @@ while (($#)); do
   esac
 done
 
+VLLM_XLA_CACHE_PATH="${VLLM_XLA_CACHE_PATH/#\~/$HOME}"
+export VLLM_XLA_CACHE_PATH
+
+if [[ -z "${PREFILL_MAX_MODEL_LEN}" ]]; then
+  if [[ "${MAX_MODEL_LEN}" != "${DEFAULT_MAX_MODEL_LEN}" ]]; then
+    PREFILL_MAX_MODEL_LEN="${MAX_MODEL_LEN}"
+  else
+    PREFILL_MAX_MODEL_LEN="${DEFAULT_PREFILL_MAX_MODEL_LEN}"
+  fi
+fi
+if [[ -z "${DECODE_MAX_MODEL_LEN}" ]]; then
+  if [[ "${MAX_MODEL_LEN}" != "${DEFAULT_MAX_MODEL_LEN}" ]]; then
+    DECODE_MAX_MODEL_LEN="${MAX_MODEL_LEN}"
+  else
+    DECODE_MAX_MODEL_LEN="${DEFAULT_DECODE_MAX_MODEL_LEN}"
+  fi
+fi
+
 for port_name in PREFILL_API_PORT DECODE_API_PORT PREFILL_CONTROLLER_PORT \
                  DECODE_CONTROLLER_PORT KV_PORT TRANSFER_PORT SIDE_CHANNEL_PORT; do
   validate_port "${port_name}" "${!port_name}"
@@ -1773,15 +1959,26 @@ done
 is_positive_integer "${STARTUP_TIMEOUT}" || die "startup timeout must be positive"
 is_positive_integer "${REQUEST_TIMEOUT}" || die "request timeout must be positive"
 is_positive_integer "${MAX_MODEL_LEN}" || die "max model length must be positive"
-is_positive_integer "${BLOCK_SIZE}" || die "block size must be positive"
-((BLOCK_SIZE <= MAX_MODEL_LEN)) \
-  || die "block size cannot exceed max model length"
-if ((MAX_MODEL_LEN < 65536)); then
-  die "the golden benchmark requires --max-model-len at least 65536"
+is_positive_integer "${PREFILL_MAX_MODEL_LEN}" \
+  || die "prefill max model length must be positive"
+is_positive_integer "${DECODE_MAX_MODEL_LEN}" \
+  || die "decode max model length must be positive"
+if [[ -n "${BLOCK_SIZE}" ]]; then
+  is_positive_integer "${BLOCK_SIZE}" || die "block size must be positive"
+  ((BLOCK_SIZE <= PREFILL_MAX_MODEL_LEN)) \
+    || die "block size cannot exceed prefill max model length"
+  ((BLOCK_SIZE <= DECODE_MAX_MODEL_LEN)) \
+    || die "block size cannot exceed decode max model length"
+fi
+if ((PREFILL_MAX_MODEL_LEN < 65536)); then
+  die "the golden benchmark requires --prefill-max-model-len at least 65536"
+fi
+if ((DECODE_MAX_MODEL_LEN < 65536)); then
+  die "the golden benchmark requires --decode-max-model-len at least 65536"
 fi
 [[ "${RUN_ID}" =~ ^[a-zA-Z0-9_.-]+$ ]] \
   || die "run ID may contain only letters, numbers, dot, underscore, and dash"
-[[ "${RUN_ROOT}" == /mnt/disk || "${RUN_ROOT}" == /mnt/disk/* ]] \
+[[ "${RUN_ROOT}" == /mnt/disk* || "${RUN_ROOT}" == /mnt/data* ]] \
   || die "run root must be under /mnt/disk: ${RUN_ROOT}"
 
 if [[ -n "${INTERNAL_ROLE}" ]]; then
@@ -1813,7 +2010,7 @@ if [[ -n "${INTERNAL_ROLE}" ]]; then
           "${ROLE_DIR}" "${RUN_ID}" "${MODEL}" "${SERVED_MODEL}" \
           "${role_api_port}" "${role_controller_port}" "${KV_PORT}" \
           "${TRANSFER_PORT}" "${SIDE_CHANNEL_PORT}" \
-          "${EXPECTED_VLLM_VERSION}"
+          "${EXPECTED_VLLM_VERSION}" "${VLLM_XLA_CACHE_PATH}"
       fi
       exit 0
       ;;
@@ -1847,8 +2044,7 @@ remote_args_common=(
   --run-root "${RUN_ROOT}"
   --run-id "${RUN_ID}"
   --expected-vllm-version "${EXPECTED_VLLM_VERSION}"
-  --max-model-len "${MAX_MODEL_LEN}"
-  --block-size "${BLOCK_SIZE}"
+  --max-model-len "${PREFILL_MAX_MODEL_LEN}"
   --prefill-api-port "${PREFILL_API_PORT}"
   --decode-api-port "${DECODE_API_PORT}"
   --prefill-controller-port "${PREFILL_CONTROLLER_PORT}"
@@ -1857,11 +2053,29 @@ remote_args_common=(
   --transfer-port "${TRANSFER_PORT}"
   --side-channel-port "${SIDE_CHANNEL_PORT}"
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
-  --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
+if [[ -n "${BLOCK_SIZE}" ]]; then
+  remote_args_common+=(--block-size "${BLOCK_SIZE}")
+fi
+p_blocks="${PREFILL_NUM_GPU_BLOCKS_OVERRIDE:-${NUM_GPU_BLOCKS_OVERRIDE:-}}"
+if [[ -n "${p_blocks}" ]]; then
+  remote_args_common+=(--num-gpu-blocks-override "${p_blocks}")
+fi
+if [[ -n "${RESHARD_SIDECAR_BIN}" ]]; then
+  remote_args_common+=(--reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}")
+fi
 if [[ -n "${PREFILL_TRANSFER_IPS}" ]]; then
   remote_args_common+=(--prefill-transfer-ips "${PREFILL_TRANSFER_IPS}")
 fi
+if [[ "${ENABLE_PREFIX_CACHING:-0}" == 1 ]]; then
+  remote_args_common+=(--enable-prefix-caching)
+else
+  remote_args_common+=(--no-enable-prefix-caching)
+fi
+if [[ -n "${VLLM_XLA_CACHE_PATH}" ]]; then
+  remote_args_common+=(--vllm-xla-cache-path "${VLLM_XLA_CACHE_PATH}")
+fi
+
 local_args_common=(
   --role-kind decode
   --role-dir "${DECODE_ROLE_DIR}"
@@ -1873,8 +2087,7 @@ local_args_common=(
   --run-root "${RUN_ROOT}"
   --run-id "${RUN_ID}"
   --expected-vllm-version "${EXPECTED_VLLM_VERSION}"
-  --max-model-len "${MAX_MODEL_LEN}"
-  --block-size "${BLOCK_SIZE}"
+  --max-model-len "${DECODE_MAX_MODEL_LEN}"
   --prefill-api-port "${PREFILL_API_PORT}"
   --decode-api-port "${DECODE_API_PORT}"
   --prefill-controller-port "${PREFILL_CONTROLLER_PORT}"
@@ -1883,10 +2096,31 @@ local_args_common=(
   --transfer-port "${TRANSFER_PORT}"
   --side-channel-port "${SIDE_CHANNEL_PORT}"
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
-  --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
+if [[ -n "${BLOCK_SIZE}" ]]; then
+  local_args_common+=(--block-size "${BLOCK_SIZE}")
+fi
+d_blocks="${DECODE_NUM_GPU_BLOCKS_OVERRIDE:-${NUM_GPU_BLOCKS_OVERRIDE:-}}"
+if [[ -n "${d_blocks}" ]]; then
+  local_args_common+=(--num-gpu-blocks-override "${d_blocks}")
+fi
+if [[ -n "${DECODE_GPU_MEMORY_UTILIZATION}" ]]; then
+  local_args_common+=(\
+    --decode-gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION}")
+fi
+if [[ -n "${RESHARD_SIDECAR_BIN}" ]]; then
+  local_args_common+=(--reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}")
+fi
 if [[ -n "${DECODE_TRANSFER_IPS}" ]]; then
   local_args_common+=(--decode-transfer-ips "${DECODE_TRANSFER_IPS}")
+fi
+if [[ "${ENABLE_PREFIX_CACHING:-0}" == 1 ]]; then
+  local_args_common+=(--enable-prefix-caching)
+else
+  local_args_common+=(--no-enable-prefix-caching)
+fi
+if [[ -n "${VLLM_XLA_CACHE_PATH}" ]]; then
+  local_args_common+=(--vllm-xla-cache-path "${VLLM_XLA_CACHE_PATH}")
 fi
 for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
   remote_args_common+=(--role-env "${_role_env}")
@@ -2119,23 +2353,35 @@ else
   fi
 fi
 
-for benchmark_length in 8192 32768 65534; do
-  primer_dir="${LOCAL_RUN_DIR}/client/primer-${benchmark_length}"
-  measured_dir="${LOCAL_RUN_DIR}/client/measured-${benchmark_length}"
-  mkdir -p "${primer_dir}" "${measured_dir}"
-  log "running excluded primer at ${benchmark_length} prompt tokens"
-  run_benchmark_phase "${DECODE_PYTHON}" "${prefill_url}" "${decode_url}" \
-    "${SERVED_MODEL}" "${primer_dir}" 1 1 "${benchmark_length}" \
-    "$((900000 + benchmark_length))" "primer-${benchmark_length}" \
-    "${REQUEST_TIMEOUT}" "${MAX_MODEL_LEN}" \
-    2>&1 | tee "${primer_dir}/client.log"
-  log "running 12 measured requests at ${benchmark_length} tokens (0.05 qps)"
-  run_benchmark_phase "${DECODE_PYTHON}" "${prefill_url}" "${decode_url}" \
-    "${SERVED_MODEL}" "${measured_dir}" 12 0.05 "${benchmark_length}" \
-    "$((100000 + benchmark_length))" "measured-${benchmark_length}" \
-    "${REQUEST_TIMEOUT}" "${MAX_MODEL_LEN}" \
-    2>&1 | tee "${measured_dir}/client.log"
-done
+if ((SKIP_CLIENT_BENCHMARK == 1)); then
+  log "WARNING: --skip-client-benchmark set; " \
+    "servers are ready for external load."
+  mkdir -p "${LOCAL_RUN_DIR}/client"
+  touch "${LOCAL_RUN_DIR}/client/SERVERS_READY"
+  while [[ ! -f "${LOCAL_RUN_DIR}/client/STOP_SERVERS" ]]; do
+    sleep 2
+  done
+  log "STOP_SERVERS signal detected; proceeding to log collection and shutdown."
+else
+  for benchmark_length in 8192 32768 65534; do
+    primer_dir="${LOCAL_RUN_DIR}/client/primer-${benchmark_length}"
+    measured_dir="${LOCAL_RUN_DIR}/client/measured-${benchmark_length}"
+    mkdir -p "${primer_dir}" "${measured_dir}"
+    log "running excluded primer at ${benchmark_length} prompt tokens"
+    run_benchmark_phase "${DECODE_PYTHON}" "${prefill_url}" "${decode_url}" \
+      "${SERVED_MODEL}" "${primer_dir}" 1 1 "${benchmark_length}" \
+      "$((900000 + benchmark_length))" "primer-${benchmark_length}" \
+      "${REQUEST_TIMEOUT}" "${MAX_MODEL_LEN}" \
+      2>&1 | tee "${primer_dir}/client.log"
+    log "running 12 measured requests at ${benchmark_length} tokens" \
+      "(${MEASURED_QPS:-0.05} qps)"
+    run_benchmark_phase "${DECODE_PYTHON}" "${prefill_url}" "${decode_url}" \
+      "${SERVED_MODEL}" "${measured_dir}" 12 "${MEASURED_QPS:-0.05}" \
+      "${benchmark_length}" "$((100000 + benchmark_length))" \
+      "measured-${benchmark_length}" "${REQUEST_TIMEOUT}" \
+      "${MAX_MODEL_LEN}" 2>&1 | tee "${measured_dir}/client.log"
+  done
+fi
 
 # Re-snapshot logs after all client phases so UUID joins see terminal timing
 # events from every measured request.
@@ -2148,7 +2394,9 @@ fi
 cp "${DECODE_ROLE_DIR}/server.command" "${RESULT_DIR}/decode.server.command"
 collect_remote_logs
 
-log "analyzing client validation and golden r20 acceptance metrics"
-analyze_golden_benchmark "${DECODE_PYTHON}" "${LOCAL_RUN_DIR}" \
-  "${PERFORMANCE_GATE}" | tee "${RESULT_DIR}/benchmark_analysis.log"
-log "golden accuracy and performance validation passed; stopping both roles"
+if ((SKIP_CLIENT_BENCHMARK != 1)); then
+  log "analyzing client validation and golden r20 acceptance metrics"
+  analyze_golden_benchmark "${DECODE_PYTHON}" "${LOCAL_RUN_DIR}" \
+    "${PERFORMANCE_GATE}" | tee "${RESULT_DIR}/benchmark_analysis.log"
+  log "golden accuracy and performance validation passed; stopping both roles"
+fi
