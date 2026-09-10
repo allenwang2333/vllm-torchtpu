@@ -173,10 +173,8 @@ class TestMxfp4MoETPU:
         layer, method = _build_layer_and_method(device)
         method.process_weights_after_loading(layer)
 
-        # The activation string is quant-method state, not layer state.
-        # DeepseekV4 remaps silu onto the clamped kernel variant, so it is
-        # NOT recomputable from layer.activation via get_fused_moe_activation
-        # -- recomputing at apply time would silently drop the clamp.
+        # Pins VllmDeepseekV4Mxfp4MoEMethod._resolve_tpu_activation, which
+        # documents why this is stored rather than recomputed at apply time.
         assert method._tpu_activation_str == "silu_and_mul_with_clamp"
         assert not hasattr(layer, "_tpu_activation_str")
 

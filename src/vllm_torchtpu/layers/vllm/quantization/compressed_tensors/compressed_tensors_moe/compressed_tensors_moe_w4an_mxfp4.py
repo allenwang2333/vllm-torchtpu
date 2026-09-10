@@ -7,8 +7,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.common.quantization import e8m0_to_fp32
 from vllm_torchtpu.layers.vllm import moe_routing, token_padding
-from vllm_torchtpu.layers.vllm.fused_moe import (fused_moe_gmm,
-                                                 get_fused_moe_activation,
+from vllm_torchtpu.layers.vllm.fused_moe import (TpuMoEActivationMixin,
+                                                 fused_moe_gmm,
                                                  load_kmajor_fp4,
                                                  prebuild_fused_moe_kernel,
                                                  requant_load_kmajor_fp4)
@@ -26,16 +26,11 @@ def _fresh(t: torch.Tensor) -> torch.Tensor:
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
-        CompressedTensorsW4A4Mxfp4MoEMethod):
+        TpuMoEActivationMixin, CompressedTensorsW4A4Mxfp4MoEMethod):
     """
     TPU compressed-tensors packed-weight W4AN MXFP4 MoE implementation.
     Accommodates both W4A4 and W4A16.
     """
-
-    # Written by process_weights_after_loading, read by the monolithic
-    # apply path. Per-layer state: vLLM builds one quant method instance
-    # per MoE layer, so this belongs on the method, not on the layer.
-    _tpu_activation_str: str
 
     @property
     def is_monolithic(self) -> bool:
@@ -215,9 +210,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
         release_memory_to_os()
 
-        activation_str = get_fused_moe_activation(layer.activation,
-                                                  layer.moe_config)
-        self._tpu_activation_str = activation_str
+        activation_str = self._set_tpu_activation(layer)
         use_ep = layer.moe_config.moe_parallel_config.use_ep
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)
@@ -238,6 +231,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         activation_str = self._tpu_activation_str
+        assert activation_str is not None, (
+            "[moe] process_weights_after_loading did not run for this layer")
 
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
