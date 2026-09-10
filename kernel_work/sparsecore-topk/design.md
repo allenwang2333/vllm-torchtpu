@@ -391,7 +391,7 @@ wave costs a full wave.** That is the floor for any work-stealing design.
 | --- | --- | --- |
 | **L6** on V4 (16× multiplicity) | ✅ **answered** — `probes/07` (`j-098b260f`) then `probes/08` `R1` (`j-300d4690`) | ⚠ the two **disagree by ~5×**: 19.192 µs/level modelled vs 12.195 µs measured *in total*. §7. The measured one governs; `v2`'s prize is 12.195, not 62 |
 | **T2**'s ρ | ✅ **answered** — host derivation, no job | ρ = 0.40005 prefill / 0.850 decode. It re-weighted the entire sheet and swapped the #1 and #3 candidates |
-| **T5** aliasing on `out_hbm` | ⏳ `probes/10`, in flight | if the D3 residual tracks output bytes, `input_output_aliases` + `donate_argnames` is the fix and it is a one-line change |
+| **T5** aliasing on `out_hbm` | ⚠ **partly answered** — `probes/10` found a clean linear output-byte term, **1.118 µs/MiB ≈ 8.9 µs** at the base shape (R² 0.99978), that the input relayout does not explain. Carried to `probes/11` Q3 | `input_output_aliases` + `donate_argnames` is a one-line change worth up to ~8.9 µs, once the term is attributed |
 | **W2**'s denominator | open, and deliberately not probed | it would have to be wrong by 2× to bind at 13.77% |
 
 **No `CONTRACT.md` row is tagged `unmodelled`.**
@@ -406,7 +406,7 @@ wave costs a full wave.** That is the floor for any work-stealing design.
 - **State:** §4 in full
 - **Measured:** 326.782 µs at ρ=1 (`j-4e0df30a`), 327.166 (`j-300d4690`) — **cross-job −0.12%** from a
   byte-identical source. Reweighted to production prefill: **189.98 µs**
-- **Achieved:** 10.6% of the 20.05 µs floor, or 50.4% of the 95.73 µs one — §1
+- **Achieved:** 10.6% of the 20.05 µs floor — §1. ⚠ That fraction is against the **measured** 189.98 µs; if `probes/11` shows D3's relayout is a harness artifact the production kernel is ~117 µs and `v1` achieves ~17%
 - **Verdict:** **KEPT** as the baseline. It is also a candidate in step 3 and it can win.
 - **What it taught:** the block is **100% SparseCore, 0% VPU, 0% MXU**, and 39.8% of it belongs to no
   op at all.
