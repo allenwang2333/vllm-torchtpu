@@ -31,6 +31,7 @@ tolerance.
 """
 
 import math
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -39,7 +40,7 @@ from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout, KVCacheType, SparseMLAKVCacheSpec,
-    update_sparse_mla_kv_cache)
+    update_sparse_mla_kv_cache, update_sparse_mla_kv_cache_jax)
 from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 
@@ -225,6 +226,12 @@ class MaskedDenseCacheSetupTest(parameterized.TestCase):
     """Validate test-cache setup without needing the TPU attention kernels."""
 
     def test_fill_cache_preserves_selected_pages_and_fp8_values(self):
+        if jax.devices()[0].platform == "cpu":
+            # Keep the production signature checked while using the CPU writer.
+            self.enter_context(
+                mock.patch(f"{__name__}.update_sparse_mla_kv_cache",
+                           autospec=True,
+                           side_effect=update_sparse_mla_kv_cache_jax))
         helper = MaskedDenseTestBase()
         helper.rng = np.random.default_rng(1234)
         seq_lens, k_scale = [3, 5], 0.5

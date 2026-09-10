@@ -343,7 +343,6 @@ def apply_tpu_patches() -> None:
                                _patch_disable_sequence_parallel_moe,
                                _patch_moe_explicit_pcp_collectives,
                                _patch_moe_runner_fused_output_is_reduced,
-                               _patch_rowparallel_defer_bias,
                                _patch_vllm_compile_all_ranges,
                                _patch_vllm_disable_compile_ranges,
                                _patch_vllm_hybrid_producer_prefix_hits)
@@ -363,7 +362,6 @@ def apply_tpu_patches() -> None:
     _patch_vllm_disable_compile_ranges()
     _patch_vllm_compile_all_ranges()
     _patch_disable_sequence_parallel_moe()
-    _patch_rowparallel_defer_bias()
     _patch_expert_map_host_lookup()
     _patch_vllm_hybrid_pcp_block_sizes()
     _patch_vllm_mamba_split_scheduler_block_size()
@@ -389,9 +387,11 @@ def apply_tpu_patches() -> None:
     _patch_vllm_config_triton_tpu()
     from vllm_torchtpu.model_loader_patches import (
         patch_default_loader_ep_weight_filter,
+        patch_default_model_loader_page_cache,
         patch_runai_sharded_expert_streaming)
     patch_runai_sharded_expert_streaming()
     patch_default_loader_ep_weight_filter()
+    patch_default_model_loader_page_cache()
     # Register the out-of-tree TPU vision-attention CustomOp by importing the
     # module: its @CustomOp.register_oot makes vLLM instantiate our
     # MMEncoderAttention subclass (Pallas flash kernel on forward_oot).
@@ -848,6 +848,11 @@ class TpuPlatform(Platform):
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead.")
         _validate_phased_profiling_config(vllm_config)
+        if "USE_MOE_EP_KERNEL" in os.environ:
+            raise ValueError(
+                "USE_MOE_EP_KERNEL is no longer supported and enables "
+                "nothing. Unset it; the fused expert-parallel MoE kernel is "
+                "USE_MOE_FUSED_EP_KERNEL=1.")
         apply_tpu_patches()
         _apply_model_specific_patches(vllm_config.model_config)
         _register_tpu_kv_connectors()

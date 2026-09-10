@@ -34,6 +34,7 @@ from absl.testing import parameterized
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
                                                       SparseMLAKVCacheSpec)
@@ -637,6 +638,14 @@ class MaskedDenseDispatchSetupTest(parameterized.TestCase):
     """Exercise the dispatch test's cache setup without a TPU kernel."""
 
     def test_step_updates_typed_caches(self):
+        if jax.devices()[0].platform == "cpu":
+            # Keep the production signature checked while using the CPU writer.
+            self.enter_context(
+                mock.patch.object(
+                    attention_interface,
+                    "update_sparse_mla_kv_cache",
+                    autospec=True,
+                    side_effect=kv_cache_utils.update_sparse_mla_kv_cache_jax))
         case = MaskedDenseDispatchTest()
         case.k_scale = 1.5
         case.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
