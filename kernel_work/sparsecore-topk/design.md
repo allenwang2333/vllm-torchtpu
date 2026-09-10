@@ -36,13 +36,36 @@ moves — the reweighting never invents a measurement.
 
 ⛔ **CORRECTION, `probes/11` (`j-9b520877`): 189.98 µs is the *harness*, and the harness is bigger
 than production.** The harness's `jit` entry aval forces an XLA relayout of the 40 MiB score buffer
-that the production caller does not pay (§1). **The production prefill kernel is 129.56–155.82 µs.**
+that the production caller does not pay (§1). **The production prefill kernel is 155.82 µs** — the
+second, ±26.251 µs leg that made this a range is ⛔ **closed against us by `probes/14`**, below.
 
 | denominator | µs | what it includes | every `Δ time %` below × |
 | --- | ---: | --- | ---: |
 | **harness** — what every table in this file uses | **189.98** | the untiling `copy` **and** the reshape+retile `bitcast-convert` fusion | 1.000 |
-| **production, firm leg** | **155.82** | drops the untiling `copy` only, −34.165 µs — ⛔ **verified absent** from the production HLO | **1.219** |
-| **production, optimistic leg** | **129.56** | also drops the `bitcast-convert`, a further −26.251 µs — ⚠ **open**, see §1 | **1.466** |
+| **production** — ✅ **now the only leg** | **155.82** | drops the untiling `copy` only, −34.165 µs — ⛔ **verified absent** from the production HLO | **1.219** |
+| ~~production, optimistic leg~~ | ~~129.56~~ | ~~also drops the `bitcast-convert`, a further −26.251 µs~~ — ⛔ **CLOSED and rejected by `probes/14`** | ~~1.466~~ |
+
+✅ **The ±26.251 µs open denominator leg is settled, and it went the conservative way.** `probes/14`
+decided it on **buffer assignment**, not on op names: XLA gives `%bitcast_convert_type` a separate,
+disjoint, exactly-adjacent 40 MiB temp buffer from its operand in **both** modules (standalone
+`1179648 + 41943040 = 43122688`; real production entry `1753088 + 41943040 = 43696128`). The
+falsification attempt found **zero** counterexamples — of 281 ENTRY instructions only 16 carry a
+non-zero `used_scoped`, all work-doing opcodes, while all 220 known-free instructions are zero, 215
+of them *present-and-zero*. So the op is **materialised**: production pays it, the denominator is
+**155.82 µs**, and the scale factor is a firm **1.219** rather than a 1.219–1.466 range.
+
+⚠ **It also corrects `probes/11`'s refusal to transfer the number.** Probe 11 declined on the
+grounds that the harness op "converts *and reshapes and retiles*" while production's is a pure
+reinterpret. Reading the harness fusion's **body** (`probes/11/hlo/hlo-A0_base.txt:35-36`) shows the
+reshape/retile is itself a free `bitcast` — same bytes — so the fusion's only real work is the same
+40 MiB in / 40 MiB out dtype traversal production does, with a byte-identical `backend_config` except
+window rank. The transfer is justified.
+
+⚠ **Two ρ caveats on this table, and they pull in opposite directions.** 189.98 → **191.76** after
+`probes/13` §7, so the production leg is **157.60**, not 155.82 — a 1.1% shift that changes no
+ranking, and the 155.82 figure is kept here because every downstream citation uses it. And the
+189.98 base is at ρ = 0.40005 while the 34.165 and 26.251 subtractions are ρ = 1 `measured`, so this
+row **mixes ρ**. It is the best available and it is not exact; do not build a second decimal on it.
 
 ⚠ **The µs figures in this file are unaffected and remain the primary quantity; only percentages
 move, and they all move up by the same factor.** Rather than restate several dozen cells against a
@@ -56,7 +79,7 @@ must not** — step 3 measures against a production-shaped entry and quotes prod
   It is the only node with a measurement, and it is bit-exact.
 - **189.98 µs modelled-from-measured → 177.79 µs**, **−6.42%** (6.4% faster), from `R1`'s measured
   12.195 µs (`j-300d4690`, bit-identical output 1024/1024 and 64/64 rows). In production
-  percentages that is **−7.83%** (firm) to **−9.41%** (optimistic).
+  percentages that is **−7.83%**.
 - **`v1` is at 10.6% of a 20.05 µs modelled floor** (13.0–15.5% against the production denominator).
   §1 carried a pessimistic 95.73 µs leg until `probes/10` returned; **that leg is withdrawn**, and
   `probes/11` replaced the 75.683 µs non-kernel residual with a **measured 5.385 µs**.
@@ -75,9 +98,11 @@ must not** — step 3 measures against a production-shaped entry and quotes prod
   dimension is exactly one 128-lane tile, so the flatten to `s32[10485760]{0:T(1024)}` is a **free
   `bitcast`**. The harness passes `f32[1024,10240]`, where `(8,128)` tiling is *not* row-major, so
   XLA must untile 40 MiB first. **So there is no ~73 µs handoff** — and every prize in this file is
-  worth **1.219× to 1.466×** what its table says. ⚠ Two smaller things survive: a live **10.007 µs
-  output retiling** in the production entry (in-model status open), and the open leg of the
-  denominator range. Both are in §10.
+  worth **1.219×** what its table says. ✅ The two smaller things that survived it are now both
+  settled by `probes/14`, and both settled *in our favour as candidates*: the **10.007 µs output
+  retiling** does survive in-model (so `v11` is live, not zero-prize), and the ±26.251 µs
+  `bitcast-convert` **is materialised in production** (so `v12`/U2's prize is real and firm, and the
+  denominator collapses to a single number). §10.
 
 ⛔ **The kernel sits behind a runtime gate, and in the one profiled prefill step it did not run.**
 `probes/14` enumerated a GLM-5.2 `PREFILL_ONLY` trace (`j-ecf4ee85`, rank 14) event-by-event, per
@@ -165,7 +190,7 @@ At the production prefill shape and ρ = 0.40005. Bytes that must move: `ρ·b·
 | `t_vpu` / `t_mxu` | 0 | measured | **both units are idle for 100% of the block** (`report.md` §2, ops 15–16 do not execute at `P=1`) |
 | **terms outside the floor** | — | | ✅ **D3 resolved: 34.2–60.4 µs of it is a harness artifact and 5.385 µs is the measured non-kernel floor** (`probes/11`; see below). ⚠ A **10.007 µs output retiling** survives in production. Also: SparseCore↔TensorCore handoff (D7, `unmodelled`); the `b_pad`-wide length DMA (D11, `assumed` negligible — **`probes/10` closed the per-row axis, so it is not promoted**) |
 | `v1` measured-and-reweighted, **harness** | 189.98 | measured (`j-4e0df30a`) + modelled reweighting | achieved: **10.6%** |
-| `v1` **production** | **155.82–129.56** | the above less `probes/11`'s harness-only relayout | achieved: **12.9–15.5%** |
+| `v1` **production** | **155.82** | the above less `probes/11`'s harness-only relayout (the further −26.251 µs leg is ⛔ closed by `probes/14` — production pays it) | achieved: **12.9%** |
 | target | 25–33 | | 60–80% of floor |
 
 ### ✅ D3 — 39.8% of the *measured* kernel — is not in the kernel, and mostly not in production
@@ -239,13 +264,29 @@ different ops sharing an opcode.**
 | | `%bitcast-convert_bitcast_fusion`, `kind=kLoop` | `%bitcast_convert_type.3`, not a fusion |
 | in → out | `f32[1024,10240]{1,0:T(8,128)}` → `s32[128,80,8,128]{3,2,1,0:T(8,128)}` | `f32[1024,80,128]{2,1,0}` → `s32[1024,80,128]{2,1,0}` |
 | what it does | convert **+ reshape + retile** — real movement | a **same-shape, same-layout, 4→4 byte** reinterpretation |
-| priced at | **26.251 µs** (`A0_s32in`) | ⚠ **unknown** |
+| priced at | **26.251 µs** (`A0_s32in`) | ✅ **26.251 µs, transferred** — `probes/14` |
 
 Production's *looks* like a no-op buffer assignment should alias away — but ⛔ it carries the **same
 `estimated_cycles: 66712`** as the harness fusion and a full `window_config`
 (`iteration_bounds ["2","5","1"]`, `buffering_level 2`), i.e. XLA's emitter planned a loop for it.
-That is evidence **for** materialisation. **`A0_s32in`'s 26.251 µs prices the harness's op and does
-not transfer.** Hence the range in "The denominator, stated once", and the open row in §10.
+That is evidence **for** materialisation, and ✅ **`probes/14` confirmed it and reversed the "does
+not transfer" call.** Two findings, neither of which relies on the op's name:
+
+- **Buffer assignment.** In both modules XLA gives `%bitcast_convert_type` a **separate, disjoint,
+  exactly-adjacent 40 MiB temp buffer** from its operand — standalone `1179648 + 41943040 =
+  43122688`; the real production entry `1753088 + 41943040 = 43696128`. An aliased reinterpretation
+  would share the operand's offset. It does not. It is materialised, and production pays it.
+- **The falsification attempt found zero counterexamples.** Of 281 ENTRY instructions only **16**
+  carry a non-zero `used_scoped`, and all 16 are work-doing opcodes; all **220** known-free
+  instructions are zero, **215** of them present-and-zero rather than absent. So "non-zero
+  `used_scoped` ⇒ real work" is not an artifact of the field being unset on free ops.
+
+⚠ **This also overturns `probes/11`'s stated reason for refusing the transfer**, which was that the
+harness op "converts *and reshapes and retiles*" while production's is a pure reinterpret. Reading
+the harness fusion's **body** (`probes/11/hlo/hlo-A0_base.txt:35-36`) shows its reshape/retile is
+itself a free `bitcast` on the same bytes, so the fusion's only real work is the same 40 MiB in /
+40 MiB out dtype traversal, with a byte-identical `backend_config` bar window rank. **The 26.251 µs
+transfers.** The denominator is therefore a single 155.82 µs, and `v12`/U2's prize is firm.
 
 **Consequences.**
 
@@ -253,11 +294,15 @@ not transfer.** Hence the range in "The denominator, stated once", and the open 
    over. Never quote "~73 µs" again.
 2. ✅ **The non-kernel floor is 5.385 µs, measured** (`A0_flatio`), not 75.683. `probes/09`'s bracket
    collapses to its optimistic leg.
-3. ✅ **Every prize in §9 is worth 1.219× to 1.466× its tabulated percentage.** The *ranking* is
-   invariant, exactly as §10 predicted — the correction is a common factor.
-4. ⚠ **One live term survives: the 10.007 µs output retiling**, `ROOT %reshape` on the kernel's flat
-   `s32[2097152]{0:T(1024)}` output, and it **is** present in the production entry. In-model status
-   open (compiling `streamindex_topk` standalone forces its ROOT layout). §10.
+3. ✅ **Every prize in §9 is worth 1.219× its tabulated percentage** — one factor, not a range, now
+   that `probes/14` has closed the second leg. The *ranking* is invariant, exactly as §10 predicted:
+   the correction is a common factor.
+4. ✅ **The 10.007 µs output retiling is live in-model** — `ROOT %reshape` on the kernel's flat
+   `s32[2097152]{0:T(1024)}` output, present in the production entry. The worry was that compiling
+   `streamindex_topk` standalone forces its ROOT layout, so the retile might be an artifact of the
+   compilation boundary. `probes/14` Q2 settled it: in the **real** entry the retile survives as an
+   `S(1)` staging copy rather than a ROOT reshape. Different op, same 40 MiB of movement, so `v11`
+   keeps its prize. §10.
 5. ⚠ **The step-3 harness measures a shape production never runs.** `instruments/` is read-only and
    its frozen md5 is what makes probes 08–11 comparable, so do not edit it — but step-3 arms build
    their own thunks, so **build every variant and the incumbent against a production-shaped entry**
@@ -940,11 +985,19 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   **Patch is four edits**: `:451`, `:317`, `:323`, `:491`. ⚠ **The indexer form matters** —
   `o.at[pl.ds(row,1)]` fails with `DMA source and target shape mismatch`; `o.at[row]` and
   `o.at[row, pl.ds(0,k)]` both lower
-- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN** — but now on the *in-model* bet alone
-  (`probes/14`), not on feasibility. ⛔ Still not `PARKED`: the strided-DMA term is `unmodelled`
-- **Note:** ⚠ **conditional on the in-model check** (§11, `stage-e-boundary.md` §3c) — if the retile
-  does not survive in-model, `v11` is **REJECTED** with prize 0. It is also **subsumed by H3**: a
-  fused consumer has no HBM output to retile.
+- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**. Both of its conditions are now closed
+  favourably — feasibility by `probes/17`, in-model by `probes/14` Q2 — so nothing conditional
+  remains. ⛔ It stays `OPEN` rather than becoming `PARKED` only because the strided-DMA term is
+  `unmodelled`, per `TEMPLATE-design.md` §10
+- **Note:** ✅ **The in-model condition is resolved, and favourably.** The worry (§11,
+  `stage-e-boundary.md` §3c) was that compiling `streamindex_topk` standalone forces its ROOT
+  layout, so the 10.007 µs retile might be an artifact of where the compilation was cut. `probes/14`
+  Q2 compiled the **real** entry: the retile survives, as an `S(1)` staging copy rather than a
+  `ROOT reshape`. A different op, the same 40 MiB of movement, so the prize stands and the "REJECTED
+  with prize 0" leg is withdrawn. ⚠ Two carry-overs from that answer: the price transfers by *shape*
+  and not by op identity — 10.007 µs was measured on the ROOT reshape, and no arm has yet deleted the
+  staging copy — and `v11` remains **subsumed by H3**, since a fused consumer has no HBM output to
+  retile at all.
 
 ---
 
@@ -957,8 +1010,11 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   the kernel; instead pass `scores` through as `f32` and reinterpret each vector inside
 - **Motivated by:** `probes/11` + stage E — the emitted `%bitcast-convert_bitcast_fusion` is a
   `kLoop` fusion carrying `used_scoped_memory_configs` **16 MiB @ ms1**, where the genuinely-free
-  flatten beside it carries **no `backend_config` at all**. ⚠ This node **dissolves** the ±26.251 µs
-  open denominator leg rather than answering it
+  flatten beside it carries **no `backend_config` at all**. ✅ `probes/14` then answered the
+  ±26.251 µs leg outright rather than leaving this node to dissolve it: XLA gives
+  `%bitcast_convert_type` a **separate, disjoint, exactly-adjacent 40 MiB temp buffer** from its
+  operand in the real production entry (`1753088 + 41943040 = 43696128`), so it is materialised and
+  production pays it
 - **Exactness:** **`exact`** — a reinterpret computes the same function. ⚠ But it owes the same
   bit-identical row gate `v11` does, and one extra risk: `monotone_key` (`:116-118`) writes an
   arbitrary int32 pattern **through an f32-typed VMEM store**, so NaN-payload bit-preservation is
@@ -966,8 +1022,12 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **State diff from `v1`:** `boundary` — the input edge moves from XLA into the kernel. `dtype` —
   `resident_vmem` becomes `f32`; two `tpu.bitcast` ops appear in the Mosaic body (0 today)
 - **Live set:** unchanged — same bytes, different declared element type
-- **Predicted:** **0 or −13.82%** (26.251 µs), depending entirely on whether the fusion is in the
-  production path
+- **Predicted:** **−13.82%** on this file's harness denominator, ⇒ **≈ −16.8% in production**
+  (26.251 / 155.82). ✅ **Firm, not conditional.** The "0 or −13.82%" this row carried until
+  `probes/14` was the two legs of "is the fusion on the production path"; Q1 answered *yes* on buffer
+  assignment, and separately showed the harness fusion's extra reshape/retile is itself a free
+  `bitcast`, so its measured price transfers rather than over-charging. That makes `v12` the
+  **largest single edge prize in the file**, and it is an edge move that composes with every node
 - **Feasibility:** ✅ **REACHABLE — closed by `probes/17`, `static-compile`, no job.** The ENTRY diff
   replaces the fusion with `%bitcast.3 = f32[128,80,8,128] bitcast(%s.1)` — free, no `backend_config`.
   ⚠ **But it is three edits, not one: the DMA is dtype-checked, not byte-oriented.** The minimal
@@ -977,9 +1037,10 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   That form lowers. Ref-level `.bitcast` would avoid the two per-load bitcasts but is unavailable on
   a 1-D ref (`jax/_src/state/utils.py:98` indexes `shape[-2]` unconditionally); it works on a 2-D
   ref, so a reshaped scratch is a fallback **if the two bitcasts ever price**
-- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory. Feasibility is closed; what
-  is still `unmodelled` is (a) whether the fusion is on the production path at all and (b) the price
-  of the two in-body `tpu.bitcast`s
+- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory. Feasibility is closed
+  (`probes/17`) and the production-path question is closed (`probes/14` Q1). The one term still
+  `unmodelled` is the price of the two in-body `tpu.bitcast`s — which is why this is `OPEN` and not
+  `PARKED`, and it is a term that can only *reduce* the prize, never reverse its sign
 - **Note:** ✅ **U2 and `v11` are independent and compose** — `probes/17` confirmed each variant's
   ENTRY still carries the other's op (16 MiB and 4 MiB respectively).
 
@@ -1079,21 +1140,24 @@ partition loop and `n` is untiled.
 boundary.** Stage E (`stage-e-boundary.md`, spliced summary in **§11**) found that **three of the
 four largest non-kernel numbers in this exercise live on the edges**, and that `v4` creates a new
 *internal* edge. The kernel does stay one `plsc` mesh call; what changes is that the edges are no
-longer assumed optimal. In particular the input edge carries a deletable XLA op worth up to
-26.251 µs, and the output edge a measured 10.007 µs retiling — neither reachable by any plan below.
+longer assumed optimal. In particular the input edge carries a deletable XLA op worth **26.251 µs**
+(✅ now firm — `probes/14` Q1), and the output edge a measured 10.007 µs retiling (✅ now confirmed
+live in-model — Q2) — neither reachable by any plan below.
 
 ⚠ **Every `Δ time %` in the plans below is in the harness denominator (189.98 µs).** `probes/11`
-showed the harness is 34.2–60.4 µs larger than production, so **multiply each by 1.219 (firm) to
-1.466 (optimistic)** to get the production figure — see "The denominator, stated once". The µs
+showed the harness is 34.165 µs larger than production, so **multiply each by 1.219** to get the
+production figure — see "The denominator, stated once". ✅ This is now one factor rather than the
+1.219–1.466 range this line used to carry: `probes/14` closed the second leg by showing production
+*does* pay the 26.251 µs `bitcast-convert`, so it stays inside the denominator. The µs
 figures need no adjustment, the ranking is unchanged, and `results.md` will quote production
 percentages directly because step-3 arms build their own production-shaped entry.
 
-| plan | µs | harness `Δ` | production `Δ`, firm → optimistic |
+| plan | µs | harness `Δ` | production `Δ` (× 1.219) |
 | --- | ---: | ---: | --- |
-| A · `v2` `R=1` | 12.195 **measured** | −6.42% | **−7.83% → −9.41%** |
-| C · `v4` pipelined DMA | ≤ 13.469 ceiling | −7.09% | **−8.64% → −10.40%** |
-| F · `v6` keep-all fast path | ~8.9 modelled | −4.7% | **−5.7% → −6.9%** |
-| (`v7`, parked) | 4.698 measured | −2.5% | −3.0% → −3.6% |
+| A · `v2` `R=1` | 12.195 **measured** | −6.42% | **−7.83%** |
+| C · `v4` pipelined DMA | ≤ 13.469 ceiling | −7.09% | **−8.64%** |
+| F · `v6` keep-all fast path | ~8.9 modelled | −4.7% | ⛔ **REJECTED** by `probes/14` — the outer runtime gate already elides the whole kernel on exactly the steps this fires on |
+| (`v7`, parked) | 4.698 measured | −2.5% | −3.0% |
 
 `v3` (Plan B), `v5` (Plan D) and `v10` (Plan E) are quoted against their own parents, and the same
 factor applies to those too.
@@ -1497,8 +1561,8 @@ prize is ~4× smaller than the number this node carried before the source read.
 | --- | --- | --- |
 | `v3` fused-emit | ✅ **CLOSED by `probes/15` (`j-78f7f537`).** The store is **6.675 µs/pass**, flat in density, and `probes/13` had overcharged it **2.08×**. Band **≈ −20.5%…−14.9%**; break-even `cnt_eff` **8531** is above the global max 6495, so **its sign is settled without building it** | step-3 variant |
 | ⚠ **NEW — is `hist0`'s sheet price understated?** | `probes/15` found `instruments/sctopk_2stage_bench.py:246` masks its "dense" arm on raw fp32 bits, dropping every negative score (~50% at `standard_normal`, and production is 81.7% negative). If the sheet's `hist0` came from that arm it is too low, and **`v10` is worth more than −12.2%**. §7. ⏳ `probes/16` is in the same region — ask it before opening a new job | probably no job |
-| **`v11`** retiled output emit | (a) ✅ **feasibility CLOSED by `probes/17`** — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) ⏳ does the 10.007 µs retile survive **in-model** — `probes/14`. If (b) is no, `v11` is `REJECTED` with prize 0 | no job |
-| **`v12`** (= **U2**) `f32` input, in-register reinterpret | ✅ **feasibility CLOSED by `probes/17`** — reachable, but **three edits, not one**: the DMA is dtype-checked, so the scratch dtype must change too and the reinterpret moves in-register. Still open: whether the 16 MiB fusion is on the production path, and the price of the two in-body `tpu.bitcast`s | no job |
+| **`v11`** retiled output emit | ✅ **both conditions CLOSED, both favourably.** (a) feasibility, `probes/17` — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) in-model, `probes/14` Q2 — the retile **survives** in the real entry, as an `S(1)` staging copy rather than a ROOT reshape. Same 40 MiB, different op, so the "`REJECTED` with prize 0" leg is withdrawn. ⚠ The 10.007 µs was measured on the ROOT reshape; no arm has yet deleted the staging copy | no job |
+| **`v12`** (= **U2**) `f32` input, in-register reinterpret | ✅ **feasibility CLOSED by `probes/17`** — reachable, but **three edits, not one**: the DMA is dtype-checked, so the scratch dtype must change too and the reinterpret moves in-register. ✅ **production path CLOSED by `probes/14` Q1** — materialised, so the prize is a firm ≈ −16.8%, the largest single edge prize in the file. One term still open: the price of the two in-body `tpu.bitcast`s, which can only shrink the prize, not flip it | no job |
 | **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. Free: read `StreamIdxTC-*` durations from an existing xprof | no job |
 | `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
@@ -1578,7 +1642,7 @@ prize is ~4× smaller than the number this node carried before the source read.
 
 | term | which version it hits hardest | asymmetry check (§10's tell) |
 | --- | --- | --- |
-| ✅ **D3 — CLOSED.** 34.165 µs harness-only (firm), a further 26.251 µs harness-or-not (open), 10.007 µs live output retiling, 5.385 µs irreducible | the **denominator**, and therefore all of them equally | ✅ **the symmetry prediction held.** `probes/11` moved every prize by the same factor (1.219–1.466) and reordered nothing. The residual open leg — is production's same-shape `bitcast-convert` materialised? — is worth 26.251 µs **of denominator**, so it too is symmetric across plans |
+| ✅ **D3 — CLOSED, and now with no residual.** 34.165 µs harness-only, 26.251 µs **production pays** (`probes/14` Q1), 10.007 µs live output retiling **confirmed in-model** (Q2), 5.385 µs irreducible | the **denominator**, and therefore all of them equally | ✅ **the symmetry prediction held.** `probes/11` moved every prize by a common factor and reordered nothing. The one leg it left open — is production's same-shape `bitcast-convert` materialised? — is now answered **yes** on buffer assignment, which collapses the factor from a 1.219–1.466 range to a firm **1.219** and converts that 26.251 µs from denominator uncertainty into `v12`'s prize |
 | **count-pass rate** | `v10` only | ⚠ **asymmetric, and this is the one to watch.** Treating it as cheap makes `v10` a −9.7% candidate; treating it as expensive kills the root. Both readings come from the same empty cell — **hence the mandatory probe above** |
 | `t_TC` (D7) | the handoff, no version | symmetric — nothing is being taken on it either way |
 | step homogeneity in ρ | `v6` only | ⚠ **asymmetric**: it is what turns `v6` from ≤−18.5% into 0%. Hence the mandatory check |
@@ -1626,7 +1690,7 @@ numbers in this exercise sit on the edges**, and `v4` creates a new internal one
 | edge | verdict | Δ time % | decided by |
 | --- | --- | ---: | --- |
 | **U1** input layout — flat view of `f32[1024,80,128]{2,1,0}` | **KEPT**, and now *evidenced* rather than assumed | 0 | re-derived: 0 `sparse-core-data-format-call`, the only `copy` in the module is `%copy.11 = f32[1024,64]` |
-| **U2** delete `%bitcast_convert_type.3` — declare the input `f32`, reinterpret in-register | **OPEN** as new node **`v12`**; feasibility ✅ closed | **0 or −13.82%** | ✅ `probes/17`, `static-compile`: reachable, but **three edits** — the DMA is dtype-checked, so the scratch dtype moves to `f32` too |
+| **U2** delete `%bitcast_convert_type.3` — declare the input `f32`, reinterpret in-register | **OPEN** as new node **`v12`**; feasibility ✅ closed, production path ✅ closed | **−13.82%** harness ⇒ ✅ **≈ −16.8% production**, firm | ✅ `probes/17`, `static-compile`: reachable, but **three edits** — the DMA is dtype-checked, so the scratch dtype moves to `f32` too. ✅ `probes/14` Q1, `static-compile`: **materialised in production** — a separate, disjoint, exactly-adjacent 40 MiB temp buffer (`1753088 + 41943040`), and 0 counterexamples in a 281-instruction falsification sweep |
 | **U3** any other input layout | **REJECTED**, priced | **+17.98%** | 34.165 µs `measured (j-9b520877)` — this is the counterfactual that makes "already optimal" a finding |
 | **P1** fuse the producer `StreamIdxTC` | ⛔ **REJECTED — illegal, not unprofitable** | unreachable | it is a **TensorCore** kernel; `dot_general` has no `SC_VECTOR_SUBCORE` lowering rule |
 | **P2 = D7** overlap TC and SC instead | ⛔ **PARKED → OPEN** | `unmodelled` (`t_TC`) | §10's rule: a verdict on an `unmodelled` term cannot be parked. Free probe — read `StreamIdxTC-*` durations from an existing xprof |

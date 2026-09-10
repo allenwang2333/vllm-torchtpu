@@ -32,9 +32,12 @@ and produced stage **C″**, which is the sheet in force:
   relayout of the score buffer *outside the Pallas kernel*.** ✅ **`probes/11` (`j-9b520877`) then
   closed it — the harness-artifact leg.** The production caller emits **no**
   `sparse-core-data-format-call` and **no** 40 MiB copy. ⛔ **So the 189.98 µs denominator is the
-  harness's; production is 155.82 µs (firm) to 129.56 µs (optimistic), and every share in this file
-  is a harness share — multiply by 1.219–1.466.** The ranking is unchanged. Surviving: a **10.007 µs
-  output retiling** (in-model status open) and a **5.385 µs** measured non-kernel floor.
+  harness's; production is **155.82 µs**, and every share in this file is a harness share — multiply
+  by **1.219**.** The ranking is unchanged. ✅ **`probes/14` closed the two things this bullet used to
+  leave open, and both closed favourably**: the second denominator leg is gone (production **does**
+  pay the 26.251 µs `bitcast-convert` — separate, disjoint, exactly-adjacent 40 MiB temp buffer — so
+  the factor is a firm 1.219, not 1.219–1.466), and the **10.007 µs output retiling survives
+  in-model** as an `S(1)` staging copy. Also surviving: a **5.385 µs** measured non-kernel floor.
   ⛔ **D11 is closed by probe 10.** ⛔ **The "~73 µs handoff" is withdrawn.**
 
 ⚠ **The sheet in force is stage C″. Stage C and stage C′ are both superseded — nothing below that
@@ -535,7 +538,7 @@ this denominator from `modelled` to `measured` and validates the entire reweight
    `probes/11` then showed the production caller does not pay it. ⛔ **Not a candidate and not a
    handoff — a denominator correction.** It inflated every share below by a common factor, so the
    ranking never depended on it; what it changes is what the exercise is worth, and that went **up**
-   by 1.219–1.466×.
+   by **1.219×** (a single factor since `probes/14`, not the 1.219–1.466 range this line carried).
 2. **The histogram is the largest *structural* lever at 28.4%** (hist0 + refinement). That is D2, the
    second root: a selection that does not scatter into tilespmem.
 3. **The score DMA's prize is 13.469 µs and has not moved.** It reads as 7.1% here rather than C′'s
@@ -550,7 +553,7 @@ this denominator from `modelled` to `measured` and validates the entire reweight
 
 | id | blocker | size (prefill ρ=0.40) | fix route | instrument | tag |
 | --- | --- | --- | --- | --- | --- |
-| **D3** | ✅ **CLOSED, and it is mostly not production.** The 75.683 µs is buffer bytes outside the Pallas call, and `probes/11` showed the **production caller emits no `sparse-core-data-format-call` and no 40 MiB copy** — its score buffer's minor dim is one lane-tile, so the flatten is a free `bitcast`. Harness-only: **34.165 µs firm**, a further 26.251 open. Real non-kernel floor: **5.385 µs**. Surviving: a **10.007 µs output retiling** | ✅ **it was never in a plan, and now it is not in the denominator either.** Production is **155.82–129.56 µs**, so every prize is worth **1.219–1.466×** its tabulated share | ⛔ **not a Pallas change, and no longer a ~73 µs handoff — that is withdrawn.** The 10.007 µs retiling is a *candidate* handoff, blocked on whether it survives in-model | **probe 10** ✅ (`j-770c6de9`); **probe 11** ✅ (`j-9b520877`) | fits **measured**; the production HLO read **verified by the main thread**, independently of the prober |
+| **D3** | ✅ **CLOSED, and it is mostly not production.** The 75.683 µs is buffer bytes outside the Pallas call, and `probes/11` showed the **production caller emits no `sparse-core-data-format-call` and no 40 MiB copy** — its score buffer's minor dim is one lane-tile, so the flatten is a free `bitcast`. Harness-only: **34.165 µs**. ✅ The further 26.251 µs is **not** harness-only — `probes/14` shows production materialises it. Real non-kernel floor: **5.385 µs**. Surviving: a **10.007 µs output retiling**, ✅ confirmed live in-model | ✅ **it was never in a plan, and now it is not in the denominator either.** Production is **155.82 µs**, so every prize is worth **1.219×** its tabulated share — one factor, not a range | ⛔ **not a Pallas change, and no longer a ~73 µs handoff — that is withdrawn.** The 10.007 µs retiling is node `v11`, its in-model condition ✅ discharged; the 26.251 µs is node `v12`, ✅ firm at ≈ −16.8% | **probe 10** ✅ (`j-770c6de9`); **probe 11** ✅ (`j-9b520877`); **probe 14** ✅ (no job, `static-compile`) | fits **measured**; the production HLO read **verified by the main thread**, independently of the prober |
 | **D2** | `hist0`'s dense scatter is **irreducible for a histogram** — one `vst.idx.add` per element whatever `NUM_BUCKETS` is | **28.4%** (hist0 17.8 + refinement 10.6) — **the largest structural lever** | not a tuning move. A selection that is not a histogram → **second root** in `design.md` | step-3 variant | measured |
 | **D6** | The refinement levels and `emit` each walk all of `L` to touch ~`cnt` and `k` elements respectively | **28.2%** (emit 17.7 + refinement hist 10.6) | one fused pass after L0 that compresses `> b_star` straight to `rowbuf` **and** `== b_star` to a scratch buffer; levels then walk `cnt`, not `L` | step-3 variant | modelled |
 | **D5** | ✅ **ANSWERED, SHIPPABLE, AND NOW MECHANICALLY EXPLAINED.** `plsc.addupdate_scatter` resolves intra-vector address conflicts: `R1` is **bit-identical, 1024/1024 and 64/64**. Its 12.195 µs win is **mostly `zero_priv` shrinking 16×** (9.238 of it) — see the ⚠ below | **−6.42% prefill** (12.195 µs of 189.98; the sweeps do not scale with ρ, so it beats the −3.73% measured at ρ=1) | drop the replication: `zero_priv(NB//LANES)`, `addr = bucket`, `fold_priv` over `range(1)` | **step-3 variant, already written** | **measured, bit-exact** |
@@ -687,9 +690,20 @@ movement, 26.251 µs); production's is a **same-shape, same-layout, 4→4 byte**
 buffer assignment ought to alias away — ⛔ except that it carries the **same `estimated_cycles: 66712`**
 and a full `window_config`, i.e. the emitter planned a loop. **`A0_s32in` does not transfer.**
 
-**So the denominator is a range: production is 155.82 µs (firm) to 129.56 µs (optimistic), not
-189.98.** Every share in the sheets below is a **harness** share; multiply by **1.219–1.466** for
-production. ⛔ The ranking is invariant, exactly as predicted — the correction is a common factor.
+⛔ **REVERSED by `probes/14` — `A0_s32in` does transfer.** Two independent findings, neither resting
+on the op's name. **(1) Buffer assignment:** in the real production entry XLA gives
+`%bitcast_convert_type` a **separate, disjoint, exactly-adjacent 40 MiB temp buffer** from its
+operand (`1753088 + 41943040 = 43696128`); an aliased reinterpretation would share the offset. It is
+materialised. **(2) The falsification sweep found nothing:** of 281 ENTRY instructions only 16 carry
+a non-zero `used_scoped`, all work-doing, while all 220 known-free instructions are zero — 215 of
+them present-and-zero — so the field is not merely unset on free ops. `probes/11`'s stated reason for
+refusing the transfer (the harness op "reshapes and retiles" too) also fails on reading the fusion
+*body*: that reshape/retile is itself a free `bitcast` on the same bytes, leaving the same 40 MiB
+in / 40 MiB out traversal production does.
+
+**So the denominator is a single number: production is 155.82 µs, not 189.98.** Every share in the
+sheets below is a **harness** share; multiply by **1.219** for production. ⛔ The ranking is
+invariant, exactly as predicted — the correction is a common factor.
 
 **Two nulls worth as much as the wins.** `A0_donate` +1.557 µs is a real null (inside the spread,
 **and** its HLO still contains the copy) — the relayout is not an aliasing artifact. `A0_fmtin`
