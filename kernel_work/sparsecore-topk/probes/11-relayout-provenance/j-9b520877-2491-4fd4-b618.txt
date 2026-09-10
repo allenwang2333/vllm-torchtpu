@@ -1,0 +1,506 @@
+SUBJECT_PATH=/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+97f3858ad447ac81911f1528a787ee27  /root/probe11/probe.py
+a583ff3f7cf97315143bfb86128692ab  /root/probe11/hlo_tools.py
+08375d7068365e1a776c58fef09cd6d0  /root/probe11/glm_dsa_block_bench.py
+MAP_GATE_OK
+subject: /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+  anchor SRC_LEVELS     count=1 OK
+  anchor ANCHOR_WALK    count=1 OK
+  anchor SRC_CVT        count=1 OK
+  anchor SRC_HIST       count=1 OK
+  anchor SRC_EMIT       count=1 OK
+  anchor SRC_ZERO_PRIV  count=1 OK
+  anchor SRC_FOLD       count=1 OK
+  anchor SRC_SCAN       count=1 OK
+  anchor SRC_FIND       count=1 OK
+  anchor SRC_DMA        count=1 OK
+  anchor SRC_FILL       count=1 OK
+  anchor SRC_OUTDMA     count=1 OK
+  anchor SRC_WAVES      count=1 OK
+ANCHOR_GATE_OK
+  patch A0  src_md5=547031a2fd48545550d864b008d817ff vs probes/09 547031a2fd48545550d864b008d817ff OK
+  patch B   src_md5=fd46ef14b38fd7781885e73d0ca33965 vs probes/09 fd46ef14b38fd7781885e73d0ca33965 OK
+P09_SRC_GATE_OK
+  arm B_base      patch=B   compiles OK  changed_lines_vs_B= 0  src_md5=fd46ef14b38fd7781885e73d0ca33965
+  arm A0_base     patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_s32in    patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatin   patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatout  patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatio   patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_fmtin    patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_donate   patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+COMPILE_GATE_OK
+
+--- derived shape facts ---
+  b=1024 n=10240 k=2048 P=1 n_p=10240 slice=10240 waves=32 two_stage=False in_MiB=40.000 out_MiB=8.000
+SHAPE_GATE_OK
+
+--- Q1 aval arithmetic (host-side) ---
+  pages_per_seq=9  num_sublanes_total=80  n = 10240
+Q1_SHAPE_GATE_OK
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789062010.301220      78 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-9b520877-2491-4fd4-b618-tpu-job-0-0 devices=8 kind=TPU7x jax=0.10.2
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+subject: /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+  timing harness: FROZEN INSTRUMENT /root/probe11/glm_dsa_block_bench.py (md5 08375d7068365e1a776c58fef09cd6d0)
+  patch A0  src_md5=547031a2fd48545550d864b008d817ff vs probes/09 547031a2fd48545550d864b008d817ff OK
+  patch B   src_md5=fd46ef14b38fd7781885e73d0ca33965 vs probes/09 fd46ef14b38fd7781885e73d0ca33965 OK
+  P09_SRC_GATE_OK
+  arm B_base      patch=B   drops=-                                             src_md5=fd46ef14b38fd7781885e73d0ca33965
+  arm A0_base     patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_s32in    patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatin   patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatout  patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatio   patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_fmtin    patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_donate   patch=A0  drops=dma,cvt,hist,sweep,emit,fill,outdma           src_md5=547031a2fd48545550d864b008d817ff
+
+--- derived shape facts (checked BEFORE timing) ---
+  b=1024 n=10240 k=2048 P=1 n_p=10240 slice=10240 waves=32 two_stage=False in_MiB=40.000 out_MiB=8.000
+  SHAPE_GATE_OK -- every arm runs the same P=1 single-stage program; only the jit signature differs.
+  buffer f32     float32 (1024, 10240)
+  buffer donate  float32 (1024, 10240)
+  buffer s32     int32  (1024, 10240)
+  buffer flat    int32  (10485760,)
+  buffer ln      int32  (1024,)
+  the s32/flat buffers are the SAME BITS as f32 (numpy .view, no conversion), so no arm sees different data.
+  layout API probe: {"jax": "0.10.2", "module": "jax.experimental.layout", "exports": ["Format", "Layout", "with_layout_constraint"]}
+    Format=<class 'jax._src.layout.Format'> Layout=<class 'jax._src.layout.Layout'> AUTO=AUTO
+    AUTO-chosen input formats: (Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device)), Format(layout=Layout(major_to_minor=(0,), tiling=((1024,),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device)))
+    default score format  : Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device))
+    committed score format: Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device))
+  !! A0_fmtin: XLA-AUTO chose the SAME layout the buffer already had -- this arm is a no-op by construction and its HLO will match A0_base. Report it as such, not as a null result about relayout.
+
+==========================================================================
+PER-ARM OPTIMIZED HLO (printed before any timing)
+==========================================================================
+
+  === HLO REPORT: B_base ===
+  module 80 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : True  (5 lines)
+  layout-changing copy >=1 MiB present : True  (1 of 1 big copies)
+  materialized >=1 MiB: copies 40.000 MiB + fusions 40.000 MiB = 80.000 MiB (~160.0 MiB of traffic)
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart", backend_config={"aliasing_operands":{"lists":[]},"flag_configs":[],"scoped_memory_configs":[
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"aliasing_operands":
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.clone
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","o
+    [df] %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.3 in %called_computation.2  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.6 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         80.000 MiB  call-start       %copy.4.cloned.1.call-start                           in %called_computation                 ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,
+         80.000 MiB  call-start       %sparse-core-data-format-call.cloned.1.call-start     in %main.2                             ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation.1               ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.2                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.0                               in %fused_computation                  s32[1024,10240]{1,0:T(8,128)}
+         40.000 MiB  copy             %copy.3                                               in %called_computation.2               s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %copy.4.cloned.1.call-done                            in %called_computation                 s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  fusion           %bitcast-convert_bitcast_fusion                       in %main.2                             s32[128,80,8,128]{3,2,1,0:T(8,128)}
+         40.000 MiB  call-done        %sparse-core-data-format-call.cloned.1.call-done      in %main.2                             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.3               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.2                             s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.3                                            in %main.2                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.8                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.2 (scores.1: f32[1024,10240], row_lengths.1: s32[1024]) -> s32[1024,2048] {
+
+  === HLO REPORT: A0_base ===
+  module 80 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : True  (5 lines)
+  layout-changing copy >=1 MiB present : True  (1 of 1 big copies)
+  materialized >=1 MiB: copies 40.000 MiB + fusions 40.000 MiB = 80.000 MiB (~160.0 MiB of traffic)
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart", backend_config={"aliasing_operands":{"lists":[]},"flag_configs":[],"scoped_memory_configs":[
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"aliasing_operands":
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.clone
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","o
+    [df] %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.3 in %called_computation.2  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.6 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         80.000 MiB  call-start       %copy.4.cloned.1.call-start                           in %called_computation                 ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,
+         80.000 MiB  call-start       %sparse-core-data-format-call.cloned.1.call-start     in %main.2                             ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation.1               ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.2                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.0                               in %fused_computation                  s32[1024,10240]{1,0:T(8,128)}
+         40.000 MiB  copy             %copy.3                                               in %called_computation.2               s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %copy.4.cloned.1.call-done                            in %called_computation                 s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  fusion           %bitcast-convert_bitcast_fusion                       in %main.2                             s32[128,80,8,128]{3,2,1,0:T(8,128)}
+         40.000 MiB  call-done        %sparse-core-data-format-call.cloned.1.call-done      in %main.2                             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.3               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.2                             s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.3                                            in %main.2                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.8                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.2 (scores.1: f32[1024,10240], row_lengths.1: s32[1024]) -> s32[1024,2048] {
+
+  === HLO REPORT: A0_s32in ===
+  module 74 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : True  (5 lines)
+  layout-changing copy >=1 MiB present : True  (1 of 1 big copies)
+  materialized >=1 MiB: copies 40.000 MiB + fusions 0.000 MiB = 40.000 MiB (~80.0 MiB of traffic)
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart", backend_config={"aliasing_operands":{"lists":[]},"flag_configs":[],"scoped_memory_configs":[
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"aliasing_operands":
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast.3, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), asyn
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","o
+    [df] %bitcast.2 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.3 in %called_computation.2  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.4 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         80.000 MiB  call-start       %copy.4.cloned.1.call-start                           in %called_computation                 ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,
+         80.000 MiB  call-start       %sparse-core-data-format-call.cloned.1.call-start     in %main.3                             ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation.1               ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.3                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  copy             %copy.3                                               in %called_computation.2               s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %copy.4.cloned.1.call-done                            in %called_computation                 s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %sparse-core-data-format-call.cloned.1.call-done      in %main.3                             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.3               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.3                             s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.1                                            in %main.3                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.6                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.3 (s.1: s32[1024,10240], l.1: s32[1024]) -> s32[1024,2048] {
+
+  === HLO REPORT: A0_flatin ===
+  module 56 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : False  (0 lines)
+  layout-changing copy >=1 MiB present : False  (0 of 0 big copies)
+  materialized >=1 MiB: copies 0.000 MiB + fusions 0.000 MiB = 0.000 MiB (~0.0 MiB of traffic)
+    inventory (>=1 MiB, async wrappers excluded):
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation                 ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.3                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation                 s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.3                             s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.1                                            in %main.3                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.2                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.3 (s.1: s32[10485760], l.1: s32[1024]) -> s32[1024,2048] {
+
+  === HLO REPORT: A0_flatout ===
+  module 79 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : True  (5 lines)
+  layout-changing copy >=1 MiB present : True  (1 of 1 big copies)
+  materialized >=1 MiB: copies 40.000 MiB + fusions 40.000 MiB = 80.000 MiB (~160.0 MiB of traffic)
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart", backend_config={"aliasing_operands":{"lists":[]},"flag_configs":[],"scoped_memory_configs":[
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"aliasing_operands":
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.clone
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","o
+    [df] %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.3 in %called_computation.2  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.6 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         80.000 MiB  call-start       %copy.4.cloned.1.call-start                           in %called_computation                 ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,
+         80.000 MiB  call-start       %sparse-core-data-format-call.cloned.1.call-start     in %main.3                             ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation.1               ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.3                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.2                               in %fused_computation                  s32[1024,10240]{1,0:T(8,128)}
+         40.000 MiB  copy             %copy.3                                               in %called_computation.2               s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %copy.4.cloned.1.call-done                            in %called_computation                 s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  fusion           %bitcast-convert_bitcast_fusion                       in %main.3                             s32[128,80,8,128]{3,2,1,0:T(8,128)}
+         40.000 MiB  call-done        %sparse-core-data-format-call.cloned.1.call-done      in %main.3                             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.3               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.3                             s32[2097152]{0:T(1024)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.8                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.3 (s.1: f32[1024,10240], l.1: s32[1024]) -> s32[2097152] {
+
+  === HLO REPORT: A0_flatio ===
+  module 53 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : False  (0 lines)
+  layout-changing copy >=1 MiB present : False  (0 of 0 big copies)
+  materialized >=1 MiB: copies 0.000 MiB + fusions 0.000 MiB = 0.000 MiB (~0.0 MiB of traffic)
+    inventory (>=1 MiB, async wrappers excluded):
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation                 ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.3                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation                 s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.3                             s32[2097152]{0:T(1024)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.2                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.3 (s.1: s32[10485760], l.1: s32[1024]) -> s32[2097152] {
+
+  === HLO REPORT: A0_fmtin ===
+  module 82 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : True  (5 lines)
+  layout-changing copy >=1 MiB present : True  (1 of 1 big copies)
+  materialized >=1 MiB: copies 40.000 MiB + fusions 40.000 MiB = 80.000 MiB (~160.0 MiB of traffic)
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart", backend_config={"aliasing_operands":{"lists":[]},"flag_configs":[],"scoped_memory_configs":[
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"aliasing_operands":
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.clone
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","o
+    [df] %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.3 in %called_computation.2  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.6 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         80.000 MiB  call-start       %copy.4.cloned.1.call-start                           in %called_computation                 ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,
+         80.000 MiB  call-start       %sparse-core-data-format-call.cloned.1.call-start     in %main.3                             ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation.1               ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.3                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.2                               in %fused_computation                  s32[1024,10240]{1,0:T(8,128)}
+         40.000 MiB  copy             %copy.3                                               in %called_computation.2               s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %copy.4.cloned.1.call-done                            in %called_computation                 s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  fusion           %bitcast-convert_bitcast_fusion                       in %main.3                             s32[128,80,8,128]{3,2,1,0:T(8,128)}
+         40.000 MiB  call-done        %sparse-core-data-format-call.cloned.1.call-done      in %main.3                             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.3               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.3                             s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.1                                            in %main.3                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.8                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.3 (s.1: f32[1024,10240], l.1: s32[1024]) -> s32[1024,2048] {
+
+  === HLO REPORT: A0_donate ===
+  module 83 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : True  (5 lines)
+  layout-changing copy >=1 MiB present : True  (1 of 1 big copies)
+  materialized >=1 MiB: copies 40.000 MiB + fusions 40.000 MiB = 80.000 MiB (~160.0 MiB of traffic)
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart", backend_config={"aliasing_operands":{"lists":[]},"flag_configs":[],"scoped_memory_configs":[
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone", backend_config={"aliasing_operands":
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.clone
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","o
+    [df] %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.5 in %called_computation.2  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.6 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         80.000 MiB  call-start       %copy.6.cloned.1.call-start                           in %called_computation                 ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,
+         80.000 MiB  call-start       %sparse-core-data-format-call.cloned.1.call-start     in %main.3                             ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation.1               ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.3                             ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.2                               in %fused_computation                  s32[1024,10240]{1,0:T(8,128)}
+         40.000 MiB  copy             %copy.5                                               in %called_computation.2               s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  call-done        %copy.6.cloned.1.call-done                            in %called_computation                 s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  fusion           %bitcast-convert_bitcast_fusion                       in %main.3                             s32[128,80,8,128]{3,2,1,0:T(8,128)}
+         40.000 MiB  call-done        %sparse-core-data-format-call.cloned.1.call-done      in %main.3                             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.3               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.3                             s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.1                                            in %main.3                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.8                                                parameter        s32[10485760]{0:T(1024)}
+      %param_1.2                                                parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.3 (s.1: f32[1024,10240], l.1: s32[1024]) -> (s32[1024,2048], f32[1024,10240]) {
+
+--- arm smoke gate (3 calls each) ---
+  B_base      ok
+  A0_base     ok
+  A0_s32in    ok
+  A0_flatin   ok
+  A0_flatout  ok
+  A0_flatio   ok
+  A0_fmtin    ok
+  A0_donate   ok
+  SMOKE_GATE_OK
+
+  patch evidence B_base     :  1024/1024 rows match B@shape
+  patch evidence A0_base    :     0/1024 rows match B@shape
+  patch evidence A0_s32in   :     0/1024 rows match B@shape
+  patch evidence A0_flatin  :     0/1024 rows match B@shape
+  patch evidence A0_flatout :     0/1024 rows match B@shape
+  patch evidence A0_flatio  :     0/1024 rows match B@shape
+  patch evidence A0_fmtin   :     0/1024 rows match B@shape
+  patch evidence A0_donate  :     0/1024 rows match B@shape
+  (probes/09's caveat stands: for an output-suppressing arm this gate cannot tell -not written- from -written identically-. No out_hbm sentinel exists in this subject.)
+
+  measuring 11 variants in ONE interleaved pool, 9 rounds
+
+  B_base      us_median=   326.770  us=   326.359  hostbound=  1.0%  suspect=False
+  A0_base     us_median=    92.701  us=    91.994  hostbound=  3.0%  suspect=False
+  A0_s32in    us_median=    66.450  us=    65.439  hostbound=  4.7%  suspect=False
+  A0_flatin   us_median=    32.286  us=    30.648  hostbound= 11.1%  suspect=False
+  A0_flatout  us_median=    82.694  us=    81.740  hostbound=  4.0%  suspect=False
+  A0_flatio   us_median=    22.190  us=    19.951  hostbound= 20.4%  suspect=False
+  A0_fmtin    us_median=    92.652  us=    92.119  hostbound=  3.1%  suspect=False
+  A0_donate   us_median=    94.259  us=    90.928  hostbound=  6.1%  suspect=False
+  #null_a     us_median=    17.059  us=    14.546  hostbound= 25.3%  suspect=False
+  #null_b     us_median=    15.857  us=    14.620  hostbound= 26.0%  suspect=False
+  #null_c     us_median=    17.499  us=    15.084  hostbound= 24.1%  suspect=False
+
+--- results ---
+  null floor (mean of 3):     16.805   samples 17.059 15.857 17.499   spread 1.641   (probes/10 spread 0.770)
+  EVERY delta below is quoted against that spread as the resolution floor.
+
+  arm          us_median         us  host%  residual d(A0_base)  dfmt?  lcopy?   matMiB  note
+  B_base         326.770    326.359    1.0   309.965    234.068   True    True    80.00  probes/09 arm called verbatim: f32[b,n] jit entry
+  A0_base         92.701     91.994    3.0    75.896      0.000   True    True    80.00  probes/09 arm called verbatim: f32[b,n] jit entry
+  A0_s32in        66.450     65.439    4.7    49.645    -26.251   True    True    40.00  jit entry takes s32[b,n]; bitcast-convert folds away
+  A0_flatin       32.286     30.648   11.1    15.481    -60.416  False   False     0.00  jit entry takes s32[b*n] flat
+  A0_flatout      82.694     81.740    4.0    65.889    -10.007   True    True    80.00  jit returns the flat s32[b*k]
+  A0_flatio       22.190     19.951   20.4     5.385    -70.511  False   False     0.00  flat s32[b*n] in AND flat s32[b*k] out
+  A0_fmtin        92.652     92.119    3.1    75.847     -0.049   True    True    80.00  AUTO in-layout, committed OUTSIDE the timed region (moves 
+  A0_donate       94.259     90.928    6.1    77.454      1.557   True    True    80.00  donate_argnums=(0,); the donated buffer is returned and re
+  null #null_a hostbound 25.3% -- a null is host-dominated by construction; not flagged.
+  null #null_b hostbound 26.0% -- a null is host-dominated by construction; not flagged.
+  null #null_c hostbound 24.1% -- a null is host-dominated by construction; not flagged.
+
+--- arm activation (an arm that did not delete what its name says is a NULL, not a win) ---
+  A0_s32in    DELETED-WORK  materialized 40.0 vs base 80.0 MiB; df_call still present=True, layout copy still present=True; delta -26.251 us
+  A0_flatin   DELETED-WORK  materialized 0.0 vs base 80.0 MiB; df_call still present=False, layout copy still present=False; delta -60.416 us
+  A0_flatout  NO-DELETION   materialized 80.0 vs base 80.0 MiB; df_call still present=True, layout copy still present=True; delta -10.007 us
+  A0_flatio   DELETED-WORK  materialized 0.0 vs base 80.0 MiB; df_call still present=False, layout copy still present=False; delta -70.511 us
+  A0_fmtin    NO-DELETION   materialized 80.0 vs base 80.0 MiB; df_call still present=True, layout copy still present=True; delta -0.049 us
+  A0_donate   NO-DELETION   materialized 80.0 vs base 80.0 MiB; df_call still present=True, layout copy still present=True; delta +1.557 us
+
+--- Q2: does deleting the relayout remove the residual? ---
+  A0_flatin   input relayout                       saving    60.416 us   MiB removed    80.00     0.7552 us/MiB
+  A0_flatout  output relayout                      saving    10.007 us   MiB removed     0.00        n/a us/MiB
+  A0_flatio   both                                 saving    70.511 us   MiB removed    80.00     0.8814 us/MiB
+  A0_s32in    bitcast-convert only                 saving    26.251 us   MiB removed    40.00     0.6563 us/MiB
+  A0_fmtin    AUTO in-layout (moved, not deleted)  saving     0.049 us   MiB removed     0.00        n/a us/MiB
+  A0_donate   donation                             saving    -1.557 us   MiB removed     0.00        n/a us/MiB
+  additivity: (flatin + flatout) / flatio = 70.422 / 70.511 = 0.999   -- probes/08 learned that single-region deletion arms can OVERLAP; a ratio far from 1 means they do.
+  residual left after deleting both: 5.385 us (was 75.896). probes/10's byte model predicted 81.928 us for the two buffers together.
+
+--- Q3: the output-byte term ---
+  A0_base     output-side big copies (<=12 MiB): none
+  A0_flatout  output-side big copies (<=12 MiB): none
+  probes/10 read 1.118 us/MiB on the output axis, i.e. 8.944 us at the base shape.
+
+--- cross-job controls ---
+  B_base     326.770  vs p10  326.732 -> +0.01%
+  B_base     326.770  vs p09  326.782 -> -0.00%
+  B_base     326.770  vs p08  327.166 -> -0.12%
+  A0_base     92.701  vs p10   92.118 -> +0.63%
+  A0_base residual    75.896  vs p10   75.349 -> +0.73%
+  !! HOSTBOUND A0_flatin: 11.1% > 5% -- the device slope is a smaller part of this arm's wall time than the rule allows; read us_median, and treat its delta with the spread, not the mean.
+  !! HOSTBOUND A0_flatio: 20.4% > 5% -- the device slope is a smaller part of this arm's wall time than the rule allows; read us_median, and treat its delta with the spread, not the mean.
+  !! HOSTBOUND A0_donate: 6.1% > 5% -- the device slope is a smaller part of this arm's wall time than the rule allows; read us_median, and treat its delta with the spread, not the mean.
+  !! A0_flatout moved -10.007 us but its HLO still materializes 80.0 MiB -- report as a NULL, not a win.
+
+wrote /cdk-outputs/outputs/j-9b520877-2491-4fd4-b618-tpu-job-0/j-9b520877-2491-4fd4-b618-tpu-job-0-0-cjt49/command-container/probe11/relayout_provenance.json (timing complete; Q1 follows)
+
+==========================================================================
+Q1 -- does the PRODUCTION call path emit the same relayout?
+==========================================================================
+  production caller : /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py
+                      md5 1e221f10cbf3573aa0d2ae78c3463532
+  streamindex_topk  : defined at streamindex_topk.py:509 (357 lines), jax.jit-decorated
+  sparsecore_topk call site: streamindex_topk.py:831   |        topk_idxs = sparsecore_topk(
+       818| 
+       819|         scores_to_reduce = scores
+       820|         if scores_to_reduce.dtype != jnp.float32:
+       821|             scores_to_reduce = scores_to_reduce.astype(jnp.float32)
+       822| 
+       823|         eff_row_lengths = _effective_row_lengths(
+       824|             seq_lens=seq_lens,
+       825|             cu_q_lens=cu_q_lens,
+       826|             distribution=distribution,
+       827|             num_tokens=q.shape[0],
+       828|             num_positions=scores_to_reduce.shape[1],
+       829|             compression_ratio=compression_ratio,
+       830|         )
+       831|         topk_idxs = sparsecore_topk(
+       832|             scores_to_reduce,
+       833|             k,
+       834|             row_lengths=eff_row_lengths,
+       835|             write_empty_rows=True,
+       836|         )
+       837| 
+
+  avals (GLM-5.2 shipping geometry, every value cited in the PROD comment):
+      q                float8_e4m3fn  (1024, 64, 128)
+      indexer_weights  float32        (1024, 64)
+      cache_kv         uint8          (576, 256, 4, 256)
+      seq_lens         int32          (64,)
+      page_indices     int32          (576,)
+      cu_q_lens        int32          (65,)
+      distribution     int32          (3,)
+      derived: {'pages_per_seq': 9, 'num_pages': 576, 'num_sublanes_total': 80}
+      -> score matrix f32[1024, 10240] (reshaped from f32[nt, 80, 128]), k=2048
+
+  compiled streamindex_topk (enable_early_exit=True) in 4.3s -- THIS IS THE PRODUCTION ENTRY, not a wrapper written by this probe.
+
+  === HLO REPORT: prod_early_exit_True ===
+  module 3301 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : False  (0 lines)
+  layout-changing copy >=1 MiB present : False  (0 of 0 big copies)
+  materialized >=1 MiB: copies 0.000 MiB + fusions 8.000 MiB = 8.000 MiB (~16.0 MiB of traffic)
+    inventory (>=1 MiB, async wrappers excluded):
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation                 ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %region_1.13                        ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  broadcast        %broadcast.13                                         in %region_1.13                        f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  custom-call      %StreamIdxTC-d-bq_1-bkvp_2.2                          in %region_1.13                        f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  custom-call      %StreamIdxTC-d-bq_1-bkvp_2.3                          in %region_1.13                        f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  custom-call      %StreamIdxTC-m-bq_128-bkvp_2.1                        in %region_1.13                        f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.3                               in %region_1.13                        s32[1024,80,128]{2,1,0:T(8,128)}
+         16.000 MiB  copy-start       %copy-start.2                                         in %main.23                            (s32[1024,2048]{1,0:T(8,128)}, s32[1024,2048]{1,0:T(8,128)S(1)}, u32[]
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation                 s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %region_1.13                        s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.1                                            in %region_1.13                        s32[1024,2048]{1,0:T(8,128)S(1)}
+          8.000 MiB  iota             %iota.23                                              in %fused_computation.18               s32[1024,2048]{1,0:T(8,128)}
+          8.000 MiB  broadcast        %le.1                                                 in %fused_computation.18               s32[1024,2048]{1,0:T(8,128)}
+          8.000 MiB  broadcast        %broadcast_in_dim.36                                  in %fused_computation.18               s32[1024,2048]{1,0:T(8,128)}
+          8.000 MiB  select           %select_n.69                                          in %fused_computation.18               s32[1024,2048]{1,0:T(8,128)S(1)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.517                                              parameter        s32[10485760]{0:T(1024)}
+      %param_1.668                                              parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.23 (q.1: f8e4m3fn[1024,64,128], indexer_weights.1: f32[1024,64], cache_kv.1: u8[576,256,4,256], seq_lens.1: s32[64], page_indices.1: s32[576], cu_q_lens.1: s32[65], distribution.1: s32[3]) -> s32[1024,2048] {
+  SHAPE CHECK: `sc_topk_direct_b1024_n10240_k2048` present in the production HLO: True
+
+  compiled streamindex_topk (enable_early_exit=False) in 3.9s -- THIS IS THE PRODUCTION ENTRY, not a wrapper written by this probe.
+
+  === HLO REPORT: prod_early_exit_False ===
+  module 1482 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start', 'prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start']
+  sparse-core-data-format-call present : False  (0 lines)
+  layout-changing copy >=1 MiB present : False  (0 of 0 big copies)
+  materialized >=1 MiB: copies 0.000 MiB + fusions 0.000 MiB = 0.000 MiB (~0.0 MiB of traffic)
+    inventory (>=1 MiB, async wrappers excluded):
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-st in %called_computation                 ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(10
+         48.004 MiB  call-start       %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-st in %main.12                            ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[209715
+         40.000 MiB  broadcast        %broadcast_in_dim.19                                  in %main.12                            f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  custom-call      %StreamIdxTC-d-bq_1-bkvp_2.2                          in %main.12                            f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  custom-call      %StreamIdxTC-d-bq_1-bkvp_2.3                          in %main.12                            f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  custom-call      %StreamIdxTC-m-bq_128-bkvp_2.1                        in %main.12                            f32[1024,80,128]{2,1,0:T(8,128)}
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.3                               in %main.12                            s32[1024,80,128]{2,1,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %called_computation.1               s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-do in %called_computation                 s32[2097152]{0:T(1024)}
+          8.000 MiB  call-done        %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-do in %main.12                            s32[2097152]{0:T(1024)}
+          8.000 MiB  reshape          %reshape.1                                            in %main.12                            s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6', 'prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned custom-call      s32[]{:S(2)}
+      %param_0.256                                              parameter        s32[10485760]{0:T(1024)}
+      %param_1.380                                              parameter        s32[1024]{0:T(1024)}
+    ENTRY ENTRY %main.12 (q.1: f8e4m3fn[1024,64,128], indexer_weights.1: f32[1024,64], cache_kv.1: u8[576,256,4,256], seq_lens.1: s32[64], page_indices.1: s32[576], cu_q_lens.1: s32[65], distribution.1: s32[3]) -> s32[1024,2048] {
+  SHAPE CHECK: `sc_topk_direct_b1024_n10240_k2048` present in the production HLO: True
+
+rewrote /cdk-outputs/outputs/j-9b520877-2491-4fd4-b618-tpu-job-0/j-9b520877-2491-4fd4-b618-tpu-job-0-0-cjt49/command-container/probe11/relayout_provenance.json with Q1

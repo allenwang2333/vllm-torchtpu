@@ -1,0 +1,1833 @@
+{
+  "_outdir": "/cdk-outputs/outputs/j-9b520877-2491-4fd4-b618-tpu-job-0/j-9b520877-2491-4fd4-b618-tpu-job-0-0-cjt49/command-container/probe11",
+  "activation": {
+    "A0_donate": {
+      "MiB_removed": 0.0,
+      "base_materialized_MiB": 80.0,
+      "delta_us": 1.5574500139337033,
+      "materialized_MiB": 80.0,
+      "still_has_data_format_call": true,
+      "still_has_layout_copy": true,
+      "verdict": "NO-DELETION"
+    },
+    "A0_flatin": {
+      "MiB_removed": 80.0,
+      "base_materialized_MiB": 80.0,
+      "delta_us": -60.4155251494376,
+      "materialized_MiB": 0.0,
+      "still_has_data_format_call": false,
+      "still_has_layout_copy": false,
+      "verdict": "DELETED-WORK"
+    },
+    "A0_flatio": {
+      "MiB_removed": 80.0,
+      "base_materialized_MiB": 80.0,
+      "delta_us": -70.5110502167372,
+      "materialized_MiB": 0.0,
+      "still_has_data_format_call": false,
+      "still_has_layout_copy": false,
+      "verdict": "DELETED-WORK"
+    },
+    "A0_flatout": {
+      "MiB_removed": 0.0,
+      "base_materialized_MiB": 80.0,
+      "delta_us": -10.0069501058897,
+      "materialized_MiB": 80.0,
+      "still_has_data_format_call": true,
+      "still_has_layout_copy": true,
+      "verdict": "NO-DELETION"
+    },
+    "A0_fmtin": {
+      "MiB_removed": 0.0,
+      "base_materialized_MiB": 80.0,
+      "delta_us": -0.04907524271402508,
+      "materialized_MiB": 80.0,
+      "still_has_data_format_call": true,
+      "still_has_layout_copy": true,
+      "verdict": "NO-DELETION"
+    },
+    "A0_s32in": {
+      "MiB_removed": 40.0,
+      "base_materialized_MiB": 80.0,
+      "delta_us": -26.251000235788524,
+      "materialized_MiB": 40.0,
+      "still_has_data_format_call": true,
+      "still_has_layout_copy": true,
+      "verdict": "DELETED-WORK"
+    }
+  },
+  "arm_hlo": {
+    "A0_base": {
+      "big_copy": true,
+      "big_copy_MiB": 40.0,
+      "big_copy_count": 1,
+      "big_copy_detail": [
+        {
+          "MiB": 40.0,
+          "changes": true,
+          "comp": "called_computation.2",
+          "layout_in": "3,2,1,0:T(8,128)",
+          "layout_out": "3,1,2,0:T(8,128)",
+          "name": "copy.3",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}",
+          "src": "param_0.6",
+          "src_shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        }
+      ],
+      "big_fusion_MiB": 40.0,
+      "big_fusion_count": 1,
+      "data_format_call": true,
+      "data_format_line_count": 5,
+      "data_format_lines": [
+        "%prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target=\"PrepareAsyncCallStart\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target=\"PrepareAsyncCallDone\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), async_execution_thread=\"sparsecore\", to_apply=%called_computation, backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"sparse_core_config\":{\"comp_env\":{\"enable_scs_overlays\":false,\"tile_tasks_prefetch_ahead\":0},\"core_ids\":[\"0\",\"1\"],\"core_type\":\"CORE_TYPE_SC\",\"enable_megacore\":true,\"load_dat\":false,\"offload\":\"OFFLOAD_DATA_FORMATTING\",\"subcore_ids\":[],\"subcore_type\":\"SUBCORE_TYPE_SCS\"},\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)"
+      ],
+      "inventory": [
+        {
+          "MiB": 80.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 80.0,
+          "comp": "main.2",
+          "name": "sparse-core-data-format-call.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.2",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "fused_computation",
+          "name": "bitcast_convert_type.0",
+          "opcode": "bitcast-convert",
+          "shape": "s32[1024,10240]{1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation.2",
+          "name": "copy.3",
+          "opcode": "copy",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.2",
+          "name": "bitcast-convert_bitcast_fusion",
+          "opcode": "fusion",
+          "shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.2",
+          "name": "sparse-core-data-format-call.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.2",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.2",
+          "name": "reshape.3",
+          "opcode": "reshape",
+          "shape": "s32[1024,2048]{1,0:T(8,128)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": true,
+      "layout_changing_big_copy_count": 1,
+      "lines": 80,
+      "materialized_MiB": 80.0
+    },
+    "A0_donate": {
+      "big_copy": true,
+      "big_copy_MiB": 40.0,
+      "big_copy_count": 1,
+      "big_copy_detail": [
+        {
+          "MiB": 40.0,
+          "changes": true,
+          "comp": "called_computation.2",
+          "layout_in": "3,2,1,0:T(8,128)",
+          "layout_out": "3,1,2,0:T(8,128)",
+          "name": "copy.5",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}",
+          "src": "param_0.6",
+          "src_shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        }
+      ],
+      "big_fusion_MiB": 40.0,
+      "big_fusion_count": 1,
+      "data_format_call": true,
+      "data_format_line_count": 5,
+      "data_format_lines": [
+        "%prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target=\"PrepareAsyncCallStart\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target=\"PrepareAsyncCallDone\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), async_execution_thread=\"sparsecore\", to_apply=%called_computation, backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"sparse_core_config\":{\"comp_env\":{\"enable_scs_overlays\":false,\"tile_tasks_prefetch_ahead\":0},\"core_ids\":[\"0\",\"1\"],\"core_type\":\"CORE_TYPE_SC\",\"enable_megacore\":true,\"load_dat\":false,\"offload\":\"OFFLOAD_DATA_FORMATTING\",\"subcore_ids\":[],\"subcore_type\":\"SUBCORE_TYPE_SCS\"},\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)"
+      ],
+      "inventory": [
+        {
+          "MiB": 80.0,
+          "comp": "called_computation",
+          "name": "copy.6.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 80.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "fused_computation",
+          "name": "bitcast_convert_type.2",
+          "opcode": "bitcast-convert",
+          "shape": "s32[1024,10240]{1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation.2",
+          "name": "copy.5",
+          "opcode": "copy",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation",
+          "name": "copy.6.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "bitcast-convert_bitcast_fusion",
+          "opcode": "fusion",
+          "shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "reshape.1",
+          "opcode": "reshape",
+          "shape": "s32[1024,2048]{1,0:T(8,128)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": true,
+      "layout_changing_big_copy_count": 1,
+      "lines": 83,
+      "materialized_MiB": 80.0
+    },
+    "A0_flatin": {
+      "big_copy": false,
+      "big_copy_MiB": 0.0,
+      "big_copy_count": 0,
+      "big_copy_detail": [],
+      "big_fusion_MiB": 0.0,
+      "big_fusion_count": 0,
+      "data_format_call": false,
+      "data_format_line_count": 0,
+      "data_format_lines": [],
+      "inventory": [
+        {
+          "MiB": 48.004,
+          "comp": "called_computation",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "reshape.1",
+          "opcode": "reshape",
+          "shape": "s32[1024,2048]{1,0:T(8,128)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": false,
+      "layout_changing_big_copy_count": 0,
+      "lines": 56,
+      "materialized_MiB": 0.0
+    },
+    "A0_flatio": {
+      "big_copy": false,
+      "big_copy_MiB": 0.0,
+      "big_copy_count": 0,
+      "big_copy_detail": [],
+      "big_fusion_MiB": 0.0,
+      "big_fusion_count": 0,
+      "data_format_call": false,
+      "data_format_line_count": 0,
+      "data_format_lines": [],
+      "inventory": [
+        {
+          "MiB": 48.004,
+          "comp": "called_computation",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": false,
+      "layout_changing_big_copy_count": 0,
+      "lines": 53,
+      "materialized_MiB": 0.0
+    },
+    "A0_flatout": {
+      "big_copy": true,
+      "big_copy_MiB": 40.0,
+      "big_copy_count": 1,
+      "big_copy_detail": [
+        {
+          "MiB": 40.0,
+          "changes": true,
+          "comp": "called_computation.2",
+          "layout_in": "3,2,1,0:T(8,128)",
+          "layout_out": "3,1,2,0:T(8,128)",
+          "name": "copy.3",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}",
+          "src": "param_0.6",
+          "src_shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        }
+      ],
+      "big_fusion_MiB": 40.0,
+      "big_fusion_count": 1,
+      "data_format_call": true,
+      "data_format_line_count": 5,
+      "data_format_lines": [
+        "%prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target=\"PrepareAsyncCallStart\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target=\"PrepareAsyncCallDone\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), async_execution_thread=\"sparsecore\", to_apply=%called_computation, backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"sparse_core_config\":{\"comp_env\":{\"enable_scs_overlays\":false,\"tile_tasks_prefetch_ahead\":0},\"core_ids\":[\"0\",\"1\"],\"core_type\":\"CORE_TYPE_SC\",\"enable_megacore\":true,\"load_dat\":false,\"offload\":\"OFFLOAD_DATA_FORMATTING\",\"subcore_ids\":[],\"subcore_type\":\"SUBCORE_TYPE_SCS\"},\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)"
+      ],
+      "inventory": [
+        {
+          "MiB": 80.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 80.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "fused_computation",
+          "name": "bitcast_convert_type.2",
+          "opcode": "bitcast-convert",
+          "shape": "s32[1024,10240]{1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation.2",
+          "name": "copy.3",
+          "opcode": "copy",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "bitcast-convert_bitcast_fusion",
+          "opcode": "fusion",
+          "shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": true,
+      "layout_changing_big_copy_count": 1,
+      "lines": 79,
+      "materialized_MiB": 80.0
+    },
+    "A0_fmtin": {
+      "big_copy": true,
+      "big_copy_MiB": 40.0,
+      "big_copy_count": 1,
+      "big_copy_detail": [
+        {
+          "MiB": 40.0,
+          "changes": true,
+          "comp": "called_computation.2",
+          "layout_in": "3,2,1,0:T(8,128)",
+          "layout_out": "3,1,2,0:T(8,128)",
+          "name": "copy.3",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}",
+          "src": "param_0.6",
+          "src_shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        }
+      ],
+      "big_fusion_MiB": 40.0,
+      "big_fusion_count": 1,
+      "data_format_call": true,
+      "data_format_line_count": 5,
+      "data_format_lines": [
+        "%prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target=\"PrepareAsyncCallStart\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target=\"PrepareAsyncCallDone\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), async_execution_thread=\"sparsecore\", to_apply=%called_computation, backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"sparse_core_config\":{\"comp_env\":{\"enable_scs_overlays\":false,\"tile_tasks_prefetch_ahead\":0},\"core_ids\":[\"0\",\"1\"],\"core_type\":\"CORE_TYPE_SC\",\"enable_megacore\":true,\"load_dat\":false,\"offload\":\"OFFLOAD_DATA_FORMATTING\",\"subcore_ids\":[],\"subcore_type\":\"SUBCORE_TYPE_SCS\"},\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)"
+      ],
+      "inventory": [
+        {
+          "MiB": 80.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 80.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "fused_computation",
+          "name": "bitcast_convert_type.2",
+          "opcode": "bitcast-convert",
+          "shape": "s32[1024,10240]{1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation.2",
+          "name": "copy.3",
+          "opcode": "copy",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "bitcast-convert_bitcast_fusion",
+          "opcode": "fusion",
+          "shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "reshape.1",
+          "opcode": "reshape",
+          "shape": "s32[1024,2048]{1,0:T(8,128)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": true,
+      "layout_changing_big_copy_count": 1,
+      "lines": 82,
+      "materialized_MiB": 80.0
+    },
+    "A0_s32in": {
+      "big_copy": true,
+      "big_copy_MiB": 40.0,
+      "big_copy_count": 1,
+      "big_copy_detail": [
+        {
+          "MiB": 40.0,
+          "changes": true,
+          "comp": "called_computation.2",
+          "layout_in": "3,2,1,0:T(8,128)",
+          "layout_out": "3,1,2,0:T(8,128)",
+          "name": "copy.3",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}",
+          "src": "param_0.4",
+          "src_shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        }
+      ],
+      "big_fusion_MiB": 0.0,
+      "big_fusion_count": 0,
+      "data_format_call": true,
+      "data_format_line_count": 5,
+      "data_format_lines": [
+        "%prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target=\"PrepareAsyncCallStart\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target=\"PrepareAsyncCallDone\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast.3, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), async_execution_thread=\"sparsecore\", to_apply=%called_computation, backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"sparse_core_config\":{\"comp_env\":{\"enable_scs_overlays\":false,\"tile_tasks_prefetch_ahead\":0},\"core_ids\":[\"0\",\"1\"],\"core_type\":\"CORE_TYPE_SC\",\"enable_megacore\":true,\"load_dat\":false,\"offload\":\"OFFLOAD_DATA_FORMATTING\",\"subcore_ids\":[],\"subcore_type\":\"SUBCORE_TYPE_SCS\"},\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%bitcast.2 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)"
+      ],
+      "inventory": [
+        {
+          "MiB": 80.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 80.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation.2",
+          "name": "copy.3",
+          "opcode": "copy",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.3",
+          "name": "sparse-core-data-format-call.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.3",
+          "name": "reshape.1",
+          "opcode": "reshape",
+          "shape": "s32[1024,2048]{1,0:T(8,128)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": true,
+      "layout_changing_big_copy_count": 1,
+      "lines": 74,
+      "materialized_MiB": 40.0
+    },
+    "B_base": {
+      "big_copy": true,
+      "big_copy_MiB": 40.0,
+      "big_copy_count": 1,
+      "big_copy_detail": [
+        {
+          "MiB": 40.0,
+          "changes": true,
+          "comp": "called_computation.2",
+          "layout_in": "3,2,1,0:T(8,128)",
+          "layout_out": "3,1,2,0:T(8,128)",
+          "name": "copy.3",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}",
+          "src": "param_0.6",
+          "src_shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        }
+      ],
+      "big_fusion_MiB": 40.0,
+      "big_fusion_count": 1,
+      "data_format_call": true,
+      "data_format_line_count": 5,
+      "data_format_lines": [
+        "%prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target=\"PrepareAsyncCallStart\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target=\"PrepareAsyncCallDone\", backend_config={\"aliasing_operands\":{\"lists\":[]},\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_sparse-core-data-format-call.cloned.1.call-start), async_execution_thread=\"sparsecore\", to_apply=%called_computation, backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"sparse_core_config\":{\"comp_env\":{\"enable_scs_overlays\":false,\"tile_tasks_prefetch_ahead\":0},\"core_ids\":[\"0\",\"1\"],\"core_type\":\"CORE_TYPE_SC\",\"enable_megacore\":true,\"load_dat\":false,\"offload\":\"OFFLOAD_DATA_FORMATTING\",\"subcore_ids\":[],\"subcore_type\":\"SUBCORE_TYPE_SCS\"},\"used_scoped_memory_configs\":[]}",
+        "%sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} call-done(%sparse-core-data-format-call.cloned.1.call-start), backend_config={\"flag_configs\":[],\"scoped_memory_configs\":[{\"memory_space\":\"1\",\"offset\":\"0\",\"size\":\"33554432\"}],\"used_scoped_memory_configs\":[]}",
+        "%bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)"
+      ],
+      "inventory": [
+        {
+          "MiB": 80.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 80.0,
+          "comp": "main.2",
+          "name": "sparse-core-data-format-call.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+        },
+        {
+          "MiB": 48.004,
+          "comp": "main.2",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "opcode": "call-start",
+          "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "fused_computation",
+          "name": "bitcast_convert_type.0",
+          "opcode": "bitcast-convert",
+          "shape": "s32[1024,10240]{1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation.2",
+          "name": "copy.3",
+          "opcode": "copy",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "called_computation",
+          "name": "copy.4.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.2",
+          "name": "bitcast-convert_bitcast_fusion",
+          "opcode": "fusion",
+          "shape": "s32[128,80,8,128]{3,2,1,0:T(8,128)}"
+        },
+        {
+          "MiB": 40.0,
+          "comp": "main.2",
+          "name": "sparse-core-data-format-call.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[128,80,8,128]{3,1,2,0:T(8,128)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.3",
+          "name": "sc_topk_direct_b1024_n10240_k2048.6",
+          "opcode": "custom-call",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "called_computation.1",
+          "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.2",
+          "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+          "opcode": "call-done",
+          "shape": "s32[2097152]{0:T(1024)}"
+        },
+        {
+          "MiB": 8.0,
+          "comp": "main.2",
+          "name": "reshape.3",
+          "opcode": "reshape",
+          "shape": "s32[1024,2048]{1,0:T(8,128)}"
+        }
+      ],
+      "kernel_calls": [
+        "sc_topk_direct_b1024_n10240_k2048.6",
+        "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+        "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+      ],
+      "layout_changing_big_copy": true,
+      "layout_changing_big_copy_count": 1,
+      "lines": 80,
+      "materialized_MiB": 80.0
+    }
+  },
+  "arm_notes": {
+    "A0_base": "probes/09 arm called verbatim: f32[b,n] jit entry",
+    "A0_donate": "donate_argnums=(0,); the donated buffer is returned and rethreaded",
+    "A0_flatin": "jit entry takes s32[b*n] flat",
+    "A0_flatio": "flat s32[b*n] in AND flat s32[b*k] out",
+    "A0_flatout": "jit returns the flat s32[b*k]",
+    "A0_fmtin": "AUTO in-layout, committed OUTSIDE the timed region (moves the relayout, does not delete it)",
+    "A0_s32in": "jit entry takes s32[b,n]; bitcast-convert folds away",
+    "B_base": "probes/09 arm called verbatim: f32[b,n] jit entry"
+  },
+  "arms": [
+    {
+      "isolates": "cross-job control (p08 327.166 / p09 326.782 / p10 326.732)",
+      "label": "B_base",
+      "patch": "B"
+    },
+    {
+      "isolates": "cross-job control (p09 92.231 / p10 92.118)",
+      "label": "A0_base",
+      "patch": "A0"
+    },
+    {
+      "isolates": "s32[b,n] entry: bitcast-convert has nothing to do",
+      "label": "A0_s32in",
+      "patch": "A0"
+    },
+    {
+      "isolates": "s32[b*n] entry: already in the custom call's layout",
+      "label": "A0_flatin",
+      "patch": "A0"
+    },
+    {
+      "isolates": "flat s32[b*k] result: output relayout deleted",
+      "label": "A0_flatout",
+      "patch": "A0"
+    },
+    {
+      "isolates": "flat in AND flat out",
+      "label": "A0_flatio",
+      "patch": "A0"
+    },
+    {
+      "isolates": "AUTO input layout, committed OUTSIDE the timed region",
+      "label": "A0_fmtin",
+      "patch": "A0"
+    },
+    {
+      "isolates": "donate_argnums on the score buffer (aliasing test)",
+      "label": "A0_donate",
+      "patch": "A0"
+    }
+  ],
+  "cross_job": {
+    "A0_base": 92.70132504752837,
+    "A0_base_residual": 75.89633326764063,
+    "A0_base_residual_vs_p10_pct": 0.7263975203926055,
+    "A0_vs_p10_pct": 0.6332367697175104,
+    "B_base": 326.7697749834042,
+    "B_vs_p08_pct": -0.12110824981684912,
+    "B_vs_p09_pct": -0.0037410312060572543,
+    "B_vs_p10_pct": 0.011561458138222307
+  },
+  "dropped_arms": [],
+  "facts": {
+    "A0_base": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "A0_donate": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "A0_flatin": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "A0_flatio": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "A0_flatout": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "A0_fmtin": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "A0_s32in": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    },
+    "B_base": {
+      "P": 1,
+      "b": 1024,
+      "in_mib": 40.0,
+      "k": 2048,
+      "k_ok": true,
+      "n": 10240,
+      "n_ok": true,
+      "n_p": 10240,
+      "out_mib": 8.0,
+      "slice_len": 10240,
+      "two_stage": false,
+      "waves": 32
+    }
+  },
+  "harness": "frozen",
+  "jax": "0.10.2",
+  "layout_api": {
+    "auto_equals_default": true,
+    "auto_input_formats": "(Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device)), Format(layout=Layout(major_to_minor=(0,), tiling=((1024,),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device)))",
+    "auto_output_formats": "Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device))",
+    "committed_score_format": "Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device))",
+    "default_score_format": "Format(layout=Layout(major_to_minor=(0, 1), tiling=((8, 128),), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), memory_kind=device))",
+    "exports": [
+      "Format",
+      "Layout",
+      "with_layout_constraint"
+    ],
+    "has_AUTO": true,
+    "has_Format": true,
+    "has_Layout": true,
+    "jax": "0.10.2",
+    "module": "jax.experimental.layout"
+  },
+  "null_mean": 16.80499177988774,
+  "null_spread": 1.6412002878496406,
+  "nulls": {
+    "#null_a": 17.058775119949132,
+    "#null_b": 15.857499965932222,
+    "#null_c": 17.498700253781863
+  },
+  "order": [
+    [
+      "A0_flatin",
+      "A0_base",
+      "#null_a",
+      "A0_s32in",
+      "A0_fmtin",
+      "A0_donate",
+      "#null_c",
+      "B_base",
+      "A0_flatio",
+      "#null_b",
+      "A0_flatout"
+    ],
+    [
+      "A0_flatio",
+      "B_base",
+      "A0_flatin",
+      "A0_base",
+      "A0_flatout",
+      "A0_s32in",
+      "A0_fmtin",
+      "#null_a",
+      "#null_b",
+      "A0_donate",
+      "#null_c"
+    ],
+    [
+      "A0_donate",
+      "A0_flatout",
+      "A0_fmtin",
+      "A0_flatio",
+      "A0_s32in",
+      "A0_flatin",
+      "#null_c",
+      "B_base",
+      "#null_b",
+      "A0_base",
+      "#null_a"
+    ],
+    [
+      "A0_fmtin",
+      "B_base",
+      "A0_flatout",
+      "A0_donate",
+      "A0_base",
+      "A0_s32in",
+      "#null_a",
+      "A0_flatio",
+      "A0_flatin",
+      "#null_b",
+      "#null_c"
+    ],
+    [
+      "#null_b",
+      "#null_a",
+      "A0_fmtin",
+      "#null_c",
+      "A0_base",
+      "A0_flatout",
+      "A0_flatin",
+      "A0_s32in",
+      "A0_donate",
+      "B_base",
+      "A0_flatio"
+    ],
+    [
+      "A0_flatout",
+      "A0_donate",
+      "A0_flatio",
+      "A0_fmtin",
+      "A0_base",
+      "#null_a",
+      "#null_b",
+      "A0_s32in",
+      "A0_flatin",
+      "B_base",
+      "#null_c"
+    ],
+    [
+      "A0_flatin",
+      "A0_fmtin",
+      "B_base",
+      "#null_c",
+      "A0_flatio",
+      "A0_flatout",
+      "A0_s32in",
+      "A0_donate",
+      "#null_a",
+      "#null_b",
+      "A0_base"
+    ],
+    [
+      "A0_flatio",
+      "#null_b",
+      "#null_a",
+      "B_base",
+      "A0_fmtin",
+      "A0_base",
+      "A0_flatin",
+      "A0_s32in",
+      "A0_donate",
+      "A0_flatout",
+      "#null_c"
+    ],
+    [
+      "#null_b",
+      "#null_a",
+      "A0_flatio",
+      "A0_s32in",
+      "A0_fmtin",
+      "A0_flatin",
+      "A0_donate",
+      "#null_c",
+      "A0_base",
+      "B_base",
+      "A0_flatout"
+    ]
+  ],
+  "p09_src_md5": {
+    "A0": "547031a2fd48545550d864b008d817ff",
+    "B": "fd46ef14b38fd7781885e73d0ca33965"
+  },
+  "patch_evidence": {
+    "A0_base": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "A0_donate": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "A0_flatin": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "A0_flatio": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "A0_flatout": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "A0_fmtin": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "A0_s32in": {
+      "rows": 1024,
+      "rows_matching_B": 0
+    },
+    "B_base": {
+      "rows": 1024,
+      "rows_matching_B": 1024
+    }
+  },
+  "probe": "11-relayout-provenance",
+  "q1": {
+    "caller_file": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk.py",
+    "caller_md5": "1e221f10cbf3573aa0d2ae78c3463532",
+    "config": {
+      "compression_ratio": 1,
+      "head_dim": 128,
+      "k": 2048,
+      "kv_packing": 4,
+      "lkv_dim": 256,
+      "max_model_len": 9216,
+      "max_num_seqs": 64,
+      "num_index_heads": 64,
+      "num_kv_pages_per_block": [
+        2,
+        2,
+        2
+      ],
+      "num_queries_per_block": [
+        1,
+        128,
+        128
+      ],
+      "num_tokens": 1024,
+      "page_size": 1024
+    },
+    "derived": {
+      "num_pages": 576,
+      "num_sublanes_total": 80,
+      "pages_per_seq": 9
+    },
+    "hlo": {
+      "prod_early_exit_False": {
+        "big_copy": false,
+        "big_copy_MiB": 0.0,
+        "big_copy_count": 0,
+        "big_copy_detail": [],
+        "big_fusion_MiB": 0.0,
+        "big_fusion_count": 0,
+        "data_format_call": false,
+        "data_format_line_count": 0,
+        "data_format_lines": [],
+        "inventory": [
+          {
+            "MiB": 48.004,
+            "comp": "called_computation",
+            "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+            "opcode": "call-start",
+            "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+          },
+          {
+            "MiB": 48.004,
+            "comp": "main.12",
+            "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+            "opcode": "call-start",
+            "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "main.12",
+            "name": "broadcast_in_dim.19",
+            "opcode": "broadcast",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "main.12",
+            "name": "StreamIdxTC-d-bq_1-bkvp_2.2",
+            "opcode": "custom-call",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "main.12",
+            "name": "StreamIdxTC-d-bq_1-bkvp_2.3",
+            "opcode": "custom-call",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "main.12",
+            "name": "StreamIdxTC-m-bq_128-bkvp_2.1",
+            "opcode": "custom-call",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "main.12",
+            "name": "bitcast_convert_type.3",
+            "opcode": "bitcast-convert",
+            "shape": "s32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "called_computation.1",
+            "name": "sc_topk_direct_b1024_n10240_k2048.6",
+            "opcode": "custom-call",
+            "shape": "s32[2097152]{0:T(1024)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "called_computation",
+            "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+            "opcode": "call-done",
+            "shape": "s32[2097152]{0:T(1024)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "main.12",
+            "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+            "opcode": "call-done",
+            "shape": "s32[2097152]{0:T(1024)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "main.12",
+            "name": "reshape.1",
+            "opcode": "reshape",
+            "shape": "s32[1024,2048]{1,0:T(8,128)}"
+          }
+        ],
+        "kernel_calls": [
+          "sc_topk_direct_b1024_n10240_k2048.6",
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+        ],
+        "layout_changing_big_copy": false,
+        "layout_changing_big_copy_count": 0,
+        "lines": 1482,
+        "materialized_MiB": 0.0,
+        "shipping_shape_kernel_present": true
+      },
+      "prod_early_exit_True": {
+        "big_copy": false,
+        "big_copy_MiB": 0.0,
+        "big_copy_count": 0,
+        "big_copy_detail": [],
+        "big_fusion_MiB": 8.0,
+        "big_fusion_count": 1,
+        "data_format_call": false,
+        "data_format_line_count": 0,
+        "data_format_lines": [],
+        "inventory": [
+          {
+            "MiB": 48.004,
+            "comp": "called_computation",
+            "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start",
+            "opcode": "call-start",
+            "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}), s32[2097152]{0:T(1024)}, u32[]{:S(8)})"
+          },
+          {
+            "MiB": 48.004,
+            "comp": "region_1.13",
+            "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+            "opcode": "call-start",
+            "shape": "((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)})"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "region_1.13",
+            "name": "broadcast.13",
+            "opcode": "broadcast",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "region_1.13",
+            "name": "StreamIdxTC-d-bq_1-bkvp_2.2",
+            "opcode": "custom-call",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "region_1.13",
+            "name": "StreamIdxTC-d-bq_1-bkvp_2.3",
+            "opcode": "custom-call",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "region_1.13",
+            "name": "StreamIdxTC-m-bq_128-bkvp_2.1",
+            "opcode": "custom-call",
+            "shape": "f32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 40.0,
+            "comp": "region_1.13",
+            "name": "bitcast_convert_type.3",
+            "opcode": "bitcast-convert",
+            "shape": "s32[1024,80,128]{2,1,0:T(8,128)}"
+          },
+          {
+            "MiB": 16.0,
+            "comp": "main.23",
+            "name": "copy-start.2",
+            "opcode": "copy-start",
+            "shape": "(s32[1024,2048]{1,0:T(8,128)}, s32[1024,2048]{1,0:T(8,128)S(1)}, u32[]{:S(2)})"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "called_computation.1",
+            "name": "sc_topk_direct_b1024_n10240_k2048.6",
+            "opcode": "custom-call",
+            "shape": "s32[2097152]{0:T(1024)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "called_computation",
+            "name": "sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done",
+            "opcode": "call-done",
+            "shape": "s32[2097152]{0:T(1024)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "region_1.13",
+            "name": "sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done",
+            "opcode": "call-done",
+            "shape": "s32[2097152]{0:T(1024)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "region_1.13",
+            "name": "reshape.1",
+            "opcode": "reshape",
+            "shape": "s32[1024,2048]{1,0:T(8,128)S(1)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "fused_computation.18",
+            "name": "iota.23",
+            "opcode": "iota",
+            "shape": "s32[1024,2048]{1,0:T(8,128)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "fused_computation.18",
+            "name": "le.1",
+            "opcode": "broadcast",
+            "shape": "s32[1024,2048]{1,0:T(8,128)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "fused_computation.18",
+            "name": "broadcast_in_dim.36",
+            "opcode": "broadcast",
+            "shape": "s32[1024,2048]{1,0:T(8,128)}"
+          },
+          {
+            "MiB": 8.0,
+            "comp": "fused_computation.18",
+            "name": "select_n.69",
+            "opcode": "select",
+            "shape": "s32[1024,2048]{1,0:T(8,128)S(1)}"
+          }
+        ],
+        "kernel_calls": [
+          "sc_topk_direct_b1024_n10240_k2048.6",
+          "prepare_start_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start",
+          "prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start"
+        ],
+        "layout_changing_big_copy": false,
+        "layout_changing_big_copy_count": 0,
+        "lines": 3301,
+        "materialized_MiB": 8.0,
+        "shipping_shape_kernel_present": true
+      }
+    },
+    "sparsecore_topk_call_lines": [
+      831
+    ],
+    "streamindex_topk_def_len": 357,
+    "streamindex_topk_def_line": 509
+  },
+  "q2": {
+    "A0_donate": {
+      "MiB_removed": 0.0,
+      "saving_us": -1.5574500139337033,
+      "us_per_MiB_removed": null,
+      "what": "donation"
+    },
+    "A0_flatin": {
+      "MiB_removed": 80.0,
+      "saving_us": 60.4155251494376,
+      "us_per_MiB_removed": 0.75519406436797,
+      "what": "input relayout"
+    },
+    "A0_flatio": {
+      "MiB_removed": 80.0,
+      "saving_us": 70.5110502167372,
+      "us_per_MiB_removed": 0.881388127709215,
+      "what": "both"
+    },
+    "A0_flatout": {
+      "MiB_removed": 0.0,
+      "saving_us": 10.0069501058897,
+      "us_per_MiB_removed": null,
+      "what": "output relayout"
+    },
+    "A0_fmtin": {
+      "MiB_removed": 0.0,
+      "saving_us": 0.04907524271402508,
+      "us_per_MiB_removed": null,
+      "what": "AUTO in-layout (moved, not deleted)"
+    },
+    "A0_s32in": {
+      "MiB_removed": 40.0,
+      "saving_us": 26.251000235788524,
+      "us_per_MiB_removed": 0.6562750058947131,
+      "what": "bitcast-convert only"
+    },
+    "additivity_ratio": 0.9987438144640075,
+    "residual_after_both": 5.385283050903428
+  },
+  "q3": {
+    "MiB_removed": 0.0,
+    "measured_saving_us": 10.0069501058897,
+    "output_side_copies": {
+      "A0_base": [],
+      "A0_flatout": []
+    },
+    "p10_out_slope_us_per_MiB": 1.118,
+    "p10_predicted_at_8MiB": 8.944
+  },
+  "raw": {
+    "#null_a": {
+      "hostbound_pct": 25.32899684689682,
+      "suspect": false,
+      "us": 14.545675003319047,
+      "us_mean": 18.549905507825315,
+      "us_median": 17.058775119949132,
+      "us_unpaired": 16.412249897257425
+    },
+    "#null_b": {
+      "hostbound_pct": 26.004437705609917,
+      "suspect": false,
+      "us": 14.619549983763136,
+      "us_mean": 16.29399452617185,
+      "us_median": 15.857499965932222,
+      "us_unpaired": 16.67752549110446
+    },
+    "#null_c": {
+      "hostbound_pct": 24.148528341458867,
+      "suspect": false,
+      "us": 15.083975449670106,
+      "us_mean": 18.0822002423358,
+      "us_median": 17.498700253781863,
+      "us_unpaired": 17.165500321425498
+    },
+    "A0_base": {
+      "hostbound_pct": 3.007170280208513,
+      "suspect": false,
+      "us": 91.99417509080376,
+      "us_mean": 93.42279170394048,
+      "us_median": 92.70132504752837,
+      "us_unpaired": 92.19920029863715
+    },
+    "A0_donate": {
+      "hostbound_pct": 6.087567152310395,
+      "suspect": false,
+      "us": 90.92847503779922,
+      "us_mean": 94.17644169944752,
+      "us_median": 94.25877506146207,
+      "us_unpaired": 92.83665021939669
+    },
+    "A0_flatin": {
+      "hostbound_pct": 11.112489890986197,
+      "suspect": false,
+      "us": 30.64752454520203,
+      "us_mean": 32.16688880153621,
+      "us_median": 32.28579989809077,
+      "us_unpaired": 32.55037481721956
+    },
+    "A0_flatio": {
+      "hostbound_pct": 20.42654647858941,
+      "suspect": false,
+      "us": 19.95055026782211,
+      "us_mean": 22.4158583377074,
+      "us_median": 22.190274830791168,
+      "us_unpaired": 22.563974926015362
+    },
+    "A0_flatout": {
+      "hostbound_pct": 4.006075259220298,
+      "suspect": false,
+      "us": 81.7400748928776,
+      "us_mean": 82.72954437416047,
+      "us_median": 82.69437494163867,
+      "us_unpaired": 82.70015023299493
+    },
+    "A0_fmtin": {
+      "hostbound_pct": 3.0960248563823747,
+      "suspect": false,
+      "us": 92.11854994646274,
+      "us_mean": 92.89970281921948,
+      "us_median": 92.65224980481435,
+      "us_unpaired": 92.61727464036085
+    },
+    "A0_s32in": {
+      "hostbound_pct": 4.702246035608427,
+      "suspect": false,
+      "us": 65.43912531924434,
+      "us_mean": 66.5097222129892,
+      "us_median": 66.45032481173985,
+      "us_unpaired": 66.9578501401702
+    },
+    "B_base": {
+      "hostbound_pct": 1.0407137763349474,
+      "suspect": false,
+      "us": 326.35909992677625,
+      "us_mean": 326.88086943784987,
+      "us_median": 326.7697749834042,
+      "us_unpaired": 327.13757500459906
+    }
+  },
+  "rounds": 9,
+  "rows": {
+    "A0_base": {
+      "big_copy_MiB": 40.0,
+      "big_fusion_MiB": 40.0,
+      "data_format_call": true,
+      "delta_vs_A0_base": 0.0,
+      "layout_changing_big_copy": true,
+      "materialized_MiB": 80.0,
+      "note": "probes/09 arm called verbatim: f32[b,n] jit entry",
+      "residual": 75.89633326764063,
+      "us_median": 92.70132504752837
+    },
+    "A0_donate": {
+      "big_copy_MiB": 40.0,
+      "big_fusion_MiB": 40.0,
+      "data_format_call": true,
+      "delta_vs_A0_base": 1.5574500139337033,
+      "layout_changing_big_copy": true,
+      "materialized_MiB": 80.0,
+      "note": "donate_argnums=(0,); the donated buffer is returned and rethreaded",
+      "residual": 77.45378328157433,
+      "us_median": 94.25877506146207
+    },
+    "A0_flatin": {
+      "big_copy_MiB": 0.0,
+      "big_fusion_MiB": 0.0,
+      "data_format_call": false,
+      "delta_vs_A0_base": -60.4155251494376,
+      "layout_changing_big_copy": false,
+      "materialized_MiB": 0.0,
+      "note": "jit entry takes s32[b*n] flat",
+      "residual": 15.480808118203033,
+      "us_median": 32.28579989809077
+    },
+    "A0_flatio": {
+      "big_copy_MiB": 0.0,
+      "big_fusion_MiB": 0.0,
+      "data_format_call": false,
+      "delta_vs_A0_base": -70.5110502167372,
+      "layout_changing_big_copy": false,
+      "materialized_MiB": 0.0,
+      "note": "flat s32[b*n] in AND flat s32[b*k] out",
+      "residual": 5.385283050903428,
+      "us_median": 22.190274830791168
+    },
+    "A0_flatout": {
+      "big_copy_MiB": 40.0,
+      "big_fusion_MiB": 40.0,
+      "data_format_call": true,
+      "delta_vs_A0_base": -10.0069501058897,
+      "layout_changing_big_copy": true,
+      "materialized_MiB": 80.0,
+      "note": "jit returns the flat s32[b*k]",
+      "residual": 65.88938316175093,
+      "us_median": 82.69437494163867
+    },
+    "A0_fmtin": {
+      "big_copy_MiB": 40.0,
+      "big_fusion_MiB": 40.0,
+      "data_format_call": true,
+      "delta_vs_A0_base": -0.04907524271402508,
+      "layout_changing_big_copy": true,
+      "materialized_MiB": 80.0,
+      "note": "AUTO in-layout, committed OUTSIDE the timed region (moves the relayout, does not delete it)",
+      "residual": 75.8472580249266,
+      "us_median": 92.65224980481435
+    },
+    "A0_s32in": {
+      "big_copy_MiB": 40.0,
+      "big_fusion_MiB": 0.0,
+      "data_format_call": true,
+      "delta_vs_A0_base": -26.251000235788524,
+      "layout_changing_big_copy": true,
+      "materialized_MiB": 40.0,
+      "note": "jit entry takes s32[b,n]; bitcast-convert folds away",
+      "residual": 49.645333031852104,
+      "us_median": 66.45032481173985
+    },
+    "B_base": {
+      "big_copy_MiB": 40.0,
+      "big_fusion_MiB": 40.0,
+      "data_format_call": true,
+      "delta_vs_A0_base": 234.06844993587583,
+      "layout_changing_big_copy": true,
+      "materialized_MiB": 80.0,
+      "note": "probes/09 arm called verbatim: f32[b,n] jit entry",
+      "residual": 309.96478320351645,
+      "us_median": 326.7697749834042
+    }
+  },
+  "seed": 20260904,
+  "shape": {
+    "b": 1024,
+    "k": 2048,
+    "n": 10240
+  },
+  "subject_md5": "44353b347c96e0eedbd742c710d4540a",
+  "subject_path": "/root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+  "us_median": {
+    "#null_a": 17.058775119949132,
+    "#null_b": 15.857499965932222,
+    "#null_c": 17.498700253781863,
+    "A0_base": 92.70132504752837,
+    "A0_donate": 94.25877506146207,
+    "A0_flatin": 32.28579989809077,
+    "A0_flatio": 22.190274830791168,
+    "A0_flatout": 82.69437494163867,
+    "A0_fmtin": 92.65224980481435,
+    "A0_s32in": 66.45032481173985,
+    "B_base": 326.7697749834042
+  }
+}

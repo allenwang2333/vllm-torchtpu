@@ -1,0 +1,160 @@
+### CMD 1: probe.py --dry-run --subject /tmp/p11-src/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+subject: /tmp/p11-src/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+  anchor SRC_LEVELS     count=1 OK
+  anchor ANCHOR_WALK    count=1 OK
+  anchor SRC_CVT        count=1 OK
+  anchor SRC_HIST       count=1 OK
+  anchor SRC_EMIT       count=1 OK
+  anchor SRC_ZERO_PRIV  count=1 OK
+  anchor SRC_FOLD       count=1 OK
+  anchor SRC_SCAN       count=1 OK
+  anchor SRC_FIND       count=1 OK
+  anchor SRC_DMA        count=1 OK
+  anchor SRC_FILL       count=1 OK
+  anchor SRC_OUTDMA     count=1 OK
+  anchor SRC_WAVES      count=1 OK
+ANCHOR_GATE_OK
+  patch A0  src_md5=547031a2fd48545550d864b008d817ff vs probes/09 547031a2fd48545550d864b008d817ff OK
+  patch B   src_md5=fd46ef14b38fd7781885e73d0ca33965 vs probes/09 fd46ef14b38fd7781885e73d0ca33965 OK
+P09_SRC_GATE_OK
+  arm B_base      patch=B   compiles OK  changed_lines_vs_B= 0  src_md5=fd46ef14b38fd7781885e73d0ca33965
+  arm A0_base     patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_s32in    patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatin   patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatout  patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_flatio   patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_fmtin    patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+  arm A0_donate   patch=A0  compiles OK  changed_lines_vs_B=21  src_md5=547031a2fd48545550d864b008d817ff
+COMPILE_GATE_OK
+
+--- derived shape facts ---
+  b=1024 n=10240 k=2048 P=1 n_p=10240 slice=10240 waves=32 two_stage=False in_MiB=40.000 out_MiB=8.000
+SHAPE_GATE_OK
+
+--- Q1 aval arithmetic (host-side) ---
+  pages_per_seq=9  num_sublanes_total=80  n = 10240
+Q1_SHAPE_GATE_OK
+### rc=0
+
+### CMD 2: probe.py --self-test (CPU, stubbed kernels)
+fixture: /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/11-relayout-provenance/fixture_hlo.txt md5=330a0780d5a4acbddd2897514174218b
+
+  === HLO REPORT: FIXTURE ===
+  module 26 lines; kernel custom-calls: ['sc_topk_direct_b1024_n10240_k2048.6']
+  sparse-core-data-format-call present : True  (6 lines)
+  layout-changing copy >=1 MiB present : True  (2 of 2 big copies)
+  materialized >=1 MiB: copies 48.000 MiB + fusions 40.000 MiB = 88.000 MiB (~176.0 MiB of traffic)
+    [df] %sparse-core-data-format-call.cloned.1 (param_0.6: s32[128,80,8,128]) -> s32[128,80,8,128] {
+    [df] %prepare_start_sparse-core-data-format-call.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart"
+    [df] %prepare_done_sparse-core-data-format-call.cloned.1.call-start = token[] custom-call(%prepare_start_sparse-core-data-format-call.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone"
+    [df] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]) async-start(%bitcast-convert_bitcast_fusion), calls=%sparse-core-data-format-call.cloned.1
+    [df] %sparse-core-data-format-call.cloned.1.call-done = s32[128,80,8,128]{3,1,2,0:T(8,128)} async-done(%sparse-core-data-format-call.cloned.1.call-start)
+    [df] %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+    [copy] copy.3 in %sparse-core-data-format-call.cloned.1  40.000 MiB  layout 3,2,1,0:T(8,128) -> 3,1,2,0:T(8,128)  changes=True
+           operand %param_0.6 = s32[128,80,8,128]{3,2,1,0:T(8,128)}
+           output    s32[128,80,8,128]{3,1,2,0:T(8,128)}
+    [copy] copy.9 in %main.2  8.000 MiB  layout 1,0:T(1024) -> 1,0:T(8,128)  changes=True
+           operand %bitcast.7 = s32[1024,2048]{1,0:T(1024)}
+           output    s32[1024,2048]{1,0:T(8,128)}
+    inventory (>=1 MiB, async wrappers excluded):
+         40.000 MiB  bitcast-convert  %bitcast_convert_type.0                               in %fused_computation                  s32[1024,10240]{1,0:T(8,128)}
+         40.000 MiB  copy             %copy.3                                               in %sparse-core-data-format-call.clone s32[128,80,8,128]{3,1,2,0:T(8,128)}
+         40.000 MiB  fusion           %bitcast-convert_bitcast_fusion                       in %main.2                             s32[128,80,8,128]{3,2,1,0:T(8,128)}
+          8.000 MiB  custom-call      %sc_topk_direct_b1024_n10240_k2048.6                  in %main.2                             s32[2097152]{0:T(1024)}
+          8.000 MiB  copy             %copy.9                                               in %main.2                             s32[1024,2048]{1,0:T(8,128)}
+    operand walk from ['sc_topk_direct_b1024_n10240_k2048.6'] (names resolved, not grepped):
+      %sc_topk_direct_b1024_n10240_k2048.6                      custom-call      s32[2097152]{0:T(1024)}
+      %bitcast.3                                                bitcast          s32[10485760]{0:T(1024)}
+      %row_lengths.1                                            parameter        s32[1024]{0:T(1024)}
+      %sparse-core-data-format-call.cloned.1.call-done          async-done       s32[128,80,8,128]{3,1,2,0:T(8,128)}
+      %sparse-core-data-format-call.cloned.1.call-start         async-start      ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u
+      %copy.3                                                   copy             s32[128,80,8,128]{3,1,2,0:T(8,128)}
+      %bitcast-convert_bitcast_fusion                           fusion           s32[128,80,8,128]{3,2,1,0:T(8,128)}
+      %param_0.6                                                parameter        s32[128,80,8,128]{3,2,1,0:T(8,128)}
+      %bitcast.2                                                bitcast          s32[128,80,8,128]{3,2,1,0:T(8,128)}
+      %scores.1                                                 parameter        f32[1024,10240]{1,0:T(8,128)}
+      %bitcast_convert_type.0                                   bitcast-convert  s32[1024,10240]{1,0:T(8,128)}
+      %param_0.1                                                parameter        f32[1024,10240]{1,0:T(8,128)}
+    ENTRY ENTRY %main.2 (scores.1: f32[1024,10240], row_lengths.1: s32[1024]) -> s32[1024,2048] {
+HLO_PARSER_GATE_OK  (fixture: df=True, layout copy=True, 88.000 MiB materialized, kernel named at the shipping shape)
+HLO_PARSER_GATE_OK  (stripped fixture: df=False, copies=False, 0.000 MiB)
+
+--- build_thunks on CPU with stubbed kernels ---
+  layout API probe: {"jax": "0.10.2", "module": "jax.experimental.layout", "exports": ["Format", "Layout", "with_layout_constraint"]}
+    Format=<class 'jax._src.layout.Format'> Layout=<class 'jax._src.layout.Layout'> AUTO=AUTO
+    AUTO-chosen input formats: (Format(layout=Layout(major_to_minor=(0, 1), tiling=(), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=CpuDevice(id=0), memory_kind=device)), Format(layout=Layout(major_to_minor=(0,), tiling=(), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=CpuDevice(id=0), memory_kind=device)))
+    default score format  : Format(layout=Layout(major_to_minor=(0, 1), tiling=(), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=CpuDevice(id=0), memory_kind=device))
+    committed score format: Format(layout=Layout(major_to_minor=(0, 1), tiling=(), sub_byte_element_size_in_bits=0), sharding=SingleDeviceSharding(device=CpuDevice(id=0), memory_kind=device))
+  !! A0_fmtin: XLA-AUTO chose the SAME layout the buffer already had -- this arm is a no-op by construction and its HLO will match A0_base. Report it as such, not as a null result about relayout.
+  built 8/8 arms; missing=none
+  B_base      ok  out(8, 16)  matches_first=True
+              hlo   79 lines  df=False bigcopy=False mat=0.0
+  A0_base     ok  out(8, 16)  matches_first=True
+              hlo   79 lines  df=False bigcopy=False mat=0.0
+  A0_s32in    ok  out(8, 16)  matches_first=True
+              hlo   94 lines  df=False bigcopy=False mat=0.0
+  A0_flatin   ok  out(8, 16)  matches_first=True
+              hlo   97 lines  df=False bigcopy=False mat=0.0
+  A0_flatout  ok  out(8, 16)  matches_first=True
+              hlo   89 lines  df=False bigcopy=False mat=0.0
+  A0_flatio   ok  out(8, 16)  matches_first=True
+              hlo  100 lines  df=False bigcopy=False mat=0.0
+  A0_fmtin    ok  out(8, 16)  matches_first=True
+              hlo   86 lines  df=False bigcopy=False mat=0.0
+  A0_donate   ok  out(8, 16)  matches_first=True
+              hlo   88 lines  df=False bigcopy=False mat=0.0
+  pool of 11 ran; us_median sample: {'B_base': 15.24, 'A0_base': 13.28, 'A0_s32in': 11.55}
+BUILD_THUNKS_GATE_OK
+
+--- results ---
+  null floor (mean of 3):     16.733   samples 17.200 16.400 16.600   spread 0.800   (probes/10 spread 0.770)
+  EVERY delta below is quoted against that spread as the resolution floor.
+
+  arm          us_median         us  host%  residual d(A0_base)  dfmt?  lcopy?   matMiB  note
+  B_base         326.500    326.100    3.0   309.767    234.500   True    True    88.00  cross-job control (p08 327.166 / p09 326.782 / p10 326.732
+  A0_base         92.000     91.600    3.0    75.267      0.000   True    True    88.00  cross-job control (p09 92.231 / p10 92.118)
+  A0_s32in        55.000     54.600    3.0    38.267    -37.000   True    True    88.00  s32[b,n] entry: bitcast-convert has nothing to do
+  A0_flatin       25.000     24.600    3.0     8.267    -67.000  False   False     0.00  s32[b*n] entry: already in the custom call's layout
+  A0_flatout      83.000     82.600    3.0    66.267     -9.000   True    True    88.00  flat s32[b*k] result: output relayout deleted
+  A0_flatio       17.500     17.100    3.0     0.767    -74.500  False   False     0.00  flat in AND flat out
+  A0_fmtin        26.000     25.600    3.0     9.267    -66.000  False   False     0.00  AUTO input layout, committed OUTSIDE the timed region
+  A0_donate       92.400     92.000    3.0    75.667      0.400   True    True    88.00  donate_argnums on the score buffer (aliasing test)
+  null #null_a hostbound 27.0% -- a null is host-dominated by construction; not flagged.
+  null #null_b hostbound 27.0% -- a null is host-dominated by construction; not flagged.
+  null #null_c hostbound 27.0% -- a null is host-dominated by construction; not flagged.
+
+--- arm activation (an arm that did not delete what its name says is a NULL, not a win) ---
+  A0_s32in    NO-DELETION   materialized 88.0 vs base 88.0 MiB; df_call still present=True, layout copy still present=True; delta -37.000 us
+  !! A0_s32in moved -37.000 us but its HLO still materializes 88.0 MiB -- report as a NULL, not a win.
+  A0_flatin   DELETED-WORK  materialized 0.0 vs base 88.0 MiB; df_call still present=False, layout copy still present=False; delta -67.000 us
+  A0_flatout  NO-DELETION   materialized 88.0 vs base 88.0 MiB; df_call still present=True, layout copy still present=True; delta -9.000 us
+  !! A0_flatout moved -9.000 us but its HLO still materializes 88.0 MiB -- report as a NULL, not a win.
+  A0_flatio   DELETED-WORK  materialized 0.0 vs base 88.0 MiB; df_call still present=False, layout copy still present=False; delta -74.500 us
+  A0_fmtin    DELETED-WORK  materialized 0.0 vs base 88.0 MiB; df_call still present=False, layout copy still present=False; delta -66.000 us
+  A0_donate   NO-DELETION   materialized 88.0 vs base 88.0 MiB; df_call still present=True, layout copy still present=True; delta +0.400 us
+
+--- Q2: does deleting the relayout remove the residual? ---
+  A0_flatin   input relayout                       saving    67.000 us   MiB removed    88.00     0.7614 us/MiB
+  A0_flatout  output relayout                      saving     9.000 us   MiB removed     0.00        n/a us/MiB
+  A0_flatio   both                                 saving    74.500 us   MiB removed    88.00     0.8466 us/MiB
+  A0_s32in    bitcast-convert only                 saving    37.000 us   MiB removed     0.00        n/a us/MiB
+  A0_fmtin    AUTO in-layout (moved, not deleted)  saving    66.000 us   MiB removed    88.00     0.7500 us/MiB
+  A0_donate   donation                             saving    -0.400 us   MiB removed     0.00        n/a us/MiB
+  additivity: (flatin + flatout) / flatio = 76.000 / 74.500 = 1.020   -- probes/08 learned that single-region deletion arms can OVERLAP; a ratio far from 1 means they do.
+  residual left after deleting both: 0.767 us (was 75.267). probes/10's byte model predicted 81.928 us for the two buffers together.
+
+--- Q3: the output-byte term ---
+  A0_base     output-side big copies (<=12 MiB): [('copy.9', 8.0, '1,0:T(1024) -> 1,0:T(8,128)')]
+  A0_flatout  output-side big copies (<=12 MiB): [('copy.9', 8.0, '1,0:T(1024) -> 1,0:T(8,128)')]
+  probes/10 read 1.118 us/MiB on the output axis, i.e. 8.944 us at the base shape.
+
+--- cross-job controls ---
+  B_base     326.500  vs p10  326.732 -> -0.07%
+  B_base     326.500  vs p09  326.782 -> -0.09%
+  B_base     326.500  vs p08  327.166 -> -0.20%
+  A0_base     92.000  vs p10   92.118 -> -0.13%
+  A0_base residual    75.267  vs p10   75.349 -> -0.11%
+
+REPORT_GATE_OK  json round-trips at /tmp/p11-selftest/selftest.json (31626 bytes)
+SELF_TEST_OK
+### rc=0
