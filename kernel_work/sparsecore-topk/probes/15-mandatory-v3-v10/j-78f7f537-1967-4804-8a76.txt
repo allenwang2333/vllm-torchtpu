@@ -1,0 +1,209 @@
+44353b347c96e0eedbd742c710d4540a  /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+0650be443c9384c51553536016d4020b  /root/probe15/probe.py
+c8f32c31ce0d8d68bce911d28fc2420f  /root/probe15/level_sim.py
+08375d7068365e1a776c58fef09cd6d0  /root/probe15/glm_dsa_block_bench.py
+MAP_GATE_OK
+=== DRY RUN (host only) ===
+level_sim: N=10240 K=2048 HEAD_DIM=128 N_HEAD=64 KV_ROWS=9216 SEED=20260910
+  shape: [32, 10240]
+  finite_frac: 1.0
+  neg_frac_pop: 0.5192901611328125
+  neg_frac_row0: 0.2763671875
+  neg_frac_perrow_min_med_max: [0.09521484375, 0.536572265625, 0.9060546875]
+  exact_zeros: 0
+  distinct_frac_row0: 1.0
+  never_bits_hits: 0
+  realized_density_d004: 0.00616455078125
+  realized_density_d05: 0.052789306640625
+  realized_density_d15: 0.1488800048828125
+  realized_density_d30: 0.3025146484375
+  realized_density_d45: 0.450439453125
+  realized_density_d65: 0.6498260498046875
+  realized_density_cnt: 0.4807098388671875
+  probes/13 row-0 reproduction: neg%=81.677 (README.md:81 says 81.7)
+arms planned: 33
+  A_p0
+  A_cvt_p1
+  A_cvt_p2
+  A_cvt_p4
+  A_scat_p1
+  A_scat_p2
+  A_scat_p4
+  A_cnt_p1
+  A_cnt_p2
+  A_cnt_p4
+  A_cntv_p1
+  A_cntv_p2
+  A_cntv_p4
+  A_cnt_p2#rep
+  A_scat_p2#rep
+  A_cvt_p1#flatin
+  B_ns_d004
+  B_st_d004
+  B_ns_d05
+  B_st_d05
+  B_ns_d15
+  B_st_d15
+  B_ns_d30
+  B_st_d30
+  B_ns_d45
+  B_st_d45
+  B_ns_d65
+  B_st_d65
+  B_ns_d30_p2
+  B_st_d30_p2
+  B_st2_d30
+  B_st2_d65
+  B_st_d30#rep
+DRY_GATE_OK
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789064639.790150      83 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+FROZEN INSTRUMENT glm_dsa_block_bench.py md5=08375d7068365e1a776c58fef09cd6d0  REPS_LO=20 REPS_HI=60
+jax 0.10.2  devices=[TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), TpuDevice(id=1, process_index=0, coords=(0,0,0), core_on_chip=1), TpuDevice(id=2, process_index=0, coords=(1,0,0), core_on_chip=0), TpuDevice(id=3, process_index=0, coords=(1,0,0), core_on_chip=1), TpuDevice(id=4, process_index=0, coords=(0,1,0), core_on_chip=0), TpuDevice(id=5, process_index=0, coords=(0,1,0), core_on_chip=1), TpuDevice(id=6, process_index=0, coords=(1,1,0), core_on_chip=0), TpuDevice(id=7, process_index=0, coords=(1,1,0), core_on_chip=1)]
+scores built in 3.6s
+  shape: [1024, 10240]
+  finite_frac: 1.0
+  neg_frac_pop: 0.4957697868347168
+  neg_frac_row0: 0.2763671875
+  neg_frac_perrow_min_med_max: [0.0078125, 0.504541015625, 0.9912109375]
+  exact_zeros: 0
+  distinct_frac_row0: 1.0
+  never_bits_hits: 0
+  realized_density_d004: 0.006557559967041016
+  realized_density_d05: 0.05297584533691406
+  realized_density_d15: 0.14987421035766602
+  realized_density_d30: 0.30272369384765624
+  realized_density_d45: 0.4507643699645996
+  realized_density_d65: 0.6494138717651368
+  realized_density_cnt: 0.5042302131652832
+entry array: (1024, 80, 128) float32
+
+=== BUILD + COMPILE ===
+  A_p0                 ok      0.2s  len(HLO)=11350
+  A_cvt_p1             ok      0.2s  len(HLO)=12518
+  A_cvt_p2             ok      0.2s  len(HLO)=12726
+  A_cvt_p4             ok      0.3s  len(HLO)=13142
+  A_scat_p1            ok      0.2s  len(HLO)=12978
+  A_scat_p2            ok      0.3s  len(HLO)=13222
+  A_scat_p4            ok      0.3s  len(HLO)=13718
+  A_cnt_p1             ok      0.2s  len(HLO)=13018
+  A_cnt_p2             ok      0.3s  len(HLO)=13266
+  A_cnt_p4             ok      0.3s  len(HLO)=13774
+  A_cntv_p1            ok      0.2s  len(HLO)=12618
+  A_cntv_p2            ok      0.2s  len(HLO)=12846
+  A_cntv_p4            ok      0.3s  len(HLO)=13306
+  A_cnt_p2#rep         ok      0.3s  len(HLO)=13266
+  A_scat_p2#rep        ok      0.3s  len(HLO)=13222
+  A_cvt_p1#flatin      ok      0.2s  len(HLO)=11338
+  B_ns_d004            ok      0.3s  len(HLO)=14314
+  B_st_d004            ok      0.3s  len(HLO)=14482
+  B_ns_d05             ok      0.3s  len(HLO)=14346
+  B_st_d05             ok      0.3s  len(HLO)=14514
+  B_ns_d15             ok      0.2s  len(HLO)=14346
+  B_st_d15             ok      0.3s  len(HLO)=14514
+  B_ns_d30             ok      0.3s  len(HLO)=14346
+  B_st_d30             ok      0.3s  len(HLO)=14518
+  B_ns_d45             ok      0.3s  len(HLO)=14366
+  B_st_d45             ok      0.3s  len(HLO)=14534
+  B_ns_d65             ok      0.3s  len(HLO)=14366
+  B_st_d65             ok      0.3s  len(HLO)=14534
+  B_ns_d30_p2          ok      0.3s  len(HLO)=14858
+  B_st_d30_p2          ok      0.3s  len(HLO)=15070
+  B_st2_d30            ok      0.3s  len(HLO)=14598
+  B_st2_d65            ok      0.3s  len(HLO)=14618
+  B_st_d30#rep         ok      0.3s  len(HLO)=14518
+
+=== HLO STRUCTURAL GATE ===
+  len(HLO) st-ns @ d004: +168  (ns=14314 st=14482)
+  len(HLO) st-ns @ d05: +168  (ns=14346 st=14514)
+  len(HLO) st-ns @ d15: +168  (ns=14346 st=14514)
+  len(HLO) st-ns @ d30: +172  (ns=14346 st=14518)
+  len(HLO) st-ns @ d45: +168  (ns=14366 st=14534)
+  len(HLO) st-ns @ d65: +168  (ns=14366 st=14534)
+  st-ns HLO delta identical across densities: False  values=[168, 172]
+  st != ns everywhere: True
+
+=== ENTRY HLO GATE ===
+  sparse_core_data_format_call: 0
+  copy_on_score_operand: []
+  bitcast_lines: ['%bitcast.1 = s32[10485760]{0:T(1024)} bitcast(%bitcast_convert_type.1)', '%p15_cvt_p1_t0_s0.3.cloned.1.call-start = ((s32[10485760]{0:T(1024)}, token[]), s32[16]{0:T(128)}) call-start(%bitcast.1, %prepare_done_p15_cvt_p1_t0_s0.3.cloned.1.call-start), async_execution_thread=']
+  fusion_on_scores: []
+  clean: True
+
+=== MEASURE  36 arms x 9 rounds ===
+  dispatch floor: 35.18 us/call
+  measured in 4.8s
+
+  arm                    us_median          us     us_mean  hostbnd%  suspect
+  A_p0                      82.316      80.547      83.380      3.72  False
+  A_cvt_p1                 101.677     101.362     102.757      2.69  False
+  A_cvt_p2                 122.297     122.079     123.332      2.13  False
+  A_cvt_p4                 163.377     163.043     164.756      1.73  False
+  A_scat_p1                187.762      82.016     177.612     56.84  False
+  A_scat_p2                296.425     295.806     297.956      1.17  False
+  A_scat_p4                514.519     510.039     514.443      1.34  False
+  A_cnt_p1                 101.747     101.341     101.874      2.87  False
+  A_cnt_p2                 123.149     122.421     130.278      2.31  False
+  A_cnt_p4                 164.683     159.749     165.189      4.52  False
+  A_cntv_p1                101.452      95.525     101.702      8.08  False
+  A_cntv_p2                121.948     121.589     122.520      2.23  False
+  A_cntv_p4                162.818     162.407     164.079      1.95  False
+  A_cnt_p2#rep             122.934     122.016     124.098      2.67  False
+  A_scat_p2#rep            296.764     284.986     297.039      4.76  False
+  A_cvt_p1#flatin           75.934      75.098      77.168      3.64  False
+  B_ns_d004                192.954     189.521     192.070      1.45  False
+  B_st_d004                199.823     195.550     198.832      1.58  False
+  B_ns_d05                 189.576     189.136     191.019      1.56  False
+  B_st_d05                 196.450     186.730     196.801      6.15  False
+  B_ns_d15                 190.721     189.409     191.729      1.46  False
+  B_st_d15                 196.806     196.029     197.549      1.49  False
+  B_ns_d30                 190.459     189.341     199.046      1.51  False
+  B_st_d30                 198.362     196.469     199.483      1.38  False
+  B_ns_d45                 189.982     189.095     191.562      1.61  False
+  B_st_d45                 198.614     196.201     199.185      1.47  False
+  B_ns_d65                 193.262     190.249     193.922      1.30  False
+  B_st_d65                 196.948     164.674     195.235     17.43  False
+  B_ns_d30_p2              300.662     299.218     301.010      1.40  False
+  B_st_d30_p2              314.753     313.399     315.974      1.26  False
+  B_st2_d30                203.671     200.235     210.347      1.40  False
+  B_st2_d65                204.704     199.947     203.754      1.84  False
+  B_st_d30#rep             199.644     158.837     194.930     20.33  False
+  #null0                    28.642      24.532      28.485     19.88  False
+  #null1                    27.318      23.734      26.958     16.71  False
+  #null2                    28.887      26.399      29.109     11.15  False
+
+=== FLOORS ===
+  three nulls: [28.642, 27.318, 28.887]  spread 1.568 us   <- instrument floor
+  same-program replicate |A_cnt_p2 - A_cnt_p2#rep| = 0.214 us
+  same-program replicate |A_scat_p2 - A_scat_p2#rep| = 0.338 us
+  same-program replicate |B_st_d30 - B_st_d30#rep| = 1.282 us
+  RESOLUTION FLOOR (max same-program replicate) = 1.282 us
+
+=== PROBE A: pass-price ladder (slope over p in 0,1,2,4) ===
+  A_p0 (0 passes, DMA + launch only) = 82.316 us
+  kind             p1         p2         p4    us/pass       R2   ps/elem   x cvt  x scat
+  cvt         101.677    122.297    163.377     20.327  0.99985     1.939   1.000     nan
+  scat        187.762    296.425    514.519    108.217  0.99995    10.320   5.324   1.000
+  cnt         101.747    123.149    164.683     20.681  0.99978     1.972   1.017   0.191
+  cntv        101.452    121.948    162.818     20.192  0.99981     1.926   0.993   0.187
+
+=== PROBE B: marginal conditional store_compressed at L0 ===
+  density     t  realized       B_ns       B_st   marginal  d time %  x floor
+  d004        1    0.0066    192.954    199.823     +6.869    +3.560     5.36
+  d05        13    0.0530    189.576    196.450     +6.874    +3.626     5.36
+  d15        38    0.1499    190.721    196.806     +6.085    +3.190     4.75
+  d30        77    0.3027    190.459    198.362     +7.903    +4.149     6.16
+  d45       115    0.4508    189.982    198.614     +8.632    +4.544     6.73
+  d65       166    0.6494    193.262    196.948     +3.686    +1.907     2.87
+
+  marginal(density) = +7.340 + -2.474 * density  us   (R2 0.12854)
+  intercept +7.340 us = the per-vector ISSUE cost of a store that stores nothing
+  slope     -2.474 us per unit density = -0.2359 ps per stored element
+  p2 linearity @d30: +14.091 us
+  2nd store  @d30: +5.309 us
+  2nd store  @d65: +7.756 us
+
+wrote /cdk-outputs/outputs/j-78f7f537-1967-4804-8a76-tpu-job-0/j-78f7f537-1967-4804-8a76-tpu-job-0-0-lh6j4/command-container/probe15/probe15.json
+PROBE15_DONE
