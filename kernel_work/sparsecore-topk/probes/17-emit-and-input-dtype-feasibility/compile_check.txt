@@ -1,0 +1,349 @@
+Failed to find host bounds for accelerator type: WARNING: could not determine TPU accelerator type, please set env var `TPU_ACCELERATOR_TYPE` manually, otherwise libtpu.so may not properly initialize.
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789064143.934840 3129708 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1610, in _lower_jaxpr_to_func_common
+    func_op.verify()
+jaxlib.mlir._mlir_libs._mlir.ir.MLIRError: Verification failed:
+error: "dma_start:"("dma_start/dma_start"(callsite(callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_in_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":75:8 to :59)) at callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_in_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":75:8 to :59))))): 'tpu.enqueue_dma' op DMA source and target element type mismatch
+ note: "dma_start:"("dma_start/dma_start"(callsite(callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_in_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":75:8 to :59)) at callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_in_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":75:8 to :59))))): see current operation: "tpu.enqueue_dma"(%6, %arg4, %4) <{operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, strict_ordering = false}> : (memref<10240xf32, #tpu.memory_space<hbm>>, memref<10240xi32, #tpu.memory_space<vmem>>, memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) -> ()
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 95, in build
+    return pl.kernel(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 938, in wrapper
+    flat_outs = mpmd_map_p.bind(
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: jax._src.pallas.mosaic.error_handling.VerificationError: Pallas encountered an internal verification error. Please file a bug at https://github.com/jax-ml/jax/issues/new/choose. Error details: 'tpu.enqueue_dma' op DMA source and target element type mismatch
+ see current operation: "tpu.enqueue_dma"(%6, %arg4, %4) <{operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, strict_ordering = false}> : (memref<10240xf32, #tpu.memory_space<hbm>>, memref<10240xi32, #tpu.memory_space<vmem>>, memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) -> ()
+
+The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
+
+--------------------
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 199, in run
+    lowered = traced.lower(lowering_platforms=("tpu", ))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/stages.py", line 492, in lower
+    lowering = _resolve_and_lower(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1091, in _resolve_and_lower
+    return _pjit_lower(
+           ^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1264, in _pjit_lower
+    return pxla.lower_sharding_computation(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 1123, in lower_sharding_computation
+    tuple_args, shape_poly_state) = _cached_lowering_to_hlo(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 736, in _cached_lowering_to_hlo
+    lowering_result = mlir.lower_jaxpr_to_module(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1403, in lower_jaxpr_to_module
+    lower_jaxpr_to_fun(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1994, in lower_jaxpr_to_fun
+    out_vals, tokens_out = jaxpr_subcomp(
+                           ^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2166, in jaxpr_subcomp
+    cache_entry = _cached_lowering_miss(
+                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2235, in _cached_lowering_miss
+    cache_entry = _emit_lowering_rule_as_fun(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2373, in _emit_lowering_rule_as_fun
+    outs = lowering_rule(sub_ctx, *unflattened_args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2408, in _uncached_lowering
+    ans = lower_per_platform(ctx, str(primitive), platform_rules, default_rule,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2536, in lower_per_platform
+    output = type_cast(Sequence[IrValues], rule(ctx, *rule_args, **rule_kwargs))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 598, in _mpmd_map_lowering
+    return _mpmd_map_tpu_lowering(ctx, *in_nodes, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 466, in _mpmd_map_tpu_lowering
+    return pallas_call_registration.mpmd_map_tpu_lowering_rule(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/pallas_call_registration.py", line 638, in mpmd_map_tpu_lowering_rule
+    lowering.lower_jaxpr_into_unpipelined_module(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1448, in lower_jaxpr_into_unpipelined_module
+    func_op = _lower_jaxpr_to_func_common(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1612, in _lower_jaxpr_to_func_common
+    raise error_handling.mlir_error_to_verification_error(e) from e
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 75, in _mk_in_variant.<locals>.kernel
+    _dma(src.at[pl.ds(0, SLICE)], resident, sems.at[0])
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 65, in _dma
+    cp.start()
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 75, in _mk_in_variant.<locals>.kernel
+    _dma(src.at[pl.ds(0, SLICE)], resident, sems.at[0])
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 65, in dma_start/dma_start"(callsite(callsite("_dma
+    cp.start()
+jax._src.pallas.mosaic.error_handling.VerificationError: Pallas encountered an internal verification error. Please file a bug at https://github.com/jax-ml/jax/issues/new/choose. Error details: 'tpu.enqueue_dma' op DMA source and target element type mismatch
+ see current operation: "tpu.enqueue_dma"(%6, %arg4, %4) <{operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, strict_ordering = false}> : (memref<10240xf32, #tpu.memory_space<hbm>>, memref<10240xi32, #tpu.memory_space<vmem>>, memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) -> ()
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 192, in run
+    traced = jax.jit(fn).trace(x)
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 95, in build
+    return pl.kernel(
+           ^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 898, in wrapper
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 75, in kernel
+    _dma(src.at[pl.ds(0, SLICE)], resident, sems.at[0])
+         ~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/functools.py", line 995, in __get__
+    val = self.func(instance)
+          ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/state/utils.py", line 112, in eval_bitcast_shape
+    return api.eval_shape(f, api.ShapeDtypeStruct.like(x)).shape
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/state/utils.py", line 98, in bitcast
+    shape[-2] = shape[-2] * x_bitwidth // y_bitwidth
+                ~~~~~^^^^
+IndexError: list index out of range
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1610, in _lower_jaxpr_to_func_common
+    func_op.verify()
+jaxlib.mlir._mlir_libs._mlir.ir.MLIRError: Verification failed:
+error: "dma_start:"("dma_start/dma_start"(callsite(callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_out_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":129:8 to :69)) at callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_out_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":129:8 to :69))))): 'tpu.enqueue_dma' op DMA source and target shape mismatch.
+ note: "dma_start:"("dma_start/dma_start"(callsite(callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_out_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":129:8 to :69)) at callsite("_dma"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":65:4 to :14) at "_mk_out_variant.<locals>.kernel"("/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py":129:8 to :69))))): see current operation: "tpu.enqueue_dma"(%24, %22, %20) <{operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, strict_ordering = false}> : (memref<2048xi32, #tpu.memory_space<vmem>>, memref<1x2048xi32, #tpu.memory_space<hbm>>, memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) -> ()
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 132, in build
+    return pl.kernel(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 938, in wrapper
+    flat_outs = mpmd_map_p.bind(
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: jax._src.pallas.mosaic.error_handling.VerificationError: Pallas encountered an internal verification error. Please file a bug at https://github.com/jax-ml/jax/issues/new/choose. Error details: 'tpu.enqueue_dma' op DMA source and target shape mismatch.
+ see current operation: "tpu.enqueue_dma"(%24, %22, %20) <{operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, strict_ordering = false}> : (memref<2048xi32, #tpu.memory_space<vmem>>, memref<1x2048xi32, #tpu.memory_space<hbm>>, memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) -> ()
+
+The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
+
+--------------------
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 199, in run
+    lowered = traced.lower(lowering_platforms=("tpu", ))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/stages.py", line 492, in lower
+    lowering = _resolve_and_lower(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1091, in _resolve_and_lower
+    return _pjit_lower(
+           ^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1264, in _pjit_lower
+    return pxla.lower_sharding_computation(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 1123, in lower_sharding_computation
+    tuple_args, shape_poly_state) = _cached_lowering_to_hlo(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 736, in _cached_lowering_to_hlo
+    lowering_result = mlir.lower_jaxpr_to_module(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1403, in lower_jaxpr_to_module
+    lower_jaxpr_to_fun(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1994, in lower_jaxpr_to_fun
+    out_vals, tokens_out = jaxpr_subcomp(
+                           ^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2166, in jaxpr_subcomp
+    cache_entry = _cached_lowering_miss(
+                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2235, in _cached_lowering_miss
+    cache_entry = _emit_lowering_rule_as_fun(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2373, in _emit_lowering_rule_as_fun
+    outs = lowering_rule(sub_ctx, *unflattened_args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2408, in _uncached_lowering
+    ans = lower_per_platform(ctx, str(primitive), platform_rules, default_rule,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2536, in lower_per_platform
+    output = type_cast(Sequence[IrValues], rule(ctx, *rule_args, **rule_kwargs))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 598, in _mpmd_map_lowering
+    return _mpmd_map_tpu_lowering(ctx, *in_nodes, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 466, in _mpmd_map_tpu_lowering
+    return pallas_call_registration.mpmd_map_tpu_lowering_rule(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/pallas_call_registration.py", line 638, in mpmd_map_tpu_lowering_rule
+    lowering.lower_jaxpr_into_unpipelined_module(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1448, in lower_jaxpr_into_unpipelined_module
+    func_op = _lower_jaxpr_to_func_common(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1612, in _lower_jaxpr_to_func_common
+    raise error_handling.mlir_error_to_verification_error(e) from e
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 129, in _mk_out_variant.<locals>.kernel
+    _dma(rowbuf.at[pl.ds(0, K)], indexer(o_hbm, row), sems.at[1])
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 65, in _dma
+    cp.start()
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 129, in _mk_out_variant.<locals>.kernel
+    _dma(rowbuf.at[pl.ds(0, K)], indexer(o_hbm, row), sems.at[1])
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 65, in dma_start/dma_start"(callsite(callsite("_dma
+    cp.start()
+jax._src.pallas.mosaic.error_handling.VerificationError: Pallas encountered an internal verification error. Please file a bug at https://github.com/jax-ml/jax/issues/new/choose. Error details: 'tpu.enqueue_dma' op DMA source and target shape mismatch.
+ see current operation: "tpu.enqueue_dma"(%24, %22, %20) <{operandSegmentSizes = array<i32: 1, 0, 1, 1, 0, 0, 0>, priority = 0 : i32, strict_ordering = false}> : (memref<2048xi32, #tpu.memory_space<vmem>>, memref<1x2048xi32, #tpu.memory_space<hbm>>, memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) -> ()
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/sc_primitives.py", line 906, in wrapped
+    body(idx)
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 167, in cvt
+    resident[pl.ds(i * LANES, LANES)] = jnp.sin(v).astype(jnp.int32)
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unimplemented primitive in Pallas TPU lowering for sc_vector_subcore: sin. Please file an issue at https://github.com/jax-ml/jax/issues/new/choose.
+
+The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
+
+--------------------
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/17-emit-and-input-dtype-feasibility/compile_check.py", line 199, in run
+    lowered = traced.lower(lowering_platforms=("tpu", ))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/stages.py", line 492, in lower
+    lowering = _resolve_and_lower(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1091, in _resolve_and_lower
+    return _pjit_lower(
+           ^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1264, in _pjit_lower
+    return pxla.lower_sharding_computation(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 1123, in lower_sharding_computation
+    tuple_args, shape_poly_state) = _cached_lowering_to_hlo(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 736, in _cached_lowering_to_hlo
+    lowering_result = mlir.lower_jaxpr_to_module(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1403, in lower_jaxpr_to_module
+    lower_jaxpr_to_fun(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1994, in lower_jaxpr_to_fun
+    out_vals, tokens_out = jaxpr_subcomp(
+                           ^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2166, in jaxpr_subcomp
+    cache_entry = _cached_lowering_miss(
+                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2235, in _cached_lowering_miss
+    cache_entry = _emit_lowering_rule_as_fun(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2373, in _emit_lowering_rule_as_fun
+    outs = lowering_rule(sub_ctx, *unflattened_args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2408, in _uncached_lowering
+    ans = lower_per_platform(ctx, str(primitive), platform_rules, default_rule,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2536, in lower_per_platform
+    output = type_cast(Sequence[IrValues], rule(ctx, *rule_args, **rule_kwargs))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 598, in _mpmd_map_lowering
+    return _mpmd_map_tpu_lowering(ctx, *in_nodes, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 466, in _mpmd_map_tpu_lowering
+    return pallas_call_registration.mpmd_map_tpu_lowering_rule(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/pallas_call_registration.py", line 638, in mpmd_map_tpu_lowering_rule
+    lowering.lower_jaxpr_into_unpipelined_module(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1448, in lower_jaxpr_into_unpipelined_module
+    func_op = _lower_jaxpr_to_func_common(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1595, in _lower_jaxpr_to_func_common
+    body: Any = func.FuncOp.from_py_func(*arg_types, name=name)(body_func)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jaxlib/mlir/dialects/func.py", line 197, in decorator
+    return_values = f(*func_args, **func_kwargs)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1592, in body_func
+    return jaxpr_subcomp(lowering_context, jaxpr, *other_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1794, in jaxpr_subcomp
+    cache_entry = _emit_pallas_lowering_rule_as_fun(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 458, in _emit_pallas_lowering_rule_as_fun
+    return _emit_detached_func(func_name, input_types, output_types, body_builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 397, in _emit_detached_func
+    outs = body_builder(list(entry_block.arguments))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 446, in body_builder
+    outs = rule(sub_ctx, *rule_args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/sc_primitives.py", line 804, in _parallel_loop_lowering_rule
+    carry_out = tc_lowering.jaxpr_subcomp(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1839, in jaxpr_subcomp
+    raise NotImplementedError(
+NotImplementedError: Unimplemented primitive in Pallas TPU lowering for sc_vector_subcore: sin. Please file an issue at https://github.com/jax-ml/jax/issues/new/choose.
+jax 0.10.2 | devices: [CpuDevice(id=0)]
+========================================================================
+C0-control-incumbent: c0_incumbent_i32in_i32scratch
+  trace: OK
+  lower: OK -> 4792 chars
+  tpu.enqueue_dma: 0  tpu.bitcast: 0  memref_bitcast: 0
+  compile: skipped/failed (ValueError: Only interpret mode is supported on CPU backend.)
+========================================================================
+U2a-f32in-i32scratch: u2a_f32in_i32scratch
+  trace: OK
+  LOWER FAILED [U2a-f32in-i32scratch]
+========================================================================
+U2b-f32in-f32scratch: u2b_f32in_f32scratch_inreg_bitcast
+  trace: OK
+  lower: OK -> 5026 chars
+  tpu.enqueue_dma: 0  tpu.bitcast: 0  memref_bitcast: 0
+  compile: skipped/failed (ValueError: Only interpret mode is supported on CPU backend.)
+========================================================================
+U2c-f32in-refbitcast: u2c_f32in_refbitcast_i32scratch
+  TRACE FAILED [U2c-f32in-refbitcast]
+========================================================================
+V11a-2Dout-row: v11a_2d_out_row_index
+  trace: OK
+  lower: OK -> 3483 chars
+  tpu.enqueue_dma: 0  tpu.bitcast: 0  memref_bitcast: 0
+  compile: skipped/failed (ValueError: Only interpret mode is supported on CPU backend.)
+========================================================================
+V11b-2Dout-ds: v11b_2d_out_ds_row
+  trace: OK
+  LOWER FAILED [V11b-2Dout-ds]
+========================================================================
+V11c-2Dout-row-col: v11c_2d_out_row_and_col_ds
+  trace: OK
+  lower: OK -> 3501 chars
+  tpu.enqueue_dma: 0  tpu.bitcast: 0  memref_bitcast: 0
+  compile: skipped/failed (ValueError: Only interpret mode is supported on CPU backend.)
+========================================================================
+NEG-sin: NEG
+  trace: OK
+  LOWER FAILED [NEG-sin]
+========================================================================
+  C0-control-incumbent         LOWERS
+  U2a-f32in-i32scratch         FAILS
+  U2b-f32in-f32scratch         LOWERS
+  U2c-f32in-refbitcast         FAILS
+  V11a-2Dout-row               LOWERS
+  V11b-2Dout-ds                FAILS
+  V11c-2Dout-row-col           LOWERS
+  NEG-sin                      FAILS
+negative control must read FAILS: True

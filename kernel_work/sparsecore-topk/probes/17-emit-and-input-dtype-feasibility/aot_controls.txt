@@ -1,0 +1,10 @@
+Failed to find host bounds for accelerator type: WARNING: could not determine TPU accelerator type, please set env var `TPU_ACCELERATOR_TYPE` manually, otherwise libtpu.so may not properly initialize.
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789064534.356285 3132860 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+V11-2Dout-AOT: AOT COMPILED ok (6710 chars)
+AOT-NEGCTL-8MiB-vmem: FAILED -> JaxRuntimeError: INTERNAL: Failed to run MLO pass pipeline.aot_negctl_oversized_vmem.6:49:1: error: 'memref.alloca' op E3000: CompileTimeSparseCoreAllocationFailure: current allocation offset upper bound (33554431 words) exceeds the legitimate user allocatable offset upper bound (2097151 words) in memory space spmem when allocating 33554432 words
+See https://openxla.org/xla/errors/error_3000 for more details.
+aot_
+refbitcast-2D-f32-scratch: AOT COMPILED ok (10199 chars)

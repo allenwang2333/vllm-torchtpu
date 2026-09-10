@@ -274,7 +274,12 @@ def run_case(scores, lengths, k, num_buckets=256):
         ka.append(c)
         un.append(d and not c)
         cn.append(e)
-    return walk_stats(lv, ka, un, max_levels, cn)
+    eff = np.minimum(np.asarray(lengths, np.float64), scores.shape[1])
+    st = walk_stats(lv, ka, un, max_levels, cn)
+    # Refinement-hist work is levels_row * eff_len_row, aggregated critically.
+    st["lvlen_crit"] = _crit(np.asarray(lv, np.float64) * eff, st["waves"])
+    st["lvlen_mean"] = float((np.asarray(lv, np.float64) * eff).mean())
+    return st
 
 
 def fmt(tag, st):
@@ -405,7 +410,11 @@ def main():
                     cnt_wavemax=float(cw.mean()), cnt_max=float(cx),
                     prod_mean=float(pm.mean()), prod_crit=float(pc.mean()),
                     prod_wavemax=float(pw.mean()),
-                    prod_crit_se=float(pc.std(ddof=1) / math.sqrt(reps)))
+                    prod_crit_se=float(pc.std(ddof=1) / math.sqrt(reps)),
+                    lvlen_crit=float(np.mean([s["lvlen_crit"]
+                                              for s in per_rep])),
+                    lvlen_mean=float(np.mean([s["lvlen_mean"]
+                                              for s in per_rep])))
             agg[(phase, tag)] = per_rep
             print()
 
@@ -427,6 +436,18 @@ def main():
         print(f"  -> {phase} rho=1: mean {m.mean():.3f}+-"
               f"{m.std(ddof=1)/math.sqrt(reps):.3f}  crit {c.mean():.3f}+-"
               f"{c.std(ddof=1)/math.sqrt(reps):.3f}")
+        if phase == "prefill":
+            V3_IN["rho1"] = dict(lvl_crit=float(c.mean()),
+                                 lvl_mean=float(m.mean()),
+                                 lvlen_crit=float(np.mean(
+                                     [s["lvlen_crit"] for s in ms])))
+    # probes/05's actual instrument data: standard_normal at rho=1, b=1024.
+    rng = np.random.default_rng(20260904)
+    st = run_case(synth("random", 1024, N, rng), np.full(1024, N), K)
+    V3_IN["sn_rho1"] = dict(lvl_crit=st["crit"], lvl_mean=st["mean_all"],
+                            lvlen_crit=st["lvlen_crit"])
+    print(f"  -> standard_normal rho=1 b=1024 (the probes' own data): "
+          f"crit {st['crit']:.3f}  mean {st['mean_all']:.3f}")
     print()
 
     # ---------------------------------------------------------- ties --------
@@ -642,6 +663,122 @@ def main():
     print(f"  -> NB=64 stops winning once the non-scaling intercept exceeds "
           f"c = {cx:.2f} us = {100*cx/LVL_FIXED_256:.0f}% of the NB=256 sweep.")
     print("  -> UNMEASURED at every NB but 256.  v5 is OPEN, not a result.")
+    print()
+    print("-" * 100)
+    print("STEP 7  hardware_map.md stage C'' -- reconcile and re-derive the two")
+    print("        production-rho refinement rows")
+    print("-" * 100)
+    REF_HIST_R1 = 53.544      # 138.306 - 84.762, modelled split of two measured
+    SWEEP_ALL_R1 = 18.866     # probes/09, E0 - E0-swp, measured, ALL levels
+    v = V3_IN["prefill"]
+    r1 = V3_IN["sn_rho1"]     # the probes' own instrument data
+    L_R1 = r1["lvl_crit"]
+    L_PROD = v["lvl_crit"]
+    print(f"level executions, critical: rho=1 standard_normal (the probes' own "
+          f"data) {L_R1:.3f}; production prefill {L_PROD:.3f}")
+    print(f"2.231 is a TIMING inversion: 2.231/{L_R1:.3f} = "
+          f"{2.231/L_R1:.3f}x more than the executions that happened.")
+    print()
+    print("(1) RECONCILE the sheet's two rows against its stated method")
+    a = REF_HIST_R1 * 0.75 * 0.50005
+    print(f"  refinement hist  53.544 x 6/8 x 0.50005 = {a:.3f}   sheet 20.08"
+          f"   -> EXACT.  Uses NO level count; 53.544 is measured.")
+    s_l0_2231 = SWEEP_ALL_R1 / (1 + 2.231)
+    b_ = s_l0_2231 * (1 + 2.231 * 0.75)
+    print(f"  V4 sweeps        18.866 split 1:2.231, refinement x 6/8 = "
+          f"{b_:.3f}   sheet 15.63  -> 0.16% apart.  DOES use 2.231.")
+    print(f"  (implied L0 sweep {s_l0_2231:.3f}, refinement "
+          f"{SWEEP_ALL_R1 - s_l0_2231:.3f}; back-solving 15.63 exactly needs "
+          f"level 2.186, so 15.63 is the sheet's plug for total=189.98)")
+    print()
+    print("(2) RE-DERIVE both on measured execution counts")
+    print("  refinement hist work is levels_row x eff_len_row, critical:")
+    F = v["lvlen_crit"] / (r1["lvlen_crit"])
+    print(f"    crit(lvl*eff) production = {v['lvlen_crit']:.0f}   "
+          f"crit(lvl*n) rho=1 = {r1['lvlen_crit']:.0f}   factor F = {F:.4f}")
+    print(f"    sheet's proxy factor 6/8 x 0.50005 = {0.75*0.50005:.4f} "
+          f"({100*(0.75*0.50005/F - 1):+.1f}% vs measured)")
+    new_hist = REF_HIST_R1 * F
+    print(f"    refinement hist: 20.08 -> {new_hist:.2f} us")
+    s_l0 = SWEEP_ALL_R1 / (1 + L_R1)
+    new_sweep = s_l0 * (1 + L_PROD)
+    print(f"  V4 sweeps are fixed-size, so only the execution count matters:")
+    print(f"    per-level sweep = 18.866/(1+{L_R1:.3f}) = {s_l0:.3f} us")
+    print(f"    V4 sweeps: 15.63 -> {new_sweep:.2f} us  "
+          f"(L0 {s_l0:.3f} + refinement {s_l0*L_PROD:.3f})")
+    alt = SWEEP_ALL_R1 / (1 + 2.231) * (1 + L_PROD * 2.231 / L_R1)
+    print(f"    alt convention (keep the 2.231 timing basis on both sides): "
+          f"{alt:.2f} us -- {100*(alt/new_sweep-1):+.1f}%, so the choice barely "
+          f"matters")
+    print()
+    print("(3) CLOSURE")
+    others = 75.683 + 33.91 + 33.54 + 13.469 + 5.872 - 8.20
+    old_tot = others + 20.08 + 15.63
+    new_tot = others + new_hist + new_sweep
+    print(f"  unchanged rows (residual, hist0, emit, DMAs, cvt) = {others:.3f}")
+    print(f"  OLD total {old_tot:.2f} (the sheet's 189.98)")
+    print(f"  NEW total {new_tot:.2f}   delta {new_tot-old_tot:+.2f} us "
+          f"= {100*(new_tot-old_tot)/old_tot:+.2f}%")
+    print("  The production sheet is a SUM OF ITS OWN ROWS -- no probe ran at")
+    print("  rho=0.40005 (hardware_map.md:376).  There is nothing to close")
+    print("  against, so no gap opens; the PREDICTION moves.")
+    print()
+    print("(4) the rho=1 stage-C rows are correct as-is")
+    print(f"  38.004 x 2.231 = {38.004*2.231:.2f} (sheet 84.79); "
+          f"19.192 x 2.231 = {19.192*2.231:.2f} (sheet 42.81)")
+    print(f"  sum = {57.196*2.231:.2f} = 57.196 x 2.231 = the MEASURED L3-L0 "
+          f"delta by construction, so these are measured, not modelled.")
+    print()
+    print("(5) percentages at hardware_map.md:103 and :165")
+    for label, us in (("refinement region 127.579 (:103)", 127.579),
+                      ("V4 sweep L0 19.192 (:165)", 19.192),
+                      ("V4 sweep refinement 42.82 (:165)", 19.192 * 2.231),
+                      ("V4 sweep total 62.01 (:165)", 19.192 * 3.231)):
+        print(f"  {label:<36} of 454.602 (STALE) = {100*us/454.602:5.2f}%   "
+              f"of B=326.782 (C'') = {100*us/326.782:5.2f}%")
+    print(f"  but C'' adopts probes/09's 18.866 for ALL sweeps, not 62.01:")
+    print(f"    18.866 of B=326.782 = {100*18.866/326.782:.2f}% at rho=1; "
+          f"{new_sweep:.2f} of {new_tot:.2f} = "
+          f"{100*new_sweep/new_tot:.2f}% at production")
+    print(f"    refinement region at production = {new_hist:.2f} + "
+          f"{s_l0*L_PROD:.2f} = {new_hist+s_l0*L_PROD:.2f} = "
+          f"{100*(new_hist+s_l0*L_PROD)/new_tot:.2f}% (was '28.1%')")
+    print()
+    print("(6) 19.192/level (probes/07) vs 18.866 all-levels (probes/09) "
+          "CONTRADICT by 3.1x")
+    print(f"  probes/07 marginal slope implies "
+          f"{19.192*(1+L_R1):.2f} us for {1+L_R1:.3f} executions; "
+          f"probes/09 measured {SWEEP_ALL_R1:.3f}.")
+    print("  This is load-bearing for v5.  Re-pricing STEP 6b's v5 at "
+          f"fixed(256) = {s_l0:.3f} instead of 19.192:")
+    for nb, lvl in V5_PREFILL:
+        f2 = s_l0 * nb / 256.0
+        V5_T[nb] = (1 + lvl) * f2 + lvl * LVL_WALK_R1 * RHO_PRE
+    for nb, lvl in V5_PREFILL:
+        d = V5_T[nb] - V5_T[256]
+        print(f"    NB={nb:>4} T={V5_T[nb]:7.2f} us  delta vs 256 = {d:+7.2f}"
+              f" us = {100*d/new_tot:+6.2f}% of {new_tot:.2f}")
+    print()
+    print("(7) KNOCK-ON: STEP 6b's v3 used deleted = 20.08 x (lvl/2.231), which")
+    print("    is WRONG -- 20.08 never came from 2.231.  The correct deleted")
+    print(f"    refinement-hist term is the re-derived row itself, {new_hist:.2f} us.")
+    walk_09 = REF_HIST_R1 / L_R1      # probes/09 basis, us per level at rho=1
+    print(f"    walk per level: probes/07 {LVL_WALK_R1:.3f} vs probes/09-implied "
+          f"{walk_09:.3f} ({LVL_WALK_R1/walk_09:.2f}x apart -- same contradiction)")
+    print(f"  {'variant':<40}{'deleted':>9}{'added':>8}{'net us':>9}"
+          f"{'% 191.76':>10}{'% 189.98':>10}")
+    for name, lvl, cnt_eff, walk in (
+            ("D CENTRAL, probes/07 walk", L_PROD, v["prod_crit"] / L_PROD,
+             LVL_WALK_R1),
+            ("D CENTRAL, probes/09 walk", L_PROD, v["prod_crit"] / L_PROD,
+             walk_09),
+            ("E upper bound (wavemax), probes/07 walk", v["lvl_wavemax"],
+             v["prod_wavemax"] / v["lvl_wavemax"], LVL_WALK_R1)):
+        deleted = new_hist * (lvl / L_PROD) + EMIT
+        added = EMIT1 * RHO_PRE + lvl * walk * (cnt_eff / 10240.0)
+        net = added - deleted
+        print(f"  {name:<40}{deleted:>9.2f}{added:>8.2f}{net:>+9.2f}"
+              f"{100*net/new_tot:>+10.2f}{100*net/old_tot:>+10.2f}")
     print()
     print(f"elapsed {time.time()-t0:.1f}s")
 

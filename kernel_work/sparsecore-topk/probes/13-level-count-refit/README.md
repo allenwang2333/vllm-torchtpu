@@ -137,6 +137,10 @@ mean-vs-crit really bites.
 
 ## 5. Consumer 1 — v3 (fused emit), `design.md:460-482`, `:780-812`
 
+> ⚠ **Row D of this table is superseded by §7.6(i): −33.57 µs = −17.51%, not −26.21 / −13.80%.** The
+> `deleted` term below rescales `20.08 × (lvl/2.231)`, and §7.1 shows 20.08 never came from 2.231.
+> The *aggregation* argument in this section stands; only the `deleted` input was wrong.
+
 Re-priced (`modelled`, on probes/07's `measured` slopes: walk 38.004 µs/level at ρ=1, fixed sweep
 19.192 µs/level, base 189.98 µs from `hardware_map.md:470-490`). All rows prefill:
 
@@ -220,3 +224,144 @@ level blow-up at any radix, which kills v5's stated failure mode outright.
 
 `level_sim.py` (run with `../../../../uv_venv/bin/python level_sim.py`, 28 s) and `level_sim.txt`,
 its verbatim output.
+
+---
+
+## 7. Stage C″ reconciliation — both refinement rows go **UP**, and nothing fails to close
+
+Requested follow-up. Short version: **no gap opens, because the production sheet has never closed
+against anything.** Both rows move, both upward, and the v3 prize gets *larger* because §5 rescaled a
+row that was never scaled by 2.231 in the first place.
+
+### 7.1 Reconciling the two rows against the stated method
+
+| row | reconstruction | sheet | verdict |
+| --- | --- | --- | --- |
+| refinement `hist` | `53.544 × 6/8 × 0.50005 = 20.081` | 20.08 | **exact — and it uses NO level count** |
+| V4 sweeps | `18.866` split `1 : 2.231`, refinement `× 6/8` → `15.609` | 15.63 | 0.16% apart — **it does use 2.231** |
+
+So the answer is **(a) for one row and (b) for the other**.
+
+`53.544` is `hardware_map.md:475-476`'s modelled split of two measured numbers
+(`hist, all levels` 138.306 − `hist0 ≤ 84.762`), and 138.306 was measured on hardware running
+*whatever level count the data produced*. The level count is **baked into the measurement**, not
+multiplied onto it. Your `38.004 × 2.231 × 0.50005 × 0.75 = 31.8` failed because 38.004 is
+`probes/07`'s per-level slope and this row is not built from a slope at all.
+
+The V4 row **is** built from 2.231 — as a *split ratio*, 1 L0 sweep to 2.231 refinement sweeps, which
+is the right structural move: all four sweep primitives run identically at L0 (`zero_priv(NUM_BUCKETS)`
+`:185`, `fold_priv` `:197`, `scan_glob` `:208`, `find_bucket` `:211`) and at each refinement level
+(`:224`, `:245`, `:247`, `:248`), all four gated by `done` to bound 0. The residual 0.16% is the
+sheet's plug: back-solving 15.63 exactly needs level 2.186, not 2.231, so **15.63 was nudged to make
+the total land on 189.98**.
+
+### 7.2 Re-derived on measured execution counts
+
+The right basis for splitting a *measured* total is **how many level executions actually happened**,
+which is the critical count, not the timing inversion: `standard_normal` at ρ=1, b=1024 — the probes'
+own data — runs **2.031** critical levels (`measured`). 2.231 is 1.098× that; the excess is
+`probes/07`'s unexplained timing residual (§1).
+
+**Refinement `hist`.** The work is `levels_row × eff_len_row` — a *joint* statistic, exactly as with
+`cnt` in §4a, because the long rows are also the rows that walk deep. The sheet's `6/8 × 0.50005 =
+0.3750` factorises that product and loses the correlation. Measured:
+
+`crit(levels·eff_len)` at production = **8348**, `crit(levels·n)` at ρ=1 = **20800**, so
+**F = 0.4014** — the proxy is **6.6% low**.
+
+> **refinement `hist`: 20.08 → 21.49 µs** (`modelled` on a `measured` factor). It goes **up** despite
+> the level count falling 2.231→1.570, because 2.231 was never in this row and the correlation was.
+
+**V4 sweeps.** Fixed-size, so only the execution count matters: per-level sweep =
+`18.866/(1 + 2.031)` = **6.224 µs** (the sheet's 1:2.231 split gave 5.839, too small), and production
+runs `1 + 1.570` of them.
+
+> **V4 sweeps: 15.63 → 16.00 µs** (L0 6.224 + refinement 9.773). Keeping the 2.231 timing basis on
+> *both* sides instead gives 15.91, −0.5% — **the convention choice does not matter.**
+
+### 7.3 Closure — there is nothing to close, and that is the finding
+
+`hardware_map.md:376`: *"Every probe in this exercise ran `row_lengths = jnp.full((b,), n)` — ρ =
+1.0."* **No probe has ever run at ρ = 0.40005.** The production sheet's 189.98 is the sum of its own
+reweighted rows (`design.md:43` labels it "modelled-from-measured"; `design.md:82` "measured
+(`j-4e0df30a`) + modelled reweighting"). It is a *prediction*, not a baseline.
+
+| | µs |
+| --- | ---: |
+| unchanged rows (residual 75.683 + hist0 33.91 + emit 33.54 + score DMA 13.469 + out DMA 5.872 + cvt −8.20) | 154.274 |
+| refinement `hist` 20.08 → 21.49 | +1.41 |
+| V4 sweeps 15.63 → 16.00 | +0.37 |
+| **total 189.98 → 191.76** | **+1.78 = +0.94%** |
+
+**So: no unattributed hole, and nothing was rebalanced.** What moves is the *denominator every share
+in the exercise is quoted against*, by +0.94%. That is small enough to change no ranking, and I have
+quoted both denominators in §7.5 so nothing has to be re-derived twice.
+
+⚠ One label to fix, not mine to edit: `design.md:496` calls 189.98 "the **measured** 189.98 µs". It is
+not measured; `design.md:43` and `:82` have it right.
+
+### 7.4 The ρ=1 sheet — confirmed correct, for a stronger reason than stated
+
+`84.79 = 38.004 × 2.231` ✓ and `42.81 = 19.192 × 2.231` ✓. **Do not touch them** — but the reason is
+not "2.231 belongs in a ρ=1 sheet". It is that `57.196 × 2.231 = 127.60` **is** the measured `L3 − L0`
+delta, because 2.231 was *defined* as `(L3 − L0)/57.196`. Those rows are a restatement of a
+measurement, so they are `measured`, and substituting 2.031 would silently discard ~0.20 levels of
+real measured time. **The ρ=1 C″ sheet has no row that changes and its +1.62% closure is untouched.**
+
+The two sheets therefore legitimately use different level counts, and the reason is now on the
+record: *the ρ=1 sheet consumes 2.231 as a measured time-equivalent; the production sheet consumes a
+level count as an execution count, and the execution count is 2.031 at ρ=1 and 1.570 at production.*
+
+### 7.5 `:103` and `:165` — both are ρ=1 rows against a **superseded** denominator
+
+Both are percentages of **454.602 µs**, the stage-C total that `hardware_map.md:321` retracts
+("The 454.602 µs total is superseded"). C″'s ρ=1 denominator is `B` = **326.782**.
+
+| claim | as written | of `B` = 326.782 (ρ=1) | at production |
+| --- | --- | --- | --- |
+| `:103` refinement region 127.579 | 28.1% | **39.04%** | see ⚠ below |
+| `:165` V4 sweep, L0 (19.192) | 4.2% | 5.87% | — |
+| `:165` V4 sweep, refinement (42.82) | 9.4% | 13.10% | — |
+| `:165` V4 sweep, total (62.01) | 13.6% | 18.98% | — |
+
+⚠ **But the µs are superseded too.** C″ adopts `probes/09`'s **18.866 µs for all sweeps**, not 62.01.
+On C″'s own numbers: sweeps are **5.77% of `B`** at ρ=1 and **16.00 / 191.76 = 8.34%** at production
+(the sheet already says 8.2%). The refinement region at production is
+`21.49 + 9.77 = 31.26 µs = 16.30%` of 191.76 — **not 28.1%**.
+
+### 7.6 ⚠ Two knock-ons, one of which is large
+
+**(i) §5's v3 `deleted` term was wrong.** It used `20.08 × (1.570/2.231)` = 14.13 — but 20.08 never
+came from 2.231, so that rescale should never have happened. The correct deleted refinement-hist term
+is the re-derived row itself, **21.49**:
+
+| variant | deleted | added | net | % of 191.76 | % of 189.98 |
+| --- | --- | --- | --- | --- | --- |
+| **D CENTRAL** (crit 1.570, `cnt_eff` 1798, probes/07 walk) | 55.03 | 21.46 | **−33.57** | **−17.51%** | −17.67% |
+| D on probes/09's implied walk (26.36 µs/level) | 55.03 | 18.25 | −36.78 | −19.18% | −19.36% |
+| E upper bound (`wavemax`) | 65.83 | 42.94 | −22.89 | −11.94% | −12.05% |
+
+**v3's central estimate moves from −13.80% to −17.51%; band −17.51% to −11.94%.** It moved *toward*
+the old −20%/−33% band without reaching it. **Supersedes §5's table.**
+
+**(ii) `probes/07` and `probes/09` contradict each other on the sweep price by 3.1×, and v5 hangs on
+it.** `probes/07`'s marginal slope 19.192 µs/level implies **58.18 µs** for the 3.031 executions that
+happen at ρ=1; `probes/09` measured **18.866**. Both are `measured`, in different jobs, with
+different arm constructions, and all four primitives are `done`-gated identically in source so there
+is no structural reason for them to disagree. C″ adopts 09 for the sweep row while stage D `:164`
+still quotes 07's 19.192 — and **§6 of this document used 19.192.** At 09's 6.224 µs/level:
+
+| NB | T (µs) | Δ vs 256 |
+| --- | --- | --- |
+| 64 | 41.36 | −3.03 µs = **−1.58%** |
+| 128 | 38.60 | −5.79 µs = **−3.02%** |
+| 256 | 44.39 | 0 |
+| 512 | 53.06 | +8.67 µs = +4.52% |
+
+**v5's prize collapses from −14.82% to −1.58%, and the optimum moves from NB=64 to NB=128.** v5 was
+already `OPEN` on the unmeasured `∝NB` scaling; it is now `OPEN` on *two* unresolved terms, and the
+second one is a contradiction between two measurements rather than a missing one. The mandatory probe
+should therefore re-measure the sweep at NB ∈ {64, 256, 512} in **one** job with **one** arm
+construction — that settles the scaling and the 07-vs-09 contradiction together. **The v5 ranking
+should not be quoted until it lands.** (The level side of v5 — §6's radix→levels table — is
+unaffected: it is `measured` and needs no hardware.)

@@ -17,7 +17,21 @@ the direction in words.
 **The denominator, stated once.** Every share and every `Δ time %` in this file is against the
 **harness prefill kernel, 189.98 µs** (stage C″ — the ρ = 0.40005 reweighting of the ρ = 1
 microbenchmark). It is not the 326.782 µs the instrument reads, and it is not the 451.2 µs of
-step 1. Where a number was measured at ρ = 1 the µs figure is quoted unchanged and only its share
+step 1.
+
+⚠ **189.98 µs has never been measured, and nothing in this exercise has ever run at production ρ.**
+Every probe ran at ρ = 1 (`hardware_map.md:376`). 189.98 is the **sum of its own reweighted rows** —
+a modelled prediction that happens to be quoted as a baseline, not an instrument reading. Three
+consequences, and they bind every number below:
+
+- **It cannot fail to close.** The Stage C″ production sheet "closing to 189.98" is arithmetic, not
+  corroboration. Do not cite the closure as evidence of anything.
+- **When a row in that sheet is corrected, the total moves** — there is no hole to open, because
+  there was never an independent measurement for a hole to open against. `probes/13` §7 corrected
+  two rows and the prediction moved to **191.76 µs (+0.94%)**, which changes no ranking.
+- **The first thing step 3 should buy is one ρ = 0.40005 arm of the incumbent.** It converts the
+  denominator from `modelled` to `measured` and validates the whole reweighting in a single arm.
+  ⚠ Until then, treat every percentage here as a ratio of two modelled quantities. Where a number was measured at ρ = 1 the µs figure is quoted unchanged and only its share
 moves — the reweighting never invents a measurement.
 
 ⛔ **CORRECTION, `probes/11` (`j-9b520877`): 189.98 µs is the *harness*, and the harness is bigger
@@ -493,7 +507,10 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **State:** §4 in full
 - **Measured:** 326.782 µs at ρ=1 (`j-4e0df30a`), 327.166 (`j-300d4690`) — **cross-job −0.12%** from a
   byte-identical source. Reweighted to production prefill: **189.98 µs**
-- **Achieved:** 10.6% of the 20.05 µs floor — §1. ⚠ That fraction is against the **measured** 189.98 µs; if `probes/11` shows D3's relayout is a harness artifact the production kernel is ~117 µs and `v1` achieves ~17%
+- **Achieved:** 10.6% of the 20.05 µs floor — §1. ⚠ **Not against a measured number.** 189.98 µs is
+  `measured + modelled reweighting`; see the warning in "Numbers in this document". `probes/11` since
+  confirmed D3's relayout is a harness artifact, so the production kernel is 155.82 µs (firm) and
+  `v1` achieves **12.9%**
 - **Verdict:** **KEPT** as the baseline. It is also a candidate in step 3 and it can win.
 - **What it taught:** the block is **100% SparseCore, 0% VPU, 0% MXU**, and 39.8% of it belongs to no
   op at all.
@@ -556,13 +573,18 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   sent to check.** Removes the refinement walk (20.08) and `emit`'s traversal, replacing them with ~1
   extra pass over `L` at L0 and `levels × cnt` walks. Old inputs (level 2.231, `cnt` **assumed 4096**)
   gave −8.72 µs = −4.59%. Correct inputs — critical-subcore level **1.570** and the joint statistic
-  **`cnt_eff` = 1798** — give **−26.21 µs = −13.80%** of the 189.98 µs harness baseline (**−16.8% of
-  the 155.82 µs production denominator**). `modelled` on `probes/07`'s measured slopes
-- **Band:** **−13.80% central, −6.23% at the barriered `wavemax` upper bound.** ⚠ The old **−20% to
-  −33% band does not exist**: the new band sits entirely below it and is less than half as wide.
+  **`cnt_eff` = 1798** — give **−33.57 µs = −17.51%**. `modelled` on `probes/07`'s measured slopes
+- **Band:** **−17.51% central, −11.94% at the barriered `wavemax` upper bound** (−19.18% if the
+  walk is priced on `probes/09` instead — see the ⚠ below). ⚠ The old **−20% to −33% band does not
+  exist**, though the corrected figure moved back toward it without reaching it.
   **`v3` cannot become a loss under any plausible aggregation** — break-even is `cnt_eff` = 6295
   against a measured 1798 (3.5× margin) and a barriered bound of 3649 (1.7× margin); only assuming
   the global max 6495 on every row crosses over, and that is an impossibility, not an aggregation
+- ⚠ **Two intermediate figures for this node are superseded; ignore them if you meet them elsewhere.**
+  −16.48% used a walking-row level count against a global-mean `cnt` (wrong aggregation on both);
+  −13.80% then rescaled the `deleted` term by 1.570/2.231, which is wrong because the production
+  sheet's refinement row **contains no level count at all** — it is `53.544 × 6/8 × 0.50005`, with
+  the executions already baked into a measured quantity. **−17.51% is the figure**
 - **Built?** **No** — step-3 variant
 - **Measured:** — · **Verdict:** **OPEN**
 - **Note:** this is the **largest in-algorithm prize on the board** and it is the one `v10` competes
@@ -661,9 +683,21 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   **NB=64 stops winning once `c` > 11.12 µs = 58% of the NB=256 sweep**, and with four
   `parallel_loop`s per level and ~22 µs of fixed launch cost measured elsewhere
   (`probes/07/README.md:122`), 58% is not implausible
+- ⛔ **`v5` is `OPEN` on TWO terms, and the second is worse than a missing number — it is a
+  contradiction between two measurements.** `probes/07` prices the sweep at a marginal **19.192
+  µs/level**, implying 58.18 µs for the 3.031 executions at ρ=1. `probes/09` measured the sweep
+  region directly, four ways, additive to 0.2%: **18.866 µs total**, i.e. ~6.224 µs/level. **A 3.1×
+  disagreement, both tagged `measured`**, from different jobs with different arm constructions — and
+  all four primitives are `done`-gated identically in source, so nothing structural explains it.
+  ⚠ The two live side by side in one document today: stage C″ adopts 09's 18.866 for its sweep row
+  while `hardware_map.md:164` still quotes 07's 19.192.
+  **At 09's price `v5` collapses from −14.82% to −1.58% and the optimum moves to NB=128 (−3.02%).**
+  ⛔ **Do not quote `v5`'s ranking until this is adjudicated.** Its *level* side is `measured` and
+  unaffected
 - **Mandatory probe (§10):** re-run the `probes/09` sweep split at `NUM_BUCKETS ∈ {64, 512}` with 256
-  as an in-pool control — three points fix both slope and intercept. ⏳ **dispatched,
-  `probes/16-num-buckets-scaling`**
+  as an in-pool control, **one arm construction across all three** — which fixes the slope, the
+  intercept **and** the 07-vs-09 conflict together, since the NB=256 absolute adjudicates it.
+  ⏳ **dispatched, `probes/16-num-buckets-scaling`**
 - **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory probe (§10)
 - ⚠ **Not additive with `v2`.** `v2` already shrinks the clear 16×; `v5` shrinks what is left. Measure
   the pair.
@@ -783,16 +817,66 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **Exactness:** **`exact`** — a layout change computes the same function. ⚠ Not "no evidence
   needed": it changes the *store pattern*, so it owes the same bit-identical row gate `v2` passed
 - **State diff from `v1`:** `boundary` — the output edge moves from XLA into the kernel. `transfer` —
-  `rowbuf → out_hbm` goes from one 8 KiB contiguous run per row to **16 runs of 512 B at stride 1024
-  words**. 512 B = 128 int32 = the SparseCore granule exactly
+  ⚠ **corrected by `probes/17`.** Stage E wrote "one 8 KiB contiguous run per row → **16 runs of
+  512 B at stride 1024 words**". At the *Mosaic op* level that is **not observable**: the enqueue is
+  the same `2048xi32 vmem → 2048xi32 hbm` in both arms, with the row folded into a `memref_slice`
+  (+ `memref_squeeze`). The 16×512 B descriptor is implied only by the memref *tiling* that
+  `tpu-infer-memref-layout` assigns (2-D i32 → COMPACT `(8,128)`, `tpu_info.py:565-580`), matching
+  XLA's `T(8,128)`. Consistent, but **`modelled`, not observed**
 - **Live set:** unchanged — same `rowbuf_vmem`, no new buffer
-- **Predicted:** ≤ **−5.27%** (10.007 µs) less the strided-DMA cost, which is `unmodelled`
-- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory probe. ⛔ Not `PARKED`: its
-  verdict turns on an `unmodelled` term, which `TEMPLATE-design.md` §10 forbids parking on.
-  ⏳ feasibility dispatched, `probes/17`
+- **Predicted:** ≤ **−5.27%** (10.007 µs) less the strided-DMA cost, which is `unmodelled` — and is
+  now the **only** `unmodelled` term left in this node
+- **Feasibility:** ✅ **REACHABLE — closed by `probes/17`, `static-compile`, no job.** AOT-compiling
+  the real kernel at production dims, the base `ROOT %reshape.4 = s32[1024,2048]{1,0:T(8,128)}`
+  (which carries `used_scoped` **4 MiB**, independently re-deriving `stage-e-boundary.md:54`) is
+  **gone**; the ROOT becomes the `call-done` itself, already typed `s32[1024,2048]{1,0:T(8,128)}`.
+  ENTRY 13 → 12 instructions. Pallas pins only the minor-to-major dim order
+  (`jax/_src/tpu_custom_call.py:374-375`) and XLA handed the custom call the consumer's tiling.
+  **Patch is four edits**: `:451`, `:317`, `:323`, `:491`. ⚠ **The indexer form matters** —
+  `o.at[pl.ds(row,1)]` fails with `DMA source and target shape mismatch`; `o.at[row]` and
+  `o.at[row, pl.ds(0,k)]` both lower
+- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN** — but now on the *in-model* bet alone
+  (`probes/14`), not on feasibility. ⛔ Still not `PARKED`: the strided-DMA term is `unmodelled`
 - **Note:** ⚠ **conditional on the in-model check** (§11, `stage-e-boundary.md` §3c) — if the retile
   does not survive in-model, `v11` is **REJECTED** with prize 0. It is also **subsumed by H3**: a
   fused consumer has no HBM output to retile.
+
+---
+
+### `v12` (= **U2**) — `f32` kernel input, reinterpret in-register  *(new, from stage E)*
+
+- **Parent:** `v1` — an **edge** move on the *input* side, so it composes with every node, and with
+  `v11` · **Move:** `[boundary]`/`[dtype]`
+- **What changes:** stop asking XLA for a dtype change the kernel does not need.
+  `sparsecore_topk.py:438` does `words = jax.lax.bitcast_convert_type(scores, jnp.int32)` *outside*
+  the kernel; instead pass `scores` through as `f32` and reinterpret each vector inside
+- **Motivated by:** `probes/11` + stage E — the emitted `%bitcast-convert_bitcast_fusion` is a
+  `kLoop` fusion carrying `used_scoped_memory_configs` **16 MiB @ ms1**, where the genuinely-free
+  flatten beside it carries **no `backend_config` at all**. ⚠ This node **dissolves** the ±26.251 µs
+  open denominator leg rather than answering it
+- **Exactness:** **`exact`** — a reinterpret computes the same function. ⚠ But it owes the same
+  bit-identical row gate `v11` does, and one extra risk: `monotone_key` (`:116-118`) writes an
+  arbitrary int32 pattern **through an f32-typed VMEM store**, so NaN-payload bit-preservation is
+  `assumed`, not proven
+- **State diff from `v1`:** `boundary` — the input edge moves from XLA into the kernel. `dtype` —
+  `resident_vmem` becomes `f32`; two `tpu.bitcast` ops appear in the Mosaic body (0 today)
+- **Live set:** unchanged — same bytes, different declared element type
+- **Predicted:** **0 or −13.82%** (26.251 µs), depending entirely on whether the fusion is in the
+  production path
+- **Feasibility:** ✅ **REACHABLE — closed by `probes/17`, `static-compile`, no job.** The ENTRY diff
+  replaces the fusion with `%bitcast.3 = f32[128,80,8,128] bitcast(%s.1)` — free, no `backend_config`.
+  ⚠ **But it is three edits, not one: the DMA is dtype-checked, not byte-oriented.** The minimal
+  one-line edit fails to lower with `'tpu.enqueue_dma' op DMA source and target element type
+  mismatch`, so the scratch dtype must change too — `:438` (`words = scores`), `:455`
+  (scratch `int32 → float32`), and in-register `bitcast_convert_type` at `:172-173` and `:178`.
+  That form lowers. Ref-level `.bitcast` would avoid the two per-load bitcasts but is unavailable on
+  a 1-D ref (`jax/_src/state/utils.py:98` indexes `shape[-2]` unconditionally); it works on a 2-D
+  ref, so a reshaped scratch is a fallback **if the two bitcasts ever price**
+- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory. Feasibility is closed; what
+  is still `unmodelled` is (a) whether the fusion is on the production path at all and (b) the price
+  of the two in-body `tpu.bitcast`s
+- **Note:** ✅ **U2 and `v11` are independent and compose** — `probes/17` confirmed each variant's
+  ENTRY still carries the other's op (16 MiB and 4 MiB respectively).
 
 ## 6. Instruments — every probe, capture and job
 
@@ -811,6 +895,8 @@ Raw output under `probes/`; nothing pasted here.
 | 9 | probe `11-relayout-provenance` | is the relayout in the production call path, or only under the harness's `jit`? | `probes/11-…/` | ⏳ **IN FLIGHT.** Decides whether D3 is a ~73 µs handoff or a 40% overstatement of the denominator. Also carries probe 10's unexplained output-byte term |
 | 10 | host derivation of ρ | what is `E[eff_len]/n` in production? | no job — `glm-5.2-fp8-dp16-ep.sh` + `streamindex_topk.py:482-506` | **re-weighted the entire balance sheet** and swapped the #1 and #3 candidates. The cheapest instrument in the exercise |
 
+| 11 | probe `17-emit-and-input-dtype-feasibility` | are `v11` and `v12`/U2 reachable at all? | `probes/17-…/`, **no job** — AOT `static-compile` | closed both feasibility terms. Found U2 is **three edits, not one** (`tpu.enqueue_dma` is dtype-checked); corrected stage E's 16×512 B DMA model to `modelled`; confirmed the two compose. ⚠ **Method worth reusing:** `topologies.get_topology_desc("tpu7x:2x2x1")` runs the full XLA-TPU + Mosaic **SparseCore** pipeline on the host with **no TPU attached** — the 8 MiB-scratch control fails with a SparseCore `spmem` allocator error, which is what makes "AOT COMPILED ok" mean the backend accepted it |
+
 **Instrument runs that changed nothing:** none — every probe above moved at least one verdict, which
 is itself unusual enough to note rather than take as a good sign. See §8.
 
@@ -821,6 +907,14 @@ is itself unusual enough to note rather than take as a good sign. See §8.
 2. **The SparseCore relayout model is not the TensorCore one.** 16 int32 lanes, no sublane axis, no
    MXU; `hardware-facts.md`'s 8×128 tile model must be scoped or it silently mis-prices every
    SparseCore design.
+3. **A SparseCore Pallas kernel can be compiled to optimized HLO with no TPU attached**
+   (`probes/17`). `jax.jit(...).lower(...).compile()` against
+   `topologies.get_topology_desc("tpu7x:2x2x1")` runs the real XLA-TPU + Mosaic SparseCore backend
+   on the host. That makes "does this lower, and what does it do to the ENTRY computation" a
+   **seconds-long local check instead of a pod job** — two feasibility terms closed here for zero
+   cluster time. ⚠ It needs a negative control to mean anything: an 8 MiB VMEM scratch must fail
+   with `E3000: CompileTimeSparseCoreAllocationFailure … memory space spmem`, which proves the
+   SparseCore backend ran rather than the MLIR verifier alone.
 
 ## 7. What `references/` got wrong
 
@@ -992,12 +1086,12 @@ distribution`; 4096 is the safe bound (a bucket cannot exceed the row's live len
 | --- | ---: | --- |
 | baseline | 189.98 µs | measured + reweighting |
 | predicted | 132.4 µs standalone / 124.2 µs on top of Plan A | **modelled** |
-| **Δ time %** | ~~−30.2%~~ → **−13.80%** standalone (harness denom) · **−16.8%** on the 155.82 µs production denom | re-priced, `probes/13` |
-| % of block floor | 15.1% → **6.9%** | |
+| **Δ time %** | ~~−30.2%~~ → **−17.51%** standalone (harness denom) · **−21.3%** on the 155.82 µs production denom | re-priced, `probes/13` §5+§7 |
+| % of block floor | 15.1% → **8.8%** | |
 
 **Mechanism:** deletes two full traversals of `L`, acting on the **ρ-scaled walk** terms
 (`emit` 17.7% + refinement `hist` 10.6%). Same denominator as §1.
-**Band:** ⚠ ~~−20% to −33%~~ → **−13.80% central, −6.23% at the barriered upper bound.** The old band
+**Band:** ⚠ ~~−20% to −33%~~ → **−17.51% central, −11.94% at the barriered upper bound.** The old band
 was set by the level count and was wrong in both inputs: the level count is **1.570** (crit), not
 2.231, *and* the pivot-bucket occupancy the design sized at the 4096 safe bound has a joint critical
 statistic `cnt_eff` of **1798**. The two errors ran in opposite directions and the occupancy one was
@@ -1292,8 +1386,8 @@ prize is ~4× smaller than the number this node carried before the source read.
 | node | what closes it | cost |
 | --- | --- | --- |
 | `v3` fused-emit | ⚠ a probe on the cost of a conditional `store_compressed` inside the L0 walk. ⏳ **dispatched, `probes/15`** — as a *slope in store density*, not one number at one density | one arm |
-| **`v11`** retiled output emit | ⚠ **new node from stage E.** Two things: (a) can `plsc` declare a 2-D tiled `out_type` — ⏳ `probes/17`, no job; (b) does the 10.007 µs retile survive **in-model** — ⏳ `probes/14`. If (b) is no, `v11` is `REJECTED` with prize 0 | no job |
-| **U2** `f32` input, in-register reinterpret | ⚠ **new from stage E, and it dissolves rather than answers the 26.251 µs denominator leg.** `sparsecore_topk.py:438` asks XLA for a dtype change the kernel does not need; the emitted `%bitcast_convert_type.3` carries **16 MiB** of `used_scoped_memory_configs`, where the genuinely-free flatten carries no `backend_config` at all. ⏳ feasibility `probes/17` | no job |
+| **`v11`** retiled output emit | (a) ✅ **feasibility CLOSED by `probes/17`** — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) ⏳ does the 10.007 µs retile survive **in-model** — `probes/14`. If (b) is no, `v11` is `REJECTED` with prize 0 | no job |
+| **`v12`** (= **U2**) `f32` input, in-register reinterpret | ✅ **feasibility CLOSED by `probes/17`** — reachable, but **three edits, not one**: the DMA is dtype-checked, so the scratch dtype must change too and the reinterpret moves in-register. Still open: whether the 16 MiB fusion is on the production path, and the price of the two in-body `tpu.bitcast`s | no job |
 | **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. Free: read `StreamIdxTC-*` durations from an existing xprof | no job |
 | `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
@@ -1399,13 +1493,20 @@ numbers in this exercise sit on the edges**, and `v4` creates a new internal one
 | edge | verdict | Δ time % | decided by |
 | --- | --- | ---: | --- |
 | **U1** input layout — flat view of `f32[1024,80,128]{2,1,0}` | **KEPT**, and now *evidenced* rather than assumed | 0 | re-derived: 0 `sparse-core-data-format-call`, the only `copy` in the module is `%copy.11 = f32[1024,64]` |
-| **U2** delete `%bitcast_convert_type.3` — declare the input `f32`, reinterpret in-register | **OPEN**, mandatory | **0 or −13.82%** | feasibility `unmodelled` — ⏳ `probes/17` |
+| **U2** delete `%bitcast_convert_type.3` — declare the input `f32`, reinterpret in-register | **OPEN** as new node **`v12`**; feasibility ✅ closed | **0 or −13.82%** | ✅ `probes/17`, `static-compile`: reachable, but **three edits** — the DMA is dtype-checked, so the scratch dtype moves to `f32` too |
 | **U3** any other input layout | **REJECTED**, priced | **+17.98%** | 34.165 µs `measured (j-9b520877)` — this is the counterfactual that makes "already optimal" a finding |
 | **P1** fuse the producer `StreamIdxTC` | ⛔ **REJECTED — illegal, not unprofitable** | unreachable | it is a **TensorCore** kernel; `dot_general` has no `SC_VECTOR_SUBCORE` lowering rule |
 | **P2 = D7** overlap TC and SC instead | ⛔ **PARKED → OPEN** | `unmodelled` (`t_TC`) | §10's rule: a verdict on an `unmodelled` term cannot be parked. Free probe — read `StreamIdxTC-*` durations from an existing xprof |
-| **D1′/D2′** output retiling, `ROOT %reshape.1` | **OPEN** as new node **`v11`** | ≤ **−5.27%** | 10.007 µs `measured`, `used_scoped` 4 MiB. ⚠ conditional on the in-model check |
+| **D1′/D2′** output retiling, `ROOT %reshape.1` | **OPEN** as new node **`v11`**; feasibility ✅ closed | ≤ **−5.27%** | 10.007 µs `measured`, `used_scoped` 4 MiB. ✅ `probes/17`: the ROOT reshape disappears, ENTRY 13 → 12. ⚠ still conditional on the in-model check |
 | **D4′** fuse the consumer `sc_dsa_gather` | **carried (H3)** | **−8.36% to −11.42%** | larger than any single §9 plan; rejected here only because it changes the block's **output value** — a step-1 re-scope, not a version |
 | **I4** `v4`'s within-slice `emit_pipeline`, `grid=(n // chunk,)` | **KEPT** — the new internal edge | **−2.06% to −6.38%** | encloses exactly `cvt ⊕ hist0`; chunk **1024** |
+
+**One correction made *to* stage E, by `probes/17`.** `stage-e-boundary.md:55` states `v11`'s out
+DMA becomes "16 runs of 512 B at stride 1024 words". At the Mosaic-op level that is **not
+observable** — the enqueue is the same `2048xi32 vmem → 2048xi32 hbm` in both arms, with the row
+folded into a `memref_slice`. The 16×512 B pattern is implied only by the memref *tiling*, so it is
+`modelled`, and the strided-DMA cost stays the one `unmodelled` term in `v11`. Full note in the
+`v11` block above.
 
 **Two corrections stage E made to earlier documents.**
 

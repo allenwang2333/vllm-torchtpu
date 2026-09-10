@@ -100,7 +100,7 @@ and no matmul anywhere in it, so the column below counts integer ops instead and
 | 7 | `find_bucket(16)` | 148–154, 211 | `i32[256]` → scalar | i32 | `[lane=bucket] VMEM` | scalar reg | 256 cmp + popcount | 1 KiB VMEM rd | SC VPU | SC VPU | Serial carry again. A binary search would be 8 steps instead of 16 chunks — but each step is a scalar-indexed load, not a vector op |
 | **Z** | `zg` — zero `glob` on empty rows | 199–206 | → `i32[256]` | i32 | — | `[lane=bucket] VMEM` | — | 1 KiB VMEM wr | SC VPU | SC VPU | **Missing from `report.md` §2.** Only fires when `i_hi == 0` (a padded row past `b`, or a zero-length row). Costs nothing at the shipping shapes because `b` is a multiple of 32 there — but it is the *only* work an inactive subcore does, so it sets the floor for a work-stealing design |
 | **S0** | L0 scalar select | 209–221 | `i32[256]` → 7 scalars | i32 | scalar | scalar | ~20 scalar ops + 2 `vec_at` | 2 × 64 B VMEM rd | SC scalar | SC scalar | `total`, `keep_all`, `b_star`, `cum_at`, `cum_lo`, `c_hi`, `cnt`, `quota`, `prefix`, `shift`, `done`. Negligible cost, **but it is the head of the serial chain** that forbids reordering the levels |
-| 8–10 | **3× refinement level** = `zero_priv` + `ref_body` + `fold_priv` + `scan_glob` + `find_bucket` | 223–265 | `i32[L]` → 7 scalars | i32 | `[lane=n] VMEM` | `lane[lane=bucket] VMEM` scatter → scalar | **fixed** 4096 wr + 4096 rd + 512 scan/cmp, **plus** `~8L` + `L` scatter — the `L` half skippable per row via `done` | 32 KiB VMEM fixed + `4L` rd per level | SC VPU + scatter | SC scatter ✅ **Measured, `probes/07`.** A whole level is **57.196 µs**, not the fitted 114.3: **19.192 µs fixed sweep** (33.6%) + **38.004 µs `L` walk** (66.4%). The walk is 1.1876 µs/wave against `probes/03`'s `scatter_sparse` at 1.1013 — a sparse scatter costs a sparse scatter's price. At ~2.231 active levels the whole region is **127.579 µs = 28.1%** of the prefill kernel, not 51.4% |
+| 8–10 | **3× refinement level** = `zero_priv` + `ref_body` + `fold_priv` + `scan_glob` + `find_bucket` | 223–265 | `i32[L]` → 7 scalars | i32 | `[lane=n] VMEM` | `lane[lane=bucket] VMEM` scatter → scalar | **fixed** 4096 wr + 4096 rd + 512 scan/cmp, **plus** `~8L` + `L` scatter — the `L` half skippable per row via `done` | 32 KiB VMEM fixed + `4L` rd per level | SC VPU + scatter | SC scatter ✅ **Measured, `probes/07`.** A whole level is **57.196 µs**, not the fitted 114.3: **19.192 µs fixed sweep** (33.6%) + **38.004 µs `L` walk** (66.4%). The walk is 1.1876 µs/wave against `probes/03`'s `scatter_sparse` at 1.1013 — a sparse scatter costs a sparse scatter's price. At ~2.231 active levels the whole region is **127.579 µs**, ~~28.1%~~ → **39.04% of `B` = 326.782** (the 28.1% was against the retracted 454.602, `:321`); at production ρ the region is **31.26 µs = 16.30%**. ⚠ Note `57.196 × 2.231 = 127.60` **is** the measured `L3 − L0` — 2.231 was *defined* as that quotient — so this row is a restatement of a measurement and must **not** be rescaled to `probes/13`'s 1.570. See the two-sheets note at "Tags" |
 | **SL** | per-level scalar epilogue | 249–265 | `i32[256]` → 7 scalars | i32 | scalar | scalar | ~25 scalar ops + 2 `vec_at` | 2 × 64 B VMEM rd | SC scalar | SC scalar | **Missing from §2.** Cheap, but it is the loop-carried dependency: level `j+1`'s `prefix`/`shift`/`done` are computed here, so **the levels cannot be pipelined, reordered or speculated** |
 | 11 | `fill_body` | 271–281 | → `i32[k]`(+`i32[k]`) | i32 | — | `[lane=k] VMEM` | — | `4k`(+`4k`) VMEM wr, **only when `total < k`** | SC VPU | SC VPU | Fires only on short rows. At `n=10240, k=2048` with full rows it never runs at the shipping shapes |
 | 12 | `emit_body` | 283–311 | `i32[L]` → `i32[k]`(+`i32[k]`) | i32 | `[lane=n] VMEM` | `[lane=k] VMEM` compressed | `~7L` + cumsum + popcount | `4L` VMEM rd, `4k` compressed wr | SC VPU | SC VPU | 27.456 µs (`probes/03`). **Serial**: `(woff, rank)` carry chains all `W` chunks, unlike ops 4 and 8–10 which are fully parallel. Also the **only** hot loop with register spills (`probes/06` Q4: 9 slots in 26 bundles) |
@@ -161,10 +161,19 @@ has no FLOP term and no HBM term, so **step 1's floor scores it at zero**; unlik
 not appear folded into a neighbouring op in a profile — it appears as `zero_priv` and `fold_priv`,
 which look like negligible 256-iteration loops and are 4096 words each.
 
-`probes/07` measured it. **The V4 sweeps are 19.192 µs per level** — 4.2% of the prefill kernel in L0
-and 9.4% across the ~2.231 active refinement levels, **13.6% in total**, which makes deleting the
-replication the third-largest single move available and the one the design graph's required `mutate`
-edge is built on.
+`probes/07` measured it. **The V4 sweeps are 19.192 µs per level** — ~~4.2% / 9.4% / **13.6%**~~.
+⚠ **Those three shares are stale twice over** (`probes/13` §7). (a) *Wrong denominator*: they are
+percentages of **454.602 µs**, a total retracted at `:321`. Against `B` = 326.782 they are
+5.87 / 13.10 / **18.98%**. (b) *Superseded magnitude*: stage C″ adopts `probes/09`'s directly
+measured **18.866 µs for the whole sweep**, not 19.192 per level, which puts the region at **5.77%**
+at ρ=1 and **8.34%** at production ρ.
+⛔ **And 19.192 vs `probes/09` is an open contradiction, not a refinement** — 07's marginal slope
+implies 58.18 µs across the 3.031 executions at ρ=1 against 09's measured 18.866, a **3.1×**
+disagreement between two `measured` numbers from different jobs with different arm constructions.
+This line and stage C″ currently quote opposite sides of it. ⏳ `probes/16` adjudicates via an
+NB=256 control built the same way as its other arms.
+Deleting the replication is still a leading move; **its rank is not quotable until the conflict is
+settled**, and it is the one the design graph's required `mutate` edge is built on.
 
 **But V4 was not where the missing ~150 µs went, and the way that error was made is the transferable
 part.** `report.md` §5d had one free parameter and one equation, so *everything* `probes/03` had not
@@ -441,6 +450,14 @@ explanation (0.060 µs, not 3.8). ~0.20 levels remain **unexplained timing resid
 cost, so carrying it is conservative, but it is not explained. The 1.625 factor is measured at ρ=1
 and **assumed** to hold at ρ=0.4.
 
+⚠ **The two sheets below legitimately use different level counts, and this is the sentence that says
+why.** The **ρ=1 sheet consumes 2.231 as a measured time-equivalent** — `refinement L walk × 2.231 =
+84.79` and `V4 sweep × 2.231 = 42.81` are restatements of measured arm differences, because 2.231
+was *defined* as `(L3−L0)/level_slope`. **Substituting 1.570 into them would discard ~0.20 levels of
+real measured time, and is wrong.** The **production sheet consumes a level count as an execution
+count** — 2.031 at ρ=1, **1.570 at production ρ** — which is where `probes/13`'s number belongs.
+Rescaling the wrong one of these was the first error `probes/13` §7 caught in its own §5.
+
 ---
 
 ## Stage C″ — the sheet in force
@@ -486,12 +503,30 @@ mean ρ of 0.50005 (`keep_all` fires for all of chunks 0–1); fixed terms unsca
 | ⚠ **residual (D3)** | **75.683** | **39.8%** | **no** |
 | `hist0` | 33.91 | 17.8% | yes |
 | `emit` | 33.54 | 17.7% | yes |
-| refinement `hist` | 20.08 | 10.6% | yes, and gated by `keep_all` |
-| V4 sweeps | 15.63 | 8.2% | no, but gated |
+| refinement `hist` | ~~20.08~~ **21.49** | 11.2% | yes, and gated by `keep_all` |
+| V4 sweeps | ~~15.63~~ **16.00** | 8.3% | no, but gated |
 | score DMA | 13.469 | 7.1% | **no — static `slice_len`** |
 | output DMA | 5.872 | 3.1% | no |
 | `cvt` | −8.20 | −4.3% | yes |
-| **total** | **189.98** | 100% | |
+| **total** | ~~189.98~~ **191.76** | 100% | ⚠ **a prediction, not a reading** — see below |
+
+⛔ **This sheet is a prediction and it cannot fail to close — do not cite its closure as evidence.**
+Every probe in this exercise ran at **ρ = 1** (`:376`); **nothing has ever been measured at
+ρ = 0.40005**. The total is the sum of the sheet's own reweighted rows, so when a row is corrected
+the total simply moves and **no unattributed hole opens** — there was never an independent reading
+for a hole to open against. `probes/13` §7 corrected two rows and it moved **189.98 → 191.76 µs
+(+0.94%)**, which changes no ranking. Corrections, both **upward**:
+
+- **refinement `hist` 20.08 → 21.49.** The old value is `53.544 × 6/8 × 0.50005` **exactly** and uses
+  **no level count at all** — the executions are already baked into the measured 53.544. The correct
+  gate is the *joint* `crit(levels·eff_len)/crit(levels·n)` = **0.4014 measured**, against the
+  sheet's factorised proxy 0.3750, which is **6.6% low**.
+- **V4 sweeps 15.63 → 16.00.** This one *does* use 2.231, splitting 18.866 as `1:2.231`. That gives
+  15.609, so the recorded 15.63 was a small plug to make the total reach 189.98. The correct split is
+  by **executions**, `1:2.031`.
+
+⚠ **The first thing step 3 should buy is one ρ = 0.40005 arm of the incumbent.** One arm converts
+this denominator from `modelled` to `measured` and validates the entire reweighting.
 
 **Three things this reorders:**
 

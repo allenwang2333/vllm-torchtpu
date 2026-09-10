@@ -1,0 +1,26 @@
+Failed to find host bounds for accelerator type: WARNING: could not determine TPU accelerator type, please set env var `TPU_ACCELERATOR_TYPE` manually, otherwise libtpu.so may not properly initialize.
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789064285.594403 3130685 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+jax 0.10.2 | src /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+--- base
+  ENTRY instructions      : 13
+  bitcast-convert in ENTRY: 0
+  ROOT: ROOT %reshape.4 = s32[1024,2048]{1,0:T(8,128)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name="jit(<lambda>)/reshape" stack_frame_id=
+  [bitcast-convert] %bitcast-convert_bitcast_fusion = s32[128,80,8,128]{3,2,1,0:T(8,128)} fusion(%s.1), kind=kLoop, calls=%fused_computation, backend_config={"flag_configs":[],"window_config":{"kernel_window_bounds":[],"
+  [bitcast-convert] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_spar
+--- u2
+  ENTRY instructions      : 13
+  bitcast-convert in ENTRY: 0
+  ROOT: ROOT %reshape.4 = s32[1024,2048]{1,0:T(8,128)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name="jit(<lambda>)/reshape" stack_frame_id=
+--- v11
+  ENTRY instructions      : 12
+  bitcast-convert in ENTRY: 0
+  ROOT: ROOT %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done = s32[1024,2048]{1,0:T(8,128)} call-done(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), frontend_
+  [bitcast-convert] %bitcast-convert_bitcast_fusion = s32[128,80,8,128]{3,2,1,0:T(8,128)} fusion(%s.1), kind=kLoop, calls=%fused_computation, backend_config={"flag_configs":[],"window_config":{"kernel_window_bounds":[],"
+  [bitcast-convert] %sparse-core-data-format-call.cloned.1.call-start = ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,128]{3,1,2,0:T(8,128)}) call-start(%bitcast-convert_bitcast_fusion, %prepare_done_spar
+
+===== ENTRY diff base -> u2 (22 lines) =====
+
+===== ENTRY diff base -> v11 (10 lines) =====

@@ -66,6 +66,7 @@ decode rho=1 rep1                  rows=   64 mean_all=1.984+-0.047 mean_walk=1.
 decode rho=1 rep2                  rows=   64 mean_all=1.891+-0.039 mean_walk=1.891+-0.039 keep_all=  0.0% crit=2.000 hist=[0, 7, 57, 0] unconv=0 cnt(mean/p99/max)=2740/6893/7412
 decode rho=1 rep3                  rows=   64 mean_all=1.938+-0.054 mean_walk=1.938+-0.054 keep_all=  0.0% crit=2.500 hist=[0, 8, 52, 4] unconv=0 cnt(mean/p99/max)=2502/6465/6788
   -> decode rho=1: mean 1.918+-0.027  crit 2.250+-0.144
+  -> standard_normal rho=1 b=1024 (the probes' own data): crit 2.031  mean 1.925
 
 ----------------------------------------------------------------------------------------------------
 STEP 5b  tie / zero-mass census on the production distribution (prefill row, eff_len=8192)
@@ -164,4 +165,64 @@ intercept c is unmeasured.  fixed(NB) = c + (19.192-c)*NB/256:
   -> NB=64 stops winning once the non-scaling intercept exceeds c = 11.12 us = 58% of the NB=256 sweep.
   -> UNMEASURED at every NB but 256.  v5 is OPEN, not a result.
 
-elapsed 28.3s
+----------------------------------------------------------------------------------------------------
+STEP 7  hardware_map.md stage C'' -- reconcile and re-derive the two
+        production-rho refinement rows
+----------------------------------------------------------------------------------------------------
+level executions, critical: rho=1 standard_normal (the probes' own data) 2.031; production prefill 1.570
+2.231 is a TIMING inversion: 2.231/2.031 = 1.098x more than the executions that happened.
+
+(1) RECONCILE the sheet's two rows against its stated method
+  refinement hist  53.544 x 6/8 x 0.50005 = 20.081   sheet 20.08   -> EXACT.  Uses NO level count; 53.544 is measured.
+  V4 sweeps        18.866 split 1:2.231, refinement x 6/8 = 15.609   sheet 15.63  -> 0.16% apart.  DOES use 2.231.
+  (implied L0 sweep 5.839, refinement 13.027; back-solving 15.63 exactly needs level 2.186, so 15.63 is the sheet's plug for total=189.98)
+
+(2) RE-DERIVE both on measured execution counts
+  refinement hist work is levels_row x eff_len_row, critical:
+    crit(lvl*eff) production = 8348   crit(lvl*n) rho=1 = 20800   factor F = 0.4014
+    sheet's proxy factor 6/8 x 0.50005 = 0.3750 (-6.6% vs measured)
+    refinement hist: 20.08 -> 21.49 us
+  V4 sweeps are fixed-size, so only the execution count matters:
+    per-level sweep = 18.866/(1+2.031) = 6.224 us
+    V4 sweeps: 15.63 -> 16.00 us  (L0 6.224 + refinement 9.773)
+    alt convention (keep the 2.231 timing basis on both sides): 15.91 us -- -0.5%, so the choice barely matters
+
+(3) CLOSURE
+  unchanged rows (residual, hist0, emit, DMAs, cvt) = 154.274
+  OLD total 189.98 (the sheet's 189.98)
+  NEW total 191.76   delta +1.78 us = +0.94%
+  The production sheet is a SUM OF ITS OWN ROWS -- no probe ran at
+  rho=0.40005 (hardware_map.md:376).  There is nothing to close
+  against, so no gap opens; the PREDICTION moves.
+
+(4) the rho=1 stage-C rows are correct as-is
+  38.004 x 2.231 = 84.79 (sheet 84.79); 19.192 x 2.231 = 42.82 (sheet 42.81)
+  sum = 127.60 = 57.196 x 2.231 = the MEASURED L3-L0 delta by construction, so these are measured, not modelled.
+
+(5) percentages at hardware_map.md:103 and :165
+  refinement region 127.579 (:103)     of 454.602 (STALE) = 28.06%   of B=326.782 (C'') = 39.04%
+  V4 sweep L0 19.192 (:165)            of 454.602 (STALE) =  4.22%   of B=326.782 (C'') =  5.87%
+  V4 sweep refinement 42.82 (:165)     of 454.602 (STALE) =  9.42%   of B=326.782 (C'') = 13.10%
+  V4 sweep total 62.01 (:165)          of 454.602 (STALE) = 13.64%   of B=326.782 (C'') = 18.98%
+  but C'' adopts probes/09's 18.866 for ALL sweeps, not 62.01:
+    18.866 of B=326.782 = 5.77% at rho=1; 16.00 of 191.76 = 8.34% at production
+    refinement region at production = 21.49 + 9.77 = 31.26 = 16.30% (was '28.1%')
+
+(6) 19.192/level (probes/07) vs 18.866 all-levels (probes/09) CONTRADICT by 3.1x
+  probes/07 marginal slope implies 58.18 us for 3.031 executions; probes/09 measured 18.866.
+  This is load-bearing for v5.  Re-pricing STEP 6b's v5 at fixed(256) = 6.224 instead of 19.192:
+    NB=  64 T=  41.36 us  delta vs 256 =   -3.03 us =  -1.58% of 191.76
+    NB= 128 T=  38.60 us  delta vs 256 =   -5.79 us =  -3.02% of 191.76
+    NB= 256 T=  44.39 us  delta vs 256 =   +0.00 us =  +0.00% of 191.76
+    NB= 512 T=  53.06 us  delta vs 256 =   +8.67 us =  +4.52% of 191.76
+
+(7) KNOCK-ON: STEP 6b's v3 used deleted = 20.08 x (lvl/2.231), which
+    is WRONG -- 20.08 never came from 2.231.  The correct deleted
+    refinement-hist term is the re-derived row itself, 21.49 us.
+    walk per level: probes/07 38.004 vs probes/09-implied 26.360 (1.44x apart -- same contradiction)
+  variant                                   deleted   added   net us  % 191.76  % 189.98
+  D CENTRAL, probes/07 walk                   55.03   21.46   -33.57    -17.51    -17.67
+  D CENTRAL, probes/09 walk                   55.03   18.25   -36.78    -19.18    -19.36
+  E upper bound (wavemax), probes/07 walk     65.83   42.94   -22.89    -11.94    -12.05
+
+elapsed 29.9s
