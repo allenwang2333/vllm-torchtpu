@@ -499,12 +499,37 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   ⚠ **D1 and D8 cap at the same 13.469** — moving fewer bytes and overlapping the bytes you move
   cannot both be paid out of one exposed-transfer budget
 - **Built?** **No** — step-3 variant
-- **Measured:** — · **Verdict:** **OPEN**
+- **Measured:** — · **Verdict:** **OPEN** — but its one *feasibility* blocker is now closed, see below
+- ✅ **`probes/12` closes the mechanism question, with no job.** `pltpu.emit_pipeline` **is** usable
+  inside a `plsc.VectorSubcoreMesh` kernel: four SparseCore kernels in this checkout already do it,
+  one of them (`ragged_gather_v2.py:182,208`, nested pipelines with a dynamic grid) on the production
+  MoE path via `fused_moe_gmm.py:238`. `dma_start_p`/`dma_wait_p` have SparseCore lowering rules
+  (`sc_lowering.py:428,533`), and a toy SC kernel in the **exact `v4` shape** — `emit_pipeline` from
+  HBM into a persistent `pltpu.VMEM` scratch, then one manual DMA out — lowered cleanly against a
+  `jnp.sin` negative control that failed as intended. **The hand-rolled `BufferedRef` fallback is
+  withdrawn**; `emit_pipeline` is the repo idiom and no kernel here rolls its own.
+  ⚠ Pallas→Mosaic MLIR only — it does not exercise the Mosaic→LLO compile, so VMEM/register pressure
+  at LLO is still a job-only risk.
+- ⚠ **`probes/12` also splits this node by phase, and the split is structural.** `num_waves =
+  _cdiv(b, 32)` (`:443`) is **32 at prefill** (`b=1024`, `P=1`) and **1 at decode** (`b=16` → `P=2` →
+  `b_eff=32`). So there are two different `[transfer]` moves wearing one name:
+  - **cross-wave**, what the caller described: wave `w+1`'s score DMA overlaps **all** of wave `w`'s
+    compute. Valid at prefill, where the 32 waves are, and prefill is the phase §1's denominator is
+    measured in — so the 13.469 µs ceiling below is unaffected. **Worth exactly 0 at decode**, where
+    the `fori_loop` at `:329` runs once and there is no next wave.
+  - **within-slice**: `grid=(n // chunk,)`, with `cvt` (`:171`) and `hist0` (`:187`) fused onto the
+    pipeline buffer. Works in **both** phases and subsumes the cross-wave form — but its ceiling is
+    lower, because passes 2..N (`REFINEMENT_LEVELS`, `emit_body` `:283`) re-read `resident_vmem`, not
+    HBM. It hides the DMA behind **pass 1 only**: ceiling `min(DMA, cvt+hist0)`, not the whole DMA.
+  ⚠ These two are **not** additive and must not be summed. Build the within-slice form (it covers
+  both phases), and if it underperforms, the cross-wave form is the prefill-only fallback.
 - ⚠ **The risk that is specific to this node, and it is not a modelling risk.** `cvt` has a
   **negative marginal cost** — it is already absorbing the transfer's arrival latency
   (`j-300d4690`). A double buffer **competes with that mitigation**. The realistic outcome is well
   under 13.469 µs, and a measured 0 would be a coherent result rather than a broken variant. This is
-  why the caller's mechanism, though real, is not the headline.
+  why the caller's mechanism, though real, is not the headline. ⚠ The within-slice form makes this
+  *sharper*, not milder: it fuses the pipeline onto `cvt`, the very pass whose absorption is the
+  competing mitigation.
 
 ---
 
@@ -842,10 +867,28 @@ _topk_kernel                          src/…/sparsecore_topk.py:150
     └── semaphores = 2, one per buffer
 ```
 
-⚠ **`emit_pipeline` vs a hand-rolled `BufferedRef` is `undecided — settled by whether `pltpu`'s
-pipeline helper accepts a `plsc` mesh kernel with a `fori_loop` grid.** The grid here is a manual
-`fori_loop` over waves, not a Pallas `BlockSpec` grid, so the helper may not apply at all. **That is
-the first thing Plan C must check, and it is a compile, not a job.**
+✅ **SETTLED by `probes/12`, locally, no job: use `emit_pipeline`.** It accepts a `plsc` mesh kernel
+— it supplies its *own* grid and never touches the outer kernel's `program_id`, so the manual
+`fori_loop` over waves is simply irrelevant to it — and four SparseCore kernels in this checkout
+already use it, one on the production MoE path. **The hand-rolled `BufferedRef` fallback is
+withdrawn.** Dynamic (traced, possibly-zero) grid bounds are allowed; **block shapes must be static**.
+
+⚠ **Two consequences `probes/12` found that change this plan's shape**, both derived from source:
+
+1. **`num_waves` is 32 at prefill and 1 at decode** (`:443`, with `P=1` and `P=2` respectively). The
+   cross-wave pipeline drawn below is a **prefill** construct. It is worth 0 at decode.
+2. **Prefer the within-slice form** — `grid=(n // chunk,)`, fusing `cvt` (`:171`) and `hist0`
+   (`:187`) onto the pipeline buffer. It covers both phases, but hides the DMA behind **pass 1 only**
+   (passes 2..N re-read `resident_vmem`, not HBM), so its ceiling is `min(DMA, cvt+hist0)`.
+   ⚠ `chunk` must divide `n`: the kernel flattens scores to 1-D (`:486`), so a `BlockSpec` index map
+   returns `row_c * n / chunk`. Every production `n` is a power of two, so any power-of-two `chunk`
+   works. Alternatively pass scores 2-D `(b, n)` with a `(1, chunk)` block.
+   ⚠ The `pl.when(i_hi > 0)` gate at `:166` must become a **dynamic grid of 0**, not a `pl.when`
+   around the pipeline — wrapping it puts its `run_scoped` allocations under a conditional. Repo
+   idiom: `ragged_gather_v2.py:102,208`.
+   ⚠ Double buffering adds `2 * chunk * 4` B on top of `resident_vmem` (up to 256 KB at
+   `MAX_SLICE_WORDS`) against a 512 KB budget — comfortable to `chunk <= 8K` words, but it is a real
+   subtraction from the headroom `_pick_partition` sizes against.
 
 **3. The pipeline.**
 
@@ -898,7 +941,8 @@ existing mitigation. **D1 and D8 cap at the same 13.469 µs and do not add.**
 | risk | signal, and which instrument shows it | fallback | threatens |
 | --- | --- | --- | --- |
 | ⚠ **the whole prize is already taken by `cvt`** and the measured delta is ~0 | a flat arm against a live control in the same job. **This is the expected outcome, not a failure** | report the null; it answers the caller's question definitively | speed |
-| `emit_pipeline` does not accept a `plsc` mesh kernel with a `fori_loop` grid | a compile error — **catch it locally, before any job** | hand-rolled `BufferedRef` with explicit semaphores | speed |
+| ~~`emit_pipeline` does not accept a `plsc` mesh kernel with a `fori_loop` grid~~ | ✅ **closed by `probes/12`** — it does, and four SC kernels here already use it | — (fallback withdrawn) | — |
+| ⚠ **the Pallas→Mosaic lowering is clean but the Mosaic→LLO compile is not exercised** | a VMEM- or register-pressure failure that only appears on hardware. `probes/12` is explicit that it cannot see this | shrink `chunk`; `/xprof-llo` the arm to read VMEM high-water and spills | speed, and the build itself |
 | the ragged size creates a sub-granule tail and the DMA slows down | bytes/µs falls below the 1255 GB/s slice rate | round `i_hi` up to 8 words (§4d T5) | speed |
 
 ---
@@ -1072,7 +1116,7 @@ prize is ~4× smaller than the number this node carried before the source read.
 | node | what closes it | cost |
 | --- | --- | --- |
 | `v3` fused-emit | ⚠ a probe on the cost of a conditional `store_compressed` inside the L0 walk. **Not yet dispatched** | one arm |
-| `v4` pipelined-DMA | a local compile check that `emit_pipeline` accepts a `plsc` mesh kernel with a `fori_loop` grid — **no job**. ⏳ **dispatched, `probes/12-emit-pipeline-feasibility`** | minutes |
+| `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
 | `v6` keep-all-fastpath | ✅ **check done — the gate does not exist** (no inter-subcore barrier), and the prize is 4× smaller than recorded because a `keep_all` short-circuit is already in the kernel. Now a plain build at a `modelled` −4.7% | step-3 variant |
 | `v10` sample-and-count | ⚠ **mandatory probe** — the count-pass rate vs `cvt`. It is the highest-value probe in the wave because it decides a whole root | one arm |
@@ -1120,11 +1164,11 @@ prize is ~4× smaller than the number this node carried before the source read.
 1. ⏳ **Collect `probes/11`.** It decides whether D3 is a ~73 µs handoff or a 40% overstatement of
    every denominator in this file. Nothing else here is worth more.
 2. ✅ **The scheduler source read is done** — it settled `v6`, verified ρ to 5 significant figures,
-   and identified the production score distribution. Both cheap follow-ons are now ⏳ **in flight and
-   need no job**: `probes/12` (the `emit_pipeline`/`plsc` compile check for `v4`) and `probes/13`
-   (re-fitting the refinement level count at the real ReLU'd, tie-dense, zero-piled distribution
-   rather than `standard_normal`). The level count feeds `v3`'s band and `v5`'s whole trade, so
-   neither is built before `13` lands.
+   and identified the production score distribution. ✅ **`probes/12` has landed**: `emit_pipeline`
+   is viable on SparseCore, the `BufferedRef` fallback is withdrawn, and `v4` split by phase.
+   ⏳ **`probes/13`** (re-fitting the refinement level count at the real ReLU'd, tie-dense,
+   zero-piled distribution rather than `standard_normal`) is still out. The level count feeds `v3`'s
+   band and `v5`'s whole trade, so neither is built before `13` lands.
 3. **Dispatch the two mandatory probes in one job**: the count-pass rate (`v10`) and the conditional
    `store_compressed` cost (`v3`). Both are single arms and they decide two of the three largest
    candidates. ⚠ **Give both the real score distribution**, not `standard_normal` — a tie-dense input

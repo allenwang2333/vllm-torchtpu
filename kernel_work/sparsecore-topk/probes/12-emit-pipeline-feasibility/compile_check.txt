@@ -1,0 +1,120 @@
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/sc_primitives.py", line 906, in wrapped
+    body(idx)
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/12-emit-pipeline-feasibility/compile_check.py", line 161, in cvt
+    LANES)] = jnp.sin(v).astype(jnp.int32)
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unimplemented primitive in Pallas TPU lowering for sc_vector_subcore: sin. Please file an issue at https://github.com/jax-ml/jax/issues/new/choose.
+
+The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
+
+--------------------
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/12-emit-pipeline-feasibility/compile_check.py", line 194, in run
+    lowered = traced.lower(lowering_platforms=("tpu", ))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/stages.py", line 492, in lower
+    lowering = _resolve_and_lower(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1091, in _resolve_and_lower
+    return _pjit_lower(
+           ^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pjit.py", line 1264, in _pjit_lower
+    return pxla.lower_sharding_computation(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/profiler.py", line 420, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 1123, in lower_sharding_computation
+    tuple_args, shape_poly_state) = _cached_lowering_to_hlo(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 736, in _cached_lowering_to_hlo
+    lowering_result = mlir.lower_jaxpr_to_module(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1403, in lower_jaxpr_to_module
+    lower_jaxpr_to_fun(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 1994, in lower_jaxpr_to_fun
+    out_vals, tokens_out = jaxpr_subcomp(
+                           ^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2166, in jaxpr_subcomp
+    cache_entry = _cached_lowering_miss(
+                  ^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2235, in _cached_lowering_miss
+    cache_entry = _emit_lowering_rule_as_fun(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2373, in _emit_lowering_rule_as_fun
+    outs = lowering_rule(sub_ctx, *unflattened_args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2408, in _uncached_lowering
+    ans = lower_per_platform(ctx, str(primitive), platform_rules, default_rule,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/interpreters/mlir.py", line 2536, in lower_per_platform
+    output = type_cast(Sequence[IrValues], rule(ctx, *rule_args, **rule_kwargs))
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 598, in _mpmd_map_lowering
+    return _mpmd_map_tpu_lowering(ctx, *in_nodes, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mpmd.py", line 466, in _mpmd_map_tpu_lowering
+    return pallas_call_registration.mpmd_map_tpu_lowering_rule(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/pallas_call_registration.py", line 638, in mpmd_map_tpu_lowering_rule
+    lowering.lower_jaxpr_into_unpipelined_module(
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1448, in lower_jaxpr_into_unpipelined_module
+    func_op = _lower_jaxpr_to_func_common(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1595, in _lower_jaxpr_to_func_common
+    body: Any = func.FuncOp.from_py_func(*arg_types, name=name)(body_func)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jaxlib/mlir/dialects/func.py", line 197, in decorator
+    return_values = f(*func_args, **func_kwargs)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1592, in body_func
+    return jaxpr_subcomp(lowering_context, jaxpr, *other_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1794, in jaxpr_subcomp
+    cache_entry = _emit_pallas_lowering_rule_as_fun(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 458, in _emit_pallas_lowering_rule_as_fun
+    return _emit_detached_func(func_name, input_types, output_types, body_builder)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 397, in _emit_detached_func
+    outs = body_builder(list(entry_block.arguments))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 446, in body_builder
+    outs = rule(sub_ctx, *rule_args, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/sc_primitives.py", line 804, in _parallel_loop_lowering_rule
+    carry_out = tc_lowering.jaxpr_subcomp(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 1839, in jaxpr_subcomp
+    raise NotImplementedError(
+NotImplementedError: Unimplemented primitive in Pallas TPU lowering for sc_vector_subcore: sin. Please file an issue at https://github.com/jax-ml/jax/issues/new/choose.
+jax 0.10.2 | devices: [CpuDevice(id=0)]
+pinned tpu_info: 7x SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+========================================================================
+variant C-incumbent: variant_c
+  trace: OK (jaxpr built)
+  lower: OK -> 4048 chars of StableHLO/Mosaic
+  tpu.enqueue_dma occurrences in module: 0
+  tpu.wait_dma* occurrences in module:   0
+  mentions 'sparse_core'/'sc_':           1
+========================================================================
+variant A-emit_pipeline-hbm2hbm: variant_a
+  trace: OK (jaxpr built)
+  lower: OK -> 10194 chars of StableHLO/Mosaic
+  tpu.enqueue_dma occurrences in module: 0
+  tpu.wait_dma* occurrences in module:   0
+  mentions 'sparse_core'/'sc_':           1
+========================================================================
+variant B-emit_pipeline-into-resident-vmem: variant_b
+  trace: OK (jaxpr built)
+  lower: OK -> 8746 chars of StableHLO/Mosaic
+  tpu.enqueue_dma occurrences in module: 0
+  tpu.wait_dma* occurrences in module:   0
+  mentions 'sparse_core'/'sc_':           1
+========================================================================
+variant D-negative-control-sin: variant_d
+  trace: OK (jaxpr built)
+  LOWER FAILED for D-negative-control-sin
