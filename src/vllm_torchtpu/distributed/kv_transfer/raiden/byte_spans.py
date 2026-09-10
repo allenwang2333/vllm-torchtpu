@@ -401,19 +401,15 @@ def lower_dsv4_row_spans(
 ) -> PoolSpanRegistration:
     """Lower one DeepSeek-V4 cache class to round-robin per-page byte spans.
 
-    Same striping and same page-prefix trimming as `lower_glm_row_spans`, but
-    DSv4's roles put a different number of rows on a page: CSA NoPE packs four
-    logical tokens into one row, RoPE and the indexer sixteen, and HCA spends
-    two rows on every compressed token. The tail is therefore rounded up in
-    rows rather than assuming whole tokens per row.
+    Same striping and page-prefix trimming as ``lower_glm_row_spans``. DSv4
+    differs in that each role packs a different number of tokens into a row
+    (CSA NoPE four, RoPE and the indexer sixteen, HCA two rows per token), so
+    the tail is rounded up in rows rather than in whole tokens.
 
-    Striping across `parallelism` ranks is inherited from the GLM lowering
-    and is dead weight for DSv4 step 1, which pins parallelism to 1 because
-    both replicas run DP attention and every rank owns whole requests.
-
-    `block_ids` are the request's pages *in this cache group's block table*.
+    ``block_ids`` are the request's pages in this cache group's block table.
     Groups never share a block ID, which is what keeps the aliased arrays
-    (SWA on CSA NoPE, states on their own compressed-KV array) apart.
+    apart. Striping is inherited from GLM and unused here: DSv4 pins
+    parallelism to 1 because both replicas run DP attention.
     """
     if not tag:
         raise ValueError("pool tag must not be empty")

@@ -149,16 +149,12 @@ def _stage3_skipped_window_pages(*, num_tokens: int, page_tokens: int,
                                  window_tokens: Optional[int]) -> int:
     """Leading pages of a sliding-window block table that hold no live KV.
 
-    vLLM's `SlidingWindowManager` frees every page that falls out of the
-    window and writes the null block over its entry, so the table starts with
-    a run of one repeated ID. Transferring those pages would hand Raiden a
-    destination block list with duplicates, which it rejects, and would move
-    bytes the decode replica cannot read anyway.
-
-    Mirrors `SlidingWindowManager.get_num_skipped_tokens` and
-    `SingleTypeKVCacheManager.remove_skipped_blocks`. Both peers derive the
-    count from the same request length and page geometry, so they trim the
-    same pages and the surviving pages stay paired.
+    `SlidingWindowManager` frees each page that falls out of the window and
+    writes the null block over its entry, so the table opens with a run of one
+    repeated ID. Sending those pages would hand Raiden a duplicate destination,
+    which it rejects. Mirrors `SlidingWindowManager.get_num_skipped_tokens`;
+    both peers compute it from the same request length and page geometry, so
+    they trim the same pages.
     """
     if not window_tokens:
         return 0
@@ -176,9 +172,9 @@ def _stage3_trim_window_pages(
 ) -> list[int]:
     """`block_ids` without the dead prefix a sliding window leaves.
 
-    A windowed group's block table still has one entry per page of the whole
-    request, but the allocator has already freed the pages that fell behind
-    the window and points them at the null block. Those entries are dropped here.
+    The table still has one entry per page of the whole request, but the
+    allocator freed the pages that fell behind the window and pointed them at
+    the null block. Those entries get dropped here.
     """
     ids = [int(block_id) for block_id in block_ids]
     skipped = min(
@@ -188,11 +184,10 @@ def _stage3_trim_window_pages(
     if not skipped:
         return ids
     dropped, kept = ids[:skipped], ids[skipped:]
-    # Out-of-window pages hold nothing the consumer can attend to, so dropping
-    # them is right either way, but the allocator normally has already written
-    # the null block over all of them. A varied prefix means this arithmetic
-    # and vLLM's have drifted apart, which is worth seeing before it turns
-    # into a silent mis-transfer.
+    # Dropping out-of-window pages is right either way, but they should all be
+    # the null block. A varied prefix means this arithmetic and vLLM's have
+    # drifted apart, which is worth seeing before it becomes a silent
+    # mis-transfer.
     if len(set(dropped)) != 1:
         logger.warning(
             "Stage-3 sliding-window trim dropped pages that are not all the "
@@ -216,20 +211,17 @@ def _stage3_recycled_transfer_pages(
     page_tokens: int,
     window_tokens: Optional[int],
 ) -> int:
-    """How many pages this group would transfer that the allocator already freed.
+    """Pages this group would send that the allocator has already freed.
 
-    Both peers derive their skip from `num_tokens`, the transfer prefix, but the
-    allocator freed pages against wherever the producer actually got to. Those
-    two agree only while the producer stops at the handoff token. Let it run one
-    page further and it has recycled a page the send still lists, which arrives
-    as the null block: `num_tokens=374` with a 16-token page and an 8-token
-    window skips 22 pages while the allocator freed 23, so page 22 goes over the
-    wire dead. Let it run far enough and two dead pages collide, which is a
-    duplicate destination that Raiden rejects outright.
+    Both peers skip against `num_tokens`, the transfer prefix, while the
+    allocator freed against however far the producer actually ran. The two
+    agree only while the producer stops at the handoff token. One page further
+    and the send still lists a recycled page, which arrives as the null block.
+    Far enough and two of them collide into a duplicate destination, which
+    Raiden rejects outright.
 
-    Counting the null blocks left in the range beats re-deriving the allocator's
-    position, because it reads what the block table actually says rather than
-    assuming the two formulas line up.
+    Counting the null blocks in the range reads what the block table says,
+    rather than assuming the two formulas line up.
     """
     skipped = _stage3_skipped_window_pages(num_tokens=num_tokens,
                                            page_tokens=page_tokens,
@@ -259,20 +251,16 @@ def _stage3_transfer_groups(
 ) -> tuple[_Stage3TransferGroup, ...]:
     """The KV cache groups whose pages Stage 3 transfers, in group order.
 
-    Mamba groups are excluded: their state rides the state-class tags and is
-    addressed one committed checkpoint at a time, not as a page range.
+    Mamba groups are excluded; their state rides the state-class tags, one
+    committed checkpoint at a time rather than a page range. ``page_tokens``
+    travels with each group because DSv4's groups page at different sizes, its
+    SWA block being an eighth of its CSA block, so one connector-wide page size
+    cannot validate them all.
 
-    ``page_tokens`` travels with the group index because DeepSeek-V4's groups
-    page at different sizes -- its SWA group's block is an eighth of the CSA
-    group's -- so a single connector-wide page size cannot validate them all.
-
-    ``multi_group`` says which plan this is, and it is exact in both
-    directions. Qwen3.5 and GLM have one such group and must have one. DSv4
-    has several by construction, because the whole reason it needs its own
-    admission path is that its groups disagree about page geometry; a
-    single-group DSv4 plan would mean the scheduler sends no per-group block
-    tables while the worker's DSv4 path requires them, and the transfer would
-    fail at runtime rather than here.
+    ``multi_group`` is checked in both directions. Qwen3.5 and GLM must have
+    exactly one group. DSv4 has several by construction, and a single-group
+    DSv4 plan would only fail later, when the worker looks for the per-group
+    block tables the scheduler never sent.
     """
     groups = tuple(
         _Stage3TransferGroup(cache_group_index=index,
@@ -303,19 +291,17 @@ def _stage3_transfer_groups(
 class _Stage3Dsv4Pool:
     """One tag in the DSv4 transfer plan, and the geometry to move it."""
 
-    # Pool tag, e.g. `dsv4.csa.nope.g0`. The `.g0` suffix names the kv cache
-    # group whose block table addresses these bytes.
+    # e.g. `dsv4.csa.nope.g0`; the suffix names the kv cache group whose block
+    # table addresses these bytes.
     tag: str
-    # Which block table to read, as an index into `SendMeta.group_block_ids`.
-    # That list skips Mamba groups, so this is not a kv-cache-group index.
-    # Tags of one group share a position: `dsv4.csa.nope.g0` and
-    # `dsv4.csa.rope.g0` do, because a CSA layer's two arrays page together.
+    # Index into `SendMeta.group_block_ids`. That list skips Mamba groups, so
+    # this is not a kv-cache-group index. Tags of one group share a position,
+    # as `dsv4.csa.nope.g0` and `dsv4.csa.rope.g0` do.
     plan_position: int
     page_tokens: int
     live_bytes_per_block: int
-    # `live_bytes_per_block // row_bytes` is rows per page, which is not
-    # `page_tokens`: each DSv4 role packs a different number of tokens into a
-    # row, four for CSA NoPE and sixteen for RoPE.
+    # Rows per page is `live_bytes_per_block // row_bytes`, not `page_tokens`:
+    # CSA NoPE packs four tokens into a row and RoPE sixteen.
     row_bytes: int
     # None for full attention.
     window_tokens: Optional[int] = None
@@ -328,11 +314,10 @@ def _stage3_dsv4_pool_pages(
 ) -> tuple[list[int], int]:
     """The pages one DSv4 pool actually transfers, and the tokens they hold.
 
-    A windowed group's block table opens with null blocks standing in for
-    pages the allocator already freed, so both the pages and the token count
-    they would account for come off the front together. Producer and consumer
-    call this with the same pool geometry and the same request length, which
-    is what keeps their page lists aligned index for index.
+    A windowed group's table opens with null blocks, so the dead pages and the
+    tokens they would have covered come off the front together. Producer and
+    consumer call this with the same geometry and request length, so their page
+    lists line up.
     """
     trimmed = _stage3_trim_window_pages(block_ids,
                                         num_tokens=num_tokens,
@@ -694,7 +679,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             # use_raiden here means __init__ selected
             # TPURaidenConnectorScheduler, the only one of the two schedulers
             # accepting mamba block ids. The checker cannot narrow the union
-            # to that subclass on its own, so say which one it is.
+            # to that subclass, so the cast says which one it is.
             scheduler = cast(TPURaidenConnectorScheduler,
                              self.connector_scheduler)
             return scheduler.request_finished(
@@ -850,22 +835,18 @@ class TPUConnectorScheduler:
     def _maybe_truncate_prompt_for_handoff(self, request: "Request") -> None:
         """P-side: drop the last prompt token so P stops where the handoff does.
 
-        The transfer always excludes the final prompt token, since D has to
-        recompute it to get its first logits. Let P compute it anyway and P
-        sits one token ahead of what it publishes, which matters wherever
-        state is derived from how far P actually ran rather than from the
-        transfer extent.
+        The transfer always excludes the final prompt token, since D recomputes
+        it to get its first logits. If P computes it anyway, P sits one token
+        ahead of what it publishes, and anything derived from how far P ran
+        disagrees with the transfer extent.
 
-        Mamba state advances with every token, so shipping h(N) would have D
-        advance the recurrence a second time over token N. Stopping at N-1
-        ships h(N-1) and D's recompute reproduces h(N).
-
-        A sliding window frees pages behind itself against
-        `num_computed_tokens`, while the connector skips those same pages
-        against the transfer extent. The two disagree whenever `N - W + 1`
-        lands on a page boundary, and the send then lists a page the allocator
-        has already recycled. Stopping at N-1 puts both formulas on the same
-        input, so they agree by construction instead of by luck.
+        Two things depend on that. Mamba state advances with every token, so
+        shipping h(N) would have D advance the recurrence over token N a second
+        time; stopping at N-1 ships h(N-1) and D's recompute gives h(N). A
+        sliding window frees pages against `num_computed_tokens` while the
+        connector skips those pages against the transfer extent, and the two
+        disagree whenever `N - W + 1` lands on a page boundary. Stopping at N-1
+        feeds both formulas the same input.
         """
         if request.num_prompt_tokens <= 1:
             return
@@ -1172,12 +1153,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     self.kv_ip, self.kv_port)
 
     def _stage3_truncates_prompt(self) -> bool:
-        """Whether this model needs P to stop one token short of its prompt.
+        """Whether P must stop one token short of the prompt.
 
         Mamba state and sliding-window page recycling both key off how far P
-        actually ran, so both need P to stop where the transfer stops. A model
-        with neither can let P run to the end of the prompt; the extra token
-        changes nothing anyone reads.
+        actually ran. A model with neither can run to the end of the prompt,
+        where the extra token changes nothing anyone reads.
         """
         return bool(self._stage3_mamba_group_indices) or any(
             group.window_tokens for group in self._stage3_transfer_groups)
@@ -1364,9 +1344,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "Stage-3 source transfer parallelism must be positive")
 
         grouped_block_ids = blocks.get_block_ids()
-        # Every planned group must be present before any of them is read; a
-        # missing one means the decode allocation and the admitted manifest
-        # disagree about the group layout.
+        # Check every planned group before reading any of them. A missing group
+        # means the decode allocation and the admitted manifest disagree about
+        # the group layout.
         for transfer_group in (
                 self._stage3_transfer_groups or (_Stage3TransferGroup(
                     cache_group_index=self._stage3_fa_group_index,
@@ -1405,10 +1385,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             raise ValueError(
                 "External token count exceeds the published reshard payload: "
                 f"external={external_tokens}, num_tokens={num_tokens}")
-        # The suffix clip is a single dst_skip_bytes offset into one flat byte
-        # space, so it cannot say "skip a different prefix in each group". A
-        # multi-group model pulls its whole prefix and pays the redundant
-        # bytes; only the single-group FA path takes the clip.
+        # The suffix clip is one dst_skip_bytes offset into a flat byte space,
+        # so it cannot skip a different prefix per group. A multi-group model
+        # pulls its whole prefix and pays the redundant bytes.
         skip_tokens = (num_tokens - external_tokens if
                        (self._stage3_prefix_aware_load_enabled
                         and not multi_group) else 0)
@@ -1572,10 +1551,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if isinstance(finish_params, dict) and bool(
                 finish_params.get("_p_side_truncated")):
             # The producer already dropped one token; N-1 is already applied.
-            # This branch is also what makes num_tokens equal computed_tokens,
-            # which is what the sliding-window skip needs: the allocator freed
-            # against computed_tokens, so anything else re-derives a different
-            # page boundary and lists a page that is already back in the pool.
+            # It also makes num_tokens equal computed_tokens, which the
+            # sliding-window skip needs: the allocator freed against
+            # computed_tokens, and any other value picks a different page
+            # boundary and lists a page that is back in the pool.
             num_tokens = min(computed_tokens, prompt_tokens)
         else:
             num_tokens = min(computed_tokens, prompt_tokens - 1)
@@ -1630,10 +1609,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             ]
 
         # Count the pages this send would carry that the allocator has already
-        # taken back. The connector skips against `num_tokens`, the transfer
-        # prefix, while the allocator freed against wherever the producer
-        # actually stopped, so the two drift apart as soon as the producer runs
-        # past the handoff token.
+        # taken back. See `_stage3_recycled_transfer_pages` for why they drift.
         if normalized_group_block_ids is not None:
             recycled: list[tuple[int, int]] = []
             for group, ids in zip(self._stage3_transfer_groups,
@@ -1645,10 +1621,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     window_tokens=group.window_tokens)
                 if dead:
                     recycled.append((group.cache_group_index, dead))
-            # Two dead pages in one group are two copies of the null block, a
-            # duplicate destination that Raiden rejects by raising out of
-            # `execute_model` and killing the engine along with every other
-            # request on it. Nothing can be salvaged, so drop the send.
+            # Two dead pages in one group are two copies of the null block.
+            # Raiden rejects that duplicate destination by raising out of
+            # `execute_model`, which kills the engine and every other request
+            # on it, so drop the send instead.
             if any(dead > 1 for _, dead in recycled):
                 logger.warning(
                     "Stage-3 skipping the send for req=%s: the producer ran to "
@@ -1659,14 +1635,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     num_tokens, recycled)
                 return False, {}
             if recycled:
-                # A single dead page is a hole in one group's window rather
-                # than a transfer Raiden will refuse, and it predates this
-                # check: roughly one send in twelve hits it on the ordinary
-                # proxy path. Skipping it here would be worse than shipping it,
-                # because the decode replica is provisioned to decode and falls
-                # over trying to prefill a long prompt. Say so and carry on.
-                # The repair is for the producer to publish the page count it
-                # actually dropped instead of having the consumer re-derive it.
+                # One dead page is a hole in that group's window, not something
+                # Raiden refuses, and it predates this check. Skipping the send
+                # would be worse: the decode replica is provisioned to decode
+                # and falls over prefilling a long prompt. The real fix is for
+                # the producer to publish the page count it dropped instead of
+                # having the consumer re-derive it.
                 logger.warning(
                     "Stage-3 send for req=%s carries sliding-window pages the "
                     "allocator already recycled, as (cache group, dead pages) "
@@ -2227,11 +2201,10 @@ class TPURaidenConnectorWorker:
     def _admit_raiden_dsv4_kv_cache(self, runner: TPUModelRunner) -> None:
         """Constructs the Raiden engine over DeepSeek-V4's cache classes.
 
-        DSv4 is the first admitted model with more than one attention KV cache
-        group, and the first whose caches alias one array at the same byte
-        offset (SWA on a CSA NoPE array, compressor states on their own
-        compressed-KV array). Every pool tag therefore names its cache group,
-        and every transfer carries that group's own block table.
+        DSv4 has several attention KV cache groups, and its caches alias one
+        array at the same byte offset: SWA on a CSA NoPE array, compressor
+        states on their own compressed-KV array. So every pool tag names its
+        cache group, and every transfer carries that group's block table.
         """
         if self._raiden_transfer_engine is not None:
             return
@@ -2412,10 +2385,9 @@ class TPURaidenConnectorWorker:
         """Layout identity and page geometry of the admitted model."""
         if _use_raiden_dsv4_admission():
             fingerprint, payload = self._measure_raiden_dsv4_layout(manifest)
-            # DSv4's roles page at different sizes, so the single page_tokens
-            # the controller registers is only the nominal one; the real
-            # per-tag geometry travels in the fingerprint and in each span
-            # registration.
+            # DSv4's roles page at different sizes, so the page_tokens the
+            # controller registers is nominal. The real per-tag geometry
+            # travels in the fingerprint and in each span registration.
             page_tokens = int(self.vllm_config.cache_config.block_size)
             return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
@@ -3223,10 +3195,9 @@ class TPURaidenConnectorWorker:
             self, metadata: TPUConnectorMetadata) -> None:
         """Registers this producer's span set, one registration per pool tag.
 
-        Under DP attention this rank owns every page of every request it
-        prefilled, so the striping degenerates to `parallelism=1`. What DSv4
-        adds over GLM is that the tags no longer share a block table: each
-        one is lowered against its own cache group's pages.
+        Under DP attention this rank owns every page it prefilled, so the
+        striping degenerates to `parallelism=1`. Unlike GLM, the tags no longer
+        share a block table: each is lowered against its own group's pages.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
             lower_dsv4_row_spans
@@ -3776,9 +3747,8 @@ class TPURaidenConnectorWorker:
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
             if _use_raiden_dsv4_admission():
-                # Each DSv4 tag replays over its own cache group's pages,
-                # not one shared page list: the groups' block IDs are
-                # disjoint, and that disjointness is the only thing
+                # Each DSv4 tag replays over its own group's pages rather than
+                # one shared list. Disjoint block IDs are the only thing
                 # separating the caches that alias one array.
                 group_blocks = self._stage3_dsv4_group_blocks(req_meta)
                 transfer_tags = []

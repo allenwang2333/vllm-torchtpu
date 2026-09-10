@@ -13,17 +13,17 @@ TAG_DSA_IDX = "dsa.idx"
 TAG_MLA_NOPE = "mla.nope"
 TAG_MLA_ROPE = "mla.rope"
 
-# DeepSeek-V4. Every DSv4 tag carries a ``.g{index}`` suffix naming its
-# kv-cache-group, because DSv4 is the first admitted model whose logical caches
-# alias one array at the same byte offset and are told apart only by block ID.
-# A tag that did not name the group would address the wrong caches' pages.
+# DeepSeek-V4. Its logical caches alias one array at the same byte offset and
+# are told apart only by block ID, so every tag carries a ``.g{index}`` suffix
+# naming its kv-cache group. Without it a tag would address another cache's
+# pages.
 TAG_DSV4_CSA_NOPE = "dsv4.csa.nope"
 TAG_DSV4_CSA_ROPE = "dsv4.csa.rope"
 TAG_DSV4_IDX = "dsv4.idx"
 TAG_DSV4_HCA = "dsv4.hca"
 TAG_DSV4_SWA = "dsv4.swa"
-# The compressor's paged staging buffer, one tag per compressed-KV role since
-# their windows (and so their per-request block counts) differ.
+# The compressor's paged staging buffer. One tag per compressed-KV role,
+# because their windows, and so their per-request block counts, differ.
 TAG_DSV4_STATE_CSA = "dsv4.state.csa"
 TAG_DSV4_STATE_IDX = "dsv4.state.idx"
 TAG_DSV4_STATE_HCA = "dsv4.state.hca"

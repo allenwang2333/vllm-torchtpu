@@ -3,18 +3,15 @@
 
 DSv4 overlays several logical caches onto one physical array: every SWA cache
 onto a CSA NoPE array, every compressor state onto its own compressed-KV
-layer's array (see ``TPUModelRunner._allocate_ds_v4_kv_caches``). Those
-overlays sit at the *same* byte offset in the same array, so nothing about
-their geometry keeps them apart. What keeps them apart is block ownership:
-the docstring's claim is that "state and full-attention groups never own the
-same block ID, so the rows never collide".
+layer's array (see ``TPUModelRunner._allocate_ds_v4_kv_caches``). The overlays
+sit at the same byte offset in the same array, so only block ownership keeps
+them apart.
 
-A pool manifest for DSv4 would therefore declare several pools over one
-storage, all with ``base_offset_bytes=0`` and overlapping block ranges, and
-rely on this invariant for correctness. That is worth an explicit test,
-because a violation is silent: Raiden would copy real bytes to real
-addresses, just the wrong ones, and the failure would surface as bad tokens
-rather than as an error.
+The manifest declares several pools over one storage, all at
+``base_offset_bytes=0`` with overlapping block ranges, and rests on that. It
+is worth testing because a violation is silent: Raiden would copy real bytes
+to real addresses, just the wrong ones, and it would surface as bad tokens
+rather than an error.
 
 Deviceless: vLLM's block allocator is plain Python and never touches a TPU.
 """
@@ -36,8 +33,8 @@ _CSA_COMPRESS_RATIO = 4
 _SWA_BLOCK_TOKENS = _CSA_BLOCK_TOKENS // _CSA_COMPRESS_RATIO // 2
 # Sized for the multi-request case: the SWA group takes 8 blocks to the CSA
 # group's 1, so four 2-page requests need 4 * (2 + 2 + 16) blocks. Running
-# short raises out of the *shared* pool, which is the invariant showing
-# through: one group's allocation drains the blocks another group could use.
+# short raises out of the shared pool, which is the invariant showing through:
+# one group's allocation drains blocks another group could have used.
 _NUM_BLOCKS = 256
 
 
@@ -114,11 +111,10 @@ def _group_block_ids(coordinator, request_id: str) -> list[set[int]]:
 
 
 def test_all_groups_draw_from_one_shared_block_pool():
-    """Every single-type manager is handed the *same* BlockPool instance.
+    """Every single-type manager is handed the same BlockPool instance.
 
-    This is the structural reason block IDs are globally unique: there is one
-    free-block queue, so a block that is popped for one group cannot also be
-    popped for another.
+    That is the structural reason block IDs are globally unique: one free-block
+    queue, so a block popped for one group cannot also be popped for another.
     """
     coordinator = _coordinator()
     pools = {id(m.block_pool) for m in coordinator.single_type_managers}
@@ -151,8 +147,8 @@ def test_cache_groups_never_share_a_block_id(num_tokens):
 def test_groups_stay_disjoint_across_concurrent_requests():
     """Disjointness must hold across requests too, not just within one.
 
-    Two pools over one storage are safe only if no *live* block id is claimed
-    twice anywhere, so the interesting check spans every request in flight.
+    Two pools over one storage are safe only if no live block ID is claimed
+    twice anywhere, so the check has to span every request in flight.
     """
     coordinator = _coordinator()
     request_ids = [f"req-{index}" for index in range(4)]
@@ -175,13 +171,13 @@ def test_groups_stay_disjoint_across_concurrent_requests():
 
 
 def test_swa_group_pages_more_blocks_than_csa_for_the_same_tokens():
-    """SWA's smaller logical block is a *count* difference, not a byte one.
+    """SWA's smaller logical block is a count difference, not a byte one.
 
-    _swa_block_size divides the CSA block by 8, so the SWA group takes 8x the
-    blocks for the same token count while each block covers the same 131072
-    bytes. This is why the manifest can give both pools the same
-    block_stride_bytes and the same num_blocks, and why the difference shows
-    up in region granularity instead.
+    _swa_block_size divides the CSA block by 8, so the SWA group takes eight
+    times the blocks for the same tokens while each block still covers 131072
+    bytes. That is why the manifest gives both pools the same
+    block_stride_bytes and num_blocks, and the difference shows up in region
+    granularity instead.
     """
     coordinator = _coordinator()
     coordinator.allocate_new_blocks("req-0",

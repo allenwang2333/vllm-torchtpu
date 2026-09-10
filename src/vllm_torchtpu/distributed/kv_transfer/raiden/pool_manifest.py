@@ -943,11 +943,10 @@ def _dsv4_row_region(*, row_bytes: int,
 def _dsv4_layer_spec(group_spec: Any, layer_name: str) -> Any:
     """The per-layer spec behind a DSv4 cache group.
 
-    DSv4 groups its layers under a `UniformTypeKVCacheSpecs` wrapper, whose
-    `block_size` is the uncompressed page and which carries no
-    `compress_ratio` at all. Reading role geometry off the wrapper reports
-    every layer as an uncompressed HCA page. `TPUModelRunner`'s
-    `_per_layer_spec` unwraps the same way before allocating.
+    The group's spec is a `UniformTypeKVCacheSpecs` wrapper whose `block_size`
+    is the uncompressed page and which has no `compress_ratio`, so reading role
+    geometry off it reports every layer as an uncompressed HCA page.
+    `TPUModelRunner._per_layer_spec` unwraps the same way before allocating.
     """
     specs = getattr(group_spec, "kv_cache_specs", None)
     if specs is None:
@@ -984,15 +983,13 @@ def _dsv4_kv_tag(layer_name: str, spec: Any) -> str:
 
 
 class Dsv4LayerEntry(NamedTuple):
-    """One layer's claim on one array: the unit a pool is built from.
+    """One layer's claim on one array, which is what a pool is built from.
 
-    A DSv4 layer does not map one-to-one onto an array. A CSA layer binds a
-    `(nope, rope)` pair and so yields two entries, while an SWA or
-    compressor-state layer owns no memory at all and yields one entry naming
-    the array it was overlaid onto. `group_index` is what makes an entry
-    addressable: it says which cache group's block table the array's pages
-    will be drawn from, and two entries on the same array with different
-    indices are the aliasing case this whole module exists to describe.
+    Layers and arrays are not one-to-one. A CSA layer binds a `(nope, rope)`
+    pair and yields two entries; an overlaid SWA or compressor-state layer owns
+    no memory of its own and yields one entry naming the array it sits on.
+    `group_index` says whose block table addresses those pages, so two entries
+    on one array with different indices are the aliasing case.
     """
 
     # Role tag without the `.g{index}` suffix, e.g. `dsv4.csa.nope`.
@@ -1037,10 +1034,9 @@ def _dsv4_classify(
                     raise ManifestError(
                         f"DSv4 state cache {layer_name} names a compressed-KV "
                         f"layer {kv_layer} that is not an MLA cache")
-                # CSA states are overlaid on the `(nope, rope)` pair but the
-                # compressor only ever writes state rows through NoPE (it runs
-                # in overlap mode, with no separate state view), so the RoPE
-                # array holds no state and must not be transferred as one.
+                # CSA states are overlaid on the `(nope, rope)` pair, but in
+                # overlap mode the compressor writes state rows through NoPE
+                # only. The RoPE array holds no state, so do not send one.
                 entries.append(
                     Dsv4LayerEntry(_DSV4_STATE_TAG_BY_KV_TAG[kv_tag],
                                    layer_name, group_index, arrays[0]))
@@ -1099,29 +1095,15 @@ def build_dsv4_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
 ) -> PoolManifest:
-    """Builds the Pool Manifest for DeepSeek-V4.
-
-    Five nouns, and they do not nest the way the names suggest:
-
-    - A **layer** is a model layer with KV to cache. It binds one array, or
-      two for CSA, or none of its own if the runner overlaid it.
-    - An **array** is the physical `[blocks, rows, packing, width]` tensor.
-      Fewer arrays than layers, because the overlaid layers get no memory.
-    - A **cache group** is the set of layers that share one block table, so
-      it is a unit of *page allocation*, not of memory. Layers land in one
-      group when the allocator can page them identically: same page size,
-      same eviction window.
-    - A **pool** is what this function emits, one per (layer, array). It is
-      a named block-strided window into one storage, not the storage itself.
-    - A **tag** names a pool, and pools sharing a tag transfer together. It
-      pairs a role, meaning the cache kind (`dsv4.swa`, `dsv4.csa.nope`, and
-      the rest of `tags.py`), with a cache group.
+    """Builds the Pool Manifest for DeepSeek-V4, one pool per (layer, array).
 
     DSv4's caches alias: an SWA cache sits on a CSA NoPE array, a compressor
     state on its own compressed-KV array, both at byte offset 0. Only the
-    allocator never giving one block ID to two groups keeps them apart, and
-    Raiden cannot see that. So a tag names its group, and a byte-span
+    allocator never giving one block ID to two cache groups keeps them apart,
+    and Raiden cannot see that. So a tag names its group, and a byte-span
     registration always addresses the pages of one block table.
+
+    DESIGN_DSV4_PD.md defines layer, array, cache group, pool and tag.
     """
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
