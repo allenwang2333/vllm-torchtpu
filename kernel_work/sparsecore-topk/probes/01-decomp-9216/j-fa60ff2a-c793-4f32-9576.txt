@@ -1,0 +1,86 @@
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789020300.172460      81 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-fa60ff2a-c793-4f32-9576-tpu-job-0-0 devices=2 kind=TPU7x
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+shapes: short ctx 9216 -> n=10240, 128K ctx 132096 -> n=133120
+  b=16: {'b': 16, 'n': 10240, 'k': 2048, 'P': 2, 'n_p': 5120, 'slice_len': 5120, 'candidates': 4096, 'two_stage': True, 'stage1_rows': 32, 'stage1_waves': 1, 'stage2_waves': 1, 'max_slice_words': 65536}
+  b=64: {'b': 64, 'n': 10240, 'k': 2048, 'P': 1, 'n_p': 10240, 'slice_len': 10240, 'candidates': 2048, 'two_stage': False, 'stage1_rows': 64, 'stage1_waves': 2, 'stage2_waves': 0, 'max_slice_words': 65536}
+  b=1024: {'b': 1024, 'n': 10240, 'k': 2048, 'P': 1, 'n_p': 10240, 'slice_len': 10240, 'candidates': 2048, 'two_stage': False, 'stage1_rows': 1024, 'stage1_waves': 32, 'stage2_waves': 0, 'max_slice_words': 65536}
+
+=== DECOMPOSE  b=16 n=10240 P=2 n_p=5120 cand=4096 ===
+  dispatch floor: 26.65 us/call
+  full               us_median=    56.511  us=    47.191  hostbound= 19.3%  suspect=False
+  stage1             us_median=    33.390  us=    32.718  hostbound=  7.2%  suspect=False
+  gatherA            us_median=    27.994  us=    24.819  hostbound= 16.5%  suspect=False
+  stage2             us_median=    34.655  us=    33.166  hostbound=  8.7%  suspect=False
+  gatherB            us_median=    26.503  us=    25.695  hostbound=  9.2%  suspect=False
+  dma_only/w1        us_median=    22.052  us=    21.126  hostbound= 11.8%  suspect=False
+  full#null0         us_median=    55.934  us=    55.400  hostbound=  4.1%  suspect=False
+  full#null1         us_median=    55.824  us=    55.124  hostbound=  4.9%  suspect=False
+  full#null2         us_median=    55.935  us=    55.171  hostbound=  5.0%  suspect=False
+
+  four-null spread on `full`: 1.23% (55.824 .. 56.511 us)
+  sum(parts) = 122.543 us vs full = 56.511 us  -> parts/full = 2.168
+  ^ a ratio far from 1.0 means the pieces do NOT compose: XLA is fusing or overlapping across the boundaries, and no per-piece saving can be assumed to reach the whole.
+
+  CANDIDATE A prize  = gatherA 27.994 us = 49.5% of full
+  CANDIDATE A2 prize = gatherB 26.503 us = 46.9% of full
+  both gathers       = 54.498 us = 96.4% of full
+
+  stage1 = 33.390 us,  pure DMA at w1 = 22.052 us
+  CANDIDATE B gate: stage1 is 66.0% DMA -> BUILD B (gate is 25%)
+  ^ perfect overlap saves min(DMA%, compute%) of stage1, so this caps B at 34.0% of stage1 = 20.1% of full.
+
+=== DECOMPOSE  b=64 n=10240 P=1 n_p=10240 cand=2048 ===
+  dispatch floor: 19.20 us/call
+  full               us_median=    51.658  us=    51.132  hostbound=  4.6%  suspect=False
+  stage1             us_median=    51.645  us=    50.468  hostbound=  5.5%  suspect=False
+  gatherA            us_median=    30.107  us=    28.616  hostbound= 11.4%  suspect=False
+  stage2             us_median=    32.681  us=    32.271  hostbound=  8.4%  suspect=False
+  gatherB            us_median=    33.495  us=    32.825  hostbound=  6.6%  suspect=False
+  dma_only/w2        us_median=    22.776  us=    21.923  hostbound= 13.6%  suspect=False
+  full#null0         us_median=    51.519  us=    51.012  hostbound=  4.9%  suspect=False
+  full#null1         us_median=    49.943  us=    49.709  hostbound=  4.8%  suspect=False
+  full#null2         us_median=    50.741  us=    49.890  hostbound=  5.4%  suspect=False
+
+  four-null spread on `full`: 3.37% (49.943 .. 51.658 us)
+  sum(parts) = 147.928 us vs full = 51.658 us  -> parts/full = 2.864
+  ^ a ratio far from 1.0 means the pieces do NOT compose: XLA is fusing or overlapping across the boundaries, and no per-piece saving can be assumed to reach the whole.
+
+  CANDIDATE A prize  = gatherA 30.107 us = 58.3% of full
+  CANDIDATE A2 prize = gatherB 33.495 us = 64.8% of full
+  both gathers       = 63.602 us = 123.1% of full
+
+  stage1 = 51.645 us,  pure DMA at w2 = 22.776 us
+  CANDIDATE B gate: stage1 is 44.1% DMA -> BUILD B (gate is 25%)
+  ^ perfect overlap saves min(DMA%, compute%) of stage1, so this caps B at 44.1% of stage1 = 44.1% of full.
+
+=== DECOMPOSE  b=1024 n=10240 P=1 n_p=10240 cand=2048 ===
+  dispatch floor: 27.34 us/call
+  full               us_median=   450.260  us=   444.952  hostbound=  1.6%  suspect=False
+  stage1             us_median=   451.226  us=   449.622  hostbound=  0.6%  suspect=False
+  gatherA            us_median=   131.923  us=   127.627  hostbound=  4.8%  suspect=False
+  stage2             us_median=   144.570  us=   144.181  hostbound=  1.7%  suspect=False
+  gatherB            us_median=   173.124  us=   168.151  hostbound=  4.0%  suspect=False
+  dma_only/w32       us_median=    55.321  us=    54.671  hostbound=  4.0%  suspect=False
+  full#null0         us_median=   450.895  us=   450.063  hostbound=  0.7%  suspect=False
+  full#null1         us_median=   453.511  us=   452.997  hostbound=  0.6%  suspect=False
+  full#null2         us_median=   452.592  us=   449.690  hostbound=  1.1%  suspect=False
+
+  four-null spread on `full`: 0.72% (450.260 .. 453.511 us)
+  sum(parts) = 900.843 us vs full = 450.260 us  -> parts/full = 2.001
+  ^ a ratio far from 1.0 means the pieces do NOT compose: XLA is fusing or overlapping across the boundaries, and no per-piece saving can be assumed to reach the whole.
+
+  CANDIDATE A prize  = gatherA 131.923 us = 29.3% of full
+  CANDIDATE A2 prize = gatherB 173.124 us = 38.4% of full
+  both gathers       = 305.046 us = 67.7% of full
+
+  stage1 = 451.226 us,  pure DMA at w32 = 55.321 us
+  CANDIDATE B gate: stage1 is 12.3% DMA -> DROP B AND C (gate is 25%)
+  ^ perfect overlap saves min(DMA%, compute%) of stage1, so this caps B at 12.3% of stage1 = 12.3% of full.
+
+wrote /cdk-outputs/outputs/j-fa60ff2a-c793-4f32-9576-tpu-job-0/j-fa60ff2a-c793-4f32-9576-tpu-job-0-0-fv5lz/command-container/json/decomp_9216.json
+
+GATE: NOT-RUN

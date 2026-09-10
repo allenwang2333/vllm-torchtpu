@@ -194,6 +194,18 @@ SHAPES = [
     # `--max-num-batched-tokens=1024`. It is as much a production shape as 16
     # is, and it is the one with 64 stage-1 waves rather than 2.
     pytest.param(1024, N_128K, 2048, 4, id="p4-b1024-n133120"),
+    # The top of the ladder at the context length that is actually checked in.
+    # `--max-model-len 9216` is what both `glm-5.2-fp8-dp16-ep.sh:18` and
+    # `deepseek-v4-flash-dp8-ep.sh:5` set, so this row and `p1-b64-n10240` are
+    # the two shapes production runs; every `N_128K` row above needs
+    # `--max-model-len 132096`, which no checked-in config sets.
+    #
+    # It is also the single-stage shape with the most waves -- 32, against 2 at
+    # `p1-b64-n10240` -- which is what makes it worth its runtime. Anything that
+    # reuses a buffer across waves (a double-buffered or pipelined score load,
+    # say) is correct at one wave by construction and can only go wrong at many,
+    # and no other single-stage row here has more than two.
+    pytest.param(1024, N_SHORT, 2048, 1, id="p1-b1024-n10240"),
 ]
 
 

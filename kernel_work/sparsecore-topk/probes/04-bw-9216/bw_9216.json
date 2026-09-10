@@ -1,0 +1,149 @@
+{
+  "ctx": 9216,
+  "n": 10240,
+  "shapes": {
+    "16": {
+      "b": 16,
+      "n": 10240,
+      "k": 2048,
+      "P": 2,
+      "n_p": 5120,
+      "slice_len": 5120,
+      "candidates": 4096,
+      "two_stage": true,
+      "stage1_rows": 32,
+      "stage1_waves": 1,
+      "stage2_waves": 1,
+      "max_slice_words": 65536
+    },
+    "1024": {
+      "b": 1024,
+      "n": 10240,
+      "k": 2048,
+      "P": 1,
+      "n_p": 10240,
+      "slice_len": 10240,
+      "candidates": 2048,
+      "two_stage": false,
+      "stage1_rows": 1024,
+      "stage1_waves": 32,
+      "stage2_waves": 0,
+      "max_slice_words": 65536
+    }
+  },
+  "bandwidth": {
+    "slice_len": 10240,
+    "bytes_per_wave": 1310720,
+    "rows": [
+      {
+        "waves": 4,
+        "us": 24.84319993527606,
+        "us_median": 25.355499747092836,
+        "us_mean": 25.37115275724015,
+        "us_unpaired": 25.2649999310961,
+        "hostbound_pct": 9.358017105530694,
+        "suspect": false,
+        "bytes": 5242880
+      },
+      {
+        "waves": 8,
+        "us": 27.54199995251838,
+        "us_median": 29.722050021518953,
+        "us_mean": 29.525061068448448,
+        "us_unpaired": 29.7344995487947,
+        "hostbound_pct": 12.625640212986964,
+        "suspect": false,
+        "bytes": 10485760
+      },
+      {
+        "waves": 16,
+        "us": 36.93170001497492,
+        "us_median": 38.345225038938224,
+        "us_mean": 38.22671941533271,
+        "us_unpaired": 38.15117488557007,
+        "hostbound_pct": 7.118180267722638,
+        "suspect": false,
+        "bytes": 20971520
+      },
+      {
+        "waves": 32,
+        "us": 54.04900039138738,
+        "us_median": 54.65867507155053,
+        "us_mean": 54.7063250754339,
+        "us_unpaired": 54.92055024660658,
+        "hostbound_pct": 4.471426312504664,
+        "suspect": false,
+        "bytes": 41943040
+      }
+    ],
+    "slope_us_per_wave": 1.0447344649709647,
+    "intercept_us": 21.349345495210667,
+    "max_resid_us": 0.28012810419212286,
+    "bandwidth_gb_s": 1254.596305518099,
+    "null_spread_pct": 1.2235783326208949,
+    "nulls_us_median": [
+      30.268625050666742,
+      29.9876497592777,
+      30.357225477928296
+    ],
+    "dispatch_floor_us": 23.464775222237222,
+    "raw": {
+      "dma/w4": {
+        "us": 24.84319993527606,
+        "us_median": 25.355499747092836,
+        "us_mean": 25.37115275724015,
+        "us_unpaired": 25.2649999310961,
+        "hostbound_pct": 9.358017105530694,
+        "suspect": false
+      },
+      "dma/w8": {
+        "us": 27.54199995251838,
+        "us_median": 29.722050021518953,
+        "us_mean": 29.525061068448448,
+        "us_unpaired": 29.7344995487947,
+        "hostbound_pct": 12.625640212986964,
+        "suspect": false
+      },
+      "dma/w16": {
+        "us": 36.93170001497492,
+        "us_median": 38.345225038938224,
+        "us_mean": 38.22671941533271,
+        "us_unpaired": 38.15117488557007,
+        "hostbound_pct": 7.118180267722638,
+        "suspect": false
+      },
+      "dma/w32": {
+        "us": 54.04900039138738,
+        "us_median": 54.65867507155053,
+        "us_mean": 54.7063250754339,
+        "us_unpaired": 54.92055024660658,
+        "hostbound_pct": 4.471426312504664,
+        "suspect": false
+      },
+      "dma/w8#null0": {
+        "us": 29.208424894022755,
+        "us_median": 30.268625050666742,
+        "us_mean": 30.179533213312325,
+        "us_unpaired": 29.768099921057,
+        "hostbound_pct": 7.309318742476069,
+        "suspect": false
+      },
+      "dma/w8#null1": {
+        "us": 28.846299755969085,
+        "us_median": 29.9876497592777,
+        "us_mean": 30.008847210814967,
+        "us_unpaired": 29.9876497592777,
+        "hostbound_pct": 8.606892507139044,
+        "suspect": false
+      },
+      "dma/w8#null2": {
+        "us": 29.12070012826007,
+        "us_median": 30.357225477928296,
+        "us_mean": 30.908602881633364,
+        "us_unpaired": 29.70944988192059,
+        "hostbound_pct": 7.484459728130133,
+        "suspect": false
+      }
+    }
+  }
+}

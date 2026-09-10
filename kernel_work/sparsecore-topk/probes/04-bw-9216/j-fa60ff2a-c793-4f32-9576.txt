@@ -1,0 +1,27 @@
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789020300.172461      87 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-fa60ff2a-c793-4f32-9576-tpu-job-0-0 devices=2 kind=TPU7x
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+shapes: short ctx 9216 -> n=10240, 128K ctx 132096 -> n=133120
+  b=16: {'b': 16, 'n': 10240, 'k': 2048, 'P': 2, 'n_p': 5120, 'slice_len': 5120, 'candidates': 4096, 'two_stage': True, 'stage1_rows': 32, 'stage1_waves': 1, 'stage2_waves': 1, 'max_slice_words': 65536}
+  b=1024: {'b': 1024, 'n': 10240, 'k': 2048, 'P': 1, 'n_p': 10240, 'slice_len': 10240, 'candidates': 2048, 'two_stage': False, 'stage1_rows': 1024, 'stage1_waves': 32, 'stage2_waves': 0, 'max_slice_words': 65536}
+
+=== DMA PROBE  slice_len=10240 words (40 KiB/subcore) ===
+  dispatch floor: 23.46 us/call
+  three-null spread at w=8: 1.22% (29.988 .. 30.357 us)
+  w=4   us_median=   25.355  us=   24.843  hostbound=  9.4%  suspect=False
+  w=8   us_median=   29.722  us=   27.542  hostbound= 12.6%  suspect=False
+  w=16  us_median=   38.345  us=   36.932  hostbound=  7.1%  suspect=False
+  w=32  us_median=   54.659  us=   54.049  hostbound=  4.5%  suspect=False
+
+  slope     = 1.0447 us/wave  (1.25 MiB/wave)
+  intercept = 21.349 us   (program load + mesh entry, NOT bandwidth)
+  max resid = 0.280 us (0.76% of mean)
+  SC HBM read bandwidth = 1254.6 GB/s   [MEASURED, one job -- not a floor]
+  TensorCore HBM peak per chiplet = 3364.9 GB/s (tpu/V7X.md, MODELLED derate) -> SC is 37.3% of it
+
+wrote /cdk-outputs/outputs/j-fa60ff2a-c793-4f32-9576-tpu-job-0/j-fa60ff2a-c793-4f32-9576-tpu-job-0-0-fv5lz/command-container/json/bw_9216.json
+
+GATE: NOT-RUN

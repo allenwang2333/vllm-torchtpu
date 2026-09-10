@@ -1,0 +1,102 @@
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789020300.172460      85 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-fa60ff2a-c793-4f32-9576-tpu-job-0-0 devices=2 kind=TPU7x
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)
+shapes: short ctx 9216 -> n=10240, 128K ctx 132096 -> n=133120
+  b=16: {'b': 16, 'n': 10240, 'k': 2048, 'P': 2, 'n_p': 5120, 'slice_len': 5120, 'candidates': 4096, 'two_stage': True, 'stage1_rows': 32, 'stage1_waves': 1, 'stage2_waves': 1, 'max_slice_words': 65536}
+  b=1024: {'b': 1024, 'n': 10240, 'k': 2048, 'P': 1, 'n_p': 10240, 'slice_len': 10240, 'candidates': 2048, 'two_stage': False, 'stage1_rows': 1024, 'stage1_waves': 32, 'stage2_waves': 0, 'max_slice_words': 65536}
+
+=== PASSES  b=16 n=10240 P=2 n_p=5120 slice_len=5120 waves=1 ===
+  dispatch floor: 23.37 us/call
+  cvt/p0             us_median=    27.121  us=    24.732  suspect=False
+  cvt/p1             us_median=    28.049  us=    24.107  suspect=False
+  cvt/p2             us_median=    29.053  us=    26.308  suspect=False
+  cvt/p4             us_median=    27.958  us=    25.626  suspect=False
+  scatter/p1         us_median=    28.090  us=    26.276  suspect=False
+  scatter/p2         us_median=    28.954  us=    26.304  suspect=False
+  scatter/p4         us_median=    29.237  us=    27.007  suspect=False
+  scatter_mid/p1     us_median=    28.225  us=    26.725  suspect=False
+  scatter_mid/p2     us_median=    28.268  us=    25.974  suspect=False
+  scatter_mid/p4     us_median=    28.428  us=    26.442  suspect=False
+  scatter_sparse/p1  us_median=    28.233  us=    26.163  suspect=False
+  scatter_sparse/p2  us_median=    28.016  us=    26.565  suspect=False
+  scatter_sparse/p4  us_median=    27.681  us=    26.161  suspect=False
+  emit1/p1           us_median=    28.088  us=    25.311  suspect=False
+  emit1/p2           us_median=    27.707  us=    25.732  suspect=False
+  emit1/p4           us_median=    27.993  us=    26.011  suspect=False
+  emit2/p1           us_median=    27.942  us=    26.436  suspect=False
+  emit2/p2           us_median=    28.268  us=    24.361  suspect=False
+  emit2/p4           us_median=    27.990  us=    25.317  suspect=False
+  cvt/p1#null0       us_median=    28.667  us=    26.571  suspect=False
+  cvt/p1#null1       us_median=    28.706  us=    26.175  suspect=False
+  cvt/p1#null2       us_median=    28.825  us=    24.611  suspect=False
+
+  four-null spread on cvt/p1: 2.72% (28.049 .. 28.825 us)
+  cvt          0.191 us/pass  (intercept   27.711 us, max resid  0.960 us = 3.42%)
+  scatter      0.513 us/pass  (intercept   27.452 us, max resid  0.475 us = 1.68%)
+  scatter_mid     0.274 us/pass  (intercept   27.531 us, max resid  0.420 us = 1.50%)
+  scatter_sparse     0.074 us/pass  (intercept   27.633 us, max resid  0.526 us = 1.90%)
+    !! scatter_sparse: the slope is inside the null floor. Read this as 'not measured' -- the likeliest cause is that the pass was dead-code eliminated, not that it is free.
+  emit1        0.158 us/pass  (intercept   27.451 us, max resid  0.480 us = 1.73%)
+    !! emit1: the slope is inside the null floor. Read this as 'not measured' -- the likeliest cause is that the pass was dead-code eliminated, not that it is free.
+  emit2        0.186 us/pass  (intercept   27.505 us, max resid  0.391 us = 1.41%)
+    !! emit2: the slope is inside the null floor. Read this as 'not measured' -- the likeliest cause is that the pass was dead-code eliminated, not that it is free.
+
+  uniform  1 cvt + 4 x scatter(dense) + 1 emit + 27.1 us = 29.524 us
+  graded   1 cvt + 1 scatter(dense) + 3 x scatter(1/256) + 1 emit + 27.1 us = 28.206 us
+  ^ compare BOTH against the measured stage1. Whichever closes is the model; do not invert the loser for a pass count.
+  scatter_mid    / scatter(dense) = 0.534
+  scatter_sparse / scatter(dense) = 0.144
+  ^ ~1.0 means addupdate_scatter issues masked-off lanes anyway (cost is the walk, not the updates); well below 1.0 means density is the lever and the refinements are cheap.
+
+  CANDIDATE A cost side = emit2 - emit1 = 0.028 us (the second store_compressed, at stage 1's geometry).
+  ^ this is A's cost side ONLY. It excludes the extra k-word output DMA that emit_keys also adds, so the true cost is a little higher and the predicted saving a little lower.
+
+=== PASSES  b=1024 n=10240 P=1 n_p=10240 slice_len=10240 waves=32 ===
+  dispatch floor: 19.97 us/call
+  cvt/p0             us_median=    54.868  us=    54.085  suspect=False
+  cvt/p1             us_median=    75.037  us=    73.125  suspect=False
+  cvt/p2             us_median=    95.563  us=    94.594  suspect=False
+  cvt/p4             us_median=   137.138  us=   135.614  suspect=False
+  scatter/p1         us_median=   170.548  us=   169.954  suspect=False
+  scatter/p2         us_median=   287.510  us=   286.368  suspect=False
+  scatter/p4         us_median=   520.052  us=   513.723  suspect=False
+  scatter_mid/p1     us_median=    91.074  us=    90.421  suspect=False
+  scatter_mid/p2     us_median=   127.895  us=   127.430  suspect=False
+  scatter_mid/p4     us_median=   200.735  us=   200.071  suspect=False
+  scatter_sparse/p1  us_median=    89.912  us=    89.128  suspect=False
+  scatter_sparse/p2  us_median=   125.009  us=   121.212  suspect=False
+  scatter_sparse/p4  us_median=   195.811  us=   195.154  suspect=False
+  emit1/p1           us_median=    82.422  us=    81.352  suspect=False
+  emit1/p2           us_median=   109.632  us=   107.672  suspect=False
+  emit1/p4           us_median=   164.739  us=   159.378  suspect=False
+  emit2/p1           us_median=    87.970  us=    87.663  suspect=False
+  emit2/p2           us_median=   121.420  us=   120.632  suspect=False
+  emit2/p4           us_median=   190.340  us=   188.829  suspect=False
+  cvt/p1#null0       us_median=    75.310  us=    75.100  suspect=False
+  cvt/p1#null1       us_median=    75.019  us=    74.815  suspect=False
+  cvt/p1#null2       us_median=    74.965  us=    74.683  suspect=False
+
+  four-null spread on cvt/p1: 0.46% (74.965 .. 75.310 us)
+  cvt         20.589 us/pass  (intercept   54.621 us, max resid  0.247 us = 0.27%)
+  scatter    116.350 us/pass  (intercept   54.631 us, max resid  0.434 us = 0.17%)
+  scatter_mid    36.492 us/pass  (intercept   54.783 us, max resid  0.200 us = 0.17%)
+  scatter_sparse    35.243 us/pass  (intercept   54.725 us, max resid  0.202 us = 0.17%)
+  emit1       27.456 us/pass  (intercept   54.868 us, max resid  0.147 us = 0.14%)
+  emit2       33.900 us/pass  (intercept   54.325 us, max resid  0.705 us = 0.62%)
+
+  uniform  1 cvt + 4 x scatter(dense) + 1 emit + 54.9 us = 568.314 us
+  graded   1 cvt + 1 scatter(dense) + 3 x scatter(1/256) + 1 emit + 54.9 us = 324.992 us
+  ^ compare BOTH against the measured stage1. Whichever closes is the model; do not invert the loser for a pass count.
+  scatter_mid    / scatter(dense) = 0.314
+  scatter_sparse / scatter(dense) = 0.303
+  ^ ~1.0 means addupdate_scatter issues masked-off lanes anyway (cost is the walk, not the updates); well below 1.0 means density is the lever and the refinements are cheap.
+
+  CANDIDATE A cost side = emit2 - emit1 = 6.444 us (the second store_compressed, at stage 1's geometry).
+  ^ this is A's cost side ONLY. It excludes the extra k-word output DMA that emit_keys also adds, so the true cost is a little higher and the predicted saving a little lower.
+
+wrote /cdk-outputs/outputs/j-fa60ff2a-c793-4f32-9576-tpu-job-0/j-fa60ff2a-c793-4f32-9576-tpu-job-0-0-fv5lz/command-container/json/passes_9216.json
+
+GATE: NOT-RUN

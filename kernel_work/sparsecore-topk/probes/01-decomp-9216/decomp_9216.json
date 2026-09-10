@@ -1,0 +1,341 @@
+{
+  "ctx": 9216,
+  "n": 10240,
+  "shapes": {
+    "16": {
+      "b": 16,
+      "n": 10240,
+      "k": 2048,
+      "P": 2,
+      "n_p": 5120,
+      "slice_len": 5120,
+      "candidates": 4096,
+      "two_stage": true,
+      "stage1_rows": 32,
+      "stage1_waves": 1,
+      "stage2_waves": 1,
+      "max_slice_words": 65536
+    },
+    "64": {
+      "b": 64,
+      "n": 10240,
+      "k": 2048,
+      "P": 1,
+      "n_p": 10240,
+      "slice_len": 10240,
+      "candidates": 2048,
+      "two_stage": false,
+      "stage1_rows": 64,
+      "stage1_waves": 2,
+      "stage2_waves": 0,
+      "max_slice_words": 65536
+    },
+    "1024": {
+      "b": 1024,
+      "n": 10240,
+      "k": 2048,
+      "P": 1,
+      "n_p": 10240,
+      "slice_len": 10240,
+      "candidates": 2048,
+      "two_stage": false,
+      "stage1_rows": 1024,
+      "stage1_waves": 32,
+      "stage2_waves": 0,
+      "max_slice_words": 65536
+    }
+  },
+  "decompose": {
+    "16": {
+      "b": 16,
+      "n": 10240,
+      "P": 2,
+      "n_p": 5120,
+      "k_p": 2048,
+      "stage1_waves": 1,
+      "rows": {
+        "full": {
+          "us": 47.19147509604227,
+          "us_median": 56.51085011777468,
+          "us_mean": 55.526291624927474,
+          "us_unpaired": 56.54635024257004,
+          "hostbound_pct": 19.26192007106204,
+          "suspect": false
+        },
+        "stage1": {
+          "us": 32.71755012974609,
+          "us_median": 33.38985006848816,
+          "us_mean": 33.34153047439435,
+          "us_unpaired": 33.03412486275192,
+          "hostbound_pct": 7.173633566565191,
+          "suspect": false
+        },
+        "gatherA": {
+          "us": 24.818774545565248,
+          "us_median": 27.994325137115084,
+          "us_mean": 90.29266111610923,
+          "us_unpaired": 27.966250127064995,
+          "hostbound_pct": 16.485530112325712,
+          "suspect": false
+        },
+        "stage2": {
+          "us": 33.16552501928527,
+          "us_median": 34.655399576877244,
+          "us_mean": 1011.6466861897302,
+          "us_unpaired": 34.50370022619609,
+          "hostbound_pct": 8.692100212043222,
+          "suspect": false
+        },
+        "gatherB": {
+          "us": 25.69464995758608,
+          "us_median": 26.50339993124362,
+          "us_mean": 26.565752786053864,
+          "us_unpaired": 26.50339993124362,
+          "hostbound_pct": 9.226872520836848,
+          "suspect": false
+        },
+        "dma_only/w1": {
+          "us": 21.126049614395015,
+          "us_median": 22.05182536272332,
+          "us_mean": 21.938411050036343,
+          "us_unpaired": 21.71829983126372,
+          "hostbound_pct": 11.80409716950495,
+          "suspect": false
+        },
+        "full#null0": {
+          "us": 55.39952508115675,
+          "us_median": 55.93427522398997,
+          "us_mean": 56.21168889370489,
+          "us_unpaired": 55.847700059530325,
+          "hostbound_pct": 4.132504052642096,
+          "suspect": false
+        },
+        "full#null1": {
+          "us": 55.12395036930684,
+          "us_median": 55.82407502515707,
+          "us_mean": 55.80184733844362,
+          "us_unpaired": 55.981200421229005,
+          "hostbound_pct": 4.855551302593721,
+          "suspect": false
+        },
+        "full#null2": {
+          "us": 55.171250278363004,
+          "us_median": 55.934549527592026,
+          "us_mean": 55.890938812000165,
+          "us_unpaired": 55.970725225051865,
+          "hostbound_pct": 4.97311029091766,
+          "suspect": false
+        }
+      },
+      "null_spread_pct": 1.225269591504569,
+      "nulls_us_median": [
+        55.93427522398997,
+        55.82407502515707,
+        55.934549527592026,
+        56.51085011777468
+      ],
+      "sum_parts_us": 122.5429747137241,
+      "parts_over_full": 2.1684857767726267,
+      "gatherA_pct_of_full": 49.53796497269445,
+      "gatherB_pct_of_full": 46.899665950888526,
+      "stage1_dma_pct": 66.04349919958115,
+      "candidate_B_gate": "BUILD",
+      "B_cap_pct_of_full": 20.063447430246008,
+      "dispatch_floor_us": 26.652850283426233
+    },
+    "64": {
+      "b": 64,
+      "n": 10240,
+      "P": 1,
+      "n_p": 10240,
+      "k_p": 2048,
+      "stage1_waves": 2,
+      "rows": {
+        "full": {
+          "us": 51.13167535455432,
+          "us_median": 51.657924996106885,
+          "us_mean": 51.6016472425286,
+          "us_unpaired": 51.56972511031199,
+          "hostbound_pct": 4.63295820839088,
+          "suspect": false
+        },
+        "stage1": {
+          "us": 50.46762526035309,
+          "us_median": 51.644700215547346,
+          "us_mean": 52.3091445453853,
+          "us_unpaired": 51.43352536833845,
+          "hostbound_pct": 5.457286912257806,
+          "suspect": false
+        },
+        "gatherA": {
+          "us": 28.61617540474981,
+          "us_median": 30.106700069154613,
+          "us_mean": 30.234180626899214,
+          "us_unpaired": 30.502950176014565,
+          "hostbound_pct": 11.350275664373571,
+          "suspect": false
+        },
+        "stage2": {
+          "us": 32.27119996154215,
+          "us_median": 32.68075015512295,
+          "us_mean": 33.14194444909743,
+          "us_unpaired": 33.130675001302734,
+          "hostbound_pct": 8.372862604300376,
+          "suspect": false
+        },
+        "gatherB": {
+          "us": 32.82475008745678,
+          "us_median": 33.49545004311949,
+          "us_mean": 33.53192777366429,
+          "us_unpaired": 33.40065013617277,
+          "hostbound_pct": 6.593828540068185,
+          "suspect": false
+        },
+        "dma_only/w2": {
+          "us": 21.922550149611197,
+          "us_median": 22.775549950893037,
+          "us_mean": 22.759144404618482,
+          "us_unpaired": 23.249299920280464,
+          "hostbound_pct": 13.564440137590998,
+          "suspect": false
+        },
+        "full#null0": {
+          "us": 51.01212482259143,
+          "us_median": 51.518899999791756,
+          "us_mean": 51.71754168663432,
+          "us_unpaired": 51.886400251532905,
+          "hostbound_pct": 4.905596856682883,
+          "suspect": false
+        },
+        "full#null1": {
+          "us": 49.709075028658845,
+          "us_median": 49.94259979866911,
+          "us_mean": 50.039035947217286,
+          "us_unpaired": 49.9876248795772,
+          "hostbound_pct": 4.766717440986902,
+          "suspect": false
+        },
+        "full#null2": {
+          "us": 49.89047520211898,
+          "us_median": 50.74092514405493,
+          "us_mean": 50.92096119672836,
+          "us_unpaired": 50.916900363517925,
+          "hostbound_pct": 5.404880525531848,
+          "suspect": false
+        }
+      },
+      "null_spread_pct": 3.3656867516497844,
+      "nulls_us_median": [
+        51.518899999791756,
+        49.94259979866911,
+        50.74092514405493,
+        51.657924996106885
+      ],
+      "sum_parts_us": 147.9276004829444,
+      "parts_over_full": 2.8635993508080846,
+      "gatherA_pct_of_full": 58.28089314741843,
+      "gatherB_pct_of_full": 64.84087397169712,
+      "stage1_dma_pct": 44.10045920653168,
+      "candidate_B_gate": "BUILD",
+      "B_cap_pct_of_full": 44.08916918867624,
+      "dispatch_floor_us": 19.202875046175905
+    },
+    "1024": {
+      "b": 1024,
+      "n": 10240,
+      "P": 1,
+      "n_p": 10240,
+      "k_p": 2048,
+      "stage1_waves": 32,
+      "rows": {
+        "full": {
+          "us": 444.95157526398543,
+          "us_median": 450.2597999817226,
+          "us_mean": 450.2715667007983,
+          "us_unpaired": 449.63902510062326,
+          "hostbound_pct": 1.600737642743456,
+          "suspect": false
+        },
+        "stage1": {
+          "us": 449.62202446185984,
+          "us_median": 451.2262752541574,
+          "us_mean": 452.33235278929993,
+          "us_unpaired": 449.96042488492094,
+          "hostbound_pct": 0.5972221078123854,
+          "suspect": false
+        },
+        "gatherA": {
+          "us": 127.62737496814226,
+          "us_median": 131.92264996177983,
+          "us_mean": 132.30643045163663,
+          "us_unpaired": 131.89747514843475,
+          "hostbound_pct": 4.7984126560302816,
+          "suspect": false
+        },
+        "stage2": {
+          "us": 144.180899951607,
+          "us_median": 144.56992503255606,
+          "us_mean": 145.57268332282547,
+          "us_unpaired": 144.56882527156267,
+          "hostbound_pct": 1.6536696367692048,
+          "suspect": false
+        },
+        "gatherB": {
+          "us": 168.15147500892635,
+          "us_median": 173.12384989054408,
+          "us_mean": 173.5341026586765,
+          "us_unpaired": 172.89554998569656,
+          "hostbound_pct": 3.950591167845589,
+          "suspect": false
+        },
+        "dma_only/w32": {
+          "us": 54.670849567628466,
+          "us_median": 55.32097457034979,
+          "us_mean": 56.52182226185687,
+          "us_unpaired": 54.995874597807415,
+          "hostbound_pct": 4.030358391400108,
+          "suspect": false
+        },
+        "full#null0": {
+          "us": 450.0627997913398,
+          "us_median": 450.8950252784416,
+          "us_mean": 451.9083860537244,
+          "us_unpaired": 450.8938749495428,
+          "hostbound_pct": 0.7093657190811524,
+          "suspect": false
+        },
+        "full#null1": {
+          "us": 452.9968249698868,
+          "us_median": 453.51109984039795,
+          "us_mean": 454.6557278242997,
+          "us_unpaired": 453.40585020312574,
+          "hostbound_pct": 0.6135619916949495,
+          "suspect": false
+        },
+        "full#null2": {
+          "us": 449.6895500778919,
+          "us_median": 452.59180005814414,
+          "us_mean": 454.38826123750505,
+          "us_unpaired": 452.38520033308305,
+          "hostbound_pct": 1.1265140455489624,
+          "suspect": false
+        }
+      },
+      "null_spread_pct": 0.7196095639076208,
+      "nulls_us_median": [
+        450.8950252784416,
+        453.51109984039795,
+        452.59180005814414,
+        450.2597999817226
+      ],
+      "sum_parts_us": 900.8427001390373,
+      "parts_over_full": 2.0007175861038564,
+      "gatherA_pct_of_full": 29.299229015589432,
+      "gatherB_pct_of_full": 38.449768310999936,
+      "stage1_dma_pct": 12.260140334068476,
+      "candidate_B_gate": "DROP",
+      "B_cap_pct_of_full": 12.28645652412128,
+      "dispatch_floor_us": 27.343274996383116
+    }
+  }
+}
