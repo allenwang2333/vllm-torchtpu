@@ -1,4 +1,4 @@
-# NVFP4 block-512 fused EP MoE
+# NVFP4 block-scaled fused EP MoE
 
 The TPU plugin can serve NVFP4 routed experts through `fused_ep_moe_v2`
 in W4A8 mode. Enable both settings before starting the service:
@@ -15,7 +15,8 @@ experts remain FP4.
 
 During loading, the checkpoint's per-block and global scales are combined,
 then the original block-16 weights are dequantized and requantized to
-block-512. The native FP4 K-major weights and block scales are prepared once.
+the requested block size. The native FP4 K-major weights and block scales
+are prepared once.
 The fused kernel dynamically quantizes input and intermediate activations to
 FP8, handles routing and EP exchange, and returns the local token shard.
 FP4 weights are packed in memory and widened to FP8 inside the kernel; this
@@ -24,16 +25,22 @@ is not a native FP4 matrix instruction.
 Only admitted layers claim communication ownership. Admission retains the
 existing FP8 path's checks for expert placement, supported routing, bias,
 TP/PCP configuration and token threshold, with additional FP4 dtype and
-block-512 scale checks. Unsupported layers retain the GMM path. The GMM path also uses W4A8 when
+block-scale layout checks. The block size must be a positive multiple of 64
+(the packed-weight row tile) and divide both runtime hidden and intermediate
+dimensions. Scales must have shape `[E, K / block_size, 1, N]`. For example,
+hidden=4096 and intermediate=1024 admit blocks 64, 128, 256, 512 and 1024
+at the bridge; smaller blocks still need kernel compilation, numerical and
+performance validation for the target deployment. Unsupported layers retain
+the GMM path. The GMM path also uses W4A8 when
 requantization is enabled, as implemented by the existing GMM W4A8 support.
 Requantizing weights is controlled by `MOE_REQUANTIZE_BLOCK_SIZE`.
 With that variable unset, original block-16 NVFP4 continues using W4A16.
 
-Successful admission logs both `Fused EP MoE armed` with `format=fp4
+For the block-512 example above, successful admission logs both `Fused EP MoE armed` with `format=fp4
 rhs_qb=512` and `NVFP4 fused EP W4A8 enabled: block-512`. An enabled environment
 flag alone does not prove that the fused kernel is serving a layer.
 
-Block-512 requantization and FP8 activation/transport introduce numerical
+Block-size requantization and FP8 activation/transport introduce numerical
 changes relative to the original checkpoint. Kernel numerical tests compare
 against a dense reference using the same dequantized FP4 weights. Model-level
 quality and throughput must be evaluated separately with real weights.
