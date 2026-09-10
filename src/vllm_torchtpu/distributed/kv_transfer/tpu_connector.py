@@ -3756,7 +3756,8 @@ class TPURaidenConnectorWorker:
                 dst_counts = []
                 for pool in self._stage3_dsv4_plan:
                     pages, _ = _stage3_dsv4_pool_pages(
-                        pool, group_blocks[pool.plan_position], num_tokens)
+                        pool, group_blocks[pool.plan_position],
+                        pending.num_tokens)
                     transfer_tags.append(pool.tag)
                     dst_blocks.extend(pages)
                     dst_counts.append(len(pages))
