@@ -549,11 +549,20 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   its downstream consumers. `live set` — a straddler buffer appears. `grid` — refinement's loop bound
   changes from `walk_chunks` to `cdiv(cnt,16)`
 - **Live set:** 57,152 + `4·cnt_max`. At `cnt_max = 4096` (a bucket cannot hold more than the row):
-  **73,536 B = 71.81 KiB, 14.03%.** Binding term: still none. ⚠ Sizing `cnt_max` is the one design
-  decision here, and 4096 is the safe bound, not a tuned one
-- **Predicted:** removes the refinement walk (20.08) and `emit`'s traversal, replacing them with ~1
-  extra pass over `L` at L0 and ~2.231 walks of `cnt`. **~124.2 µs, −30.2%** from `v2`, 16.1% of
-  floor. `modelled`
+  **73,536 B = 71.81 KiB, 14.03%.** Binding term: still none. ⚠ `cnt_max` sizes the **buffer** and
+  4096 remains the correct safe bound — do not shrink it to the measured occupancy. What `probes/13`
+  changed is the **cost**, which is driven by actual occupancy, not by the allocation
+- **Predicted:** ⚠ **RE-PRICED by `probes/13` — and the dominant error was not the level count it was
+  sent to check.** Removes the refinement walk (20.08) and `emit`'s traversal, replacing them with ~1
+  extra pass over `L` at L0 and `levels × cnt` walks. Old inputs (level 2.231, `cnt` **assumed 4096**)
+  gave −8.72 µs = −4.59%. Correct inputs — critical-subcore level **1.570** and the joint statistic
+  **`cnt_eff` = 1798** — give **−26.21 µs = −13.80%** of the 189.98 µs harness baseline (**−16.8% of
+  the 155.82 µs production denominator**). `modelled` on `probes/07`'s measured slopes
+- **Band:** **−13.80% central, −6.23% at the barriered `wavemax` upper bound.** ⚠ The old **−20% to
+  −33% band does not exist**: the new band sits entirely below it and is less than half as wide.
+  **`v3` cannot become a loss under any plausible aggregation** — break-even is `cnt_eff` = 6295
+  against a measured 1798 (3.5× margin) and a barriered bound of 3649 (1.7× margin); only assuming
+  the global max 6495 on every row crosses over, and that is an impossibility, not an aggregation
 - **Built?** **No** — step-3 variant
 - **Measured:** — · **Verdict:** **OPEN**
 - **Note:** this is the **largest in-algorithm prize on the board** and it is the one `v10` competes
@@ -619,9 +628,26 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **Exactness:** **`exact`** — a different radix, the same exact selection
 - **State diff from `v2`:** `grid` — one compile-time constant. `live set` — `4·NB` in `glob_vmem`
 - **Live set:** 57,152 ± `4·ΔNB`, i.e. ±768 B across the sweep. Negligible; binding term still none
-- **Predicted:** ⚠ **`unmodelled` — and that is exactly why it is `OPEN` and not `PARKED`.** The
-  trade is a smaller fixed clear against more refinement levels, and the level count at production ρ
-  is itself `assumed` at 2.231. Cheapest node in the graph to settle
+- **Predicted:** ⚠ **The trade REVERSES — `v5` points at a *smaller* radix, not a larger one — but it
+  stays `OPEN` on a different term than before.** `probes/13` settled the level half `measured` and
+  it needs no hardware: crit levels at NB 64/128/256/512 = 2.375/1.938/1.781/1.469, with **zero
+  non-convergence at any radix and zero rows reaching level 5 at NB=64**, so `v5`'s stated failure
+  mode (deep walks at a small radix) is dead either way. Extra levels are cheap because they cost
+  `walk·ρ` at ρ=0.4; the per-level 256-bucket fixed sweep is not. Priced: NB=64 **−14.82%**, NB=128
+  −12.01%, NB=512 **+19.28%**.
+  ⚠ **The whole reversal rests on `fixed(NB) = 19.192·NB/256` — a pure proportionality with zero
+  intercept, `modelled` from a single anchor.** There is *structural* support (all four sweep
+  primitives have NB-proportional trip counts: `zero_priv(NUM_BUCKETS)` `:223`, `zg`/`scan_glob`/
+  `find_bucket` at `NUM_BUCKETS//LANES` `:206`/`:208`/`:211`) and `probes/09` measured their sizes at
+  NB=256 — **but there is no second `NUM_BUCKETS` value anywhere in `probes/03`, `07` or `09`**
+  (probes/03 swept *pass count*, not bucket count), so the intercept `c` is unbounded. Bounding
+  `fixed(NB) = c + (19.192−c)·NB/256`: NB=64 goes −14.82% (c=0) → −2.04% → **+4.36%** as `c` rises.
+  **NB=64 stops winning once `c` > 11.12 µs = 58% of the NB=256 sweep**, and with four
+  `parallel_loop`s per level and ~22 µs of fixed launch cost measured elsewhere
+  (`probes/07/README.md:122`), 58% is not implausible
+- **Mandatory probe (§10):** re-run the `probes/09` sweep split at `NUM_BUCKETS ∈ {64, 512}` with 256
+  as an in-pool control — three points fix both slope and intercept. ⏳ **dispatched,
+  `probes/16-num-buckets-scaling`**
 - **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory probe (§10)
 - ⚠ **Not additive with `v2`.** `v2` already shrinks the clear 16×; `v5` shrinks what is left. Measure
   the pair.
@@ -915,18 +941,23 @@ distribution`; 4096 is the safe bound (a bucket cannot exceed the row's live len
 | --- | ---: | --- |
 | baseline | 189.98 µs | measured + reweighting |
 | predicted | 132.4 µs standalone / 124.2 µs on top of Plan A | **modelled** |
-| **Δ time %** | **−30.2%** (30% faster) standalone | |
-| % of block floor | 15.1% | |
+| **Δ time %** | ~~−30.2%~~ → **−13.80%** standalone (harness denom) · **−16.8%** on the 155.82 µs production denom | re-priced, `probes/13` |
+| % of block floor | 15.1% → **6.9%** | |
 
 **Mechanism:** deletes two full traversals of `L`, acting on the **ρ-scaled walk** terms
-(`emit` 17.7% + refinement `hist` 10.6%). Same denominator as §1. **Band:** −20% to −33%, the range
-set by the level count, which is `assumed` at 2.231.
+(`emit` 17.7% + refinement `hist` 10.6%). Same denominator as §1.
+**Band:** ⚠ ~~−20% to −33%~~ → **−13.80% central, −6.23% at the barriered upper bound.** The old band
+was set by the level count and was wrong in both inputs: the level count is **1.570** (crit), not
+2.231, *and* the pivot-bucket occupancy the design sized at the 4096 safe bound has a joint critical
+statistic `cnt_eff` of **1798**. The two errors ran in opposite directions and the occupancy one was
+larger, so the prize **improves** while the band **moves entirely below** its old range. **`v3`
+cannot become a loss** — break-even `cnt_eff` = 6295 vs 1798 measured. See `probes/13` §5.
 
 **6. Evidence status.**
 
 | measured | modelled (formula) | unmeasured (the probe that would settle it) |
 | --- | --- | --- |
-| `emit` = 33.54 µs and refinement `hist` = 20.08 µs at production ρ (`j-4e0df30a`) | the replacement cost: 1 extra conditional store per element at L0, plus 2.231 walks of `cnt` | ⚠ **the cost of a conditional `store_compressed` inside the L0 walk** — it may not be free, and `probes/03` priced `emit1` at 27.456 µs, which is not negligible. **This is the probe Plan B owes** |
+| `emit` = 33.54 µs and refinement `hist` = 20.08 µs at production ρ (`j-4e0df30a`); level count **1.570** crit and `cnt_eff` **1798** (`probes/13`, CPU replay, no job) | the replacement cost: 1 extra conditional store per element at L0, plus `1.570 × 1798` walk elements | ⚠ **the cost of a conditional `store_compressed` inside the L0 walk** — it may not be free, and `probes/03` priced `emit1` at 27.456 µs, which is not negligible. **This is the probe Plan B owes.** ⏳ **dispatched, `probes/15-mandatory-v3-v10`** — measured as a *slope in store density* across ~5–65%, because a masked store's cost tracks density, not element count |
 
 **7. Risks.**
 
@@ -1249,7 +1280,8 @@ prize is ~4× smaller than the number this node carried before the source read.
 
 | the assumption | where it bites | what would settle it |
 | --- | --- | --- |
-| refinement level count = ~~2.231~~ → **1.740** | `v3`'s band, `v5`'s whole trade | ✅ **CLOSED by `probes/13`, and it moved the opposite way to the prediction.** At production prefill the walk runs **1.300 ± 0.009 levels/row over all rows**, **1.740 ± 0.009 over walking rows**, critical-subcore **1.570 ± 0.035** (`measured`, CPU replay of the kernel's integer logic, 4 KV draws). ⚠ **Two things this row previously asserted were wrong.** (a) *Provenance*: 2.231 was never a distribution fit — it is `probes/07`'s hardware-timing inversion `(L3−L0)/level_slope` at **ρ=1** (`probes/07/README.md:77`), whose simulated companion is `probes/05`'s 2.03. (b) *Direction*: the ReLU premise below is refuted at the source — see the next row |
+| refinement level count = ~~2.231~~ → **1.570** (crit) | `v3`'s band, `v5`'s whole trade | ✅ **CLOSED by `probes/13`, and it moved the opposite way to the prediction.** At production prefill: **1.300 ± 0.009 over all rows**, 1.740 ± 0.009 over walking rows, **critical-subcore 1.570 ± 0.035** (`measured`, CPU replay of the kernel's integer logic, 4 KV draws). ⚠ **Use 1.570.** The aggregation is *derived, not chosen*: `wave_body` gives subcore `flat` the rows `w*32 + flat` (`sparsecore_topk.py:157`) inside a `fori_loop` run independently per subcore (`:443`) with **no barrier anywhere** (`:19`, `:528`), so cost = **max over the 32 subcores of the sum of its own rows** — not sum-over-waves-of-max, which is the *barriered* upper bound and is carried only as such. 1.740 is a conditional mean over walking rows and is not a cost aggregation at all; 2.231 is a timing inversion and so is already critical-subcore, which is what makes 1.570 the matched replacement. ⚠ **Two things this row previously asserted were wrong.** (a) *Provenance*: 2.231 was never a distribution fit — it is `probes/07`'s inversion `(L3−L0)/level_slope` at **ρ=1** (`probes/07/README.md:77`), companion `probes/05`'s 2.03. (b) *Direction*: the ReLU premise below is refuted at the source — see the next row |
+| L0 pivot-bucket occupancy `cnt` = ~~4096 (safe bound)~~ → **1798** (`cnt_eff`) | `v3`'s prize — **this, not the level count, was the dominant error** | ✅ **CLOSED by `probes/13`.** Prefill `measured`: mean 1071, **crit 1423 ± 65**, barriered `wavemax` 4192, global max 6495. ⚠ **But `cnt` alone is the wrong input**: `v3`'s work is `levels_row × cnt_row` **jointly**, so the statistic is `crit(levels·cnt)`, giving **`cnt_eff` = 1798** (1.68× the mean — levels and `cnt` are positively correlated, so the joint statistic exceeds `crit(cnt)` = 1423). Decode: `cnt_eff` 2823 at b=1024; crit 5539 at b=64, where only 2 waves exist and there is nothing to average over |
 | ~~production scores are non-negative, zero-massed, tie-dense~~ | was the stated reason to expect a *higher* count | ⛔ **REFUTED on every premise by `probes/13` §3.** The indexer weights are **signed**: `weights_proj`/`wk_weights_proj` is a plain `nn.Linear` with no activation (`mla_attention_op.py:246`, `modular_deepseek_v4.py:382-395`), so the ReLU sits **inside** the per-head sum, not outside it. One production prefill row (`eff_len=8192`): **8192/8192 distinct values, 0 exact zeros**, 81.7% negative, skew −0.048, boundary not tied, **14** occupied L0 buckets vs 16 for `standard_normal`. `unconverged = 0` in every production config at every radix, so the arbitrary tie-break at `sparsecore_topk.py:289` is never exercised. Sensitivity grid (α up to 0.99, `\|w\|`, per-head scale spread, n_head 16–128, ×1e±6 rescale) tops out at 2.031 — **below** 2.231 even when built adversarially |
 | ~~the 2.231-vs-2.03 gap is a score-distribution mismatch~~ | how much of the level cost is real | ⛔ **REFUTED — and this was asserted in three places.** At **matched ρ=1** the production distribution gives 1.889 mean / **2.031** crit against `standard_normal`'s 1.92 / **2.03**: the distribution is worth −1.6% on the mean and **0.0% on crit**. `probes/08` had already refuted the skipped-level explanation (0.060 µs, not 3.8). So ~0.20 levels of the timing inversion is **still unexplained residual** — not distribution, not skip overhead. It is small and it inflates a cost, so it is conservative to carry; but stop calling it explained |
 | ρ = **0.40005** prefill | **every share in this document** | ✅ **VERIFIED independently to 5 significant figures**, from `streamindex_topk.py:503-506` with `compression_ratio = 1` (`mla_attention_op.py:116`), `n = 10240` (`streamindex_topk.py:603-605`), and `max-model-len 9216` / `ISL 8192` / `RANDOM_RANGE_RATIO 0.0` in `glm-5.2-fp8-dp16-ep.sh:43,27,37`. It is **robust to the chunk mix** — ρ is uniform over `token_pos ∈ [1, 8192]` however the budget is split. ⚠ What is *not* robust is "2 of 8 chunks"; state it as **1/4 of prefill rows have `token_pos < 2048`**, which holds regardless |
