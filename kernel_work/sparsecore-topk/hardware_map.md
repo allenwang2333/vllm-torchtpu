@@ -430,10 +430,16 @@ carried scans, i.e. **D13, at ~135 ns per carried iteration = 235 cycles for a b
 bundles.** The split between the three is `probes/09`.
 
 **Tags.** ρ itself is `derived` (`file:line` for every input). The 6/8 refinement factor is `derived`.
-The *level count* within chunks 2–7 is **`assumed`** at 2.231, carried from ρ=1; `probes/08` refuted
-the "a skipped level costs 3.8 µs" explanation of probes/05's 2.231-vs-2.03 gap (a skipped level costs
-**0.060 µs**), so that gap is a score-distribution mismatch and any candidate priced on the level
-count must re-derive it. The 1.625 factor is measured at ρ=1 and **assumed** to hold at ρ=0.4.
+The *level count* within chunks 2–7 is ~~`assumed` at 2.231~~ → **`measured` at 1.740** walking rows
+/ 1.300 all rows / 1.570 critical-subcore, `probes/13` (CPU replay of the kernel's integer logic, 4
+KV draws, no job). ⚠ **Two corrections came with it.** (1) 2.231 was **not** a ρ=1 level count at all
+— it is `probes/07`'s timing inversion `(L3−L0)/level_slope`, whose simulated companion is probes/05's
+2.03. (2) The 2.231-vs-2.03 gap is **not** a score-distribution mismatch, as this file and `report.md`
+both previously asserted: at matched ρ=1 the production distribution reads 1.889/2.031 against
+`standard_normal`'s 1.92/2.03 — **0.0% on crit**. `probes/08` had already killed the skipped-level
+explanation (0.060 µs, not 3.8). ~0.20 levels remain **unexplained timing residual**; it inflates a
+cost, so carrying it is conservative, but it is not explained. The 1.625 factor is measured at ρ=1
+and **assumed** to hold at ρ=0.4.
 
 ---
 
@@ -555,8 +561,11 @@ of scheduling, unrolling or hoisting can be its cause.
 3. ⛔ **M3, `parallel_loop` entry/exit — REFUTED.** `-alld` (dynamic-zero bounds, loops entered) minus
    `-alls` (loops eliminated at trace time) is **−0.333 µs over 32 waves**. A skipped loop is free.
    The same arm answers `probes/07` §4 from the other side: **a skipped refinement level costs 0.060
-   µs**, not the ~3.8 µs that would have closed the 2.231-vs-2.03 gap. That gap is a score-distribution
-   mismatch, exactly the caveat `probes/05` carried forward about itself.
+   µs**, not the ~3.8 µs that would have closed the 2.231-vs-2.03 gap. ~~That gap is a
+   score-distribution mismatch, exactly the caveat `probes/05` carried forward about itself.~~
+   ⛔ **That attribution is refuted by `probes/13`**: at matched ρ=1 the production distribution gives
+   crit 2.031 against `standard_normal`'s 2.03. The distribution explains **none** of the gap, which
+   remains ~0.20 levels of unexplained timing residual.
 
 4. ⛔ **M4, the wave loop itself — REFUTED, and it takes M1's premise with it.** `probes/09` measured
    the slope against `num_waves` **directly** instead of dividing: `A0_W8` 92.012, `A0_W16` 91.994,

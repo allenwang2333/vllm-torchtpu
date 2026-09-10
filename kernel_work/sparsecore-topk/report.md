@@ -587,10 +587,18 @@ purely per-wave term must be. That is the internal check that makes the decompos
 
 **One thing the probe did not settle.** `implied active levels` reads 2.545 at decode against probe
 05's critical-subcore 2.50 (1.8% — a good confirmation), but 2.231 at prefill against 2.03 (9.9%).
-Do not call that a distribution error yet: **a skipped level is not free** in the incumbent — it
+✅ **Settled in step 2, and neither candidate explanation survived.** `probes/08` measured a skipped
+level at **0.060 µs**, not the ~3.8 µs the skip-overhead theory needed. `probes/13` then measured the
+distribution theory: at **matched ρ=1** the production score distribution gives crit **2.031**
+against `standard_normal`'s **2.03** — the distribution is worth **0.0%**. So ~0.20 levels is
+**unexplained timing residual**. It inflates a cost the design is trying to delete, so carrying it is
+the conservative direction, but it should not be described as understood. The original caution below
+was right to withhold the distribution verdict; the verdict, when taken, was negative.
+
+~~Do not call that a distribution error yet: **a skipped level is not free** in the incumbent — it
 still enters four `parallel_loop`s at bound 0 and runs the scalar epilogue at 249–265, three times —
 and a ~3.8 µs/level skip overhead would explain the whole gap. One arm settles it (3 levels, `done`
-pinned **True**) and it is not in this probe.
+pinned **True**) and it is not in this probe.~~ *(That arm ran, as `probes/08`; see above.)*
 
 ### 5d″. Two clock-free findings that survive regardless
 
@@ -947,7 +955,7 @@ ranking.
 | 5 | **pipelined score DMA — the caller's request** | replace the blocking `start()`/`wait()` at 108-111 with `emit_pipeline` or a hand-rolled cross-wave double buffer | ⛔ SUPERSEDED by `probes/08` (`j-300d4690`): **2.8% of the kernel at shipping ρ; ceiling −4.12% prefill / −1.97% decode.** Premise and headroom confirmed at machine-code level (§6). **The one prize probe 07 did not move** | step 2, this skill |
 | 6 | **decode launch cost** | 22.04 µs of fixed intercept = **43.2% of the decode kernel**. Not proportional to work | up to 43.2% at decode, **but** probe 07's null arm — a trivial jitted add that never touches the SparseCore — measures **27.19 µs, above the intercept**. So it may be mostly instrument-side dispatch, and this instrument cannot tell | step 2, **only after** a probe that separates on-device program load from host dispatch |
 | — | subcore load imbalance | 1.28× at decode from data-dependent early exit with only 2 rows/subcore (§2) | bounded by the refinement term, now measured at 19.4% of decode — so the imbalance is worth at most ~4% of decode | step 2, likely subsumed by 2 |
-| — | skipped-level overhead | a `done` level still enters four `parallel_loop`s at bound 0 and runs the scalar epilogue, 3× per row | **unmeasured.** ~3.8 µs/level would explain the whole 2.231-vs-2.03 gap in probe 07 | one arm, foldable into candidate 3's probe |
+| — | ~~skipped-level overhead~~ | a `done` level still enters four `parallel_loop`s at bound 0 and runs the scalar epilogue, 3× per row | ⛔ **CLOSED, refuted.** `probes/08` measures a skipped level at **0.060 µs**, not the ~3.8 µs needed. `probes/13` then refuted the fallback distribution explanation too (0.0% on crit at matched ρ=1), so the 2.231-vs-2.03 gap is unexplained residual, not this | closed |
 | — | ~~LICM in `ref_body`~~ | 4 loop-invariant recomputes survive into the body | **rejected without a job**: ~3 of 14 bundles, and the loop is not issue-bound (§5d″) | closed |
 | — | ~~better scheduling / register pressure~~ | — | **rejected without a job**: hot loops run 4.0–4.7 slots/bundle with zero NOPs and zero spills, except emit (§5d″) | closed |
 
