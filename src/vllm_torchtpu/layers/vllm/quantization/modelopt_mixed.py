@@ -115,6 +115,10 @@ class VllmModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig,
             raise NotImplementedError(
                 "ModelOpt mixed-precision MXFP8 layers are not supported on "
                 "TPU.")
+        if quant_algo is not None:
+            raise ValueError(
+                f"Unsupported ModelOpt mixed-precision quant_algo "
+                f"{quant_algo!r} for layer {prefix!r} on TPU.")
 
         if isinstance(layer, LinearBase):
             return UnquantizedLinearMethod()

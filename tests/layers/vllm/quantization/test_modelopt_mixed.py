@@ -14,8 +14,13 @@
 
 import pytest
 import torch
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
+
+from vllm_torchtpu.layers.vllm.quantization import modelopt_mixed
+from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+    VllmUnquantizedFusedMoEMethod
 
 
 @pytest.fixture
@@ -69,3 +74,79 @@ def test_modelopt_mixed_unlisted_linear_is_unquantized(linear_layer):
     method = cfg.get_quant_method(linear_layer,
                                   prefix="model.layers.0.self_attn.o_proj")
     assert isinstance(method, UnquantizedLinearMethod)
+
+
+@pytest.fixture(params=["linear", "moe"])
+def dispatch_layer(request, linear_layer, monkeypatch):
+    if request.param == "linear":
+        return linear_layer
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    # Keep this a dispatch test without initializing distributed MoE state.
+    method = object.__new__(VllmUnquantizedFusedMoEMethod)
+    monkeypatch.setattr(modelopt_mixed.VllmModelOptMixedPrecisionConfig,
+                        "get_moe_config", lambda self, layer: None)
+    monkeypatch.setattr(modelopt_mixed, "VllmUnquantizedFusedMoEMethod",
+                        lambda config: method)
+    return layer
+
+
+@pytest.mark.parametrize("quant_algo", ["UNSUPPORTED", ""])
+def test_modelopt_mixed_rejects_unknown_quant_algo(dispatch_layer, quant_algo):
+    prefix = "model.layers.0.proj"
+    cfg = modelopt_mixed.VllmModelOptMixedPrecisionConfig.from_config({
+        "quant_method":
+        "modelopt",
+        "quant_algo":
+        "MIXED_PRECISION",
+        "quantized_layers": {
+            prefix: {
+                "quant_algo": quant_algo
+            }
+        },
+    })
+    with pytest.raises(ValueError, match="Unsupported.*quant_algo") as exc:
+        cfg.get_quant_method(dispatch_layer, prefix)
+    assert prefix in str(exc.value)
+    assert repr(quant_algo) in str(exc.value)
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+def test_modelopt_mixed_preserves_unquantized_dispatch(dispatch_layer,
+                                                       excluded):
+    prefix = "model.layers.0.proj"
+    cfg = modelopt_mixed.VllmModelOptMixedPrecisionConfig.from_config({
+        "quant_method":
+        "modelopt",
+        "quant_algo":
+        "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.layers.1.proj": {
+                "quant_algo": "FP8"
+            },
+        },
+    })
+    if excluded:
+        cfg.quantized_layers[prefix] = {"quant_algo": "UNSUPPORTED"}
+        cfg.exclude_modules = [prefix]
+    method = cfg.get_quant_method(dispatch_layer, prefix)
+    expected = (UnquantizedLinearMethod if isinstance(
+        dispatch_layer, LinearBase) else VllmUnquantizedFusedMoEMethod)
+    assert isinstance(method, expected)
+
+
+def test_modelopt_mixed_still_rejects_mxfp8(dispatch_layer):
+    prefix = "model.layers.0.proj"
+    cfg = modelopt_mixed.VllmModelOptMixedPrecisionConfig.from_config({
+        "quant_method":
+        "modelopt",
+        "quant_algo":
+        "MIXED_PRECISION",
+        "quantized_layers": {
+            prefix: {
+                "quant_algo": "MXFP8"
+            }
+        },
+    })
+    with pytest.raises(NotImplementedError, match="MXFP8"):
+        cfg.get_quant_method(dispatch_layer, prefix)
