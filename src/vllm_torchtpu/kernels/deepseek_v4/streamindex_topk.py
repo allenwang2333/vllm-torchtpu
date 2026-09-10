@@ -119,7 +119,7 @@ def cp_global_to_local(global_idx, cp_size: int, interleave_c: int):
 def cp_rank_as_data(cp_axis_name: str, cp_size: int):
     """This shard's index along `cp_axis_name`, without `lax.axis_index`.
 
-    `lax.axis_index` is the obvious spelling, but it lowers to `partition-id`,
+    `lax.axis_index` lowers to `partition-id`,
     which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
     through its `jax.export` bridge ("partitionId instruction is not supported
     for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
