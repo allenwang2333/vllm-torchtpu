@@ -10,8 +10,6 @@ from vllm_torchtpu.distributed.cp_mesh import (CpGroupLayout,
                                                get_cp_group_layout,
                                                get_or_create_cp_mesh)
 
-# The old name for the layout dataclass, kept so existing callers and type
-# annotations do not have to change. `cp_mesh.CpGroupLayout` is the same class.
 PcpGroupLayout = CpGroupLayout
 
 
