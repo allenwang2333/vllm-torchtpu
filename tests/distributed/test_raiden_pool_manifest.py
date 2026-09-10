@@ -13,7 +13,8 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
+from .raiden_test_utils import (FakeTensor, dsv4_materialization,
+                                glm_named_kv_caches)
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
