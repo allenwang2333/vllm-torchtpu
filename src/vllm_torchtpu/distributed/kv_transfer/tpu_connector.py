@@ -149,12 +149,7 @@ def _stage3_skipped_window_pages(*, num_tokens: int, page_tokens: int,
                                  window_tokens: Optional[int]) -> int:
     """Leading pages of a sliding-window block table that hold no live KV.
 
-    `SlidingWindowManager` frees each page that falls out of the window and
-    writes the null block over its entry, so the table opens with a run of one
-    repeated ID. Sending those pages would hand Raiden a duplicate destination,
-    which it rejects. Mirrors `SlidingWindowManager.get_num_skipped_tokens`;
-    both peers compute it from the same request length and page geometry, so
-    they trim the same pages.
+    Mirrors `SlidingWindowManager.get_num_skipped_tokens`.
     """
     if not window_tokens:
         return 0
@@ -184,10 +179,9 @@ def _stage3_trim_window_pages(
     if not skipped:
         return ids
     dropped, kept = ids[:skipped], ids[skipped:]
-    # Dropping out-of-window pages is right either way, but they should all be
-    # the null block. A varied prefix means this arithmetic and vLLM's have
-    # drifted apart, which is worth seeing before it becomes a silent
-    # mis-transfer.
+    # The dropped prefix should be all null block. Anything else means this
+    # skip count and vLLM's have drifted apart. Warn rather than raise, since
+    # dropping out-of-window pages is still the right move.
     if len(set(dropped)) != 1:
         logger.warning(
             "Stage-3 sliding-window trim dropped pages that are not all the "
@@ -213,15 +207,14 @@ def _stage3_recycled_transfer_pages(
 ) -> int:
     """Pages this group would send that the allocator has already freed.
 
-    Both peers skip against `num_tokens`, the transfer prefix, while the
-    allocator freed against however far the producer actually ran. The two
-    agree only while the producer stops at the handoff token. One page further
-    and the send still lists a recycled page, which arrives as the null block.
-    Far enough and two of them collide into a duplicate destination, which
-    Raiden rejects outright.
-
-    Counting the null blocks in the range reads what the block table says,
-    rather than assuming the two formulas line up.
+    Skipping counts from `num_tokens`, the transfer prefix, while the allocator
+    freed against however far the producer actually ran. Those agree only when
+    the producer stops at the handoff token, which is what
+    `_maybe_truncate_prompt_for_handoff` arranges. This guard covers what
+    truncation cannot reach: a client that hits the prefill port directly keeps
+    generating past the handoff, and the allocator frees pages the prefix still
+    lists. Two of them collide into a duplicate destination and Raiden raises
+    out of `execute_model`.
     """
     skipped = _stage3_skipped_window_pages(num_tokens=num_tokens,
                                            page_tokens=page_tokens,
@@ -231,12 +224,9 @@ def _stage3_recycled_transfer_pages(
 
 
 def _stage3_group_window_tokens(group_spec: Any) -> Optional[int]:
-    """The sliding window of a cache group, or None if it is full attention.
-
-    DSv4 hands its groups over as `UniformTypeKVCacheSpecs`, which carries no
-    `sliding_window` of its own; the layers under it are uniform by
-    construction, so any one of them answers for the group.
-    """
+    """The sliding window of a cache group, or None if it is full attention."""
+    # A UniformTypeKVCacheSpecs wrapper has no sliding_window of its own, and
+    # its layers are uniform, so any one of them answers for the group.
     specs = getattr(group_spec, "kv_cache_specs", None)
     if specs:
         group_spec = next(iter(specs.values()))
@@ -251,16 +241,18 @@ def _stage3_transfer_groups(
 ) -> tuple[_Stage3TransferGroup, ...]:
     """The KV cache groups whose pages Stage 3 transfers, in group order.
 
-    Mamba groups are excluded; their state rides the state-class tags, one
-    committed checkpoint at a time rather than a page range. ``page_tokens``
-    travels with each group because DSv4's groups page at different sizes, its
-    SWA block being an eighth of its CSA block, so one connector-wide page size
-    cannot validate them all.
+    Mamba groups are excluded because their state does not travel as pages. It
+    goes over the ``gdn.conv`` and ``gdn.ssm`` tags as one checkpoint, handed
+    over separately as ``mamba_block_ids``.
 
-    ``multi_group`` is checked in both directions. Qwen3.5 and GLM must have
-    exactly one group. DSv4 has several by construction, and a single-group
-    DSv4 plan would only fail later, when the worker looks for the per-group
-    block tables the scheduler never sent.
+    Each group carries its own ``page_tokens`` because DSv4's groups page at
+    different sizes, its SWA block being an eighth of its CSA block, so no one
+    connector-wide page size validates them all.
+
+    ``multi_group`` is checked both ways. Qwen3.5 and GLM must have exactly one
+    group; DSv4 must have several. A single-group DSv4 plan would otherwise
+    fail much later, in the worker, looking for the per-group block tables the
+    scheduler never sent.
     """
     groups = tuple(
         _Stage3TransferGroup(cache_group_index=index,
