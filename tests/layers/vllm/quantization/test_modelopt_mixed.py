@@ -14,8 +14,10 @@
 
 import pytest
 import torch
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import LinearBase
+
+from vllm_torchtpu.layers.vllm.quantization.unquantized import \
+    VllmUnquantizedLinearMethod
 
 
 @pytest.fixture
@@ -66,6 +68,6 @@ def test_modelopt_mixed_unlisted_linear_is_unquantized(linear_layer):
             },
         },
     })
-    method = cfg.get_quant_method(linear_layer,
-                                  prefix="model.layers.0.self_attn.o_proj")
-    assert isinstance(method, UnquantizedLinearMethod)
+    method = cfg.get_quant_method(
+        linear_layer, prefix="model.layers.0.self_attn.o_proj")
+    assert isinstance(method, VllmUnquantizedLinearMethod)

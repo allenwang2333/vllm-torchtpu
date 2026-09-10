@@ -18,8 +18,7 @@ from typing import Any, Optional
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.linear import (LinearBase,
-                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import \
@@ -32,8 +31,8 @@ from vllm_torchtpu.layers.common.quant_methods import (MODELOPT_MIXED,
 from vllm_torchtpu.layers.vllm.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.layers.vllm.quantization.nvfp4 import VllmNvfp4Config
-from vllm_torchtpu.layers.vllm.quantization.unquantized import \
-    VllmUnquantizedFusedMoEMethod
+from vllm_torchtpu.layers.vllm.quantization.unquantized import (
+    VllmUnquantizedFusedMoEMethod, VllmUnquantizedLinearMethod)
 
 
 @register_quantization_config(get_tpu_quant_method(MODELOPT_MIXED))
@@ -100,7 +99,7 @@ class VllmModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig,
 
         if self.is_layer_excluded(prefix):
             if isinstance(layer, LinearBase):
-                return UnquantizedLinearMethod()
+                return VllmUnquantizedLinearMethod()
             if isinstance(layer, RoutedExperts):
                 return VllmUnquantizedFusedMoEMethod(
                     self.get_moe_config(layer))
@@ -117,7 +116,7 @@ class VllmModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig,
                 "TPU.")
 
         if isinstance(layer, LinearBase):
-            return UnquantizedLinearMethod()
+            return VllmUnquantizedLinearMethod()
         if isinstance(layer, RoutedExperts):
             return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
         return None
