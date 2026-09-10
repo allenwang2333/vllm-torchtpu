@@ -75,8 +75,14 @@ must not** — step 3 measures against a production-shaped entry and quotes prod
 
 ## 0. Where the search landed
 
-- **Best version:** `v2` — the incumbent with the 16× lane-private histogram replication removed.
-  It is the only node with a measurement, and it is bit-exact.
+- **Best *measured* version:** `v2` — the incumbent with the 16× lane-private histogram replication
+  removed. It is the only node with a measurement, and it is bit-exact. ⚠ It is **rank 6** of 7 on
+  predicted prize; it leads on evidence, not on size. **The ranking is §9a**, and it supersedes the
+  `rank N` labels in the plan headings.
+- **Top of the shortlist:** `v3` fused emit (≈ −25.0% production), then ⏳ `v5` (blocked on
+  `probes/16`), then `v12` (≈ −16.8%, firm), then `v10` (≈ −14.9%). ⛔ `v3` and `v10` are
+  alternative roots and **compete**; the two edge nodes `v12` and `v11` compose with everything and
+  are worth ≈ −23% between them for seven edits.
 - **189.98 µs modelled-from-measured → 177.79 µs**, **−6.42%** (6.4% faster), from `R1`'s measured
   12.195 µs (`j-300d4690`, bit-identical output 1024/1024 and 64/64 rows). In production
   percentages that is **−7.83%**.
@@ -1142,7 +1148,46 @@ four largest non-kernel numbers in this exercise live on the edges**, and that `
 *internal* edge. The kernel does stay one `plsc` mesh call; what changes is that the edges are no
 longer assumed optimal. In particular the input edge carries a deletable XLA op worth **26.251 µs**
 (✅ now firm — `probes/14` Q1), and the output edge a measured 10.007 µs retiling (✅ now confirmed
-live in-model — Q2) — neither reachable by any plan below.
+live in-model — Q2). ⛔ **This block used to end "neither reachable by any plan below". That is no
+longer true** — both became nodes, `v12` and `v11`, and both are in the shortlist immediately below.
+
+### 9a. The closing shortlist — ⛔ this supersedes the `rank N` in the plan headers
+
+The `rank 1`…`rank 6` in the six plan headings below were assigned **before** the probe wave and are
+now wrong in three places: `v3` and `v10` both grew, `v6` is rejected outright, and two edge nodes
+(`v11`, `v12`) did not exist when the ranks were written. The headings are left alone so the plans
+stay findable; **this table is the ranking.**
+
+| # | node | plan | harness `Δ` | production `Δ` (× 1.219) | evidence | composes? |
+| ---: | --- | --- | ---: | ---: | --- | --- |
+| **1** | **`v3`** fused emit | B | **−20.5%** | **−25.0%** | `measured` rate (`probes/15`); **sign settled without building it** — break-even `cnt_eff` 8531 > global max 6495 | ⛔ competes with `v10` |
+| **2** | **`v5`** `NUM_BUCKETS` swept | D | ⏳ **−14.82% or −1.58%** | ⏳ −18.1% or −1.9% | ⛔ **not quotable** — `probes/07` and `probes/09` disagree 3.1× on the sweep price; `probes/16` in flight | yes |
+| **3** | **`v12`** (= U2) `f32` input | — *(edge)* | **−13.82%** | **−16.8%** | `static-compile` ×2 (`probes/17` reachable, `probes/14` materialised); **firm** | ✅ **with everything** |
+| **4** | **`v10`** sample-and-count | E | **−12.2%** | **−14.9%** | `measured` count-pass rate, **at the read-only walk floor** (`probes/15`) | ⛔ competes with `v3` |
+| **5** | **`v4`** pipelined score DMA | C | ≤ **−7.09%** | ≤ **−8.64%** | ceiling, `modelled`; the caller's original request | yes |
+| **6** | **`v2`** `R=1` | A | **−6.42%** | **−7.83%** | ✅ **`measured` and bit-exact** (`j-300d4690`) — the only measured node | yes |
+| **7** | **`v11`** retiled output emit | — *(edge)* | ≤ **−5.27%** | ≤ **−6.42%** | `measured` 10.007 µs; both conditions discharged (`probes/17`, `probes/14` Q2) | ✅ with everything **except H3**, which subsumes it |
+| — | ~~`v6`~~ keep-all fast path | F | ~~−4.7%~~ | ⛔ **REJECTED** | the outer runtime gate already elides the whole kernel on exactly the steps it fires on (`probes/14`) | — |
+| — | `v7` shallow scans | — | −2.5% | −3.0% | `PARKED` (§5) | yes |
+
+**Three things this ranking says that the prize column alone does not.**
+
+- **The two edge nodes are the cheapest wins per line of code in the file.** `v12` is three edits
+  and `v11` is four, neither touches the algorithm, both are `exact`, and together they are worth
+  **≈ −23% production** — more than `v10`, and they compose with whichever root wins. ⚠ Their prizes
+  are `measured` on the *harness's* ops; what transfers is the shape, argued in §1, not the op
+  identity.
+- **The top of the ranking is a fork, not a stack.** `v3` and `v10` are alternative second roots and
+  the probe wave grew both without adjudicating between them. Step 3 must build both; the ranking
+  cannot decide it, because their prizes rest on different `measured` rates and neither dominates
+  the other under the ρ = 0.40005 reweighting the whole sheet is predicated on.
+- **Rank 6 is where step 3 starts.** `v2` is last but one on prize and **first** on build order: it
+  is already written, already bit-exact and already measured, so lifting it into `variants/`
+  validates the step-3 harness against a known answer before any unmeasured arm runs.
+
+⛔ **`v5`'s rank is provisional and must not be quoted.** The two candidate prizes differ by 9.4×
+and straddle the "worth building at all" line. `probes/16` adjudicates; until it returns, treat
+rank 2 as a placeholder holding a slot, not a claim.
 
 ⚠ **Every `Δ time %` in the plans below is in the harness denominator (189.98 µs).** `probes/11`
 showed the harness is 34.165 µs larger than production, so **multiply each by 1.219** to get the
@@ -1536,22 +1581,31 @@ prize is ~4× smaller than the number this node carried before the source read.
 
 ### Build order
 
-- **Parallel:** Plans A, B, D, F and E's probe. **Blocked:** Plan C — on Plan B, for timing only,
-  since the fused pass changes what the DMA feeds; and on its own local compile check of
-  `emit_pipeline`. ⚠ **F overlaps C and D**: it deletes the score DMA and the sweeps on a quarter of
-  rows, which are exactly what C and D act on. Measure F against each, never sum them.
-- **Build first:** **Plan A.** It is already written (`probes/08-…/arms/arm-R1.py`), already
-  bit-exact, and already measured — it is a lift into `variants/`, not a build, and it establishes
-  the step-3 harness against a known answer.
-- **Probe first, before Plan E is written at all:** the count-pass rate. One arm, minutes, and it
-  decides whether 150 new lines get written.
-- ⚠ **The one thing that outranks this whole list, and no plan here can build it:** ⏳ `probes/11`.
-  `probes/10` traced D3's 75.683 µs to an XLA relayout of the score buffer **outside the Pallas
-  kernel**. If it is in the production path, the fix is a layout or dtype decision at the call site
-  worth ~73 µs — **more than Plans A, C and D combined** — and it leaves this file as a `carried:`
-  handoff (§10), because a call-site layout change is not a kernel variant. If it is a harness
-  artifact, every plan above is worth roughly double what its table says. **Settle it before step 3
-  spends a job.**
+⛔ **Rewritten at the close of step 2.** Three of the four bullets this block used to carry are
+discharged or dead: the count-pass probe returned (`probes/15`), `probes/11` returned and then
+`probes/14` finished it, and Plan F is rejected so its overlap warning is moot.
+
+- **Build first: Plan A (`v2`).** It is already written (`probes/08-…/arms/arm-R1.py`), already
+  bit-exact and already measured — a lift into `variants/`, not a build. Its job is to validate the
+  step-3 harness against a known answer before an unmeasured arm runs.
+- **Buy first, in the same job: one ρ = 0.40005 arm of the incumbent.** ⛔ This outranks every
+  variant. The whole sheet's denominator is `modelled` — nothing has ever run at the production ρ —
+  so until this arm exists every percentage in this file is a ratio of two predictions. One arm
+  converts it to `measured` and validates the reweighting whole. See "Numbers in this document".
+- **Then the fork, in parallel: Plans B (`v3`) and E (`v10`).** Ranks 1 and 4, alternative roots,
+  and the ranking cannot separate them. Both get built; the measurement adjudicates.
+- **Cheap and parallel with all of the above: `v12` and `v11`.** Three edits and four, no algorithm
+  change, `exact`, and worth ≈ −23% production between them. They have no plan section because they
+  were promoted from stage E after §9 was written — build them from their §5 blocks.
+- **Blocked:** Plan C (`v4`) — on Plan B, for timing only, since the fused pass changes what the DMA
+  feeds; and on its own local compile check of `emit_pipeline`. ✅ That compile check is now cheap
+  and needs no pod: AOT against `topologies.get_topology_desc("tpu7x:2x2x1")`, per `probes/17`.
+- **Blocked on a probe:** Plan D (`v5`) — ⏳ `probes/16`. Do not write it until the 3.1× sweep-price
+  conflict is adjudicated; the answer decides whether it is worth −18.1% or −1.9%.
+- ⛔ **Do not build Plan F (`v6`).** Rejected by `probes/14`, not by a microbenchmark: the outer
+  `lax.cond` already elides the entire kernel on exactly the steps an in-kernel `keep_all` fast path
+  would fire on. Its residual — short rows batched with a long one — is `unmodelled` and out of
+  scope for this exercise.
 
 ## 10. Open, parked, and carried
 
