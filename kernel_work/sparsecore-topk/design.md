@@ -579,12 +579,28 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   60% of prefill bytes are never read (host ρ derivation)
 - **Exactness:** n/a — a `transfer` move changes no arithmetic
 - **State diff from `v3`:** `transfer` — T1 buffer count 1 → 2, T2 padded → ragged. `live set` — one
-  more `4·L` buffer. `grid` — unchanged; still a static `fori_loop` over waves
-- **Live set:** 73,536 + 40,960 = **114,496 B = 111.81 KiB, 21.84%.** Binding term: still none — and
-  §4d already checked that this coexists with `v3`'s straddler
-- **Predicted:** **≤ 13.469 µs**, `measured` ceiling (`j-300d4690`). **~110.7 µs, −10.8%** from `v3`.
+  more buffer. ⚠ **`boundary` and `grid` both change — restated by stage E (§11).** `boundary`: the
+  single `plsc` mesh call gains an **inner pipeline grid** `(n // chunk,)` enclosing exactly
+  `cvt ⊕ hist0`. `grid`: no longer "unchanged; still a static `fori_loop` over waves"
+- **Live set:** ⚠ **81,728 B = 15.59%** at the chosen within-slice form (`+2·1024·4` on `v3`'s
+  73,536) — **24,576 B cheaper than the 114,496 B / 21.84% the cross-wave form would cost.** Binding
+  term: still none; §4d already checked coexistence with `v3`'s straddler
+- **`chunk` = 1024 words (4 KiB); sweep {512, 1024, 2048} in step 3.** ⛔ **4096 is illegal** —
+  `n = 10240 = 2¹¹·5` is **not** a power of two, contradicting `probes/12`'s escape clause. Legal
+  chunks are divisors of 10240 that are multiples of `LANES=16`
+- **Predicted:** ⚠ **RESTATED — the "≤ 13.469 µs" ceiling was never reachable.** Step 0's DMA is
+  never hidden, so the unhidden head is `13.469/(n/chunk)` = 1.347 µs at chunk 1024, and `cvt`'s
+  measured −8.20 µs absorption re-emerges once the DMA stops being something to absorb. Optimistic
+  `13.469 − 1.347 = 12.122 µs` → **−6.38%**; pessimistic `− 8.20` more → **−2.06%**. `modelled` on
+  `measured` inputs. ⚠ **The pessimistic end is the weakest number in stage E**: it subtracts cvt's
+  *full* marginal cost on the theory the absorption is banked twice, and a marginal-removal
+  measurement is not a decomposition. The chunk sweep measures it directly
   ⚠ **D1 and D8 cap at the same 13.469** — moving fewer bytes and overlapping the bytes you move
   cannot both be paid out of one exposed-transfer budget
+- ⚠ **This is `hardware_map.md:675`'s S2 seam, and S2 and `v4` are ONE move — do not sum them.**
+  S2's ~10 µs is `modelled` and is contradicted by cvt's **measured** −8.20 µs: the pass is already
+  free because it absorbs arrival latency, so S2's prize is ≤ 0 at the incumbent's schedule and
+  becomes positive only *inside* this node
 - **Built?** **No** — step-3 variant
 - **Measured:** — · **Verdict:** **OPEN** — but its one *feasibility* blocker is now closed, see below
 - ✅ **`probes/12` closes the mechanism question, with no job.** `pltpu.emit_pipeline` **is** usable
@@ -666,6 +682,10 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **State diff from `v2`:** `boundary` — a second, near-empty path through the kernel. `algebra` —
   the identity emit. ⚠ **Not a pure skip**: the fast path must still write `0..eff_len-1` and `−1`
   padding, so it needs a cheap replacement emit
+- ⚠ **Composing with `v4` changes the mechanism — restated by stage E (§11).** `@pl.when(i_hi > k)`
+  **cannot wrap `v4`'s pipeline**: that puts `emit_pipeline`'s `run_scoped` allocations under a
+  conditional. The repo idiom is a **grid that evaluates to 0** (`ragged_gather_v2.py:102,208`), so
+  `v6 ∘ v4` is `grid=(0,)` on the fast path, not a `pl.when`. `v6` standalone is unaffected
 - **Live set:** unchanged; the fast path allocates nothing new
 - **Predicted:** **~8.9 µs, −4.7%.** `modelled`, and see the two corrections below — the earlier
   "≤ −18.5%, or 0% if a step is mixed" was wrong in both directions. Terms saved on the 25% of
@@ -750,6 +770,30 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 
 ---
 
+### `v11` — retiled output emit  *(new, from stage E)*
+
+- **Parent:** `v1` — an **edge** move, so it composes with every node · **Move:**
+  `[boundary]`/`[relayout]`
+- **What changes:** declare `out_type = jax.ShapeDtypeStruct((b, k), jnp.int32)` with the consumer's
+  tiling instead of the flat `(b*k,)` at `sparsecore_topk.py:451`, and let the out DMA (`:315-319`)
+  write tiled rows directly. `out.reshape(b, k)` at `:491` disappears
+- **Motivated by:** `probes/11` — `ROOT %reshape.1 = s32[1024,2048]{1,0:T(8,128)} reshape(…call-done)`
+  is in the production entry, **10.007 µs `measured (j-9b520877)`** = 1.251 µs/MiB, and carries
+  `used_scoped_memory_configs` 4 MiB. **It is the only survivor of D3**
+- **Exactness:** **`exact`** — a layout change computes the same function. ⚠ Not "no evidence
+  needed": it changes the *store pattern*, so it owes the same bit-identical row gate `v2` passed
+- **State diff from `v1`:** `boundary` — the output edge moves from XLA into the kernel. `transfer` —
+  `rowbuf → out_hbm` goes from one 8 KiB contiguous run per row to **16 runs of 512 B at stride 1024
+  words**. 512 B = 128 int32 = the SparseCore granule exactly
+- **Live set:** unchanged — same `rowbuf_vmem`, no new buffer
+- **Predicted:** ≤ **−5.27%** (10.007 µs) less the strided-DMA cost, which is `unmodelled`
+- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory probe. ⛔ Not `PARKED`: its
+  verdict turns on an `unmodelled` term, which `TEMPLATE-design.md` §10 forbids parking on.
+  ⏳ feasibility dispatched, `probes/17`
+- **Note:** ⚠ **conditional on the in-model check** (§11, `stage-e-boundary.md` §3c) — if the retile
+  does not survive in-model, `v11` is **REJECTED** with prize 0. It is also **subsumed by H3**: a
+  fused consumer has no HBM output to retile.
+
 ## 6. Instruments — every probe, capture and job
 
 Raw output under `probes/`; nothing pasted here.
@@ -826,6 +870,13 @@ every step-3 plan.
 Ranked. `REJECTED` nodes get no entry; `v7` is `PARKED` and gets a pointer (§5). **Each entry is
 exactly one kernel call** — the boundary never splits in this block, because `P=1` leaves no
 partition loop and `n` is untiled.
+
+⚠ **That sentence is true about the *middle* and was mistaken for an answer about the whole
+boundary.** Stage E (`stage-e-boundary.md`, spliced summary in **§11**) found that **three of the
+four largest non-kernel numbers in this exercise live on the edges**, and that `v4` creates a new
+*internal* edge. The kernel does stay one `plsc` mesh call; what changes is that the edges are no
+longer assumed optimal. In particular the input edge carries a deletable XLA op worth up to
+26.251 µs, and the output edge a measured 10.007 µs retiling — neither reachable by any plan below.
 
 ⚠ **Every `Δ time %` in the plans below is in the harness denominator (189.98 µs).** `probes/11`
 showed the harness is 34.2–60.4 µs larger than production, so **multiply each by 1.219 (firm) to
@@ -1240,7 +1291,10 @@ prize is ~4× smaller than the number this node carried before the source read.
 
 | node | what closes it | cost |
 | --- | --- | --- |
-| `v3` fused-emit | ⚠ a probe on the cost of a conditional `store_compressed` inside the L0 walk. **Not yet dispatched** | one arm |
+| `v3` fused-emit | ⚠ a probe on the cost of a conditional `store_compressed` inside the L0 walk. ⏳ **dispatched, `probes/15`** — as a *slope in store density*, not one number at one density | one arm |
+| **`v11`** retiled output emit | ⚠ **new node from stage E.** Two things: (a) can `plsc` declare a 2-D tiled `out_type` — ⏳ `probes/17`, no job; (b) does the 10.007 µs retile survive **in-model** — ⏳ `probes/14`. If (b) is no, `v11` is `REJECTED` with prize 0 | no job |
+| **U2** `f32` input, in-register reinterpret | ⚠ **new from stage E, and it dissolves rather than answers the 26.251 µs denominator leg.** `sparsecore_topk.py:438` asks XLA for a dtype change the kernel does not need; the emitted `%bitcast_convert_type.3` carries **16 MiB** of `used_scoped_memory_configs`, where the genuinely-free flatten carries no `backend_config` at all. ⏳ feasibility `probes/17` | no job |
+| **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. Free: read `StreamIdxTC-*` durations from an existing xprof | no job |
 | `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
 | `v6` keep-all-fastpath | ✅ **check done — the gate does not exist** (no inter-subcore barrier), and the prize is 4× smaller than recorded because a `keep_all` short-circuit is already in the kernel. Now a plain build at a `modelled` −4.7% | step-3 variant |
@@ -1251,11 +1305,17 @@ prize is ~4× smaller than the number this node carried before the source read.
 - **`v7` shallow-scans** — parked on a **measured** term (the two carries are 4.698 µs, 2.5%), not an
   unpriced one, so the §10 rule is satisfied. **Reopens if `v5` selects a larger `NUM_BUCKETS`.**
   Route is inside the kernel → a **Not adopted** row in `final_report.md`.
-- **D7, the SparseCore/TensorCore pipeline** — route is *outside* the kernel: `P=1` leaves no
-  partition loop, so the overlap must be constructed in the attention op. This is a **`carried:`
-  handoff**, and it owes the five things a handoff owes. Its prize is `min(t_TC, t_SC)·(p−1)/p` with
-  `t_TC` **`unmodelled`** — ⚠ and by §10's own rule that means it needs a number before anyone can
-  judge it. `t_TC` is readable from an existing xprof of the attention op; that is the action.
+- ⛔ **D7, the SparseCore/TensorCore pipeline — MOVED `PARKED` → `OPEN` by stage E.** The paragraph
+  below already said it "needs a number before anyone can judge it" and then parked it anyway; that
+  is precisely what §10's rule forbids, and stage E caught it. It is now an **`OPEN` item with a
+  mandatory, free probe**: read the durations of `StreamIdxTC-m-bq_128-bkvp_2` and
+  `StreamIdxTC-d-bq_1-bkvp_2` (scope names, `streamindex_topk.py:703`) from an **existing** GLM-5.2
+  prefill xprof. No job. It remains a `carried:` handoff **as well** — the fix is outside the kernel
+  — but it may not close the step unpriced.
+  ⚠ Stage E added a structural constraint the prize must respect: the three `StreamIdxTC` calls are
+  **serially chained by aliasing** (operand 10), so the SC kernel starts only after the third.
+  Route is *outside* the kernel: `P=1` leaves no partition loop, so the overlap must be constructed
+  in the attention op. Prize `min(t_TC, t_SC)·(p−1)/p`, `t_TC` **`unmodelled`**.
 - **D11, the `b_pad`-wide length DMA** — ✅ **closed by `probes/10`, not promoted.** It was the
   per-row candidate and the per-row axis measured **−0.886 ns/row** against a 0.770 µs floor. It stays
   `assumed` negligible, but now on evidence rather than on assumption.
@@ -1324,3 +1384,44 @@ prize is ~4× smaller than the number this node carried before the source read.
 5. **Lift Plan A into `variants/`** — it is written, bit-exact and measured, and it validates the
    step-3 harness against a known answer before anything unknown is measured against it.
 6. Then `v5`'s three-arm sweep, and Plan B.
+
+---
+
+## 11. Stage E — the boundary
+
+Full working: **`stage-e-boundary.md`** (option table with all 15 rows, the six checks per row, and
+every rejection priced). This section is the summary the graph needs; the file is the evidence.
+
+**The decision.** The kernel stays exactly one `plsc` mesh call. What §9 got wrong was treating that
+as the whole boundary question: the middle does not split, but **three of the four largest non-kernel
+numbers in this exercise sit on the edges**, and `v4` creates a new internal one.
+
+| edge | verdict | Δ time % | decided by |
+| --- | --- | ---: | --- |
+| **U1** input layout — flat view of `f32[1024,80,128]{2,1,0}` | **KEPT**, and now *evidenced* rather than assumed | 0 | re-derived: 0 `sparse-core-data-format-call`, the only `copy` in the module is `%copy.11 = f32[1024,64]` |
+| **U2** delete `%bitcast_convert_type.3` — declare the input `f32`, reinterpret in-register | **OPEN**, mandatory | **0 or −13.82%** | feasibility `unmodelled` — ⏳ `probes/17` |
+| **U3** any other input layout | **REJECTED**, priced | **+17.98%** | 34.165 µs `measured (j-9b520877)` — this is the counterfactual that makes "already optimal" a finding |
+| **P1** fuse the producer `StreamIdxTC` | ⛔ **REJECTED — illegal, not unprofitable** | unreachable | it is a **TensorCore** kernel; `dot_general` has no `SC_VECTOR_SUBCORE` lowering rule |
+| **P2 = D7** overlap TC and SC instead | ⛔ **PARKED → OPEN** | `unmodelled` (`t_TC`) | §10's rule: a verdict on an `unmodelled` term cannot be parked. Free probe — read `StreamIdxTC-*` durations from an existing xprof |
+| **D1′/D2′** output retiling, `ROOT %reshape.1` | **OPEN** as new node **`v11`** | ≤ **−5.27%** | 10.007 µs `measured`, `used_scoped` 4 MiB. ⚠ conditional on the in-model check |
+| **D4′** fuse the consumer `sc_dsa_gather` | **carried (H3)** | **−8.36% to −11.42%** | larger than any single §9 plan; rejected here only because it changes the block's **output value** — a step-1 re-scope, not a version |
+| **I4** `v4`'s within-slice `emit_pipeline`, `grid=(n // chunk,)` | **KEPT** — the new internal edge | **−2.06% to −6.38%** | encloses exactly `cvt ⊕ hist0`; chunk **1024** |
+
+**Two corrections stage E made to earlier documents.**
+
+- ⛔ **`probes/12`'s "all production `n` are powers of two" is false.** `n = 10240 = 2¹¹·5`
+  (`streamindex_topk.py:603-605`), so **chunk 4096 is illegal**. Legal chunks are the divisors of
+  10240 that are multiples of `LANES=16`: 16, 32, 64, 80, 128, 160, 256, 320, 512, 640, 1024, …
+- ⛔ **`hardware_map.md`'s S2 seam (~10 µs, `modelled`) is contradicted by measurement.** `cvt`'s
+  marginal cost is **−8.20 µs measured** — the pass is already free because it absorbs the DMA's
+  arrival latency. **S2 only becomes positive inside I4**, once the DMA is pipelined and `cvt` stops
+  absorbing. **S2 and I4 are one move; do not sum them.**
+
+⚠ **The `v4` ceiling was never reachable.** §5 carried "≤ 13.469 µs"; the honest range is
+**−2.06% to −6.38%**, because step 0's DMA is never hidden (head = `13.469/(n/chunk)`) and cvt's
+absorption re-emerges. The weakest number here is the pessimistic bound: it subtracts cvt's full
+measured −8.20 µs on the theory the absorption is banked twice, and that is a marginal-removal
+measurement, not a decomposition. The chunk sweep in step 3 measures it directly.
+
+**Independence check.** No price in stage E uses the refinement level count, so `probes/13` changed
+nothing here. `v3`'s and `v5`'s **boundary fields are both unchanged** — their moves are internal.
