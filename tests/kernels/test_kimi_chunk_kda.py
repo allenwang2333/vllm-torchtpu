@@ -13,14 +13,8 @@ import pytest
 
 from vllm_torchtpu.kernels.kimi_k3 import chunk_kda
 from vllm_torchtpu.kernels.kimi_k3.chunk_kda import (
-    BC,
-    BC_INV,
-    CHUNK_SIZE,
-    _plan_tiles,
-    chunk_kda_fwd_h_o_varlen,
-    pallas_kda_fwd_intra_fused,
-    segment_ids_to_seqlens,
-)
+    BC, BC_INV, CHUNK_SIZE, _plan_tiles, chunk_kda_fwd_h_o_varlen,
+    pallas_kda_fwd_intra_fused, segment_ids_to_seqlens)
 
 HEADS = 2
 HEAD_DIM = 128
@@ -700,34 +694,70 @@ def test_chunk_kda_fwd_h_o_varlen_validations() -> None:
     query_lens = jnp.array([[64]], dtype=jnp.int32)
 
     # Mismatched chunk size / tile rows
-    with pytest.raises(ValueError, match="tile rows 64 must equal chunk_size=32"):
-        chunk_kda_fwd_h_o_varlen(
-            w, u, kg, gk, q, A, plan, query_lens, num_tokens=64, chunk_size=32
-        )
+    with pytest.raises(ValueError,
+                       match="tile rows 64 must equal chunk_size=32"):
+        chunk_kda_fwd_h_o_varlen(w,
+                                 u,
+                                 kg,
+                                 gk,
+                                 q,
+                                 A,
+                                 plan,
+                                 query_lens,
+                                 num_tokens=64,
+                                 chunk_size=32)
 
     # Mismatched A chunk size
     with pytest.raises(ValueError, match="must equal chunk_size"):
         A_bad = jnp.zeros((HEADS, 1, 1, 64, 32), jnp.bfloat16)
-        chunk_kda_fwd_h_o_varlen(
-            w, u, kg, gk, q, A_bad, plan, query_lens, num_tokens=64, chunk_size=64
-        )
+        chunk_kda_fwd_h_o_varlen(w,
+                                 u,
+                                 kg,
+                                 gk,
+                                 q,
+                                 A_bad,
+                                 plan,
+                                 query_lens,
+                                 num_tokens=64,
+                                 chunk_size=64)
 
     # Mismatched initial_state segment count (expected N=1)
     with pytest.raises(ValueError, match="initial_state has N="):
         h0_bad = jnp.zeros((1, 2, HEADS, HEAD_DIM, HEAD_DIM), jnp.float32)
-        chunk_kda_fwd_h_o_varlen(
-            w, u, kg, gk, q, A, plan, query_lens, num_tokens=64, initial_state=h0_bad
-        )
+        chunk_kda_fwd_h_o_varlen(w,
+                                 u,
+                                 kg,
+                                 gk,
+                                 q,
+                                 A,
+                                 plan,
+                                 query_lens,
+                                 num_tokens=64,
+                                 initial_state=h0_bad)
 
     # Key dimension > 256
     with pytest.raises(NotImplementedError, match="does not support K > 256"):
         q_large = jnp.zeros((HEADS, 1, 1, 64, 512), jnp.bfloat16)
-        chunk_kda_fwd_h_o_varlen(
-            w, u, kg, gk, q_large, A, plan, query_lens, num_tokens=64, chunk_size=64
-        )
+        chunk_kda_fwd_h_o_varlen(w,
+                                 u,
+                                 kg,
+                                 gk,
+                                 q_large,
+                                 A,
+                                 plan,
+                                 query_lens,
+                                 num_tokens=64,
+                                 chunk_size=64)
 
     # Indivisible mini_batch
     with pytest.raises(ValueError, match="must be divisible by mini_batch"):
-        chunk_kda_fwd_h_o_varlen(
-            w, u, kg, gk, q, A, plan, query_lens, num_tokens=64, mini_batch=HEADS + 1
-        )
+        chunk_kda_fwd_h_o_varlen(w,
+                                 u,
+                                 kg,
+                                 gk,
+                                 q,
+                                 A,
+                                 plan,
+                                 query_lens,
+                                 num_tokens=64,
+                                 mini_batch=HEADS + 1)

@@ -1074,7 +1074,8 @@ def chunk_kda_fwd_h_o_varlen(
     if K > 256:
         raise NotImplementedError("current kernel does not support K > 256.")
     if mini_batch is not None and H % mini_batch != 0:
-        raise ValueError(f"H={H} must be divisible by mini_batch={mini_batch}.")
+        raise ValueError(
+            f"H={H} must be divisible by mini_batch={mini_batch}.")
 
     align_major = pltpu.get_tpu_info().num_lanes
     K_PADSIZE = int(align_up(K, align_major))
