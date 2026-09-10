@@ -185,8 +185,8 @@ v1  incumbent: 16x-replicated 256-bucket radix select      189.98 us  measured+r
 │     │                                 hist0 + sweep to discover "keep everything"
 │     │                    ◄ judged:    NOT YET -- and its verdict turns on an
 │     │                                 UNMODELLED term (step homogeneity in rho)
-│     v6  keep-all-fastpath                                <= -18.5%   OPEN
-│                                                                    ^ mandatory check, §10
+│     v6  keep-all-fastpath                                ~181.1 us  modelled   11.1%   OPEN
+│                                                                                 -4.7%
 │
 └─[mutate] SECOND ROOT: estimate-and-verify instead of radix-partition.
    │       Histogram a 1/16 sample to estimate the k-th threshold, then COUNT
@@ -293,7 +293,7 @@ Full axis table: `hardware_map.md` "Stage A — every axis of the iteration spac
 
 | axis | extent | tiled? | why |
 | --- | --- | --- | --- |
-| `b` (rows) | 1024 | **yes** — `num_waves = b/32`, a static `fori_loop`; subcore `flat` owns rows `flat, flat+32, …` | 32 subcores. ⚠ The **stride** is what makes ρ a row *average* that survives a mixed prefill/decode step: every subcore gets a representative sample, so `max over subcores ≈ mean` |
+| `b` (rows) | 1024 | **yes** — `num_waves = b/32`, a static `fori_loop` (`:329`); wave `w` covers rows `[32w, 32w+32)`, so subcore `flat` owns `flat, flat+32, …` (`:156-158`) | 32 subcores. ⚠ **There is no inter-subcore barrier** (`:19`, `:528`), so cost is `max` over subcores of each subcore's own 32-row sum. The **stride** then makes those sums near-equal even in a mixed prefill/decode step — every subcore gets a representative sample, so `max ≈ mean`, and a per-row saving converts to wall time proportionally. ✅ Source-read confirmed; it is what unblocks `v6` |
 | `n` (scores) | 10240 | **no — by algorithmic decision, not by capacity** | making the whole row resident gives a 1:5 HBM:VMEM pass ratio instead of 5:5. VMEM is at 13.77% |
 | `NUM_BUCKETS` | 256 | no | fixed compile-time constant — **never swept**, which is `v5` |
 | `P` (score split) | **1** at both shipping shapes | n/a | `P>1` needs `max-model-len` above 9216 |
@@ -381,9 +381,18 @@ is validated, not asserted.
 
 **`CONTRACT.md` §D — partial tiles.** `n` is untiled, so **there is no partial tile on `n`.** The
 partial unit is a **partial wave**: the last wave has `b mod 32` active subcores. At `b ∈ {64,1024}`
-this never fires on the shipping path. When it does, inactive subcores run op `Z` and wait at `BAR`
-— they compute and write no garbage, but because the kernel costs `max` over subcores, **a partial
-wave costs a full wave.** That is the floor for any work-stealing design.
+this never fires on the shipping path. When it does, inactive subcores run op `Z` — they compute and
+write no garbage.
+
+⚠ **Corrected.** This row used to say "a partial wave costs a full wave, because the kernel costs
+`max` over subcores". There is **no inter-subcore barrier** — `sparsecore_topk.py:19` and `:528` say
+so, and `lax.fori_loop(0, num_waves, wave_body, 0)` (`:329`) is executed independently per subcore;
+the only reductions are lane-wise *within* a subcore (`:152`, `:302`). So the cost is `max` over
+subcores of **that subcore's own row-sum**, not `Σ` over waves of the max row. An idle subcore in the
+last wave finishes early and waits only at the kernel's single trailing barrier. The practical
+consequence is the same — an odd row is exposed on whichever subcore owns it — but the *reasoning*
+matters, because it is what unblocks `v6` (§5) and it is why the stride-32 ownership makes
+`max ≈ mean`.
 
 **The contract's probe list** — rows whose answer is a measurement, not arithmetic:
 
@@ -518,24 +527,40 @@ wave costs a full wave.** That is the floor for any work-stealing design.
 
 ### `v6` — `keep_all` fast path
 
-- **Parent:** `v2` · **Move:** `[boundary]` `@pl.when(i_hi > k)` around the entire selection; emit
-  the identity permutation otherwise
+- **Parent:** `v2` · **Move:** `[boundary]` `@pl.when(i_hi > k)` around the DMA, `cvt`, `hist0` and
+  the sweeps; emit the identity permutation otherwise
 - **Motivated by:** D14 — `keep_all = total <= k` and `total ≈ eff_len`, so **`keep_all` ⟺ ρ ≤ 0.2**.
-  Prefill chunk ρ is `0.1·c + 0.05005`, so **chunks 0 and 1 of 8 run a full DMA + `cvt` + `hist0` +
-  sweep to discover "keep everything"** — a fact `i_hi <= k` decides with no histogram at all. Host
-  derivation from `glm-5.2-fp8-dp16-ep.sh`, no job
+  Prefill chunk ρ is `0.1·c + 0.05005`, so **prefill chunks 0 and 1 of 8 run a full DMA + `cvt` +
+  `hist0` + sweep to discover "keep everything"** — a fact `i_hi <= k` decides with no histogram at
+  all. Host derivation from `glm-5.2-fp8-dp16-ep.sh`, no job
 - **Exactness:** **`exact`** — when `eff_len ≤ k` the top-k *is* the whole row
 - **State diff from `v2`:** `boundary` — a second, near-empty path through the kernel. `algebra` —
-  the identity emit
+  the identity emit. ⚠ **Not a pure skip**: the fast path must still write `0..eff_len-1` and `−1`
+  padding, so it needs a cheap replacement emit
 - **Live set:** unchanged; the fast path allocates nothing new
-- **Predicted:** **≤ −18.5%** if a step is homogeneous in ρ (2 of 8 chunks × everything but the
-  output DMA). **0% if it is not** — the kernel costs `max` over subcores, so one long row in the
-  wave pays for all 32
-- **Built?** **No** · **Measured:** — · **Verdict:** ⚠ **OPEN, not PARKED**
-- ⚠ **Its verdict turns on an `unmodelled` term — step homogeneity in ρ — and §10's rule forbids
-  parking on that.** The check is **not a pod probe**: it is a source read of whether the vLLM TPU
-  scheduler puts chunks of different sequences, at different `token_pos`, into one
-  `max-num-batched-tokens=1024` step. Minutes, no job. §10 lists it.
+- **Predicted:** **~8.9 µs, −4.7%.** `modelled`, and see the two corrections below — the earlier
+  "≤ −18.5%, or 0% if a step is mixed" was wrong in both directions. Terms saved on the 25% of
+  prefill rows with `token_pos < 2048`: score DMA 3.367 (fixed in ρ) + sweeps 3.908 (fixed) +
+  `hist0` 2.119 (ρ-scaled) + `cvt` −0.512 (**negative — removing `cvt` costs time**)
+- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN** — nothing blocks it now; it needs a
+  build, not a probe
+
+⚠ **Two corrections from the source read, and they cut in opposite directions.**
+
+1. **The prize is ~4× smaller than recorded, because a `keep_all` short-circuit already exists.**
+   `sparsecore_topk.py:213` computes `keep_all = total <= k` and `:224` folds it into `done`; when it
+   fires, `zero_priv(0)`, `active_walk = 0` (`:226-227`) and `fold_bound = 0` (`:250`) already neuter
+   all three refinement levels, and `emit_body` selects `valid` wholesale (`:293`). **The refinement
+   passes this node was credited with deleting are already skipped.** What `@pl.when(i_hi > k)` adds
+   is only the *earlier* exit: the score DMA, `monotone_key`, `hist0` and `scan_glob`. The stage-C″
+   ledger was right about this (refinement carries ×6/8); the `v6` prize double-counted it.
+2. ⛔ **The gate this node was blocked on does not exist. `v1` has no inter-subcore barrier**, so
+   "one long row in a wave pays for all 32" is **false** — see §4c. Steps *are* mixed in ρ
+   (`tpu_runner.py:1154-1215` partitions decode and prefill rows within one batch; one
+   `sparsecore_topk` call at `streamindex_topk.py:829-834` covers both), but that no longer matters:
+   cost is `max` over subcores of each subcore's **own 32-row sum**, and the stride-32 ownership makes
+   those sums near-equal, so a per-row skip converts to wall time roughly proportionally. **The saving
+   is unconditional, not gated on homogeneity.**
 
 ---
 
@@ -654,7 +679,7 @@ page.
 | **`hist0`'s scatter is irreducible for a histogram** | closed every "tune the histogram" branch and forced D2 to be a second root | `probes/03`'s price sheet: one `vst.idx.add` per element regardless of `NUM_BUCKETS`, and a measured 4.40× issue ratio | ✅ **discriminates.** It also survives an adversarial re-derivation: a **register** histogram costs ~71× more per element on the same measured rates, so the alternative was priced and rejected, not assumed away | **HOLDS** |
 | **D4 — the launch intercept is 0** | deleted a whole candidate ("decode is 43.2% launch") | trivial-op launch 20.193 µs vs a 19.630 µs null; one extra launch of *this* kernel at constant work costs −0.704 (`j-300d4690`) | ✅ **discriminates** — two independent arms, opposite signs, both landing at zero. ⚠ Note the prior: two earlier fits had agreed to 3.2% *with each other* and were both wrong, because they shared a confound. Agreement between two derivations is not independence | **HOLDS** |
 | **`cvt` has a negative marginal cost** | ⚠ **the one finding that made the field *harder*** — it cut `v4`, the caller's own request, from a modelled −7.18% to a measured ceiling of −4.12% and killed a −25.2% branch | deleting a 640-chunk traversal made the kernel 20.5 µs slower (`j-300d4690`) | ✅ **discriminates**, and it was verified against the obvious artifact — the arm source was diffed to confirm the patch took before the sign was believed | **HOLDS** |
-| **D5 is bit-exact** | promoted `v2` to best and made a `mutate` edge free | 1024/1024 and 64/64 rows bit-identical (`j-300d4690`) | ⚠ **WEAKENED as a correctness argument, though not as a result.** `probes/08` also showed the row-comparison gate is **vacuous for `monotone_key`**: scores are `rng.standard_normal`, `monotone_key` only rewrites negatives, and with k=2048 of n=10240 the top-k is entirely positive. The gate cannot see a `monotone_key` bug. `v2` does not touch `monotone_key`, so its verdict stands — but **`v3` and `v10` do reorder comparisons and must not lean on this gate** | **WEAKENED** — and it changes what step 3 owes: a negative-heavy input case, or a distinct `out_hbm` sentinel |
+| **D5 is bit-exact** | promoted `v2` to best and made a `mutate` edge free | 1024/1024 and 64/64 rows bit-identical (`j-300d4690`) | ⚠ **WEAKENED as a correctness argument, though not as a result.** `probes/08` also showed the row-comparison gate is **vacuous for `monotone_key`**: scores are `rng.standard_normal`, `monotone_key` only rewrites negatives, and with k=2048 of n=10240 the top-k is entirely positive. The gate cannot see a `monotone_key` bug. ⚠ **The source read makes this worse than §8 first recorded**: production rows carry *hundreds of exact ties* and rows whose maximum is exactly 0.0 (`test_dsv4_sparsecore_topk.py:64-70`), because scores are a weighted sum of **ReLU'd** fp8 dot products — the one regime where a reordered emit can differ and a Gaussian input never will. `v2` does not touch `monotone_key` or tie order, so its verdict stands — but **`v3`, `v6` and `v10` all reorder or replace the emit and must not lean on this gate** | **WEAKENED** — and it changes what step 3 owes: a negative-heavy input case, or a distinct `out_hbm` sentinel |
 
 **What the audit changes.** Nothing is reopened by a `WITHDRAWN` row here — `v7`'s demotion is
 already reflected in §3 and §5. What it does change is procedure, twice: **no prize in this file is
@@ -965,11 +990,68 @@ scatter-free count passes, acting on the **histogram** term (28.4%). Same denomi
 
 ---
 
+---
+
+### Plan F — `keep_all` fast path (implements `v6`) · rank 6
+
+**1. What it is.** A quarter of production prefill rows are short enough that the answer is "keep
+everything" — their live length is below `k`. The kernel discovers this the expensive way: it
+transfers the full 40 KiB score slice, converts it, histograms all of it and sweeps the buckets,
+only to compute `keep_all = total <= k` and take the trivial branch. `i_hi <= k` decides the same
+thing from a scalar already in hand, before any of that. Plan F tests it up front and, when it
+holds, skips straight to writing the identity permutation.
+
+**2. The call chain.**
+
+```
+_topk_kernel                          src/…/sparsecore_topk.py:150
+└── wave_body
+    ├── @pl.when(i_hi > k)  around ops 1-9 (DMA, cvt, hist0, zero/fold/scan/find)   EDIT
+    └── @pl.when(i_hi <= k) -> _emit_identity: 0..eff_len-1 then -1 padding          NEW
+```
+
+⚠ **Not a pure skip.** The fast path still owes `rowbuf` a full `k` words — `0..eff_len-1` followed
+by `−1` padding — so it needs a cheap replacement emit, not an early return.
+
+**3. The pipeline.** Unchanged.
+
+**4. Files.** `sparsecore_topk.py`: the guard and `_emit_identity`. ~30 lines.
+
+**5. Expected gain vs the step-1 baseline.**
+
+| | value | tag |
+| --- | ---: | --- |
+| baseline | 189.98 µs | measured + reweighting |
+| predicted | 181.1 µs | **modelled** |
+| **Δ time %** | **−4.7%** (5% faster) | |
+| % of block floor | 11.1% | |
+
+**Mechanism:** on the 25% of prefill rows with `token_pos < 2048`, deletes the score DMA (3.367,
+fixed in ρ), the sweeps (3.908, fixed), and `hist0` (2.119, ρ-scaled), against `cvt`'s **negative**
+−0.512. Same denominator as §1. ⚠ It does **not** delete the refinement passes — those are already
+skipped by the in-kernel `keep_all` short-circuit at `sparsecore_topk.py:213-250`, which is why this
+prize is ~4× smaller than the number this node carried before the source read.
+
+**6. Evidence status.**
+
+| measured | modelled (formula) | unmeasured |
+| --- | --- | --- |
+| every term above, from stage C″ (`j-4e0df30a`, `j-300d4690`) | the ρ-weighted split of each term across chunks 0–1 vs 2–7 | the replacement emit's cost, assumed ≈ the emit it replaces |
+
+**7. Risks.**
+
+| risk | signal, and which instrument shows it | fallback | threatens |
+| --- | --- | --- | --- |
+| the extra branch costs more on the 75% of rows that do not take it than it saves on the 25% that do | a slower arm at a b=1024 shape whose rows are *all* long | drop it | speed |
+| the identity emit disagrees with the incumbent on tie-dense rows | ⚠ the row-comparison gate **at the real distribution** — production rows carry hundreds of exact ties and some have a maximum of exactly 0.0 (`test_dsv4_sparsecore_topk.py:64-70`) | — | **correctness** |
+| a mixed prefill/decode step dilutes the saving | ✅ **checked and it does not** — there is no inter-subcore barrier, and stride-32 ownership makes `max ≈ mean` (§4c) | — | speed |
+
 ### Build order
 
-- **Parallel:** Plans A, B, D and E's probe (four independent builds, one per chip). **Blocked:**
-  Plan C — on Plan B, for timing only, since the fused pass changes what the DMA feeds; and on its
-  own local compile check of `emit_pipeline`.
+- **Parallel:** Plans A, B, D, F and E's probe. **Blocked:** Plan C — on Plan B, for timing only,
+  since the fused pass changes what the DMA feeds; and on its own local compile check of
+  `emit_pipeline`. ⚠ **F overlaps C and D**: it deletes the score DMA and the sweeps on a quarter of
+  rows, which are exactly what C and D act on. Measure F against each, never sum them.
 - **Build first:** **Plan A.** It is already written (`probes/08-…/arms/arm-R1.py`), already
   bit-exact, and already measured — it is a lift into `variants/`, not a build, and it establishes
   the step-3 harness against a known answer.
@@ -992,7 +1074,7 @@ scatter-free count passes, acting on the **histogram** term (28.4%). Same denomi
 | `v3` fused-emit | ⚠ a probe on the cost of a conditional `store_compressed` inside the L0 walk. **Not yet dispatched** | one arm |
 | `v4` pipelined-DMA | a local compile check that `emit_pipeline` accepts a `plsc` mesh kernel with a `fori_loop` grid — **no job** | minutes |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
-| `v6` keep-all-fastpath | ⚠ **mandatory check** — a source read of whether the vLLM TPU scheduler puts chunks of different sequences into one `max-num-batched-tokens=1024` step. **Not a pod probe; minutes** | minutes |
+| `v6` keep-all-fastpath | ✅ **check done — the gate does not exist** (no inter-subcore barrier), and the prize is 4× smaller than recorded because a `keep_all` short-circuit is already in the kernel. Now a plain build at a `modelled` −4.7% | step-3 variant |
 | `v10` sample-and-count | ⚠ **mandatory probe** — the count-pass rate vs `cvt`. It is the highest-value probe in the wave because it decides a whole root | one arm |
 
 **`PARKED` versions.**
@@ -1020,9 +1102,9 @@ scatter-free count passes, acting on the **histogram** term (28.4%). Same denomi
 
 | the assumption | where it bites | what would settle it |
 | --- | --- | --- |
-| refinement level count = **2.231** | `v3`'s band (−20% to −33%), `v5`'s whole trade | it is carried from ρ=1 and `probes/08` **refuted** the explanation of its 2.231-vs-2.03 gap (a skipped level costs 0.060 µs, not 3.8). The gap is a score-distribution mismatch — measure the level count at the **shipping** distribution, not `standard_normal` |
-| ρ = **0.40005** prefill | **every share in this document** | `derived` with a `file:line` per input, not assumed — but it assumes the scheduler's chunk mix. Same source read as `v6` |
-| the row-comparison gate proves exactness | `v3` and `v10` | ⚠ **§8 shows it is vacuous for `monotone_key`.** A negative-heavy input, and a distinct `out_hbm` sentinel so a suppressed write cannot read as a match |
+| refinement level count = **2.231** | `v3`'s band (−20% to −33%), `v5`'s whole trade | ⚠ **worse than `assumed` — now known to be fitted on the wrong distribution family.** Production scores are a per-head-weighted sum of **ReLU'd** fp8 dot products (`streamindex_topk.py:326-338`): right-skewed, mass piled at exactly 0.0, hundreds of exact ties, masked entries at `−inf`. `rng.standard_normal` (`test_dsv4_sparsecore_topk.py:147`) is wrong on sign, skew *and* ties, and L0 buckets on the top 8 **exponent+sign** bits (`L0_SHIFT=24`), the axis on which the two differ most. Expect the true count to be **higher**. Re-fit at the shipping distribution |
+| ρ = **0.40005** prefill | **every share in this document** | ✅ **VERIFIED independently to 5 significant figures**, from `streamindex_topk.py:503-506` with `compression_ratio = 1` (`mla_attention_op.py:116`), `n = 10240` (`streamindex_topk.py:603-605`), and `max-model-len 9216` / `ISL 8192` / `RANDOM_RANGE_RATIO 0.0` in `glm-5.2-fp8-dp16-ep.sh:43,27,37`. It is **robust to the chunk mix** — ρ is uniform over `token_pos ∈ [1, 8192]` however the budget is split. ⚠ What is *not* robust is "2 of 8 chunks"; state it as **1/4 of prefill rows have `token_pos < 2048`**, which holds regardless |
+| the row-comparison gate proves exactness | `v3` and `v10` | ⚠ **§8 shows it is vacuous for `monotone_key`, and the source read makes it worse.** Production rows carry **hundreds of exact ties**, and rows where every head's dot product is ≤ 0 have a maximum of **exactly 0.0** — both called out in `test_dsv4_sparsecore_topk.py:64-70`. A tie-dense row is precisely where a reordered emit can differ while a Gaussian input never would. The gate needs a **tie-dense, negative-and-zero-heavy** input and a distinct `out_hbm` sentinel |
 
 **`unmodelled` terms still in the floor.**
 
@@ -1037,12 +1119,15 @@ scatter-free count passes, acting on the **histogram** term (28.4%). Same denomi
 
 1. ⏳ **Collect `probes/11`.** It decides whether D3 is a ~73 µs handoff or a 40% overstatement of
    every denominator in this file. Nothing else here is worth more.
-2. **Run the three cheap settling actions that need no job**: the `emit_pipeline`/`plsc` compile
-   check (`v4`), the scheduler source read (`v6`, and it also firms ρ), and the level count at the
-   shipping distribution.
+2. ✅ **The scheduler source read is done** — it settled `v6`, verified ρ to 5 significant figures,
+   and identified the production score distribution. Two cheap actions remain: the
+   `emit_pipeline`/`plsc` compile check (`v4`), and **re-fitting the refinement level count at the
+   real distribution** — a ReLU'd, tie-dense, zero-piled one, not `standard_normal`. The level count
+   feeds `v3`'s band and `v5`'s whole trade, so do it before either is built.
 3. **Dispatch the two mandatory probes in one job**: the count-pass rate (`v10`) and the conditional
    `store_compressed` cost (`v3`). Both are single arms and they decide two of the three largest
-   candidates.
+   candidates. ⚠ **Give both the real score distribution**, not `standard_normal` — a tie-dense input
+   changes the mask densities they are measuring.
 4. **Lift Plan A into `variants/`** — it is written, bit-exact and measured, and it validates the
    step-3 harness against a known answer before anything unknown is measured against it.
 5. Then `v5`'s three-arm sweep, and Plan B.
