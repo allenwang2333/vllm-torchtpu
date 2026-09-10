@@ -28,8 +28,11 @@ and produced stage **C″**, which is the sheet in force:
 - The residual is **flat in `num_waves`** (0.009 µs/wave, measured directly). Probe 08's
   "2.561 µs/wave" was a division, and the division's premise is refuted.
 - De-contaminated, **D3 is 75.683 µs = 39.8% of the production prefill kernel — the largest single
-  object in it**, with no known mechanism. `probes/10-residual-driver/` is in flight to find what it
-  scales with.
+  object in it.** ✅ **`probes/10` (`j-770c6de9`) answered it: buffer bytes, no per-row term, and the
+  dominant ≈73 µs is an XLA relayout of the score buffer *outside the Pallas kernel*.** So **no
+  candidate in `design.md` can reach it**, and `probes/11-relayout-provenance/` is in flight to decide
+  whether it is a ~73 µs handoff in the production path or a ~40% overstatement of the 189.98 µs
+  denominator. ⛔ **D11 is closed by the same probe.**
 
 ⚠ **The sheet in force is stage C″. Stage C and stage C′ are both superseded — nothing below that
 predates `probes/09` should be quoted without checking it against C″.**
@@ -508,8 +511,10 @@ mean ρ of 0.50005 (`keep_all` fires for all of chunks 0–1); fixed terms unsca
 
 **Three things this reorders:**
 
-1. **D3 is the largest object in the kernel at 39.8%** — 5.6× the caller's score-DMA hypothesis, and
-   its mechanism is unknown after four refutations. Everything else is second.
+1. **D3 is the largest object at 39.8% — and `probes/10` put it outside the kernel.** It is buffer
+   bytes: an XLA relayout of the whole score buffer, ≈73 µs, plus an unexplained ~8.9 µs output term.
+   ⚠ **It is therefore not a candidate — it is a handoff**, and it inflates every denominator below
+   by the same factor, so it changes what the exercise is worth without changing the ranking.
 2. **The histogram is the largest *structural* lever at 28.4%** (hist0 + refinement). That is D2, the
    second root: a selection that does not scatter into tilespmem.
 3. **The score DMA's prize is 13.469 µs and has not moved.** It reads as 7.1% here rather than C′'s
@@ -524,7 +529,7 @@ mean ρ of 0.50005 (`keep_all` fires for all of chunks 0–1); fixed terms unsca
 
 | id | blocker | size (prefill ρ=0.40) | fix route | instrument | tag |
 | --- | --- | --- | --- | --- | --- |
-| **D3** | ⚠ **75.683 µs belongs to no op.** De-contaminated of `fill` and the output DMA, and **flat in `num_waves`** (0.009 µs/wave, measured directly) | ⚠ **39.8% — the largest object in the kernel** | ⛔ **four mechanisms refuted — see below.** It grows 7.6× from b=64 to b=1024 by an axis that is not the wave loop | **probe 10** (`A0` at varying `n`, `k`, `b`) — in flight | **measured** (`probes/09`) |
+| **D3** | ✅ **ANSWERED — and it is not in the kernel.** 75.683 µs belongs to no op because it is **buffer bytes outside the Pallas call**: an XLA relayout of the whole 40 MiB score buffer (`%copy.3`, `{3,2,1,0:T(8,128)}` → `{3,1,2,0:T(8,128)}`, under a `sparse-core-data-format-call`), ≈73 µs, plus an unexplained ~8.9 µs output-byte term. **No per-row term** (−0.886 ns/row) | ⚠ **39.8% — the largest object in the block, and no kernel variant can reach it** | ⛔ **not a Pallas change.** A layout/dtype decision at the call site → **`carried:` handoff**, ~73 µs, ~5× the caller's own double-buffer request | **probe 10** ✅ (`j-770c6de9`); **probe 11** ⏳ — is the relayout in the *production* path, or only under the harness's `jit`? | fits **measured**; mechanism **`modelled`** from HLO |
 | **D2** | `hist0`'s dense scatter is **irreducible for a histogram** — one `vst.idx.add` per element whatever `NUM_BUCKETS` is | **28.4%** (hist0 17.8 + refinement 10.6) — **the largest structural lever** | not a tuning move. A selection that is not a histogram → **second root** in `design.md` | step-3 variant | measured |
 | **D6** | The refinement levels and `emit` each walk all of `L` to touch ~`cnt` and `k` elements respectively | **28.2%** (emit 17.7 + refinement hist 10.6) | one fused pass after L0 that compresses `> b_star` straight to `rowbuf` **and** `== b_star` to a scratch buffer; levels then walk `cnt`, not `L` | step-3 variant | modelled |
 | **D5** | ✅ **ANSWERED, SHIPPABLE, AND NOW MECHANICALLY EXPLAINED.** `plsc.addupdate_scatter` resolves intra-vector address conflicts: `R1` is **bit-identical, 1024/1024 and 64/64**. Its 12.195 µs win is **mostly `zero_priv` shrinking 16×** (9.238 of it) — see the ⚠ below | **−6.42% prefill** (12.195 µs of 189.98; the sweeps do not scale with ρ, so it beats the −3.73% measured at ρ=1) | drop the replication: `zero_priv(NB//LANES)`, `addr = bucket`, `fold_priv` over `range(1)` | **step-3 variant, already written** | **measured, bit-exact** |
@@ -536,7 +541,7 @@ mean ρ of 0.50005 (`keep_all` fires for all of chunks 0–1); fixed terms unsca
 | **D9** | `NUM_BUCKETS = 256` has **never been swept**. It trades fixed-sweep size against level count — and stage C″ shows the fixed side is dominated by `zero_priv`, which is **linear in `NUM_BUCKETS`** | `unmodelled`, but now with a named mechanism | one compile-time constant, three arms | step-3 variant | `unmodelled` |
 | **D4** | ⛔ **CLOSED — the 22.042 µs intercept was the instrument.** A trivial op's launch costs 20.193 µs against a 19.630 µs null; launching *this* kernel one extra time at constant total work costs **−0.704** | ⛔ **0%.** "Decode is 43.2% launch" is **retracted** | none — it does not exist in production, where the kernel is one op in a fused step with no per-call fence | — | **measured** (`probes/08`) |
 | **D7** | **The TensorCore and MXU are idle for 100% of the block**, and the block is 99.8% unoverlapped with its neighbours at prefill | `min(t_TC, t_SC)·(p−1)/p` — `t_TC` **`unmodelled`** | ⚠ `P=1`: there is **no partition loop to reorder** (see the S6 note). The pipeline must be *constructed*, in the attention op | **handoff** | `unmodelled` |
-| **D11** | Every subcore DMAs all `b_pad` lengths and reads `b/32` of them — 4 KiB for 32 useful words at prefill, 4 KiB for 2 at decode | `assumed` negligible — ⚠ **but it is one of the few costs that scales with `b` and not with the wave loop**, so probe 10 may promote it | none proposed | **probe 10 touches this incidentally** | **`assumed`, never measured** |
+| **D11** | Every subcore DMAs all `b_pad` lengths and reads `b/32` of them — 4 KiB for 32 useful words at prefill, 4 KiB for 2 at decode | ⛔ **CLOSED, not promoted.** It was the per-row candidate for D3 and `probes/10` measured the per-row axis at **−0.886 ns/row**, inside the 0.770 µs null spread | none needed | **probe 10** ✅ | now **measured-negligible**, not `assumed` |
 | **D12** | `emit` is the only hot loop with register spills (9 slots in 26 bundles) and is serial via its `(woff, rank)` carry | 17.7% — emit is bigger than stage C thought | **PARKED — strictly dominated by D6**, which deletes the traversal this would optimize | — | measured |
 
 ⚠ **D5 and D13 are the same saving and must not be added.** `R1`'s measured 12.195 µs and
@@ -586,20 +591,51 @@ predicted: `-alld` 101.492 − `A0` 92.231 = **9.261 µs of fill + output DMA**,
 output DMA and 3.389 the spurious fill. The de-contaminated residual is **75.683 µs**, and it is
 **39.8% of the production prefill kernel — the largest single object in the block.**
 
-**The one live clue.** The residual is flat in `num_waves` yet grows **7.6× from b=64 to b=1024**, a
-16× change in `b`. So it scales with something tied to `b` that the wave loop does not touch. Three
-candidates, which `probes/10-residual-driver/` separates by varying `n`, `k` and `b` independently on
-this same `A0` arm:
+### ✅ D3: answered by `probes/10` — it is buffer bytes, and it is outside the Pallas kernel
 
-- the **input** buffer `scores_hbm`, `b·n` int32 — 41.9 MB at b=1024. A fit gives ~600 GB/s, which is
-  a plausible rate for XLA to touch a buffer the kernel never reads.
-- the **output** buffer `out_hbm`, `b·k` int32 — 8.39 MB. A fit gives ~120 GB/s, low for HBM.
-- a genuine **per-row** cost — which would promote D11 (`vec_at` on `len_vmem`, and the `b_pad`-wide
-  length DMA every subcore performs) from `assumed negligible` to the explanation.
+`probes/10-residual-driver/` (`j-770c6de9-2044-4216-bcdd`) varied `n`, `k` and `b` independently on
+this same `A0` arm. Full write-up: `probes/10-residual-driver/README.md`.
 
-Neither fit is linear on its own across the two points available, so both have a fixed component and
-neither is yet distinguishable. **Mechanism: still open, after four refutations.** At 39.8% it is
-worth the one job rather than a fifth guess.
+**The per-row candidate is dead, and it was excluded without a fit.** `A0_n/4` and `A0_b/4` carry
+**identical input bytes** (10 MiB) and differ 4× in `b`; after the output-byte slope the leftover is
+**−0.886 ns/row**, inside the 0.770 µs null spread. ⛔ **D11 is closed, not promoted.**
+
+⚠ **Do not quote the b-axis fit.** It reads 71.4 ns/row at R² 0.992 and it is an artifact: scaling
+`b` scales both byte axes by the same factor, so that "slope" is the byte slopes relabelled. The
+bytes-only model leaves residues of the *wrong sign* for a per-row cost.
+
+**It is buffer bytes, in two terms:**
+
+| term | rate | quality |
+| --- | --- | --- |
+| **input**, `b·n·4` | ⚠ **convex** — 1.020 µs/MiB over 10→20 MiB, **2.147** over 20→40 MiB. **Quote the segment; the fitted 1.8246 chord (R² 0.977) hides a 2.1× change in rate** and extrapolates to nonsense below 10 MiB | dominant — ~73 of 75.3 µs |
+| **output**, `b·k·4` | 1.118 µs/MiB, intercept 66.4, **R² 0.99978** — genuinely linear | ~8.9 µs at the base shape, and **unexplained** |
+
+**The optimized HLO names the input term, and it is not in the kernel.** Inside the timed `jit`,
+before the custom call:
+
+```
+ENTRY %main.2 (scores.1: f32[1024,10240], row_lengths.1: s32[1024]) -> s32[1024,2048]
+  %bitcast-convert_bitcast_fusion = s32[128,80,8,128]{3,2,1,0:T(8,128)} fusion(%scores.1), kind=kLoop
+  %copy.3                         = s32[128,80,8,128]{3,1,2,0:T(8,128)} copy(%param_0.6)
+  … sparse-core-data-format-call …
+```
+
+A layout change on the **whole 40 MiB score buffer** — full read plus full write, ≈73 µs at
+~1.1 TB/s. ⚠ **`A0` deletes the score DMA and XLA reformats the buffer anyway**, because it is a
+custom-call operand. That is precisely why a total kernel blackout does not remove it, and it is what
+all four refuted mechanisms were groping for.
+
+**Status of the two halves.** The timing fits are **measured**; the mechanism is **`modelled`** from a
+static read of one arm's optimized module. `probes/11-relayout-provenance/` is dispatched to settle
+whether the relayout exists in the **production** call path or only under this harness's `jit`
+signature, and to chase the unexplained output-byte term.
+
+⚠ **Both answers are consequential and neither is a kernel change.** If production has the relayout,
+D3 is a ~73 µs **`carried:` handoff** — a layout or dtype decision at the call site, worth more than
+every in-kernel plan combined. If it does not, the **189.98 µs denominator overstates the production
+kernel by ~40%** (it becomes ~117 µs) and every share in the sheets below roughly doubles. The
+ranking is invariant either way, because D3 is outside every candidate.
 
 ### The seam pass
 
