@@ -202,41 +202,16 @@ of them is in `report.md` §2.
 
 ---
 
-## Stage A — `CONTRACT.md` §A, filled for `v1`
+## Stage A — `CONTRACT.md` §A
 
-Drafted here beside the value table that produces it. **Its home is `design.md` §4d**; it is
-transcribed there verbatim when that file opens, and this copy is deleted at that point so the two
-cannot drift.
+⛔ **Moved.** The filled L1–L7 table lives in `design.md` §4d, which is now its only copy —
+the draft that was drafted here beside the value table has been deleted so the two cannot
+drift. §B, §C and §D are filled at stage D below and are also transcribed into `design.md` §4d.
 
-| value | L1 produced | L1 consumed | L2 window | L3 broadcast | L4 concat/split | L5 transpose | L6 multiplicity | L7 itemsize |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **V2** `scores` | `(b)[lane=n] HBM` | `[lane=n] VMEM` | none — no windowed read | none | **split on `n` into `P`; at both shipping shapes `P=1`, not split** | none | none | n/a |
-| **V3** `resident_vmem` | `[lane=n] VMEM` | `[lane=n] VMEM`, all five consumers | none | none | not split — `n` untiled by decision | none | none | `int32` |
-| **V4** `priv_vmem` | `lane[lane=bucket] VMEM`, addr `lane*256+bucket` | `lane[lane=bucket] VMEM` | none — `fold_priv` is **16 contiguous 16-word loads**, not a strided read (`for m in range(16)` is a python unroll) | **`lane_iota` replicates the 256-bucket histogram 16× along the leading axis.** Leading, so free to *address*; **not** free to zero or to fold | none | none | ⛔ **16×, and it is not elementwise.** `CONTRACT` L6's exception: the compiler does not hoist it, because the 16 replicas are genuinely distinct accumulators. **Measured (`probes/07`): 19.192 µs per level, 13.6% of the prefill kernel** across L0 + ~2.231 refinement levels | `int32` (`lane_iota`, line 100; `addr`; `mask` from int32 compares) |
-| **V5** `glob_vmem` | `[lane=bucket] VMEM` | `[lane=bucket] VMEM` | none | none | none | none | none | `int32` |
-| **V7/V8** `rowbuf`/`keybuf` | `[lane=k] VMEM`, data-dependent `woff` | `[lane=k] VMEM` contiguous | none | none | none | none | none | `int32` |
-| **V10/V11** (`P>1` only) | `(b,P)[sub=·, lane=k_p] HBM` | `(b)[sub=·, lane=P·k_p] HBM` | none | none | **merge of the `P` splits — this is stage 2** | none — leading-axis reshape | none | `int32` |
-
-**L1** — answered per value above; no cell says "as the compiler lays it out".
-**L2** — no value in the block is read through a sliding window or a shifted tap. Nothing to measure.
-**L3** — one broadcast, V4's, on a **leading** axis. Free to address; the cost is in L6, not here.
-**L4** — the only split is `P`, and it is 1 at both shipping shapes. There is no contraction in the
-block, so the "was a narrow contraction merged with a sibling" half does not apply — **there is no
-MXU row at all**.
-**L5** — no transpose or axis swap anywhere. There is one register axis.
-**L6** — ⛔ **the one row that is not free.** Priced by `probes/07` at **19.192 µs per level = 13.6%
-of the prefill kernel**; no longer `unmodelled`.
-**L7** — `int32` throughout; no int8 iota, no 8-bit compare, so the floor `CONTRACT` L7 warns about
-is not approached.
-
-**Rows answered by a probe** (the mechanically generated list, which is what this table is for):
-
-| row | probe id | what each answer would change |
-| --- | --- | --- |
-| **L6** on V4 | ✅ `probes/07-refinement-fixed-vs-walk`, `j-098b260f-a9f7-4fe5-937c` | **Answered.** The fixed sweep is 33.6% of a level, not most of it — so *both* halves of the alternative are live, and they are separate candidates rather than one being a red herring. Deleting the replication is worth 13.6% of the prefill kernel; shortening the walk is worth 18.7%. Candidate 1's prize fell 51.4% → 18.7%, close to §5d′'s predicted ~15.8% |
-
-Every other §A contract row is closed on paper, which `CONTRACT.md` says is a fine result to state
-explicitly. **§B, §C and §D are filled at stage D below.**
+⚠ One correction the move carries: L6 on V4 was priced here at **19.192 µs per level** from
+`probes/07`. `R1` later removed the replication outright, bit-exactly, for **12.195 µs in
+total** (`j-300d4690`) — **~5× less**. The per-level fit attributed the level's walk to its
+replication. `design.md` §7 records it as a failed internal claim.
 
 ---
 

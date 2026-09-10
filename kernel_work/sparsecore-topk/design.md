@@ -314,12 +314,31 @@ buffer. That is `v4`, and it is the caller's request stated in the kernel's own 
 Transcribed verbatim from `hardware_map.md` stage A/D, which is now deleted there so the two cannot
 drift.
 
-**`CONTRACT.md` §A — layout, per value.** Full L1–L7 table: `hardware_map.md` "Stage A —
-`CONTRACT.md` §A". Summary: **L1** answered per value, no cell says "as the compiler lays it out";
-**L2** no windowed or shifted read anywhere; **L3** one broadcast, V4's, on a leading axis;
-**L4** the only split is `P`, which is 1, and **there is no contraction in the block at all** — no
-MXU row exists; **L5** no transpose, one register axis; **L6** ⛔ the one row that is not free, V4's
-16× multiplicity, now measured by removal at 12.195 µs; **L7** `int32` throughout.
+**`CONTRACT.md` §A — layout, per value.** This is the only copy; the draft beside the value table in
+`hardware_map.md` is deleted.
+
+| value | L1 produced | L1 consumed | L2 window | L3 broadcast | L4 concat/split | L5 transpose | L6 multiplicity | L7 itemsize |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **V2** `scores` | `(b)[lane=n] HBM` | `[lane=n] VMEM` | none — no windowed read | none | **split on `n` into `P`; at both shipping shapes `P=1`, not split** | none | none | n/a |
+| **V3** `resident_vmem` | `[lane=n] VMEM` | `[lane=n] VMEM`, all five consumers | none | none | not split — `n` untiled by decision | none | none | `int32` |
+| **V4** `priv_vmem` | `lane[lane=bucket] VMEM`, addr `lane*256+bucket` | `lane[lane=bucket] VMEM` | none — `fold_priv` is **16 contiguous 16-word loads**, not a strided read (`for m in range(16)` is a python unroll) | **`lane_iota` replicates the 256-bucket histogram 16× along the leading axis.** Leading, so free to *address*; **not** free to zero or to fold | none | none | ⛔ **16×, and it is not elementwise.** `CONTRACT` L6's exception: the compiler does not hoist it, because the 16 replicas are genuinely distinct accumulators. ⚠ **Measured by removal (`R1`, `j-300d4690`): 12.195 µs in total, bit-exact.** The earlier `probes/07` fit of *19.192 µs per level* — ~62 µs over 3.231 levels — is **~5× too high** and is retracted in §7 | `int32` (`lane_iota`, line 100; `addr`; `mask` from int32 compares) |
+| **V5** `glob_vmem` | `[lane=bucket] VMEM` | `[lane=bucket] VMEM` | none | none | none | none | none | `int32` |
+| **V7/V8** `rowbuf`/`keybuf` | `[lane=k] VMEM`, data-dependent `woff` | `[lane=k] VMEM` contiguous | none | none | none | none | none | `int32` |
+| **V10/V11** (`P>1` only) | `(b,P)[sub=·, lane=k_p] HBM` | `(b)[sub=·, lane=P·k_p] HBM` | none | none | **merge of the `P` splits — this is stage 2** | none — leading-axis reshape | none | `int32` |
+
+**L1** — answered per value above; no cell says "as the compiler lays it out".
+**L2** — no value in the block is read through a sliding window or a shifted tap. Nothing to measure.
+**L3** — one broadcast, V4's, on a **leading** axis. Free to address; the cost is in L6, not here.
+**L4** — the only split is `P`, and it is 1 at both shipping shapes. There is no contraction in the
+block, so the "was a narrow contraction merged with a sibling" half does not apply — **there is no
+MXU row at all**.
+**L5** — no transpose or axis swap anywhere. There is one register axis.
+**L6** — ⛔ **the one row that is not free**, and the one row whose first price was wrong. Now
+**measured by removal at 12.195 µs**, not `unmodelled` and not the fitted 19.192 µs/level.
+**L7** — `int32` throughout; no int8 iota, no 8-bit compare, so the floor `CONTRACT` L7 warns about
+is not approached.
+
+Every other §A row is closed on paper, which `CONTRACT.md` says is a fine result to state explicitly.
 
 **`CONTRACT.md` §C — transfer, per array.**
 
