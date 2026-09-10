@@ -1,0 +1,824 @@
+diff --git a/src/vllm_torchtpu/kernels/inverse_permutation.py b/src/vllm_torchtpu/kernels/inverse_permutation.py
+new file mode 100644
+index 0000000..8febfa5
+--- /dev/null
++++ b/src/vllm_torchtpu/kernels/inverse_permutation.py
+@@ -0,0 +1,61 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Internal fixed-size integer inverse for the 128-route MoE permutation."""
++
++import jax
++import jax.numpy as jnp
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++_SIZE = 128
++
++
++def _inverse_permutation_kernel(permutation_ref, inverse_ref):
++    # Destination ids occupy the lane dimension. The 128-by-128 values stay
++    # inside the kernel; only the permutation and its inverse cross HBM.
++    positions = jnp.arange(_SIZE, dtype=jnp.int32)[:, None]
++    destinations = jnp.arange(_SIZE, dtype=jnp.int32)[None, :]
++    matches = permutation_ref[...][:, None] == destinations
++    contributions = jnp.where(matches, positions, jnp.int32(0))
++    inverse_ref[...] = jnp.sum(contributions, axis=0, dtype=jnp.int32,
++                               keepdims=True)
++
++
++def inverse_permutation_128(permutation: jax.Array,
++                            *,
++                            interpret: bool = False) -> jax.Array:
++    """Invert an int32 permutation of 0..127, as produced by ``argsort``.
++
++    The caller guarantees that each value appears exactly once. Thus each
++    destination has one matching position, and the integer sum is exact and
++    bounded by 127. This is not an inverse for arbitrary routing expert ids.
++    ``interpret=True`` executes the same Pallas body for CPU-only tests.
++    """
++    if permutation.shape != (_SIZE, ):
++        raise ValueError("inverse_permutation_128 requires shape (128,)")
++    if permutation.dtype != jnp.int32:
++        raise TypeError("inverse_permutation_128 requires int32 indices")
++
++    in_spec = pl.BlockSpec((_SIZE, ), lambda _: (0, ), memory_space=pltpu.VMEM)
++    out_spec = pl.BlockSpec((1, _SIZE), lambda _: (0, 0),
++                            memory_space=pltpu.VMEM)
++    return pl.pallas_call(
++        _inverse_permutation_kernel,
++        grid=(1, ),
++        in_specs=[in_spec],
++        out_specs=out_spec,
++        out_shape=jax.ShapeDtypeStruct((1, _SIZE), jnp.int32),
++        name="inverse_permutation_128",
++        interpret=interpret,
++    )(permutation).reshape((_SIZE, ))
+diff --git a/src/vllm_torchtpu/kernels/stable_order_and_inverse.py b/src/vllm_torchtpu/kernels/stable_order_and_inverse.py
+new file mode 100644
+index 0000000..baf2720
+--- /dev/null
++++ b/src/vllm_torchtpu/kernels/stable_order_and_inverse.py
+@@ -0,0 +1,77 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Internal joint stable order and inverse for 128 signed integer keys."""
++
++import jax
++import jax.numpy as jnp
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++_SIZE = 128
++
++
++def _stable_order_and_inverse_kernel(keys_ref, order_ref, inverse_ref):
++    keys = keys_ref[...]
++    positions = jnp.arange(_SIZE, dtype=jnp.int32)
++    # Rows are potential predecessors j; columns are original positions i.
++    # Compare signed keys directly: subtraction could overflow at int32 extrema.
++    precedes = ((keys[:, None] < keys[None, :]) |
++                ((keys[:, None] == keys[None, :]) &
++                 (positions[:, None] < positions[None, :])))
++    inverse = jnp.sum(precedes.astype(jnp.int32), axis=0, dtype=jnp.int32,
++                      keepdims=True)
++    # Unique ranks select exactly one original position per destination.
++    # Position zero participates too; its exact contribution is zero.
++    matches = inverse.reshape((_SIZE, 1)) == positions[None, :]
++    contributions = jnp.where(matches, positions[:, None], jnp.int32(0))
++    order_ref[...] = jnp.sum(contributions, axis=0, dtype=jnp.int32,
++                             keepdims=True)
++    inverse_ref[...] = inverse
++
++
++def stable_order_and_inverse_128(
++    sort_keys: jax.Array,
++    *,
++    interpret: bool = False,
++) -> tuple[jax.Array, jax.Array]:
++    """Return stable argsort and its inverse for arbitrary int32[128] keys.
++
++    Lexicographic (signed key, original position) ranks are a permutation of
++    0..127 even for duplicate keys. Both integer reductions are exact and
++    bounded by 127; there is no packing, subtraction or key-range assumption.
++    ``interpret=True`` requests Pallas interpretation for CPU-only checks;
++    support depends on the installed JAX interpreter.
++    """
++    if sort_keys.shape != (_SIZE, ):
++        raise ValueError("stable_order_and_inverse_128 requires shape (128,)")
++    if sort_keys.dtype != jnp.int32:
++        raise TypeError("stable_order_and_inverse_128 requires int32 keys")
++
++    in_spec = pl.BlockSpec((_SIZE, ), lambda _: (0, ), memory_space=pltpu.VMEM)
++    order_spec = pl.BlockSpec((1, _SIZE), lambda _: (0, 0),
++                              memory_space=pltpu.VMEM)
++    inverse_spec = pl.BlockSpec((1, _SIZE), lambda _: (0, 0),
++                                memory_space=pltpu.VMEM)
++    order, inverse = pl.pallas_call(
++        _stable_order_and_inverse_kernel,
++        grid=(1, ),
++        in_specs=[in_spec],
++        out_specs=(order_spec, inverse_spec),
++        out_shape=(jax.ShapeDtypeStruct((1, _SIZE), jnp.int32),
++                   jax.ShapeDtypeStruct((1, _SIZE), jnp.int32)),
++        name="stable_order_and_inverse_128",
++        interpret=interpret,
++    )(sort_keys)
++    # Reshape array outputs outside Pallas, never the rank-one input Ref.
++    return order.reshape((_SIZE, )), inverse.reshape((_SIZE, ))
+diff --git a/src/vllm_torchtpu/layers/common/fused_moe_gmm.py b/src/vllm_torchtpu/layers/common/fused_moe_gmm.py
+index ce175a8..d2f02f4 100644
+--- a/src/vllm_torchtpu/layers/common/fused_moe_gmm.py
++++ b/src/vllm_torchtpu/layers/common/fused_moe_gmm.py
+@@ -19,6 +19,7 @@ from jax import numpy as jnp
+ from jax.experimental.pallas import tpu as pltpu
+ 
+ import vllm_torchtpu.envs as envs
++from vllm_torchtpu.kernels.inverse_permutation import inverse_permutation_128
+ from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
+     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
+@@ -29,6 +30,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import \
+ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import \
+     ragged_gather_reduce as ragged_gather_reduce_v3
+ from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
++from vllm_torchtpu.kernels.stable_order_and_inverse import \
++    stable_order_and_inverse_128
+ from vllm_torchtpu.logger import init_logger
+ 
+ logger = init_logger(__name__)
+@@ -212,8 +215,24 @@ def prepare_routed_gmm_inputs(
+     else:
+         valid_mask = topk_indices_flat >= 0
+     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+-    sorted_indices = jnp.argsort(sort_keys)
+-    argsort_revert_indices = jnp.argsort(sorted_indices)
++    # For 128 routes, JAX argsort uses int64 indices iff x64 is enabled.
++    # Eligibility is entirely static; signed int32 key values are unrestricted.
++    if (not use_ep and topk_indices_flat.dtype == jnp.int32
++            and topk_indices_flat.shape == (128, )
++            and sort_keys.dtype == jnp.int32 and sort_keys.shape == (128, )
++            and not jax.config.x64_enabled):
++        sorted_indices, argsort_revert_indices = stable_order_and_inverse_128(
++            sort_keys)
++    else:
++        sorted_indices = jnp.argsort(sort_keys)
++        # Preserve the immediate baseline's inverse-helper eligibility, which
++        # depends on the permutation dtype, not the sort-key dtype.
++        if (not use_ep and topk_indices_flat.dtype == jnp.int32
++                and sorted_indices.shape == (128, )
++                and sorted_indices.dtype == jnp.int32):
++            argsort_revert_indices = inverse_permutation_128(sorted_indices)
++        else:
++            argsort_revert_indices = jnp.argsort(sorted_indices)
+ 
+     token_indices_sorted = token_indices_flat[sorted_indices]
+     topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+diff --git a/tests/kernels/check_inverse_permutation_llo.py b/tests/kernels/check_inverse_permutation_llo.py
+new file mode 100644
+index 0000000..8c35e1a
+--- /dev/null
++++ b/tests/kernels/check_inverse_permutation_llo.py
+@@ -0,0 +1,76 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Static checks for separately generated, isolated inverse-permutation LLO.
++
++Usage: python tests/kernels/check_inverse_permutation_llo.py \
++    baseline_inverse.llo candidate_inverse.llo
++
++Both inputs must contain ONLY the isolated inverse computation emitted by
++the unchanged local driver. Whole-decode assembly is not a valid input: the
++first expert sort remains and shares sorting code with the baseline inverse.
++This script reads artifacts; it does not compile, profile or measure cycles.
++Passing these checks does not establish latency improvement or correctness.
++"""
++
++import argparse
++import json
++import re
++from pathlib import Path
++
++LLO_CHECKS = (
++    (r"\bvlt\.8x128\.s32\b", "absent"),
++    (r"\bvsel\.8x128\b", "decrease"),
++    (r"\bvadd\.8x128\.s32\b", "increase"),
++)
++
++
++def check_llo(baseline: str, candidate: str) -> list[dict]:
++    if not baseline.strip() or not candidate.strip():
++        raise ValueError("Both isolated LLO inputs must be nonempty")
++    if not re.search(LLO_CHECKS[0][0], baseline):
++        raise ValueError("Baseline is missing the expected inverse-sort vlt")
++    results = []
++    for pattern, relation in LLO_CHECKS:
++        before = len(re.findall(pattern, baseline))
++        after = len(re.findall(pattern, candidate))
++        passed = {
++            "absent": after == 0,
++            "decrease": after < before,
++            "increase": after > before,
++        }[relation]
++        results.append(dict(pattern=pattern, relation=relation,
++                            baseline_count=before, candidate_count=after,
++                            passed=passed))
++    return results
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("baseline_inverse", type=Path)
++    parser.add_argument("candidate_inverse", type=Path)
++    args = parser.parse_args()
++    try:
++        results = check_llo(args.baseline_inverse.read_text(),
++                            args.candidate_inverse.read_text())
++    except (OSError, ValueError) as exc:
++        print(json.dumps(dict(passed=False, error=str(exc))))
++        return 1
++    passed = all(result["passed"] for result in results)
++    print(json.dumps(dict(scope="isolated inverse permutation", passed=passed,
++                          checks=results)))
++    return 0 if passed else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/kernels/test_inverse_permutation.py b/tests/kernels/test_inverse_permutation.py
+new file mode 100644
+index 0000000..326f398
+--- /dev/null
++++ b/tests/kernels/test_inverse_permutation.py
+@@ -0,0 +1,247 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""CPU interpreter checks; these do not validate Mosaic or TPU execution.
++
++Run without Torch, pytest or accelerator initialization:
++  JAX_PLATFORMS=cpu PYTHONPATH=src python -m unittest discover \
++      -s tests/kernels -p test_inverse_permutation.py -v
++"""
++
++import functools
++import importlib.util
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++from vllm_torchtpu.kernels.inverse_permutation import inverse_permutation_128
++from vllm_torchtpu.kernels.stable_order_and_inverse import \
++    stable_order_and_inverse_128
++
++
++def _load_routing_module():
++    # Load the real JAX source without layers/__init__.py registering Torch
++    # attention operators. No routing or floating-point source is rewritten.
++    path = (Path(__file__).resolve().parents[2] /
++            "src/vllm_torchtpu/layers/common/fused_moe_gmm.py")
++    spec = importlib.util.spec_from_file_location("_inverse_test_routing", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++class InversePermutationTest(unittest.TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        cls.enterClassContext(jax.default_device(jax.devices("cpu")[0]))
++        cls.invert = staticmethod(
++            jax.jit(functools.partial(inverse_permutation_128, interpret=True)))
++
++    def _check_permutation(self, permutation):
++        permutation = np.asarray(permutation, dtype=np.int32)
++        actual = np.asarray(self.invert(jnp.asarray(permutation)))
++        positions = np.arange(128, dtype=np.int32)
++        # An indexed assignment is independent of both the equality/sum
++        # implementation and the original inverse argsort.
++        expected = np.empty(128, dtype=np.int32)
++        expected[permutation] = positions
++        self.assertEqual(actual.shape, (128, ))
++        self.assertEqual(actual.dtype, np.dtype(np.int32))
++        np.testing.assert_array_equal(actual, expected)
++        np.testing.assert_array_equal(actual[permutation], positions)
++        np.testing.assert_array_equal(permutation[actual], positions)
++        np.testing.assert_array_equal(actual, np.argsort(permutation))
++
++    def test_identity(self):
++        self._check_permutation(np.arange(128))
++
++    def test_reverse(self):
++        self._check_permutation(np.arange(127, -1, -1))
++
++    def test_every_cyclic_shift(self):
++        for shift in range(128):
++            with self.subTest(shift=shift):
++                self._check_permutation(np.roll(np.arange(128), shift))
++
++    def test_random_permutations(self):
++        for seed in range(64):
++            with self.subTest(seed=seed):
++                self._check_permutation(
++                    np.random.default_rng(seed).permutation(128))
++
++    def test_duplicate_experts_and_masked_keys(self):
++        rng = np.random.default_rng(19)
++        for all_masked in (False, True):
++            ids = rng.integers(0, 8, size=(16, 8), dtype=np.int32)
++            ids.ravel()[::3] = -1
++            if all_masked:
++                ids.fill(-1)
++            keys = np.where(ids.ravel() >= 0, ids.ravel(), 256)
++            # Preserve the same first stable expert sort as production.
++            permutation = np.asarray(jnp.argsort(jnp.asarray(keys)))
++            np.testing.assert_array_equal(permutation,
++                                          np.argsort(keys, kind="stable"))
++            self._check_permutation(permutation)
++
++    def test_rejects_unsupported_shapes_and_dtypes(self):
++        for shape in ((0, ), (127, ), (129, ), (16, 8), (1, 128)):
++            with self.subTest(shape=shape), self.assertRaises(ValueError):
++                inverse_permutation_128(
++                    jax.ShapeDtypeStruct(shape, jnp.int32), interpret=True)
++        for dtype in (jnp.int16, jnp.int64, jnp.uint32, jnp.float32):
++            with self.subTest(dtype=dtype), self.assertRaises(TypeError):
++                inverse_permutation_128(
++                    jax.ShapeDtypeStruct((128, ), dtype), interpret=True)
++
++
++class RoutedInversePermutationTest(unittest.TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        cls.enterClassContext(jax.default_device(jax.devices("cpu")[0]))
++        cls.routing = _load_routing_module()
++
++    def _inputs(self, tokens=16, dtype=jnp.int32, mask="mixed"):
++        rng = np.random.default_rng(23)
++        ids = rng.integers(0, 8, size=(tokens, 8), dtype=np.int32)
++        ids[0] = [255, 0, 128, 127, 1, 254, 64, 63]
++        weights = rng.random((tokens, 8), dtype=np.float32)
++        weights[1:] = 0  # one active token, keeping all padded routes
++        if mask == "mixed":
++            ids.ravel()[::5] = -1
++        elif mask == "all":
++            ids.fill(-1)
++        hidden = jnp.asarray(rng.standard_normal((tokens, 16)), jnp.bfloat16)
++        return hidden, jnp.asarray(ids, dtype), jnp.asarray(weights)
++
++    def _prepare(self, inputs, **kwargs):
++        return self.routing.prepare_routed_gmm_inputs(
++            *inputs, local_num_experts=256, topk=8, **kwargs)
++
++    def test_routing_metadata_matches_stable_sort_reference(self):
++        for mask in ("none", "mixed", "all"):
++            for skip_padding in (False, True):
++                for sparse_core in (False, True):
++                    with self.subTest(mask=mask, skip_padding=skip_padding,
++                                      sparse_core=sparse_core):
++                        inputs = self._inputs(mask=mask)
++                        with patch.object(
++                                self.routing, "stable_order_and_inverse_128",
++                                wraps=functools.partial(
++                                    stable_order_and_inverse_128,
++                                    interpret=True)) as kernel:
++                            actual = self._prepare(
++                                inputs, use_ep=False,
++                                use_sparse_core=sparse_core,
++                                skip_padded_tokens=skip_padding)
++                        kernel.assert_called_once()
++                        hidden, ids, weights = map(np.asarray, inputs)
++                        valid = ids.ravel() >= 0
++                        if skip_padding:
++                            valid &= weights.ravel() != 0
++                        order = np.argsort(
++                            np.where(valid, ids.ravel(), 256), kind="stable")
++                        expected = (
++                            hidden[np.repeat(np.arange(16), 8)[order]],
++                            np.bincount(ids.ravel()[valid], minlength=256),
++                            np.argsort(order), weights.ravel(), valid, order)
++                        for got, want in zip(actual, expected):
++                            np.testing.assert_array_equal(got, want)
++                        self.assertEqual(actual[0].shape, (128, 16))
++
++    def test_fallback_for_ep_other_sizes_and_index_dtypes(self):
++        cases = [(16, jnp.int32, True), (1, jnp.int32, False),
++                 (15, jnp.int32, False), (17, jnp.int32, False),
++                 (16, jnp.int16, False), (16, jnp.uint32, False),
++                 (16, jnp.int64, False)]
++        for tokens, dtype, use_ep in cases:
++            with jax.enable_x64(dtype == jnp.int64):
++                with self.subTest(tokens=tokens, dtype=dtype, use_ep=use_ep):
++                    inputs = self._inputs(tokens, dtype, mask="none")
++                    with patch.object(self.routing,
++                                      "inverse_permutation_128") as kernel:
++                        actual = self._prepare(inputs, use_ep=use_ep,
++                                               use_sparse_core=False)
++                    kernel.assert_not_called()
++                    expected = np.argsort(np.asarray(actual[-1]))
++                    np.testing.assert_array_equal(actual[2], expected)
++
++    def test_downstream_combine_matches_original_argsort_path(self):
++        # Exercise the real moe_gmm gather, weighting, masking, reduction and
++        # output cast. CPU substitutes fixed GMM outputs; actual TPU GMM and
++        # complete model parity remain separate controller gates.
++        rng = np.random.default_rng(37)
++        for dtype in (jnp.bfloat16, jnp.float32):
++            for skip_padding in (False, True):
++                with self.subTest(dtype=dtype, skip_padding=skip_padding):
++                    inputs = self._inputs()
++                    kwargs = dict(use_ep=False, use_sparse_core=False,
++                                  skip_padded_tokens=skip_padding)
++                    with patch.object(
++                            self.routing, "stable_order_and_inverse_128",
++                            functools.partial(stable_order_and_inverse_128,
++                                              interpret=True)):
++                        optimized = self._prepare(inputs, **kwargs)
++                    # Adapt only the joint helper's test wiring, keeping the
++                    # existing original-argsort reference below unchanged.
++                    def original_order_chain(keys):
++                        order = jnp.argsort(keys)
++                        return (order,
++                                self.routing.inverse_permutation_128(order))
++
++                    # Restore exactly the original second argsort for the
++                    # baseline; do not change any reference implementation.
++                    with patch.object(self.routing, "inverse_permutation_128",
++                                      jnp.argsort), patch.object(
++                                          self.routing,
++                                          "stable_order_and_inverse_128",
++                                          original_order_chain):
++                        baseline = self._prepare(inputs, **kwargs)
++                    for got, want in zip(optimized, baseline):
++                        np.testing.assert_array_equal(got, want)
++
++                    routes = jnp.asarray(rng.standard_normal((128, 16)), dtype)
++                    # Invalid GMM tail rows may be undefined, including NaN.
++                    routes = jnp.where(optimized[4][:, None], routes, jnp.nan)
++                    sorted_routes = routes[baseline[-1]]
++
++                    def combine(metadata):
++                        x, groups, inverse, weights, valid, order = metadata
++                        with patch.object(
++                                self.routing, "gmm_wrapper",
++                                side_effect=[x, sorted_routes]):
++                            return self.routing.moe_gmm(
++                                x, jnp.zeros((256, 16, 32), dtype), None, None,
++                                jnp.zeros((256, 16, 16), dtype), None, None,
++                                groups, inverse, weights, valid, order,
++                                activation="silu", num_tokens=16, topk=8,
++                                **kwargs)
++
++                    actual = combine(optimized)
++                    np.testing.assert_array_equal(actual, combine(baseline))
++                    # Independently combine in original token/slot order.
++                    weighted = routes.reshape(16, 8, 16) * inputs[2][:, :, None]
++                    expected = jnp.where(
++                        optimized[4].reshape(16, 8, 1), weighted,
++                        0).sum(axis=1).astype(inputs[0].dtype)
++                    np.testing.assert_array_equal(actual, expected)
++                    self.assertEqual(actual.dtype, inputs[0].dtype)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/kernels/test_stable_order_and_inverse.py b/tests/kernels/test_stable_order_and_inverse.py
+new file mode 100644
+index 0000000..6fb9d79
+--- /dev/null
++++ b/tests/kernels/test_stable_order_and_inverse.py
+@@ -0,0 +1,285 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""CPU interpreter regressions, not TPU correctness or lowering validation.
++
++Run without pytest's Torch/accelerator fixtures:
++  JAX_PLATFORMS=cpu PYTHONPATH=src python -m unittest discover \
++      -s tests/kernels -p test_stable_order_and_inverse.py -v
++"""
++
++import functools
++import importlib.util
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++from vllm_torchtpu.kernels.inverse_permutation import inverse_permutation_128
++from vllm_torchtpu.kernels.stable_order_and_inverse import \
++    stable_order_and_inverse_128
++
++
++def _numpy_order_and_inverse(keys):
++    order = np.argsort(keys, kind="stable")
++    inverse = np.empty_like(order)
++    inverse[order] = np.arange(keys.size, dtype=order.dtype)
++    return order, inverse
++
++
++def _check_order_and_inverse(test, keys, order, inverse):
++    order, inverse = np.asarray(order), np.asarray(inverse)
++    expected_order, expected_inverse = _numpy_order_and_inverse(keys)
++    np.testing.assert_array_equal(order, expected_order)
++    np.testing.assert_array_equal(inverse, expected_inverse)
++    positions = np.arange(keys.size)
++    np.testing.assert_array_equal(inverse[order], positions)
++    np.testing.assert_array_equal(order[inverse], positions)
++    tied = keys[order[:-1]] == keys[order[1:]]
++    test.assertTrue(np.all(order[:-1][tied] < order[1:][tied]))
++
++
++def _baseline_order_and_inverse(keys):
++    # The immediate candidate2 chain, with only Pallas interpretation enabled.
++    order = jnp.argsort(keys)
++    return order, inverse_permutation_128(order, interpret=True)
++
++
++class StableOrderAndInverseTest(unittest.TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        cls.enterClassContext(jax.default_device(jax.devices("cpu")[0]))
++        cls.sort = staticmethod(jax.jit(functools.partial(
++            stable_order_and_inverse_128, interpret=True)))
++
++    def _check(self, keys):
++        keys = np.asarray(keys, dtype=np.int32)
++        order, inverse = self.sort(jnp.asarray(keys))
++        for output in (order, inverse):
++            self.assertEqual(output.shape, (128, ))
++            self.assertEqual(output.dtype, jnp.int32)
++        _check_order_and_inverse(self, keys, order, inverse)
++
++    def test_equal_monotonic_duplicate_negative_and_extreme_keys(self):
++        limits = np.iinfo(np.int32)
++        cases = {
++            "all_equal": np.full(128, -17),
++            "all_min": np.full(128, limits.min),
++            "all_max": np.full(128, limits.max),
++            "ascending": np.arange(128),
++            "reversed": np.arange(127, -1, -1),
++            "negative": np.arange(-1, -129, -1),
++            "duplicates_across_tokens": np.tile(
++                [7, 0, 7, 255, 0, 255, 7, 0], 16),
++            "sentinels": np.tile([256, 255, 0, 256, 0, 255, 256, 0], 16),
++            "all_sentinel": np.full(128, 256),
++            "extrema": np.tile(
++                [limits.min, limits.max, -1, 0, 1, limits.min + 1,
++                 limits.max - 1, limits.min], 16),
++        }
++        for name, keys in cases.items():
++            with self.subTest(name=name):
++                self._check(keys)
++
++    def test_random_full_int32_and_duplicate_keys(self):
++        limits = np.iinfo(np.int32)
++        for seed in range(32):
++            rng = np.random.default_rng(seed)
++            with self.subTest(seed=seed, distribution="full_int32"):
++                self._check(rng.integers(limits.min, limits.max, size=128,
++                                         dtype=np.int32, endpoint=True))
++            with self.subTest(seed=seed, distribution="duplicates"):
++                self._check(rng.integers(-8, 9, size=128, dtype=np.int32))
++
++    def test_route_zero_at_every_destination(self):
++        for destination in range(128):
++            with self.subTest(destination=destination):
++                self._check(np.roll(np.arange(128), -destination))
++
++    def test_explicit_int32_outputs_with_x64_enabled(self):
++        with jax.enable_x64(True):
++            self._check(np.tile([np.iinfo(np.int32).min, 0,
++                                np.iinfo(np.int32).max, -1], 32))
++
++    def test_rejects_unsupported_shapes_and_dtypes(self):
++        for shape in ((0, ), (127, ), (129, ), (16, 8), (1, 128)):
++            with self.subTest(shape=shape), self.assertRaises(ValueError):
++                stable_order_and_inverse_128(
++                    jax.ShapeDtypeStruct(shape, jnp.int32), interpret=True)
++        for dtype in (jnp.int16, jnp.int64, jnp.uint32, jnp.float32):
++            with self.subTest(dtype=dtype), self.assertRaises(TypeError):
++                stable_order_and_inverse_128(
++                    jax.ShapeDtypeStruct((128, ), dtype), interpret=True)
++
++
++class RoutedStableOrderAndInverseTest(unittest.TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        cls.enterClassContext(jax.default_device(jax.devices("cpu")[0]))
++        cls.enterClassContext(jax.enable_x64(False))
++        # Load production JAX code without registering Torch attention ops.
++        path = (Path(__file__).resolve().parents[2] /
++                "src/vllm_torchtpu/layers/common/fused_moe_gmm.py")
++        spec = importlib.util.spec_from_file_location("_joint_test_routing",
++                                                       path)
++        cls.routing = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(cls.routing)
++
++    def _inputs(self, *, tokens=16, topk=8, dtype=jnp.int32, mask="mixed",
++                hidden_size=16, seed=23):
++        rng = np.random.default_rng(seed)
++        # Duplicate expert IDs span every token, including experts 0 and 255.
++        ids = rng.choice(np.array([0, 1, 7, 127, 255], dtype=np.int32),
++                         size=(tokens, topk))
++        ids.ravel()[:2] = [0, 255]
++        weights = rng.random((tokens, topk), dtype=np.float32)
++        weights[1:] = 0
++        if mask == "mixed":
++            ids.ravel()[2::5] = -1
++        elif mask == "all":
++            ids.fill(-1)
++        elif mask == "zero_weights":
++            weights.fill(0)
++        elif mask == "poison_weights":
++            weights.ravel()[:4] = [np.nan, np.inf, -np.inf, -0.0]
++        hidden = jnp.asarray(rng.standard_normal((tokens, hidden_size)),
++                             jnp.bfloat16)
++        return hidden, jnp.asarray(ids, dtype), jnp.asarray(weights)
++
++    def _prepare(self, inputs, **kwargs):
++        return self.routing.prepare_routed_gmm_inputs(
++            *inputs, local_num_experts=256, topk=inputs[1].shape[1], **kwargs)
++
++    def _check_preparation(self, inputs, outputs, skip_padding):
++        hidden, ids, weights = map(np.asarray, inputs)
++        valid = ids.ravel() >= 0
++        if skip_padding:
++            valid &= weights.ravel() != 0
++        keys = np.where(valid, ids.ravel(), 256)
++        order, inverse = _numpy_order_and_inverse(keys)
++        expected = (
++            hidden[np.repeat(np.arange(hidden.shape[0]), ids.shape[1])[order]],
++            np.bincount(ids.ravel()[valid].astype(np.int64), minlength=256),
++            inverse, weights.ravel(), valid, order)
++        self.assertEqual(len(outputs), 6)
++        for got, want in zip(outputs, expected):
++            got = np.asarray(got)
++            want = np.asarray(want, dtype=got.dtype)
++            np.testing.assert_array_equal(got, want)
++            # Also preserve NaN payloads and signed zeros in gathered values
++            # and routing weights: these are unchanged array movements.
++            self.assertEqual(got.tobytes(), want.tobytes())
++        _check_order_and_inverse(self, keys, outputs[-1], outputs[2])
++
++    def test_all_six_outputs_match_numpy_and_immediate_baseline(self):
++        for mask in ("none", "mixed", "all", "zero_weights", "poison_weights"):
++            for skip_padding in (False, True):
++                for sparse_core in (False, True):
++                    with self.subTest(mask=mask, skip_padding=skip_padding,
++                                      sparse_core=sparse_core):
++                        inputs = self._inputs(mask=mask)
++                        kwargs = dict(use_ep=False, use_sparse_core=sparse_core,
++                                      skip_padded_tokens=skip_padding)
++                        with patch.object(
++                                self.routing, "stable_order_and_inverse_128",
++                                wraps=functools.partial(
++                                    stable_order_and_inverse_128,
++                                    interpret=True)) as joint, patch.object(
++                                        self.routing, "inverse_permutation_128"
++                                    ) as old_inverse:
++                            actual = self._prepare(inputs, **kwargs)
++                        joint.assert_called_once()
++                        old_inverse.assert_not_called()
++                        with patch.object(self.routing,
++                                          "stable_order_and_inverse_128",
++                                          _baseline_order_and_inverse):
++                            baseline = self._prepare(inputs, **kwargs)
++                        for got, want in zip(actual, baseline):
++                            self.assertEqual(got.shape, want.shape)
++                            self.assertEqual(got.dtype, want.dtype)
++                            self.assertEqual(np.asarray(got).tobytes(),
++                                             np.asarray(want).tobytes())
++                        self._check_preparation(inputs, actual, skip_padding)
++
++    def test_jitted_full_shape_preparation_with_dynamic_inputs(self):
++        with patch.object(self.routing, "stable_order_and_inverse_128",
++                          functools.partial(stable_order_and_inverse_128,
++                                            interpret=True)):
++            prepare = jax.jit(functools.partial(
++                self._prepare, use_ep=False, use_sparse_core=False,
++                skip_padded_tokens=True))
++            for seed in range(4):
++                inputs = self._inputs(hidden_size=2048, seed=seed)
++                actual = prepare(inputs)
++                self._check_preparation(inputs, actual, True)
++                self.assertEqual(actual[0].shape, (128, 2048))
++
++    def test_fallback_for_ep_route_counts_and_input_or_index_dtypes(self):
++        cases = [(16, jnp.int32, True, False),
++                 (1, jnp.int32, False, False),
++                 (15, jnp.int32, False, False),
++                 (17, jnp.int32, False, False),
++                 (16, jnp.int16, False, False),
++                 (16, jnp.uint32, False, False),
++                 (16, jnp.float32, False, False),
++                 (16, jnp.int32, False, True),
++                 (16, jnp.int64, False, True)]
++        for tokens, dtype, use_ep, x64 in cases:
++            with self.subTest(tokens=tokens, dtype=dtype, use_ep=use_ep,
++                              x64=x64), jax.enable_x64(x64):
++                inputs = self._inputs(tokens=tokens, dtype=dtype, mask="none")
++                with patch.object(self.routing, "stable_order_and_inverse_128"
++                                  ) as joint, patch.object(
++                                      self.routing, "inverse_permutation_128"
++                                  ) as old_inverse:
++                    actual = self._prepare(inputs, use_ep=use_ep,
++                                           use_sparse_core=False)
++                joint.assert_not_called()
++                old_inverse.assert_not_called()
++                self._check_preparation(inputs, actual, False)
++                expected_dtype = jnp.int64 if x64 else jnp.int32
++                self.assertEqual(actual[2].dtype, expected_dtype)
++                self.assertEqual(actual[-1].dtype, expected_dtype)
++
++    def test_non_int32_sort_keys_retain_older_inverse_eligibility(self):
++        inputs = self._inputs()
++        original_where = jnp.where
++
++        def promoted_sort_keys(condition, x, y):
++            result = original_where(condition, x, y)
++            # Isolate the constructed-key dtype guard with otherwise eligible
++            # IDs/indices. Mask and key values are unchanged.
++            if isinstance(y, int) and y == 256:
++                return result.astype(jnp.float32)
++            return result
++
++        with patch.object(self.routing.jnp, "where", promoted_sort_keys), \
++                patch.object(self.routing, "stable_order_and_inverse_128"
++                             ) as joint, patch.object(
++                                 self.routing, "inverse_permutation_128",
++                                 wraps=functools.partial(
++                                     inverse_permutation_128, interpret=True)
++                             ) as old_inverse:
++            actual = self._prepare(inputs, use_ep=False, use_sparse_core=False)
++        joint.assert_not_called()
++        old_inverse.assert_called_once()
++        self._check_preparation(inputs, actual, False)
++
++
++if __name__ == "__main__":
++    unittest.main()

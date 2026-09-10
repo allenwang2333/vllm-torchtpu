@@ -1,0 +1,194 @@
+{
+  "hardware": "8 local TPUv6e chips, TP8",
+  "model": "Qwen/Qwen3.5-35B-A3B",
+  "workload": {
+    "input_tokens": 512,
+    "output_tokens": 256,
+    "concurrency": 1,
+    "attention_backend": "CUSTOM (batched RPA)"
+  },
+  "source": {
+    "baseline_revision": "2e2ce889bd45327fa2a68b97ad3ae00070582c9c",
+    "candidate_tree": "066d1a0385154e39c72778ad537b6e975d16297e",
+    "candidate_patch_sha256": "eec9c7afd8c579f5e54be70787ee3216be96ceb80c1fc9e857b75fd1394f6248"
+  },
+  "measurement_scope": "Historical captured revisions, before adding the opt-in flag and porting to current upstream; not new measurements of the PR.",
+  "stages": {
+    "pilot": {
+      "pairs": 3,
+      "baseline_ms": 1521.936222111496,
+      "candidate_ms": 1464.1599124879576,
+      "latency_reduction_percent": 3.7962372393884447,
+      "mean_paired_ratio_ci95": [
+        0.9406119816576486,
+        0.9987207748961443
+      ],
+      "paired_block_means": {
+        "0": {
+          "baseline": 1526.5196552344908,
+          "candidate": 1447.2833062619127
+        },
+        "1": {
+          "candidate": 1485.0461639037046,
+          "baseline": 1486.9483055042413
+        },
+        "2": {
+          "baseline": 1552.3407055957553,
+          "candidate": 1460.1502672982558
+        }
+      }
+    },
+    "confirmation": {
+      "pairs": 10,
+      "baseline_ms": 1512.1671906296008,
+      "candidate_ms": 1469.1358959967815,
+      "latency_reduction_percent": 2.8456704324409277,
+      "mean_paired_ratio_ci95": [
+        0.9577631720122372,
+        0.9873624374055135
+      ],
+      "paired_block_means": {
+        "0": {
+          "baseline": 1548.2445635658223,
+          "candidate": 1472.3020912671927
+        },
+        "1": {
+          "candidate": 1435.8685925641719,
+          "baseline": 1482.4142269033473
+        },
+        "2": {
+          "candidate": 1431.659006839618,
+          "baseline": 1529.406929697143
+        },
+        "3": {
+          "candidate": 1482.2328915955343,
+          "baseline": 1504.299875961927
+        },
+        "4": {
+          "candidate": 1509.097894426668,
+          "baseline": 1489.6490988011162
+        },
+        "5": {
+          "baseline": 1540.3265379951335,
+          "candidate": 1475.6863271002658
+        },
+        "6": {
+          "baseline": 1472.6526926989511,
+          "candidate": 1434.0359016030561
+        },
+        "7": {
+          "baseline": 1559.2651925670605,
+          "candidate": 1492.4119545709498
+        },
+        "8": {
+          "candidate": 1466.5579233318567,
+          "baseline": 1522.326416304956
+        },
+        "9": {
+          "baseline": 1473.086371800552,
+          "candidate": 1491.5063766685005
+        }
+      }
+    }
+  },
+  "native_counts": {
+    "columns": [
+      "one_baseline_sort_body",
+      "baseline_pair_two_body_visits",
+      "one_candidate_joint_body"
+    ],
+    "instruction_records": [
+      342,
+      684,
+      129
+    ],
+    "vadd.8x128.s32": [
+      0,
+      0,
+      36
+    ],
+    "vbcast.lane.8x128": [
+      0,
+      0,
+      48
+    ],
+    "veq.8x128.s32": [
+      63,
+      126,
+      32
+    ],
+    "vlt.8x128.s32": [
+      112,
+      224,
+      32
+    ],
+    "vnsel.8x128": [
+      0,
+      0,
+      16
+    ],
+    "vperm.lane.8x128": [
+      56,
+      112,
+      0
+    ],
+    "vrot.slane.8x128.u32": [
+      0,
+      0,
+      6
+    ],
+    "vsel.8x128": [
+      336,
+      672,
+      21
+    ]
+  },
+  "runtime_packages": {
+    "torch": "2.13.0+cpu",
+    "torch-tpu": "0.1.1+hierevo.local20260907profiler2",
+    "libtpu": "0.0.44.1",
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2",
+    "vllm": "0.27.0+empty",
+    "vllm-torchtpu": "0.1.dev2241+gb65e22b0d",
+    "ijson": "3.5.1"
+  },
+  "server_command": [
+    "/home/jianming_gatech/hierevo_v2/.venv-torchtpu-profiler/bin/python",
+    "-m",
+    "vllm.entrypoints.cli.main",
+    "serve",
+    "/dev/shm/hierevo-phase2-models-20260909/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "19135",
+    "--tensor-parallel-size",
+    "8",
+    "--max-model-len",
+    "768",
+    "--max-num-batched-tokens",
+    "512",
+    "--profiler-config.profiler",
+    "torch",
+    "--profiler-config.torch_profiler_dir",
+    "/dev/shm/hierevo-phase2-model-runs-20260909/qwen3.5-35b-a3b/baseline/02/native/profile",
+    "--profiler-config.ignore_frontend",
+    "true",
+    "--max-num-seqs",
+    "1",
+    "--gpu-memory-utilization",
+    "0.8",
+    "--no-enable-prefix-caching",
+    "--attention-backend",
+    "CUSTOM",
+    "--revision",
+    "59d61f3ce65a6d9863b86d2e96597125219dc754",
+    "--profiler-config.torch_profiler_with_stack",
+    "false",
+    "--tokenizer",
+    "/dev/shm/hierevo-phase2-models-20260909/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754",
+    "--served-model-name",
+    "Qwen/Qwen3.5-35B-A3B"
+  ]
+}

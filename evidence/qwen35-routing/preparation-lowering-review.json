@@ -1,0 +1,29 @@
+{
+  "passed": true,
+  "complete_preparation_outputs_bitexact": true,
+  "counts": {
+    "baseline": {
+      "vlt.8x128.s32": 118,
+      "vsel.8x128": 363,
+      "vperm.lane.8x128": 120,
+      "vadd.8x128.s32": 61
+    },
+    "candidate": {
+      "vlt.8x128.s32": 38,
+      "vsel.8x128": 48,
+      "vperm.lane.8x128": 64,
+      "vadd.8x128.s32": 79
+    }
+  },
+  "source_reports": {
+    "baseline": {
+      "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-preflight-v1/baseline/result.json",
+      "sha256": "b9b302a16354d395c265b711337ec5e44038569a8b44b856592e2bdc3dca4e2a"
+    },
+    "candidate": {
+      "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-preflight-v1/candidate/result.json",
+      "sha256": "393808e08c45db81e78116a75f511b741a2a94e81a0eccf0b12ff74a5930ac83"
+    }
+  },
+  "scope": "Allsixcompletepreparationoutputs and wholeprogramassembly; no timingclaim"
+}

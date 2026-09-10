@@ -1,0 +1,129 @@
+1232073 : {v1 = vlaneseq.8x128.u32;  v35 = vimm.8x128.s32 $0;  v36 = vimm.8x128.s32 $0;  v38 = vimm.8x128.s32 $0}
+1232074 : {v42 = vimm.8x128.s32 $0;  v43 = vimm.8x128.s32 $0;  v46 = vimm.8x128.s32 $0;  v0 = vld.8x128 [vmem:s0 ss:$0]}
+1232075 : {v2 = vand.8x128.u32 $0x7f, v1;  (trf1) = vbcast.lane.8x128 v0, $272;  (trf0) = vbcast.lane.8x128 v0, $256}
+1232076 : {(trf1) = vbcast.lane.8x128 v0, $280;  (trf0) = vbcast.lane.8x128 v0, $264}
+1232077 : {(trf1) = vbcast.lane.8x128 v0, $296;  (trf0) = vbcast.lane.8x128 v0, $288}
+1232078 : {(trf1) = vbcast.lane.8x128 v0, $312;  (trf0) = vbcast.lane.8x128 v0, $304}
+1232079 : {(trf1) = vbcast.lane.8x128 v2, $264;  (trf0) = vbcast.lane.8x128 v2, $256}
+1232080 : {(trf1) = vbcast.lane.8x128 v2, $280;  (trf0) = vbcast.lane.8x128 v2, $272}
+1232081 : {(trf1) = vbcast.lane.8x128 v2, $296;  (trf0) = vbcast.lane.8x128 v2, $288}
+1232082 : {(trf1) = vbcast.lane.8x128 v2, $312;  (trf0) = vbcast.lane.8x128 v2, $304}
+1232083 : {(trf1) = vbcast.lane.8x128 v0, $328;  (trf0) = vbcast.lane.8x128 v0, $320}
+1232084 : {(trf1) = vbcast.lane.8x128 v0, $344;  (trf0) = vbcast.lane.8x128 v0, $336}
+1232085 : {(trf1) = vbcast.lane.8x128 v2, $328;  (trf0) = vbcast.lane.8x128 v2, $320}
+1232086 : {(trf1) = vbcast.lane.8x128 v2, $344;  (trf0) = vbcast.lane.8x128 v2, $336}
+1232087 : {(trf1) = vbcast.lane.8x128 v0, $360;  (trf0) = vbcast.lane.8x128 v0, $352}
+1232088 : {(trf1) = vbcast.lane.8x128 v0, $376;  (trf0) = vbcast.lane.8x128 v0, $368}
+1232089 : {(trf1) = vbcast.lane.8x128 v2, $360;  (trf0) = vbcast.lane.8x128 v2, $352}
+1232090 : {(trf1) = vbcast.lane.8x128 v2, $376;  (trf0) = vbcast.lane.8x128 v2, $368}
+1232091 : {v3 = vpop.8x128 (trf1);  v4 = vpop.8x128 (trf0)}
+1232092 : {vm4 = veq.8x128.s32 v4, v0;  vm15 = veq.8x128.s32 v3, v0}
+1232093 : {v5 = vpop.8x128 (trf1);  v6 = vpop.8x128 (trf0)}
+1232094 : {vm2 = veq.8x128.s32 v6, v0;  vm13 = veq.8x128.s32 v5, v0}
+1232095 : {v7 = vpop.8x128 (trf1);  v8 = vpop.8x128 (trf0)}
+1232096 : {vm7 = veq.8x128.s32 v7, v0;  vm10 = veq.8x128.s32 v8, v0}
+1232097 : {v9 = vpop.8x128 (trf1);  v10 = vpop.8x128 (trf0)}
+1232098 : {v11 = vpop.8x128 (trf1);  v12 = vpop.8x128 (trf0)}
+1232099 : {vm0 = vlt.8x128.s32 v11, v2;  vm1 = vlt.8x128.s32 v12, v2}
+1232100 : {vm0 = vlt.8x128.s32 v6, v0;  vm2 = veq.8x128.s32 v10, v0;  vm5 = vmand.8x128.u1 vm2, vm0}
+1232101 : {vm4 = vlt.8x128.s32 v8, v0;  vm8 = vmand.8x128.u1 vm4, vm1}
+1232102 : {v13 = vpop.8x128 (trf1);  v14 = vpop.8x128 (trf0)}
+1232103 : {vm9 = vlt.8x128.s32 v13, v2;  vm11 = vlt.8x128.s32 v14, v2}
+1232104 : {vm13 = veq.8x128.s32 v9, v0;  vm9 = vlt.8x128.s32 v5, v0;  vm1 = vmand.8x128.u1 vm13, vm9}
+1232105 : {v15 = vpop.8x128 (trf1);  v16 = vpop.8x128 (trf0)}
+1232106 : {vm3 = vlt.8x128.s32 v15, v2;  vm6 = vlt.8x128.s32 v16, v2}
+1232107 : {vm3 = vlt.8x128.s32 v7, v0;  vm12 = vmand.8x128.u1 vm7, vm3}
+1232108 : {vm10 = vlt.8x128.s32 v4, v0;  vm14 = vmand.8x128.u1 vm10, vm6}
+1232109 : {vm0 = vlt.8x128.s32 v3, v0;  vm6 = vmor.8x128.u1 vm0, vm5;  v17 = vpop.8x128 (trf1);  v18 = vpop.8x128 (trf0)}
+1232110 : {v47 = vsel.8x128 vm6, $0x1, v46;  vm7 = vmand.8x128.u1 vm15, vm11}
+1232111 : {vm5 = vmor.8x128.u1 vm3, vm12}
+1232112 : {vm14 = vlt.8x128.s32 v17, v2;  v49 = vsel.8x128 vm5, $0x1, v46;  vm11 = vmor.8x128.u1 vm4, vm14}
+1232113 : {vm8 = vlt.8x128.s32 v18, v2;  v60 = vadd.8x128.s32 v49, v47;  v35 = vsel.8x128 vm11, $0xffffffff, v35;  vm12 = vmor.8x128.u1 vm10, vm8;  v19 = vpop.8x128 (trf1);  v20 = vpop.8x128 (trf0)}
+1232114 : {vm12 = veq.8x128.s32 v19, v0;  vm13 = vlt.8x128.s32 v9, v0;  v36 = vsel.8x128 vm12, $0xffffffff, v36;  vm3 = vmand.8x128.u1 vm13, vm14}
+1232115 : {vm1 = vlt.8x128.s32 v10, v0;  vm4 = vmor.8x128.u1 vm9, vm1}
+1232116 : {v57 = vsel.8x128 vm4, $0x1, v46;  vm11 = vmor.8x128.u1 vm0, vm7}
+1232117 : {vm2 = vlt.8x128.s32 v19, v0;  vm11 = vlt.8x128.s32 v20, v0;  v38 = vsel.8x128 vm11, $0xffffffff, v38;  vm10 = vmand.8x128.u1 vm2, vm8;  v21 = vpop.8x128 (trf1);  v22 = vpop.8x128 (trf0)}
+1232118 : {vm9 = vmor.8x128.u1 vm13, vm3}
+1232119 : {vm10 = veq.8x128.s32 v21, v0;  vm1 = veq.8x128.s32 v22, v0;  v51 = vsel.8x128 vm9, $0x1, v46;  vm0 = vmor.8x128.u1 vm1, vm10}
+1232120 : {v62 = vadd.8x128.s32 v51, v57;  v42 = vsel.8x128 vm0, $0xffffffff, v42}
+1232121 : {v25 = vpop.8x128 (trf1);  v26 = vpop.8x128 (trf0)}
+1232122 : {vm15 = vlt.8x128.s32 v25, v2;  vm7 = vlt.8x128.s32 v26, v2}
+1232123 : {vm12 = veq.8x128.s32 v20, v0;  vm14 = vmand.8x128.u1 vm12, vm15}
+1232124 : {vm2 = vlt.8x128.s32 v21, v0;  vm8 = vmor.8x128.u1 vm2, vm14}
+1232125 : {vm7 = vnez.u8 v35;  v43 = vsel.8x128 vm8, $0xffffffff, v43;  vm13 = vmand.8x128.u1 vm12, vm7;  v32 = vpop.8x128 (trf1);  v33 = vpop.8x128 (trf0)}
+1232126 : {vm15 = vlt.8x128.s32 v32, v2;  vm3 = vlt.8x128.s32 v33, v2;  vm11 = vnez.u8 v36;  v50 = vsel.8x128 vm7, $0x1, v46;  vm8 = vmor.8x128.u1 vm11, vm13}
+1232127 : {vm15 = vlt.8x128.s32 v22, v0;  vm10 = vnez.u8 v42;  vm7 = vnez.u8 v43;  v55 = vsel.8x128 vm11, $0x1, v46;  vm0 = vmand.8x128.u1 vm10, vm15}
+1232128 : {vm3 = vnez.u8 v38;  v61 = vadd.8x128.s32 v50, v55;  v59 = vsel.8x128 vm10, $0x1, v46;  v63 = vsel.8x128 vm7, $0x1, v46;  vm14 = vmand.8x128.u1 vm1, vm3}
+1232129 : {v10 = vadd.8x128.s32 v60, v63;  v58 = vsel.8x128 vm3, $0x1, v46;  v1 = vsel.8x128 vm8, $0x1, v46;  vm6 = vmor.8x128.u1 vm2, vm0;  v39 = vpop.8x128 (trf1);  v40 = vpop.8x128 (trf0)}
+1232130 : {vm9 = veq.8x128.s32 v39, v0;  vm13 = vlt.8x128.s32 v39, v0;  vm14 = veq.8x128.s32 v40, v0;  v3 = vsel.8x128 vm6, $0x1, v46;  vm5 = vmor.8x128.u1 vm15, vm14}
+1232131 : {vm4 = vlt.8x128.s32 v40, v0;  v6 = vadd.8x128.s32 v59, v58;  v19 = vadd.8x128.s32 v61, v1;  v7 = vsel.8x128 vm5, $0x1, v46}
+1232132 : {v20 = vadd.8x128.s32 v62, v3}
+1232133 : {v22 = vadd.8x128.s32 v6, v7;  v44 = vpop.8x128 (trf1);  v45 = vpop.8x128 (trf0)}
+1232134 : {vm11 = veq.8x128.s32 v44, v0;  vm3 = veq.8x128.s32 v45, v0}
+1232135 : {v53 = vpop.8x128 (trf1);  v54 = vpop.8x128 (trf0)}
+1232136 : {vm12 = vlt.8x128.s32 v53, v2;  vm0 = vlt.8x128.s32 v54, v2}
+1232137 : {vm12 = vlt.8x128.s32 v44, v0;  vm1 = vmand.8x128.u1 vm9, vm12}
+1232138 : {vm13 = vlt.8x128.s32 v45, v0;  vm2 = vmor.8x128.u1 vm13, vm1}
+1232139 : {v8 = vsel.8x128 vm2, $0x1, v46;  vm15 = vmand.8x128.u1 vm14, vm0;  v4 = vpop.8x128 (trf1);  v5 = vpop.8x128 (trf0)}
+1232140 : {vm8 = vlt.8x128.s32 v4, v2;  vm6 = vlt.8x128.s32 v5, v2;  v23 = vadd.8x128.s32 v10, v8;  vm9 = vmor.8x128.u1 vm4, vm15}
+1232141 : {v9 = vsel.8x128 vm9, $0x1, v46;  vm0 = vmand.8x128.u1 vm11, vm8}
+1232142 : {v24 = vadd.8x128.s32 v19, v9;  vm10 = vmor.8x128.u1 vm12, vm0}
+1232143 : {v21 = vsel.8x128 vm10, $0x1, v46;  vm1 = vmand.8x128.u1 vm3, vm6}
+1232144 : {v27 = vadd.8x128.s32 v20, v21;  v30 = vadd.8x128.s32 v23, v24;  vm5 = vmor.8x128.u1 vm13, vm1}
+1232145 : {v28 = vsel.8x128 vm5, $0x1, v46}
+1232146 : {v29 = vadd.8x128.s32 v22, v28}
+1232147 : {v31 = vadd.8x128.s32 v27, v29}
+1232148 : {v34 = vadd.8x128.s32 v31, v30}
+1232149 : {v35 = vrot.slane.8x128.u32 v34, $0x4}
+1232150 : {v36 = vadd.8x128.s32 v35, v34}
+1232151 : {v37 = vrot.slane.8x128.u32 v36, $0x2}
+1232152 : {v38 = vadd.8x128.s32 v37, v36}
+1232153 : {v39 = vrot.slane.8x128.u32 v38, $0x1}
+1232154 : {v40 = vadd.8x128.s32 v39, v38}
+1232155 : {[vmem:s2 sm:$0x1] = vst.8x128 v40;  (trf1) = vbcast.lane.8x128 v40, $264;  (trf0) = vbcast.lane.8x128 v40, $256}
+1232156 : {(trf1) = vbcast.lane.8x128 v40, $280;  (trf0) = vbcast.lane.8x128 v40, $272}
+1232157 : {(trf1) = vbcast.lane.8x128 v40, $296;  (trf0) = vbcast.lane.8x128 v40, $288}
+1232158 : {(trf1) = vbcast.lane.8x128 v40, $312;  (trf0) = vbcast.lane.8x128 v40, $304}
+1232159 : {(trf1) = vbcast.lane.8x128 v40, $328;  (trf0) = vbcast.lane.8x128 v40, $320}
+1232160 : {(trf1) = vbcast.lane.8x128 v40, $344;  (trf0) = vbcast.lane.8x128 v40, $336}
+1232161 : {(trf1) = vbcast.lane.8x128 v40, $360;  (trf0) = vbcast.lane.8x128 v40, $352}
+1232162 : {(trf1) = vbcast.lane.8x128 v40, $376;  (trf0) = vbcast.lane.8x128 v40, $368}
+1232163 : {v0 = vpop.8x128 (trf1);  v41 = vpop.8x128 (trf0)}
+1232164 : {vm7 = veq.8x128.s32 v0, v2;  vm4 = veq.8x128.s32 v41, v2}
+1232165 : {v56 = vnsel.8x128 vm7, $0, v11;  v57 = vnsel.8x128 vm4, $0, v12}
+1232166 : {v42 = vpop.8x128 (trf1);  v43 = vpop.8x128 (trf0)}
+1232167 : {vm15 = veq.8x128.s32 v42, v2;  vm11 = veq.8x128.s32 v43, v2}
+1232168 : {v58 = vnsel.8x128 vm15, $0, v13;  v59 = vnsel.8x128 vm11, $0, v14}
+1232169 : {v44 = vpop.8x128 (trf1);  v45 = vpop.8x128 (trf0)}
+1232170 : {vm14 = veq.8x128.s32 v44, v2;  vm2 = veq.8x128.s32 v45, v2}
+1232171 : {v52 = vnsel.8x128 vm14, $0, v15;  v55 = vnsel.8x128 vm2, $0, v16}
+1232172 : {v60 = vadd.8x128.s32 v52, v56;  v61 = vadd.8x128.s32 v55, v57}
+1232173 : {v46 = vpop.8x128 (trf1);  v47 = vpop.8x128 (trf0)}
+1232174 : {vm9 = veq.8x128.s32 v46, v2;  vm8 = veq.8x128.s32 v47, v2}
+1232175 : {v15 = vnsel.8x128 vm9, $0, v17;  v16 = vnsel.8x128 vm8, $0, v18}
+1232176 : {v13 = vadd.8x128.s32 v15, v58;  v14 = vadd.8x128.s32 v16, v59}
+1232177 : {v48 = vpop.8x128 (trf1);  v49 = vpop.8x128 (trf0)}
+1232178 : {vm6 = veq.8x128.s32 v48, v2;  vm12 = veq.8x128.s32 v49, v2}
+1232179 : {v62 = vnsel.8x128 vm6, $0, v25;  v11 = vnsel.8x128 vm12, $0, v26}
+1232180 : {v6 = vadd.8x128.s32 v60, v62;  v25 = vadd.8x128.s32 v61, v11}
+1232181 : {v50 = vpop.8x128 (trf1);  v51 = vpop.8x128 (trf0)}
+1232182 : {vm0 = veq.8x128.s32 v50, v2;  vm3 = veq.8x128.s32 v51, v2}
+1232183 : {v1 = vnsel.8x128 vm0, $0, v32;  v3 = vnsel.8x128 vm3, $0, v33}
+1232184 : {v7 = vadd.8x128.s32 v13, v1;  v26 = vadd.8x128.s32 v14, v3}
+1232185 : {v63 = vpop.8x128 (trf1);  v12 = vpop.8x128 (trf0)}
+1232186 : {vm10 = veq.8x128.s32 v63, v2;  vm13 = veq.8x128.s32 v12, v2}
+1232187 : {v17 = vnsel.8x128 vm10, $0, v53;  v18 = vnsel.8x128 vm13, $0, v54}
+1232188 : {v10 = vadd.8x128.s32 v6, v17;  v32 = vadd.8x128.s32 v25, v18}
+1232189 : {v8 = vpop.8x128 (trf1);  v9 = vpop.8x128 (trf0)}
+1232190 : {vm1 = veq.8x128.s32 v8, v2;  vm5 = veq.8x128.s32 v9, v2;  v21 = vadd.8x128.s32 v10, v32}
+1232191 : {v33 = vnsel.8x128 vm1, $0, v4;  v19 = vnsel.8x128 vm5, $0, v5}
+1232192 : {v20 = vadd.8x128.s32 v7, v33;  v53 = vadd.8x128.s32 v26, v19}
+1232193 : {v54 = vadd.8x128.s32 v20, v53}
+1232194 : {v22 = vadd.8x128.s32 v54, v21}
+1232195 : {v23 = vrot.slane.8x128.u32 v22, $0x4}
+1232196 : {v24 = vadd.8x128.s32 v23, v22}
+1232197 : {v27 = vrot.slane.8x128.u32 v24, $0x2}
+1232198 : {v28 = vadd.8x128.s32 v27, v24}
+1232199 : {v29 = vrot.slane.8x128.u32 v28, $0x1}
+1232200 : {v30 = vadd.8x128.s32 v29, v28}
+1232201 : {[vmem:s1 sm:$0x1] = vst.8x128 v30}

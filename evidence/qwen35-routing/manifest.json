@@ -1,0 +1,54 @@
+{
+  "model-decode-baseline.llo.gz": {
+    "sha256": "acb4d4eab0870ba8db6107c1dee29e6f2aaa1cefcae37b3bc0b8a912c7517132",
+    "uncompressed_sha256": "f6324244db7d75cc5edc9c933cdadcfe088c29079f0c0ac8f261d9e38592978e",
+    "uncompressed_bytes": 202464006
+  },
+  "model-decode-candidate.llo.gz": {
+    "sha256": "702999595df38ac74dfa58dcd4f8c1a7fc21197c3903df424de03b8673a9ef77",
+    "uncompressed_sha256": "a4974a3443ae842d02630f8d3f31b30c0fc0295d05f87b2d7261072f8fef21b7",
+    "uncompressed_bytes": 202391099
+  },
+  "preparation-baseline.llo": {
+    "sha256": "a9db2507fffeb04cadb5561b63f024a65e5f0a3623929331fd6a54bb0502d0e2"
+  },
+  "model-routing-candidate-body.llo": {
+    "sha256": "e9572c876dd62b257f977fa62ba33f4b86d5f90e78f6ad09b72f1933160e19eb"
+  },
+  "preparation-candidate.llo": {
+    "sha256": "dd8a11707fe50c125ef0536f91f82861507e86e7a4296abf1591548026df4003"
+  },
+  "model-output-dataflow.json": {
+    "sha256": "db8203ec5cd9f6808cc2d06b9fe1b9662ab702409e7ac056bfc3c4a8d2128974"
+  },
+  "summary.json": {
+    "sha256": "e9b5744f45b034a2923fc5fa2c3ba943adc9402dffa6ac6257bd0f9c4aaf6a23"
+  },
+  "serving-closeout-audit.json": {
+    "sha256": "d90c0b7cdf3b0aab505ccf98f73d2d524912af102d86f6ea4261c441943ebf68"
+  },
+  "model-program-comparison.json": {
+    "sha256": "1bee1231a0e83480f2d21f572d38f414e0559bb8101155f2e8137714c41e33b3"
+  },
+  "model-routing-baseline-body.llo": {
+    "sha256": "4aaad44c2c989f189976a1c6b7739d677c0f5f903762abb2d496c6c030e5eb86"
+  },
+  "preparation-confirmation.json": {
+    "sha256": "0271cee79641ac619ff78ea0813b61b7a806edcd937e07da6115ca814bfcc088"
+  },
+  "serving-statistics-audit.json": {
+    "sha256": "64e6126d07166d2e22d564076a56ab5b57e178c6cc7e5898deb9fa9e41dffea6"
+  },
+  "preparation-lowering-review.json": {
+    "sha256": "6e12bd94665c66173bfa253b720fc21a25757f3745ba4dc1f4305ff201af129d"
+  },
+  "serving-request-latencies.csv": {
+    "sha256": "e7a674dcbf2b8434d864fc455148d012f9a4907b1b1396e3f53162c22d02c751"
+  },
+  "model-native-review.json": {
+    "sha256": "0649eb380fca1e47eb8e22d5cf9a2ffd3ca2c6dba7e706a643286d790d933413"
+  },
+  "captured-candidate.patch": {
+    "sha256": "eec9c7afd8c579f5e54be70787ee3216be96ceb80c1fc9e857b75fd1394f6248"
+  }
+}

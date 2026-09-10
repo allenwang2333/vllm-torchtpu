@@ -1,0 +1,204 @@
+{
+  "pairs": [
+    {
+      "pair": 0,
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "candidate": 7.233711,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/00-candidate/result.json",
+        "sha256": "64da03d257e5de5da7771ea65f73dadcd0d33659582c691a7cf559912233f196"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "baseline": 9.647617,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/00-baseline/result.json",
+        "sha256": "62aae5de25c31126ef9b3e2fc34cdb02dd8cdbf3e23110f025b77289070fa869"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 1,
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "baseline": 9.648202999999999,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/01-baseline/result.json",
+        "sha256": "61ab90a2ec4faffb75da9041045a87e4bbe61cd2b08d1789eb251b4f28b2266e"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "candidate": 7.192617,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/01-candidate/result.json",
+        "sha256": "8ae83695b64bbb005a938e672943604154615fba0af1ce832b9d42f80204255b"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 2,
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "candidate": 7.191836,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/02-candidate/result.json",
+        "sha256": "f407194543b28ce8b5f1b88a68d7f8121d7d88336d00e8fbbfb4aeec8d3c68ec"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "baseline": 9.646328,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/02-baseline/result.json",
+        "sha256": "a216019ad9f45a2304e43263b58ece81a1f8da72b45be9f10fdaa779a741ce6d"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 3,
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "baseline": 9.648710999999999,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/03-baseline/result.json",
+        "sha256": "9a5e0091d775670f35c1cd6437e4e58e726288c6642803577426bb107e669c93"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "candidate": 7.216914,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/03-candidate/result.json",
+        "sha256": "64d65534317d67c69b2c63fa23ace4777a5e02c4a5ae1e0294e9dfda92e72540"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 4,
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "baseline": 9.648672,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/04-baseline/result.json",
+        "sha256": "fa2fe18eec8f34deecacb844f07e50bebd48fccc47692ffb8fa8929e417693c9"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "candidate": 7.193047,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/04-candidate/result.json",
+        "sha256": "4a0f7406752e3e89b9edf8fbbcda245c0ef811cdea72045f44c87cbf8511fc16"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 5,
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "baseline": 9.64875,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/05-baseline/result.json",
+        "sha256": "0dddb078e646c6e7f3977597074b8205635e53e43333600857c960b1f6f9c644"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "candidate": 7.196211,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/05-candidate/result.json",
+        "sha256": "84432b02927a4baef4fb5c04be18ab02aab0afdbe5bb7c6a7a434d0c43154b3a"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 6,
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "candidate": 7.191172,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/06-candidate/result.json",
+        "sha256": "d6c7497e09582023264879ebd28e0c1b107295194d24253e718b4f797dcebe33"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "baseline": 9.648672,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/06-baseline/result.json",
+        "sha256": "cf28ccebd7e06289207367638239739133f7c7cd90cd5c80e2246319596127a1"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 7,
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "candidate": 7.20375,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/07-candidate/result.json",
+        "sha256": "4ef403f6cb9dfc05c7bcb0832f92edd5c2443065e7624db26c03fee8e08f77ce"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "baseline": 9.648086,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/07-baseline/result.json",
+        "sha256": "9806001e10fa6cfb4bae60371ca60970277ef3bf936b58d0142d08acd33be0f9"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 8,
+      "order": [
+        "baseline",
+        "candidate"
+      ],
+      "baseline": 9.648125,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/08-baseline/result.json",
+        "sha256": "946ab53e058188c996a9c22b16497cebfeec6e61ddd7003c90a1a86b9c48cf9f"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "candidate": 7.191172,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/08-candidate/result.json",
+        "sha256": "aac2c8b50a16d83ea43c8e2a4df42c639960ae1dff4e311a555bd3ed3c79221e"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    },
+    {
+      "pair": 9,
+      "order": [
+        "candidate",
+        "baseline"
+      ],
+      "candidate": 7.235703,
+      "candidate_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/09-candidate/result.json",
+        "sha256": "3b45be5b62c8ea5ea369e36ca3117cf9c96782c648528d7e11f255567fecef08"
+      },
+      "candidate_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1",
+      "baseline": 9.6475,
+      "baseline_evidence": {
+        "path": "/home/jianming_gatech/hierevo/runs/phase2-v6e-20260909/joint-routing-preparation-timing-v1/confirmation/09-baseline/result.json",
+        "sha256": "6cc88f0d7c984ee69fe931a7f9171c630dc897a979723c2e42b39dbf3e996e4f"
+      },
+      "baseline_input": "81dc328023353e0ef367ad2ebe8028b05da5395f0e2a37033a595d74df113ff1"
+    }
+  ],
+  "baseline_us": 9.6480664,
+  "candidate_us": 7.2046133,
+  "ratio_ci95": [
+    0.745739643856227,
+    0.7479452069883873
+  ],
+  "latency_reduction_percent": 25.32583212735766,
+  "performance_confirmed": true,
+  "full_model_accepted": false,
+  "scope": "Complete local routing preparation with allsix outputs; captured geometry, syntheticseed1729, skip_padded_tokens=False; frozenexactnativejoins andconfirmationcriterion; fullmodelacceptance separate"
+}

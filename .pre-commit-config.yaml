@@ -1,3 +1,5 @@
+# Preserve captured evidence byte-for-byte; verify.py checks its SHA256 manifest.
+exclude: ^evidence/qwen35-routing/.*\.(llo|gz|json|patch|csv)$
 default_install_hook_types:
   - pre-commit
   - commit-msg
