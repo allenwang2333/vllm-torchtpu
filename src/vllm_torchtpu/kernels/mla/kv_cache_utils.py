@@ -224,12 +224,12 @@ def update_sparse_mla_kv_cache_dcp(
     The all-gather disappears entirely rather than moving.
 
     Ownership follows the same interleave the readers assume, so the indexer
-    cache (`_pcp_scatter_indexer_k`), the latent cache written here, and the
-    top-k coordinates from `streamindex_topk_dcp` are all in one space: a
-    virtual page spans `page_size * dcp_size` positions, and rank `r` holds the
-    `interleave_size`-sized chunks at offset `r * interleave_size` within each
-    `dcp_size * interleave_size` cycle. That identity is what lets a global
-    top-k index be handed to a rank as a plain local cache index.
+    cache (`mla_attention_op._cp_scatter_indexer_k`), the latent cache written
+    here, and the top-k coordinates from `streamindex_topk_dcp` are all in one
+    space: a virtual page spans `page_size * dcp_size` positions, and rank `r`
+    holds the `interleave_size`-sized chunks at offset `r * interleave_size`
+    within each `dcp_size * interleave_size` cycle. That identity is what lets
+    a global top-k index be handed to a rank as a plain local cache index.
 
     Rows owned by another rank are dropped by aiming them at an out-of-bounds
     page -- the same trick the unsharded scatter uses for padding, and it is
