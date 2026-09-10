@@ -23,6 +23,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_torchtpu.distributed.pcp import (PcpGroupLayout,
+                                           get_or_create_pcp_mesh,
+                                           get_pcp_group_layout)
+
+# The JAX mesh axis the DCP kernels shard the KV cache over. Defined here
+# rather than beside the kernels because the dependency only runs one way:
+# the kernels already import this package, so the mesh built here and the
+# partition specs built there can share one constant without the distributed
+# layer having to reach back into a kernel module.
+DCP_AXIS_NAME = "dcp"
+
 
 def get_dcp_group() -> Any | None:
     """Return vLLM's DCP GroupCoordinator, or None if not initialized."""
@@ -41,3 +52,26 @@ def get_dcp_rank() -> int:
 def get_dcp_world_size() -> int:
     group = get_dcp_group()
     return 1 if group is None else int(group.world_size)
+
+
+def get_dcp_group_layout() -> PcpGroupLayout:
+    """The DCP group's rank order and the TPU device each rank sits on."""
+    return get_pcp_group_layout(get_dcp_group())
+
+
+def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
+    """Build the op-local JAX mesh for the DCP axis.
+
+    Shares `pcp.py`'s implementation because none of it is PCP-specific -- the
+    mesh is just this group's devices in rank order. Under `tp=N, dcp=N` the
+    DCP group covers the same devices as the TP group, and the mesh cache is
+    keyed on the axis name as well as the device ids, so a run with both axes
+    live keeps two distinct meshes rather than aliasing them.
+
+    The axis name defaults to `DCP_AXIS_NAME`; the kernels take the same
+    constant from here, so a caller that overrides it has to override it in
+    both places or the mesh and the partition specs will not agree.
+    """
+    if axis_name is None:
+        axis_name = DCP_AXIS_NAME
+    return get_or_create_pcp_mesh(axis_name=axis_name, group=get_dcp_group())

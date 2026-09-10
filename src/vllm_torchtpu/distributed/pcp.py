@@ -151,15 +151,22 @@ def _collect_rank_to_device_id(group: Any, global_rank: int,
     return rank_to_device_id
 
 
-def get_pcp_group_layout() -> PcpGroupLayout:
+def get_pcp_group_layout(group: Any | None = None) -> PcpGroupLayout:
     """Return the current PCP group's rank order and TPU device-id order.
 
     The order of ``device_ids`` mirrors ``get_pcp_group().ranks``. This is the
     order a PCP Pallas mesh should use so TP+PCP layouts form one PCP ring per
     TP lane.
+
+    Args:
+      group: the process group to describe. Defaults to the PCP group; the DCP
+        path passes its own group, because nothing below is PCP-specific --
+        the layout is just "this group's ranks, in order, and the TPU device
+        each one sits on".
     """
 
-    group = get_pcp_group()
+    if group is None:
+        group = get_pcp_group()
     global_rank = _get_current_global_rank()
     device_id = _get_tpu_global_device_id()
     if group is None or int(group.world_size) == 1:
@@ -195,14 +202,19 @@ def get_pcp_group_layout() -> PcpGroupLayout:
     return layout
 
 
-def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
+def get_or_create_pcp_mesh(axis_name: str = "pcp",
+                           group: Any | None = None) -> Any:
     """Build a JAX mesh ordered by the current vLLM PCP group.
 
     This helper is intentionally op-local: it does not replace the runner's
     normal single-device model mesh.
+
+    `group` defaults to the PCP group; `dcp.get_or_create_dcp_mesh` passes the
+    DCP group instead. The mesh cache is keyed on `(axis_name, device_ids)`, so
+    the two coexist even when they cover the same devices.
     """
 
-    layout = get_pcp_group_layout()
+    layout = get_pcp_group_layout(group)
     cache_key = (axis_name, layout.device_ids)
     cached = _MESH_CACHE.get(cache_key)
     if cached is not None:
@@ -222,8 +234,9 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
     ]
     if missing:
         raise RuntimeError(
-            "Cannot build PCP mesh because JAX does not expose all PCP TPU "
-            f"device ids: missing={missing}, layout={layout}, "
+            f"Cannot build the '{axis_name}' mesh because JAX does not "
+            f"expose all of the group's TPU device ids: missing={missing}, "
+            f"layout={layout}, "
             f"jax_device_ids={sorted(devices_by_id)}")
 
     mesh_devices = np.asarray(
@@ -244,7 +257,7 @@ def get_or_create_pcp_mesh(axis_name: str = "pcp") -> Any:
         for position, (rank, device_id, device) in enumerate(
             zip(layout.ranks, layout.device_ids, mesh_devices)))
     logger.info(
-        "PCP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
+        "CP device mesh | axis=%s world_size=%d my_rank_in_group=%d | %s",
         axis_name, layout.world_size, layout.rank_in_group, positions)
 
     _MESH_CACHE[cache_key] = mesh
