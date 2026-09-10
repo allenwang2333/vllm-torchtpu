@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
+from vllm_torchtpu.distributed.kv_transfer import doorbell
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -1243,6 +1244,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 attn_metadata.request_distribution,
                 sink,
             )
+
+        # Ring this layer's doorbell so a host reader can see the layer's KV
+        # land without waiting for the rest of the pass. Passing the cache the
+        # kernel just wrote is what orders the store after it. Costs nothing
+        # on a worker with no doorbells. See distributed/kv_transfer/doorbell.
+        if ctx.doorbells is not None:
+            doorbell.ring_for(
+                ctx.doorbells, layer.layer_name, ctx.kv_cache_bundle
+                if ctx.kv_cache_bundle is not None else kv_cache)
 
         # Drop the padding added above so callers see the layer's own width.
         if outputs.shape[-1] > self.head_size:

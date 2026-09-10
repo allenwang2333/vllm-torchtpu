@@ -32,6 +32,10 @@ class VllmModelWrapperContext:
     # attention forward execution routes through the bundled RPA custom op with
     # in-place buffer donation, bypassing the per-layer tensor views bound by vLLM.
     kv_cache_bundle: Optional[torch.Tensor] = None
+    # Per-layer progress counters this worker rings from inside the forward
+    # pass, or None on a worker that has none. A `DoorbellSet`, untyped here
+    # to keep this module free of a kv_transfer import.
+    doorbells: Optional[object] = None
 
 
 _vllm_model_wrapper_context: Optional[VllmModelWrapperContext] = None
@@ -53,6 +57,7 @@ def set_vllm_model_wrapper_context(
     layer_name_to_kvcache_index: Optional[Dict[str, int]] = None,
     vllm_config: Optional[object] = None,
     kv_cache_bundle: Optional[torch.Tensor] = None,
+    doorbells: Optional[object] = None,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
@@ -62,6 +67,7 @@ def set_vllm_model_wrapper_context(
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
         kv_cache_bundle=kv_cache_bundle,
+        doorbells=doorbells,
     )
 
     try:

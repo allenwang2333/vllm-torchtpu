@@ -73,6 +73,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer import doorbell
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
     materialize_kv_cache_tensors)
@@ -599,6 +600,11 @@ class TPUModelRunner(GPUModelRunner):
         # the bundled RPA kernel when these are set.
         self._kv_cache_bundle: torch.Tensor | None = None
         self._kv_cache_bundle_layer_index: dict[str, int] = {}
+
+        # Per-layer progress counters rung from inside the forward pass. None
+        # unless TPU_KV_DOORBELL is set. Nothing reads them here; the reader
+        # belongs in raiden. See `distributed.kv_transfer.doorbell`.
+        self._doorbells: doorbell.DoorbellSet | None = None
 
         # EP-DP lockstep state, refreshed each step by execute_model /
         # execute_dummy_batch: the coordinated (max-across-ranks) token
@@ -3684,12 +3690,25 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
+                    doorbells=self._doorbells,
             ):
+                # Advance the counter before the pass, so every bell this pass
+                # rings carries a value no earlier pass wrote. The buffer
+                # outlives requests, and a repeated value would read as
+                # progress that has not happened.
+                if self._doorbells is not None:
+                    self._doorbells.next_generation()
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                 )
+
+            # Reads the bells for the first few steps only, so a ring that
+            # silently does nothing is visible without a device sync on every
+            # step contaminating the throughput this stage is measuring.
+            if self._doorbells is not None:
+                self._doorbells.maybe_verify()
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -4749,6 +4768,7 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
+                    doorbells=self._doorbells,
                 ),
         ):
             out, _ = self.forward_model(input_ids=input_ids,
@@ -6507,6 +6527,11 @@ class TPUModelRunner(GPUModelRunner):
             self.mamba_slot_read_offsets = torch.zeros(
                 allocated_mamba_num_blocks, dtype=torch.int32).to(self.device)
 
+        # Doorbells have to exist before precompile, both so the ring is in
+        # the traced graph and so its cost shows up in the compiled program
+        # rather than as a retrace on the first real step.
+        self._maybe_initialize_doorbells()
+
         # Precompile after KV cache allocation so XLA's buffer assignment sees
         # the same HBM pressure as runtime.
         # Rebuild custom attention ops here too: only now are block sizes final.
@@ -6514,6 +6539,41 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
+
+    def _maybe_initialize_doorbells(self) -> None:
+        """Allocate the doorbell buffer, if enabled.
+
+        One group per full-attention layer, in the order vLLM reports them.
+        The GDN layers never reach this attention backend, so they have no
+        group and never ring.
+        """
+        if not envs.TPU_KV_DOORBELL:
+            return
+
+        from vllm_torchtpu.layers.vllm.attention import \
+            PallasAttentionBackendImpl
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        layer_names = [
+            name for name, attn_layer in layers.items() if isinstance(
+                getattr(attn_layer, "impl", None), PallasAttentionBackendImpl)
+        ]
+        if not layer_names:
+            logger.info("TPU_KV_DOORBELL is set but this worker has no "
+                        "eligible attention layers; skipping doorbells.")
+            return
+
+        bells = doorbell.DoorbellSet(layer_names, self.device)
+
+        # The ring's `announced` operand is the KV cache, so it needs the same
+        # mesh and sharding the attention kernel runs under.
+        use_pcp = self.parallel_config.prefill_context_parallel_size > 1
+        mesh, _, specs = PallasAttentionBackendImpl._select_kernel_mesh(
+            self.mesh, use_pcp)
+        bells.prebuild(mesh, specs[0] if specs else None)
+
+        self._doorbells = bells
+        logger.info("KV doorbells allocated over %d attention layers",
+                    len(layer_names))
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""

@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_KV_DOORBELL: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
@@ -442,6 +443,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Each full-attention layer stores a step counter into a small HBM buffer
+    # once its slice of the KV cache is written, so a reader can tell how far
+    # the forward pass has got without waiting for it to finish. Only the
+    # write exists so far; the reader belongs in raiden's transfer loop.
+    # See `distributed.kv_transfer.doorbell`.
+    "TPU_KV_DOORBELL":
+    env_bool("TPU_KV_DOORBELL"),
     # Evict host page cache for checkpoint weight files via posix_fadvise
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":
