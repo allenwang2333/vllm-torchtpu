@@ -1611,13 +1611,25 @@ discharged or dead: the count-pass probe returned (`probes/15`), `probes/11` ret
 
 **`OPEN` versions — none may remain when the step closes.**
 
+⛔ **The closing audit against that rule, stated plainly rather than asserted.** Five rows below are
+still `OPEN` at the close, and the rule is satisfied only because each has a *named* closer that is
+already scheduled. Anything not in this list would be a genuine violation:
+
+| still `OPEN` | what closes it | when |
+| --- | --- | --- |
+| `v11`, `v12` | their **step-3 measurement** — each has one `unmodelled` term (a strided DMA; two `tpu.bitcast`s) and both are on the build list. Neither term can flip a sign, only shrink a prize | step 3 |
+| `v5` | ⏳ **`probes/16`, in flight.** Its verdict turns on the 3.1× `probes/07`-vs-`probes/09` sweep-price conflict | before step 3 writes it |
+| `v10`'s pass count | **host simulation**, no job — the rate it rested on is already `measured` | step 3, with the variant |
+| the `hist0` density question | ⏳ folded into `probes/16`, same region | with `v5` |
+| **D7** | ⛔ **the one that does not have a cheap closer any more.** See its row | ⚠ carried forward |
+
 | node | what closes it | cost |
 | --- | --- | --- |
 | `v3` fused-emit | ✅ **CLOSED by `probes/15` (`j-78f7f537`).** The store is **6.675 µs/pass**, flat in density, and `probes/13` had overcharged it **2.08×**. Band **≈ −20.5%…−14.9%**; break-even `cnt_eff` **8531** is above the global max 6495, so **its sign is settled without building it** | step-3 variant |
 | ⚠ **NEW — is `hist0`'s sheet price understated?** | `probes/15` found `instruments/sctopk_2stage_bench.py:246` masks its "dense" arm on raw fp32 bits, dropping every negative score (~50% at `standard_normal`, and production is 81.7% negative). If the sheet's `hist0` came from that arm it is too low, and **`v10` is worth more than −12.2%**. §7. ⏳ `probes/16` is in the same region — ask it before opening a new job | probably no job |
 | **`v11`** retiled output emit | ✅ **both conditions CLOSED, both favourably.** (a) feasibility, `probes/17` — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) in-model, `probes/14` Q2 — the retile **survives** in the real entry, as an `S(1)` staging copy rather than a ROOT reshape. Same 40 MiB, different op, so the "`REJECTED` with prize 0" leg is withdrawn. ⚠ The 10.007 µs was measured on the ROOT reshape; no arm has yet deleted the staging copy | no job |
 | **`v12`** (= **U2**) `f32` input, in-register reinterpret | ✅ **feasibility CLOSED by `probes/17`** — reachable, but **three edits, not one**: the DMA is dtype-checked, so the scratch dtype must change too and the reinterpret moves in-register. ✅ **production path CLOSED by `probes/14` Q1** — materialised, so the prize is a firm ≈ −16.8%, the largest single edge prize in the file. One term still open: the price of the two in-body `tpu.bitcast`s, which can only shrink the prize, not flip it | no job |
-| **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. Free: read `StreamIdxTC-*` durations from an existing xprof | no job |
+| **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. ⛔ **And its "free, no job" closer is gone.** The plan was to read `StreamIdxTC-*` durations out of an existing xprof; `probes/14` tried exactly that on `j-ecf4ee85` and got **0 device events**, because that step took branch 1 and the whole chain was elided. `t_TC` is not obtainable from any capture in which the kernel did not run. The cost has changed class — from "read a file" to **step selection**: capture a prefill step past chunk 1, or a mixed step. It stays `OPEN` and is **carried into step 3** rather than closed here | ⚠ **a capture, not a file read** |
 | `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
 | `v6` keep-all-fastpath | ⛔ **REJECTED for this workload by `probes/14`** — the outer `lax.cond` (`max(seq_lens) <= 2048`) elides the kernel in exactly the chunks D14 said would sweep to discover "keep everything", and the set coincidence is *exact* because `k` is a whole multiple of the chunk size. **Prize 0 `measured`** (all 96 `batch_composition_stats_*.json`: `num_reqs: 1`), **`unmodelled` in steady-state serving** — a mixed batch would reopen it | no job |
@@ -1647,7 +1659,17 @@ discharged or dead: the count-pass probe returned (`probes/15`), `probes/11` ret
   score buffer's minor dimension is one lane-tile, so the flatten is a free `bitcast`. The ~73 µs
   was an artifact of the microbenchmark's `jit` entry aval. Nothing to hand off. ✅ Its real payoff
   was to the denominator (§1), and it went in our favour.
-- ⚠ **The output retiling, 10.007 µs — a candidate `carried:` handoff, and the only survivor of D3.**
+- ✅ **The output retiling, 10.007 µs — RESOLVED, and it is a *variant*, not a handoff.** ⛔ The
+  bullet below is kept for its evidence but its conclusion is superseded twice over. (1) Its blocking
+  condition — "does it exist at all in-model?" — is **answered yes** by `probes/14` Q2: in the real
+  entry the retile survives as an `S(1)` staging copy rather than a `ROOT reshape`, a different op
+  moving the same 40 MiB. It is **not** an artifact of the same class as the input relayout was.
+  (2) `probes/17` then showed the kernel can emit the consumer's tiling directly, which makes this
+  reachable *from inside* the kernel. So it is node **`v11`**, rank 7 in §9a, on the step-3 build
+  list — and the "candidate handoff" framing is withdrawn. ⚠ One caveat survives: the 10.007 µs was
+  measured against the ROOT reshape, and no arm has yet deleted the staging copy.
+
+- ⚠ **The original bullet, kept for its evidence:**
   `ROOT %reshape.1 = s32[1024,2048]{1,0:T(8,128)} reshape(…call-done)` retiles the kernel's flat
   `s32[2097152]{0:T(1024)}` output, and it **is** in the production entry (`measured` 10.007 µs =
   1.251 µs/MiB, `A0_flatout`). Of the five things a handoff owes it has four: *what to change* — have
