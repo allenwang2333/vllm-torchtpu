@@ -1059,6 +1059,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
                     linear_config=self.linear_config,
                     linear_quant_config=self._linear_quant_config,
                 ))
+        elif self.online_fp8:
+            from vllm_torchtpu.layers.vllm.quantization.online_fp8 import \
+                quantize_online_fp8
+            weight, weight_scale, requant_block_size = quantize_online_fp8(
+                layer.weight.data, self.online_fp8_policy)
+            requant_dtype_name = "fp8"
         else:
             requant_dtype = torch.float8_e4m3fn
             requant_block_size = None
