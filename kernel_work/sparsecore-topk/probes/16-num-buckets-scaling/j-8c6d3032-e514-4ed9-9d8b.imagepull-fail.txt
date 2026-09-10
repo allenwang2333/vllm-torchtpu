@@ -1,0 +1,3 @@
+Error reading logs from GCS: failed to open object reader for jobs/j-8c6d3032-e514-4ed9-9d8b/logs/j-8c6d3032-e514-4ed9-9d8b-tpu-job-0/j-8c6d3032-e514-4ed9-9d8b-tpu-job-0-0-tv6c5/command-container.log: storage: object doesn't exist.
+Please use log explorer as a backup for now:
+https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22%0Aresource.labels.pod_name%3D%22j-8c6d3032-e514-4ed9-9d8b-tpu-job-0-0-tv6c5%22%0Aresource.labels.container_name%3D%22command-container%22;startTime=2026-09-10T17:23:35.705Z;endTime=2026-09-10T19:38:46.535Z?project=cloud-tpu-inference-test

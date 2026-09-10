@@ -170,13 +170,27 @@ percentages of **454.602 µs**, a total retracted at `:321`. Against `B` = 326.7
 5.87 / 13.10 / **18.98%**. (b) *Superseded magnitude*: stage C″ adopts `probes/09`'s directly
 measured **18.866 µs for the whole sweep**, not 19.192 per level, which puts the region at **5.77%**
 at ρ=1 and **8.34%** at production ρ.
-⛔ **And 19.192 vs `probes/09` is an open contradiction, not a refinement** — 07's marginal slope
-implies 58.18 µs across the 3.031 executions at ρ=1 against 09's measured 18.866, a **3.1×**
-disagreement between two `measured` numbers from different jobs with different arm constructions.
-This line and stage C″ currently quote opposite sides of it. ⏳ `probes/16` adjudicates via an
-NB=256 control built the same way as its other arms.
-Deleting the replication is still a leading move; **its rank is not quotable until the conflict is
-settled**, and it is the one the design graph's required `mutate` edge is built on.
+⛔ ~~And 19.192 vs `probes/09` is an open contradiction, not a refinement~~ — ✅ **ADJUDICATED by
+`probes/16` (`j-c47cfec1`), and `probes/09` wins decisively.** The NB=256 control, built the same
+way as its NB=64 and NB=512 siblings and byte-identical to 09's arms (six md5s gated in-job),
+measured the sweep at **18.967 µs** — **+0.54%** from 09's 18.866 and **−67.39%** from 07's implied
+58.17 µs. So stage C″ was quoting the right side all along, and this line was quoting the wrong one.
+
+⛔ **The mechanism of 07's error, which matters more than the number.** `probes/07` obtained
+19.192 µs/level as a **marginal slope from deleting a level**, and deleting a level removes the
+sweep *and everything else that level does* — the `L` walk, the scatter, the carries. It is not the
+sweep. That it lands numerically near the sweep's *total* (18.967) is a coincidence, and a costly
+one: it is exactly the shape of coincidence that survives review. ⚠ **Do not price a region by
+deleting the loop iteration that contains it** — measure the region.
+
+✅ **`fixed(NB) = 0.299 + 0.074870·NB`**, r² = 0.99934, from 5.375 / 18.967 / 38.845 µs at
+NB = 64 / 256 / 512. The intercept is **1.6%** of the NB=256 sweep, so the sweep really is
+essentially proportional to `NB` — but see `design.md` §5 `v5`, which is **REFUTED** anyway, because
+the L0 histogram moves the *other* way with `NB` and moves further.
+
+Deleting the replication (`v2`) is unaffected by any of this and remains a leading move — it is
+`measured` at 12.195 µs by removal, and it is the edge the design graph's required `mutate` is built
+on.
 
 **But V4 was not where the missing ~150 µs went, and the way that error was made is the transferable
 part.** `report.md` §5d had one free parameter and one equation, so *everything* `probes/03` had not
@@ -488,8 +502,16 @@ against probe 08's 327.166 (−0.12%) from a byte-identical source.
 `emit` reproduces across two jobs to 0.23%. **No prize is divided by 1.625.**
 
 The sweep splits four ways, additive to 0.2%: `zero_priv` **9.238** · `fold_priv` 4.900 ·
-`scan_glob` 3.498 · `find_bucket` 1.200. Half the sweep is a **dense 256-bucket clear**, not a
+`scan_glob` 3.498 · ~~`find_bucket` 1.200~~. Half the sweep is a **dense 256-bucket clear**, not a
 carried scan — the opposite of what D10/D13 assumed.
+
+✅ **`probes/16` reproduced this split at three radices and it holds — with one correction.**
+At NB = 64 / 256 / 512: `zero_priv` 2.368 / 9.927 / 20.234 (**52% of the sweep**, scaling exactly
+with `NB`, r² = 1.0000); `fold_priv` 1.770 / 5.532 / 11.233; `scan_glob` 1.476 / 3.930 / 7.147,
+**the only primitive with a real intercept** (0.675 µs). ⛔ **`find_bucket` is 0.047 / −1.385 /
+3.634 — unresolved at every radix, and negative at one.** It is below the 1.859 µs resolution floor,
+so **stop carrying `probes/09`'s 1.200 as a number**: the sweep is three priced primitives plus
+noise. The looseness in the additivity check (1.053 / 0.949 / 1.088) is all of it.
 
 One split is available without another job: probe 08's `-sweep` = 175.842 leaves
 `hist0 + emit_degenerate + fill_spurious = 84.762`, so **hist0 ≤ 84.76** and refinement hists

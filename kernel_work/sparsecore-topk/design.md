@@ -79,10 +79,10 @@ must not** — step 3 measures against a production-shaped entry and quotes prod
   removed. It is the only node with a measurement, and it is bit-exact. ⚠ It is **rank 6** of 7 on
   predicted prize; it leads on evidence, not on size. **The ranking is §9a**, and it supersedes the
   `rank N` labels in the plan headings.
-- **Top of the shortlist:** `v3` fused emit (≈ −25.0% production), then ⏳ `v5` (blocked on
-  `probes/16`), then `v12` (≈ −16.8%, firm), then `v10` (≈ −14.9%). ⛔ `v3` and `v10` are
-  alternative roots and **compete**; the two edge nodes `v12` and `v11` compose with everything and
-  are worth ≈ −23% between them for seven edits.
+- **The shortlist is six**, ranked in §9a: `v3` fused emit (≈ **−25.0%** production), `v12`
+  (≈ −16.8%, firm), `v10` (≈ −14.9%), `v4` (≤ −8.64%), `v2` (−7.83%), `v11` (≤ −6.42%). ⛔ `v3` and
+  `v10` are alternative roots and **compete**; the two edge nodes `v12` and `v11` compose with
+  everything and are worth ≈ −23% between them for seven edits.
 - **189.98 µs modelled-from-measured → 177.79 µs**, **−6.42%** (6.4% faster), from `R1`'s measured
   12.195 µs (`j-300d4690`, bit-identical output 1024/1024 and 64/64 rows). In production
   percentages that is **−7.83%**.
@@ -90,7 +90,15 @@ must not** — step 3 measures against a production-shaped entry and quotes prod
   §1 carried a pessimistic 95.73 µs leg until `probes/10` returned; **that leg is withdrawn**, and
   `probes/11` replaced the 75.683 µs non-kernel residual with a **measured 5.385 µs**.
 - **Versions:** **10 explored** (`v1`–`v7`, `v10`–`v12`; there is no `v8`/`v9`), 1 built and
-  measured, **1 rewind** — `v6` is killed by `probes/14`, on a trace rather than on a microbenchmark.
+  measured, **1 rewind**, and **2 killed this wave** — `v6` by `probes/14` on a trace, `v5` by
+  `probes/16` on a microbenchmark.
+- ⛔ **Both kills came the same way, and neither node died of its own arithmetic.** Each deleted work
+  from a region correctly — `v5`'s sweep really is proportional to `NB` (r² 0.99934), `v6`'s short
+  rows really are a quarter of prefill — and each had the saving absorbed by a term the model had **no
+  entry for**: the L0 histogram grows as `NB` shrinks (+53.420 µs at NB=64), and an outer `lax.cond`
+  already elides the whole kernel on `v6`'s steps. **§8b.** This is the most transferable thing the
+  wave produced, and it sets a rule for step 3: **every arm measures the whole kernel, not the region
+  it edits.**
 - **The two largest prizes are both re-priced and both grew.** `v3` fused-emit ≈ **−20.5%**
   (−14.9% at the barriered bound), with its **sign settled without building it**: break-even
   `cnt_eff` 8531 exceeds the global maximum 6495. `v10` sample-and-count ≈ **−12.2%**, with the rate
@@ -254,7 +262,7 @@ regions are additive and non-overlapping.
 | --- | ---: | --- |
 | `A0_flatin` | **−60.416 µs** | the whole input path — df-call, `copy.3`, and the `bitcast-convert` fusion |
 | `A0_s32in` | −26.251 µs | the `bitcast-convert` fusion only; `copy.3` survives |
-| ⇒ `copy.3` alone | **34.165 µs** | by subtraction; 40 MiB moved twice ⇒ 2.46 TB/s, a plausible full-buffer rate |
+| ⇒ `copy.3` alone | **34.165 µs** | by subtraction; 40 MiB moved twice ⇒ 2.46 TB/s, a plausible full-buffer rate. ✅ **Independently confirmed by `probes/16`**, which was not looking for it: its 3-D entry HLO is clean (0 df-calls, 0 copies) against 8 df-calls on the 2-D entry, and it *timed* the relayout at **+32.994 µs** — **3.4%** from this number, in a different job and a different pool |
 | `A0_flatout` | −10.007 µs | the output retiling `ROOT %reshape` |
 | `A0_flatio` | −70.511 µs | both; **leaves a 5.385 µs residual** |
 | `A0_donate` | +1.557 µs | ✅ **null** — inside the spread, HLO unchanged. Not an aliasing artifact |
@@ -384,8 +392,8 @@ v1  incumbent: 16x-replicated 256-bucket radix select      189.98 us  measured+r
 │  │  │                                 LINEAR in NUM_BUCKETS, and is half the
 │  │  │                                 sweep. Never swept. (D9)
 │  │  │                    ◄ judged:    NOT YET -- three compile-time arms
-│  │  v5  NB-tuned                                         unmodelled            OPEN
-│  │                                                                    ^ mandatory probe, §10
+│  │  v5  NB-tuned                                         measured          REFUTED
+│  │                                    ^ probes/16: won both open terms, lost on a third
 │  │
 │  ├─[remove] block-sum -> cumsum -> add back: depth 16 -> 3 on scan_glob        ∥
 │  │  │       and find_bucket.  exact
@@ -491,7 +499,7 @@ The per-op sheet, from stage C″ (`probes/09` + `probes/08`), at production ρ:
 | `hist0` dense scatter | 33.91 | 17.8% | yes | modelled from `j-300d4690` |
 | `emit` | 33.54 | 17.7% | yes | measured (`j-4e0df30a`) |
 | refinement `hist` | 20.08 | 10.6% | yes, and gated by `keep_all` | modelled |
-| V4 sweeps (`zero_priv` 9.238 · `fold_priv` 4.900 · `scan_glob` 3.498 · `find_bucket` 1.200) | 15.63 | 8.2% | no | measured (`j-4e0df30a`) |
+| V4 sweeps (`zero_priv` 9.238 · `fold_priv` 4.900 · `scan_glob` 3.498 · ⛔ ~~`find_bucket` 1.200~~ — `probes/16` finds it **unresolved at every radix**, 0.047 / −1.385 / 3.634 at NB 64/256/512, below a 1.859 µs floor; three primitives plus noise) | 15.63 | 8.2% | no | measured (`j-4e0df30a`), split reproduced at three radices by `probes/16` (`j-c47cfec1`) |
 | score DMA | 13.469 | 7.1% | **no — static `slice_len`** | measured (`j-300d4690`) |
 | output DMA | 5.872 | 3.1% | no | measured (`j-4e0df30a`) |
 | `cvt` | −8.20 | −4.3% | yes | measured (`j-300d4690`) — **negative, and real** |
@@ -845,8 +853,28 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **Mandatory probe (§10):** re-run the `probes/09` sweep split at `NUM_BUCKETS ∈ {64, 512}` with 256
   as an in-pool control, **one arm construction across all three** — which fixes the slope, the
   intercept **and** the 07-vs-09 conflict together, since the NB=256 absolute adjudicates it.
-  ⏳ **dispatched, `probes/16-num-buckets-scaling`**
-- **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory probe (§10)
+  ✅ **RETURNED — `probes/16` (`j-c47cfec1`), 22 arms in one pool, 12 interleaved rounds**
+
+- ⛔ **VERDICT: `v5` is REFUTED — and *not* by either term it was open on.** Both open terms resolved
+  **in `v5`'s favour**, and it lost anyway on a term the model never had:
+
+  | term | resolution |
+  | --- | --- |
+  | the intercept `c` | ✅ **`c = 0.299 µs`**, from a 3-point fit `fixed(NB) = 0.299 + 0.074870·NB`, r² = **0.99934** (5.375 / 18.967 / 38.845 µs at NB = 64 / 256 / 512). That is **1.6%** of the NB=256 sweep, far below the 11.12 µs break-even. `probes/13`'s zero-intercept proportionality was essentially right |
+  | **07 vs 09** | ✅ **09 wins, decisively.** Measured 18.967 µs is **+0.54%** from 09's 18.866 and **−67.39%** from 07's implied 58.17 µs. The arms are byte-identical to 09's (six md5s gated in-job), so this reproduces 09's construction in a fresh pool |
+  | ⛔ **the term the model omitted** | The same pool priced `E0-swp` — everything *but* the sweep, i.e. DMA + `cvt` + the dense L0 histogram — at **259.647 / 206.227 / 177.546 µs** at NB = 64 / 256 / 512. **The L0 histogram is strongly NB-dependent in the *opposite* direction**: fewer buckets means more `addupdate_scatter` address collisions, so **+53.420 µs at NB=64** and **−28.681 µs at NB=512** |
+
+  Adding that term (× ρ) turns the headline round: **NB=64 goes from −32.05% to −5.28% ± 11.19%** —
+  ⛔ **unresolved, not a win** — and NB=512 goes to **+33.75%**. Two further unmeasured terms bias
+  the *same* way (refinement match density is 1/NB; `levels_crit(64)` is a CPU replay), so the
+  central estimate is if anything optimistic.
+
+- ⛔ **Do not cite the job log's own `V5_VERDICT: SURVIVES` line.** The probe computed it under the
+  briefed premise — sweep-only — that its own `E0-swp` arms falsify. The prober flagged this itself.
+- **Built?** **No** · **Measured:** — · **Verdict:** ⛔ **REFUTED.** Not built. The mechanism is real
+  and the sweep does shrink linearly with `NB`; it is simply paid for at the histogram, which is
+  larger. ⚠ **This is the second time in this exercise that shrinking one region grew another** —
+  see `v6`, and §8.
 - ⚠ **Not additive with `v2`.** `v2` already shrinks the clear 16×; `v5` shrinks what is left. Measure
   the pair.
 
@@ -1069,6 +1097,8 @@ Raw output under `probes/`; nothing pasted here.
 
 | 11 | probe `15-mandatory-v3-v10` | the two mandatory rates: a count pass vs the dense L0 histogram (`v10`), and a fused conditional store as a **slope in density** (`v3`) | `probes/15-…/`, `j-78f7f537` | closed **both** mandatory terms in one pool, one job. `v10`'s rate is **1.30× better than modelled** and **at the walk floor**, so its bimodality collapses onto the cheap branch; `v3`'s store was overcharged **2.08×** by `probes/13`. Both nodes grew, so it does **not** adjudicate between them. ⚠ Also found the bug in `instruments/sctopk_2stage_bench.py:851` — see §7 |
 | 12 | probe `17-emit-and-input-dtype-feasibility` | are `v11` and `v12`/U2 reachable at all? | `probes/17-…/`, **no job** — AOT `static-compile` | closed both feasibility terms. Found U2 is **three edits, not one** (`tpu.enqueue_dma` is dtype-checked); corrected stage E's 16×512 B DMA model to `modelled`; confirmed the two compose. ⚠ **Method worth reusing:** `topologies.get_topology_desc("tpu7x:2x2x1")` runs the full XLA-TPU + Mosaic **SparseCore** pipeline on the host with **no TPU attached** — the 8 MiB-scratch control fails with a SparseCore `spmem` allocator error, which is what makes "AOT COMPILED ok" mean the backend accepted it |
+| 13 | probe `16-num-buckets-scaling` | fix the sweep's `NB` slope **and** intercept, and adjudicate the 3.1× `probes/07`-vs-`probes/09` conflict | `probes/16-…/`, `j-c47cfec1` (22 arms, one pool, 12 interleaved rounds; floor **1.859 µs**) | ✅ **both, plus a third thing that killed the node.** `fixed(NB) = 0.299 + 0.074870·NB`, r² 0.99934 — intercept 1.6% of the sweep. **09 wins the conflict**: 18.967 measured vs 09's 18.866 (+0.54%) and 07's implied 58.17 (−67.39%). ⛔ But `E0-swp` shows the **L0 histogram is NB-dependent the other way** (+53.420 µs at NB=64), which **REFUTES `v5`**. Also: `find_bucket` unresolved at every radix — stop carrying 1.200. Also: ⛔ **retracts `probes/15`'s instrument-bug claim in full** (§7) |
+| — | *(main thread, no job)* | re-verify that retraction rather than take it on trust | four lines of `numpy` | ✅ **confirmed, and more strongly than `probes/16` claimed**: the mask density is **1.000000 under *both* readings**, so the claim fails even granting its own false premise. §7 |
 
 **Instrument runs that changed nothing:** none — every probe above moved at least one verdict, which
 is itself unusual enough to note rather than take as a good sign. See §8.
@@ -1088,6 +1118,15 @@ is itself unusual enough to note rather than take as a good sign. See §8.
    cluster time. ⚠ It needs a negative control to mean anything: an 8 MiB VMEM scratch must fail
    with `E3000: CompileTimeSparseCoreAllocationFailure … memory space spmem`, which proves the
    SparseCore backend ran rather than the MLIR verifier alone.
+4. ⛔ **The image tag this exercise has been measuring against is not immutable, and it moved.**
+   `probes/16` found that tag `fa63d6df` now ships `sparsecore_topk.py` md5 `1a89d451…`, **not** the
+   `44353b34…` (commit `b11b6eb6`) that `probes/07`–`09` measured. `j-8c6d3032` then died on
+   `ImagePullBackOff` because the full-sha tag is gone from the registry, and `j-a70d48d9` was
+   correctly refused by the in-job md5 gate. Probes 14 and 15 hit the same gate independently.
+   **Any probe re-running against that tag is measuring different source than probes 07–11 did**, and
+   nothing in the tag's name says so. Two consequences for step 3: ship the subject under `subject/`
+   and `--map-dir` it, and **keep the in-job md5 gate on every arm** — it has now caught this four
+   times and has never produced a false positive.
 
 ## 7. What `references/` got wrong
 
@@ -1097,13 +1136,33 @@ is itself unusual enough to note rather than take as a good sign. See §8.
 | `references/` HBM rates | 337 GB/s for HBM-bound streaming; no rate at all for a **VMEM-resident SparseCore pass** | `probes/03` measures VMEM-resident passes directly; the SparseCore HBM *read* rate is 2138 GB/s with a 21.9 µs intercept, and the shipping 40 KiB slice runs at 1255 GB/s | **narrower than stated** | add the VMEM-resident pass rates and say the HBM figure is asymptotic, with the intercept | **no** |
 | `hardware_map.md` L6, from `probes/07` (`j-098b260f`) — an internal claim, held to the same standard | V4's 16× multiplicity costs **19.192 µs per level = 13.6% of the prefill kernel**, i.e. ~62 µs over 3.231 levels | ⚠ `R1` removes the replication entirely, bit-exactly, for **12.195 µs total** (`j-300d4690`) — **~5× less** | **wrong** | the per-level fit attributed the level's *walk* to its replication. Edges argued from it: `v2`'s prediction (measured anyway, so its verdict is unaffected) and `v7`'s original promotion (**already demoted**, on independent evidence) | ⚠ **partly** — recorded in §4b and §8; the L6 cell now carries both numbers |
 
-| `instruments/sctopk_2stage_bench.py:246` — **our own step-1 instrument**, found by `probes/15` | the `scatter` arm is a **100% dense** L0 histogram, and is what the price sheet's `hist0` rate comes from | its mask is `m = key > jnp.int32(KEY_NEG_INF)` over **raw fp32 bits**. A negative float has the sign bit set, so as `int32` it is *below* the `-inf` bit pattern — the mask is **false for every negative score**. `:849` fills the arm with `rng.standard_normal`, so ~**50%** of elements are masked out. The arm is ~50% dense, not 100%, and it runs at **n = 9216**, not 10240 | **understates** | the arm measures a half-density scatter; a dense `hist0` rate must come from a pool with a correct mask | ⚠ **no, and deliberately not** — `instruments/` is frozen read-only after step 1, which is what makes `probes/08`–`11` comparable. Verified in place: line 246, and `:849` |
+| ⛔ ~~`instruments/sctopk_2stage_bench.py:246` — our own step-1 instrument, found by `probes/15`~~ | ~~the `scatter` arm is a 100% dense L0 histogram~~ | ⛔ **RETRACTED IN FULL by `probes/16`, and re-verified by the main thread.** The claim was that `m = key > jnp.int32(KEY_NEG_INF)` runs over **raw fp32 bits** and is therefore false for every negative score, making the arm ~50% dense at `n = 9216`. **All three parts are wrong** — see the retraction note below | ⛔ **no error** | none — the arm is 100% dense as designed | n/a |
 
-**Four rows, and two are ours.** A `references/` audit that only finds fault outside the
-exercise has not been run honestly; both internal claims failed the same test and are listed
-under the same heading. ⚠ The instrument row has a live consequence: if `hist0`'s sheet price came
-from a half-density arm it is **understated**, which would make the histogram a *larger* share of
-the kernel and `v10` — the only node that attacks it — worth **more**, not less. Tracked in §10.
+**Three rows, and one of them is ours** — `probes/07`'s L6 claim. ⛔ **The fourth row, the instrument
+bug, is retracted; the count in this paragraph used to read "Four rows, and two are ours".** The
+principle it was making stands and is worth keeping: an audit that only finds fault outside the
+exercise has not been run honestly. But manufacturing a fourth row is the other failure mode, and
+that is what happened here.
+
+⛔ **The retraction, in detail, because it was propagated to three documents and a user-facing
+summary before it was checked.** `probes/16` refuted it and the main thread re-derived the
+arithmetic independently rather than taking the refutation on trust:
+
+| the claim | why it is false |
+| --- | --- |
+| "the mask runs over **raw fp32 bits**" | `resident_vmem` holds **monotone keys**, written at `:826` by the XOR the arm itself performs. The local is literally named `key` |
+| "`KEY_NEG_INF` is the raw −inf bit pattern, so negatives fall below it" | `sparsecore_topk.py:50-51`: `KEY_NEG_INF = BITS_NEG_INF ^ 0x7FFFFFFF = 0x807FFFFF = −2139095041` — the **monotone key** of −inf, sitting at the bottom of int32 by construction. That is the whole point of the transform |
+| "~50% of elements are masked out" | ⛔ **the density is 1.000000 under *both* readings.** The main thread computed it on 655360 `standard_normal` draws: monotone-key density 1.0, **raw-bits density also 1.0**. Raw `−1.0` is `0xBF800000` = −1082130432, which is *greater* than −2139095041. So even granting the false premise, the conclusion does not follow. Only `−0.0` and subnormals differ |
+| "it runs at **n = 9216**, not 10240" | `9216` is `--max-model-len`; `_topk_n(9216) = 10240`, and `probes/03`'s own log line reads `n=10240 slice_len=10240` |
+
+✅ **Consequence: `hist0` is not understated, and `v10` gains nothing from this.** The 33.91 µs in
+the C″ sheet comes from `probes/08`'s `-sweep` residual, not from this arm at all. The 116.350 and
+108.217 µs figures are comparable and differ by −6.99%, an ordinary cross-pool reproduction.
+
+⚠ **The lesson is not "probe 15 erred".** It is that a bug found in a *frozen, read-only* instrument
+is the most tempting kind of finding to propagate unchecked — it explains a discrepancy, it flatters
+the node we already liked, and the freeze supplies a reason not to go and test it. The check that
+settled it was four lines of arithmetic on a laptop. Run it before writing the row, not after.
 
 ## 8. The self-audit — findings that favour the winner
 
@@ -1136,6 +1195,36 @@ failed the same way — an arm was believed to have deleted what its name said. 
 how this exercise measures, not about that job, and it is why §9 puts a de-contamination control in
 every step-3 plan.
 
+### 8b. The pattern that killed two nodes, and one finding of our own that had to be withdrawn
+
+⛔ **`v5` and `v6` both died the same death, and it is not the death either was expected to die.**
+Both were priced by *deleting work from one region*, both had that arithmetic checked, and both were
+right about the region they named:
+
+| | it deletes | it was right that | it lost because |
+| --- | --- | --- | --- |
+| `v5` | the 256-bucket fixed sweep, by shrinking `NB` | the sweep really is ≈ proportional to `NB` (r² 0.99934, intercept 1.6%) | the **L0 histogram moves the other way** — fewer buckets, more `addupdate_scatter` address collisions, **+53.420 µs at NB=64** |
+| `v6` | the sweep on rows with `token_pos < 2048` | those rows really are a quarter of prefill | an **outer `lax.cond` already elides the entire kernel** on exactly those steps |
+
+**The common failure is a missing term, not a wrong number.** In both cases the model priced the
+region the change touches and had **no term at all** for the thing that absorbs the saving. That is
+invisible to any amount of care applied *within* the model, and it is why both were caught by a
+probe that measured something the brief did not ask about — `probes/16` priced `E0-swp` as a
+control, and `probes/14` enumerated a trace for a different question. ⚠ **Step 3's rule follows
+directly: every arm measures the whole kernel, not the region it edits.** An arm that only reports
+its own region cannot see this class of loss. Compare
+`freed-device-time-spills-onto-untouched-ops` — the same phenomenon with the sign flipped.
+
+⛔ **And one finding of *ours* was withdrawn this wave, which belongs in an audit that is honest.**
+`probes/15` reported a bug in our own frozen step-1 instrument — that the "dense" histogram arm was
+~50% dense — and I propagated it into three documents and a user-facing summary before checking it.
+`probes/16` refuted it; the main thread then re-derived the arithmetic and found it fails **twice
+over** (§7). It was the most tempting shape of finding available: it explained a live discrepancy,
+it made the node we already liked worth *more*, and the instrument's read-only freeze supplied a
+ready reason not to go and test it. The check that settled it took four lines and no hardware.
+**The audit's own rule — does this evidence discriminate, or is it merely consistent? — was not
+applied to it, because it arrived as a bug report rather than as a claim.**
+
 ## 9. The implementation plan — what step 3 builds
 
 Ranked. `REJECTED` nodes get no entry; `v7` is `PARKED` and gets a pointer (§5). **Each entry is
@@ -1161,12 +1250,12 @@ stay findable; **this table is the ranking.**
 | # | node | plan | harness `Δ` | production `Δ` (× 1.219) | evidence | composes? |
 | ---: | --- | --- | ---: | ---: | --- | --- |
 | **1** | **`v3`** fused emit | B | **−20.5%** | **−25.0%** | `measured` rate (`probes/15`); **sign settled without building it** — break-even `cnt_eff` 8531 > global max 6495 | ⛔ competes with `v10` |
-| **2** | **`v5`** `NUM_BUCKETS` swept | D | ⏳ **−14.82% or −1.58%** | ⏳ −18.1% or −1.9% | ⛔ **not quotable** — `probes/07` and `probes/09` disagree 3.1× on the sweep price; `probes/16` in flight | yes |
-| **3** | **`v12`** (= U2) `f32` input | — *(edge)* | **−13.82%** | **−16.8%** | `static-compile` ×2 (`probes/17` reachable, `probes/14` materialised); **firm** | ✅ **with everything** |
-| **4** | **`v10`** sample-and-count | E | **−12.2%** | **−14.9%** | `measured` count-pass rate, **at the read-only walk floor** (`probes/15`) | ⛔ competes with `v3` |
-| **5** | **`v4`** pipelined score DMA | C | ≤ **−7.09%** | ≤ **−8.64%** | ceiling, `modelled`; the caller's original request | yes |
-| **6** | **`v2`** `R=1` | A | **−6.42%** | **−7.83%** | ✅ **`measured` and bit-exact** (`j-300d4690`) — the only measured node | yes |
-| **7** | **`v11`** retiled output emit | — *(edge)* | ≤ **−5.27%** | ≤ **−6.42%** | `measured` 10.007 µs; both conditions discharged (`probes/17`, `probes/14` Q2) | ✅ with everything **except H3**, which subsumes it |
+| **2** | **`v12`** (= U2) `f32` input | — *(edge)* | **−13.82%** | **−16.8%** | `static-compile` ×2 (`probes/17` reachable, `probes/14` materialised); **firm** | ✅ **with everything** |
+| **3** | **`v10`** sample-and-count | E | **−12.2%** | **−14.9%** | `measured` count-pass rate, **at the read-only walk floor** (`probes/15`) | ⛔ competes with `v3` |
+| **4** | **`v4`** pipelined score DMA | C | ≤ **−7.09%** | ≤ **−8.64%** | ceiling, `modelled`; the caller's original request | yes |
+| **5** | **`v2`** `R=1` | A | **−6.42%** | **−7.83%** | ✅ **`measured` and bit-exact** (`j-300d4690`) — the only measured node | yes |
+| **6** | **`v11`** retiled output emit | — *(edge)* | ≤ **−5.27%** | ≤ **−6.42%** | `measured` 10.007 µs; both conditions discharged (`probes/17`, `probes/14` Q2) | ✅ with everything **except H3**, which subsumes it |
+| — | ~~`v5`~~ `NUM_BUCKETS` swept | D | ~~−14.82%~~ | ⛔ **REFUTED** | `probes/16` (`j-c47cfec1`) won **both** its open terms and it lost anyway: the sweep shrinks with `NB`, but the L0 histogram grows faster (+53.420 µs at NB=64). Nets to **−5.28% ± 11.19%** — unresolved | — |
 | — | ~~`v6`~~ keep-all fast path | F | ~~−4.7%~~ | ⛔ **REJECTED** | the outer runtime gate already elides the whole kernel on exactly the steps it fires on (`probes/14`) | — |
 | — | `v7` shallow scans | — | −2.5% | −3.0% | `PARKED` (§5) | yes |
 
@@ -1185,9 +1274,11 @@ stay findable; **this table is the ranking.**
   is already written, already bit-exact and already measured, so lifting it into `variants/`
   validates the step-3 harness against a known answer before any unmeasured arm runs.
 
-⛔ **`v5`'s rank is provisional and must not be quoted.** The two candidate prizes differ by 9.4×
-and straddle the "worth building at all" line. `probes/16` adjudicates; until it returns, treat
-rank 2 as a placeholder holding a slot, not a claim.
+⛔ **The shortlist is six nodes, and two of the original eight died on the same mechanism.** `v5` and
+`v6` were both priced by deleting work from one region, and both lost because the deleted work was
+being paid for somewhere the model did not have a term. That is a pattern, not two accidents — see
+§8. Every surviving row above prices a region the price sheet **measured**, and the three largest
+(`v3`, `v12`, `v10`) rest on rates that were re-measured this wave.
 
 ⚠ **Every `Δ time %` in the plans below is in the harness denominator (189.98 µs).** `probes/11`
 showed the harness is 34.165 µs larger than production, so **multiply each by 1.219** to get the
@@ -1600,8 +1691,10 @@ discharged or dead: the count-pass probe returned (`probes/15`), `probes/11` ret
 - **Blocked:** Plan C (`v4`) — on Plan B, for timing only, since the fused pass changes what the DMA
   feeds; and on its own local compile check of `emit_pipeline`. ✅ That compile check is now cheap
   and needs no pod: AOT against `topologies.get_topology_desc("tpu7x:2x2x1")`, per `probes/17`.
-- **Blocked on a probe:** Plan D (`v5`) — ⏳ `probes/16`. Do not write it until the 3.1× sweep-price
-  conflict is adjudicated; the answer decides whether it is worth −18.1% or −1.9%.
+- ⛔ **Do not build Plan D (`v5`) either.** `probes/16` returned and **refuted** it. Both terms it
+  was open on resolved in its favour — the intercept is 0.299 µs (1.6% of the sweep) and the
+  07-vs-09 conflict went to 09 — but the L0 histogram grows with smaller `NB` faster than the sweep
+  shrinks, netting **−5.28% ± 11.19%**: unresolved, not a win.
 - ⛔ **Do not build Plan F (`v6`).** Rejected by `probes/14`, not by a microbenchmark: the outer
   `lax.cond` already elides the entire kernel on exactly the steps an in-kernel `keep_all` fast path
   would fire on. Its residual — short rows batched with a long one — is `unmodelled` and out of
@@ -1618,15 +1711,15 @@ already scheduled. Anything not in this list would be a genuine violation:
 | still `OPEN` | what closes it | when |
 | --- | --- | --- |
 | `v11`, `v12` | their **step-3 measurement** — each has one `unmodelled` term (a strided DMA; two `tpu.bitcast`s) and both are on the build list. Neither term can flip a sign, only shrink a prize | step 3 |
-| `v5` | ⏳ **`probes/16`, in flight.** Its verdict turns on the 3.1× `probes/07`-vs-`probes/09` sweep-price conflict | before step 3 writes it |
+| ~~`v5`~~ | ✅ **CLOSED by `probes/16` — `REFUTED`, not `OPEN`.** It won both terms it was open on and lost on a third the model omitted | ✅ done |
 | `v10`'s pass count | **host simulation**, no job — the rate it rested on is already `measured` | step 3, with the variant |
-| the `hist0` density question | ⏳ folded into `probes/16`, same region | with `v5` |
+| ~~the `hist0` density question~~ | ✅ **CLOSED — false premise, retracted.** §7 | ✅ done, on arithmetic |
 | **D7** | ⛔ **the one that does not have a cheap closer any more.** See its row | ⚠ carried forward |
 
 | node | what closes it | cost |
 | --- | --- | --- |
 | `v3` fused-emit | ✅ **CLOSED by `probes/15` (`j-78f7f537`).** The store is **6.675 µs/pass**, flat in density, and `probes/13` had overcharged it **2.08×**. Band **≈ −20.5%…−14.9%**; break-even `cnt_eff` **8531** is above the global max 6495, so **its sign is settled without building it** | step-3 variant |
-| ⚠ **NEW — is `hist0`'s sheet price understated?** | `probes/15` found `instruments/sctopk_2stage_bench.py:246` masks its "dense" arm on raw fp32 bits, dropping every negative score (~50% at `standard_normal`, and production is 81.7% negative). If the sheet's `hist0` came from that arm it is too low, and **`v10` is worth more than −12.2%**. §7. ⏳ `probes/16` is in the same region — ask it before opening a new job | probably no job |
+| ⛔ ~~is `hist0`'s sheet price understated?~~ | ⛔ **CLOSED — the question was based on a false premise, now retracted.** `probes/16` refuted `probes/15`'s instrument-bug claim and the main thread re-derived it: the mask runs over **monotone keys**, `KEY_NEG_INF` is the monotone key of −inf, and the measured density is **1.000000 under both readings**. `hist0`'s 33.91 µs also comes from `probes/08`'s residual, not from that arm. **`v10` gains nothing.** Full retraction in §7 | ✅ **no job — closed on arithmetic** |
 | **`v11`** retiled output emit | ✅ **both conditions CLOSED, both favourably.** (a) feasibility, `probes/17` — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) in-model, `probes/14` Q2 — the retile **survives** in the real entry, as an `S(1)` staging copy rather than a ROOT reshape. Same 40 MiB, different op, so the "`REJECTED` with prize 0" leg is withdrawn. ⚠ The 10.007 µs was measured on the ROOT reshape; no arm has yet deleted the staging copy | no job |
 | **`v12`** (= **U2**) `f32` input, in-register reinterpret | ✅ **feasibility CLOSED by `probes/17`** — reachable, but **three edits, not one**: the DMA is dtype-checked, so the scratch dtype must change too and the reinterpret moves in-register. ✅ **production path CLOSED by `probes/14` Q1** — materialised, so the prize is a firm ≈ −16.8%, the largest single edge prize in the file. One term still open: the price of the two in-body `tpu.bitcast`s, which can only shrink the prize, not flip it | no job |
 | **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. ⛔ **And its "free, no job" closer is gone.** The plan was to read `StreamIdxTC-*` durations out of an existing xprof; `probes/14` tried exactly that on `j-ecf4ee85` and got **0 device events**, because that step took branch 1 and the whole chain was elided. `t_TC` is not obtainable from any capture in which the kernel did not run. The cost has changed class — from "read a file" to **step selection**: capture a prefill step past chunk 1, or a mixed step. It stays `OPEN` and is **carried into step 3** rather than closed here | ⚠ **a capture, not a file read** |

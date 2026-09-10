@@ -82,10 +82,22 @@ Densities are set by `sel = (bits & 255) < t`, data-dependent so it cannot be fo
 realized fraction is measured host-side on the same array (`j-…txt:70-76`). `t = 0` is deliberately
 not used: `x & 255 < 0` is provably false and a control the compiler can fold away is not a control.
 The `valid` mask on every dense scatter is `key != 0x7FC00000`, a NaN pattern verified absent
-(`never_bits_hits: 0`), so the histogram arm is **genuinely 100 % dense** — unlike
-`instruments/sctopk_2stage_bench.py:851` whose `key > KEY_NEG_INF` on raw fp32 bits excludes every
-negative score. Its 116.350 µs is also at `n=9216`, so the two are not comparable; **108.217 is the
-in-pool L0 price and the ratios above are the quantity to carry.**
+(`never_bits_hits: 0`), so the histogram arm is **genuinely 100 % dense**.
+
+> ⛔ **RETRACTED, by `probes/16` and re-verified by the main thread.** This paragraph continued:
+> "— unlike `instruments/sctopk_2stage_bench.py:851` whose `key > KEY_NEG_INF` on raw fp32 bits
+> excludes every negative score. Its 116.350 µs is also at `n=9216`, so the two are not comparable."
+> **Every part of that is false.** The mask (at `:856`, not `:851`) runs over **monotone keys**
+> written at `:826`; `KEY_NEG_INF` is `BITS_NEG_INF ^ 0x7FFFFFFF = 0x807FFFFF = −2139095041`, the
+> monotone key of −inf, at the *bottom* of int32; the measured density on 655360 standard normals is
+> **1.000000 under both readings** (raw `−1.0` is −1082130432, which is greater than −2139095041);
+> and `9216` is `--max-model-len`, with `_topk_n(9216) = 10240` and `probes/03`'s log reading
+> `n=10240`. The two arms **are** comparable and differ by −6.99%, an ordinary cross-pool
+> reproduction. Retraction and arithmetic in `design.md` §7.
+>
+> ✅ **What survives:** **108.217 is the in-pool L0 price and the ratios above are the quantity to
+> carry** — that recommendation is right for the ordinary reason (same pool, same rounds), not
+> because the other arm was broken.
 
 ## The entry shape came out clean
 
@@ -155,9 +167,10 @@ densities and +172 at d30**, and never 0 — the store is present in every `st` 
   3. **20.3 µs is the walk floor at this geometry**, replicated to 1.3 % against `probes/03`'s `cvt`
      (20.589) from a different job. Any node whose move is "replace a pass with a cheaper pass"
      is bounded below by it — including `v10`'s count passes, which are already at it.
-  4. **`probes/03`'s `scatter` arm is not 100 % dense** (`sctopk_2stage_bench.py:851` masks on raw
-     fp32 bits under `key > KEY_NEG_INF`, which is false for every negative score, and `:241`
-     generates standard normals). Not a retraction of the price sheet — `probes/07` vindicated it —
-     but the L0 histogram price should be taken from this pool, not from that row.
+  4. ⛔ ~~**`probes/03`'s `scatter` arm is not 100 % dense**~~ — **RETRACTED IN FULL** by `probes/16`
+     and re-verified by the main thread. The mask is on **monotone keys**, `KEY_NEG_INF` is the
+     monotone key of −inf, the density is **1.000000 under both readings**, and `n` was 10240 not
+     9216. The arm is 100 % dense as designed. See the boxed retraction above and `design.md` §7.
+     The recommendation to take the L0 price from this pool still stands, on same-pool grounds.
   5. **The mandatory-probe gate of `§10` is satisfied for `v3` and `v10`.** `v5` remains blocked on
      `probes/16`.
