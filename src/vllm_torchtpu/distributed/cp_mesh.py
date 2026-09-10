@@ -5,11 +5,6 @@
 their process group paired with the TPU device each one sits on, and a
 one-axis JAX mesh laid out in that order. Neither is specific to which axis
 asked -- a layout is just "this group's ranks, in order, and where they live"
--- so both live here, and neither sibling has to import the other.
-
-Every entry point takes its group explicitly. There is deliberately no
-default: a module that guessed would have to guess one axis, and supplying
-that argument is the whole job of the two callers.
 
 Named for `ep_mesh.py`, which plays the same role for expert parallelism.
 """
