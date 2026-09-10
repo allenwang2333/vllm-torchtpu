@@ -207,6 +207,17 @@ synchronization** — there is no `subcore_barrier` in the file. So the kernel c
 subcore at decode it does not** (**1.28×**). Roughly a fifth of decode's refinement work is the
 critical subcore waiting on nothing.
 
+> ⚠ **The profile will tell you this imbalance does not exist. Do not believe it.** All 16 `TEC n`
+> lines on SparseCore 0 report the kernel scope at 356,434–356,451 ns — a **17 ns spread across all
+> 32 subcores**, which reads as perfect balance. It is not. The Mosaic dump has an `sfence` and a
+> `barrier` at the end of the kernel body (lines 904, 907), so every subcore's scope *ends* at the
+> same instant by construction and the per-TEC duration measures the barrier, not the work.
+> The source has no `subcore_barrier` — the exit barrier is emitted by the lowering, not written by
+> the author, which is why grepping the file for one comes up empty and still leaves it there.
+> That exit barrier is also what makes the cost `max` over subcores rather than the mean, so it
+> confirms the model in the table above at the same time as it hides the effect from the trace.
+> `[static: Mosaic post-emit-tec dump; measured: per-TEC durations, j-5726664a-06d0-40f9-88cf]`
+
 This is a real, separately-addressable inefficiency with an obvious shape (work-stealing, or
 ordering rows so long and short ones pair up) and it is **orthogonal to the DMA question the caller
 asked about**. It is recorded here and carried to step 2 as a candidate rather than folded into the
@@ -472,6 +483,74 @@ refinement would pass this check identically. What pins the split is probe 03's 
 measured `cvt`/`hist0`/`emit` slopes, which were not fitted to anything here; the single fitted
 parameter is the refinement pass alone.
 
+### 5d′. ⛔ The LLO capture contradicts this fit, and the contradiction is not resolved
+
+That caution turned out to be the right one to write. `probes/06-llo-incumbent` breaks the fit open,
+and I would rather hand this over live than let it be found in step 3.
+
+**The machine code says both loops issue the same number of scatters.**
+`plsc.addupdate_scatter` lowers to a single instruction, `vst.idx.add.s32.msk` — a *masked* store.
+Per 64 elements, `hist0` (`.LBB2_88`) issues **4** of them and a refinement pass (`.LBB2_93`) issues
+**4** of them. The mask does not remove the instruction; it only suppresses lanes.
+
+**So mask density is a memory-side cost, not an issue-side one** — which is exactly why probe 03
+measures `scatter_sparse` at 35.243 µs and `scatter_dense` at 116.350 µs, **0.30×**, from
+bundle-identical code. That is a real and useful fact. But it makes the fit above incoherent:
+
+| | mask density | probe-03 price for that density | fitted price |
+| --- | --- | --- | --- |
+| `hist0` | dense (every valid word) | 116.350 µs | 116.350 (used as given) |
+| a refinement pass | **sparse** (only `key>>shift == prefix`) | **~35.2 µs** | **114.3 µs** |
+
+**A refinement pass is priced at 3.2× what its own mask density says it should cost.** Something in
+the budget is misattributed by roughly 150 µs — a third of the kernel.
+
+Three candidate explanations, none yet eliminated:
+
+1. **The fitted parameter is a whole refinement *level*, not the `ref_body` walk.** A level is
+   `zero_priv` + `ref_body` + `fold_priv` + `scan_glob` + `find_bucket` (op-inventory rows 8–10).
+   `zero_priv` writes 4096 words and `fold_priv` reads 4096 — 0.8·`L` of extra traffic per level
+   that probe 03's arms never included. **This is the explanation I currently favour**, and it is
+   the one with teeth: it would mean the per-level cost is dominated by a *fixed* 4096-word
+   histogram sweep rather than by the `L`-word walk.
+2. **The level count is 3.00, not 2.03**, because the microbench's score data is not the N(0,1) my
+   numpy assumed (probe 05's own caveat). That gives 77.4 µs/level — closer, still not 35.
+3. **`scatter_sparse`'s 1/256 density is not the refinement mask's density.** After L0 the matching
+   fraction is roughly `cnt/L`, which is data-dependent and not 1/256 by construction.
+
+**Why this is the first thing step 2 does, ahead of any variant.** Candidate 1 is "make the
+refinement walk proportional to `cnt` instead of `L`". Under explanation 1 that leaves the fixed
+`zero_priv`/`fold_priv` sweep untouched and wins ~35 µs × 2.03 = **15.8% of the kernel, not 51.4%** —
+a 3× reduction in the prize, and enough to reorder it against the launch intercept. The resolving
+probe is cheap and needs no new kernel: time one refinement level with `active_walk` forced to 0
+while keeping `zero_priv`/`fold_priv`/`scan_glob`, and difference it against the full level.
+
+**Until that probe returns, treat §5e's 51.4% refinement row as an upper bound on that region and
+not as a candidate prize.** The three shipping-shape *totals* (451.2 / 51.6 µs) are measured and
+unaffected; it is only the split inside them that is in question.
+
+### 5d″. Two clock-free findings that survive regardless
+
+**The hot loops are not issue-bound, and the discriminator needs no clock.** Static issue work per
+64 elements is 14 bundles for refinement against 9 for `hist0`, a ratio of **1.556**. If issue set
+the pace, refinement would have to cost ~56% more than `hist0`. Measured, the two are within 3% of
+each other — off by 1.6× *in the wrong direction*. Refinement issues 56% more instructions and runs
+slightly faster. **The pace-setter is the `vst.idx.add.s32.msk` read-modify-write into tilespmem**,
+which is what makes mask density the governing variable and instruction count nearly irrelevant.
+Note this holds under all three explanations above, so it is safe to design against.
+
+**Schedule quality is not the problem, and register pressure exists in exactly one place.** The TEC
+program is 1168 bundles / 2544 slots, mean 2.178 slots/bundle, but **4.00–4.67 slots/bundle inside
+every hot loop** and **zero pure-NOP bundles in any of them** (program-wide NOP density is 3.94% of
+bundles, all in scalar setup/teardown). Spills are 110 slots over 1168 bundles, and **all of the
+ones in a hot loop are in the emit/compaction loop** (`.LBB2_105`, 9 spill/fill slots in 26
+bundles); the four scatter loops, `cvt` and the histogram reductions are spill-free. So "schedule it
+better" and "reduce register pressure" are both dead ends here — except in emit, which is 6.1%.
+
+The Mosaic dump does show four loop-invariant recomputes surviving into `ref_body` (`lane_iota*256`
+and two broadcasts). Hoisting them would remove ~3 of 14 bundles — and since the loop is not
+issue-bound, the expected saving is near zero. **Not worth a job**, recorded so nobody spends one.
+
 ### 5e. Where the time actually goes
 
 **Shipping prefill, `b=1024 n=10240 k=2048 P=1`, measured 451.2 µs:**
@@ -535,11 +614,71 @@ the first wave's load can never be hidden:
 | `b=16 n=133120` P=4 | 2 | 94.4 µs | 4.0 µs | 4.2% | −2.12% |
 | `b=1024 n=133120` P=4 | 128 | 4801.6 µs | 256.1 µs | 5.3% | −5.29% |
 
-These are **ceilings on a perfect implementation**, not predictions. Three things make the realised
-number smaller: the DMA engine writes VMEM while the VPU reads it, and at 77% scatter-bound the VPU
-is saturating VMEM already, so overlap is not free; a second slice buffer costs +40 KiB of a 512 KiB
-per-subcore budget (fine at shipping, tighter at 130 KiB); and the `(waves−1)/waves` cap bites hard
-at decode's 2 waves.
+These are **ceilings on a perfect implementation**, not predictions. Two things make the realised
+number smaller: the DMA engine writes VMEM while the VPU reads it, and the kernel is scatter-bound
+into that same tilespmem (§5c), so overlap is not free; and the `(waves−1)/waves` cap bites hard at
+decode's 2 waves.
+
+### The premise is confirmed at the machine-code level, and so is the room to fix it
+
+`probes/06-llo-incumbent`, jobs `j-5726664a-06d0-40f9-88cf` and `j-f65d952c-e64c-40e4-ade8`. All
+`[static]` — read out of the compiler's own dumps, not inferred from a timing delta.
+
+**The DMA is exposed.** The TEC program contains exactly three `stream.linear.*` transfers, and
+their sizes identify them without relying on any label:
+
+| bundle | transfer | size | wait | gap |
+| --- | --- | --- | --- | --- |
+| `0xf` | `gather` → `tilespmem:s8` | `$0x400` = 1024 w | `0x10` | 0 bundles |
+| `0x16` | `scatter` ← `tilespmem:s12` | `$0x800` = 2048 w | `0x17` | 0 bundles |
+| **`0x28`** | **`gather` → `tilespmem:s2`** | **`$0x2800` = 10240 w** | **`0x2d`** | **4 bundles** |
+
+`0x2800` = 10240 words is `slice_len` — **that row, and only that row, is the score DMA.** The
+1024-word transfer is `len_vmem` and the 2048-word one is the `rowbuf` store-back. What sits in the
+four-bundle gap is not work:
+
+```
+0x28: [tilespmem:s2], [sflag:$0x2] = stream.linear.gather [hbm4b:s20+s2], $0x2800, $0x38 ; vst v63
+0x29: s20 = sand.u32 $0x7FC, s17
+0x2a: p1  = seq.s32 s20, $0x0
+0x2b: _ = snop ; (pc) = sbr.rel @p1 .LBB2_9
+0x2c: _ = snop
+0x2d: _ = swait.ge [sflag:s10], $0x2800
+```
+
+Two scalar ops computing a `walk_chunks == 0` branch, and **two bundles that are literally `snop`**.
+The compiler had four bundles of slack across a 40 KiB HBM read and could find nothing to put in
+half of them. Your reading of the source was right, and the schedule is not merely un-overlapped —
+it is idle.
+
+The Mosaic dump agrees independently: `enqueue_transfer` at line 203, `transfer_wait` at 207, three
+address-arithmetic ops between.
+
+> **A label in a dump is not an op.** The capture agent reported the `0xf`/`0x10` pair as the score
+> gather and concluded "adjacent bundles". It is the lengths DMA — 1024 words, not 10240 — and the
+> real score DMA has a four-bundle gap. The conclusion survived; the citation did not. **Identify a
+> transfer by its size against a known buffer extent, never by its position or its neighbours.**
+
+**The structural reason is a single buffer.** The whole module contains **3 `enqueue_transfer` / 3
+`transfer_wait`** and exactly **one `resident` alloca (`10240xi32`)**. Cross-wave overlap is not
+merely unscheduled — it is impossible to express without allocating a second slice buffer. That is
+precisely what your change does, so it is attacking the right object.
+
+**And it fits comfortably.** This is the one number that improves on the design: the compiler's own
+high-water mark for the shipping shape is **18,048 words = 70.50 KiB per subcore**, confirmed twice
+(the `sc_hwm.pb` protobuf field, and the buffer base addresses read out of the bundle dump: resident
+`0x0000`, priv `0x2800`, glob `~0x3810`, rowbuf `0x3A00`, len_vmem `0x4280`, DMA scratch `0x4680`).
+A second `10240xi32` slice buffer adds 40 KiB → **110.50 KiB, about 21.6% of the 512 KiB budget**.
+
+> The §1 diagram's 180.5 KiB is **not** in conflict with this — it is drawn at `n=133120`, where the
+> resident slice alone is 130 KiB. At the shipping `n=10240` it is 40 KiB. Same accounting, different
+> shape, and the shipping one is the one with room.
+
+The 512 KiB denominator is the one thing still unconfirmed from the compiler side —
+`kTileSpmemCapacity` is a compiled constant, not a string in libtpu, so it could not be read back.
+It comes from the in-job `SparseCoreInfo`, which is a runtime report rather than the allocator's
+own limit. The numerator is confirmed twice; only the denominator is open, and it would have to be
+wrong by 2× to make the double buffer tight.
 
 **So the mechanism is real, it is not zero, and it is small: at best 7.2% of the kernel at prefill
 and 2.0% at decode.** Chained through the block's own denominator — prior measurement puts this
@@ -655,6 +794,7 @@ this report is at `--ctx 9216` for that reason. Other constants checked: `CSA_TO
 | 03 | `passes-9216` | what does a VMEM-resident SparseCore pass cost? (no `references/` entry exists) | same | `cvt` 20.589, `emit1` 27.456, sparse scatter 35.243, **dense scatter 116.350** µs/pass | the price sheet for every step-2 candidate; and `addupdate_scatter` is 77% of the kernel |
 | 04 | `bw-9216` | what is the DMA slope at the shipping 40 KiB slice? | same | `21.349 µs + 1.0447 µs/wave`; 1255 GB/s apparent, ≈3113 GB/s asymptotic with ≈0.62 µs/wave fixed | separates hideable transfer from unhideable launch cost — the correction that overturns probe 01's printed gate |
 | 05 | `refinement-count` | how many of the 3 refinement levels run? (2× swing in the compute term) | **none — computed exactly in numpy** | 2.03 levels at `b=1024`, 2.50 at `b=64`; 1.06× / 1.28× subcore imbalance | no probe needed; and it supplied the out-of-sample validation in §5d |
+| 06 | `llo-incumbent` | is the score DMA actually exposed, and does a second buffer fit? | `j-5726664a-06d0-40f9-88cf`, `j-f65d952c-e64c-40e4-ade8` | **exposed — 4 bundles of slack, 2 of them `snop`**; one `resident` alloca so overlap is structurally impossible today; VMEM high-water 70.50 KiB so a second buffer lands at 21.6% | the caller's premise confirmed at machine-code level and the one structural objection to it removed — **and §5d′'s contradiction opened** |
 
 Probe 05 is recorded here because it answered a question the wave was going to spend a job on. The
 two-question rule applies in reverse: it is not in `references/`, and being wrong *would* have
@@ -665,17 +805,25 @@ changed a decision — but the answer was derivable exactly from the kernel's ow
 
 ## 9. Carried to step 2
 
-Three candidates, ranked by measured prize at the shipping prefill shape. **The caller's mechanism
-is the smallest of the three**, which is stated plainly rather than buried; it is still built,
-because it was the explicit ask, it is non-zero, and the marginal cost of one more variant is
-minutes plus one job.
+**Step 2 opens with a probe, not a design.** §5d′ shows the split between `hist0` and the refinement
+levels is off by ~150 µs — a third of the kernel — and candidate 1's prize swings 3× on the answer.
+One arm resolves it: time a refinement level with `active_walk` forced to 0, keeping
+`zero_priv`/`fold_priv`/`scan_glob`, and difference it against the full level. That separates the
+fixed 4096-word histogram sweep from the `L`-word walk, which is the whole question.
+
+Candidates, ranked by measured prize at the shipping prefill shape. **The caller's mechanism is the
+smallest of the three and is the only one whose prize is not in question** — it is measured against
+the DMA slope, which §5d′ does not touch. It is built because it was the explicit ask, it is
+non-zero, and the marginal cost of one more variant is minutes plus one job.
 
 | # | candidate | mechanism | measured prize (ceiling) | route |
 | --- | --- | --- | --- | --- |
-| 1 | **refinement walk** | `ref_body` (227-243) walks all `L` words to test `match` though almost none match after L0. Measured at 0.98× a *dense* scatter — the cost is the traversal. Compacting L0's straddling bucket once would make the ~2.03 refinement passes proportional to `cnt`, not `L` | **51.4% of the kernel** | step 2, this skill |
+| 1 | **refinement walk** | `ref_body` (227-243) walks all `L` words to test `match` though almost none match after L0. Compacting L0's straddling bucket once would make the ~2.03 refinement passes proportional to `cnt`, not `L` | **⚠ 51.4% of the kernel is an UPPER BOUND on the region, not the prize.** §5d′ puts the walk's own share as low as ~15.8%; the resolving probe runs first | step 2, this skill, **after the probe** |
 | 2 | **decode launch cost** | 21.3 µs of fixed mesh-entry/program-load, = **41.3% of the decode kernel**. Not proportional to work | up to 41.3% at decode, **but** confounded with residual host dispatch (§5e) and needs §4 unknown 4 to become an e2e claim | step 2, with a probe that separates on-device program load from host dispatch **first** |
-| 3 | **pipelined score DMA — the caller's request** | replace the blocking `start()`/`wait()` at 108-111 with `emit_pipeline` or a hand-rolled double buffer | **−7.18% prefill / −2.02% decode** | step 2, this skill |
+| 3 | **pipelined score DMA — the caller's request** | replace the blocking `start()`/`wait()` at 108-111 with `emit_pipeline` or a hand-rolled double buffer | **−7.18% prefill / −2.02% decode.** Premise and headroom both confirmed at machine-code level (§6); prize not affected by §5d′ | step 2, this skill |
 | — | subcore load imbalance | 1.28× at decode from data-dependent early exit with only 2 rows/subcore (§2) | bounded by candidate 1's term | step 2, likely subsumed by 1 |
+| — | ~~LICM in `ref_body`~~ | 4 loop-invariant recomputes survive into the body | **rejected without a job**: ~3 of 14 bundles, and the loop is not issue-bound (§5d″) | closed |
+| — | ~~better scheduling / register pressure~~ | — | **rejected without a job**: hot loops run 4.0–4.7 slots/bundle with zero NOPs and zero spills, except emit (§5d″) | closed |
 
 **On the caller's stated mechanism specifically**: `pltpu.emit_pipeline` **does** lower and run
 inside a SparseCore kernel — `references/08-sparsecore.md:609`,
@@ -691,3 +839,15 @@ in step 2's design graph as branches, not as a settled choice.
 streaming pipeline that retires a tile after one consumption does not fit this kernel without
 restructuring. The tractable form is a **cross-wave** double buffer — issue wave `w+1`'s load before
 wave `w`'s compute — which is what the `(waves−1)/waves` cap in §6 already assumes.
+
+This is the sharpest thing to check about `emit_pipeline` before committing to it: **it is built for
+the tile-consumed-once case, which is not this kernel.** Whether it can express "one buffer, five
+consumers, prefetch the next wave" — or whether expressing it needs the hand-rolled form — is the
+first branch in step 2's design graph, and it is a reading question, not a job.
+
+**One more thing step 2 inherits, from §6**: the score DMA's four idle bundles are followed by a
+`walk_chunks == 0` branch. A cross-wave prefetch has to issue wave `w+1`'s load *before* that
+branch is resolved for wave `w+1`, i.e. speculatively or under its own `pl.when`. The degenerate
+case — the last wave, which has no successor to prefetch — is where a naive version reads out of
+bounds, and it is exactly the case `p1-b1024-n10240` (32 waves) exercises and `p1-b64-n10240`
+(2 waves) barely does.
