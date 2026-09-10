@@ -258,14 +258,6 @@ class DeepseekV4Model(nn.Module):
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
 
-        # `index_topk` wide on every path. Under DCP a row holds only the slice
-        # of that token's global top-k this rank physically owns -- averaging
-        # `index_topk / dcp_size` entries, left-packed with a `-1` tail -- but
-        # ownership is data-dependent and a rank can legally own the whole list,
-        # so the buffer has to be full width. The consequence is that the tail
-        # is usually padding: the sparse attention kernel must bound its gather
-        # by the per-row count, not by this width, or DCP buys nothing on the
-        # attention side.
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
