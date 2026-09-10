@@ -74,6 +74,51 @@ must not** — step 3 measures against a production-shaped entry and quotes prod
   output retiling** in the production entry (in-model status open), and the open leg of the
   denominator range. Both are in §10.
 
+⛔ **The kernel sits behind a runtime gate, and in the one profiled prefill step it did not run.**
+`probes/14` enumerated a GLM-5.2 `PREFILL_ONLY` trace (`j-ecf4ee85`, rank 14) event-by-event, per
+xplane **line**, uncapped: `StreamIdxTC-m-bq_128-bkvp_2`, `StreamIdxTC-d-bq_1-bkvp_2` and
+`sc_topk_direct_b1024_n10240_k2048` have **0 device events each** — against 105 / 210 / 5,158 raw
+`strings` text hits, which live in the `/host:metadata` `HloProto`. The ops are in the shipped
+program (21 copies, one per index-share group) inside **branch 0** of `conditional.21`…`.41`;
+**branch 1 executed**, at 659.59 µs × 21 = **13.851 ms/prefill step**.
+
+The gate, read from source and **not** from the profile:
+
+| | |
+| --- | --- |
+| `streamindex_topk.py:858-864` | `lax.cond(jnp.max(seq_lens) // compression_ratio <= k, _fast_path, _common_path)` |
+| `mla_attention_op.py:57` | `STREAMIDX_ENABLE_EARLY_EXIT = True` — a hard-coded constant, no env var |
+| `mla_attention_op.py:116` | `compression_ratio=1`, and `k = topk = 2048` |
+
+⇒ the predicate is **`max(seq_lens) <= 2048`**. JAX orders `branches=[false_fun, true_fun]`, so
+branch 0 is `_common_path` and branch 1 is `_fast_path` — which independently confirms `probes/14`'s
+branch identification. `_fast_path` (`:840-856`) returns the **identity permutation**, correct
+exactly when there are at most `k` candidates.
+
+⚠ **"Not executed in the captured step" is what is established. "Dead at the benchmark" is not.**
+The predicate is evaluated **per step on that step's batch**. The capture is one 1024-token
+`PREFILL_ONLY` step; the config is exact nominal **8192 in / 1024 out**
+(`glm-5.2-fp8-dp16-ep.sh:36,40,43`), so an 8192-token prompt is **eight** 1024-token chunks and
+`max(seq_lens) <= 2048` holds for about the first two. **A chunked-prefill capture samples the first
+few chunks, and the one it holds is the gated chunk** — a previously-burned trap on this same model,
+not a new observation. Which chunk indices take which branch is `unmodelled`; ⏳ `probes/14` is
+checking the capture's truncated second module for a branch flip.
+
+⛔ **This kills `v6`, and the kill is the cleanest result in the graph.** D14's premise was "prefill
+chunks 0 and 1 of 8 run a full DMA + `cvt` + `hist0` + sweep to discover *keep everything*". They do
+not — the outer `lax.cond` elides the kernel entirely in exactly those chunks, so `v6`'s in-kernel
+`@pl.when(i_hi > k)` proposes a saving already taken one level up. `v6`'s prize survives only for
+**short rows inside a batch that also holds a long sequence** (the gate is a `max` over the batch),
+and a `PREFILL_ONLY` step covering one sequence's chunk has none. ⏳ `probes/14` is pricing that
+residual; expected **REJECTED, prize ≈ 0**.
+
+✅ **And it hands over a bigger non-kernel number than anything in this graph.** The executed
+`_fast_path` costs **13.851 ms/step, 2.12% of a 655 ms prefill step** — to emit an identity
+permutation. `(1024, 2048) int32 × 21` is 168 MiB of writes, ~105 µs at HBM rate; the measured cost
+is **~130× that**, spent in a `searchsorted` `while` loop and 42 `gather_fusion`s. That is a
+`carried:` handoff, not a kernel variant. ⚠ It applies only to the gated chunks, so weight it by
+their share before quoting an e2e figure.
+
 ⚠ **The caller's stated mechanism is node `v4`, and it is small.** "The DMA is synchronously waited;
 use `emit_pipeline` for double buffering" is a real finding — the transfer is 100% exposed, overlap
 fraction 0.0000 (`probes/06` Q1) — but its whole prize is the **13.469 µs** of exposed transfer
