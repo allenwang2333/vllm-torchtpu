@@ -1072,7 +1072,7 @@ prize is ~4× smaller than the number this node carried before the source read.
 | node | what closes it | cost |
 | --- | --- | --- |
 | `v3` fused-emit | ⚠ a probe on the cost of a conditional `store_compressed` inside the L0 walk. **Not yet dispatched** | one arm |
-| `v4` pipelined-DMA | a local compile check that `emit_pipeline` accepts a `plsc` mesh kernel with a `fori_loop` grid — **no job** | minutes |
+| `v4` pipelined-DMA | a local compile check that `emit_pipeline` accepts a `plsc` mesh kernel with a `fori_loop` grid — **no job**. ⏳ **dispatched, `probes/12-emit-pipeline-feasibility`** | minutes |
 | `v5` NB-tuned | ⚠ **mandatory probe** — three compile-time arms. Its verdict currently turns on an `unmodelled` term, so §10's rule forbids parking it | one job, three arms |
 | `v6` keep-all-fastpath | ✅ **check done — the gate does not exist** (no inter-subcore barrier), and the prize is 4× smaller than recorded because a `keep_all` short-circuit is already in the kernel. Now a plain build at a `modelled` −4.7% | step-3 variant |
 | `v10` sample-and-count | ⚠ **mandatory probe** — the count-pass rate vs `cvt`. It is the highest-value probe in the wave because it decides a whole root | one arm |
@@ -1102,7 +1102,7 @@ prize is ~4× smaller than the number this node carried before the source read.
 
 | the assumption | where it bites | what would settle it |
 | --- | --- | --- |
-| refinement level count = **2.231** | `v3`'s band (−20% to −33%), `v5`'s whole trade | ⚠ **worse than `assumed` — now known to be fitted on the wrong distribution family.** Production scores are a per-head-weighted sum of **ReLU'd** fp8 dot products (`streamindex_topk.py:326-338`): right-skewed, mass piled at exactly 0.0, hundreds of exact ties, masked entries at `−inf`. `rng.standard_normal` (`test_dsv4_sparsecore_topk.py:147`) is wrong on sign, skew *and* ties, and L0 buckets on the top 8 **exponent+sign** bits (`L0_SHIFT=24`), the axis on which the two differ most. Expect the true count to be **higher**. Re-fit at the shipping distribution |
+| refinement level count = **2.231** | `v3`'s band (−20% to −33%), `v5`'s whole trade | ⚠ **worse than `assumed` — now known to be fitted on the wrong distribution family.** Production scores are a per-head-weighted sum of **ReLU'd** fp8 dot products (`streamindex_topk.py:326-338`): right-skewed, mass piled at exactly 0.0, hundreds of exact ties, masked entries at `−inf`. `rng.standard_normal` (`test_dsv4_sparsecore_topk.py:147`) is wrong on sign, skew *and* ties, and L0 buckets on the top 8 **exponent+sign** bits (`L0_SHIFT=24`), the axis on which the two differ most. Expect the true count to be **higher**. Re-fit at the shipping distribution. ⏳ **dispatched, `probes/13-level-count-refit`** — CPU simulation, no job |
 | ρ = **0.40005** prefill | **every share in this document** | ✅ **VERIFIED independently to 5 significant figures**, from `streamindex_topk.py:503-506` with `compression_ratio = 1` (`mla_attention_op.py:116`), `n = 10240` (`streamindex_topk.py:603-605`), and `max-model-len 9216` / `ISL 8192` / `RANDOM_RANGE_RATIO 0.0` in `glm-5.2-fp8-dp16-ep.sh:43,27,37`. It is **robust to the chunk mix** — ρ is uniform over `token_pos ∈ [1, 8192]` however the budget is split. ⚠ What is *not* robust is "2 of 8 chunks"; state it as **1/4 of prefill rows have `token_pos < 2048`**, which holds regardless |
 | the row-comparison gate proves exactness | `v3` and `v10` | ⚠ **§8 shows it is vacuous for `monotone_key`, and the source read makes it worse.** Production rows carry **hundreds of exact ties**, and rows where every head's dot product is ≤ 0 have a maximum of **exactly 0.0** — both called out in `test_dsv4_sparsecore_topk.py:64-70`. A tie-dense row is precisely where a reordered emit can differ while a Gaussian input never would. The gate needs a **tie-dense, negative-and-zero-heavy** input and a distinct `out_hbm` sentinel |
 
@@ -1120,14 +1120,16 @@ prize is ~4× smaller than the number this node carried before the source read.
 1. ⏳ **Collect `probes/11`.** It decides whether D3 is a ~73 µs handoff or a 40% overstatement of
    every denominator in this file. Nothing else here is worth more.
 2. ✅ **The scheduler source read is done** — it settled `v6`, verified ρ to 5 significant figures,
-   and identified the production score distribution. Two cheap actions remain: the
-   `emit_pipeline`/`plsc` compile check (`v4`), and **re-fitting the refinement level count at the
-   real distribution** — a ReLU'd, tie-dense, zero-piled one, not `standard_normal`. The level count
-   feeds `v3`'s band and `v5`'s whole trade, so do it before either is built.
+   and identified the production score distribution. Both cheap follow-ons are now ⏳ **in flight and
+   need no job**: `probes/12` (the `emit_pipeline`/`plsc` compile check for `v4`) and `probes/13`
+   (re-fitting the refinement level count at the real ReLU'd, tie-dense, zero-piled distribution
+   rather than `standard_normal`). The level count feeds `v3`'s band and `v5`'s whole trade, so
+   neither is built before `13` lands.
 3. **Dispatch the two mandatory probes in one job**: the count-pass rate (`v10`) and the conditional
    `store_compressed` cost (`v3`). Both are single arms and they decide two of the three largest
    candidates. ⚠ **Give both the real score distribution**, not `standard_normal` — a tie-dense input
-   changes the mask densities they are measuring.
+   changes the mask densities they are measuring, and that is why this waits on `probes/13`'s
+   validated generator rather than each probe rolling its own.
 4. **Lift Plan A into `variants/`** — it is written, bit-exact and measured, and it validates the
    step-3 harness against a known answer before anything unknown is measured against it.
 5. Then `v5`'s three-arm sweep, and Plan B.
