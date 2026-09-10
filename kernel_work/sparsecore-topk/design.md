@@ -15,31 +15,50 @@ Every percentage is a change in time, `(new − old)/old`, so **negative is fast
 the direction in words.
 
 **The denominator, stated once.** Every share and every `Δ time %` in this file is against the
-**production prefill kernel, 189.98 µs** (stage C″ — the ρ = 0.40005 reweighting of the ρ = 1
+**harness prefill kernel, 189.98 µs** (stage C″ — the ρ = 0.40005 reweighting of the ρ = 1
 microbenchmark). It is not the 326.782 µs the instrument reads, and it is not the 451.2 µs of
 step 1. Where a number was measured at ρ = 1 the µs figure is quoted unchanged and only its share
 moves — the reweighting never invents a measurement.
+
+⛔ **CORRECTION, `probes/11` (`j-9b520877`): 189.98 µs is the *harness*, and the harness is bigger
+than production.** The harness's `jit` entry aval forces an XLA relayout of the 40 MiB score buffer
+that the production caller does not pay (§1). **The production prefill kernel is 129.56–155.82 µs.**
+
+| denominator | µs | what it includes | every `Δ time %` below × |
+| --- | ---: | --- | ---: |
+| **harness** — what every table in this file uses | **189.98** | the untiling `copy` **and** the reshape+retile `bitcast-convert` fusion | 1.000 |
+| **production, firm leg** | **155.82** | drops the untiling `copy` only, −34.165 µs — ⛔ **verified absent** from the production HLO | **1.219** |
+| **production, optimistic leg** | **129.56** | also drops the `bitcast-convert`, a further −26.251 µs — ⚠ **open**, see §1 | **1.466** |
+
+⚠ **The µs figures in this file are unaffected and remain the primary quantity; only percentages
+move, and they all move up by the same factor.** Rather than restate several dozen cells against a
+range, this file keeps the harness denominator throughout and converts once, here. **`results.md`
+must not** — step 3 measures against a production-shaped entry and quotes production percentages
+(`probes/11` § "The consequence for step 3").
 
 ## 0. Where the search landed
 
 - **Best version:** `v2` — the incumbent with the 16× lane-private histogram replication removed.
   It is the only node with a measurement, and it is bit-exact.
 - **189.98 µs modelled-from-measured → 177.79 µs**, **−6.42%** (6.4% faster), from `R1`'s measured
-  12.195 µs (`j-300d4690`, bit-identical output 1024/1024 and 64/64 rows).
-- **`v1` is at 10.6% of a 20.05 µs modelled floor.** §1 carried a pessimistic 95.73 µs leg until
-  `probes/10` returned; **that leg is now withdrawn** — the residual scales with buffer bytes, so it
-  is not an irreducible cost of invoking the op.
+  12.195 µs (`j-300d4690`, bit-identical output 1024/1024 and 64/64 rows). In production
+  percentages that is **−7.83%** (firm) to **−9.41%** (optimistic).
+- **`v1` is at 10.6% of a 20.05 µs modelled floor** (13.0–15.5% against the production denominator).
+  §1 carried a pessimistic 95.73 µs leg until `probes/10` returned; **that leg is withdrawn**, and
+  `probes/11` replaced the 75.683 µs non-kernel residual with a **measured 5.385 µs**.
 - **Versions:** 8 explored, 1 built and measured, 0 rewinds (nothing has been rejected on a
   measurement yet — this is step 2, and that is the expected state).
-- ⚠ **What would change the answer, and it is bigger than anything in the graph:** `probes/10` traced
-  the 75.683 µs residual to an **XLA relayout of the whole 40 MiB score buffer**, inside the timed
-  `jit` and **outside the Pallas kernel** — `%copy.3`, layout `{3,2,1,0:T(8,128)}` →
-  `{3,1,2,0:T(8,128)}`, a full read plus a full write, ≈73 of the 75.3 µs. If `probes/11` (in flight)
-  confirms it exists in the production call path, the fix is **a layout or dtype decision at the call
-  site, not a kernel change** — a `carried:` handoff worth ~4× the caller's own request. If instead
-  it is an artifact of the microbenchmark's `jit` signature, the **189.98 µs denominator overstates
-  the production kernel by ~40%** and every share below roughly doubles. Either way it is the first
-  thing to settle.
+- ✅ **The biggest open question in this file is closed, and it went the good way.** `probes/10`
+  traced the 75.683 µs residual to an XLA relayout of the 40 MiB score buffer, outside the Pallas
+  kernel, and left two legs. **`probes/11` (`j-9b520877`) settled it: the artifact leg.** The
+  production caller (`streamindex_topk.py:831`) emits **no** `sparse-core-data-format-call` and
+  **no** 40 MiB untiling copy — its score buffer is `f32[1024,80,128]{2,1,0:T(8,128)}`, whose minor
+  dimension is exactly one 128-lane tile, so the flatten to `s32[10485760]{0:T(1024)}` is a **free
+  `bitcast`**. The harness passes `f32[1024,10240]`, where `(8,128)` tiling is *not* row-major, so
+  XLA must untile 40 MiB first. **So there is no ~73 µs handoff** — and every prize in this file is
+  worth **1.219× to 1.466×** what its table says. ⚠ Two smaller things survive: a live **10.007 µs
+  output retiling** in the production entry (in-model status open), and the open leg of the
+  denominator range. Both are in §10.
 
 ⚠ **The caller's stated mechanism is node `v4`, and it is small.** "The DMA is synchronously waited;
 use `emit_pipeline` for double buffering" is a real finding — the transfer is 100% exposed, overlap
@@ -59,11 +78,12 @@ At the production prefill shape and ρ = 0.40005. Bytes that must move: `ρ·b·
 | `t_hbm` | 20.05 | modelled | 25.17 MB ÷ 1255 GB/s, the *measured* 40 KiB-slice rate (`report.md` §5b), not the 3113 GB/s asymptote |
 | `t_sparsecore` | ~16.5 | modelled | ≥ 2 passes over the live elements at `cvt`'s measured 1.963 ps/element (`probes/03`): one to fix a threshold, one to emit. A correct exact top-k cannot do it in one |
 | `t_vpu` / `t_mxu` | 0 | measured | **both units are idle for 100% of the block** (`report.md` §2, ops 15–16 do not execute at `P=1`) |
-| **terms outside the floor** | — | | ⚠ **D3, 75.683 µs — now attributed, and it is outside the kernel** (see below). Also: SparseCore↔TensorCore handoff (D7, `unmodelled`); the `b_pad`-wide length DMA (D11, `assumed` negligible — **and `probes/10` closed the per-row axis, so it is not promoted**) |
-| `v1` measured-and-reweighted | 189.98 | measured (`j-4e0df30a`) + modelled reweighting | achieved: **10.6%** |
+| **terms outside the floor** | — | | ✅ **D3 resolved: 34.2–60.4 µs of it is a harness artifact and 5.385 µs is the measured non-kernel floor** (`probes/11`; see below). ⚠ A **10.007 µs output retiling** survives in production. Also: SparseCore↔TensorCore handoff (D7, `unmodelled`); the `b_pad`-wide length DMA (D11, `assumed` negligible — **`probes/10` closed the per-row axis, so it is not promoted**) |
+| `v1` measured-and-reweighted, **harness** | 189.98 | measured (`j-4e0df30a`) + modelled reweighting | achieved: **10.6%** |
+| `v1` **production** | **155.82–129.56** | the above less `probes/11`'s harness-only relayout | achieved: **12.9–15.5%** |
 | target | 25–33 | | 60–80% of floor |
 
-### ⚠ D3 — 39.8% of the measured kernel — is not in the kernel at all
+### ✅ D3 — 39.8% of the *measured* kernel — is not in the kernel, and mostly not in production
 
 **D3 is 75.683 µs and belongs to no op.** `probes/09` measured it with every region switched off
 (`dma, cvt, hist, sweep, emit, fill, outdma`) against an empty launch, and refuted four mechanisms:
@@ -88,17 +108,75 @@ slope rather than a division — the wave loop, at **0.009 µs/wave**.
 **withdrawn**: a cost that scales with buffers is not an irreducible cost of invoking the op. Every
 "% of floor" in §3 and §5 stands against **20.05 µs**.
 
-⚠ **But the denominator is now the open question, and `probes/11` (in flight) decides it.** The HLO
-block is a static read of one arm — the timing fits are measured, the mechanism is `modelled`:
+### ✅ `probes/11` (`j-9b520877`) decided it: **the harness-artifact leg**
 
-| if the relayout… | what D3 is | what changes |
+The production caller is `streamindex_topk` (`streamindex_topk.py:509`, calling `sparsecore_topk` at
+`:831`). Its optimized HLO, compiled at both `enable_early_exit` settings on GLM-5.2 avals and
+self-checked to contain `sc_topk_direct_b1024_n10240_k2048`, contains **zero**
+`sparse-core-data-format-call` and **no** layout-changing copy ≥ 1 MiB — the only `copy` in the whole
+module is `%copy.11 = f32[1024,64]`, 256 KiB of `indexer_weights`. I re-derived this myself from
+`probes/11/hlo/hlo-prod_early_exit_False.txt`, walking the operand chain **by name**:
+
+```
+%StreamIdxTC-m-bq_128-bkvp_2.1 = f32[1024,80,128]{2,1,0:T(8,128)}   custom-call
+%bitcast_convert_type.3        = s32[1024,80,128]{2,1,0:T(8,128)}   bitcast-convert(↑)
+%bitcast.74                    = s32[10485760]{0:T(1024)}           bitcast(↑)          ◄ FREE
+%sc_topk_direct_…call-start(%bitcast.74, …)
+```
+
+**Why the two differ.** Production's minor dimension is exactly **128 = one lane-tile**, so
+`{2,1,0:T(8,128)}` *is* row-major and the flatten is a bitcast. The harness's entry aval is
+`f32[1024,10240]{1,0:T(8,128)}`, minor dim 10240 ≫ 128, so the tiling is not row-major and XLA must
+untile the whole buffer before a SparseCore call can read it.
+
+**The arms, and what they price.** One interleaved pool, 9 rounds, null spread **1.641 µs** (⚠ 2.1×
+worse than probe 10's 0.770 — every delta is quoted against 1.641). Every arm that moved also deleted
+the named region **in its own dumped HLO**, and `(flatin + flatout)/flatio = 0.999`, so the two
+regions are additive and non-overlapping.
+
+| arm | Δ vs `A0_base` | what it deletes |
+| --- | ---: | --- |
+| `A0_flatin` | **−60.416 µs** | the whole input path — df-call, `copy.3`, and the `bitcast-convert` fusion |
+| `A0_s32in` | −26.251 µs | the `bitcast-convert` fusion only; `copy.3` survives |
+| ⇒ `copy.3` alone | **34.165 µs** | by subtraction; 40 MiB moved twice ⇒ 2.46 TB/s, a plausible full-buffer rate |
+| `A0_flatout` | −10.007 µs | the output retiling `ROOT %reshape` |
+| `A0_flatio` | −70.511 µs | both; **leaves a 5.385 µs residual** |
+| `A0_donate` | +1.557 µs | ✅ **null** — inside the spread, HLO unchanged. Not an aliasing artifact |
+| `A0_fmtin` | −0.049 µs | ⚠ **inert, not a null** — `Layout.AUTO` returned the layout the buffer already had, so the arm moved nothing. It did not test the hypothesis |
+
+⚠ **The prober's headline over-transferred by 26.251 µs, and the main thread corrected it.** Its
+report read "production pays *neither* input relayout, so ~70.5 of 75.3 µs does not exist". The
+`copy.3` leg is right. The `bitcast-convert` leg is not: **the two modules' `bitcast-convert`s are
+different ops sharing an opcode.**
+
+| | harness | production |
 | --- | --- | --- |
-| **exists in the production call path too** | a real ~73 µs cost, **outside the kernel** | a `carried:` handoff — a layout/dtype decision at the call site, worth ~5× Plan C. No plan in §9 can reach it |
-| **is an artifact of the harness's `jit` signature** | not production cost at all | ⛔ the **189.98 µs denominator overstates the production kernel by ~40%**; it becomes ~117 µs and **every share in this document roughly doubles** |
+| | `%bitcast-convert_bitcast_fusion`, `kind=kLoop` | `%bitcast_convert_type.3`, not a fusion |
+| in → out | `f32[1024,10240]{1,0:T(8,128)}` → `s32[128,80,8,128]{3,2,1,0:T(8,128)}` | `f32[1024,80,128]{2,1,0}` → `s32[1024,80,128]{2,1,0}` |
+| what it does | convert **+ reshape + retile** — real movement | a **same-shape, same-layout, 4→4 byte** reinterpretation |
+| priced at | **26.251 µs** (`A0_s32in`) | ⚠ **unknown** |
 
-Neither leg changes the *ranking* in §3 — D3 is outside every plan either way, so it inflates all
-denominators equally — and that symmetry is checked in §10. What it changes is how much any of this
-is worth.
+Production's *looks* like a no-op buffer assignment should alias away — but ⛔ it carries the **same
+`estimated_cycles: 66712`** as the harness fusion and a full `window_config`
+(`iteration_bounds ["2","5","1"]`, `buffering_level 2`), i.e. XLA's emitter planned a loop for it.
+That is evidence **for** materialisation. **`A0_s32in`'s 26.251 µs prices the harness's op and does
+not transfer.** Hence the range in "The denominator, stated once", and the open row in §10.
+
+**Consequences.**
+
+1. ⛔ **There is no ~73 µs `carried:` handoff.** Remove it from §10; nothing at the call site to hand
+   over. Never quote "~73 µs" again.
+2. ✅ **The non-kernel floor is 5.385 µs, measured** (`A0_flatio`), not 75.683. `probes/09`'s bracket
+   collapses to its optimistic leg.
+3. ✅ **Every prize in §9 is worth 1.219× to 1.466× its tabulated percentage.** The *ranking* is
+   invariant, exactly as §10 predicted — the correction is a common factor.
+4. ⚠ **One live term survives: the 10.007 µs output retiling**, `ROOT %reshape` on the kernel's flat
+   `s32[2097152]{0:T(1024)}` output, and it **is** present in the production entry. In-model status
+   open (compiling `streamindex_topk` standalone forces its ROOT layout). §10.
+5. ⚠ **The step-3 harness measures a shape production never runs.** `instruments/` is read-only and
+   its frozen md5 is what makes probes 08–11 comparable, so do not edit it — but step-3 arms build
+   their own thunks, so **build every variant and the incumbent against a production-shaped entry**
+   and quote production percentages in `results.md`.
 
 **Revising the floor.** Step 1 quoted 8.9% of a 40.1 µs HBM roofline at ρ = 1. That is superseded
 twice: by ρ (25.17 MB required, not 50.33) and by the `t_sparsecore` term, which step 1 left unpriced
@@ -723,6 +801,22 @@ Ranked. `REJECTED` nodes get no entry; `v7` is `PARKED` and gets a pointer (§5)
 exactly one kernel call** — the boundary never splits in this block, because `P=1` leaves no
 partition loop and `n` is untiled.
 
+⚠ **Every `Δ time %` in the plans below is in the harness denominator (189.98 µs).** `probes/11`
+showed the harness is 34.2–60.4 µs larger than production, so **multiply each by 1.219 (firm) to
+1.466 (optimistic)** to get the production figure — see "The denominator, stated once". The µs
+figures need no adjustment, the ranking is unchanged, and `results.md` will quote production
+percentages directly because step-3 arms build their own production-shaped entry.
+
+| plan | µs | harness `Δ` | production `Δ`, firm → optimistic |
+| --- | ---: | ---: | --- |
+| A · `v2` `R=1` | 12.195 **measured** | −6.42% | **−7.83% → −9.41%** |
+| C · `v4` pipelined DMA | ≤ 13.469 ceiling | −7.09% | **−8.64% → −10.40%** |
+| F · `v6` keep-all fast path | ~8.9 modelled | −4.7% | **−5.7% → −6.9%** |
+| (`v7`, parked) | 4.698 measured | −2.5% | −3.0% → −3.6% |
+
+`v3` (Plan B), `v5` (Plan D) and `v10` (Plan E) are quoted against their own parents, and the same
+factor applies to those too.
+
 ---
 
 ### Plan A — `R=1`, one shared histogram (implements `v2`) · rank 1
@@ -1134,13 +1228,22 @@ prize is ~4× smaller than the number this node carried before the source read.
 - **D11, the `b_pad`-wide length DMA** — ✅ **closed by `probes/10`, not promoted.** It was the
   per-row candidate and the per-row axis measured **−0.886 ns/row** against a 0.770 µs floor. It stays
   `assumed` negligible, but now on evidence rather than on assumption.
-- ⚠ **D3's relayout, if `probes/11` confirms it** — a **`carried:` handoff**, and the largest single
-  item this exercise has found. It owes the five things a handoff owes, and four are already in hand:
-  *what to change* — the layout or dtype of the score tensor at the call site, so XLA has no
-  `sparse-core-data-format-call` to insert; *the prize* — ~73 µs, `modelled` from HLO against a
-  measured 75.349; *the correctness evidence* — none needed, a layout change computes the same
-  function; *the constraint* — it is outside the Pallas kernel, so no variant in §9 can build it.
-  The missing one is *the route*: the owning file and function, which is `probes/11` Q1.
+- ⛔ **D3's input relayout — WITHDRAWN, it is not a handoff and not a production cost.** `probes/11`
+  found **zero** `sparse-core-data-format-call` and no 40 MiB copy in the production module: the
+  score buffer's minor dimension is one lane-tile, so the flatten is a free `bitcast`. The ~73 µs
+  was an artifact of the microbenchmark's `jit` entry aval. Nothing to hand off. ✅ Its real payoff
+  was to the denominator (§1), and it went in our favour.
+- ⚠ **The output retiling, 10.007 µs — a candidate `carried:` handoff, and the only survivor of D3.**
+  `ROOT %reshape.1 = s32[1024,2048]{1,0:T(8,128)} reshape(…call-done)` retiles the kernel's flat
+  `s32[2097152]{0:T(1024)}` output, and it **is** in the production entry (`measured` 10.007 µs =
+  1.251 µs/MiB, `A0_flatout`). Of the five things a handoff owes it has four: *what to change* — have
+  the consumer accept the flat `{0:T(1024)}` output, or give the kernel the retiled output layout
+  directly; *the prize* — 10.007 µs `measured`, 6.4–7.7% of the production kernel; *the correctness
+  evidence* — none needed, a layout change computes the same function; *the constraint* — outside the
+  Pallas kernel, so no §9 plan reaches it. ⛔ **The missing one is whether it exists at all in-model**:
+  compiling `streamindex_topk` standalone forces its ROOT to the default entry layout, so this may be
+  an artifact of the same class as the input relayout was. **Do not promote it to a handoff until
+  that is checked** — the check is free, see below.
 
 **`assumed` numbers the graph depends on.**
 
@@ -1154,15 +1257,21 @@ prize is ~4× smaller than the number this node carried before the source read.
 
 | term | which version it hits hardest | asymmetry check (§10's tell) |
 | --- | --- | --- |
-| ⚠ **D3, 75.683 µs — no longer `unmodelled`, but not yet placed** | **all of them equally** — it is 39.8% of the denominator every prize is divided by | ✅ **checked, and it is symmetric**: no plan is credited with removing it, and both legs of §1 inflate every denominator by the same factor, so the *ranking* is invariant. What is not invariant is the worth of the whole exercise, which is why `probes/11` is first in the list below |
+| ✅ **D3 — CLOSED.** 34.165 µs harness-only (firm), a further 26.251 µs harness-or-not (open), 10.007 µs live output retiling, 5.385 µs irreducible | the **denominator**, and therefore all of them equally | ✅ **the symmetry prediction held.** `probes/11` moved every prize by the same factor (1.219–1.466) and reordered nothing. The residual open leg — is production's same-shape `bitcast-convert` materialised? — is worth 26.251 µs **of denominator**, so it too is symmetric across plans |
 | **count-pass rate** | `v10` only | ⚠ **asymmetric, and this is the one to watch.** Treating it as cheap makes `v10` a −9.7% candidate; treating it as expensive kills the root. Both readings come from the same empty cell — **hence the mandatory probe above** |
 | `t_TC` (D7) | the handoff, no version | symmetric — nothing is being taken on it either way |
 | step homogeneity in ρ | `v6` only | ⚠ **asymmetric**: it is what turns `v6` from ≤−18.5% into 0%. Hence the mandatory check |
 
 **What a next session should do first, in order.**
 
-1. ⏳ **Collect `probes/11`.** It decides whether D3 is a ~73 µs handoff or a 40% overstatement of
-   every denominator in this file. Nothing else here is worth more.
+1. ✅ **`probes/11` is collected and D3 is closed** — the harness-artifact leg. Two **free, no-job**
+   follow-ons it left, both worth doing before step 3 spends anything:
+   - **Is production's `%bitcast_convert_type.3` materialised (~26 µs) or aliased away?** It closes
+     the denominator range. Cheapest check: an **existing GLM-5.2 prefill xprof** — look for a ~26 µs
+     op between `StreamIdxTC` and `sc_topk_direct`. Failing that, XLA's buffer-assignment dump.
+   - **Does the 10.007 µs output retiling survive in-model?** Compile the enclosing
+     `mla_attention_op` entry (or read the full-model optimized HLO) and grep for the `reshape` on the
+     `call-done`. This is what decides whether the one surviving handoff is real.
 2. ✅ **The scheduler source read is done** — it settled `v6`, verified ρ to 5 significant figures,
    and identified the production score distribution. ✅ **`probes/12` has landed**: `emit_pipeline`
    is viable on SparseCore, the `BufferedRef` fallback is withdrawn, and `v4` split by phase.
@@ -1174,6 +1283,10 @@ prize is ~4× smaller than the number this node carried before the source read.
    candidates. ⚠ **Give both the real score distribution**, not `standard_normal` — a tie-dense input
    changes the mask densities they are measuring, and that is why this waits on `probes/13`'s
    validated generator rather than each probe rolling its own.
-4. **Lift Plan A into `variants/`** — it is written, bit-exact and measured, and it validates the
+4. ⚠ **Before any step-3 arm: give the thunks a production-shaped entry.** `probes/11`'s
+   `A0_flatin` shows how — the harness's `f32[1024,10240]` parameter adds 34–60 µs that production
+   does not pay, and a constant in the denominator dilutes every delta. `instruments/` stays
+   read-only and frozen (it is what makes probes 08–11 comparable); the arms build their own thunks.
+5. **Lift Plan A into `variants/`** — it is written, bit-exact and measured, and it validates the
    step-3 harness against a known answer before anything unknown is measured against it.
-5. Then `v5`'s three-arm sweep, and Plan B.
+6. Then `v5`'s three-arm sweep, and Plan B.
