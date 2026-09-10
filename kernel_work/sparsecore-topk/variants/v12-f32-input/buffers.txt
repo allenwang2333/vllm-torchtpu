@@ -1,0 +1,57 @@
+--- incumbent: rc=0 ['compiled ok']
+
+===== incumbent buffer assignment (1 file(s)) =====
+  module_0000.jit__lambda.cl_954665169.after_optimizations-buffer-assignment.txt
+    allocations           : 8
+    sum(allocation sizes) : 167841800
+    preallocated-temp     : [(3, 33554432), (4, 83951616), (5, 0), (6, 4), (7, 4)]  peak=83951616
+    >=4MiB alloc 1: 41943040  parameter 0, shape |f32[1024,10240]| at ShapeIndex {}:
+    >=4MiB alloc 2: 8388608  output shape is |s32[1024,2048]|, maybe-live-out:
+    >=4MiB alloc 3: 33554432  color 1, preallocated-temp:
+    >=4MiB alloc 4: 83951616  preallocated-temp:
+    values matching 'bitcast_convert_type': 0
+    values matching 'bitcast-convert': 1
+        value: <11 bitcast-convert_bitcast_fusion @0> (size=41943040,offset=65536): s32[128,80,8,128]{3,2,1,0:T(8,128)}
+    values matching 'copy': 4
+        value: <2 copy.4 @0> (size=41943040,offset=42008576): s32[128,80,8,128]{3,1,2,0:T(8,128)}
+        value: <3 copy.5.cloned.1.call-start{} @7> (size=0,offset=0): ((s32[128,80,8,128]{3,2,1,0:T(8,128)}), s32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)
+        value: <4 copy.5.cloned.1.call-start{0} @7> (size=0,offset=0): (s32[128,80,8,128]{3,2,1,0:T(8,128)})
+        value: <5 copy.5.cloned.1.call-start{2} @8> (size=4,offset=0): u32[]{:S(8)}
+    values matching 'sparse-core-data-format': 4
+        value: <13 prepare_done_sparse-core-data-format-call.cloned.1.call-start @0> (size=0,offset=0): token[]
+        value: <14 sparse-core-data-format-call.cloned.1.call-start{} @0> (size=32,offset=0): ((s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), s32[128,80,8,12
+        value: <15 sparse-core-data-format-call.cloned.1.call-start{0} @0> (size=32,offset=16384): (s32[128,80,8,128]{3,2,1,0:T(8,128)}, token[])
+        value: <12 prepare_start_sparse-core-data-format-call.cloned.1.call-start @2> (size=4,offset=0): s32[]{:S(2)}
+  dump file kinds: {'.debug_options': 1, '.flagfile': 1, '.html': 1, '.mlir': 1, '.textproto': 2, '.txt': 415}
+  files matching *llo*: 27 ['1789070605891405267-<late-initialization>-29-DGO-post-llo-late-decomposer.txt', '1789070605891405267-<late-initialization>-35-post-llo-dependency-graph-optimizations.txt', '1789070605921999896-reshape.4-23-DGO-post-llo-late-decomposer.txt', '1789070605891405267-<late-initialization>-49-pre-finalize-registers-and-allocations.txt', '1789070605016422086-TLP-01-memory-space-assignment-allocinfo.txt', '1789070605925507341-bitcast-convert_bitcast_fusion-44-pre-finalize-registers-and-allocations.txt']
+  files matching *mosaic*: 38 ['1789070605326537407-0003-mosaic-dump-anonymous-post-mosaic-module-infer-memref-layout.txt', '1789070605186032021-0004-mosaic-dump-anonymous-post-simplify.txt', '1789070605326537407-0008-mosaic-dump-anonymous-post-mosaic-module-logical-to-physical-device-id.txt', '1789070605186032021-0003-mosaic-dump-anonymous-post-mosaic-module-infer-memref-layout.txt', '1789070605186032021-0006-mosaic-dump-anonymous-post-mosaic-module-canonicalize-memory-space.txt', '1789070605188521127-0000-mosaic-dump-anonymous-post-deserialization.txt']
+  files matching *bundle*: 93 ['1789070605891405267-<late-finalization>-30-DGO-post-vliw-bundle-scheduler.txt', '1789070605891405267-TLP-77-bundles-pre-codegen.txt', '1789070605925507341-bitcast-convert_bitcast_fusion-65-final_bundles.txt', '1789070605921999896-reshape.4-40-schedule-analysis_packed-bundles-pre-ra.txt', '1789070605921999896-reshape.4-49-schedule-analysis_packed-bundles-no-ra-deps.txt', '1789070605891405267-TLP-56-schedule-analysis_packed-bundles-no-ra-deps.txt']
+  files matching *sc_topk*: 0 []
+--- variant: rc=0 ['compiled ok']
+
+===== variant buffer assignment (1 file(s)) =====
+  module_0000.jit__lambda.cl_954665169.after_optimizations-buffer-assignment.txt
+    allocations           : 8
+    sum(allocation sizes) : 134287368
+    preallocated-temp     : [(3, 33554432), (4, 50397184), (5, 0), (6, 4), (7, 4)]  peak=50397184
+    >=4MiB alloc 1: 41943040  parameter 0, shape |f32[1024,10240]| at ShapeIndex {}:
+    >=4MiB alloc 2: 8388608  output shape is |s32[1024,2048]|, maybe-live-out:
+    >=4MiB alloc 3: 33554432  color 1, preallocated-temp:
+    >=4MiB alloc 4: 50397184  preallocated-temp:
+    values matching 'bitcast_convert_type': 0
+    values matching 'bitcast-convert': 0
+    values matching 'copy': 4
+        value: <0 copy.4 @0> (size=41943040,offset=65536): f32[128,80,8,128]{3,1,2,0:T(8,128)}
+        value: <1 copy.5.cloned.1.call-start{} @7> (size=0,offset=0): ((f32[128,80,8,128]{3,2,1,0:T(8,128)}), f32[128,80,8,128]{3,1,2,0:T(8,128)}, u32[]{:S(8)
+        value: <2 copy.5.cloned.1.call-start{0} @7> (size=0,offset=0): (f32[128,80,8,128]{3,2,1,0:T(8,128)})
+        value: <3 copy.5.cloned.1.call-start{2} @8> (size=4,offset=0): u32[]{:S(8)}
+    values matching 'sparse-core-data-format': 4
+        value: <10 prepare_done_sparse-core-data-format-call.cloned.1.call-start @0> (size=0,offset=0): token[]
+        value: <11 sparse-core-data-format-call.cloned.1.call-start{} @0> (size=32,offset=0): ((f32[128,80,8,128]{3,2,1,0:T(8,128)}, token[]), f32[128,80,8,12
+        value: <12 sparse-core-data-format-call.cloned.1.call-start{0} @0> (size=32,offset=16384): (f32[128,80,8,128]{3,2,1,0:T(8,128)}, token[])
+        value: <9 prepare_start_sparse-core-data-format-call.cloned.1.call-start @2> (size=4,offset=0): s32[]{:S(2)}
+  dump file kinds: {'.debug_options': 1, '.flagfile': 1, '.html': 1, '.mlir': 1, '.textproto': 2, '.txt': 349}
+  files matching *llo*: 22 ['1789070609856932865-<late-finalization>-28-DGO-post-llo-late-decomposer.txt', '1789070609856932865-<late-initialization>-35-post-llo-dependency-graph-optimizations.txt', '1789070609856932865-<late-finalization>-31-DGO-post-llo-late-decomposer-2.txt', '1789070609887211282-reshape.4-26-DGO-post-llo-late-decomposer-2.txt', '1789070609856932865-<late-initialization>-06-post-rematerialize-allocations.txt', '1789070609856932865-TLP-51-pre-finalize-registers-and-allocations.txt']
+  files matching *mosaic*: 38 ['1789070609291323393-0001-mosaic-dump-anonymous-mosaic-module-original.txt', '1789070609291323393-0010-mosaic-dump-anonymous-sparsecore-module-post-emit-tec.txt', '1789070609291323393-0005-mosaic-dump-anonymous-post-mosaic-module-canonicalize-operations.txt', '1789070609013956832-0001-mosaic-dump-anonymous-mosaic-module-original.txt', '1789070609013956832-0003-mosaic-dump-anonymous-post-mosaic-module-infer-memref-layout.txt', '1789070609138251217-0005-mosaic-dump-anonymous-post-mosaic-module-canonicalize-operations.txt']
+  files matching *bundle*: 75 ['1789070609856932865-TLP-49-post-bundle-packing-pre-ra.txt', '1789070609856932865-<late-finalization>-54-schedule-analysis_packed-bundles-no-ra-deps.txt', '1789070609856932865-<late-initialization>-45-schedule-analysis_packed-bundles-pre-ra.txt', '1789070609887211282-reshape.4-59-post-bundle-packing-post-ra.txt', '1789070609856932865-<late-initialization>-70-final_bundles.txt', '1789070609856932865-<late-finalization>-63-pre-delay_hlo-static-per-bundle-utilization.txt']
+  files matching *sc_topk*: 0 []

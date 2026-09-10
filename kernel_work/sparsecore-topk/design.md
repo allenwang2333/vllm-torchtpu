@@ -39,10 +39,33 @@ than production.** The harness's `jit` entry aval forces an XLA relayout of the 
 that the production caller does not pay (§1). **The production prefill kernel is 155.82 µs** — the
 second, ±26.251 µs leg that made this a range is ⛔ **closed against us by `probes/14`**, below.
 
+⛔⛔ **THIS WHOLE FRAMEWORK IS REFUTED BY MEASUREMENT. `probes/18-rho-denominator` (`j-97b98f97`)
+measured the incumbent at the production ρ on the production entry — the arm the bullet above asked
+for — and it does not agree with any row of the table below.** Read `results.md` § "The denominator,
+remeasured" before using a single percentage in this file. In short:
+
+- The production number is **275.185 µs**, not 155.82 — **+76.60%**. Gate-corrected per invocation,
+  291.075 µs.
+- **The 1.219 is not a factor.** The relayout is a *constant additive* **35.563 µs** (three ρ, spread
+  0.195 µs — sixteen times inside the floor). `T_production = T_harness − 35.563`, not `÷ 1.219`.
+  Divided in it is 1.129.
+- **ρ is not a sufficient statistic.** At a fixed mean the cost spans **19.37%** on distribution
+  alone, of which **8.26%** is row *arrangement* at an identical multiset. Nothing may be measured at
+  ρ=1 and reweighted.
+- **The denominator splits and the halves reweight oppositely** — ρ-independent savings ×1.55,
+  in-walk savings ×0.62, a **2.5× fork**. So the percentages below cannot be repaired by any single
+  scale factor. Treat each as a rank hint and a mechanism, never a magnitude.
+- **`probes/09` is unsafe to quote at all**: its `B` anchor does not reproduce (+38.77%, with two
+  other jobs agreeing against it), *and* all 12 of its arms carry `REFINEMENT_LEVELS = ()`, so
+  `hardware_map.md:493`'s "V4 sweeps, **all levels**" row is labelled for a configuration its arms
+  never ran.
+
+The table is kept as the record of what step 2 believed, and is struck rather than deleted:
+
 | denominator | µs | what it includes | every `Δ time %` below × |
 | --- | ---: | --- | ---: |
-| **harness** — what every table in this file uses | **189.98** | the untiling `copy` **and** the reshape+retile `bitcast-convert` fusion | 1.000 |
-| **production** — ✅ **now the only leg** | **155.82** | drops the untiling `copy` only, −34.165 µs — ⛔ **verified absent** from the production HLO | **1.219** |
+| ~~**harness** — what every table in this file uses~~ | ~~**189.98**~~ | the untiling `copy` **and** the reshape+retile `bitcast-convert` fusion | ~~1.000~~ |
+| ~~**production**~~ — ⛔ **refuted, measured 275.185** | ~~**155.82**~~ | drops the untiling `copy` only, −34.165 µs — ⛔ **verified absent** from the production HLO | ~~**1.219**~~ |
 | ~~production, optimistic leg~~ | ~~129.56~~ | ~~also drops the `bitcast-convert`, a further −26.251 µs~~ — ⛔ **CLOSED and rejected by `probes/14`** | ~~1.466~~ |
 
 ✅ **The ±26.251 µs open denominator leg is settled, and it went the conservative way.** `probes/14`
@@ -315,8 +338,11 @@ transfers.** The denominator is therefore a single 155.82 µs, and `v12`/U2's pr
    `s32[2097152]{0:T(1024)}` output, present in the production entry. The worry was that compiling
    `streamindex_topk` standalone forces its ROOT layout, so the retile might be an artifact of the
    compilation boundary. `probes/14` Q2 settled it: in the **real** entry the retile survives as an
-   `S(1)` staging copy rather than a ROOT reshape. Different op, same 40 MiB of movement, so `v11`
-   keeps its prize. §10.
+   `S(1)` staging copy rather than a ROOT reshape. Different op, same **8 MiB** of movement, so `v11`
+   keeps its prize. §10. ⛔ **This sentence read "40 MiB" until step 3 corrected it** — 40 MiB is the
+   `f32[1024,10240]` *input* buffer, which is `v12`'s prize. The retiled *output* is
+   `s32[1024,2048]` = 8 MiB, and the design's own rate agrees: 10.007 µs ÷ 1.251 µs/MiB = 8.0 MiB.
+   No prize moves, because both were computed from the rate and never from the byte count.
 5. ⚠ **The step-3 harness measures a shape production never runs.** `instruments/` is read-only and
    its frozen md5 is what makes probes 08–11 comparable, so do not edit it — but step-3 arms build
    their own thunks, so **build every variant and the incumbent against a production-shaped entry**
@@ -713,10 +739,25 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **State diff from `v2`:** `algebra` — the L0 walk gains two conditional compressed stores and loses
   its downstream consumers. `live set` — a straddler buffer appears. `grid` — refinement's loop bound
   changes from `walk_chunks` to `cdiv(cnt,16)`
-- **Live set:** 57,152 + `4·cnt_max`. At `cnt_max = 4096` (a bucket cannot hold more than the row):
-  **73,536 B = 71.81 KiB, 14.03%.** Binding term: still none. ⚠ `cnt_max` sizes the **buffer** and
-  4096 remains the correct safe bound — do not shrink it to the measured occupancy. What `probes/13`
-  changed is the **cost**, which is driven by actual occupancy, not by the allocation
+- **Live set:** 57,152 + `4·cnt_max`. ⛔⛔ **`cnt_max = 4096` IS FALSIFIED — this bound is not safe
+  and building to it corrupts memory.** The parenthetical reasoning below ("a bucket cannot hold more
+  than the row") is wrong: the step-3 `v3` build measured `cnt` reaching **10240**, i.e. the full
+  `slice_len`, on an all-negative score distribution. A variant built to 4096 with
+  `disable_bounds_checks=True` **overflows by 2.5× and corrupts adjacent scratch.** Size from
+  `slice_len` — `v3` uses `slice_len + LANES`, which makes overflow impossible by construction.
+  ✅ **The frozen suite does catch this one**, with 1.35× of margin: max `cnt` at ρ=1 is
+  `strict_desc` 1536, `random` 3054, **`heavy_ties` 5526**, `all_negative` 7089, and `heavy_ties`
+  runs at P=1 — so `test_exact_topk_full_rows[heavy_ties-p1-b1024-n10240]` goes red against a
+  4096-word buffer. ⚠ **But the margin is one kind and 1.35×**, and `TWO_STAGE_SHAPES` leaves P=1
+  with **no coverage of negative winners at all** (`all_negative` is the only kind whose winners are
+  negative, hence the only one exercising `monotone_key`'s involution at emit time, and it is `P>1`
+  only — `--collect-only` confirms it in exactly 5 ids, 0 at P=1). Adding `all_negative` to
+  `test_exact_topk_full_rows`'s kind list closes both, but that test spans all 7 `SHAPES`, so it
+  costs **7 ids, 5 at the expensive `N_128K` shapes**; restricting it to the two P=1 shapes — where
+  both gaps live — buys the whole fix for **2**. ~~At `cnt_max = 4096` (a bucket cannot hold more than the row):
+  **73,536 B = 71.81 KiB, 14.03%.** Binding term: still none. `cnt_max` sizes the **buffer** and
+  4096 remains the correct safe bound — do not shrink it to the measured occupancy.~~ What
+  `probes/13` changed is the **cost**, which is driven by actual occupancy, not by the allocation
 - **Predicted:** ⚠ **RE-PRICED by `probes/13` — and the dominant error was not the level count it was
   sent to check.** Removes the refinement walk (20.08) and `emit`'s traversal, replacing them with ~1
   extra pass over `L` at L0 and `levels × cnt` walks. Old inputs (level 2.231, `cnt` **assumed 4096**)
@@ -733,9 +774,23 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
 - **Band:** **≈ −20.5% central, −14.9% at the barriered `wavemax` upper bound.** ⚠ Supersedes
   −17.51%/−11.94%, which superseded −16.48% and −13.80%. The old **−20% to −33% band still does not
   exist**, but the corrected figure has now re-entered its lower edge from below
-- ✅ **`v3` cannot be a loss, and the margin is no longer arguable.** Break-even `cnt_eff` moved
+- ⛔⛔ **REFUTED BY THE STEP-3 BUILD. `v3` IS PREDICTED TO LOSE: +1.85% … +6.27% harness /
+  +2.27% … +7.71% production.** Every re-pricing above, including the two that felt like corrections,
+  shares one false premise: **the fused pass cannot exist.** Plan B's `_l0_fused` wants the level-0
+  histogram walk to also classify elements against the pivot bucket — but **`b_star` is the *output*
+  of that histogram**, so nothing during the walk knows the pivot yet. The two stores cannot ride an
+  existing pass; they need their own full-length walk of `L`. Since `store_compressed` is flat in
+  density (the `probes/15` bullet above, 6.675 µs/pass = 0.32×W), `v3` adds **two** of them to a full
+  walk (+5.34 µs) to save 0.33 of a walk (−2.74 µs). **Break-even is α = cnt/i_hi = 0.2375; measured
+  α is 0.347 prefill, 0.636 decode.** Confirmed at bundle level: the new `split` region is +204
+  bundles while the L0 region is **unchanged at 108, with identical opcode sequences.**
+- ~~✅ **`v3` cannot be a loss, and the margin is no longer arguable.** Break-even `cnt_eff` moved
   6295 → **8531**, which is **above the global maximum `cnt` of 6495** — so even `probes/13`'s
-  deliberately absurd bound F is a win. The node's sign is settled without building it
+  deliberately absurd bound F is a win. The node's sign is settled without building it~~
+  ⛔ **This is the sentence the build overturned, and the way it was wrong is the lesson: it was
+  computed against the impossible pass, so no amount of re-pricing its inputs could have found the
+  error.** ⚠ Its risk row 1 signal — "L0's own arm time rises" — **reads clean and would have
+  exonerated the change**, because the cost lands on a different pass.
 - ⚠ **Two intermediate figures for this node are superseded; ignore them if you meet them elsewhere.**
   −16.48% used a walking-row level count against a global-mean `cnt` (wrong aggregation on both);
   −13.80% then rescaled the `deleted` term by 1.570/2.231, which is wrong because the production
@@ -1027,7 +1082,9 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   `stage-e-boundary.md` §3c) was that compiling `streamindex_topk` standalone forces its ROOT
   layout, so the 10.007 µs retile might be an artifact of where the compilation was cut. `probes/14`
   Q2 compiled the **real** entry: the retile survives, as an `S(1)` staging copy rather than a
-  `ROOT reshape`. A different op, the same 40 MiB of movement, so the prize stands and the "REJECTED
+  `ROOT reshape`. A different op, the same **8 MiB** of movement (⛔ **not 40 MiB, as this line said
+  until step 3** — 40 MiB is `v12`'s input buffer; `s32[1024,2048]` is 8 MiB, which is what
+  10.007 µs ÷ 1.251 µs/MiB independently gives), so the prize stands and the "REJECTED
   with prize 0" leg is withdrawn. ⚠ Two carry-overs from that answer: the price transfers by *shape*
   and not by op identity — 10.007 µs was measured on the ROOT reshape, and no arm has yet deleted the
   staging copy — and `v11` remains **subsumed by H3**, since a fused consumer has no HBM output to
@@ -1070,7 +1127,12 @@ matters, because it is what unblocks `v6` (§5) and it is why the stride-32 owne
   (scratch `int32 → float32`), and in-register `bitcast_convert_type` at `:172-173` and `:178`.
   That form lowers. Ref-level `.bitcast` would avoid the two per-load bitcasts but is unavailable on
   a 1-D ref (`jax/_src/state/utils.py:98` indexes `shape[-2]` unconditionally); it works on a 2-D
-  ref, so a reshaped scratch is a fallback **if the two bitcasts ever price**
+  ref, so a reshaped scratch is a fallback ~~**if the two bitcasts ever price**~~
+  ⛔ **RETIRED by the step-3 `v12` build. Do not spend a structural change on this.** The bitcasts
+  price at **exactly zero** — 1364 SparseCore bundles in both arms, `static-compile`. ⚠ And
+  `probes/17` **undercounted them 3.5×**: it reported 2, the real kernel has **7** in Mosaic MLIR,
+  becoming 35 LLVM instructions under `unroll=4`. Harmless here because the prize was zero either
+  way, but the method generalises badly — **a toy-kernel op count is not the production op count.**
 - **Built?** **No** · **Measured:** — · **Verdict:** **OPEN**, mandatory. Feasibility is closed
   (`probes/17`) and the production-path question is closed (`probes/14` Q1). The one term still
   `unmodelled` is the price of the two in-body `tpu.bitcast`s — which is why this is `OPEN` and not
@@ -1274,6 +1336,15 @@ stay findable; **this table is the ranking.**
   is already written, already bit-exact and already measured, so lifting it into `variants/`
   validates the step-3 harness against a known answer before any unmeasured arm runs.
 
+⚠ **Step 3 added one gating condition to this table, from `v11`'s build.** `v11` is a **`P=1`-only**
+win. At `P>1` it does not fail — it *relocates* the relayout to the stage-1/stage-2 seam, where it is
+larger, and its ENTRY op count grows at all four `P>1` shapes. Both production shapes are `P=1`
+(`report.md` §4), so the candidate survives whole; but the consequence for measurement is general and
+binds every arm in this exercise: **`b=16` is `P=2` at `--ctx 9216` while `b=64` and `b=1024` are
+`P=1`, so a per-arm summary spanning them is summing two different kernels.** Pooling a `P=1` win
+with a `P>1` loss reports a null. This is also a standing warning on whichever node ever touches
+`_pick_partition`.
+
 ⛔ **The shortlist is six nodes, and two of the original eight died on the same mechanism.** `v5` and
 `v6` were both priced by deleting work from one region, and both lost because the deleted work was
 being paid for somewhere the model did not have a term. That is a pattern, not two accidents — see
@@ -1312,14 +1383,29 @@ fold collapses to a single pass. The clear that zeroes the histogram before each
 
 **2. The call chain.** All existing; no new files.
 
+⛔ **CORRECTED by the step-3 `v2` build — this list was three edits and it needed four. Taken
+literally, together with the `v2` node's 1 KiB `priv_vmem` allocation, it is memory-corrupting.**
+With `priv_vmem` shrunk to 272 words, leaving `zero_priv(NUM_BUCKETS)` at **`:224`** writes
+`LANES * NUM_BUCKETS = 4096` words into a 272-word ref on **every unconverged refinement level**,
+over the top of `glob_vmem`. The probe that priced this plan could not have caught it:
+`probes/08/arms/arm-R1.py:48` sets `REFINEMENT_LEVELS = ()`, so the line never executes, and the
+probe kept the 16 KiB allocation anyway. The fourth edit is mandatory, not defensive.
+
 ```
 _topk_kernel                          src/…/deepseek_v4/sparsecore_topk.py:150
 └── wave_body                         src/…/sparsecore_topk.py:~160
     ├── zero_priv(NUM_BUCKETS)     -> zero_priv(NUM_BUCKETS // LANES)      EDIT :185
-    ├── scatter addr = lane*NB+b   -> addr = bucket                        EDIT
-    └── fold_priv(NUM_BUCKETS//LANES) -> fold_priv over range(1)           EDIT :197
+    ├── scatter addr = lane*NB+b   -> addr = bucket                        EDIT :191
+    ├── fold_priv(NUM_BUCKETS//LANES) -> fold_priv over range(1)           EDIT :197
+    ├── zero_priv(where(done,0,NUM_BUCKETS))                               EDIT :224  ◄ REQUIRED
+    │     -> the same // LANES bound. Omitting it overruns priv_vmem.
+    └── refinement scatter addr                                            EDIT :238
     stays with XLA: _effective_row_lengths before; the out_hbm gather after
 ```
+
+The as-built variant is **seven** hunks (incumbent lines 72, 128-135, 185, 191, 224, 238, 456); see
+`results.md` and `variants/v02-r1-shared-hist/README.md` for the three further places where `v2`
+deliberately differs from the `arm-R1` probe that priced it.
 
 **3. The pipeline.** No pipeline change — this plan does not touch T1–T5. The DMA remains one
 buffer, manually started and waited, overlap 0.0000.
@@ -1720,7 +1806,7 @@ already scheduled. Anything not in this list would be a genuine violation:
 | --- | --- | --- |
 | `v3` fused-emit | ✅ **CLOSED by `probes/15` (`j-78f7f537`).** The store is **6.675 µs/pass**, flat in density, and `probes/13` had overcharged it **2.08×**. Band **≈ −20.5%…−14.9%**; break-even `cnt_eff` **8531** is above the global max 6495, so **its sign is settled without building it** | step-3 variant |
 | ⛔ ~~is `hist0`'s sheet price understated?~~ | ⛔ **CLOSED — the question was based on a false premise, now retracted.** `probes/16` refuted `probes/15`'s instrument-bug claim and the main thread re-derived it: the mask runs over **monotone keys**, `KEY_NEG_INF` is the monotone key of −inf, and the measured density is **1.000000 under both readings**. `hist0`'s 33.91 µs also comes from `probes/08`'s residual, not from that arm. **`v10` gains nothing.** Full retraction in §7 | ✅ **no job — closed on arithmetic** |
-| **`v11`** retiled output emit | ✅ **both conditions CLOSED, both favourably.** (a) feasibility, `probes/17` — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) in-model, `probes/14` Q2 — the retile **survives** in the real entry, as an `S(1)` staging copy rather than a ROOT reshape. Same 40 MiB, different op, so the "`REJECTED` with prize 0" leg is withdrawn. ⚠ The 10.007 µs was measured on the ROOT reshape; no arm has yet deleted the staging copy | no job |
+| **`v11`** retiled output emit | ✅ **both conditions CLOSED, both favourably.** (a) feasibility, `probes/17` — the 2-D tiled `out_type` lowers, the `ROOT reshape` disappears, ENTRY 13 → 12, four edits, `o.at[pl.ds(row,1)]` is the one indexer form that fails; (b) in-model, `probes/14` Q2 — the retile **survives** in the real entry, as an `S(1)` staging copy rather than a ROOT reshape. Same **8 MiB** (⛔ not 40 MiB — corrected in step 3; 40 MiB is `v12`'s input), different op, so the "`REJECTED` with prize 0" leg is withdrawn. ⚠ The 10.007 µs was measured on the ROOT reshape; no arm has yet deleted the staging copy. ✅ **Step 3 closed that caveat**: `v11`'s in-model AOT compile deletes **both** the `S(1)` reshape and the `copy-start.5`/`copy-done.5` pair, ENTRY 220 → 218, because the `cond`'s 8 MiB result buffer leaves the VMEM pool and becomes the HBM live-out | no job |
 | **`v12`** (= **U2**) `f32` input, in-register reinterpret | ✅ **feasibility CLOSED by `probes/17`** — reachable, but **three edits, not one**: the DMA is dtype-checked, so the scratch dtype must change too and the reinterpret moves in-register. ✅ **production path CLOSED by `probes/14` Q1** — materialised, so the prize is a firm ≈ −16.8%, the largest single edge prize in the file. One term still open: the price of the two in-body `tpu.bitcast`s, which can only shrink the prize, not flip it | no job |
 | **D7** SC↔TC overlap | ⛔ **moved `PARKED` → `OPEN`** — see below. ⛔ **And its "free, no job" closer is gone.** The plan was to read `StreamIdxTC-*` durations out of an existing xprof; `probes/14` tried exactly that on `j-ecf4ee85` and got **0 device events**, because that step took branch 1 and the whole chain was elided. `t_TC` is not obtainable from any capture in which the kernel did not run. The cost has changed class — from "read a file" to **step selection**: capture a prefill step past chunk 1, or a mixed step. It stays `OPEN` and is **carried into step 3** rather than closed here | ⚠ **a capture, not a file read** |
 | `v4` pipelined-DMA | ✅ **CLOSED by `probes/12`, no job.** `emit_pipeline` is viable on SparseCore and is the repo idiom; the `BufferedRef` fallback is withdrawn. The node stays a step-3 variant, and it gained a **phase split**: cross-wave is prefill-only (32 waves vs 1), within-slice covers both but hides only pass 1 | step-3 variant |
@@ -1756,7 +1842,8 @@ already scheduled. Anything not in this list would be a genuine violation:
   bullet below is kept for its evidence but its conclusion is superseded twice over. (1) Its blocking
   condition — "does it exist at all in-model?" — is **answered yes** by `probes/14` Q2: in the real
   entry the retile survives as an `S(1)` staging copy rather than a `ROOT reshape`, a different op
-  moving the same 40 MiB. It is **not** an artifact of the same class as the input relayout was.
+  moving the same **8 MiB** (⛔ **"40 MiB" until step 3 corrected it** — that is `v12`'s input
+  buffer). It is **not** an artifact of the same class as the input relayout was.
   (2) `probes/17` then showed the kernel can emit the consumer's tiling directly, which makes this
   reachable *from inside* the kernel. So it is node **`v11`**, rank 7 in §9a, on the step-3 build
   list — and the "candidate handoff" framing is withdrawn. ⚠ One caveat survives: the 10.007 µs was

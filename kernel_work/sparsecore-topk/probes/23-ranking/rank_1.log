@@ -1,0 +1,246 @@
+[     0.0s] ==========================================================================
+[     0.0s] STAGE 0  SUBJECT MD5 GATE (in-job)
+[     0.0s] ==========================================================================
+[     0.0s]   p18_probe.py               ceafc734d10632672d3db48f2cea23f6  OK
+[     0.0s]   glm_dsa_block_bench.py     08375d7068365e1a776c58fef09cd6d0  OK
+[     0.0s]   base/sparsecore_topk.py    44353b347c96e0eedbd742c710d4540a  OK
+[     0.0s]   v11/sparsecore_topk.py     67a16569d281d845aae2ad2ca0040583  OK
+[     0.0s]   v12/sparsecore_topk.py     408ef72e9afc935c928f2803764878cc  OK
+[     0.0s]   v4ragged/sparsecore_topk.py 69c8834e130e23999e0284929230da3a  OK
+[     0.0s]   v4c2048/sparsecore_topk.py 88a67892e8c063b5d9fea96de72e99c4  OK
+[     0.0s]   v2/sparsecore_topk.py      3c041d952227dc006fb939797325aedd  OK
+[     0.0s]   v2big/sparsecore_topk.py   79f05d554b98e4681a569d1157f8e6a6  OK
+[     0.0s]   v10a2/sparsecore_topk.py   f83332273f1cdc05995965c0405e8665  OK
+[     0.0s]   v10a2/sparsecore_topk_sample.py 21f2d777419b3cf43ba940f004bd765a  OK
+[     0.0s] MD5_GATE_OK
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789076812.420016     107 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+[     8.2s] host=j-66c7e331-fa41-461e-8686-tpu-job-0-0 devices=8 kind=TPU7x sc=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32) jax=0.10.2
+[     8.2s] 
+[     8.2s] ==========================================================================
+[     8.2s] STAGE 1  MODULES -- one process, separately staged, env set per arm
+[     8.2s] ==========================================================================
+[     8.2s]   base       md5=44353b347c96 suffix=None           env={}
+[     8.2s]   v11        md5=67a16569d281 suffix=_v11retile     env={}
+[     8.2s]   v12        md5=408ef72e9afc suffix=_f32in         env={}
+[     8.2s]   v4ragged   md5=69c8834e130e suffix=_v4ragged      env={}
+[     8.2s]   v4c2048    md5=88a67892e8c0 suffix=_v4c2048       env={}
+[     8.2s]   v2         md5=3c041d952227 suffix=_v2r1          env={}
+[     8.2s]   v2big      md5=79f05d554b98 suffix=_v2bigscratch  env={}
+[     8.3s]   v10a2      md5=f83332273f1c suffix=_sc2           env={'SCTOPK_SAMPLE_AND_COUNT': '1', 'SCTOPK_COUNT_ARITY': '2'}  _scs=/root/p23/subjects/v10a2/sparsecore_topk_sample.py
+[     8.3s]   + 3 nulls (identical incumbent source, separate module objects) -> the incumbent holds 4 slots in every cell
+[     8.3s]   P=1 confirmed at b=1024 and b=64 for all 11 modules
+[     8.3s] 
+[     8.3s] STAGE 1b  OPERANDS (production scores, production length draws)
+[    12.1s]   scores built in 3.6s  pre.md5=e1c3558aca6e7bbd dec.md5=e378603bf93ebb86
+[    12.1s]   cell P.prefillX   b= 1024 rho=0.40005 eff in [5,8188] P(eff<=k)= 25.0%  stratified Uniform{1..8192}, permuted: rho=0.40005 EXACTLY
+[    12.1s]   cell D.decodeX    b=   64 rho=0.85000 eff in [8200,9208] P(eff<=k)=  0.0%  stratified Uniform{8193..9215}: rho=0.850 EXACTLY
+[    12.1s]   cell P.rho1       b= 1024 rho=1.00000 eff in [10240,10240] P(eff<=k)=  0.0%  row_lengths = n: what EVERY prior probe ran
+[    13.2s] 
+[    13.2s] ==========================================================================
+[    13.2s] STAGE 2  ARM ACTIVATION (scope name) + CORRECTNESS SMOKE
+[    13.2s] ==========================================================================
+[    14.4s]   base       expect=None           ACTIVE  bare name present, no variant suffix
+[    15.4s]   v11        expect=_v11retile     ACTIVE  suffix present, no foreign suffix
+[    16.5s]   v12        expect=_f32in         ACTIVE  suffix present, no foreign suffix
+[    17.5s]   v4ragged   expect=_v4ragged      ACTIVE  suffix present, no foreign suffix
+[    18.7s]   v4c2048    expect=_v4c2048       ACTIVE  suffix present, no foreign suffix
+[    19.6s]   v2         expect=_v2r1          ACTIVE  suffix present, no foreign suffix
+[    20.5s]   v2big      expect=_v2bigscratch  ACTIVE  suffix present, no foreign suffix
+[    21.4s]   v10a2      expect=_sc2           ACTIVE  suffix present, no foreign suffix
+[    22.4s]   #null_a    expect=None           ACTIVE  bare name present, no variant suffix
+[    23.5s]   #null_b    expect=None           ACTIVE  bare name present, no variant suffix
+[    24.5s]   #null_c    expect=None           ACTIVE  bare name present, no variant suffix
+[    24.5s] ARM_CHECK_OK (HLO scope names)
+[    24.5s]   P.prefillX   base       rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.5s]   P.prefillX   v11        rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   v12        rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   v4ragged   rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   v4c2048    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   v2         rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   v2big      rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   v10a2      rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   #null_a    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   #null_b    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.prefillX   #null_c    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    base       rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v11        rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v12        rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v4ragged   rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v4c2048    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v2         rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v2big      rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    v10a2      rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    #null_a    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    #null_b    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   D.decodeX    #null_c    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.rho1       base       rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.rho1       v4ragged   rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.rho1       v2         rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.6s]   P.rho1       v2big      rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.7s]   P.rho1       #null_a    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.7s]   P.rho1       #null_b    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.7s]   P.rho1       #null_c    rows_wrong=  0 oor=  0 live_bad=  0 bit==base=True  EXACT
+[    24.7s] SMOKE_OK
+[    24.7s] 
+[    24.7s] ==========================================================================
+[    24.7s] STAGE 3  INSIDE-KERNEL CAPTURE (eager _sc_topk_direct + pl.kernel spy)
+[    24.7s] ==========================================================================
+[    26.1s]   base       b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048'] OK
+[    26.9s]   base       b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048'] OK
+[    27.4s]   v11        b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_v11retile'] OK
+[    27.9s]   v11        b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_v11retile'] OK
+[    28.6s]   v12        b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_f32in'] OK
+[    29.2s]   v12        b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_f32in'] OK
+[    30.2s]   v4ragged   b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_v4ragged'] OK
+[    30.7s]   v4ragged   b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_v4ragged'] OK
+[    31.2s]   v4c2048    b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_v4c2048'] OK
+[    31.7s]   v4c2048    b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_v4c2048'] OK
+[    32.6s]   v2         b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_v2r1'] OK
+[    33.0s]   v2         b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_v2r1'] OK
+[    33.9s]   v2big      b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_v2bigscratch'] OK
+[    34.3s]   v2big      b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_v2bigscratch'] OK
+[    34.7s]   v10a2      b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048_sc2'] OK
+[    35.1s]   v10a2      b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048_sc2'] OK
+[    36.1s]   #null_a    b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048'] OK
+[    36.6s]   #null_a    b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048'] OK
+[    37.5s]   #null_b    b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048'] OK
+[    38.0s]   #null_b    b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048'] OK
+[    39.0s]   #null_c    b= 1024 kernels=1 names=['sc_topk_direct_b1024_n10240_k2048'] OK
+[    39.5s]   #null_c    b=   64 kernels=1 names=['sc_topk_direct_b64_n10240_k2048'] OK
+[    39.5s] CAPTURE_OK -- every inside-kernel bracket carries its arm's scope name, read from the pl.kernel name= kwarg directly
+[    39.5s] 
+[    39.5s] ==========================================================================
+[    39.5s] STAGE 4  POOL
+[    39.5s] ==========================================================================
+  timing harness: FROZEN INSTRUMENT /root/p23/glm_dsa_block_bench.py (md5 08375d7068365e1a776c58fef09cd6d0)
+[    39.6s]   58 arms in ONE pool, 12 interleaved rounds, reshuffled per round, paired REPS 20/60, read us_median
+[    39.7s]   dispatch floor: 31.53 us/call  (it is IN every absolute below; it cancels in an in-cell delta)
+[    61.8s] 
+[    61.8s] ==========================================================================
+[    61.8s] STAGE 5  RESOLUTION FLOOR (four identical incumbent modules per cell)
+[    61.8s] ==========================================================================
+[    61.8s]   P.prefillX   whole   275.213 /  275.253 /  275.214 /  275.232   -> FLOOR   0.040 us = 0.015%
+[    61.8s]   P.prefillX   inside  240.659 /  240.864 /  240.430 /  240.529   -> FLOOR   0.433 us = 0.180%
+[    61.8s]   D.decodeX    whole    49.302 /   49.559 /   49.978 /   50.031   -> FLOOR   0.730 us = 1.480%
+[    61.8s]   D.decodeX    inside   46.836 /   46.631 /   46.625 /   46.733   -> FLOOR   0.211 us = 0.450%
+[    61.8s]   P.rho1       whole   425.971 /  425.237 /  426.871 /  424.912   -> FLOOR   1.960 us = 0.460%
+[    61.8s]   P.rho1       inside  390.499 /  390.503 /  390.604 /  392.402   -> FLOOR   1.903 us = 0.487%
+[    61.8s] 
+[    61.8s] ==========================================================================
+[    61.8s] STAGE 6  RANKING -- absolutes first, deltas against the in-cell base
+[    61.8s] ==========================================================================
+[    61.8s]   rho SOURCE for every cell: p18_probe.build_lengths, i.e. probes/13
+[    61.8s]   level_sim transcribed verbatim. b=64 is REAL PRODUCTION DECODE at
+[    61.8s]   rho=0.850, NOT the frozen bench's rho=0.391 small-batch prefill
+[    61.8s]   occupancy. Do not read the b=64 cell as the bench's 0.391 cell.
+[    61.8s] 
+[    61.8s]   --- P.prefillX  bracket=whole  b=1024  rho=0.40005  base=275.213 us  floor=0.040 us ---
+[    61.8s]   arm           us_median   delta_us    delta%  hostbnd  verdict
+[    61.8s]   base            275.213      0.000    +0.00%     1.1%  reference
+[    61.8s]   v11             265.767     -9.446    -3.43%     1.1%  FASTER
+[    61.8s]   v12             250.064    -25.149    -9.14%     1.1%  FASTER
+[    61.8s]   v4ragged        268.125     -7.088    -2.58%     1.2%  FASTER
+[    61.8s]   v4c2048         263.624    -11.588    -4.21%     1.1%  FASTER
+[    61.8s]   v2              238.161    -37.052   -13.46%     1.4%  FASTER
+[    61.8s]   v2big           238.365    -36.848   -13.39%     1.4%  FASTER
+[    61.8s]   v10a2           396.817    121.604   +44.19%     0.8%  SLOWER
+[    61.8s]   #null_a         275.253      0.040    +0.01%     1.2%  null (must be inside the floor)
+[    61.8s]   #null_b         275.214      0.001    +0.00%     1.2%  null (must be inside the floor)
+[    61.8s]   #null_c         275.232      0.019    +0.01%     1.2%  null (must be inside the floor)
+[    61.8s] 
+[    61.8s]   --- P.prefillX  bracket=inside  b=1024  rho=0.40005  base=240.659 us  floor=0.433 us ---
+[    61.8s]   arm           us_median   delta_us    delta%  hostbnd  verdict
+[    61.8s]   base            240.659      0.000    +0.00%     1.3%  reference
+[    61.8s]   v11             240.579     -0.080    -0.03%     1.3%  not resolvable
+[    61.8s]   v12             240.578     -0.081    -0.03%     1.4%  not resolvable
+[    61.8s]   v4ragged        234.494     -6.165    -2.56%     1.1%  FASTER
+[    61.8s]   v4c2048         229.470    -11.189    -4.65%     1.3%  FASTER
+[    61.8s]   v2              203.259    -37.400   -15.54%     1.4%  FASTER
+[    61.8s]   v2big           203.748    -36.911   -15.34%     2.0%  FASTER
+[    61.8s]   v10a2           360.705    120.046   +49.88%     2.7%  SLOWER
+[    61.8s]   #null_a         240.864      0.205    +0.09%     1.5%  null (must be inside the floor)
+[    61.8s]   #null_b         240.430     -0.228    -0.09%     1.7%  null (must be inside the floor)
+[    61.8s]   #null_c         240.529     -0.130    -0.05%     1.6%  null (must be inside the floor)
+[    61.8s] 
+[    61.8s]   --- D.decodeX  bracket=whole  b=64  rho=0.85000  base=49.302 us  floor=0.730 us ---
+[    61.8s]   arm           us_median   delta_us    delta%  hostbnd  verdict
+[    61.8s]   base             49.302      0.000    +0.00%     5.4%  reference
+[    61.8s]   v11              48.090     -1.212    -2.46%     6.6%  FASTER
+[    61.8s]   v12              48.408     -0.893    -1.81%     6.9%  FASTER
+[    61.8s]   v4ragged         49.697      0.395    +0.80%     5.0%  not resolvable
+[    61.8s]   v4c2048          49.034     -0.267    -0.54%     6.0%  not resolvable
+[    61.8s]   v2               46.037     -3.265    -6.62%     5.9%  FASTER
+[    61.8s]   v2big            46.539     -2.763    -5.60%     5.9%  FASTER
+[    61.8s]   v10a2            71.545     22.243   +45.12%     4.0%  SLOWER
+[    61.8s]   #null_a          49.559      0.257    +0.52%     5.8%  null (must be inside the floor)
+[    61.8s]   #null_b          49.978      0.676    +1.37%     5.0%  null (must be inside the floor)
+[    61.8s]   #null_c          50.031      0.730    +1.48%     5.7%  null (must be inside the floor)
+[    61.8s] 
+[    61.8s]   --- D.decodeX  bracket=inside  b=64  rho=0.85000  base=46.836 us  floor=0.211 us ---
+[    61.8s]   arm           us_median   delta_us    delta%  hostbnd  verdict
+[    61.8s]   base             46.836      0.000    +0.00%     4.8%  reference
+[    61.8s]   v11              47.104      0.268    +0.57%     5.4%  SLOWER
+[    61.8s]   v12              46.584     -0.252    -0.54%     6.0%  FASTER
+[    61.8s]   v4ragged         46.607     -0.229    -0.49%     6.4%  FASTER
+[    61.8s]   v4c2048          46.502     -0.334    -0.71%     6.7%  FASTER
+[    61.8s]   v2               42.769     -4.067    -8.68%     6.9%  FASTER
+[    61.8s]   v2big            43.043     -3.793    -8.10%     8.6%  FASTER
+[    61.8s]   v10a2            68.268     21.431   +45.76%     5.5%  SLOWER
+[    61.8s]   #null_a          46.631     -0.205    -0.44%     7.1%  null (must be inside the floor)
+[    61.8s]   #null_b          46.625     -0.211    -0.45%     6.7%  null (must be inside the floor)
+[    61.8s]   #null_c          46.733     -0.103    -0.22%     5.7%  null (must be inside the floor)
+[    61.8s] 
+[    61.8s]   --- P.rho1  bracket=whole  b=1024  rho=1.00000  base=425.971 us  floor=1.960 us ---
+[    61.8s]   arm           us_median   delta_us    delta%  hostbnd  verdict
+[    61.8s]   base            425.971      0.000    +0.00%     0.8%  reference
+[    61.8s]   v4ragged        425.237     -0.734    -0.17%     0.7%  not resolvable
+[    61.8s]   v2              379.366    -46.605   -10.94%     0.8%  FASTER
+[    61.8s]   v2big           377.495    -48.476   -11.38%     0.9%  FASTER
+[    61.8s]   #null_a         425.237     -0.734    -0.17%     0.8%  null (must be inside the floor)
+[    61.8s]   #null_b         426.871      0.900    +0.21%     0.7%  null (must be inside the floor)
+[    61.8s]   #null_c         424.912     -1.059    -0.25%     0.8%  null (must be inside the floor)
+[    61.8s] 
+[    61.8s]   --- P.rho1  bracket=inside  b=1024  rho=1.00000  base=390.499 us  floor=1.903 us ---
+[    61.8s]   arm           us_median   delta_us    delta%  hostbnd  verdict
+[    61.8s]   base            390.499      0.000    +0.00%     0.8%  reference
+[    61.8s]   v4ragged        390.470     -0.029    -0.01%     0.8%  not resolvable
+[    61.8s]   v2              342.610    -47.889   -12.26%     1.1%  FASTER
+[    61.8s]   v2big           342.772    -47.727   -12.22%     0.9%  FASTER
+[    61.8s]   #null_a         390.503      0.004    +0.00%     0.8%  null (must be inside the floor)
+[    61.8s]   #null_b         390.604      0.105    +0.03%     1.4%  null (must be inside the floor)
+[    61.8s]   #null_c         392.402      1.903    +0.49%     0.8%  null (must be inside the floor)
+[    61.8s] 
+[    61.8s] ==========================================================================
+[    61.8s] STAGE 7  PRE-REGISTERED READINGS (set before the numbers existed)
+[    61.8s] ==========================================================================
+[    61.8s]   v4c2048 - v4ragged  P.prefillX   whole    -4.500 us (floor 0.040)  c2048 faster by 4.500 us
+[    61.8s]   v4c2048 - v4ragged  P.prefillX   inside   -5.024 us (floor 0.433)  c2048 faster by 5.024 us
+[    61.8s]   v4c2048 - v4ragged  D.decodeX    whole    -0.663 us (floor 0.730)  TIE -> SHIPS RAGGED (pre-registered)
+[    61.8s]   v4c2048 - v4ragged  D.decodeX    inside   -0.105 us (floor 0.211)  TIE -> SHIPS RAGGED (pre-registered)
+[    61.8s] 
+[    61.8s]   v2 -- ABSOLUTE us only (pre-registered: its two reweightings are
+[    61.8s]   mutually inconsistent, so no percentage is quoted for it here).
+[    61.8s]     v2     P.prefillX   whole    238.161 us  base   275.213 us  delta  -37.052 us
+[    61.8s]     v2big  P.prefillX   whole    238.365 us  base   275.213 us  delta  -36.848 us
+[    61.8s]     v2     P.prefillX   inside   203.259 us  base   240.659 us  delta  -37.400 us
+[    61.8s]     v2big  P.prefillX   inside   203.748 us  base   240.659 us  delta  -36.911 us
+[    61.8s]     v2     D.decodeX    whole     46.037 us  base    49.302 us  delta   -3.265 us
+[    61.8s]     v2big  D.decodeX    whole     46.539 us  base    49.302 us  delta   -2.763 us
+[    61.8s]     v2     D.decodeX    inside    42.769 us  base    46.836 us  delta   -4.067 us
+[    61.8s]     v2big  D.decodeX    inside    43.043 us  base    46.836 us  delta   -3.793 us
+[    61.8s]     v2     P.rho1       whole    379.366 us  base   425.971 us  delta  -46.605 us
+[    61.8s]     v2big  P.rho1       whole    377.495 us  base   425.971 us  delta  -48.476 us
+[    61.8s]     v2     P.rho1       inside   342.610 us  base   390.499 us  delta  -47.889 us
+[    61.8s]     v2big  P.rho1       inside   342.772 us  base   390.499 us  delta  -47.727 us
+[    61.8s] 
+[    61.8s]   CONTROL v4ragged at rho=1, whole: delta -0.734 us, floor 1.960 us -> INSIDE the floor as predicted
+[    61.8s] 
+[    61.8s]   CONTROL v4ragged at rho=1, inside: delta -0.029 us, floor 1.903 us -> INSIDE the floor as predicted
+[    61.8s] 
+[    61.8s]   DO NOT ADD UP the adopted candidates' percentages. The arms
+[    61.8s]   overlap and composition is step 4's job.
+[    61.9s] wrote /cdk-outputs/outputs/j-66c7e331-fa41-461e-8686-tpu-job-0/j-66c7e331-fa41-461e-8686-tpu-job-0-0-4hv5p/command-container/ranking.json
+[    61.9s] RANKING_DONE

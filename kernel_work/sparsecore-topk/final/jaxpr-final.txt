@@ -1,0 +1,2125 @@
+jaxpr for sc_vector_subcore
+let jaxpr = { lambda ; a:i32[] b:Ref<vmem>{i32[1024]} c:Ref<vmem>{i32[272]} d:Ref<hbm>{f32[10485760]}
+    e:Ref<vmem>{f32[10240]} f:i32[16] g:Ref<vmem>{i32[272]} h:Ref<vmem>{i32[2064]}
+    i:Ref<hbm>{i32[2097152]} j:Ref<semaphore_mem>{dma_sem[4]} k:i32[] l:i32[]. let
+    m:i32[] = add k 1:i32[]
+    n:i32[] = mul k 32:i32[]
+    o:i32[] = convert_element_type[new_dtype=int32 weak_type=False] n
+    p:i32[] = add o a
+    q:bool[] = lt p 1024:i32[]
+    r:i32[] = min p 1023:i32[]
+    s:i32[16] <- b[r:r+16]
+    t:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] s
+    u:i32[] = squeeze[dimensions=(0,)] t
+    v:i32[] = min u 10240:i32[]
+    w:i32[] = jit[name=_where jaxpr=_where] q v 0:i32[]
+    x:bool[] = gt w 0:i32[]
+    y:i32[] = min 10240:i32[] w
+    z:i32[] = jit[name=_where jaxpr=_where] x y 0:i32[]
+    ba:i32[] = add z 15:i32[]
+    bb:i32[] = shift_right_arithmetic ba 4:i32[]
+    bc:i32[] = add z 2047:i32[]
+    bd:i32[] = shift_right_arithmetic bc 11:i32[]
+    be:i32[] = mul r 5:i32[]
+    bf:bool[] = gt z 0:i32[]
+    bg:i32[] = jit[name=_where jaxpr=_where1] bf 16:i32[] 0:i32[]
+    parallel_loop[
+      jaxpr={ lambda bh:Ref<vmem>{i32[272]}; bi:i32[]. let
+          bj:i32[16] = broadcast_in_dim 0:i32[]
+          bk:i32[] = mul bi 16:i32[]
+          bl:i32[16], bh[bk:bk+16] <- bh[bk:bk+16], bj
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] bg 1:i32[] c
+    bm:i32[] = mul 1:i32[] bd
+    run_scoped[
+      collective_axes=()
+      jaxpr={ lambda bn:i32[] bo:i32[] bp:i32[] bq:Ref<hbm>{f32[10485760]} br:i32[]
+          bs:Ref<vmem>{f32[10240]} bt:i32[16] bu:Ref<vmem>{i32[272]}; bv:Ref<vmem>{f32[4096]}
+          bw:Ref<semaphore_mem>{dma_sem[2]}. let
+          bx:bool[] = gt bn 0:i32[]
+          by:i32[] = convert_element_type[new_dtype=int32 weak_type=False] bx
+          cond[
+            branches=(
+              { lambda ; bz:i32[] ca:i32[] cb:Ref<hbm>{f32[10485760]} cc:Ref<vmem>{f32[4096]}
+                  cd:Ref<semaphore_mem>{dma_sem[2]} ce:i32[] cf:Ref<vmem>{f32[10240]}
+                  cg:i32[16] ch:Ref<vmem>{i32[272]} ci:i32[]. let
+                  
+                in () }
+              jaxpr5
+            )
+          ] by bo bp bq bv bw br bs bt bu bn
+        in () }
+      ref_transforms=((), ())
+    ] bm bd be d z e f c
+    cj:bool[] = gt z 0:i32[]
+    ck:i32[] = convert_element_type[new_dtype=int32 weak_type=False] cj
+    cond[
+      branches=(
+        { lambda ; cl:Ref<vmem>{i32[272]} cm:Ref<vmem>{i32[272]}. let  in () }
+        { lambda ; cn:Ref<vmem>{i32[272]} co:Ref<vmem>{i32[272]}. let
+            parallel_loop[
+              jaxpr={ lambda cp:Ref<vmem>{i32[272]} cq:Ref<vmem>{i32[272]}; cr:i32[]. let
+                  cs:i32[] = mul cr 16:i32[]
+                  ct:i32[16] <- cp[cs:cs+16]
+                  cu:i32[16], cq[cs:cs+16] <- cq[cs:cs+16], ct
+                in () }
+              tree=PyTreeDef((*, *, *, [*, *], []))
+              unroll=2
+            ] 0:i32[] 16:i32[] 1:i32[] cn co
+          in () }
+      )
+    ] ck c g
+    cv:bool[] = eq z 0:i32[]
+    cw:i32[] = convert_element_type[new_dtype=int32 weak_type=False] cv
+    cond[
+      branches=(
+        { lambda ; cx:Ref<vmem>{i32[272]}. let  in () }
+        { lambda ; cy:Ref<vmem>{i32[272]}. let
+            parallel_loop[
+              jaxpr={ lambda cz:Ref<vmem>{i32[272]}; da:i32[]. let
+                  db:i32[16] = broadcast_in_dim 0:i32[]
+                  dc:i32[] = mul da 16:i32[]
+                  dd:i32[16], cz[dc:dc+16] <- cz[dc:dc+16], db
+                in () }
+              tree=PyTreeDef((*, *, *, [*], []))
+              unroll=4
+            ] 0:i32[] 16:i32[] 1:i32[] cy
+          in () }
+      )
+    ] cw g
+    de:i32[] = parallel_loop[
+      jaxpr={ lambda df:Ref<vmem>{i32[272]}; dg:i32[] dh:i32[]. let
+          di:i32[] = mul dg 16:i32[]
+          dj:i32[16] <- df[di:di+16]
+          dk:bool[16] = broadcast_in_dim True:bool[]
+          dl:i32[16] = masked_cumsum dj dk
+          dm:i32[16] = add dl dh
+          dn:i32[] = mul dg 16:i32[]
+          do:i32[16], df[dn:dn+16] <- df[dn:dn+16], dm
+          dp:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] dm
+          dq:i32[] = squeeze[dimensions=(0,)] dp
+        in (dq,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] 16:i32[] 1:i32[] g 0:i32[]
+    dr:bool[] = le de 2048:i32[]
+    ds:i32[] = sub de 2048:i32[]
+    dt:i32[] = parallel_loop[
+      jaxpr={ lambda du:Ref<vmem>{i32[272]} dv:i32[]; dw:i32[] dx:i32[]. let
+          dy:i32[] = mul dw 16:i32[]
+          dz:i32[16] <- du[dy:dy+16]
+          ea:bool[16] = le dz dv
+          eb:i32[16] = all_reduce_population_count[reduce=1] ea
+          ec:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] eb
+          ed:i32[] = squeeze[dimensions=(0,)] ec
+          ee:i32[] = add dx ed
+        in (ee,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] 16:i32[] 1:i32[] g ds 0:i32[]
+    ef:i32[16] <- g[dt:dt+16]
+    eg:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] ef
+    eh:i32[] = squeeze[dimensions=(0,)] eg
+    ei:bool[] = gt dt 0:i32[]
+    ej:i32[] = sub dt 1:i32[]
+    ek:i32[] = max ej 0:i32[]
+    el:i32[16] <- g[ek:ek+16]
+    em:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] el
+    en:i32[] = squeeze[dimensions=(0,)] em
+    eo:i32[] = jit[name=_where jaxpr=_where] ei en 0:i32[]
+    ep:i32[] = sub de eh
+    eq:i32[] = sub eh eo
+    er:i32[] = sub 2048:i32[] ep
+    es:i32[] = sub dt 128:i32[]
+    et:bool[] = eq er eq
+    eu:bool[] = or dr et
+    ev:i32[] = jit[name=_where jaxpr=_where1] eu 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda ew:Ref<vmem>{i32[272]}; ex:i32[]. let
+          ey:i32[16] = broadcast_in_dim 0:i32[]
+          ez:i32[] = mul ex 16:i32[]
+          fa:i32[16], ew[ez:ez+16] <- ew[ez:ez+16], ey
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] ev 1:i32[] c
+    fb:i32[] = jit[name=_where jaxpr=_where2] eu 0:i32[] bb
+    parallel_loop[
+      jaxpr=jaxpr1
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] fb 1:i32[] e f z 24:i32[] es c
+    fc:i32[] = jit[name=_where jaxpr=_where1] eu 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda fd:Ref<vmem>{i32[272]} fe:Ref<vmem>{i32[272]}; ff:i32[]. let
+          fg:i32[] = mul ff 16:i32[]
+          fh:i32[16] <- fd[fg:fg+16]
+          fi:i32[16], fe[fg:fg+16] <- fe[fg:fg+16], fh
+        in () }
+      tree=PyTreeDef((*, *, *, [*, *], []))
+      unroll=2
+    ] 0:i32[] fc 1:i32[] c g
+    fj:i32[] = parallel_loop[
+      jaxpr={ lambda fk:Ref<vmem>{i32[272]}; fl:i32[] fm:i32[]. let
+          fn:i32[] = mul fl 16:i32[]
+          fo:i32[16] <- fk[fn:fn+16]
+          fp:bool[16] = broadcast_in_dim True:bool[]
+          fq:i32[16] = masked_cumsum fo fp
+          fr:i32[16] = add fq fm
+          fs:i32[] = mul fl 16:i32[]
+          ft:i32[16], fk[fs:fs+16] <- fk[fs:fs+16], fr
+          fu:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] fr
+          fv:i32[] = squeeze[dimensions=(0,)] fu
+        in (fv,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] fc 1:i32[] g 0:i32[]
+    fw:i32[] = sub fj er
+    fx:i32[] = parallel_loop[
+      jaxpr={ lambda fy:Ref<vmem>{i32[272]} fz:i32[]; ga:i32[] gb:i32[]. let
+          gc:i32[] = mul ga 16:i32[]
+          gd:i32[16] <- fy[gc:gc+16]
+          ge:bool[16] = le gd fz
+          gf:i32[16] = all_reduce_population_count[reduce=1] ge
+          gg:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] gf
+          gh:i32[] = squeeze[dimensions=(0,)] gg
+          gi:i32[] = add gb gh
+        in (gi,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] fc 1:i32[] g fw 0:i32[]
+    gj:i32[16] <- g[fx:fx+16]
+    gk:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] gj
+    gl:i32[] = squeeze[dimensions=(0,)] gk
+    gm:bool[] = gt fx 0:i32[]
+    gn:i32[] = sub fx 1:i32[]
+    go:i32[] = max gn 0:i32[]
+    gp:i32[16] <- g[go:go+16]
+    gq:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] gp
+    gr:i32[] = squeeze[dimensions=(0,)] gq
+    gs:i32[] = jit[name=_where jaxpr=_where] gm gr 0:i32[]
+    gt:i32[] = sub fj gl
+    gu:i32[] = sub gl gs
+    gv:i32[] = sub er gt
+    gw:i32[] = sub 24:i32[] 16:i32[]
+    gx:i32[] = shift_left es gw
+    gy:i32[] = or gx fx
+    gz:bool[] = eq gv gu
+    ha:bool[] = or eu gz
+    hb:bool[] = eq gv 0:i32[]
+    hc:bool[] = or ha hb
+    hd:i32[] = jit[name=_where jaxpr=_where3] eu es gy
+    he:i32[] = jit[name=_where jaxpr=_where3] eu 24:i32[] 16:i32[]
+    hf:i32[] = add ep gt
+    hg:i32[] = jit[name=_where jaxpr=_where3] eu ep hf
+    hh:i32[] = jit[name=_where jaxpr=_where3] eu er gv
+    hi:i32[] = jit[name=_where jaxpr=_where3] eu eq gu
+    hj:i32[] = jit[name=_where jaxpr=_where1] hc 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda hk:Ref<vmem>{i32[272]}; hl:i32[]. let
+          hm:i32[16] = broadcast_in_dim 0:i32[]
+          hn:i32[] = mul hl 16:i32[]
+          ho:i32[16], hk[hn:hn+16] <- hk[hn:hn+16], hm
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] hj 1:i32[] c
+    hp:i32[] = jit[name=_where jaxpr=_where2] hc 0:i32[] bb
+    parallel_loop[
+      jaxpr=jaxpr2
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] hp 1:i32[] e f z he hd c
+    hq:i32[] = jit[name=_where jaxpr=_where1] hc 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda hr:Ref<vmem>{i32[272]} hs:Ref<vmem>{i32[272]}; ht:i32[]. let
+          hu:i32[] = mul ht 16:i32[]
+          hv:i32[16] <- hr[hu:hu+16]
+          hw:i32[16], hs[hu:hu+16] <- hs[hu:hu+16], hv
+        in () }
+      tree=PyTreeDef((*, *, *, [*, *], []))
+      unroll=2
+    ] 0:i32[] hq 1:i32[] c g
+    hx:i32[] = parallel_loop[
+      jaxpr={ lambda hy:Ref<vmem>{i32[272]}; hz:i32[] ia:i32[]. let
+          ib:i32[] = mul hz 16:i32[]
+          ic:i32[16] <- hy[ib:ib+16]
+          id:bool[16] = broadcast_in_dim True:bool[]
+          ie:i32[16] = masked_cumsum ic id
+          if:i32[16] = add ie ia
+          ig:i32[] = mul hz 16:i32[]
+          ih:i32[16], hy[ig:ig+16] <- hy[ig:ig+16], if
+          ii:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] if
+          ij:i32[] = squeeze[dimensions=(0,)] ii
+        in (ij,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] hq 1:i32[] g 0:i32[]
+    ik:i32[] = sub hx hh
+    il:i32[] = parallel_loop[
+      jaxpr={ lambda im:Ref<vmem>{i32[272]} in:i32[]; io:i32[] ip:i32[]. let
+          iq:i32[] = mul io 16:i32[]
+          ir:i32[16] <- im[iq:iq+16]
+          is:bool[16] = le ir in
+          it:i32[16] = all_reduce_population_count[reduce=1] is
+          iu:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] it
+          iv:i32[] = squeeze[dimensions=(0,)] iu
+          iw:i32[] = add ip iv
+        in (iw,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] hq 1:i32[] g ik 0:i32[]
+    ix:i32[16] <- g[il:il+16]
+    iy:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] ix
+    iz:i32[] = squeeze[dimensions=(0,)] iy
+    ja:bool[] = gt il 0:i32[]
+    jb:i32[] = sub il 1:i32[]
+    jc:i32[] = max jb 0:i32[]
+    jd:i32[16] <- g[jc:jc+16]
+    je:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] jd
+    jf:i32[] = squeeze[dimensions=(0,)] je
+    jg:i32[] = jit[name=_where jaxpr=_where] ja jf 0:i32[]
+    jh:i32[] = sub hx iz
+    ji:i32[] = sub iz jg
+    jj:i32[] = sub hh jh
+    jk:i32[] = sub he 8:i32[]
+    jl:i32[] = shift_left hd jk
+    jm:i32[] = or jl il
+    jn:bool[] = eq jj ji
+    jo:bool[] = or hc jn
+    jp:bool[] = eq jj 0:i32[]
+    jq:bool[] = or jo jp
+    jr:i32[] = jit[name=_where jaxpr=_where3] hc hd jm
+    js:i32[] = jit[name=_where jaxpr=_where3] hc he 8:i32[]
+    jt:i32[] = add hg jh
+    ju:i32[] = jit[name=_where jaxpr=_where3] hc hg jt
+    jv:i32[] = jit[name=_where jaxpr=_where3] hc hh jj
+    jw:i32[] = jit[name=_where jaxpr=_where3] hc hi ji
+    jx:i32[] = jit[name=_where jaxpr=_where1] jq 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda jy:Ref<vmem>{i32[272]}; jz:i32[]. let
+          ka:i32[16] = broadcast_in_dim 0:i32[]
+          kb:i32[] = mul jz 16:i32[]
+          kc:i32[16], jy[kb:kb+16] <- jy[kb:kb+16], ka
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] jx 1:i32[] c
+    kd:i32[] = jit[name=_where jaxpr=_where2] jq 0:i32[] bb
+    parallel_loop[
+      jaxpr=jaxpr3
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] kd 1:i32[] e f z js jr c
+    ke:i32[] = jit[name=_where jaxpr=_where1] jq 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda kf:Ref<vmem>{i32[272]} kg:Ref<vmem>{i32[272]}; kh:i32[]. let
+          ki:i32[] = mul kh 16:i32[]
+          kj:i32[16] <- kf[ki:ki+16]
+          kk:i32[16], kg[ki:ki+16] <- kg[ki:ki+16], kj
+        in () }
+      tree=PyTreeDef((*, *, *, [*, *], []))
+      unroll=2
+    ] 0:i32[] ke 1:i32[] c g
+    kl:i32[] = parallel_loop[
+      jaxpr={ lambda km:Ref<vmem>{i32[272]}; kn:i32[] ko:i32[]. let
+          kp:i32[] = mul kn 16:i32[]
+          kq:i32[16] <- km[kp:kp+16]
+          kr:bool[16] = broadcast_in_dim True:bool[]
+          ks:i32[16] = masked_cumsum kq kr
+          kt:i32[16] = add ks ko
+          ku:i32[] = mul kn 16:i32[]
+          kv:i32[16], km[ku:ku+16] <- km[ku:ku+16], kt
+          kw:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] kt
+          kx:i32[] = squeeze[dimensions=(0,)] kw
+        in (kx,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] ke 1:i32[] g 0:i32[]
+    ky:i32[] = sub kl jv
+    kz:i32[] = parallel_loop[
+      jaxpr={ lambda la:Ref<vmem>{i32[272]} lb:i32[]; lc:i32[] ld:i32[]. let
+          le:i32[] = mul lc 16:i32[]
+          lf:i32[16] <- la[le:le+16]
+          lg:bool[16] = le lf lb
+          lh:i32[16] = all_reduce_population_count[reduce=1] lg
+          li:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] lh
+          lj:i32[] = squeeze[dimensions=(0,)] li
+          lk:i32[] = add ld lj
+        in (lk,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] ke 1:i32[] g ky 0:i32[]
+    ll:i32[16] <- g[kz:kz+16]
+    lm:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] ll
+    ln:i32[] = squeeze[dimensions=(0,)] lm
+    lo:bool[] = gt kz 0:i32[]
+    lp:i32[] = sub kz 1:i32[]
+    lq:i32[] = max lp 0:i32[]
+    lr:i32[16] <- g[lq:lq+16]
+    ls:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] lr
+    lt:i32[] = squeeze[dimensions=(0,)] ls
+    lu:i32[] = jit[name=_where jaxpr=_where] lo lt 0:i32[]
+    lv:i32[] = sub kl ln
+    lw:i32[] = sub ln lu
+    lx:i32[] = sub jv lv
+    ly:i32[] = sub js 0:i32[]
+    lz:i32[] = shift_left jr ly
+    ma:i32[] = or lz kz
+    mb:bool[] = eq lx lw
+    mc:bool[] = or jq mb
+    md:bool[] = eq lx 0:i32[]
+    me:bool[] = or mc md
+    mf:i32[] = jit[name=_where jaxpr=_where3] jq jr ma
+    mg:i32[] = jit[name=_where jaxpr=_where3] jq js 0:i32[]
+    mh:i32[] = add ju lv
+    mi:i32[] = jit[name=_where jaxpr=_where3] jq ju mh
+    mj:i32[] = jit[name=_where jaxpr=_where3] jq jv lx
+    mk:i32[] = jit[name=_where jaxpr=_where3] jq jw lw
+    ml:i32[] = jit[name=_where jaxpr=_where2] dr 0:i32[] mj
+    mm:bool[] = lt de 2048:i32[]
+    mn:bool[] = and q mm
+    mo:i32[] = jit[name=_where jaxpr=_where1] mn 128:i32[] 0:i32[]
+    parallel_loop[
+      jaxpr={ lambda mp:Ref<vmem>{i32[2064]}; mq:i32[]. let
+          mr:i32[16] = broadcast_in_dim -1:i32[]
+          ms:i32[] = mul mq 16:i32[]
+          mt:i32[16], mp[ms:ms+16] <- mp[ms:ms+16], mr
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] mo 1:i32[] h
+    mu:i32[] = jit[name=_where jaxpr=_where] q bb 0:i32[]
+    mv:i32[] mw:i32[] = parallel_loop[
+      jaxpr=jaxpr4
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *, *, *], [*, *]))
+      unroll=4
+    ] 0:i32[] mu 1:i32[] e f z mg mf ml dr h 0:i32[] 0:i32[]
+    mx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] q
+    cond[
+      branches=(
+        { lambda ; my:i32[] mz:Ref<vmem>{i32[2064]} na:Ref<hbm>{i32[2097152]} nb:Ref<semaphore_mem>{dma_sem[4]}. let
+            
+          in () }
+        { lambda ; nc:i32[] nd:Ref<vmem>{i32[2064]} ne:Ref<hbm>{i32[2097152]} nf:Ref<semaphore_mem>{dma_sem[4]}. let
+            ng:i32[] = mul nc 2048:i32[]
+            dma_start(p0) nd[:2048] -> ne[ng:ng+2048] nf[2]
+            dma_wait ne[ng:ng+2048] nf[2]
+          in () }
+      )
+    ] mx r h i j
+  in (m, 0:i32[]) } in
+let _where = { lambda ; nh:bool[] ni:i32[] nj:i32[]. let
+    nk:i32[] = convert_element_type[new_dtype=int32 weak_type=False] nj
+    nl:i32[] = select_n nh nk ni
+  in (nl,) } in
+let _where1 = { lambda ; nm:bool[] nn:i32[] no:i32[]. let
+    np:i32[] = select_n nm no nn
+  in (np,) } in
+let _where2 = { lambda ; nq:bool[] nr:i32[] ns:i32[]. let
+    nt:i32[] = convert_element_type[new_dtype=int32 weak_type=False] nr
+    nu:i32[] = select_n nq ns nt
+  in (nu,) } in
+let jaxpr1 = { lambda nv:Ref<vmem>{f32[10240]} nw:i32[16] nx:i32[] ny:i32[] nz:i32[]
+    oa:Ref<vmem>{i32[272]}; ob:i32[]. let
+    oc:i32[] = mul ob 16:i32[]
+    od:f32[16] <- nv[oc:oc+16]
+    oe:i32[16] = bitcast_convert_type[new_dtype=int32] od
+    of:i32[] = mul ob 16:i32[]
+    og:i32[16] = add of nw
+    oh:bool[16] = lt og nx
+    oi:bool[16] = gt oe -2139095041:i32[]
+    oj:bool[16] = and oh oi
+    ok:i32[16] = shift_right_arithmetic oe ny
+    ol:bool[16] = eq ok nz
+    om:bool[16] = and oj ol
+    on:i32[16] = shift_right_arithmetic oe 16:i32[]
+    oo:i32[16] = and on 255:i32[]
+    op:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] oa oo op om
+  in () } in
+let _where3 = { lambda ; oq:bool[] or:i32[] os:i32[]. let
+    ot:i32[] = select_n oq os or
+  in (ot,) } in
+let jaxpr2 = { lambda ou:Ref<vmem>{f32[10240]} ov:i32[16] ow:i32[] ox:i32[] oy:i32[]
+    oz:Ref<vmem>{i32[272]}; pa:i32[]. let
+    pb:i32[] = mul pa 16:i32[]
+    pc:f32[16] <- ou[pb:pb+16]
+    pd:i32[16] = bitcast_convert_type[new_dtype=int32] pc
+    pe:i32[] = mul pa 16:i32[]
+    pf:i32[16] = add pe ov
+    pg:bool[16] = lt pf ow
+    ph:bool[16] = gt pd -2139095041:i32[]
+    pi:bool[16] = and pg ph
+    pj:i32[16] = shift_right_arithmetic pd ox
+    pk:bool[16] = eq pj oy
+    pl:bool[16] = and pi pk
+    pm:i32[16] = shift_right_arithmetic pd 8:i32[]
+    pn:i32[16] = and pm 255:i32[]
+    po:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] oz pn po pl
+  in () } in
+let jaxpr3 = { lambda pp:Ref<vmem>{f32[10240]} pq:i32[16] pr:i32[] ps:i32[] pt:i32[]
+    pu:Ref<vmem>{i32[272]}; pv:i32[]. let
+    pw:i32[] = mul pv 16:i32[]
+    px:f32[16] <- pp[pw:pw+16]
+    py:i32[16] = bitcast_convert_type[new_dtype=int32] px
+    pz:i32[] = mul pv 16:i32[]
+    qa:i32[16] = add pz pq
+    qb:bool[16] = lt qa pr
+    qc:bool[16] = gt py -2139095041:i32[]
+    qd:bool[16] = and qb qc
+    qe:i32[16] = shift_right_arithmetic py ps
+    qf:bool[16] = eq qe pt
+    qg:bool[16] = and qd qf
+    qh:i32[16] = shift_right_arithmetic py 0:i32[]
+    qi:i32[16] = and qh 255:i32[]
+    qj:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] pu qi qj qg
+  in () } in
+let jaxpr4 = { lambda qk:Ref<vmem>{f32[10240]} ql:i32[16] qm:i32[] qn:i32[] qo:i32[]
+    qp:i32[] qq:bool[] qr:Ref<vmem>{i32[2064]}; qs:i32[] qt:i32[] qu:i32[]. let
+    qv:i32[] = mul qs 16:i32[]
+    qw:f32[16] <- qk[qv:qv+16]
+    qx:i32[16] = bitcast_convert_type[new_dtype=int32] qw
+    qy:i32[] = mul qs 16:i32[]
+    qz:i32[16] = add qy ql
+    ra:bool[16] = lt qz qm
+    rb:bool[16] = gt qx -2139095041:i32[]
+    rc:bool[16] = and ra rb
+    rd:i32[16] = shift_right_arithmetic qx qn
+    re:bool[16] = gt rd qo
+    rf:bool[16] = and rc re
+    rg:bool[16] = eq rd qo
+    rh:bool[16] = and rc rg
+    ri:i32[16] = convert_element_type[new_dtype=int32 weak_type=False] rh
+    rj:bool[16] = broadcast_in_dim True:bool[]
+    rk:i32[16] = masked_cumsum ri rj
+    rl:i32[16] = add rk qu
+    rm:bool[16] = le rl qp
+    rn:bool[16] = and rh rm
+    ro:bool[16] = or rf rn
+    rp:bool[16] = jit[
+      name=_where
+      jaxpr={ lambda ; qq:bool[] rc:bool[16] ro:bool[16]. let
+          rp:bool[16] = select_n qq ro rc
+        in (rp,) }
+    ] qq rc ro
+    rq:i32[16] = swap[
+      add=False
+      has_mask=True
+      tree=PyTreeDef((CustomNode(NDIndexer[(PyTreeDef((CustomNode(Slice[(None, 16, 1)], [*, None]),)), (2064,), ())], [*]),))
+    ] qr qz qt rp
+    rr:i32[16] = all_reduce_population_count[reduce=1] rp
+    rs:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] rr
+    rt:i32[] = squeeze[dimensions=(0,)] rs
+    ru:i32[] = add qt rt
+    rv:i32[1] = slice[limit_indices=(16,) start_indices=(15,) strides=None] rl
+    rw:i32[] = squeeze[dimensions=(0,)] rv
+  in (ru, rw) } in
+let jaxpr5 = { lambda ; rx:i32[] ry:i32[] rz:Ref<hbm>{f32[10485760]} sa:Ref<vmem>{f32[4096]}
+    sb:Ref<semaphore_mem>{dma_sem[2]} sc:i32[] sd:Ref<vmem>{f32[10240]} se:i32[16]
+    sf:Ref<vmem>{i32[272]} sg:i32[]. let
+    sh:i32[] = mul 1:i32[] rx
+    si:i32[] = sub sh 1:i32[]
+    sj:bool[] = eq si 0:i32[]
+    sk:i32[] = select_n True:bool[] 0:i32[] -1:i32[]
+    sl:bool[] = eq sk -1:i32[]
+    sm:i32[] = sub rx 1:i32[]
+    sn:i32[] = select_n sl sk sm
+    so:i32[] = add sn 0:i32[]
+    sp:i32[] = select_n True:bool[] 0:i32[] 1:i32[]
+    sq:i32[] = convert_element_type[new_dtype=int32 weak_type=False] sp
+    sr:bool[] = eq sq rx
+    ss:i32[] = select_n sr sp 0:i32[]
+    st:i32[] = add ss 0:i32[]
+    su:i32[] = add ss 1:i32[]
+    sv:i32[] = select_n True:bool[] ss su
+    sw:i32[] = convert_element_type[new_dtype=int32 weak_type=False] sv
+    sx:bool[] = eq sw rx
+    sy:i32[] = select_n sx sv 0:i32[]
+    sz:i32[] = add sy 0:i32[]
+    ta:u32[] = rem 0:u32[] 2:u32[]
+    tb:i32[] = add ry 0:i32[]
+    tc:i32[] = mul 2048:i32[] tb
+    td:u32[] = mul ta 2048:u32[]
+    te:u32[] = add td 0:u32[]
+    dma_start(p0) rz[tc:tc+2048] -> sa[te:te+2048] sb[ta]
+    tf:u32[] = add 0:u32[] 1:u32[]
+    tg:u32[] = select_n True:bool[] 0:u32[] tf
+    th:i32[] ti:i32[] tj:u32[] tk:u32[] tl:i32[] = while[
+      body_jaxpr=jaxpr6
+      body_nconsts=9
+      cond_jaxpr={ lambda ; tm:i32[] tn:i32[] to:u32[] tp:u32[] tq:i32[]. let
+          tr:bool[] = lt tm tn
+        in (tr,) }
+      cond_nconsts=0
+    ] sa sb rx ry rz sc sd se sf 0:i32[] sg tg 0:u32[] 0:i32[]
+    ts:i32[] = sub tl 1:i32[]
+    tt:i32[] = select_n True:bool[] tl ts
+    tu:bool[] = eq tt -1:i32[]
+    tv:i32[] = sub rx 1:i32[]
+    tw:i32[] = select_n tu tt tv
+    tx:i32[] = sub sg 1:i32[]
+    ty:i32[] = mul 1:i32[] rx
+    tz:bool[] = eq tx 0:i32[]
+    ua:i32[] = sub ty 1:i32[]
+    ub:bool[] = eq tx ua
+    uc:i32[] = add tw 0:i32[]
+    ud:i32[] = sub tw 1:i32[]
+    ue:i32[] = select_n True:bool[] tw ud
+    uf:bool[] = eq ue -1:i32[]
+    ug:i32[] = sub rx 1:i32[]
+    uh:i32[] = select_n uf ue ug
+    ui:i32[] = add uh 0:i32[]
+    uj:i32[] = add tw 1:i32[]
+    uk:i32[] = select_n True:bool[] tw uj
+    ul:bool[] = eq uk rx
+    um:i32[] = select_n ul uk 0:i32[]
+    un:i32[] = add um 0:i32[]
+    uo:i32[] = add um 1:i32[]
+    up:i32[] = select_n True:bool[] um uo
+    uq:bool[] = eq up rx
+    ur:i32[] = select_n uq up 0:i32[]
+    us:i32[] = add ur 0:i32[]
+    ut:i32[] = convert_element_type[new_dtype=int32 weak_type=False] ub
+    cond[branches=({ lambda ; . let  in () } { lambda ; . let  in () })] ut
+  in () } in
+let jaxpr6 = { lambda ; uu:Ref<vmem>{f32[4096]} uv:Ref<semaphore_mem>{dma_sem[2]}
+    uw:i32[] ux:i32[] uy:Ref<hbm>{f32[10485760]} uz:i32[] va:Ref<vmem>{f32[10240]}
+    vb:i32[16] vc:Ref<vmem>{i32[272]} vd:i32[] ve:i32[] vf:u32[] vg:u32[] vh:i32[]. let
+    vi:i32[] = add vd 1:i32[]
+    vj:i32[] = mul 1:i32[] uw
+    vk:bool[] = eq vd 0:i32[]
+    vl:i32[] = sub vj 1:i32[]
+    vm:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vd
+    vn:bool[] = eq vm vl
+    vo:i32[] = add vh 0:i32[]
+    vp:i32[] = sub vh 1:i32[]
+    vq:i32[] = select_n True:bool[] vh vp
+    vr:bool[] = eq vq -1:i32[]
+    vs:i32[] = sub uw 1:i32[]
+    vt:i32[] = select_n vr vq vs
+    vu:i32[] = add vt 0:i32[]
+    vv:i32[] = add vh 1:i32[]
+    vw:i32[] = select_n True:bool[] vh vv
+    vx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vw
+    vy:bool[] = eq vx uw
+    vz:i32[] = select_n vy vw 0:i32[]
+    wa:i32[] = add vz 0:i32[]
+    wb:i32[] = add vz 1:i32[]
+    wc:i32[] = select_n True:bool[] vz wb
+    wd:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wc
+    we:bool[] = eq wd uw
+    wf:i32[] = select_n we wc 0:i32[]
+    wg:i32[] = add wf 0:i32[]
+    wh:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    wi:i32[] = add ux wh
+    wj:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wa
+    wk:i32[] = add ux wj
+    wl:bool[] = ne wi wk
+    wm:bool[] = or False:bool[] wl
+    wn:i32[] = sub vj 2:i32[]
+    wo:i32[] = add wn 1:i32[]
+    wp:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vd
+    wq:bool[] = ge wp wo
+    wr:bool[] = not wq
+    ws:bool[] = and wm wr
+    wt:i32[] = convert_element_type[new_dtype=int32 weak_type=False] ws
+    cond[
+      branches=(
+        { lambda ; wu:u32[] wv:i32[] ww:i32[] wx:Ref<hbm>{f32[10485760]} wy:Ref<vmem>{f32[4096]}
+            wz:Ref<semaphore_mem>{dma_sem[2]}. let
+            
+          in () }
+        { lambda ; xa:u32[] xb:i32[] xc:i32[] xd:Ref<hbm>{f32[10485760]} xe:Ref<vmem>{f32[4096]}
+            xf:Ref<semaphore_mem>{dma_sem[2]}. let
+            xg:u32[] = rem xa 2:u32[]
+            xh:i32[] = convert_element_type[new_dtype=int32 weak_type=False] xc
+            xi:i32[] = add xb xh
+            xj:i32[] = mul 2048:i32[] xi
+            xk:u32[] = mul xg 2048:u32[]
+            xl:u32[] = add xk 0:u32[]
+            dma_start(p0) xd[xj:xj+2048] -> xe[xl:xl+2048] xf[xg]
+          in () }
+      )
+    ] wt vf ux wa uy uu uv
+    xm:bool[] = and ws True:bool[]
+    xn:u32[] = add vf 1:u32[]
+    xo:u32[] = select_n xm vf xn
+    xp:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    xq:i32[] = add ux xp
+    xr:i32[] = add ux vu
+    xs:bool[] = ne xq xr
+    xt:bool[] = or False:bool[] xs
+    xu:bool[] = convert_element_type[new_dtype=bool weak_type=False] vk
+    xv:bool[] = or xt xu
+    xw:i32[] = convert_element_type[new_dtype=int32 weak_type=False] xv
+    cond[
+      branches=(
+        { lambda ; xx:i32[] xy:i32[] xz:u32[] ya:Ref<hbm>{f32[10485760]} yb:Ref<vmem>{f32[4096]}
+            yc:Ref<semaphore_mem>{dma_sem[2]}. let
+            
+          in () }
+        { lambda ; yd:i32[] ye:i32[] yf:u32[] yg:Ref<hbm>{f32[10485760]} yh:Ref<vmem>{f32[4096]}
+            yi:Ref<semaphore_mem>{dma_sem[2]}. let
+            yj:i32[] = convert_element_type[new_dtype=int32 weak_type=False] ye
+            yk:i32[] = add yd yj
+            yl:i32[] = mul 2048:i32[] yk
+            ym:u32[] = rem yf 2:u32[]
+            yn:u32[] = mul ym 2048:u32[]
+            yo:u32[] = add yn 0:u32[]
+            dma_wait yh[yo:yo+2048] yi[ym]
+          in () }
+      )
+    ] xw ux vo vg uy uu uv
+    yp:u32[] = rem vg 2:u32[]
+    yq:u32[] = mul yp 2048:u32[]
+    yr:i32[] = mul vo 2048:i32[]
+    ys:i32[] = convert_element_type[new_dtype=int32 weak_type=False] yr
+    yt:i32[] = sub uz ys
+    yu:i32[] = jit[
+      name=clip
+      jaxpr={ lambda ; yt:i32[] yv:i32[] yw:i32[]. let
+          yx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] yv
+          yy:i32[] = max yx yt
+          yz:i32[] = convert_element_type[new_dtype=int32 weak_type=False] yw
+          yu:i32[] = min yz yy
+        in (yu,) }
+    ] yt 0:i32[] 2048:i32[]
+    za:i32[] = add yu 15:i32[]
+    zb:i32[] = shift_right_arithmetic za 4:i32[]
+    parallel_loop[
+      jaxpr=jaxpr7
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] zb 1:i32[] uu yq yr va vb uz vc
+    zc:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    zd:i32[] = add ux zc
+    ze:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wa
+    zf:i32[] = add ux ze
+    zg:bool[] = ne zd zf
+    zh:bool[] = or False:bool[] zg
+    zi:bool[] = or zh vn
+    zj:i32[] = convert_element_type[new_dtype=int32 weak_type=False] zi
+    cond[branches=({ lambda ; . let  in () } { lambda ; . let  in () })] zj
+    zk:bool[] = and zi False:bool[]
+    zl:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    zm:i32[] = add ux zl
+    zn:i32[] = add ux vu
+    zo:bool[] = ne zm zn
+    zp:bool[] = or False:bool[] zo
+    zq:bool[] = not vk
+    zr:bool[] = convert_element_type[new_dtype=bool weak_type=False] zq
+    zs:bool[] = and zp zr
+    zt:i32[] = convert_element_type[new_dtype=int32 weak_type=False] zs
+    cond[branches=({ lambda ; . let  in () } { lambda ; . let  in () })] zt
+    zu:bool[] = and zs False:bool[]
+    zv:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    zw:i32[] = add ux zv
+    zx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wa
+    zy:i32[] = add ux zx
+    zz:bool[] = ne zw zy
+    baa:bool[] = or False:bool[] zz
+    bab:bool[] = or baa vn
+    bac:u32[] = add vg 1:u32[]
+    bad:u32[] = select_n bab vg bac
+    bae:i32[] = add vh 1:i32[]
+    baf:i32[] = select_n True:bool[] vh bae
+    bag:i32[] = convert_element_type[new_dtype=int32 weak_type=False] baf
+    bah:bool[] = eq bag uw
+    bai:i32[] = select_n bah baf 0:i32[]
+  in (vi, ve, xo, bad, bai) } in
+let jaxpr7 = { lambda baj:Ref<vmem>{f32[4096]} bak:u32[] bal:i32[] bam:Ref<vmem>{f32[10240]}
+    ban:i32[16] bao:i32[] bap:Ref<vmem>{i32[272]}; baq:i32[]. let
+    bar:i32[] = mul baq 16:i32[]
+    bas:f32[16] <- baj[bak:bak+2048][bar:bar+16]
+    bat:i32[16] = bitcast_convert_type[new_dtype=int32] bas
+    bau:i32[16] = shift_right_arithmetic bat 31:i32[]
+    bav:i32[16] = and bau 2147483647:i32[]
+    baw:i32[16] = xor bat bav
+    bax:f32[16] = bitcast_convert_type[new_dtype=float32] baw
+    bay:i32[] = convert_element_type[new_dtype=int32 weak_type=False] bal
+    baz:i32[] = add bay bar
+    bba:f32[16], bam[baz:baz+16] <- bam[baz:baz+16], bax
+    bbb:i32[] = convert_element_type[new_dtype=int32 weak_type=False] bal
+    bbc:i32[] = add bbb bar
+    bbd:i32[16] = add bbc ban
+    bbe:bool[16] = lt bbd bao
+    bbf:bool[16] = gt baw -2139095041:i32[]
+    bbg:bool[16] = and bbe bbf
+    bbh:i32[16] = shift_right_arithmetic baw 24:i32[]
+    bbi:i32[16] = add bbh 128:i32[]
+    bbj:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] bap bbi bbj bbg
+  in () } in
+{ lambda ; bbk:Ref<hbm>{f32[10485760]} bbl:Ref<hbm>{i32[1024]} bbm:Ref<hbm>{i32[2097152]}
+    bbn:Ref<vmem>{f32[10240]} bbo:Ref<vmem>{i32[272]} bbp:Ref<vmem>{i32[272]} bbq:Ref<vmem>{i32[2064]}
+    bbr:Ref<vmem>{i32[1024]} bbs:Ref<semaphore_mem>{dma_sem[4]}. let
+    bbt:i32[] = axis_index[axis_name=core] 
+    bbu:i32[] = axis_index[axis_name=subcore] 
+    bbv:i32[] = mul bbt 16:i32[]
+    bbw:i32[] = add bbv bbu
+    bbx:i32[16] = iota[dimension=0 dtype=int32 shape=(16,) sharding=None] 
+    dma_start(p0) bbl[:] -> bbr[...] bbs[0]
+    dma_wait bbr[...] bbs[0]
+    _:i32[] _:i32[] = scan[
+      jaxpr=jaxpr
+      length=32
+      num_carry=2
+      num_consts=10
+      reverse=False
+      unroll=1
+    ] bbw bbr bbo bbk bbn bbx bbp bbq bbm bbs 0:i32[] 0:i32[]
+  in () }
+
+The kernel jaxpr idx=0 for mpmd_map sc_topk_direct_b1024_n10240_k2048_c2048_final at /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/final/_solo_final_dbg.py:528:
+let jaxpr = { lambda ; a:i32[] b:Ref<vmem>{i32[1024]} c:Ref<vmem>{i32[272]} d:Ref<hbm>{f32[10485760]}
+    e:Ref<vmem>{f32[10240]} f:i32[16] g:Ref<vmem>{i32[272]} h:Ref<vmem>{i32[2064]}
+    i:Ref<hbm>{i32[2097152]} j:Ref<semaphore_mem>{dma_sem[4]} k:i32[] l:i32[]. let
+    m:i32[] = add k 1:i32[]
+    n:i32[] = mul k 32:i32[]
+    o:i32[] = convert_element_type[new_dtype=int32 weak_type=False] n
+    p:i32[] = add o a
+    q:bool[] = lt p 1024:i32[]
+    r:i32[] = min p 1023:i32[]
+    s:i32[16] <- b[r:r+16]
+    t:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] s
+    u:i32[] = squeeze[dimensions=(0,)] t
+    v:i32[] = min u 10240:i32[]
+    w:i32[] = jit[name=_where jaxpr=_where] q v 0:i32[]
+    x:bool[] = gt w 0:i32[]
+    y:i32[] = min 10240:i32[] w
+    z:i32[] = jit[name=_where jaxpr=_where] x y 0:i32[]
+    ba:i32[] = add z 15:i32[]
+    bb:i32[] = shift_right_arithmetic ba 4:i32[]
+    bc:i32[] = add z 2047:i32[]
+    bd:i32[] = shift_right_arithmetic bc 11:i32[]
+    be:i32[] = mul r 5:i32[]
+    bf:bool[] = gt z 0:i32[]
+    bg:i32[] = jit[name=_where jaxpr=_where1] bf 16:i32[] 0:i32[]
+    parallel_loop[
+      jaxpr={ lambda bh:Ref<vmem>{i32[272]}; bi:i32[]. let
+          bj:i32[16] = broadcast_in_dim 0:i32[]
+          bk:i32[] = mul bi 16:i32[]
+          bl:i32[16], bh[bk:bk+16] <- bh[bk:bk+16], bj
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] bg 1:i32[] c
+    bm:i32[] = mul 1:i32[] bd
+    run_scoped[
+      collective_axes=()
+      jaxpr={ lambda bn:i32[] bo:i32[] bp:i32[] bq:Ref<hbm>{f32[10485760]} br:i32[]
+          bs:Ref<vmem>{f32[10240]} bt:i32[16] bu:Ref<vmem>{i32[272]}; bv:Ref<vmem>{f32[4096]}
+          bw:Ref<semaphore_mem>{dma_sem[2]}. let
+          bx:bool[] = gt bn 0:i32[]
+          by:i32[] = convert_element_type[new_dtype=int32 weak_type=False] bx
+          cond[
+            branches=(
+              { lambda ; bz:i32[] ca:i32[] cb:Ref<hbm>{f32[10485760]} cc:Ref<vmem>{f32[4096]}
+                  cd:Ref<semaphore_mem>{dma_sem[2]} ce:i32[] cf:Ref<vmem>{f32[10240]}
+                  cg:i32[16] ch:Ref<vmem>{i32[272]} ci:i32[]. let
+                  
+                in () }
+              jaxpr5
+            )
+          ] by bo bp bq bv bw br bs bt bu bn
+        in () }
+      ref_transforms=((), ())
+    ] bm bd be d z e f c
+    cj:bool[] = gt z 0:i32[]
+    ck:i32[] = convert_element_type[new_dtype=int32 weak_type=False] cj
+    cond[
+      branches=(
+        { lambda ; cl:Ref<vmem>{i32[272]} cm:Ref<vmem>{i32[272]}. let  in () }
+        { lambda ; cn:Ref<vmem>{i32[272]} co:Ref<vmem>{i32[272]}. let
+            parallel_loop[
+              jaxpr={ lambda cp:Ref<vmem>{i32[272]} cq:Ref<vmem>{i32[272]}; cr:i32[]. let
+                  cs:i32[] = mul cr 16:i32[]
+                  ct:i32[16] <- cp[cs:cs+16]
+                  cu:i32[16], cq[cs:cs+16] <- cq[cs:cs+16], ct
+                in () }
+              tree=PyTreeDef((*, *, *, [*, *], []))
+              unroll=2
+            ] 0:i32[] 16:i32[] 1:i32[] cn co
+          in () }
+      )
+    ] ck c g
+    cv:bool[] = eq z 0:i32[]
+    cw:i32[] = convert_element_type[new_dtype=int32 weak_type=False] cv
+    cond[
+      branches=(
+        { lambda ; cx:Ref<vmem>{i32[272]}. let  in () }
+        { lambda ; cy:Ref<vmem>{i32[272]}. let
+            parallel_loop[
+              jaxpr={ lambda cz:Ref<vmem>{i32[272]}; da:i32[]. let
+                  db:i32[16] = broadcast_in_dim 0:i32[]
+                  dc:i32[] = mul da 16:i32[]
+                  dd:i32[16], cz[dc:dc+16] <- cz[dc:dc+16], db
+                in () }
+              tree=PyTreeDef((*, *, *, [*], []))
+              unroll=4
+            ] 0:i32[] 16:i32[] 1:i32[] cy
+          in () }
+      )
+    ] cw g
+    de:i32[] = parallel_loop[
+      jaxpr={ lambda df:Ref<vmem>{i32[272]}; dg:i32[] dh:i32[]. let
+          di:i32[] = mul dg 16:i32[]
+          dj:i32[16] <- df[di:di+16]
+          dk:bool[16] = broadcast_in_dim True:bool[]
+          dl:i32[16] = masked_cumsum dj dk
+          dm:i32[16] = add dl dh
+          dn:i32[] = mul dg 16:i32[]
+          do:i32[16], df[dn:dn+16] <- df[dn:dn+16], dm
+          dp:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] dm
+          dq:i32[] = squeeze[dimensions=(0,)] dp
+        in (dq,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] 16:i32[] 1:i32[] g 0:i32[]
+    dr:bool[] = le de 2048:i32[]
+    ds:i32[] = sub de 2048:i32[]
+    dt:i32[] = parallel_loop[
+      jaxpr={ lambda du:Ref<vmem>{i32[272]} dv:i32[]; dw:i32[] dx:i32[]. let
+          dy:i32[] = mul dw 16:i32[]
+          dz:i32[16] <- du[dy:dy+16]
+          ea:bool[16] = le dz dv
+          eb:i32[16] = all_reduce_population_count[reduce=1] ea
+          ec:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] eb
+          ed:i32[] = squeeze[dimensions=(0,)] ec
+          ee:i32[] = add dx ed
+        in (ee,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] 16:i32[] 1:i32[] g ds 0:i32[]
+    ef:i32[16] <- g[dt:dt+16]
+    eg:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] ef
+    eh:i32[] = squeeze[dimensions=(0,)] eg
+    ei:bool[] = gt dt 0:i32[]
+    ej:i32[] = sub dt 1:i32[]
+    ek:i32[] = max ej 0:i32[]
+    el:i32[16] <- g[ek:ek+16]
+    em:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] el
+    en:i32[] = squeeze[dimensions=(0,)] em
+    eo:i32[] = jit[name=_where jaxpr=_where] ei en 0:i32[]
+    ep:i32[] = sub de eh
+    eq:i32[] = sub eh eo
+    er:i32[] = sub 2048:i32[] ep
+    es:i32[] = sub dt 128:i32[]
+    et:bool[] = eq er eq
+    eu:bool[] = or dr et
+    ev:i32[] = jit[name=_where jaxpr=_where1] eu 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda ew:Ref<vmem>{i32[272]}; ex:i32[]. let
+          ey:i32[16] = broadcast_in_dim 0:i32[]
+          ez:i32[] = mul ex 16:i32[]
+          fa:i32[16], ew[ez:ez+16] <- ew[ez:ez+16], ey
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] ev 1:i32[] c
+    fb:i32[] = jit[name=_where jaxpr=_where2] eu 0:i32[] bb
+    parallel_loop[
+      jaxpr=jaxpr1
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] fb 1:i32[] e f z 24:i32[] es c
+    fc:i32[] = jit[name=_where jaxpr=_where1] eu 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda fd:Ref<vmem>{i32[272]} fe:Ref<vmem>{i32[272]}; ff:i32[]. let
+          fg:i32[] = mul ff 16:i32[]
+          fh:i32[16] <- fd[fg:fg+16]
+          fi:i32[16], fe[fg:fg+16] <- fe[fg:fg+16], fh
+        in () }
+      tree=PyTreeDef((*, *, *, [*, *], []))
+      unroll=2
+    ] 0:i32[] fc 1:i32[] c g
+    fj:i32[] = parallel_loop[
+      jaxpr={ lambda fk:Ref<vmem>{i32[272]}; fl:i32[] fm:i32[]. let
+          fn:i32[] = mul fl 16:i32[]
+          fo:i32[16] <- fk[fn:fn+16]
+          fp:bool[16] = broadcast_in_dim True:bool[]
+          fq:i32[16] = masked_cumsum fo fp
+          fr:i32[16] = add fq fm
+          fs:i32[] = mul fl 16:i32[]
+          ft:i32[16], fk[fs:fs+16] <- fk[fs:fs+16], fr
+          fu:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] fr
+          fv:i32[] = squeeze[dimensions=(0,)] fu
+        in (fv,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] fc 1:i32[] g 0:i32[]
+    fw:i32[] = sub fj er
+    fx:i32[] = parallel_loop[
+      jaxpr={ lambda fy:Ref<vmem>{i32[272]} fz:i32[]; ga:i32[] gb:i32[]. let
+          gc:i32[] = mul ga 16:i32[]
+          gd:i32[16] <- fy[gc:gc+16]
+          ge:bool[16] = le gd fz
+          gf:i32[16] = all_reduce_population_count[reduce=1] ge
+          gg:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] gf
+          gh:i32[] = squeeze[dimensions=(0,)] gg
+          gi:i32[] = add gb gh
+        in (gi,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] fc 1:i32[] g fw 0:i32[]
+    gj:i32[16] <- g[fx:fx+16]
+    gk:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] gj
+    gl:i32[] = squeeze[dimensions=(0,)] gk
+    gm:bool[] = gt fx 0:i32[]
+    gn:i32[] = sub fx 1:i32[]
+    go:i32[] = max gn 0:i32[]
+    gp:i32[16] <- g[go:go+16]
+    gq:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] gp
+    gr:i32[] = squeeze[dimensions=(0,)] gq
+    gs:i32[] = jit[name=_where jaxpr=_where] gm gr 0:i32[]
+    gt:i32[] = sub fj gl
+    gu:i32[] = sub gl gs
+    gv:i32[] = sub er gt
+    gw:i32[] = sub 24:i32[] 16:i32[]
+    gx:i32[] = shift_left es gw
+    gy:i32[] = or gx fx
+    gz:bool[] = eq gv gu
+    ha:bool[] = or eu gz
+    hb:bool[] = eq gv 0:i32[]
+    hc:bool[] = or ha hb
+    hd:i32[] = jit[name=_where jaxpr=_where3] eu es gy
+    he:i32[] = jit[name=_where jaxpr=_where3] eu 24:i32[] 16:i32[]
+    hf:i32[] = add ep gt
+    hg:i32[] = jit[name=_where jaxpr=_where3] eu ep hf
+    hh:i32[] = jit[name=_where jaxpr=_where3] eu er gv
+    hi:i32[] = jit[name=_where jaxpr=_where3] eu eq gu
+    hj:i32[] = jit[name=_where jaxpr=_where1] hc 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda hk:Ref<vmem>{i32[272]}; hl:i32[]. let
+          hm:i32[16] = broadcast_in_dim 0:i32[]
+          hn:i32[] = mul hl 16:i32[]
+          ho:i32[16], hk[hn:hn+16] <- hk[hn:hn+16], hm
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] hj 1:i32[] c
+    hp:i32[] = jit[name=_where jaxpr=_where2] hc 0:i32[] bb
+    parallel_loop[
+      jaxpr=jaxpr2
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] hp 1:i32[] e f z he hd c
+    hq:i32[] = jit[name=_where jaxpr=_where1] hc 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda hr:Ref<vmem>{i32[272]} hs:Ref<vmem>{i32[272]}; ht:i32[]. let
+          hu:i32[] = mul ht 16:i32[]
+          hv:i32[16] <- hr[hu:hu+16]
+          hw:i32[16], hs[hu:hu+16] <- hs[hu:hu+16], hv
+        in () }
+      tree=PyTreeDef((*, *, *, [*, *], []))
+      unroll=2
+    ] 0:i32[] hq 1:i32[] c g
+    hx:i32[] = parallel_loop[
+      jaxpr={ lambda hy:Ref<vmem>{i32[272]}; hz:i32[] ia:i32[]. let
+          ib:i32[] = mul hz 16:i32[]
+          ic:i32[16] <- hy[ib:ib+16]
+          id:bool[16] = broadcast_in_dim True:bool[]
+          ie:i32[16] = masked_cumsum ic id
+          if:i32[16] = add ie ia
+          ig:i32[] = mul hz 16:i32[]
+          ih:i32[16], hy[ig:ig+16] <- hy[ig:ig+16], if
+          ii:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] if
+          ij:i32[] = squeeze[dimensions=(0,)] ii
+        in (ij,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] hq 1:i32[] g 0:i32[]
+    ik:i32[] = sub hx hh
+    il:i32[] = parallel_loop[
+      jaxpr={ lambda im:Ref<vmem>{i32[272]} in:i32[]; io:i32[] ip:i32[]. let
+          iq:i32[] = mul io 16:i32[]
+          ir:i32[16] <- im[iq:iq+16]
+          is:bool[16] = le ir in
+          it:i32[16] = all_reduce_population_count[reduce=1] is
+          iu:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] it
+          iv:i32[] = squeeze[dimensions=(0,)] iu
+          iw:i32[] = add ip iv
+        in (iw,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] hq 1:i32[] g ik 0:i32[]
+    ix:i32[16] <- g[il:il+16]
+    iy:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] ix
+    iz:i32[] = squeeze[dimensions=(0,)] iy
+    ja:bool[] = gt il 0:i32[]
+    jb:i32[] = sub il 1:i32[]
+    jc:i32[] = max jb 0:i32[]
+    jd:i32[16] <- g[jc:jc+16]
+    je:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] jd
+    jf:i32[] = squeeze[dimensions=(0,)] je
+    jg:i32[] = jit[name=_where jaxpr=_where] ja jf 0:i32[]
+    jh:i32[] = sub hx iz
+    ji:i32[] = sub iz jg
+    jj:i32[] = sub hh jh
+    jk:i32[] = sub he 8:i32[]
+    jl:i32[] = shift_left hd jk
+    jm:i32[] = or jl il
+    jn:bool[] = eq jj ji
+    jo:bool[] = or hc jn
+    jp:bool[] = eq jj 0:i32[]
+    jq:bool[] = or jo jp
+    jr:i32[] = jit[name=_where jaxpr=_where3] hc hd jm
+    js:i32[] = jit[name=_where jaxpr=_where3] hc he 8:i32[]
+    jt:i32[] = add hg jh
+    ju:i32[] = jit[name=_where jaxpr=_where3] hc hg jt
+    jv:i32[] = jit[name=_where jaxpr=_where3] hc hh jj
+    jw:i32[] = jit[name=_where jaxpr=_where3] hc hi ji
+    jx:i32[] = jit[name=_where jaxpr=_where1] jq 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda jy:Ref<vmem>{i32[272]}; jz:i32[]. let
+          ka:i32[16] = broadcast_in_dim 0:i32[]
+          kb:i32[] = mul jz 16:i32[]
+          kc:i32[16], jy[kb:kb+16] <- jy[kb:kb+16], ka
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] jx 1:i32[] c
+    kd:i32[] = jit[name=_where jaxpr=_where2] jq 0:i32[] bb
+    parallel_loop[
+      jaxpr=jaxpr3
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] kd 1:i32[] e f z js jr c
+    ke:i32[] = jit[name=_where jaxpr=_where1] jq 0:i32[] 16:i32[]
+    parallel_loop[
+      jaxpr={ lambda kf:Ref<vmem>{i32[272]} kg:Ref<vmem>{i32[272]}; kh:i32[]. let
+          ki:i32[] = mul kh 16:i32[]
+          kj:i32[16] <- kf[ki:ki+16]
+          kk:i32[16], kg[ki:ki+16] <- kg[ki:ki+16], kj
+        in () }
+      tree=PyTreeDef((*, *, *, [*, *], []))
+      unroll=2
+    ] 0:i32[] ke 1:i32[] c g
+    kl:i32[] = parallel_loop[
+      jaxpr={ lambda km:Ref<vmem>{i32[272]}; kn:i32[] ko:i32[]. let
+          kp:i32[] = mul kn 16:i32[]
+          kq:i32[16] <- km[kp:kp+16]
+          kr:bool[16] = broadcast_in_dim True:bool[]
+          ks:i32[16] = masked_cumsum kq kr
+          kt:i32[16] = add ks ko
+          ku:i32[] = mul kn 16:i32[]
+          kv:i32[16], km[ku:ku+16] <- km[ku:ku+16], kt
+          kw:i32[1] = slice[
+            limit_indices=(16,)
+            start_indices=(15,)
+            strides=None
+          ] kt
+          kx:i32[] = squeeze[dimensions=(0,)] kw
+        in (kx,) }
+      tree=PyTreeDef((*, *, *, [*], [*]))
+      unroll=2
+    ] 0:i32[] ke 1:i32[] g 0:i32[]
+    ky:i32[] = sub kl jv
+    kz:i32[] = parallel_loop[
+      jaxpr={ lambda la:Ref<vmem>{i32[272]} lb:i32[]; lc:i32[] ld:i32[]. let
+          le:i32[] = mul lc 16:i32[]
+          lf:i32[16] <- la[le:le+16]
+          lg:bool[16] = le lf lb
+          lh:i32[16] = all_reduce_population_count[reduce=1] lg
+          li:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] lh
+          lj:i32[] = squeeze[dimensions=(0,)] li
+          lk:i32[] = add ld lj
+        in (lk,) }
+      tree=PyTreeDef((*, *, *, [*, *], [*]))
+      unroll=2
+    ] 0:i32[] ke 1:i32[] g ky 0:i32[]
+    ll:i32[16] <- g[kz:kz+16]
+    lm:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] ll
+    ln:i32[] = squeeze[dimensions=(0,)] lm
+    lo:bool[] = gt kz 0:i32[]
+    lp:i32[] = sub kz 1:i32[]
+    lq:i32[] = max lp 0:i32[]
+    lr:i32[16] <- g[lq:lq+16]
+    ls:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] lr
+    lt:i32[] = squeeze[dimensions=(0,)] ls
+    lu:i32[] = jit[name=_where jaxpr=_where] lo lt 0:i32[]
+    lv:i32[] = sub kl ln
+    lw:i32[] = sub ln lu
+    lx:i32[] = sub jv lv
+    ly:i32[] = sub js 0:i32[]
+    lz:i32[] = shift_left jr ly
+    ma:i32[] = or lz kz
+    mb:bool[] = eq lx lw
+    mc:bool[] = or jq mb
+    md:bool[] = eq lx 0:i32[]
+    me:bool[] = or mc md
+    mf:i32[] = jit[name=_where jaxpr=_where3] jq jr ma
+    mg:i32[] = jit[name=_where jaxpr=_where3] jq js 0:i32[]
+    mh:i32[] = add ju lv
+    mi:i32[] = jit[name=_where jaxpr=_where3] jq ju mh
+    mj:i32[] = jit[name=_where jaxpr=_where3] jq jv lx
+    mk:i32[] = jit[name=_where jaxpr=_where3] jq jw lw
+    ml:i32[] = jit[name=_where jaxpr=_where2] dr 0:i32[] mj
+    mm:bool[] = lt de 2048:i32[]
+    mn:bool[] = and q mm
+    mo:i32[] = jit[name=_where jaxpr=_where1] mn 128:i32[] 0:i32[]
+    parallel_loop[
+      jaxpr={ lambda mp:Ref<vmem>{i32[2064]}; mq:i32[]. let
+          mr:i32[16] = broadcast_in_dim -1:i32[]
+          ms:i32[] = mul mq 16:i32[]
+          mt:i32[16], mp[ms:ms+16] <- mp[ms:ms+16], mr
+        in () }
+      tree=PyTreeDef((*, *, *, [*], []))
+      unroll=4
+    ] 0:i32[] mo 1:i32[] h
+    mu:i32[] = jit[name=_where jaxpr=_where] q bb 0:i32[]
+    mv:i32[] mw:i32[] = parallel_loop[
+      jaxpr=jaxpr4
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *, *, *], [*, *]))
+      unroll=4
+    ] 0:i32[] mu 1:i32[] e f z mg mf ml dr h 0:i32[] 0:i32[]
+    mx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] q
+    cond[
+      branches=(
+        { lambda ; my:i32[] mz:Ref<vmem>{i32[2064]} na:Ref<hbm>{i32[2097152]} nb:Ref<semaphore_mem>{dma_sem[4]}. let
+            
+          in () }
+        { lambda ; nc:i32[] nd:Ref<vmem>{i32[2064]} ne:Ref<hbm>{i32[2097152]} nf:Ref<semaphore_mem>{dma_sem[4]}. let
+            ng:i32[] = mul nc 2048:i32[]
+            dma_start(p0) nd[:2048] -> ne[ng:ng+2048] nf[2]
+            dma_wait ne[ng:ng+2048] nf[2]
+          in () }
+      )
+    ] mx r h i j
+  in (m, 0:i32[]) } in
+let _where = { lambda ; nh:bool[] ni:i32[] nj:i32[]. let
+    nk:i32[] = convert_element_type[new_dtype=int32 weak_type=False] nj
+    nl:i32[] = select_n nh nk ni
+  in (nl,) } in
+let _where1 = { lambda ; nm:bool[] nn:i32[] no:i32[]. let
+    np:i32[] = select_n nm no nn
+  in (np,) } in
+let _where2 = { lambda ; nq:bool[] nr:i32[] ns:i32[]. let
+    nt:i32[] = convert_element_type[new_dtype=int32 weak_type=False] nr
+    nu:i32[] = select_n nq ns nt
+  in (nu,) } in
+let jaxpr1 = { lambda nv:Ref<vmem>{f32[10240]} nw:i32[16] nx:i32[] ny:i32[] nz:i32[]
+    oa:Ref<vmem>{i32[272]}; ob:i32[]. let
+    oc:i32[] = mul ob 16:i32[]
+    od:f32[16] <- nv[oc:oc+16]
+    oe:i32[16] = bitcast_convert_type[new_dtype=int32] od
+    of:i32[] = mul ob 16:i32[]
+    og:i32[16] = add of nw
+    oh:bool[16] = lt og nx
+    oi:bool[16] = gt oe -2139095041:i32[]
+    oj:bool[16] = and oh oi
+    ok:i32[16] = shift_right_arithmetic oe ny
+    ol:bool[16] = eq ok nz
+    om:bool[16] = and oj ol
+    on:i32[16] = shift_right_arithmetic oe 16:i32[]
+    oo:i32[16] = and on 255:i32[]
+    op:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] oa oo op om
+  in () } in
+let _where3 = { lambda ; oq:bool[] or:i32[] os:i32[]. let
+    ot:i32[] = select_n oq os or
+  in (ot,) } in
+let jaxpr2 = { lambda ou:Ref<vmem>{f32[10240]} ov:i32[16] ow:i32[] ox:i32[] oy:i32[]
+    oz:Ref<vmem>{i32[272]}; pa:i32[]. let
+    pb:i32[] = mul pa 16:i32[]
+    pc:f32[16] <- ou[pb:pb+16]
+    pd:i32[16] = bitcast_convert_type[new_dtype=int32] pc
+    pe:i32[] = mul pa 16:i32[]
+    pf:i32[16] = add pe ov
+    pg:bool[16] = lt pf ow
+    ph:bool[16] = gt pd -2139095041:i32[]
+    pi:bool[16] = and pg ph
+    pj:i32[16] = shift_right_arithmetic pd ox
+    pk:bool[16] = eq pj oy
+    pl:bool[16] = and pi pk
+    pm:i32[16] = shift_right_arithmetic pd 8:i32[]
+    pn:i32[16] = and pm 255:i32[]
+    po:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] oz pn po pl
+  in () } in
+let jaxpr3 = { lambda pp:Ref<vmem>{f32[10240]} pq:i32[16] pr:i32[] ps:i32[] pt:i32[]
+    pu:Ref<vmem>{i32[272]}; pv:i32[]. let
+    pw:i32[] = mul pv 16:i32[]
+    px:f32[16] <- pp[pw:pw+16]
+    py:i32[16] = bitcast_convert_type[new_dtype=int32] px
+    pz:i32[] = mul pv 16:i32[]
+    qa:i32[16] = add pz pq
+    qb:bool[16] = lt qa pr
+    qc:bool[16] = gt py -2139095041:i32[]
+    qd:bool[16] = and qb qc
+    qe:i32[16] = shift_right_arithmetic py ps
+    qf:bool[16] = eq qe pt
+    qg:bool[16] = and qd qf
+    qh:i32[16] = shift_right_arithmetic py 0:i32[]
+    qi:i32[16] = and qh 255:i32[]
+    qj:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] pu qi qj qg
+  in () } in
+let jaxpr4 = { lambda qk:Ref<vmem>{f32[10240]} ql:i32[16] qm:i32[] qn:i32[] qo:i32[]
+    qp:i32[] qq:bool[] qr:Ref<vmem>{i32[2064]}; qs:i32[] qt:i32[] qu:i32[]. let
+    qv:i32[] = mul qs 16:i32[]
+    qw:f32[16] <- qk[qv:qv+16]
+    qx:i32[16] = bitcast_convert_type[new_dtype=int32] qw
+    qy:i32[] = mul qs 16:i32[]
+    qz:i32[16] = add qy ql
+    ra:bool[16] = lt qz qm
+    rb:bool[16] = gt qx -2139095041:i32[]
+    rc:bool[16] = and ra rb
+    rd:i32[16] = shift_right_arithmetic qx qn
+    re:bool[16] = gt rd qo
+    rf:bool[16] = and rc re
+    rg:bool[16] = eq rd qo
+    rh:bool[16] = and rc rg
+    ri:i32[16] = convert_element_type[new_dtype=int32 weak_type=False] rh
+    rj:bool[16] = broadcast_in_dim True:bool[]
+    rk:i32[16] = masked_cumsum ri rj
+    rl:i32[16] = add rk qu
+    rm:bool[16] = le rl qp
+    rn:bool[16] = and rh rm
+    ro:bool[16] = or rf rn
+    rp:bool[16] = jit[
+      name=_where
+      jaxpr={ lambda ; qq:bool[] rc:bool[16] ro:bool[16]. let
+          rp:bool[16] = select_n qq ro rc
+        in (rp,) }
+    ] qq rc ro
+    rq:i32[16] = swap[
+      add=False
+      has_mask=True
+      tree=PyTreeDef((CustomNode(NDIndexer[(PyTreeDef((CustomNode(Slice[(None, 16, 1)], [*, None]),)), (2064,), ())], [*]),))
+    ] qr qz qt rp
+    rr:i32[16] = all_reduce_population_count[reduce=1] rp
+    rs:i32[1] = slice[limit_indices=(1,) start_indices=(0,) strides=None] rr
+    rt:i32[] = squeeze[dimensions=(0,)] rs
+    ru:i32[] = add qt rt
+    rv:i32[1] = slice[limit_indices=(16,) start_indices=(15,) strides=None] rl
+    rw:i32[] = squeeze[dimensions=(0,)] rv
+  in (ru, rw) } in
+let jaxpr5 = { lambda ; rx:i32[] ry:i32[] rz:Ref<hbm>{f32[10485760]} sa:Ref<vmem>{f32[4096]}
+    sb:Ref<semaphore_mem>{dma_sem[2]} sc:i32[] sd:Ref<vmem>{f32[10240]} se:i32[16]
+    sf:Ref<vmem>{i32[272]} sg:i32[]. let
+    sh:i32[] = mul 1:i32[] rx
+    si:i32[] = sub sh 1:i32[]
+    sj:bool[] = eq si 0:i32[]
+    sk:i32[] = select_n True:bool[] 0:i32[] -1:i32[]
+    sl:bool[] = eq sk -1:i32[]
+    sm:i32[] = sub rx 1:i32[]
+    sn:i32[] = select_n sl sk sm
+    so:i32[] = add sn 0:i32[]
+    sp:i32[] = select_n True:bool[] 0:i32[] 1:i32[]
+    sq:i32[] = convert_element_type[new_dtype=int32 weak_type=False] sp
+    sr:bool[] = eq sq rx
+    ss:i32[] = select_n sr sp 0:i32[]
+    st:i32[] = add ss 0:i32[]
+    su:i32[] = add ss 1:i32[]
+    sv:i32[] = select_n True:bool[] ss su
+    sw:i32[] = convert_element_type[new_dtype=int32 weak_type=False] sv
+    sx:bool[] = eq sw rx
+    sy:i32[] = select_n sx sv 0:i32[]
+    sz:i32[] = add sy 0:i32[]
+    ta:u32[] = rem 0:u32[] 2:u32[]
+    tb:i32[] = add ry 0:i32[]
+    tc:i32[] = mul 2048:i32[] tb
+    td:u32[] = mul ta 2048:u32[]
+    te:u32[] = add td 0:u32[]
+    dma_start(p0) rz[tc:tc+2048] -> sa[te:te+2048] sb[ta]
+    tf:u32[] = add 0:u32[] 1:u32[]
+    tg:u32[] = select_n True:bool[] 0:u32[] tf
+    th:i32[] ti:i32[] tj:u32[] tk:u32[] tl:i32[] = while[
+      body_jaxpr=jaxpr6
+      body_nconsts=9
+      cond_jaxpr={ lambda ; tm:i32[] tn:i32[] to:u32[] tp:u32[] tq:i32[]. let
+          tr:bool[] = lt tm tn
+        in (tr,) }
+      cond_nconsts=0
+    ] sa sb rx ry rz sc sd se sf 0:i32[] sg tg 0:u32[] 0:i32[]
+    ts:i32[] = sub tl 1:i32[]
+    tt:i32[] = select_n True:bool[] tl ts
+    tu:bool[] = eq tt -1:i32[]
+    tv:i32[] = sub rx 1:i32[]
+    tw:i32[] = select_n tu tt tv
+    tx:i32[] = sub sg 1:i32[]
+    ty:i32[] = mul 1:i32[] rx
+    tz:bool[] = eq tx 0:i32[]
+    ua:i32[] = sub ty 1:i32[]
+    ub:bool[] = eq tx ua
+    uc:i32[] = add tw 0:i32[]
+    ud:i32[] = sub tw 1:i32[]
+    ue:i32[] = select_n True:bool[] tw ud
+    uf:bool[] = eq ue -1:i32[]
+    ug:i32[] = sub rx 1:i32[]
+    uh:i32[] = select_n uf ue ug
+    ui:i32[] = add uh 0:i32[]
+    uj:i32[] = add tw 1:i32[]
+    uk:i32[] = select_n True:bool[] tw uj
+    ul:bool[] = eq uk rx
+    um:i32[] = select_n ul uk 0:i32[]
+    un:i32[] = add um 0:i32[]
+    uo:i32[] = add um 1:i32[]
+    up:i32[] = select_n True:bool[] um uo
+    uq:bool[] = eq up rx
+    ur:i32[] = select_n uq up 0:i32[]
+    us:i32[] = add ur 0:i32[]
+    ut:i32[] = convert_element_type[new_dtype=int32 weak_type=False] ub
+    cond[branches=({ lambda ; . let  in () } { lambda ; . let  in () })] ut
+  in () } in
+let jaxpr6 = { lambda ; uu:Ref<vmem>{f32[4096]} uv:Ref<semaphore_mem>{dma_sem[2]}
+    uw:i32[] ux:i32[] uy:Ref<hbm>{f32[10485760]} uz:i32[] va:Ref<vmem>{f32[10240]}
+    vb:i32[16] vc:Ref<vmem>{i32[272]} vd:i32[] ve:i32[] vf:u32[] vg:u32[] vh:i32[]. let
+    vi:i32[] = add vd 1:i32[]
+    vj:i32[] = mul 1:i32[] uw
+    vk:bool[] = eq vd 0:i32[]
+    vl:i32[] = sub vj 1:i32[]
+    vm:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vd
+    vn:bool[] = eq vm vl
+    vo:i32[] = add vh 0:i32[]
+    vp:i32[] = sub vh 1:i32[]
+    vq:i32[] = select_n True:bool[] vh vp
+    vr:bool[] = eq vq -1:i32[]
+    vs:i32[] = sub uw 1:i32[]
+    vt:i32[] = select_n vr vq vs
+    vu:i32[] = add vt 0:i32[]
+    vv:i32[] = add vh 1:i32[]
+    vw:i32[] = select_n True:bool[] vh vv
+    vx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vw
+    vy:bool[] = eq vx uw
+    vz:i32[] = select_n vy vw 0:i32[]
+    wa:i32[] = add vz 0:i32[]
+    wb:i32[] = add vz 1:i32[]
+    wc:i32[] = select_n True:bool[] vz wb
+    wd:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wc
+    we:bool[] = eq wd uw
+    wf:i32[] = select_n we wc 0:i32[]
+    wg:i32[] = add wf 0:i32[]
+    wh:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    wi:i32[] = add ux wh
+    wj:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wa
+    wk:i32[] = add ux wj
+    wl:bool[] = ne wi wk
+    wm:bool[] = or False:bool[] wl
+    wn:i32[] = sub vj 2:i32[]
+    wo:i32[] = add wn 1:i32[]
+    wp:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vd
+    wq:bool[] = ge wp wo
+    wr:bool[] = not wq
+    ws:bool[] = and wm wr
+    wt:i32[] = convert_element_type[new_dtype=int32 weak_type=False] ws
+    cond[
+      branches=(
+        { lambda ; wu:u32[] wv:i32[] ww:i32[] wx:Ref<hbm>{f32[10485760]} wy:Ref<vmem>{f32[4096]}
+            wz:Ref<semaphore_mem>{dma_sem[2]}. let
+            
+          in () }
+        { lambda ; xa:u32[] xb:i32[] xc:i32[] xd:Ref<hbm>{f32[10485760]} xe:Ref<vmem>{f32[4096]}
+            xf:Ref<semaphore_mem>{dma_sem[2]}. let
+            xg:u32[] = rem xa 2:u32[]
+            xh:i32[] = convert_element_type[new_dtype=int32 weak_type=False] xc
+            xi:i32[] = add xb xh
+            xj:i32[] = mul 2048:i32[] xi
+            xk:u32[] = mul xg 2048:u32[]
+            xl:u32[] = add xk 0:u32[]
+            dma_start(p0) xd[xj:xj+2048] -> xe[xl:xl+2048] xf[xg]
+          in () }
+      )
+    ] wt vf ux wa uy uu uv
+    xm:bool[] = and ws True:bool[]
+    xn:u32[] = add vf 1:u32[]
+    xo:u32[] = select_n xm vf xn
+    xp:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    xq:i32[] = add ux xp
+    xr:i32[] = add ux vu
+    xs:bool[] = ne xq xr
+    xt:bool[] = or False:bool[] xs
+    xu:bool[] = convert_element_type[new_dtype=bool weak_type=False] vk
+    xv:bool[] = or xt xu
+    xw:i32[] = convert_element_type[new_dtype=int32 weak_type=False] xv
+    cond[
+      branches=(
+        { lambda ; xx:i32[] xy:i32[] xz:u32[] ya:Ref<hbm>{f32[10485760]} yb:Ref<vmem>{f32[4096]}
+            yc:Ref<semaphore_mem>{dma_sem[2]}. let
+            
+          in () }
+        { lambda ; yd:i32[] ye:i32[] yf:u32[] yg:Ref<hbm>{f32[10485760]} yh:Ref<vmem>{f32[4096]}
+            yi:Ref<semaphore_mem>{dma_sem[2]}. let
+            yj:i32[] = convert_element_type[new_dtype=int32 weak_type=False] ye
+            yk:i32[] = add yd yj
+            yl:i32[] = mul 2048:i32[] yk
+            ym:u32[] = rem yf 2:u32[]
+            yn:u32[] = mul ym 2048:u32[]
+            yo:u32[] = add yn 0:u32[]
+            dma_wait yh[yo:yo+2048] yi[ym]
+          in () }
+      )
+    ] xw ux vo vg uy uu uv
+    yp:u32[] = rem vg 2:u32[]
+    yq:u32[] = mul yp 2048:u32[]
+    yr:i32[] = mul vo 2048:i32[]
+    ys:i32[] = convert_element_type[new_dtype=int32 weak_type=False] yr
+    yt:i32[] = sub uz ys
+    yu:i32[] = jit[
+      name=clip
+      jaxpr={ lambda ; yt:i32[] yv:i32[] yw:i32[]. let
+          yx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] yv
+          yy:i32[] = max yx yt
+          yz:i32[] = convert_element_type[new_dtype=int32 weak_type=False] yw
+          yu:i32[] = min yz yy
+        in (yu,) }
+    ] yt 0:i32[] 2048:i32[]
+    za:i32[] = add yu 15:i32[]
+    zb:i32[] = shift_right_arithmetic za 4:i32[]
+    parallel_loop[
+      jaxpr=jaxpr7
+      tree=PyTreeDef((*, *, *, [*, *, *, *, *, *, *], []))
+      unroll=4
+    ] 0:i32[] zb 1:i32[] uu yq yr va vb uz vc
+    zc:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    zd:i32[] = add ux zc
+    ze:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wa
+    zf:i32[] = add ux ze
+    zg:bool[] = ne zd zf
+    zh:bool[] = or False:bool[] zg
+    zi:bool[] = or zh vn
+    zj:i32[] = convert_element_type[new_dtype=int32 weak_type=False] zi
+    cond[branches=({ lambda ; . let  in () } { lambda ; . let  in () })] zj
+    zk:bool[] = and zi False:bool[]
+    zl:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    zm:i32[] = add ux zl
+    zn:i32[] = add ux vu
+    zo:bool[] = ne zm zn
+    zp:bool[] = or False:bool[] zo
+    zq:bool[] = not vk
+    zr:bool[] = convert_element_type[new_dtype=bool weak_type=False] zq
+    zs:bool[] = and zp zr
+    zt:i32[] = convert_element_type[new_dtype=int32 weak_type=False] zs
+    cond[branches=({ lambda ; . let  in () } { lambda ; . let  in () })] zt
+    zu:bool[] = and zs False:bool[]
+    zv:i32[] = convert_element_type[new_dtype=int32 weak_type=False] vo
+    zw:i32[] = add ux zv
+    zx:i32[] = convert_element_type[new_dtype=int32 weak_type=False] wa
+    zy:i32[] = add ux zx
+    zz:bool[] = ne zw zy
+    baa:bool[] = or False:bool[] zz
+    bab:bool[] = or baa vn
+    bac:u32[] = add vg 1:u32[]
+    bad:u32[] = select_n bab vg bac
+    bae:i32[] = add vh 1:i32[]
+    baf:i32[] = select_n True:bool[] vh bae
+    bag:i32[] = convert_element_type[new_dtype=int32 weak_type=False] baf
+    bah:bool[] = eq bag uw
+    bai:i32[] = select_n bah baf 0:i32[]
+  in (vi, ve, xo, bad, bai) } in
+let jaxpr7 = { lambda baj:Ref<vmem>{f32[4096]} bak:u32[] bal:i32[] bam:Ref<vmem>{f32[10240]}
+    ban:i32[16] bao:i32[] bap:Ref<vmem>{i32[272]}; baq:i32[]. let
+    bar:i32[] = mul baq 16:i32[]
+    bas:f32[16] <- baj[bak:bak+2048][bar:bar+16]
+    bat:i32[16] = bitcast_convert_type[new_dtype=int32] bas
+    bau:i32[16] = shift_right_arithmetic bat 31:i32[]
+    bav:i32[16] = and bau 2147483647:i32[]
+    baw:i32[16] = xor bat bav
+    bax:f32[16] = bitcast_convert_type[new_dtype=float32] baw
+    bay:i32[] = convert_element_type[new_dtype=int32 weak_type=False] bal
+    baz:i32[] = add bay bar
+    bba:f32[16], bam[baz:baz+16] <- bam[baz:baz+16], bax
+    bbb:i32[] = convert_element_type[new_dtype=int32 weak_type=False] bal
+    bbc:i32[] = add bbb bar
+    bbd:i32[16] = add bbc ban
+    bbe:bool[16] = lt bbd bao
+    bbf:bool[16] = gt baw -2139095041:i32[]
+    bbg:bool[16] = and bbe bbf
+    bbh:i32[16] = shift_right_arithmetic baw 24:i32[]
+    bbi:i32[16] = add bbh 128:i32[]
+    bbj:i32[16] = broadcast_in_dim 1:i32[]
+    scatter[add=True tree=PyTreeDef((*, (), (*,), *, *))] bap bbi bbj bbg
+  in () } in
+{ lambda ; bbk:Ref<hbm>{f32[10485760]} bbl:Ref<hbm>{i32[1024]} bbm:Ref<hbm>{i32[2097152]}
+    bbn:Ref<vmem>{f32[10240]} bbo:Ref<vmem>{i32[272]} bbp:Ref<vmem>{i32[272]} bbq:Ref<vmem>{i32[2064]}
+    bbr:Ref<vmem>{i32[1024]} bbs:Ref<semaphore_mem>{dma_sem[4]}. let
+    bbt:i32[] = axis_index[axis_name=core] 
+    bbu:i32[] = axis_index[axis_name=subcore] 
+    bbv:i32[] = mul bbt 16:i32[]
+    bbw:i32[] = add bbv bbu
+    bbx:i32[16] = iota[dimension=0 dtype=int32 shape=(16,) sharding=None] 
+    dma_start(p0) bbl[:] -> bbr[...] bbs[0]
+    dma_wait bbr[...] bbs[0]
+    _:i32[] _:i32[] = scan[
+      jaxpr=jaxpr
+      length=32
+      num_carry=2
+      num_consts=10
+      reverse=False
+      unroll=1
+    ] bbw bbr bbo bbk bbn bbx bbp bbq bbm bbs 0:i32[] 0:i32[]
+  in () }
+
+The Mosaic module for mpmd_map:
+#map = affine_map<(d0, d1) -> (0)>
+module {
+  func.func @sc_topk_direct_b1024_n10240_k2048_c2048_final(%arg0: i32, %arg1: i32, %arg2: memref<10485760xf32, #tpu.memory_space<hbm>>, %arg3: memref<1024xi32, #tpu.memory_space<hbm>>, %arg4: memref<2097152xi32, #tpu.memory_space<hbm>>, %arg5: memref<10240xf32, #tpu.memory_space<vmem>>, %arg6: memref<272xi32, #tpu.memory_space<vmem>>, %arg7: memref<272xi32, #tpu.memory_space<vmem>>, %arg8: memref<2064xi32, #tpu.memory_space<vmem>>, %arg9: memref<1024xi32, #tpu.memory_space<vmem>>, %arg10: memref<4x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) attributes {dimension_semantics = [#tpu.dimension_semantics<core_parallel>, #tpu.dimension_semantics<subcore_parallel>], iteration_bounds = array<i64: 2, 16>, scalar_prefetch = 0 : i64, scratch_operands = 6 : i64, tpu.core_type = #tpu.core_type<sc_vector_subcore>, window_params = [{transform_indices = #map}, {transform_indices = #map}, {transform_indices = #map}]} {
+    %cst = arith.constant dense<-1> : vector<16xi32>
+    %cst_0 = arith.constant dense<8> : vector<16xi32>
+    %cst_1 = arith.constant dense<255> : vector<16xi32>
+    %cst_2 = arith.constant dense<16> : vector<16xi32>
+    %cst_3 = arith.constant dense<true> : vector<16xi1>
+    %cst_4 = arith.constant dense<1> : vector<16xi32>
+    %cst_5 = arith.constant dense<128> : vector<16xi32>
+    %cst_6 = arith.constant dense<24> : vector<16xi32>
+    %cst_7 = arith.constant dense<-2139095041> : vector<16xi32>
+    %cst_8 = arith.constant dense<2147483647> : vector<16xi32>
+    %cst_9 = arith.constant dense<31> : vector<16xi32>
+    %cst_10 = arith.constant dense<0> : vector<16xi32>
+    %c8_i32 = arith.constant 8 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %c24_i32 = arith.constant 24 : i32
+    %c2048_i32 = arith.constant 2048 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c-1_i32 = arith.constant -1 : i32
+    %c5_i32 = arith.constant 5 : i32
+    %c11_i32 = arith.constant 11 : i32
+    %c2047_i32 = arith.constant 2047 : i32
+    %c4_i32 = arith.constant 4 : i32
+    %c15_i32 = arith.constant 15 : i32
+    %c10240_i32 = arith.constant 10240 : i32
+    %c1023_i32 = arith.constant 1023 : i32
+    %c1024_i32 = arith.constant 1024 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c16_i32 = arith.constant 16 : i32
+    %0 = arith.muli %arg0, %c16_i32 : i32
+    %1 = arith.addi %0, %arg1 : i32
+    %2 = tpu.iota {dimensions = array<i32: 0>} : vector<16xi32>
+    %3 = tpu.memref_slice %arg10[%c0_i32] : memref<4x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+    %4 = tpu.memref_squeeze %3 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+    tpu.enqueue_dma source(%arg3 : memref<1024xi32, #tpu.memory_space<hbm>>) target(%arg9 : memref<1024xi32, #tpu.memory_space<vmem>>) target_semaphore(%4 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>)
+    %5 = tpu.memref_slice %arg10[%c0_i32] : memref<4x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+    %6 = tpu.memref_squeeze %5 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+    tpu.wait_dma2 semaphore(%6 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) src(%arg3 : memref<1024xi32, #tpu.memory_space<hbm>>) dst(%arg9 : memref<1024xi32, #tpu.memory_space<vmem>>)
+    scf.for %arg11 = %c0_i32 to %c32_i32 step %c1_i32  : i32 {
+      %7 = arith.muli %arg11, %c32_i32 : i32
+      %8 = arith.addi %7, %1 : i32
+      %9 = arith.cmpi slt, %8, %c1024_i32 : i32
+      %10 = arith.minsi %8, %c1023_i32 : i32
+      %11 = arith.index_cast %10 : i32 to index
+      %12 = tpu.vector_load %arg9[%11] {strides = array<i32>} : memref<1024xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %13 = vector.extract %12[0] : i32 from vector<16xi32>
+      %14 = arith.minsi %13, %c10240_i32 : i32
+      %15 = arith.select %9, %14, %c0_i32 : i32
+      %16 = arith.cmpi sgt, %15, %c0_i32 : i32
+      %17 = arith.minsi %15, %c10240_i32 : i32
+      %18 = arith.select %16, %17, %c0_i32 : i32
+      %19 = arith.addi %18, %c15_i32 : i32
+      %20 = arith.shrsi %19, %c4_i32 : i32
+      %21 = arith.addi %18, %c2047_i32 : i32
+      %22 = arith.shrsi %21, %c11_i32 : i32
+      %23 = arith.muli %10, %c5_i32 : i32
+      %24 = arith.cmpi sgt, %18, %c0_i32 : i32
+      %25 = arith.select %24, %c16_i32, %c0_i32 : i32
+      scf.for %arg12 = %c0_i32 to %25 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg6[%128], %cst_10 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      "tpu.region"() ({
+        %alloca = memref.alloca() : memref<4096xf32, #tpu.memory_space<vmem>>
+        %127 = tpu.sem_alloc : memref<2x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+        %128 = arith.cmpi sgt, %22, %c0_i32 : i32
+        scf.if %128 {
+          "tpu.trace_start"() <{level = 10 : i32, message = "ep_initialize_0"}> : () -> ()
+          %129 = arith.muli %10, %c10240_i32 : i32
+          %130 = tpu.memref_slice %127[%c0_i32] : memref<2x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+          %131 = tpu.memref_squeeze %130 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+          %132 = tpu.memref_slice %alloca[%c0_i32] : memref<4096xf32, #tpu.memory_space<vmem>> -> memref<2048xf32, #tpu.memory_space<vmem>>
+          %133 = tpu.memref_slice %arg2[%129] : memref<10485760xf32, #tpu.memory_space<hbm>> -> memref<2048xf32, #tpu.memory_space<hbm>>
+          tpu.enqueue_dma source(%133 : memref<2048xf32, #tpu.memory_space<hbm>>) target(%132 : memref<2048xf32, #tpu.memory_space<vmem>>) target_semaphore(%131 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>)
+          "tpu.trace_stop"() : () -> ()
+          %134:3 = scf.for %arg12 = %c0_i32 to %22 step %c1_i32 iter_args(%arg13 = %c1_i32, %arg14 = %c0_i32, %arg15 = %c0_i32) -> (i32, i32, i32)  : i32 {
+            %135 = arith.cmpi eq, %arg12, %c0_i32 : i32
+            %136 = arith.subi %22, %c1_i32 : i32
+            %137 = arith.cmpi eq, %arg12, %136 : i32
+            %138 = arith.subi %arg15, %c1_i32 : i32
+            %139 = arith.cmpi eq, %138, %c-1_i32 : i32
+            %140 = arith.subi %22, %c1_i32 : i32
+            %141 = arith.select %139, %140, %138 : i32
+            %142 = arith.addi %arg15, %c1_i32 : i32
+            %143 = arith.cmpi eq, %142, %22 : i32
+            %144 = arith.select %143, %c0_i32, %142 : i32
+            %145 = arith.addi %23, %arg15 : i32
+            %146 = arith.addi %23, %144 : i32
+            %147 = arith.cmpi ne, %145, %146 : i32
+            %148 = arith.addi %22, %c-1_i32 : i32
+            %149 = arith.cmpi slt, %arg12, %148 : i32
+            %150 = arith.andi %147, %149 : i1
+            scf.if %150 {
+              "tpu.trace_start"() <{level = 10 : i32, message = "ep_copy_in"}> : () -> ()
+              %174 = arith.remui %arg13, %c2_i32 : i32
+              %175 = arith.addi %23, %144 : i32
+              %176 = arith.muli %175, %c2048_i32 : i32
+              %177 = arith.muli %174, %c2048_i32 : i32
+              %178 = tpu.memref_slice %127[%174] : memref<2x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+              %179 = tpu.memref_squeeze %178 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+              %180 = tpu.memref_slice %alloca[%177] : memref<4096xf32, #tpu.memory_space<vmem>> -> memref<2048xf32, #tpu.memory_space<vmem>>
+              %181 = tpu.memref_slice %arg2[%176] : memref<10485760xf32, #tpu.memory_space<hbm>> -> memref<2048xf32, #tpu.memory_space<hbm>>
+              tpu.enqueue_dma source(%181 : memref<2048xf32, #tpu.memory_space<hbm>>) target(%180 : memref<2048xf32, #tpu.memory_space<vmem>>) target_semaphore(%179 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>)
+              "tpu.trace_stop"() : () -> ()
+            }
+            %151 = arith.addi %arg13, %c1_i32 : i32
+            %152 = arith.select %150, %151, %arg13 : i32
+            %153 = arith.addi %23, %arg15 : i32
+            %154 = arith.addi %23, %141 : i32
+            %155 = arith.cmpi ne, %153, %154 : i32
+            %156 = arith.ori %155, %135 : i1
+            scf.if %156 {
+              "tpu.trace_start"() <{level = 10 : i32, message = "ep_wait_in"}> : () -> ()
+              %174 = arith.addi %23, %arg15 : i32
+              %175 = arith.muli %174, %c2048_i32 : i32
+              %176 = arith.remui %arg14, %c2_i32 : i32
+              %177 = arith.muli %176, %c2048_i32 : i32
+              %178 = tpu.memref_slice %127[%176] : memref<2x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+              %179 = tpu.memref_squeeze %178 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+              %180 = tpu.memref_slice %alloca[%177] : memref<4096xf32, #tpu.memory_space<vmem>> -> memref<2048xf32, #tpu.memory_space<vmem>>
+              %181 = tpu.memref_slice %arg2[%175] : memref<10485760xf32, #tpu.memory_space<hbm>> -> memref<2048xf32, #tpu.memory_space<hbm>>
+              tpu.wait_dma2 semaphore(%179 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) src(%181 : memref<2048xf32, #tpu.memory_space<hbm>>) dst(%180 : memref<2048xf32, #tpu.memory_space<vmem>>)
+              "tpu.trace_stop"() : () -> ()
+            }
+            %157 = arith.remui %arg14, %c2_i32 : i32
+            %158 = arith.muli %157, %c2048_i32 : i32
+            "tpu.trace_start"() <{level = 10 : i32, message = "ep_run_kernel"}> : () -> ()
+            %159 = arith.muli %arg15, %c2048_i32 : i32
+            %160 = arith.subi %18, %159 : i32
+            %161 = arith.maxsi %160, %c0_i32 : i32
+            %162 = arith.minsi %161, %c2048_i32 : i32
+            %163 = arith.addi %162, %c15_i32 : i32
+            %164 = arith.shrsi %163, %c4_i32 : i32
+            scf.for %arg16 = %c0_i32 to %164 step %c1_i32  : i32 {
+              %174 = arith.muli %arg16, %c16_i32 : i32
+              %175 = tpu.memref_slice %alloca[%158] : memref<4096xf32, #tpu.memory_space<vmem>> -> memref<2048xf32, #tpu.memory_space<vmem>>
+              %176 = arith.index_cast %174 : i32 to index
+              %177 = tpu.vector_load %175[%176] {strides = array<i32>} : memref<2048xf32, #tpu.memory_space<vmem>>, vector<16xf32>, 
+              %178 = tpu.bitcast %177 : vector<16xf32> -> vector<16xi32>
+              %179 = arith.shrsi %178, %cst_9 : vector<16xi32>
+              %180 = arith.andi %179, %cst_8 : vector<16xi32>
+              %181 = arith.xori %178, %180 : vector<16xi32>
+              %182 = tpu.bitcast %181 : vector<16xi32> -> vector<16xf32>
+              %183 = arith.addi %159, %174 : i32
+              %184 = arith.index_cast %183 : i32 to index
+              tpu.vector_store %arg5[%184], %182 {strides = array<i32>} : memref<10240xf32, #tpu.memory_space<vmem>>, vector<16xf32>, 
+              %185 = arith.addi %159, %174 : i32
+              %186 = vector.broadcast %185 : i32 to vector<16xi32>
+              %187 = arith.addi %186, %2 : vector<16xi32>
+              %188 = vector.broadcast %18 : i32 to vector<16xi32>
+              %189 = arith.cmpi slt, %187, %188 : vector<16xi32>
+              %190 = arith.cmpi sgt, %181, %cst_7 : vector<16xi32>
+              %191 = arith.andi %189, %190 : vector<16xi1>
+              %192 = arith.shrsi %181, %cst_6 : vector<16xi32>
+              %193 = arith.addi %192, %cst_5 : vector<16xi32>
+              tpu.vector_store_idx %arg6[%193], %cst_4 masked %191 {add = true} : memref<272xi32, #tpu.memory_space<vmem>>[vector<16xi32>], vector<16xi32>, vector<16xi1>
+            } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+            "tpu.trace_stop"() : () -> ()
+            %165 = arith.addi %23, %arg15 : i32
+            %166 = arith.addi %23, %144 : i32
+            %167 = arith.cmpi ne, %165, %166 : i32
+            %168 = arith.ori %167, %137 : i1
+            %169 = arith.addi %arg14, %c1_i32 : i32
+            %170 = arith.select %168, %169, %arg14 : i32
+            %171 = arith.addi %arg15, %c1_i32 : i32
+            %172 = arith.cmpi eq, %171, %22 : i32
+            %173 = arith.select %172, %c0_i32, %171 : i32
+            scf.yield %152, %170, %173 : i32, i32, i32
+          }
+        }
+        tpu.yield
+      }) : () -> ()
+      %26 = arith.cmpi sgt, %18, %c0_i32 : i32
+      scf.if %26 {
+        scf.for %arg12 = %c0_i32 to %c16_i32 step %c1_i32  : i32 {
+          %127 = arith.muli %arg12, %c16_i32 : i32
+          %128 = arith.index_cast %127 : i32 to index
+          %129 = tpu.vector_load %arg6[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+          %130 = arith.index_cast %127 : i32 to index
+          tpu.vector_store %arg7[%130], %129 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      }
+      %27 = arith.cmpi eq, %18, %c0_i32 : i32
+      scf.if %27 {
+        scf.for %arg12 = %c0_i32 to %c16_i32 step %c1_i32  : i32 {
+          %127 = arith.muli %arg12, %c16_i32 : i32
+          %128 = arith.index_cast %127 : i32 to index
+          tpu.vector_store %arg7[%128], %cst_10 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      }
+      %28 = scf.for %arg12 = %c0_i32 to %c16_i32 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = tpu.scan <sum>, %129 masked %cst_3 : vector<16xi32>, vector<16xi1> -> vector<16xi32>
+        %131 = vector.broadcast %arg13 : i32 to vector<16xi32>
+        %132 = arith.addi %130, %131 : vector<16xi32>
+        %133 = arith.muli %arg12, %c16_i32 : i32
+        %134 = arith.index_cast %133 : i32 to index
+        tpu.vector_store %arg7[%134], %132 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %135 = vector.extract %132[15] : i32 from vector<16xi32>
+        scf.yield %135 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %29 = arith.cmpi sle, %28, %c2048_i32 : i32
+      %30 = arith.subi %28, %c2048_i32 : i32
+      %31 = scf.for %arg12 = %c0_i32 to %c16_i32 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = vector.broadcast %30 : i32 to vector<16xi32>
+        %131 = arith.cmpi sle, %129, %130 : vector<16xi32>
+        %132 = tpu.all_reduce %131 {dim = 0 : i64, kind = #tpu.reduction_kind<sum>} : vector<16xi1> -> vector<16xi32>
+        %133 = vector.extract %132[0] : i32 from vector<16xi32>
+        %134 = arith.addi %arg13, %133 : i32
+        scf.yield %134 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %32 = arith.index_cast %31 : i32 to index
+      %33 = tpu.vector_load %arg7[%32] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %34 = vector.extract %33[0] : i32 from vector<16xi32>
+      %35 = arith.cmpi sgt, %31, %c0_i32 : i32
+      %36 = arith.subi %31, %c1_i32 : i32
+      %37 = arith.maxsi %36, %c0_i32 : i32
+      %38 = arith.index_cast %37 : i32 to index
+      %39 = tpu.vector_load %arg7[%38] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %40 = vector.extract %39[0] : i32 from vector<16xi32>
+      %41 = arith.select %35, %40, %c0_i32 : i32
+      %42 = arith.subi %28, %34 : i32
+      %43 = arith.subi %34, %41 : i32
+      %44 = arith.subi %c2048_i32, %42 : i32
+      %45 = arith.subi %31, %c128_i32 : i32
+      %46 = arith.cmpi eq, %44, %43 : i32
+      %47 = arith.ori %29, %46 : i1
+      %48 = arith.select %47, %c0_i32, %c16_i32 : i32
+      scf.for %arg12 = %c0_i32 to %48 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg6[%128], %cst_10 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %49 = arith.select %47, %c0_i32, %20 : i32
+      scf.for %arg12 = %c0_i32 to %49 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg5[%128] {strides = array<i32>} : memref<10240xf32, #tpu.memory_space<vmem>>, vector<16xf32>, 
+        %130 = tpu.bitcast %129 : vector<16xf32> -> vector<16xi32>
+        %131 = arith.muli %arg12, %c16_i32 : i32
+        %132 = vector.broadcast %131 : i32 to vector<16xi32>
+        %133 = arith.addi %132, %2 : vector<16xi32>
+        %134 = vector.broadcast %18 : i32 to vector<16xi32>
+        %135 = arith.cmpi slt, %133, %134 : vector<16xi32>
+        %136 = arith.cmpi sgt, %130, %cst_7 : vector<16xi32>
+        %137 = arith.andi %135, %136 : vector<16xi1>
+        %138 = arith.shrsi %130, %cst_6 : vector<16xi32>
+        %139 = vector.broadcast %45 : i32 to vector<16xi32>
+        %140 = arith.cmpi eq, %138, %139 : vector<16xi32>
+        %141 = arith.andi %137, %140 : vector<16xi1>
+        %142 = arith.shrsi %130, %cst_2 : vector<16xi32>
+        %143 = arith.andi %142, %cst_1 : vector<16xi32>
+        tpu.vector_store_idx %arg6[%143], %cst_4 masked %141 {add = true} : memref<272xi32, #tpu.memory_space<vmem>>[vector<16xi32>], vector<16xi32>, vector<16xi1>
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %50 = arith.select %47, %c0_i32, %c16_i32 : i32
+      scf.for %arg12 = %c0_i32 to %50 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg6[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg7[%130], %129 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %51 = scf.for %arg12 = %c0_i32 to %50 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = tpu.scan <sum>, %129 masked %cst_3 : vector<16xi32>, vector<16xi1> -> vector<16xi32>
+        %131 = vector.broadcast %arg13 : i32 to vector<16xi32>
+        %132 = arith.addi %130, %131 : vector<16xi32>
+        %133 = arith.muli %arg12, %c16_i32 : i32
+        %134 = arith.index_cast %133 : i32 to index
+        tpu.vector_store %arg7[%134], %132 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %135 = vector.extract %132[15] : i32 from vector<16xi32>
+        scf.yield %135 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %52 = arith.subi %51, %44 : i32
+      %53 = scf.for %arg12 = %c0_i32 to %50 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = vector.broadcast %52 : i32 to vector<16xi32>
+        %131 = arith.cmpi sle, %129, %130 : vector<16xi32>
+        %132 = tpu.all_reduce %131 {dim = 0 : i64, kind = #tpu.reduction_kind<sum>} : vector<16xi1> -> vector<16xi32>
+        %133 = vector.extract %132[0] : i32 from vector<16xi32>
+        %134 = arith.addi %arg13, %133 : i32
+        scf.yield %134 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %54 = arith.index_cast %53 : i32 to index
+      %55 = tpu.vector_load %arg7[%54] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %56 = vector.extract %55[0] : i32 from vector<16xi32>
+      %57 = arith.cmpi sgt, %53, %c0_i32 : i32
+      %58 = arith.subi %53, %c1_i32 : i32
+      %59 = arith.maxsi %58, %c0_i32 : i32
+      %60 = arith.index_cast %59 : i32 to index
+      %61 = tpu.vector_load %arg7[%60] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %62 = vector.extract %61[0] : i32 from vector<16xi32>
+      %63 = arith.select %57, %62, %c0_i32 : i32
+      %64 = arith.subi %51, %56 : i32
+      %65 = arith.subi %56, %63 : i32
+      %66 = arith.subi %44, %64 : i32
+      %67 = arith.shli %45, %c8_i32 : i32
+      %68 = arith.ori %67, %53 : i32
+      %69 = arith.cmpi eq, %66, %65 : i32
+      %70 = arith.ori %47, %69 : i1
+      %71 = arith.cmpi eq, %66, %c0_i32 : i32
+      %72 = arith.ori %70, %71 : i1
+      %73 = arith.select %47, %45, %68 : i32
+      %74 = arith.select %47, %c24_i32, %c16_i32 : i32
+      %75 = arith.select %47, %44, %66 : i32
+      %76 = arith.select %72, %c0_i32, %c16_i32 : i32
+      scf.for %arg12 = %c0_i32 to %76 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg6[%128], %cst_10 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %77 = arith.select %72, %c0_i32, %20 : i32
+      scf.for %arg12 = %c0_i32 to %77 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg5[%128] {strides = array<i32>} : memref<10240xf32, #tpu.memory_space<vmem>>, vector<16xf32>, 
+        %130 = tpu.bitcast %129 : vector<16xf32> -> vector<16xi32>
+        %131 = arith.muli %arg12, %c16_i32 : i32
+        %132 = vector.broadcast %131 : i32 to vector<16xi32>
+        %133 = arith.addi %132, %2 : vector<16xi32>
+        %134 = vector.broadcast %18 : i32 to vector<16xi32>
+        %135 = arith.cmpi slt, %133, %134 : vector<16xi32>
+        %136 = arith.cmpi sgt, %130, %cst_7 : vector<16xi32>
+        %137 = arith.andi %135, %136 : vector<16xi1>
+        %138 = vector.broadcast %74 : i32 to vector<16xi32>
+        %139 = arith.shrsi %130, %138 : vector<16xi32>
+        %140 = vector.broadcast %73 : i32 to vector<16xi32>
+        %141 = arith.cmpi eq, %139, %140 : vector<16xi32>
+        %142 = arith.andi %137, %141 : vector<16xi1>
+        %143 = arith.shrsi %130, %cst_0 : vector<16xi32>
+        %144 = arith.andi %143, %cst_1 : vector<16xi32>
+        tpu.vector_store_idx %arg6[%144], %cst_4 masked %142 {add = true} : memref<272xi32, #tpu.memory_space<vmem>>[vector<16xi32>], vector<16xi32>, vector<16xi1>
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %78 = arith.select %72, %c0_i32, %c16_i32 : i32
+      scf.for %arg12 = %c0_i32 to %78 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg6[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg7[%130], %129 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %79 = scf.for %arg12 = %c0_i32 to %78 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = tpu.scan <sum>, %129 masked %cst_3 : vector<16xi32>, vector<16xi1> -> vector<16xi32>
+        %131 = vector.broadcast %arg13 : i32 to vector<16xi32>
+        %132 = arith.addi %130, %131 : vector<16xi32>
+        %133 = arith.muli %arg12, %c16_i32 : i32
+        %134 = arith.index_cast %133 : i32 to index
+        tpu.vector_store %arg7[%134], %132 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %135 = vector.extract %132[15] : i32 from vector<16xi32>
+        scf.yield %135 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %80 = arith.subi %79, %75 : i32
+      %81 = scf.for %arg12 = %c0_i32 to %78 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = vector.broadcast %80 : i32 to vector<16xi32>
+        %131 = arith.cmpi sle, %129, %130 : vector<16xi32>
+        %132 = tpu.all_reduce %131 {dim = 0 : i64, kind = #tpu.reduction_kind<sum>} : vector<16xi1> -> vector<16xi32>
+        %133 = vector.extract %132[0] : i32 from vector<16xi32>
+        %134 = arith.addi %arg13, %133 : i32
+        scf.yield %134 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %82 = arith.index_cast %81 : i32 to index
+      %83 = tpu.vector_load %arg7[%82] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %84 = vector.extract %83[0] : i32 from vector<16xi32>
+      %85 = arith.cmpi sgt, %81, %c0_i32 : i32
+      %86 = arith.subi %81, %c1_i32 : i32
+      %87 = arith.maxsi %86, %c0_i32 : i32
+      %88 = arith.index_cast %87 : i32 to index
+      %89 = tpu.vector_load %arg7[%88] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %90 = vector.extract %89[0] : i32 from vector<16xi32>
+      %91 = arith.select %85, %90, %c0_i32 : i32
+      %92 = arith.subi %79, %84 : i32
+      %93 = arith.subi %84, %91 : i32
+      %94 = arith.subi %75, %92 : i32
+      %95 = arith.subi %74, %c8_i32 : i32
+      %96 = arith.shli %73, %95 : i32
+      %97 = arith.ori %96, %81 : i32
+      %98 = arith.cmpi eq, %94, %93 : i32
+      %99 = arith.ori %72, %98 : i1
+      %100 = arith.cmpi eq, %94, %c0_i32 : i32
+      %101 = arith.ori %99, %100 : i1
+      %102 = arith.select %72, %73, %97 : i32
+      %103 = arith.select %72, %74, %c8_i32 : i32
+      %104 = arith.select %72, %75, %94 : i32
+      %105 = arith.select %101, %c0_i32, %c16_i32 : i32
+      scf.for %arg12 = %c0_i32 to %105 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg6[%128], %cst_10 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %106 = arith.select %101, %c0_i32, %20 : i32
+      scf.for %arg12 = %c0_i32 to %106 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg5[%128] {strides = array<i32>} : memref<10240xf32, #tpu.memory_space<vmem>>, vector<16xf32>, 
+        %130 = tpu.bitcast %129 : vector<16xf32> -> vector<16xi32>
+        %131 = arith.muli %arg12, %c16_i32 : i32
+        %132 = vector.broadcast %131 : i32 to vector<16xi32>
+        %133 = arith.addi %132, %2 : vector<16xi32>
+        %134 = vector.broadcast %18 : i32 to vector<16xi32>
+        %135 = arith.cmpi slt, %133, %134 : vector<16xi32>
+        %136 = arith.cmpi sgt, %130, %cst_7 : vector<16xi32>
+        %137 = arith.andi %135, %136 : vector<16xi1>
+        %138 = vector.broadcast %103 : i32 to vector<16xi32>
+        %139 = arith.shrsi %130, %138 : vector<16xi32>
+        %140 = vector.broadcast %102 : i32 to vector<16xi32>
+        %141 = arith.cmpi eq, %139, %140 : vector<16xi32>
+        %142 = arith.andi %137, %141 : vector<16xi1>
+        %143 = arith.andi %130, %cst_1 : vector<16xi32>
+        tpu.vector_store_idx %arg6[%143], %cst_4 masked %142 {add = true} : memref<272xi32, #tpu.memory_space<vmem>>[vector<16xi32>], vector<16xi32>, vector<16xi1>
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %107 = arith.select %101, %c0_i32, %c16_i32 : i32
+      scf.for %arg12 = %c0_i32 to %107 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg6[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg7[%130], %129 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %108 = scf.for %arg12 = %c0_i32 to %107 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = tpu.scan <sum>, %129 masked %cst_3 : vector<16xi32>, vector<16xi1> -> vector<16xi32>
+        %131 = vector.broadcast %arg13 : i32 to vector<16xi32>
+        %132 = arith.addi %130, %131 : vector<16xi32>
+        %133 = arith.muli %arg12, %c16_i32 : i32
+        %134 = arith.index_cast %133 : i32 to index
+        tpu.vector_store %arg7[%134], %132 {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %135 = vector.extract %132[15] : i32 from vector<16xi32>
+        scf.yield %135 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %109 = arith.subi %108, %104 : i32
+      %110 = scf.for %arg12 = %c0_i32 to %107 step %c1_i32 iter_args(%arg13 = %c0_i32) -> (i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg7[%128] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+        %130 = vector.broadcast %109 : i32 to vector<16xi32>
+        %131 = arith.cmpi sle, %129, %130 : vector<16xi32>
+        %132 = tpu.all_reduce %131 {dim = 0 : i64, kind = #tpu.reduction_kind<sum>} : vector<16xi1> -> vector<16xi32>
+        %133 = vector.extract %132[0] : i32 from vector<16xi32>
+        %134 = arith.addi %arg13, %133 : i32
+        scf.yield %134 : i32
+      } {sc.loop_unroll_factor = 2 : i64, sc.parallel_access}
+      %111 = arith.index_cast %110 : i32 to index
+      %112 = tpu.vector_load %arg7[%111] {strides = array<i32>} : memref<272xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      %113 = vector.extract %112[0] : i32 from vector<16xi32>
+      %114 = arith.subi %108, %113 : i32
+      %115 = arith.subi %104, %114 : i32
+      %116 = arith.shli %102, %103 : i32
+      %117 = arith.ori %116, %110 : i32
+      %118 = arith.select %101, %102, %117 : i32
+      %119 = arith.select %101, %103, %c0_i32 : i32
+      %120 = arith.select %101, %104, %115 : i32
+      %121 = arith.select %29, %c0_i32, %120 : i32
+      %122 = arith.cmpi slt, %28, %c2048_i32 : i32
+      %123 = arith.andi %9, %122 : i1
+      %124 = arith.select %123, %c128_i32, %c0_i32 : i32
+      scf.for %arg12 = %c0_i32 to %124 step %c1_i32  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        tpu.vector_store %arg8[%128], %cst {strides = array<i32>} : memref<2064xi32, #tpu.memory_space<vmem>>, vector<16xi32>, 
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      %125 = arith.select %9, %20, %c0_i32 : i32
+      %126:2 = scf.for %arg12 = %c0_i32 to %125 step %c1_i32 iter_args(%arg13 = %c0_i32, %arg14 = %c0_i32) -> (i32, i32)  : i32 {
+        %127 = arith.muli %arg12, %c16_i32 : i32
+        %128 = arith.index_cast %127 : i32 to index
+        %129 = tpu.vector_load %arg5[%128] {strides = array<i32>} : memref<10240xf32, #tpu.memory_space<vmem>>, vector<16xf32>, 
+        %130 = tpu.bitcast %129 : vector<16xf32> -> vector<16xi32>
+        %131 = arith.muli %arg12, %c16_i32 : i32
+        %132 = vector.broadcast %131 : i32 to vector<16xi32>
+        %133 = arith.addi %132, %2 : vector<16xi32>
+        %134 = vector.broadcast %18 : i32 to vector<16xi32>
+        %135 = arith.cmpi slt, %133, %134 : vector<16xi32>
+        %136 = arith.cmpi sgt, %130, %cst_7 : vector<16xi32>
+        %137 = arith.andi %135, %136 : vector<16xi1>
+        %138 = vector.broadcast %119 : i32 to vector<16xi32>
+        %139 = arith.shrsi %130, %138 : vector<16xi32>
+        %140 = vector.broadcast %118 : i32 to vector<16xi32>
+        %141 = arith.cmpi sgt, %139, %140 : vector<16xi32>
+        %142 = arith.andi %137, %141 : vector<16xi1>
+        %143 = vector.broadcast %118 : i32 to vector<16xi32>
+        %144 = arith.cmpi eq, %139, %143 : vector<16xi32>
+        %145 = arith.andi %137, %144 : vector<16xi1>
+        %146 = arith.extui %145 : vector<16xi1> to vector<16xi32>
+        %147 = tpu.scan <sum>, %146 masked %cst_3 : vector<16xi32>, vector<16xi1> -> vector<16xi32>
+        %148 = vector.broadcast %arg14 : i32 to vector<16xi32>
+        %149 = arith.addi %147, %148 : vector<16xi32>
+        %150 = vector.broadcast %121 : i32 to vector<16xi32>
+        %151 = arith.cmpi sle, %149, %150 : vector<16xi32>
+        %152 = arith.andi %145, %151 : vector<16xi1>
+        %153 = arith.ori %142, %152 : vector<16xi1>
+        %154 = arith.select %29, %137, %153 : vector<16xi1>
+        %155 = arith.index_cast %arg13 : i32 to index
+        tpu.vector_store %arg8[%155], %133 masked %154 {strides = array<i32>} : memref<2064xi32, #tpu.memory_space<vmem>>, vector<16xi32>, vector<16xi1>
+        %156 = tpu.all_reduce %154 {dim = 0 : i64, kind = #tpu.reduction_kind<sum>} : vector<16xi1> -> vector<16xi32>
+        %157 = vector.extract %156[0] : i32 from vector<16xi32>
+        %158 = arith.addi %arg13, %157 : i32
+        %159 = vector.extract %149[15] : i32 from vector<16xi32>
+        scf.yield %158, %159 : i32, i32
+      } {sc.loop_unroll_factor = 4 : i64, sc.parallel_access}
+      scf.if %9 {
+        %127 = arith.muli %10, %c2048_i32 : i32
+        %128 = tpu.memref_slice %arg10[%c2_i32] : memref<4x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+        %129 = tpu.memref_squeeze %128 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+        %130 = tpu.memref_slice %arg4[%127] : memref<2097152xi32, #tpu.memory_space<hbm>> -> memref<2048xi32, #tpu.memory_space<hbm>>
+        %131 = tpu.memref_slice %arg8[%c0_i32] : memref<2064xi32, #tpu.memory_space<vmem>> -> memref<2048xi32, #tpu.memory_space<vmem>>
+        tpu.enqueue_dma source(%131 : memref<2048xi32, #tpu.memory_space<vmem>>) target(%130 : memref<2048xi32, #tpu.memory_space<hbm>>) target_semaphore(%129 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>)
+        %132 = tpu.memref_slice %arg10[%c2_i32] : memref<4x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+        %133 = tpu.memref_squeeze %132 : memref<1x!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>> -> memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>
+        %134 = tpu.memref_slice %arg4[%127] : memref<2097152xi32, #tpu.memory_space<hbm>> -> memref<2048xi32, #tpu.memory_space<hbm>>
+        %135 = tpu.memref_slice %arg8[%c0_i32] : memref<2064xi32, #tpu.memory_space<vmem>> -> memref<2048xi32, #tpu.memory_space<vmem>>
+        tpu.wait_dma2 semaphore(%133 : memref<!tpu.dma_semaphore, #tpu.memory_space<semaphore_mem>>) src(%135 : memref<2048xi32, #tpu.memory_space<vmem>>) dst(%134 : memref<2048xi32, #tpu.memory_space<hbm>>)
+      }
+    }
+    return
+  }
+}
+

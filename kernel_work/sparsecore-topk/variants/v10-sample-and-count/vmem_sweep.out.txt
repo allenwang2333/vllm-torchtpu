@@ -1,0 +1,36 @@
+##### base
+E0000 00:00:1789073280.892525 3158568 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+  n=262144   REFUSED E3000/spmem
+  n=131072   REFUSED E3000/spmem
+  n=65536    compiles
+  n=98304    compiles
+  n=114688   compiles
+  n=122880   compiles
+  n=126976   REFUSED E3000/spmem
+  n=124928   REFUSED E3000/spmem
+  n=123904   REFUSED E3000/spmem
+base: largest n that compiles = 122880  (n=123904 refused: E3000/spmem)
+##### sc2
+E0000 00:00:1789073288.202893 3158917 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+  n=262144   REFUSED E3000/spmem
+  n=131072   REFUSED E3000/spmem
+  n=65536    compiles
+  n=98304    compiles
+  n=114688   compiles
+  n=122880   compiles
+  n=126976   REFUSED E3000/spmem
+  n=124928   REFUSED E3000/spmem
+  n=123904   REFUSED E3000/spmem
+sc2: largest n that compiles = 122880  (n=123904 refused: E3000/spmem)
+##### sc16
+E0000 00:00:1789073294.632592 3159279 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+  n=262144   REFUSED E3000/spmem
+  n=131072   REFUSED E3000/spmem
+  n=65536    compiles
+  n=98304    compiles
+  n=114688   compiles
+  n=122880   compiles
+  n=126976   REFUSED E3000/spmem
+  n=124928   REFUSED E3000/spmem
+  n=123904   REFUSED E3000/spmem
+sc16: largest n that compiles = 122880  (n=123904 refused: E3000/spmem)

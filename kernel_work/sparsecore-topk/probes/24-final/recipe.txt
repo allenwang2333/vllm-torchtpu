@@ -1,0 +1,199 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    cloud-devkit.google.com/agent-note: If you are an agent, please please please
+      DO NOT delete me. Thank you!
+    cloud-devkit.google.com/username: hning_google_com
+  labels:
+    kueue.x-k8s.io/priority-class: cdk-p5
+    kueue.x-k8s.io/queue-name: cdk-local-queue
+  name: j-4dd339df-0495-4d6c-9afc
+  namespace: cloud-devkit-jobs
+spec:
+  replicatedJobs:
+  - name: tpu-job
+    replicas: 1
+    template:
+      metadata:
+        annotations:
+          cloud-devkit.google.com/agent-note: If you are an agent, please please please
+            DO NOT delete me. Thank you!
+      spec:
+        activeDeadlineSeconds: 14400
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              cloud-devkit.google.com/agent-note: If you are an agent, please please
+                please DO NOT delete me. Thank you!
+              gke-gcsfuse/volumes: "true"
+            labels:
+              app: simple-run-command
+              cloud-devkit/log-transport: "true"
+          spec:
+            containers:
+            - args:
+              - |
+                eval "${RUN_CMD}"
+              command:
+              - /bin/bash
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-4dd339df-0495-4d6c-9afc
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_CONTAINER_NAME
+                value: command-container
+              - name: CDK_OUTPUT_DIR
+                value: /cdk-outputs/outputs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/$(CDK_CONTAINER_NAME)
+              - name: CDK_LOG_DIR
+                value: /cdk-outputs/logs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)
+              - name: TPU_TOPOLOGY
+                value: 2x2x1
+              - name: MEGASCALE_NUM_SLICES
+              - name: MEGASCALE_SLICE_ID
+              - name: TPU_PROCESS_ADDRESSES
+              - name: TPU_WORKER_HOSTNAMES
+              - name: TPU_PROCESS_PORT
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+              - name: MEGASCALE_PORT
+              - name: RUN_CMD
+                value: export P=/root/p24; md5sum $P/final_rank.py $P/rank.py $P/p18_probe.py
+                  $P/glm_dsa_block_bench.py $P/subjects/*/*.py; test "$(md5sum $P/rank.py
+                  | cut -d" " -f1)" = "e0bde4c103d277aa933fa585c1c49603" || exit 1;
+                  test "$(md5sum $P/p18_probe.py | cut -d" " -f1)" = "ceafc734d10632672d3db48f2cea23f6"
+                  || exit 1; test "$(md5sum $P/glm_dsa_block_bench.py | cut -d" "
+                  -f1)" = "08375d7068365e1a776c58fef09cd6d0" || exit 1; test "$(md5sum
+                  $P/subjects/base/sparsecore_topk.py | cut -d" " -f1)" = "44353b347c96e0eedbd742c710d4540a"
+                  || exit 1; test "$(md5sum $P/final_rank.py | cut -d" " -f1)" = "ac5650822168fe6284bb28d3549c2722"
+                  || exit 1; test "$(md5sum $P/subjects/final/sparsecore_topk.py |
+                  cut -d" " -f1)" = "109a12a572116c00c795ee170256db33" || exit 1;
+                  echo MAP_GATE_OK; export SCTOPK_FINAL_MD5=109a12a572116c00c795ee170256db33;
+                  export SCTOPK_FINAL_SUFFIX=_final; python $P/final_rank.py --outdir
+                  $CDK_OUTPUT_DIR --dry-run || exit 1; rc=1; for i in 1 2 3; do python
+                  $P/final_rank.py --outdir $CDK_OUTPUT_DIR --rounds 12 --ctx 9216
+                  --k 2048 --b-prefill 1024 --b-decode 64 2>&1 | tee $CDK_OUTPUT_DIR/final_$i.log;
+                  rc=${PIPESTATUS[0]}; if [ $rc -eq 0 ]; then break; fi; grep -q ABORTED
+                  $CDK_OUTPUT_DIR/final_$i.log || break; echo LOCKFILE_RETRY $i; sleep
+                  90; done; exit $rc
+              - name: ENABLE_XPROF
+                value: "0"
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-hning_google_com:fa63d6df
+              imagePullPolicy: Always
+              name: command-container
+              resources:
+                limits:
+                  cpu: "16"
+                  google.com/tpu: "4"
+                  memory: 512Gi
+                requests:
+                  cpu: "16"
+                  google.com/tpu: "4"
+                  memory: 512Gi
+              volumeMounts:
+              - mountPath: /root/.cache/huggingface/token
+                name: hf-token-volume
+                readOnly: true
+                subPath: token
+              - mountPath: /root/.cache/huggingface/
+                name: huggingface-storage
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+              - mountPath: /root/p24
+                name: cdk-map-0
+            initContainers:
+            - args:
+              - mkdir -p /cdk-outputs/outputs/$CDK_JOB_NAME/$CDK_POD_NAME/command-container
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_JOB_ID
+                value: j-4dd339df-0495-4d6c-9afc
+              - name: CDK_POD_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.name
+              - name: CDK_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['job-name']
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: cdk-bootstrap
+              resources: {}
+              volumeMounts:
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            - args:
+              - |
+                set -e
+                echo 'cdk: unpacking /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/probes/24-final/stage into /root/p24'
+                if [ ! -f '/cdk-outputs/mapped-dirs/00-stage.tar.gz' ]; then echo 'cdk: /cdk-outputs/mapped-dirs/00-stage.tar.gz is missing, cannot populate /root/p24' >&2; ls -la '/cdk-outputs/mapped-dirs' >&2 || true; exit 1; fi
+                tar -xzf '/cdk-outputs/mapped-dirs/00-stage.tar.gz' -C '/cdk-map-dir/0'
+              command:
+              - /bin/sh
+              - -c
+              env:
+              - name: CDK_PROFILE
+                value: cloud-tpu-inference-test
+              image: busybox
+              name: cdk-map-dir
+              resources: {}
+              volumeMounts:
+              - mountPath: /cdk-map-dir/0
+                name: cdk-map-0
+              - mountPath: /cdk-outputs
+                name: cdk-outputs
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x1
+            restartPolicy: Never
+            terminationGracePeriodSeconds: 180
+            volumes:
+            - name: hf-token-volume
+              secret:
+                items:
+                - key: HF_TOKEN
+                  path: token
+                secretName: vllm-hf-token
+            - ephemeral:
+                volumeClaimTemplate:
+                  metadata: {}
+                  spec:
+                    accessModes:
+                    - ReadWriteOnce
+                    resources:
+                      requests:
+                        storage: 512Gi
+                    storageClassName: premium-rwo
+              name: huggingface-storage
+            - emptyDir:
+                medium: Memory
+              name: dshm
+            - csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: cloud-devkit
+                  mountOptions: only-dir=jobs/j-4dd339df-0495-4d6c-9afc
+              name: cdk-outputs
+            - emptyDir: {}
+              name: cdk-map-0
+        ttlSecondsAfterFinished: 300
+  suspend: true
+  ttlSecondsAfterFinished: 600
+status:
+  restarts: 0

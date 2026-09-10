@@ -1,0 +1,510 @@
+70f9873e2941bd94601c15cea1dd9d55  /root/p22/subjects/sparsecore_topk_bigscratch.py
+44353b347c96e0eedbd742c710d4540a  /root/p22/subjects/sparsecore_topk_base.py
+f83332273f1cdc05995965c0405e8665  /root/p22/subjects/v10/sparsecore_topk.py
+b3241859e471fc87fa6e7a50e4ffec4b  /root/p22/suite/test_dsv4_sparsecore_topk.py
+MAP_GATE_OK
+tpu-fanout: note 1 of 4 chips will sit idle.
+tpu-fanout: 3 shards, 1 chip(s) each, 4 chips on this pod
+tpu-fanout: logs -> /cdk-outputs/outputs/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0-0-cdglh/command-container/fanout
+tpu-fanout: shard0 chips=0 cmd: bash /root/p22/shard_gen.sh v2-bigscratch sparsecore_topk_bigscratch.py 70f9873e2941bd94601c15cea1dd9d55 NONE
+tpu-fanout: shard1 chips=1 cmd: bash /root/p22/shard_gen.sh v4-control sparsecore_topk_base.py 44353b347c96e0eedbd742c710d4540a NONE
+tpu-fanout: shard2 chips=2 cmd: bash /root/p22/shard_v10.sh 2 0
+
+===== tpu-fanout shard0 (chips=0, rc=0) : bash /root/p22/shard_gen.sh v2-bigscratch sparsecore_topk_bigscratch.py 70f9873e2941bd94601c15cea1dd9d55 NONE =====
+===== SHARD v2-bigscratch  subject=/root/p22/subjects/sparsecore_topk_bigscratch.py  want=70f9873e2941bd94601c15cea1dd9d55  suffix=NONE
+70f9873e2941bd94601c15cea1dd9d55  /root/p22/subjects/sparsecore_topk_bigscratch.py
+b3241859e471fc87fa6e7a50e4ffec4b  /root/p22/suite/test_dsv4_sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/p22/subjects/incumbent/sparsecore_topk.py
+SHARD_GATE_OK v2-bigscratch
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789075106.075976      95 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+ARM_CHECK subject=/root/p22/subjects/sparsecore_topk_bigscratch.py md5=70f9873e2941bd94601c15cea1dd9d55 arity=0
+  _SAMPLE_AND_COUNT_DEFAULT = <absent>
+  _COUNT_ARITY_DEFAULT = <absent>
+  sample module = <absent>
+  scope names found: ['sc_topk_direct_b64_n10240_k2048']
+ARM_CHECK_OK expected a bare sc_topk_direct_b_n_k with no arm suffix
+SHARD_ARM_RC v2-bigscratch 0
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[negative]
+
+68 tests collected in 0.12s
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /root
+plugins: timeout-2.4.0, anyio-4.15.1
+timeout: 3600.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 68 items
+
+p22/suite/test_dsv4_sparsecore_topk.py::test_shape_derivation_matches_max_model_len PASSED [  1%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b64-n10240] PASSED [  2%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p2-b16-n10240] PASSED [  4%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b16-n133120] PASSED [  5%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b64-n133120] PASSED [  7%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b16-n133120-k512] PASSED [  8%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b1024-n133120] PASSED [ 10%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b1024-n10240] PASSED [ 11%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p1-b64-n10240] PASSED [ 13%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p2-b16-n10240] PASSED [ 14%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b16-n133120] PASSED [ 16%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b64-n133120] PASSED [ 17%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b16-n133120-k512] PASSED [ 19%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b1024-n133120] PASSED [ 20%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p1-b1024-n10240] PASSED [ 22%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p1-b64-n10240] PASSED [ 23%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p2-b16-n10240] PASSED [ 25%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b16-n133120] PASSED [ 26%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b64-n133120] PASSED [ 27%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b16-n133120-k512] PASSED [ 29%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b1024-n133120] PASSED [ 30%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p1-b1024-n10240] PASSED [ 32%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p1-b64-n10240] PASSED [ 33%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p2-b16-n10240] PASSED [ 35%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b16-n133120] PASSED [ 36%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b64-n133120] PASSED [ 38%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b16-n133120-k512] PASSED [ 39%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b1024-n133120] PASSED [ 41%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p1-b1024-n10240] PASSED [ 42%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p1-b64-n10240] PASSED [ 44%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p2-b16-n10240] PASSED [ 45%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b16-n133120] PASSED [ 47%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b64-n133120] PASSED [ 48%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b16-n133120-k512] PASSED [ 50%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b1024-n133120] PASSED [ 51%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p1-b1024-n10240] PASSED [ 52%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p1-b64-n10240] PASSED [ 54%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p2-b16-n10240] PASSED [ 55%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b16-n133120] PASSED [ 57%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b64-n133120] PASSED [ 58%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b16-n133120-k512] PASSED [ 60%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b1024-n133120] PASSED [ 61%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p1-b1024-n10240] PASSED [ 63%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_topk_concentrated_in_the_last_partition PASSED [ 64%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p2-b16-n10240] PASSED [ 66%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b16-n133120] PASSED [ 67%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b64-n133120] PASSED [ 69%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b16-n133120-k512] PASSED [ 70%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b1024-n133120] PASSED [ 72%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p2-b16-n10240] PASSED [ 73%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b16-n133120] PASSED [ 75%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b64-n133120] PASSED [ 76%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b16-n133120-k512] PASSED [ 77%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b1024-n133120] PASSED [ 79%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p2-b16-n10240] PASSED [ 80%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b16-n133120] PASSED [ 82%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b64-n133120] PASSED [ 83%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b16-n133120-k512] PASSED [ 85%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b1024-n133120] PASSED [ 86%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p2-b16-n10240] PASSED [ 88%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b16-n133120] PASSED [ 89%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b64-n133120] PASSED [ 91%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b16-n133120-k512] PASSED [ 92%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b1024-n133120] PASSED [ 94%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[worst_index] PASSED [ 95%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[drop_one] PASSED [ 97%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[duplicate] PASSED [ 98%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[negative] PASSED [100%]
+
+- generated xml file: /cdk-outputs/outputs/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0-0-cdglh/command-container/p22/v2-bigscratch/junit.xml -
+============================= 68 passed in 24.03s ==============================
+SHARD_PYTEST_RC v2-bigscratch 0
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /root
+plugins: timeout-2.4.0, anyio-4.15.1
+timeout: 3600.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 68 items
+
+p22/suite/test_dsv4_sparsecore_topk.py::test_shape_derivation_matches_max_model_len PASSED [  1%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b64-n10240] PASSED [  2%]
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789075142.780585   23428 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+=== XGATE v2-bigscratch: variant vs PINNED incumbent ===
+  suite       /root/p22/suite/test_dsv4_sparsecore_topk.py  md5=b3241859e471fc87fa6e7a50e4ffec4b  MD5_GATE_OK
+  incumbent   /root/p22/subjects/incumbent/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a  MD5_GATE_OK
+  variant     /root/p22/subjects/sparsecore_topk_bigscratch.py  md5=70f9873e2941bd94601c15cea1dd9d55  MD5_GATE_OK
+  helpers imported from the frozen suite, not retyped: _scores=xgate_suite _mismatch=xgate_suite
+  OK  p1-b1024-n10240  strict_desc  full   bit=True  exact=True live= 2097152 neg_winners= 2096128
+  OK  p1-b1024-n10240  strict_desc  ragged bit=True  exact=True live= 1049435 neg_winners= 1048582
+  OK  p1-b1024-n10240  random       full   bit=True  exact=True live= 2097152 neg_winners=       0
+  OK  p1-b1024-n10240  random       ragged bit=True  exact=True live= 1049435 neg_winners=  176122
+  OK  p1-b1024-n10240  heavy_ties   full   bit=True  exact=True live= 2097152 neg_winners=       0
+  OK  p1-b1024-n10240  heavy_ties   ragged bit=True  exact=True live= 1049435 neg_winners=       0
+  OK  p1-b1024-n10240  all_negative full   bit=True  exact=True live= 2097152 neg_winners= 2097152
+  OK  p1-b1024-n10240  all_negative ragged bit=True  exact=True live= 1049435 neg_winners= 1049435
+  OK  p1-b1024-n10240  all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b1024-n10240  all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b64-n10240    strict_desc  full   bit=True  exact=True live=  131072 neg_winners=  131008
+  OK  p1-b64-n10240    strict_desc  ragged bit=True  exact=True live=   63675 neg_winners=   63622
+  OK  p1-b64-n10240    random       full   bit=True  exact=True live=  131072 neg_winners=       0
+  OK  p1-b64-n10240    random       ragged bit=True  exact=True live=   63675 neg_winners=   11366
+  OK  p1-b64-n10240    heavy_ties   full   bit=True  exact=True live=  131072 neg_winners=       0
+  OK  p1-b64-n10240    heavy_ties   ragged bit=True  exact=True live=   63675 neg_winners=       0
+  OK  p1-b64-n10240    all_negative full   bit=True  exact=True live=  131072 neg_winners=  131072
+  OK  p1-b64-n10240    all_negative ragged bit=True  exact=True live=   63675 neg_winners=   63675
+  OK  p1-b64-n10240    all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b64-n10240    all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+  OK  p2-b16-n10240    strict_desc  full   bit=True  exact=True live=   32768 neg_winners=   32752
+  OK  p2-b16-n10240    strict_desc  ragged bit=True  exact=True live=   20514 neg_winners=   20500
+  OK  p2-b16-n10240    random       full   bit=True  exact=True live=   32768 neg_winners=       0
+  OK  p2-b16-n10240    random       ragged bit=True  exact=True live=   20514 neg_winners=    2030
+  OK  p2-b16-n10240    heavy_ties   full   bit=True  exact=True live=   32768 neg_winners=       0
+  OK  p2-b16-n10240    heavy_ties   ragged bit=True  exact=True live=   20514 neg_winners=       0
+  OK  p2-b16-n10240    all_negative full   bit=True  exact=True live=   32768 neg_winners=   32768
+  OK  p2-b16-n10240    all_negative ragged bit=True  exact=True live=   20514 neg_winners=   20514
+  OK  p2-b16-n10240    all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p2-b16-n10240    all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+
+  --- negative control (must go RED) ---
+  bit_equal=False (want False)   multiset='max score difference np.float32(4.8411946), expected exactly 0.0' (want a reason, not None)
+  NEGATIVE_CONTROL_OK
+
+=== v2-bigscratch: 30 cells, 30 exact, 30 bit-identical to the incumbent ===
+XGATE_MULTISET_OK   v2-bigscratch is an exact top-k in every cell
+XGATE_BIT IDENTICAL  30/30
+SHARD_XGATE_RC v2-bigscratch 0
+SHARD_DONE v2-bigscratch arm=0 pytest=0 xgate=0
+
+===== tpu-fanout shard1 (chips=1, rc=0) : bash /root/p22/shard_gen.sh v4-control sparsecore_topk_base.py 44353b347c96e0eedbd742c710d4540a NONE =====
+===== SHARD v4-control  subject=/root/p22/subjects/sparsecore_topk_base.py  want=44353b347c96e0eedbd742c710d4540a  suffix=NONE
+44353b347c96e0eedbd742c710d4540a  /root/p22/subjects/sparsecore_topk_base.py
+b3241859e471fc87fa6e7a50e4ffec4b  /root/p22/suite/test_dsv4_sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/p22/subjects/incumbent/sparsecore_topk.py
+SHARD_GATE_OK v4-control
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789075106.075976      82 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+ARM_CHECK subject=/root/p22/subjects/sparsecore_topk_base.py md5=44353b347c96e0eedbd742c710d4540a arity=0
+  _SAMPLE_AND_COUNT_DEFAULT = <absent>
+  _COUNT_ARITY_DEFAULT = <absent>
+  sample module = <absent>
+  scope names found: ['sc_topk_direct_b64_n10240_k2048']
+ARM_CHECK_OK expected a bare sc_topk_direct_b_n_k with no arm suffix
+SHARD_ARM_RC v4-control 0
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[negative]
+
+68 tests collected in 0.12s
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /root
+plugins: timeout-2.4.0, anyio-4.15.1
+timeout: 3600.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 68 items
+
+p22/suite/test_dsv4_sparsecore_topk.py::test_shape_derivation_matches_max_model_len PASSED [  1%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b64-n10240] PASSED [  2%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p2-b16-n10240] PASSED [  4%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b16-n133120] PASSED [  5%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b64-n133120] PASSED [  7%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b16-n133120-k512] PASSED [  8%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b1024-n133120] PASSED [ 10%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b1024-n10240] PASSED [ 11%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p1-b64-n10240] PASSED [ 13%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p2-b16-n10240] PASSED [ 14%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b16-n133120] PASSED [ 16%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b64-n133120] PASSED [ 17%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b16-n133120-k512] PASSED [ 19%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b1024-n133120] PASSED [ 20%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p1-b1024-n10240] PASSED [ 22%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p1-b64-n10240] PASSED [ 23%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p2-b16-n10240] PASSED [ 25%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b16-n133120] PASSED [ 26%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b64-n133120] PASSED [ 27%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b16-n133120-k512] PASSED [ 29%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b1024-n133120] PASSED [ 30%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p1-b1024-n10240] PASSED [ 32%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p1-b64-n10240] PASSED [ 33%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p2-b16-n10240] PASSED [ 35%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b16-n133120] PASSED [ 36%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b64-n133120] PASSED [ 38%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b16-n133120-k512] PASSED [ 39%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b1024-n133120] PASSED [ 41%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p1-b1024-n10240] PASSED [ 42%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p1-b64-n10240] PASSED [ 44%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p2-b16-n10240] PASSED [ 45%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b16-n133120] PASSED [ 47%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b64-n133120] PASSED [ 48%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b16-n133120-k512] PASSED [ 50%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b1024-n133120] PASSED [ 51%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p1-b1024-n10240] PASSED [ 52%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p1-b64-n10240] PASSED [ 54%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p2-b16-n10240] PASSED [ 55%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b16-n133120] PASSED [ 57%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b64-n133120] PASSED [ 58%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b16-n133120-k512] PASSED [ 60%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b1024-n133120] PASSED [ 61%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p1-b1024-n10240] PASSED [ 63%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_topk_concentrated_in_the_last_partition PASSED [ 64%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p2-b16-n10240] PASSED [ 66%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b16-n133120] PASSED [ 67%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b64-n133120] PASSED [ 69%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b16-n133120-k512] PASSED [ 70%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b1024-n133120] PASSED [ 72%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p2-b16-n10240] PASSED [ 73%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b16-n133120] PASSED [ 75%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b64-n133120] PASSED [ 76%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b16-n133120-k512] PASSED [ 77%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b1024-n133120] PASSED [ 79%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p2-b16-n10240] PASSED [ 80%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b16-n133120] PASSED [ 82%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b64-n133120] PASSED [ 83%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b16-n133120-k512] PASSED [ 85%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b1024-n133120] PASSED [ 86%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p2-b16-n10240] PASSED [ 88%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b16-n133120] PASSED [ 89%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b64-n133120] PASSED [ 91%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b16-n133120-k512] PASSED [ 92%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b1024-n133120] PASSED [ 94%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[worst_index] PASSED [ 95%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[drop_one] PASSED [ 97%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[duplicate] PASSED [ 98%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[negative] PASSED [100%]
+
+- generated xml file: /cdk-outputs/outputs/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0-0-cdglh/command-container/p22/v4-control/junit.xml -
+============================= 68 passed in 25.73s ==============================
+SHARD_PYTEST_RC v4-control 0
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /root
+plugins: timeout-2.4.0, anyio-4.15.1
+timeout: 3600.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 68 items
+
+p22/suite/test_dsv4_sparsecore_topk.py::test_shape_derivation_matches_max_model_len PASSED [  1%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b64-n10240] PASSED [  2%]
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789075144.791759   23928 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+=== XGATE v4-control: variant vs PINNED incumbent ===
+  suite       /root/p22/suite/test_dsv4_sparsecore_topk.py  md5=b3241859e471fc87fa6e7a50e4ffec4b  MD5_GATE_OK
+  incumbent   /root/p22/subjects/incumbent/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a  MD5_GATE_OK
+  variant     /root/p22/subjects/sparsecore_topk_base.py  md5=44353b347c96e0eedbd742c710d4540a  MD5_GATE_OK
+  helpers imported from the frozen suite, not retyped: _scores=xgate_suite _mismatch=xgate_suite
+  OK  p1-b1024-n10240  strict_desc  full   bit=True  exact=True live= 2097152 neg_winners= 2096128
+  OK  p1-b1024-n10240  strict_desc  ragged bit=True  exact=True live= 1049435 neg_winners= 1048582
+  OK  p1-b1024-n10240  random       full   bit=True  exact=True live= 2097152 neg_winners=       0
+  OK  p1-b1024-n10240  random       ragged bit=True  exact=True live= 1049435 neg_winners=  176122
+  OK  p1-b1024-n10240  heavy_ties   full   bit=True  exact=True live= 2097152 neg_winners=       0
+  OK  p1-b1024-n10240  heavy_ties   ragged bit=True  exact=True live= 1049435 neg_winners=       0
+  OK  p1-b1024-n10240  all_negative full   bit=True  exact=True live= 2097152 neg_winners= 2097152
+  OK  p1-b1024-n10240  all_negative ragged bit=True  exact=True live= 1049435 neg_winners= 1049435
+  OK  p1-b1024-n10240  all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b1024-n10240  all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b64-n10240    strict_desc  full   bit=True  exact=True live=  131072 neg_winners=  131008
+  OK  p1-b64-n10240    strict_desc  ragged bit=True  exact=True live=   63675 neg_winners=   63622
+  OK  p1-b64-n10240    random       full   bit=True  exact=True live=  131072 neg_winners=       0
+  OK  p1-b64-n10240    random       ragged bit=True  exact=True live=   63675 neg_winners=   11366
+  OK  p1-b64-n10240    heavy_ties   full   bit=True  exact=True live=  131072 neg_winners=       0
+  OK  p1-b64-n10240    heavy_ties   ragged bit=True  exact=True live=   63675 neg_winners=       0
+  OK  p1-b64-n10240    all_negative full   bit=True  exact=True live=  131072 neg_winners=  131072
+  OK  p1-b64-n10240    all_negative ragged bit=True  exact=True live=   63675 neg_winners=   63675
+  OK  p1-b64-n10240    all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b64-n10240    all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+  OK  p2-b16-n10240    strict_desc  full   bit=True  exact=True live=   32768 neg_winners=   32752
+  OK  p2-b16-n10240    strict_desc  ragged bit=True  exact=True live=   20514 neg_winners=   20500
+  OK  p2-b16-n10240    random       full   bit=True  exact=True live=   32768 neg_winners=       0
+  OK  p2-b16-n10240    random       ragged bit=True  exact=True live=   20514 neg_winners=    2030
+  OK  p2-b16-n10240    heavy_ties   full   bit=True  exact=True live=   32768 neg_winners=       0
+  OK  p2-b16-n10240    heavy_ties   ragged bit=True  exact=True live=   20514 neg_winners=       0
+  OK  p2-b16-n10240    all_negative full   bit=True  exact=True live=   32768 neg_winners=   32768
+  OK  p2-b16-n10240    all_negative ragged bit=True  exact=True live=   20514 neg_winners=   20514
+  OK  p2-b16-n10240    all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p2-b16-n10240    all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+
+  --- negative control (must go RED) ---
+  bit_equal=False (want False)   multiset='max score difference np.float32(4.8411946), expected exactly 0.0' (want a reason, not None)
+  NEGATIVE_CONTROL_OK
+
+=== v4-control: 30 cells, 30 exact, 30 bit-identical to the incumbent ===
+XGATE_MULTISET_OK   v4-control is an exact top-k in every cell
+XGATE_BIT IDENTICAL  30/30
+SHARD_XGATE_RC v4-control 0
+SHARD_DONE v4-control arm=0 pytest=0 xgate=0
+
+===== tpu-fanout shard2 (chips=2, rc=0) : bash /root/p22/shard_v10.sh 2 0 =====
+===== SHARD v10-control  arity=2  sample=0  subject=/root/p22/subjects/v10/sparsecore_topk.py
+f83332273f1cdc05995965c0405e8665  /root/p22/subjects/v10/sparsecore_topk.py
+21f2d777419b3cf43ba940f004bd765a  /root/p22/subjects/v10/sparsecore_topk_sample.py
+b3241859e471fc87fa6e7a50e4ffec4b  /root/p22/suite/test_dsv4_sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/p22/subjects/incumbent/sparsecore_topk.py
+SHARD_GATE_OK v10-control
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789075106.075982     110 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+ARM_CHECK subject=/root/p22/subjects/v10/sparsecore_topk.py md5=f83332273f1cdc05995965c0405e8665 arity=2
+  _SAMPLE_AND_COUNT_DEFAULT = False
+  _COUNT_ARITY_DEFAULT = 2
+  sample module = /root/p22/subjects/v10/sparsecore_topk_sample.py
+  scope names found: ['sc_topk_direct_b64_n10240_k2048']
+ARM_CHECK_OK expected NO _sc<arity> suffix (control arm)
+SHARD_ARM_RC v10-control 0
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[negative]
+
+68 tests collected in 0.12s
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /root
+plugins: timeout-2.4.0, anyio-4.15.1
+timeout: 3600.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 68 items
+
+p22/suite/test_dsv4_sparsecore_topk.py::test_shape_derivation_matches_max_model_len PASSED [  1%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b64-n10240] PASSED [  2%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p2-b16-n10240] PASSED [  4%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b16-n133120] PASSED [  5%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b64-n133120] PASSED [  7%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b16-n133120-k512] PASSED [  8%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p4-b1024-n133120] PASSED [ 10%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b1024-n10240] PASSED [ 11%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p1-b64-n10240] PASSED [ 13%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p2-b16-n10240] PASSED [ 14%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b16-n133120] PASSED [ 16%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b64-n133120] PASSED [ 17%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b16-n133120-k512] PASSED [ 19%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p4-b1024-n133120] PASSED [ 20%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[strict_desc-p1-b1024-n10240] PASSED [ 22%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p1-b64-n10240] PASSED [ 23%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p2-b16-n10240] PASSED [ 25%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b16-n133120] PASSED [ 26%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b64-n133120] PASSED [ 27%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b16-n133120-k512] PASSED [ 29%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p4-b1024-n133120] PASSED [ 30%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[random-p1-b1024-n10240] PASSED [ 32%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p1-b64-n10240] PASSED [ 33%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p2-b16-n10240] PASSED [ 35%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b16-n133120] PASSED [ 36%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b64-n133120] PASSED [ 38%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b16-n133120-k512] PASSED [ 39%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p4-b1024-n133120] PASSED [ 41%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_full_rows[heavy_ties-p1-b1024-n10240] PASSED [ 42%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p1-b64-n10240] PASSED [ 44%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p2-b16-n10240] PASSED [ 45%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b16-n133120] PASSED [ 47%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b64-n133120] PASSED [ 48%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b16-n133120-k512] PASSED [ 50%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p4-b1024-n133120] PASSED [ 51%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_exact_topk_ragged_rows_straddle_partition_boundaries[p1-b1024-n10240] PASSED [ 52%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p1-b64-n10240] PASSED [ 54%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p2-b16-n10240] PASSED [ 55%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b16-n133120] PASSED [ 57%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b64-n133120] PASSED [ 58%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b16-n133120-k512] PASSED [ 60%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p4-b1024-n133120] PASSED [ 61%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_all_neg_inf_rows_return_no_selection[p1-b1024-n10240] PASSED [ 63%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_topk_concentrated_in_the_last_partition PASSED [ 64%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p2-b16-n10240] PASSED [ 66%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b16-n133120] PASSED [ 67%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b64-n133120] PASSED [ 69%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b16-n133120-k512] PASSED [ 70%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[random-p4-b1024-n133120] PASSED [ 72%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p2-b16-n10240] PASSED [ 73%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b16-n133120] PASSED [ 75%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b64-n133120] PASSED [ 76%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b16-n133120-k512] PASSED [ 77%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[heavy_ties-p4-b1024-n133120] PASSED [ 79%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p2-b16-n10240] PASSED [ 80%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b16-n133120] PASSED [ 82%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b64-n133120] PASSED [ 83%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b16-n133120-k512] PASSED [ 85%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_is_bit_identical_to_the_incumbent[all_negative-p4-b1024-n133120] PASSED [ 86%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p2-b16-n10240] PASSED [ 88%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b16-n133120] PASSED [ 89%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b64-n133120] PASSED [ 91%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b16-n133120-k512] PASSED [ 92%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_emit_pairs_survives_ragged_rows[p4-b1024-n133120] PASSED [ 94%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[worst_index] PASSED [ 95%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[drop_one] PASSED [ 97%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[duplicate] PASSED [ 98%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_comparison_detects_a_wrong_index[negative] PASSED [100%]
+
+- generated xml file: /cdk-outputs/outputs/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0/j-f114bd8a-dbaf-4964-b6a5-tpu-job-0-0-cdglh/command-container/p22/v10-control/junit.xml -
+============================= 68 passed in 25.64s ==============================
+SHARD_PYTEST_RC v10-control 0
+============================= test session starts ==============================
+platform linux -- Python 3.12.14, pytest-9.1.1, pluggy-1.6.0 -- /usr/local/bin/python
+cachedir: .pytest_cache
+rootdir: /root
+plugins: timeout-2.4.0, anyio-4.15.1
+timeout: 3600.0s
+timeout method: signal
+timeout func_only: False
+collecting ... collected 68 items
+
+p22/suite/test_dsv4_sparsecore_topk.py::test_shape_derivation_matches_max_model_len PASSED [  1%]
+p22/suite/test_dsv4_sparsecore_topk.py::test_partition_factor_is_what_these_tests_assume[p1-b64-n10240] PASSED [  2%]
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789075144.710781   23862 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+=== XGATE v10-control: variant vs PINNED incumbent ===
+  suite       /root/p22/suite/test_dsv4_sparsecore_topk.py  md5=b3241859e471fc87fa6e7a50e4ffec4b  MD5_GATE_OK
+  incumbent   /root/p22/subjects/incumbent/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a  MD5_GATE_OK
+  variant     /root/p22/subjects/v10/sparsecore_topk.py  md5=f83332273f1cdc05995965c0405e8665  MD5_GATE_OK
+  helpers imported from the frozen suite, not retyped: _scores=xgate_suite _mismatch=xgate_suite
+  OK  p1-b1024-n10240  strict_desc  full   bit=True  exact=True live= 2097152 neg_winners= 2096128
+  OK  p1-b1024-n10240  strict_desc  ragged bit=True  exact=True live= 1049435 neg_winners= 1048582
+  OK  p1-b1024-n10240  random       full   bit=True  exact=True live= 2097152 neg_winners=       0
+  OK  p1-b1024-n10240  random       ragged bit=True  exact=True live= 1049435 neg_winners=  176122
+  OK  p1-b1024-n10240  heavy_ties   full   bit=True  exact=True live= 2097152 neg_winners=       0
+  OK  p1-b1024-n10240  heavy_ties   ragged bit=True  exact=True live= 1049435 neg_winners=       0
+  OK  p1-b1024-n10240  all_negative full   bit=True  exact=True live= 2097152 neg_winners= 2097152
+  OK  p1-b1024-n10240  all_negative ragged bit=True  exact=True live= 1049435 neg_winners= 1049435
+  OK  p1-b1024-n10240  all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b1024-n10240  all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b64-n10240    strict_desc  full   bit=True  exact=True live=  131072 neg_winners=  131008
+  OK  p1-b64-n10240    strict_desc  ragged bit=True  exact=True live=   63675 neg_winners=   63622
+  OK  p1-b64-n10240    random       full   bit=True  exact=True live=  131072 neg_winners=       0
+  OK  p1-b64-n10240    random       ragged bit=True  exact=True live=   63675 neg_winners=   11366
+  OK  p1-b64-n10240    heavy_ties   full   bit=True  exact=True live=  131072 neg_winners=       0
+  OK  p1-b64-n10240    heavy_ties   ragged bit=True  exact=True live=   63675 neg_winners=       0
+  OK  p1-b64-n10240    all_negative full   bit=True  exact=True live=  131072 neg_winners=  131072
+  OK  p1-b64-n10240    all_negative ragged bit=True  exact=True live=   63675 neg_winners=   63675
+  OK  p1-b64-n10240    all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p1-b64-n10240    all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+  OK  p2-b16-n10240    strict_desc  full   bit=True  exact=True live=   32768 neg_winners=   32752
+  OK  p2-b16-n10240    strict_desc  ragged bit=True  exact=True live=   20514 neg_winners=   20500
+  OK  p2-b16-n10240    random       full   bit=True  exact=True live=   32768 neg_winners=       0
+  OK  p2-b16-n10240    random       ragged bit=True  exact=True live=   20514 neg_winners=    2030
+  OK  p2-b16-n10240    heavy_ties   full   bit=True  exact=True live=   32768 neg_winners=       0
+  OK  p2-b16-n10240    heavy_ties   ragged bit=True  exact=True live=   20514 neg_winners=       0
+  OK  p2-b16-n10240    all_negative full   bit=True  exact=True live=   32768 neg_winners=   32768
+  OK  p2-b16-n10240    all_negative ragged bit=True  exact=True live=   20514 neg_winners=   20514
+  OK  p2-b16-n10240    all_neg_inf  full   bit=True  exact=True live=       0 neg_winners=       0
+  OK  p2-b16-n10240    all_neg_inf  ragged bit=True  exact=True live=       0 neg_winners=       0
+
+  --- negative control (must go RED) ---
+  bit_equal=False (want False)   multiset='max score difference np.float32(4.8411946), expected exactly 0.0' (want a reason, not None)
+  NEGATIVE_CONTROL_OK
+
+=== v10-control: 30 cells, 30 exact, 30 bit-identical to the incumbent ===
+XGATE_MULTISET_OK   v10-control is an exact top-k in every cell
+XGATE_BIT IDENTICAL  30/30
+SHARD_XGATE_RC v10-control 0
+SHARD_DONE v10-control arm=0 pytest=0 xgate=0
+
+===== tpu-fanout EXIT CODES =====
+shard0   chips=0        rc=0    bash /root/p22/shard_gen.sh v2-bigscratch sparsecore_topk_bigscratch.py 70f9873e2941bd94601c15cea1dd9d55 NONE
+shard1   chips=1        rc=0    bash /root/p22/shard_gen.sh v4-control sparsecore_topk_base.py 44353b347c96e0eedbd742c710d4540a NONE
+shard2   chips=2        rc=0    bash /root/p22/shard_v10.sh 2 0
+tpu-fanout: 3/3 shards succeeded

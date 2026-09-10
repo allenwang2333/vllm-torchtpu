@@ -1,0 +1,10 @@
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789074788.066667     136 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+ARM_CHECK subject=/root/p22/subjects/v10/sparsecore_topk.py md5=f83332273f1cdc05995965c0405e8665 arity=2
+  _SAMPLE_AND_COUNT_DEFAULT = True
+  _COUNT_ARITY_DEFAULT = 2
+  sample module = /root/p22/subjects/v10/sparsecore_topk_sample.py
+  scope names found: ['sc_topk_direct_b64_n10240_k2048_sc2']
+ARM_CHECK_OK expected a name ending _sc2; matched ['sc_topk_direct_b64_n10240_k2048_sc2']

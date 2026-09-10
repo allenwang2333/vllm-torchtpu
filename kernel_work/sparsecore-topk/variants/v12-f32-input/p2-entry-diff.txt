@@ -1,0 +1,76 @@
+Failed to find host bounds for accelerator type: WARNING: could not determine TPU accelerator type, please set env var `TPU_ACCELERATOR_TYPE` manually, otherwise libtpu.so may not properly initialize.
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789071438.915970 3148265 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+incumbent temp 1572000
+variant temp 1572000
+--- P2-incumbent
++++ P2-v12
+@@ -1,19 +1,20 @@
+ ENTRY %main.10 (a.1: f32[16,10240], l.1: s32[16]) -> s32[16,2048] {
++  %l.1 = s32[16]{0:T(128)} parameter(1)
+   %a.1 = f32[16,10240]{1,0:T(8,128)} parameter(0)
+-  %l.1 = s32[16]{0:T(128)} parameter(1)
+   %prepare_start_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart"
+-  %iota_multiply_fusion = s32[2]{0:T(128)S(1)} fusion(), kind=kLoop, calls=%fused_computation.9
+-  %bitcast-convert_bitcast_fusion = s32[2,80,8,128]{3,2,1,0:T(8,128)S(1)} fusion(%a.1), kind=kLoop, calls=%fused_computation.1
++  %iota_multiply_fusion = s32[2]{0:T(128)S(1)} fusion(), kind=kLoop, calls=%fused_computation.8
++  %subtract_clamp_fusion = s32[16,2]{1,0:T(8,128)S(1)} fusion(%l.1, %iota_multiply_fusion), kind=kLoop, calls=%fused_computation.5
++  %reshape.49 = s32[32]{0:T(128)} reshape(%subtract_clamp_fusion)
++  %bitcast.11 = f32[2,80,8,128]{3,2,1,0:T(8,128)} bitcast(%a.1)
++  %copy.1 = f32[2,80,8,128]{3,1,2,0:T(8,128)} copy(%bitcast.11)
++  %prepare_done_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start = token[] custom-call(%prepare_start_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone"
+   %copy-start.2 = (s32[16]{0:T(128)S(1)}, s32[16]{0:T(128)}, u32[]{:S(2)}) copy-start(%l.1)
+-  %copy.1 = s32[2,80,8,128]{3,1,2,0:T(8,128)} copy(%bitcast-convert_bitcast_fusion)
++  %bitcast.10 = f32[163840]{0:T(1024)} bitcast(%copy.1)
++  %sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start = ((f32[163840]{0:T(1024)}, s32[32]{0:T(128)}, token[]), (s32[65536]{0:T(1024)}, s32[65536]{0:T(1024)})) call-start(%bitcast.10, %reshape.49, %prepare_done_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start), async_execution_thread="sparsecore", to_apply=%called_computation.1
++  %prepare_start_sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart"
+   %copy-done.2 = s32[16]{0:T(128)S(1)} copy-done(%copy-start.2)
+-  %subtract_clamp_fusion = s32[16,2]{1,0:T(8,128)S(1)} fusion(%copy-done.2, %iota_multiply_fusion), kind=kLoop, calls=%fused_computation.6
+-  %reshape.60 = s32[32]{0:T(128)} reshape(%subtract_clamp_fusion)
+-  %prepare_done_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start = token[] custom-call(%prepare_start_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone"
+-  %bitcast.11 = s32[163840]{0:T(1024)} bitcast(%copy.1)
+-  %sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start = ((s32[163840]{0:T(1024)}, s32[32]{0:T(128)}, token[]), (s32[65536]{0:T(1024)}, s32[65536]{0:T(1024)})) call-start(%bitcast.11, %reshape.60, %prepare_done_sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start), async_execution_thread="sparsecore", to_apply=%called_computation.1
+-  %prepare_start_sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart"
+-  %compare_select_fusion = s32[16]{0:T(128)} fusion(%copy-done.2), kind=kLoop, calls=%fused_computation.8
++  %compare_select_fusion = s32[16]{0:T(128)} fusion(%copy-done.2), kind=kLoop, calls=%fused_computation.7
+   %sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-done = (s32[65536]{0:T(1024)}, s32[65536]{0:T(1024)}) call-done(%sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-start)
+   %mpmd_map.1 = s32[65536]{0:T(1024)} get-tuple-element(%sc_topk_direct_b32_n5120_k2048_keys.3.cloned.1.call-done), index=1
++  %bitcast_convert_type.2 = f32[65536]{0:T(1024)} bitcast-convert(%mpmd_map.1)
+   %prepare_done_sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start = token[] custom-call(%prepare_start_sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start), custom_call_target="PrepareAsyncCallDone"
+@@ -21,14 +22,14 @@
+   %copy-start.1 = (s32[65536]{0:T(1024)S(1)}, s32[65536]{0:T(1024)}, u32[]{:S(2)}) copy-start(%mpmd_map.3)
+-  %sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start = ((s32[65536]{0:T(1024)}, s32[16]{0:T(128)}, token[]), s32[32768]{0:T(1024)}) call-start(%mpmd_map.1, %compare_select_fusion, %prepare_done_sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start), async_execution_thread="sparsecore", to_apply=%called_computation.2
++  %sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start = ((f32[65536]{0:T(1024)}, s32[16]{0:T(128)}, token[]), s32[32768]{0:T(1024)}) call-start(%bitcast_convert_type.2, %compare_select_fusion, %prepare_done_sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start), async_execution_thread="sparsecore", to_apply=%called_computation.2
+   %prepare_start_gather_offload_async_start = s32[]{:S(2)} custom-call(), custom_call_target="PrepareAsyncCallStart"
+-  %broadcast_bitcast_fusion = s32[1,16,2,128]{3,2,1,0:T(2,128)S(1)} fusion(%iota_multiply_fusion), kind=kLoop, calls=%fused_computation.7
++  %broadcast_bitcast_fusion = s32[1,16,2,128]{3,2,1,0:T(2,128)S(1)} fusion(%iota_multiply_fusion), kind=kLoop, calls=%fused_computation.6
+   %copy.2 = s32[1,16,2,128]{3,1,2,0:T(8,128)S(1)} copy(%broadcast_bitcast_fusion)
+   %copy-done.1 = s32[65536]{0:T(1024)S(1)} copy-done(%copy-start.1)
+-  %reshape.31 = s32[16,4096]{1,0:T(8,128)S(1)} reshape(%copy-done.1)
++  %reshape.21 = s32[16,4096]{1,0:T(8,128)S(1)} reshape(%copy-done.1)
+   %bitcast.12 = s32[4096]{0:T(1024)S(1)} bitcast(%copy.2)
+-  %add_select_fusion = s32[16,4096]{1,0:T(8,128)} fusion(%reshape.31, %bitcast.12), kind=kLoop, calls=%fused_computation.2
++  %add_select_fusion = s32[16,4096]{1,0:T(8,128)} fusion(%reshape.21, %bitcast.12), kind=kLoop, calls=%fused_computation.1
+   %sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-done = s32[32768]{0:T(1024)} call-done(%sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-start)
+-  %clamp_shift-left_fusion = s32[32768]{0:T(1024)S(1)} fusion(%sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-done), kind=kLoop, calls=%fused_computation.3
+-  %reshape.77 = s32[16,2048,1]{1,0,2:T(8,128)S(1)} reshape(%clamp_shift-left_fusion)
+-  %or_bitcast_fusion = s32[2,16,8,128]{3,2,1,0:T(8,128)S(1)} fusion(%reshape.77), kind=kLoop, calls=%fused_computation.5
++  %clamp_shift-left_fusion = s32[32768]{0:T(1024)S(1)} fusion(%sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-done), kind=kLoop, calls=%fused_computation.2
++  %reshape.66 = s32[16,2048,1]{1,0,2:T(8,128)S(1)} reshape(%clamp_shift-left_fusion)
++  %or_bitcast_fusion = s32[2,16,8,128]{3,2,1,0:T(8,128)S(1)} fusion(%reshape.66), kind=kLoop, calls=%fused_computation.4
+   %copy.3 = s32[2,16,8,128]{3,1,2,0:T(8,128)} copy(%or_bitcast_fusion)
+@@ -36,8 +37,8 @@
+   %copy-start = (s32[32768]{0:T(1024)S(1)}, s32[32768]{0:T(1024)}, u32[]{:S(2)}) copy-start(%sc_topk_direct_b16_n4096_k2048.3.cloned.1.call-done)
+-  %bitcast.10 = s32[32768]{0:T(1024)} bitcast(%copy.3)
+-  %gather_offload_async_start = ((s32[16,4096]{1,0:T(8,128)}, s32[32768]{0:T(1024)}, token[]), s32[32768]{0:T(1024)}) call-start(%add_select_fusion, %bitcast.10, %prepare_done_gather_offload_async_start), async_execution_thread="sparsecore", to_apply=%called_computation
++  %bitcast.9 = s32[32768]{0:T(1024)} bitcast(%copy.3)
++  %gather_offload_async_start = ((s32[16,4096]{1,0:T(8,128)}, s32[32768]{0:T(1024)}, token[]), s32[32768]{0:T(1024)}) call-start(%add_select_fusion, %bitcast.9, %prepare_done_gather_offload_async_start), async_execution_thread="sparsecore", to_apply=%called_computation
+   %gather_offload_async_done = s32[32768]{0:T(1024)} call-done(%gather_offload_async_start)
+   %copy-done = s32[32768]{0:T(1024)S(1)} copy-done(%copy-start)
+-  %select_select_fusion = s32[32768]{0:T(1024)S(1)} fusion(%gather_offload_async_done, %copy-done), kind=kLoop, calls=%fused_computation.4
+-  ROOT %reshape.75 = s32[16,2048]{1,0:T(8,128)} reshape(%select_select_fusion)
++  %select_select_fusion = s32[32768]{0:T(1024)S(1)} fusion(%gather_offload_async_done, %copy-done), kind=kLoop, calls=%fused_computation.3
++  ROOT %reshape.64 = s32[16,2048]{1,0:T(8,128)} reshape(%select_select_fusion)
+ }

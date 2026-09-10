@@ -1,0 +1,164 @@
+Failed to find host bounds for accelerator type: WARNING: could not determine TPU accelerator type, please set env var `TPU_ACCELERATOR_TYPE` manually, otherwise libtpu.so may not properly initialize.
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789070650.994990 3141602 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: === 
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1789070658.324788 3141602 pjrt_api.cc:119] GetPjrtApi was found for TPU at /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/uv_venv/lib/python3.12/site-packages/libtpu/libtpu.so
+jax 0.10.2
+  subject base  /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5 44353b347c96e0eedbd742c710d4540a
+  subject v11   /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/variants/v11-retiled-output-emit/sparsecore_topk.py  md5 3dc249276fa68985e29f4da8e9c27fbd
+AOT-NEGCTL-8MiB-vmem: FAILED as required=True
+   JaxRuntimeError: INTERNAL: Failed to run MLO pass pipeline.aot_negctl_oversized_vmem.6:49:1: error: 'memref.alloca' op E3000: CompileTimeSparseCoreAllocationFailure: current allocation offset upper bound (33554431 words) exceeds the legitimate user allocatable offset upper bound (2097151 words) in memory space spmem when allocating 33554432 words See https://openxla.org/xla/errors/error_3000 for m
+--- standalone base   (0.9s)
+  ENTRY instructions : 13
+  ROOT               : ROOT %reshape.4 = s32[1024,2048]{1,0:T(8,128)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name="jit(<lambda>)/resh
+  [move] ROOT %reshape.4 = s32[1024,2048]{1,0:T(8,128)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name   used_scoped=['4194304']
+  memory_analysis    : {"argument_size_in_bytes": 41947136, "output_size_in_bytes": 8388608, "temp_size_in_bytes": 84017024, "alias_size_in_bytes": 0, "generated_code_size_in_bytes": 153088}
+--- standalone v11   (0.8s)
+  ENTRY instructions : 12
+  ROOT               : ROOT %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done = s32[1024,2048]{1,0:T(8,128)} call-done(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.ca
+  memory_analysis    : {"argument_size_in_bytes": 41947136, "output_size_in_bytes": 8388608, "temp_size_in_bytes": 84017024, "alias_size_in_bytes": 0, "generated_code_size_in_bytes": 129536}
+
+===== standalone ENTRY diff base -> v11 (10 lines) =====
+--- ENTRY-base
++++ ENTRY-v11
+@@ -11,5 +11,4 @@
+   %bitcast.3 = s32[10485760]{0:T(1024)} bitcast(%sparse-core-data-format-call.cloned.1.call-done)
+-  %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start = ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[2097152]{0:T(1024)}) call-start(%bitcast.3, %l.1, %prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), async_execution_thread="sparsecore", to_apply=%called_computation.1, frontend_attributes={kernel_metadata={}}, metadata={op_name="jit(<lambda>)/sc_topk_direct_b1024_n10240_k2048/mpmd_map" stack_frame_id=5}, backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"33554432"}],"used_scoped_memory_configs":[],"sparse_core_config":{"tiling":"TILING_COMPACT","offload":"OFFLOAD_KERNEL","enable_megacore":true,"load_dat":false,"core_type":"CORE_TYPE_SC","subcore_type":"SUBCORE_TYPE_SCS","core_ids":["0","1"],"subcore_ids":[]}}
+-  %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done = s32[2097152]{0:T(1024)} call-done(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), frontend_attributes={kernel_metadata={}}, metadata={op_name="jit(<lambda>)/sc_topk_direct_b1024_n10240_k2048/mpmd_map" stack_frame_id=5}, backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"33554432"}],"used_scoped_memory_configs":[]}
+-  ROOT %reshape.4 = s32[1024,2048]{1,0:T(8,128)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name="jit(<lambda>)/reshape" stack_frame_id=6}, backend_config={"flag_configs":[],"integer_config":{"integer":"262144"},"scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"33554432"}],"used_scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"4194304"}],"retry_config":{"retry_count":"0"},"aliasing_operands":{"lists":[]}}
++  %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start = ((s32[10485760]{0:T(1024)}, s32[1024]{0:T(1024)}, token[]), s32[1024,2048]{1,0:T(8,128)}) call-start(%bitcast.3, %l.1, %prepare_done_sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), async_execution_thread="sparsecore", to_apply=%called_computation.1, frontend_attributes={kernel_metadata={}}, metadata={op_name="jit(<lambda>)/sc_topk_direct_b1024_n10240_k2048/mpmd_map" stack_frame_id=5}, backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"33554432"}],"used_scoped_memory_configs":[],"sparse_core_config":{"tiling":"TILING_COMPACT","offload":"OFFLOAD_KERNEL","enable_megacore":true,"load_dat":false,"core_type":"CORE_TYPE_SC","subcore_type":"SUBCORE_TYPE_SCS","core_ids":["0","1"],"subcore_ids":[]}}
++  ROOT %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done = s32[1024,2048]{1,0:T(8,128)} call-done(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), frontend_attributes={kernel_metadata={}}, metadata={op_name="jit(<lambda>)/sc_topk_direct_b1024_n10240_k2048/mpmd_map" stack_frame_id=5}, backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"33554432"}],"used_scoped_memory_configs":[]}
+ }
+INFO 09-10 20:04:18 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-10 20:04:18 [__init__.py:54] - torchtpu -> vllm_torchtpu.platforms:register_tpu_platform
+INFO 09-10 20:04:18 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+ERROR 09-10 20:04:18 [tpu_info.py:26] Unable to poll TPU GCE Metadata. Got status code: 404 and content: <!DOCTYPE html>
+ERROR 09-10 20:04:18 [tpu_info.py:26] <html lang=en>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta charset=utf-8>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <title>Error 404 (Not Found)!!1</title>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]     *{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}
+ERROR 09-10 20:04:18 [tpu_info.py:26]   </style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <a href=//www.google.com/><span id=logo aria-label=Google></span></a>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p><b>404.</b> <ins>That’s an error.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p>The requested URL <code>/computeMetadata/v1/instance/attributes/instance-id</code> was not found on this server.  <ins>That’s all we know.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26] 
+ERROR 09-10 20:04:18 [tpu_info.py:26] Unable to poll TPU GCE Metadata. Got status code: 404 and content: <!DOCTYPE html>
+ERROR 09-10 20:04:18 [tpu_info.py:26] <html lang=en>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta charset=utf-8>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <title>Error 404 (Not Found)!!1</title>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]     *{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}
+ERROR 09-10 20:04:18 [tpu_info.py:26]   </style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <a href=//www.google.com/><span id=logo aria-label=Google></span></a>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p><b>404.</b> <ins>That’s an error.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p>The requested URL <code>/computeMetadata/v1/instance/attributes/accelerator-type</code> was not found on this server.  <ins>That’s all we know.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26] 
+ERROR 09-10 20:04:18 [tpu_info.py:26] Unable to poll TPU GCE Metadata. Got status code: 404 and content: <!DOCTYPE html>
+ERROR 09-10 20:04:18 [tpu_info.py:26] <html lang=en>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta charset=utf-8>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <title>Error 404 (Not Found)!!1</title>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]     *{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}
+ERROR 09-10 20:04:18 [tpu_info.py:26]   </style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <a href=//www.google.com/><span id=logo aria-label=Google></span></a>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p><b>404.</b> <ins>That’s an error.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p>The requested URL <code>/computeMetadata/v1/instance/attributes/agent-worker-number</code> was not found on this server.  <ins>That’s all we know.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26] 
+ERROR 09-10 20:04:18 [tpu_info.py:26] Unable to poll TPU GCE Metadata. Got status code: 404 and content: <!DOCTYPE html>
+ERROR 09-10 20:04:18 [tpu_info.py:26] <html lang=en>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta charset=utf-8>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <title>Error 404 (Not Found)!!1</title>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]     *{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}
+ERROR 09-10 20:04:18 [tpu_info.py:26]   </style>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <a href=//www.google.com/><span id=logo aria-label=Google></span></a>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p><b>404.</b> <ins>That’s an error.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26]   <p>The requested URL <code>/computeMetadata/v1/instance/attributes/accelerator-type</code> was not found on this server.  <ins>That’s all we know.</ins>
+ERROR 09-10 20:04:18 [tpu_info.py:26] 
+ERROR 09-10 20:04:18 [__init__.py:24] Error occurred while logging TPU info: 'NoneType' object has no attribute 'startswith'. Are you running on CPU?
+INFO 09-10 20:04:18 [__init__.py:237] Platform plugin torchtpu is activated
+WARNING 09-10 20:04:18 [tpu_platform.py:1180] Pin memory is not supported on TPU.
+INFO 09-10 20:04:27 [importing.py:53] Triton is installed but 0 active driver(s) found (expected 1). Disabling Triton to prevent runtime errors.
+INFO 09-10 20:04:27 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+STREAMIDX_ENABLE_EARLY_EXIT = True (from mla_attention_op)
+--- in-model v11   (9.4s, 5342 lines, hlo md5 ab97c4de44e3d5f18afb13440da564ee)
+  sparsecore_topk module file: /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/kernel_work/sparsecore-topk/variants/v11-retiled-output-emit/sparsecore_topk.py
+  shape gate `sc_topk_direct_b1024_n10240_k2048` present: True
+  memory_analysis: {"argument_size_in_bytes": 161789440, "output_size_in_bytes": 159383584, "temp_size_in_bytes": 152630528, "alias_size_in_bytes": 150994944, "generated_code_size_in_bytes": 3860480}
+  call-done producers: ['sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done', 'sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done']
+  --- chain from call-done ---
+    ROOT %tuple.438 = (s32[1024,2048]{1,0:T(8,128)}) tuple(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1   used_scoped=[]
+  S(1)-annotated shapes       : 398
+      %param_0.920 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_0.917 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_0.918 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_0.919 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_1.1155 = u32[1024]{0:T(1024)S(1)} parameter(1)
+      %param_0.921 = u32[1024]{0:T(1024)S(1)} parameter(0)
+      ROOT %select_n.228 = u32[1024]{0:T(1024)S(1)} select(%lt_to.24, %add.348, %select.2014), metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/jit(_streamidx_
+      %param_1.1156 = u32[1024]{0:T(1024)S(1)} parameter(1)
+  copy-start                  : 20
+      %copy-start.1 = (s32[65]{0:T(128)}, s32[65]{0:T(128)S(1)}, u32[]{:S(2)}) copy-start(%get-tuple-element.30), backend_config={"flag_configs":[],"scoped_memory_configs":[],"
+      %copy-start.4 = (s32[64]{0:T(128)}, s32[64]{0:T(128)S(1)}, u32[]{:S(2)}) copy-start(%get-tuple-element.28), backend_config={"flag_configs":[],"scoped_memory_configs":[],"
+      %copy-done.1 = s32[65]{0:T(128)} copy-done(%copy-start.1), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dma_priority":5}
+      %copy-done.4 = s32[64]{0:T(128)} copy-done(%copy-start.4), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dma_priority":5}
+      %copy-start.8 = (pred[64]{0:T(512)(128)(4,1)S(1)}, pred[64]{0:T(512)(128)(4,1)}, u32[]{:S(2)}) copy-start(%iota_compare_fusion.5), backend_config={"flag_configs":[],"scop
+      %copy-start.9 = (s32[64]{0:T(128)S(1)}, s32[64]{0:T(128)}, u32[]{:S(2)}) copy-start(%slice.13), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_
+      %copy-start.2 = (s32[65]{0:T(128)S(1)}, s32[65]{0:T(128)}, u32[]{:S(2)}) copy-start(%copy-done.1), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scop
+      %copy-done.8 = pred[64]{0:T(512)(128)(4,1)S(1)} copy-done(%copy-start.8), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dm
+  s32[1024,2048] results      : 9
+      ROOT %sc_topk_direct_b1024_n10240_k2048.6 = s32[1024,2048]{1,0:T(8,128)} custom-call(%param_0.931, %param_1.1161), custom_call_target="tpu_custom_call", operand_layout_co
+      ROOT %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done = s32[1024,2048]{1,0:T(8,128)} call-done(%sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start), metadata=
+      %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done = s32[1024,2048]{1,0:T(8,128)} call-done(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), frontend_attri
+      %iota.32 = s32[1024,2048]{1,0:T(8,128)} iota(), iota_dimension=1, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch_1_fun/le" stack_frame_id=1
+      %le.2 = s32[1024,2048]{1,0:T(8,128)} broadcast(%param_0.256), dimensions={0}, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch_1_fun/le" stac
+      %broadcast_in_dim.43 = s32[1024,2048]{1,0:T(8,128)} broadcast(%constant.981), dimensions={}, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch
+      ROOT %select_n.164 = s32[1024,2048]{1,0:T(8,128)} select(%le.1, %iota.32, %broadcast_in_dim.43), metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/br
+      %compare_select_fusion = s32[1024,2048]{1,0:T(8,128)} fusion(%fusion.8), kind=kLoop, calls=%fused_computation.23, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamin
+  s32[2097152] results        : 0
+--- in-model base   (9.3s, 5347 lines, hlo md5 1fa8e95f7b0f3169dfec024de6e116b9)
+  sparsecore_topk module file: /mnt/pd/home-mp/vllm-torchtpu-test3/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py
+  shape gate `sc_topk_direct_b1024_n10240_k2048` present: True
+  memory_analysis: {"argument_size_in_bytes": 161789440, "output_size_in_bytes": 159383584, "temp_size_in_bytes": 152663264, "alias_size_in_bytes": 150994944, "generated_code_size_in_bytes": 3883520}
+  call-done producers: ['sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done', 'sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done']
+  --- chain from call-done ---
+    %reshape.1 = s32[1024,2048]{1,0:T(8,128)S(1)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch_   used_scoped=['2097152']
+    ROOT %tuple.438 = (s32[1024,2048]{1,0:T(8,128)S(1)}) tuple(%reshape.1), backend_config={"flag_configs":[],"scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"0"}],"used_scoped_   used_scoped=[]
+  S(1)-annotated shapes       : 406
+      %param_0.920 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_0.917 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_0.918 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_0.919 = s32[64]{0:T(128)S(1)} parameter(0)
+      %param_1.1155 = u32[1024]{0:T(1024)S(1)} parameter(1)
+      %param_0.921 = u32[1024]{0:T(1024)S(1)} parameter(0)
+      ROOT %select_n.228 = u32[1024]{0:T(1024)S(1)} select(%lt_to.24, %add.348, %select.2014), metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/jit(_streamidx_
+      %param_1.1156 = u32[1024]{0:T(1024)S(1)} parameter(1)
+  copy-start                  : 22
+      %copy-start.1 = (s32[65]{0:T(128)}, s32[65]{0:T(128)S(1)}, u32[]{:S(2)}) copy-start(%get-tuple-element.30), backend_config={"flag_configs":[],"scoped_memory_configs":[],"
+      %copy-start.4 = (s32[64]{0:T(128)}, s32[64]{0:T(128)S(1)}, u32[]{:S(2)}) copy-start(%get-tuple-element.28), backend_config={"flag_configs":[],"scoped_memory_configs":[],"
+      %copy-done.1 = s32[65]{0:T(128)} copy-done(%copy-start.1), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dma_priority":5}
+      %copy-done.4 = s32[64]{0:T(128)} copy-done(%copy-start.4), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dma_priority":5}
+      %copy-start.9 = (pred[64]{0:T(512)(128)(4,1)S(1)}, pred[64]{0:T(512)(128)(4,1)}, u32[]{:S(2)}) copy-start(%iota_compare_fusion.5), backend_config={"flag_configs":[],"scop
+      %copy-start.10 = (s32[64]{0:T(128)S(1)}, s32[64]{0:T(128)}, u32[]{:S(2)}) copy-start(%slice.13), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped
+      %copy-start.2 = (s32[65]{0:T(128)S(1)}, s32[65]{0:T(128)}, u32[]{:S(2)}) copy-start(%copy-done.1), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scop
+      %copy-done.9 = pred[64]{0:T(512)(128)(4,1)S(1)} copy-done(%copy-start.9), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dm
+  s32[1024,2048] results      : 8
+      %reshape.1 = s32[1024,2048]{1,0:T(8,128)S(1)} reshape(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done), metadata={op_name="jit(_streamidx_topk_jax)/jit(streaminde
+      %iota.32 = s32[1024,2048]{1,0:T(8,128)} iota(), iota_dimension=1, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch_1_fun/le" stack_frame_id=1
+      %le.2 = s32[1024,2048]{1,0:T(8,128)} broadcast(%param_0.256), dimensions={0}, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch_1_fun/le" stac
+      %broadcast_in_dim.43 = s32[1024,2048]{1,0:T(8,128)} broadcast(%constant.981), dimensions={}, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/cond/branch
+      ROOT %select_n.164 = s32[1024,2048]{1,0:T(8,128)S(1)} select(%le.1, %iota.32, %broadcast_in_dim.43), metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/con
+      %compare_select_fusion = s32[1024,2048]{1,0:T(8,128)S(1)} fusion(%fusion.8), kind=kLoop, calls=%fused_computation.23, metadata={op_name="jit(_streamidx_topk_jax)/jit(stre
+      %get-tuple-element.889 = s32[1024,2048]{1,0:T(8,128)S(1)} get-tuple-element(%cond.2.clone), index=0, metadata={op_name="jit(_streamidx_topk_jax)/jit(streamindex_topk)/con
+      %copy-done.5 = s32[1024,2048]{1,0:T(8,128)} copy-done(%copy-start.5), backend_config={"flag_configs":[],"scoped_memory_configs":[],"used_scoped_memory_configs":[],"dma_pr
+  s32[2097152] results        : 3
+      ROOT %sc_topk_direct_b1024_n10240_k2048.6 = s32[2097152]{0:T(1024)} custom-call(%param_0.931, %param_1.1161), custom_call_target="tpu_custom_call", operand_layout_constra
+      ROOT %sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-done = s32[2097152]{0:T(1024)} call-done(%sc_topk_direct_b1024_n10240_k2048.5.cloned.1.call-start), metadata={op_n
+      %sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-done = s32[2097152]{0:T(1024)} call-done(%sc_topk_direct_b1024_n10240_k2048.3.cloned.1.call-start), frontend_attributes

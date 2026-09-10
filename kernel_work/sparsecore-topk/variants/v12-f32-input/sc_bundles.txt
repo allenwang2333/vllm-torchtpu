@@ -1,0 +1,40 @@
+PRICING THE SEVEN IN-BODY BITCASTS -- SparseCore VLIW bundles, AOT, no TPU
+flags: LIBTPU_INIT_ARGS=--xla_sc_dump_bundles_to --xla_sc_dump_mlir_to --xla_sc_dump_llvm_ir_to
+shapes: b=1024 n=10240 k=2048   both arms compiled from f32[1024,10240]
+
+== topk kernel, per-section VLIW bundle counts ==
+section                                incumbent  variant
+__scs_entry_jumppad                           8        8
+__scs_overlays_trampoline_lowered           128      128
+called_computation.1_lowered                 60       60
+execute0_lowered (tec / vector body)       1157     1157
+_tile_overlayer_lowered                      11       11
+TOTAL                                      1364     1364
+
+opcode histogram diff: (empty == identical)
+(identical)
+
+whole-file diff after normalizing the _f32in kernel-name tag:
+294,295c294,295
+< 0x7: {  	s4 =	sadd.s32 $0x140800, s3;
+< 	s5 =	sadd.s32 $0x800, s3;
+---
+> 0x7: {  	s4 =	sadd.s32 $0x800, s3;
+> 	s5 =	sadd.s32 $0x140800, s3;
+  -> the ONLY difference is which scalar register receives two sadd.s32
+     immediates in one bundle. Same two ops, same bundle, swapped dest.
+
+== the bitcasts DO exist upstream and are folded at instruction selection ==
+  mosaic MLIR       : incumbent 0 tpu.bitcast   variant 7 tpu.bitcast (vector<16xf32><->vector<16xi32>)
+  post-emit-tec MLIR: incumbent 0 arith.bitcast variant 7 arith.bitcast
+  SC LLVM IR (.ll)  : incumbent 0 bitcast       variant 35 bitcast <16 x float> <-> <16 x i32>
+                      (7 source sites, replicated by the unroll=4 parallel_loop)
+  scheduled bundles : incumbent 1364            variant 1364   <-- ALL 35 ELIMINATED
+
+== residual found: the sparse-core-data-format SC program ==
+  called_computation_lowered (scs)         58       60
+  execute0_lowered (tec / vector)          84       84
+  _tile_overlayer_lowered                  11       11
+  +2 bundles, both in the SCALAR sequencer prologue (one extra
+  'rddreg [dreg:$0x2]', one extra sld, one extra shalt; one fewer sadd.s32).
+  The vector body is byte-identical. Executes once per launch, not per element.

@@ -1,0 +1,369 @@
+SUBJECT_PATH=/root/probe18/subject/sparsecore_topk.py
+44353b347c96e0eedbd742c710d4540a  /root/probe18/subject/sparsecore_topk.py
+ceafc734d10632672d3db48f2cea23f6  /root/probe18/probe.py
+08375d7068365e1a776c58fef09cd6d0  /root/instr/glm_dsa_block_bench.py
+1299eb9d77d718c627fe54dbaf4bf5a1  /root/p13/level_sim.py
+MAP_GATE_OK
+subject: /root/probe18/subject/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+SUBJECT_GATE_OK  44353b347c96e0eedbd742c710d4540a
+  anchor count=1 OK  NUM_BUCKETS = 256
+  anchor count=1 OK  L0_SHIFT = 24
+  anchor count=1 OK  REFINEMENT_LEVELS = ((16, 0xFF), (8, 0xFF), (0, 0xFF))
+  anchor count=1 OK  i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len
+  anchor count=1 OK  dma(scores_hbm.at[pl.ds(s, slice_len)], resident_vmem, 1)
+ANCHOR_GATE_OK  (the DMA is static-length and i_hi is rho-bounded: the two facts the whole reweighting rests on)
+VERBATIM_GATE_OK  level_schedule/_quant_fp8_rowwise/make_kv/make_scores/prefill_lengths/decode_lengths are byte-identical to /root/p13/level_sim.py
+CTX_GATE_OK  --ctx 9216 -> n=10240
+  --- prefill b=1024: 22 length vectors ---
+    rho1           rho=1.00000 eff in [10240,10240] P(eff<=k)=  0.0% md5=85919bb24ce3ad1f  row_lengths = n: what EVERY prior probe ran
+    prefill        rho=0.39604 eff in [17,8191] P(eff<=k)= 25.1% md5=51c8cefac6837e07  level_sim.prefill_lengths VERBATIM: i.i.d. Uniform{1..8192}; target rho 0.40005, realized rho is the sample mean
+    prefillX       rho=0.40005 eff in [5,8188] P(eff<=k)= 25.0% md5=f896171b299e86bd  stratified Uniform{1..8192}, permuted: rho=0.40005 EXACTLY
+    prefillXsorted rho=0.40005 eff in [5,8188] P(eff<=k)= 25.0% md5=677625bcf04748f7  prefillX multiset, sorted ascending: same rho, no within-wave spread
+    gated          rho=0.50587 eff in [2063,8185] P(eff<=k)=  0.0% md5=5c41c607a9072ed3  i.i.d. Uniform{2049..8192} = prefill CONDITIONAL on the lax.cond gate; target rho 0.50005
+    gatedX         rho=0.50005 eff in [2052,8189] P(eff<=k)=  0.0% md5=27efef12488b03fc  stratified Uniform{2049..8192}: rho=0.50005 EXACTLY
+    flat0.400      rho=0.40000 eff in [4096,4096] P(eff<=k)=  0.0% md5=46b71782617a1a79  degenerate at E[prefill]=4096
+    bimodal0.400   rho=0.40000 eff in [2048,6144] P(eff<=k)= 50.0% md5=39ca5c5d2d63ab1b  bimodal {2048, 6144}, mean 4096
+    chunk0         rho=0.05005 eff in [1,1024] P(eff<=k)=100.0% md5=489b3c9e6c79ece3  chunk 0 causal ramp, eff_len = 1024*0+i+1
+    chunk1         rho=0.15005 eff in [1025,2048] P(eff<=k)=100.0% md5=0627750e21e02d83  chunk 1 causal ramp, eff_len = 1024*1+i+1
+    chunk2         rho=0.25005 eff in [2049,3072] P(eff<=k)=  0.0% md5=91262b838936acde  chunk 2 causal ramp, eff_len = 1024*2+i+1
+    chunk3         rho=0.35005 eff in [3073,4096] P(eff<=k)=  0.0% md5=4fb9226753dfde88  chunk 3 causal ramp, eff_len = 1024*3+i+1
+    chunk4         rho=0.45005 eff in [4097,5120] P(eff<=k)=  0.0% md5=a0d77452acbf85b0  chunk 4 causal ramp, eff_len = 1024*4+i+1
+    chunk5         rho=0.55005 eff in [5121,6144] P(eff<=k)=  0.0% md5=fb304ff6149a2265  chunk 5 causal ramp, eff_len = 1024*5+i+1
+    chunk6         rho=0.65005 eff in [6145,7168] P(eff<=k)=  0.0% md5=1a78eacc4e231fe3  chunk 6 causal ramp, eff_len = 1024*6+i+1
+    chunk7         rho=0.75005 eff in [7169,8192] P(eff<=k)=  0.0% md5=c09b39680f6a79f5  chunk 7 causal ramp, eff_len = 1024*7+i+1
+    flat0.050      rho=0.05000 eff in [512,512] P(eff<=k)=100.0% md5=da4ecce3d0f4dab8  degenerate at 512
+    flat0.150      rho=0.15000 eff in [1536,1536] P(eff<=k)=100.0% md5=885ae3c3f3c2b50f  degenerate at 1536
+    flat0.250      rho=0.25000 eff in [2560,2560] P(eff<=k)=  0.0% md5=14356922b13d20f4  degenerate at 2560
+    flat0.500      rho=0.50000 eff in [5120,5120] P(eff<=k)=  0.0% md5=37980ec1c2ff1565  degenerate at 5120
+    flat0.650      rho=0.65000 eff in [6656,6656] P(eff<=k)=  0.0% md5=983f4eaf0ba7e74a  degenerate at 6656
+    flat0.850      rho=0.85000 eff in [8704,8704] P(eff<=k)=  0.0% md5=c20871cef9580a0c  degenerate at 8704
+  --- decode b=64: 9 length vectors ---
+    rho1           rho=1.00000 eff in [10240,10240] P(eff<=k)=  0.0% md5=705559b02aa3161f  row_lengths = n: what EVERY prior probe ran
+    decode         rho=0.84844 eff in [8231,9204] P(eff<=k)=  0.0% md5=5a8d2c1436fa252e  level_sim.decode_lengths VERBATIM: i.i.d. Uniform{8193..9215}; target rho 0.850, realized rho is the sample mean
+    decodeX        rho=0.85000 eff in [8200,9208] P(eff<=k)=  0.0% md5=45296d089095b5b5  stratified Uniform{8193..9215}: rho=0.850 EXACTLY
+    flat0.850      rho=0.85000 eff in [8704,8704] P(eff<=k)=  0.0% md5=f9cdc91d46e48296  degenerate at E[decode]=8704
+    flat0.200      rho=0.20000 eff in [2048,2048] P(eff<=k)=100.0% md5=50815e549b040bc9  degenerate at 2048
+    flat0.400      rho=0.40000 eff in [4096,4096] P(eff<=k)=  0.0% md5=068c7aa159c3f1f0  degenerate at 4096
+    flat0.600      rho=0.60000 eff in [6144,6144] P(eff<=k)=  0.0% md5=cbdd0bdbcd960ef4  degenerate at 6144
+    flat0.800      rho=0.80000 eff in [8192,8192] P(eff<=k)=  0.0% md5=1c75ade398f5819b  degenerate at 8192
+    flat0.900      rho=0.90000 eff in [9216,9216] P(eff<=k)=  0.0% md5=2ce93de3895cef53  degenerate at 9216
+  rho check: prefill_lengths exact mean 0.40005 (target 0.40005), 1M-sample 0.40008
+  rho check: decode_lengths  exact mean 0.85000 (target 0.85), 1M-sample 0.85000
+  rho check: gated (Uniform 2049..8192) exact mean 0.50005 (target 0.50005)
+  strat check: prefillX  rho=0.4000488 target 0.40005  err=1.17e-06  support [5,8188] subset of [1,8192]
+  strat check: gatedX    rho=0.5000488 target 0.50005  err=1.17e-06  support [2052,8189] subset of [2049,8192]
+  strat check: decodeX   rho=0.8500000 target 0.85  err=0.00e+00  support [8200,9208] subset of [8193,9215]
+RHO_GATE_OK
+DRY_RUN_OK
+WARNING: Logging before InitGoogle() is written to STDERR
+E0000 00:00:1789071494.970789      78 common_lib.cc:823] INVALID_ARGUMENT: Error: unexpected worker hostname 'WARNING: could not determine TPU worker hostnames or IP addresses' from env var TPU_WORKER_HOSTNAMES. Expecting a valid hostname or IP address without port number, or hostname:port:address triple. (Full TPU workers' addr string: WARNING: could not determine TPU worker hostnames or IP addresses, please set env var `TPU_WORKER_HOSTNAMES` manually, otherwise libtpu.so may not properly initialize.)
+=== Source Location Trace: ===
+learning/45eac/tfrc/runtime/libtpu_init_utils.cc:359
+host=j-97b98f97-142a-47f2-a173-tpu-job-0-0 devices=8 kind=TPU7x
+sparse_core=SparseCoreInfo(num_cores=2, num_subcores=16, num_lanes=16, vmem_capacity_bytes=524288, dma_granule_size_bytes=32)  jax=0.10.2
+subject: /root/probe18/subject/sparsecore_topk.py  md5=44353b347c96e0eedbd742c710d4540a
+installed: /root/cloud-devkit/vllm-torchtpu/src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py  md5=1a89d4514469e0599db97c1946110f0b  DIFFERENT -- using the pinned --subject, not the image copy
+SUBJECT_GATE_OK  44353b347c96e0eedbd742c710d4540a
+shapes: prefill b=1024 waves=32  decode b=64 waves=2  n=10240 k=2048 P=1  ctx=9216
+
+==============================================================================
+STAGE 0  OPERANDS
+==============================================================================
+  scores built in 14.5s
+  prefill  shape=(1024, 10240) zeros=0.00% md5=e1c3558aca6e7bbd
+  decode   shape=(64, 10240) zeros=0.00% md5=e378603bf93ebb86
+  normal   shape=(1024, 10240) zeros=0.00% md5=a7372cd5ff3cdfb6
+
+  length vectors:
+  P.rho1             rho=1.00000  eff in [10240,10240]  P(eff<=k)=  0.0%  md5=85919bb24ce3ad1f  row_lengths = n: what EVERY prior probe ran
+  P.prefill          rho=0.39604  eff in [17,8191]  P(eff<=k)= 25.1%  md5=51c8cefac6837e07  level_sim.prefill_lengths VERBATIM: i.i.d. Uniform{1..8192}; target rho 0.40005, realized rho is the sample mean
+  P.prefillX         rho=0.40005  eff in [5,8188]  P(eff<=k)= 25.0%  md5=f896171b299e86bd  stratified Uniform{1..8192}, permuted: rho=0.40005 EXACTLY
+  P.prefillXsorted   rho=0.40005  eff in [5,8188]  P(eff<=k)= 25.0%  md5=677625bcf04748f7  prefillX multiset, sorted ascending: same rho, no within-wave spread
+  P.gated            rho=0.50587  eff in [2063,8185]  P(eff<=k)=  0.0%  md5=5c41c607a9072ed3  i.i.d. Uniform{2049..8192} = prefill CONDITIONAL on the lax.cond gate; target rho 0.50005
+  P.gatedX           rho=0.50005  eff in [2052,8189]  P(eff<=k)=  0.0%  md5=27efef12488b03fc  stratified Uniform{2049..8192}: rho=0.50005 EXACTLY
+  P.flat0.400        rho=0.40000  eff in [4096,4096]  P(eff<=k)=  0.0%  md5=46b71782617a1a79  degenerate at E[prefill]=4096
+  P.bimodal0.400     rho=0.40000  eff in [2048,6144]  P(eff<=k)= 50.0%  md5=39ca5c5d2d63ab1b  bimodal {2048, 6144}, mean 4096
+  P.chunk0           rho=0.05005  eff in [1,1024]  P(eff<=k)=100.0%  md5=489b3c9e6c79ece3  chunk 0 causal ramp, eff_len = 1024*0+i+1
+  P.chunk1           rho=0.15005  eff in [1025,2048]  P(eff<=k)=100.0%  md5=0627750e21e02d83  chunk 1 causal ramp, eff_len = 1024*1+i+1
+  P.chunk2           rho=0.25005  eff in [2049,3072]  P(eff<=k)=  0.0%  md5=91262b838936acde  chunk 2 causal ramp, eff_len = 1024*2+i+1
+  P.chunk3           rho=0.35005  eff in [3073,4096]  P(eff<=k)=  0.0%  md5=4fb9226753dfde88  chunk 3 causal ramp, eff_len = 1024*3+i+1
+  P.chunk4           rho=0.45005  eff in [4097,5120]  P(eff<=k)=  0.0%  md5=a0d77452acbf85b0  chunk 4 causal ramp, eff_len = 1024*4+i+1
+  P.chunk5           rho=0.55005  eff in [5121,6144]  P(eff<=k)=  0.0%  md5=fb304ff6149a2265  chunk 5 causal ramp, eff_len = 1024*5+i+1
+  P.chunk6           rho=0.65005  eff in [6145,7168]  P(eff<=k)=  0.0%  md5=1a78eacc4e231fe3  chunk 6 causal ramp, eff_len = 1024*6+i+1
+  P.chunk7           rho=0.75005  eff in [7169,8192]  P(eff<=k)=  0.0%  md5=c09b39680f6a79f5  chunk 7 causal ramp, eff_len = 1024*7+i+1
+  P.flat0.050        rho=0.05000  eff in [512,512]  P(eff<=k)=100.0%  md5=da4ecce3d0f4dab8  degenerate at 512
+  P.flat0.150        rho=0.15000  eff in [1536,1536]  P(eff<=k)=100.0%  md5=885ae3c3f3c2b50f  degenerate at 1536
+  P.flat0.250        rho=0.25000  eff in [2560,2560]  P(eff<=k)=  0.0%  md5=14356922b13d20f4  degenerate at 2560
+  P.flat0.500        rho=0.50000  eff in [5120,5120]  P(eff<=k)=  0.0%  md5=37980ec1c2ff1565  degenerate at 5120
+  P.flat0.650        rho=0.65000  eff in [6656,6656]  P(eff<=k)=  0.0%  md5=983f4eaf0ba7e74a  degenerate at 6656
+  P.flat0.850        rho=0.85000  eff in [8704,8704]  P(eff<=k)=  0.0%  md5=c20871cef9580a0c  degenerate at 8704
+  D.rho1             rho=1.00000  eff in [10240,10240]  P(eff<=k)=  0.0%  md5=705559b02aa3161f  row_lengths = n: what EVERY prior probe ran
+  D.decode           rho=0.84844  eff in [8231,9204]  P(eff<=k)=  0.0%  md5=5a8d2c1436fa252e  level_sim.decode_lengths VERBATIM: i.i.d. Uniform{8193..9215}; target rho 0.850, realized rho is the sample mean
+  D.decodeX          rho=0.85000  eff in [8200,9208]  P(eff<=k)=  0.0%  md5=45296d089095b5b5  stratified Uniform{8193..9215}: rho=0.850 EXACTLY
+  D.flat0.850        rho=0.85000  eff in [8704,8704]  P(eff<=k)=  0.0%  md5=f9cdc91d46e48296  degenerate at E[decode]=8704
+  D.flat0.200        rho=0.20000  eff in [2048,2048]  P(eff<=k)=100.0%  md5=50815e549b040bc9  degenerate at 2048
+  D.flat0.400        rho=0.40000  eff in [4096,4096]  P(eff<=k)=  0.0%  md5=068c7aa159c3f1f0  degenerate at 4096
+  D.flat0.600        rho=0.60000  eff in [6144,6144]  P(eff<=k)=  0.0%  md5=cbdd0bdbcd960ef4  degenerate at 6144
+  D.flat0.800        rho=0.80000  eff in [8192,8192]  P(eff<=k)=  0.0%  md5=1c75ade398f5819b  degenerate at 8192
+  D.flat0.900        rho=0.90000  eff in [9216,9216]  P(eff<=k)=  0.0%  md5=2ce93de3895cef53  degenerate at 9216
+
+==============================================================================
+STAGE 1  LENGTHS GATE -- correctness AND arm activation
+==============================================================================
+  P.rho1             rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.prefill          rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 1831894  EXACT
+  P.prefillX         rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 1835264  EXACT
+  P.prefillXsorted   rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 1835264  EXACT
+  P.gated            rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.gatedX           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.flat0.400        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.bimodal0.400     rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.chunk0           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  524800  EXACT
+  P.chunk1           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 1573376  EXACT
+  P.chunk2           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.chunk3           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.chunk4           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.chunk5           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.chunk6           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.chunk7           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.flat0.050        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  524288  EXACT
+  P.flat0.150        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 1572864  EXACT
+  P.flat0.250        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.flat0.500        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.flat0.650        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  P.flat0.850        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots= 2097152  EXACT
+  D.rho1             rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.decode           rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.decodeX          rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.flat0.850        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.flat0.200        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.flat0.400        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.flat0.600        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.flat0.800        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+  D.flat0.900        rows_wrong=    0  out_of_range=    0  live_count_wrong=    0  live_slots=  131072  EXACT
+
+  NEGCTL  rho=1 output scored against the `prefill` lengths -> rows_wrong=0 out_of_range=1024 live_count_wrong=257
+  NEGCTL  rho=1 output identical to `prefill` output? False
+  LENGTHS_GATE_OK  (every arm exact AND the checker can go red)
+
+  --- MODELLED host replay of the kernel's control flow (explains the curve; is NOT the curve) ---
+  P.rho1             mean_refinement_levels=1.953  keep_all=  0.0%  (n=128 rows sampled)
+  P.prefillX         mean_refinement_levels=1.406  keep_all= 17.2%  (n=128 rows sampled)
+  P.gatedX           mean_refinement_levels=1.766  keep_all=  0.0%  (n=128 rows sampled)
+  P.flat0.400        mean_refinement_levels=1.711  keep_all=  0.0%  (n=128 rows sampled)
+  P.bimodal0.400     mean_refinement_levels=0.789  keep_all= 57.0%  (n=128 rows sampled)
+  P.chunk1           mean_refinement_levels=0.000  keep_all=100.0%  (n=128 rows sampled)
+  D.rho1             mean_refinement_levels=1.828  keep_all=  0.0%  (n=64 rows sampled)
+  D.decodeX          mean_refinement_levels=1.812  keep_all=  0.0%  (n=64 rows sampled)
+
+==============================================================================
+STAGE 2  ARMS
+==============================================================================
+  timing harness: FROZEN INSTRUMENT /root/instr/glm_dsa_block_bench.py (md5 08375d7068365e1a776c58fef09cd6d0)
+  arm P3.rho1            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod
+  arm P3.prefill         b= 1024 entry=3d lengths=P.prefill      rho=0.39604 scores=prod
+  arm P3.prefillX        b= 1024 entry=3d lengths=P.prefillX     rho=0.40005 scores=prod
+  arm P3.prefillXsorted  b= 1024 entry=3d lengths=P.prefillXsorted rho=0.40005 scores=prod
+  arm P3.gated           b= 1024 entry=3d lengths=P.gated        rho=0.50587 scores=prod
+  arm P3.gatedX          b= 1024 entry=3d lengths=P.gatedX       rho=0.50005 scores=prod
+  arm P3.flat0.400       b= 1024 entry=3d lengths=P.flat0.400    rho=0.40000 scores=prod
+  arm P3.bimodal0.400    b= 1024 entry=3d lengths=P.bimodal0.400 rho=0.40000 scores=prod
+  arm P3.chunk0          b= 1024 entry=3d lengths=P.chunk0       rho=0.05005 scores=prod
+  arm P3.chunk1          b= 1024 entry=3d lengths=P.chunk1       rho=0.15005 scores=prod
+  arm P3.chunk2          b= 1024 entry=3d lengths=P.chunk2       rho=0.25005 scores=prod
+  arm P3.chunk3          b= 1024 entry=3d lengths=P.chunk3       rho=0.35005 scores=prod
+  arm P3.chunk4          b= 1024 entry=3d lengths=P.chunk4       rho=0.45005 scores=prod
+  arm P3.chunk5          b= 1024 entry=3d lengths=P.chunk5       rho=0.55005 scores=prod
+  arm P3.chunk6          b= 1024 entry=3d lengths=P.chunk6       rho=0.65005 scores=prod
+  arm P3.chunk7          b= 1024 entry=3d lengths=P.chunk7       rho=0.75005 scores=prod
+  arm P3.flat0.050       b= 1024 entry=3d lengths=P.flat0.050    rho=0.05000 scores=prod
+  arm P3.flat0.150       b= 1024 entry=3d lengths=P.flat0.150    rho=0.15000 scores=prod
+  arm P3.flat0.250       b= 1024 entry=3d lengths=P.flat0.250    rho=0.25000 scores=prod
+  arm P3.flat0.500       b= 1024 entry=3d lengths=P.flat0.500    rho=0.50000 scores=prod
+  arm P3.flat0.650       b= 1024 entry=3d lengths=P.flat0.650    rho=0.65000 scores=prod
+  arm P3.flat0.850       b= 1024 entry=3d lengths=P.flat0.850    rho=0.85000 scores=prod
+  arm P2.rho1            b= 1024 entry=2d lengths=P.rho1         rho=1.00000 scores=prod
+  arm P2.prefillX        b= 1024 entry=2d lengths=P.prefillX     rho=0.40005 scores=prod
+  arm P2.gatedX          b= 1024 entry=2d lengths=P.gatedX       rho=0.50005 scores=prod
+  arm N2.rho1            b= 1024 entry=2d lengths=P.rho1         rho=1.00000 scores=normal
+  arm N2.prefillX        b= 1024 entry=2d lengths=P.prefillX     rho=0.40005 scores=normal
+  arm D3.rho1            b=   64 entry=3d lengths=D.rho1         rho=1.00000 scores=prod
+  arm D3.decode          b=   64 entry=3d lengths=D.decode       rho=0.84844 scores=prod
+  arm D3.decodeX         b=   64 entry=3d lengths=D.decodeX      rho=0.85000 scores=prod
+  arm D3.flat0.850       b=   64 entry=3d lengths=D.flat0.850    rho=0.85000 scores=prod
+  arm D3.flat0.200       b=   64 entry=3d lengths=D.flat0.200    rho=0.20000 scores=prod
+  arm D3.flat0.400       b=   64 entry=3d lengths=D.flat0.400    rho=0.40000 scores=prod
+  arm D3.flat0.600       b=   64 entry=3d lengths=D.flat0.600    rho=0.60000 scores=prod
+  arm D3.flat0.800       b=   64 entry=3d lengths=D.flat0.800    rho=0.80000 scores=prod
+  arm D3.flat0.900       b=   64 entry=3d lengths=D.flat0.900    rho=0.90000 scores=prod
+  arm D2.rho1            b=   64 entry=2d lengths=D.rho1         rho=1.00000 scores=prod
+  arm D2.decodeX         b=   64 entry=2d lengths=D.decodeX      rho=0.85000 scores=prod
+  arm #nsrc_a            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod
+  arm #dsrc_a            b=   64 entry=3d lengths=D.rho1         rho=1.00000 scores=prod
+  arm #nsrc_b            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod
+  arm #dsrc_b            b=   64 entry=3d lengths=D.rho1         rho=1.00000 scores=prod
+  arm #nsrc_c            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod
+  arm #dsrc_c            b=   64 entry=3d lengths=D.rho1         rho=1.00000 scores=prod
+  arm #ndat_a            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod_draw0
+  arm #ndat_b            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod_draw1
+  arm #ndat_c            b= 1024 entry=3d lengths=P.rho1         rho=1.00000 scores=prod_draw2
+  47 arms, 7 distinct module objects
+
+==============================================================================
+STAGE 3  TIMING -- 47 arms, ONE pool, 12 interleaved rounds, reshuffled per round, paired REPS 20/60 slope, read us_median
+==============================================================================
+  dispatch floor: 31.96 us/call
+  !! SUSPECT #dsrc_c: min slope -76.1 us/call <= 0 -- almost certainly an unwarmed recompile. `us` is invalid for this row; read `us_median` (52.38) and check it against the dispatch floor before using it.
+  P3.rho1            us_median=   425.366  us=   353.325  us_mean=   419.703  us_unpaired=   425.223  hostbound= 17.4%  suspect=False
+  P3.prefill         us_median=   272.957  us=   272.314  us_mean=   273.065  us_unpaired=   272.444  hostbound=  1.1%  suspect=False
+  P3.prefillX        us_median=   275.185  us=   274.759  us_mean=   275.899  us_unpaired=   275.211  hostbound=  1.1%  suspect=False
+  P3.prefillXsorted  us_median=   254.178  us=   253.366  us_mean=   255.129  us_unpaired=   254.047  hostbound=  1.3%  suspect=False
+  P3.gated           us_median=   306.587  us=   305.861  us_mean=   307.394  us_unpaired=   306.491  hostbound=  1.1%  suspect=False
+  P3.gatedX          us_median=   293.044  us=   292.106  us_mean=   293.845  us_unpaired=   293.010  hostbound=  1.2%  suspect=False
+  P3.flat0.400       us_median=   260.154  us=   259.607  us_mean=   260.246  us_unpaired=   260.134  hostbound=  1.2%  suspect=False
+  P3.bimodal0.400    us_median=   310.542  us=   310.177  us_mean=   311.163  us_unpaired=   310.466  hostbound=  1.0%  suspect=False
+  P3.chunk0          us_median=   137.395  us=   136.849  us_mean=   137.447  us_unpaired=   137.474  hostbound=  2.2%  suspect=False
+  P3.chunk1          us_median=   155.966  us=   155.780  us_mean=   161.192  us_unpaired=   156.049  hostbound=  1.7%  suspect=False
+  P3.chunk2          us_median=   221.107  us=   220.158  us_mean=   230.650  us_unpaired=   220.739  hostbound=  1.4%  suspect=False
+  P3.chunk3          us_median=   248.115  us=   247.301  us_mean=   249.077  us_unpaired=   247.798  hostbound=  1.2%  suspect=False
+  P3.chunk4          us_median=   277.120  us=   276.405  us_mean=   281.073  us_unpaired=   277.231  hostbound=  1.2%  suspect=False
+  P3.chunk5          us_median=   302.110  us=   301.359  us_mean=   302.895  us_unpaired=   301.698  hostbound=  1.0%  suspect=False
+  P3.chunk6          us_median=   334.545  us=   333.673  us_mean=   334.868  us_unpaired=   334.367  hostbound=  1.0%  suspect=False
+  P3.chunk7          us_median=   363.453  us=   359.828  us_mean=   363.940  us_unpaired=   360.217  hostbound=  0.9%  suspect=False
+  P3.flat0.050       us_median=   135.665  us=   134.791  us_mean=   136.466  us_unpaired=   135.589  hostbound=  2.3%  suspect=False
+  P3.flat0.150       us_median=   154.108  us=   153.656  us_mean=   154.633  us_unpaired=   153.951  hostbound=  1.7%  suspect=False
+  P3.flat0.250       us_median=   218.513  us=   217.473  us_mean=   219.572  us_unpaired=   218.523  hostbound=  1.6%  suspect=False
+  P3.flat0.500       us_median=   286.575  us=   286.132  us_mean=   286.739  us_unpaired=   286.452  hostbound=  1.1%  suspect=False
+  P3.flat0.650       us_median=   331.940  us=   331.245  us_mean=   331.921  us_unpaired=   331.875  hostbound=  1.0%  suspect=False
+  P3.flat0.850       us_median=   392.798  us=   389.943  us_mean=   392.525  us_unpaired=   390.261  hostbound=  0.7%  suspect=False
+  P2.rho1            us_median=   461.021  us=   459.932  us_mean=   462.248  us_unpaired=   460.337  hostbound=  0.7%  suspect=False
+  P2.prefillX        us_median=   310.761  us=   309.975  us_mean=   311.083  us_unpaired=   310.819  hostbound=  1.1%  suspect=False
+  P2.gatedX          us_median=   328.503  us=   328.072  us_mean=   329.298  us_unpaired=   328.513  hostbound=  0.9%  suspect=False
+  N2.rho1            us_median=   453.463  us=   451.349  us_mean=   454.198  us_unpaired=   452.084  hostbound=  0.7%  suspect=False
+  N2.prefillX        us_median=   302.438  us=   301.848  us_mean=   302.604  us_unpaired=   302.184  hostbound=  1.0%  suspect=False
+  D3.rho1            us_median=    52.567  us=    51.941  us_mean=    53.029  us_unpaired=    52.605  hostbound=  4.9%  suspect=False
+  D3.decode          us_median=    49.698  us=    42.385  us_mean=    49.160  us_unpaired=    49.941  hostbound= 18.3%  suspect=False
+  D3.decodeX         us_median=    49.171  us=    47.957  us_mean=    49.725  us_unpaired=    48.949  hostbound=  6.6%  suspect=False
+  D3.flat0.850       us_median=    49.064  us=    48.076  us_mean=    49.051  us_unpaired=    49.082  hostbound=  6.3%  suspect=False
+  D3.flat0.200       us_median=    34.577  us=    33.054  us_mean=    35.779  us_unpaired=    33.998  hostbound=  8.7%  suspect=False
+  D3.flat0.400       us_median=    41.116  us=    40.416  us_mean=    41.095  us_unpaired=    40.814  hostbound=  6.0%  suspect=False
+  D3.flat0.600       us_median=    44.866  us=    43.650  us_mean=    55.067  us_unpaired=    43.956  hostbound=  6.1%  suspect=False
+  D3.flat0.800       us_median=    48.408  us=    46.159  us_mean=    48.621  us_unpaired=    47.982  hostbound=  8.0%  suspect=False
+  D3.flat0.900       us_median=    51.760  us=    51.303  us_mean=    52.910  us_unpaired=    51.446  hostbound=  4.6%  suspect=False
+  D2.rho1            us_median=    52.513  us=    51.752  us_mean=    53.323  us_unpaired=    52.264  hostbound=  5.4%  suspect=False
+  D2.decodeX         us_median=    50.030  us=    49.082  us_mean=    50.328  us_unpaired=    49.666  hostbound=  5.2%  suspect=False
+  #nsrc_a            us_median=   425.206  us=   423.892  us_mean=   426.132  us_unpaired=   424.490  hostbound=  0.8%  suspect=False
+  #dsrc_a            us_median=    52.137  us=    42.780  us_mean=    51.786  us_unpaired=    51.989  hostbound= 21.4%  suspect=False
+  #nsrc_b            us_median=   428.044  us=   424.550  us_mean=   427.440  us_unpaired=   424.715  hostbound=  0.7%  suspect=False
+  #dsrc_b            us_median=    51.949  us=    50.791  us_mean=    52.692  us_unpaired=    51.886  hostbound=  6.6%  suspect=False
+  #nsrc_c            us_median=   424.825  us=   424.139  us_mean=   425.984  us_unpaired=   424.886  hostbound=  0.8%  suspect=False
+  #dsrc_c            us_median=    52.384  us=   -76.052  us_mean=    42.107  us_unpaired=    51.886  hostbound=240.0%  suspect=True
+  #ndat_a            us_median=   425.523  us=   422.502  us_mean=   424.920  us_unpaired=   422.523  hostbound=  0.6%  suspect=False
+  #ndat_b            us_median=   426.150  us=   423.898  us_mean=   426.343  us_unpaired=   424.742  hostbound=  0.8%  suspect=False
+  #ndat_c            us_median=   432.518  us=   429.502  us_mean=   432.889  us_unpaired=   429.978  hostbound=  0.7%  suspect=False
+
+==============================================================================
+STAGE 4  RESOLUTION FLOOR
+==============================================================================
+  #nsrc (prefill, identical source, identical operands) 425.206 / 428.044 / 424.825
+    -> PREFILL RESOLUTION FLOOR = 3.218 us = 0.757% of P3.rho1
+  #dsrc (decode,  identical source, identical operands) 52.137 / 51.949 / 52.384
+    -> DECODE  RESOLUTION FLOOR = 0.435 us = 0.827% of D3.rho1
+  #ndat (prefill, SAME executable, three different score draws) 425.523 / 426.150 / 432.518
+    -> score-draw spread = 6.995 us = 1.644% of P3.rho1. Every rho arm shares ONE draw, so this term does not enter a rho contrast; it bounds how much a different draw could move an absolute.
+
+==============================================================================
+STAGE 5  THE rho CURVE (absolutes first; percentages are derived from them in one place)
+==============================================================================
+
+  --- P3 (b=1024, 3-D entry) ---
+  arm                     rho   us_median  vs rho=1 us  Delta time %  note
+  P3.flat0.050        0.05000     135.665     -289.702       -68.11%  resolvable
+  P3.chunk0           0.05005     137.395     -287.972       -67.70%  resolvable
+  P3.flat0.150        0.15000     154.108     -271.258       -63.77%  resolvable
+  P3.chunk1           0.15005     155.966     -269.401       -63.33%  resolvable
+  P3.flat0.250        0.25000     218.513     -206.853       -48.63%  resolvable
+  P3.chunk2           0.25005     221.107     -204.259       -48.02%  resolvable
+  P3.chunk3           0.35005     248.115     -177.251       -41.67%  resolvable
+  P3.prefill          0.39604     272.957     -152.410       -35.83%  resolvable
+  P3.bimodal0.400     0.40000     310.542     -114.824       -26.99%  resolvable
+  P3.flat0.400        0.40000     260.154     -165.213       -38.84%  resolvable
+  P3.prefillX         0.40005     275.185     -150.181       -35.31%  resolvable
+  P3.prefillXsorted   0.40005     254.178     -171.189       -40.24%  resolvable
+  P3.chunk4           0.45005     277.120     -148.247       -34.85%  resolvable
+  P3.flat0.500        0.50000     286.575     -138.791       -32.63%  resolvable
+  P3.gatedX           0.50005     293.044     -132.323       -31.11%  resolvable
+  P3.gated            0.50587     306.587     -118.780       -27.92%  resolvable
+  P3.chunk5           0.55005     302.110     -123.256       -28.98%  resolvable
+  P3.flat0.650        0.65000     331.940      -93.427       -21.96%  resolvable
+  P3.chunk6           0.65005     334.545      -90.821       -21.35%  resolvable
+  P3.chunk7           0.75005     363.453      -61.913       -14.56%  resolvable
+  P3.flat0.850        0.85000     392.798      -32.569        -7.66%  resolvable
+  P3.rho1             1.00000     425.366        0.000        +0.00%  NOT RESOLVABLE
+
+  --- D3 (b=64, 3-D entry) ---
+  arm                     rho   us_median  vs rho=1 us  Delta time %  note
+  D3.flat0.200        0.20000      34.577      -17.990       -34.22%  resolvable
+  D3.flat0.400        0.40000      41.116      -11.451       -21.78%  resolvable
+  D3.flat0.600        0.60000      44.866       -7.701       -14.65%  resolvable
+  D3.flat0.800        0.80000      48.408       -4.159        -7.91%  resolvable
+  D3.decode           0.84844      49.698       -2.869        -5.46%  resolvable
+  D3.decodeX          0.85000      49.171       -3.396        -6.46%  resolvable
+  D3.flat0.850        0.85000      49.064       -3.503        -6.66%  resolvable
+  D3.flat0.900        0.90000      51.760       -0.808        -1.54%  resolvable
+  D3.rho1             1.00000      52.567        0.000        +0.00%  NOT RESOLVABLE
+
+  --- fit T(rho) = a + s*rho over the DEGENERATE (flat) prefill arms. `a` is what rho cannot remove. ---
+  points: 0.050:135.66  0.150:154.11  0.250:218.51  0.400:260.15  0.500:286.58  0.650:331.94  0.850:392.80  1.000:425.37
+  T(rho) = 125.925 + 311.096*rho   r2=0.98871   rho-independent floor = 125.925 us = 28.8% of T(1)
+  monotone in rho (within the 3.218 us floor)? True
+  residuals vs the line: -5.81  -18.48  +14.81  +9.79  +5.10  +3.80  +2.44  -11.65   max|resid| = 18.481 us (OUTSIDE the floor)
+
+  --- the eight PRODUCTION per-chunk causal ramps, and the degenerate arm nearest each ---
+  chunk0  rho=0.05005    137.395 us   vs P3.flat0.050   (rho=0.050)   135.665  delta=  +1.730  NOT RESOLVABLE
+  chunk1  rho=0.15005    155.966 us   vs P3.flat0.150   (rho=0.150)   154.108  delta=  +1.858  NOT RESOLVABLE
+  chunk2  rho=0.25005    221.107 us   vs P3.flat0.250   (rho=0.250)   218.513  delta=  +2.594  NOT RESOLVABLE
+  chunk3  rho=0.35005    248.115 us   vs P3.flat0.400   (rho=0.400)   260.154  delta= -12.039  resolvable
+  chunk4  rho=0.45005    277.120 us   vs P3.flat0.500   (rho=0.500)   286.575  delta=  -9.456  resolvable
+  chunk5  rho=0.55005    302.110 us   vs P3.flat0.500   (rho=0.500)   286.575  delta= +15.535  resolvable
+  chunk6  rho=0.65005    334.545 us   vs P3.flat0.650   (rho=0.650)   331.940  delta=  +2.605  NOT RESOLVABLE
+  chunk7  rho=0.75005    363.453 us   vs P3.flat0.850   (rho=0.850)   392.798  delta= -29.345  resolvable
+
+  chunk-weighted mean over ALL 8 chunks          = 254.976 us   (rho 0.40005 unconditionally)
+  chunk-weighted mean over the 6 that RUN (c2..c7) = 291.075 us   (rho 0.50005, the lax.cond survivors)
+  the single-vector `P3.gated` arm (Uniform 2049..8192) = 306.587 us   delta vs the chunk-weighted +15.512 us resolvable
+
+  --- DOES THE DISTRIBUTION MATTER, at E[eff_len] = 4096 (rho = 0.400)? Three distributions, one mean. ---
+  P3.flat0.400       rho=0.40000   260.154 us  degenerate 4096                          vs degenerate   +0.000 us =  +0.00%  NOT RESOLVABLE
+  P3.prefillX        rho=0.40005   275.185 us  Uniform{1..8192} shuffled (PRODUCTION)   vs degenerate  +15.032 us =  +5.78%  resolvable
+  P3.prefillXsorted  rho=0.40005   254.178 us  same multiset, sorted                    vs degenerate   -5.976 us =  -2.30%  resolvable
+  P3.bimodal0.400    rho=0.40000   310.542 us  bimodal {2048,6144}                      vs degenerate  +50.389 us = +19.37%  resolvable
+  P3.prefill         rho=0.39604   272.957 us  i.i.d. draw, rho off by sampling error   vs degenerate  +12.803 us =  +4.92%  resolvable
+  ARRANGEMENT at an IDENTICAL multiset (shuffled - sorted) = +21.008 us = +8.26%  resolvable. Rows map to subcores with stride 32 and a wave costs its slowest subcore, so this is the within-wave length imbalance, which rho cannot see.
+  -> the SHAPE of the distribution at a fixed mean is worth 50.389 us (19.37%), against a 3.218 us floor. A mean-only rho model is NOT adequate.
+
+==============================================================================
+STAGE 6  ADJUDICATION -- 189.98 / 155.82 / 1.219
+==============================================================================
+
+  (a) THE 1.219: harness (2-D) / production (3-D) entry, same scores, same lengths, same pool
+      rho1     2-D   461.021  3-D   425.366  relayout  +35.654 us  factor 1.0838  vs sheet 1.219 -> -11.09%
+      prefillX 2-D   310.761  3-D   275.185  relayout  +35.576 us  factor 1.1293  vs sheet 1.219 -> -7.36%
+      gatedX   2-D   328.503  3-D   293.044  relayout  +35.459 us  factor 1.1210  vs sheet 1.219 -> -8.04%
+
+  (b) THE rho REWEIGHTING: T(rho=1) / T(rho=0.40005), which the sheet implies to be 326.782/189.98 = 1.7201
+      P2  T(1)=  461.021  T(0.40005)=  310.761  factor 1.4835  vs 1.7201 -> -13.75%   (harness 2-D entry)
+      P3  T(1)=  425.366  T(0.40005)=  275.185  factor 1.5457  vs 1.7201 -> -10.14%   (production 3-D entry)
+      N2  T(1)=  453.463  T(0.40005)=  302.438  factor 1.4994  vs 1.7201 -> -12.83%   (2-D entry, standard-normal scores (probes/09's own operand))
+
+  (c) THE ABSOLUTES. Raw, and RE-ANCHORED -- the sheet's own rho=1 reading was 326.782 us (probes/09, 2-D entry, standard-normal scores); re-anchoring applies THIS job's measured rho ratio to THAT number, which cancels any cross-pool level difference between the two jobs.
+      P2  measured T(0.40005) =   310.761 us  vs sheet  189.98 -> raw  +63.58%   |   re-anchored   220.275 ->  +15.95%   (harness 189.98)
+      N2  measured T(0.40005) =   302.438 us  vs sheet  189.98 -> raw  +59.19%   |   re-anchored   217.948 ->  +14.72%   (harness 189.98)
+      P3  measured T(0.40005) =   275.185 us  vs sheet  155.82 -> raw  +76.60%   |   re-anchored   173.427 ->  +11.30%   (production 155.82)
+
+  (d) CROSS-JOB CONTROL. N2.rho1 (2-D entry, standard-normal scores, rho=1) = 453.463 us against probes/09's B = 326.782 -> +38.77%. This is the SAME construction in a different pool; it says how much of any disagreement above is pool level rather than rho.
+      score distribution: production 461.021 vs standard-normal 453.463 = +7.557 us (+1.67%)  resolvable
+
+  (e) DECODE. T(rho=1) = 52.567, T(rho=0.850) = 49.171, factor 1.0691, delta -3.396 us = -6.46%  resolvable
+
+wrote /cdk-outputs/outputs/j-97b98f97-142a-47f2-a173-tpu-job-0/j-97b98f97-142a-47f2-a173-tpu-job-0-0-vtkq5/command-container/probe18/rho_denominator.json

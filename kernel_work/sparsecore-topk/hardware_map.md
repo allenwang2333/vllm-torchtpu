@@ -490,7 +490,7 @@ against probe 08's 327.166 (−0.12%) from a byte-identical source.
 | `hist`, all levels | 138.306 | 42.3% | measured (`probes/08` `-hist`) |
 | `emit` | 83.830 | 25.7% | **measured** (`probes/09`, `B − E0`) |
 | **residual (D3)** | **75.683** | **23.2%** | **measured** (`probes/09`, `A0 − null`) |
-| V4 sweeps, all levels | 18.866 | 5.8% | **measured** (`probes/09`, `E0 − E0-swp`) |
+| V4 sweeps, ~~all levels~~ ⛔ **LEVEL 0 ONLY** | 18.866 | 5.8% | ⛔ `probes/09` — **unsafe to quote, see below** |
 | harness fence (null) | 16.548 | 5.1% | measured — instrument, not kernel |
 | score DMA | 13.469 | 4.1% | measured (`probes/08` `-dma`) |
 | output DMA | 5.872 | 1.8% | **measured** (`probes/09`, `B − -out`) |
@@ -518,7 +518,26 @@ One split is available without another job: probe 08's `-sweep` = 175.842 leaves
 = 53.54. Stage C's independent per-pass derivation put hist0 at 85.12 — **0.4% apart**. Both rows
 are `modelled`, corroborated but not measured.
 
-### At production prefill ρ = 0.40005 — 189.98 µs
+⛔⛔ **THE STAGE C″ LEDGER IS SUPERSEDED BY MEASUREMENT — `probes/18-rho-denominator`
+(`j-97b98f97`).** It is kept as the record of what step 2 believed. Two defects, both confirmed:
+
+1. **`probes/09` is unsafe to quote, on two independent counts.** Its `B = 326.782 µs` anchor — the
+   anchor of this entire sheet — **does not reproduce**: reconstructed exactly it reads 453.463 µs,
+   **+38.77%**, while agreeing with `probes/01` to +0.71%. Two jobs agree; `probes/09` is the
+   outlier. **Separately**, all 12 arms under `probes/09-sweep-split/arms/` carry
+   `REFINEMENT_LEVELS = ()`, so the "V4 sweeps, all levels" row above can only have measured level 0.
+   Raised by the step-3 `v2` build, confirmed by direct check of the arm files.
+2. **The ρ reweighting below is wrong in both its factor and its form.** Measured
+   `T(1)/T(0.40005) = 1.5457`, not the implied 1.7201; the harness→production relayout is a
+   **constant additive 35.563 µs**, not a ×1.219 scale; the true shape is two-piece,
+   `T(ρ) = 147.925 + 281.588·ρ` above a knee at ρ = k/n = 0.2. And **ρ is not a sufficient
+   statistic** — 19.37% of spread at a fixed mean, 8.26% of it from row *arrangement* alone.
+
+The measured production figure is **275.185 µs**, not the 189.98 below (+76.60%). No repair is being
+bought: the step-3 ranking job measures every candidate directly at production ρ and arrangement,
+which supersedes this sheet rather than fixing it. See `results.md` § "The denominator, remeasured".
+
+### At production prefill ρ = 0.40005 — ~~189.98 µs~~ ⛔ measured **275.185 µs**
 
 Same method as C′: walk-bounded terms × ρ; refinement terms additionally × 6/8 with a conditional
 mean ρ of 0.50005 (`keep_all` fires for all of chunks 0–1); fixed terms unscaled.

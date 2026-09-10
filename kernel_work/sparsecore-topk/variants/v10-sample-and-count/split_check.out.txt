@@ -1,0 +1,7 @@
+pairs checked      : 21035 x 4 arities = 84140
+widest bracket ok  : 4294967295 (32.00 bits; 2**32-1 = 4294967295)
+full-range pair    : _split(I32_MIN, I32_MAX, 2) = [-1]
+reachable pairs    : 21025 x 4 = 84100  (hi - lo >= 2)
+violations         : 0
+excluded (width 1) : 40 = 4 x 10 pairs, all hi == lo + 1, all unreachable from `correct` (loop cond excludes them)
+negative control   : naive lo+(hi-lo)//2 violates on 5263 of 21035 pairs (must be > 0)
