@@ -6,7 +6,6 @@ COMPRESSED_TENSORS = "compressed-tensors"
 # vLLM's native detection name for ModelOpt NVFP4 checkpoints
 # (ModelOptNvFp4Config.get_name()).
 NVFP4 = "modelopt_fp4"
-MODELOPT_MIXED = "modelopt_mixed"
 DEEPSEEK_V4_FP8 = "deepseek_v4_fp8"
 
 
