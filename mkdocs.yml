@@ -41,24 +41,18 @@ theme:
     - toc.follow
 
 nav:
-  - Home: index.md
+  - Home: README.md
   - Getting Started:
-    - Docker: getting_started/docker.md
+    - TPU Setup: getting_started/tpu_setup.md
+    - Installation: getting_started/installation.md
+    - Quickstart: getting_started/quickstart.md
+    - 'Out-of-Tree Usage': getting_started/out-of-tree.md
+  - 'Recommended Models and Features': recommended_models_features.md
   - Developer Guides:
-    - Pre-Public Dev Guide: PRE_PUBLIC_DEV_GUIDE.md
-    - TorchTPU Compilation: torch_tpu_compilation.md
-    - Profiling: profiling.md
-  - Contributing: CONTRIBUTING.md
+    - 'JAX Model Development': developer_guides/jax_model_development.md
+    - 'Torch Model Development': developer_guides/torchax_model_development.md
   - 'TPU Recipes (external)': https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/inference/trillium/vLLM
-
-validation:
-  nav:
-    omitted_files: info
-    not_found: warn
-  links:
-    not_found: ignore
-    absolute_links: ignore
-    unrecognized_links: ignore
+  - 'Profiling' : profiling.md
 plugins:
   - search
   - same-dir
