@@ -29,8 +29,7 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, _select_owned_winners, cp_global_to_local,
-    cp_local_to_global, cp_owner_rank, streamindex_topk,
-    streamindex_topk_dcp)
+    cp_local_to_global, cp_owner_rank, streamindex_topk, streamindex_topk_dcp)
 
 P = jax.sharding.PartitionSpec
 
@@ -51,9 +50,9 @@ def test_global_to_local_inverts_local_to_global(dcp_size, interleave_c):
         for local in range(3 * interleave_c * dcp_size):
             g = int(cp_local_to_global(local, rank, dcp_size, interleave_c))
             assert int(cp_owner_rank(jnp.int32(g), dcp_size,
-                                      interleave_c)) == rank
+                                     interleave_c)) == rank
             assert int(cp_global_to_local(jnp.int32(g), dcp_size,
-                                           interleave_c)) == local
+                                          interleave_c)) == local
 
 
 @pytest.mark.parametrize("dcp_size,interleave_c", _LAYOUTS)
@@ -72,7 +71,7 @@ def test_global_to_local_needs_no_rank_argument(dcp_size, interleave_c):
     for g in range(n):
         assert int(
             cp_local_to_global(int(locals_[g]), int(owners[g]), dcp_size,
-                                interleave_c)) == g
+                               interleave_c)) == g
 
 
 # ===================================================================== #
@@ -166,13 +165,19 @@ def _mesh(size):
 
 
 def _dcp_kwargs(**over):
-    kw = dict(mesh=None, k=16, compression_ratio=1, dcp_size=2,
+    kw = dict(mesh=None,
+              k=16,
+              compression_ratio=1,
+              dcp_size=2,
               interleave_size=1)
     kw.update(over)
     return kw
 
 
-def _dummy_args(num_tokens=8, num_heads=4, head_dim=128, pages=2,
+def _dummy_args(num_tokens=8,
+                num_heads=4,
+                head_dim=128,
+                pages=2,
                 page_size=16):
     width = 256
     return (
@@ -271,17 +276,17 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
                             jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
 
     local_topk = jax.jit(
-        functools.partial(streamindex_topk_dcp,
-                          mesh=mesh,
-                          k=K,
-                          compression_ratio=1,
-                          dcp_size=dcp_size,
-                          interleave_size=1,
-                          num_kv_pages_per_block=2,
-                          num_queries_per_block=128))(
-                              q, weights, shards, seq_lens,
-                              jnp.arange(vpages, dtype=jnp.int32), cu_q_lens,
-                              distribution)
+        functools.partial(
+            streamindex_topk_dcp,
+            mesh=mesh,
+            k=K,
+            compression_ratio=1,
+            dcp_size=dcp_size,
+            interleave_size=1,
+            num_kv_pages_per_block=2,
+            num_queries_per_block=128))(q, weights, shards, seq_lens,
+                                        jnp.arange(vpages, dtype=jnp.int32),
+                                        cu_q_lens, distribution)
 
     # Global leading dim is dcp_size * Q_LEN, rank-major.
     local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
@@ -326,26 +331,26 @@ def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
                             jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
 
     local_topk = jax.jit(
-        functools.partial(streamindex_topk_dcp,
-                          mesh=mesh,
-                          k=K,
-                          compression_ratio=1,
-                          dcp_size=dcp_size,
-                          interleave_size=1,
-                          num_kv_pages_per_block=2,
-                          num_queries_per_block=128))(
-                              q, weights, shards,
-                              jnp.array([KV_LEN], jnp.int32),
-                              jnp.arange(vpages, dtype=jnp.int32),
-                              jnp.array([0, Q_LEN], jnp.int32),
-                              jnp.array([0, 0, 1], jnp.int32))
+        functools.partial(
+            streamindex_topk_dcp,
+            mesh=mesh,
+            k=K,
+            compression_ratio=1,
+            dcp_size=dcp_size,
+            interleave_size=1,
+            num_kv_pages_per_block=2,
+            num_queries_per_block=128))(q, weights, shards,
+                                        jnp.array([KV_LEN], jnp.int32),
+                                        jnp.arange(vpages, dtype=jnp.int32),
+                                        jnp.array([0, Q_LEN], jnp.int32),
+                                        jnp.array([0, 0, 1], jnp.int32))
     local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
 
     for t in range(Q_LEN):
         globals_ = [
             int(cp_local_to_global(local, r, dcp_size, 1))
-            for r in range(dcp_size) for local in
-            local_topk[r, t][local_topk[r, t] >= 0].tolist()
+            for r in range(dcp_size)
+            for local in local_topk[r, t][local_topk[r, t] >= 0].tolist()
         ]
         assert len(globals_) == len(set(globals_)), f"token {t} has duplicates"
         # Every row is full here: the query tokens are the last Q_LEN of a

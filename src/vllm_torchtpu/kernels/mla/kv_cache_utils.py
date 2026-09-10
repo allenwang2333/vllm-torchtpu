@@ -207,18 +207,11 @@ def update_sparse_mla_kv_cache(
 
 
 def update_sparse_mla_kv_cache_dcp(
-        kv_cache_nope: jax.Array,
-        kv_cache_rope: jax.Array,
-        kv_c_normed: jax.Array,
-        k_pe: jax.Array,
-        seq_lens: jax.Array,
-        block_tables: jax.Array,
-        query_start_loc: jax.Array,
-        dcp_rank: jax.Array,
-        *,
-        nope_spec: SparseMLAKVCacheSpec,
-        rope_spec: SparseMLAKVCacheSpec,
-        dcp_size: int,
+        kv_cache_nope: jax.Array, kv_cache_rope: jax.Array,
+        kv_c_normed: jax.Array, k_pe: jax.Array, seq_lens: jax.Array,
+        block_tables: jax.Array, query_start_loc: jax.Array,
+        dcp_rank: jax.Array, *, nope_spec: SparseMLAKVCacheSpec,
+        rope_spec: SparseMLAKVCacheSpec, dcp_size: int,
         interleave_size: int) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's MLA latents into a DCP position-sharded cache.
 
@@ -269,7 +262,8 @@ def update_sparse_mla_kv_cache_dcp(
         f"{rope_spec.shape}")
     assert nope_spec.page_size == rope_spec.page_size, (
         "nope and rope caches must share a page size for the DCP interleave "
-        f"to address both, got {nope_spec.page_size} and {rope_spec.page_size}")
+        f"to address both, got {nope_spec.page_size} and {rope_spec.page_size}"
+    )
     if interleave_size % dsa_gather.TILE_SUBROWS:
         raise ValueError(
             f"interleave_size={interleave_size} must be a multiple of "
