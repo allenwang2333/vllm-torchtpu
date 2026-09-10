@@ -5910,6 +5910,11 @@ class TPUModelRunner(GPUModelRunner):
             self.mamba_slot_read_offsets = torch.zeros(
                 kv_cache_config.num_blocks, dtype=torch.int32).to(self.device)
 
+        # The unified path returns from `initialize_kv_cache` before that
+        # method's own doorbell hook, so it has to allocate them here. P/D runs
+        # on this path, which is the only place the doorbell matters.
+        self._maybe_initialize_doorbells()
+
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
@@ -6545,9 +6550,10 @@ class TPUModelRunner(GPUModelRunner):
 
         One group per full-attention layer, in the order vLLM reports them.
         The GDN layers never reach this attention backend, so they have no
-        group and never ring.
+        group and never ring. Both KV cache paths call this, so it does
+        nothing once the buffer exists.
         """
-        if not envs.TPU_KV_DOORBELL:
+        if not envs.TPU_KV_DOORBELL or self._doorbells is not None:
             return
 
         from vllm_torchtpu.layers.vllm.attention import \
