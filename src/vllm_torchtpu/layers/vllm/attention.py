@@ -19,9 +19,8 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import (all_gather_heads,
-                                           get_or_create_dcp_mesh,
-                                           merge_lse_partials_scatter_heads)
+from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
+from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
@@ -41,6 +40,12 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_kv
 from vllm_torchtpu.layers.common.sequence_layout import \
     is_pcp_streaming_attention_metadata
+from vllm_torchtpu.layers.vllm.cp_attention import \
+    build_dcp_kernels as _build_dcp_kernels
+from vllm_torchtpu.layers.vllm.cp_attention import \
+    forward_with_dcp as _forward_with_dcp
+from vllm_torchtpu.layers.vllm.cp_mla_attention import (
+    all_gather_heads, merge_lse_partials_scatter_heads)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -53,12 +58,6 @@ if envs.USE_BATCHED_RPA_LONGCTX:
     import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched_wrapper
 else:
     import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
-
-from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.layers.vllm.cp_attention import \
-    build_dcp_kernels as _build_dcp_kernels
-from vllm_torchtpu.layers.vllm.cp_attention import \
-    forward_with_dcp as _forward_with_dcp
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -1780,10 +1779,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         The op returns unmerged partials. Combining them is one log-sum-exp
         reduction over the DCP group, and it is deliberately left to the torch
-        caller (`distributed.dcp.merge_lse_partials_scatter_heads`), which also
-        narrows the head axis back down: it needs no Pallas, and
-        keeping it out of the exported module avoids the export path's
-        constraints on how collectives inside `pallas.jax_op` are launched.
+        caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
+        also narrows the head axis back down: it needs no Pallas, and keeping
+        it out of the exported module avoids the export path's constraints on
+        how collectives inside `pallas.jax_op` are launched.
         """
         from vllm_torchtpu.layers.common.attention_interface import \
             sparse_mla_attention_dcp
