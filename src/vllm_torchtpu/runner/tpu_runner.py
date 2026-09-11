@@ -602,9 +602,14 @@ class TPUModelRunner(GPUModelRunner):
         self._kv_cache_bundle_layer_index: dict[str, int] = {}
 
         # Per-layer progress counters rung from inside the forward pass. None
-        # unless TPU_KV_DOORBELL is set. Nothing reads them here; the reader
-        # belongs in raiden. See `distributed.kv_transfer.doorbell`.
+        # unless TPU_KV_DOORBELL is set. Nothing here reads them directly; the
+        # reading is raiden's. See `distributed.kv_transfer.doorbell`.
         self._doorbells: doorbell.DoorbellSet | None = None
+
+        # Owns raiden's polling thread and reports the stagger it sees. None
+        # unless TPU_KV_DOORBELL_POLL_US is also set, since polling is the
+        # measurement and the writes need measuring without it first.
+        self._doorbell_watcher: doorbell.DoorbellWatcher | None = None
 
         # EP-DP lockstep state, refreshed each step by execute_model /
         # execute_dummy_batch: the coordinated (max-across-ranks) token
@@ -3709,6 +3714,10 @@ class TPUModelRunner(GPUModelRunner):
             # step contaminating the throughput this stage is measuring.
             if self._doorbells is not None:
                 self._doorbells.maybe_verify()
+            # The reader runs on its own thread and needs nothing from here.
+            # This call only asks it, every so often, what it has seen.
+            if self._doorbell_watcher is not None:
+                self._doorbell_watcher.after_step()
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(
                 self)
@@ -6568,18 +6577,41 @@ class TPUModelRunner(GPUModelRunner):
                         "eligible attention layers; skipping doorbells.")
             return
 
-        bells = doorbell.DoorbellSet(layer_names, self.device)
-
         # The ring's `announced` operand is the KV cache, so it needs the same
         # mesh and sharding the attention kernel runs under.
         use_pcp = self.parallel_config.prefill_context_parallel_size > 1
         mesh, _, specs = PallasAttentionBackendImpl._select_kernel_mesh(
             self.mesh, use_pcp)
-        bells.prebuild(mesh, specs[0] if specs else None)
+        kv_spec = specs[0] if specs else None
+
+        bells = doorbell.DoorbellSet(
+            layer_names,
+            self.device,
+            verify_steps=8 if envs.TPU_KV_DOORBELL_VERIFY else 0)
+        bells.prebuild(mesh, kv_spec)
 
         self._doorbells = bells
-        logger.info("KV doorbells allocated over %d attention layers",
-                    len(layer_names))
+        # The chip count is logged, not used, so that a run can be checked for
+        # having sharded the bells the way it meant to.
+        logger.info(
+            "KV doorbells allocated over %d attention layers, "
+            "one of %d chips", len(layer_names),
+            doorbell.shards_for(mesh, kv_spec))
+
+        if envs.TPU_KV_DOORBELL_POLL_US <= 0:
+            return
+        # A wheel without the reader is the likely case on any image that was
+        # not built for this, and it should cost a log line rather than a dead
+        # server, since the writes are worth measuring on their own.
+        try:
+            self._doorbell_watcher = doorbell.DoorbellWatcher(
+                bells,
+                poll_interval_ns=envs.TPU_KV_DOORBELL_POLL_US * 1000,
+                report_every=envs.TPU_KV_DOORBELL_REPORT_EVERY)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "TPU_KV_DOORBELL_POLL_US is set but the reader would not "
+                "start, so the bells will be written and not read: %s", exc)
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""

@@ -66,6 +66,9 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_KV_DOORBELL: bool = False
+    TPU_KV_DOORBELL_VERIFY: bool = False
+    TPU_KV_DOORBELL_POLL_US: int = 0
+    TPU_KV_DOORBELL_REPORT_EVERY: int = 200
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
@@ -450,6 +453,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # See `distributed.kv_transfer.doorbell`.
     "TPU_KV_DOORBELL":
     env_bool("TPU_KV_DOORBELL"),
+
+    # Read the bells back and log them. Each read forces a device sync, and
+    # the first reads land inside the first benchmark leg, so a timing run
+    # must leave this off.
+    "TPU_KV_DOORBELL_VERIFY":
+    env_bool("TPU_KV_DOORBELL_VERIFY"),
+
+    # How often raiden's C++ reader copies the bells to the host, in
+    # microseconds. Zero leaves the reader off entirely. The default when it is
+    # on, 200 us, is about five hundred reads of a 60 KiB buffer across an 8K
+    # prefill, which resolves a stagger of a millisecond or more without the
+    # copies themselves becoming the thing being measured.
+    "TPU_KV_DOORBELL_POLL_US":
+    lambda: int(os.getenv("TPU_KV_DOORBELL_POLL_US") or "0"),
+
+    # Steps between stagger reports. Each report drains the reader and writes
+    # two log lines, so it is cheap, but not cheap enough to want per step.
+    "TPU_KV_DOORBELL_REPORT_EVERY":
+    lambda: int(os.getenv("TPU_KV_DOORBELL_REPORT_EVERY") or "200"),
     # Evict host page cache for checkpoint weight files via posix_fadvise
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":

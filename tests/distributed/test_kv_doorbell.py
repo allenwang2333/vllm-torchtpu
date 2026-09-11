@@ -93,9 +93,13 @@ def test_every_group_is_reachable_and_fully_written(group):
     assert all(int(bells[g].max()) == 0 for g in others)
 
 
-def _cpu_set():
-    names = [f"model.layers.{4 * i + 3}.self_attn.attn" for i in range(15)]
-    return DoorbellSet(names, torch.device("cpu")), names
+def _layer_names():
+    return [f"model.layers.{4 * i + 3}.self_attn.attn" for i in range(15)]
+
+
+def _cpu_set(**kwargs):
+    names = _layer_names()
+    return DoorbellSet(names, torch.device("cpu"), **kwargs), names
 
 
 def test_operands_all_share_the_buffer_shape():
@@ -105,6 +109,24 @@ def test_operands_all_share_the_buffer_shape():
     assert tuple(bells.bells.shape) == want
     assert tuple(bells.generation.shape) == want
     assert tuple(bells.selectors[0].shape) == want
+
+
+def test_sharding_does_not_change_the_buffer():
+    """A torch tensor handed to a Pallas op is one chip's shard, which
+    `jax_placeholder` multiplies up to the global shape. So sharding the bells
+    changes the partition spec and nothing about the allocation."""
+    from jax.sharding import PartitionSpec
+
+    mesh = jax.make_mesh((1, ), ("pcp", ), devices=jax.devices("cpu")[:1])
+    want = (NUM_GROUPS, BELL_SUBLANES, BELL_LANES)
+
+    plain, _ = _cpu_set()
+    plain.prebuild(None, None)
+    sharded, _ = _cpu_set()
+    sharded.prebuild(mesh, PartitionSpec("pcp"))
+
+    assert tuple(plain.bells.shape) == want
+    assert tuple(sharded.bells.shape) == want
 
 
 def test_each_selector_picks_out_exactly_one_group():
@@ -126,8 +148,7 @@ def test_layers_map_to_groups_in_order_and_gdn_layers_do_not():
 
 def test_verify_reads_are_bounded():
     """A read forces a device sync, so it must not happen every step."""
-    names = [f"model.layers.{4 * i + 3}.self_attn.attn" for i in range(15)]
-    bells = DoorbellSet(names, torch.device("cpu"), verify_steps=3)
+    bells, _ = _cpu_set(verify_steps=3)
 
     reads = []
     bells.read = lambda: reads.append(1) or [0] * NUM_GROUPS
@@ -160,8 +181,202 @@ def test_prebuild_registers_a_torch_op_under_shard_map():
 
     mesh = jax.make_mesh((1, ), ("x", ), devices=jax.devices("cpu")[:1])
     bells, _ = _cpu_set()
-    bells.prebuild(mesh, PartitionSpec())
+    bells.prebuild(mesh, PartitionSpec("x"))
     assert bells.op is not None
+
+
+def test_shards_come_from_the_mesh_not_from_a_second_config_read():
+    from jax.sharding import PartitionSpec
+
+    from vllm_torchtpu.distributed.kv_transfer.doorbell import shards_for
+
+    mesh = jax.make_mesh((1, ), ("pcp", ), devices=jax.devices("cpu")[:1])
+    assert shards_for(mesh, PartitionSpec("pcp")) == 1
+    # No mesh, no spec, or a spec that leaves dimension zero alone all mean
+    # the KV cache lives on one chip.
+    assert shards_for(None, None) == 1
+    assert shards_for(mesh, None) == 1
+    assert shards_for(mesh, PartitionSpec(None)) == 1
+
+
+def test_the_bells_follow_the_kv_cache_onto_its_axis():
+    """The axis is read off the KV cache's own spec rather than named in the
+    doorbell, so the two cannot drift apart. Recording the specs `shard_map`
+    was handed is the only way to see that from outside."""
+    from jax.sharding import PartitionSpec
+
+    import vllm_torchtpu.distributed.kv_transfer.doorbell as mod
+
+    seen = {}
+    original = mod._make_sharded_bell_fn
+
+    def spy(num_groups, mesh, announced_spec, bells_spec):
+        seen["bells"] = bells_spec
+        return original(num_groups, mesh, announced_spec, bells_spec)
+
+    mesh = jax.make_mesh((1, ), ("pcp", ), devices=jax.devices("cpu")[:1])
+    bells, _ = _cpu_set()
+    mod._make_sharded_bell_fn = spy
+    try:
+        bells.prebuild(mesh, PartitionSpec("pcp"))
+    finally:
+        mod._make_sharded_bell_fn = original
+
+    assert seen["bells"] == PartitionSpec("pcp")
+
+
+class _FakeStats:
+
+    def __init__(self, polls):
+        self.polls = polls
+        self.poll_failures = 0
+        self.poll_nanos_total = polls * 40_000
+        self.poll_nanos_max = 90_000
+        self.torn_tiles = 0
+        self.sightings_dropped = 0
+        self.sightings_recorded = 0
+
+
+class _FakeSighting:
+
+    def __init__(self, group, generation, host_nanos):
+        self.group = group
+        self.generation = generation
+        self.host_nanos = host_nanos
+
+
+class _FakeReader:
+    """Stands in for raiden's C++ reader.
+
+    The watcher's job is bookkeeping: grouping sightings by generation,
+    deciding which generations are complete, and turning the complete ones
+    into a stagger. None of that needs a device, and testing it here means the
+    only thing the TPU has to answer is whether the counters move at all.
+    """
+
+    def __init__(self, num_groups):
+        self._num_groups = num_groups
+        self.queued = []
+        self.started_with = None
+        self.stopped = False
+
+    def start(self, poll_interval_nanos):
+        self.started_with = poll_interval_nanos
+
+    def stop(self):
+        self.stopped = True
+
+    def num_groups(self):
+        return self._num_groups
+
+    def drain_sightings(self):
+        out, self.queued = self.queued, []
+        return out
+
+    def stats(self):
+        return _FakeStats(polls=1000)
+
+
+def _watcher_with(monkeypatch, reader, report_every=1):
+    import vllm_torchtpu.distributed.kv_transfer.doorbell as mod
+
+    bells, _ = _cpu_set()
+    monkeypatch.setattr(mod, "_make_reader", lambda tensor: reader)
+    return mod.DoorbellWatcher(bells,
+                               poll_interval_ns=200_000,
+                               report_every=report_every), bells
+
+
+def test_watcher_starts_the_reader_at_the_requested_cadence(monkeypatch):
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, _ = _watcher_with(monkeypatch, reader)
+    assert reader.started_with == 200_000
+    watcher.close()
+    assert reader.stopped
+
+
+def test_watcher_reports_only_passes_where_every_group_rang(
+        monkeypatch, caplog):
+    """A pass missing a group has no stagger, since the span would be measured
+    against whichever groups happened to be sighted."""
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, _ = _watcher_with(monkeypatch, reader)
+
+    reader.queued = [
+        _FakeSighting(g, 1, 1_000_000 * g) for g in range(NUM_GROUPS - 1)
+    ]
+    with caplog.at_level("INFO"):
+        watcher.after_step()
+    assert "no pass yet had all" in caplog.text
+    assert "stagger over" not in caplog.text
+
+
+def test_watcher_measures_the_span_from_first_bell_to_last(
+        monkeypatch, caplog):
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, _ = _watcher_with(monkeypatch, reader)
+
+    # Group g rings one millisecond after group g-1, so fifteen groups span
+    # fourteen milliseconds.
+    reader.queued = [
+        _FakeSighting(g, 1, 1_000_000 * g) for g in range(NUM_GROUPS)
+    ]
+    with caplog.at_level("INFO"):
+        watcher.after_step()
+    assert "median 14.00 ms" in caplog.text
+    assert "0.00, 1.00, 2.00" in caplog.text
+
+
+def test_watcher_reports_a_stale_buffer_differently_from_silent_bells(
+        monkeypatch, caplog):
+    """These fail identically from the reader's side and have opposite causes,
+    so the direct read that tells them apart is worth its one device sync."""
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, bells = _watcher_with(monkeypatch, reader)
+    bells.read = lambda: [7] * NUM_GROUPS
+
+    with caplog.at_level("INFO"):
+        watcher.after_step()
+    assert "watching stale memory" in caplog.text
+
+
+def test_watcher_stays_quiet_when_the_bells_are_genuinely_unrung(
+        monkeypatch, caplog):
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, bells = _watcher_with(monkeypatch, reader)
+    bells.read = lambda: [0] * NUM_GROUPS
+
+    with caplog.at_level("INFO"):
+        watcher.after_step()
+    assert "agrees the bells are unrung" in caplog.text
+    assert "watching stale memory" not in caplog.text
+
+
+def test_watcher_reports_every_nth_step_and_not_between(monkeypatch):
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, _ = _watcher_with(monkeypatch, reader, report_every=5)
+
+    drains = []
+    original = reader.drain_sightings
+    reader.drain_sightings = lambda: drains.append(1) or original()
+
+    for _ in range(12):
+        watcher.after_step()
+    assert len(drains) == 2
+
+
+def test_watcher_forgets_passes_older_than_the_newest_complete_one(
+        monkeypatch):
+    """Generations arrive in order, so a pass still missing a group once a
+    later pass has finished will never fill in. Keeping it would leak."""
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, _ = _watcher_with(monkeypatch, reader)
+
+    reader.queued = (
+        [_FakeSighting(0, 1, 0)] +
+        [_FakeSighting(g, 2, 1000 * g) for g in range(NUM_GROUPS)])
+    watcher.after_step()
+    assert list(watcher._pending) == [2]
 
 
 def test_generation_starts_below_first_and_rises_once_per_step():
