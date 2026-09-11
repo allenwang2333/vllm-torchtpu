@@ -49,30 +49,15 @@ def get_dtype_packing(dtype):
 
 
 # --------------------------------------------------------------------------- #
-# Context-parallel compressed-coordinate helpers.
+# Context-parallel coordinate helpers.
 #
 # A context-parallel axis shards the KV cache chunk-interleaved over
-# `interleave_size` *uncompressed* tokens. The indexer stores one compressed row
-# per `compression_ratio` tokens, so the chunk width in compressed space is
-# `interleave_c = interleave_size // compression_ratio` and global compressed
-# position `g` is owned by rank `(g // interleave_c) % cp_size`.
-#
-# The arithmetic is the same whichever axis owns the interleave, so these are
-# plain `cp_` helpers: DCP is the only caller here, but nothing below reads the
-# axis name except `cp_rank_as_data`, which takes it as an argument.
-#
-# `cp_rank` is a traced i32 scalar throughout, so a single compiled program
-# serves every rank; only `cp_size` and `interleave_c` are static.
+# `interleave_size` uncompressed tokens.
 # --------------------------------------------------------------------------- #
 
 
 def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
-    """Map a rank-local compressed index to its global compressed position.
-
-    Monotonic in `local_idx`, so the l-th position this rank owns is exactly
-    ``cp_local_to_global(l, ...)``. That is what lets the kernel keep using a
-    plain ``global_pos < kv_len`` test as the local bounds check.
-    """
+    """Map a rank-local compressed index to its global compressed position."""
     if cp_size == 1:
         return local_idx
     cycle_c = cp_size * interleave_c
@@ -102,14 +87,7 @@ def cp_owner_rank(global_idx, cp_size: int, interleave_c: int):
 
 
 def cp_global_to_local(global_idx, cp_size: int, interleave_c: int):
-    """Inverse of `cp_local_to_global`, evaluated on the owning rank.
-
-    Takes no rank argument, and does not need one: the owner is recoverable
-    from `global_idx` alone (`cp_owner_rank`), and once the owner is fixed the
-    local index is the same arithmetic everywhere. That is what lets the DCP
-    merge convert a winner to the coordinate space of whichever rank holds it
-    without being on that rank.
-    """
+    """Inverse of `cp_local_to_global`, evaluated on the owning rank."""
     if cp_size == 1:
         return global_idx
     cycle_c = cp_size * interleave_c
