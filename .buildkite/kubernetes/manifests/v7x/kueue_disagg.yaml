@@ -57,6 +57,21 @@ spec:
       - benchmark
   # Long enough for the launcher's last log poll after the client exits.
   ttlSecondsAfterFinished: 300
+  # One role at a time, in the order below, each waiting for the previous to be
+  # ready. The two engines want the same weights, and the Hugging Face cache
+  # they populate is a gcsfuse mount: the lock file HF takes around a download
+  # is a real lock on a local disk, which is what makes this safe on bare metal,
+  # and an ordinary object here. Started together, two engines race in the model
+  # directory and one reads a file whose inode has been replaced underneath it -
+  # OSError: [Errno 116] Stale file handle, out of the tokenizer load, before
+  # either reaches the chips.
+  #
+  # Serialising costs one cold load: prefill fetches, decode finds everything
+  # cached. It also means the client is created only once both engines answer
+  # /health, so its own wait loop below returns on the first attempt and stays
+  # as the thing that fails the run if an engine dies after being ready.
+  startupPolicy:
+    startupPolicyOrder: InOrder
   replicatedJobs:
     # ---------------------------------------------------------
     # PREFILL ENGINE (DP1/PCP8/TP1)
@@ -113,6 +128,19 @@ spec:
                     ulimit -c 0
                     export VLLM_HOST_IP="$${POD_IP}"
                     exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=32768 --long-prefill-token-threshold=32768 --max-num-seqs=8 --prefill-context-parallel-size=8 --cp-kv-cache-interleave-size=256 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[1024,2048,4096,5120],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}'
+                # What startupPolicy waits on: a pod counts as ready only once
+                # the server answers, so "ready" means the weights are loaded
+                # and cached rather than that the container has started. No
+                # failureThreshold worth setting - a readiness probe never
+                # restarts anything, it only holds the pod out of ready - and
+                # no livenessProbe, because a cold load here is measured in
+                # tens of minutes and restarting an engine mid-load would only
+                # start it again.
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  periodSeconds: 10
                 env:
                 - name: POD_IP
                   valueFrom:
@@ -314,6 +342,11 @@ spec:
                     ulimit -c 0
                     export VLLM_HOST_IP="$${POD_IP}"
                     exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=4384 --max-num-seqs=32 --prefill-context-parallel-size=1 --data-parallel-size=8 --data-parallel-size-local=8 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[8,16,32,4352,4384],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}'
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8000
+                  periodSeconds: 10
                 env:
                 - name: POD_IP
                   valueFrom:
