@@ -879,40 +879,6 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
-def merge_dcp_lse_partials(outputs: jax.Array, lses: jax.Array) -> jax.Array:
-    """Combine per-rank sparse-MLA partials into the whole-context result.
-
-    With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
-    exact global result is `o = sum_r softmax_r(lse) * o_r`. This is the whole
-    reason DCP does not need a ring: the partial state `(m, l, l*o)` forms a
-    commutative monoid, so the shards can be combined in any order by a single
-    reduction instead of rotated past each other.
-
-    Args:
-      outputs: `[dcp_size, num_tokens, num_heads, v_dim]` per-rank outputs.
-      lses: `[dcp_size, num_tokens, num_heads]` matching log-sum-exps.
-        Non-finite entries mark ranks that own none of that token's top-k;
-        `sparse_mla_attention_dcp` sets them, because such a rank is still fed
-        a dummy key (the kernel requires `kv_len >= 1`) and returns a real but
-        meaningless softmax that must not be weighted in.
-
-    Returns:
-      `[num_tokens, num_heads, v_dim]` in f32. Tokens no rank contributed to
-      -- padding rows -- come back as zeros rather than NaN.
-    """
-    lses = lses.astype(jnp.float32)
-    shift = jnp.max(lses, axis=0, keepdims=True)
-    # A token with no contributor anywhere would give inf - inf; pin the shift
-    # to 0 there and let the all-zero denominator carry the result to zero.
-    all_empty = ~jnp.isfinite(shift)
-    weights = jnp.exp(lses - jnp.where(all_empty, 0.0, shift))
-    weights = jnp.where(jnp.isfinite(lses), weights, 0.0)
-    denom = jnp.sum(weights, axis=0, keepdims=True)
-    weights = jnp.where(denom > 0, weights / jnp.where(denom > 0, denom, 1.0),
-                        0.0)
-    return jnp.sum(weights[..., None] * outputs.astype(jnp.float32), axis=0)
-
-
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -954,10 +920,14 @@ def sparse_mla_attention_dcp(
     plain TP every rank gathers the *same* 640 B rows, once per rank. Sharding
     the positions removes that redundancy for the cost of one LSE merge.
 
-    This returns partials rather than the merged result. The merge is a single
-    reduction over `dcp_axis_name` (see `merge_dcp_lse_partials`) and is left
-    to the caller so it can run outside this exported op, where the
-    torch->JAX export path places no constraints on collectives.
+    This returns partials rather than the merged result. With per-rank
+    normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the exact global
+    result is `o = sum_r softmax_r(lse) * o_r` -- a single reduction over
+    `dcp_axis_name`, because the partial state `(m, l, l*o)` forms a
+    commutative monoid and needs no ring. It is left to the caller
+    (`cp_mla_attention.merge_lse_partials_scatter_heads`) so it can run
+    outside this exported op, where the torch->JAX export path places no
+    constraints on collectives.
 
     Args:
       ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
@@ -977,10 +947,10 @@ def sparse_mla_attention_dcp(
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
       `[dcp_size * num_tokens, num_heads, lkv_dim]` and `lse` is
       `[dcp_size * num_tokens, num_heads]`, both sharded over `dcp_axis_name`
-      and both *partial*: reshape to `[dcp_size, num_tokens, ...]` and pass to
-      `merge_dcp_lse_partials`. `lse` is `-inf` wherever a rank owns none of a
-      token's top-k, which is what makes that merge a plain softmax with no
-      separate count channel.
+      and both *partial*: they must go through the log-sum-exp merge above
+      before `W_UV`. `lse` is `-inf` wherever a rank owns none of a token's
+      top-k, which is what makes that merge a plain softmax with no separate
+      count channel.
     """
     if dcp_size <= 1:
         raise ValueError(
