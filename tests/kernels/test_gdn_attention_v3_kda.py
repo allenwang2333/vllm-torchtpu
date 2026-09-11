@@ -282,7 +282,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
         seq_lens = jnp.asarray(q_loc[1:max_reqs + 1] - q_loc[:max_reqs],
                                dtype=jnp.int32)
 
-        common_kwargs = dict(
+        ref_kwargs = dict(
             qkv=qkv,
             b=b,
             a=a,
@@ -305,7 +305,12 @@ class KdaAttentionV3Test(parameterized.TestCase):
             gate_lower_bound=gate_lower_bound,
         )
 
-        (_, ref_state), ref_out = kda_attention_ref(**common_kwargs)
+        (_, ref_state), ref_out = kda_attention_ref(**ref_kwargs)
+
+        common_kwargs = dict(ref_kwargs)
+        common_kwargs.pop("conv_state")
+        common_kwargs.pop("recurrent_state")
+        common_kwargs["states"] = (conv_state, recurrent_state)
 
         kda_jitted = jax.jit(
             wrapper.fused_conv1d_gdn,
@@ -362,8 +367,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=jnp.zeros((8, dim_size)),
             b=jnp.zeros((8, n_v)),
             a=jnp.zeros((8, n_v * d_k)),
-            conv_state=jnp.zeros((9, kernel_size - 1, dim_size)),
-            recurrent_state=jnp.zeros((9, n_v, d_k, d_v)),
+            states=(jnp.zeros((9, kernel_size - 1, dim_size)),
+                    jnp.zeros((9, n_v, d_k, d_v))),
             conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
             conv_bias=None,
             a_log=jnp.zeros((n_v, )),

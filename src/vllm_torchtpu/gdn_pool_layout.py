@@ -27,6 +27,7 @@ POOLED_GDN_ARCHITECTURES = frozenset({
 DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
 DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
 _ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
+GRANULE_BYTES: int = 512
 
 
 def pooled_gdn_state_dtypes(
@@ -91,6 +92,18 @@ class PooledGDNStateLayout:
     conv_tokens: int
 
     @property
+    def granules_per_token(self) -> int:
+        return self.token_bytes // GRANULE_BYTES
+
+    @property
+    def ssm_granules(self) -> int:
+        return self.ssm_tokens * self.granules_per_token
+
+    @property
+    def conv_granules(self) -> int:
+        return self.conv_tokens * self.granules_per_token
+
+    @property
     def required_tokens(self) -> int:
         return self.ssm_tokens + self.conv_tokens
 
@@ -112,6 +125,11 @@ def derive_pooled_gdn_state_layout(
     """
     if min(ssm_bytes, conv_bytes, token_bytes) <= 0:
         raise ValueError("pooled GDN byte sizes must be positive")
+    if token_bytes % GRANULE_BYTES != 0:
+        raise ValueError(
+            f"token_bytes ({token_bytes}) must be a multiple of "
+            f"hardware DMA granule size ({GRANULE_BYTES} bytes)"
+        )
 
     ssm_tokens = (ssm_bytes + token_bytes - 1) // token_bytes
     conv_tokens = 1

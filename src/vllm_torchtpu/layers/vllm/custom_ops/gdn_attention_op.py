@@ -329,12 +329,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 torch,
                 DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
         else:
-            # TODO: Support bf16 conv state.
-            # Per-layer cache: unlike the pool, the declared dtype IS the
-            # storage dtype (vLLM strides the raw tensor with it), and this
-            # kernel path still reads fp32 conv state. Nothing pads this
-            # layout, so the wider declaration costs only its own bytes.
-            conv_state_dtype = torch.float32
+            # Per-layer cache: support both bf16 and fp32 conv state.
+            if conv_state_dtype not in (torch.bfloat16, torch.float32):
+                conv_state_dtype = torch.bfloat16
         return conv_state_dtype, temporal_state_dtype
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:

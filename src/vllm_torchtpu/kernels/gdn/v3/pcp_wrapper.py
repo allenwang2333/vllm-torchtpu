@@ -16,7 +16,7 @@
 The Qwen3.5 FP8 entry projects QKVZ in-kernel and interleaves all but the first
 projection block with GDN tiles. BA exchange, gated normalization, and the
 final output projection remain outside. GDN state streams directly to and from
-the unified KV pool through a StateSourcePlan. QKV is written directly into a
+the unified KV pool through direct layout offsets. QKV is written directly into a
 compact destination-major HBM layout, so each source rank pushes one contiguous
 rank-local token chunk per destination without head-width padding.
 
@@ -36,6 +36,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from typing import Any
 
 from vllm_torchtpu.kernels.gdn.v3 import (config, memory_ref, pcp_metadata,
                                           wrapper)
@@ -219,8 +220,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     # Outputs.
     gdn_out_ref: jax.Array,
     packed_out_ref: jax.Array,
-    conv_state_updates_ref: jax.Array,
-    recurrent_state_updates_ref: jax.Array,
+    state_source_out_ref: jax.Array,
     projected_qkv_ref: jax.Array,
     z_ref: jax.Array,
     active_rows_out_ref: jax.Array,
@@ -257,7 +257,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     pcp_axis_name: str,
 ) -> None:
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
-    del packed_out_hbm_ref
+    del packed_out_hbm_ref, state_source_out_ref
 
     rank = lax.axis_index(pcp_axis_name)
     active_rows_smem_ref[0] = stage_metadata_ref.rank_active_row_end[rank]
@@ -748,8 +748,6 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             conv_state_ref=state_source_ref,
             recurrent_state_ref=state_source_ref,
             cfg=cfg,
-            conv_state_output_ref=conv_state_updates_ref,
-            recurrent_state_output_ref=recurrent_state_updates_ref,
         ))
 
     num_tiles = metadata_ref.num_tiles[...]
@@ -1117,49 +1115,6 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     )
 
 
-def _scatter_compact_state_updates(
-    state_source: jax.Array,
-    updates: jax.Array,
-    state_indices: jax.Array,
-    query_start_loc: jax.Array,
-    num_active_seqs: jax.Array,
-    *,
-    state_stride: int,
-    region: config.StateRegion,
-) -> jax.Array:
-    """Apply raw per-sequence state tiles to a donated unified pool.
-
-    Pallas emits only the state bytes touched by this invocation.  Expressing
-    the final pool update with native dynamic slices keeps the mutation visible
-    to JAX/XLA and allows donation to reuse the input allocation, without
-    making the whole pool a Pallas output.
-    """
-    num_sequences = state_indices.shape[0]
-    active_bound = jnp.minimum(num_active_seqs, num_sequences)
-
-    def _apply_one(sequence_id, pool):
-        state_index = state_indices[sequence_id]
-        block_start = state_index * state_stride + region.kb0
-        has_tokens = (query_start_loc[sequence_id + 1]
-                      > query_start_loc[sequence_id])
-        valid = jnp.logical_and(has_tokens, state_index >= 0)
-        valid = jnp.logical_and(
-            valid,
-            block_start + region.nblocks <= state_source.shape[0],
-        )
-
-        def _write(pool):
-            start_indices = (block_start, region.row0,
-                             *(0, ) * (state_source.ndim - 2))
-            return lax.dynamic_update_slice(pool, updates[sequence_id],
-                                            start_indices)
-
-        return lax.cond(valid, _write, lambda pool: pool, pool)
-
-    # A runtime loop scales the update work with the live request count rather
-    # than the compile bucket's maximum sequence capacity.
-    return lax.fori_loop(0, active_bound, _apply_one, state_source)
-
 
 @functools.partial(
     jax.jit,
@@ -1176,7 +1131,12 @@ def _scatter_compact_state_updates(
         "compute_precision",
         "mesh_axis_names",
         "pcp_axis_name",
-        "state_plan",
+        "state_stride",
+        "state_layout",
+        "ssm_tokens",
+        "conv_tokens",
+        "recurrent_state_dtype",
+        "conv_state_dtype",
     ),
 )
 def fused_qkvz_projection_pcp_gdn(
@@ -1204,18 +1164,61 @@ def fused_qkvz_projection_pcp_gdn(
     comm_chunk_size: int,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
-    state_plan: config.StateSourcePlan,
+    state_stride: int = 1,
+    state_layout: Any = None,
+    ssm_tokens: int | None = None,
+    conv_tokens: int | None = None,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
+    recurrent_state_dtype: jnp.dtype = jnp.float32.dtype,
+    conv_state_dtype: jnp.dtype = jnp.bfloat16.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Run ragged PCP prefill with fused QKVZ projection and communication.
 
     hidden_states is the rank-local token shard. b and a have already been
     exchanged and restored to global request-major order for the PCP-local
-    value-head shard. state_source is this rank's unified KV pool; state_plan
-    describes its conv and recurrent byte regions. Runtime stage metadata
-    handles mixed request lengths and arbitrary absolute query offsets without
-    expanding active work to the compile bucket.
+    value-head shard. state_source is this rank's unified KV pool. Runtime stage
+    metadata handles mixed request lengths and arbitrary absolute query offsets
+    without expanding active work to the compile bucket.
+
+    Args:
+        hidden_states: Rank-local token shard (num_tokens, hidden_dim).
+        qkvz_weight: Quantized projection weights.
+        qkvz_weight_scale: Quantization scales.
+        b: Global BA b projection shard.
+        a: Global BA a projection shard.
+        state_source: Donated unified KV pool in HBM.
+        conv_weight: Conv1d weight tensor.
+        conv_bias: Conv1d bias tensor or None.
+        a_log: GDN A_log weight tensor.
+        dt_bias: GDN dt_bias weight tensor.
+        query_start_loc: Sequence token offsets.
+        state_indices: Per-sequence pool manager block indices.
+        distribution: Sequence distribution buckets.
+        seq_lens: Sequence token lengths.
+        n_kq: Total KQ attention heads across all ranks.
+        n_v: Total V attention heads across all ranks.
+        d_k: KQ head dimension.
+        d_v: V head dimension.
+        kernel_size: Conv1d kernel size.
+        pcp_size: Context parallelism group size.
+        comm_chunk_size: Token chunk size for ring communication.
+        mesh_axis_names: Device mesh axis name tuple.
+        pcp_axis_name: Name of PCP device mesh axis.
+        state_stride: Manager-to-kernel block split ratio.
+        state_layout: Optional unified pool layout descriptor.
+        ssm_tokens: Optional number of token rows for SSM state.
+        conv_tokens: Optional number of token rows for conv state.
+        mixed_tile_size: Maximum GDN compute tile size.
+        compute_precision: Dtype for GDN inner loop arithmetic.
+        recurrent_state_dtype: Storage dtype of recurrent state in unified pool.
+        conv_state_dtype: Storage dtype of conv state in unified pool.
+
+    Returns:
+        Tuple of (mutated_state_source, packed_gdn_out, z_projection).
+
+    Raises:
+        ValueError: On incompatible geometry, invalid PCP size, or missing layouts.
     """
     if pcp_size <= 1:
         raise ValueError("The PCP fused GDN kernel requires pcp_size > 1.")
@@ -1239,8 +1242,7 @@ def fused_qkvz_projection_pcp_gdn(
     if b.shape != a.shape:
         raise ValueError(f"b and a shapes must match, got {b.shape} and "
                          f"{a.shape}.")
-    if state_plan is None:
-        raise ValueError("The unified-pool PCP kernel requires a state plan.")
+    del state_stride, state_layout, ssm_tokens, conv_tokens
 
     global_batch_size = b.shape[0]
     local_num_tokens = hidden_states.shape[0]
@@ -1361,8 +1363,8 @@ def fused_qkvz_projection_pcp_gdn(
             act_in=jnp.float32.dtype,
             act_out=act_out_dtype,
             compute=compute_precision,
-            recurrent_state=jnp.float32.dtype,
-            conv_state=jnp.float32.dtype,
+            recurrent_state=jnp.dtype(recurrent_state_dtype),
+            conv_state=jnp.dtype(conv_state_dtype),
         ),
         batch_size=global_batch_size,
         dim_size=local_dim,
@@ -1372,7 +1374,7 @@ def fused_qkvz_projection_pcp_gdn(
         num_v_heads=local_n_v,
         kq_head_dim=d_k,
         v_head_dim=d_v,
-        state_plan=state_plan,
+        is_shared=True,
     )
     receive_group_stride = _qkv_receive_group_stride(comm_chunk_size,
                                                      tile_size)
@@ -1451,25 +1453,13 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         act_out_dtype,
     )
-    state_update_tail = state_source.shape[2:]
-    conv_state_updates_shape = jax.ShapeDtypeStruct(
-        (
-            state_indices.shape[0],
-            state_plan.conv.nblocks,
-            state_plan.conv.nrows,
-            *state_update_tail,
-        ),
-        state_source.dtype,
-    )
-    recurrent_state_updates_shape = jax.ShapeDtypeStruct(
-        (
-            state_indices.shape[0],
-            state_plan.recurrent.nblocks,
-            state_plan.recurrent.nrows,
-            *state_update_tail,
-        ),
-        state_source.dtype,
-    )
+    num_lanes = 128
+    sublanes = (num_lanes * 4) // (num_lanes * state_source.dtype.itemsize)
+    granule_elements = sublanes * num_lanes
+    state_source_orig_shape = state_source.shape
+    if state_source.size % granule_elements == 0:
+        state_source = state_source.reshape(state_source.shape[0], -1, sublanes, num_lanes)
+
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
@@ -1517,6 +1507,7 @@ def fused_qkvz_projection_pcp_gdn(
     stage_metadata_leaves = len(jax.tree_util.tree_leaves(stage_metadata_obj))
     state_input_offset = metadata_leaves + stage_metadata_leaves
     input_output_aliases = {
+        state_input_offset + 5: 2,
         state_input_offset + 6: 0,
         state_input_offset + 7: 1,
     }
@@ -1527,7 +1518,7 @@ def fused_qkvz_projection_pcp_gdn(
     # the same 90% hardware budget as the production GMM kernels.
     vmem_limit_bytes = int(0.90 * pltpu.get_tpu_info().vmem_capacity_bytes)
 
-    (gdn_out, packed_out, conv_state_updates, recurrent_state_updates,
+    (gdn_out, packed_out, updated_state_source,
      _projected_qkv, z, active_rows) = pl.pallas_call(
          functools.partial(
              _pcp_qkvz_projection_gdn_outer_kernel,
@@ -1541,8 +1532,7 @@ def fused_qkvz_projection_pcp_gdn(
          out_shape=(
              zero_gdn_out,
              zero_packed_out,
-             conv_state_updates_shape,
-             recurrent_state_updates_shape,
+             state_source,
              projected_qkv_shape,
              z_shape,
              jax.ShapeDtypeStruct((1, ), jnp.int32),
@@ -1561,7 +1551,6 @@ def fused_qkvz_projection_pcp_gdn(
              weights_spec,
          ),
          out_specs=(
-             hbm_spec,
              hbm_spec,
              hbm_spec,
              hbm_spec,
@@ -1620,26 +1609,7 @@ def fused_qkvz_projection_pcp_gdn(
          weights,
      )
 
-    num_active_seqs = distribution[-1]
-    state_source = _scatter_compact_state_updates(
-        state_source,
-        conv_state_updates,
-        state_indices,
-        query_start_loc,
-        num_active_seqs,
-        state_stride=state_plan.stride,
-        region=state_plan.conv,
-    )
-    state_source = _scatter_compact_state_updates(
-        state_source,
-        recurrent_state_updates,
-        state_indices,
-        query_start_loc,
-        num_active_seqs,
-        state_stride=state_plan.stride,
-        region=state_plan.recurrent,
-    )
-
+    updated_state_source = updated_state_source.reshape(state_source_orig_shape)
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)
     value_tile_rows = shard_value_dim // _TPU_TILE_COLUMNS
     z = z[:, :, :value_tile_rows, :].reshape(local_num_tokens, n_v, d_v)
@@ -1649,4 +1619,4 @@ def fused_qkvz_projection_pcp_gdn(
     # to normalization or later compiled layers.
     live_row = jnp.arange(local_num_tokens, dtype=jnp.int32) < active_rows[0]
     z = jnp.where(live_row[:, None, None], z, jnp.zeros((), dtype=z.dtype))
-    return state_source, packed_out, z
+    return updated_state_source, packed_out, z

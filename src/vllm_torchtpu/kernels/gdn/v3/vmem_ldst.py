@@ -19,8 +19,19 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+
+
+def load_state_from_slot(slot_val: jax.Array,
+                         target_shape: tuple[int, ...]) -> jax.Array:
+    """Load compute state from VMEM slot, slicing away any granule padding."""
+    target_elements = math.prod(target_shape)
+    if slot_val.size == target_elements:
+        return slot_val.reshape(target_shape).astype(jnp.float32)
+    num_lanes = slot_val.shape[-1]
+    target_lanes = target_elements // num_lanes
+    val_f32 = slot_val.astype(jnp.float32).reshape(-1, num_lanes)
+    return val_f32[:target_lanes].reshape(target_shape)
 
 
 def load_strided_heads(vmem_ref: jax.Ref,
@@ -97,96 +108,6 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
 
 
-def _region_rows_per_block(slot_ref: jax.Ref,
-                           region: config.StateRegion) -> tuple[int, int]:
-    """(typed rows per source block, typed lane count) of a slot tile."""
-    out_lanes = slot_ref.shape[-1] // region.lane_split
-    block_bytes = (math.prod(slot_ref.shape[1:]) *
-                   jnp.dtype(slot_ref.dtype).itemsize)
-    rows_pb = block_bytes // (jnp.dtype(region.view_dtype).itemsize *
-                              out_lanes)
-    return rows_pb, out_lanes
-
-
-def load_state_region(slot_ref: jax.Ref, region: config.StateRegion,
-                      shape: tuple[int, ...]) -> jax.Array:
-    """Loads one slot's state from its raw source-layout tile.
-
-    Args:
-        slot_ref: One slot's VMEM tile of shape [region.nblocks,
-            region.nrows, *source payload dims, source lanes] in the
-            source dtype.
-        region: The region's copy-plan (typed view parameters).
-        shape: Logical state shape; its element count must equal
-            ``region.rows_used`` times the typed view's lane count. The FP32
-            path narrows the ref to the logical minor dimension; BF16 keeps
-            the full carrier width and reshapes the loaded array here.
-
-    Returns:
-        The logical state of ``shape`` in ``region.view_dtype``.
-    """
-    parts = [
-        typed_ldst.load_typed(slot_ref.at[j],
-                              view_dtype=region.view_dtype,
-                              lane_split=region.lane_split)
-        for j in range(region.nblocks)
-    ]
-    arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
-    arr = arr[:region.rows_used]
-    if region.rows_perm is not None:
-        # Static row gather from the stored order to the logical order;
-        # sublane-dim slices + concat only, no lane crossing.
-        arr = jnp.concat([arr[p][None] for p in region.rows_perm], axis=0)
-    return arr.reshape(shape)
-
-
-def store_state_region(slot_ref: jax.Ref, region: config.StateRegion,
-                       values: jax.Array) -> None:
-    """Stores one slot's logical state into its raw source-layout tile.
-
-    Typed rows past ``region.rows_used`` are zeroed so the tile's whole
-    region has deterministic bytes when copied out.
-    """
-    rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
-    arr = values.astype(region.view_dtype)
-    arr = arr.reshape(-1, out_lanes)
-    if region.rows_perm is not None:
-        # Inverse of the load-side gather: logical row i is stored at
-        # typed row rows_perm[i].
-        inverse = [0] * len(region.rows_perm)
-        for logical, stored in enumerate(region.rows_perm):
-            inverse[stored] = logical
-        arr = jnp.concat([arr[i][None] for i in inverse], axis=0)
-    capacity = region.nblocks * rows_pb
-    if region.rows_used < capacity:
-        arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
-    for j in range(region.nblocks):
-        typed_ldst.store_typed(slot_ref.at[j],
-                               arr[j * rows_pb:(j + 1) * rows_pb],
-                               lane_split=region.lane_split)
-
-
-def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
-                     idx: int) -> jax.Array:
-    """One slot's conv state, decoded through the plan when there is one."""
-    # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-    if cfg.state_plan is None:
-        return slot_ref[idx, 0].astype(jnp.float32)
-    return load_state_region(slot_ref.at[idx, 0], cfg.state_plan.conv,
-                             (cfg.prev_kernel_size, 1, cfg.dim_size)).astype(
-                                 jnp.float32)
-
-
-def _load_recurrent_state(slot_ref: jax.Ref, cfg: config.GDNConfig,
-                          idx: int) -> jax.Array:
-    """One slot's recurrent state, converted to FP32 for compute."""
-    if cfg.state_plan is None:
-        return slot_ref[idx, 0].astype(jnp.float32)
-    return load_state_region(
-        slot_ref.at[idx, 0], cfg.state_plan.recurrent,
-        (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim)).astype(jnp.float32)
-
-
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
@@ -196,41 +117,14 @@ def load_and_select_states(
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Load correct states from HBM or prior tile, and masks invalid states.
-
-    Reference metadata to select the appropriate prior states. If `is_first_tile`
-    is True, it selects states read from HBM. If it is False, it selects
-    carry states from previous tile. If `has_initial_state` is False, states are
-    zero initialized.
-
-    When `cfg.state_plan` is set, the state refs hold raw source-layout
-    tiles (see `memory_ref.ExternalStateBufferedRef`) and are decoded
-    through the plan's typed region views instead of read directly.
-
-    Args:
-        metadata_ref: Metadata reference containing grid and sequence mappings.
-        p_id: Current Pallas program ID.
-        conv_state_slot_ref: Convolution state read from HBM of shape
-            [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
-        recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            window_size, num_v_heads, kq_head_dim, v_head_dim].
-        carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
-            [seq_tile_size, prev_kernel_size, 1, dim_size].
-        carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
-            shape [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
-        cfg: GDN configuration object.
-
-    Returns:
-        real_sizes: Valid token count per sequence tile of shape [seq_tile_size].
-        prev_conv_state: Selected convolution state of shape [seq_tile_size,
-        prev_kernel_size, 1, dim_size] in float32.
-        prev_recurrent_state: Selected recurrent state of shape [seq_tile_size,
-        num_v_heads, kq_head_dim, v_head_dim].
-    """
-
+    """Load correct states from HBM or prior tile, and masks invalid states."""
     real_sizes_list = []
     prev_conv_state_list = []
     prev_recurrent_state_list = []
+
+    expected_conv_shape = (cfg.prev_kernel_size, 1, cfg.dim_size)
+    expected_recurrent_shape = (cfg.num_v_heads, cfg.kq_head_dim,
+                                cfg.v_head_dim)
 
     for idx in range(cfg.seq_tile_size):
         s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
@@ -238,39 +132,24 @@ def load_and_select_states(
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
-        # NOTE: The VMEM window holds one state per window position and the
-        # initial state was DMA'd into position 0.
-        # Both scratches are allocated together (see GDNConfig.scratch_shapes).
-        # Only the pool decode is worth guarding; a dense slot read is cheap
-        # enough that the guard costs more than it saves.
-        if carry_conv_scratch_ref is None or cfg.state_plan is None:
-            prev_conv_state = jnp.where(
-                has_initial_state,
-                _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
-            prev_recurrent_state = jnp.where(
-                has_initial_state,
-                _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
-            if carry_conv_scratch_ref is not None:
-                prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
-                                            carry_conv_scratch_ref[idx])
-                prev_recurrent_state = jnp.where(
-                    is_first_tile, prev_recurrent_state,
-                    carry_recurrent_scratch_ref[idx])
-        else:
-            # Later tiles resume from the carry, so decode both sources once
-            # instead of on every tile. One guard, not one per state.
-            # pl.when traces the body here, so `idx` is this iteration's.
-            @pl.when(is_first_tile)
-            def _():
-                carry_conv_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_conv_state(conv_state_slot_ref, cfg, idx), 0)
-                carry_recurrent_scratch_ref[idx] = jnp.where(
-                    has_initial_state,
-                    _load_recurrent_state(recurrent_slot_ref, cfg, idx), 0)
+        # Direct slot read, slice away padding via load_state_from_slot, and cast to float32.
+        hbm_conv_state = load_state_from_slot(conv_state_slot_ref[idx, 0],
+                                              expected_conv_shape)
+        prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0.0)
+        if carry_conv_scratch_ref is not None:
+            prev_tile_conv = carry_conv_scratch_ref[idx]
+            prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
+                                        prev_tile_conv)
 
-            prev_conv_state = carry_conv_scratch_ref[idx]
-            prev_recurrent_state = carry_recurrent_scratch_ref[idx]
+        hbm_recurrent_state = load_state_from_slot(recurrent_slot_ref[idx, 0],
+                                                   expected_recurrent_shape)
+        prev_recurrent_state = jnp.where(has_initial_state,
+                                         hbm_recurrent_state, 0.0)
+        if carry_recurrent_scratch_ref is not None:
+            prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
+            prev_recurrent_state = jnp.where(is_first_tile,
+                                             prev_recurrent_state,
+                                             prev_tile_recurrent_scratch)
 
         real_sizes_list.append(real_sizes)
         prev_conv_state_list.append(prev_conv_state)
@@ -279,7 +158,6 @@ def load_and_select_states(
     real_sizes = jnp.stack(real_sizes_list, axis=0)
     prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
     prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
-
     return real_sizes, prev_conv_state, prev_recurrent_state
 
 

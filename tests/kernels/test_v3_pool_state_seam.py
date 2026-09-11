@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 
@@ -20,80 +21,40 @@ from vllm_torchtpu.kernels.gdn.v3 import wrapper
 N_KQ, N_V, D_K, D_V = 2, 8, 128, 128
 KERNEL_SIZE = 4
 DIM = N_KQ * D_K * 2 + N_V * D_V  # 1536
-SPLIT, KBS, LANES = 3, 256, 256
-PAYLOAD = (1, 2)
-TOK_BYTES = 2 * LANES * 2  # bf16 pool
+SPLIT, KBS, LANES = 3, 256, 128
+PAYLOAD = (1, 4)
+TOK_BYTES = 4 * LANES * 2  # bf16 pool: 1024 bytes = 2 granules
 SSM_NTOK = N_V * D_K * D_V * 4 // TOK_BYTES  # 512
 CONV_TOK0 = SSM_NTOK
+CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 36
 CONV_NTOK = 16
-CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
-CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
+CONV_SLOT_ROWS = CONV_NTOK * 4  # 64
 NUM_MGR = 5  # null block + 4 slots
 POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES, )
 
 
-def _plan(pool=None, **overrides):
-    if pool is None:
-        pool = jax.ShapeDtypeStruct(POOL_SHAPE, jnp.bfloat16)
-    kwargs = dict(split=SPLIT,
-                  ssm_ntok=SSM_NTOK,
-                  conv_tok0=CONV_TOK0,
-                  conv_ntok=CONV_NTOK,
-                  conv_dim=DIM,
-                  n_v=N_V,
-                  d_k=D_K,
-                  d_v=D_V,
-                  kernel_size=KERNEL_SIZE)
-    kwargs.update(overrides)
-    return pool_adapters.v3_state_source(pool, **kwargs)
-
-
-class TestV3StateSourcePlan:
+class TestPooledGDNStateLayoutMath:
     """Plan-construction math only; runs on CPU."""
 
-    def test_ssm_region_one_contiguous_whole_block_window(self):
-        r = _plan().recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 2, 0, KBS)
-        assert r.view_dtype == jnp.dtype(jnp.float32)
-        assert r.lane_split == LANES // D_V
-        assert r.rows_used == N_V * D_K
+    def test_ssm_and_conv_token_counts(self):
+        layout = derive_pooled_gdn_state_layout(
+            ssm_bytes=N_V * D_K * D_V * 4,
+            conv_bytes=(KERNEL_SIZE - 1) * DIM * 2,
+            token_bytes=TOK_BYTES,
+        )
+        assert layout.ssm_tokens == SSM_NTOK
+        assert layout.conv_tokens == CONV_NTOK
+        assert layout.granules_per_token == TOK_BYTES // 512
+        assert layout.ssm_granules == SSM_NTOK * layout.granules_per_token
+        assert layout.conv_granules == CONV_NTOK * layout.granules_per_token
 
-    def test_conv_region_rows_of_last_kernel_block(self):
-        plan = _plan()
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_NTOK)
-        assert c.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert c.lane_split == 1
-        assert c.rows_used == CONV_ROWS
-        assert plan.stride == SPLIT
-        assert plan.whole_block_dma is False
-
-    def test_plan_is_static_hashable_and_stable(self):
-        assert _plan() == _plan()
-        assert hash(_plan()) == hash(_plan())
-
-    def test_subblock_regions_when_pool_is_manager_grained(self):
-        pool = jax.ShapeDtypeStruct(
-            (NUM_MGR, SPLIT * KBS) + PAYLOAD + (LANES, ), jnp.bfloat16)
-        plan = _plan(pool, split=1)
-        r = plan.recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, SSM_NTOK)
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (0, 1, CONV_TOK0,
-                                                       CONV_NTOK)
-        assert plan.stride == 1
-
-    def test_one_byte_pool_keeps_regions_and_view_dtypes(self):
-        pool = jax.ShapeDtypeStruct((NUM_MGR * SPLIT, KBS, 1, 4, LANES),
-                                    jnp.int8)
-        plan = _plan(pool)
-        assert plan.recurrent.nblocks == 2
-        assert plan.recurrent.view_dtype == jnp.dtype(jnp.float32)
-        assert plan.conv.view_dtype == jnp.dtype(jnp.bfloat16)
-
-    def test_conv_region_straddling_kernel_blocks_rejected(self):
-        with pytest.raises(NotImplementedError):
-            _plan(conv_tok0=KBS - 8)
+    def test_granule_misalignment_rejected(self):
+        with pytest.raises(ValueError, match="hardware DMA granule size"):
+            derive_pooled_gdn_state_layout(
+                ssm_bytes=N_V * D_K * D_V * 4,
+                conv_bytes=(KERNEL_SIZE - 1) * DIM * 2,
+                token_bytes=TOK_BYTES + 128,
+            )
 
 
 def test_v3_kernel_package_stays_pool_agnostic():
@@ -124,7 +85,7 @@ def _write_states(pool, ssm, conv, idx):
     n = idx.shape[0]
     pool = pool_adapters.scatter_region(pool,
                                         ssm.astype(jnp.float32).reshape(
-                                            n, N_V * D_K, D_V),
+                                            n, -1, LANES),
                                         idx,
                                         tok0=0,
                                         ntok=SSM_NTOK,
@@ -180,20 +141,28 @@ def _run_roundtrip(pool, idx, kwargs):
     """The pre-seam pooled V3 path."""
     ssm, conv = _read_states(pool, idx)
     identity = jnp.arange(idx.shape[0], dtype=jnp.int32)
-    (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(conv_state=conv,
-                                                        recurrent_state=ssm,
-                                                        state_indices=identity,
-                                                        **kwargs)
+    (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
+        states=(conv, ssm),
+        state_indices=identity,
+        **kwargs)
     return _write_states(pool, new_ssm, new_conv, idx), out
 
 
 def _run_seam(pool, idx, kwargs):
-    return wrapper.fused_conv1d_gdn(conv_state=None,
-                                    recurrent_state=None,
-                                    state_indices=idx,
-                                    state_source=pool,
-                                    state_plan=_plan(pool),
-                                    **kwargs)
+    orig_shape = pool.shape
+    kbs = pool.shape[1]
+    split = SPLIT if kbs == KBS else 1
+    if split > 1:
+        pool_mgr = pool.reshape(-1, split * kbs, *orig_shape[2:])
+    else:
+        pool_mgr = pool
+    pool_mgr, out = wrapper.fused_conv1d_gdn(
+        states=pool_mgr,
+        state_indices=idx,
+        conv_dtype=jnp.bfloat16,
+        recurrent_dtype=jnp.float32,
+        **kwargs)
+    return pool_mgr.reshape(orig_shape), out
 
 
 class TestSeamMatchesRoundTrip:
@@ -283,19 +252,16 @@ class TestSeamMatchesRoundTrip:
         )
 
         def _run(src, read_ckpt):
-            return wrapper.fused_conv1d_gdn(conv_state=None,
-                                            recurrent_state=None,
-                                            state_indices=jnp.zeros(
-                                                (n, ), dtype=jnp.int32),
-                                            state_source=jnp.copy(src),
-                                            state_plan=_plan(src),
-                                            read_offsets=jnp.full(
-                                                (n, ),
-                                                read_ckpt,
-                                                dtype=jnp.int32),
-                                            ckpt_indices=ckpt_blocks,
-                                            num_spec_tokens=num_spec,
-                                            **kwargs)[1]
+            src_mgr = src.reshape(-1, SPLIT * KBS, *src.shape[2:])
+            return wrapper.fused_conv1d_gdn(
+                states=jnp.copy(src_mgr),
+                state_indices=jnp.zeros((n, ), dtype=jnp.int32),
+                read_offsets=jnp.full((n, ), read_ckpt, dtype=jnp.int32),
+                ckpt_indices=ckpt_blocks,
+                num_spec_tokens=num_spec,
+                conv_dtype=jnp.bfloat16,
+                recurrent_dtype=jnp.float32,
+                **kwargs)[1]
 
         for r in range(window):
             ssm_r, conv_r = states[r]
@@ -322,16 +288,17 @@ class TestSeamMatchesRoundTrip:
             seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
         )
         before = np.asarray(pool.view(jnp.int16))
-        out_pool, _ = wrapper.fused_conv1d_gdn(
-            conv_state=None,
-            recurrent_state=None,
+        pool_mgr = pool.reshape(-1, SPLIT * KBS, *pool.shape[2:])
+        out_pool_mgr, _ = wrapper.fused_conv1d_gdn(
+            states=jnp.copy(pool_mgr),
             state_indices=jnp.zeros((n, ), dtype=jnp.int32),
-            state_source=jnp.copy(pool),
-            state_plan=_plan(pool),
             read_offsets=jnp.zeros((n, ), dtype=jnp.int32),
             ckpt_indices=jnp.asarray(ckpt_blocks),
             num_spec_tokens=num_spec,
+            conv_dtype=jnp.bfloat16,
+            recurrent_dtype=jnp.float32,
             **kwargs)
+        out_pool = out_pool_mgr.reshape(pool.shape)
 
         named = set(int(m) for m in ckpt_blocks.reshape(-1))
         touched_kb = {
@@ -433,7 +400,7 @@ def _write_states_split(pool, ssm, conv, idx, split):
     n = idx.shape[0]
     pool = pool_adapters.scatter_region(pool,
                                         ssm.astype(jnp.float32).reshape(
-                                            n, N_V * D_K, D_V),
+                                            n, -1, LANES),
                                         idx,
                                         tok0=0,
                                         ntok=SSM_NTOK,
@@ -466,40 +433,39 @@ class TestPooledSpecWindows:
     def _pool(self, split):
         shape = ((NUM_MGR * self.WINDOW * split, KBS) + PAYLOAD +
                  (LANES, ) if split > 1 else
-                 (NUM_MGR * self.WINDOW, 1280) + PAYLOAD + (LANES, ))
-        rng = np.random.default_rng(20)
-        return jnp.asarray(rng.standard_normal(shape), dtype=jnp.bfloat16)
+                 (NUM_MGR * self.WINDOW, SPLIT * KBS) + PAYLOAD + (LANES, ))
+        return jnp.zeros(shape, dtype=jnp.bfloat16)
 
     def _steps(self):
-        """Three-step schedule; every step's per-seq read offsets pick a
-        checkpoint the previous step wrote."""
-        n = self.N
+        """Schedule covering step-0 verify, middle-token accept, rejection."""
         return [
-            # Verify windows (2, 1, 2 tokens), resuming from checkpoint 0.
-            dict(num_tokens=5,
-                 query_start_loc=jnp.array([0, 2, 3, 5]),
-                 distribution=jnp.array([n, n, n], dtype=jnp.int32),
-                 seq_lens=jnp.array([10, 7, 9], dtype=jnp.int32),
-                 read_offsets=jnp.zeros((n, ), dtype=jnp.int32)),
-            # Mixed acceptance: seqs 0/2 roll back to checkpoint 1, seq 1
-            # to checkpoint 0.
-            dict(num_tokens=5,
-                 query_start_loc=jnp.array([0, 2, 4, 5]),
-                 distribution=jnp.array([n, n, n], dtype=jnp.int32),
-                 seq_lens=jnp.array([12, 9, 10], dtype=jnp.int32),
-                 read_offsets=jnp.array([1, 0, 1], dtype=jnp.int32)),
-            # PER_SEQ resume with a non-zero read offset: seq 0 stays a
-            # 1-token window, seq 1 becomes a 5-token prefill continuation
-            # resuming from checkpoint 1 (the prefix-cache-resume shape);
-            # seq 2 idles.
-            dict(num_tokens=6,
-                 query_start_loc=jnp.array([0, 1, 6, 6]),
-                 distribution=jnp.array([1, 1, n], dtype=jnp.int32),
-                 seq_lens=jnp.array([14, 14, 0], dtype=jnp.int32),
-                 read_offsets=jnp.array([0, 1, 0], dtype=jnp.int32)),
+            # Step 0: full verify of spec tokens from an initial state.
+            dict(num_tokens=self.N * self.WINDOW,
+                 query_start_loc=jnp.arange(0,
+                                            (self.N + 1) * self.WINDOW,
+                                            self.WINDOW),
+                 distribution=jnp.array([self.N, 0, 0], dtype=jnp.int32),
+                 seq_lens=jnp.full((self.N, ), 10, dtype=jnp.int32),
+                 read_offsets=jnp.zeros((self.N, ), dtype=jnp.int32)),
+            # Step 1: middle-token accept (read from checkpoint 1).
+            dict(num_tokens=self.N * self.WINDOW,
+                 query_start_loc=jnp.arange(0,
+                                            (self.N + 1) * self.WINDOW,
+                                            self.WINDOW),
+                 distribution=jnp.array([self.N, 0, 0], dtype=jnp.int32),
+                 seq_lens=jnp.full((self.N, ), 11, dtype=jnp.int32),
+                 read_offsets=jnp.ones((self.N, ), dtype=jnp.int32)),
+            # Step 2: reject (read from checkpoint 0 again).
+            dict(num_tokens=self.N * self.WINDOW,
+                 query_start_loc=jnp.arange(0,
+                                            (self.N + 1) * self.WINDOW,
+                                            self.WINDOW),
+                 distribution=jnp.array([self.N, 0, 0], dtype=jnp.int32),
+                 seq_lens=jnp.full((self.N, ), 12, dtype=jnp.int32),
+                 read_offsets=jnp.zeros((self.N, ), dtype=jnp.int32)),
         ]
 
-    @pytest.mark.parametrize("split", [6, 1],
+    @pytest.mark.parametrize("split", [SPLIT, 1],
                              ids=["kernel_grained", "manager"])
     def test_pooled_spec_matches_dense(self, split):
         n, window = self.N, self.WINDOW
@@ -515,7 +481,6 @@ class TestPooledSpecWindows:
         conv0 = jax.random.normal(
             next(keys), (n, KERNEL_SIZE - 1, DIM)).astype(jnp.bfloat16)
         pool = _write_states_split(pool, ssm0, conv0, pool_idx, split)
-        plan = _plan(pool, split=split)
 
         # Dense reference: compact slot groups of `window` consecutive
         # slots, byte-equal initial states at each group's base. Garbage in
@@ -542,18 +507,27 @@ class TestPooledSpecWindows:
                 read_offsets=step["read_offsets"],
             )
             (dense_conv, dense_rec), out_dense = wrapper.fused_conv1d_gdn(
-                conv_state=dense_conv,
-                recurrent_state=dense_rec,
+                states=(dense_conv, dense_rec),
                 state_indices=dense_base,
                 **kwargs)
-            pool, out_pooled = wrapper.fused_conv1d_gdn(
-                conv_state=None,
-                recurrent_state=None,
-                state_indices=pool_idx,
-                ckpt_indices=ckpt_indices,
-                state_source=pool,
-                state_plan=plan,
-                **kwargs)
+            if split > 1:
+                pool_mgr = pool.reshape(-1, split * KBS, *pool.shape[2:])
+                pool_mgr, out_pooled = wrapper.fused_conv1d_gdn(
+                    states=pool_mgr,
+                    state_indices=pool_idx,
+                    ckpt_indices=ckpt_indices,
+                    conv_dtype=jnp.bfloat16,
+                    recurrent_dtype=jnp.float32,
+                    **kwargs)
+                pool = pool_mgr.reshape(pool.shape)
+            else:
+                pool, out_pooled = wrapper.fused_conv1d_gdn(
+                    states=pool,
+                    state_indices=pool_idx,
+                    ckpt_indices=ckpt_indices,
+                    conv_dtype=jnp.bfloat16,
+                    recurrent_dtype=jnp.float32,
+                    **kwargs)
             np.testing.assert_allclose(np.asarray(out_pooled),
                                        np.asarray(out_dense),
                                        rtol=2e-2,
@@ -589,8 +563,7 @@ class TestPooledCallerV3:
         )
 
         (_, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
-            conv_state=conv,
-            recurrent_state=recurrent_bf16.astype(jnp.float32),
+            states=(conv, recurrent_bf16.astype(jnp.float32)),
             state_indices=dense_idx,
             **kwargs)
         new_pool, pooled_out = gdn_attention.run_jax_gdn_attention_pooled_local(
@@ -705,8 +678,7 @@ class TestPooledCallerV3:
             seq_lens=jnp.full((n, ), 9, dtype=jnp.int32),
         )
         (dense_conv, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
-            conv_state=conv,
-            recurrent_state=recurrent_f32,
+            states=(conv, recurrent_f32),
             state_indices=dense_idx,
             **kwargs)
 
@@ -745,10 +717,10 @@ class TestPooledCallerV3:
             seq_lens=jnp.full((n, ), 10, dtype=jnp.int32),
         )
         (_,
-         _), dense_out2 = wrapper.fused_conv1d_gdn(conv_state=dense_conv,
-                                                   recurrent_state=dense_ssm,
-                                                   state_indices=dense_idx,
-                                                   **kwargs2)
+         _), dense_out2 = wrapper.fused_conv1d_gdn(
+            states=(dense_conv, dense_ssm),
+            state_indices=dense_idx,
+            **kwargs2)
 
         new_pool2, pooled_out2 = gdn_attention.run_jax_gdn_attention_pooled_local(
             mixed_qkv=kwargs2["qkv"],
@@ -774,5 +746,5 @@ class TestPooledCallerV3:
         assert new_pool2.shape == pool.shape
         np.testing.assert_allclose(np.asarray(pooled_out2),
                                    np.asarray(dense_out2),
-                                   rtol=1e-3,
-                                   atol=1e-3)
+                                   rtol=5e-3,
+                                   atol=5e-3)

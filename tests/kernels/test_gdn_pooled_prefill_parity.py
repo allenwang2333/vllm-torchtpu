@@ -24,6 +24,8 @@ TPU only. Timings print (use `-s`); the ratio is the assertion.
 import functools
 import time
 
+import pytest
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -44,13 +46,14 @@ BENCH_DIM = (BENCH_N_KQ * BENCH_D_K * 2 + BENCH_N_V * BENCH_D_V)
 BENCH_NUM_TOKENS = 4096
 BENCH_ITERATIONS = 5
 BENCH_DECODE_TILE_SIZE = 4
-BENCH_KBS, BENCH_LANES = 256, 256
+BENCH_KBS, BENCH_LANES = 256, 128
 BENCH_PAYLOAD = (1, 4)
+BENCH_POOL_DTYPE = jnp.bfloat16
 BENCH_TOK_BYTES = int(
-    np.prod(BENCH_PAYLOAD) * BENCH_LANES * np.dtype(np.int8).itemsize)
+    np.prod(BENCH_PAYLOAD) * BENCH_LANES * np.dtype(BENCH_POOL_DTYPE).itemsize)
 BENCH_SSM_NTOK = (BENCH_N_V * BENCH_D_K * BENCH_D_V * 4 // BENCH_TOK_BYTES)
 BENCH_CONV_TOK0 = BENCH_SSM_NTOK
-BENCH_CONV_NTOK = 128
+BENCH_CONV_NTOK = 256
 BENCH_MANAGER_TOKENS = 4352
 BENCH_SPLIT = BENCH_MANAGER_TOKENS // BENCH_KBS
 BENCH_NUM_MGR = 2  # null slot and one active request
@@ -64,54 +67,43 @@ BENCH_DISTRIBUTION = np.array([0, 1, 1], dtype=np.int32)
 # Greater than the query length so every iteration consumes its input state.
 BENCH_SEQ_LENS = np.array([BENCH_NUM_TOKENS + 1], dtype=np.int32)
 
+BENCH_REC_BYTES = BENCH_N_V * BENCH_D_K * BENCH_D_V * 4
+BENCH_CONV_BYTES = (BENCH_KERNEL_SIZE - 1) * BENCH_DIM * 2
+BENCH_REC_GRANULES = BENCH_REC_BYTES // 512
+BENCH_CONV_GRANULES = BENCH_CONV_BYTES // 512
+
 
 def _benchmark_write_states(pool, recurrent, conv):
-    recurrent_rows = recurrent.reshape(1, BENCH_N_V * BENCH_D_K, BENCH_D_V)
-    pool = pool_adapters.scatter_region(
-        pool,
-        recurrent_rows,
+    rec_u32 = recurrent.reshape(-1, BENCH_LANES).view(jnp.uint32)
+    low16 = (rec_u32 & 0xFFFF).astype(jnp.uint16).view(jnp.bfloat16)
+    high16 = ((rec_u32 >> 16) & 0xFFFF).astype(jnp.uint16).view(jnp.bfloat16)
+    rec_bf16 = jnp.stack([low16, high16], axis=-2).reshape(
+        1, BENCH_REC_GRANULES, 2, BENCH_LANES)
+
+    conv_bf16 = conv.astype(jnp.bfloat16).reshape(
+        1, BENCH_CONV_GRANULES, 2, BENCH_LANES)
+
+    pool_4d = pool.reshape(BENCH_NUM_MGR, -1, 2, BENCH_LANES)
+    pool_4d = pool_4d.at[BENCH_STATE_IDX, :BENCH_REC_GRANULES].set(rec_bf16)
+    pool_4d = pool_4d.at[
         BENCH_STATE_IDX,
-        tok0=0,
-        ntok=BENCH_SSM_NTOK,
-        split=BENCH_SPLIT,
-    )
-    conv_rows = conv.astype(jnp.bfloat16).reshape(1, -1, BENCH_LANES)
-    conv_capacity_rows = (BENCH_CONV_NTOK * BENCH_TOK_BYTES //
-                          (jnp.dtype(jnp.bfloat16).itemsize * BENCH_LANES))
-    conv_rows = jnp.pad(
-        conv_rows,
-        ((0, 0), (0, conv_capacity_rows - conv_rows.shape[1]), (0, 0)),
-    )
-    return pool_adapters.scatter_region(
-        pool,
-        conv_rows,
-        BENCH_STATE_IDX,
-        tok0=BENCH_CONV_TOK0,
-        ntok=BENCH_CONV_NTOK,
-        split=BENCH_SPLIT,
-    )
+        BENCH_REC_GRANULES:BENCH_REC_GRANULES + BENCH_CONV_GRANULES,
+    ].set(conv_bf16)
+    return pool_4d.reshape(BENCH_POOL_SHAPE)
 
 
 def _benchmark_read_states(pool):
-    recurrent = pool_adapters.gather_region(
-        pool,
+    pool_4d = pool.reshape(BENCH_NUM_MGR, -1, 2, BENCH_LANES)
+    rec_bf16 = pool_4d[BENCH_STATE_IDX, :BENCH_REC_GRANULES].reshape(-1, 2, BENCH_LANES)
+    low16 = rec_bf16[:, 0, :].view(jnp.uint16).astype(jnp.uint32)
+    high16 = rec_bf16[:, 1, :].view(jnp.uint16).astype(jnp.uint32)
+    rec_u32 = low16 | (high16 << 16)
+    recurrent = rec_u32.view(jnp.float32).reshape(1, BENCH_N_V, BENCH_D_K, BENCH_D_V)
+
+    conv = pool_4d[
         BENCH_STATE_IDX,
-        tok0=0,
-        ntok=BENCH_SSM_NTOK,
-        split=BENCH_SPLIT,
-        out_dtype=jnp.float32,
-        out_lanes=BENCH_D_V,
-    ).reshape(1, BENCH_N_V, BENCH_D_K, BENCH_D_V)
-    conv = pool_adapters.gather_region(
-        pool,
-        BENCH_STATE_IDX,
-        tok0=BENCH_CONV_TOK0,
-        ntok=BENCH_CONV_NTOK,
-        split=BENCH_SPLIT,
-        out_dtype=jnp.bfloat16,
-    )
-    conv_rows = ((BENCH_KERNEL_SIZE - 1) * BENCH_DIM // BENCH_LANES)
-    conv = conv[:, :conv_rows].reshape(1, BENCH_KERNEL_SIZE - 1, BENCH_DIM)
+        BENCH_REC_GRANULES:BENCH_REC_GRANULES + BENCH_CONV_GRANULES,
+    ].reshape(1, BENCH_KERNEL_SIZE - 1, BENCH_DIM)
     return conv, recurrent
 
 
@@ -143,10 +135,7 @@ def _benchmark_dense_five(conv_state, recurrent_state, qkv, b, a, conv_weight,
 
     def step(states, _):
         new_states, output = wrapper.fused_conv1d_gdn(
-            conv_state=states[0],
-            recurrent_state=states[1],
-            state_source=None,
-            state_plan=None,
+            states=states,
             **_benchmark_common_args(qkv, b, a, conv_weight, conv_bias, a_log,
                                      dt_bias))
         return new_states, output
@@ -261,7 +250,7 @@ class TestProductionShapeDenseVsUnifiedPool:
             dtype=jnp.float32,
         ).at[1].set(initial_recurrent[0])
         pool = _benchmark_write_states(
-            jnp.zeros(BENCH_POOL_SHAPE, dtype=jnp.int8),
+            jnp.zeros(BENCH_POOL_SHAPE, dtype=BENCH_POOL_DTYPE),
             initial_recurrent,
             initial_conv,
         )

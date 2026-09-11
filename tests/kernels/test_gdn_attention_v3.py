@@ -30,27 +30,31 @@ def gdn_attention_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
-    conv_weight: jnp.ndarray,
-    conv_bias: jnp.ndarray | None,
-    a_log: jnp.ndarray,
-    dt_bias: jnp.ndarray,
-    query_start_loc: jnp.ndarray,
-    state_indices: jnp.ndarray,
-    distribution: jnp.ndarray,
-    seq_lens: jnp.ndarray,
-    n_kq: int,
-    n_v: int,
-    d_k: int,
-    d_v: int,
-    kernel_size: int,
+    conv_state: jnp.ndarray | None = None,
+    recurrent_state: jnp.ndarray | None = None,
+    conv_weight: jnp.ndarray = None,
+    conv_bias: jnp.ndarray | None = None,
+    a_log: jnp.ndarray = None,
+    dt_bias: jnp.ndarray = None,
+    query_start_loc: jnp.ndarray = None,
+    state_indices: jnp.ndarray = None,
+    distribution: jnp.ndarray = None,
+    seq_lens: jnp.ndarray = None,
+    n_kq: int = 0,
+    n_v: int = 0,
+    d_k: int = 0,
+    d_v: int = 0,
+    kernel_size: int = 0,
+    states: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    **kwargs,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs reference GDN attention sequence-by-sequence in eager mode.
 
     Bypasses XLA ragged masking complexity required for jax.jit by slicing
     sequence chunks directly in Python loop using query_start_loc boundaries.
     """
+    if states is not None:
+        conv_state, recurrent_state = states
 
     num_tokens = qkv.shape[0]
     num_valid_seqs = int(distribution[2])
@@ -395,8 +399,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=A_log,
@@ -523,8 +526,7 @@ class GDNAttentionTest(parameterized.TestCase):
             mixed_qkv,
             b,
             a,
-            conv_state,
-            recurrent_state,
+            (conv_state, recurrent_state),
             conv_weight,
             conv_bias,
             A_log,
@@ -707,8 +709,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
         # Reference run: fresh-zero slots.
         (new_conv_fresh, new_rec_fresh), output_fresh = run_jitted(
-            conv_state=conv_state_fresh,
-            recurrent_state=recurrent_state_fresh,
+            states=(conv_state_fresh, recurrent_state_fresh),
             **common_kwargs,
         )
         # Stale-slot run: same inputs, but the slots already contain a
@@ -716,8 +717,7 @@ class GDNAttentionTest(parameterized.TestCase):
         # masks that out; outputs and the writeback at the active slots
         # must match the fresh-zero run.
         (new_conv_stale, new_rec_stale), output_stale = run_jitted(
-            conv_state=conv_state_stale,
-            recurrent_state=recurrent_state_stale,
+            states=(conv_state_stale, recurrent_state_stale),
             **common_kwargs,
         )
 
@@ -811,8 +811,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_full,
             b=b,
             a=a,
-            conv_state=conv_state_zero,
-            recurrent_state=recurrent_state_zero,
+            states=(conv_state_zero, recurrent_state_zero),
             query_start_loc=jnp.array([0, full]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
             seq_lens=jnp.array([full], dtype=jnp.int32),
@@ -824,8 +823,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_a,
             b=b[:half],
             a=a[:half],
-            conv_state=conv_state_zero,
-            recurrent_state=recurrent_state_zero,
+            states=(conv_state_zero, recurrent_state_zero),
             query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
             seq_lens=jnp.array([half], dtype=jnp.int32),
@@ -839,8 +837,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_b,
             b=b[half:],
             a=a[half:],
-            conv_state=conv_after_a,
-            recurrent_state=rec_after_a,
+            states=(conv_after_a, rec_after_a),
             query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
             seq_lens=jnp.array([full], dtype=jnp.int32),

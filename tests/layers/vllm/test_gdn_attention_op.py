@@ -87,8 +87,8 @@ class TestVllmGatedDeltaNetAttention:
                                           num_kv_heads, kv_packing, head_dim,
                                           dtype):
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-        from vllm_torchtpu.layers.common.gdn_attention import \
-            _build_v3_pool_state_plan
+        from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+        from vllm_torchtpu.kernels import pool_adapters
 
         manager_block_size = 4096 if page_size == 512 else 4352
         num_kv_heads_x2 = num_kv_heads * 2
@@ -96,21 +96,25 @@ class TestVllmGatedDeltaNetAttention:
         shape = (10, num_kv_heads_x2, packed_head_dim, kv_packing, page_size)
         pool = jnp.zeros(shape, dtype=dtype)
 
-        plan = _build_v3_pool_state_plan(
-            pool,
-            conv_dim=1536,
-            n_v=8,
-            d_k=128,
-            d_v=128,
-            kernel_size=4,
-            pool_block_tokens=manager_block_size,
-            qk_pair_layout=False,
-            recurrent_state_dtype=jnp.float32,
+        assert pool_adapters.is_seq_along_lane_pool()
+        block_size, payload, lanes = pool_adapters._pool_geometry(pool)
+        assert block_size == page_size
+
+        token_bytes = num_kv_heads_x2 * head_dim * jnp.dtype(dtype).itemsize
+        ssm_bytes = 8 * 128 * 128 * 4
+        conv_bytes = (4 - 1) * 1536 * 2
+
+        layout = derive_pooled_gdn_state_layout(
+            ssm_bytes=ssm_bytes,
+            conv_bytes=conv_bytes,
+            token_bytes=token_bytes,
         )
-        assert plan.stride == manager_block_size // page_size
-        assert plan.recurrent.view_dtype == jnp.float32
-        assert plan.conv.view_dtype == jnp.bfloat16
-        assert plan.whole_block_dma is True
+        assert layout.ssm_tokens * layout.token_bytes >= layout.ssm_bytes
+        assert layout.conv_tokens * layout.token_bytes >= layout.conv_bytes
+        assert layout.ssm_granules > 0
+        assert layout.conv_granules > 0
+        assert layout.granules_per_token == layout.token_bytes // 512
+        assert layout.required_tokens == layout.ssm_tokens + layout.conv_tokens
 
     @patch("vllm_torchtpu.layers.vllm.custom_ops.gdn_attention_op."
            "run_jax_gdn_attention_pcp_tp_prefill")

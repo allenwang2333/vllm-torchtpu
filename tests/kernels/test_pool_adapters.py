@@ -601,60 +601,23 @@ class TestKimiLinearMlaPoolGeometry:
         return jnp.zeros((self.NB, self.BS, self.PACK, self.LANES),
                          dtype=jnp.bfloat16)
 
-    def _layout(self):
-        return derive_pooled_gdn_state_layout(
-            ssm_bytes=self.SSM_BYTES,
-            conv_bytes=self.CONV_BYTES,
-            token_bytes=self.TOK_BYTES,
-        )
+    def test_mla_pool_geometry_and_alignment(self):
+        # Validate that MLA pool geometry extracts expected block_size, payload, and lanes
+        block_size, payload, lanes = pool_adapters._pool_geometry(self._pool())
+        assert block_size == self.BS
+        assert payload == (self.PACK, )
+        assert lanes == self.LANES
+        assert self.TOK_BYTES % 512 == 0
 
-    def test_padded_ssm_region_builds_plan(self):
-        # conv_dim placeholder: KDA's real conv layout needs its own pool
-        # view (see the rejection test below); here a GDN-compatible conv
-        # dim exercises the padded SSM region through the real plan builder.
-        layout = self._layout()
-        plan = pool_adapters.v3_state_source(
-            self._pool(),
-            split=1,
-            ssm_ntok=layout.ssm_tokens,
-            conv_tok0=layout.ssm_tokens,
-            conv_ntok=layout.conv_tokens,
-            conv_dim=1280,
-            n_v=self.N_V,
-            d_k=self.D_K,
-            d_v=self.D_V,
-            kernel_size=2,
-        )
-
-        ssm = plan.recurrent
-        # The padded region fits in the single kernel block (split=1), keeps
-        # the real state extent in rows_used, and tiles whole f32 rows.
-        assert (ssm.kb0, ssm.nblocks, ssm.row0, ssm.nrows) == (0, 1, 0, 103)
-        assert ssm.rows_used == self.N_V * self.D_K
-        assert ssm.nrows * self.TOK_BYTES >= self.SSM_BYTES
-        assert ssm.nrows * self.TOK_BYTES - self.SSM_BYTES == 1536
-        assert self.TOK_BYTES % (self.D_V * 4) == 0
-        # The conv region sits right after the padded SSM extent, inside the
-        # same kernel block.
-        conv = plan.conv
-        assert (conv.kb0, conv.row0) == (0, 103)
-        assert conv.row0 + conv.nrows <= self.BS
-
-    def test_kda_conv_dim_rejected_by_gdn_view(self):
+    def test_kda_conv_dim_rejected_by_qk_pair_perm(self):
         # Phase 1.2 boundary: the MLA pool's 640 lanes do not divide KDA's
-        # per-tap conv dim (3 * 4 * 128 = 1536), so the GDN conv view cannot
-        # express the KDA conv region; KDA needs its own pool view.
-        layout = self._layout()
-        with pytest.raises(AssertionError):
-            pool_adapters.v3_state_source(
-                self._pool(),
-                split=1,
-                ssm_ntok=layout.ssm_tokens,
-                conv_tok0=layout.ssm_tokens,
-                conv_ntok=layout.conv_tokens,
+        # per-tap conv dim (3 * 4 * 128 = 1536), so _conv_qk_pair_rows_perm raises NotImplementedError
+        with pytest.raises(NotImplementedError, match="lane-aligned equal Q/K segments"):
+            pool_adapters._conv_qk_pair_rows_perm(
+                taps=self.KERNEL_SIZE - 1,
                 conv_dim=self.CONV_DIM,
                 n_v=self.N_V,
-                d_k=self.D_K,
                 d_v=self.D_V,
-                kernel_size=self.KERNEL_SIZE,
+                lanes=self.LANES,
             )
+
