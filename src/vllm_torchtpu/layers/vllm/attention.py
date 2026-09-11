@@ -1945,8 +1945,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         "sparse MLA layers use a native (nope, rope) split "
                         f"cache; got {type(kv_cache)}")
             if self.dcp_size > 1:
-                # Built eagerly in `process_weights_after_loading`, same
-                # tracing constraint as the PCP op.
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first.")
@@ -1954,9 +1952,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # heads, so attention runs at `tp // dcp` head sharding: every
                 # rank attends with the whole DCP group's heads over its own
                 # KV shard, and the head axis is scattered back after the
-                # merge. Skipping this does not merely lose parallelism -- the
-                # merge would combine rank `r`'s heads with rank `r'`'s as
-                # though they were the same head.
+                # merge.
                 ql_nope_dcp = all_gather_heads(ql_nope_flat)
                 q_pe_dcp = all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
@@ -1974,9 +1970,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
-                # The collectives DCP costs. Outside the exported op on
-                # purpose -- see `_build_sparse_mla_dcp_op`. The scatter undoes
-                # the head all-gather above, so `outputs` is back to
+                # The scatter undoes the head all-gather above, so `outputs` is back to
                 # `layer.num_heads` and `W_UV` below needs no change.
                 outputs = merge_lse_partials_scatter_heads(partial, lse)
             else:
