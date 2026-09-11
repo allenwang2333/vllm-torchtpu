@@ -2659,16 +2659,20 @@ class TestTPURaidenConnectorWorker:
             worker._submit_stage3_loads(meta, MagicMock())
             # The step thread is not blocked on the in-flight RPC.
             assert "dst-slow" in worker._stage3_inflight_submits
+            start_time = worker._stage3_load_start_times["dst-slow"]
             # The native terminal is parked, not dropped and not reported.
             assert worker.get_finished() == (set(), set())
             assert worker._stage3_deferred_native_failures == {
                 "dst-slow": False
             }
+            assert worker._stage3_load_start_times == {"dst-slow": start_time}
             rpc_gate.set()
             _flush_stage3_submits(worker)
             assert worker.get_finished() == (set(), {"dst-slow"})
             assert worker._stage3_deferred_native_failures == {}
             assert worker._stage3_inflight_submits == {}
+            assert worker.get_finished({"dst-slow"}) == (set(), set())
+            assert worker._stage3_load_start_times == {}
         assert worker.get_block_ids_with_load_errors() == set()
 
     def test_stage3_async_submit_abandons_overdue_rpc(self):
@@ -3076,6 +3080,7 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_source_req_ids == {}
         assert worker._stage3_destination_req_ids == {}
+        assert worker._stage3_load_start_times == {}
 
         assert len(facade.start_transfer_calls) == 1
         call = facade.start_transfer_calls[0]
@@ -3176,6 +3181,9 @@ class TestTPURaidenConnectorWorker:
             _flush_stage3_submits(worker)
             assert worker.get_finished() == (set(), {"failed-load-decode"})
             assert worker.get_finished() == (set(), set())
+            assert worker.get_finished({"failed-load-decode"}) == (set(),
+                                                                   set())
+            assert worker._stage3_load_start_times == {}
 
         assert len(facade.start_transfer_calls) == 1
         assert facade.start_transfer_calls[0]["req_id"] == (
@@ -3294,6 +3302,7 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_transfer_engine = engine
         worker._stage3_submitted_loads["aborted-load-decode"] = 911
         worker._stage3_submitted_load_tokens["aborted-load-decode"] = 1536
+        worker._stage3_load_start_times["aborted-load-decode"] = 1.0
         worker._bind_stage3_request_ids("aborted-load-decode",
                                         "aborted-load-prefill")
         worker._stage3_controller_accepted.add("aborted-load-decode")
@@ -3310,6 +3319,9 @@ class TestTPURaidenConnectorWorker:
                                                                     set())
             assert worker._stage3_submitted_loads == {
                 "aborted-load-decode": 911
+            }
+            assert worker._stage3_load_start_times == {
+                "aborted-load-decode": 1.0
             }
             assert worker._stage3_controller_accepted == {
                 "aborted-load-decode"
@@ -3333,6 +3345,7 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._stage3_submitted_loads == {}
         assert worker._stage3_submitted_load_tokens == {}
+        assert worker._stage3_load_start_times == {}
         assert worker._stage3_controller_accepted == set()
         assert worker._load_block_ids == {}
         assert worker._stage3_finished_loads_pending_cleanup == set()
