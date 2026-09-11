@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_KV_DOORBELL: bool = False
     TPU_KV_DOORBELL_VERIFY: bool = False
+    TPU_KV_DOORBELL_CHECK: bool = False
     TPU_KV_DOORBELL_POLL_US: int = 0
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
@@ -459,6 +460,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # must leave this off.
     "TPU_KV_DOORBELL_VERIFY":
     env_bool("TPU_KV_DOORBELL_VERIFY"),
+
+    # Checksum the KV pages this step wrote, for the first few steps, and log
+    # the result per layer. This answers a different question from
+    # TPU_KV_DOORBELL_VERIFY: that one asks whether a bell rang, this one asks
+    # whether the memory it rang about holds anything. It copies pages to the
+    # host, so a timing run must leave it off.
+    "TPU_KV_DOORBELL_CHECK":
+    env_bool("TPU_KV_DOORBELL_CHECK"),
 
     # How often raiden's C++ reader copies the bells to the host, in
     # microseconds. Zero leaves the reader off entirely. The default when it is

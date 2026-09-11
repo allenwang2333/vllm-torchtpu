@@ -86,6 +86,49 @@ BELL_LANES = 128
 # buffer whose first pass has already rung.
 FIRST_GENERATION = 1
 
+# How many of a request's pages the correctness check looks at. A prefill of a
+# few thousand tokens touches on the order of ten pages per layer, so this
+# covers most of a short request and a fixed prefix of a long one. It is a
+# constant rather than the true page count because the device-side half of the
+# check, which lands next, needs a static Pallas grid.
+CHECKED_PAGES = 8
+
+# How many token slots of each page the check reads. The production config runs
+# `--block-size 8192`, so a whole page is hundreds of megabytes and copying one
+# to the host per layer would dominate the step it is meant to observe. The
+# first 256 slots are real data for any request long enough to be worth
+# checking, and 256 is also the PCP interleave, so the slice lands inside one
+# rank's contiguous run rather than straddling two.
+CHECKED_TOKENS = 256
+
+
+def page_checksum(kv_cache: torch.Tensor,
+                  block_ids: Sequence[int]) -> Optional[int]:
+    """Sum the leading bytes of the named pages of one layer's cache.
+
+    Bytes rather than cache values, because the cache is fp8 here and an
+    accumulation in fp8 saturates almost immediately, which would map wildly
+    different pages onto the same total. Reinterpreting as unsigned bytes makes
+    the sum exact, and it lets the device-side check compute the identical
+    number with integer arithmetic instead of having to match float rounding.
+
+    Returns None when the layer has no cache bound yet, which is the case
+    during the memory-probe forward.
+    """
+    if kv_cache is None or kv_cache.numel() == 0 or not block_ids:
+        return None
+    ids = [b for b in block_ids if 0 <= b < kv_cache.shape[0]]
+    if not ids:
+        return None
+    index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
+    pages = kv_cache.index_select(0, index)
+    if pages.dim() > 1:
+        pages = pages[:, :CHECKED_TOKENS]
+    # To the host before reinterpreting: a byte view of an fp8 tensor is not
+    # something every TPU op accepts, and this slice is a small copy.
+    flat = pages.reshape(-1).cpu().contiguous()
+    return int(flat.view(torch.uint8).to(torch.int64).sum())
+
 
 def _bell_kernel(group_ref, gen_ref, ann_ref, bell_in_ref, out_ref):
     """Store the generation into one group's tile.
@@ -244,10 +287,20 @@ class DoorbellSet:
     def __init__(self,
                  layer_names: Sequence[str],
                  device: torch.device,
-                 verify_steps: int = 0):
+                 verify_steps: int = 0,
+                 check_steps: int = 0):
         self._group_of = {name: i for i, name in enumerate(layer_names)}
         self.num_groups = len(layer_names)
         self._verify_budget = verify_steps
+        self._check_budget = check_steps
+
+        # Filled by `install`, in group order, so the page check can reach each
+        # layer's cache. Held as the module rather than the tensor because vLLM
+        # binds the cache onto the layer after the doorbells are built.
+        self._layers: list = []
+        # Last step's per-layer page checksums, kept so a repeat of the same
+        # prompt can be compared against it.
+        self._last_checksums: Optional[list] = None
 
         # This chip's fifteen counters. A bell says "this chip's slice of this
         # layer's KV is written", which is a claim only that chip is in a
@@ -358,6 +411,11 @@ class DoorbellSet:
     def group_for(self, layer_name: str) -> Optional[int]:
         return self._group_of.get(layer_name)
 
+    @property
+    def layer_names(self) -> list:
+        """The watched layers, in group order."""
+        return sorted(self._group_of, key=self._group_of.get)
+
     def next_generation(self) -> int:
         """Advance the counter. Host-side, between steps, never under trace."""
         self.generation += 1
@@ -395,6 +453,58 @@ class DoorbellSet:
         # a matter of lining up eight workers' logs.
         logger.info("KV doorbell after step %d: %s",
                     int(self.generation[0, 0, 0]), self.read())
+
+    def wants_page_check(self) -> bool:
+        """Whether a page check would do anything, so callers can skip the
+        work of gathering page ids once the budget is spent."""
+        return self._check_budget > 0 and bool(self._layers)
+
+    def maybe_check_pages(self, block_ids: Sequence[int]) -> None:
+        """Checksum the pages this step wrote, for the first few steps.
+
+        This is the reference side of the correctness question. A bell claims
+        its layer's KV is in the cache, and nothing so far reads that cache to
+        see whether anything is there, so a ring that fires against an untouched
+        page looks exactly like one that fires against a full one. Summing the
+        pages the block table names turns that into a number.
+
+        Three things are worth reading off the log it writes. The sums should
+        be non-zero, or the pages the bells point at hold nothing. They should
+        differ between layers, or every bell is pointing at the same memory.
+        And repeating an identical prompt should reproduce them exactly, since
+        the same tokens through the same weights write the same bytes; that
+        last one is what says the numbers mean anything at all.
+
+        Like `maybe_verify` this is bounded, because it copies pages to the
+        host and forces a sync, which would otherwise land in the very latency
+        this stage is measuring.
+        """
+        if self._check_budget <= 0 or not self._layers:
+            return
+        self._check_budget -= 1
+
+        sums = [
+            page_checksum(getattr(layer, "kv_cache", None), block_ids)
+            for layer in self._layers
+        ]
+        if all(s is None for s in sums):
+            logger.info("KV doorbell page check: no cache bound yet, skipping")
+            return
+
+        step = int(self.generation[0, 0, 0])
+        logger.info("KV doorbell page check at step %d over pages %s: %s", step,
+                    list(block_ids), sums)
+        if sums.count(sums[0]) == len(sums):
+            logger.error(
+                "KV doorbell page check: all %d layers hashed to the same "
+                "value, so the bells are not pointing at per-layer memory.",
+                len(sums))
+        if self._last_checksums is not None:
+            same = sum(a == b for a, b in zip(sums, self._last_checksums))
+            logger.info(
+                "KV doorbell page check: %d of %d layers match the previous "
+                "checked step", same, len(sums))
+        self._last_checksums = sums
 
 
 def _make_reader(bells: torch.Tensor):
@@ -605,6 +715,11 @@ def install(bells: DoorbellSet, layers: dict) -> int:
     block to the layers it reports on. Returns how many layers were wrapped.
     """
     wrapped = 0
+    # In group order, not in `layers` order, so that index i of the page check
+    # is the same layer as bell i. The two orders agree today, but the page
+    # check exists to catch exactly this kind of mismatch and so must not
+    # assume it.
+    by_group = {}
     for name, layer in layers.items():
         if bells.group_for(name) is None:
             continue
@@ -620,5 +735,8 @@ def install(bells: DoorbellSet, layers: dict) -> int:
         # only, which matters because the same `Attention` class serves layers
         # that have no group.
         layer.forward = ringing(layer.forward, name)
+        by_group[bells.group_for(name)] = layer
         wrapped += 1
+
+    bells._layers = [by_group[g] for g in sorted(by_group)]
     return wrapped

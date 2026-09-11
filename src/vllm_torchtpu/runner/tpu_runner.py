@@ -610,6 +610,10 @@ class TPUModelRunner(GPUModelRunner):
         # unless TPU_KV_DOORBELL_POLL_US is also set, since polling is the
         # measurement and the writes need measuring without it first.
         self._doorbell_watcher: doorbell.DoorbellWatcher | None = None
+        # Resolved once, on the first page check, since the KV cache groups do
+        # not change after `initialize_kv_cache`.
+        self._doorbell_group_id: int | None = None
+        self._pages_this_step: list[int] = []
 
         # EP-DP lockstep state, refreshed each step by execute_model /
         # execute_dummy_batch: the coordinated (max-across-ranks) token
@@ -3702,6 +3706,12 @@ class TPUModelRunner(GPUModelRunner):
                 # progress that has not happened.
                 if self._doorbells is not None:
                     self._doorbells.next_generation()
+                    # Read here, not after the pass. The check runs once the
+                    # forward has returned, and by then the batch has moved on,
+                    # so row zero of the block table can name a different
+                    # request's pages than the ones this pass wrote.
+                    if self._doorbells.wants_page_check():
+                        self._pages_this_step = self._first_request_pages()
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
@@ -3713,6 +3723,8 @@ class TPUModelRunner(GPUModelRunner):
             # step contaminating the throughput this stage is measuring.
             if self._doorbells is not None:
                 self._doorbells.maybe_verify()
+                if self._doorbells.wants_page_check():
+                    self._doorbells.maybe_check_pages(self._pages_this_step)
             # The reader runs on its own thread and needs nothing from here.
             # This call only asks it, every so often, what it has seen.
             if self._doorbell_watcher is not None:
@@ -6552,6 +6564,57 @@ class TPUModelRunner(GPUModelRunner):
         if not self.enforce_eager:
             self._precompile_substitute_placeholder_token()
 
+    def _doorbell_block_group(self) -> int | None:
+        """Which KV cache group holds the layers the bells watch.
+
+        `input_batch.block_table` is indexed by KV cache group, and this model
+        has mamba groups alongside the attention one, so group zero is not the
+        attention group and reading it hands back another group's pages. That
+        is not a hypothetical: the first version of the page check read group
+        zero and reported two different prompts hashing identically, because
+        the pages it read belonged to neither of them.
+        """
+        if self._doorbells is None:
+            return None
+        if self._doorbell_group_id is not None:
+            return self._doorbell_group_id
+        watched = set(self._doorbells.layer_names)
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if watched & set(group.layer_names):
+                self._doorbell_group_id = gid
+                return gid
+        return None
+
+    def _first_request_pages(self) -> list[int]:
+        """Page ids the batch's first request occupies, for the page check.
+
+        One request is enough: the check asks whether the memory a bell points
+        at holds this step's KV, and that is the same question on every request
+        in the batch. The block table is already mirrored on the host, so this
+        reads no device memory.
+
+        Must be called before the forward. Afterwards the batch has moved on
+        and row zero can belong to a different request than the one whose KV
+        is being checked.
+        """
+        gid = self._doorbell_block_group()
+        table = getattr(self.input_batch, "block_table", None)
+        if gid is None or not table:
+            return []
+        rows = table[gid].get_cpu_tensor()
+        if rows.numel() == 0:
+            return []
+        ids = rows[0, :doorbell.CHECKED_PAGES].tolist()
+        # Unused slots read as zero, and page zero is a real page, so trailing
+        # zeros cannot be told from a request that genuinely holds it. Keep the
+        # leading run instead, which is the part that is certainly allocated.
+        kept = []
+        for i, block in enumerate(ids):
+            if block == 0 and i > 0:
+                break
+            kept.append(int(block))
+        return kept
+
     def _maybe_initialize_doorbells(self) -> None:
         """Allocate the doorbell buffer, if enabled.
 
@@ -6585,7 +6648,8 @@ class TPUModelRunner(GPUModelRunner):
         bells = doorbell.DoorbellSet(
             layer_names,
             self.device,
-            verify_steps=8 if envs.TPU_KV_DOORBELL_VERIFY else 0)
+            verify_steps=8 if envs.TPU_KV_DOORBELL_VERIFY else 0,
+            check_steps=8 if envs.TPU_KV_DOORBELL_CHECK else 0)
         bells.prebuild(mesh, kv_spec)
         wrapped = doorbell.install(bells, layers)
 

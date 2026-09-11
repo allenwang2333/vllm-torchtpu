@@ -499,3 +499,93 @@ def test_generation_starts_below_first_and_rises_once_per_step():
     # A freshly zeroed buffer must not read as already rung.
     assert bells.read() == [0] * NUM_GROUPS
     assert FIRST_GENERATION > 0
+
+
+class _FakeCachedAttention(_FakeAttention):
+    """An attention layer with a KV cache bound, as vLLM leaves it.
+
+    The cache is a small paged buffer whose pages hold distinct bytes, so a
+    checksum over the wrong pages produces a different number rather than
+    coincidentally the right one.
+    """
+
+    def __init__(self, fill: int):
+        super().__init__()
+        pages = torch.arange(4 * 8, dtype=torch.uint8).reshape(4, 8)
+        self.kv_cache = (pages + fill).to(torch.uint8)
+
+
+def test_page_checksum_sums_the_named_pages_only():
+    """The number has to depend on which pages were asked for."""
+    layer = _FakeCachedAttention(fill=0)
+    first = doorbell_module.page_checksum(layer.kv_cache, [0])
+    second = doorbell_module.page_checksum(layer.kv_cache, [1])
+    assert first == sum(range(0, 8))
+    assert second == sum(range(8, 16))
+    assert doorbell_module.page_checksum(layer.kv_cache, [0, 1]) == (first +
+                                                                     second)
+
+
+def test_page_checksum_is_none_when_there_is_no_cache():
+    """The memory-probe forward runs before any cache is bound."""
+    assert doorbell_module.page_checksum(None, [0]) is None
+    assert doorbell_module.page_checksum(torch.zeros(0), [0]) is None
+    assert doorbell_module.page_checksum(torch.zeros(4, 8), []) is None
+
+
+def test_page_checksum_ignores_pages_outside_the_cache():
+    """A short block-table row pads with ids the cache does not have."""
+    layer = _FakeCachedAttention(fill=0)
+    assert doorbell_module.page_checksum(layer.kv_cache, [0, 999]) == sum(
+        range(0, 8))
+
+
+def test_page_check_is_bounded_like_the_verify_read(monkeypatch):
+    """It copies pages to the host, so it cannot run on every step."""
+    bells, names = _cpu_set(check_steps=3)
+    layers = {n: _FakeCachedAttention(fill=i) for i, n in enumerate(names)}
+    monkeypatch.setattr(doorbell_module, "ring_for",
+                        lambda b, name, announced: announced)
+    doorbell_module.install(bells, layers)
+
+    seen = []
+    monkeypatch.setattr(doorbell_module, "page_checksum",
+                        lambda cache, ids: seen.append(1) or 7)
+    for _ in range(10):
+        if bells.wants_page_check():
+            bells.maybe_check_pages([0, 1])
+    # Three checked steps, each hashing all fifteen layers.
+    assert len(seen) == 3 * NUM_GROUPS
+    assert not bells.wants_page_check()
+
+
+def test_page_check_walks_layers_in_group_order(monkeypatch):
+    """Index i of the check has to be the same layer as bell i.
+
+    `install` iterates the dict vLLM hands it, and nothing guarantees that
+    order matches the group numbering. If the two ever diverge, a check that
+    trusted dict order would compare each bell against a different layer's
+    pages and report a mismatch that is really its own bug.
+    """
+    bells, names = _cpu_set(check_steps=1)
+    monkeypatch.setattr(doorbell_module, "ring_for",
+                        lambda b, name, announced: announced)
+    # Hand `install` the layers back to front.
+    layers = {n: _FakeCachedAttention(fill=i) for i, n in enumerate(names)}
+    doorbell_module.install(bells, dict(reversed(list(layers.items()))))
+
+    assert [id(x) for x in bells._layers] == [id(layers[n]) for n in names]
+
+
+def test_page_check_says_so_when_every_layer_hashes_alike(monkeypatch, caplog):
+    """Identical sums across layers means the bells share memory."""
+    bells, names = _cpu_set(check_steps=1)
+    monkeypatch.setattr(doorbell_module, "ring_for",
+                        lambda b, name, announced: announced)
+    # Every layer given the same cache contents.
+    doorbell_module.install(bells,
+                            {n: _FakeCachedAttention(fill=0)
+                             for n in names})
+    with caplog.at_level("ERROR"):
+        bells.maybe_check_pages([0])
+    assert "same" in caplog.text
