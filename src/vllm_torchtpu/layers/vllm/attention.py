@@ -1943,8 +1943,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
-                # The scatter undoes the head all-gather above, so `outputs` is back to
-                # `layer.num_heads` and `W_UV` below needs no change.
+                # The scatter undoes the head all-gather above.
                 outputs = merge_lse_partials_scatter_heads(partial, lse)
             else:
                 if (not hasattr(layer, "sparse_mla_op")
