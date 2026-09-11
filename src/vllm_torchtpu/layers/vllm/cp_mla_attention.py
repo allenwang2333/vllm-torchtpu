@@ -43,16 +43,16 @@ from vllm_torchtpu.distributed.dcp import get_dcp_group
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     """Widen a rank's query head slice to the whole DCP group's heads.
 
-    DCP does not add a parallel axis on top of TP, it *re-spends*
-    `dcp_size` of TP's ways on positions instead of heads. So the
-    head sharding coarsens from `tp` to `tp // dcp`.
+    DCP doesn't add a new parallel dimension—it borrows from TP. It
+    reallocates dcp ways from heads to sequence positions, reducing
+    head sharding from tp to tp // dcp.
 
     Args:
-      q: `[num_tokens, num_heads, dim]`, this rank's head slice.
+      q: `[num_tokens, tp_local_num_heads, dim]`, this rank's head slice.
 
     Returns:
-      `[num_tokens, num_heads * dcp_size, dim]`, identical on every rank, with
-      rank `r`'s heads in block `r`. Returned unchanged without a DCP group.
+      `[num_tokens, tp_local_num_heads * dcp_size, dim]`, identical
+      on every rank. Returned unchanged without a DCP group.
     """
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
@@ -66,31 +66,14 @@ def merge_lse_partials_scatter_heads(output: torch.Tensor,
 
     With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
     exact whole-context result is `o = sum_r softmax_r(lse) * o_r`. Correctness
-    does not depend on the order the ranks are combined in -- the partial state
-    `(m, l, l*o)` is a commutative monoid -- which is exactly why DCP needs one
-    reduction rather than a ring: rotating queries around dcp_size ranks would move
-    more data.
+    does not depend on the order the ranks are combined in.
 
     Two collectives:
 
       1. all-gather the log-sum-exps. They are `[num_tokens, num_heads]` f32 --
-         gathering them outright is cheap, and it leaves every rank holding
-         every `lse_r`.
+         Leaves every rank holding every `lse_r`.
       2. reduce-scatter the weighted outputs,
       `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`
-
-    The point of (1) is that it makes the softmax denominator a local
-    computation: with all the `lse_r` in hand each rank derives the shared
-    maximum and the full sum itself, so there is no second reduction over the
-    large tensor and no numerically fragile `exp` of an unshifted logit. It is
-    also what leaves (2) a plain sum, which is the only reduction a collective
-    can do.
-
-    (2) is the counterpart to `all_gather_heads`, and upstream's
-    `cp_lse_ag_out_rs`. Every rank attended with the whole group's heads;
-    the reduce-scatter does the narrowing. The head blocks line up with
-    `all_gather_heads` by construction: it put rank `r`'s heads in block `r`,
-    and the scatter hands block `r` back to rank `r`.
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`, this rank's partial.
@@ -101,8 +84,7 @@ def merge_lse_partials_scatter_heads(output: torch.Tensor,
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` -- this rank's head
-      slice of the whole-context result. Tokens no rank contributed to --
-      padding rows -- come back zeroed rather than NaN.
+      slice of the whole-context result.
     """
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
