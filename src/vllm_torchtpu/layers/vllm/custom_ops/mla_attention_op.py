@@ -73,11 +73,9 @@ def _cp_scatter_indexer_k(
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
-    """Scatter this step's indexer K rows into the CP-sharded K cache.
+    """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
-    Unlike the sparse-MLA nope/rope caches, the indexer cache stays sharded:
-    the top-k merge in `streamindex_topk_dcp` is exact over a *partition* of
-    the KV positions. So each rank writes only the rows it owns, and ownership
+    Each rank writes only the rows it owns, and ownership
     follows the same interleave the reader assumes -- a virtual page spans
     `page_size * cp_size` positions and rank `r` holds the `interleave_size`
     -sized chunks at offset `r * interleave_size` within each
@@ -88,10 +86,7 @@ def _cp_scatter_indexer_k(
     `k_packed` must already be in request-major order, since the positions
     come from `cu_q_lens`/`seq_lens`.
 
-    `axis_name`/`cp_size` name the axis the cache is split over, and nothing
-    below is specific to which context-parallel axis that is: this function
-    never touches the queries, only the cache and the already-replicated,
-    request-major `k_packed`.
+    `axis_name`/`cp_size` name the axis the cache is split over.
     """
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
