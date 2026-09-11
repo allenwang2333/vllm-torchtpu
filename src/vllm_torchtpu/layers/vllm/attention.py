@@ -1531,13 +1531,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
 
-        # Resolved once here rather than per forward: the layer is built inside
-        # the vLLM config context, and the parallel sizes cannot change after
-        # that. The mesh in particular must not be built in the (lazy,
-        # dynamo-traced) op builder -- it bottoms out in the pybind
-        # `tpu_distributed.global_device_id()`, which Dynamo refuses to trace.
-        # The DCP process group already exists by model-construction time; the
-        # DSA indexer builds its own DCP op from the same mesh.
         parallel_config = getattr(get_current_vllm_config_or_none(),
                                   "parallel_config", None)
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
@@ -1548,9 +1541,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self._dcp_mesh = None
         if self.dcp_size > 1:
             # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`); this path would silently
-            # produce a wrong answer in that case rather than a bad one, so it
-            # refuses too. Two interleaves over one cache is not a thing.
+            # `VllmTPUSparseAttnIndexer.__init__`)
             pcp_size = getattr(parallel_config,
                                "prefill_context_parallel_size", 1)
             if isinstance(pcp_size, int) and pcp_size > 1:
@@ -1558,17 +1549,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
                     "both >1; sparse MLA has one KV-position interleave, "
                     "not two.")
-            # Checked here rather than inside the traced op so the failure
-            # lands at model build with somewhere to go. vLLM defaults this to
-            # 1, which `dsa_gather` cannot use: it packs 4 rope tokens per
-            # tile, so an interleave finer than WORD_BYTES puts one tile's
-            # tokens on different ranks.
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
                 raise ValueError(
                     "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
                     f"a multiple of {kv_cache_utils.WORD_BYTES} "
                     f"(kv_cache_utils.WORD_BYTES), got "
-                    f"{self.dcp_interleave_size}. 4 is also the best value for "
+                    f"{self.dcp_interleave_size}. It is also the best value for "
                     "top-k load balance across the shards -- coarser cycles "
                     "let a contiguous run of winners land on fewer ranks.")
             self._dcp_mesh = get_or_create_dcp_mesh()
