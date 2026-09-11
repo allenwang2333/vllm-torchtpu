@@ -689,16 +689,9 @@ def streamindex_topk(
                 f"compression_ratio ({compression_ratio}) for the CP chunk "
                 "boundary to fall on a compressed-row boundary.")
         if enable_early_exit:
-            # The fast path builds identity indices 0..k, which are global
-            # positions. Supporting it under CP means emitting this rank's
-            # owned subset instead; not worth it, since it cannot fire at the
-            # context lengths CP is used for.
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1.")
     if enable_early_exit and return_scores:
-        # The fast path never computes scores, so it has nothing to return for
-        # the second `lax.cond` branch. Only the cross-rank merge wants scores,
-        # and that already excludes the fast path.
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit.")
     interleave_c = interleave_size // compression_ratio if cp_size > 1 else 1
