@@ -46,3 +46,4 @@ PROFILE_GCS_BASE="gs://tpu-commons-ci/xprof/deepseek-v4-flash/torchtpu"
 BENCHMARK_TEMPERATURE=0
 # todo(patemotter) decrease tolerance to 0.02 once we have more nightly results
 EVAL_TOLERANCE="0.03"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
