@@ -658,6 +658,44 @@ def _dcp_caches(dcp_size):
         for spec in (NOPE_SPEC, ROPE_SPEC))
 
 
+def _merge_dcp_lse_partials(outputs, lses):
+    """Combine per-rank sparse-MLA partials into the whole-context result.
+
+    Lives here rather than beside `sparse_mla_attention_dcp` because nothing
+    in the serving path calls it: `PallasMLAttentionBackendImpl.forward` runs
+    the torch collective version (`merge_lse_partials_scatter_heads`), which
+    also has to scatter the head axis. This is the plain arithmetic, with the
+    whole `[dcp_size, ...]` stack in hand, so the tests below can check the
+    kernel's partials against a numpy MLA reference without a process group.
+
+    With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
+    exact global result is `o = sum_r softmax_r(lse) * o_r`.
+
+    Args:
+      outputs: `[dcp_size, num_tokens, num_heads, v_dim]` per-rank outputs.
+      lses: `[dcp_size, num_tokens, num_heads]` matching log-sum-exps.
+        Non-finite entries mark ranks that own none of that token's top-k;
+        `sparse_mla_attention_dcp` sets them, because such a rank is still fed
+        a dummy key (the kernel requires `kv_len >= 1`) and returns a real but
+        meaningless softmax that must not be weighted in.
+
+    Returns:
+      `[num_tokens, num_heads, v_dim]` in f32. Tokens no rank contributed to
+      -- padding rows -- come back as zeros rather than NaN.
+    """
+    lses = lses.astype(jnp.float32)
+    shift = jnp.max(lses, axis=0, keepdims=True)
+    # A token with no contributor anywhere would give inf - inf; pin the shift
+    # to 0 there and let the all-zero denominator carry the result to zero.
+    all_empty = ~jnp.isfinite(shift)
+    weights = jnp.exp(lses - jnp.where(all_empty, 0.0, shift))
+    weights = jnp.where(jnp.isfinite(lses), weights, 0.0)
+    denom = jnp.sum(weights, axis=0, keepdims=True)
+    weights = jnp.where(denom > 0, weights / jnp.where(denom > 0, denom, 1.0),
+                        0.0)
+    return jnp.sum(weights[..., None] * outputs.astype(jnp.float32), axis=0)
+
+
 def _random_causal_topk(rng, num_tokens, topk):
     """Token t attends to a random subset of [0, t], as a `-1`-padded prefix."""
     rows = np.full((num_tokens, topk), -1, np.int32)
@@ -668,7 +706,7 @@ def _random_causal_topk(rng, num_tokens, topk):
 
 
 class SparseMlaDcpTest(parameterized.TestCase):
-    """`sparse_mla_attention_dcp` + `merge_dcp_lse_partials`, end to end.
+    """`sparse_mla_attention_dcp` + `_merge_dcp_lse_partials`, end to end.
 
     The comparison is against the same pure-numpy f32 MLA reference the
     unsharded tests use, not against the unsharded kernel, so a layout bug
@@ -771,7 +809,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
             dcp_size=dcp_size,
             interleave_size=interleave_size,
         )
-        merged = attention_interface.merge_dcp_lse_partials(
+        merged = _merge_dcp_lse_partials(
             out.reshape(dcp_size, DCP_SEQ, NUM_HEADS, LKV_DIM),
             lse.reshape(dcp_size, DCP_SEQ, NUM_HEADS))
         return np.asarray(merged)

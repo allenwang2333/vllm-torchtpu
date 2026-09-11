@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """The MLA DCP head gather and log-sum-exp merge (`cp_mla_attention`).
 
-`attention_interface.merge_dcp_lse_partials` is the JAX statement of the same
-arithmetic and is validated on hardware against a numpy MLA reference
-(`SparseMlaDcpTest`). These tests hold the torch path to that already-checked
-implementation, so the two cannot drift, and cover the collective plumbing the
-JAX version has no equivalent of.
+This is the merge that runs in serving. `SparseMlaDcpTest` in
+`tests/layers/common/test_sparse_mla_attention.py` checks the same arithmetic
+end to end against a numpy MLA reference, on real devices; what it cannot
+cover is the collective plumbing -- the head-block indexing and the
+reduce-scatter -- which is what these tests are for. Both sides are held to
+`_reference_merge` below rather than to each other, so neither can drift into
+being the other's second opinion.
 
 The process group is faked: every rank's partials are held in one process and
 the group calls are served from that stack. That is a real test of the merge --
 the arithmetic, the rank indexing, and the `-inf` masking are all exercised --
 and it needs no distributed launcher.
 """
-
-import multiprocessing
 
 import numpy as np
 import pytest
@@ -93,57 +93,6 @@ def _reference_merge(outputs, lses):
     return (out * weights[..., None]).sum(axis=0)
 
 
-def _jax_merge_worker(payload, queue):
-    """Body of `_jax_merge`, run in its own process. Top-level, so it pickles."""
-    outputs, lses = payload
-    try:
-        import jax.numpy as jnp
-
-        from vllm_torchtpu.layers.common import attention_interface
-
-        # The JAX twin arrives with the sparse-MLA DCP attention path; until
-        # then this cross-check has nothing to compare against and the test
-        # skips itself. It re-enables on its own once the symbol exists.
-        jax_merge = getattr(attention_interface, "merge_dcp_lse_partials",
-                            None)
-        if jax_merge is None:
-            queue.put(("UNAVAILABLE",
-                       "attention_interface.merge_dcp_lse_partials is not "
-                       "present yet"))
-            return
-        queue.put(
-            ("OK",
-             np.asarray(jax_merge(jnp.asarray(outputs), jnp.asarray(lses)))))
-    except Exception:  # noqa: BLE001 - re-raised in the parent
-        import traceback
-        queue.put(("ERROR", traceback.format_exc()))
-
-
-def _jax_merge(outputs, lses):
-    """`merge_dcp_lse_partials` (the JAX twin), evaluated out of process.
-
-    Spawned rather than called inline because importing the JAX side here
-    initializes a PJRT client and takes the libtpu lockfile for the whole
-    pytest process. `test_kv_scatter.py` sorts after this module and runs its
-    own cases in spawned subprocesses, which then cannot get a client at all --
-    so an inline call turns three unrelated tests red. Pinning JAX to the CPU
-    backend does not avoid it; only keeping the parent clean does.
-    """
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue()
-    process = ctx.Process(target=_jax_merge_worker,
-                          args=((outputs.numpy(), lses.numpy()), queue))
-    process.start()
-    result = queue.get()
-    process.join()
-    status, payload = result
-    if status == "ERROR":
-        raise AssertionError(f"JAX reference merge failed:\n{payload}")
-    if status == "UNAVAILABLE":
-        pytest.skip(payload)
-    return payload
-
-
 def _partials(rng, dcp_size, tokens=8, local_heads=2, vdim=16, empty=()):
     """Per-rank partials, sized the way the kernel really produces them.
 
@@ -163,11 +112,11 @@ def _partials(rng, dcp_size, tokens=8, local_heads=2, vdim=16, empty=()):
 
 
 @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
-def test_torch_merge_matches_the_jax_merge(dcp_size, monkeypatch):
+def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
     outputs, lses = _partials(np.random.default_rng(20260907), dcp_size)
     got = _merge_whole(outputs, lses, monkeypatch).numpy()
     np.testing.assert_allclose(got,
-                               _jax_merge(outputs, lses),
+                               _reference_merge(outputs, lses),
                                rtol=1e-5,
                                atol=1e-5)
 
