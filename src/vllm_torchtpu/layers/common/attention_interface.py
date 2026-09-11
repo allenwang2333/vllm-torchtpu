@@ -903,32 +903,6 @@ def sparse_mla_attention_dcp(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
-    Every spec here is the inverse of the PCP path's, because the two split
-    orthogonal axes. PCP shards *queries* and replicates the cache; DCP shards
-    the *cache* by KV position and replicates the queries. Concretely:
-    `ql_nope`/`q_pe` go from sharded to replicated, both caches from replicated
-    to sharded, and the `kv_c_normed`/`k_pe` all-gather PCP needs disappears
-    rather than moving -- the latents are computed from a replicated residual
-    stream, so every rank already holds every row and only masks its write.
-
-    Why DCP and not PCP for long-context GLM-5.2: PCP replicates weights across
-    its axis, which an FP8 GLM-5.2 cannot afford on 16 chips, and it does not
-    shard the cache at all -- at 1M tokens the latent cache is ~45 GB per
-    sequence and does not fit next to the weights. DCP keeps the full weight
-    sharding and re-partitions only attention. The gain it buys is gather
-    bandwidth: `num_kv_heads=1` means top-k indices are per-token, so under
-    plain TP every rank gathers the *same* 640 B rows, once per rank. Sharding
-    the positions removes that redundancy for the cost of one LSE merge.
-
-    This returns partials rather than the merged result. With per-rank
-    normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the exact global
-    result is `o = sum_r softmax_r(lse) * o_r` -- a single reduction over
-    `dcp_axis_name`, because the partial state `(m, l, l*o)` forms a
-    commutative monoid and needs no ring. It is left to the caller
-    (`cp_mla_attention.merge_lse_partials_scatter_heads`) so it can run
-    outside this exported op, where the torch->JAX export path places no
-    constraints on collectives.
-
     Args:
       ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
       kv_c_normed, k_pe: this step's latents, replicated and identical on every
