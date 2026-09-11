@@ -28,10 +28,10 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
     invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
     pcp_streaming_jax_op)
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
                                                       SparseMLAKVCacheSpec)
-from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.common.attention_interface import (
     attention, attention_bundled, mla_attention, ragged_paged_attention,
@@ -1568,13 +1568,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             # Checked here rather than inside the traced op so the failure
             # lands at model build with somewhere to go. vLLM defaults this to
             # 1, which `dsa_gather` cannot use: it packs 4 rope tokens per
-            # tile, so an interleave finer than TILE_SUBROWS puts one tile's
+            # tile, so an interleave finer than WORD_BYTES puts one tile's
             # tokens on different ranks.
-            if self.dcp_interleave_size % dsa_gather.TILE_SUBROWS:
+            if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
                 raise ValueError(
                     "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
-                    f"a multiple of {dsa_gather.TILE_SUBROWS} "
-                    f"(dsa_gather.TILE_SUBROWS), got "
+                    f"a multiple of {kv_cache_utils.WORD_BYTES} "
+                    f"(kv_cache_utils.WORD_BYTES), got "
                     f"{self.dcp_interleave_size}. 4 is also the best value for "
                     "top-k load balance across the shards -- coarser cycles "
                     "let a contiguous run of winners land on fewer ranks.")
