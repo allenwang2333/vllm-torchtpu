@@ -242,17 +242,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
         """The DCP twin of `_build_streamidx_op`.
 
-        Shorter than the PCP twin, and the reason is the whole difference
-        between the two axes: DCP shards the KV cache and leaves the *queries*
+        DCP shards the KV cache and leaves the *queries*
         replicated, so there is no rank-major token packing to undo. Every
         token-major input arrives already in request-major order and stays
         replicated across the op boundary. Only the cache is split.
-
-        The output is the inverse of the PCP op's, too. PCP hands each rank the
-        merged global list for its own tokens; DCP hands each rank, for *every*
-        token, the slice of that token's global top-k it physically holds --
-        already converted to local cache indices, left-packed into a `topk`-wide
-        row that averages `topk / dcp_size` real entries.
         """
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
@@ -651,11 +644,6 @@ class VllmTPUMLAAttention(MLAAttention):
                                               v_scale=v_scale)
         self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
 
-        # The DCP twin must be built here and never lazily from `forward`:
-        # `pcp_streaming_jax_op` runs `inspect.signature` and builds
-        # PartitionSpecs, none of which Dynamo can trace. Like the op above it
-        # reads `layer.mla_kv_spec` only inside the jax callable, so it is fine
-        # that `initialize_kv_cache` has not run yet.
         dcp_size = getattr(self.impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         if dcp_size > 1:
