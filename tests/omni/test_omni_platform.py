@@ -93,9 +93,21 @@ def test_tpu_sdpa_attention_backend():
     assert res_gqa.shape == (1, 16, 8, 16)
 
 
-def test_ltx2_safe_decode_output():
-    from unittest.mock import MagicMock
+def test_vllm_omni_is_mocked():
+    import sys
 
+    import vllm_omni
+
+    try:
+        from .mock_omni import vllm_omni_mock
+    except (ImportError, ValueError):
+        from tests.omni.mock_omni import vllm_omni_mock
+
+    assert sys.modules["vllm_omni"] is vllm_omni_mock
+    assert getattr(vllm_omni, "__file__", None) is None
+
+
+def test_ltx2_safe_decode_output():
     from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
     from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
@@ -109,30 +121,7 @@ def test_ltx2_safe_decode_output():
             self.cpu_called = True
             return super().cpu(*args, **kwargs)
 
-    def _create_mock_runtime(video_out, audio_out):
-        runtime = object.__new__(ltx2_runtime.LTXRuntime)
-        runtime.reports_stage_durations = False
-        runtime.distributed_video_decode = False
-
-        mock_vae = MagicMock()
-        mock_vae.config.timestep_conditioning = False
-        mock_vae.dtype = torch.float32
-        mock_vae.decode.return_value = [
-            video_out if video_out is not None else torch.randn(1, 3, 16, 16)
-        ]
-        runtime.vae = mock_vae
-
-        mock_vp = MagicMock()
-        mock_vp.postprocess_video = lambda video, **kw: video_out
-        runtime.video_processor = mock_vp
-
-        mock_audio_vae = MagicMock()
-        mock_audio_vae.dtype = torch.float32
-        mock_audio_vae.decode.return_value = [torch.randn(1, 80)]
-        runtime.audio_vae = mock_audio_vae
-
-        runtime.vocoder = MagicMock(return_value=audio_out)
-        return runtime
+    runtime = ltx2_runtime.LTXRuntime()
 
     decode_kwargs = dict(
         latents=torch.randn(1, 128, 4, 4),
@@ -149,7 +138,7 @@ def test_ltx2_safe_decode_output():
     # Case 1: Video and audio are both Tensors (verify .cpu() is invoked)
     v = torch.randn(1, 3, 16, 16).as_subclass(TrackedTensor)
     a = torch.randn(1, 100).as_subclass(TrackedTensor)
-    runtime = _create_mock_runtime(v, a)
+    runtime.output = (v, a)
     res = runtime._decode_output(**decode_kwargs)
     assert v.cpu_called is True
     assert a.cpu_called is True
@@ -158,13 +147,13 @@ def test_ltx2_safe_decode_output():
 
     # Case 2: Video is Tensor, audio is None
     v = torch.randn(1, 3, 16, 16).as_subclass(TrackedTensor)
-    runtime = _create_mock_runtime(v, None)
+    runtime.output = (v, None)
     res = runtime._decode_output(**decode_kwargs)
     assert v.cpu_called is True
     assert res.output[0].device.type == "cpu"
     assert res.output[1] is None
 
     # Case 3: Both are None (verify non-tensor outputs pass through safely)
-    runtime = _create_mock_runtime(None, None)
+    runtime.output = (None, None)
     res = runtime._decode_output(**decode_kwargs)
     assert res.output == (None, None)
