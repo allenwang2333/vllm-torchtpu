@@ -17,6 +17,19 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_global_to_local, cp_owner_rank)
 
+# This is index arithmetic, so it needs no accelerator -- and it must not take
+# one. These are eager `jnp` calls, so on a TPU agent they initialize the
+# runtime in the *pytest parent*, which then holds the libtpu lockfile for the
+# rest of the session; libtpu exposes no release API (see the note on
+# `pytest_collection_modifyitems` in `tests/conftest.py`). Every later test
+# that needs a fresh process -- `test_kv_scatter.py`'s `spawn`ed bodies, the
+# vLLM engine cores under `tests/entrypoints/llm/` -- then fails to bootstrap.
+# `tests/distributed` collects first and this file sorts ahead of
+# `test_kv_scatter.py`, so it would be the first thing in the general suite to
+# spring that trap. `cpu_test` keeps it on the CPU agent, where there is no
+# lockfile to hold.
+pytestmark = pytest.mark.cpu_test
+
 # The indexer's return leg is an all-gather plus a per-rank owner filter, which
 # is only exact because `cp_owner_rank` is a *partition*: total, single-valued,
 # and onto every rank. These pin that, because it is what replaced the
