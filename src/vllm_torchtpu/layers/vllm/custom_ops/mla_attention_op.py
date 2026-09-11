@@ -330,8 +330,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
 
         # We must overwrite the default fake implementation as vLLM uses
-        # dynamic dimensions for the query. `q_bytes` is replicated here, so
-        # its leading dim is already the local (and global) token count.
+        # dynamic dimensions for the query.
         def _fake_streamidx_topk_dcp(q_bytes, weights, cache_kv, k_packed,
                                      seq_lens, page_indices, cu_q_lens,
                                      distribution, **kwargs):
