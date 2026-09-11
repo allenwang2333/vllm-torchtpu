@@ -30,6 +30,7 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
@@ -775,14 +776,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
             lse.reshape(dcp_size, DCP_SEQ, NUM_HEADS))
         return np.asarray(merged)
 
-    @parameterized.named_parameters(
-        dict(testcase_name="d2_c4", dcp_size=2, interleave_size=4),
-        dict(testcase_name="d4_c4", dcp_size=4, interleave_size=4),
-        dict(testcase_name="d8_c4", dcp_size=8, interleave_size=4),
-        dict(testcase_name="d2_c8", dcp_size=2, interleave_size=8),
-    )
-    def test_dcp_merge_matches_the_unsharded_reference(self, dcp_size,
-                                                       interleave_size):
+    def _check_merge_matches_the_reference(self, dcp_size, interleave_size):
         self._require_devices(dcp_size)
         inp = self._inputs()
         merged = self._run_dcp(inp, dcp_size, interleave_size)
@@ -791,6 +785,30 @@ class SparseMlaDcpTest(parameterized.TestCase):
                                    rtol=2e-2,
                                    atol=2e-2)
 
+    @parameterized.named_parameters(
+        dict(testcase_name="d2_c4", dcp_size=2, interleave_size=4),
+        dict(testcase_name="d2_c8", dcp_size=2, interleave_size=8),
+    )
+    def test_dcp_merge_matches_the_unsharded_reference(self, dcp_size,
+                                                       interleave_size):
+        self._check_merge_matches_the_reference(dcp_size, interleave_size)
+
+    # Split from the two-rank cases above rather than marking the whole
+    # method: CI selects by marker, so an unmarked case needing four or eight
+    # devices lands on the two-chip agent and skips itself into a green tick.
+    # The marker goes *under* `named_parameters` so it lands on the function
+    # absl copies onto each generated case; above it, absl's expansion drops
+    # it and `-m multichip` silently deselects both.
+    @parameterized.named_parameters(
+        dict(testcase_name="d4_c4", dcp_size=4, interleave_size=4),
+        dict(testcase_name="d8_c4", dcp_size=8, interleave_size=4),
+    )
+    @pytest.mark.multichip
+    def test_dcp_merge_matches_the_unsharded_reference_multichip(
+            self, dcp_size, interleave_size):
+        self._check_merge_matches_the_reference(dcp_size, interleave_size)
+
+    @pytest.mark.multichip
     def test_dcp_write_mask_partitions_the_cache(self):
         """Each rank must hold exactly the positions it owns -- no more.
 
@@ -856,6 +874,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
                                       np.full(dcp_size, DCP_SEQ // dcp_size))
         np.testing.assert_array_equal(written, expected)
 
+    @pytest.mark.multichip
     def test_a_rank_owning_nothing_is_dropped_by_the_merge(self):
         """The empty-shard path, isolated.
 

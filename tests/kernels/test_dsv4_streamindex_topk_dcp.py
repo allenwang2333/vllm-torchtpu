@@ -198,6 +198,7 @@ def test_dcp_size_one_is_rejected():
                              **_dcp_kwargs(mesh=mesh, dcp_size=1))
 
 
+@pytest.mark.multichip
 def test_token_count_must_divide_over_the_dcp_axis():
     if len(jax.devices()) < 4:
         pytest.skip("needs 4 devices")
