@@ -148,6 +148,39 @@ def test_layers_map_to_groups_in_order_and_gdn_layers_do_not():
     assert bells.group_for("model.layers.4.linear_attn") is None
 
 
+def test_each_ring_donates_the_previous_rings_output():
+    """The pass has to be one donation chain, not a chain of copies.
+
+    Four CDK runs came back with every bell of a pass visible at the same
+    instant. The cause was a `copy_` writeback after each ring: the buffer is
+    donated and cannot be passed twice, so the copy existed to supply the next
+    ring a fresh one, and on a lazy backend fifteen such copies coalesce into
+    one flush at the end of the step. Passing each ring's output to the next
+    keeps the whole pass inside the graph, and the reader's buffer is the root
+    of the chain, so every store lands there when the schedule reaches it.
+    """
+    bells, names = _cpu_set()
+    original = bells.bells
+    handed = []
+    outputs = []
+
+    def op(announced, doorbells, group, generation):
+        handed.append(doorbells)
+        out = torch.empty_like(doorbells)
+        outputs.append(out)
+        return out
+
+    bells.op = op
+    for name in names:
+        doorbell_module.ring_for(bells, name, torch.zeros(1))
+
+    # The first ring donates the buffer the reader watches; every later ring
+    # donates the one before it, and nothing is ever donated twice.
+    assert handed[0] is original
+    assert handed[1:] == outputs[:-1]
+    assert bells.bells is outputs[-1]
+
+
 class _FakeAttention:
     """Enough of vLLM's `Attention` for `install` to wrap: a forward that
     returns a value derived from its input, and a record of being called."""

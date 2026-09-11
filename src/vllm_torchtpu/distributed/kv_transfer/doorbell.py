@@ -484,7 +484,7 @@ def ring_for(bells: DoorbellSet, layer_name: str,
     A no-op for a layer with no group, which is every layer on a worker that
     is not the KV source.
 
-    Two conditions have to hold, and only one of them is about `announced`.
+    Three conditions have to hold, and only one of them is about `announced`.
 
     `announced` must be a value the attention kernel *returned*, not the cache
     it wrote. The cache is written in place through donation, so it enters the
@@ -501,17 +501,25 @@ def ring_for(bells: DoorbellSet, layer_name: str,
     time instead of becoming graph instructions. On a lazy backend fifteen such
     rings pile up and flush together in one small program, which is a flat pass
     however carefully their operands are chosen.
+
+    Nothing may sit between the rings either. See the buffer chain below: a
+    per-ring writeback is enough to undo everything the other two conditions
+    buy, because it moves the moment of publication out of the graph.
     """
     group = bells.group_for(layer_name)
     if group is None or bells.op is None:
         return
 
-    rung = bells.op(announced, bells.bells, bells.group_ids[group],
-                    bells.generation)
-    # The op returns the donated buffer, but torch_tpu hands back a new tensor
-    # object bound to the same memory. Copying it back keeps `bells.bells`
-    # pointing at the storage the eventual reader watches.
-    bells.bells.copy_(rung)
+    # Hand the next ring this ring's output rather than copying it back. The
+    # buffer is donated, so it cannot be passed twice, and the copy that used
+    # to supply a fresh one was the last piece of the doorbell still running
+    # outside the model's program. Fifteen such copies coalesce into a single
+    # flush at the end of the step, which publishes every bell of a pass at the
+    # same instant no matter how well the stores themselves are spread. Chaining
+    # instead makes the pass one donation chain rooted at the buffer the reader
+    # watches, so each store lands there in place, when the schedule reaches it.
+    bells.bells = bells.op(announced, bells.bells, bells.group_ids[group],
+                           bells.generation)
 
 
 def install(bells: DoorbellSet, layers: dict) -> int:
