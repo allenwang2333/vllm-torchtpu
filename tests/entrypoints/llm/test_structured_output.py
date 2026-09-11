@@ -20,6 +20,8 @@ vLLM core on the host; the TPU runner's only job is applying the packed
 int32 bitmask to the logits before sampling. These tests check that job
 across the shapes it must handle:
 - every constraint type the runner sees identically (choice / json / regex);
+- a recursive JSON schema (cyclic $ref), which keeps a grammar stack open for
+  the whole generation instead of closing after a few tokens;
 - mixed batches (structured + unstructured requests side by side);
 - greedy and non-greedy sampling;
 - multi-chunk execution (the per-step batch split TPU does when the
@@ -80,6 +82,17 @@ REGEX_PARAMS = SamplingParams(
 )
 REGEX_PROMPT = "A random US phone number without area code: "
 
+# Shared between the schema and its assertions below, so the two cannot
+# drift apart.
+AST_DESCRIPTION_PATTERN = r"[A-Za-z0-9_ -]{5,50}"
+AST_OPERATORS = ["ADD", "SUB", "MUL", "DIV", "POW", "MOD"]
+AST_SUB_OPERATORS = ["ADD", "SUB", "MUL"]
+
+# SubTree references itself, so the grammar compiler has to handle a cyclic
+# $ref rather than inlining a fixed number of levels. The top-level operands
+# are SubTree refs rather than anyOf[number, SubTree]: with the union, greedy
+# decoding takes the cheapest branch and emits a flat "operands": [1, 2],
+# which would leave the $ref path untested on every run.
 COMPLEX_AST_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "ExpressionTree",
@@ -87,23 +100,16 @@ COMPLEX_AST_SCHEMA = {
     "properties": {
         "operator": {
             "type": "string",
-            "enum": ["ADD", "SUB", "MUL", "DIV", "POW", "MOD"],
+            "enum": AST_OPERATORS,
         },
         "description": {
             "type": "string",
-            "pattern": r"^[A-Za-z0-9_ -]{5,50}$",
+            "pattern": f"^{AST_DESCRIPTION_PATTERN}$",
         },
         "operands": {
             "type": "array",
             "items": {
-                "anyOf": [
-                    {
-                        "type": "number"
-                    },
-                    {
-                        "$ref": "#/$defs/SubTree"
-                    },
-                ]
+                "$ref": "#/$defs/SubTree"
             },
             "minItems": 2,
             "maxItems": 2,
@@ -116,12 +122,19 @@ COMPLEX_AST_SCHEMA = {
             "properties": {
                 "operator": {
                     "type": "string",
-                    "enum": ["ADD", "SUB", "MUL"]
+                    "enum": AST_SUB_OPERATORS
                 },
                 "operands": {
                     "type": "array",
                     "items": {
-                        "type": "number"
+                        "anyOf": [
+                            {
+                                "type": "number"
+                            },
+                            {
+                                "$ref": "#/$defs/SubTree"
+                            },
+                        ]
                     },
                     "minItems": 2,
                     "maxItems": 2,
@@ -131,12 +144,16 @@ COMPLEX_AST_SCHEMA = {
         }
     },
 }
+# Guaranteed nesting makes the output longer than the flat JSON test's, and
+# recursion means the model chooses when to stop. Budget accordingly: the
+# fixture caps max_model_len at 256, and the prompt is ~15 tokens.
 COMPLEX_AST_PARAMS = SamplingParams(
     temperature=0,
-    max_tokens=128,
+    max_tokens=192,
     structured_outputs=StructuredOutputsParams(json=COMPLEX_AST_SCHEMA),
 )
-COMPLEX_AST_PROMPT = "Generate a math expression AST in JSON format: "
+COMPLEX_AST_PROMPT = ("Generate a math expression AST in JSON format, using "
+                      "nested sub-expressions: ")
 
 UNCONSTRAINED_PARAMS = SamplingParams(temperature=0, max_tokens=16)
 UNCONSTRAINED_PROMPT = "The capital of France is"
@@ -153,37 +170,50 @@ def _assert_json(text: str) -> None:
     assert isinstance(parsed.get("age"), int), text
 
 
-def _validate_sub_tree(node: dict, text: str) -> None:
-    assert isinstance(node, dict), text
-    assert node.get("operator") in ["ADD", "SUB", "MUL"], text
+def _assert_number(value: object, text: str) -> None:
+    # bool is a subclass of int, so a bare isinstance(value, (int, float))
+    # would accept a JSON `true` as a number -- precisely the kind of leak a
+    # dropped bitmask produces, and the one this suite exists to catch.
+    assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+        f"operand must be a number: {value!r} in {text!r}")
+
+
+def _assert_sub_tree(node: object, text: str) -> None:
+    assert isinstance(node, dict), f"expected a SubTree object in {text!r}"
+    assert node.get("operator") in AST_SUB_OPERATORS, text
     operands = node.get("operands")
     assert isinstance(operands, list) and len(operands) == 2, text
     for op in operands:
-        assert isinstance(
-            op, (int, float)), f"operand must be number: {op!r} in {text!r}"
+        # SubTree.operands is anyOf[number, SubTree], so recurse on objects.
+        if isinstance(op, dict):
+            _assert_sub_tree(op, text)
+        else:
+            _assert_number(op, text)
 
 
 def _assert_complex_ast_json(text: str) -> None:
-    parsed = json.loads(text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # A recursive schema can run long. Distinguish "the mask let through
+        # invalid JSON" from "generation was cut off mid-object", instead of
+        # surfacing a bare JSONDecodeError.
+        raise AssertionError(
+            f"output is not valid JSON ({exc}) -- truncated at max_tokens? "
+            f"raw: {text!r}") from exc
     assert isinstance(parsed, dict), text
-    assert parsed.get("operator") in [
-        "ADD", "SUB", "MUL", "DIV", "POW", "MOD"
-    ], text
+    assert parsed.get("operator") in AST_OPERATORS, text
     desc = parsed.get("description")
     assert isinstance(desc, str), text
     assert re.fullmatch(
-        r"^[A-Za-z0-9_ -]{5,50}$",
+        AST_DESCRIPTION_PATTERN,
         desc), (f"invalid description pattern: {desc!r} in {text!r}")
     operands = parsed.get("operands")
     assert isinstance(operands, list) and len(operands) == 2, text
+    # The schema pins the top-level operands to SubTree refs, so a bare
+    # number here means the $ref branch of the grammar was not honoured.
     for op in operands:
-        if isinstance(op, dict):
-            _validate_sub_tree(op, text)
-        else:
-            assert isinstance(
-                op,
-                (int, float
-                 )), f"operand must be number or SubTree: {op!r} in {text!r}"
+        _assert_sub_tree(op, text)
 
 
 def _assert_regex(text: str) -> None:
@@ -239,6 +269,13 @@ def test_json_schema_greedy(llm: LLM):
 
 
 def test_complex_ast_json_schema_greedy(llm: LLM):
+    """A recursive schema is the longest constraint the runner has to carry.
+
+    test_json_schema_greedy closes its object in a handful of tokens; this
+    one holds a grammar stack open across the whole generation, so the
+    bitmask changes shape on nearly every step instead of settling. That is
+    the regime where a stale or misapplied mask actually shows up.
+    """
     outputs = llm.generate([COMPLEX_AST_PROMPT] * 4, COMPLEX_AST_PARAMS)
     assert len(outputs) == 4
     for output in outputs:
