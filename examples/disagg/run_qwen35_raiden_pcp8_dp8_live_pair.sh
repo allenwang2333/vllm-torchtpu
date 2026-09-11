@@ -996,7 +996,6 @@ PY
       --max-num-seqs "${DECODE_MAX_NUM_SEQS:-64}"
       --async-scheduling
       --limit-mm-per-prompt '{"image":0,"video":0}'
-      --disable-log-stats
       --compilation-config "${decode_compilation_config}"
       --prefill-context-parallel-size 1
       --data-parallel-size 8
