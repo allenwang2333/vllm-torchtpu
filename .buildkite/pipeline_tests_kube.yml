@@ -1,0 +1,257 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pipeline_tests.yml on the Kueue fleet.
+#
+# A pipeline of its own rather than a branch inside pipeline_tests.yml. The two
+# run the same tests on different hardware from different pools, and while the
+# fleet is being brought up a failure here must not read as a regression in the
+# repo - so this one is non-blocking and pipeline_tests.yml is untouched.
+#
+# Every step of pipeline_tests.yml is here, with keys kept identical so the two
+# files read side by side. Only the agent changes: a TPU step names a shape and
+# a command, and chips, topology, Kueue queue, caches and deadlines all come
+# from the cluster-side profile registry in ci-infra.
+#
+# The CPU steps and the image build stay on cpu_64_core. There is nothing to
+# move: they hold no chips, so running them on the fleet would buy a different
+# scheduler and nothing else, and the fleet has no CPU-only node pool to put
+# them on.
+#
+# The `tests` plugin still runs on the agent - it exchanges an OIDC token,
+# ensures the suite exists, and exports BUILDKITE_TEST_ENGINE_* and
+# BUILDKITE_ANALYTICS_TOKEN - while bktec itself runs in the pod, out of the
+# image. run.sh forwards the plugin's exports across, which is what joins the
+# two halves.
+
+# The pod template the fleet publishes: it carries the launcher binary, the
+# profile registry and the service account that may submit a workload. Repeated
+# per step rather than merged in, because a step's `plugins:` is a list and a
+# YAML merge key replaces it wholesale.
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+    # Blobless. A step clones this repo only to read run.sh; the tree the tests
+    # need is already in the image, and a full clone was most of the time
+    # before the pod started. Blobs are still fetched on demand, so the working
+    # tree stays complete.
+    checkout:
+      cloneFlags: -v --filter=blob:none
+      fetchFlags: -v --prune --filter=blob:none
+
+x-tpu-step-defaults: &tpu_step
+  depends_on: "build_docker"
+  # soft_fail everywhere while the lane is being proven: a failure here is a
+  # question about the fleet, not about the commit.
+  soft_fail: true
+  # Covers queueing as well as running, because Buildkite adds no queue time of
+  # its own - the agent pod starts at once and then waits inside the step.
+  timeout_in_minutes: 240
+  agents:
+    queue: "kube"
+  commands:
+    # One command for every shape, as in pipeline_tests.yml, with the shape
+    # itself the only thing a step varies. Exit 5 is pytest's "no tests
+    # collected", which a shard can legitimately reach once the marker filter
+    # has emptied it.
+    - .buildkite/kubernetes/run.sh $$SHAPE bktec run || [ $$? -eq 5 ]
+
+x-cpu-unit-test-defaults: &cpu_unit_test_defaults
+  depends_on: "build_docker"
+  soft_fail: true
+  commands:
+    - bash .buildkite/scripts/run_in_docker.sh bktec run
+  agents:
+    queue: "cpu_64_core"
+  env:
+    CPU_ONLY: "1"
+
+x-tests-plugin-defaults: &tests_plugin_defaults
+  # Resolved relative to the Buildkite org running the build.
+  suite-slug: tpu-ci
+  test-runner: pytest
+  install-client: false
+  oidc-lifetime: 7200
+
+# tpu_v7x_2_queue on bare metal: two TensorCores, which is one v7x chip. The
+# queue name counts cores and the profile registry counts chips, so the two
+# numbers differ for the same hardware.
+x-shape-1-chip: &shape_1_chip "tpu7x-standard-1t/1x1x1"
+# tpu_v7x_8_queue: eight cores, four chips, one host.
+x-shape-4-chip: &shape_4_chip "tpu7x-standard-4t/2x2x1"
+
+steps:
+  # The builder pipeline_build.yml uses, repeated because this pipeline is
+  # uploaded on its own rather than beside that one. A docker build is not a
+  # TPU workload, so it does not go through the launcher.
+  - label: ":docker: Build and Push CI Image"
+    key: "build_docker"
+    timeout_in_minutes: 120
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "Unit Tests - CPU (PR)"
+    key: "unit_tests_cpu_pr"
+    <<: *cpu_unit_test_defaults
+    if: 'build.env("NIGHTLY") != "1"'
+    plugins:
+      - tests#v1.0.0:
+          <<: *tests_plugin_defaults
+          test-file-pattern: "tests/**/{test_*,*_test}.py"
+          fail-on-no-tests: true
+          test-cmd: "pytest -sv --timeout=600 -m 'cpu_test and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
+
+  - label: "Unit Tests - CPU (Nightly)"
+    key: "unit_tests_cpu_nightly"
+    <<: *cpu_unit_test_defaults
+    if: 'build.env("NIGHTLY") == "1"'
+    plugins:
+      - tests#v1.0.0:
+          <<: *tests_plugin_defaults
+          test-file-pattern: "tests/**/{test_*,*_test}.py"
+          fail-on-no-tests: true
+          test-cmd: "pytest -sv --timeout=600 -m 'cpu_test' --junit-xml={{resultPath}} {{testExamples}}"
+
+  - group: ":kubernetes: Unit Tests on TPU"
+    steps:
+      # test_speculative_decoding.py gets its own PR steps, mirroring the
+      # nightly pair below, so spec-decode results are visible as their own
+      # step rather than buried in the general run and so the suite runs on
+      # its own chips instead of serializing behind everything else. The
+      # general steps exclude the file to avoid running it twice.
+      - label: ":kubernetes: Unit Tests - General (PR)"
+        key: "unit_tests_general_pr"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") != "1"'
+        env:
+          SHAPE: *shape_1_chip
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: ":kubernetes: Unit Tests - Multichip (PR)"
+        key: "unit_tests_multichip_pr"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") != "1"'
+        env:
+          SHAPE: *shape_4_chip
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      # Representative correctness cases run on PRs; the full parameter matrix
+      # and acceptance-rate tests run nightly. Split by example because the
+      # suite is a single file. bktec balances using recorded test durations.
+      - label: ":kubernetes: Unit Tests - Speculative Decoding (PR)"
+        key: "unit_tests_spec_decode_pr"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 3
+        env:
+          SHAPE: *shape_1_chip
+          # bktec enumerates the examples to split with a plain
+          # `pytest --collect-only`, which does not see the `-m` filter in
+          # test-cmd. Without this the nightly-only cases would be handed to
+          # the splitter carrying their (long) nightly timings and then
+          # deselected at run time, so a shard could be planned full and
+          # actually run almost nothing. PYTEST_ADDOPTS applies to collection
+          # as well as to the run, which keeps the split over what a PR
+          # actually executes. run.sh forwards it into the pod.
+          PYTEST_ADDOPTS: "-m 'not nightly and not multichip'"
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              split-by-example: true
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=1800 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: ":kubernetes: Unit Tests - Speculative Decoding Multichip (PR)"
+        key: "unit_tests_spec_decode_multichip_pr"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") != "1"'
+        env:
+          SHAPE: *shape_4_chip
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=3600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: ":kubernetes: Unit Tests - Speculative Decoding (Nightly)"
+        key: "unit_tests_spec_decode_nightly"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 3
+        env:
+          SHAPE: *shape_1_chip
+          PYTEST_ADDOPTS: "-m 'not multichip'"
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              split-by-example: true
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      # The data-parallel MTP tests in the same file need DP*TP chips, which
+      # the one-chip shape above cannot provide (they self-skip there). This
+      # step is the only place they get enough chips to run.
+      - label: ":kubernetes: Unit Tests - Speculative Decoding Multichip (Nightly)"
+        key: "unit_tests_spec_decode_multichip_nightly"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_4_chip
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: ":kubernetes: Unit Tests - General (Nightly)"
+        key: "unit_tests_general_nightly"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_1_chip
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: ":kubernetes: Unit Tests - Multichip (Nightly)"
+        key: "unit_tests_multichip_nightly"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_4_chip
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and multichip' --junit-xml={{resultPath}} {{testExamples}}"
