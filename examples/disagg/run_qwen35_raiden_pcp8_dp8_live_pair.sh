@@ -929,7 +929,7 @@ PY
   }'
   decode_compilation_config='{
     "backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor",
-    "compile_sizes":[8,16,32,64,16384],
+    "compile_sizes":[8,16,32,64],
     "inductor_compile_config":{
       "enable_auto_functionalized_v2":false,
       "size_asserts":false,
