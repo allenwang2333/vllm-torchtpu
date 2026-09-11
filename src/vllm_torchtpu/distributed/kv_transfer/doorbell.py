@@ -96,9 +96,9 @@ def _bell_kernel(group_ref, gen_ref, ann_ref, bell_in_ref, out_ref):
     read-modify-write and no mask.
 
     Three of the four refs go untouched. `group_ref` is consumed by the output
-    block's index map rather than by the body. `ann_ref` is the KV cache and
-    exists only so the call has it as an operand; see `bell_fn` for why that
-    is what orders the store. `bell_in_ref` exists only to give
+    block's index map rather than by the body. `ann_ref` is the attention
+    output and exists only so the call has it as an operand; see `bell_fn` for
+    why that is what orders the store. `bell_in_ref` exists only to give
     `input_output_aliases` something to alias. Both sit in HBM, so declaring
     them costs no transfer.
     """
@@ -119,7 +119,7 @@ def _make_bell_fn(num_groups: int, interpret: bool = False):
             grid=(1, ),
             in_specs=[
                 pl.BlockSpec(block, lambda i, s: (0, 0, 0)),
-                # The KV cache. Never read, so it never leaves HBM.
+                # The attention output. Never read, so it never leaves HBM.
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 # Aliased with the output. Never read, so it stays in HBM too.
                 pl.BlockSpec(memory_space=pltpu.HBM),
@@ -134,22 +134,43 @@ def _make_bell_fn(num_groups: int, interpret: bool = False):
 
     # The annotations are load-bearing: `pallas.jax_op` reads the signature to
     # build the torch op schema and rejects a bare parameter.
-    def bell_fn(announced: jax.Array, doorbells: jax.Array, group: jax.Array,
-                generation: jax.Array) -> jax.Array:
-        """Ring one group's bell, ordered after `announced` is written.
+    def bell_fn(
+        announced: jax.Array, doorbells: jax.Array, group: jax.Array,
+        generation: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """Ring one group's bell, pinned between `announced` and its readers.
 
-        `announced` is passed to the kernel, unread, purely to be an operand
-        of the call. That is what keeps the ring downstream of the layer whose
-        KV it reports. This used to be an `optimization_barrier` over
-        `(announced, generation)` whose `announced` result was discarded, on
-        the theory that a barrier operand survives dead-code elimination. It
+        `announced` is both an operand of the kernel and a result of the call,
+        and the two roles fence the ring from opposite sides. A schedule is a
+        topological order of the dataflow graph, so an instruction can only be
+        held in place by the things it reads and the things that read it, and
+        the bell needs one of each.
+
+        The operand supplies the predecessor. It is passed to the kernel
+        unread, purely to be an operand, which keeps the ring downstream of the
+        layer whose KV it reports. This used to be an `optimization_barrier`
+        over `(announced, generation)` whose `announced` result was discarded,
+        on the theory that a barrier operand survives dead-code elimination. It
         does not: with the result unused XLA drops the operand and the edge
         with it, and every bell was then scheduled at the top of the program,
-        ahead of the layers it claimed to announce. An operand of a Pallas
-        call cannot be dropped that way, because XLA cannot see inside the
-        custom call to prove it unused.
+        ahead of the layers it claimed to announce. An operand of a Pallas call
+        cannot be dropped that way, because XLA cannot see inside the custom
+        call to prove it unused.
+
+        Returning `announced` supplies the successor, which the operand alone
+        does not. With the ring's only reader being the program's own return of
+        the doorbell buffer, XLA is free to place the whole chain of them
+        anywhere after their attention kernels, and it sinks them to the end to
+        shorten that buffer's live range. On the 35B under the production
+        config all ten bells landed within twenty instructions of each other at
+        the tail of a 54790 instruction schedule, while their attention kernels
+        were spread over the preceding five thousand. Barriering `announced`
+        against `rung` gives the caller a value that cannot exist until the
+        ring has run; the caller feeds it to the rest of the layer, so every
+        instruction after this attention is now after this bell.
         """
-        return bell_call(group, generation, announced, doorbells)
+        rung = bell_call(group, generation, announced, doorbells)
+        return jax.lax.optimization_barrier((rung, announced))
 
     return bell_fn
 
@@ -169,13 +190,28 @@ def _make_sharded_bell_fn(num_groups: int, mesh, announced_spec, bells_spec):
     inner = _make_bell_fn(num_groups)
     replicated = P()
 
-    return jax.shard_map(
+    sharded = jax.shard_map(
         inner,
         mesh=mesh,
         in_specs=(announced_spec, bells_spec, replicated, replicated),
-        out_specs=bells_spec,
+        # Two results now: the rung buffer, and `announced` passed back through
+        # the barrier so the ring has a consumer. The second carries the same
+        # sharding it came in with, since the barrier is an identity.
+        out_specs=(bells_spec, announced_spec),
         check_vma=False,
     )
+
+    # The annotations have to be on the function `prebuild` hands over, not
+    # merely on `inner`. `pcp_streaming_jax_op` reads the signature with
+    # `follow_wrapped=False`, and `shard_map` presents a bare
+    # `(*args, **kwargs)`, which it rejects.
+    def sharded_bell_fn(
+        announced: jax.Array, doorbells: jax.Array, group: jax.Array,
+        generation: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return sharded(announced, doorbells, group, generation)
+
+    return sharded_bell_fn
 
 
 def shards_for(mesh, announced_spec) -> int:
@@ -259,11 +295,26 @@ class DoorbellSet:
         if self.op is not None:
             return
 
+        name = f"pallas::kv_doorbell_{_op_counter}"
+        # Donating the doorbell buffer is what makes the store land in the
+        # memory the reader watches. Without it the op returns a fresh buffer
+        # and the writeback lands somewhere nobody reads.
+        donated = (1, )
+
         if mesh is None:
-            fn = _make_bell_fn(self.num_groups)
-            specs = None
+            op = pallas.jax_op(name,
+                               _make_bell_fn(self.num_groups),
+                               donate_argnums=donated)
         else:
+            from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.\
+                vllm_adapter import pcp_streaming_jax_op
             from jax.sharding import PartitionSpec
+            replicated = PartitionSpec()
+            # A worker without PCP still has a mesh, but attention hands back
+            # no spec for it, and `NamedSharding` will not accept None.
+            # Replicated is what "on this mesh, unsharded" means.
+            if announced_spec is None:
+                announced_spec = replicated
             # The bells follow the KV cache onto whatever axis it is sharded
             # on, read off `announced_spec` rather than named here, so that
             # the two cannot drift apart if the attention mesh changes.
@@ -271,21 +322,36 @@ class DoorbellSet:
                 announced_spec[0] if announced_spec else None)
             fn = _make_sharded_bell_fn(self.num_groups, mesh, announced_spec,
                                        bells_spec)
-            replicated = PartitionSpec()
-            specs = [announced_spec, bells_spec, replicated, replicated]
+            # Not `pallas.jax_op`, despite the PCP name on this one. Stock
+            # `jax_op` reads output shapes off `lowered.out_avals`, and
+            # `jax.export` records every `shard_map` output there as
+            # replicated, so a sharded output comes back at its global shape.
+            # That is survivable while the only output is the donated bell
+            # buffer, which the writeback reshapes anyway, but the barrier's
+            # `announced` goes straight into the next layer and arrived eight
+            # times too long under PCP8. This wrapper carries
+            # `output_partition_specs` through to the allocation instead.
+            op = pcp_streaming_jax_op(
+                name,
+                fn,
+                donate_argnums=donated,
+                mesh=mesh,
+                input_partition_specs=[
+                    announced_spec, bells_spec, replicated, replicated
+                ],
+                output_partition_specs=[bells_spec, announced_spec],
+            )
 
-        op = pallas.jax_op(
-            f"pallas::kv_doorbell_{_op_counter}",
-            fn,
-            # Donating the doorbell buffer is what makes the store land in
-            # the memory the reader watches. Without it the op returns a
-            # fresh buffer and the writeback lands somewhere nobody reads.
-            donate_argnums=(1, ),
-            mesh=mesh,
-            input_partition_specs=specs,
-        )
+        # Both wrappers ship a fake kernel and neither will do. Each derives
+        # the output shape from the lowered JAX avals, which are concrete, and
+        # the token dimension of `announced` is symbolic: dynamo has it tied to
+        # `input_ids.size(0)` and rejects the graph the moment a constant shows
+        # up in its place. `empty_like` copies the input's shape whatever it is
+        # made of, so the SymInt survives. It also gives the local shard rather
+        # than the global array, which is what the caller is holding.
         op.register_fake(lambda announced, doorbells, group, generation:
-                         torch.empty_like(doorbells))
+                         (torch.empty_like(doorbells),
+                          torch.empty_like(announced)))
         _op_counter += 1
         self.op = op
 
@@ -478,11 +544,15 @@ class DoorbellWatcher:
 
 
 def ring_for(bells: DoorbellSet, layer_name: str,
-             announced: torch.Tensor) -> None:
-    """Ring `layer_name`'s bell, ordered after `announced` is produced.
+             announced: torch.Tensor) -> torch.Tensor:
+    """Ring `layer_name`'s bell and return the value the layer should use.
 
-    A no-op for a layer with no group, which is every layer on a worker that
-    is not the KV source.
+    The return is `announced`, but it is not the tensor that came in: it has
+    been through the barrier in `bell_fn` and so depends on the ring. Callers
+    have to use it in place of the original, or the ring keeps no consumer and
+    XLA sinks it to the end of the program. For a layer with no group, which is
+    every layer on a worker that is not the KV source, the original comes
+    straight back.
 
     Two conditions have to hold, and only one of them is about `announced`.
 
@@ -504,14 +574,15 @@ def ring_for(bells: DoorbellSet, layer_name: str,
     """
     group = bells.group_for(layer_name)
     if group is None or bells.op is None:
-        return
+        return announced
 
-    rung = bells.op(announced, bells.bells, bells.group_ids[group],
-                    bells.generation)
+    rung, announced = bells.op(announced, bells.bells,
+                               bells.group_ids[group], bells.generation)
     # The op returns the donated buffer, but torch_tpu hands back a new tensor
     # object bound to the same memory. Copying it back keeps `bells.bells`
     # pointing at the storage the eventual reader watches.
     bells.bells.copy_(rung)
+    return announced
 
 
 def install(bells: DoorbellSet, layers: dict) -> int:
@@ -526,10 +597,12 @@ def install(bells: DoorbellSet, layers: dict) -> int:
     returns is the one that op wrote, so it is both a real graph value and the
     right thing to depend on.
 
-    Nothing here orders the bells against each other, and nothing needs to. The
-    output aliasing already chains them: each call takes the previous call's
-    buffer as an operand, so the fifteen stores form a sequence XLA cannot
-    reshuffle. Returns how many layers were wrapped.
+    The wrapper returns what `ring_for` hands back rather than what attention
+    returned, and that substitution is the point of the whole file. The output
+    aliasing chains the bells to each other, so their relative order is safe,
+    but a chain with nothing downstream of it is free to slide as a block and
+    XLA slides it to the end. Feeding the layer the post-ring value nails the
+    block to the layers it reports on. Returns how many layers were wrapped.
     """
     wrapped = 0
     for name, layer in layers.items():
@@ -539,8 +612,7 @@ def install(bells: DoorbellSet, layers: dict) -> int:
         def ringing(original, name):
             def forward(*args, **kwargs):
                 out = original(*args, **kwargs)
-                ring_for(bells, name, out)
-                return out
+                return ring_for(bells, name, out)
 
             return forward
 

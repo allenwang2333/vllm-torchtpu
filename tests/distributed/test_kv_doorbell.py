@@ -40,15 +40,20 @@ SHAPE = (NUM_GROUPS, BELL_SUBLANES, BELL_LANES)
 def _ring(bells, group, generation):
     """One ring through the real `bell_fn`, interpreted so it needs no TPU.
 
-    `announced` stands in for the KV cache. The kernel never reads it, so its
-    contents and shape do not matter; it is passed because the production call
-    passes it, which is what orders the ring after the layer.
+    `announced` stands in for the attention output. The kernel never reads it,
+    so its contents and shape do not matter; it is passed because the
+    production call passes it, which is what orders the ring after the layer.
+
+    `bell_fn` returns `(rung, announced)`, and only the rung buffer is of
+    interest here. The second result exists to give the ring a consumer, which
+    is a scheduling property and so has nothing to observe in interpret mode.
     """
     fn = _make_bell_fn(NUM_GROUPS, interpret=True)
     announced = jnp.zeros((BELL_SUBLANES, BELL_LANES), jnp.int32)
     group_id = jnp.asarray([group], jnp.int32)
     gen = jnp.full((1, BELL_SUBLANES, BELL_LANES), generation, jnp.int32)
-    return fn(announced, bells, group_id, gen)
+    rung, _ = fn(announced, bells, group_id, gen)
+    return rung
 
 
 def _counters(bells):
@@ -168,9 +173,12 @@ def test_install_wraps_only_the_layers_that_have_a_group(monkeypatch):
     layers["model.layers.4.linear_attn"] = _FakeAttention()
 
     rung = []
-    monkeypatch.setattr(doorbell_module, "ring_for",
-                        lambda b, name, announced: rung.append(
-                            (name, announced)))
+
+    def fake_ring(b, name, announced):
+        rung.append((name, announced))
+        return announced
+
+    monkeypatch.setattr(doorbell_module, "ring_for", fake_ring)
 
     assert doorbell_module.install(bells, layers) == NUM_GROUPS
 
@@ -192,12 +200,43 @@ def test_install_keeps_each_layers_own_name(monkeypatch):
     layers = {n: _FakeAttention() for n in names}
 
     rung = []
-    monkeypatch.setattr(doorbell_module, "ring_for",
-                        lambda b, name, announced: rung.append(name))
+
+    def fake_ring(b, name, announced):
+        rung.append(name)
+        return announced
+
+    monkeypatch.setattr(doorbell_module, "ring_for", fake_ring)
 
     doorbell_module.install(bells, layers)
     layers[names[0]].forward(1)
     assert rung == [names[0]]
+
+
+def test_install_returns_the_post_ring_value(monkeypatch):
+    """The wrapper must hand the layer what `ring_for` returned.
+
+    Returning the original instead leaves the ring with no consumer, and XLA
+    then schedules every bell at the end of the program rather than beside the
+    attention it reports on. Nothing about the numbers changes when this
+    regresses, so only a test of the plumbing catches it.
+    """
+    bells, names = _cpu_set()
+    layers = {n: _FakeAttention() for n in names}
+
+    monkeypatch.setattr(doorbell_module, "ring_for",
+                        lambda b, name, announced: announced + 1)
+
+    doorbell_module.install(bells, layers)
+    # `_FakeAttention.forward` doubles, so the unwrapped answer is 6.
+    assert layers[names[0]].forward(3) == 7
+
+
+def test_ring_for_passes_through_an_unwatched_layer():
+    """A layer with no group has to get its own value back untouched."""
+    bells, _ = _cpu_set()
+    sentinel = object()
+    assert doorbell_module.ring_for(bells, "model.layers.4.linear_attn",
+                                    sentinel) is sentinel
 
 
 def test_verify_reads_are_bounded():
