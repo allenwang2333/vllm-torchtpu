@@ -80,6 +80,10 @@ Options:
                            acceptance bands. Client and oracle validation
                            remain mandatory.
   --keep-cache             Keep per-run compilation caches after teardown.
+  --prefill-transfer-ips IPS
+                           Comma-separated or single transfer IP(s) for prefill.
+  --decode-transfer-ips IPS
+                           Comma-separated or single transfer IP(s) for decode.
   -h, --help               Show this help.
 
 Advanced port overrides:
@@ -318,6 +322,11 @@ check_role_environment() {
   export HUGGINGFACE_HUB_CACHE=/mnt/disk/hub
   export TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-17179869184}"
   export TPU_VISIBLE_CHIPS=0,1,2,3,4,5,6,7
+  if [[ "${role}" == prefill && -n "${PREFILL_TRANSFER_IPS}" ]]; then
+    export TPU_KV_TRANSFER_IPS="${PREFILL_TRANSFER_IPS}"
+  elif [[ "${role}" == decode && -n "${DECODE_TRANSFER_IPS}" ]]; then
+    export TPU_KV_TRANSFER_IPS="${DECODE_TRANSFER_IPS}"
+  fi
 
   if [[ "${model}" == /* ]]; then
     [[ "${model}" == /mnt/disk/* ]] || die "absolute model paths must be under /mnt/disk: ${model}"
@@ -553,6 +562,12 @@ configure_role_environment() {
   mkdir -p "${TPU_LOG_DIR}" "${XDG_CACHE_HOME}" "${TRITON_CACHE_DIR}" "${TMPDIR}"
 
   export VLLM_HOST_IP="${role_host}"
+  if [[ "${role}" == prefill && -n "${PREFILL_TRANSFER_IPS}" ]]; then
+    export TPU_KV_TRANSFER_IPS="${PREFILL_TRANSFER_IPS}"
+  elif [[ "${role}" == decode && -n "${DECODE_TRANSFER_IPS}" ]]; then
+    export TPU_KV_TRANSFER_IPS="${DECODE_TRANSFER_IPS}"
+  fi
+  unset TPU_RAIDEN_BIND_IP TPU_RAIDEN_INTERFACE
   export TPU_VISIBLE_CHIPS=0,1,2,3,4,5,6,7
   export TPU_CHIPS_PER_HOST_BOUNDS=1,8,1
   unset DEBUG_TPU_LOCAL_RANK_OFFSET
@@ -1671,6 +1686,8 @@ SKIP_ACCURACY_ORACLE=0
 # Extra KEY=VALUE environment entries exported into both role processes
 # (forwarded verbatim to the internal-role invocations on each host).
 ROLE_ENVS=()
+PREFILL_TRANSFER_IPS=""
+DECODE_TRANSFER_IPS=""
 PREFILL_HOST=""
 DECODE_HOST=""
 MODEL="${DEFAULT_MODEL}"
@@ -1717,6 +1734,10 @@ while (($#)); do
     --block-size) BLOCK_SIZE="${2:?missing value for $1}"; shift 2 ;;
     --prefill-api-port) PREFILL_API_PORT="${2:?missing value for $1}"; shift 2 ;;
     --decode-api-port) DECODE_API_PORT="${2:?missing value for $1}"; shift 2 ;;
+    --prefill-transfer-ips)
+      PREFILL_TRANSFER_IPS="${2:?missing value for $1}"; shift 2 ;;
+    --decode-transfer-ips)
+      DECODE_TRANSFER_IPS="${2:?missing value for $1}"; shift 2 ;;
     --prefill-controller-port) PREFILL_CONTROLLER_PORT="${2:?missing value for $1}"; shift 2 ;;
     --decode-controller-port) DECODE_CONTROLLER_PORT="${2:?missing value for $1}"; shift 2 ;;
     --kv-port) KV_PORT="${2:?missing value for $1}"; shift 2 ;;
@@ -1838,6 +1859,9 @@ remote_args_common=(
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
   --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
+if [[ -n "${PREFILL_TRANSFER_IPS}" ]]; then
+  remote_args_common+=(--prefill-transfer-ips "${PREFILL_TRANSFER_IPS}")
+fi
 local_args_common=(
   --role-kind decode
   --role-dir "${DECODE_ROLE_DIR}"
@@ -1861,6 +1885,9 @@ local_args_common=(
   --reshard-controller-impl "${RESHARD_CONTROLLER_IMPL}"
   --reshard-sidecar-bin "${RESHARD_SIDECAR_BIN}"
 )
+if [[ -n "${DECODE_TRANSFER_IPS}" ]]; then
+  local_args_common+=(--decode-transfer-ips "${DECODE_TRANSFER_IPS}")
+fi
 for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
   remote_args_common+=(--role-env "${_role_env}")
   local_args_common+=(--role-env "${_role_env}")
