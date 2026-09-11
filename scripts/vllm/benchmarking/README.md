@@ -48,8 +48,11 @@ the same live server:
   prompt-len), median TTFT is queue-position noise, so nightly baselines are
   calibrated with `--gate-ttft-max-concurrency 0` to omit it.
 - `--mode eval` compares `lm_eval` accuracy to
-  `baselines/eval/<config>.<task>.baseline.json` (1.5pp tolerance). Only keys
-  present in the baseline are gated. `--run-lm-eval` walks `LM_EVAL_TASKS`
+  `baselines/eval/<config>.<task>.baseline.json` (1.5pp default tolerance, or
+  config `EVAL_TOLERANCE`). Only keys present in the baseline are gated. Where
+  the baseline carries standard error (`exact_match_stderr`), the allowed drop
+  takes `max(tolerance, stderr)` to account for per-category sampling variance.
+  `--run-lm-eval` walks `LM_EVAL_TASKS`
   (default `mmlu_llama mmlu_pro`; configs may narrow it). MMLU tasks
   (`mmlu_llama`, `mmlu_pro`) run against the chat-completions endpoint;
   code-generation tasks

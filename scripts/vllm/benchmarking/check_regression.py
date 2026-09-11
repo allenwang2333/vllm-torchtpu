@@ -224,9 +224,16 @@ def primary_metric(entry: dict) -> tuple[str, float] | None:
     return None
 
 
+def primary_stderr(entry: dict) -> float | None:
+    for k in STDERR_KEYS:
+        if k in entry:
+            return entry[k]
+    return None
+
+
 def check_eval(results: dict[str, dict], baseline: dict[str, dict],
                tolerance: float) -> int:
-    rows: list[tuple[str, str, float, float, float, str]] = []
+    rows: list[tuple[str, str, float, float, float, float, str]] = []
     failed = 0
 
     # Eval result JSONs include every MMLU subtask even when the baseline only
@@ -234,36 +241,37 @@ def check_eval(results: dict[str, dict], baseline: dict[str, dict],
     keys = sorted(baseline)
     for task in keys:
         if task not in results:
-            rows.append((task, "(no result)", 0.0, 0.0, 0.0, "FAIL"))
+            rows.append((task, "(no result)", 0.0, 0.0, 0.0, 0.0, "FAIL"))
             failed += 1
             continue
 
         b = primary_metric(baseline[task])
         r = primary_metric(results[task])
         if b is None or r is None:
-            rows.append((task, "(no acc)", 0.0, 0.0, 0.0, "SKIP"))
+            rows.append((task, "(no acc)", 0.0, 0.0, 0.0, 0.0, "SKIP"))
             continue
         metric_name = b[0]
         baseline_acc = b[1]
         actual_acc = r[1]
         delta = actual_acc - baseline_acc
+        stderr = primary_stderr(baseline[task]) or 0.0
+        allowed_drop = max(tolerance, stderr)
         # Epsilon guards the exactly-at-tolerance case against binary
         # floating-point error (e.g. 0.88 - 0.90 = -0.020000000000000018).
-        status = "PASS" if delta >= -tolerance - 1e-9 else "FAIL"
+        status = "PASS" if delta >= -allowed_drop - 1e-9 else "FAIL"
         if status == "FAIL":
             failed += 1
-        rows.append(
-            (task, metric_name, actual_acc, baseline_acc, delta, status))
+        rows.append((task, metric_name, actual_acc, baseline_acc, stderr,
+                     delta, status))
 
     print(
         f"\n## MMLU/eval regression check (tolerance: -{tolerance*100:.2f}pp)\n"
     )
-    print("| task | metric | actual | baseline | delta | status |")
-    print("|---|---|---:|---:|---:|---|")
-    for task, metric, actual, baseline, delta, status in rows:
-        print(
-            f"| `{task}` | {metric} | {actual:.4f} | {baseline:.4f} | {delta:+.4f} | {status} |"
-        )
+    print("| task | metric | actual | baseline | stderr | delta | status |")
+    print("|---|---|---:|---:|---:|---:|---|")
+    for task, metric, actual, baseline, stderr, delta, status in rows:
+        print(f"| `{task}` | {metric} | {actual:.4f} | {baseline:.4f} | "
+              f"{stderr:.4f} | {delta:+.4f} | {status} |")
     print()
     return failed
 
