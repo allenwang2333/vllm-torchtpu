@@ -1823,7 +1823,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
                 torch.empty_like(ql_nope),
-                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32), #LSE
+                # LSE: one f32 per (token, head).
+                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
             )
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
