@@ -1,0 +1,176 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A benchmark across both hosts of a 2x2x2 v7x slice - what
+# .buildkite/scripts/run_multihost.sh sets up on bare metal.
+#
+# Nothing here names a benchmark. The two GLM steps in pipeline_perf_kube.yml
+# differ only in the arguments they hand multihost_entry.sh, so they differ
+# only in MULTIHOST_ARGS and share this file; the shape, the caches and the
+# bring-up are the same either way.
+#
+# One replicatedJob, not one per role. A multi-host TPU slice is placed by GKE
+# as the pods of a single Job: parallelism equals the slice's host count, the
+# nodeSelector names the whole slice's topology, and the scheduler puts index i
+# on host i of one physical slice. Two Jobs asking for 2x2x2 would be two
+# slices, and the interconnect the workload needs would not exist between them.
+#
+# So both hosts run the same container and the same command, and which role a
+# host plays comes from JOB_COMPLETION_INDEX inside multihost_entry.sh. That is
+# also what makes the topology a property of this file alone: to run a larger
+# slice, change the topology and parallelism together and nothing else moves.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted by the launcher before
+# submission; a literal dollar is written $$.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+spec:
+  # Gives each pod a DNS name - <jobset>-slice-0-<index> under a headless
+  # service named for the JobSet - which is how a host addresses the head
+  # without a Service to select it and without discovering anyone's IP.
+  network:
+    enableDNSHostnames: true
+  # Long enough for the launcher's last log poll after the pods exit.
+  ttlSecondsAfterFinished: 300
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          # Two hosts, one per node of the slice. Indexed is required both by
+          # enableDNSHostnames and by GKE's multi-host TPU placement, and the
+          # index is what assigns the roles.
+          parallelism: 2
+          completions: 2
+          completionMode: Indexed
+          # No retries. A failed host leaves the other one waiting on a peer
+          # that will come back with an empty compilation cache and a different
+          # pod name; the run is over either way, and the log says why.
+          backoffLimit: 0
+          # Ten hours, not the fleet's three-hour default: these models compile
+          # for the better part of an hour before the sweep starts. The
+          # launcher bounds it by the step's whole budget.
+          activeDeadlineSeconds: 36000
+          template:
+            metadata:
+              annotations:
+                # Without this GKE does not inject the sidecar and the cache
+                # claims below never mount.
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/metadata-prefetch-memory-limit: "2Gi"
+                # Unthrottled sidecar: these are hundred-billion-parameter
+                # checkpoints and the parallel download is CPU-bound.
+                gke-gcsfuse/cpu-limit: "0"
+                gke-gcsfuse/memory-limit: "0"
+                # A benchmark holds both nodes for hours with nothing else on
+                # them, which is what OPTIMIZE_UTILIZATION consolidates away.
+                cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            spec:
+              restartPolicy: Never
+              serviceAccountName: tpu-workload
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x2
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Equal"
+                  value: "present"
+                  effect: "NoSchedule"
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "-lc"]
+                  args:
+                    - |
+                      export VLLM_HOST_IP="$${POD_IP}"
+                      exec bash .buildkite/kubernetes/multihost_entry.sh $${MULTIHOST_ARGS}
+                  env:
+                    # The DNS name of index 0. Every host addresses the head by
+                    # this: the Ray workers join it, and the mp engines take it
+                    # as --data-parallel-address.
+                    - name: HEAD_HOST
+                      value: ${WORKLOAD_NAME}-slice-0-0.${WORKLOAD_NAME}
+                    # Must match parallelism above. The head waits for this
+                    # many peers, and the mp path checks the config's data
+                    # parallelism divides by it.
+                    - name: NUM_HOSTS
+                      value: "2"
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    # HF_TOKEN is not here: the step reads it from Secret
+                    # Manager and the launcher forwards it, so no copy of it
+                    # sits in the namespace between runs.
+                    - name: HF_HOME
+                      value: /cache/hf
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: RAY_LOG_TO_STDERR
+                      value: "1"
+                    # Both compile caches on the fleet's compilation bucket, so
+                    # a cold compile is paid once rather than once per run.
+                    # VLLM_CACHE_ROOT defaults under $$HOME and would otherwise
+                    # land on the node's boot disk, which it does not fit on.
+                    - name: VLLM_XLA_CACHE_PATH
+                      value: /cache/jax/xla
+                    - name: VLLM_CACHE_ROOT
+                      value: /cache/jax/vllm
+                  ports:
+                    - containerPort: 8000
+                  # As in kueue_disagg.yaml: the pod holds every chip on the
+                  # node and the pool is tainted, so cpu and memory are stated
+                  # only as much as the scheduler needs to place it, and left
+                  # unlimited above that. ephemeral-storage stays well under
+                  # the node's allocatable because nothing large is written to
+                  # the container filesystem - weights and caches are mounts,
+                  # and core dumps are off.
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "20Gi"
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "180"
+                      memory: "700Gi"
+                      ephemeral-storage: "20Gi"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: jax-cache
+                      mountPath: /cache/jax
+                    - name: hf-cache
+                      mountPath: /cache/hf/hub
+              volumes:
+                # Backing store for the gcsfuse file cache, in RAM. The
+                # launcher sets sizeLimit from the machine type.
+                - name: gke-gcsfuse-cache
+                  emptyDir:
+                    medium: Memory
+                # Larger than the disagg engines': Ray puts its object store
+                # here, and the mp path's DP handoff is shared memory too.
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 64Gi
+                # Claims, not inline CSI volumes: the buckets are regional, so
+                # the name differs per cluster and only a claim resolves in
+                # whichever cluster the workload was dispatched to.
+                - name: jax-cache
+                  persistentVolumeClaim:
+                    claimName: jax-cache
+                - name: hf-cache
+                  persistentVolumeClaim:
+                    claimName: hf-cache
