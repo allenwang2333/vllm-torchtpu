@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from typing import NamedTuple
 
 import jax
@@ -29,6 +28,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import varlen_tiles
 
 __all__ = [
@@ -68,8 +68,7 @@ def exp2(x):
 
 
 def get_interpret() -> bool:
-    env = os.environ.get("PALLAS_INTERPRET", "")
-    return env.strip().lower() in ("1", "true")
+    return envs.PALLAS_INTERPRET
 
 
 def cdiv(x, y: int):
