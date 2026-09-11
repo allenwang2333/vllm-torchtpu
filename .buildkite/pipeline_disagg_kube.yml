@@ -1,0 +1,95 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The P/D disaggregated benchmark on the managed kube fleet, beside
+# pipeline_disagg_gke.yml rather than in place of it. Soft-failing while the two
+# run side by side: this lane is being proven, the other still owns the nightly
+# numbers.
+#
+# There is no cluster name and no zone here. A step on queue `kube` runs in the
+# manager cluster and submits its manifest to Kueue, which admits it against
+# fleet quota and dispatches it to whichever worker cluster holds the chips. The
+# kubectl and Cloud SDK downloads the other pipeline does on every run go with
+# them: the agent image already has both.
+
+# One definition for both steps: the build step's -t and the launch step's
+# WORKLOAD_IMAGE are by construction the same string. A fixed tag rather than one
+# per commit, because the launcher resolves it to a digest when it submits, so a
+# run is pinned to the bytes this build pushed even if a later build moves the
+# tag underneath it.
+env:
+  WORKLOAD_IMAGE: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:kube-disagg"
+
+steps:
+  # The benchmark pod publishes its own results, which needs buildkite-agent in
+  # the image, and the nightly `dev` tag is only as new as the last nightly. So
+  # this lane builds what it runs, from the commit it is testing. Drop the step
+  # and point WORKLOAD_IMAGE back at :latest once a nightly has been published
+  # from a Dockerfile carrying the agent.
+  - label: ":docker: Build the benchmark image"
+    key: "build_kube_disagg_image"
+    agents:
+      queue: cpu_64_core
+    commands:
+      # dev, not prod: prod is not a CI image and does not carry CI tooling.
+      # dev is the ci stage - buildkite-agent, the bq CLI - plus the installed
+      # package, which a pod needs and ci alone does not have, since ci expects
+      # the repo bind-mounted and a pod has nothing to mount.
+      - ./docker/build_image.sh --target dev -t "$$WORKLOAD_IMAGE"
+      - docker push "$$WORKLOAD_IMAGE"
+
+  - label: ":kubernetes: :tpu: Kube P/D Disaggregated Benchmark"
+    key: "kube_pd_disagg_benchmark"
+    depends_on: "build_kube_disagg_image"
+    # Eleven hours, the fleet's whole per-step budget: the workload may serve
+    # for ten, and the rest is queueing for chips plus reading results back.
+    timeout_in_minutes: 660
+    soft_fail: true
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          # The pod template the fleet publishes: it is what carries the
+          # launcher binary, the profile registry and the service account that
+          # may submit a workload.
+          podTemplate: tpu-launcher
+    env:
+      CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+      # Nothing is written to BigQuery while this lane runs beside
+      # pipeline_disagg_gke.yml: they measure the same benchmark on the same
+      # chips, and the table's readers assume one row a night. Set to 1 - or
+      # delete the GKE lane and this line with it - when this one takes over.
+      BQ_UPLOAD: "0"
+    commands:
+      # No wrapper script. Everything a run needs is either the fleet's
+      # (admission, dispatch, the image digest, log streaming, cleanup) or the
+      # benchmark pod's (measuring, uploading, publishing), so there is nothing
+      # left for a step to do between them.
+      #
+      # --env forwards by name into every container called `workload`. The
+      # three BUILDKITE_ ones are what buildkite-agent needs to attach an
+      # artifact to this job: that puts the step's own credential in a workload
+      # pod, which is a widening against the fleet as designed but not against
+      # what runs today, since the bare-metal lanes run the same image on the
+      # agent host with the same credential already in reach.
+      - >-
+        /opt/launcher/launch
+        --manifest .buildkite/kubernetes/manifests/v7x/kueue_disagg.yaml
+        --env HF_TOKEN
+        --env BQ_UPLOAD
+        --env CREATED_BY
+        --env BUILDKITE_COMMIT
+        --env BUILDKITE_AGENT_ACCESS_TOKEN
+        --env BUILDKITE_JOB_ID
+        --env BUILDKITE_BUILD_ID

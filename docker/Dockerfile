@@ -45,6 +45,12 @@ FROM base AS ci
 # Copy bktec binary from Buildkite Test Engine client image
 COPY --from=buildkite/test-engine-client /usr/local/bin/bktec /usr/local/bin/bktec
 
+# The agent CLI, for a job step that runs somewhere the agent is not. On the
+# kube fleet a benchmark runs in a pod of its own in another cluster, and the
+# pod is deleted the moment it finishes, so uploading its results from inside
+# it is the only way they outlive it.
+COPY --from=buildkite/agent:3 /usr/local/bin/buildkite-agent /usr/local/bin/buildkite-agent
+
 # Install tools needed for CI (git, gcloud, lsof, fuser)
 RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg git lsof psmisc lsb-release && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \

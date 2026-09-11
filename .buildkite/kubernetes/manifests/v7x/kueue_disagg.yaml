@@ -1,0 +1,683 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The 1P1D benchmark as a Kueue workload: the same engines and the same client
+# sweep as jobset_disagg.yaml, submitted through the tpu-ci launcher instead of
+# kubectl, so the chips are admitted against fleet quota and returned to the
+# reservation when the run ends.
+#
+# What differs from jobset_disagg.yaml is only what the fleet owns:
+#
+#   - name, namespace, queue and the image come from the launcher, so this file
+#     states none of them. ${WORKLOAD_NAME} and ${IMAGE} are substituted before
+#     submission; a literal dollar is written $$.
+#   - the two Services are gone. JobSet publishes a hostname per pod, which is
+#     unique to a run, where a selector on `app: vllm-prefill` is not - two
+#     builds overlapping would have sent half of one run's traffic into the
+#     other's engines.
+#   - the caches are the fleet's GCS buckets rather than per-run PersistentDisk
+#     claims, so a compile survives the run that paid for it and the weights are
+#     fetched once for the whole fleet.
+#   - no privileged containers and no init containers. vm.max_map_count is a
+#     property of the TPU node pools now; PodSecurity `baseline` on the workload
+#     namespace would refuse the container that used to set it.
+#
+# Every role that holds chips asks for the same shape, because a workload is
+# admitted against one queue and a queue is one shape. The client asks for no
+# accelerator and rides along: the queues put google.com/tpu alone under quota.
+#
+# All three containers are named `workload`. That is the name the launcher
+# forwards step environment into and reads logs from, so naming all three gets
+# HF_TOKEN to the engines and the engines' output into the Buildkite log.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+spec:
+  # Each pod gets a DNS name of its own - <jobset>-<role>-<job>-<pod> under a
+  # headless service named for the JobSet - which is how the client finds the
+  # engines without a Service to select them.
+  network:
+    enableDNSHostnames: true
+  # The engines serve until told to stop, so the client finishing is what
+  # finishes the run; JobSet then tears the engines down.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  # Long enough for the launcher's last log poll after the client exits.
+  ttlSecondsAfterFinished: 300
+  replicatedJobs:
+    # ---------------------------------------------------------
+    # PREFILL ENGINE (DP1/PCP8/TP1)
+    # ---------------------------------------------------------
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Ten hours, not the fleet's three-hour default: a cold compile of
+          # this model can take two on its own, and the client sweep is another
+          # eight. The launcher bounds it by the step's whole budget.
+          activeDeadlineSeconds: 36000
+          # Indexed because enableDNSHostnames requires it: the pod index is
+          # half of the hostname.
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              annotations:
+                # Without this GKE does not inject the sidecar and the cache
+                # claims below never mount.
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/metadata-prefetch-memory-limit: "2Gi"
+                # Unthrottled sidecar: parallel checkpoint downloads are
+                # CPU-bound, and this is a 397B model.
+                gke-gcsfuse/cpu-limit: "0"
+                gke-gcsfuse/memory-limit: "0"
+                # A benchmark holds one node for hours with nothing else on it,
+                # which is exactly what OPTIMIZE_UTILIZATION consolidates away.
+                cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            spec:
+              restartPolicy: Never
+              serviceAccountName: tpu-workload
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Equal"
+                  value: "present"
+                  effect: "NoSchedule"
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: [ "/bin/bash", "-c", "--" ]
+                args:
+                  - |
+                    set -e
+                    # Worker core dumps are ~4GiB each and overflow the
+                    # ephemeral-storage limit; the backtrace in the log is
+                    # the useful artifact.
+                    ulimit -c 0
+                    export VLLM_HOST_IP="$${POD_IP}"
+                    exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=32768 --long-prefill-token-threshold=32768 --max-num-seqs=8 --prefill-context-parallel-size=8 --cp-kv-cache-interleave-size=256 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[1024,2048,4096,5120],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}'
+                env:
+                - name: POD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                # HF_TOKEN is not here: the step reads it from Secret Manager
+                # and the launcher forwards it, so no copy of it sits in the
+                # namespace between runs.
+                - name: HF_HOME
+                  value: /cache/hf
+                - name: VLLM_LOGGING_LEVEL
+                  value: "INFO"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                # Raiden runtime env; kernel-selection vars deliberately
+                # stay unset.
+                - name: JAX_PLATFORMS
+                  value: "tpu,cpu"
+                - name: PJRT_DEVICE
+                  value: TPU
+                - name: TPU_BACKEND_TYPE
+                  value: jax
+                - name: VLLM_XLA_CHECK_RECOMPILATION
+                  value: "0"
+                - name: TPU_VLLM_SKIP_DYNAMIC_SMEM_NEGOTIATION_FLAG
+                  value: "1"
+                - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                  value: "1"
+                - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                  value: "1"
+                - name: TPU_RAIDEN_QWEN35_ADMISSION
+                  value: "1"
+                - name: TPU_KV_RESHARD_TRANSPORT
+                  value: "raiden"
+                # Sidecar-less reshard plane: rank-0 hosts the service at
+                # PORT_BASE + dp_rank, dispatch at DISPATCH_BASE + dp_rank.
+                - name: TPU_RAIDEN_RESHARD_IMPL
+                  value: "store"
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_RESHARD_PORT_BASE
+                  value: "27000"
+                - name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE
+                  value: "27100"
+                - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                  value: "8"
+                - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+                  value: "1"
+                - name: XLA_PYTHON_CLIENT_PREALLOCATE
+                  value: "false"
+                - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+                  value: "1"
+                - name: TPU_PREMAPPED_BUFFER_SIZE
+                  value: "17179869184"
+                - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                  value: "600"
+                - name: TPU_KV_SHM_POOL_GB
+                  value: "8"
+                - name: TPU_KV_TRANSFER_PORT
+                  value: "9100"
+                - name: TPU_SIDE_CHANNEL_PORT
+                  value: "9600"
+                - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                  value: "disabled"
+                - name: TPU_KV_TRANSFER_NAMESPACE
+                  value: "gke_prefill"
+                - name: TPU_RAIDEN_JOB_NAME
+                  value: "prefill"
+                - name: TPU_RAIDEN_ENGINE_ID
+                  value: "gke-prefill-engine"
+                # GKE topology plumbing.
+                - name: TPU_TOPOLOGY
+                  value: "2x2x1"
+                - name: TPU_HOST_BOUNDS
+                  value: "1,1,1"
+                - name: TPU_ACCELERATOR_TYPE
+                  value: "tpu7x"
+                - name: MEGASCALE_NUM_SLICES
+                  value: ""
+                - name: MEGASCALE_SLICE_ID
+                  value: ""
+                - name: TPU_PROCESS_ADDRESSES
+                  value: ""
+                - name: TPU_WORKER_HOSTNAMES
+                  value: ""
+                - name: TPU_PROCESS_PORT
+                  value: ""
+                - name: MEGASCALE_COORDINATOR_ADDRESS
+                  value: ""
+                - name: MEGASCALE_PORT
+                  value: ""
+                - name: RAY_LOG_TO_STDERR
+                  value: "1"
+                # Container startup plumbing.
+                - name: VLLM_ENGINE_READY_TIMEOUT_S
+                  value: "7200"
+                # Both compile caches on the fleet's compilation bucket, so a
+                # cold compile of this model is paid once rather than once per
+                # run. VLLM_CACHE_ROOT defaults under $$HOME and would otherwise
+                # land on the node's boot disk, which it does not fit on.
+                - name: VLLM_XLA_CACHE_PATH
+                  value: "/cache/jax/xla"
+                - name: VLLM_CACHE_ROOT
+                  value: "/cache/jax/vllm"
+                ports:
+                - containerPort: 8000
+                # Nothing else can land on this node - it holds all four chips
+                # and the pool is tainted - so cpu and memory are stated only
+                # as much as the scheduler needs to place the pod. Unlimited
+                # above that, because the engine's host-memory ceiling is the
+                # node's and pinning a number here only invites an OOM kill
+                # when a model grows.
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                    ephemeral-storage: "30Gi"
+                  requests:
+                    google.com/tpu: "4"
+                    cpu: "180"
+                    memory: "700Gi"
+                    ephemeral-storage: "30Gi"
+                volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: jax-cache
+                  mountPath: /cache/jax
+                - name: hf-cache
+                  mountPath: /cache/hf/hub
+              volumes:
+              # Backing store for the gcsfuse file cache, in RAM. The launcher
+              # sets sizeLimit from the machine type.
+              - name: gke-gcsfuse-cache
+                emptyDir:
+                  medium: Memory
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 16Gi
+              # Claims, not inline CSI volumes: the buckets are regional, so
+              # the name differs per cluster and only a claim resolves in
+              # whichever cluster the workload was dispatched to.
+              - name: jax-cache
+                persistentVolumeClaim:
+                  claimName: jax-cache
+              - name: hf-cache
+                persistentVolumeClaim:
+                  claimName: hf-cache
+
+    # ---------------------------------------------------------
+    # DECODE ENGINE (TP1/DP8/EP8)
+    # ---------------------------------------------------------
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Ten hours, not the fleet's three-hour default: a cold compile of
+          # this model can take two on its own, and the client sweep is another
+          # eight. The launcher bounds it by the step's whole budget.
+          activeDeadlineSeconds: 36000
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            metadata:
+              annotations:
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/metadata-prefetch-memory-limit: "2Gi"
+                gke-gcsfuse/cpu-limit: "0"
+                gke-gcsfuse/memory-limit: "0"
+                cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+            spec:
+              restartPolicy: Never
+              serviceAccountName: tpu-workload
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              tolerations:
+                - key: "google.com/tpu"
+                  operator: "Equal"
+                  value: "present"
+                  effect: "NoSchedule"
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                command: [ "/bin/bash", "-c", "--" ]
+                args:
+                  - |
+                    set -e
+                    ulimit -c 0
+                    export VLLM_HOST_IP="$${POD_IP}"
+                    exec vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --trust-remote-code --seed=42 --max-model-len=66560 --block-size=8192 --enable-expert-parallel --disable-custom-all-reduce --gpu-memory-utilization=0.9 --kv-cache-dtype=fp8 --language-model-only --no-disable-hybrid-kv-cache-manager --attention-backend=CUSTOM --mamba-cache-mode=align --enable-prompt-tokens-details --no-enable-log-requests --no-enable-prefix-caching --no-async-scheduling --tensor-parallel-size=1 --max-num-batched-tokens=4384 --max-num-seqs=32 --prefill-context-parallel-size=1 --data-parallel-size=8 --data-parallel-size-local=8 --compilation-config '{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[8,16,32,4352,4384],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}' --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}'
+                env:
+                - name: POD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: HF_HOME
+                  value: /cache/hf
+                - name: VLLM_LOGGING_LEVEL
+                  value: "INFO"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: JAX_PLATFORMS
+                  value: "tpu,cpu"
+                - name: PJRT_DEVICE
+                  value: TPU
+                - name: TPU_BACKEND_TYPE
+                  value: jax
+                - name: VLLM_XLA_CHECK_RECOMPILATION
+                  value: "0"
+                - name: TPU_VLLM_SKIP_DYNAMIC_SMEM_NEGOTIATION_FLAG
+                  value: "1"
+                - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+                  value: "1"
+                - name: TPU_USE_RAIDEN_KV_CACHE_MANAGER
+                  value: "1"
+                - name: TPU_RAIDEN_QWEN35_ADMISSION
+                  value: "1"
+                - name: TPU_KV_RESHARD_TRANSPORT
+                  value: "raiden"
+                # Sidecar-less reshard plane; DP8, so ranks 0-7 bind
+                # 28000-28007 (service) and 28100-28107 (dispatch).
+                - name: TPU_RAIDEN_RESHARD_IMPL
+                  value: "store"
+                - name: TPU_RAIDEN_ADVERTISE_HOST
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+                - name: TPU_RAIDEN_RESHARD_PORT_BASE
+                  value: "28000"
+                - name: TPU_RAIDEN_STORE_DISPATCH_PORT_BASE
+                  value: "28100"
+                - name: TPU_RAIDEN_TRANSFER_PARALLELISM
+                  value: "8"
+                - name: TPU_GDN_CONV_QK_PAIR_LAYOUT
+                  value: "1"
+                - name: XLA_PYTHON_CLIENT_PREALLOCATE
+                  value: "false"
+                - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+                  value: "1"
+                - name: TPU_PREMAPPED_BUFFER_SIZE
+                  value: "17179869184"
+                - name: TPU_P2P_WAIT_PULL_TIMEOUT
+                  value: "600"
+                - name: TPU_KV_SHM_POOL_GB
+                  value: "8"
+                - name: TPU_KV_TRANSFER_PORT
+                  value: "9100"
+                - name: TPU_SIDE_CHANNEL_PORT
+                  value: "9600"
+                - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                  value: "disabled"
+                - name: TPU_KV_TRANSFER_NAMESPACE
+                  value: "gke_decode"
+                - name: TPU_RAIDEN_JOB_NAME
+                  value: "decode"
+                - name: TPU_RAIDEN_ENGINE_ID
+                  value: "gke-decode-engine"
+                # GKE topology plumbing.
+                - name: TPU_TOPOLOGY
+                  value: "2x2x1"
+                - name: TPU_HOST_BOUNDS
+                  value: "1,1,1"
+                - name: TPU_ACCELERATOR_TYPE
+                  value: "tpu7x"
+                - name: MEGASCALE_NUM_SLICES
+                  value: ""
+                - name: MEGASCALE_SLICE_ID
+                  value: ""
+                - name: TPU_PROCESS_ADDRESSES
+                  value: ""
+                - name: TPU_WORKER_HOSTNAMES
+                  value: ""
+                - name: TPU_PROCESS_PORT
+                  value: ""
+                - name: MEGASCALE_COORDINATOR_ADDRESS
+                  value: ""
+                - name: MEGASCALE_PORT
+                  value: ""
+                - name: RAY_LOG_TO_STDERR
+                  value: "1"
+                # Container startup plumbing.
+                - name: VLLM_ENGINE_READY_TIMEOUT_S
+                  value: "7200"
+                - name: VLLM_XLA_CACHE_PATH
+                  value: "/cache/jax/xla"
+                - name: VLLM_CACHE_ROOT
+                  value: "/cache/jax/vllm"
+                ports:
+                - containerPort: 8000
+                resources:
+                  limits:
+                    google.com/tpu: "4"
+                    ephemeral-storage: "30Gi"
+                  requests:
+                    google.com/tpu: "4"
+                    cpu: "180"
+                    memory: "700Gi"
+                    ephemeral-storage: "30Gi"
+                volumeMounts:
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: jax-cache
+                  mountPath: /cache/jax
+                - name: hf-cache
+                  mountPath: /cache/hf/hub
+              volumes:
+              - name: gke-gcsfuse-cache
+                emptyDir:
+                  medium: Memory
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 16Gi
+              - name: jax-cache
+                persistentVolumeClaim:
+                  claimName: jax-cache
+              - name: hf-cache
+                persistentVolumeClaim:
+                  claimName: hf-cache
+
+    # ---------------------------------------------------------
+    # BENCHMARK CLIENT & PROXY
+    # ---------------------------------------------------------
+    # No accelerator and no cache mounts: this is an HTTP client that reads a
+    # tokenizer and writes JSON. It lands on the worker's system pool, and the
+    # queues charge nothing for it because only google.com/tpu is under quota.
+    - name: benchmark
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Ten hours, not the fleet's three-hour default: a cold compile of
+          # this model can take two on its own, and the client sweep is another
+          # eight. The launcher bounds it by the step's whole budget.
+          activeDeadlineSeconds: 36000
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              # Holds no chips, but it is the pod that publishes the run: the
+              # BigQuery insert below is authenticated as this account through
+              # the metadata server, and it is the one with a grant on the
+              # benchmark table.
+              serviceAccountName: tpu-workload
+              containers:
+              - name: workload
+                image: ${IMAGE}
+                env:
+                # What the BigQuery row is tagged with. The rest of the fields
+                # the parser reads - the commit, who triggered the build - are
+                # the step's and arrive by --env; these two are properties of
+                # the manifest, so the manifest states them.
+                - name: RUN_TYPE
+                  value: "KUBE_DISAGG"
+                - name: REPOSITORY
+                  value: "vllm-torchtpu"
+                # The digest the launcher resolved, so the row names the exact
+                # bytes that were measured rather than a tag that has moved.
+                - name: DOCKER_IMAGE
+                  value: ${IMAGE}
+                # Off unless the step says otherwise. This lane runs beside
+                # pipeline_disagg_gke.yml and the two measure the same
+                # benchmark on the same chips, so publishing from both would
+                # put two rows a night into a table whose readers assume one.
+                - name: BQ_UPLOAD
+                  value: "0"
+                # vllm bench serve is a pure HTTP client on a CPU node; loading
+                # the torchtpu platform plugin there makes vLLM's CLI call
+                # torch.device("tpu"), which fails without import torch_tpu.
+                - name: VLLM_PLUGINS
+                  value: ""
+                # PyTorch auto-imports torch_tpu at `import torch` via the
+                # torch.backends entry point; without libtpu its native init
+                # fatally aborts. Disable backend autoload on this CPU client.
+                - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+                  value: "0"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    set -e
+                    # This pod is a CPU-only HTTP client. The image ships
+                    # libtpu, which makes vLLM's built-in platform detection
+                    # pick TPU and fail (tpu_inference is not installed).
+                    # Remove it so vLLM falls back to the CPU platform.
+                    pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
+
+                    # JobSet's per-pod DNS, substituted by the launcher: unique
+                    # to this run, where a Service selector would be shared with
+                    # any other build running at the same time.
+                    prefill_host=${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
+                    decode_host=${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+
+                    echo "Starting proxy server..."
+                    python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+                      --host 0.0.0.0 \
+                      --port 10000 \
+                      --prefiller-host "$$prefill_host" \
+                      --prefiller-port 8000 \
+                      --decoder-host "$$decode_host" \
+                      --decoder-port 8000 &
+
+                    echo "Waiting for prefill ($$prefill_host) and decode ($$decode_host) servers..."
+                    # Bounded wait: a server whose engine dies during startup
+                    # can leave its API process (and /health) hanging forever.
+                    # Cold compiles finish well inside 3h.
+                    health_tries=0
+                    until curl -s "http://$$prefill_host:8000/health" && curl -s "http://$$decode_host:8000/health"; do
+                      health_tries=$$((health_tries+1))
+                      if [ "$$health_tries" -gt 1080 ]; then
+                        echo "ERROR: servers not healthy after 3h; failing the benchmark."
+                        exit 1
+                      fi
+                      echo "Waiting for prefill and decode health checks..."
+                      sleep 10
+                    done
+
+                    echo "Both prefill and decode servers are HEALTHY!"
+
+                    mkdir -p /tmp/benchmark_results
+                    model="Qwen/Qwen3.5-397B-A17B-FP8"
+
+                    # A cell is published from here, by the pod that measured
+                    # it. Nothing can read it afterwards: this pod is deleted
+                    # the moment the JobSet finishes, so anything that is to
+                    # outlive the run has to leave while it is still alive.
+                    #
+                    # One record id for the whole sweep, suffixed per cell, so
+                    # a night's rows can be selected together.
+                    record_base="kube-vllm-torchtpu-run-$$(date +%Y%m%d-%H%M%S)"
+                    publish_failed=0
+
+                    publish_result() {
+                      local path=$$1
+                      [ -f "$$path" ] || return 0
+                      local name
+                      name=$$(basename "$$path")
+
+                      # The artifact first, and unconditionally: it is the copy
+                      # a human reads when the numbers look wrong, and the only
+                      # one that survives a BigQuery outage.
+                      (cd "$$(dirname "$$path")" && buildkite-agent artifact upload "$$name") \
+                        || { echo "WARNING: could not upload $$name"; publish_failed=1; }
+
+                      # A cell whose requests failed describes a broken serving
+                      # path, not a measurement: one nightly went green after
+                      # the prefill server died mid-run and inserted six
+                      # zero-throughput rows. Stop the sweep rather than let it
+                      # spend the remaining hours measuring the same breakage,
+                      # and publish nothing for this cell. Single-line JSON with
+                      # one top-level "failed", so a grep is enough.
+                      if grep -q -E '"failed": *[1-9]' "$$path"; then
+                        echo "ERROR: $$name recorded failed requests: $$(grep -oE '"(completed|failed)": *[0-9]+' "$$path" | tr '\n' ' ')"
+                        exit 1
+                      fi
+
+                      if [ "$${BQ_UPLOAD:-0}" != "1" ]; then
+                        echo "BigQuery upload is off for this lane; $$name is an artifact only."
+                        return 0
+                      fi
+                      # Authenticated as tpu-workload through the metadata
+                      # server. Not fatal on its own - the artifact is already
+                      # up and the sweep has hours left - but the step goes red
+                      # at the end so a silent gap in the table cannot pass.
+                      python3 /root/torchtpu-vllm/.buildkite/scripts/parse_gke_results.py \
+                        "$$path" "$${record_base}-$${name%.json}" \
+                        || { echo "WARNING: BigQuery insert failed for $$name"; publish_failed=1; }
+                    }
+
+                    # Client flags mirror tpu_benchmark_daily's bench_all.sh /
+                    # bench_prefill_ttft.sh: openai backend on /v1/completions,
+                    # random dataset with range-ratio 0, temperature 0, seed
+                    # 42, request-rate inf, percentiles 50/90/99. The o=1
+                    # prefill cells use their ttft,e2el selection; the decode
+                    # cells add tpot,itl since TPOT is the decode-tracking
+                    # metric.
+                    run_cell() {
+                      local filename=$$1 concurrency=$$2 input_len=$$3 output_len=$$4 num_prompts=$$5 pmetrics=$$6
+                      local path="/tmp/benchmark_results/$$filename"
+                      echo "Starting benchmark cell: $$filename (c=$$concurrency, i=$$input_len, o=$$output_len, n=$$num_prompts)"
+                      vllm bench serve \
+                        --backend=openai \
+                        --endpoint=/v1/completions \
+                        --model="$$model" \
+                        --dataset-name=random \
+                        --random-input-len="$$input_len" \
+                        --random-output-len="$$output_len" \
+                        --random-range-ratio=0 \
+                        --num-prompts="$$num_prompts" \
+                        --request-rate=inf \
+                        --max-concurrency="$$concurrency" \
+                        --ignore-eos \
+                        --temperature=0 \
+                        --seed=42 \
+                        --percentile-metrics="$$pmetrics" \
+                        --metric-percentiles=50,90,99 \
+                        --host=localhost \
+                        --port=10000 \
+                        --label="$${filename%.json}" \
+                        --append-result \
+                        --result-file="$$path"
+
+                      # Per cell rather than at the end, so a sweep that runs
+                      # out its deadline still yields the cells that finished.
+                      publish_result "$$path"
+                      sleep 10
+                    }
+
+                    # Smoke: warms the prefill + transfer + decode path
+                    # before any measured cell.
+                    run_cell "pd_disagg_decode_smoke_c8_i8192_o32.json" 8 8192 32 8 "ttft,tpot,itl,e2el"
+
+                    # Prefill throughput sweep (bench_all.sh): 8192/1 at
+                    # concurrency 8-256, 512 prompts per level.
+                    for c in 8 16 32 64 128 256; do
+                      run_cell "pd_disagg_prefill_c$${c}_i8192_o1.json" "$$c" 8192 1 512 "ttft,e2el"
+                    done
+
+                    # Single-request TTFT sweep (bench_prefill_ttft.sh): 16
+                    # serial requests per input length. 128K/252K exceed the
+                    # servers' 66560 max-model-len.
+                    for ilen in 8192 16384 32768 65536; do
+                      run_cell "pd_disagg_ttft_c1_i$${ilen}_o1.json" 1 "$$ilen" 1 16 "ttft,e2el"
+                    done
+
+                    # Decode rounds: C8/P8192/D1024 for continuity with
+                    # earlier runs, then the tpu_benchmark_daily decode shape
+                    # C256/P65536/D1024 enabled by the 2304-page pool.
+                    for round in 1 2 3; do
+                      run_cell "pd_disagg_decode_round$${round}_c8_i8192_o1024.json" 8 8192 1024 8 "ttft,tpot,itl,e2el"
+                    done
+                    for round in 1 2 3; do
+                      run_cell "pd_disagg_decode_daily_round$${round}_c256_i65536_o1024.json" 256 65536 1024 256 "ttft,tpot,itl,e2el"
+                    done
+
+                    echo "Benchmark complete! Results saved in /tmp/benchmark_results."
+
+                    # Everything once more, to pick up any cell whose upload
+                    # failed on the first attempt. Buildkite keys an artifact
+                    # by path and the step takes the newest, so a repeat costs
+                    # a second upload and nothing else.
+                    (cd /tmp/benchmark_results && buildkite-agent artifact upload "pd_disagg_*.json") \
+                      || echo "WARNING: final result upload failed"
+
+                    # Every cell ran and none of them failed requests, but
+                    # something did not get published. Red, because a sweep
+                    # whose numbers are missing from the table looks identical
+                    # to a sweep that never ran.
+                    if [ "$$publish_failed" -ne 0 ]; then
+                      echo "ERROR: the benchmark completed but at least one result was not published."
+                      exit 1
+                    fi
+                resources:
+                  requests:
+                    cpu: "6"
+                    memory: "16Gi"
+                    ephemeral-storage: "20Gi"
+                  limits:
+                    cpu: "14"
+                    memory: "48Gi"
+                    ephemeral-storage: "20Gi"
