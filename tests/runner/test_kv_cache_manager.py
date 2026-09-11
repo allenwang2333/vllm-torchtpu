@@ -18,7 +18,7 @@ they cover; see vllm-project/vllm-torchtpu#713.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 import torch
@@ -190,11 +190,14 @@ class TestKVCacheManager:
         self.runner.use_spmd = False
         self.runner.vllm_config = vllm_config
         self.runner.cache_config = vllm_config.cache_config
+        self.runner.kv_cache_config = None
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
+        self.runner._hybrid_attn_page_size_bytes = None
         self.runner.max_num_reqs = 16
         self.runner.max_model_len = 1024
         self.runner.max_num_tokens = 2048
+        self.runner.most_model_len = None
         self.runner.pin_memory = False
         self.runner.model_config = vllm_config.model_config
         self.runner.shared_kv_cache_layers = {}
@@ -215,6 +218,9 @@ class TestKVCacheManager:
         self.runner.kv_cache_raw_tensors = []
         self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
             self.runner
+        )
+        self.runner._update_block_size_dependent_state = (
+            TPUModelRunner._update_block_size_dependent_state.__get__(self.runner)
         )
         self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
             self.runner
@@ -247,7 +253,7 @@ class TestKVCacheManager:
         for i in range(3):
             layers[f"mamba_{i}"] = DummyMamba()
 
-        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers, 16)
 
         # Mamba unpadded size:
         # (4 * 128 * 2) + (8 * 64 * 32 * 4) = 1024 + 65536 = 66560
@@ -293,7 +299,7 @@ class TestKVCacheManager:
             layers[f"mamba_{i}"] = DummyMamba()
 
         with pytest.raises(ValueError, match="does not fit"):
-            self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+            self.runner.kv_cache_manager._update_mamba_page_size_padded(layers, 16)
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
@@ -326,7 +332,7 @@ class TestKVCacheManager:
         for i in range(3):
             layers[f"mamba_{i}"] = DummyMamba()
 
-        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers, 16)
 
         # Same sizing as test_update_mamba_page_size_padded, but avail is
         # reduced by the 1 GiB reserve:
@@ -334,6 +340,125 @@ class TestKVCacheManager:
         #   attn_num_blocks = (8,589,934,592 - 3 * 17 * 66560) // 4096
         #                   = 2,096,323  (vs 2,358,467 with no reserve)
         assert self.runner.cache_config.num_gpu_blocks_override == 2096323
+
+    @pytest.mark.parametrize("sizing", ["compact", "uniform", "user_pinned"])
+    def test_hybrid_sizing_after_block_size_finalization(self, sizing):
+        runner = self.runner
+        config = runner.vllm_config
+        config.model_config.max_model_len = 103424
+        config.scheduler_config.max_num_seqs = 32
+        config.cache_config.cache_dtype = "fp8"
+        config.cache_config.kv_cache_memory_bytes = budget = 22 * 2**30
+        runner.max_num_reqs = 32
+        runner.max_model_len = 103424
+        runner.kv_cache_dtype = torch.float8_e4m3fn
+        runner._uniform_mamba_layout = sizing == "uniform"
+        if sizing == "user_pinned":
+            config.cache_config.num_gpu_blocks_override = 1234
+
+        layers = {}
+        for i in range(24):
+            layer = MagicMock(spec=MLAAttention)
+            layer.head_size = 576
+            layers[f"attn_{i}"] = layer
+        for i in range(69):
+            layers[f"mamba_{i}"] = DummyMamba()
+        mamba_page = layers["mamba_0"].get_kv_cache_spec(config).page_size_bytes
+
+        with (
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+                return_value=layers,
+            ),
+            patch.object(ModelConfig, "is_hybrid", PropertyMock(return_value=True)),
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.unified_kv_layout_enabled",
+                return_value=False,
+            ),
+        ):
+            TpuPlatform.update_block_size_for_backend(config)
+            assert config.cache_config.block_size == 32
+            specs = runner.get_kv_cache_spec()
+        assert runner.block_size == 32
+        assert runner.max_num_blocks_per_req == 3232
+        assert runner.num_reqs_max_model_len == 32
+
+        attn_page = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            32, 1, 576, runner.kv_cache_dtype
+        )
+        uniform_page = attn_page + 3 * mamba_page
+        assert runner._hybrid_attn_page_size_bytes == attn_page
+        assert all(specs[f"attn_{i}"].block_size == 32 for i in range(24))
+        assert all(s.page_size_padded == uniform_page for s in specs.values())
+
+        blocks = config.cache_config.num_gpu_blocks_override
+        if sizing == "compact":
+            assert runner._mamba_num_blocks == 33
+            reserved_mamba = 24 * 3 * 33 * mamba_page
+            assert blocks == (budget // 24 - 3 * 33 * mamba_page) // attn_page
+            accounted = 24 * blocks * attn_page + reserved_mamba
+            assert accounted <= budget < accounted + 24 * attn_page + 24
+        elif sizing == "uniform":
+            assert runner._mamba_num_blocks is None
+            assert blocks == (budget // (24 * attn_page) * attn_page // uniform_page)
+            assert 24 * blocks * uniform_page <= budget
+        else:
+            assert blocks == 1234
+            assert runner._mamba_num_blocks is None
+
+    @pytest.mark.parametrize(
+        "spec_cls, backend",
+        [
+            (MLAAttentionSpec, PallasMLAttentionBackend),
+            (FullAttentionSpec, PallasAttentionBackend),
+        ],
+    )
+    def test_hybrid_page_mismatch_fails_before_allocation(self, spec_cls, backend):
+        dtype = torch.float8_e4m3fn
+        expected = backend.get_kv_cache_page_size_bytes(16, 1, 576, dtype)
+        actual = backend.get_kv_cache_page_size_bytes(32, 1, 576, dtype)
+        self.runner._hybrid_attn_page_size_bytes = expected
+        spec = spec_cls(block_size=32, num_kv_heads=1, head_size=576, dtype=dtype)
+        config = KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=actual,
+                    layers=["attn"],
+                    layer_stride=actual,
+                    block_stride=actual,
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)
+            ],
+        )
+        with (
+            patch.object(torch, "zeros") as allocate,
+            pytest.raises(
+                ValueError,
+                match=f"attn: budgeted {expected} bytes, "
+                f"but allocation requires {actual} bytes",
+            ),
+        ):
+            self.runner.initialize_kv_cache(config)
+        allocate.assert_not_called()
+
+        self.runner._hybrid_attn_page_size_bytes = actual
+        with (
+            patch.object(
+                self.runner,
+                "may_reinitialize_input_batch",
+                side_effect=RuntimeError("page validation passed"),
+            ),
+            pytest.raises(RuntimeError, match="page validation passed"),
+        ):
+            self.runner.initialize_kv_cache(config)
 
     @patch(
         "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
@@ -1890,11 +2015,10 @@ def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
 
 class TestUpdateAttentionPageSizePadded:
     """_update_attention_page_size_padded must size pages with the caller's
-    block_size instead of self.block_size, which is initialized at __init__
-    time. This is because for hybrid models the update is skipped during that
-    time. It only gets updated after the model is loaded, so using
-    self.block_size will cause the unify_kv_cache_spec_page_size
-    `page_size_padded >= real_page_size_bytes` assertion.
+    block_size, the value get_kv_cache_spec reads after the executor finalizes
+    cache_config.block_size. Sizing with a pre-finalization block size trips
+    unify_kv_cache_spec_page_size's `page_size_padded >= real_page_size_bytes`
+    assertion.
     """
 
     @pytest.fixture(autouse=True)

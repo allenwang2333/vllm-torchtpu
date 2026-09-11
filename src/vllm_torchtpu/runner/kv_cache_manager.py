@@ -192,7 +192,7 @@ class KVCacheManager:
         if has_attention and not self.runner._unified_kv_layout:
             self._update_attention_page_size_padded(layers, block_size)
             if has_mamba:
-                self._update_mamba_page_size_padded(layers)
+                self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
 
@@ -602,7 +602,7 @@ class KVCacheManager:
             self.runner.cache_config.mamba_page_size_padded = attn_page_sizes.pop()
 
     def _update_mamba_page_size_padded(
-        self, layers: dict[str, AttentionLayerBase]
+        self, layers: dict[str, AttentionLayerBase], block_size: int
     ) -> None:
         """Pad attention and mamba page sizes so vLLM's num_blocks matches
         what the TPU allocates per layer.
@@ -618,6 +618,7 @@ class KVCacheManager:
         Args:
             layers: A dictionary mapping layer names to their corresponding
                 attention module instances (e.g., `MambaBase`, `Attention`).
+            block_size: The finalized attention block size.
         """
         attn_modules = [
             m for m in layers.values() if isinstance(m, (Attention, MLAAttention))
@@ -633,7 +634,7 @@ class KVCacheManager:
         )
         attention_backend = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
-            self.runner.block_size,
+            block_size,
             num_kv_heads,
             first_attn_module.head_size,
             self.runner.kv_cache_dtype,
@@ -714,6 +715,7 @@ class KVCacheManager:
         )
 
         self.runner._hybrid_uniform_page_size_bytes = int(uniform_page_size_bytes)
+        self.runner._hybrid_attn_page_size_bytes = attn_page_size_bytes
         self.runner.cache_config.mamba_page_size_padded = int(uniform_page_size_bytes)
 
         # Prefer compact-mamba sizing: cap each mamba layer at
@@ -1184,6 +1186,22 @@ class KVCacheManager:
             if isinstance(spec, MambaSpec):
                 # We can safely ignore block size for Mamba layers since they only use a single cache state per sequence.
                 continue
+            budgeted = self.runner._hybrid_attn_page_size_bytes
+            if budgeted is not None and isinstance(spec, AttentionSpec):
+                backend = (
+                    PallasMLAttentionBackend
+                    if isinstance(spec, MLAAttentionSpec)
+                    else backend_cls
+                )
+                page_size_bytes = backend.get_kv_cache_page_size_bytes(
+                    spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+                )
+                if page_size_bytes != budgeted:
+                    raise ValueError(
+                        f"Hybrid KV cache page size mismatch for "
+                        f"{group.layer_names[0]}: budgeted {budgeted} bytes, "
+                        f"but allocation requires {page_size_bytes} bytes."
+                    )
             if (
                 not isinstance(spec, AttentionSpec)
                 and len(kv_cache_config.kv_cache_groups) > 1

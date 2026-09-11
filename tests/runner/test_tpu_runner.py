@@ -28,7 +28,14 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer import kv_transfer_state
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.block_table import BlockTable, SlotMappingMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
@@ -561,6 +568,7 @@ class TestTPURunner:
         self.runner.use_spmd = False
         self.runner.vllm_config = vllm_config
         self.runner.cache_config = vllm_config.cache_config
+        self.runner.kv_cache_config = None
         self.runner.scheduler_config = vllm_config.scheduler_config
         self.runner._hybrid_uniform_page_size_bytes = None
         self.runner.max_num_reqs = 16
@@ -570,6 +578,9 @@ class TestTPURunner:
         self.runner.model_config = vllm_config.model_config
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner._update_block_size_dependent_state = (
+            TPUModelRunner._update_block_size_dependent_state.__get__(self.runner)
+        )
 
         self._find_non_ssm_backend_patcher = patch.object(
             TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
@@ -1562,6 +1573,158 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         15,
     ]
     assert [len(runner.input_batch.spec_token_ids[i]) for i in (1, 2)] == [15, 15]
+
+
+@pytest.mark.parametrize(
+    "model_len, block_size, table_width, most_len",
+    [
+        (103424, 32, 3232, 90000),
+        (103424, 32, 1616, None),
+    ],
+)
+def test_reinitialize_input_batch_refreshes_block_size_state(
+    model_len, block_size, table_width, most_len
+):
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.cache_config = SimpleNamespace(block_size=16)
+    runner.kv_cache_config = None
+    runner.max_model_len = model_len
+    runner.most_model_len = most_len
+    runner.max_num_reqs = 32
+    runner.max_num_tokens = 8192
+    runner._update_block_size_dependent_state()
+    assert runner.num_reqs_max_model_len == 20
+    assert runner.max_num_blocks_per_req == (model_len + 15) // 16
+    runner.block_table_cpu = torch.zeros(
+        (32, runner.max_num_blocks_per_req), dtype=torch.int32
+    )
+    table = BlockTable(
+        block_size=block_size,
+        max_num_reqs=runner.max_num_reqs,
+        max_num_blocks_per_req=table_width,
+        max_num_batched_tokens=runner.max_num_tokens,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        kernel_block_size=block_size,
+        cp_kv_cache_interleave_size=1,
+        slot_mapping_mode=SlotMappingMode.NONE,
+    )
+    runner.input_batch = SimpleNamespace(block_table=[table])
+    runner.cache_config.block_size = block_size
+    runner.kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["attn"],
+                kv_cache_spec=FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        ],
+    )
+
+    with patch.object(GPUModelRunner, "may_reinitialize_input_batch"):
+        runner.may_reinitialize_input_batch(runner.kv_cache_config, [block_size])
+
+    assert runner.block_size == block_size
+    assert runner.num_reqs_max_model_len == 32
+    assert runner.max_num_blocks_per_req == table_width
+    assert runner.block_table_cpu.shape == (32, table_width)
+    if most_len is None:
+        assert runner.num_blocks_per_most_len_req is None
+        assert runner.num_reqs_most_model_len is None
+    else:
+        assert (
+            runner.num_blocks_per_most_len_req
+            == (most_len + block_size - 1) // block_size
+        )
+        assert runner.num_reqs_most_model_len == 32
+
+
+@pytest.mark.parametrize(
+    "leading_group, wrap_attention, most_len, most_reqs",
+    [
+        (None, False, 131072, 256),
+        ("mamba", False, 196608, 170),
+        ("attention", True, 196608, 170),
+    ],
+)
+def test_reinitialize_input_batch_caps_requests_by_kernel_pages(
+    leading_group, wrap_attention, most_len, most_reqs
+):
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.cache_config = SimpleNamespace(block_size=1280)
+    runner.kv_cache_config = None
+    runner.max_model_len = 262144
+    runner.most_model_len = most_len
+    runner.max_num_reqs = 256
+    runner.max_num_tokens = 8192
+    runner._update_block_size_dependent_state()
+    assert runner.num_reqs_max_model_len == 256
+    runner.block_table_cpu = torch.zeros(
+        (256, runner.max_num_blocks_per_req), dtype=torch.int32
+    )
+
+    attention_spec = FullAttentionSpec(
+        block_size=1280, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    specs = []
+    kernel_block_sizes = []
+    if leading_group == "mamba":
+        specs.append(MambaSpec(block_size=16, shapes=((1,),), dtypes=(torch.bfloat16,)))
+        kernel_block_sizes.append(16)
+    elif leading_group == "attention":
+        specs.append(attention_spec)
+        kernel_block_sizes.append(1280)
+    specs.append(
+        UniformTypeKVCacheSpecs(
+            block_size=1280, kv_cache_specs={"attn": attention_spec}
+        )
+        if wrap_attention
+        else attention_spec
+    )
+    kernel_block_sizes.append(256)
+    tables = [
+        BlockTable(
+            block_size=spec.block_size,
+            max_num_reqs=runner.max_num_reqs,
+            max_num_blocks_per_req=(
+                1
+                if isinstance(spec, MambaSpec)
+                else (runner.max_model_len + spec.block_size - 1) // spec.block_size
+            ),
+            max_num_batched_tokens=runner.max_num_tokens,
+            pin_memory=False,
+            device=torch.device("cpu"),
+            kernel_block_size=kernel_block_size,
+            cp_kv_cache_interleave_size=1,
+            slot_mapping_mode=SlotMappingMode.NONE,
+        )
+        for spec, kernel_block_size in zip(specs, kernel_block_sizes)
+    ]
+    runner.input_batch = SimpleNamespace(block_table=tables)
+    runner.kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[f"layer_{i}"], kv_cache_spec=spec)
+            for i, spec in enumerate(specs)
+        ],
+    )
+
+    with patch.object(GPUModelRunner, "may_reinitialize_input_batch"):
+        runner.may_reinitialize_input_batch(runner.kv_cache_config, kernel_block_sizes)
+
+    # Manager-block rounding leaves one more column than ceil(context / 256).
+    assert tables[-1].max_num_blocks_per_req == 1025
+    assert runner.num_reqs_max_model_len == 127
+    assert runner.num_reqs_most_model_len == most_reqs
+    assert runner.max_num_blocks_per_req == tables[0].max_num_blocks_per_req
+    assert runner.block_table_cpu.shape == tables[0].get_cpu_tensor().shape
 
 
 class TestBuildAttentionMetadataForLayers:

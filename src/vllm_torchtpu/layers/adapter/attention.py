@@ -634,9 +634,8 @@ class PallasAttentionBackend(AttentionBackend):
         return (0, 1, 2, 3, 4)
 
     @staticmethod
-    def get_max_num_seqs(model_len: int, page_size: int) -> int:
-        num_page_per_req = cdiv(model_len, page_size)
-        return 1024 * 1024 // 2 // num_page_per_req // 4
+    def get_max_num_seqs(num_blocks_per_req: int) -> int:
+        return 1024 * 1024 // 2 // num_blocks_per_req // 4
 
     # TPU has limited SREGs (scalar registers), if page_size is too small, we
     # can spill SREGs easily which leads to bad performance. The strategy we

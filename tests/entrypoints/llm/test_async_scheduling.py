@@ -15,19 +15,21 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
-# Capture the original __init__ to allow safe monkeypatching and clean restoration.
-_ORIGINAL_TPU_RUNNER_INIT = TPUModelRunner.__init__
+# Capture the original refresh to allow safe monkeypatching and clean restoration.
+# The runner recomputes its request caps whenever the KV block size is
+# finalized, so pinning them in __init__ would not survive engine startup.
+_ORIGINAL_TPU_RUNNER_REFRESH = TPUModelRunner._update_block_size_dependent_state
 
 
-def force_multiple_forward_passes_init(self, *args, **kwargs):
+def force_multiple_forward_passes_refresh(self):
     """
-    A custom __init__ for TPUModelRunner that artificially limits the number of
-    requests processed in a single forward pass.
+    A custom block-size refresh for TPUModelRunner that artificially limits the
+    number of requests processed in a single forward pass.
     This forces the runner to split a batch into multiple chunks during the same engine step.
     """
-    _ORIGINAL_TPU_RUNNER_INIT(self, *args, **kwargs)
+    _ORIGINAL_TPU_RUNNER_REFRESH(self)
     self.num_reqs_max_model_len = 2
-    if hasattr(self, "num_reqs_most_model_len"):
+    if self.num_reqs_most_model_len is not None:
         self.num_reqs_most_model_len = 2
 
 
@@ -36,7 +38,7 @@ def _run_generation_worker(
     prompts: list[str],
     max_tokens: int,
     max_num_seqs: int,
-    monkeypatch_tpu_runner_init,
+    monkeypatch_tpu_runner_refresh,
     queue: multiprocessing.Queue,
 ):
     """
@@ -44,8 +46,10 @@ def _run_generation_worker(
     """
     try:
         # We apply the monkeypatch dynamically
-        if monkeypatch_tpu_runner_init is not None:
-            TPUModelRunner.__init__ = monkeypatch_tpu_runner_init
+        if monkeypatch_tpu_runner_refresh is not None:
+            TPUModelRunner._update_block_size_dependent_state = (
+                monkeypatch_tpu_runner_refresh
+            )
 
         llm = LLM(
             model=MODEL_NAME,
@@ -65,9 +69,11 @@ def _run_generation_worker(
     except Exception:
         queue.put(("ERROR", traceback.format_exc()))
     finally:
-        # Restore the original __init__ to guarantee we do not pollute subsequent runs
-        if monkeypatch_tpu_runner_init is not None:
-            TPUModelRunner.__init__ = _ORIGINAL_TPU_RUNNER_INIT
+        # Restore the original refresh to guarantee we do not pollute subsequent runs
+        if monkeypatch_tpu_runner_refresh is not None:
+            TPUModelRunner._update_block_size_dependent_state = (
+                _ORIGINAL_TPU_RUNNER_REFRESH
+            )
 
 
 def run_llm_generation_in_isolated_process(
@@ -75,7 +81,7 @@ def run_llm_generation_in_isolated_process(
     prompts: list[str],
     max_tokens: int,
     max_num_seqs: int,
-    monkeypatch_tpu_runner_init=None,
+    monkeypatch_tpu_runner_refresh=None,
 ) -> list[list[int]]:
     """
     Spawns a clean OS process to run the LLM generation and retrieves the token IDs.
@@ -89,7 +95,7 @@ def run_llm_generation_in_isolated_process(
             prompts,
             max_tokens,
             max_num_seqs,
-            monkeypatch_tpu_runner_init,
+            monkeypatch_tpu_runner_refresh,
             queue,
         ),
     )
@@ -161,14 +167,14 @@ def test_async_scheduling_preserves_output_when_batch_is_split_into_multiple_for
     )
     max_num_seqs = 4  # Ensures 4 prompts are batched together by the scheduler.
 
-    # - We use monkeypatch_tpu_runner_init to force TPUModelRunner to split
+    # - We use monkeypatch_tpu_runner_refresh to force TPUModelRunner to split
     #   this batch of 4 into 2 execution chunks (2 requests each).
     sync_tokens = run_llm_generation_in_isolated_process(
         async_scheduling=False,
         prompts=prompts,
         max_tokens=max_tokens,
         max_num_seqs=max_num_seqs,
-        monkeypatch_tpu_runner_init=force_multiple_forward_passes_init,
+        monkeypatch_tpu_runner_refresh=force_multiple_forward_passes_refresh,
     )
 
     async_tokens = run_llm_generation_in_isolated_process(
@@ -176,7 +182,7 @@ def test_async_scheduling_preserves_output_when_batch_is_split_into_multiple_for
         prompts=prompts,
         max_tokens=max_tokens,
         max_num_seqs=max_num_seqs,
-        monkeypatch_tpu_runner_init=force_multiple_forward_passes_init,
+        monkeypatch_tpu_runner_refresh=force_multiple_forward_passes_refresh,
     )
 
     assert sync_tokens == async_tokens, (

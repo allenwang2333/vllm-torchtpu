@@ -59,6 +59,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -547,6 +548,9 @@ class TPUModelRunner(GPUModelRunner):
         # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
         self._hybrid_uniform_page_size_bytes: int | None = None
+        # Native attention page the hybrid budget was computed with;
+        # `initialize_kv_cache` checks every attention spec against it.
+        self._hybrid_attn_page_size_bytes: int | None = None
 
         # Compact-mamba sizing.
         # When set, mamba/GDN layers allocate only `_mamba_num_blocks`
@@ -659,18 +663,24 @@ class TPUModelRunner(GPUModelRunner):
 
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
-        self.block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
         )
+        # InputBatch needs to work with sampling tensors greater than padding
+        # to avoid dynamic shapes. Also, avoid suboptimal alignment.
+        self.max_num_reqs = max(self.max_num_reqs, MIN_NUM_SEQS)
+        self.num_tokens_paddings = vllm_config.compilation_config.compile_sizes
+        # Override parent's max_num_tokens with the last (largest) padding
+        # bucket so all CPU staging buffers cover it.
+        self.max_num_tokens = self.num_tokens_paddings[-1]
+        self._update_block_size_dependent_state()
         # Sync max_num_blocks_per_req with the underlying GPUInputBatch's
         # block_table capacity if already created during super().__init__().
         # This ensures that calculations derived from max_num_blocks_per_req
         # (such as spec-decode warmup block count `nblk`) strictly respect the
         # actual BlockTable allocation limits, preventing bounds mismatch errors
         # (e.g., broadcasting shape (8,) into capacity (5,)).
-        self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
         if (
             hasattr(self, "input_batch")
             and self.input_batch is not None
@@ -682,18 +692,6 @@ class TPUModelRunner(GPUModelRunner):
                 )
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
-        self.num_blocks_per_most_len_req = (
-            cdiv(self.most_model_len, self.block_size)
-            if self.most_model_len is not None
-            else None
-        )
-        # InputBatch needs to work with sampling tensors greater than padding
-        # to avoid dynamic shapes. Also, avoid suboptimal alignment.
-        self.max_num_reqs = max(self.max_num_reqs, MIN_NUM_SEQS)
-        self.num_tokens_paddings = vllm_config.compilation_config.compile_sizes
-        # Override parent's max_num_tokens with the last (largest) padding
-        # bucket so all CPU staging buffers cover it.
-        self.max_num_tokens = self.num_tokens_paddings[-1]
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
@@ -765,26 +763,6 @@ class TPUModelRunner(GPUModelRunner):
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
-        )
-
-        # Pallas SMEM-aware num_reqs caps.
-        self.num_reqs_most_model_len = (
-            min(
-                PallasAttentionBackend.get_max_num_seqs(
-                    self.most_model_len, self.block_size
-                ),
-                self.max_num_reqs,
-                self.max_num_tokens,
-            )
-            if self.most_model_len is not None
-            else None
-        )
-        self.num_reqs_max_model_len = min(
-            PallasAttentionBackend.get_max_num_seqs(
-                self.max_model_len, self.block_size
-            ),
-            self.max_num_reqs,
-            self.max_num_tokens,
         )
 
         self.sample_from_logits_func = self.sample_from_logits
@@ -1440,6 +1418,7 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        self._update_block_size_dependent_state()
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()
 
@@ -1617,10 +1596,7 @@ class TPUModelRunner(GPUModelRunner):
         # Column stride of the mamba block tables, in logical (whole-sequence)
         # tokens. Three block sizes meet here and only one is correct:
         #   * self.block_size is the attention/scheduler size -- unrelated to
-        #     mamba tables, whose width is cdiv(max_model_len, mamba size) --
-        #     and a stale __init__-time snapshot besides (the executor
-        #     finalizes cache_config.block_size only after the runner is
-        #     constructed);
+        #     mamba tables, whose width is cdiv(max_model_len, mamba size);
         #   * the mamba groups' kv_cache_spec.block_size (the copy of
         #     cache_config.mamba_block_size that get_kv_cache_spec bakes into
         #     every MambaSpec, which then sizes these tables) is physical and
@@ -5626,9 +5602,7 @@ class TPUModelRunner(GPUModelRunner):
         # real requests overwrite their valid KV positions on first prefill.
         # Cover the highest context this request reaches, reserving block 0.
         # Count blocks per kv-cache group at that group's own block size:
-        # groups differ on hybrid models (mamba vs attention), and the
-        # runner-level self.block_size predates the executor's post-load
-        # block-size finalization.
+        # groups differ on hybrid models (mamba vs attention).
         max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
@@ -5877,6 +5851,53 @@ class TPUModelRunner(GPUModelRunner):
             return cast(type[Any], PallasAttentionBackend)
         raise NotImplementedError(f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
 
+    def _update_block_size_dependent_state(self) -> None:
+        """Refresh block accounting and SMEM caps after block-size finalization.
+
+        Initialized attention tables include kernel-page splitting and rounding.
+        Callers retain the first group's actual width for CPU staging.
+        """
+        self.block_size = self.cache_config.block_size
+        self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+        self.num_blocks_per_most_len_req = (
+            cdiv(self.most_model_len, self.block_size)
+            if self.most_model_len is not None
+            else None
+        )
+        max_pages = self.max_num_blocks_per_req
+        most_pages = self.num_blocks_per_most_len_req
+        if self.kv_cache_config is not None:
+            attention_tables = []
+            for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.first_spec
+                if isinstance(spec, AttentionSpec):
+                    attention_tables.append(self.input_batch.block_table[gid])
+            if attention_tables:
+                max_pages = max(
+                    table.max_num_blocks_per_req for table in attention_tables
+                )
+                if self.most_model_len is not None:
+                    most_pages = max(
+                        cdiv(self.most_model_len, table.block_size)
+                        for table in attention_tables
+                    )
+        self.num_reqs_most_model_len = (
+            min(
+                PallasAttentionBackend.get_max_num_seqs(most_pages),
+                self.max_num_reqs,
+                self.max_num_tokens,
+            )
+            if most_pages is not None
+            else None
+        )
+        self.num_reqs_max_model_len = min(
+            PallasAttentionBackend.get_max_num_seqs(max_pages),
+            self.max_num_reqs,
+            self.max_num_tokens,
+        )
+
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> None:
@@ -5893,6 +5914,7 @@ class TPUModelRunner(GPUModelRunner):
         allocations perfectly match the new underlying `BlockTable` capacity.
         """
         super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        self._update_block_size_dependent_state()
         if hasattr(self, "input_batch") and self.input_batch is not None:
             if hasattr(self.input_batch, "block_table"):
                 try:
