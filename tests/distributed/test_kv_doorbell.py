@@ -30,25 +30,24 @@ from vllm_torchtpu.distributed.kv_transfer.doorbell import (BELL_LANES,
                                                             BELL_SUBLANES,
                                                             FIRST_GENERATION,
                                                             DoorbellSet,
-                                                            _bell_kernel)
+                                                            _make_bell_fn)
 
 NUM_GROUPS = 15
 SHAPE = (NUM_GROUPS, BELL_SUBLANES, BELL_LANES)
 
 
 def _ring(bells, group, generation):
-    """One ring, built the way `DoorbellSet` builds its operands."""
-    call = pl.pallas_call(
-        _bell_kernel,
-        out_shape=jax.ShapeDtypeStruct(SHAPE, jnp.int32),
-        input_output_aliases={2: 0},
-        interpret=True,
-    )
-    onehot = (jnp.arange(NUM_GROUPS,
-                         dtype=jnp.int32) == group).astype(jnp.int32)
-    selector = jnp.broadcast_to(onehot[:, None, None], SHAPE)
-    gen = jnp.full(SHAPE, generation, jnp.int32)
-    return call(selector, gen, bells)
+    """One ring through the real `bell_fn`, interpreted so it needs no TPU.
+
+    `announced` stands in for the KV cache. The kernel never reads it, so its
+    contents and shape do not matter; it is passed because the production call
+    passes it, which is what orders the ring after the layer.
+    """
+    fn = _make_bell_fn(NUM_GROUPS, interpret=True)
+    announced = jnp.zeros((BELL_SUBLANES, BELL_LANES), jnp.int32)
+    group_id = jnp.asarray([group], jnp.int32)
+    gen = jnp.full((1, BELL_SUBLANES, BELL_LANES), generation, jnp.int32)
+    return fn(announced, bells, group_id, gen)
 
 
 def _counters(bells):
@@ -102,13 +101,18 @@ def _cpu_set(**kwargs):
     return DoorbellSet(names, torch.device("cpu"), **kwargs), names
 
 
-def test_operands_all_share_the_buffer_shape():
-    """The kernel selects elementwise, so nothing may be a scalar or a tile."""
+def test_operands_are_sized_for_a_single_tile_write():
+    """A ring writes one tile, so only the buffer is buffer-shaped.
+
+    The generation is a tile because that is all the output block covers, and
+    the group index is a one-element array because the index map reads it from
+    SMEM. Growing either back to the buffer's shape would put 60 KiB through
+    VMEM on every ring for no reason.
+    """
     bells, _ = _cpu_set()
-    want = (NUM_GROUPS, BELL_SUBLANES, BELL_LANES)
-    assert tuple(bells.bells.shape) == want
-    assert tuple(bells.generation.shape) == want
-    assert tuple(bells.selectors[0].shape) == want
+    assert tuple(bells.bells.shape) == (NUM_GROUPS, BELL_SUBLANES, BELL_LANES)
+    assert tuple(bells.generation.shape) == (1, BELL_SUBLANES, BELL_LANES)
+    assert tuple(bells.group_ids[0].shape) == (1, )
 
 
 def test_sharding_does_not_change_the_buffer():
@@ -129,13 +133,10 @@ def test_sharding_does_not_change_the_buffer():
     assert tuple(sharded.bells.shape) == want
 
 
-def test_each_selector_picks_out_exactly_one_group():
+def test_each_group_id_names_its_own_group():
     bells, _ = _cpu_set()
     for group in range(NUM_GROUPS):
-        selector = bells.selectors[group]
-        assert int(selector[group].min()) == 1
-        others = [g for g in range(NUM_GROUPS) if g != group]
-        assert all(int(selector[g].max()) == 0 for g in others)
+        assert int(bells.group_ids[group][0]) == group
 
 
 def test_layers_map_to_groups_in_order_and_gdn_layers_do_not():

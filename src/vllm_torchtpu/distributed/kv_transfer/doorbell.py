@@ -71,6 +71,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.logger import init_logger
@@ -86,49 +87,69 @@ BELL_LANES = 128
 FIRST_GENERATION = 1
 
 
-def _bell_kernel(sel_ref, gen_ref, bell_in_ref, out_ref):
-    """Store the generation into the selected group, preserving the others.
+def _bell_kernel(group_ref, gen_ref, ann_ref, bell_in_ref, out_ref):
+    """Store the generation into one group's tile.
 
-    `bell_in_ref` is aliased onto `out_ref`, so this writes the caller's
-    buffer instead of a fresh one. Aliasing donates the memory; it does not
-    make unwritten elements keep their old contents, so the groups this ring
-    does not own have to be copied through explicitly.
+    The output block is exactly the tile named by `group_ref`, and it is fully
+    written, so the other fourteen survive through the HBM alias without ever
+    being read. That is why the kernel body is a single store: there is no
+    read-modify-write and no mask.
 
-    Choosing the group with a mask rather than an index is deliberate. A
-    dynamic index into a Pallas ref has to travel through SMEM as a scalar,
-    and selecting across a 60 KiB buffer is cheaper than that plumbing.
+    Three of the four refs go untouched. `group_ref` is consumed by the output
+    block's index map rather than by the body. `ann_ref` is the KV cache and
+    exists only so the call has it as an operand; see `bell_fn` for why that
+    is what orders the store. `bell_in_ref` exists only to give
+    `input_output_aliases` something to alias. Both sit in HBM, so declaring
+    them costs no transfer.
     """
-    out_ref[...] = jnp.where(sel_ref[...] != 0, gen_ref[...], bell_in_ref[...])
+    del group_ref, ann_ref, bell_in_ref
+    out_ref[...] = gen_ref[...]
 
 
-def _make_bell_fn(num_groups: int):
+def _make_bell_fn(num_groups: int, interpret: bool = False):
+    """`interpret` is for the tests, which have to run without a TPU."""
+    block = (1, BELL_SUBLANES, BELL_LANES)
     bell_call = pl.pallas_call(
         _bell_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            # The group index has to reach the index map, and an index map can
+            # only read scalars that were prefetched into SMEM. It cannot come
+            # from the doorbell buffer or from a VMEM operand.
+            num_scalar_prefetch=1,
+            grid=(1, ),
+            in_specs=[
+                pl.BlockSpec(block, lambda i, s: (0, 0, 0)),
+                # The KV cache. Never read, so it never leaves HBM.
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                # Aliased with the output. Never read, so it stays in HBM too.
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(block, lambda i, s: (s[0], 0, 0)),
+        ),
         out_shape=jax.ShapeDtypeStruct((num_groups, BELL_SUBLANES, BELL_LANES),
                                        jnp.int32),
-        input_output_aliases={2: 0},
+        input_output_aliases={3: 0},
+        interpret=interpret,
     )
 
     # The annotations are load-bearing: `pallas.jax_op` reads the signature to
     # build the torch op schema and rejects a bare parameter.
-    def bell_fn(announced: jax.Array, doorbells: jax.Array,
-                selector: jax.Array, generation: jax.Array) -> jax.Array:
+    def bell_fn(announced: jax.Array, doorbells: jax.Array, group: jax.Array,
+                generation: jax.Array) -> jax.Array:
         """Ring one group's bell, ordered after `announced` is written.
 
-        The ordering rests on two things. `announced` is a parameter of the
-        exported function, so at the call site the ring is a consumer of the
-        KV cache the attention kernel just produced and XLA cannot schedule it
-        first. `optimization_barrier` keeps that edge alive through inlining,
-        since ordinary dead-code elimination will not drop a barrier operand
-        even when its result goes unused.
-
-        `selector` and `generation` arrive already broadcast to the buffer's
-        shape so the kernel needs no scalar operands.
+        `announced` is passed to the kernel, unread, purely to be an operand
+        of the call. That is what keeps the ring downstream of the layer whose
+        KV it reports. This used to be an `optimization_barrier` over
+        `(announced, generation)` whose `announced` result was discarded, on
+        the theory that a barrier operand survives dead-code elimination. It
+        does not: with the result unused XLA drops the operand and the edge
+        with it, and every bell was then scheduled at the top of the program,
+        ahead of the layers it claimed to announce. An operand of a Pallas
+        call cannot be dropped that way, because XLA cannot see inside the
+        custom call to prove it unused.
         """
-        announced, generation = jax.lax.optimization_barrier(
-            (announced, generation))
-        del announced
-        return bell_call(selector, generation, doorbells)
+        return bell_call(group, generation, announced, doorbells)
 
     return bell_fn
 
@@ -139,7 +160,7 @@ def _make_sharded_bell_fn(num_groups: int, mesh, announced_spec, bells_spec):
     Mosaic kernels are not automatically partitioned, so under a mesh the call
     has to say what each rank sees. The bells carry `bells_spec`, the same
     sharding the KV cache has, because a bell is a claim about one chip's KV
-    and only that chip can make it. The selector and the generation are
+    and only that chip can make it. The group index and the generation are
     replicated, since which group is ringing and which pass it is are the same
     everywhere.
     """
@@ -201,23 +222,22 @@ class DoorbellSet:
                                  dtype=torch.int32,
                                  device=device)
 
-        # One pre-built one-hot selector per group. Building them here rather
-        # than in the ring keeps an `arange` and a comparison out of every
-        # layer's graph.
-        eye = torch.eye(self.num_groups, dtype=torch.int32)
-        self.selectors = eye[:, :, None,
-                             None].expand(self.num_groups, self.num_groups,
-                                          BELL_SUBLANES,
-                                          BELL_LANES).contiguous().to(device)
+        # Which group each ring writes, one pre-built `(1,)` tensor per group.
+        # The kernel's index map reads this out of SMEM, so it has to arrive as
+        # its own operand rather than as a Python int, which would bake a
+        # different graph per layer.
+        self.group_ids = torch.arange(self.num_groups,
+                                      dtype=torch.int32,
+                                      device=device).reshape(
+                                          self.num_groups, 1)
 
         # A device tensor, not a Python int, so that bumping it between steps
-        # does not retrace the graph. Shaped like the buffer because the
-        # kernel selects elementwise and has no scalar operands.
-        self.generation = torch.full(
-            (self.num_groups, BELL_SUBLANES, BELL_LANES),
-            FIRST_GENERATION - 1,
-            dtype=torch.int32,
-            device=device)
+        # does not retrace the graph. One tile, because that is the whole of
+        # what a ring writes.
+        self.generation = torch.full((1, BELL_SUBLANES, BELL_LANES),
+                                     FIRST_GENERATION - 1,
+                                     dtype=torch.int32,
+                                     device=device)
 
         # Set by `prebuild`. Held here rather than in a module-level cache
         # because under PCP the mesh comes from `get_pcp_streaming_mesh()`,
@@ -264,7 +284,7 @@ class DoorbellSet:
             mesh=mesh,
             input_partition_specs=specs,
         )
-        op.register_fake(lambda announced, doorbells, selector, generation:
+        op.register_fake(lambda announced, doorbells, group, generation:
                          torch.empty_like(doorbells))
         _op_counter += 1
         self.op = op
@@ -469,7 +489,7 @@ def ring_for(bells: DoorbellSet, layer_name: str,
     if group is None or bells.op is None:
         return
 
-    rung = bells.op(announced, bells.bells, bells.selectors[group],
+    rung = bells.op(announced, bells.bells, bells.group_ids[group],
                     bells.generation)
     # The op returns the donated buffer, but torch_tpu hands back a new tensor
     # object bound to the same memory. Copying it back keeps `bells.bells`
