@@ -20,7 +20,6 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.kv_transfer import doorbell
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -1245,22 +1244,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 sink,
             )
 
-        # Ring this layer's doorbell so a host reader can see the layer's KV
-        # land without waiting for the rest of the pass. Costs nothing on a
-        # worker with no doorbells. See distributed/kv_transfer/doorbell.
-        #
-        # `outputs` is the operand, not the cache. The cache would read as the
-        # obvious choice, since it is the thing the bell reports on, but the
-        # kernel writes it in place through donation, so the name still refers
-        # to the value that went in. In the traced graph that is a program
-        # input, available before the first instruction, and a bell whose only
-        # operand is a program input can be scheduled first. It was: every
-        # bell of a pass landed within one 200 us poll on an eight chip
-        # prefill, spread 0.00 ms across all fifteen layers. `outputs` comes
-        # out of the same call that wrote the cache, so depending on it means
-        # depending on that call having run, which is the claim the bell makes.
-        if ctx.doorbells is not None:
-            doorbell.ring_for(ctx.doorbells, layer.layer_name, outputs)
+        # The KV doorbell is rung one level up, by a wrapper around this
+        # layer's `Attention.forward`, not here. This function runs inside
+        # `torch.ops.vllm.unified_attention_with_output`, whose body dynamo
+        # never traces, so a ring placed here executes at run time rather than
+        # becoming an instruction in the model's program. Fifteen such rings
+        # then flush together in one small program and every bell of a pass
+        # lands in the same 200 us poll, which is what three CDK runs showed.
+        # See `doorbell.install`.
 
         # Drop the padding added above so callers see the layer's own width.
         if outputs.shape[-1] > self.head_size:

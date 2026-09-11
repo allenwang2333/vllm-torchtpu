@@ -26,6 +26,7 @@ import pytest
 import torch
 from jax.experimental import pallas as pl
 
+from vllm_torchtpu.distributed.kv_transfer import doorbell as doorbell_module
 from vllm_torchtpu.distributed.kv_transfer.doorbell import (BELL_LANES,
                                                             BELL_SUBLANES,
                                                             FIRST_GENERATION,
@@ -145,6 +146,58 @@ def test_layers_map_to_groups_in_order_and_gdn_layers_do_not():
     # A GDN layer never reaches this backend, so it has no group and the ring
     # is a no-op for it.
     assert bells.group_for("model.layers.4.linear_attn") is None
+
+
+class _FakeAttention:
+    """Enough of vLLM's `Attention` for `install` to wrap: a forward that
+    returns a value derived from its input, and a record of being called."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x * 2
+
+
+def test_install_wraps_only_the_layers_that_have_a_group(monkeypatch):
+    bells, names = _cpu_set()
+    layers = {n: _FakeAttention() for n in names}
+    # A GDN layer sits in the same mapping on a real worker and must be left
+    # alone, since wrapping it would ring a bell that does not exist.
+    layers["model.layers.4.linear_attn"] = _FakeAttention()
+
+    rung = []
+    monkeypatch.setattr(doorbell_module, "ring_for",
+                        lambda b, name, announced: rung.append(
+                            (name, announced)))
+
+    assert doorbell_module.install(bells, layers) == NUM_GROUPS
+
+    for name in names:
+        assert layers[name].forward(3) == 6
+    assert [n for n, _ in rung] == names
+    # The bell hears what the layer returned, not what it was handed. That is
+    # the whole ordering guarantee.
+    assert [a for _, a in rung] == [6] * NUM_GROUPS
+
+    layers["model.layers.4.linear_attn"].forward(3)
+    assert len(rung) == NUM_GROUPS
+
+
+def test_install_keeps_each_layers_own_name(monkeypatch):
+    """The wrapper closes over the loop variable, so a naive closure would give
+    every layer the last name and every bell the same group."""
+    bells, names = _cpu_set()
+    layers = {n: _FakeAttention() for n in names}
+
+    rung = []
+    monkeypatch.setattr(doorbell_module, "ring_for",
+                        lambda b, name, announced: rung.append(name))
+
+    doorbell_module.install(bells, layers)
+    layers[names[0]].forward(1)
+    assert rung == [names[0]]
 
 
 def test_verify_reads_are_bounded():

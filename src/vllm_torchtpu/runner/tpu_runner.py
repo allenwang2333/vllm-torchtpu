@@ -3695,7 +3695,6 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
-                    doorbells=self._doorbells,
             ):
                 # Advance the counter before the pass, so every bell this pass
                 # rings carries a value no earlier pass wrote. The buffer
@@ -4777,7 +4776,6 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
-                    doorbells=self._doorbells,
                 ),
         ):
             out, _ = self.forward_model(input_ids=input_ids,
@@ -6577,8 +6575,8 @@ class TPUModelRunner(GPUModelRunner):
                         "eligible attention layers; skipping doorbells.")
             return
 
-        # The ring's `announced` operand is the KV cache, so it needs the same
-        # mesh and sharding the attention kernel runs under.
+        # The ring's `announced` operand is the attention output, so it needs
+        # the same mesh and sharding the attention kernel runs under.
         use_pcp = self.parallel_config.prefill_context_parallel_size > 1
         mesh, _, specs = PallasAttentionBackendImpl._select_kernel_mesh(
             self.mesh, use_pcp)
@@ -6589,14 +6587,15 @@ class TPUModelRunner(GPUModelRunner):
             self.device,
             verify_steps=8 if envs.TPU_KV_DOORBELL_VERIFY else 0)
         bells.prebuild(mesh, kv_spec)
+        wrapped = doorbell.install(bells, layers)
 
         self._doorbells = bells
         # The chip count is logged, not used, so that a run can be checked for
         # having sharded the bells the way it meant to.
         logger.info(
             "KV doorbells allocated over %d attention layers, "
-            "one of %d chips", len(layer_names),
-            doorbell.shards_for(mesh, kv_spec))
+            "one of %d chips, %d layers wrapped", len(layer_names),
+            doorbell.shards_for(mesh, kv_spec), wrapped)
 
         if envs.TPU_KV_DOORBELL_POLL_US <= 0:
             return

@@ -484,13 +484,23 @@ def ring_for(bells: DoorbellSet, layer_name: str,
     A no-op for a layer with no group, which is every layer on a worker that
     is not the KV source.
 
+    Two conditions have to hold, and only one of them is about `announced`.
+
     `announced` must be a value the attention kernel *returned*, not the cache
     it wrote. The cache is written in place through donation, so it enters the
     traced graph as a program input, and an operand edge to a program input
     orders nothing: the value exists before the first instruction, so the bell
-    is free to run first and does. The kernel's output carries the same
-    guarantee without that hole, since it cannot exist until the call that
-    wrote the cache has run.
+    is free to run first. The kernel's output carries the same guarantee
+    without that hole, since it cannot exist until the call that wrote the
+    cache has run.
+
+    The call must also be traced. `install` exists because the obvious place to
+    ring, inside the attention implementation, is not: vLLM reaches that
+    implementation through `torch.ops.vllm.unified_attention_with_output`, and
+    a custom op's body is opaque to dynamo, so anything in it runs at execution
+    time instead of becoming graph instructions. On a lazy backend fifteen such
+    rings pile up and flush together in one small program, which is a flat pass
+    however carefully their operands are chosen.
     """
     group = bells.group_for(layer_name)
     if group is None or bells.op is None:
@@ -502,3 +512,41 @@ def ring_for(bells: DoorbellSet, layer_name: str,
     # object bound to the same memory. Copying it back keeps `bells.bells`
     # pointing at the storage the eventual reader watches.
     bells.bells.copy_(rung)
+
+
+def install(bells: DoorbellSet, layers: dict) -> int:
+    """Ring after each attention layer by wrapping its `forward`.
+
+    `layers` maps layer name to the vLLM `Attention` module. Only the ones with
+    a group are wrapped, so a worker that is not the KV source is untouched.
+
+    Wrapping the module rather than editing the implementation is what puts the
+    store in the model's own XLA program: `Attention.forward` is ordinary traced
+    Python, and only the custom op it calls is opaque. The tensor that forward
+    returns is the one that op wrote, so it is both a real graph value and the
+    right thing to depend on.
+
+    Nothing here orders the bells against each other, and nothing needs to. The
+    output aliasing already chains them: each call takes the previous call's
+    buffer as an operand, so the fifteen stores form a sequence XLA cannot
+    reshuffle. Returns how many layers were wrapped.
+    """
+    wrapped = 0
+    for name, layer in layers.items():
+        if bells.group_for(name) is None:
+            continue
+
+        def ringing(original, name):
+            def forward(*args, **kwargs):
+                out = original(*args, **kwargs)
+                ring_for(bells, name, out)
+                return out
+
+            return forward
+
+        # Assigning to the instance shadows the class method for this layer
+        # only, which matters because the same `Attention` class serves layers
+        # that have no group.
+        layer.forward = ringing(layer.forward, name)
+        wrapped += 1
+    return wrapped
