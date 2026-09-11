@@ -73,6 +73,10 @@ FORWARD=(
   # not see the -m filter in the plugin's test-cmd, so the steps that shard one
   # file set this to keep the split over what actually runs.
   PYTEST_ADDOPTS
+  # The suite token bktec uploads results with. Unset above, so this asks the
+  # launcher for it: it is in the env_secrets registry, the same way HF_TOKEN
+  # is.
+  BUILDKITE_ANALYTICS_TOKEN
   # What a slice's pods are asked to run, read by multihost_entry.sh. Unset for
   # a single-host step, and so skipped.
   MULTIHOST_ARGS
@@ -96,9 +100,10 @@ FORWARD=(
 #   step's own commands already run with this token, from the same repo as the
 #   test.
 #
-#   BUILDKITE_TEST_ENGINE_* and BUILDKITE_ANALYTICS_TOKEN are what the `tests`
-#   plugin exports for bktec, including the OIDC token it exchanged. bktec runs
-#   inside the workload, so without them a suite runs and reports nothing.
+#   BUILDKITE_TEST_ENGINE_* is the suite slug and runner configuration the
+#   `tests` plugin exports for bktec. bktec runs inside the workload, so
+#   without them a suite runs and reports nothing. The two credentials the
+#   plugin exports beside them are not carried; see below.
 #
 #   BUILDKITE_PARALLEL_JOB and _COUNT are how bktec knows which shard it is.
 #   They are unset on a step without `parallelism:`, and unset names are
@@ -119,10 +124,30 @@ FORWARD=(
 #   entirely, so none of them can ever resolve. Forwarding is worse than
 #   omitting: absent, the CLI says "socket empty or undefined", which names the
 #   problem; present and dangling, it fails as a connection or open error.
-#   Nothing is lost with the OIDC path in particular - the `tests` plugin
-#   exchanges the token on the agent and exports the result, which the sweep
-#   above already carries.
+#   Nothing depends on them: `buildkite-agent oidc request-token` is an API
+#   call made with BUILDKITE_AGENT_ACCESS_TOKEN, which the sweep does carry.
 FORWARD_DENY="BUILDKITE_COMMAND BUILDKITE_PLUGINS BUILDKITE_AGENT_JOB_API_SOCKET BUILDKITE_AGENT_JOB_API_TOKEN BUILDKITE_OIDC_TOKEN_PATH"
+
+# The `tests` plugin's pre-command mints one OIDC token on the agent and
+# exports it as both of these. On bare metal that is fine, because bktec starts
+# seconds later. Here the clock starts before Kueue admits the workload, before
+# a node scales up, before a CI image is pulled cold and before the model
+# compiles - and the token's default lifetime is two hours, which a step whose
+# own timeout is four can spend entirely on waiting. bktec then fails at the
+# end of a run that already did the work, which is the most expensive place to
+# discover an expired credential.
+#
+# Unset rather than deny-listed: the launcher prefers its own environment to
+# the registry, so leaving either set here would forward the stale token and
+# never reach Secret Manager.
+#
+# Uploads take the suite token from the fleet registry, named in FORWARD above.
+# It does not expire, and it authenticates against the suite directly, so a
+# result upload no longer depends on the suite's OIDC policy listing this
+# pipeline. Test splitting has no such token - it wants an org API token, which
+# the fleet does not hold - so it is left unset on purpose: bktec then mints
+# its own OIDC token from inside the pod, at the moment it needs one.
+unset BUILDKITE_ANALYTICS_TOKEN BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN
 
 env_args=()
 _forward_seen=" "

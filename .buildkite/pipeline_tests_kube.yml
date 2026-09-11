@@ -29,11 +29,11 @@
 # scheduler and nothing else, and the fleet has no CPU-only node pool to put
 # them on.
 #
-# The `tests` plugin still runs on the agent - it exchanges an OIDC token,
-# ensures the suite exists, and exports BUILDKITE_TEST_ENGINE_* and
-# BUILDKITE_ANALYTICS_TOKEN - while bktec itself runs in the pod, out of the
-# image. run.sh forwards the plugin's exports across, which is what joins the
-# two halves.
+# The `tests` plugin still runs on the agent - it ensures the suite exists and
+# exports the BUILDKITE_TEST_ENGINE_* configuration - while bktec itself runs
+# in the pod, out of the image. run.sh forwards that configuration across,
+# which is what joins the two halves. The credentials the plugin mints beside
+# it are dropped and re-obtained in the pod; see common.sh.
 
 # The pod template the fleet publishes: it carries the launcher binary, the
 # profile registry and the service account that may submit a workload. Repeated
