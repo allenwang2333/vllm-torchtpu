@@ -144,9 +144,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
 
-        # Same reason for the DCP twin, which is why it is built here even
-        # though only the DCP branch of `forward_oot` ever calls it. The DCP
-        # process group already exists by model-construction time.
         parallel_config = getattr(get_current_vllm_config_or_none(),
                                   "parallel_config", None)
         pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
