@@ -27,10 +27,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec, update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp)
-from vllm_torchtpu.kernels.mla.sparse import dsa_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
@@ -800,18 +801,18 @@ def sparse_mla_attention(
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
     """
-    # dsa_gather moves one (`TILE_SUBROWS`, `TILE_LANE_BYTES`) uint8 tile of
+    # dsa_gather moves one (`WORD_BYTES`, `TILE_LANE_BYTES`) uint8 tile of
     # nope and one `TILE_LANE_BYTES`-byte lane row of rope per token; other
     # head dims don't fit its address arithmetic.
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
-    tile_subrows = dsa_gather.TILE_SUBROWS
-    lane_bytes = dsa_gather.TILE_LANE_BYTES
-    assert (
-        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes), (
-            "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-            f"head dimension to be {tile_subrows * lane_bytes} and the fp8 "
-            f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-            f"{rope_dim}")
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    assert (lkv_dim == word_bytes * lane_bytes
+            and rope_dim * 2 == lane_bytes), (
+                "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+                f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+                f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+                f"{rope_dim}")
 
     in_specs = (
         P(None, None, None),  # ql_nope
@@ -851,11 +852,12 @@ def sparse_mla_attention(
             rope_spec=rope_spec)
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        output = sparse_mla_ragged_paged_attention(
+        output = mla_dispatch.ragged_paged_attention(
             q,
             kv_cache_nope,
             kv_cache_rope,
             topk_idx,
+            seq_lens_,
             block_tables_,
             query_start_loc_,
             request_distribution_,
@@ -1004,13 +1006,14 @@ def sparse_mla_attention_dcp(
             f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}.")
 
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
-    tile_subrows, lane_bytes = dsa_gather.TILE_SUBROWS, dsa_gather.TILE_LANE_BYTES
-    assert (
-        lkv_dim == tile_subrows * lane_bytes and rope_dim * 2 == lane_bytes), (
-            "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-            f"head dimension to be {tile_subrows * lane_bytes} and the fp8 "
-            f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-            f"{rope_dim}")
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    assert (lkv_dim == word_bytes * lane_bytes
+            and rope_dim * 2 == lane_bytes), (
+                "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+                f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+                f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+                f"{rope_dim}")
 
     replicated_3d = P(None, None, None)
     in_specs = (
