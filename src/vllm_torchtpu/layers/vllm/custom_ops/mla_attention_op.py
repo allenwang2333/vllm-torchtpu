@@ -383,9 +383,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         if self.topk_op_dcp is not None:
-            # No permutation tables: DCP replicates the queries, so the token
+            # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
-            # comes back is *not* global positions but this rank's own local
+            # comes back is not global positions but this rank's own local
             # cache indices, left-packed and `-1` padded -- the attention side
             # consumes them directly and merges across ranks by log-sum-exp.
             topk_indices = self.topk_op_dcp(
