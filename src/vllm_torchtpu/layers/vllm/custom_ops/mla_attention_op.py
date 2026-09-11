@@ -46,6 +46,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
+from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
@@ -93,19 +94,34 @@ def _cp_scatter_indexer_k(
         rank = cp_rank_as_data(axis_name, cp_size)
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
+        # The latent cache is guarded on its own page size in
+        # `update_sparse_mla_kv_cache_dcp`; this cache is a separate
+        # allocation, so it needs the check on its own number.
+        if page_size % interleave_size:
+            raise ValueError(
+                f"interleave_size={interleave_size} must divide the indexer "
+                f"K cache page_size={page_size}. Otherwise an interleave "
+                "chunk straddles a page boundary and the local index "
+                "`streamindex_topk_dcp` derives from a global position stops "
+                "agreeing with the (page, slot) written here.")
         k_packed = jnp.pad(k_packed,
                            ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
+        # Row positions exactly as `kv_cache_utils._row_positions` computes
+        # them: `in_batch` is taken before `seq_id` is clamped, so a padded
+        # token stays in bounds instead of reading `cu_q_lens[num_seqs + 1]`,
+        # one past the end.
         tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
         seq_id = jnp.searchsorted(cu_q_lens[1:], tok,
                                   side="right").astype(jnp.int32)
+        in_batch = tok < cu_q_lens[-1]
+        seq_id = jnp.minimum(seq_id, seq_lens.shape[0] - 1)
         q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
         pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
 
         virtual_page_size = jnp.int32(page_size * cp_size)
         cycle = jnp.int32(cp_size * interleave_size)
         interleave = jnp.int32(interleave_size)
-        virtual_page = pos // virtual_page_size
         offset = pos % virtual_page_size
         owner = (offset % cycle) // interleave
         slot = (offset // cycle) * interleave + (offset % interleave)
@@ -113,14 +129,18 @@ def _cp_scatter_indexer_k(
         # Virtual ordinal -> physical block in this rank's own shard, exactly
         # as `streamindex_topk_dcp` resolves it on the read side.
         local_page_indices = jnp.mod(page_indices,
-                                     jnp.int32(cache_kv.shape[0]))
+                                     jnp.int32(cache_kv.shape[0])).reshape(
+                                         seq_lens.shape[0], -1)
+        # A padded token's `pos` is meaningless and can run off the end of the
+        # page table; clip so the gather stays in bounds and let `valid` drop
+        # the row, the same way the sparse MLA writer does.
+        max_pages_per_seq = local_page_indices.shape[1]
+        virtual_page = jnp.clip(pos // virtual_page_size, 0,
+                                max_pages_per_seq - 1)
 
-        valid = jnp.logical_and(tok < cu_q_lens[-1], owner == rank)
-        page = jnp.where(
-            valid,
-            local_page_indices.reshape(seq_lens.shape[0], -1)[seq_id,
-                                                              virtual_page],
-            jnp.int32(2**30))
+        valid = jnp.logical_and(in_batch, owner == rank)
+        page = jnp.where(valid, local_page_indices[seq_id, virtual_page],
+                         jnp.int32(OOB_PAGE))
         return cache_kv.at[page, slot // kv_packing,
                            slot % kv_packing].set(k_packed)
 
