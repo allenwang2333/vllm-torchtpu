@@ -62,16 +62,9 @@ else:
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
 
-# Partition specs for the PCP sparse-MLA op. Module level on purpose: the op is
-# built lazily from inside the Dynamo-traced forward, and `PartitionSpec.__new__`
-# is not traceable (`nb_func.__call__`). Same reason
-# `PCP_STREAMING_RPA_INPUT_PARTITION_SPECS` is a constant.
 _PCP_REPLICATED = jax.sharding.PartitionSpec()
-
-# The DCP specs, and note they are the *inverse* of the PCP ones almost
-# everywhere: PCP shards queries and replicates the cache, DCP shards the cache
-# by KV position and replicates the queries. Same reason for module scope.
 _DCP_SHARDED = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+
 _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
     _DCP_SHARDED,  # kv_cache_nope, this rank's position shard
     _DCP_SHARDED,  # kv_cache_rope
