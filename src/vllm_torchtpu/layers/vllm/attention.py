@@ -1749,24 +1749,19 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                  interleave_size: int):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
-        Simpler than the PCP variant, and for the same reason the DCP indexer
-        op is: the queries are replicated, so nothing arrives rank-major and
-        there is no permutation to undo. `kv_c_normed`/`k_pe` in particular
+        In DCP the queries are replicated. `kv_c_normed`/`k_pe` in particular
         need no all-gather -- they are computed from a replicated residual
-        stream, so every rank already holds every row and only its *write mask*
-        differs.
+        stream, so every rank already holds every row and only its write mask
+        (owner rank) differs.
 
         The op returns unmerged partials. Combining them is one log-sum-exp
-        reduction over the DCP group, and it is deliberately left to the torch
+        reduction over the DCP group, is done by the torch
         caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
-        also narrows the head axis back down: it needs no Pallas, and keeping
-        it out of the exported module avoids the export path's constraints on
-        how collectives inside `pallas.jax_op` are launched.
+        also narrows the head axis back down.
         """
         from vllm_torchtpu.layers.common.attention_interface import \
             sparse_mla_attention_dcp
 
-        # Resolved in __init__: this builder runs inside the traced forward.
         mesh = self._dcp_mesh
 
         k_scale = None
