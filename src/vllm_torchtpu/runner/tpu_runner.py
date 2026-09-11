@@ -2561,13 +2561,13 @@ class TPUModelRunner(GPUModelRunner):
         current_req_ids = set(
             self.input_batch.req_ids[:self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        # An empty map means the previous step committed no tokens at all --
-        # every request in it was a partial (chunked-prefill) chunk, so it
-        # landed in discard_sampled_tokens_req_indices and never reached
-        # _update_placeholder. There is nothing to reconcile and nothing the
-        # next step could substitute, so this is NOT the disjoint case.
-        if not previous_req_ids or any(req_id in current_req_ids
-                                       for req_id in previous_req_ids):
+        if not previous_req_ids:
+            # An empty map means the previous step committed no tokens at all:
+            # every request in request_seq_lens was a partial (chunked-prefill)
+            # chunk.
+            self._pre_async_results = None
+            return
+        if any(req_id in current_req_ids for req_id in previous_req_ids):
             return
         self._modify_prev_results()
         self._pre_async_results = None
