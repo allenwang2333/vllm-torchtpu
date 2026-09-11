@@ -413,7 +413,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         self.topk_indices_buffer[:hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
         # Both branches return `topk_tokens`-wide rows.
-        self.topk_indices_buffer[:num_out, :self.topk_tokens] = topk_indices[:num_out]
+        topk = self.topk_tokens
+        self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
         return self.topk_indices_buffer
 
 
