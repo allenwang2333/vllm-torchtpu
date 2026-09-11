@@ -34,7 +34,7 @@ from absl.testing import parameterized
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, _partition_winners_by_owner, cp_global_to_local)
+    DCP_AXIS_NAME, _select_owned_winners, cp_global_to_local)
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
@@ -728,18 +728,20 @@ class SparseMlaDcpTest(parameterized.TestCase):
         return out
 
     def _run_dcp(self, inp, dcp_size, interleave_size):
-        """Shard, attend, merge. Returns (merged_output, dropped)."""
+        """Shard, attend, merge. Returns the merged output."""
         mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]),
                                  (DCP_AXIS_NAME, ))
         sharded = jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
 
-        lists, dropped = _partition_winners_by_owner(
-            jnp.asarray(inp["topk"], jnp.int32), dcp_size, interleave_size,
-            DCP_ATTN_TOPK)
-        # [T, D, C] -> [D, T, C] -> [D*T, C], the rank-major stacking
-        # `streamindex_topk_dcp` produces and the shard_map expects.
-        local_topk = jnp.asarray(lists).transpose(1, 0, 2).reshape(
-            dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
+        # Every rank filters the same global list with its own rank id, which
+        # is what stage 3's all-gather leaves each rank holding. Stacking those
+        # per-rank results gives [D, T, C], the rank-major layout the shard_map
+        # expects.
+        merged_topk = jnp.asarray(inp["topk"], jnp.int32)
+        local_topk = jnp.stack([
+            _select_owned_winners(merged_topk, dcp_size, interleave_size, r)
+            for r in range(dcp_size)
+        ]).reshape(dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
 
         # One virtual page spans `PAGE_SIZE * dcp_size` global positions.
         vpages = math.ceil(DCP_SEQ / (PAGE_SIZE * dcp_size))
@@ -771,7 +773,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         merged = attention_interface.merge_dcp_lse_partials(
             out.reshape(dcp_size, DCP_SEQ, NUM_HEADS, LKV_DIM),
             lse.reshape(dcp_size, DCP_SEQ, NUM_HEADS))
-        return np.asarray(merged), int(dropped)
+        return np.asarray(merged)
 
     @parameterized.named_parameters(
         dict(testcase_name="d2_c4", dcp_size=2, interleave_size=4),
@@ -783,8 +785,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
                                                        interleave_size):
         self._require_devices(dcp_size)
         inp = self._inputs()
-        merged, dropped = self._run_dcp(inp, dcp_size, interleave_size)
-        self.assertEqual(dropped, 0)
+        merged = self._run_dcp(inp, dcp_size, interleave_size)
         np.testing.assert_allclose(merged,
                                    self._numpy_reference(inp),
                                    rtol=2e-2,
@@ -809,11 +810,11 @@ class SparseMlaDcpTest(parameterized.TestCase):
         nope, rope = (jax.device_put(c, sharded)
                       for c in _dcp_caches(dcp_size))
 
-        lists, _ = _partition_winners_by_owner(
-            jnp.asarray(inp["topk"], jnp.int32), dcp_size, interleave_size,
-            DCP_ATTN_TOPK)
-        local_topk = jnp.asarray(lists).transpose(1, 0, 2).reshape(
-            dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
+        merged_topk = jnp.asarray(inp["topk"], jnp.int32)
+        local_topk = jnp.stack([
+            _select_owned_winners(merged_topk, dcp_size, interleave_size, r)
+            for r in range(dcp_size)
+        ]).reshape(dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
 
         new_nope, _, _, _ = attention_interface.sparse_mla_attention_dcp(
             inp["ql_nope"],
@@ -872,8 +873,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         topk[DCP_SEQ - 1, :4] = [0, 1, 2, 3]
         inp["topk"] = topk
 
-        merged, dropped = self._run_dcp(inp, dcp_size, interleave_size)
-        self.assertEqual(dropped, 0)
+        merged = self._run_dcp(inp, dcp_size, interleave_size)
         np.testing.assert_allclose(merged[DCP_SEQ - 1],
                                    self._numpy_reference(inp)[DCP_SEQ - 1],
                                    rtol=2e-2,
