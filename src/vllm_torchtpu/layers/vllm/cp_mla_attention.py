@@ -72,8 +72,7 @@ def merge_lse_partials_scatter_heads(output: torch.Tensor,
 
       1. all-gather the log-sum-exps. They are `[num_tokens, num_heads]` f32 --
          Leaves every rank holding every `lse_r`.
-      2. reduce-scatter the weighted outputs,
-      `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`
+      2. reduce-scatter the weighted outputs
 
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`, this rank's partial.
