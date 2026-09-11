@@ -376,7 +376,26 @@ def test_watcher_forgets_passes_older_than_the_newest_complete_one(
         [_FakeSighting(0, 1, 0)] +
         [_FakeSighting(g, 2, 1000 * g) for g in range(NUM_GROUPS)])
     watcher.after_step()
-    assert list(watcher._pending) == [2]
+    # Generation 2 completed, so it is measured and retired; generation 1 never
+    # will and is dropped. Nothing is left waiting.
+    assert list(watcher._pending) == []
+    assert len(watcher._spans_ms) == 1
+
+
+def test_watcher_measures_every_complete_pass_not_just_the_last(monkeypatch):
+    """Pruning used to run before the spans were taken, which left one pass
+    behind and reported its span as a median over the whole run."""
+    reader = _FakeReader(NUM_GROUPS)
+    watcher, _ = _watcher_with(monkeypatch, reader)
+
+    # Three complete passes, each wider than the one before.
+    reader.queued = [
+        _FakeSighting(g, gen, 1000 * g * gen)
+        for gen in (1, 2, 3) for g in range(NUM_GROUPS)
+    ]
+    watcher.after_step()
+    assert len(watcher._spans_ms) == 3
+    assert watcher._spans_ms == sorted(watcher._spans_ms)
 
 
 def test_generation_starts_below_first_and_rises_once_per_step():

@@ -335,6 +335,11 @@ class DoorbellWatcher:
         self._report_every = report_every
         self._steps = 0
         self._pending: dict[int, dict[int, int]] = {}
+        # Every pass whose groups all rang, retired out of `_pending` as soon
+        # as it completed. One float per pass, so a long run costs nothing.
+        self._spans_ms: list[float] = []
+        self._zero_spans = 0
+        self._newest_offsets: list[float] | None = None
         # Set once the reader has reported anything at all. Until it does, a
         # step whose direct read shows rung bells means the reader is watching
         # the wrong memory, which is worth saying out loud exactly once.
@@ -359,18 +364,27 @@ class DoorbellWatcher:
             self._saw_anything = True
             gen = self._pending.setdefault(sighting.generation, {})
             gen[sighting.group] = sighting.host_nanos
-        # A generation is only interesting once every group has rung, and
-        # generations arrive in order, so anything older than the newest
-        # complete one will never fill in and is dropped rather than kept.
-        complete = [
-            g for g, seen in self._pending.items()
-            if len(seen) == self._bells.num_groups
-        ]
+        # A generation is only interesting once every group has rung. Retire
+        # every complete one into the running sample before pruning. Pruning
+        # first would leave exactly one pass behind, which is how an earlier
+        # run reported a median over a single sample.
+        complete = sorted(g for g, seen in self._pending.items()
+                          if len(seen) == self._bells.num_groups)
+        for gen in complete:
+            seen = self._pending[gen]
+            first = min(seen.values())
+            span_ms = (max(seen.values()) - first) / 1e6
+            self._spans_ms.append(span_ms)
+            if span_ms == 0.0:
+                self._zero_spans += 1
+            self._newest_offsets = [(seen[g] - first) / 1e6
+                                    for g in range(self._bells.num_groups)]
+        # Generations arrive in order, so anything not newer than the newest
+        # retired one will never fill in and is dropped rather than kept.
         if complete:
-            newest = max(complete)
             self._pending = {
                 g: seen
-                for g, seen in self._pending.items() if g >= newest
+                for g, seen in self._pending.items() if g > complete[-1]
             }
 
     def _report(self) -> None:
@@ -378,17 +392,6 @@ class DoorbellWatcher:
         if not self._saw_anything:
             self._report_nothing_seen(stats)
             return
-
-        spans_ms = []
-        newest_offsets = None
-        for gen in sorted(self._pending):
-            seen = self._pending[gen]
-            if len(seen) < self._bells.num_groups:
-                continue
-            first = min(seen.values())
-            spans_ms.append((max(seen.values()) - first) / 1e6)
-            newest_offsets = [(seen[g] - first) / 1e6
-                              for g in range(self._bells.num_groups)]
 
         mean_poll_us = (stats.poll_nanos_total / stats.polls /
                         1000.0) if stats.polls else 0.0
@@ -400,23 +403,28 @@ class DoorbellWatcher:
             stats.torn_tiles, stats.sightings_recorded,
             stats.sightings_dropped)
 
-        if not spans_ms:
+        if not self._spans_ms:
             logger.info(
                 "KV doorbell stagger: no pass yet had all %d groups sighted, "
                 "so the poll is slower than the pass or some group never "
                 "rings", self._bells.num_groups)
             return
 
-        spans_ms.sort()
+        spans_ms = sorted(self._spans_ms)
+        # Passes whose span is exactly zero had all their groups first seen in
+        # one poll. That is the difference between a pass with no stagger and
+        # a stagger too small for the poll interval to resolve, and without it
+        # a median of zero is ambiguous.
         logger.info(
             "KV doorbell stagger over %d complete passes: median %.2f ms, "
-            "max %.2f ms", len(spans_ms), spans_ms[len(spans_ms) // 2],
-            spans_ms[-1])
+            "max %.2f ms, %d passes within one poll", len(spans_ms),
+            spans_ms[len(spans_ms) // 2], spans_ms[-1], self._zero_spans)
         # The shape matters as much as the span. A stagger that rises steadily
         # across groups is real pipelining; one where fourteen groups land
         # together and one lags is a straggler and not an opportunity.
         logger.info("KV doorbell per-group offsets (ms): %s",
-                    ", ".join(f"{off:.2f}" for off in newest_offsets))
+                    ", ".join(f"{off:.2f}"
+                              for off in self._newest_offsets))
 
     def _report_nothing_seen(self, stats) -> None:
         """Distinguish a reader watching dead memory from bells that never ring.
