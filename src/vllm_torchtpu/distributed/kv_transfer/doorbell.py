@@ -479,11 +479,18 @@ class DoorbellWatcher:
 
 def ring_for(bells: DoorbellSet, layer_name: str,
              announced: torch.Tensor) -> None:
-    """Ring `layer_name`'s bell, ordered after `announced` is written.
+    """Ring `layer_name`'s bell, ordered after `announced` is produced.
 
     A no-op for a layer with no group, which is every layer on a worker that
-    is not the KV source. `announced` should be the tensor the attention
-    kernel just wrote, since that dependency is the whole ordering guarantee.
+    is not the KV source.
+
+    `announced` must be a value the attention kernel *returned*, not the cache
+    it wrote. The cache is written in place through donation, so it enters the
+    traced graph as a program input, and an operand edge to a program input
+    orders nothing: the value exists before the first instruction, so the bell
+    is free to run first and does. The kernel's output carries the same
+    guarantee without that hole, since it cannot exist until the call that
+    wrote the cache has run.
     """
     group = bells.group_for(layer_name)
     if group is None or bells.op is None:

@@ -1246,13 +1246,21 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
 
         # Ring this layer's doorbell so a host reader can see the layer's KV
-        # land without waiting for the rest of the pass. Passing the cache the
-        # kernel just wrote is what orders the store after it. Costs nothing
-        # on a worker with no doorbells. See distributed/kv_transfer/doorbell.
+        # land without waiting for the rest of the pass. Costs nothing on a
+        # worker with no doorbells. See distributed/kv_transfer/doorbell.
+        #
+        # `outputs` is the operand, not the cache. The cache would read as the
+        # obvious choice, since it is the thing the bell reports on, but the
+        # kernel writes it in place through donation, so the name still refers
+        # to the value that went in. In the traced graph that is a program
+        # input, available before the first instruction, and a bell whose only
+        # operand is a program input can be scheduled first. It was: every
+        # bell of a pass landed within one 200 us poll on an eight chip
+        # prefill, spread 0.00 ms across all fifteen layers. `outputs` comes
+        # out of the same call that wrote the cache, so depending on it means
+        # depending on that call having run, which is the claim the bell makes.
         if ctx.doorbells is not None:
-            doorbell.ring_for(
-                ctx.doorbells, layer.layer_name, ctx.kv_cache_bundle
-                if ctx.kv_cache_bundle is not None else kv_cache)
+            doorbell.ring_for(ctx.doorbells, layer.layer_name, outputs)
 
         # Drop the padding added above so callers see the layer's own width.
         if outputs.shape[-1] > self.head_size:
