@@ -103,7 +103,8 @@ CHECKED_TOKENS = 256
 
 
 def page_checksum(kv_cache: torch.Tensor,
-                  block_ids: Sequence[int]) -> Optional[int]:
+                  block_ids: Sequence[int],
+                  tokens: int = CHECKED_TOKENS) -> Optional[int]:
     """Sum the leading bytes of the named pages of one layer's cache.
 
     Bytes rather than cache values, because the cache is fp8 here and an
@@ -123,7 +124,7 @@ def page_checksum(kv_cache: torch.Tensor,
     index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
     pages = kv_cache.index_select(0, index)
     if pages.dim() > 1:
-        pages = pages[:, :CHECKED_TOKENS]
+        pages = pages[:, :tokens]
     # To the host before reinterpreting: a byte view of an fp8 tensor is not
     # something every TPU op accepts, and this slice is a small copy.
     flat = pages.reshape(-1).cpu().contiguous()
@@ -288,11 +289,13 @@ class DoorbellSet:
                  layer_names: Sequence[str],
                  device: torch.device,
                  verify_steps: int = 0,
-                 check_steps: int = 0):
+                 check_steps: int = 0,
+                 check_tokens: int = CHECKED_TOKENS):
         self._group_of = {name: i for i, name in enumerate(layer_names)}
         self.num_groups = len(layer_names)
         self._verify_budget = verify_steps
         self._check_budget = check_steps
+        self._check_tokens = check_tokens
 
         # Filled by `install`, in group order, so the page check can reach each
         # layer's cache. Held as the module rather than the tensor because vLLM
@@ -484,16 +487,17 @@ class DoorbellSet:
         self._check_budget -= 1
 
         sums = [
-            page_checksum(getattr(layer, "kv_cache", None), block_ids)
-            for layer in self._layers
+            page_checksum(getattr(layer, "kv_cache", None), block_ids,
+                          self._check_tokens) for layer in self._layers
         ]
         if all(s is None for s in sums):
             logger.info("KV doorbell page check: no cache bound yet, skipping")
             return
 
         step = int(self.generation[0, 0, 0])
-        logger.info("KV doorbell page check at step %d over pages %s: %s", step,
-                    list(block_ids), sums)
+        logger.info(
+            "KV doorbell page check at step %d over pages %s, %d slots "
+            "each: %s", step, list(block_ids), self._check_tokens, sums)
         if sums.count(sums[0]) == len(sums):
             logger.error(
                 "KV doorbell page check: all %d layers hashed to the same "

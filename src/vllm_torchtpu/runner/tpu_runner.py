@@ -6649,7 +6649,8 @@ class TPUModelRunner(GPUModelRunner):
             layer_names,
             self.device,
             verify_steps=8 if envs.TPU_KV_DOORBELL_VERIFY else 0,
-            check_steps=8 if envs.TPU_KV_DOORBELL_CHECK else 0)
+            check_steps=8 if envs.TPU_KV_DOORBELL_CHECK else 0,
+            check_tokens=envs.TPU_KV_DOORBELL_CHECK_TOKENS)
         bells.prebuild(mesh, kv_spec)
         wrapped = doorbell.install(bells, layers)
 

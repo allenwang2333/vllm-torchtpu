@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL: bool = False
     TPU_KV_DOORBELL_VERIFY: bool = False
     TPU_KV_DOORBELL_CHECK: bool = False
+    TPU_KV_DOORBELL_CHECK_TOKENS: int = 256
     TPU_KV_DOORBELL_POLL_US: int = 0
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
@@ -468,6 +469,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # host, so a timing run must leave it off.
     "TPU_KV_DOORBELL_CHECK":
     env_bool("TPU_KV_DOORBELL_CHECK"),
+
+    # How many token slots of each page the check reads. The default covers a
+    # short request cheaply. Raise it to cover a long one: the slots past a
+    # request's own tokens hold whatever the allocation left behind, and those
+    # bytes are the same whatever the prompt was, so a slice much longer than
+    # the request dilutes the signal rather than strengthening it.
+    "TPU_KV_DOORBELL_CHECK_TOKENS":
+    lambda: int(os.getenv("TPU_KV_DOORBELL_CHECK_TOKENS") or "256"),
 
     # How often raiden's C++ reader copies the bells to the host, in
     # microseconds. Zero leaves the reader off entirely. The default when it is

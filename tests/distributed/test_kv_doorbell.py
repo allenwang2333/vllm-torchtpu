@@ -550,7 +550,7 @@ def test_page_check_is_bounded_like_the_verify_read(monkeypatch):
 
     seen = []
     monkeypatch.setattr(doorbell_module, "page_checksum",
-                        lambda cache, ids: seen.append(1) or 7)
+                        lambda cache, ids, tokens: seen.append(1) or 7)
     for _ in range(10):
         if bells.wants_page_check():
             bells.maybe_check_pages([0, 1])
@@ -589,3 +589,17 @@ def test_page_check_says_so_when_every_layer_hashes_alike(monkeypatch, caplog):
     with caplog.at_level("ERROR"):
         bells.maybe_check_pages([0])
     assert "same" in caplog.text
+
+
+def test_page_checksum_reads_only_the_requested_slots():
+    """The slice width has to change the number, or it is not being applied.
+
+    The production config runs `--block-size 8192`, so a page is far larger
+    than any request that fits in one, and reading all of it would drown the
+    request's own bytes in whatever the allocator left behind.
+    """
+    cache = torch.arange(2 * 16, dtype=torch.uint8).reshape(2, 16)
+    narrow = doorbell_module.page_checksum(cache, [0], tokens=4)
+    wide = doorbell_module.page_checksum(cache, [0], tokens=16)
+    assert narrow == sum(range(0, 4))
+    assert wide == sum(range(0, 16))
