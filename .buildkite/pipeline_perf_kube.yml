@@ -19,9 +19,12 @@
 # models on different hardware, and while the fleet is being brought up a
 # number from here must not be read as a regression.
 #
-# Every step of pipeline_perf.yml is here except the two Kimi ones - kimi-k3
-# wants a four-host v7x-32 slice, which the fleet has no profile for. Keys and
-# labels are otherwise identical so the two files read side by side.
+# Every step of pipeline_perf.yml is here except three. kimi-k3 wants a
+# four-host v7x-32 slice, which the fleet has no profile for, and kimi-k2.6 is
+# excluded with it. The GLM `mp` variant is left on bare metal for now: it
+# regression-tests a bring-up path this lane does not use, and porting it means
+# reproducing run_multihost_mp.sh's serve-flag construction in a second place.
+# Keys and labels are otherwise identical so the two files read side by side.
 #
 # Three things move that are not just a change of agent:
 #
@@ -93,6 +96,7 @@ steps:
           # inside the pod. The copy is a no-op once the fleet has the model.
           - |
             .buildkite/kubernetes/run.sh $$SHAPE bash -c '
+              set -e
               bash .buildkite/scripts/stage_model_snapshot.sh \
                 gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ /cache/hf/hub
               exec bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
@@ -130,6 +134,7 @@ steps:
         commands:
           - |
             .buildkite/kubernetes/run.sh $$SHAPE bash -c '
+              set -e
               bash .buildkite/scripts/stage_model_snapshot.sh \
                 gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ /cache/hf/hub
               exec bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
@@ -217,6 +222,9 @@ steps:
         key: "perf_nightly_glm_5_2_fp8_dp16_ep"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
+        # The JobSet asks for eight hours and the launcher gives it the fleet's
+        # remaining three to be admitted, so the step has to allow for both.
+        timeout_in_minutes: 660
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -224,29 +232,7 @@ steps:
         plugins:
           - *kube_plugin
         commands:
-          - .buildkite/kubernetes/run_multihost.sh ray bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep
-
-      # Same config and benchmark as glm-5.2-fp8-dp16-ep above, but through
-      # the `mp` distributed-executor backend (independent `vllm serve` head +
-      # `--headless` processes with vllm-torchtpu's own multihost DP bootstrap,
-      # src/vllm_torchtpu/distributed/tpu_mp_multihost.py) instead of Ray.
-      # Regression-tests that bootstrap path directly. DATA_PARALLELISM_LOCAL
-      # is this host's DP share (8 cores/host x 2 hosts = 16) -- topology, not
-      # benchmark, so it's supplied here rather than hardcoded into the shared
-      # config.
-      - label: ":kubernetes: Perf: Nightly glm-5.2-fp8-mp-dp16-ep (TPU v7x-16)"
-        key: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
-        <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-          BENCHMARK_WARMUP_RUNS: "1"
-          DATA_PARALLELISM_LOCAL: "8"
-        plugins:
-          - *kube_plugin
-        commands:
-          - .buildkite/kubernetes/run_multihost.sh mp glm-5.2-fp8-dp16-ep
+          - .buildkite/kubernetes/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval --results-dir /perf_eval_results/glm-5.2-fp8-dp16-ep
 
       - label: ":kubernetes: Perf/Eval: Nightly deepseek-v4-flash-dp8-ep (TPU v7x-8)"
         key: "perf_nightly_deepseek_v4_flash_dp8_ep"
@@ -262,6 +248,7 @@ steps:
         commands:
           - |
             .buildkite/kubernetes/run.sh $$SHAPE bash -c '
+              set -e
               bash .buildkite/scripts/stage_model_snapshot.sh \
                 gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/ /cache/hf/hub
               exec bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep'
@@ -300,7 +287,7 @@ steps:
                 echo "::error::No xplane traces under $$profile_dir; the profiler was armed but wrote nothing xprof can open."
                 exit 1
               fi
-              dest=$$(jq -r ".profile_gcs_dir // \"\"" "$$results_dir/config.json")
+              dest=$$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(\"profile_gcs_dir\") or \"\")" "$$results_dir/config.json")
               if [ -z "$$dest" ]; then
                 echo "::error::config.json carries no profile_gcs_dir, so nothing states where these profiles belong."
                 exit 1

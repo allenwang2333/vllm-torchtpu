@@ -62,10 +62,13 @@ x-tpu-step-defaults: &tpu_step
     queue: "kube"
   commands:
     # One command for every shape, as in pipeline_tests.yml, with the shape
-    # itself the only thing a step varies. Exit 5 is pytest's "no tests
-    # collected", which a shard can legitimately reach once the marker filter
-    # has emptied it.
-    - .buildkite/kubernetes/run.sh $$SHAPE bktec run || [ $$? -eq 5 ]
+    # itself the only thing a step varies.
+    #
+    # Exit 5 is pytest's "no tests collected", which a shard can legitimately
+    # reach once the marker filter has emptied it. Tolerated inside the pod
+    # rather than around the launcher: the launcher reports a workload as 0 or
+    # 1, so a 5 never survives to be compared out here.
+    - .buildkite/kubernetes/run.sh $$SHAPE bash -c 'bktec run || [ $$? -eq 5 ]'
 
 x-cpu-unit-test-defaults: &cpu_unit_test_defaults
   depends_on: "build_docker"

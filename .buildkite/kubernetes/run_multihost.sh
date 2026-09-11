@@ -15,11 +15,11 @@
 
 # run.sh, for a benchmark that spans the hosts of a slice.
 #
-#   .buildkite/kubernetes/run_multihost.sh ray <command> [args...]
-#   .buildkite/kubernetes/run_multihost.sh mp  <config-name> [args...]
+#   .buildkite/kubernetes/run_multihost.sh <command> [args...]
 #
 # The arguments are .buildkite/scripts/run_multihost.sh's, so the two pipelines
-# name the same benchmark the same way.
+# name the same benchmark the same way, and like it this runs the command on a
+# Ray cluster spanning the slice.
 #
 # Not run.sh with a different shape: the launcher's built-in Job is one pod
 # holding one host's chips, and a slice is several pods that have to be placed
@@ -28,18 +28,10 @@
 # nodeSelector rather than from a flag.
 set -euo pipefail
 
-if [[ $# -lt 2 ]]; then
-  echo "usage: $0 ray|mp <command-or-config> [args...]" >&2
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <command> [args...]" >&2
   exit 2
 fi
-
-case "$1" in
-  ray | mp) ;;
-  *)
-    echo "$0: expected ray or mp, got '$1'" >&2
-    exit 2
-    ;;
-esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/common.sh"

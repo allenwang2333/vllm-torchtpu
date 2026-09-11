@@ -35,7 +35,9 @@ WORKLOAD_IMAGE="${WORKLOAD_IMAGE:-${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}}"
 export WORKLOAD_IMAGE
 
 # What run_in_docker.sh passes as a fixed -e on every container. Exported here
-# rather than named in the pipeline because none of it varies by step.
+# rather than named in the pipeline because none of it varies by step, and
+# named in FORWARD below because exporting alone would only set them for the
+# launcher: the launcher forwards a variable when a --env names it.
 export FORCE_COLOR="1"
 export TQDM_MININTERVAL="30"
 export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
@@ -51,6 +53,9 @@ export UV_NO_CACHE="1"
 # is skipped rather than injected empty, which is what run_in_docker.sh's
 # `${VAR:+-e VAR=...}` expansions buy and what several of these depend on.
 FORWARD=(
+  # The fixed set exported above.
+  FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU
+  UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
   # Unset on a kube agent, and naming an unset variable is how the launcher is
   # asked for it: HF_TOKEN is in its env_secrets registry, so it reads it from
   # Secret Manager and puts it in the pod. On bare metal run_in_docker.sh
@@ -60,7 +65,7 @@ FORWARD=(
   BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_TYPE MODEL_PATH MODEL_URI
   SERVED_MODEL_NAME RUN_ROOT VLLM_ENGINE_READY_TIMEOUT_S
   TPU_ACCELERATOR_TYPE TPU_MULTIHOST_BACKEND TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
-  USE_MOE_SPARSE_CORE DATA_PARALLELISM_LOCAL P4D2_BIND_HOST PROXY_PORT
+  USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT
   # Set by bootstrap.sh on a nightly build; several benchmark configs branch on
   # it, and a step's `if:` cannot pass it into the pod for them.
   NIGHTLY CREATED_BY
@@ -68,7 +73,7 @@ FORWARD=(
   # not see the -m filter in the plugin's test-cmd, so the steps that shard one
   # file set this to keep the split over what actually runs.
   PYTEST_ADDOPTS
-  # What a slice's pods are asked to do, read by multihost_entry.sh. Unset for
+  # What a slice's pods are asked to run, read by multihost_entry.sh. Unset for
   # a single-host step, and so skipped.
   MULTIHOST_ARGS
 )
@@ -99,7 +104,7 @@ FORWARD=(
 #   They are unset on a step without `parallelism:`, and unset names are
 #   skipped.
 #
-# Four are held back:
+# Five are held back:
 #
 #   BUILDKITE_COMMAND is this step's own script. Forwarding it into the
 #   container invites something to re-execute the launcher from inside the
@@ -108,14 +113,16 @@ FORWARD=(
 #   BUILDKITE_PLUGINS is a JSON blob describing agent-side plugins, which mean
 #   nothing in the pod and can be large enough to bloat the pod spec.
 #
-#   BUILDKITE_AGENT_JOB_API_SOCKET and _TOKEN address a unix socket the agent
-#   opens for its own job. The docker plugin can mount that socket into a
-#   container because the container shares the host; a workload pod is on
-#   another cluster entirely, so the path can never resolve. Forwarding it is
-#   worse than omitting it: the CLI fails with "socket empty or undefined",
-#   which names the problem, where a path present in the variable but not on
-#   disk fails as a connection error.
-FORWARD_DENY="BUILDKITE_COMMAND BUILDKITE_PLUGINS BUILDKITE_AGENT_JOB_API_SOCKET BUILDKITE_AGENT_JOB_API_TOKEN"
+#   BUILDKITE_AGENT_JOB_API_SOCKET, _TOKEN and BUILDKITE_OIDC_TOKEN_PATH are
+#   all paths on the agent host. run_in_docker.sh can forward them because it
+#   bind-mounts what they point at; a workload pod is on another cluster
+#   entirely, so none of them can ever resolve. Forwarding is worse than
+#   omitting: absent, the CLI says "socket empty or undefined", which names the
+#   problem; present and dangling, it fails as a connection or open error.
+#   Nothing is lost with the OIDC path in particular - the `tests` plugin
+#   exchanges the token on the agent and exports the result, which the sweep
+#   above already carries.
+FORWARD_DENY="BUILDKITE_COMMAND BUILDKITE_PLUGINS BUILDKITE_AGENT_JOB_API_SOCKET BUILDKITE_AGENT_JOB_API_TOKEN BUILDKITE_OIDC_TOKEN_PATH"
 
 env_args=()
 _forward_seen=" "

@@ -15,10 +15,10 @@
 # A benchmark across both hosts of a 2x2x2 v7x slice - what
 # .buildkite/scripts/run_multihost.sh sets up on bare metal.
 #
-# Nothing here names a benchmark. The two GLM steps in pipeline_perf_kube.yml
-# differ only in the arguments they hand multihost_entry.sh, so they differ
-# only in MULTIHOST_ARGS and share this file; the shape, the caches and the
-# bring-up are the same either way.
+# Nothing here names a benchmark. A step's whole contribution is
+# MULTIHOST_ARGS - the command multihost_entry.sh runs on the Ray head - so any
+# number of slice-wide benchmarks share this file; the shape, the caches and
+# the bring-up are the same for all of them.
 #
 # One replicatedJob, not one per role. A multi-host TPU slice is placed by GKE
 # as the pods of a single Job: parallelism equals the slice's host count, the
@@ -59,10 +59,13 @@ spec:
           # that will come back with an empty compilation cache and a different
           # pod name; the run is over either way, and the log says why.
           backoffLimit: 0
-          # Ten hours, not the fleet's three-hour default: these models compile
-          # for the better part of an hour before the sweep starts. The
-          # launcher bounds it by the step's whole budget.
-          activeDeadlineSeconds: 36000
+          # Eight hours, not the fleet's three-hour default: these models
+          # compile for the better part of an hour before the sweep starts.
+          # Not ten, which is what the disagg benchmark asks for: the launcher
+          # gives a workload the fleet's eleven-hour total minus its deadline
+          # as its admission window, so asking for ten would leave one hour to
+          # find eight free v7x chips.
+          activeDeadlineSeconds: 28800
           template:
             metadata:
               annotations:
@@ -97,14 +100,13 @@ spec:
                       export VLLM_HOST_IP="$${POD_IP}"
                       exec bash .buildkite/kubernetes/multihost_entry.sh $${MULTIHOST_ARGS}
                   env:
-                    # The DNS name of index 0. Every host addresses the head by
-                    # this: the Ray workers join it, and the mp engines take it
-                    # as --data-parallel-address.
+                    # The DNS name of index 0, which is what every worker
+                    # joins its Ray cluster to and then watches to know when
+                    # the run is over.
                     - name: HEAD_HOST
                       value: ${WORKLOAD_NAME}-slice-0-0.${WORKLOAD_NAME}
-                    # Must match parallelism above. The head waits for this
-                    # many peers, and the mp path checks the config's data
-                    # parallelism divides by it.
+                    # Must match parallelism above: it is how many Ray nodes
+                    # the head waits for before starting the benchmark.
                     - name: NUM_HOSTS
                       value: "2"
                     - name: POD_IP
@@ -159,12 +161,15 @@ spec:
                 - name: gke-gcsfuse-cache
                   emptyDir:
                     medium: Memory
-                # Larger than the disagg engines': Ray puts its object store
-                # here, and the mp path's DP handoff is shared memory too.
+                # What scripts/multihost/run_cluster.sh gives the bare-metal
+                # container. Larger than the disagg engines' because the
+                # torch_tpu compile cache lives in /dev/shm and every DP engine
+                # caches its own compiled graphs: 16Gi overflows at DP>=4 on
+                # GLM-5.2, and these steps are DP16.
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 64Gi
+                    sizeLimit: 128Gi
                 # Claims, not inline CSI volumes: the buckets are regional, so
                 # the name differs per cluster and only a claim resolves in
                 # whichever cluster the workload was dispatched to.
