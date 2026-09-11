@@ -412,13 +412,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         self.topk_indices_buffer[:hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        # Both branches return `topk_tokens`-wide rows, matching the buffer.
-        # Under DCP the row is the slice of the global list this rank owns,
-        # left-packed, so it is only `1 / dcp_size` full on average -- the
-        # attention side must bound its gather by the per-row count rather than
-        # by this width, or it pays `dcp_size`x more than it needs to.
-        width = topk_indices.shape[1]
-        self.topk_indices_buffer[:num_out, :width] = topk_indices[:num_out]
+        # Both branches return `topk_tokens`-wide rows.
+        self.topk_indices_buffer[:num_out, :self.topk_tokens] = topk_indices[:num_out]
         return self.topk_indices_buffer
 
 
