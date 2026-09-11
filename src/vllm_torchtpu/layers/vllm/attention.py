@@ -1815,9 +1815,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         # We must overwrite the default fake implementation as vLLM uses
-        # dynamic dimensions for the query. Local shapes off the local inputs:
-        # the output is `ql_nope`'s shape (the kernel's rope tail is dropped
-        # before it returns) and the log-sum-exps are one f32 per (token, head).
+        # dynamic dimensions for the query.
         def _fake_sparse_mla_dcp(kv_cache_nope, kv_cache_rope, ql_nope, *rest,
                                  **kwargs):
             del rest, kwargs
@@ -1825,7 +1823,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
                 torch.empty_like(ql_nope),
-                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
+                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32), #LSE
             )
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
