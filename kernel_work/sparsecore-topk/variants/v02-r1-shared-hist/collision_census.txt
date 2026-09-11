@@ -1,9 +1,0 @@
-L0 histogram intra-vector conflict census, n=10240 (--ctx 9216)
--- b=64
-  random       rows=64    n_eff=10240  vectors=40960     conflicting_vectors=40960     (100.0%)  colliding_lane_pairs=421174     distinct_L0_buckets(first rows)=[16, 15, 17, 19, 18, 17, 17, 16]
-  heavy_ties   rows=64    n_eff=10240  vectors=40960     conflicting_vectors=40960     (100.0%)  colliding_lane_pairs=522370     distinct_L0_buckets(first rows)=[4, 4, 4, 4, 4, 4, 4, 4]
-  strict_desc  rows=64    n_eff=10240  vectors=40960     conflicting_vectors=40960     (100.0%)  colliding_lane_pairs=614208     distinct_L0_buckets(first rows)=[9, 9, 9, 9, 9, 9, 9, 9]
--- b=1024
-  random       rows=1024  n_eff=10240  vectors=655360    conflicting_vectors=655360    (100.0%)  colliding_lane_pairs=6734859    distinct_L0_buckets(first rows)=[17, 17, 16, 17, 17, 16, 17, 16]
-  heavy_ties   rows=1024  n_eff=10240  vectors=655360    conflicting_vectors=655360    (100.0%)  colliding_lane_pairs=8362161    distinct_L0_buckets(first rows)=[4, 4, 4, 4, 4, 4, 4, 4]
-  strict_desc  rows=1024  n_eff=10240  vectors=655360    conflicting_vectors=655360    (100.0%)  colliding_lane_pairs=9827328    distinct_L0_buckets(first rows)=[9, 9, 9, 9, 9, 9, 9, 9]

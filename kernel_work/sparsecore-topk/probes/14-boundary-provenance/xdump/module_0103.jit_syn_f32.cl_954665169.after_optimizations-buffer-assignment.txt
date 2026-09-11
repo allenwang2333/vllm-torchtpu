@@ -1,6 +1,0 @@
-BufferAssignment:
-allocation 0: size 41943040, parameter 0, shape |f32[1024,80,128]| at ShapeIndex {}:
- value: <0 a.1 @0> (size=41943040,offset=0): f32[1024,80,128]{2,1,0:T(8,128)}
-allocation 1: size 41943040, output shape is |s32[10485760]|, maybe-live-out:
- value: <1 bitcast_convert_type.1 @0> (size=41943040,offset=0): s32[1024,80,128]{2,1,0:T(8,128)}
-allocation 2: size 33554432, color 1, preallocated-temp:
