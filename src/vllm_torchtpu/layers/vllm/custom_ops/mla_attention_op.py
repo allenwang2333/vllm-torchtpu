@@ -308,19 +308,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
             return cache_kv, local_topk
 
-        def _fake_outputs(q_bytes, weights, cache_kv, k_packed, seq_lens,
-                          page_indices, cu_q_lens, distribution):
-            # Local shapes off the local inputs, keeping the token dim
-            # symbolic -- see `pcp_streaming_jax_op` on why the default rule
-            # cannot. `q_bytes` is replicated here, so its leading dim is
-            # already the local (and global) token count.
-            del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
-                 distribution)
-            return (
-                torch.empty_like(cache_kv),
-                q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
-            )
-
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
         op_name = ("pallas::streamidx_topk_dcp_"
@@ -348,8 +335,22 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 sharded,  # new cache_kv
                 sharded,  # local_topk: [num_tokens, topk] per rank
             ),
-            fake_outputs=_fake_outputs,
         )
+
+        # We must overwrite the default fake implementation as vLLM uses
+        # dynamic dimensions for the query. `q_bytes` is replicated here, so
+        # its leading dim is already the local (and global) token count.
+        def _fake_streamidx_topk_dcp(q_bytes, weights, cache_kv, k_packed,
+                                     seq_lens, page_indices, cu_q_lens,
+                                     distribution, **kwargs):
+            del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
+                 distribution, kwargs)
+            return (
+                torch.empty_like(cache_kv),
+                q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
+            )
+
+        jax_op.register_fake(_fake_streamidx_topk_dcp)
 
         def op(*args):
             new_cache, local_topk = jax_op(*args)

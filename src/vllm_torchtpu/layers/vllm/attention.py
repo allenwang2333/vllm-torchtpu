@@ -1829,19 +1829,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 interleave_size=interleave_size,
             )
 
-        def _fake_outputs(kv_cache_nope, kv_cache_rope, ql_nope, *rest):
-            # Local shapes off the local inputs, keeping the token dim symbolic
-            # -- see `pcp_streaming_jax_op`. The output is `ql_nope`'s shape
-            # (the kernel's rope tail is dropped before it returns) and the
-            # log-sum-exps are one f32 per (token, head).
-            del rest
-            return (
-                torch.empty_like(kv_cache_nope),
-                torch.empty_like(kv_cache_rope),
-                torch.empty_like(ql_nope),
-                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
-            )
-
         op_name = ("pallas::sparse_mla_attention_dcp_"
                    f"{layer.layer_name.replace('.', '_')}")
         sparse_mla_jax_op = pcp_streaming_jax_op(
@@ -1851,8 +1838,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             mesh=mesh,
             input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
             output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
-            fake_outputs=_fake_outputs,
         )
+
+        # We must overwrite the default fake implementation as vLLM uses
+        # dynamic dimensions for the query. Local shapes off the local inputs:
+        # the output is `ql_nope`'s shape (the kernel's rope tail is dropped
+        # before it returns) and the log-sum-exps are one f32 per (token, head).
+        def _fake_sparse_mla_dcp(kv_cache_nope, kv_cache_rope, ql_nope, *rest,
+                                 **kwargs):
+            del rest, kwargs
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty_like(ql_nope),
+                ql_nope.new_empty(ql_nope.shape[:2], dtype=torch.float32),
+            )
+
+        sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
 
         def sparse_mla_dcp_impl(
             kv_cache: tuple[torch.Tensor, torch.Tensor],
