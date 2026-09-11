@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import jax
 import torch
+from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -62,29 +63,27 @@ else:
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
 
-_PCP_REPLICATED = jax.sharding.PartitionSpec()
-_DCP_SHARDED = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
-
 _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
-    _DCP_SHARDED,  # kv_cache_nope, this rank's position shard
-    _DCP_SHARDED,  # kv_cache_rope
-    _PCP_REPLICATED,  # ql_nope
-    _PCP_REPLICATED,  # q_pe
-    _PCP_REPLICATED,  # kv_c_normed -- no all-gather: every rank already has it
-    _PCP_REPLICATED,  # k_pe
+    P(DCP_AXIS_NAME),  # kv_cache_nope, this rank's position shard
+    P(DCP_AXIS_NAME),  # kv_cache_rope
+    P(),  # ql_nope
+    P(),  # q_pe
+    P(),  # kv_c_normed -- no all-gather: every rank already has it
+    P(),  # k_pe
     # This rank's slice of every token's global top-k, already local indices.
     # Sharded, so the global leading dim is `dcp_size * num_tokens`.
-    _DCP_SHARDED,  # local_topk_indices
-    _PCP_REPLICATED,  # seq_lens
-    _PCP_REPLICATED,  # block_tables (virtual page ordinals)
-    _PCP_REPLICATED,  # query_start_loc
-    _PCP_REPLICATED,  # request_distribution
+    P(DCP_AXIS_NAME),  # local_topk_indices
+    P(),  # seq_lens
+    P(),  # block_tables (virtual page ordinals)
+    P(),  # query_start_loc
+    P(),  # request_distribution
 )
 _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
-    _DCP_SHARDED,  # updated nope cache
-    _DCP_SHARDED,  # updated rope cache
-    _DCP_SHARDED,  # partial attention output over this rank's KV positions
-    _DCP_SHARDED,  # matching log-sum-exps, `-inf` where this rank owns nothing
+    P(DCP_AXIS_NAME),  # updated nope cache
+    P(DCP_AXIS_NAME),  # updated rope cache
+    P(DCP_AXIS_NAME),  # partial attention output over this rank's KV positions
+    # Matching log-sum-exps, `-inf` where this rank owns nothing.
+    P(DCP_AXIS_NAME),  # partial lse
 )
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
