@@ -11,13 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for DCP (decode context parallel) StreamIndex Top-K.
-
-DCP replicates the queries and shards the KV, so each rank's `streamindex_topk`
-returns a *local* top-k: correct only after the caller merges the returned
-scores across ranks. These tests run that merge end to end against the
-unsharded kernel.
-"""
+"""DCP StreamIndex Top-K: the cross-rank merge against the unsharded kernel."""
 
 import jax
 import jax.numpy as jnp
@@ -27,13 +21,7 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 
-# The coordinate algebra this rests on -- `cp_local_to_global` and the torch
-# inverse the return leg applies -- is covered on CPU in
-# `tests/distributed/test_dcp_wiring.py`.
-
-# ===================================================================== #
 # Argument validation on the CP path of `streamindex_topk`.
-# ===================================================================== #
 
 
 def _dummy_args(num_tokens=8,
@@ -84,9 +72,7 @@ def test_early_exit_is_rejected_under_cp():
                          **_topk_kwargs(enable_early_exit=True))
 
 
-# ===================================================================== #
 # End-to-end against the unsharded kernel.
-# ===================================================================== #
 
 H_IDX, D_IDX, K = 32, 128, 2048
 Q_LEN, KV_LEN, PAGE_SIZE = 256, 32768, 1024
@@ -94,7 +80,7 @@ WIDTH = 256
 
 
 def _global_records(kv_len, seed=7):
-    """One record array; both paths are views of it, so any diff is a real bug."""
+    """One record array; both paths are views of it, so a diff is a bug."""
     vals = jax.random.normal(jax.random.key(seed), (kv_len, D_IDX),
                              jnp.float32)
     fp8 = jax.lax.bitcast_convert_type(vals.astype(jnp.float8_e4m3fn),
@@ -128,12 +114,7 @@ def _local_candidates(q, weights, shard, seq_lens, page_indices, cu_q_lens,
 
 def _merged_global_topk(q, weights, shards, seq_lens, page_indices, cu_q_lens,
                         distribution, *, dcp_size):
-    """The DCP pipeline of `_build_streamidx_dcp_op`, in pure JAX.
-
-    Local candidates per rank, concatenated rank-major the way the torch
-    all-gather leaves them, re-ranked by `sparsecore_topk`, and read back out
-    as global positions.
-    """
+    """The DCP pipeline of `_build_streamidx_dcp_op`, in pure JAX."""
     per_rank = [
         _local_candidates(q,
                           weights,
@@ -161,8 +142,7 @@ def _merged_global_topk(q, weights, shards, seq_lens, page_indices, cu_q_lens,
 
 
 def _shards(rec, dcp_size, vpages):
-    """interleave_size=1: global position g lives on rank g % dcp_size at
-    local index g // dcp_size, so the shards are a strided de-interleave."""
+    """interleave_size=1, so the shards are a strided de-interleave."""
     return [
         rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
         for r in range(dcp_size)
@@ -171,13 +151,7 @@ def _shards(rec, dcp_size, vpages):
 
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
-    """The merged list must be the unsharded global top-k, exactly.
-
-    Exactness is the requirement, not an approximation target: DCP partitions
-    the KV, so a global winner is beaten by at most `k - 1` positions overall
-    and hence by at most `k - 1` on its own shard, and always survives that
-    shard's local top-k.
-    """
+    """The merged list must be the unsharded global top-k, exactly."""
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(0))
     q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) *
@@ -216,8 +190,7 @@ def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
 
     for t in range(Q_LEN):
         got = merged[t][merged[t] >= 0].tolist()
-        # Multiplicity, not just set equality: the LSE merge double-counts a
-        # position delivered twice.
+        # The LSE merge double-counts a position delivered twice.
         assert len(got) == len(set(got)), f"token {t} has duplicates"
         want = set(reference[t][reference[t] >= 0].tolist())
         assert set(got) == want, (
@@ -226,11 +199,7 @@ def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
 
 
 def test_local_candidates_stay_inside_their_own_shard(dcp_size=4):
-    """Each rank's pre-merge candidates are global positions it owns.
-
-    The torch ownership filter reads `slots // k` rather than the gathered
-    index, so this precondition is what keeps that shortcut sound.
-    """
+    """Each rank's pre-merge candidates are global positions it owns."""
     rec = _global_records(KV_LEN, seed=3)
     kq, kw = jax.random.split(jax.random.key(3))
     q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) *

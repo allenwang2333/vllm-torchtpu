@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The torch ownership filter against a plain-python reference: it keeps the
-winners this rank owns and nothing else. No devices needed."""
+"""The torch ownership filter keeps the winners this rank owns, and no more."""
 
 import jax.numpy as jnp
 import numpy as np
@@ -36,8 +35,7 @@ _LAYOUTS = [
 
 
 def _candidates(rng, dcp_size, interleave_c, k, num_rows, empty_frac):
-    """Per-rank `idxs`: global positions that rank owns, `-1` padded, as
-    stage 1 emits them -- the precondition the column filter rests on."""
+    """Per-rank `idxs`: global positions that rank owns, `-1` padded."""
     idxs = np.full((dcp_size, num_rows, k), -1, np.int32)
     for r in range(dcp_size):
         for t in range(num_rows):
@@ -138,10 +136,7 @@ def test_ranks_partition_the_winners(dcp_size, interleave_c, k, num_rows):
 
 
 def test_a_rank_owning_every_winner_loses_nothing():
-    """Ownership is data-dependent, so any per-rank width below `k` is a bet.
-
-    `k` is not a bet: a rank owning the whole list still fits it.
-    """
+    """A rank owning the whole winner list still fits it at width `k`."""
     dcp_size, interleave_c, k = 4, 1, 16
     slots = np.arange(k, dtype=np.int32)[None, :]
     idxs = np.arange(0, k * dcp_size, dcp_size, dtype=np.int32)[None, :]
@@ -157,11 +152,7 @@ def test_a_rank_owning_every_winner_loses_nothing():
 
 
 def test_unowned_rank_gets_an_all_minus_one_row():
-    """A rank owning none of a token's winners gets an all -1 row.
-
-    The attention side keys its LSE mask off exactly this, so it has to be
-    distinguishable from "owns position 0".
-    """
+    """A rank owning none of a token's winners gets an all -1 row."""
     dcp_size, interleave_c, k = 4, 1, 4
     slots = np.arange(k, 2 * k, dtype=np.int32)[None, :]
     idxs = np.asarray([[1, 5, 9, 13]], np.int32)

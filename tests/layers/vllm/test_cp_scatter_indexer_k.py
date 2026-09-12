@@ -11,14 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`_cp_scatter_indexer_k`: the DCP indexer-K writer.
-
-The reader places global position `p` on rank `(p // c) % D` at local index
-`(p // (D * c)) * c + p % c`. The writer derives its own
-`(rank, page, slot)` from a different expression, so the property worth
-testing is that the two agree: a row written for global position `p` must
-land exactly where the reader will go looking for it, and nowhere else.
-"""
+"""`_cp_scatter_indexer_k`: the writer must land where the reader looks."""
 
 import functools
 
@@ -68,11 +61,7 @@ def _rows(num_tokens):
 
 def _scatter(cache, rows, seq_lens, page_tbl, cu_q_lens, dcp_size,
              interleave_size):
-    """Every rank's shard through the writer, restacked into a global cache.
-
-    The writer is unsharded now, so the ranks run one after another on one
-    device; concatenating in rank order rebuilds what the mesh used to hold.
-    """
+    """Every rank's shard through the writer, restacked into a global cache."""
     shards = np.asarray(cache).reshape((dcp_size, -1) + cache.shape[1:])
     rest = (jnp.asarray(rows), jnp.asarray(seq_lens), jnp.asarray(page_tbl),
             jnp.asarray(cu_q_lens))
@@ -145,11 +134,7 @@ def test_padded_tokens_write_nothing(dcp_size=4,
                                      interleave_size=4,
                                      page_size=32,
                                      pages_per_seq=2):
-    """Rows past `cu_q_lens[-1]` are dropped, not aimed at a real slot.
-
-    Their `pos` is meaningless and can index past the page table, so this is
-    what the `seq_id` clamp and the `virtual_page` clip protect.
-    """
+    """Rows past `cu_q_lens[-1]` are dropped, not aimed at a real slot."""
     seq_lens, cu_q_lens, page_tbl, cache, _ = _case(dcp_size,
                                                     page_size,
                                                     pages_per_seq,
@@ -167,13 +152,7 @@ def test_padded_tokens_write_nothing(dcp_size=4,
 
 @pytest.mark.cpu_test
 def test_interleave_must_divide_the_page(dcp_size=4):
-    """The guard that keeps writer and reader in one coordinate space.
-
-    `owner` is derived from `pos % (page_size * dcp_size)`; the reader's
-    owner is derived from `pos` directly. They coincide only when
-    the `dcp_size * interleave_size` cycle divides the virtual page, i.e.
-    when `interleave_size` divides `page_size`.
-    """
+    """The guard that keeps writer and reader in one coordinate space."""
     page_size, pages_per_seq = 32, 2
     seq_lens, cu_q_lens, page_tbl, cache, num_tokens = _case(dcp_size,
                                                              page_size,

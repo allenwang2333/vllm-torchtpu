@@ -409,18 +409,7 @@ DCP_INTERLEAVE_C = 4
 
 def _shard_topk_by_owner(topk_rows: np.ndarray, dcp_size: int,
                          interleave_c: int):
-    """Partition each token's top-k list by the position's owning DCP rank.
-
-    Returns `(shards, counts)` with `shards[r]` shaped like `topk_rows`.
-    The cache stays replicated here, so entries keep their *global* indices
-    and no local-index remap is involved: this isolates the LSE merge, which
-    is the only part the kernel is responsible for.
-
-    A rank that owns none of a token's top-k still has to be handed a row with
-    one valid entry (the kernel derives `kv_len` from the `-1` tail and
-    requires `kv_len >= 1`). Such a row computes a real but meaningless
-    softmax, so `counts` records the emptiness and the merge masks it out.
-    """
+    """Partition each token's top-k by owning rank; `(shards, counts)`."""
     num_tokens, topk = topk_rows.shape
     shards = np.full((dcp_size, num_tokens, topk), -1, np.int32)
     counts = np.zeros((dcp_size, num_tokens), np.int32)
@@ -437,12 +426,7 @@ def _shard_topk_by_owner(topk_rows: np.ndarray, dcp_size: int,
 
 def _merge_partials(outs: np.ndarray, lses: np.ndarray,
                     counts: np.ndarray) -> np.ndarray:
-    """`o = sum_r softmax_r(lse) * o_r` over the DCP axis, in f32.
-
-    outs: f32[D, T, N, Dh] normalized per-shard outputs.
-    lses: f32[D, T, N] per-shard log-sum-exp.
-    counts: i32[D, T] valid entries per shard, 0 meaning "did not participate".
-    """
+    """`o = sum_r softmax_r(lse) * o_r` over the DCP axis, in f32."""
     lses = np.where(counts[:, :, None] > 0, lses, -np.inf)
     shift = lses.max(0, keepdims=True)
     # An unowned token would give 0/0; the guard makes it a zero, not a NaN.
@@ -456,13 +440,7 @@ def _merge_partials(outs: np.ndarray, lses: np.ndarray,
 
 
 class SparseMlaLseTest(parameterized.TestCase):
-    """`return_lse` and the KV-sharded (DCP) merge it exists to enable.
-
-    Unlike the PCP class above, DCP splits a single token's top-k across
-    ranks, so each rank sees a *partial* softmax and parity can only be
-    approximate. The tolerance here is set by the kernel's bf16 output dtype,
-    not by the merge: the merge itself is exact in f32 given exact partials.
-    """
+    """`return_lse` and the KV-sharded (DCP) merge it exists to enable."""
 
     def setUp(self):
         super().setUp()
@@ -569,13 +547,7 @@ class SparseMlaLseTest(parameterized.TestCase):
     )
     def test_merging_position_sharded_partials_reproduces_the_whole(
             self, dcp_size):
-        """The core DCP claim, at the kernel boundary.
-
-        Splitting a token's top-k across ranks by KV *position* and merging the
-        per-rank `(output, lse)` pairs must reproduce the unsplit result. With
-        `_causal_topk` the early tokens own fewer entries than there are ranks,
-        so the empty-shard path is exercised too.
-        """
+        """Splitting a token's top-k by position and merging is the whole."""
         inp = self._prefilled()
         whole = np.asarray(
             self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
@@ -596,11 +568,7 @@ class SparseMlaLseTest(parameterized.TestCase):
         np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
 
     def test_an_empty_shard_contributes_nothing(self):
-        """A rank owning none of a token's top-k must not shift the merge.
-
-        Its `lse` is meaningless (the kernel was handed a dummy entry), so the
-        merge has to drop it on `counts`, not on the value of `lse`.
-        """
+        """A rank owning none of a token's top-k must not shift the merge."""
         inp = self._prefilled()
         whole = np.asarray(
             self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
@@ -628,8 +596,7 @@ DCP_ATTN_TOPK = 64
 
 
 def _owned_local_topk(merged, dcp_size, interleave_c, rank):
-    """The slice of a global top-k list `rank` owns, as local indices,
-    left-packed and `-1` padded back out to the input width."""
+    """The slice of a top-k list `rank` owns, as left-packed local indices."""
     merged = np.asarray(merged)
     cycle = dcp_size * interleave_c
     mine = (merged >= 0) & ((merged // interleave_c) % dcp_size == rank)
@@ -648,30 +615,7 @@ def _dcp_caches():
 
 
 def _merge_dcp_lse_partials(outputs, lses):
-    """Combine per-rank sparse-MLA partials into the whole-context result.
-
-    Lives here rather than beside `sparse_mla_attention_dcp` because nothing
-    in the serving path calls it: `PallasMLAttentionBackendImpl.forward` runs
-    the torch collective version (`merge_lse_partials_scatter_heads`), which
-    also has to scatter the head axis. This is the plain arithmetic, with the
-    whole `[dcp_size, ...]` stack in hand, so the tests below can check the
-    kernel's partials against a numpy MLA reference without a process group.
-
-    With per-rank normalized outputs `o_r` and `lse_r = m_r + log(l_r)`, the
-    exact global result is `o = sum_r softmax_r(lse) * o_r`.
-
-    Args:
-      outputs: `[dcp_size, num_tokens, num_heads, v_dim]` per-rank outputs.
-      lses: `[dcp_size, num_tokens, num_heads]` matching log-sum-exps.
-        Non-finite entries mark ranks that own none of that token's top-k;
-        `sparse_mla_attention_dcp` sets them, because such a rank is still fed
-        a dummy key (the kernel requires `kv_len >= 1`) and returns a real but
-        meaningless softmax that must not be weighted in.
-
-    Returns:
-      `[num_tokens, num_heads, v_dim]` in f32. Tokens no rank contributed to
-      -- padding rows -- come back as zeros rather than NaN.
-    """
+    """Per-rank partials into the whole: `o = sum_r softmax_r(lse) * o_r`."""
     lses = lses.astype(jnp.float32)
     shift = jnp.max(lses, axis=0, keepdims=True)
     # No contributor anywhere gives inf - inf; pin the shift to 0 there.
@@ -694,12 +638,7 @@ def _random_causal_topk(rng, num_tokens, topk):
 
 
 class SparseMlaDcpTest(parameterized.TestCase):
-    """`sparse_mla_attention_dcp` + `_merge_dcp_lse_partials`, end to end.
-
-    The comparison is against the same pure-numpy f32 MLA reference the
-    unsharded tests use, not against the unsharded kernel, so a layout bug
-    that happened to be symmetric between the two paths cannot hide.
-    """
+    """`sparse_mla_attention_dcp` + `_merge_dcp_lse_partials`, end to end."""
 
     def setUp(self):
         super().setUp()
@@ -753,12 +692,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         return out
 
     def _run_ranks(self, inp, dcp_size, interleave_size, block_tables):
-        """Every rank over its own shard, results stacked rank-major.
-
-        The op is unsharded now, so a rank is just an argument: one device runs
-        all `dcp_size` of them in turn and the stack stands in for the torch
-        collective the serving path would do here.
-        """
+        """Every rank over its own shard, results stacked rank-major."""
         merged_topk = jnp.asarray(inp["topk"], jnp.int32)
         nope, rope = _dcp_caches()
         per_rank = [
@@ -816,13 +750,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         self._check_merge_matches_the_reference(dcp_size, interleave_size)
 
     def test_dcp_write_mask_partitions_the_cache(self):
-        """Each rank must hold exactly the positions it owns -- no more.
-
-        If the ownership mask in the scatter disagreed with the interleave the
-        readers assume, the merge would still produce *a* number; it would just
-        be one that double-counted some positions and dropped others. Counting
-        written slots catches that directly.
-        """
+        """Each rank must hold exactly the positions it owns -- no more."""
         self._require_tpu()
         dcp_size, interleave_size = 4, 4
         inp = self._inputs()
@@ -850,13 +778,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         np.testing.assert_array_equal(written, expected)
 
     def test_a_rank_owning_nothing_is_dropped_by_the_merge(self):
-        """The empty-shard path, isolated.
-
-        A rank with no winners for a token is still handed a dummy key, so its
-        partial output is a real number that must be excluded on the strength
-        of `lse = -inf` alone. Force that case by giving one token winners on a
-        single rank only, and check the merge ignores the other three.
-        """
+        """The empty-shard path: `lse = -inf` alone must exclude a rank."""
         self._require_tpu()
         dcp_size, interleave_size = 4, 4
         inp = self._inputs()

@@ -1,19 +1,17 @@
-# SPDX-License-Identifier: Apache-2.0
-"""The MLA DCP head gather and log-sum-exp merge (`cp_mla_attention`).
-
-This is the merge that runs in serving. `SparseMlaDcpTest` in
-`tests/layers/common/test_sparse_mla_attention.py` checks the same arithmetic
-end to end against a numpy MLA reference, on real devices; what it cannot
-cover is the collective plumbing -- the head-block indexing and the
-reduce-scatter -- which is what these tests are for. Both sides are held to
-`_reference_merge` below rather than to each other, so neither can drift into
-being the other's second opinion.
-
-The process group is faked: every rank's partials are held in one process and
-the group calls are served from that stack. That is a real test of the merge --
-the arithmetic, the rank indexing, and the `-inf` masking are all exercised --
-and it needs no distributed launcher.
-"""
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The MLA DCP head gather and log-sum-exp merge, over a faked group."""
 
 import numpy as np
 import pytest
@@ -23,15 +21,7 @@ from vllm_torchtpu.layers.vllm import cp_mla_attention as cp_mla
 
 
 class _FakeGroup:
-    """Serves `all_gather`/`reduce_scatter` from a full stack of rank partials.
-
-    `reduce_scatter` is where the fake has to be careful: the real collective
-    sums a contribution from every rank, but only one rank's tensor is passed
-    in. The other summands are produced by running the module's own
-    `_weight_by_lse` as each peer -- rather than by reimplementing the
-    weighting here, which would quietly replace the code under test with a
-    second copy of itself and leave the real one unexercised.
-    """
+    """Serves `all_gather`/`reduce_scatter` from a stack of rank partials."""
 
     def __init__(self, outputs, lses, rank):
         self.world_size = len(lses)
@@ -60,19 +50,14 @@ class _FakeGroup:
 
 
 def _merge_as_rank(outputs, lses, rank, monkeypatch):
-    """The merge as rank `r` sees it: its own head block of the whole answer."""
+    """The merge as rank `r` sees it: its head block of the whole answer."""
     group = _FakeGroup(outputs, lses, rank)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
     return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
 
 
 def _merge_whole(outputs, lses, monkeypatch):
-    """The full merged tensor, reassembled from every rank's scatter block.
-
-    The scatter deliberately leaves each rank only `num_heads // dcp_size`
-    heads, so the whole-context tensor the arithmetic tests below want is the
-    concatenation of what all `dcp_size` ranks got back.
-    """
+    """The full merged tensor, reassembled from every rank's scatter block."""
     return torch.cat([
         _merge_as_rank(outputs, lses, rank, monkeypatch)
         for rank in range(outputs.shape[0])
@@ -81,8 +66,7 @@ def _merge_whole(outputs, lses, monkeypatch):
 
 
 def _reference_merge(outputs, lses):
-    """`o = sum_r softmax_r(lse) * o_r` in f64 numpy, owing nothing to the
-    module -- an oracle rather than a second opinion."""
+    """`o = sum_r softmax_r(lse) * o_r` in f64 numpy: the oracle."""
     out = outputs.numpy().astype(np.float64)
     lse = lses.numpy().astype(np.float64)
     shift = np.where(np.isfinite(lse), lse, -np.inf).max(axis=0)
@@ -94,12 +78,7 @@ def _reference_merge(outputs, lses):
 
 
 def _partials(rng, dcp_size, tokens=8, local_heads=2, vdim=16, empty=()):
-    """Per-rank partials, sized the way the kernel really produces them.
-
-    `local_heads` is what a rank keeps *after* the scatter, so the merged head
-    axis is `dcp_size * local_heads` -- which is also the divisibility the
-    reduce-scatter requires.
-    """
+    """Per-rank partials, sized the way the kernel really produces them."""
     heads = dcp_size * local_heads
     outputs = torch.from_numpy(
         rng.standard_normal(
@@ -123,8 +102,7 @@ def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_each_rank_gets_its_own_block_of_one_answer(rank, monkeypatch):
-    """The rank index must only select which head block comes back -- never
-    change the arithmetic that produced it."""
+    """The rank index selects a head block; it changes no arithmetic."""
     local_heads = 3
     outputs, lses = _partials(np.random.default_rng(11),
                               4,
@@ -143,8 +121,7 @@ def test_ranks_owning_nothing_are_excluded(monkeypatch):
     rng = np.random.default_rng(5)
     outputs, lses = _partials(rng, 4, empty=[(1, 3), (2, 3), (3, 3)])
     got = _merge_whole(outputs, lses, monkeypatch).numpy()
-    # Token 3 is owned by rank 0 alone, so the merge must return rank 0's
-    # output there verbatim.
+    # Token 3 is rank 0's alone, so its output must come back verbatim.
     np.testing.assert_allclose(got[3],
                                outputs[0, 3].numpy(),
                                rtol=1e-6,
@@ -161,7 +138,7 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
 
 
 class _HeadGatherGroup:
-    """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
+    """Serves only `all_gather(dim=1)`, from per-rank head slices."""
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -176,12 +153,7 @@ class _HeadGatherGroup:
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
-    """The gather/scatter pair only lines up if block `r` belongs to rank `r`.
-
-    `merge_lse_partials_scatter_heads` hands block `r` back to rank `r`, and
-    `W_UV` downstream is that rank's TP head slice, so anything else silently
-    applies the wrong up-projection.
-    """
+    """The gather/scatter pair lines up only if block `r` is rank `r`'s."""
     rng = np.random.default_rng(31)
     per_rank = torch.from_numpy(
         rng.standard_normal((4, 6, 3, 8)).astype(np.float32))
@@ -209,11 +181,7 @@ def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
 
 
 def test_merge_reproduces_an_unsplit_softmax(monkeypatch):
-    """Ground truth, independent of both implementations.
-
-    Split one attention problem's keys across ranks, attend per shard, merge:
-    the result must equal the softmax over all the keys at once.
-    """
+    """Attending per shard and merging equals one softmax over all keys."""
     rng = np.random.default_rng(99)
     dcp_size, tokens, local_heads, vdim, keys = 4, 6, 3, 8, 40
     heads = dcp_size * local_heads
