@@ -149,6 +149,18 @@ FORWARD_DENY="BUILDKITE_COMMAND BUILDKITE_PLUGINS BUILDKITE_AGENT_JOB_API_SOCKET
 # its own OIDC token from inside the pod, at the moment it needs one.
 unset BUILDKITE_ANALYTICS_TOKEN BUILDKITE_TEST_ENGINE_API_ACCESS_TOKEN
 
+# What lets bktec mint that token in the pod. `buildkite-agent oidc
+# request-token` refuses by default unless it can register the token it is
+# about to print with the agent's log redactor, and the redactor lives behind
+# the Job API socket - a path on the agent host, which is why the sweep denies
+# it. So the guard fires on exactly the one caller it cannot help.
+#
+# Safe here because the token is never printed. bktec captures stdout into its
+# own configuration, and the pod's log reaches Buildkite through the launcher,
+# which forwards lines rather than evaluating them. The redactor would be
+# guarding against a leak that has no path to occur.
+export BUILDKITE_AGENT_OIDC_REQUEST_TOKEN_SKIP_TOKEN_REDACTION=true
+
 env_args=()
 _forward_seen=" "
 for _name in $(compgen -v | grep '^BUILDKITE_' | sort); do
