@@ -46,7 +46,7 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-# Context-parallel compressed-coordinate helpers.
+# Context-parallel  helpers.
 
 
 def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
