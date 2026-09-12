@@ -42,9 +42,10 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk)
+    DCP_AXIS_NAME, streamindex_topk)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions

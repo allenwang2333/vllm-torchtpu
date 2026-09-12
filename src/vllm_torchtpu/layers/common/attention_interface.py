@@ -18,6 +18,7 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
 from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
@@ -979,7 +980,7 @@ def sparse_mla_attention_dcp(
     def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
                topk_idx, seq_lens_, block_tables_, query_start_loc_,
                request_distribution_):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,

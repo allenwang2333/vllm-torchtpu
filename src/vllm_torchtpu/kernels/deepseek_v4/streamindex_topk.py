@@ -57,8 +57,8 @@ def get_dtype_packing(dtype):
 # position `g` is owned by rank `(g // interleave_c) % cp_size`.
 #
 # The arithmetic is the same whichever axis owns the interleave, so these are
-# plain `cp_` helpers: DCP is the only caller here, but nothing below reads the
-# axis name except `cp_rank_as_data`, which takes it as an argument.
+# plain `cp_` helpers: DCP is the only caller here, and nothing below reads the
+# axis name. Deriving the rank itself is `mesh_utils.cp_rank_as_data`.
 #
 # `cp_rank` is a traced i32 scalar throughout, so a single compiled program
 # serves every rank; only `cp_size` and `interleave_c` are static.
@@ -91,27 +91,6 @@ def cp_local_length(global_len, cp_rank, cp_size: int, interleave_c: int):
     rem = global_len - full * cycle_c
     return full * interleave_c + jnp.clip(rem - cp_rank * interleave_c, 0,
                                           interleave_c)
-
-
-def cp_rank_as_data(cp_axis_name: str, cp_size: int):
-    """This shard's index along `cp_axis_name`, without `lax.axis_index`.
-
-    `lax.axis_index` lowers to `partition-id`,
-    which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
-    through its `jax.export` bridge ("partitionId instruction is not supported
-    for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
-    a replicated iota says the same thing with an instruction the partitioner
-    accepts: every device splits `[0..cp_size)` into single elements and
-    keeps the chunks addressed to it, so device `r` receives `r` from each
-    peer and every lane of the result is `r`.
-
-    Same trick as `pcp_streaming_rpa/wrapper.py`'s
-    `_select_replicated_shard_for_pcp_rank`, on an iota rather than real data.
-    Must be called from inside a `shard_map` body.
-    """
-    ranks = jnp.arange(cp_size, dtype=jnp.int32)
-    exchanged = lax.all_to_all(ranks, cp_axis_name, 0, 0, tiled=True)
-    return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
 
 
 class MlaCase(Enum):

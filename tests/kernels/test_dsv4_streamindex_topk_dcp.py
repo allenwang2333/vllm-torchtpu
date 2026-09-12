@@ -24,9 +24,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk)
+    DCP_AXIS_NAME, streamindex_topk)
 
 P = jax.sharding.PartitionSpec
 
