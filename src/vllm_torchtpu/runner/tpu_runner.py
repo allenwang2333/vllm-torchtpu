@@ -803,6 +803,12 @@ class TPUModelRunner(GPUModelRunner):
         self.phased_profiling_dir = (profiler_config.torch_profiler_dir
                                      if envs.USE_PHASED_PROFILER else "")
         self.phase_based_profiler = None
+        # The census is independent of the phased profiler: it stays on for
+        # measured passes, where the profiler must be off to avoid distorting
+        # the very step times the run is measuring.
+        census_dir = envs.VLLM_TPU_STEP_CENSUS_DIR
+        self.step_census = (runner_utils.StepCensus(
+            census_dir, self._profiler_rank) if census_dir else None)
 
     def start_phased_profiling(self,
                                profile_prefix: str | None = None) -> None:
@@ -1180,18 +1186,12 @@ class TPUModelRunner(GPUModelRunner):
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
 
-        grouped_bounds: tuple[int, ...] = ()
-        if (not spec_decode_tokens and self._has_groupable_sparse_mla
-                and envs.TPU_MLA_MASKED_DENSE_ENABLED):
-            # Keep MLA policy in the kernel package. Import lazily so the
-            # generic runner has no dependency on these optional kernels when
-            # the experiment is disabled.
-            from vllm_torchtpu.kernels.mla.dispatch import \
-                grouped_partition_limits
-            grouped_bounds = grouped_partition_limits()
+        order_by_length = (not spec_decode_tokens
+                           and self._has_groupable_sparse_mla
+                           and envs.TPU_MLA_MASKED_DENSE_ENABLED)
 
         kv_lens_by_req: dict[str, int] = {}
-        if grouped_bounds:
+        if order_by_length:
             for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                 assert req_id is not None
                 kv_lens_by_req[req_id] = (
@@ -1205,13 +1205,7 @@ class TPUModelRunner(GPUModelRunner):
                 return 0
             if req_id in spec_decode_tokens:
                 return 1
-            category = 2
-            if grouped_bounds:
-                kv_len = kv_lens_by_req[req_id]
-                for bound in grouped_bounds:
-                    if kv_len <= bound:
-                        category += 1
-            return category
+            return 2
 
         def partition(start: int, end: int, bound: int) -> int:
             """Two-pointer partition of [start, end]: requests with
@@ -1242,14 +1236,24 @@ class TPUModelRunner(GPUModelRunner):
         if spec_decode_tokens and num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
 
-        # For non-speculative sparse MLA steps, group non-decode requests as
-        # [long][...][short] using only kernel-published length boundaries.
-        # No selected tier or split point is added to attention metadata.
-        group_start = num_windowed
-        for category_bound in range(2, 2 + len(grouped_bounds)):
-            if group_start >= num_reqs:
-                break
-            group_start = partition(group_start, num_reqs - 1, category_bound)
+        if order_by_length:
+            # Reorder only within the existing prefill/mixed section. Every
+            # request-associated buffer follows the same state swaps.
+            tail = self.input_batch.req_ids[num_windowed:num_reqs]
+            positions = {
+                req_id: i + num_windowed
+                for i, req_id in enumerate(tail)
+            }
+            ordered = sorted(tail,
+                             key=kv_lens_by_req.__getitem__,
+                             reverse=True)
+            for dst, req_id in enumerate(ordered, start=num_windowed):
+                src = positions[req_id]
+                if src != dst:
+                    displaced = self.input_batch.req_ids[dst]
+                    self.input_batch.swap_states(dst, src)
+                    positions[displaced] = src
+                    positions[req_id] = dst
         return num_decode, num_windowed
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -3528,8 +3532,10 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
 
-        # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
-        if self.phase_based_profiler:
+        # Batch composition drives both per-step diagnostics. Computing it is
+        # host-only work proportional to the request count, so the census can
+        # run on every step; the phased profiler consumes the same dict.
+        if self.phase_based_profiler or self.step_census:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
                 self.num_tokens_paddings,
@@ -3542,10 +3548,14 @@ class TPUModelRunner(GPUModelRunner):
                 num_reqs=self.input_batch.num_reqs,
                 padded_total_num_scheduled_tokens=padded_total_tokens,
                 scheduler_output=scheduler_output,
-                num_decode_reqs=num_decode_reqs,
-                num_windowed_reqs=num_windowed_reqs,
             )
-            self.phase_based_profiler.step(batch_composition_stats)
+            if self.step_census:
+                self.step_census.record(batch_composition_stats,
+                                        self.input_batch,
+                                        self.input_batch.num_reqs,
+                                        scheduler_output, num_decode_reqs)
+            if self.phase_based_profiler:
+                self.phase_based_profiler.step(batch_composition_stats)
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
@@ -6418,8 +6428,21 @@ class TPUModelRunner(GPUModelRunner):
                         indexer = getattr(attn_module, "indexer", None)
                         topk = getattr(indexer, "topk_tokens",
                                        getattr(attn_module, "topk_tokens", -1))
+                        # Split (nope, rope) cache; each half's shape and dtype
+                        # come from its own layout spec.
+                        specs = (
+                            PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                                num_blocks,
+                                kv_cache_spec.block_size,
+                                kv_cache_spec.head_size,
+                                kv_cache_spec.dtype,
+                            ))
+                        from vllm_torchtpu.kernels.mla.kv_cache_utils import \
+                            KVCacheLayout
                         self._has_groupable_sparse_mla |= (
-                            matches_glm52_tpu7x_dimensions(
+                            all(spec.layout is KVCacheLayout.TENSORCORE
+                                for spec in specs)
+                            and matches_glm52_tpu7x_dimensions(
                                 num_heads=getattr(attn_module, "num_heads",
                                                   -1),
                                 nope_dim=getattr(attn_module,
@@ -6433,15 +6456,6 @@ class TPUModelRunner(GPUModelRunner):
                                 topk=topk,
                                 page_size=kv_cache_spec.block_size,
                                 rope_page_size=kv_cache_spec.block_size,
-                            ))
-                        # Split (nope, rope) cache; each half's shape and dtype
-                        # come from its own layout spec.
-                        specs = (
-                            PallasMLAttentionBackend.get_sparse_kv_cache_specs(
-                                num_blocks,
-                                kv_cache_spec.block_size,
-                                kv_cache_spec.head_size,
-                                kv_cache_spec.dtype,
                             ))
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = tuple(

@@ -2112,6 +2112,43 @@ class TestReorderBatchForRpa:
 
         assert runner.input_batch.req_ids == ["short", "long"]
 
+    def test_length_ordering_within_one_tier_preserves_request_state(self):
+        runner = self._make_runner(groupable_sparse_mla=True)
+        self._batch(runner, ["short", "decode", "long", "equal"],
+                    computed=[2500, 9000, 3900, 3400])
+        sched = self._sched({
+            "short": 100,
+            "decode": 1,
+            "long": 100,
+            "equal": 600
+        })
+        with patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED",
+                          True):
+            assert runner._reorder_batch_for_rpa(sched) == (1, 1)
+
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "decode"
+        assert set(ids[1:3]) == {"long", "equal"}
+        assert ids[-1] == "short"
+        assert dict(zip(ids, runner.input_batch.num_computed_tokens_cpu)) == {
+            "short": 2500,
+            "decode": 9000,
+            "long": 3900,
+            "equal": 3400
+        }
+
+    def test_disabled_length_ordering_preserves_original_tail(self):
+        runner = self._make_runner(groupable_sparse_mla=True)
+        self._batch(runner, ["short", "long"], computed=[1000, 7000])
+        with patch.object(tpu_runner.envs, "TPU_MLA_MASKED_DENSE_ENABLED",
+                          False):
+            assert runner._reorder_batch_for_rpa(
+                self._sched({
+                    "short": 512,
+                    "long": 32
+                })) == (0, 0)
+        assert runner.input_batch.req_ids == ["short", "long"]
+
     def test_speculative_step_keeps_existing_three_segments(self):
         runner = self._make_runner(groupable_sparse_mla=True)
         self._batch(runner, ["short", "verify", "long"],

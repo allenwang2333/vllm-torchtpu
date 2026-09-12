@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    VLLM_TPU_STEP_CENSUS_DIR: str = ""
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
@@ -335,6 +336,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER":
     env_bool("USE_PHASED_PROFILER"),
+    # Directory for the per-step census: one JSON line per engine step giving
+    # batch composition, KV range and host step period. Unset disables it.
+    # The census reads only host-side scheduler state, so it adds no device
+    # synchronisation and can stay on during measured, unprofiled passes.
+    "VLLM_TPU_STEP_CENSUS_DIR":
+    lambda: os.getenv("VLLM_TPU_STEP_CENSUS_DIR", ""),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server

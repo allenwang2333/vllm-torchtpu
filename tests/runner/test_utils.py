@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -7,9 +8,9 @@ import pytest
 
 from vllm_torchtpu import profiler_trace
 from vllm_torchtpu.runner.utils import (
-    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, InferencePhase,
-    PhaseBasedProfiler, determine_phase_from_batch_composition_stats,
-    get_batch_composition_stats)
+    PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR, STEP_CENSUS_MAX_REQUEST_DETAIL,
+    InferencePhase, PhaseBasedProfiler, StepCensus,
+    determine_phase_from_batch_composition_stats, get_batch_composition_stats)
 
 
 @pytest.fixture
@@ -158,7 +159,7 @@ def test_determine_phase_treats_single_token_step_as_decode_only():
     }) == InferencePhase.DECODE_ONLY
 
 
-def test_batch_composition_stats_preserve_masked_dense_route_inputs():
+def test_batch_composition_stats_keep_shared_phase_contract():
     input_batch = SimpleNamespace(
         req_ids=["decode", "long-prefill", "short-prefill"],
         num_computed_tokens_cpu=[8192, 7680, 1024],
@@ -179,15 +180,12 @@ def test_batch_composition_stats_preserve_masked_dense_route_inputs():
         num_reqs=3,
         padded_total_num_scheduled_tokens=2048,
         scheduler_output=scheduler_output,
-        num_decode_reqs=1,
-        num_windowed_reqs=1,
     )
 
-    assert stats["q_lens"] == [1, 512, 512]
-    assert stats["kv_lens"] == [8193, 8192, 1536]
-    assert stats["request_distribution"] == [1, 1, 3]
-    assert stats["num_decode_reqs"] == 1
-    assert stats["num_windowed_reqs"] == 1
+    assert stats["num_prefill_tokens"] == 1024
+    assert stats["num_decode_tokens"] == 1
+    assert stats["min_kv_len"] == 1024
+    assert stats["num_reqs"] == 3
     json.dumps(stats)
 
 
@@ -599,3 +597,135 @@ def test_merge_profile_directories_multiworker(tmp_path):
                 ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def _census_batch(num_reqs, q_per_req, kv_per_req):
+    """A minimal input batch and scheduler output for the census."""
+    req_ids = [f"r{i}" for i in range(num_reqs)]
+    input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        num_computed_tokens_cpu=list(kv_per_req),
+    )
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={
+        r: q
+        for r, q in zip(req_ids, q_per_req)
+    })
+    return input_batch, scheduler_output
+
+
+def _census_stats(**overrides):
+    stats = {
+        "batch_id": 1,
+        "total_num_scheduled_tokens": 1024,
+        "num_prefill_tokens": 1023,
+        "num_decode_tokens": 1,
+        "padded_total_num_scheduled_tokens": 1024,
+        "num_reqs": 2,
+        "min_kv_len": 3069,
+        "phase": "PREFILL_HEAVY",
+    }
+    stats.update(overrides)
+    return stats
+
+
+def _read_census(census):
+    return [
+        json.loads(line)
+        for line in Path(census.path).read_text().splitlines()
+    ]
+
+
+def test_step_census_records_one_line_per_step(tmp_path):
+    census = StepCensus(str(tmp_path), worker_rank=3)
+    assert census.path.endswith("step_census_rank3.jsonl")
+    input_batch, scheduler_output = _census_batch(2, [1023, 1], [3069, 8192])
+
+    for batch_id in (1, 2, 3):
+        census.record(_census_stats(batch_id=batch_id),
+                      input_batch,
+                      2,
+                      scheduler_output,
+                      num_decode_reqs=1)
+    census.close()
+
+    rows = _read_census(census)
+    assert [r["b"] for r in rows] == [1, 2, 3]
+    first = rows[0]
+    assert first["ph"] == "PREFILL_HEAVY"
+    assert first["tok"] == 1024 and first["pad"] == 1024
+    assert first["pre"] == 1023 and first["dec"] == 1
+    assert first["n"] == 2 and first["n_dec"] == 1 and first["kv_min"] == 3069
+    # kv_max is the longest sequence after this step, which is what the
+    # masked-dense routing limits are expressed against.
+    assert first["kv_max"] == 8193
+    assert first["rq"] == [[1023, 3069], [1, 8192]]
+
+
+def test_step_census_first_step_has_no_period(tmp_path):
+    census = StepCensus(str(tmp_path), worker_rank=0)
+    input_batch, scheduler_output = _census_batch(1, [1024], [0])
+    census.record(_census_stats(num_reqs=1),
+                  input_batch,
+                  1,
+                  scheduler_output,
+                  num_decode_reqs=0)
+    census.record(_census_stats(num_reqs=1, batch_id=2),
+                  input_batch,
+                  1,
+                  scheduler_output,
+                  num_decode_reqs=0)
+    census.close()
+
+    rows = _read_census(census)
+    assert rows[0]["dt_ms"] is None
+    assert rows[1]["dt_ms"] >= 0
+    assert rows[1]["t_ms"] >= rows[0]["t_ms"]
+
+
+def test_step_census_omits_request_detail_for_large_batches(tmp_path):
+    census = StepCensus(str(tmp_path), worker_rank=0)
+    num_reqs = STEP_CENSUS_MAX_REQUEST_DETAIL + 1
+    input_batch, scheduler_output = _census_batch(num_reqs, [1] * num_reqs,
+                                                  [8192] * num_reqs)
+    census.record(_census_stats(num_reqs=num_reqs, phase="DECODE_ONLY"),
+                  input_batch,
+                  num_reqs,
+                  scheduler_output,
+                  num_decode_reqs=num_reqs)
+    census.close()
+
+    row = _read_census(census)[0]
+    assert "rq" not in row
+    assert row["kv_max"] == 8193 and row["n"] == num_reqs
+
+
+def test_step_census_survives_an_unwritable_directory(tmp_path):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    census = StepCensus(str(blocked / "census"), worker_rank=0)
+    input_batch, scheduler_output = _census_batch(1, [1024], [0])
+
+    # A diagnostic must never break serving.
+    census.record(_census_stats(num_reqs=1),
+                  input_batch,
+                  1,
+                  scheduler_output,
+                  num_decode_reqs=0)
+    census.close()
+
+
+def test_step_census_reports_detail_errors_without_raising(tmp_path):
+    census = StepCensus(str(tmp_path), worker_rank=0)
+    broken = SimpleNamespace(req_ids=["r0"], num_computed_tokens_cpu=[])
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"r0": 1024})
+
+    census.record(_census_stats(num_reqs=1),
+                  broken,
+                  1,
+                  scheduler_output,
+                  num_decode_reqs=0)
+    census.close()
+
+    row = _read_census(census)[0]
+    assert "detail_error" in row
+    assert row["b"] == 1 and row["kv_min"] == 3069

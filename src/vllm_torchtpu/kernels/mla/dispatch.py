@@ -32,7 +32,11 @@ from vllm_torchtpu.kernels.mla.masked_dense.kernel import (
     _masked_dense_suffix_ragged_paged_attention,
     masked_dense_ragged_paged_attention)
 from vllm_torchtpu.kernels.mla.sparse.kernel import (
-    _sparse_prefix_ragged_paged_attention, sparse_ragged_paged_attention)
+    _prepare_sparse_first_chunk, _sparse_prefix_ragged_paged_attention)
+from vllm_torchtpu.kernels.mla.sparse.kernel import \
+    prepare_q_inputs as _prepare_query
+from vllm_torchtpu.kernels.mla.sparse.kernel import \
+    sparse_ragged_paged_attention
 
 # This profile is deliberately exact. The opt-in is process-wide, while the
 # sparse MLA wrapper is generic to vLLM's DeepSeekV2-style model family. An
@@ -186,19 +190,7 @@ def masked_dense_prefill_mla_tier(
     return jnp.argmin(costs).astype(jnp.int32)
 
 
-def grouped_partition_limits() -> tuple[int, ...]:
-    """Enabled runner reorder bounds, longest first, without cost policy."""
-    return tuple(
-        sorted(
-            {
-                bound
-                for bound in (MASKED_DENSE_ANALYTIC_LIMIT, MASKED_DENSE_LIMIT)
-                if bound > 0
-            },
-            reverse=True))
-
-
-def ragged_paged_attention(
+def _ragged_paged_attention(
     q: jax.Array,
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
@@ -210,6 +202,8 @@ def ragged_paged_attention(
     *,
     sm_scale: float | None = None,
     k_scale: float | None = None,
+    dense_first: bool = False,
+    shared_query_padding: bool = False,
 ) -> jax.Array:
     """Dispatch one traced DSA step without changing the layer interface."""
     limits = (MASKED_DENSE_ANALYTIC_LIMIT, MASKED_DENSE_LIMIT)
@@ -260,35 +254,55 @@ def ragged_paged_attention(
             )
 
         def _split(_):
+            query = _prepare_query(q) if shared_query_padding else q
+
+            def finish(output):
+                return output[:, :q.shape[1], :q.shape[2]]
+
             split_token = query_start_loc[split_seq]
-            output = _sparse_prefix_ragged_paged_attention(
-                q,
-                kv_cache_nope,
-                kv_cache_rope,
-                topk_indices,
-                block_tables,
-                query_start_loc,
-                request_distribution,
-                split_token,
-                sm_scale=sm_scale or 1.0,
-                k_scale=k_scale or 1.0,
-            )
-            return _masked_dense_suffix_ragged_paged_attention(
-                output,
-                kv_cache_nope,
-                kv_cache_rope,
-                seq_lens,
-                topk_indices,
-                block_tables,
-                query_start_loc,
-                request_distribution,
-                split_seq,
-                sm_scale=sm_scale or 1.0,
-                k_scale=k_scale or 1.0,
-                max_kv_len=max_kv_len,
-                num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
-                num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
-            )
+            prepared_inputs = first_gather = None
+            if dense_first:
+                prepared_inputs, first_gather = _prepare_sparse_first_chunk(
+                    kv_cache_nope, kv_cache_rope, topk_indices, block_tables,
+                    query_start_loc)
+
+            def sparse_prefix(query):
+                return _sparse_prefix_ragged_paged_attention(
+                    query,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    topk_indices,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    split_token,
+                    prepared_inputs=prepared_inputs,
+                    first_gather=first_gather,
+                    sm_scale=sm_scale or 1.0,
+                    k_scale=k_scale or 1.0,
+                )
+
+            def dense_suffix(query):
+                return _masked_dense_suffix_ragged_paged_attention(
+                    query,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    seq_lens,
+                    topk_indices,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    split_seq,
+                    sm_scale=sm_scale or 1.0,
+                    k_scale=k_scale or 1.0,
+                    max_kv_len=max_kv_len,
+                    num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
+                    num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
+                )
+
+            if dense_first:
+                return finish(sparse_prefix(dense_suffix(query)))
+            return finish(dense_suffix(sparse_prefix(query)))
 
         return jax.lax.cond(split_seq > 0, _split, _whole, None)
 
@@ -312,3 +326,29 @@ def ragged_paged_attention(
         kept = 0 if tier_limits[0] else 1
         return jax.lax.cond(tier == kept, branches[0], branches[1])
     return jax.lax.switch(tier, branches)
+
+
+def ragged_paged_attention(
+    q: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+) -> jax.Array:
+    """Dispatch one traced DSA step with the established layer interface."""
+    return _ragged_paged_attention(q,
+                                   kv_cache_nope,
+                                   kv_cache_rope,
+                                   topk_indices,
+                                   seq_lens,
+                                   block_tables,
+                                   query_start_loc,
+                                   request_distribution,
+                                   sm_scale=sm_scale,
+                                   k_scale=k_scale)

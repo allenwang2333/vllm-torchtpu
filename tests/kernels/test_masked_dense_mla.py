@@ -548,5 +548,60 @@ class AnalyticCausalMaskTest(MaskedDenseTestBase):
                       max_kv_len=MAX_KV_LEN * 2)
 
 
+class SparsePrefixOwnershipTest(MaskedDenseTestBase):
+    """Rounded sparse stores retain rows owned by another attention segment."""
+
+    def test_dynamic_prefix_preserves_suffix_with_donation(self):
+        tokens = 128
+        pages = self._block_tables(1)
+        caches, _, _ = self._fill_cache([192], pages, 1.0)
+        query = self._random_queries(tokens)
+        original = np.asarray(query).copy()
+        topk = jnp.asarray(
+            self._topk_rows(tokens, np.zeros(tokens, np.int32), [192], 2048,
+                            lambda _: 96))
+        starts = jnp.array([0, tokens], jnp.int32)
+        distribution = jnp.array([0, 0, 1], jnp.int32)
+        expected = np.asarray(
+            sparse_mla_kernel.sparse_ragged_paged_attention(
+                query,
+                *caches,
+                topk,
+                pages,
+                starts,
+                distribution,
+                sm_scale=self.sm_scale))
+
+        def prefix(q, nope, rope, indices, page_table, query_starts, dist,
+                   end):
+            return sparse_mla_kernel._sparse_prefix_ragged_paged_attention(
+                q,
+                nope,
+                rope,
+                indices,
+                page_table,
+                query_starts,
+                dist,
+                end,
+                sm_scale=self.sm_scale)
+
+        operands = (*caches, topk, pages, starts, distribution)
+        compiled = jax.jit(prefix, donate_argnums=(0, )).lower(
+            query, *operands, jnp.array(63, jnp.int32)).compile()
+        self.assertGreater(compiled.memory_analysis().alias_size_in_bytes, 0)
+        for end in (0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 128):
+            with self.subTest(end=end):
+                donated = jax.device_put(original.copy())
+                result = np.asarray(
+                    compiled(donated, *operands, jnp.array(end, jnp.int32)))
+                self.assertTrue(donated.is_deleted())
+                np.testing.assert_allclose(result[:end, :, :LKV_DIM],
+                                           expected[:end, :, :LKV_DIM],
+                                           rtol=2e-2,
+                                           atol=2e-2)
+                # These values may already contain completed dense outputs.
+                np.testing.assert_array_equal(result[end:], original[end:])
+
+
 if __name__ == "__main__":
     absltest.main()

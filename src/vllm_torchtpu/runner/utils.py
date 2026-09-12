@@ -4,6 +4,7 @@
 import datetime
 import json
 import os
+import time
 from enum import Enum
 from typing import Any, Optional
 
@@ -84,17 +85,8 @@ def get_batch_composition_stats(
     num_reqs: int,
     padded_total_num_scheduled_tokens: int,
     scheduler_output: "VllmSchedulerOutput",
-    num_decode_reqs: int = 0,
-    num_windowed_reqs: int = 0,
 ) -> dict:
-    """Returns phase and route inputs for one reordered scheduler step.
-
-    ``q_lens`` and ``kv_lens`` retain request order after the runner's RPA/MLA
-    partition. Together with ``request_distribution`` and the padded token
-    count, they are sufficient to replay the masked-dense selector offline.
-    Keeping these host-owned values in the profiler sidecar avoids a
-    device-to-host callback in the timed model graph.
-    """
+    """Logs batch composition stats and returns them as a dict."""
     num_prefill_tokens = 0
     num_decode_tokens = 0
 
@@ -103,7 +95,6 @@ def get_batch_composition_stats(
     # Get the number of tokens already processed for each request.
     num_computed_tokens_per_req = input_batch.num_computed_tokens_cpu[:
                                                                       num_reqs]
-    kv_lens = []
 
     scheduled_spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
     min_kv_len = float("inf") if num_reqs > 0 else 0
@@ -111,14 +102,12 @@ def get_batch_composition_stats(
         assert req_id is not None
 
         # This is the number of tokens to process in the current step for this request
-        num_scheduled_for_req = int(
-            scheduler_output.num_scheduled_tokens[req_id])
+        num_scheduled_for_req = scheduler_output.num_scheduled_tokens[req_id]
         num_scheduled_tokens_per_req_list.append(num_scheduled_for_req)
 
         # This is the number of tokens already processed for this request (before this step)
         num_already_computed = int(
             num_computed_tokens_per_req[i])  # Cast from np.int32
-        kv_lens.append(num_already_computed + num_scheduled_for_req)
         min_kv_len = min(min_kv_len, num_already_computed)
 
         # When speculative decoding is enabled for this request, the extra
@@ -149,14 +138,130 @@ def get_batch_composition_stats(
         "padded_total_num_scheduled_tokens": padded_total_num_scheduled_tokens,
         "num_reqs": num_reqs,
         "min_kv_len": min_kv_len if min_kv_len != float("inf") else 0,
-        "q_lens": num_scheduled_tokens_per_req_list,
-        "kv_lens": kv_lens,
-        "request_distribution": [num_decode_reqs, num_windowed_reqs, num_reqs],
-        "num_decode_reqs": num_decode_reqs,
-        "num_windowed_reqs": num_windowed_reqs,
     }
     stats["phase"] = determine_phase_from_batch_composition_stats(stats).name
     return stats
+
+
+# Census records are appended per step, so the file must stay small enough to
+# sync back with the job's other outputs. Per-request detail is kept only for
+# batches small enough for it to be informative; a decode batch of 46 requests
+# is summarised by its aggregates instead.
+STEP_CENSUS_MAX_REQUEST_DETAIL = 8
+STEP_CENSUS_FLUSH_EVERY = 50
+
+
+class StepCensus:
+    """Appends one JSON line per engine step: composition, KV range, timing.
+
+    This is host-only bookkeeping. It reads the scheduler output and the input
+    batch's CPU-side computed-token counts, never a device tensor, so it adds
+    no synchronisation and can stay enabled during measured, unprofiled passes.
+    A profiled pass samples a handful of steps; this covers every step, which
+    is what a phase and KV-length census of a whole run needs.
+
+    ``dt_ms`` is the wall-clock period between consecutive step records on this
+    rank. Under async scheduling the host runs ahead of the device by a bounded
+    amount, so an individual period is not a device step time; summed over a
+    saturated run the periods still decompose where the wall clock went.
+    """
+
+    def __init__(self, out_dir: str, worker_rank: int) -> None:
+        self.path = os.path.join(out_dir,
+                                 f"step_census_rank{worker_rank}.jsonl")
+        self._file: Optional[Any] = None
+        self._pending = 0
+        self._prev_start: Optional[float] = None
+        self._first_start: Optional[float] = None
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            self._file = open(self.path, "a", buffering=1 << 16)
+        except Exception as e:  # a diagnostic must never break serving
+            logger.warning("Step census disabled, cannot open %s: %s",
+                           self.path, e)
+            self._file = None
+            return
+        logger.info("Step census enabled, writing %s", self.path)
+
+    def record(
+        self,
+        batch_composition_stats: dict,
+        input_batch: Any,
+        num_reqs: int,
+        scheduler_output: "VllmSchedulerOutput",
+        num_decode_reqs: int,
+    ) -> None:
+        if self._file is None:
+            return
+        now = time.monotonic()
+        if self._first_start is None:
+            self._first_start = now
+        record = {
+            "b":
+            batch_composition_stats["batch_id"],
+            "t_ms":
+            round((now - self._first_start) * 1e3, 3),
+            "dt_ms": (round((now - self._prev_start) *
+                            1e3, 3) if self._prev_start is not None else None),
+            "ph":
+            batch_composition_stats["phase"],
+            "tok":
+            batch_composition_stats["total_num_scheduled_tokens"],
+            "pad":
+            batch_composition_stats["padded_total_num_scheduled_tokens"],
+            "pre":
+            batch_composition_stats["num_prefill_tokens"],
+            "dec":
+            batch_composition_stats["num_decode_tokens"],
+            "n":
+            num_reqs,
+            # Requests the reorder placed in the decode section. The
+            # masked-dense tier selection reads this as request_distribution[0],
+            # so recording it lets the route be reconstructed offline exactly
+            # rather than guessed from token counts.
+            "n_dec":
+            num_decode_reqs,
+            "kv_min":
+            batch_composition_stats["min_kv_len"],
+        }
+        self._prev_start = now
+        try:
+            computed = input_batch.num_computed_tokens_cpu[:num_reqs]
+            kv_max = 0
+            detail = []
+            for i, req_id in enumerate(input_batch.req_ids[:num_reqs]):
+                kv = int(computed[i])
+                q = scheduler_output.num_scheduled_tokens[req_id]
+                kv_max = max(kv_max, kv + q)
+                if num_reqs <= STEP_CENSUS_MAX_REQUEST_DETAIL:
+                    detail.append([q, kv])
+            record["kv_max"] = kv_max
+            if detail:
+                record["rq"] = detail
+        except Exception as e:
+            record["detail_error"] = repr(e)
+        self._write(record)
+
+    def _write(self, record: dict) -> None:
+        try:
+            self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._pending += 1
+            if self._pending >= STEP_CENSUS_FLUSH_EVERY:
+                self._file.flush()
+                self._pending = 0
+        except Exception as e:
+            logger.warning("Step census write failed, disabling: %s", e)
+            self.close()
+
+    def close(self) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.flush()
+            self._file.close()
+        except Exception:
+            pass
+        self._file = None
 
 
 class PhaseBasedProfiler:

@@ -125,7 +125,7 @@ def gather_page_ids(
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
-    start_end_seq_idx_ref,  # [3] (grid_start, grid_end, valid_end)
+    start_end_seq_idx_ref,  # grid bounds, plus valid_end for segmented calls
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     # Input
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -144,6 +144,7 @@ def _attention_kernel(
     sm_scale: float,
     k_scale: float = 1.0,
     batch_size: int = 1,
+    segmented: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -162,7 +163,8 @@ def _attention_kernel(
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
-    valid_end_seq_idx = start_end_seq_idx_ref[2]
+    if segmented:
+        valid_end_seq_idx = start_end_seq_idx_ref[2]
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
@@ -376,14 +378,15 @@ def _attention_kernel(
 
             if prev_p is not None:
                 assert prev_bkv is not None
-                assert prev_bq is not None
                 assert prev_l_sum is not None
                 out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
                 # A dynamic segment end is rounded up to `batch_size` for the
                 # static Pallas grid. Preserve aliased query rows outside the
-                # exact segment for the following masked-dense launch.
-                prev_idx = batch_start_seq_idx + batch_idx - 1
-                out = jnp.where(prev_idx < valid_end_seq_idx, out, prev_bq)
+                # exact segment, including completed dense suffix outputs.
+                if segmented:
+                    assert prev_bq is not None
+                    prev_idx = batch_start_seq_idx + batch_idx - 1
+                    out = jnp.where(prev_idx < valid_end_seq_idx, out, prev_bq)
 
                 # Store output from acc to bo.
                 bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
@@ -391,14 +394,16 @@ def _attention_kernel(
 
             prev_p = p
             prev_bkv = bkv
-            prev_bq = bq
+            if segmented:
+                prev_bq = bq
             prev_l_sum = l_sum
 
         # end of pipelining loop
-        assert prev_bq is not None
         out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        final_idx = batch_start_seq_idx + batch_size - 1
-        out = jnp.where(final_idx < valid_end_seq_idx, out, prev_bq)
+        if segmented:
+            assert prev_bq is not None
+            final_idx = batch_start_seq_idx + batch_size - 1
+            out = jnp.where(final_idx < valid_end_seq_idx, out, prev_bq)
         bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
 
@@ -451,6 +456,58 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+@functools.partial(jax.jit, static_argnames=("page_size", "total_num_pages"))
+def _prepare_sparse_gather(topk_indices, page_indices, cu_q_lens, *, page_size,
+                           total_num_pages):
+    """Prepare per-token lengths and cache indices once for private handoffs."""
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(jnp.arange(max_num_seqs),
+                                 tokens_per_seq,
+                                 total_repeat_length=topk_indices.shape[0])
+    assert topk_indices is not None
+    # TODO: skip gather for padding tokens in topk_indices.
+    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+
+    seq_page_ids = topk_indices // page_size
+    token_offset = topk_indices % page_size
+    topk = topk_indices.shape[-1]
+    page_ids = gather_page_ids(page_indices, seq_page_ids, seq_ids_segment,
+                               max_num_seqs)
+
+    # For the "-1" padding elements in topk_indices, we scatter the corresponding
+    # page_ids and token_offset to avoid gather memory access hotspotting.
+    is_padding = topk_indices == -1
+    flat_element_index = jnp.arange(topk_indices.shape[0] * topk,
+                                    dtype=jnp.int32).reshape(
+                                        topk_indices.shape[0], topk)
+    # 104729 and 15485863 are randomly chosen large prime numbers.
+    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
+    scattered_token_offset = (flat_element_index * 15485863) % page_size
+    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+    token_offset = jnp.where(
+        is_padding,
+        scattered_token_offset,
+        token_offset,
+    )
+
+    assert page_ids.shape == (topk_indices.shape[0], topk)
+    return kv_lens, page_ids * page_size + token_offset
+
+
+def _prepare_sparse_first_chunk(cache_kv_nope, cache_kv_rope, topk_indices,
+                                page_indices, cu_q_lens):
+    """Prefetch the standard first gather independently of query output."""
+    prepared = _prepare_sparse_gather(topk_indices,
+                                      page_indices,
+                                      cu_q_lens,
+                                      page_size=cache_kv_nope.shape[1],
+                                      total_num_pages=cache_kv_nope.shape[0])
+    gathered = dsa_gather.dsa_gather(cache_kv_nope, cache_kv_rope,
+                                     prepared[1][:64].reshape(-1))
+    return prepared, gathered
+
+
 # Main attention kernel for GLM-5.2 DSA (top-k gather and attention).
 # The KV entries referenced by `topk_indices` (including the current batch's
 # own tokens) must already be resident in the caches before this call;
@@ -475,6 +532,8 @@ def _sparse_ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     token_end: jax.Array | None = None,
     *,
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
+    first_gather: tuple[jax.Array, jax.Array] | None = None,
     sm_scale: float = 1.0,
     k_scale: float = 1.0,
     # Kernel optimization params.
@@ -498,8 +557,10 @@ def _sparse_ragged_paged_attention(
       k is also the total number of sequences.
     token_end: optional dynamic exclusive query-token bound. Sparse gather and
       attention are issued only for chunks intersecting ``[0, token_end)``;
-      rows at or after the bound retain their input value for a following
-      segmented kernel.
+      rows at or after the bound retain their input value.
+    prepared_inputs: optional private lengths/index handoff from first-gather
+      preparation; avoids repeating page/index preprocessing.
+    first_gather: optional prepared buffers for the first standard chunk.
     sm_scale: the softmax scale which will be applied to the Q@K^T.
     k_scale: per-tensor dequantization scale for the fp8 nope cache.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
@@ -579,10 +640,12 @@ def _sparse_ragged_paged_attention(
             pltpu.SemaphoreType.DMA((4, 2)),
         ]
 
+        bounds = [start_seq_idx, end_seq_idx]
+        if segmented:
+            bounds.append(valid_end_seq_idx)
         scalar_prefetches = (
             kv_lens,
-            jnp.array([start_seq_idx, end_seq_idx, valid_end_seq_idx],
-                      jnp.int32),
+            jnp.array(bounds, jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2, ), jnp.int32),
         )
@@ -601,6 +664,7 @@ def _sparse_ragged_paged_attention(
                     sm_scale=sm_scale,
                     k_scale=k_scale,
                     batch_size=batch_size,
+                    segmented=segmented,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -629,45 +693,22 @@ def _sparse_ragged_paged_attention(
             cache_kv_rope,
         )
 
-    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_ids_segment = jnp.repeat(jnp.arange(max_num_seqs),
-                                 tokens_per_seq,
-                                 total_repeat_length=q.shape[0])
-    assert topk_indices is not None
-    # TODO: skip gather for padding tokens in topk_indices.
-    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-
-    seq_page_ids = topk_indices // page_size
-    token_offset = topk_indices % page_size
+    if prepared_inputs is None:
+        prepared_inputs = _prepare_sparse_gather(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            page_size=page_size,
+            total_num_pages=cache_kv_nope.shape[0])
+    kv_lens, cache_indices = prepared_inputs
     topk = topk_indices.shape[-1]
-    page_ids = gather_page_ids(page_indices, seq_page_ids, seq_ids_segment,
-                               max_num_seqs)
-
-    # For the "-1" padding elements in topk_indices, we scatter the corresponding
-    # page_ids and token_offset to avoid gather memory access hotspotting.
-    is_padding = topk_indices == -1
-    total_num_pages = cache_kv_nope.shape[0]
-    flat_element_index = jnp.arange(q.shape[0] * topk,
-                                    dtype=jnp.int32).reshape(q.shape[0], topk)
-    # 104729 and 15485863 are randomly chosen large prime numbers.
-    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-    scattered_token_offset = (flat_element_index * 15485863) % page_size
-    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-    token_offset = jnp.where(
-        is_padding,
-        scattered_token_offset,
-        token_offset,
-    )
-
-    assert page_ids.shape == (q.shape[0], topk)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
-        indices = (page_ids[start_pos:end_pos, ...] * page_size +
-                   token_offset[start_pos:end_pos, ...]).reshape(-1)
+        indices = cache_indices[start_pos:end_pos].reshape(-1)
 
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
@@ -688,8 +729,12 @@ def _sparse_ragged_paged_attention(
                               start_pos=start_pos,
                               end_pos=end_pos,
                               kernel_batch_size=kernel_batch_size):
-            gathered_nope_buffer, gathered_rope_buffer = (
-                dsa_gather.dsa_gather(cache_kv_nope, cache_kv_rope, indices))
+            if start_pos == 0 and first_gather is not None:
+                gathered_nope_buffer, gathered_rope_buffer = first_gather
+            else:
+                gathered_nope_buffer, gathered_rope_buffer = (
+                    dsa_gather.dsa_gather(cache_kv_nope, cache_kv_rope,
+                                          indices))
             gathered_nope_buffer = gathered_nope_buffer.reshape(
                 chunk_size,
                 topk * kv_cache_utils.WORD_BYTES,
@@ -770,6 +815,8 @@ def _sparse_prefix_ragged_paged_attention(
     distribution: jax.Array,
     token_end: jax.Array,
     *,
+    prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
+    first_gather: tuple[jax.Array, jax.Array] | None = None,
     sm_scale: float = 1.0,
     k_scale: float = 1.0,
     gather_and_attention_chunk_size: int = 64,
@@ -786,6 +833,8 @@ def _sparse_prefix_ragged_paged_attention(
         cu_q_lens,
         distribution,
         token_end,
+        prepared_inputs=prepared_inputs,
+        first_gather=first_gather,
         sm_scale=sm_scale,
         k_scale=k_scale,
         gather_and_attention_chunk_size=gather_and_attention_chunk_size,

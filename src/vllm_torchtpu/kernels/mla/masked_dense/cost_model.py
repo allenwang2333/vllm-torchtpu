@@ -39,7 +39,7 @@ GLM52_TPU7X_PREFILL_COST_MODEL = MaskedDensePrefillCostModel(
     analytic_token_ns=245,
     bitmap_fixed_ns=227_000,
     bitmap_token_ns=451,
-    q_kv_block_ns=9_040,
+    q_kv_block_ns=8_700,
     sparse_fixed_ns=259_000,
     sparse_token_ns=2_156,
 )
