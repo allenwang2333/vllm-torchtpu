@@ -674,6 +674,12 @@ def test_qwen_wrappers_are_installed_once_across_model_loads(
         (modeling.Qwen3VLModel, "get_rope_index"),
         (modeling.Qwen3VLVisionAttention, "forward"),
     ]
+    for name in ("Qwen3VLVisionModel", "Qwen3VisionTransformerPretrainedModel",
+                 "Qwen3_VisionTransformerPretrainedModel",
+                 "Qwen3_VisionTransformer", "Qwen3VisionTransformer"):
+        cls = getattr(modeling, name, None)
+        if cls is not None and (cls, "forward") not in targets:
+            targets.append((cls, "forward"))
     originals = [getattr(target, name) for target, name in targets]
     for (target, name), original in zip(targets, originals):
         monkeypatch.setattr(target, name, original)
@@ -894,3 +900,32 @@ class TestQwen3VLModelPatches:
         with pytest.raises(RuntimeError, match="Number of source elements"):
             _patched_masked_scatter(inp, mask, short_source)
 
+    def test_qwen3_vl_vision_transformer_candidate_class_names(self):
+        from vllm_torchtpu.models.vllm.qwen3_vl_patch import \
+            _patch_qwen3_vl_vision_transformer
+
+        class FakeQwen3VLVisionModel:
+
+            def forward(self, hidden_states):
+                # Verify that scoped ops are active inside vision encoder forward
+                assert torch.cumsum != torch._orig_cumsum_ref
+                return hidden_states
+
+        orig_cumsum = torch.cumsum
+        torch._orig_cumsum_ref = orig_cumsum
+        try:
+            fake_modeling = SimpleNamespace(
+                Qwen3VLVisionModel=FakeQwen3VLVisionModel)
+            _patch_qwen3_vl_vision_transformer(fake_modeling)
+
+            # Idempotence: calling again is a no-op
+            _patch_qwen3_vl_vision_transformer(fake_modeling)
+
+            inst = FakeQwen3VLVisionModel()
+            out = inst.forward(torch.tensor([1, 2, 3]))
+            assert torch.equal(out, torch.tensor([1, 2, 3]))
+            # Outside vision forward, torch ops are restored
+            assert torch.cumsum == orig_cumsum
+        finally:
+            if hasattr(torch, "_orig_cumsum_ref"):
+                delattr(torch, "_orig_cumsum_ref")

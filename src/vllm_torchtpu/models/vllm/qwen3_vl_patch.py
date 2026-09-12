@@ -19,7 +19,6 @@ else:
 
 logger = init_logger(__name__)
 
-_qwen3_vl_patches_applied = False
 _qwen3_vl_torch_ops_depth = 0
 _orig_torch_ops: dict = {}
 _torch_ops_lock = threading.RLock()
@@ -199,8 +198,6 @@ def _patch_qwen3_vl_get_rope_index(modeling) -> None:
     target_cls = getattr(modeling, "Qwen3VLModel", None)
     if target_cls is None:
         return
-    if getattr(target_cls, "_tpu_qwen3_vl_rope_index_patch", False):
-        return
 
     _orig_get_rope_index = getattr(target_cls, "get_rope_index", None)
     if _orig_get_rope_index is None:
@@ -272,7 +269,6 @@ def _patch_qwen3_vl_get_rope_index(modeling) -> None:
 
     patched_get_rope_index._tpu_qwen3_vl_rope_index_patch = True
     target_cls.get_rope_index = patched_get_rope_index
-    target_cls._tpu_qwen3_vl_rope_index_patch = True
     logger.info("Applied TPU patch: Qwen3VLModel.get_rope_index.")
 
 
@@ -280,8 +276,6 @@ def _patch_qwen3_vl_vision_attention(modeling) -> None:
     """Patch Qwen3VLVisionAttention.forward to ensure cu_seqlens is on CPU."""
     target_cls = getattr(modeling, "Qwen3VLVisionAttention", None)
     if target_cls is None:
-        return
-    if getattr(target_cls, "_tpu_qwen3_vl_vision_attn_patch", False):
         return
 
     _orig_vision_attn_forward = getattr(target_cls, "forward", None)
@@ -315,37 +309,50 @@ def _patch_qwen3_vl_vision_attention(modeling) -> None:
 
     patched_vision_attn_forward._tpu_qwen3_vl_vision_attn_patch = True
     target_cls.forward = patched_vision_attn_forward
-    target_cls._tpu_qwen3_vl_vision_attn_patch = True
     logger.info("Applied TPU patch: Qwen3VLVisionAttention.forward.")
 
 
+_VISION_MODEL_CANDIDATE_NAMES = (
+    "Qwen3VLVisionModel",  # Standard Hugging Face transformers
+    "Qwen3VisionTransformerPretrainedModel",  # HF PretrainedModel alternate convention
+    "Qwen3_VisionTransformerPretrainedModel",  # Alternate HF naming convention
+    "Qwen3_VisionTransformer",  # vLLM internal model naming
+    "Qwen3VisionTransformer",  # Custom / alias modeling
+)
+
+
 def _patch_qwen3_vl_vision_transformer(modeling) -> None:
-    """Patch Qwen3VisionTransformer.forward to scope PyTorch ops during vision encoding."""
-    target_cls = getattr(modeling, "Qwen3VisionTransformer", None)
-    if target_cls is None:
-        return
-    if getattr(target_cls, "_tpu_qwen3_vl_vision_transformer_patch", False):
-        return
+    """Patch vision encoder forward to scope PyTorch ops during vision encoding."""
+    target_classes = []
+    for name in _VISION_MODEL_CANDIDATE_NAMES:
+        cls = getattr(modeling, name, None)
+        if cls is not None and cls not in target_classes:
+            target_classes.append(cls)
 
-    _orig_vision_forward = getattr(target_cls, "forward", None)
-    if _orig_vision_forward is None:
-        return
-    if getattr(_orig_vision_forward, "_tpu_qwen3_vl_vision_transformer_patch",
-               False):
-        return
+    def _make_patched_vision_forward(orig_forward):
 
-    @functools.wraps(_orig_vision_forward)
-    def patched_vision_forward(self, *args, **kwargs):
-        with _scoped_qwen3_vl_torch_ops():
-            return _orig_vision_forward(self, *args, **kwargs)
+        @functools.wraps(orig_forward)
+        def patched_vision_forward(self, *args, **kwargs):
+            with _scoped_qwen3_vl_torch_ops():
+                return orig_forward(self, *args, **kwargs)
 
-    patched_vision_forward._tpu_qwen3_vl_vision_transformer_patch = True
-    target_cls.forward = patched_vision_forward
-    target_cls._tpu_qwen3_vl_vision_transformer_patch = True
-    logger.info("Applied TPU patch: Qwen3VisionTransformer.forward.")
+        patched_vision_forward._tpu_qwen3_vl_vision_transformer_patch = True
+        return patched_vision_forward
+
+    for target_cls in target_classes:
+        _orig_vision_forward = getattr(target_cls, "forward", None)
+        if _orig_vision_forward is None:
+            continue
+        if getattr(_orig_vision_forward,
+                   "_tpu_qwen3_vl_vision_transformer_patch", False):
+            continue
+
+        target_cls.forward = _make_patched_vision_forward(_orig_vision_forward)
+        logger.info("Applied TPU patch: %s.forward.", target_cls.__name__)
 
 
-def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> None:
+def maybe_patch_qwen3_vl(
+        model_config: Optional["ModelConfig"] = None) -> bool | None:
     """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.
 
     This function applies the following scoped patches:
@@ -365,11 +372,8 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> None:
        - torch.repeat_interleave & torch.cumsum: Evaluates integer/bool TPU tensors on CPU
          scoped strictly to vision-encoder execution instead of process-wide mutation.
     """
-    global _qwen3_vl_patches_applied
     if not _is_qwen3_vl_model(model_config):
-        return
-    if _qwen3_vl_patches_applied:
-        return
+        return False
 
     modeling = None
     try:
@@ -383,12 +387,12 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> None:
             logger.warning(
                 "Qwen3-VL model detected but transformers.models.qwen3_vl "
                 "could not be imported or located: %s", e)
-            return
+            return None
 
     _patch_qwen3_vl_get_rope_index(modeling)
     _patch_qwen3_vl_vision_attention(modeling)
     _patch_qwen3_vl_vision_transformer(modeling)
-    _qwen3_vl_patches_applied = True
+    return None
 
 
 # Backward-compatible alias

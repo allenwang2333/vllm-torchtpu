@@ -334,7 +334,6 @@ def _apply_model_specific_patches(
     return maybe_patch_qwen3_vl(model_config)
 
 
-
 class TpuPlatform(Platform):
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
