@@ -56,8 +56,13 @@ x-tpu-step-defaults: &tpu_step
   # question about the fleet, not about the commit.
   soft_fail: true
   # Covers queueing as well as running, because Buildkite adds no queue time of
-  # its own - the agent pod starts at once and then waits inside the step.
-  timeout_in_minutes: 240
+  # its own - the agent pod starts at once and then waits inside the step. So
+  # this has to be the launcher's whole budget and not the length of a test
+  # run: the fleet's eight v7x chips are routinely a day deep, and a step cut
+  # off at four hours is one that was still in line, retried to the back of a
+  # queue it had nearly reached the front of. The launcher's own admission
+  # deadline is what stops a step waiting forever.
+  timeout_in_minutes: 1440
   agents:
     queue: "kube"
   commands:

@@ -55,6 +55,14 @@ x-perf-step-defaults: &perf_step
   # soft_fail everywhere while the lane is being proven: a failure here is a
   # question about the fleet, not about the commit.
   soft_fail: true
+  # A step's clock starts when the agent pod does, which is before the launcher
+  # has asked for chips, so this covers queueing as well as running and cannot
+  # be set from how long the work takes. The fleet's eight v7x chips are
+  # routinely a day deep; a step cut off while still in line is retried to the
+  # back of a queue it had nearly reached the front of. What bounds the two
+  # halves is the launcher - the workload's own activeDeadlineSeconds, and the
+  # rest of the day's budget to be admitted within.
+  timeout_in_minutes: 1440
   agents:
     queue: "kube"
 
@@ -222,9 +230,6 @@ steps:
         key: "perf_nightly_glm_5_2_fp8_dp16_ep"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
-        # The JobSet asks for eight hours and the launcher gives it the fleet's
-        # remaining three to be admitted, so the step has to allow for both.
-        timeout_in_minutes: 660
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -238,7 +243,6 @@ steps:
         key: "perf_nightly_deepseek_v4_flash_dp8_ep"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 360
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
@@ -257,7 +261,6 @@ steps:
         key: "perf_nightly_deepseek_v4_flash_xprof"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 240
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
