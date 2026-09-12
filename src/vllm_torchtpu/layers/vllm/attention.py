@@ -7,7 +7,6 @@ from typing import Any, ClassVar
 
 import jax
 import torch
-from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv, next_power_of_2
@@ -20,9 +19,8 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import get_dcp_rank as _get_dcp_rank
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -62,28 +60,6 @@ else:
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
-
-_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
-    P(DCP_AXIS_NAME),  # kv_cache_nope, this rank's position shard
-    P(DCP_AXIS_NAME),  # kv_cache_rope
-    P(),  # ql_nope
-    P(),  # q_pe
-    P(),  # kv_c_normed -- no all-gather: every rank already has it
-    P(),  # k_pe
-    # This rank's slice of the global top-k, already as local indices.
-    P(DCP_AXIS_NAME),  # local_topk_indices
-    P(),  # seq_lens
-    P(),  # block_tables (virtual page ordinals)
-    P(),  # query_start_loc
-    P(),  # request_distribution
-)
-_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
-    P(DCP_AXIS_NAME),  # updated nope cache
-    P(DCP_AXIS_NAME),  # updated rope cache
-    P(DCP_AXIS_NAME),  # partial attention output over this rank's KV positions
-    # Matching log-sum-exps, `-inf` where this rank owns nothing.
-    P(DCP_AXIS_NAME),  # partial lse
-)
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
 # from to fp32 directly. That's why it has a dtype mapping different from GPU
@@ -1536,7 +1512,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                                int) and dcp_size > 1 else 1
         self.dcp_interleave_size = getattr(parallel_config,
                                            "cp_kv_cache_interleave_size", 1)
-        self._dcp_mesh = None
         if self.dcp_size > 1:
             # The indexer refuses pcp>1 and dcp>1 together.
             pcp_size = getattr(parallel_config,
@@ -1554,7 +1529,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     f"{self.dcp_interleave_size}. It is also the best value for "
                     "top-k load balance across the shards -- coarser cycles "
                     "let a contiguous run of winners land on fewer ranks.")
-            self._dcp_mesh = get_or_create_dcp_mesh()
 
     def _get_kv_scales(
             self,
@@ -1749,7 +1723,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         from vllm_torchtpu.layers.common.attention_interface import \
             sparse_mla_attention_dcp
 
-        mesh = self._dcp_mesh
+        # Unsharded op over this rank's own shards: every DCP collective lives
+        # in torch, so the rank is a build-time constant, not traced data.
+        dcp_rank = _get_dcp_rank()
 
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
@@ -1781,24 +1757,25 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 block_tables,
                 query_start_loc,
                 request_distribution,
-                mesh,
                 nope_spec,
                 rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
                 dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
                 interleave_size=interleave_size,
             )
 
+        # Rank-invariant: every rank registers the same name, and the rank
+        # itself is baked into the traced function as a constant.
         op_name = ("pallas::sparse_mla_attention_dcp_"
                    f"{layer.layer_name.replace('.', '_')}")
-        sparse_mla_jax_op = pcp_streaming_jax_op(
+        sparse_mla_jax_op = pallas.jax_op(
             op_name,
             sparse_mla_attention_core_tpu_dcp,
             donate_argnums=(0, 1),
-            mesh=mesh,
-            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
-            output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+            mesh=None,
+            input_partition_specs=None,
         )
 
         # We must overwrite the default fake implementation as vLLM uses

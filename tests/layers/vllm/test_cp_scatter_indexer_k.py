@@ -26,10 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import \
     _cp_scatter_indexer_k
 
@@ -59,13 +56,6 @@ def _reader_local(pos, dcp_size, interleave_size):
                                                                interleave_size)
 
 
-def _mesh(dcp_size):
-    devices = jax.devices()
-    if len(devices) < dcp_size:
-        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
-    return Mesh(np.asarray(devices[:dcp_size]), (DCP_AXIS_NAME, ))
-
-
 def _rows(num_tokens):
     """One identifiable byte row per token: `[lo, hi, 7, 0...]`."""
     t = np.arange(num_tokens, dtype=np.int64)
@@ -76,18 +66,24 @@ def _rows(num_tokens):
     return rows
 
 
-def _scatter(mesh, cache, rows, seq_lens, page_tbl, cu_q_lens, dcp_size,
+def _scatter(cache, rows, seq_lens, page_tbl, cu_q_lens, dcp_size,
              interleave_size):
-    fn = functools.partial(_cp_scatter_indexer_k,
-                           mesh=mesh,
-                           cp_size=dcp_size,
-                           interleave_size=interleave_size,
-                           axis_name=DCP_AXIS_NAME)
-    sharded = jax.device_put(jnp.asarray(cache),
-                             NamedSharding(mesh, P(DCP_AXIS_NAME)))
-    return np.asarray(
-        jax.jit(fn)(sharded, jnp.asarray(rows), jnp.asarray(seq_lens),
-                    jnp.asarray(page_tbl), jnp.asarray(cu_q_lens)))
+    """Every rank's shard through the writer, restacked into a global cache.
+
+    The writer is unsharded now, so the ranks run one after another on one
+    device; concatenating in rank order rebuilds what the mesh used to hold.
+    """
+    shards = np.asarray(cache).reshape((dcp_size, -1) + cache.shape[1:])
+    rest = (jnp.asarray(rows), jnp.asarray(seq_lens), jnp.asarray(page_tbl),
+            jnp.asarray(cu_q_lens))
+    out = []
+    for r in range(dcp_size):
+        fn = functools.partial(_cp_scatter_indexer_k,
+                               cp_size=dcp_size,
+                               cp_rank=r,
+                               interleave_size=interleave_size)
+        out.append(np.asarray(jax.jit(fn)(jnp.asarray(shards[r]), *rest)))
+    return np.concatenate(out, axis=0)
 
 
 def _case(dcp_size, page_size, pages_per_seq, num_seqs=2, pad=13):
@@ -104,19 +100,18 @@ def _case(dcp_size, page_size, pages_per_seq, num_seqs=2, pad=13):
     return seq_lens, cu_q_lens, page_tbl, cache, int(cu_q_lens[-1]) + pad
 
 
-@pytest.mark.multichip
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("dcp_size,interleave_size,page_size,pages_per_seq",
                          _LAYOUTS)
 def test_writer_lands_where_the_reader_looks(dcp_size, interleave_size,
                                              page_size, pages_per_seq):
     """Every token's row is at the reader's `(owner, local index)`, exactly."""
-    mesh = _mesh(dcp_size)
     num_seqs = 2
     seq_lens, cu_q_lens, page_tbl, cache, num_tokens = _case(
         dcp_size, page_size, pages_per_seq, num_seqs)
     rows = _rows(num_tokens)
 
-    out = _scatter(mesh, cache, rows, seq_lens, page_tbl, cu_q_lens, dcp_size,
+    out = _scatter(cache, rows, seq_lens, page_tbl, cu_q_lens, dcp_size,
                    interleave_size)
     local_pages = cache.shape[0] // dcp_size
     shards = out.reshape(dcp_size, local_pages, page_size // KV_PACKING,
@@ -145,7 +140,7 @@ def test_writer_lands_where_the_reader_looks(dcp_size, interleave_size,
     assert (untouched == UNWRITTEN).all(), "the writer scribbled outside"
 
 
-@pytest.mark.multichip
+@pytest.mark.cpu_test
 def test_padded_tokens_write_nothing(dcp_size=4,
                                      interleave_size=4,
                                      page_size=32,
@@ -155,23 +150,22 @@ def test_padded_tokens_write_nothing(dcp_size=4,
     Their `pos` is meaningless and can index past the page table, so this is
     what the `seq_id` clamp and the `virtual_page` clip protect.
     """
-    mesh = _mesh(dcp_size)
     seq_lens, cu_q_lens, page_tbl, cache, _ = _case(dcp_size,
                                                     page_size,
                                                     pages_per_seq,
                                                     num_seqs=2,
                                                     pad=0)
     n_real = int(cu_q_lens[-1])
-    ref = _scatter(mesh, cache, _rows(n_real), seq_lens, page_tbl, cu_q_lens,
+    ref = _scatter(cache, _rows(n_real), seq_lens, page_tbl, cu_q_lens,
                    dcp_size, interleave_size)
     padded = _rows(n_real + 97)
     padded[n_real:] = 0x5C
-    got = _scatter(mesh, cache, padded, seq_lens, page_tbl, cu_q_lens,
-                   dcp_size, interleave_size)
+    got = _scatter(cache, padded, seq_lens, page_tbl, cu_q_lens, dcp_size,
+                   interleave_size)
     assert np.array_equal(ref, got), "a padded token reached the cache"
 
 
-@pytest.mark.multichip
+@pytest.mark.cpu_test
 def test_interleave_must_divide_the_page(dcp_size=4):
     """The guard that keeps writer and reader in one coordinate space.
 
@@ -180,7 +174,6 @@ def test_interleave_must_divide_the_page(dcp_size=4):
     the `dcp_size * interleave_size` cycle divides the virtual page, i.e.
     when `interleave_size` divides `page_size`.
     """
-    mesh = _mesh(dcp_size)
     page_size, pages_per_seq = 32, 2
     seq_lens, cu_q_lens, page_tbl, cache, num_tokens = _case(dcp_size,
                                                              page_size,
@@ -188,8 +181,7 @@ def test_interleave_must_divide_the_page(dcp_size=4):
                                                              num_seqs=1,
                                                              pad=0)
     with pytest.raises(ValueError, match="must divide the indexer"):
-        _scatter(mesh,
-                 cache,
+        _scatter(cache,
                  _rows(num_tokens),
                  seq_lens,
                  page_tbl,

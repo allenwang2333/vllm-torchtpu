@@ -614,8 +614,7 @@ def streamindex_topk(
       compiles away. When > 1, `cache_kv` / `page_indices` describe only this
       rank's shard, and the returned top-k is *local* -- correct only after the
       cross-rank merge the caller performs on the returned scores.
-    cp_rank: this rank's index in the CP group. Traced, so one compiled program
-      serves every rank.
+    cp_rank: this rank's index in the CP group, as a Python int or traced data.
     interleave_size: CP chunk-interleave width in uncompressed tokens. Must be
       a multiple of `compression_ratio`.
     return_scores: also return the score of each selected position, which is

@@ -30,11 +30,9 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
@@ -664,11 +662,10 @@ def _owned_local_topk(merged, dcp_size, interleave_c, rank):
                  -1).astype(np.int32))
 
 
-def _dcp_caches(dcp_size):
-    """Zeroed caches whose *global* page axis is `dcp_size` local shards."""
+def _dcp_caches():
+    """One rank's zeroed cache shards. Every rank is allocated the same."""
     return tuple(
-        jnp.zeros((dcp_size * spec.shape[0], ) + spec.shape[1:], jnp.uint8)
-        for spec in (NOPE_SPEC, ROPE_SPEC))
+        jnp.zeros(spec.shape, jnp.uint8) for spec in (NOPE_SPEC, ROPE_SPEC))
 
 
 def _merge_dcp_lse_partials(outputs, lses):
@@ -732,11 +729,9 @@ class SparseMlaDcpTest(parameterized.TestCase):
         self.k_scale = 1.5
         self.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
 
-    def _require_devices(self, n):
+    def _require_tpu(self):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("sparse MLA kernel requires a TPU (SparseCore).")
-        if len(jax.devices()) < n:
-            self.skipTest(f"needs {n} devices, have {len(jax.devices())}")
 
     def _inputs(self):
         kv_c = self.rng.standard_normal((DCP_SEQ, LKV_DIM)).astype(np.float32)
@@ -779,56 +774,51 @@ class SparseMlaDcpTest(parameterized.TestCase):
             out[t] = probs @ inp["kv_c_deq"][sel]
         return out
 
+    def _run_ranks(self, inp, dcp_size, interleave_size, block_tables):
+        """Every rank over its own shard, results stacked rank-major.
+
+        The op is unsharded now, so a rank is just an argument: one device runs
+        all `dcp_size` of them in turn and the stack stands in for the torch
+        collective the serving path would do here.
+        """
+        merged_topk = jnp.asarray(inp["topk"], jnp.int32)
+        nope, rope = _dcp_caches()
+        per_rank = [
+            attention_interface.sparse_mla_attention_dcp(
+                inp["ql_nope"],
+                inp["q_pe"],
+                inp["kv_c_fp8"],
+                inp["k_pe_fp8"],
+                nope,
+                rope,
+                _owned_local_topk(merged_topk, dcp_size, interleave_size, r),
+                inp["seq_lens"],
+                block_tables,
+                inp["cu_q_lens"],
+                inp["distribution"],
+                NOPE_SPEC,
+                ROPE_SPEC,
+                sm_scale=self.sm_scale,
+                k_scale=self.k_scale,
+                dcp_size=dcp_size,
+                dcp_rank=r,
+                interleave_size=interleave_size,
+            ) for r in range(dcp_size)
+        ]
+        return [jnp.stack(x) for x in zip(*per_rank)]
+
     def _run_dcp(self, inp, dcp_size, interleave_size):
         """Shard, attend, merge. Returns the merged output."""
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]),
-                                 (DCP_AXIS_NAME, ))
-        sharded = jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
-
-        # Every rank filters the same global list with its own rank id, which
-        # is what stage 3's all-gather leaves each rank holding. Stacking those
-        # per-rank results gives [D, T, C], the rank-major layout the shard_map
-        # expects.
-        merged_topk = jnp.asarray(inp["topk"], jnp.int32)
-        local_topk = jnp.stack([
-            _owned_local_topk(merged_topk, dcp_size, interleave_size, r)
-            for r in range(dcp_size)
-        ]).reshape(dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
-
         # One virtual page spans `PAGE_SIZE * dcp_size` global positions.
         vpages = math.ceil(DCP_SEQ / (PAGE_SIZE * dcp_size))
         block_tables = jnp.asarray(
             self.rng.permutation(NOPE_SPEC.num_pages)[:vpages], jnp.int32)
-
-        nope, rope = (jax.device_put(c, sharded)
-                      for c in _dcp_caches(dcp_size))
-        _, _, out, lse = attention_interface.sparse_mla_attention_dcp(
-            inp["ql_nope"],
-            inp["q_pe"],
-            inp["kv_c_fp8"],
-            inp["k_pe_fp8"],
-            nope,
-            rope,
-            jax.device_put(local_topk, sharded),
-            inp["seq_lens"],
-            block_tables,
-            inp["cu_q_lens"],
-            inp["distribution"],
-            mesh,
-            NOPE_SPEC,
-            ROPE_SPEC,
-            sm_scale=self.sm_scale,
-            k_scale=self.k_scale,
-            dcp_size=dcp_size,
-            interleave_size=interleave_size,
-        )
-        merged = _merge_dcp_lse_partials(
-            out.reshape(dcp_size, DCP_SEQ, NUM_HEADS, LKV_DIM),
-            lse.reshape(dcp_size, DCP_SEQ, NUM_HEADS))
-        return np.asarray(merged)
+        _, _, out, lse = self._run_ranks(inp, dcp_size, interleave_size,
+                                         block_tables)
+        return np.asarray(_merge_dcp_lse_partials(out, lse))
 
     def _check_merge_matches_the_reference(self, dcp_size, interleave_size):
-        self._require_devices(dcp_size)
+        self._require_tpu()
         inp = self._inputs()
         merged = self._run_dcp(inp, dcp_size, interleave_size)
         np.testing.assert_allclose(merged,
@@ -836,30 +826,19 @@ class SparseMlaDcpTest(parameterized.TestCase):
                                    rtol=2e-2,
                                    atol=2e-2)
 
+    # All four cases run on one device now: `dcp_size` is an argument to an
+    # unsharded op, not a device count, so none of them need the multichip
+    # agent any more.
     @parameterized.named_parameters(
         dict(testcase_name="d2_c4", dcp_size=2, interleave_size=4),
         dict(testcase_name="d2_c8", dcp_size=2, interleave_size=8),
+        dict(testcase_name="d4_c4", dcp_size=4, interleave_size=4),
+        dict(testcase_name="d8_c4", dcp_size=8, interleave_size=4),
     )
     def test_dcp_merge_matches_the_unsharded_reference(self, dcp_size,
                                                        interleave_size):
         self._check_merge_matches_the_reference(dcp_size, interleave_size)
 
-    # Split from the two-rank cases above rather than marking the whole
-    # method: CI selects by marker, so an unmarked case needing four or eight
-    # devices lands on the two-chip agent and skips itself into a green tick.
-    # The marker goes *under* `named_parameters` so it lands on the function
-    # absl copies onto each generated case; above it, absl's expansion drops
-    # it and `-m multichip` silently deselects both.
-    @parameterized.named_parameters(
-        dict(testcase_name="d4_c4", dcp_size=4, interleave_size=4),
-        dict(testcase_name="d8_c4", dcp_size=8, interleave_size=4),
-    )
-    @pytest.mark.multichip
-    def test_dcp_merge_matches_the_unsharded_reference_multichip(
-            self, dcp_size, interleave_size):
-        self._check_merge_matches_the_reference(dcp_size, interleave_size)
-
-    @pytest.mark.multichip
     def test_dcp_write_mask_partitions_the_cache(self):
         """Each rank must hold exactly the positions it owns -- no more.
 
@@ -868,42 +847,14 @@ class SparseMlaDcpTest(parameterized.TestCase):
         be one that double-counted some positions and dropped others. Counting
         written slots catches that directly.
         """
-        self._require_devices(4)
+        self._require_tpu()
         dcp_size, interleave_size = 4, 4
         inp = self._inputs()
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]),
-                                 (DCP_AXIS_NAME, ))
-        sharded = jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
         vpages = math.ceil(DCP_SEQ / (PAGE_SIZE * dcp_size))
         block_tables = jnp.arange(vpages, dtype=jnp.int32)
-        nope, rope = (jax.device_put(c, sharded)
-                      for c in _dcp_caches(dcp_size))
 
-        merged_topk = jnp.asarray(inp["topk"], jnp.int32)
-        local_topk = jnp.stack([
-            _owned_local_topk(merged_topk, dcp_size, interleave_size, r)
-            for r in range(dcp_size)
-        ]).reshape(dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
-
-        new_nope, _, _, _ = attention_interface.sparse_mla_attention_dcp(
-            inp["ql_nope"],
-            inp["q_pe"],
-            inp["kv_c_fp8"],
-            inp["k_pe_fp8"],
-            nope,
-            rope,
-            jax.device_put(local_topk, sharded),
-            inp["seq_lens"],
-            block_tables,
-            inp["cu_q_lens"],
-            inp["distribution"],
-            mesh,
-            NOPE_SPEC,
-            ROPE_SPEC,
-            sm_scale=self.sm_scale,
-            k_scale=self.k_scale,
-            dcp_size=dcp_size,
-            interleave_size=interleave_size)
+        new_nope, _, _, _ = self._run_ranks(inp, dcp_size, interleave_size,
+                                            block_tables)
 
         # A written latent row is all-zero with probability ~0, so the
         # nonzero (page, slot) pairs are exactly the written ones.
@@ -925,7 +876,6 @@ class SparseMlaDcpTest(parameterized.TestCase):
                                       np.full(dcp_size, DCP_SEQ // dcp_size))
         np.testing.assert_array_equal(written, expected)
 
-    @pytest.mark.multichip
     def test_a_rank_owning_nothing_is_dropped_by_the_merge(self):
         """The empty-shard path, isolated.
 
@@ -934,7 +884,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         of `lse = -inf` alone. Force that case by giving one token winners on a
         single rank only, and check the merge ignores the other three.
         """
-        self._require_devices(4)
+        self._require_tpu()
         dcp_size, interleave_size = 4, 4
         inp = self._inputs()
         topk = inp["topk"].copy()

@@ -18,8 +18,6 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
-from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
@@ -892,35 +890,29 @@ def sparse_mla_attention_dcp(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
-    mesh: Mesh,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
     sm_scale: float | None = None,
     k_scale: float | None = None,
     *,
     dcp_size: int,
+    dcp_rank: int,
     interleave_size: int,
-    dcp_axis_name: str = DCP_AXIS_NAME,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Sparse MLA attention over a DCP position-sharded latent cache. Returns
-    a *partial* `(caches, output, lse)` for the log-sum-exp merge above."""
+    """Sparse MLA attention over this rank's shard of a DCP position-sharded
+    latent cache. Returns a *partial* `(caches, output, lse)` for the merge."""
     if dcp_size <= 1:
         raise ValueError(
             f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
             "use sparse_mla_attention for the unsharded case.")
-    if dcp_axis_name not in mesh.axis_names:
-        raise ValueError(f"dcp_size={dcp_size} requires a mesh with a "
-                         f"{dcp_axis_name!r} axis, got {mesh.axis_names}.")
-    if mesh.shape[dcp_axis_name] != dcp_size:
+    if not 0 <= dcp_rank < dcp_size:
         raise ValueError(
-            f"dcp_size={dcp_size} does not match mesh axis "
-            f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+            f"dcp_rank={dcp_rank} out of range for dcp_size={dcp_size}.")
     num_tokens = ql_nope.shape[0]
-    if local_topk_indices.shape[0] != dcp_size * num_tokens:
+    if local_topk_indices.shape[0] != num_tokens:
         raise ValueError(
-            "local_topk_indices must carry one row per (rank, token): "
-            f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
-            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}.")
+            "local_topk_indices must carry one row per token: expected "
+            f"{num_tokens}, got {local_topk_indices.shape[0]}.")
 
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
     word_bytes = kv_cache_utils.WORD_BYTES
@@ -932,79 +924,42 @@ def sparse_mla_attention_dcp(
                 f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
                 f"{rope_dim}")
 
-    replicated_3d = P(None, None, None)
-    in_specs = (
-        replicated_3d,  # ql_nope
-        replicated_3d,  # q_pe
-        P(None, None),  # kv_c_normed
-        P(None, None),  # k_pe
-        P(dcp_axis_name),  # kv_cache_nope
-        P(dcp_axis_name),  # kv_cache_rope
-        P(dcp_axis_name, None),  # local_topk_indices
-        P(None),  # seq_lens
-        P(None),  # block_tables
-        P(None),  # query_start_loc
-        P(None),  # request_distribution
-    )
-    out_specs = (
-        P(dcp_axis_name),  # nope cache shard
-        P(dcp_axis_name),  # rope cache shard
-        P(dcp_axis_name, None, None),  # partial output
-        P(dcp_axis_name, None),  # partial lse
-    )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
 
-    def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
-               topk_idx, seq_lens_, block_tables_, query_start_loc_,
-               request_distribution_):
-        dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
-            kv_cache_nope,
-            kv_cache_rope,
-            kv_c_normed,
-            k_pe,
-            seq_lens_,
-            block_tables_,
-            query_start_loc_,
-            dcp_rank,
-            nope_spec=nope_spec,
-            rope_spec=rope_spec,
-            dcp_size=dcp_size,
-            interleave_size=interleave_size)
+    kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size)
 
-        # The kernel needs `kv_len >= 1`; feed a dummy and let `owns` mask it.
-        owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(
-            jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+    # The kernel needs `kv_len >= 1`; feed a dummy and let `owns` mask it.
+    owns = jnp.any(local_topk_indices >= 0, axis=-1)
+    topk_idx = local_topk_indices.at[:, 0].set(
+        jnp.where(owns, local_topk_indices[:, 0], jnp.int32(0)))
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        # Virtual page ordinal -> physical block in this rank's own shard.
-        local_block_tables = jnp.mod(block_tables_,
-                                     jnp.int32(nope_spec.num_pages))
-        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
-            q,
-            kv_cache_nope,
-            kv_cache_rope,
-            topk_idx,
-            local_block_tables,
-            query_start_loc_,
-            request_distribution_,
-            sm_scale=sm_scale or 1.0,
-            k_scale=dequant_scale,
-            return_lse=True,
-        )
-        lse = jnp.where(owns[:, None], lse, -jnp.inf)
-        # Drop the rope tail: only the nope part is the MLA value (P @ latent).
-        return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]],
-                lse)
-
-    return jax.jit(
-        shard_map.shard_map(_local,
-                            mesh=mesh,
-                            in_specs=in_specs,
-                            out_specs=out_specs,
-                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
-                                              kv_cache_nope, kv_cache_rope,
-                                              local_topk_indices, seq_lens,
-                                              block_tables, query_start_loc,
-                                              request_distribution)
+    q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+    # Virtual page ordinal -> physical block in this rank's own shard.
+    local_block_tables = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages))
+    output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+        q,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        local_block_tables,
+        query_start_loc,
+        request_distribution,
+        sm_scale=sm_scale or 1.0,
+        k_scale=dequant_scale,
+        return_lse=True,
+    )
+    lse = jnp.where(owns[:, None], lse, -jnp.inf)
+    # Drop the rope tail: only the nope part is the MLA value (P @ latent).
+    return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]], lse)

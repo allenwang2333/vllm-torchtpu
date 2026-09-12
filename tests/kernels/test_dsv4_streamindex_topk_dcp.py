@@ -24,12 +24,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
-from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
-
-P = jax.sharding.PartitionSpec
 
 # The coordinate algebra this rests on -- `cp_local_to_global` and the torch
 # inverse the return leg applies -- is covered on CPU in
@@ -108,62 +104,71 @@ def _global_records(kv_len, seed=7):
     return jnp.pad(rec, ((0, 0), (0, WIDTH - rec.shape[-1])))
 
 
+def _local_candidates(q, weights, shard, seq_lens, page_indices, cu_q_lens,
+                      distribution, *, dcp_size, dcp_rank, return_scores):
+    """One rank's candidates over its own shard, as the shipped op calls it."""
+    return streamindex_topk(
+        q,
+        weights,
+        shard,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        k=K,
+        compression_ratio=1,
+        num_kv_pages_per_block=2,
+        num_queries_per_block=128,
+        cp_size=dcp_size,
+        cp_rank=dcp_rank,
+        interleave_size=1,
+        return_scores=return_scores,
+    )
+
+
 def _merged_global_topk(q, weights, shards, seq_lens, page_indices, cu_q_lens,
-                        distribution, *, mesh, dcp_size):
+                        distribution, *, dcp_size):
     """The DCP pipeline of `_build_streamidx_dcp_op`, in pure JAX.
 
-    Local candidates per rank, all-gathered, re-ranked by `sparsecore_topk`,
-    and read back out as global positions.
+    Local candidates per rank, concatenated rank-major the way the torch
+    all-gather leaves them, re-ranked by `sparsecore_topk`, and read back out
+    as global positions.
     """
-
-    def _rank(q, weights, cache_kv, seq_lens, page_indices, cu_q_lens,
-              distribution):
-        idxs, scores = streamindex_topk(
-            q,
-            weights,
-            cache_kv,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            k=K,
-            compression_ratio=1,
-            num_kv_pages_per_block=2,
-            num_queries_per_block=128,
-            cp_size=dcp_size,
-            cp_rank=cp_rank_as_data(DCP_AXIS_NAME, dcp_size),
-            interleave_size=1,
-            return_scores=True,
-        )
-        all_idxs = jax.lax.all_gather(idxs, DCP_AXIS_NAME, axis=1, tiled=True)
-        all_scores = jax.lax.all_gather(scores,
-                                        DCP_AXIS_NAME,
-                                        axis=1,
-                                        tiled=True)
-        slots = sparsecore_topk(all_scores,
-                                K,
-                                row_lengths=jnp.full((all_scores.shape[0], ),
-                                                     all_scores.shape[1],
-                                                     jnp.int32),
-                                write_empty_rows=True)
-        picked = jnp.take_along_axis(all_idxs,
-                                     jnp.clip(slots, 0).astype(jnp.int32),
-                                     axis=1)
-        return jnp.where(slots >= 0, picked, jnp.int32(-1))
-
-    replicated = P()
-    return jax.jit(
-        jax.shard_map(_rank,
-                      mesh=mesh,
-                      in_specs=(replicated, replicated, P(DCP_AXIS_NAME),
-                                replicated, replicated, replicated,
-                                replicated),
-                      out_specs=replicated,
-                      check_vma=False))(q, weights, shards, seq_lens,
-                                        page_indices, cu_q_lens, distribution)
+    per_rank = [
+        _local_candidates(q,
+                          weights,
+                          shards[r],
+                          seq_lens,
+                          page_indices,
+                          cu_q_lens,
+                          distribution,
+                          dcp_size=dcp_size,
+                          dcp_rank=r,
+                          return_scores=True) for r in range(dcp_size)
+    ]
+    all_idxs = jnp.concatenate([idxs for idxs, _ in per_rank], axis=1)
+    all_scores = jnp.concatenate([scores for _, scores in per_rank], axis=1)
+    slots = sparsecore_topk(all_scores,
+                            K,
+                            row_lengths=jnp.full((all_scores.shape[0], ),
+                                                 all_scores.shape[1],
+                                                 jnp.int32),
+                            write_empty_rows=True)
+    picked = jnp.take_along_axis(all_idxs,
+                                 jnp.clip(slots, 0).astype(jnp.int32),
+                                 axis=1)
+    return jnp.where(slots >= 0, picked, jnp.int32(-1))
 
 
-@pytest.mark.multichip
+def _shards(rec, dcp_size, vpages):
+    """interleave_size=1: global position g lives on rank g % dcp_size at
+    local index g // dcp_size, so the shards are a strided de-interleave."""
+    return [
+        rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
+        for r in range(dcp_size)
+    ]
+
+
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
     """The merged list must be the unsharded global top-k, exactly.
@@ -173,10 +178,6 @@ def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
     and hence by at most `k - 1` on its own shard, and always survives that
     shard's local top-k.
     """
-    devices = jax.devices()
-    if len(devices) < dcp_size:
-        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
-
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(0))
     q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) *
@@ -201,26 +202,15 @@ def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
                          num_kv_pages_per_block=2,
                          num_queries_per_block=128))
 
-    # interleave_size=1: global position g lives on rank g % dcp_size at local
-    # index g // dcp_size, so the shards are a strided de-interleave.
     vpages = KV_LEN // (PAGE_SIZE * dcp_size)
-    shards = jnp.concatenate([
-        rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
-        for r in range(dcp_size)
-    ], 0)
-    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), (DCP_AXIS_NAME, ))
-    shards = jax.device_put(shards,
-                            jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
-
     merged = np.asarray(
         _merged_global_topk(q,
                             weights,
-                            shards,
+                            _shards(rec, dcp_size, vpages),
                             seq_lens,
                             jnp.arange(vpages, dtype=jnp.int32),
                             cu_q_lens,
                             distribution,
-                            mesh=mesh,
                             dcp_size=dcp_size))
     assert merged.shape == (Q_LEN, K)
 
@@ -235,17 +225,12 @@ def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
             f"{len(set(got) - want)} spurious")
 
 
-@pytest.mark.multichip
 def test_local_candidates_stay_inside_their_own_shard(dcp_size=4):
     """Each rank's pre-merge candidates are global positions it owns.
 
     The torch ownership filter reads `slots // k` rather than the gathered
     index, so this precondition is what keeps that shortcut sound.
     """
-    devices = jax.devices()
-    if len(devices) < dcp_size:
-        pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
-
     rec = _global_records(KV_LEN, seed=3)
     kq, kw = jax.random.split(jax.random.key(3))
     q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) *
@@ -254,40 +239,20 @@ def test_local_candidates_stay_inside_their_own_shard(dcp_size=4):
                                 jnp.float32).astype(jnp.bfloat16)
 
     vpages = KV_LEN // (PAGE_SIZE * dcp_size)
-    shards = jnp.concatenate([
-        rec[r::dcp_size].reshape(vpages, PAGE_SIZE // 4, 4, WIDTH)
-        for r in range(dcp_size)
-    ], 0)
-    mesh = jax.sharding.Mesh(np.array(devices[:dcp_size]), (DCP_AXIS_NAME, ))
-    shards = jax.device_put(shards,
-                            jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
-
-    def _rank(*args):
-        return streamindex_topk(
-            *args,
-            k=K,
-            compression_ratio=1,
-            num_kv_pages_per_block=2,
-            num_queries_per_block=128,
-            cp_size=dcp_size,
-            cp_rank=cp_rank_as_data(DCP_AXIS_NAME, dcp_size),
-            interleave_size=1,
-        )
-
-    replicated = P()
-    local = jax.jit(
-        jax.shard_map(_rank,
-                      mesh=mesh,
-                      in_specs=(replicated, replicated, P(DCP_AXIS_NAME),
-                                replicated, replicated, replicated,
-                                replicated),
-                      out_specs=P(DCP_AXIS_NAME),
-                      check_vma=False))(q, weights, shards,
-                                        jnp.array([KV_LEN], jnp.int32),
-                                        jnp.arange(vpages, dtype=jnp.int32),
-                                        jnp.array([0, Q_LEN], jnp.int32),
-                                        jnp.array([0, 0, 1], jnp.int32))
-    local = np.asarray(local).reshape(dcp_size, Q_LEN, K)
+    shards = _shards(rec, dcp_size, vpages)
+    local = np.stack([
+        np.asarray(
+            _local_candidates(q,
+                              weights,
+                              shards[r],
+                              jnp.array([KV_LEN], jnp.int32),
+                              jnp.arange(vpages, dtype=jnp.int32),
+                              jnp.array([0, Q_LEN], jnp.int32),
+                              jnp.array([0, 0, 1], jnp.int32),
+                              dcp_size=dcp_size,
+                              dcp_rank=r,
+                              return_scores=False)) for r in range(dcp_size)
+    ])
 
     for r in range(dcp_size):
         held = local[r][local[r] >= 0]

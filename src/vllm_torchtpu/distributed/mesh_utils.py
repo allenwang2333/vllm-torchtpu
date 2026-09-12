@@ -205,14 +205,3 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
 
     _MESH_CACHE[cache_key] = mesh
     return mesh
-
-
-def cp_rank_as_data(cp_axis_name: str, cp_size: int):
-    """This shard's index along `cp_axis_name`, without `lax.axis_index`,
-    which lowers to a `partition-id` the SPMD partitioner rejects."""
-    import jax.numpy as jnp
-    from jax import lax
-
-    ranks = jnp.arange(cp_size, dtype=jnp.int32)
-    exchanged = lax.all_to_all(ranks, cp_axis_name, 0, 0, tiled=True)
-    return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
