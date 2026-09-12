@@ -20,7 +20,8 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     cp_local_to_global
-from vllm_torchtpu.layers.vllm.cp_indexer_merge import select_owned_winners
+from vllm_torchtpu.layers.vllm.cp_indexer_merge import (check_positional_owner,
+                                                        select_owned_winners)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -149,6 +150,70 @@ def test_a_rank_owning_every_winner_loses_nothing():
                interleave_c=interleave_c)
     assert (got[0] >= 0).sum() == k
     assert sorted(got[0].tolist()) == list(range(k))
+
+
+def _fake_gather(idxs, order):
+    """Stand-in for the DCP all-gather that lands blocks in `order`."""
+
+    def gather(x):
+        if tuple(x.shape) == (1, 1):
+            return torch.as_tensor([list(order)], dtype=torch.int32)
+        return torch.from_numpy(
+            np.concatenate([idxs[o] for o in order], axis=1))
+
+    return gather
+
+
+@pytest.mark.parametrize("dcp_size,interleave_c,k,num_rows", _LAYOUTS)
+def test_owner_check_passes_in_rank_order(dcp_size, interleave_c, k, num_rows):
+    rng = np.random.default_rng(dcp_size * 13 + k)
+    idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.5)
+    slots = _slots(rng, dcp_size, k, num_rows, 0.5)
+
+    for r in range(dcp_size):
+        check_positional_owner(torch.from_numpy(slots),
+                               torch.from_numpy(idxs[r]),
+                               k=k,
+                               dcp_size=dcp_size,
+                               dcp_rank=r,
+                               interleave_c=interleave_c,
+                               gather=_fake_gather(idxs, range(dcp_size)))
+
+
+@pytest.mark.parametrize("dcp_size,interleave_c,k,num_rows", _LAYOUTS)
+def test_owner_check_catches_a_permuted_gather(dcp_size, interleave_c, k,
+                                               num_rows):
+    rng = np.random.default_rng(dcp_size * 17 + k)
+    idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.0)
+    slots = _slots(rng, dcp_size, k, num_rows, 0.0)
+    order = list(range(dcp_size))
+    order[0], order[1] = order[1], order[0]
+
+    with pytest.raises(RuntimeError, match="column order"):
+        check_positional_owner(torch.from_numpy(slots),
+                               torch.from_numpy(idxs[0]),
+                               k=k,
+                               dcp_size=dcp_size,
+                               dcp_rank=0,
+                               interleave_c=interleave_c,
+                               gather=_fake_gather(idxs, order))
+
+
+def test_owner_check_catches_a_wrong_interleave():
+    """Order is right but the ownership arithmetic is not."""
+    dcp_size, interleave_c, k, num_rows = 4, 4, 8, 6
+    rng = np.random.default_rng(99)
+    idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.0)
+    slots = _slots(rng, dcp_size, k, num_rows, 0.0)
+
+    with pytest.raises(RuntimeError, match="owner mismatch"):
+        check_positional_owner(torch.from_numpy(slots),
+                               torch.from_numpy(idxs[0]),
+                               k=k,
+                               dcp_size=dcp_size,
+                               dcp_rank=0,
+                               interleave_c=interleave_c * 2,
+                               gather=_fake_gather(idxs, range(dcp_size)))
 
 
 def test_unowned_rank_gets_an_all_minus_one_row():

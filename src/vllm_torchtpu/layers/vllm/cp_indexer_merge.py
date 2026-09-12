@@ -16,9 +16,13 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
+
+CHECK_OWNER = os.environ.get("VLLM_TORCHTPU_DCP_CHECK_OWNER", "0") == "1"
 
 
 def all_gather_candidates(x: torch.Tensor) -> torch.Tensor:
@@ -42,6 +46,49 @@ def cp_global_to_local(global_idx: torch.Tensor, dcp_size: int,
         torch.remainder(global_idx, interleave_c))
 
 
+def cp_owner_rank(global_idx: torch.Tensor, dcp_size: int,
+                  interleave_c: int) -> torch.Tensor:
+    """Rank holding `global_idx`, read out of the value. Mirrors
+    `streamindex_topk.cp_owner_rank`."""
+    if dcp_size == 1:
+        return torch.zeros_like(global_idx)
+    return torch.remainder(
+        torch.div(global_idx, interleave_c, rounding_mode="floor"), dcp_size)
+
+
+def check_positional_owner(slots: torch.Tensor,
+                           idxs: torch.Tensor,
+                           *,
+                           k: int,
+                           dcp_size: int,
+                           dcp_rank: int,
+                           interleave_c: int,
+                           gather=all_gather_candidates) -> None:
+    """Assert `slots // k` agrees with the rank stamped into the gathered index
+    values, which is how `dcp-only` derives ownership."""
+    if dcp_size == 1:
+        return
+    tag = gather(
+        torch.full((1, 1), dcp_rank, dtype=torch.int32, device=slots.device))
+    want = torch.arange(dcp_size, dtype=torch.int32, device=slots.device)
+    got = tag.flatten()
+    if not torch.equal(got, want):
+        raise RuntimeError(
+            f"DCP all_gather(dim=1) column order is {got.tolist()}, "
+            f"expected {want.tolist()}")
+
+    picked = torch.gather(gather(idxs), 1,
+                          torch.clamp(slots, min=0).to(torch.int64))
+    valid = (slots >= 0) & (picked >= 0)
+    bad = valid & (torch.div(slots, k, rounding_mode="floor") != cp_owner_rank(
+        picked, dcp_size, interleave_c))
+    n = int(bad.sum())
+    if n:
+        raise RuntimeError(
+            f"DCP owner mismatch on rank {dcp_rank}: {n} of {int(valid.sum())} "
+            f"winners disagree, positional vs value-carried")
+
+
 def select_owned_winners(
     slots: torch.Tensor,
     idxs: torch.Tensor,
@@ -53,6 +100,14 @@ def select_owned_winners(
 ) -> torch.Tensor:
     """Keep the winners this rank owns, left-packed as local indices and `-1`
     padded. Ownership is `slots // k`, so the gathered `idxs` are never read."""
+    if CHECK_OWNER:
+        check_positional_owner(slots,
+                               idxs,
+                               k=k,
+                               dcp_size=dcp_size,
+                               dcp_rank=dcp_rank,
+                               interleave_c=interleave_c)
+
     num_rows, width = slots.shape
     owner = torch.div(slots, k, rounding_mode="floor")
     mine = (slots >= 0) & (owner == dcp_rank)
