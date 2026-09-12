@@ -41,8 +41,6 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.common import attention_interface
 
-P = jax.sharding.PartitionSpec
-
 LKV_DIM = 512
 ROPE_DIM = 64
 NUM_HEADS = 16
