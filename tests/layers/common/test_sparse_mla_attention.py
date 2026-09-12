@@ -34,7 +34,7 @@ import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,

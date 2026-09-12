@@ -208,21 +208,8 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
 
 
 def cp_rank_as_data(cp_axis_name: str, cp_size: int):
-    """This shard's index along `cp_axis_name`, without `lax.axis_index`.
-
-    `lax.axis_index` lowers to `partition-id`,
-    which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
-    through its `jax.export` bridge ("partitionId instruction is not supported
-    for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
-    a replicated iota says the same thing with an instruction the partitioner
-    accepts: every device splits `[0..cp_size)` into single elements and
-    keeps the chunks addressed to it, so device `r` receives `r` from each
-    peer and every lane of the result is `r`.
-
-    Same trick as `pcp_streaming_rpa/wrapper.py`'s
-    `_select_replicated_shard_for_pcp_rank`, on an iota rather than real data.
-    Must be called from inside a `shard_map` body.
-    """
+    """This shard's index along `cp_axis_name`, without `lax.axis_index`,
+    which lowers to a `partition-id` the SPMD partitioner rejects."""
     import jax.numpy as jnp
     from jax import lax
 

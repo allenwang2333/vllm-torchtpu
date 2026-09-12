@@ -33,8 +33,7 @@ def all_gather_candidates(x: torch.Tensor) -> torch.Tensor:
 def cp_global_to_local(global_idx: torch.Tensor, dcp_size: int,
                        interleave_c: int) -> torch.Tensor:
     """Inverse of `streamindex_topk.cp_local_to_global`. Needs no rank: once
-    the owner is fixed the arithmetic is the same everywhere, which is what
-    lets the merge address a winner into its owner's cache from any rank."""
+    the owner is fixed the arithmetic is the same everywhere."""
     if dcp_size == 1:
         return global_idx
     cycle_c = dcp_size * interleave_c

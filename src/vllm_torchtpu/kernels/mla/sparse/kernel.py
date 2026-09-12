@@ -132,8 +132,7 @@ def _attention_kernel(
     # [num_tokens, topk * WORD_BYTES, TILE_LANE_BYTES] (gathered, raw tiles)
     cache_kv_nope_hbm_ref,
     cache_kv_rope_hbm_ref,  # [num_tokens, topk, rope_dim] (gathered)
-    # Output (+ scratch) refs are positional and their count depends on
-    # `return_lse`, so they arrive packed and are unpacked below.
+    # Count depends on `return_lse`, so they arrive packed, unpacked below.
     *refs,
     sm_scale: float,
     k_scale: float = 1.0,
@@ -215,8 +214,7 @@ def _attention_kernel(
         p = jnp.exp(s - m)
         l_sum = jnp.sum(p, axis=1, keepdims=True)
 
-        # `m` is needed only to reconstruct the log-sum-exp for a cross-shard
-        # merge; the single-device path drops it.
+        # `m` only reconstructs the lse; the single-device path drops it.
         return p, l_sum, m
 
     def attention_step2_pv(
@@ -388,9 +386,7 @@ def _attention_kernel(
         prev_out = None
 
         def write_blse(batch_idx, m, l_sum):
-            # log-sum-exp in the *unshifted* frame, so a peer holding a
-            # disjoint slice of the same token's top-k can merge with
-            # o = sum_r softmax(lse_r) * o_r without knowing our max.
+            # Unshifted frame, so a peer can merge without knowing our max.
             if not return_lse:
                 return
             blse_x2_ref.at[bo_sem_idx, batch_idx][...] = m + jnp.log(l_sum)
@@ -596,9 +592,7 @@ def sparse_ragged_paged_attention(
         ]
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
-        # Each chunk writes only its own token rows, so -- exactly like `q` --
-        # the lse buffer is threaded through as an aliased in/out to carry
-        # earlier chunks' rows forward.
+        # Aliased in/out like `q`, to carry earlier chunks' rows forward.
         if return_lse:
             in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
@@ -629,8 +623,7 @@ def sparse_ragged_paged_attention(
         if return_lse:
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32))
-        # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
-        # (+ blse when the log-sum-exp is exported).
+        # Double buffering for bkv_nope, bq, bo, bkv_rope (+ blse).
         scratch_shapes.append(
             pltpu.SemaphoreType.DMA((5 if return_lse else 4, 2)))
 
@@ -716,9 +709,7 @@ def sparse_ragged_paged_attention(
     assert page_ids.shape == (q.shape[0], topk)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
-    # Rows the grid never reaches (padding past `batch_end`) keep this
-    # sentinel, so a downstream merge weights them at exp(min - max) == 0
-    # instead of tripping on uninitialised memory.
+    # Sentinel for rows the grid never reaches; merges weight them at 0.
     lse = (jnp.full((q.shape[0], num_q_heads, 1),
                     jnp.finfo(jnp.float32).min,
                     dtype=jnp.float32) if return_lse else None)

@@ -20,9 +20,9 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -70,8 +70,7 @@ _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
     P(),  # q_pe
     P(),  # kv_c_normed -- no all-gather: every rank already has it
     P(),  # k_pe
-    # This rank's slice of every token's global top-k, already local indices.
-    # Sharded, so the global leading dim is `dcp_size * num_tokens`.
+    # This rank's slice of the global top-k, already as local indices.
     P(DCP_AXIS_NAME),  # local_topk_indices
     P(),  # seq_lens
     P(),  # block_tables (virtual page ordinals)
@@ -1539,8 +1538,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                            "cp_kv_cache_interleave_size", 1)
         self._dcp_mesh = None
         if self.dcp_size > 1:
-            # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`)
+            # The indexer refuses pcp>1 and dcp>1 together.
             pcp_size = getattr(parallel_config,
                                "prefill_context_parallel_size", 1)
             if isinstance(pcp_size, int) and pcp_size > 1:
@@ -1747,17 +1745,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int,
                                  interleave_size: int):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
-
-        In DCP the queries are replicated. `kv_c_normed`/`k_pe` in particular
-        need no all-gather -- they are computed from a replicated residual
-        stream, so every rank already holds every row and only its write mask
-        (owner rank) differs.
-
-        The op returns unmerged partials. Combining them is one log-sum-exp
-        reduction over the DCP group, is done by the torch
-        caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
-        also narrows the head axis back down.
-        """
+        Returns unmerged partials for the torch caller to combine."""
         from vllm_torchtpu.layers.common.attention_interface import \
             sparse_mla_attention_dcp
 
@@ -1920,16 +1908,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first.")
-                # DCP re-spends `dcp_size` of TP's ways on positions instead of
-                # heads, so attention runs at `tp // dcp` head sharding: every
-                # rank attends with the whole DCP group's heads over its own
-                # KV shard, and the head axis is scattered back after the
-                # merge.
+                # DCP re-spends TP's ways on positions: attend at tp // dcp.
                 ql_nope_dcp = all_gather_heads(ql_nope_flat)
                 q_pe_dcp = all_gather_heads(q_pe_flat)
-                # `topk_indices` here is not global positions: the DCP indexer
-                # already resolved each token's global top-k into this rank's
-                # own local cache indices, `-1` where it owns nothing.
+                # `topk_indices` is rank-local here, not global positions.
                 partial, lse = layer.sparse_mla_dcp_op(
                     kv_cache,
                     ql_nope_dcp,

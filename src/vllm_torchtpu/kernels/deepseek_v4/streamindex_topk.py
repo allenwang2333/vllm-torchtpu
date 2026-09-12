@@ -26,7 +26,6 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 
 Enum = enum.Enum
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-DCP_AXIS_NAME = "dcp"
 
 
 def cdiv(a, b):
@@ -47,31 +46,11 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-# --------------------------------------------------------------------------- #
 # Context-parallel compressed-coordinate helpers.
-#
-# A context-parallel axis shards the KV cache chunk-interleaved over
-# `interleave_size` *uncompressed* tokens. The indexer stores one compressed row
-# per `compression_ratio` tokens, so the chunk width in compressed space is
-# `interleave_c = interleave_size // compression_ratio` and global compressed
-# position `g` is owned by rank `(g // interleave_c) % cp_size`.
-#
-# The arithmetic is the same whichever axis owns the interleave, so these are
-# plain `cp_` helpers: DCP is the only caller here, and nothing below reads the
-# axis name. Deriving the rank itself is `mesh_utils.cp_rank_as_data`.
-#
-# `cp_rank` is a traced i32 scalar throughout, so a single compiled program
-# serves every rank; only `cp_size` and `interleave_c` are static.
-# --------------------------------------------------------------------------- #
 
 
 def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
-    """Map a rank-local compressed index to its global compressed position.
-
-    Monotonic in `local_idx`, so the l-th position this rank owns is exactly
-    ``cp_local_to_global(l, ...)``. That is what lets the kernel keep using a
-    plain ``global_pos < kv_len`` test as the local bounds check.
-    """
+    """Map a rank-local compressed index to its global compressed position"""
     if cp_size == 1:
         return local_idx
     cycle_c = cp_size * interleave_c
@@ -81,9 +60,7 @@ def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
 
 def cp_local_length(global_len, cp_rank, cp_size: int, interleave_c: int):
     """Count compressed positions ``< global_len`` owned by `cp_rank`.
-
-    Mirrors ``_local_page_valid_len`` in pcp_streaming_rpa/schedule.py.
-    """
+    Mirrors ``_local_page_valid_len`` in pcp_streaming_rpa/schedule.py."""
     if cp_size == 1:
         return global_len
     cycle_c = cp_size * interleave_c
@@ -175,12 +152,10 @@ def kernel(
         q_lens.append(q_len)
         seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
         seq_lens.append(seq_len)
-        # Global compressed length; the causal / validity masks stay in global
-        # coordinates so they are identical on every CP rank.
+        # Global compressed length; the masks stay in global coordinates.
         kv_len = seq_len // compression_ratio
         kv_lens.append(kv_len)
-        # How many of those positions live in *this* rank's shard, which is what
-        # bounds the kv-block loop and the local score-matrix width.
+        # How many of those positions live in this rank's shard.
         local_kv_lens.append(
             cp_local_length(kv_len, cp_rank, cp_size, interleave_c))
 
@@ -397,10 +372,7 @@ def kernel(
             s_summed = (s_summed * scale_val_stacked
                         )  # Shape: (seq_batch_size, bq_sz, bkv_sz)
 
-            # Score columns are rank-local, but both masks are expressed in
-            # global compressed coordinates. `cp_local_to_global` is monotonic,
-            # so `k_span < kv_len` doubles as the local bounds check: the l-th
-            # position this rank owns exists iff its global position is in range.
+            # Score columns are rank-local.
             k_local = bkv_idx * bkv_sz + jnp.arange(
                 bkv_sz, dtype=jnp.int32)  # Shape: (bkv_sz,)
             k_span = cp_local_to_global(k_local, cp_rank, cp_size,
@@ -556,11 +528,8 @@ def _effective_row_lengths(
     cp_size: int = 1,
     interleave_c: int = 1,
 ) -> jax.Array:  # i32[num_tokens]
-    """Visible compressed KV positions per token row of the score matrix.
-
-    Under context parallelism the score matrix is rank-local, so the row length
-    is the number of globally-visible positions that *this* rank owns.
-    """
+    """Visible compressed KV positions per token row of the score matrix,
+    counting only the ones this rank owns when context parallel."""
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -667,16 +636,11 @@ def streamindex_topk(
                 f"compression_ratio ({compression_ratio}) for the CP chunk "
                 "boundary to fall on a compressed-row boundary.")
         if enable_early_exit:
-            # The fast path builds identity indices 0..k, which are global
-            # positions. Supporting it under CP means emitting this rank's
-            # owned subset instead; not worth it, since it cannot fire at the
-            # context lengths CP is used for.
+            # Its identity indices 0..k are global, not this rank's subset.
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1.")
     if enable_early_exit and return_scores:
-        # The fast path never computes scores, so it has nothing to return for
-        # the second `lax.cond` branch. Only the cross-rank merge wants scores,
-        # and that already excludes the fast path.
+        # The fast path never computes scores, so it has none to return.
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit.")
     interleave_c = interleave_size // compression_ratio if cp_size > 1 else 1
@@ -962,8 +926,7 @@ def streamindex_topk(
         if cp_size == 1 and not return_scores:
             return topk_idxs
 
-        # `sparsecore_topk` suffix-pads with -1; clamp before the gather so the
-        # negative index cannot wrap onto the last column, then restore -inf.
+        # Clamp the -1 pad before the gather so it cannot wrap to the last col.
         filled = topk_idxs >= 0
         topk_scores = jnp.take_along_axis(scores_to_reduce,
                                           jnp.maximum(topk_idxs, 0),

@@ -29,7 +29,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import \
     _cp_scatter_indexer_k
 

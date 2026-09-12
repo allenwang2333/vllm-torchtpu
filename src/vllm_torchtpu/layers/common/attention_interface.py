@@ -18,8 +18,8 @@ import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME
 from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
-from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
@@ -900,33 +900,10 @@ def sparse_mla_attention_dcp(
     *,
     dcp_size: int,
     interleave_size: int,
-    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    dcp_axis_name: str = DCP_AXIS_NAME,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Sparse MLA attention over a DCP position-sharded latent cache.
-
-    Args:
-      ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
-      kv_c_normed, k_pe: this step's latents, replicated and identical on every
-        rank; the write mask, not the data, is what differs per rank.
-      kv_cache_nope, kv_cache_rope: this rank's position shards.
-      local_topk_indices: DCP indexer output -- this rank's slice of
-        every token's global top-k, already in *rank-local* cache coordinates,
-        `-1` padded, sharded over `dcp_axis_name` with a global leading
-        dimension of `dcp_size * num_tokens`.
-      seq_lens, block_tables, query_start_loc, request_distribution: global
-        sequence coordinates, replicated. `block_tables` holds virtual page
-        ordinals, resolved per rank exactly as on the indexer side.
-      dcp_size, interleave_size: the shard layout.
-
-    Returns:
-      `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
-      `[dcp_size * num_tokens, num_heads, lkv_dim]` and `lse` is
-      `[dcp_size * num_tokens, num_heads]`, both sharded over `dcp_axis_name`
-      and both *partial*: they must go through the log-sum-exp merge above
-      before `W_UV`. `lse` is `-inf` wherever a rank owns none of a token's
-      top-k, which is what makes that merge a plain softmax with no separate
-      count channel.
-    """
+    """Sparse MLA attention over a DCP position-sharded latent cache. Returns
+    a *partial* `(caches, output, lse)` for the log-sum-exp merge above."""
     if dcp_size <= 1:
         raise ValueError(
             f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
@@ -995,18 +972,13 @@ def sparse_mla_attention_dcp(
             dcp_size=dcp_size,
             interleave_size=interleave_size)
 
-        # A rank owning none of a token's top-k still has to be handed one
-        # valid entry: the kernel derives `kv_len` from the `-1` tail and
-        # requires `kv_len >= 1`. Position 0 always exists, so it is the
-        # cheapest dummy; the softmax it produces is real but meaningless, and
-        # `owns` below is what keeps it out of the merge.
+        # The kernel needs `kv_len >= 1`; feed a dummy and let `owns` mask it.
         owns = jnp.any(topk_idx >= 0, axis=-1)
         topk_idx = topk_idx.at[:, 0].set(
             jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        # Virtual page ordinal -> physical block in this rank's own shard, the
-        # same resolution the scatter above and the DCP indexer use.
+        # Virtual page ordinal -> physical block in this rank's own shard.
         local_block_tables = jnp.mod(block_tables_,
                                      jnp.int32(nope_spec.num_pages))
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(

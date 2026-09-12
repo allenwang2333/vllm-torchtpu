@@ -41,11 +41,11 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (DCP_AXIS_NAME, get_dcp_rank,
+                                           get_or_create_dcp_mesh)
 from vllm_torchtpu.distributed.mesh_utils import cp_rank_as_data
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, streamindex_topk)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
@@ -78,29 +78,14 @@ def _cp_scatter_indexer_k(
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
-    """Scatter this step's indexer K rows into the DCP-sharded K cache.
-
-    Each rank writes only the rows it owns, and ownership
-    follows the same interleave the reader assumes -- a virtual page spans
-    `page_size * cp_size` positions and rank `r` holds the `interleave_size`
-    -sized chunks at offset `r * interleave_size` within each
-    `cp_size * interleave_size` cycle. Rows owned by another rank are dropped
-    by aiming them at an out-of-bounds page, the same trick the unsharded
-    scatter uses for padding.
-
-    `k_packed` must already be in request-major order, since the positions
-    come from `cu_q_lens`/`seq_lens`.
-
-    `axis_name`/`cp_size` name the axis the cache is split over.
-    """
+    """Scatter this step's indexer K rows into the DCP-sharded K cache, on the
+    same interleave the reader assumes. `k_packed` must be request-major."""
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
         rank = cp_rank_as_data(axis_name, cp_size)
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
-        # The latent cache is guarded on its own page size in
-        # `update_sparse_mla_kv_cache_dcp`; this cache is a separate
-        # allocation, so it needs the check on its own number.
+        # A separate allocation from the latent cache, so check it separately.
         if page_size % interleave_size:
             raise ValueError(
                 f"interleave_size={interleave_size} must divide the indexer "
@@ -111,8 +96,7 @@ def _cp_scatter_indexer_k(
         k_packed = jnp.pad(k_packed,
                            ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
-        # Same notion of "where does this row belong" as the latent-cache
-        # writers, so the two cannot drift apart.
+        # Same row-placement rule as the latent-cache writers.
         _, seq_id, pos, in_batch = _row_positions(k_packed.shape[0], seq_lens,
                                                   cu_q_lens)
 
@@ -123,14 +107,11 @@ def _cp_scatter_indexer_k(
         owner = (offset % cycle) // interleave
         slot = (offset // cycle) * interleave + (offset % interleave)
 
-        # Virtual ordinal -> physical block in this rank's own shard, exactly
-        # as `_local_candidates` resolves it on the read side.
+        # Virtual ordinal -> physical block in this rank's own shard.
         local_page_indices = jnp.mod(page_indices,
                                      jnp.int32(cache_kv.shape[0])).reshape(
                                          seq_lens.shape[0], -1)
-        # A padded token's `pos` is meaningless and can run off the end of the
-        # page table; clip so the gather stays in bounds and let `valid` drop
-        # the row, the same way the sparse MLA writer does.
+        # A padded token's `pos` can run off the page table; clip, then drop.
         max_pages_per_seq = local_page_indices.shape[1]
         virtual_page = jnp.clip(pos // virtual_page_size, 0,
                                 max_pages_per_seq - 1)
@@ -257,21 +238,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         return op
 
     def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
-        """The DCP twin of `_build_streamidx_op`.
-
-        DCP shards the KV cache and leaves the *queries*
-        replicated, so there is no rank-major token packing to undo. Every
-        token-major input arrives already in request-major order and stays
-        replicated across the op boundary. Only the cache is split.
-
-        Two exported ops with `cp_indexer_merge`'s all-gather between them: the
-        sharded local candidates through the PCP wrapper, the replicated merge
-        through the stock one.
-
-        `compression_ratio` is 1 here, as in `_build_streamidx_op`: this
-        indexer's K cache holds one row per token, so `interleave_size` is
-        already in the compressed space the top-k indices live in.
-        """
+        """The DCP twin of `_build_streamidx_op`: two exported ops, sharded
+        local candidates then a replicated merge, all-gather in between."""
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
         dcp_rank = get_dcp_rank()
@@ -315,8 +283,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
-            # the cache's 128-lane width itself.
+            # The scatter pads the fp8+scale rows to 128 lanes itself.
             cache_kv = _cp_scatter_indexer_k(
                 cache_kv,
                 k_packed,
@@ -463,11 +430,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         if self.topk_op_dcp is not None:
-            # DCP replicates the queries, so the token
-            # inputs are already the whole batch in request-major order. What
-            # comes back is not global positions but this rank's own local
-            # cache indices, left-packed and `-1` padded -- the attention side
-            # consumes them directly and merges across ranks by log-sum-exp.
+            # Returns this rank's own local cache indices, not global ones.
             topk_indices = self.topk_op_dcp(
                 q_values.view(torch.uint8),
                 weights,
