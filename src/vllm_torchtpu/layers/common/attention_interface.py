@@ -908,7 +908,7 @@ def sparse_mla_attention_dcp(
       kv_c_normed, k_pe: this step's latents, replicated and identical on every
         rank; the write mask, not the data, is what differs per rank.
       kv_cache_nope, kv_cache_rope: this rank's position shards.
-      local_topk_indices: `streamindex_topk_dcp` output -- this rank's slice of
+      local_topk_indices: DCP indexer output -- this rank's slice of
         every token's global top-k, already in *rank-local* cache coordinates,
         `-1` padded, sharded over `dcp_axis_name` with a global leading
         dimension of `dcp_size * num_tokens`.
@@ -1005,7 +1005,7 @@ def sparse_mla_attention_dcp(
 
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         # Virtual page ordinal -> physical block in this rank's own shard, the
-        # same resolution the scatter above and `streamindex_topk_dcp` use.
+        # same resolution the scatter above and the DCP indexer use.
         local_block_tables = jnp.mod(block_tables_,
                                      jnp.int32(nope_spec.num_pages))
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(

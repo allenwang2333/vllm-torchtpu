@@ -41,9 +41,10 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import get_dcp_rank, get_or_create_dcp_mesh
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
+    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
@@ -51,6 +52,8 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.layers.vllm.cp_indexer_merge import (all_gather_candidates,
+                                                        select_owned_winners)
 from vllm_torchtpu.layers.vllm.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -102,7 +105,7 @@ def _cp_scatter_indexer_k(
                 f"interleave_size={interleave_size} must divide the indexer "
                 f"K cache page_size={page_size}. Otherwise an interleave "
                 "chunk straddles a page boundary and the local index "
-                "`streamindex_topk_dcp` derives from a global position stops "
+                "the indexer derives from a global position stops "
                 "agreeing with the (page, slot) written here.")
         k_packed = jnp.pad(k_packed,
                            ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
@@ -120,7 +123,7 @@ def _cp_scatter_indexer_k(
         slot = (offset // cycle) * interleave + (offset % interleave)
 
         # Virtual ordinal -> physical block in this rank's own shard, exactly
-        # as `streamindex_topk_dcp` resolves it on the read side.
+        # as `_local_candidates` resolves it on the read side.
         local_page_indices = jnp.mod(page_indices,
                                      jnp.int32(cache_kv.shape[0])).reshape(
                                          seq_lens.shape[0], -1)
@@ -259,11 +262,49 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         replicated, so there is no rank-major token packing to undo. Every
         token-major input arrives already in request-major order and stays
         replicated across the op boundary. Only the cache is split.
+
+        Two exported ops with `cp_indexer_merge`'s all-gather between them: the
+        sharded local candidates through the PCP wrapper, the replicated merge
+        through the stock one.
+
+        `compression_ratio` is 1 here, as in `_build_streamidx_op`: this
+        indexer's K cache holds one row per token, so `interleave_size` is
+        already in the compressed space the top-k indices live in.
         """
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
+        dcp_rank = get_dcp_rank()
+        compression_ratio = 1
+        interleave_c = interleave_size // compression_ratio
+        replicated = jax.sharding.PartitionSpec()
+        sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
 
-        def _streamidx_topk_dcp_jax(
+        def _local_candidates(q, weights, cache_kv, seq_lens, page_indices,
+                              cu_q_lens, distribution):
+            """This rank's `[num_tokens, topk]` candidate positions (`-1`
+            padded) and their scores (`-inf` padded)."""
+            local_page_indices = jnp.mod(page_indices,
+                                         jnp.int32(cache_kv.shape[0]))
+            return streamindex_topk(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                local_page_indices,
+                cu_q_lens,
+                distribution,
+                k=topk,
+                compression_ratio=compression_ratio,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 128, 128),
+                enable_early_exit=False,
+                cp_size=dcp_size,
+                cp_rank=cp_rank_as_data(DCP_AXIS_NAME, dcp_size),
+                interleave_size=interleave_size,
+                return_scores=True,
+            )
+
+        def _streamidx_topk_dcp_local_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
             weights: jax.Array,  # replicated
             cache_kv: jax.Array,  # this rank's position shard
@@ -272,7 +313,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices: jax.Array,  # virtual page ordinals
             cu_q_lens: jax.Array,
             distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
             # the cache's 128-lane width itself.
             cache_kv = _cp_scatter_indexer_k(
@@ -288,35 +329,39 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            local_topk = streamindex_topk_dcp(
-                q,
-                weights,
-                cache_kv,
-                seq_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
+            idxs, scores = jax.shard_map(
+                _local_candidates,
                 mesh=mesh,
-                k=topk,
-                compression_ratio=1,
-                dcp_size=dcp_size,
-                interleave_size=interleave_size,
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
-            )
-            return cache_kv, local_topk
+                in_specs=(replicated, replicated, sharded, replicated,
+                          replicated, replicated, replicated),
+                out_specs=(sharded, sharded),
+                check_vma=False,
+            )(q, weights, cache_kv, seq_lens, page_indices, cu_q_lens,
+              distribution)
+            return cache_kv, idxs, scores
 
-        replicated = jax.sharding.PartitionSpec()
-        sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
-        op_name = ("pallas::streamidx_topk_dcp_"
-                   f"{self.k_cache.prefix.replace('.', '_')}")
-        # Reuses the PCP export wrapper verbatim: nothing in it is PCP-specific
-        # once the mesh and the specs are arguments, and the reason it exists --
-        # `jax_placeholders` specializing the dynamic token dim while scaling
-        # sharded dims to global size -- applies identically here.
-        jax_op = pcp_streaming_jax_op(
-            op_name,
-            _streamidx_topk_dcp_jax,
+        def _streamidx_topk_dcp_merge_jax(scores: jax.Array) -> jax.Array:
+
+            def _merge(scores):
+                return sparsecore_topk(
+                    scores,
+                    topk,
+                    row_lengths=jnp.full((scores.shape[0], ),
+                                         scores.shape[1],
+                                         dtype=jnp.int32),
+                    write_empty_rows=True,
+                )
+
+            return jax.shard_map(_merge,
+                                 mesh=mesh,
+                                 in_specs=(replicated, ),
+                                 out_specs=replicated,
+                                 check_vma=False)(scores)
+
+        prefix = self.k_cache.prefix.replace('.', '_')
+        local_op = pcp_streaming_jax_op(
+            f"pallas::streamidx_topk_dcp_local_{prefix}",
+            _streamidx_topk_dcp_local_jax,
             donate_argnums=(2, ),
             mesh=mesh,
             input_partition_specs=(
@@ -331,28 +376,49 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             ),
             output_partition_specs=(
                 sharded,  # new cache_kv
-                sharded,  # local_topk: [num_tokens, topk] per rank
+                sharded,  # idxs: [num_tokens, topk] per rank
+                sharded,  # scores: [num_tokens, topk] per rank
             ),
+        )
+
+        merge_op = pallas.jax_op(
+            f"pallas::streamidx_topk_dcp_merge_{prefix}",
+            _streamidx_topk_dcp_merge_jax,
+            mesh=mesh,
+            input_partition_specs=(replicated, ),
         )
 
         # We must overwrite the default fake implementation as vLLM uses
         # dynamic dimensions for the query.
-        def _fake_streamidx_topk_dcp(q_bytes, weights, cache_kv, k_packed,
-                                     seq_lens, page_indices, cu_q_lens,
-                                     distribution, **kwargs):
+        def _fake_streamidx_topk_dcp_local(q_bytes, weights, cache_kv,
+                                           k_packed, seq_lens, page_indices,
+                                           cu_q_lens, distribution, **kwargs):
             del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
                  distribution, kwargs)
+            num_tokens = q_bytes.shape[0]
             return (
                 torch.empty_like(cache_kv),
-                q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.int32),
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.float32),
             )
 
-        jax_op.register_fake(_fake_streamidx_topk_dcp)
+        def _fake_streamidx_topk_dcp_merge(scores, **kwargs):
+            del kwargs
+            return scores.new_empty((scores.shape[0], topk), dtype=torch.int32)
+
+        local_op.register_fake(_fake_streamidx_topk_dcp_local)
+        merge_op.register_fake(_fake_streamidx_topk_dcp_merge)
 
         def op(*args):
-            new_cache, local_topk = jax_op(*args)
+            new_cache, idxs, scores = local_op(*args)
             args[2].copy_(new_cache)
-            return local_topk
+            slots = merge_op(all_gather_candidates(scores))
+            return select_owned_winners(slots,
+                                        idxs,
+                                        k=topk,
+                                        dcp_size=dcp_size,
+                                        dcp_rank=dcp_rank,
+                                        interleave_c=interleave_c)
 
         return op
 

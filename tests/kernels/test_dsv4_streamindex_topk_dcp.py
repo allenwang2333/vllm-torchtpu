@@ -13,165 +13,30 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K.
 
-The DCP variant differs from PCP in what it delivers, not in how it selects:
-queries are replicated and the KV is sharded, so each rank must come away with
-the slice of *every* token's global top-k that it happens to own. These tests
-pin the two properties that makes usable -- the reassembled result is exactly
-the unsharded global top-k, and each rank is handed only positions it holds.
+DCP replicates the queries and shards the KV, so each rank's `streamindex_topk`
+returns a *local* top-k: correct only after the caller merges the returned
+scores across ranks. These tests run that merge end to end against the
+unsharded kernel.
 """
-
-import functools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, _select_owned_winners, cp_global_to_local,
-    cp_local_to_global, cp_owner_rank, streamindex_topk, streamindex_topk_dcp)
+    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk)
 
 P = jax.sharding.PartitionSpec
 
-# ===================================================================== #
-# Coordinate algebra. `cp_local_to_global` is already covered by the PCP
-# tests; what is new here is the *inverse*, which DCP needs in order to
-# hand a rank a position in that rank's own coordinate space while
-# running on some other rank.
-# ===================================================================== #
-
-_LAYOUTS = [(d, ic) for d in (2, 4, 8, 16) for ic in (1, 2, 4, 8, 64)]
-
-
-@pytest.mark.parametrize("dcp_size,interleave_c", _LAYOUTS)
-def test_global_to_local_inverts_local_to_global(dcp_size, interleave_c):
-    """Round-trip on every rank, over several interleave cycles."""
-    for rank in range(dcp_size):
-        for local in range(3 * interleave_c * dcp_size):
-            g = int(cp_local_to_global(local, rank, dcp_size, interleave_c))
-            assert int(cp_owner_rank(jnp.int32(g), dcp_size,
-                                     interleave_c)) == rank
-            assert int(cp_global_to_local(jnp.int32(g), dcp_size,
-                                          interleave_c)) == local
-
-
-@pytest.mark.parametrize("dcp_size,interleave_c", _LAYOUTS)
-def test_global_to_local_needs_no_rank_argument(dcp_size, interleave_c):
-    """The whole point: the inverse is rank-free, so any rank can compute it.
-
-    Evaluated blind on a contiguous global range, `(owner, local)` must still
-    be a bijection onto the shards -- that is what lets the merge rank address
-    a winner into its owner's cache without being that owner.
-    """
-    n = 5 * dcp_size * interleave_c + 3
-    gs = jnp.arange(n, dtype=jnp.int32)
-    owners = np.asarray(cp_owner_rank(gs, dcp_size, interleave_c))
-    locals_ = np.asarray(cp_global_to_local(gs, dcp_size, interleave_c))
-    assert len(set(zip(owners.tolist(), locals_.tolist()))) == n
-    for g in range(n):
-        assert int(
-            cp_local_to_global(int(locals_[g]), int(owners[g]), dcp_size,
-                               interleave_c)) == g
-
+# The coordinate algebra this rests on -- `cp_local_to_global` and the torch
+# inverse the return leg applies -- is covered on CPU in
+# `tests/distributed/test_dcp_wiring.py`.
 
 # ===================================================================== #
-# The owner filter, on its own. Every rank runs this over the same
-# all-gathered list with a different rank id, so the `dcp_size` results
-# have to be a partition of that list -- nothing kept twice, nothing lost,
-# and no width at which it starts dropping winners.
+# Argument validation on the CP path of `streamindex_topk`.
 # ===================================================================== #
-
-
-def _filter_all_ranks(merged, dcp_size, interleave_c):
-    """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
-    return np.stack([
-        np.asarray(
-            _select_owned_winners(jnp.asarray(merged), dcp_size, interleave_c,
-                                  jnp.int32(r))) for r in range(dcp_size)
-    ])
-
-
-@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4),
-                                                   (8, 64)])
-def test_owner_filters_partition_the_list(dcp_size, interleave_c):
-    """Unioning what each rank keeps recovers the input set exactly."""
-    rng = np.random.default_rng(20260906)
-    num_rows, k, span = 16, 128, 4096
-    merged = np.stack([
-        rng.choice(span, size=k, replace=False).astype(np.int32)
-        for _ in range(num_rows)
-    ])
-    # A ragged tail, to exercise the `-1` padding of the input as well.
-    merged[0, -5:] = -1
-
-    lists = _filter_all_ranks(merged, dcp_size, interleave_c)
-    assert lists.shape == (dcp_size, num_rows, k)
-
-    for t in range(num_rows):
-        want = set(merged[t][merged[t] >= 0].tolist())
-        got = []
-        for r in range(dcp_size):
-            row = lists[r, t]
-            for local in row[row >= 0].tolist():
-                g = int(cp_local_to_global(local, r, dcp_size, interleave_c))
-                # A rank must only ever keep positions it actually owns.
-                assert (g // interleave_c) % dcp_size == r
-                got.append(g)
-        # Multiplicity, not just set equality: the LSE merge double-counts a
-        # position delivered to two ranks.
-        assert len(got) == len(set(got))
-        assert set(got) == want
-
-
-def test_a_rank_owning_every_winner_loses_nothing():
-    """The property the capacity-bounded all-to-all could not offer.
-
-    Ownership is data-dependent -- winners correlated with
-    `position mod (interleave_size * dcp_size)` can all land on one rank -- so
-    any per-rank width below `k` is a bet. `k` is not a bet: a rank owning the
-    whole list still fits it.
-    """
-    dcp_size, interleave_c, k = 4, 1, 16
-    # interleave_c=1: every multiple of dcp_size is owned by rank 0.
-    merged = jnp.arange(0, k * dcp_size, dcp_size, dtype=jnp.int32)[None, :]
-    lists = _filter_all_ranks(np.asarray(merged), dcp_size, interleave_c)
-    assert (lists[0, 0] >= 0).sum() == k
-    assert sorted(lists[0, 0].tolist()) == list(range(k))
-    for r in (1, 2, 3):
-        assert (lists[r, 0] == -1).all()
-
-
-def test_unowned_rank_gets_an_all_minus_one_row():
-    """A rank owning none of a token's winners gets an all -1 row.
-
-    The attention side keys its LSE mask off exactly this, so it has to be
-    distinguishable from "owns position 0".
-    """
-    # interleave_c=1, dcp_size=4: these are all owned by rank 1.
-    merged = jnp.asarray([[1, 5, 9, 13]], jnp.int32)
-    lists = _filter_all_ranks(np.asarray(merged), 4, 1)
-    assert (lists[1, 0] >= 0).sum() == 4
-    for r in (0, 2, 3):
-        assert (lists[r, 0] == -1).all()
-
-
-# ===================================================================== #
-# Argument validation.
-# ===================================================================== #
-
-
-def _mesh(size):
-    return jax.sharding.Mesh(np.array(jax.devices()[:size]), (DCP_AXIS_NAME, ))
-
-
-def _dcp_kwargs(**over):
-    kw = dict(mesh=None,
-              k=16,
-              compression_ratio=1,
-              dcp_size=2,
-              interleave_size=1)
-    kw.update(over)
-    return kw
 
 
 def _dummy_args(num_tokens=8,
@@ -191,20 +56,35 @@ def _dummy_args(num_tokens=8,
     )
 
 
-def test_dcp_size_one_is_rejected():
-    mesh = _mesh(1)
-    with pytest.raises(ValueError, match="requires dcp_size > 1"):
-        streamindex_topk_dcp(*_dummy_args(),
-                             **_dcp_kwargs(mesh=mesh, dcp_size=1))
+def _topk_kwargs(**over):
+    kw = dict(k=16,
+              compression_ratio=1,
+              num_kv_pages_per_block=2,
+              num_queries_per_block=8,
+              cp_size=2,
+              interleave_size=1)
+    kw.update(over)
+    return kw
 
 
-@pytest.mark.multichip
-def test_token_count_must_divide_over_the_dcp_axis():
-    if len(jax.devices()) < 4:
-        pytest.skip("needs 4 devices")
-    with pytest.raises(ValueError, match="divisible by"):
-        streamindex_topk_dcp(*_dummy_args(num_tokens=6),
-                             **_dcp_kwargs(mesh=_mesh(4), dcp_size=4))
+def test_cp_size_must_be_positive():
+    with pytest.raises(ValueError, match="cp_size must be >= 1"):
+        streamindex_topk(*_dummy_args(), **_topk_kwargs(cp_size=0))
+
+
+def test_interleave_size_must_cover_whole_compressed_rows():
+    """Otherwise a CP chunk boundary falls inside a compressed row."""
+    with pytest.raises(ValueError, match="must be a multiple of"):
+        streamindex_topk(
+            *_dummy_args(),
+            **_topk_kwargs(compression_ratio=4, interleave_size=2))
+
+
+def test_early_exit_is_rejected_under_cp():
+    """Its identity indices are global positions, not this rank's subset."""
+    with pytest.raises(NotImplementedError, match="enable_early_exit"):
+        streamindex_topk(*_dummy_args(),
+                         **_topk_kwargs(enable_early_exit=True))
 
 
 # ===================================================================== #
@@ -227,10 +107,65 @@ def _global_records(kv_len, seed=7):
     return jnp.pad(rec, ((0, 0), (0, WIDTH - rec.shape[-1])))
 
 
+def _merged_global_topk(q, weights, shards, seq_lens, page_indices, cu_q_lens,
+                        distribution, *, mesh, dcp_size):
+    """The DCP pipeline of `_build_streamidx_dcp_op`, in pure JAX.
+
+    Local candidates per rank, all-gathered, re-ranked by `sparsecore_topk`,
+    and read back out as global positions.
+    """
+
+    def _rank(q, weights, cache_kv, seq_lens, page_indices, cu_q_lens,
+              distribution):
+        idxs, scores = streamindex_topk(
+            q,
+            weights,
+            cache_kv,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            k=K,
+            compression_ratio=1,
+            num_kv_pages_per_block=2,
+            num_queries_per_block=128,
+            cp_size=dcp_size,
+            cp_rank=cp_rank_as_data(DCP_AXIS_NAME, dcp_size),
+            interleave_size=1,
+            return_scores=True,
+        )
+        all_idxs = jax.lax.all_gather(idxs, DCP_AXIS_NAME, axis=1, tiled=True)
+        all_scores = jax.lax.all_gather(scores,
+                                        DCP_AXIS_NAME,
+                                        axis=1,
+                                        tiled=True)
+        slots = sparsecore_topk(all_scores,
+                                K,
+                                row_lengths=jnp.full((all_scores.shape[0], ),
+                                                     all_scores.shape[1],
+                                                     jnp.int32),
+                                write_empty_rows=True)
+        picked = jnp.take_along_axis(all_idxs,
+                                     jnp.clip(slots, 0).astype(jnp.int32),
+                                     axis=1)
+        return jnp.where(slots >= 0, picked, jnp.int32(-1))
+
+    replicated = P()
+    return jax.jit(
+        jax.shard_map(_rank,
+                      mesh=mesh,
+                      in_specs=(replicated, replicated, P(DCP_AXIS_NAME),
+                                replicated, replicated, replicated,
+                                replicated),
+                      out_specs=replicated,
+                      check_vma=False))(q, weights, shards, seq_lens,
+                                        page_indices, cu_q_lens, distribution)
+
+
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
-    """Union the per-rank lists back together; it must be the global top-k.
+def test_dcp_merge_reproduces_the_unsharded_global_topk(dcp_size):
+    """The merged list must be the unsharded global top-k, exactly.
 
     Exactness is the requirement, not an approximation target: DCP partitions
     the KV, so a global winner is beaten by at most `k - 1` positions overall
@@ -276,46 +211,41 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
     shards = jax.device_put(shards,
                             jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
 
-    local_topk = jax.jit(
-        functools.partial(
-            streamindex_topk_dcp,
-            mesh=mesh,
-            k=K,
-            compression_ratio=1,
-            dcp_size=dcp_size,
-            interleave_size=1,
-            num_kv_pages_per_block=2,
-            num_queries_per_block=128))(q, weights, shards, seq_lens,
-                                        jnp.arange(vpages, dtype=jnp.int32),
-                                        cu_q_lens, distribution)
-
-    # Global leading dim is dcp_size * Q_LEN, rank-major.
-    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
-    assert local_topk.max() < KV_LEN // dcp_size, "a rank got a foreign index"
+    merged = np.asarray(
+        _merged_global_topk(q,
+                            weights,
+                            shards,
+                            seq_lens,
+                            jnp.arange(vpages, dtype=jnp.int32),
+                            cu_q_lens,
+                            distribution,
+                            mesh=mesh,
+                            dcp_size=dcp_size))
+    assert merged.shape == (Q_LEN, K)
 
     for t in range(Q_LEN):
-        got = set()
-        for r in range(dcp_size):
-            row = local_topk[r, t]
-            for local in row[row >= 0].tolist():
-                got.add(int(cp_local_to_global(local, r, dcp_size, 1)))
+        got = merged[t][merged[t] >= 0].tolist()
+        # Multiplicity, not just set equality: the LSE merge double-counts a
+        # position delivered twice.
+        assert len(got) == len(set(got)), f"token {t} has duplicates"
         want = set(reference[t][reference[t] >= 0].tolist())
-        assert got == want, (f"token {t}: {len(want - got)} missing, "
-                             f"{len(got - want)} spurious")
+        assert set(got) == want, (
+            f"token {t}: {len(want - set(got))} missing, "
+            f"{len(set(got) - want)} spurious")
 
 
 @pytest.mark.multichip
-def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
-    """Each winner lands on exactly one rank -- else the LSE merge double-counts.
+def test_local_candidates_stay_inside_their_own_shard(dcp_size=4):
+    """Each rank's pre-merge candidates are global positions it owns.
 
-    Set equality above would still pass if a position were delivered twice, so
-    this checks the multiplicity the attention merge actually depends on.
+    The torch ownership filter reads `slots // k` rather than the gathered
+    index, so this precondition is what keeps that shortcut sound.
     """
     devices = jax.devices()
     if len(devices) < dcp_size:
         pytest.skip(f"needs {dcp_size} devices, have {len(devices)}")
 
-    rec = _global_records(KV_LEN)
+    rec = _global_records(KV_LEN, seed=3)
     kq, kw = jax.random.split(jax.random.key(3))
     q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) *
          0.5).astype(jnp.float8_e4m3fn)
@@ -331,29 +261,35 @@ def test_dcp_ranks_partition_the_winners_without_duplication(dcp_size=4):
     shards = jax.device_put(shards,
                             jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
 
-    local_topk = jax.jit(
-        functools.partial(
-            streamindex_topk_dcp,
-            mesh=mesh,
+    def _rank(*args):
+        return streamindex_topk(
+            *args,
             k=K,
             compression_ratio=1,
-            dcp_size=dcp_size,
-            interleave_size=1,
             num_kv_pages_per_block=2,
-            num_queries_per_block=128))(q, weights, shards,
+            num_queries_per_block=128,
+            cp_size=dcp_size,
+            cp_rank=cp_rank_as_data(DCP_AXIS_NAME, dcp_size),
+            interleave_size=1,
+        )
+
+    replicated = P()
+    local = jax.jit(
+        jax.shard_map(_rank,
+                      mesh=mesh,
+                      in_specs=(replicated, replicated, P(DCP_AXIS_NAME),
+                                replicated, replicated, replicated,
+                                replicated),
+                      out_specs=P(DCP_AXIS_NAME),
+                      check_vma=False))(q, weights, shards,
                                         jnp.array([KV_LEN], jnp.int32),
                                         jnp.arange(vpages, dtype=jnp.int32),
                                         jnp.array([0, Q_LEN], jnp.int32),
                                         jnp.array([0, 0, 1], jnp.int32))
-    local_topk = np.asarray(local_topk).reshape(dcp_size, Q_LEN, K)
+    local = np.asarray(local).reshape(dcp_size, Q_LEN, K)
 
-    for t in range(Q_LEN):
-        globals_ = [
-            int(cp_local_to_global(local, r, dcp_size, 1))
-            for r in range(dcp_size)
-            for local in local_topk[r, t][local_topk[r, t] >= 0].tolist()
-        ]
-        assert len(globals_) == len(set(globals_)), f"token {t} has duplicates"
-        # Every row is full here: the query tokens are the last Q_LEN of a
-        # KV_LEN context, so even the earliest sees far more than K positions.
-        assert len(globals_) == K
+    for r in range(dcp_size):
+        held = local[r][local[r] >= 0]
+        assert held.size == Q_LEN * K, f"rank {r} returned a short row"
+        owners = held % dcp_size
+        assert np.all(owners == r), f"rank {r} claimed a foreign index"

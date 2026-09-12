@@ -34,8 +34,7 @@ import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, _select_owned_winners, cp_global_to_local)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
@@ -641,7 +640,7 @@ class SparseMlaLseTest(parameterized.TestCase):
 # =====================================================================
 # DCP: attention over a position-sharded latent cache.
 #
-# Step 3 (`streamindex_topk_dcp`) proves the *selection* survives sharding
+# The DCP indexer proves the *selection* survives sharding
 # the KV positions. This proves the *attention* does: each rank attends
 # only over the winners it holds, and the LSE merge puts the pieces back
 # together into the same answer the unsharded path gives.
@@ -649,6 +648,20 @@ class SparseMlaLseTest(parameterized.TestCase):
 
 DCP_SEQ = 256  # positions in the (single) sequence
 DCP_ATTN_TOPK = 64
+
+
+def _owned_local_topk(merged, dcp_size, interleave_c, rank):
+    """The slice of a global top-k list `rank` owns, as local indices,
+    left-packed and `-1` padded back out to the input width."""
+    merged = np.asarray(merged)
+    cycle = dcp_size * interleave_c
+    mine = (merged >= 0) & ((merged // interleave_c) % dcp_size == rank)
+    local = (merged // cycle) * interleave_c + merged % interleave_c
+    order = np.argsort(~mine, axis=1, kind="stable")
+    return jnp.asarray(
+        np.where(np.take_along_axis(mine, order, axis=1),
+                 np.take_along_axis(local, order, axis=1),
+                 -1).astype(np.int32))
 
 
 def _dcp_caches(dcp_size):
@@ -778,7 +791,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
         # expects.
         merged_topk = jnp.asarray(inp["topk"], jnp.int32)
         local_topk = jnp.stack([
-            _select_owned_winners(merged_topk, dcp_size, interleave_size, r)
+            _owned_local_topk(merged_topk, dcp_size, interleave_size, r)
             for r in range(dcp_size)
         ]).reshape(dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
 
@@ -868,7 +881,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
 
         merged_topk = jnp.asarray(inp["topk"], jnp.int32)
         local_topk = jnp.stack([
-            _select_owned_winners(merged_topk, dcp_size, interleave_size, r)
+            _owned_local_topk(merged_topk, dcp_size, interleave_size, r)
             for r in range(dcp_size)
         ]).reshape(dcp_size * DCP_SEQ, DCP_ATTN_TOPK)
 
@@ -900,12 +913,12 @@ class SparseMlaDcpTest(parameterized.TestCase):
 
         # `block_tables` is the identity here, so the expected slots follow
         # straight from the layout: rank r holds global position p iff
-        # `(p // c) % D == r`, at local index `cp_global_to_local(p)`.
+        # `(p // c) % D == r`, at local index `(p // (D * c)) * c + p % c`.
         expected = np.zeros_like(written)
+        cycle = dcp_size * interleave_size
         for pos in range(DCP_SEQ):
             r = (pos // interleave_size) % dcp_size
-            local = int(
-                cp_global_to_local(jnp.int32(pos), dcp_size, interleave_size))
+            local = (pos // cycle) * interleave_size + pos % interleave_size
             expected[r, local // NOPE_SPEC.page_size,
                      local % NOPE_SPEC.page_size] = True
         np.testing.assert_array_equal(written.sum((1, 2)),

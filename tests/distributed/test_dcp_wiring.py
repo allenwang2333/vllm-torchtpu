@@ -13,9 +13,11 @@ and the KV write have to agree on.
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    cp_global_to_local, cp_owner_rank)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
+    cp_local_to_global
+from vllm_torchtpu.layers.vllm.cp_indexer_merge import cp_global_to_local
 
 # This is index arithmetic, so it needs no accelerator -- and it must not take
 # one. These are eager `jnp` calls, so on a TPU agent they initialize the
@@ -31,10 +33,28 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 pytestmark = pytest.mark.cpu_test
 
 # The indexer's return leg is an all-gather plus a per-rank owner filter, which
-# is only exact because `cp_owner_rank` is a *partition*: total, single-valued,
-# and onto every rank. These pin that, because it is what replaced the
+# is only exact because ownership is a *partition*: total, single-valued, and
+# onto every rank. These pin that, because it is what replaced the
 # capacity-sized all-to-all -- an all-to-all had to bet a static per-rank width
 # and silently shed winners when the bet lost.
+#
+# `cp_local_to_global` is the only side of the map the kernel spells out, so
+# ownership is read off it: rank `r` owns exactly the positions in its image.
+
+
+def _owned_below(n, dcp_size, interleave_c):
+    """Each rank's owned global positions below `n`, in local-index order.
+
+    The map is monotonic, so the r-th list is what rank `r` sees at local
+    indices `0, 1, 2, ...`.
+    """
+    locals_ = jnp.arange(n, dtype=jnp.int32)
+    images = []
+    for rank in range(dcp_size):
+        g = np.asarray(
+            cp_local_to_global(locals_, rank, dcp_size, interleave_c))
+        images.append(g[g < n])
+    return images
 
 
 @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
@@ -42,10 +62,10 @@ pytestmark = pytest.mark.cpu_test
 def test_ownership_is_a_partition_of_the_positions(dcp_size, interleave_c):
     """Every position has exactly one owner, and every rank is an owner."""
     n = 5 * dcp_size * interleave_c + 3
-    owners = np.asarray(
-        cp_owner_rank(jnp.arange(n, dtype=jnp.int32), dcp_size, interleave_c))
-    assert owners.min() >= 0 and owners.max() < dcp_size
-    assert set(owners.tolist()) == set(range(dcp_size))
+    images = _owned_below(n, dcp_size, interleave_c)
+    assert all(len(img) for img in images)
+    np.testing.assert_array_equal(np.sort(np.concatenate(images)),
+                                  np.arange(n))
 
 
 @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
@@ -58,11 +78,9 @@ def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
     where the winners cluster inside the cycle.
     """
     cycle = dcp_size * interleave_c
-    owners = np.asarray(
-        cp_owner_rank(jnp.arange(3 * cycle, dtype=jnp.int32), dcp_size,
-                      interleave_c))
-    counts = np.bincount(owners, minlength=dcp_size)
-    assert (counts == 3 * interleave_c).all()
+    images = _owned_below(3 * cycle, dcp_size, interleave_c)
+    counts = [len(img) for img in images]
+    assert counts == [3 * interleave_c] * dcp_size
 
 
 @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
@@ -70,7 +88,23 @@ def test_owner_counts_are_balanced_over_a_whole_cycle(dcp_size, interleave_c):
 def test_local_indices_stay_inside_the_shard(dcp_size, interleave_c):
     """A rank is only ever handed an index into its own cache shard."""
     n = 5 * dcp_size * interleave_c
-    gs = jnp.arange(n, dtype=jnp.int32)
-    locals_ = np.asarray(cp_global_to_local(gs, dcp_size, interleave_c))
+    gs = torch.arange(n, dtype=torch.int32)
+    locals_ = cp_global_to_local(gs, dcp_size, interleave_c).numpy()
     assert locals_.min() >= 0
     assert locals_.max() < n // dcp_size
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+@pytest.mark.parametrize("interleave_c", [1, 4, 64])
+def test_global_to_local_inverts_the_kernel_map(dcp_size, interleave_c):
+    """The merge's rank-free inverse must undo the kernel's forward map.
+
+    They sit on opposite sides of the op boundary -- one in JAX inside the
+    kernel, one in torch on the return leg -- so nothing but this makes them
+    agree, and the inverse never learns which rank it is inverting for.
+    """
+    n = 5 * dcp_size * interleave_c
+    for img in _owned_below(n, dcp_size, interleave_c):
+        back = cp_global_to_local(torch.from_numpy(img), dcp_size,
+                                  interleave_c).numpy()
+        np.testing.assert_array_equal(back, np.arange(len(img)))
