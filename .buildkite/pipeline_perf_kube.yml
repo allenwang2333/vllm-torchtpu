@@ -28,10 +28,12 @@
 #
 # Three things move that are not just a change of agent:
 #
-#   Model staging runs inside the pod. On bare metal stage_model_snapshot.sh
-#   fills a directory on the VM's data disk before the container starts; here
-#   the cache is a gcsfuse mount that only exists inside the pod, so the copy
-#   is part of the same command and its second argument names that mount.
+#   Checkpoints are not staged from GCS. On bare metal stage_model_snapshot.sh
+#   copies one into a directory on the VM's data disk, because that disk is the
+#   agent's alone and starts empty. Here the HF cache is a mount of the fleet's
+#   model bucket, shared by every step on every worker and retained for months,
+#   so a config's repository id is enough: the first step to want a checkpoint
+#   fetches it from Hugging Face and every later one reads the bucket.
 #
 #   Results are not collected by artifact_paths. Nothing outside the pod can
 #   see /perf_eval_results, so run.sh has the pod upload its own results, under
@@ -99,21 +101,14 @@ steps:
         plugins:
           - *kube_plugin
         commands:
-          # Staging and benchmark as one in-pod command, because the cache it
-          # stages into is a mount of the fleet's model bucket that exists only
-          # inside the pod. The copy is a no-op once the fleet has the model.
           - |
-            .buildkite/kubernetes/run.sh $$SHAPE bash -c '
-              set -e
-              bash .buildkite/scripts/stage_model_snapshot.sh \
-                gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ /cache/hf/hub
-              exec bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
-                qwen3-coder-30b-fp8-tp8-ep \
-                qwen3-30b-a3b-nvfp4-tp8-ep \
-                qwen3.5-35b-fp8-tp4-ep \
-                deepseek-v2-tp8-ep \
-                gemma-4-31b-fp8-dp4-tp2-multimodal \
-                gemma-4-26b-fp8-dp4-tp2-multimodal'
+            .buildkite/kubernetes/run.sh $$SHAPE bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-coder-30b-fp8-tp8-ep \
+              qwen3-30b-a3b-nvfp4-tp8-ep \
+              qwen3.5-35b-fp8-tp4-ep \
+              deepseek-v2-tp8-ep \
+              gemma-4-31b-fp8-dp4-tp2-multimodal \
+              gemma-4-26b-fp8-dp4-tp2-multimodal
 
       - label: ":kubernetes: Perf/Eval: qwen3-0.6b-tp1"
         key: "perf_qwen3_0_6b_tp1"
@@ -141,14 +136,10 @@ steps:
           - *kube_plugin
         commands:
           - |
-            .buildkite/kubernetes/run.sh $$SHAPE bash -c '
-              set -e
-              bash .buildkite/scripts/stage_model_snapshot.sh \
-                gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/ /cache/hf/hub
-              exec bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
-                qwen3-coder-30b-tp8-ep \
-                qwen3.5-35b-fp8-dp8-ep \
-                qwen3.5-35b-fp8-dp4-tp2-ep'
+            .buildkite/kubernetes/run.sh $$SHAPE bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-coder-30b-tp8-ep \
+              qwen3.5-35b-fp8-dp8-ep \
+              qwen3.5-35b-fp8-dp4-tp2-ep
 
       - label: ":kubernetes: Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
         key: "perf_nightly_qwen3_coder_480b_fp8_tp8_ep"
@@ -250,12 +241,7 @@ steps:
         plugins:
           - *kube_plugin
         commands:
-          - |
-            .buildkite/kubernetes/run.sh $$SHAPE bash -c '
-              set -e
-              bash .buildkite/scripts/stage_model_snapshot.sh \
-                gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/ /cache/hf/hub
-              exec bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep'
+          - .buildkite/kubernetes/run.sh $$SHAPE bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep
 
       - label: ":kubernetes: Perf: Nightly deepseek-v4-flash xprof capture (TPU v7x-8)"
         key: "perf_nightly_deepseek_v4_flash_xprof"
@@ -278,8 +264,6 @@ steps:
             .buildkite/kubernetes/run.sh $$SHAPE bash -c '
               set -e
               results_dir=/perf_eval_results/deepseek-v4-flash-dp8-ep-profile
-              bash .buildkite/scripts/stage_model_snapshot.sh \
-                gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/ /cache/hf/hub
               bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep-profile --results-dir "$$results_dir"
               profile_dir=$$results_dir/profile
               for phase in "$$profile_dir"/*/; do
