@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_POOL_TAGS_PER_LAYER: bool = False
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
@@ -59,6 +60,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -347,6 +350,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    # Tag every raiden pool with its layer index so pools pair up by layer
+    # across a pipeline-parallel producer and its decode peer. Both peers
+    # must set it identically.
+    "TPU_RAIDEN_POOL_TAGS_PER_LAYER":
+    env_bool("TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
     "TPU_RAIDEN_GLM_ADMISSION":
     env_bool("TPU_RAIDEN_GLM_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
@@ -527,6 +535,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Pipeline parallelism: size prefill chunks by a per-step time budget
+    # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
+    "TPU_PP_DYNAMIC_CHUNKS":
+    env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
+    # Fraction above the time of a full prefix-free step that a step may
+    # take before its chunks are shortened.
+    "TPU_PP_CHUNK_SLACK":
+    lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
