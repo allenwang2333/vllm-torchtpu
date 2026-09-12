@@ -49,8 +49,7 @@ PAGES_PER_SEQ = 4
 TOTAL_PAGES = 16
 TOKEN_PAD = 16  # attention kernel batch size; token count must be a multiple
 
-# Layouts pinned explicitly rather than read from the environment: these
-# tests check the exact geometry dsa_gather is written against.
+# Pinned, not read from the environment: this is the geometry dsa_gather wants.
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
 NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
                                         KVCacheLayout.TENSORCORE, TOTAL_PAGES,
@@ -313,10 +312,7 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         topk_rows = np.full((q_len, topk), -1, np.int32)
         for pos in range(q_len):
             n_sel = min(pos + 1, 8)
-            # Always include self, and never repeat an index: the indexer
-            # emits distinct positions, and the two DSA kernels do not agree
-            # on repeats -- a gathered row is attended twice, a mask bit set
-            # twice is still one column.
+            # Include self, never repeat: the DSA kernels differ on repeats.
             others = self.rng.choice(pos, size=n_sel -
                                      1, replace=False) if pos else np.empty(
                                          0, np.int64)
@@ -365,8 +361,7 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             kv_c_deq.append(_dequantize(kv_c_rows[s], self.k_scale))
             k_pe_deq.append(_dequantize(k_pe_rows[s], self.k_scale))
 
-        # Step 2: one decode token per sequence, attending causally over the
-        # prefilled context plus itself.
+        # Step 2: one decode token per sequence, causal over context plus self.
         num_tokens = TOKEN_PAD
         kv_c_new, k_pe_new = self._random_latents(num_seqs)
         kv_c_fp8 = _quantize_fp8(kv_c_new, self.k_scale)
@@ -404,15 +399,11 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         self._check(output, expected, valid)
 
 
-# =====================================================================
 # DCP: log-sum-exp export and the cross-shard merge.
-# =====================================================================
 
 DCP_TOKENS = 64  # multiple of TOKEN_PAD, fits PAGES_PER_SEQ * PAGE_SIZE
 DCP_TOPK = 64
-# The DCP shard rule from streamindex_topk.cp_local_to_global: compressed
-# position `p` is owned by rank `(p // interleave_c) % dcp_size`. Anything
-# below `kv_cache_utils.WORD_BYTES` would split a rope tile across ranks.
+# Shard rule: rank `(p // interleave_c) % dcp_size` owns compressed position p.
 DCP_INTERLEAVE_C = 4
 
 
@@ -454,8 +445,7 @@ def _merge_partials(outs: np.ndarray, lses: np.ndarray,
     """
     lses = np.where(counts[:, :, None] > 0, lses, -np.inf)
     shift = lses.max(0, keepdims=True)
-    # A token no shard owns would give 0/0; it cannot occur for a real top-k
-    # list but the guard keeps the failure a zero rather than a NaN.
+    # An unowned token would give 0/0; the guard makes it a zero, not a NaN.
     all_empty = ~np.isfinite(shift)
     shift = np.where(all_empty, 0.0, shift)
     weights = np.exp(lses - shift[0])  # [D, T, N]
@@ -483,7 +473,7 @@ class SparseMlaLseTest(parameterized.TestCase):
             self.skipTest("sparse MLA kernel requires a TPU (SparseCore).")
 
     def _prefilled(self):
-        """One prefilled sequence: populated caches plus kernel-ready inputs."""
+        """One prefilled sequence: caches plus kernel-ready inputs."""
         kv_c = self.rng.standard_normal(
             (DCP_TOKENS, LKV_DIM)).astype(np.float32)
         k_pe = self.rng.standard_normal(
@@ -501,9 +491,7 @@ class SparseMlaLseTest(parameterized.TestCase):
             self.rng.permutation(TOTAL_PAGES)[:PAGES_PER_SEQ], dtype=jnp.int32)
         mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
 
-        # Run the layer once purely to insert this step's rows into the caches;
-        # every assertion below then drives the kernel directly, because
-        # `return_lse` is a kernel-level flag.
+        # One layer call to insert the rows; `return_lse` is kernel-level.
         nope_cache, rope_cache, _ = attention_interface.sparse_mla_attention(
             ql_nope,
             q_pe,
@@ -633,14 +621,7 @@ class SparseMlaLseTest(parameterized.TestCase):
         np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
 
 
-# =====================================================================
 # DCP: attention over a position-sharded latent cache.
-#
-# The DCP indexer proves the *selection* survives sharding
-# the KV positions. This proves the *attention* does: each rank attends
-# only over the winners it holds, and the LSE merge puts the pieces back
-# together into the same answer the unsharded path gives.
-# =====================================================================
 
 DCP_SEQ = 256  # positions in the (single) sequence
 DCP_ATTN_TOPK = 64
@@ -693,8 +674,7 @@ def _merge_dcp_lse_partials(outputs, lses):
     """
     lses = lses.astype(jnp.float32)
     shift = jnp.max(lses, axis=0, keepdims=True)
-    # A token with no contributor anywhere would give inf - inf; pin the shift
-    # to 0 there and let the all-zero denominator carry the result to zero.
+    # No contributor anywhere gives inf - inf; pin the shift to 0 there.
     all_empty = ~jnp.isfinite(shift)
     weights = jnp.exp(lses - jnp.where(all_empty, 0.0, shift))
     weights = jnp.where(jnp.isfinite(lses), weights, 0.0)
@@ -705,7 +685,7 @@ def _merge_dcp_lse_partials(outputs, lses):
 
 
 def _random_causal_topk(rng, num_tokens, topk):
-    """Token t attends to a random subset of [0, t], as a `-1`-padded prefix."""
+    """Token t attends to a random subset of [0, t], `-1`-padded."""
     rows = np.full((num_tokens, topk), -1, np.int32)
     for t in range(num_tokens):
         n = min(topk, t + 1)
@@ -824,9 +804,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
                                    rtol=2e-2,
                                    atol=2e-2)
 
-    # All four cases run on one device now: `dcp_size` is an argument to an
-    # unsharded op, not a device count, so none of them need the multichip
-    # agent any more.
+    # One device: `dcp_size` is an op argument now, not a device count.
     @parameterized.named_parameters(
         dict(testcase_name="d2_c4", dcp_size=2, interleave_size=4),
         dict(testcase_name="d2_c8", dcp_size=2, interleave_size=8),
@@ -854,15 +832,12 @@ class SparseMlaDcpTest(parameterized.TestCase):
         new_nope, _, _, _ = self._run_ranks(inp, dcp_size, interleave_size,
                                             block_tables)
 
-        # A written latent row is all-zero with probability ~0, so the
-        # nonzero (page, slot) pairs are exactly the written ones.
+        # A written row is all-zero with probability ~0, so nonzero == written.
         per_rank = np.asarray(new_nope).reshape(dcp_size, NOPE_SPEC.num_pages,
                                                 NOPE_SPEC.page_size, -1)
         written = (per_rank != 0).any(-1)
 
-        # `block_tables` is the identity here, so the expected slots follow
-        # straight from the layout: rank r holds global position p iff
-        # `(p // c) % D == r`, at local index `(p // (D * c)) * c + p % c`.
+        # Identity `block_tables`, so rank r holds p iff `(p // c) % D == r`.
         expected = np.zeros_like(written)
         cycle = dcp_size * interleave_size
         for pos in range(DCP_SEQ):
@@ -933,9 +908,7 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         self.assertEqual(self._tier([1024, 2048], [512, 512], [0, 0, 2]), 0)
 
     def test_multi_token_verification_is_kernel_supported(self):
-        # With no one-token decode prefix, a verification-shaped query is safe
-        # to select just like any other mixed launch. This removes the need for
-        # a speculative-decoding classification bit in attention metadata.
+        # Without a one-token decode prefix this selects like any mixed launch.
         self.assertEqual(self._tier([1024], [4], [0, 0, 1]), 0)
 
     def test_padded_entries_past_num_seqs_do_not_veto(self):
@@ -1022,9 +995,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         kv_c = rng.standard_normal((num_tokens, LKV_DIM)).astype(np.float32)
         k_pe = rng.standard_normal((num_tokens, ROPE_DIM)).astype(np.float32)
 
-        # Fully causal selection: with kv_len <= topk this is exactly what
-        # `streamindex_topk` emits, since it scores every non-causal or
-        # past-kv_len position -inf and takes an exact top-k.
+        # Fully causal: at kv_len <= topk this is `streamindex_topk` output.
         positions = []
         for s, q_len in enumerate(q_lens):
             base = kv_lens[s] - q_len
@@ -1102,8 +1073,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
                                    atol=2e-2)
 
     @parameterized.named_parameters(
-        # One over-limit sequence pushes the whole step to the gather kernel,
-        # short neighbour included -- the dispatch is per step.
+        # One over-limit sequence sends the whole step to the gather kernel.
         dict(testcase_name="one_long_sequence",
              q_lens=[40, 24],
              seq_lens=[40, 100],
