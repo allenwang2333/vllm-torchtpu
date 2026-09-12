@@ -97,12 +97,17 @@ x-tests-plugin-defaults: &tests_plugin_defaults
 # eight cores, four chips, one host. The queue name counts cores and the profile
 # registry counts chips, so the two numbers differ for the same hardware.
 #
-# Overridable because the two families are not equally available. The fleet has
-# eight v7x chips and rather more v6e, so a run that is exercising the kube path
-# rather than measuring v7x can be pointed at whichever family is idle - env
-# KUBE_SHAPE_1_CHIP=ct6e-standard-1t/1x1 KUBE_SHAPE_4_CHIP=ct6e-standard-8t/2x4
-# - and take hours off the wait without queueing behind the work that does need
-# v7x. Scheduled and PR runs set neither and stay on v7x.
+# Overridable because the two families are not equally available: the fleet has
+# eight v7x chips and rather more v6e, so pointing a run at whichever is idle -
+# env KUBE_SHAPE_1_CHIP=ct6e-standard-1t/1x1 KUBE_SHAPE_4_CHIP=ct6e-standard-8t/2x4
+# - takes hours off the wait. Scheduled and PR runs set neither and stay on v7x.
+#
+# Only worth doing to prove the plumbing reaches a chip at all. This suite is
+# not portable between the families: several hundred kernel tests gate on v7+
+# and call pytest.fail rather than skip when they find v6e, and the SparseCore
+# tests that do run there fail on the narrower geometry - eight SIMD lanes
+# against v7x's sixteen. On v6e the result is a red build whose redness says
+# nothing about the lane, so it cannot stand in for a real one.
 x-shape-1-chip: &shape_1_chip "${KUBE_SHAPE_1_CHIP:-tpu7x-standard-1t/1x1x1}"
 x-shape-4-chip: &shape_4_chip "${KUBE_SHAPE_4_CHIP:-tpu7x-standard-4t/2x2x1}"
 
