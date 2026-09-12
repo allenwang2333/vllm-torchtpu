@@ -20,8 +20,9 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     cp_local_to_global
-from vllm_torchtpu.layers.vllm.cp_indexer_merge import (check_positional_owner,
-                                                        select_owned_winners)
+from vllm_torchtpu.layers.vllm.cp_indexer_merge import (
+    check_positional_owner, select_owned_winners,
+    select_owned_winners_gathered)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -162,6 +163,79 @@ def _fake_gather(idxs, order):
             np.concatenate([idxs[o] for o in order], axis=1))
 
     return gather
+
+
+def _merged_in_order(idxs, slots, order):
+    """The global position each winning column carries, blocks in `order`."""
+    g = np.concatenate([idxs[o] for o in order], axis=1)
+    rows = np.arange(slots.shape[0])[:, None]
+    return np.where(slots >= 0, g[rows, np.maximum(slots, 0)], -1)
+
+
+def _run_gathered(slots, idxs, order, *, dcp_size, dcp_rank, interleave_c):
+    return select_owned_winners_gathered(torch.from_numpy(slots),
+                                         torch.from_numpy(idxs[dcp_rank]),
+                                         dcp_size=dcp_size,
+                                         dcp_rank=dcp_rank,
+                                         interleave_c=interleave_c,
+                                         gather=_fake_gather(idxs,
+                                                             order)).numpy()
+
+
+@pytest.mark.parametrize("dcp_size,interleave_c,k,num_rows", _LAYOUTS)
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_gathered_path_is_order_independent(dcp_size, interleave_c, k,
+                                            num_rows, shuffle):
+    """Ownership rides in the value, so any concat order gives the same answer."""
+    rng = np.random.default_rng(dcp_size * 23 + k)
+    idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.5)
+    slots = _slots(rng, dcp_size, k, num_rows, 0.5)
+    order = list(range(dcp_size))
+    if shuffle:
+        rng.shuffle(order)
+
+    merged = _merged_in_order(idxs, slots, order)
+    for r in range(dcp_size):
+        want = _reference(merged, dcp_size, interleave_c, r, k)
+        got = _run_gathered(slots,
+                            idxs,
+                            order,
+                            dcp_size=dcp_size,
+                            dcp_rank=r,
+                            interleave_c=interleave_c)
+        np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("dcp_size,interleave_c,k,num_rows", _LAYOUTS)
+def test_positional_path_breaks_where_the_gathered_one_holds(
+        dcp_size, interleave_c, k, num_rows):
+    """Why the second all-gather matters: only the value-carried owner survives
+    a gather that does not land in rank order."""
+    rng = np.random.default_rng(dcp_size * 29 + k)
+    idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.0)
+    slots = _slots(rng, dcp_size, k, num_rows, 0.0)
+    order = list(range(dcp_size))
+    order[0], order[1] = order[1], order[0]
+
+    merged = _merged_in_order(idxs, slots, order)
+    diverged = False
+    for r in range(dcp_size):
+        want = _reference(merged, dcp_size, interleave_c, r, k)
+        np.testing.assert_array_equal(
+            _run_gathered(slots,
+                          idxs,
+                          order,
+                          dcp_size=dcp_size,
+                          dcp_rank=r,
+                          interleave_c=interleave_c), want)
+        positional = _run(slots,
+                          idxs[r],
+                          k=k,
+                          dcp_size=dcp_size,
+                          dcp_rank=r,
+                          interleave_c=interleave_c)
+        diverged = diverged or not np.array_equal(positional, want)
+    assert diverged
 
 
 @pytest.mark.parametrize("dcp_size,interleave_c,k,num_rows", _LAYOUTS)

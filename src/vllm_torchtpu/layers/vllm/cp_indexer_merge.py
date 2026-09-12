@@ -23,6 +23,7 @@ import torch
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 
 CHECK_OWNER = os.environ.get("VLLM_TORCHTPU_DCP_CHECK_OWNER", "0") == "1"
+GATHER_IDXS = os.environ.get("VLLM_TORCHTPU_DCP_GATHER_IDXS", "0") == "1"
 
 
 def all_gather_candidates(x: torch.Tensor) -> torch.Tensor:
@@ -89,6 +90,43 @@ def check_positional_owner(slots: torch.Tensor,
             f"winners disagree, positional vs value-carried")
 
 
+def _left_pack(mine: torch.Tensor, local: torch.Tensor,
+               width: int) -> torch.Tensor:
+    """Pack the `mine` entries of `local` into a prefix, `-1` padded."""
+    num_rows = mine.shape[0]
+    mine_i = mine.to(torch.int32)
+    slot = torch.cumsum(mine_i, dim=1, dtype=torch.int32) - mine_i
+    dst = torch.where(mine, slot, torch.full_like(slot, width)).to(torch.int64)
+    src = torch.where(mine, local, torch.full_like(local, -1))
+    out = torch.full((num_rows, width + 1),
+                     -1,
+                     dtype=torch.int32,
+                     device=local.device)
+    out.scatter_(1, dst, src)
+    return out[:, :width]
+
+
+def select_owned_winners_gathered(
+    slots: torch.Tensor,
+    idxs: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_c: int,
+    gather=all_gather_candidates,
+) -> torch.Tensor:
+    """Keep the winners this rank owns, ownership read out of the gathered index
+    value rather than its column. Mirrors dcp-only's `_select_owned_winners`."""
+    merged = torch.gather(gather(idxs), 1,
+                          torch.clamp(slots, min=0).to(torch.int64))
+    merged = torch.where(slots >= 0, merged, torch.full_like(merged, -1))
+    mine = (merged >= 0) & (cp_owner_rank(merged, dcp_size, interleave_c)
+                            == dcp_rank)
+    local = cp_global_to_local(torch.clamp(merged, min=0), dcp_size,
+                               interleave_c).to(torch.int32)
+    return _left_pack(mine, local, slots.shape[1])
+
+
 def select_owned_winners(
     slots: torch.Tensor,
     idxs: torch.Tensor,
@@ -108,7 +146,7 @@ def select_owned_winners(
                                dcp_rank=dcp_rank,
                                interleave_c=interleave_c)
 
-    num_rows, width = slots.shape
+    width = slots.shape[1]
     owner = torch.div(slots, k, rounding_mode="floor")
     mine = (slots >= 0) & (owner == dcp_rank)
 
@@ -117,14 +155,4 @@ def select_owned_winners(
     mine = mine & (global_idx >= 0)
     local = cp_global_to_local(torch.clamp(global_idx, min=0), dcp_size,
                                interleave_c).to(torch.int32)
-
-    mine_i = mine.to(torch.int32)
-    slot = torch.cumsum(mine_i, dim=1, dtype=torch.int32) - mine_i
-    dst = torch.where(mine, slot, torch.full_like(slot, width)).to(torch.int64)
-    src = torch.where(mine, local, torch.full_like(local, -1))
-    out = torch.full((num_rows, width + 1),
-                     -1,
-                     dtype=torch.int32,
-                     device=slots.device)
-    out.scatter_(1, dst, src)
-    return out[:, :width]
+    return _left_pack(mine, local, width)
