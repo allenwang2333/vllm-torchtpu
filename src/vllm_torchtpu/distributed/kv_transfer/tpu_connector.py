@@ -1548,6 +1548,15 @@ class TPURaidenConnectorWorker:
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
         self._failed_recving: set[str] = set()
+        # A receive finishes when the number of arrivals reaches the number
+        # expected, rather than when any arrival lands. Today every request
+        # expects exactly one, so this is the same rule written differently.
+        # It is written this way now because shipping a prefill's KV per layer
+        # turns one arrival into several, and the difference between "an
+        # arrival landed" and "all of them landed" is the difference between
+        # decoding on a complete cache and decoding on a partial one.
+        self._recv_arrivals: dict[str, int] = {}
+        self._recv_expected: dict[str, int] = {}
         self._suppress_done_recving: set[str] = set()
         # Report each req's recv-completion to the scheduler at most once. vLLM's
         # _update_from_kv_xfer_finished asserts a finished_recving req is still
@@ -3124,6 +3133,9 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
             self._stage3_load_start_times[
                 destination_req_id] = time.perf_counter()
+            # One whole-cache transfer per request, for now. Stage 7 raises
+            # this to one per early-shipped layer group plus the final one.
+            self._recv_expected[destination_req_id] = 1
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
             now = time.perf_counter()
@@ -3559,6 +3571,8 @@ class TPURaidenConnectorWorker:
             self._reported_recving.discard(req_id)
             self._failed_recving.discard(req_id)
             self._suppress_done_recving.discard(req_id)
+            self._recv_arrivals.pop(req_id, None)
+            self._recv_expected.pop(req_id, None)
             self._load_block_ids.pop(req_id, None)
             self._stage3_submitted_loads.pop(req_id, None)
             self._stage3_submitted_load_tokens.pop(req_id, None)
@@ -3702,7 +3716,11 @@ class TPURaidenConnectorWorker:
         native_terminal_sends = set(done_sending) | sender_failures
         terminal_sends = native_terminal_sends | cancelled_sends
         self._done_sending.update(terminal_sends)
-        self._done_recving.update(done_recving)
+        for req_id in done_recving:
+            count = self._recv_arrivals.get(req_id, 0) + 1
+            self._recv_arrivals[req_id] = count
+            if count >= self._recv_expected.get(req_id, 1):
+                self._done_recving.add(req_id)
         newly_failed = set(failed_recving) - self._failed_recving
         self._failed_recving.update(failed_recving)
         # Stage the affected device blocks so get_block_ids_with_load_errors()
