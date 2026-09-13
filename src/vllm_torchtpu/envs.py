@@ -327,11 +327,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug knobs for the compact KDA path (issue #845): keep the state
     # buffers undonated, and check the recurrent state after every call.
     "KDA_NO_DONATE":
-    env_bool("KDA_NO_DONATE", False),
+    lambda: os.getenv("KDA_NO_DONATE", "0") == "1",
     "KDA_STATE_CHECK":
-    env_bool("KDA_STATE_CHECK", False),
+    lambda: os.getenv("KDA_STATE_CHECK", "0") == "1",
     "KDA_STATE_CHECK_MAX":
-    env_int("KDA_STATE_CHECK_MAX", 40),
+    lambda: int(os.getenv("KDA_STATE_CHECK_MAX", "40")),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
