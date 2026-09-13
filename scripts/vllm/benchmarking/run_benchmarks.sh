@@ -16,19 +16,19 @@
 #   qwen3-coder-30b-fp8-tp8-ep   - Guard: Qwen3-Coder-30B-A3B-Instruct-FP8 (TP=8, EP)
 #
 # Profiler capture (diagnostic only):
-#   CAPTURE_PROFILE=1     turn on TPU/XProf trace capture for the bench window.
-#                         Server gets --profiler-config.profiler torch +
-#                         torch_profiler_dir + ignore_frontend (the last skips
-#                         AsyncLLM's CPU profiler we don't read). Traces go to
-#                         <results>/profile. Implied when EXTRA_SERVE_ARGS sets
-#                         --profiler-config.torch_profiler_dir, which then also
-#                         chooses the trace directory; CAPTURE_PROFILE=0 opts
-#                         back out. Bench gets --profile so /start_profile
-#                         and /stop_profile fire
-#                         around the main run; warmup runs aren't profiled.
-#                         --profile costs roughly +11% TTFT and −4% throughput,
-#                         so don't compare profile-on numbers to a non-profile
-#                         baseline. Prefer a single ISL/OSL case for clean
+#   CAPTURE_PROFILE=1     capture TPU/XProf traces on the same server as the
+#                         measured run, without profiling that run. Server gets
+#                         --profiler-config.profiler torch + torch_profiler_dir
+#                         + ignore_frontend (the last skips AsyncLLM's CPU
+#                         profiler we don't read). After each cell's measured
+#                         run, one extra run with --profile writes
+#                         <cell>.profile.json, which the perf gate and uploader
+#                         skip, and traces to <results>/profile.
+#                         PROFILE_NUM_PROMPTS sizes that run (default: the
+#                         cell's concurrency). Implied when EXTRA_SERVE_ARGS
+#                         sets --profiler-config.torch_profiler_dir, which then
+#                         also chooses the trace directory; CAPTURE_PROFILE=0
+#                         opts back out. Prefer a single ISL/OSL case for clean
 #                         attribution. Recorded as capture_profile + profile_dir
 #                         in config.json.
 
@@ -373,7 +373,7 @@ run_benchmark_once() {
     local concurrency=$3
     local result_file=$4
     local bench_log=$5
-    local is_warmup=${6:-0}
+    local mode=${6:-measured}  # measured | warmup | profile
 
     # min-style ratios sample in [r*len, len]; vllm bench serve only supports
     # the symmetric [(1-h)*mid, (1+h)*mid], so pass mid = len*(1+r)/2 and
@@ -388,8 +388,12 @@ run_benchmark_once() {
     fi
 
     local profile_arg=""
-    if [ "${CAPTURE_PROFILE:-0}" = "1" ] && [ "$is_warmup" != "1" ]; then
+    local num_prompts="${NUM_PROMPTS:-320}"
+    if [ "$mode" = "profile" ]; then
         profile_arg="--profile"
+        # At least one full-concurrency wave, so decode reaches the batch
+        # width the measured run saw.
+        num_prompts="${PROFILE_NUM_PROMPTS:-$concurrency}"
     fi
 
     # Force greedy (or any fixed temperature) when BENCHMARK_TEMPERATURE is set.
@@ -425,7 +429,7 @@ run_benchmark_once() {
         --random-input-len "$bench_input_len" \
         --random-output-len "$bench_output_len" \
         --random-range-ratio "$bench_range_ratio" \
-        --num-prompts "${NUM_PROMPTS:-320}" \
+        --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
         --percentile-metrics ttft,tpot,itl,e2el \
@@ -617,7 +621,7 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             warmup_file="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.json"
             warmup_log="${RESULTS_DIR}/${base_name}.warmup${warmup_idx}.log"
             echo "    Warmup run $warmup_idx/$BENCHMARK_WARMUP_RUNS"
-            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" 1; then
+            if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$warmup_file" "$warmup_log" warmup; then
                 warmup_exit=0
             else
                 warmup_exit=$?
@@ -653,6 +657,21 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
             if ! check_server_alive; then
                 exit_code=1
                 break 2
+            fi
+            if [ "${CAPTURE_PROFILE:-0}" = "1" ]; then
+                profile_file="${RESULTS_DIR}/${base_name}.profile.json"
+                profile_log="${RESULTS_DIR}/${base_name}.profile.log"
+                echo "    Profile run"
+                # A failed capture doesn't fail the measured run; a dead server does.
+                if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$profile_file" "$profile_log" profile; then
+                    echo "    Profile OK -> $profile_file"
+                else
+                    echo "    PROFILE RUN FAILED (exit $?)"
+                fi
+                if ! check_server_alive; then
+                    exit_code=1
+                    break 2
+                fi
             fi
         else
             echo "    FAILED (exit $bench_exit)"

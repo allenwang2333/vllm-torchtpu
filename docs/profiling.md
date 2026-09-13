@@ -129,8 +129,12 @@ and `--profiler-config.max_iterations` limits are honored only by the
 
 [`scripts/vllm/benchmarking/run_benchmarks.sh`](../scripts/vllm/benchmarking/run_benchmarks.sh)
 wires all of this up. Setting `CAPTURE_PROFILE=1` adds the profiler flags to the
-server and `--profile` to the bench client, writing traces to
-`<results-dir>/profile`:
+server and, after each case's measured run, runs the case once more with
+`--profile`, writing traces to `<results-dir>/profile`. The measured run itself
+is never profiled, so its numbers stay comparable to a baseline, and the extra
+run's `<case>.profile.json` is ignored by the regression check and the results
+upload. `PROFILE_NUM_PROMPTS` sizes the extra run and defaults to the case's
+concurrency:
 
 ```bash
 CAPTURE_PROFILE=1 ./scripts/vllm/benchmarking/run_benchmarks.sh \
@@ -144,8 +148,7 @@ client would not send `--profile`, so nothing would call `/start_profile` and
 the run would silently produce no traces. Set `CAPTURE_PROFILE=0` to opt back
 out.
 
-Warmup passes are never profiled. Prefer a single ISL/OSL case so the trace maps
-to one workload shape.
+Prefer a single ISL/OSL case so the trace maps to one workload shape.
 
 ## Phased profiling
 
@@ -175,8 +178,8 @@ EXTRA_SERVE_ARGS='--profiler-config.profiler torch --profiler-config.torch_profi
 The harness makes both calls itself: it infers `CAPTURE_PROFILE=1` from the
 trace directory in `EXTRA_SERVE_ARGS`
 ([as above](#through-the-benchmark-harness)) and passes `--profile` to
-`vllm bench serve`, which POSTs to the two endpoints around the measured run.
-Warmup passes are excluded.
+`vllm bench serve` for the extra profile run, which POSTs to the two endpoints
+around it. Warmup and measured runs are never profiled.
 
 ### Option 2: against your own `vllm serve`
 

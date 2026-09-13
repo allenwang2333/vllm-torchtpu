@@ -38,6 +38,15 @@ SERVER_READY_WAIT_MIN=120
 
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--api-server-count=1 --trust-remote-code --generation-config=vllm --override-generation-config={\"do_sample\":false,\"temperature\":0.0,\"model\":\"deepseek-ai/DeepSeek-V4-Flash-0731\"}"
 
+# Traces come from an extra run after the measured one; see run_benchmarks.sh.
+# CAPTURE_PROFILE=0 skips it.
+export CAPTURE_PROFILE="${CAPTURE_PROFILE:-1}"
+export USE_PHASED_PROFILER="$CAPTURE_PROFILE"
+
+PROFILE_GCS_BUCKET="tpu-commons-ci"
+PROFILE_GCS_PATH="xprof/deepseek-v4-flash/torchtpu"
+PROFILE_GCS_BASE="gs://$PROFILE_GCS_BUCKET/$PROFILE_GCS_PATH"
+
 BENCHMARK_TEMPERATURE=0
 # todo(patemotter) decrease tolerance to 0.02 once we have more nightly results
 EVAL_TOLERANCE="0.03"
