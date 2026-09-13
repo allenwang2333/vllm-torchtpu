@@ -19,6 +19,7 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.megablox.gmm_fused import can_fuse
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
@@ -147,6 +148,14 @@ def quantize_to_native_fp4_kmajor(w: jax.Array,
     return packed, scale
 
 
+def _is_fp4_weight(rhs: jax.Array) -> bool:
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    return (jnp.issubdtype(rhs.dtype, jnp.floating)
+            and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -157,11 +166,7 @@ def gmm_wrapper(lhs,
                 fuse_act=None,
                 preferred_element_type=None,
                 rhs_quant_dtype=None):
-    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
-    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
-    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (jnp.issubdtype(rhs.dtype, jnp.floating)
-                     and jax.dtypes.itemsize_bits(rhs.dtype) == 4)
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -177,15 +182,17 @@ def gmm_wrapper(lhs,
     )
 
 
-# Rows per block of the rank contraction: the triangular matmul is B x B, so this
-# trades that against the number of blocks.
-_COUNTING_SORT_BLOCK = 512
+# The rank matmul is m * block * num_buckets MACs, so a block above 512 costs
+# more for no return, and below 256 the cost per row grows; the smaller steps
+# avoid padding when 512 does not divide m.
+_COUNTING_SORT_BLOCKS = (512, 256, 128)
 
 
 def _counting_sort_positions(
         sort_keys: jax.Array,
         num_buckets: int) -> tuple[jax.Array | None, jax.Array | None]:
-    """Stable counting sort: row -> its position in the sorted order.
+    """Stable counting sort: row -> its position, plus the bucket totals.
+    Keys must be in ``[0, num_buckets)`` or the result is not a permutation.
 
     `jnp.argsort(jnp.argsort(keys))` spends a second comparison sort over M
     distinct values on what is really the inverse of the first permutation.
@@ -195,40 +202,35 @@ def _counting_sort_positions(
     fall out of the same histogram, which is exactly `group_sizes`.
     """
     m = sort_keys.shape[0]
-    block = min(_COUNTING_SORT_BLOCK, m)
+    block = min(_COUNTING_SORT_BLOCKS[0], m)
+    for size in _COUNTING_SORT_BLOCKS:
+        if size <= block and m % size == 0:
+            block = size
+            break
     if num_buckets > block:
         # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
         # 0.0.44.1: under jit the positions come back not a permutation. Only
         # num_buckets > block is affected, so that is the excluded region.
         return None, None
     pad = -m % block
-    if pad:
-        # The sentinel bucket sorts after every real one, so padding into it
-        # leaves the real bucket bases untouched; the caller slices the
-        # sentinel off `counts` anyway.
-        sort_keys = jnp.pad(sort_keys, (0, pad),
-                            constant_values=num_buckets - 1)
+    sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
     onehot = jax.nn.one_hot(sort_keys.reshape(-1, block),
                             num_buckets,
                             dtype=jnp.bfloat16)
-    # The histogram rides along as one more row of the contraction the rank
-    # matmul already performs. Exact: 0/1 summands, at most `block` of them.
-    lower = jnp.concatenate(
-        [
-            jnp.ones((1, block), jnp.bfloat16),
-            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
-        ],
-        axis=0,
-    )
-    both = jnp.einsum("ij,bje->bie",
+    # fp32 accumulate: positions run to M, bf16 is exact only to 2**8.
+    hist = onehot.sum(axis=1, dtype=jnp.float32)
+    counts = hist.sum(axis=0)
+    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
+    lower = jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1)
+    rank = jnp.einsum("ij,bje->bie",
                       lower,
                       onehot,
                       preferred_element_type=jnp.float32)
-    hist = both[:, 0, :]
-    rank = both[:, 1:, :]
-    counts = hist.sum(axis=0)
-    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    # Pad rows sort after every real one, so only that bucket's total is off;
+    # pad is static, so a masked subtraction beats an indexed update.
+    counts -= jnp.where(
+        jnp.arange(num_buckets) == num_buckets - 1, float(pad), 0.0)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
@@ -268,38 +270,35 @@ def prepare_routed_gmm_inputs(
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     # The keys take only `local_num_experts + 1` values, so a counting sort
-    # gives the positions and `group_sizes` without a second comparison sort.
-    # Ragged permute only: under the one-hot permute these positions break MTP.
-    ragged_permute = (use_ep and use_sparse_core
-                      and token_indices_flat.shape[0]
-                      > onehot_moe_permute_threshold)
+    # gives the positions and `group_sizes` without a second comparison sort
+    # (USE_MOE_COUNTING_SORT; it declines shapes whose bucket count exceeds
+    # its block). It runs on the one-hot permute path too, where its gain
+    # was measured, which main avoids because of a draft-token acceptance
+    # regression seen with these positions there; not validated with MTP.
     argsort_revert_indices, bucket_counts = (_counting_sort_positions(
-        sort_keys, local_num_experts + 1) if ragged_permute else (None, None))
-    token_bits = max(1, (num_tokens_local - 1).bit_length())
-    packable = ((local_num_experts + 1).bit_length() + token_bits < 31)
-    sorted_indices = (jnp.argsort(sort_keys) if argsort_revert_indices is None
-                      or not packable else None)
-
+        sort_keys, local_num_experts + 1) if envs.USE_MOE_COUNTING_SORT else
+                                             (None, None))
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
+
+        # int32 overflows only past num_tokens * local_num_experts >= 2**30.
+        token_bits = (num_tokens_local - 1).bit_length()
+        # (key, token) packed: no payload, no gather, and token_indices_flat is
+        # non-decreasing so this IS the stable order by row.
+        packed = jax.lax.sort(
+            jnp.left_shift(sort_keys.astype(jnp.int32), token_bits)
+            | token_indices_flat,
+            is_stable=False)
+        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     else:
+        sorted_indices = jnp.argsort(sort_keys)
         argsort_revert_indices = jnp.argsort(sorted_indices)
+        token_indices_sorted = token_indices_flat[sorted_indices]
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = (jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
                              valid_mask[:, None].astype(jnp.int32))
         group_sizes_local = group_sizes_local.sum(axis=0)
-
-    if packable:
-        # Packing (key, token) into one int32 keeps the payload out of the sort
-        # and drops the follow-up gather. Equal packed values carry the same
-        # token id, so their order cannot matter.
-        packed = jax.lax.sort(jnp.left_shift(sort_keys, token_bits)
-                              | token_indices_flat,
-                              is_stable=False)
-        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
-    else:
-        token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
@@ -357,32 +356,68 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
+    # can_fuse runs the fused kernel's own operand checks and configuration
+    # build over shapes and dtypes, so the decision is the kernel's and costs
+    # no kernel trace: a shape it would refuse (whole-expert weight slabs over
+    # VMEM, scales it does not take, rows it cannot tile) keeps the two-call
+    # path below.
+    use_fused = envs.USE_FUSED_MOE_GMM and can_fuse(x,
+                                                    w1,
+                                                    w2,
+                                                    group_sizes,
+                                                    w1_scale,
+                                                    w2_scale,
+                                                    w1_bias,
+                                                    w2_bias,
+                                                    group_offset,
+                                                    fuse_act=activation)
+
+    if use_fused:
+        # The fused grouped matmul (kernels/megablox/gmm_fused.py): scalar group offset, zero-initialized rows
+        # outside the shard's expert window, the merged-body pipeline off.
+        from vllm_torchtpu.kernels.megablox.gmm_fused import (
+            GMM_FUSED_BUCKET_BASE, gmm_fused)
+        gmm2_res = gmm_fused(lhs=x,
+                             w1=w1,
+                             w2=w2,
+                             group_sizes=group_sizes,
+                             w1_scale=w1_scale,
+                             w2_scale=w2_scale,
+                             w1_bias=w1_bias,
+                             w2_bias=w2_bias,
+                             group_offset=group_offset[0],
+                             fuse_act=activation,
+                             zero_initialize=True,
+                             unconditional_pipeline=False,
+                             bucket_base=GMM_FUSED_BUCKET_BASE)
+    else:
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
+
+        gmm2_res = gmm_wrapper(gmm1_res,
+                               w2,
+                               w2_scale,
+                               w2_bias,
+                               group_sizes,
+                               group_offset,
+                               zero_initialize=False,
+                               preferred_element_type=x.dtype,
+                               rhs_quant_dtype=rhs_quant_dtype)
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(gmm1_res,
-                           w2,
-                           w2_scale,
-                           w2_bias,
-                           group_sizes,
-                           group_offset,
-                           zero_initialize=False,
-                           preferred_element_type=x.dtype,
-                           rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
