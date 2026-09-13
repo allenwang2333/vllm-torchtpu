@@ -46,11 +46,13 @@
 x-kube-plugin: &kube_plugin
   kubernetes:
     podTemplate: tpu-launcher
-    # Blobless. A step clones this repo only to read the wrapper scripts; the
-    # tree the benchmark needs is already in the image.
+    # One commit, and no blobs until something opens them. A step clones this
+    # repo to read the wrapper scripts; the tree the benchmark needs is already
+    # in the image, and nothing on this path reads history. Blobless alone
+    # still walks every tree the repo has ever had.
     checkout:
-      cloneFlags: -v --filter=blob:none
-      fetchFlags: -v --prune --filter=blob:none
+      cloneFlags: -v --depth 1 --filter=blob:none
+      fetchFlags: -v --prune --depth 1 --filter=blob:none
 
 x-perf-step-defaults: &perf_step
   depends_on: "build_docker"

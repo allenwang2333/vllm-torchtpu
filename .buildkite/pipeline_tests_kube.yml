@@ -42,13 +42,14 @@
 x-kube-plugin: &kube_plugin
   kubernetes:
     podTemplate: tpu-launcher
-    # Blobless. A step clones this repo only to read run.sh; the tree the tests
-    # need is already in the image, and a full clone was most of the time
-    # before the pod started. Blobs are still fetched on demand, so the working
-    # tree stays complete.
+    # One commit, and no blobs until something opens them. A step clones this
+    # repo to read run.sh; the tree the tests need is already in the image, and
+    # nothing on this path reads history. Blobless alone still walks every tree
+    # the repo has ever had, which is most of the time before the pod starts.
+    # The working tree stays complete either way.
     checkout:
-      cloneFlags: -v --filter=blob:none
-      fetchFlags: -v --prune --filter=blob:none
+      cloneFlags: -v --depth 1 --filter=blob:none
+      fetchFlags: -v --prune --depth 1 --filter=blob:none
 
 x-tpu-step-defaults: &tpu_step
   depends_on: "build_docker"
