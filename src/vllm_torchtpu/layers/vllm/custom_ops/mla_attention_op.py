@@ -49,9 +49,8 @@ from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
-from vllm_torchtpu.layers.vllm.cp_indexer_merge import (
-    GATHER_IDXS, all_gather_candidates, select_owned_winners,
-    select_owned_winners_gathered)
+from vllm_torchtpu.layers.vllm.cp_indexer_merge import (all_gather_candidates,
+                                                        select_owned_winners)
 from vllm_torchtpu.layers.vllm.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -332,15 +331,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             new_cache, idxs, scores = local_op(*args)
             args[2].copy_(new_cache)
             slots = merge_op(all_gather_candidates(scores))
-            if GATHER_IDXS:
-                return select_owned_winners_gathered(slots,
-                                                     idxs,
-                                                     dcp_size=dcp_size,
-                                                     dcp_rank=dcp_rank,
-                                                     interleave_c=interleave_c)
             return select_owned_winners(slots,
                                         idxs,
-                                        k=topk,
                                         dcp_size=dcp_size,
                                         dcp_rank=dcp_rank,
                                         interleave_c=interleave_c)
