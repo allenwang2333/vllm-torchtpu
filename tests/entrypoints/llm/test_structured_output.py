@@ -208,6 +208,20 @@ def _assert_complex_ast_json(text: str) -> None:
         _assert_sub_tree(op, text)
 
 
+def _is_complex_ast_json(text: str) -> bool:
+    """Whether `text` satisfies the complex AST schema.
+
+    Only the AssertionErrors raised by _assert_complex_ast_json are treated as
+    "does not satisfy the schema"; anything else propagates, so a broken helper
+    cannot masquerade as a schema violation.
+    """
+    try:
+        _assert_complex_ast_json(text)
+    except AssertionError:
+        return False
+    return True
+
+
 def _assert_regex(text: str) -> None:
     assert re.fullmatch(REGEX_PATTERN,
                         text), (f"regex constraint violated: {text!r}")
@@ -272,6 +286,27 @@ def test_complex_ast_json_schema_greedy(llm: LLM):
     assert len(outputs) == 4
     for output in outputs:
         _assert_complex_ast_json(output.outputs[0].text)
+
+
+def test_complex_ast_json_schema_unconstrained_negative(llm: LLM):
+    """Negative control for test_complex_ast_json_schema_greedy.
+
+    Same prompt, same token budget, no grammar. If the model satisfied the
+    recursive AST schema on its own, the positive test would pass whether or
+    not the bitmask was applied at all -- it would be measuring the prompt,
+    not the runner. Asserting the unconstrained output violates the schema is
+    what makes the positive test evidence.
+    """
+    params = SamplingParams(
+        temperature=COMPLEX_AST_PARAMS.temperature,
+        max_tokens=COMPLEX_AST_PARAMS.max_tokens,
+    )
+    outputs = llm.generate([COMPLEX_AST_PROMPT] * 4, params)
+    assert len(outputs) == 4
+    texts = [output.outputs[0].text for output in outputs]
+    assert not any(_is_complex_ast_json(text) for text in texts), (
+        "unconstrained generation already satisfies the AST schema, so "
+        f"test_complex_ast_json_schema_greedy proves nothing: {texts!r}")
 
 
 def test_regex_greedy(llm: LLM):
