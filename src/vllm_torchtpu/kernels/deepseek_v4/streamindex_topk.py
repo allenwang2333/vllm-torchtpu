@@ -48,12 +48,9 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-# --------------------------------------------------------------------------- #
-# Context-parallel coordinate helpers.
-#
+# Context-parallel helpers.
 # A context-parallel axis shards the KV cache chunk-interleaved over
 # `interleave_size` uncompressed tokens.
-# --------------------------------------------------------------------------- #
 
 
 def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
@@ -66,10 +63,7 @@ def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
 
 
 def cp_local_length(global_len, cp_rank, cp_size: int, interleave_c: int):
-    """Count compressed positions ``< global_len`` owned by `cp_rank`.
-
-    Mirrors ``_local_page_valid_len`` in pcp_streaming_rpa/schedule.py.
-    """
+    """Count compressed positions ``< global_len`` owned by `cp_rank`"""
     if cp_size == 1:
         return global_len
     cycle_c = cp_size * interleave_c
@@ -95,21 +89,7 @@ def cp_global_to_local(global_idx, cp_size: int, interleave_c: int):
 
 
 def cp_rank_as_data(cp_axis_name: str, cp_size: int):
-    """This shard's index along `cp_axis_name`, without `lax.axis_index`.
-
-    `lax.axis_index` lowers to `partition-id`,
-    which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
-    through its `jax.export` bridge ("partitionId instruction is not supported
-    for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
-    a replicated iota says the same thing with an instruction the partitioner
-    accepts: every device splits `[0..cp_size)` into single elements and
-    keeps the chunks addressed to it, so device `r` receives `r` from each
-    peer and every lane of the result is `r`.
-
-    Same trick as `pcp_streaming_rpa/wrapper.py`'s
-    `_select_replicated_shard_for_pcp_rank`, on an iota rather than real data.
-    Must be called from inside a `shard_map` body.
-    """
+    """This shard's index along `cp_axis_name`, without `lax.axis_index`"""
     ranks = jnp.arange(cp_size, dtype=jnp.int32)
     exchanged = lax.all_to_all(ranks, cp_axis_name, 0, 0, tiled=True)
     return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
@@ -197,12 +177,10 @@ def kernel(
         q_lens.append(q_len)
         seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
         seq_lens.append(seq_len)
-        # Global compressed length; the causal / validity masks stay in global
+        # Global compressed length; the causal masks stay in global
         # coordinates so they are identical on every CP rank.
         kv_len = seq_len // compression_ratio
         kv_lens.append(kv_len)
-        # How many of those positions live in *this* rank's shard, which is what
-        # bounds the kv-block loop and the local score-matrix width.
         local_kv_lens.append(
             cp_local_length(kv_len, cp_rank, cp_size, interleave_c))
 
@@ -581,7 +559,7 @@ def _effective_row_lengths(
     """Visible compressed KV positions per token row of the score matrix.
 
     Under context parallelism the score matrix is rank-local, so the row length
-    is the number of globally-visible positions that *this* rank owns.
+    is the number of globally-visible positions that this rank owns.
     """
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
@@ -664,17 +642,13 @@ def streamindex_topk(
     decode_req_batch_size: maximum decode batch size per iteration.
     cp_size: number of context-parallel ranks the compressed KV cache is
       sharded over. 1 (default) means no sharding and the whole CP path
-      compiles away. When > 1, `cache_kv` / `page_indices` describe only this
-      rank's shard, and the returned top-k is *local* -- correct only after the
-      cross-rank merge in `streamindex_topk_dcp`.
+      compiles away.
     cp_rank: this rank's index in the CP group. Traced, so one compiled program
       serves every rank.
     interleave_size: CP chunk-interleave width in uncompressed tokens. Must be
       a multiple of `compression_ratio`.
     return_scores: also return the score of each selected position, which is
-      what makes a cross-rank merge possible. A local top-k over a sharded KV
-      axis is not the global top-k, so the merge needs the scores the same way
-      the DCP attention kernels need an LSE output.
+      what makes a cross-rank merge possible.
 
   Returns:
     Top-K indices in global compressed space, or `(indices, scores)` if
@@ -1141,14 +1115,13 @@ def streamindex_topk_dcp(
             return_scores=True,
         )
 
-        # Stage 2. Widen the candidate axis instead of splitting the token
-        # axis: [T, k] -> [T, dcp * k], concatenated in source-rank order. Both
-        # gathers are the only communication in the op.
+        # Stage 2. Widen the candidate axis: [T, k] -> [T, dcp * k], concatenated
+        # in source-rank order. Both gathers are the only communication in the op.
         idxs = lax.all_gather(idxs, dcp_axis_name, axis=1, tiled=True)
         scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
 
-        # Stage 3. Full width as the row length: -inf entries (unfilled local
-        # slots, padding tokens) are never selected, so they need no masking.
+        # Stage 3. Full width as the row length: -inf entries are never
+        # selected, so they need no masking.
         # Every rank runs this over identical inputs.
         slots = sparsecore_topk(
             scores,

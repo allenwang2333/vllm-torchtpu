@@ -544,10 +544,8 @@ def sparse_ragged_paged_attention(
     k_scale: per-tensor dequantization scale for the fp8 nope cache.
     vmem_limit_bytes: the vmem limit for the pallas kernel.
     return_lse: also return the per-(token, head) log-sum-exp of the attention
-      scores. Needed only when `topk_indices` holds a *slice* of a token's
-      global top-k and the partial outputs of several ranks must be merged:
-      with normalized outputs `o_r` and their `lse_r`, the exact global result
-      is `sum_r softmax_r(lse) * o_r`. Costs one extra f32 per (token, head).
+      scores. Needed only when `topk_indices` holds a slice of a token's
+      global top-k and the partial outputs of several ranks must be merged.
 
   Returns:
     The output of attention, or `(output, lse)` when `return_lse` is set.
