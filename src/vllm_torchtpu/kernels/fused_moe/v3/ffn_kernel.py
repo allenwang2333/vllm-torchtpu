@@ -303,7 +303,6 @@ def build_ffn_kernel(
         vmem_fraction=device.VMEM_FRACTION,
         activation_columns_per_pass=ACTIVATION_COLUMNS_PER_PASS_DEFAULT,
         weight_dma_priority=WEIGHT_DMA_PRIORITY_DEFAULT,
-        region_push=False,
         token_block=None,
         intermediate="fp8",
         sorted_rows=False,
@@ -411,7 +410,8 @@ def build_ffn_kernel(
                                  stream_block=stream_block,
                                  stream_rows=stream_rows,
                                  token_block=token_block,
-                                 intermediate=intermediate)
+                                 intermediate=intermediate,
+                                 token_dtype=token_dtype)
     limit = device.vmem_limit(vmem_fraction)
     if needed > limit:
         raise ValueError(
@@ -520,7 +520,6 @@ def build_ffn_kernel(
                        stream_rows=stream_rows,
                        activation_columns_per_pass=activation_columns_per_pass,
                        weight_dma_priority=weight_dma_priority,
-                       region_push=region_push,
                        intermediate=intermediate,
                        sorted_rows=sorted_rows,
                        lane_blocks=lane_blocks,
@@ -563,8 +562,6 @@ def build_ffn_kernel(
         lax.fori_loop(0, ctx.n_visit,
                       lambda visit_i, carry: step.visit(ctx, visit_i, carry),
                       step.initial_carry(ctx))
-        if region_push:
-            body.push_regions(ctx)
         body.drain_transport(ctx)
         transport.all_shards_barrier(num_shards, build.mesh_axes)
 
@@ -616,7 +613,7 @@ def build_ffn_kernel(
         f"{'_l' + str(swiglu_limit) if activation == 'swigluoai' else ''}"
         f"{'_p' + str(activation_columns_per_pass) if activation_columns_per_pass != ACTIVATION_COLUMNS_PER_PASS_DEFAULT else ''}"
         f"{'_q' + str(weight_dma_priority) if weight_dma_priority != WEIGHT_DMA_PRIORITY_DEFAULT else ''}"
-        f"{'_r' if region_push else ''}{'_m16' if intermediate == 'bf16' else ''}"
+        f"{'_m16' if intermediate == 'bf16' else ''}"
         f"_g{experts_per_shard}_t{tile_rows}_w{weight_slots}_s{result_slots}")
 
     def pallas_call(arrival_rows):

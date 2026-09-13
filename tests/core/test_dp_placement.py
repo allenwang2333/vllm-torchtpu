@@ -188,3 +188,45 @@ def test_install_if_enabled_checks_the_mode(monkeypatch):
         dp_placement.install_if_enabled()
     monkeypatch.setenv("DP_PLACEMENT", "")
     dp_placement.install_if_enabled()  # off: nothing to install
+
+
+def test_a_cancel_during_a_release_is_honoured_once():
+    """A request cancelled while the release loop is sending another one is
+    never sent, and the requests still held are sent once, not twice."""
+    C = _release_client()
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    def send_input(self, kind, request, engine):
+        self.sent.append((request.request_id, engine))
+        first = len(self.sent) == 1
+
+        async def done():
+            if first:
+                started.set()
+                await finish.wait()
+
+        return done()
+
+    C._send_input = send_input
+    dp_placement.install_release(C,
+                                 threshold=2,
+                                 deadline_s=100.0,
+                                 idle_trigger=False,
+                                 quiet_s=0.0)
+    c = C()
+
+    async def go():
+        await c.add_request_async(R(0))  # held: below the threshold
+        # The threshold: the release starts and its first send blocks.
+        releasing = asyncio.create_task(c.add_request_async(R(1)))
+        await asyncio.wait_for(started.wait(), 5)
+        await c.abort_requests_async(["1"])  # cancelled while still held
+        finish.set()
+        await releasing
+        held = list(c._release_buf)
+        await c.add_request_async(R(2))
+        await c.add_request_async(R(3))
+        return held, [rid for rid, _ in c.sent]
+
+    held, sent = asyncio.run(go())
+    assert held == [] and sent == ["0", "2", "3"]

@@ -220,8 +220,7 @@ class ResultRowFormsTest(parameterized.TestCase):
 
     def test_the_grid_forms_reach_the_reference_unchanged(self):
         """The grid form named fp4_grid gives the reference's fp4 output
-        exactly, and the six-bit forms sit between fp4 and the unrounded
-        rows (a shadowed expert index once made every grid form garbage)."""
+        exactly (a shadowed expert index once made every grid form garbage)."""
         rng = np.random.default_rng(0)
         shape = dict(tokens=64, top_k=2, experts=8, hidden=256, inter=128)
         x = jnp.asarray(
@@ -250,20 +249,9 @@ class ResultRowFormsTest(parameterized.TestCase):
                                        weight_format=WeightFormat.FP8,
                                        **kw), np.float32)
 
-        exact = reference(intermediate="exact", result_rows="f32")
         fp4 = reference(result_rows="fp4", result_block=16)
         np.testing.assert_array_equal(
             reference(result_rows="fp4_grid", result_block=16), fp4)
-
-        def error(out):
-            return float(np.linalg.norm(out - exact) / np.linalg.norm(exact))
-
-        for form in ("fp6_e2m3", "fp6_e3m2"):
-            self.assertLess(
-                error(reference(result_rows=form, result_block=32)),
-                error(fp4))
-            self.assertGreater(
-                error(reference(result_rows=form, result_block=32)), 0.0)
 
 
 if __name__ == "__main__":

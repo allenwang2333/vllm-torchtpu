@@ -67,7 +67,6 @@ class Build:
     stream_rows: int
     activation_columns_per_pass: int
     weight_dma_priority: int
-    region_push: bool  # results home as one copy per destination after the last expert
     sorted_rows: bool  # each tile fetched as one copy from rows sorted into expert order (no token windows)
     intermediate: str  # "fp8" (requantized between the matmuls) or "bf16"
     lane_blocks: int
@@ -472,11 +471,8 @@ def finish_rows(ctx, expert, acc2, mid_scales):
 # ---- the push and the drains ----
 def push_expert(ctx, expert):
     """Pushes the expert's runs to their shards. The own-shard run is
-    copied locally (it is read only after the drain). With region_push the
-    runs wait for push_regions after the last expert."""
+    copied locally (it is read only after the drain)."""
     b, tables, outputs, sems = ctx.b, ctx.tables, ctx.outputs, ctx.sems
-    if b.region_push:
-        return
     for d in range(b.num_shards):
         blocks = tables.push_blocks[expert, d]
         src_block = tables.outgoing_offset[expert, d]
@@ -525,74 +521,12 @@ def push_expert(ctx, expert):
                     sems.local_hop_scales).start()
 
 
-def push_regions(ctx):
-    """Pushes every destination's whole outgoing region home in one copy
-    (and one for the scales): the region holds the shard's runs for that
-    destination in expert order, block-aligned, and the destination's
-    arrival area for this shard is laid out the same way, so the copy
-    lands every run where push_expert would have put it, padding rows
-    included. The own-shard region is copied locally."""
-    b, tables, outputs, sems = ctx.b, ctx.tables, ctx.outputs, ctx.sems
-    for d in range(b.num_shards):
-        blocks = tables.push_blocks[0, d]
-        for g in range(1, b.experts_per_shard):
-            blocks = blocks + tables.push_blocks[g, d]
-        src_block = tables.outgoing_offset[0, d]
-        dst_block = tables.push_destination[0, d]
-        is_me = jnp.int32(d) == ctx.me
-
-        @pl.when(and_nonempty(jnp.logical_not(is_me), blocks))
-        def _():
-            pltpu.make_async_remote_copy(
-                src_ref=outputs.outgoing.at[pl.ds(src_block * ROW_BLOCK,
-                                                  blocks * ROW_BLOCK)],
-                dst_ref=outputs.arrivals.at[pl.ds(dst_block * ROW_BLOCK,
-                                                  blocks * ROW_BLOCK)],
-                send_sem=sems.push_send,
-                recv_sem=sems.push_receive,
-                device_id=device_coords(jnp.int32(d), b.mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH).start()
-            if b.has_result_scales:
-                pltpu.make_async_remote_copy(
-                    src_ref=outputs.outgoing_scales.at[pl.ds(
-                        src_block, blocks)],
-                    dst_ref=outputs.arrival_scales.at[pl.ds(dst_block,
-                                                            blocks)],
-                    send_sem=sems.push_send_scales,
-                    recv_sem=sems.push_receive_scales,
-                    device_id=device_coords(jnp.int32(d), b.mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
-
-        @pl.when(and_nonempty(is_me, blocks))
-        def _():
-            pltpu.make_async_copy(
-                outputs.outgoing.at[pl.ds(src_block * ROW_BLOCK,
-                                          blocks * ROW_BLOCK)],
-                outputs.arrivals.at[pl.ds(dst_block * ROW_BLOCK,
-                                          blocks * ROW_BLOCK)],
-                sems.local_hop).start()
-            if b.has_result_scales:
-                pltpu.make_async_copy(
-                    outputs.outgoing_scales.at[pl.ds(src_block, blocks)],
-                    outputs.arrival_scales.at[pl.ds(dst_block, blocks)],
-                    sems.local_hop_scales).start()
-
-
 def drain_transport(ctx):
-    """Consumes every push and the commits the per-tile waits left. The
-    region pushes move whole aligned regions, so their row counts are the
-    aligned ones."""
+    """Consumes every push and the commits the per-tile waits left."""
     b, tables, outputs, sems = ctx.b, ctx.tables, ctx.outputs, ctx.sems
-    if b.region_push:
-        wait_rows(sems.push_send, outputs.outgoing,
-                  count(ctx, COUNT_SEND_ALIGNED_ROWS))
-        wait_rows(sems.push_receive, outputs.arrivals,
-                  count(ctx, COUNT_RECEIVE_ALIGNED_ROWS))
-    else:
-        wait_rows(sems.push_send, outputs.outgoing,
-                  count(ctx, COUNT_SEND_ROWS))
-        wait_rows(sems.push_receive, outputs.arrivals,
-                  count(ctx, COUNT_RECEIVE_ROWS))
+    wait_rows(sems.push_send, outputs.outgoing, count(ctx, COUNT_SEND_ROWS))
+    wait_rows(sems.push_receive, outputs.arrivals,
+              count(ctx, COUNT_RECEIVE_ROWS))
     if b.has_result_scales:
         wait_rows(sems.push_send_scales, outputs.outgoing_scales,
                   count(ctx, COUNT_SEND_ALIGNED_ROWS) // ROW_BLOCK)

@@ -204,11 +204,6 @@ class Config:
         a table whose sort program is over the sparse core's program
         size. None (the default): sorted_rows_by_shape decides from the
         shard's experts and tokens.
-      region_push: how the results go home. False: one copy per (expert,
-        destination) run after each expert (num_shards copies, and as many
-        for the scales, per expert). True: one copy per destination of the
-        whole outgoing region after the last expert (the region and the
-        destination's arrival area share one aligned layout).
     """
     result_slots: int = RESULT_SLOTS_DEFAULT
     row_fetch_ahead: int = ROW_FETCH_AHEAD_DEFAULT
@@ -236,7 +231,6 @@ class Config:
     activation_columns_per_pass: int = ACTIVATION_COLUMNS_PER_PASS_DEFAULT
     tables_zero_words: int = TABLES_ZERO_WORDS_DEFAULT
     weight_dma_priority: int = WEIGHT_DMA_PRIORITY_DEFAULT
-    region_push: bool = False
     sorted_rows: object = None
 
     @property

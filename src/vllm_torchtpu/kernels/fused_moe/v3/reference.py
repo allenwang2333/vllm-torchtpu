@@ -154,8 +154,6 @@ def float_grid_rows(rows,
 
 
 FLOAT_GRIDS = {  # result_rows name -> (exponent bits, mantissa bits, bias)
-    "fp6_e2m3": (2, 3, 1),
-    "fp6_e3m2": (3, 2, 3),
     "fp4_grid":
     (2, 1, 1),  # e2m1 by the same arithmetic, a check on fp4_block_rows
 }
@@ -206,8 +204,8 @@ def fused_ep_moe_reference(x,
     the token rows' rounding block (None: activation_block).
     result_rows: "fp8" (one scale per row), "fp8_block" (fp8 with one
     scale per `result_block` values), "bf16", "f32" (no rounding: the
-    yardstick for the result rows), "fp6_e2m3" / "fp6_e3m2" (the OCP FP6
-    formats with block scales, by float_grid_rows), or "fp4" (float4_e2m1fn with one
+    yardstick for the result rows), "fp4_grid" (e2m1 by float_grid_rows, a check on
+    "fp4"), or "fp4" (float4_e2m1fn with one
     scale per `result_block` values, the scale rounded to
     `result_scale_dtype` before use).
     token_rows: "fp8" (the token rows rounded to fp8 with one scale per

@@ -210,6 +210,7 @@ def expert_buffers_that_fit(experts_per_shard,
             stream_block=block,
             stream_rows=rows,
             token_block=token_block,
+            intermediate=config.intermediate,
             token_dtype=jnp.bfloat16 if token_rows == "bf16" else FP8)
 
     def group_rows():
@@ -918,7 +919,6 @@ def fused_ep_moe(x,
         vmem_fraction=config.vmem_fraction,
         activation_columns_per_pass=config.activation_columns_per_pass,
         weight_dma_priority=config.weight_dma_priority,
-        region_push=config.region_push,
         token_block=token_block,
         intermediate=config.intermediate,
         sorted_rows=sorted_rows,

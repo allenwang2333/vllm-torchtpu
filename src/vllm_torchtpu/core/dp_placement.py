@@ -107,7 +107,10 @@ def install_release(client_cls,
             assigned = Counter()
             start = getattr(self, "_rr_next", 0) % num
             while buf:
-                _t0, request = buf[0]
+                # The request leaves the buffer before its send: a cancel that
+                # lands during the send finds it gone here and, through the
+                # send's registration, reaches the engine instead.
+                _t0, request = buf.pop(0)
                 pinned = getattr(request, "data_parallel_rank", None)
                 if pinned is not None:
                     idx = int(pinned)
@@ -121,15 +124,13 @@ def install_release(client_cls,
                 try:
                     await _send_one(self, request, idx)
                 except BaseException:
-                    # A request whose send failed is dropped from the buffer
-                    # and reported; the rest stay held for the next release.
-                    buf.pop(0)
+                    # A request whose send failed is reported; the rest stay
+                    # held for the next release.
                     logger.exception(
                         "DP placement: request %s could not be "
                         "sent to engine %s", request.request_id,
                         self.core_engines[idx])
                     raise
-                buf.pop(0)
             self._rr_next = start
 
     async def _maybe_release(self):
@@ -165,8 +166,8 @@ def install_release(client_cls,
         ids = set(request_ids)
         buf = _buf(self)
         if buf:
-            self._release_buf = [(t, r) for t, r in buf
-                                 if r.request_id not in ids]
+            # Filtered in place: a release in progress holds this same list.
+            buf[:] = [(t, r) for t, r in buf if r.request_id not in ids]
         await orig_abort(self, request_ids)
 
     def shutdown(self, *args, **kwargs):

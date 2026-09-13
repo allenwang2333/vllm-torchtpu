@@ -1,8 +1,5 @@
 """The fused gated norm and fp8 quantisation (kernels/gated_norm_quant.py) against the two-step path, in Pallas
 interpret mode on CPU: identical fp8 rows and scales, and the pre-quantised matmul equals the XLA per-channel path."""
-import os
-
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,8 +13,9 @@ from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 def _on_the_host():
     """Every array on the CPU device: the kernel runs in interpret mode and
     the reference must round the same way, even in a session that has already
-    brought up the TPU backend (then the JAX_PLATFORMS default above is too
-    late, and the reference's XLA fusions on the chip round differently)."""
+    brought up the TPU backend (the reference's XLA fusions on the chip round
+    differently). A session of the host-only tests alone is pinned to the CPU
+    by the collection hook in tests/conftest.py."""
     with jax.default_device(jax.devices("cpu")[0]):
         yield
 

@@ -46,7 +46,7 @@ def _stage_dtype(dtype, lane_blocks):
 
 
 def _weighted_sum_body(*refs, tokens_per_tile, top_k, lane_blocks, hidden,
-                       unroll, with_scales, dtype, dma_only):
+                       unroll, with_scales, dtype):
     """One tile of tokens. The tile's scales and weights, [tokens, top_k]
     each, arrive as vectors and are multiplied once into the coefficient
     table; then token by token the top_k rows (a row fills whole vector
@@ -59,10 +59,6 @@ def _weighted_sum_body(*refs, tokens_per_tile, top_k, lane_blocks, hidden,
         scales_ref, weights_ref, rows_ref, out_ref, coef_vmem, sum_vmem = refs
     else:
         weights_ref, rows_ref, out_ref, coef_vmem, sum_vmem = refs
-    if dma_only:
-        # A measurement form: the blocks move, nothing is summed.
-        out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
-        return
     coef = weights_ref[...]
     if with_scales:
         coef = coef * scales_ref[...]
@@ -72,7 +68,12 @@ def _weighted_sum_body(*refs, tokens_per_tile, top_k, lane_blocks, hidden,
         c = coef_vmem[pl.ds(t, 1), :].astype(dtype)  # [1, top_k]
         acc = None
         for k in range(top_k):
-            term = rows_ref[t, k].astype(dtype) * c[:, k:k + 1]
+            coef = c[:, k:k + 1]
+            term = rows_ref[t, k].astype(dtype) * coef
+            # A route of weight zero points at a row nobody wrote this
+            # call: its term is dropped, not multiplied, so a NaN or Inf
+            # there cannot reach the token.
+            term = jnp.where(coef != 0, term, jnp.zeros_like(term))
             acc = term if k == 0 else acc + term
         row0 = pl.multiple_of(t * lane_blocks, _stage_align(sum_vmem.dtype))
         sum_vmem[pl.ds(row0, lane_blocks), :] = acc.astype(sum_vmem.dtype)
@@ -95,16 +96,12 @@ def weighted_sum(rows,
                  out_dtype,
                  tokens_per_tile=COMBINE_TOKENS_PER_TILE_DEFAULT,
                  unroll=COMBINE_UNROLL_DEFAULT,
-                 dtype=jnp.float32,
-                 dma_only=False,
-                 compute_only=False):
+                 dtype=jnp.float32):
     """rows [tokens * top_k, lane blocks, LANES] fp8 or bf16 in pair order
     (token-major: pair t * top_k + k is token t's slot k), scales
     [tokens * top_k] f32 the same or None, weights [tokens, top_k] f32 ->
     [tokens, hidden] out_dtype. The rows' blocks are the true width padded
-    to whole SUBLANES (zero blocks past `hidden`). Two measurement forms:
-    dma_only moves the blocks and computes nothing; compute_only computes
-    every tile on the first tile's blocks, fetched once."""
+    to whole SUBLANES (zero blocks past `hidden`)."""
     n_rows, lane_blocks, lanes = rows.shape
     if not 0 < hidden <= lane_blocks * lanes:
         raise ValueError(f"hidden {hidden} does not fit in the gathered rows' "
@@ -147,8 +144,7 @@ def weighted_sum(rows,
               2 * tokens_per_tile * hidden * itemsize +
               tokens_per_tile * staged * jnp.dtype(stage_dtype).itemsize)
     vmem_limit = min(2 * needed, device.vmem_limit())
-    step = (lambda i: 0) if compute_only else (lambda i: i)
-    table = pl.BlockSpec((tokens_per_tile, top_k), lambda i: (step(i), 0))
+    table = pl.BlockSpec((tokens_per_tile, top_k), lambda i: (i, 0))
     tables = [weights]
     if with_scales:
         tables = [scales.reshape(tokens_per_shard, top_k)] + tables
@@ -161,12 +157,11 @@ def weighted_sum(rows,
                                   hidden=hidden,
                                   unroll=unroll,
                                   with_scales=with_scales,
-                                  dtype=dtype,
-                                  dma_only=dma_only)
+                                  dtype=dtype)
 
     rows = rows.reshape(tokens_per_shard, top_k, lane_blocks, lanes)
     rows_spec = pl.BlockSpec((tokens_per_tile, top_k, lane_blocks, lanes),
-                             lambda i: (step(i), 0, 0, 0))
+                             lambda i: (i, 0, 0, 0))
     out_spec = pl.BlockSpec((tokens_per_tile, hidden), lambda i: (i, 0))
     coefficients = pltpu.VMEM((tokens_per_tile, top_k), jnp.float32)
     accumulator = pltpu.VMEM((tokens_per_tile * lane_blocks, lanes),
@@ -182,9 +177,7 @@ def weighted_sum(rows,
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit),
         name=f"fused_ep_combine_sum_t{tokens_per_tile}u{unroll}"
         f"{'' if with_scales else '_bf16'}"
-        f"{'' if dtype == jnp.float32 else '_e16'}"
-        f"{'_dma' if dma_only else ''}"
-        f"{'_compute' if compute_only else ''}")
+        f"{'' if dtype == jnp.float32 else '_e16'}")
     return program(*tables, rows)
 
 
@@ -199,8 +192,7 @@ def combine(arrivals,
             ring=GATHER_RING_DEFAULT,
             tokens_per_tile=COMBINE_TOKENS_PER_TILE_DEFAULT,
             unroll=COMBINE_UNROLL_DEFAULT,
-            dtype=jnp.float32,
-            dma_only=False):
+            dtype=jnp.float32):
     """The layer's output from the arrival rows as the FFN kernel returns
     it: arrivals [R, result blocks, LANES] fp8 or bf16 (the true `hidden`
     padded with zero blocks to whole SUBLANES), arrival_scales [R] f32 (a
@@ -231,5 +223,4 @@ def combine(arrivals,
                         out_dtype=out_dtype,
                         tokens_per_tile=tokens_per_tile,
                         unroll=unroll,
-                        dtype=dtype,
-                        dma_only=dma_only)
+                        dtype=dtype)
