@@ -420,38 +420,49 @@ def _warn_if_kv_cache_is_padded(
         num_kv_heads, head_size, dtype, backend.get_name())
 
 
-# Recompilation-avoidance contract:
-#   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
-#   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
-#      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so _dummy_run and execute_model trace identically.
-#   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
-#      compiled before the first real request.
 def shared_kv_tensor_num_blocks(
     tensor_size: int,
     specs: Sequence[KVCacheSpec],
-    attention_backend: type,
+    attention_backend: type | None,
     expected_num_blocks: int,
 ) -> int:
-    """Blocks a KV tensor shared by attention and Mamba layers can hold.
+    """Block count of the per-layer tensors carved out of one shared KV tensor.
 
-    vLLM sizes the shared tensor as ``num_blocks x page_size_padded`` and
-    addresses it with block ids below ``expected_num_blocks``. The runner
-    allocates one tensor per layer out of that budget, so the count is
-    derived from the TPU-actual per-layer page sizes: the Mamba page as vLLM
-    defines it without padding, and the attention page as laid out by
-    ``attention_backend``, the backend that serves these layers.
+    vLLM sizes a tensor shared by several layers as
+    ``num_blocks x page_size_padded`` and addresses it with block ids below
+    ``expected_num_blocks``. The runner allocates one tensor per layer out of
+    that budget, so the count is the budget divided by the TPU-actual page
+    sizes of the sharing layers.
 
-    Returns the count. Raises when it is smaller than ``expected_num_blocks``,
-    because block ids beyond the tensor would read and write out of bounds.
+    For a tensor that holds Mamba layers, the attention page is the one the
+    serving backend lays out (``PallasMLAttentionBackend`` for an
+    ``MLAAttentionSpec``, ``attention_backend`` otherwise) and the Mamba page
+    is vLLM's unpadded one. The result is capped at ``expected_num_blocks``,
+    since vLLM never uses a higher block id, and a result below it raises,
+    since those block ids would read and write out of bounds.
+
+    A tensor shared only by attention layers keeps the RPA page formula for
+    every layer and returns the divided count unchanged; a count below
+    ``expected_num_blocks`` is logged as a warning.
     """
+    has_mamba = any(isinstance(spec, MambaSpec) for spec in specs)
     per_block = 0
     for spec in specs:
         if isinstance(spec, MambaSpec):
             per_block += dataclasses.replace(
                 spec, page_size_padded=None).page_size_bytes
         elif isinstance(spec, AttentionSpec):
-            per_block += attention_backend.get_kv_cache_page_size_bytes(
+            if not has_mamba:
+                backend = PallasAttentionBackend
+            elif isinstance(spec, MLAAttentionSpec):
+                backend = PallasMLAttentionBackend
+            elif attention_backend is not None:
+                backend = attention_backend
+            else:
+                raise ValueError(
+                    "no attention backend for a shared KV tensor with an "
+                    f"attention layer ({type(spec).__name__})")
+            per_block += backend.get_kv_cache_page_size_bytes(
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
@@ -462,20 +473,38 @@ def shared_kv_tensor_num_blocks(
                 f"Unsupported KV cache spec in a shared tensor: {type(spec)!r}"
             )
     num_blocks = tensor_size // per_block
-    logger.info(
-        "[kv-alloc] shared KV tensor: size=%d B, per-block=%d B (%s) -> "
-        "num_blocks=%d (vLLM num_blocks=%d)", tensor_size, per_block,
-        attention_backend.__name__, num_blocks, expected_num_blocks)
+    backend_name = getattr(attention_backend, "__name__", None)
+    if num_blocks == expected_num_blocks:
+        return num_blocks
+    if not has_mamba:
+        if num_blocks < expected_num_blocks:
+            logger.warning(
+                "[kv-alloc] attention-only shared KV tensor: size=%d B, "
+                "per-block=%d B -> %d blocks per layer, vLLM num_blocks=%d "
+                "(backend %s)", tensor_size, per_block, num_blocks,
+                expected_num_blocks, backend_name)
+        return num_blocks
     if num_blocks < expected_num_blocks:
         raise ValueError(
             f"[kv-alloc] a shared KV tensor of {tensor_size} B holds "
             f"{num_blocks} blocks at {per_block} B per block, but vLLM will "
             f"hand out {expected_num_blocks} block ids; the ids past the "
-            "tensor would read and write out of bounds "
-            f"(attention backend {attention_backend.__name__}).")
-    return num_blocks
+            f"tensor would read and write out of bounds (backend "
+            f"{backend_name}).")
+    logger.info(
+        "[kv-alloc] shared KV tensor: size=%d B, per-block=%d B -> %d blocks, "
+        "capped at vLLM num_blocks=%d", tensor_size, per_block, num_blocks,
+        expected_num_blocks)
+    return expected_num_blocks
 
 
+# Recompilation-avoidance contract:
+#   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
+#   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
+#      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
+#      gather_logprobs) so _dummy_run and execute_model trace identically.
+#   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
+#      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
 
     @property
@@ -6693,7 +6722,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_blocks = shared_kv_tensor_num_blocks(
                     tensor_size,
                     [layer_name_to_spec[name] for name in shared_by],
-                    TpuPlatform._find_non_ssm_backend(self.vllm_config),
+                    backend_cls,
                     kv_cache_config.num_blocks,
                 )
             else:
