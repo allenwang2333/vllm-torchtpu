@@ -161,15 +161,13 @@ spec:
                 - name: gke-gcsfuse-cache
                   emptyDir:
                     medium: Memory
-                # What scripts/multihost/run_cluster.sh gives the bare-metal
-                # container. Larger than the disagg engines' because the
+                # Also the launcher's to size, and for the same reason: the
                 # torch_tpu compile cache lives in /dev/shm and every DP engine
-                # caches its own compiled graphs: 16Gi overflows at DP>=4 on
-                # GLM-5.2, and these steps are DP16.
+                # caches its own compiled graphs, so what this needs follows
+                # the chips on the host.
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 128Gi
                 # Claims, not inline CSI volumes: the buckets are regional, so
                 # the name differs per cluster and only a claim resolves in
                 # whichever cluster the workload was dispatched to.

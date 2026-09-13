@@ -278,7 +278,6 @@ spec:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 16Gi
               # Claims, not inline CSI volumes: the buckets are regional, so
               # the name differs per cluster and only a claim resolves in
               # whichever cluster the workload was dispatched to.
@@ -484,7 +483,6 @@ spec:
               - name: dshm
                 emptyDir:
                   medium: Memory
-                  sizeLimit: 16Gi
               - name: jax-cache
                 persistentVolumeClaim:
                   claimName: jax-cache
