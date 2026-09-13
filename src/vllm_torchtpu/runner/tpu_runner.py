@@ -11,7 +11,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -427,6 +427,55 @@ def _warn_if_kv_cache_is_padded(
 #      gather_logprobs) so _dummy_run and execute_model trace identically.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
+def shared_kv_tensor_num_blocks(
+    tensor_size: int,
+    specs: Sequence[KVCacheSpec],
+    attention_backend: type,
+    expected_num_blocks: int,
+) -> int:
+    """Blocks a KV tensor shared by attention and Mamba layers can hold.
+
+    vLLM sizes the shared tensor as ``num_blocks x page_size_padded`` and
+    addresses it with block ids below ``expected_num_blocks``. The runner
+    allocates one tensor per layer out of that budget, so the count is
+    derived from the TPU-actual per-layer page sizes: the Mamba page as vLLM
+    defines it without padding, and the attention page as laid out by
+    ``attention_backend``, the backend that serves these layers.
+
+    Returns the count. Raises when it is smaller than ``expected_num_blocks``,
+    because block ids beyond the tensor would read and write out of bounds.
+    """
+    per_block = 0
+    for spec in specs:
+        if isinstance(spec, MambaSpec):
+            per_block += dataclasses.replace(
+                spec, page_size_padded=None).page_size_bytes
+        elif isinstance(spec, AttentionSpec):
+            per_block += attention_backend.get_kv_cache_page_size_bytes(
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported KV cache spec in a shared tensor: {type(spec)!r}"
+            )
+    num_blocks = tensor_size // per_block
+    logger.info(
+        "[kv-alloc] shared KV tensor: size=%d B, per-block=%d B (%s) -> "
+        "num_blocks=%d (vLLM num_blocks=%d)", tensor_size, per_block,
+        attention_backend.__name__, num_blocks, expected_num_blocks)
+    if num_blocks < expected_num_blocks:
+        raise ValueError(
+            f"[kv-alloc] a shared KV tensor of {tensor_size} B holds "
+            f"{num_blocks} blocks at {per_block} B per block, but vLLM will "
+            f"hand out {expected_num_blocks} block ids; the ids past the "
+            "tensor would read and write out of bounds "
+            f"(attention backend {attention_backend.__name__}).")
+    return num_blocks
+
+
 class TPUModelRunner(GPUModelRunner):
 
     @property
@@ -6641,31 +6690,12 @@ class TPUModelRunner(GPUModelRunner):
             tensor_size = kv_cache_tensor.size
             shared_by = kv_cache_tensor.shared_by
             if len(shared_by) > 1:
-                total_group_page_size = 0
-                for name in shared_by:
-                    spec = layer_name_to_spec[name]
-                    # Use the per-layer *TPU-actual* per-block bytes so the
-                    # sum equals the `page_size_padded` that
-                    # `update_mamba_page_size_padded` installed on every
-                    # spec (== attn_page + N × mamba_unpadded). For
-                    # attention, the TPU-actual size includes dtype-
-                    # specific packing (e.g., fp8 KV packs 4 elements per
-                    # 32-bit word) which `spec.real_page_size_bytes`
-                    # doesn't account for — on fp8 models they differ by
-                    # 2×, which would break the num_blocks match here.
-                    if isinstance(spec, MambaSpec):
-                        total_group_page_size += dataclasses.replace(
-                            spec, page_size_padded=None).page_size_bytes
-                    elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
-                            spec.block_size,
-                            spec.num_kv_heads,
-                            spec.head_size,
-                            spec.dtype,
-                        )
-                    else:
-                        raise NotImplementedError
-                num_blocks = tensor_size // total_group_page_size
+                num_blocks = shared_kv_tensor_num_blocks(
+                    tensor_size,
+                    [layer_name_to_spec[name] for name in shared_by],
+                    TpuPlatform._find_non_ssm_backend(self.vllm_config),
+                    kv_cache_config.num_blocks,
+                )
             else:
                 num_blocks = kv_cache_config.num_blocks
 
