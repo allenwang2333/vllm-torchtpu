@@ -55,7 +55,21 @@ x-kube-plugin: &kube_plugin
       fetchFlags: -v --prune --depth 1 --filter=blob:none
 
 x-perf-step-defaults: &perf_step
-  depends_on: "build_docker"
+  # The v7x-16 step ahead of the v7x-8 ones, not because it is more important
+  # but because it is the only one that cannot wait its turn. It needs all
+  # eight of the fleet's chips at once, from a queue that holds no quota of its
+  # own and borrows the lot; every other step needs four and there are a dozen
+  # of them. Kueue reserves nothing for a workload it cannot yet admit, so each
+  # time four chips come free the next four-chip step takes them and the
+  # sixteen-chip one is no closer than before. Left to run alongside, it is not
+  # slow - it never starts.
+  #
+  # Costs one step's duration of two-way parallelism at the front of a suite
+  # that is a day deep either way. On a build that is not nightly the step is
+  # skipped, and Buildkite counts a skipped dependency as satisfied.
+  depends_on:
+    - "build_docker"
+    - "perf_nightly_glm_5_2_fp8_dp16_ep"
   # soft_fail everywhere while the lane is being proven: a failure here is a
   # question about the fleet, not about the commit.
   soft_fail: true
@@ -222,6 +236,8 @@ steps:
       - label: ":kubernetes: Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
         key: "perf_nightly_glm_5_2_fp8_dp16_ep"
         <<: *perf_step
+        # Overrides the anchor, which makes every other step wait for this one.
+        depends_on: "build_docker"
         if: 'build.env("NIGHTLY") == "1"'
         env:
           TPU_ACCELERATOR_TYPE: "tpu7x"
