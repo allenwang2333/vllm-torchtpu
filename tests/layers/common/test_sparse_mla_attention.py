@@ -49,7 +49,8 @@ PAGES_PER_SEQ = 4
 TOTAL_PAGES = 16
 TOKEN_PAD = 16  # attention kernel batch size; token count must be a multiple
 
-# Pinned, not read from the environment: this is the geometry dsa_gather wants.
+# Layouts pinned explicitly rather than read from the environment: these
+# tests check the exact geometry dsa_gather is written against.
 KV_PACKING = sparse_mla_kernel.get_dtype_packing(jnp.float8_e4m3fn)
 NOPE_SPEC = SparseMLAKVCacheSpec.create(KVCacheType.NOPE,
                                         KVCacheLayout.TENSORCORE, TOTAL_PAGES,
@@ -312,7 +313,10 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         topk_rows = np.full((q_len, topk), -1, np.int32)
         for pos in range(q_len):
             n_sel = min(pos + 1, 8)
-            # Include self, never repeat: the DSA kernels differ on repeats.
+            # Always include self, and never repeat an index: the indexer
+            # emits distinct positions, and the two DSA kernels do not agree
+            # on repeats -- a gathered row is attended twice, a mask bit set
+            # twice is still one column.
             others = self.rng.choice(pos, size=n_sel -
                                      1, replace=False) if pos else np.empty(
                                          0, np.int64)
@@ -361,7 +365,8 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             kv_c_deq.append(_dequantize(kv_c_rows[s], self.k_scale))
             k_pe_deq.append(_dequantize(k_pe_rows[s], self.k_scale))
 
-        # Step 2: one decode token per sequence, causal over context plus self.
+        # Step 2: one decode token per sequence, attending causally over the
+        # prefilled context plus itself.
         num_tokens = TOKEN_PAD
         kv_c_new, k_pe_new = self._random_latents(num_seqs)
         kv_c_fp8 = _quantize_fp8(kv_c_new, self.k_scale)
@@ -830,7 +835,9 @@ class MaskedDensePrefillTierTest(parameterized.TestCase):
         self.assertEqual(self._tier([1024, 2048], [512, 512], [0, 0, 2]), 0)
 
     def test_multi_token_verification_is_kernel_supported(self):
-        # Without a one-token decode prefix this selects like any mixed launch.
+        # With no one-token decode prefix, a verification-shaped query is safe
+        # to select just like any other mixed launch. This removes the need for
+        # a speculative-decoding classification bit in attention metadata.
         self.assertEqual(self._tier([1024], [4], [0, 0, 1]), 0)
 
     def test_padded_entries_past_num_seqs_do_not_veto(self):
@@ -917,7 +924,9 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         kv_c = rng.standard_normal((num_tokens, LKV_DIM)).astype(np.float32)
         k_pe = rng.standard_normal((num_tokens, ROPE_DIM)).astype(np.float32)
 
-        # Fully causal: at kv_len <= topk this is `streamindex_topk` output.
+        # Fully causal selection: with kv_len <= topk this is exactly what
+        # `streamindex_topk` emits, since it scores every non-causal or
+        # past-kv_len position -inf and takes an exact top-k.
         positions = []
         for s, q_len in enumerate(q_lens):
             base = kv_lens[s] - q_len
@@ -995,7 +1004,8 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
                                    atol=2e-2)
 
     @parameterized.named_parameters(
-        # One over-limit sequence sends the whole step to the gather kernel.
+        # One over-limit sequence pushes the whole step to the gather kernel,
+        # short neighbour included -- the dispatch is per step.
         dict(testcase_name="one_long_sequence",
              q_lens=[40, 24],
              seq_lens=[40, 100],
