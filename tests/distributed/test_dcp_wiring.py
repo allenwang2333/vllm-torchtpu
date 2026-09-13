@@ -13,7 +13,6 @@
 # limitations under the License.
 """The ownership rule the indexer's return leg and the KV write must share."""
 
-import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
@@ -22,17 +21,17 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     cp_local_to_global
 from vllm_torchtpu.layers.vllm.cp_indexer_merge import cp_global_to_local
 
-# Eager `jnp` here would take the libtpu lockfile in the pytest parent.
+# numpy, not jnp: an eager jnp call claims the TPU in the pytest parent and
+# breaks every later spawn-based test in the session.
 pytestmark = pytest.mark.cpu_test
 
 
 def _owned_below(n, dcp_size, interleave_c):
     """Each rank's owned global positions below `n`, in local-index order."""
-    locals_ = jnp.arange(n, dtype=jnp.int32)
+    locals_ = np.arange(n, dtype=np.int32)
     images = []
     for rank in range(dcp_size):
-        g = np.asarray(
-            cp_local_to_global(locals_, rank, dcp_size, interleave_c))
+        g = cp_local_to_global(locals_, rank, dcp_size, interleave_c)
         images.append(g[g < n])
     return images
 

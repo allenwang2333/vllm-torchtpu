@@ -13,7 +13,6 @@
 # limitations under the License.
 """The torch ownership filter keeps the winners this rank owns, and no more."""
 
-import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
@@ -41,9 +40,8 @@ def _candidates(rng, dcp_size, interleave_c, k, num_rows, empty_frac):
         for t in range(num_rows):
             n = rng.integers(0, k + 1) if rng.random() < empty_frac else k
             local = rng.choice(4 * k, size=int(n), replace=False)
-            idxs[r, t, :n] = np.asarray(
-                cp_local_to_global(jnp.asarray(local, jnp.int32), r, dcp_size,
-                                   interleave_c))
+            idxs[r, t, :n] = cp_local_to_global(local.astype(np.int32), r,
+                                                dcp_size, interleave_c)
     return idxs
 
 
