@@ -4588,6 +4588,20 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        # TPU_SHARDED_LM_HEAD: the projection split across the engines; rows
+        # padded to the largest request bucket so every engine calls the op
+        # with one shape. The engine's largest prompt chunk decides with the
+        # row count whether the head may go on (its known limit).
+        from vllm_torchtpu.layers.vllm import sharded_lm_head
+        sharded_lm_head.install_if_enabled(
+            model, int(max(self.num_reqs_paddings)),
+            int(self.vllm_config.scheduler_config.max_num_batched_tokens))
+        # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
+        from vllm_torchtpu.layers.vllm import norm_weight_hoist
+        norm_weight_hoist.install_if_enabled(model)
+        # TPU_GDN_FUSED_NORM_QUANT: the GDN output's gated norm and fp8 quantisation as one op, built here.
+        from vllm_torchtpu.layers.vllm import gated_norm_quant_op
+        gated_norm_quant_op.install_if_enabled(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -6657,7 +6671,11 @@ class TPUModelRunner(GPUModelRunner):
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        # `backend_cls`, not `PallasAttentionBackend`: the
+                        # tensor this divides into is allocated from
+                        # `backend_cls.get_kv_cache_shape` below, and a
+                        # backend may lay its page out differently.
+                        total_group_page_size += backend_cls.get_kv_cache_page_size_bytes(
                             spec.block_size,
                             spec.num_kv_heads,
                             spec.head_size,
