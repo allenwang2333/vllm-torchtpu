@@ -21,6 +21,8 @@ import json
 import queue
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -238,6 +240,67 @@ class _Stage3RegisteredSend:
     local_block_ids: tuple[int, ...]
     num_tokens: int
     expiration_time: float
+
+
+@dataclass(frozen=True)
+class _Stage3Admission:
+    """What the producer promised the proxy when it admitted a request."""
+
+    uuid: int
+    num_tokens: int
+
+
+class _AdmissionNotifier:
+    """Posts admission announcements to the proxy off the scheduler thread.
+
+    The scheduler must not block on the network, so announcements go onto a
+    queue and a daemon thread drains it. Losing one is not a correctness
+    problem: the proxy waits a bounded time and then falls back to reading the
+    same parameters out of prefill's response, which is where they come from
+    with this feature off. Dropping the oldest under backpressure is therefore
+    better than growing without bound.
+    """
+
+    _MAX_PENDING = 1024
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[Optional[tuple[str, dict[str, Any]]]] = (
+            queue.Queue(maxsize=self._MAX_PENDING))
+        self._dropped = 0
+        self._thread = threading.Thread(target=self._run,
+                                        name="kv-admission-notify",
+                                        daemon=True)
+        self._thread.start()
+
+    def post(self, url: str, payload: dict[str, Any]) -> None:
+        try:
+            self._queue.put_nowait((url, payload))
+        except queue.Full:
+            self._dropped += 1
+            logger.warning(
+                "Admission announcement queue is full; dropped %d so far. "
+                "Affected requests fall back to the post-prefill handoff.",
+                self._dropped)
+
+    def _run(self) -> None:
+        timeout = float(tpu_envs.TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S)
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            url, payload = item
+            try:
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                with urllib.request.urlopen(request, timeout=timeout):
+                    pass
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                logger.warning(
+                    "Admission announcement to %s failed for req_id=%s: %s",
+                    url, payload.get("req_id"), exc)
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -940,6 +1003,15 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # registration.
         self._stage3_finished_sends: OrderedDict[str, tuple[int, tuple[
             int, ...], int, dict[str, Any]]] = OrderedDict()
+        # req_id -> what admission promised the proxy, for requests whose
+        # prefill has not finished yet. request_finished() drains this and
+        # reuses the uuid rather than minting a second one.
+        self._stage3_admitted_sends: OrderedDict[
+            str, _Stage3Admission] = OrderedDict()
+        self._admission_notifier: Optional[_AdmissionNotifier] = None
+        if self.is_producer and _use_raiden_stage3_transport(
+        ) and tpu_envs.TPU_KV_ADMISSION_REORDER:
+            self._admission_notifier = _AdmissionNotifier()
         self._stage3_fa_group_index = 0
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
@@ -1008,7 +1080,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        if self.is_producer or not request.kv_transfer_params:
+        if self.is_producer:
+            # The producer has just been given the blocks it will prefill
+            # into, which is the earliest point at which it can promise that
+            # this request's KV will exist under a particular uuid.
+            self._maybe_announce_admission(request)
+            return
+        if not request.kv_transfer_params:
             return
 
         if _use_raiden_stage3_transport():
@@ -1261,6 +1339,130 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "source_req_id=%s uuid=%d releases the producer registration",
             request.request_id, source_req_id, uuid)
 
+    def _stage3_source_params(self, pcp_size: int) -> dict[str, Any]:
+        """The half of the wire parameters that says where the pages live.
+
+        None of it depends on the request, so admission can compute it as
+        readily as completion can. It is a method rather than a cached value
+        because the validation below is the only thing that catches a
+        misconfigured deployment, and it is cheap enough to repeat.
+        """
+        parallel_config = self.vllm_config.parallel_config
+        producer_dp_rank = (parallel_config.data_parallel_rank
+                            if parallel_config else 0)
+        controller_address = _resolved_reshard_controller_address(
+            producer_dp_rank)
+        if not controller_address:
+            raise ValueError("Stage-3 producer metadata requires "
+                             "TPU_RAIDEN_CONTROLLER_ADDRESS")
+        src_job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or "prefill"
+        src_engine_id = self._raiden_engine_id()
+        src_parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
+        src_data_replica_idx = int(parallel_config.data_parallel_rank or 0)
+        if not src_engine_id:
+            raise ValueError("TPU_RAIDEN_ENGINE_ID must not be empty")
+        if src_parallelism <= 0:
+            raise ValueError(
+                "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
+        if _use_raiden_glm_admission():
+            tp_size = int(parallel_config.tensor_parallel_size or 1)
+            if src_parallelism != tp_size:
+                raise ValueError(
+                    "Stage-3 GLM producer transfer parallelism must equal "
+                    f"TP size: parallelism={src_parallelism}, "
+                    f"tp_size={tp_size}")
+        elif src_parallelism != pcp_size:
+            raise ValueError(
+                "Stage-3 producer transfer parallelism must equal PCP size: "
+                f"parallelism={src_parallelism}, pcp_size={pcp_size}")
+        if src_data_replica_idx < 0:
+            raise ValueError(
+                "Producer data-parallel rank must be non-negative")
+        return {
+            "src_controller_address": controller_address,
+            "src_job_name": src_job_name,
+            "src_engine_id": src_engine_id,
+            "src_data_replica_idx": src_data_replica_idx,
+            "src_parallelism": src_parallelism,
+        }
+
+    def _predicted_transfer_tokens(self, request: "Request",
+                                   pcp_size: int) -> Optional[int]:
+        """How many tokens this request will ship, decided at admission.
+
+        request_finished() uses min(num_computed_tokens, prompt_tokens - 1).
+        At admission num_computed_tokens is not known, but for a request the
+        producer is about to prefill to completion the two agree, because the
+        producer computes the whole prompt. The mamba truncation that would
+        otherwise change the count has already run, in on_new_request().
+
+        Returning None means "do not announce": each gate below is one that
+        request_finished() would later use to decline the transfer outright,
+        and announcing a transfer that never happens leaves decode waiting.
+        """
+        params = request.kv_transfer_params
+        truncated = bool(
+            isinstance(params, dict) and params.get("_p_side_truncated"))
+        prompt_tokens = int(request.num_prompt_tokens)
+        num_tokens = prompt_tokens if truncated else prompt_tokens - 1
+        if num_tokens <= 0:
+            return None
+        if not _use_raiden_glm_admission():
+            interleave_size = int(
+                getattr(self.vllm_config.parallel_config,
+                        "cp_kv_cache_interleave_size", 256) or 256)
+            if num_tokens < pcp_size * interleave_size:
+                return None
+        max_transfer_tokens = tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS
+        if (max_transfer_tokens is not None and max_transfer_tokens > 0
+                and num_tokens > max_transfer_tokens):
+            return None
+        return num_tokens
+
+    def _maybe_announce_admission(self, request: "Request") -> None:
+        """Tell the proxy this request's uuid now, not when prefill ends.
+
+        Decode cannot allocate until it knows the uuid and the token count,
+        and today it learns both from prefill's final response. Sending them
+        at admission lets decode's allocation, its scheduler round trip and
+        its registration overlap the prefill rather than follow it.
+        """
+        if self._admission_notifier is None:
+            return
+        params = request.kv_transfer_params
+        if not isinstance(params, dict):
+            return
+        callback_url = params.get("admit_callback_url")
+        if not callback_url:
+            return
+        if request.request_id in self._stage3_admitted_sends:
+            # A preempted request is admitted a second time, and decode is
+            # already holding blocks against the uuid from the first.
+            return
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+            or 1)
+        num_tokens = self._predicted_transfer_tokens(request, pcp_size)
+        if num_tokens is None:
+            return
+        if len(self._stage3_admitted_sends) >= _STAGE3_FINISH_DEDUP_LIMIT:
+            raise RuntimeError(
+                "Stage-3 admission announcement capacity exhausted: "
+                f"limit={_STAGE3_FINISH_DEDUP_LIMIT}")
+        uuid = get_uuid()
+        self._stage3_admitted_sends[request.request_id] = _Stage3Admission(
+            uuid=uuid, num_tokens=num_tokens)
+        announcement: dict[str, Any] = {
+            "req_id": request.request_id,
+            "uuid": uuid,
+            "num_tokens": num_tokens,
+            **self._stage3_source_params(pcp_size),
+        }
+        self._admission_notifier.post(str(callback_url), announcement)
+        logger.info(
+            "TPURaidenConnectorScheduler Stage-3 admit req_id=%s uuid=%d "
+            "num_tokens=%d", request.request_id, uuid, num_tokens)
+
     def request_finished(
         self,
         request: "Request",
@@ -1271,6 +1473,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return super().request_finished(request, block_ids)
         if not self.is_producer:
             return False, None
+        # Drained here rather than at the send site so that a request which
+        # never reaches one, because it was aborted or because a gate below
+        # declines the transfer, does not leave its announcement behind.
+        announced = self._stage3_admitted_sends.pop(request.request_id, None)
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
 
@@ -1289,6 +1495,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         else:
             num_tokens = min(computed_tokens, prompt_tokens - 1)
         if num_tokens <= 0 or not block_ids:
+            if announced is not None:
+                logger.warning(
+                    "Stage-3 announced uuid=%d for req_id=%s at admission but "
+                    "the finished prefill has no pages to send "
+                    "(num_tokens=%d, blocks=%d); decode will wait out its "
+                    "registration budget.", announced.uuid, request.request_id,
+                    num_tokens, len(block_ids))
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
@@ -1331,38 +1544,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 f"{expected_scheduler_blocks}, num_tokens={num_tokens}, "
                 f"page_tokens={self.block_size}, pcp_size={pcp_size}")
 
-        producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
-                            if self.vllm_config.parallel_config else 0)
-        controller_address = _resolved_reshard_controller_address(
-            producer_dp_rank)
-        if not controller_address:
-            raise ValueError("Stage-3 producer metadata requires "
-                             "TPU_RAIDEN_CONTROLLER_ADDRESS")
+        source = self._stage3_source_params(pcp_size)
         normalized_ids = normalized_block_ids
-        src_job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or "prefill"
-        src_engine_id = self._raiden_engine_id()
-        src_parallelism = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
-        parallel_config = self.vllm_config.parallel_config
-        src_data_replica_idx = int(parallel_config.data_parallel_rank or 0)
-        if not src_engine_id:
-            raise ValueError("TPU_RAIDEN_ENGINE_ID must not be empty")
-        if src_parallelism <= 0:
-            raise ValueError(
-                "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
-        if _use_raiden_glm_admission():
-            tp_size = int(parallel_config.tensor_parallel_size or 1)
-            if src_parallelism != tp_size:
-                raise ValueError(
-                    "Stage-3 GLM producer transfer parallelism must equal "
-                    f"TP size: parallelism={src_parallelism}, "
-                    f"tp_size={tp_size}")
-        elif src_parallelism != pcp_size:
-            raise ValueError(
-                "Stage-3 producer transfer parallelism must equal PCP size: "
-                f"parallelism={src_parallelism}, pcp_size={pcp_size}")
-        if src_data_replica_idx < 0:
-            raise ValueError(
-                "Producer data-parallel rank must be non-negative")
         existing = self._stage3_finished_sends.get(request.request_id)
         if existing is not None:
             uuid, old_ids, old_num_tokens, params = existing
@@ -1390,7 +1573,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                  "mamba block tables were not provided")
             mamba_state_block_ids = _select_committed_mamba_blocks(
                 mamba_block_ids, self._stage3_mamba_num_speculative_blocks)
-        uuid = get_uuid()
+        # An admitted request already told the proxy, and through it decode,
+        # which uuid its pages live under. Minting a second one here would
+        # leave decode waiting on a uuid the producer never registers.
+        if announced is None:
+            uuid = get_uuid()
+        else:
+            uuid = announced.uuid
+            if announced.num_tokens != num_tokens:
+                logger.warning(
+                    "Stage-3 admission announced %d tokens for req_id=%s but "
+                    "the finished prefill covers %d; decode sized its "
+                    "allocation from the announcement.", announced.num_tokens,
+                    request.request_id, num_tokens)
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
         self.reqs_to_send[request.request_id] = SendMeta(
@@ -1404,11 +1599,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "req_id": request.request_id,
             "uuid": uuid,
             "num_tokens": num_tokens,
-            "src_controller_address": controller_address,
-            "src_job_name": src_job_name,
-            "src_engine_id": src_engine_id,
-            "src_data_replica_idx": src_data_replica_idx,
-            "src_parallelism": src_parallelism,
+            **source,
         }
         self._stage3_finished_sends[request.request_id] = (
             uuid,
@@ -1423,7 +1614,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             uuid,
             num_tokens,
             len(normalized_ids),
-            controller_address,
+            source["src_controller_address"],
         )
         return True, params
 

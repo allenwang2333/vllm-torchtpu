@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import asyncio
 import codecs
 import itertools
 import logging
@@ -63,6 +64,29 @@ def _proxy_latency_interval() -> float:
 
 
 _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+# Requests waiting to hear that prefill has admitted them. The value is
+# resolved by the /kv_admit callback with the transfer parameters decode needs,
+# which today arrive only in prefill's final response.
+_ADMIT_WAITERS: dict[str, "asyncio.Future[dict]"] = {}
+
+
+def _admission_reorder_enabled() -> bool:
+    return os.getenv("TPU_KV_ADMISSION_REORDER",
+                     "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _admit_timeout_s() -> float:
+    """How long to wait for the admission callback before falling back.
+
+    The fallback is the ordinary path, so this bounds the damage from a lost
+    callback to the latency the feature was meant to save. It has to exceed a
+    prefill queueing delay, though, or a busy prefill never gets to announce.
+    """
+    try:
+        return float(os.getenv("PROXY_ADMIT_TIMEOUT_S", "30"))
+    except ValueError:
+        return 30.0
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
@@ -197,6 +221,14 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
 
+    # Where prefill should POST its admission announcements. It has to be an
+    # address the prefill process can reach, which --host often is not: the
+    # usual value there is a bind address, and localhost on the prefill host
+    # is the prefill host.
+    parser.add_argument("--admit-callback-url",
+                        type=str,
+                        default=os.getenv("PROXY_ADMIT_CALLBACK_URL", ""))
+
     # For prefiller instances
     parser.add_argument("--prefiller-hosts",
                         "--prefiller-host",
@@ -236,6 +268,10 @@ def parse_args():
     args.prefiller_instances = list(
         zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+
+    if not args.admit_callback_url:
+        args.admit_callback_url = f"http://{args.host}:{args.port}"
+    args.admit_callback_url = args.admit_callback_url.rstrip("/")
 
     return args
 
@@ -334,6 +370,54 @@ async def stream_from_decode(client_info: dict, endpoint: str, req_data: dict,
             yield chunk
 
 
+def _watch_prefill(task: "asyncio.Future", request_id: str, t_send_perf: float,
+                   t_recv_perf: float) -> None:
+    """Record prefill's outcome once decode has already been started.
+
+    Nothing downstream is waiting on it, but an un-retrieved task exception is
+    invisible, and prefill failing after decode has been dispatched is the one
+    failure this reordering introduces.
+    """
+
+    def _done(fut: "asyncio.Future") -> None:
+        prefill_ms = (time.perf_counter() - t_send_perf) * 1000.0
+        _PROXY_LATENCY.record("prefill", prefill_ms)
+        _PROXY_LATENCY.record("prefill_from_req",
+                              (time.perf_counter() - t_recv_perf) * 1000.0)
+        exc = None if fut.cancelled() else fut.exception()
+        if exc is not None:
+            print(
+                f"PERF PROXY prefill_failed req_id={request_id} "
+                f"dur_ms={prefill_ms:.2f} err={exc!r}",
+                flush=True)
+            logger.error("Prefill failed after decode was dispatched for %s",
+                         request_id,
+                         exc_info=exc)
+        else:
+            print(
+                f"PERF PROXY prefill_recv req_id={request_id} "
+                f"ts={time.time():.6f} dur_ms={prefill_ms:.2f}",
+                flush=True)
+
+    task.add_done_callback(_done)
+
+
+@app.post("/kv_admit/{token}")
+async def handle_kv_admit(token: str, request: Request):
+    """Prefill's announcement that it has admitted a request.
+
+    The body is the same parameter dict prefill would otherwise return at the
+    end of its response. Arriving late or twice is harmless: the waiter is
+    gone or already resolved, and the request has taken the ordinary path.
+    """
+    payload = await request.json()
+    future = _ADMIT_WAITERS.get(token)
+    if future is not None and not future.done():
+        future.set_result(payload)
+        return {"status": "ok"}
+    return {"status": "ignored"}
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         t_request_recv_perf = time.perf_counter()
@@ -352,32 +436,90 @@ async def _handle_completions(api: str, request: Request):
             req_data = _replace_prompt_with_rendered_token_ids(
                 req_data, render_response.json())
 
+        # Ask prefill to announce this request the moment it is admitted, so
+        # decode can allocate and register while the prefill is still running
+        # instead of afterwards.
+        admit_future: "asyncio.Future[dict] | None" = None
+        if _admission_reorder_enabled():
+            admit_future = asyncio.get_running_loop().create_future()
+            _ADMIT_WAITERS[request_id] = admit_future
+            kv_params_out = dict(req_data.get("kv_transfer_params") or {})
+            kv_params_out["admit_callback_url"] = (
+                f"{global_args.admit_callback_url}/kv_admit/{request_id}")
+            req_data["kv_transfer_params"] = kv_params_out
+
         # Send request to prefill service
         t_prefill_send = time.time()
         t_prefill_send_perf = time.perf_counter()
         print(
             f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
             flush=True)
-        response = await send_request_to_prefill(prefill_client_info, api,
-                                                 req_data, request_id)
-        t_prefill_recv = time.time()
-        t_prefill_recv_perf = time.perf_counter()
-        prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
-        _PROXY_LATENCY.record("prefill", prefill_ms)
-        _PROXY_LATENCY.record("prefill_from_req",
-                              (t_prefill_recv_perf - t_request_recv_perf) *
-                              1000.0)
+        # Prefill gets its own copy: req_data is rewritten below with the
+        # parameters decode needs, and with the reorder on that happens while
+        # the prefill request is still in flight.
+        prefill_task = asyncio.ensure_future(
+            send_request_to_prefill(prefill_client_info, api, dict(req_data),
+                                    request_id))
 
-        # Extract the needed fields
-        response_json = response.json()
-        kv_transfer_params = response_json.get('kv_transfer_params', {})
+        kv_transfer_params: dict | None = None
+        try:
+            if admit_future is not None:
+                await asyncio.wait({admit_future, prefill_task},
+                                   return_when=asyncio.FIRST_COMPLETED,
+                                   timeout=_admit_timeout_s())
+                if not prefill_task.done() and admit_future.done():
+                    kv_transfer_params = admit_future.result()
+                    t_admit = time.time()
+                    admit_ms = (time.perf_counter() -
+                                t_prefill_send_perf) * 1000.0
+                    _PROXY_LATENCY.record("prefill_admit", admit_ms)
+                    print(
+                        f"PERF PROXY prefill_admit req_id={request_id} "
+                        f"ts={t_admit:.6f} dur_ms={admit_ms:.2f} "
+                        f"kv_uuid={kv_transfer_params.get('uuid')}",
+                        flush=True)
+                elif not admit_future.done():
+                    print(
+                        f"PERF PROXY admit_fallback req_id={request_id} "
+                        "reason=prefill_first_or_timeout",
+                        flush=True)
+
+            if kv_transfer_params is None:
+                # Either the reorder is off or its callback did not arrive in
+                # time. Both land on the original path: read the parameters
+                # out of prefill's response.
+                response = await prefill_task
+                t_prefill_recv = time.time()
+                t_prefill_recv_perf = time.perf_counter()
+                prefill_ms = (t_prefill_recv_perf -
+                              t_prefill_send_perf) * 1000.0
+                _PROXY_LATENCY.record("prefill", prefill_ms)
+                _PROXY_LATENCY.record(
+                    "prefill_from_req",
+                    (t_prefill_recv_perf - t_request_recv_perf) * 1000.0)
+                kv_transfer_params = response.json().get(
+                    'kv_transfer_params', {})
+                kv_uuid = (kv_transfer_params.get("uuid")
+                           if kv_transfer_params else None)
+                kv_uuid_log = (f" kv_uuid={kv_uuid}"
+                               if kv_uuid is not None else "")
+                print(
+                    f"PERF PROXY prefill_recv req_id={request_id} "
+                    f"ts={t_prefill_recv:.6f} "
+                    f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
+                    flush=True)
+            else:
+                # Decode goes now; prefill's response is still worth reading,
+                # but only to log a failure that decode would otherwise report
+                # as an expired registration wait.
+                _watch_prefill(prefill_task, request_id, t_prefill_send_perf,
+                               t_request_recv_perf)
+        finally:
+            _ADMIT_WAITERS.pop(request_id, None)
+
         kv_uuid = kv_transfer_params.get(
             "uuid") if kv_transfer_params else None
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
-        print(
-            f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
-            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
-            flush=True)
 
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params

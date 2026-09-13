@@ -11,6 +11,7 @@ TPU.
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -154,6 +155,7 @@ def _make_raiden_scheduler(*,
                            dp_rank: int = 0,
                            tp_size: int = 1,
                            pcp_size: int = 1,
+                           interleave_size: int = 1,
                            kv_ips: Any = "127.0.0.1",
                            kv_ports: Any = 9100):
     """Construct a TPURaidenConnectorScheduler with network calls patched."""
@@ -162,7 +164,8 @@ def _make_raiden_scheduler(*,
                             enable_prefix_caching=enable_prefix_caching,
                             dp_rank=dp_rank,
                             tp_size=tp_size,
-                            pcp_size=pcp_size)
+                            pcp_size=pcp_size,
+                            interleave_size=interleave_size)
     with patch(f"{_MOD}.dist_utils.get_kv_ips", return_value=kv_ips), \
          patch(f"{_MOD}.dist_utils.get_kv_ports", return_value=kv_ports):
         return TPURaidenConnectorScheduler(cfg)
@@ -1437,6 +1440,210 @@ class TestTPURaidenConnectorScheduler:
                                            tp_size=4,
                                            kv_ports=[9100, 9200])
         assert scheduler.kv_port == [9108, 9208]
+
+
+class _RecordingNotifier:
+    """Stands in for the thread that POSTs announcements to the proxy."""
+
+    def __init__(self):
+        self.posts: list[tuple[str, dict]] = []
+
+    def post(self, url, payload):
+        self.posts.append((url, payload))
+
+
+def _stage3_producer_env(uuid_value: int):
+    """The env patches every Stage-3 producer call needs, as one context."""
+    return [
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+              "raiden",
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+              "prefill-controller.test:27000",
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+              "custom-prefill-job",
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+              "producer-engine-9",
+              create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+              8,
+              create=True),
+        patch(f"{_MOD}.get_uuid", return_value=uuid_value),
+        patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+              return_value=30.0),
+    ]
+
+
+class TestStage4AdmissionReorder:
+    """Prefill announcing a request's uuid when it admits it, not when it
+    finishes, so decode can allocate during the prefill rather than after."""
+
+    def _producer(self, *, announce: bool, interleave_size: int = 1):
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8,
+                                          interleave_size=interleave_size)
+        notifier = _RecordingNotifier()
+        if announce:
+            producer._admission_notifier = notifier
+        return producer, notifier
+
+    def _request(self, req_id: str, prompt_tokens: int = 65_024):
+        req = MagicMock()
+        req.request_id = req_id
+        req.prompt_token_ids = [0] * prompt_tokens
+        req.num_prompt_tokens = prompt_tokens
+        req.num_computed_tokens = prompt_tokens
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.kv_transfer_params = {
+            "admit_callback_url": "http://proxy.test:8000/kv_admit/r-1"
+        }
+        return req
+
+    def test_all_off_leaves_the_producer_path_unchanged(self):
+        """The stage gate: with TPU_KV_ADMISSION_REORDER unset, nothing about
+        the producer moves, including for a request carrying a callback URL."""
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_ADMISSION_REORDER",
+                   False,
+                   create=True):
+            producer = _make_raiden_scheduler(is_producer=True,
+                                              block_size=4096,
+                                              pcp_size=8)
+        assert producer._admission_notifier is None
+
+        req = self._request("off-1")
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            assert producer._stage3_admitted_sends == {}
+            delay, params = producer.request_finished(req, [100, 101])
+
+        assert delay
+        assert params["uuid"] == 777
+        assert params["num_tokens"] == 65_023
+
+    def test_admission_announces_and_the_finish_reuses_that_uuid(self):
+        producer, notifier = self._producer(announce=True)
+        req = self._request("reorder-1")
+
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            assert len(notifier.posts) == 1
+            url, announced = notifier.posts[0]
+            delay, params = producer.request_finished(req, [100, 101])
+
+        assert url == "http://proxy.test:8000/kv_admit/r-1"
+        # The announcement has to be the wire parameters in full: decode reads
+        # it in place of prefill's response, not alongside it.
+        assert announced == {
+            "req_id": "reorder-1",
+            "uuid": 777,
+            "num_tokens": 65_023,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "custom-prefill-job",
+            "src_engine_id": "producer-engine-9",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+        }
+        assert delay
+        assert params == announced
+        assert producer.reqs_to_send["reorder-1"].uuid == 777
+        assert producer._stage3_admitted_sends == {}
+
+    def test_no_callback_url_means_no_announcement(self):
+        """A request the proxy did not opt in stays on the old path even with
+        the feature enabled, so the two can run side by side."""
+        producer, notifier = self._producer(announce=True)
+        req = self._request("plain-1")
+        req.kv_transfer_params = {}
+
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+
+        assert notifier.posts == []
+        assert producer._stage3_admitted_sends == {}
+
+    def test_readmission_after_preemption_does_not_mint_a_second_uuid(self):
+        """Decode is already holding blocks against the first uuid."""
+        producer, notifier = self._producer(announce=True)
+        req = self._request("preempt-1")
+
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+
+        assert len(notifier.posts) == 1
+
+    def test_a_prompt_below_the_interleave_minimum_is_not_announced(self):
+        """request_finished declines this transfer, so announcing it would
+        leave decode waiting for a registration that never arrives."""
+        producer, notifier = self._producer(announce=True, interleave_size=256)
+        # PCP8 against a 256-token interleave needs 2048 tokens to transfer.
+        req = self._request("tiny-1", prompt_tokens=1_000)
+
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            delay, _params = producer.request_finished(req, [100])
+
+        assert notifier.posts == []
+        assert not delay
+
+    def test_an_aborted_request_leaves_no_announcement_behind(self):
+        producer, _notifier = self._producer(announce=True)
+        req = self._request("abort-1")
+
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            assert len(producer._stage3_admitted_sends) == 1
+            req.status = RequestStatus.FINISHED_ABORTED
+            delay, _params = producer.request_finished(req, [100, 101])
+
+        assert not delay
+        assert producer._stage3_admitted_sends == {}
+
+    def test_the_predicted_token_count_matches_the_finished_one(self):
+        """The announcement sizes decode's allocation, so a disagreement here
+        is decode allocating for a payload of a different length."""
+        producer, notifier = self._producer(announce=True)
+        for prompt_tokens in (4_096, 32_768, 65_024):
+            req = self._request(f"sz-{prompt_tokens}",
+                                prompt_tokens=prompt_tokens)
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(700 + prompt_tokens):
+                    stack.enter_context(ctx)
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+                _delay, params = producer.request_finished(
+                    req, [100] * (prompt_tokens // 32_768 + 1))
+            assert notifier.posts[-1][1]["num_tokens"] == params["num_tokens"]
+
+    def test_a_truncated_mamba_prompt_is_announced_at_its_full_length(self):
+        """on_new_request() has already dropped the last token, so N-1 must
+        not be applied a second time."""
+        producer, notifier = self._producer(announce=True)
+        req = self._request("mamba-1")
+        req.kv_transfer_params["_p_side_truncated"] = True
+
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            _delay, params = producer.request_finished(req, [100, 101])
+
+        assert notifier.posts[0][1]["num_tokens"] == 65_024
+        assert params["num_tokens"] == 65_024
 
 
 class _FakeRaidenEngine:

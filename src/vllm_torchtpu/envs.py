@@ -71,6 +71,8 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL_CHECK_TOKENS: int = 256
     TPU_KV_DOORBELL_POLL_US: int = 0
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
+    TPU_KV_ADMISSION_REORDER: bool = False
+    TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
@@ -490,6 +492,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two log lines, so it is cheap, but not cheap enough to want per step.
     "TPU_KV_DOORBELL_REPORT_EVERY":
     lambda: int(os.getenv("TPU_KV_DOORBELL_REPORT_EVERY") or "200"),
+
+    # Mint the transfer uuid when prefill admits a request rather than when it
+    # finishes, and tell the proxy over a callback so decode can allocate its
+    # blocks while prefill is still computing. Today decode learns the request
+    # exists only from prefill's final response, so admission, the scheduler
+    # round trip and the block allocation all sit between the last prefill
+    # layer and the first byte moving. The transfer itself is unchanged.
+    "TPU_KV_ADMISSION_REORDER":
+    env_bool("TPU_KV_ADMISSION_REORDER"),
+
+    # How long the callback POST may take before the producer gives up on it.
+    # Giving up is safe and costs only the latency this feature saves: the
+    # proxy falls back to reading the uuid out of prefill's response, which is
+    # where it comes from today.
+    "TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S":
+    lambda: float(os.getenv("TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S") or "2.0"),
     # Evict host page cache for checkpoint weight files via posix_fadvise
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":
