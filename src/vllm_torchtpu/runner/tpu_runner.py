@@ -6330,7 +6330,16 @@ class TPUModelRunner(GPUModelRunner):
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     elif isinstance(spec, AttentionSpec):
-                        total_group_page_size += PallasAttentionBackend.get_kv_cache_page_size_bytes(
+                        # The page must come from the backend that serves
+                        # this spec. The base RPA layout formula counts an
+                        # fp8 MLA page at 4x its real size (2 packed heads
+                        # x 4-way packing), which shrinks the attention
+                        # tensor to ~2/3 of the block count vLLM was told
+                        # and sends block ids past its end (issue #845).
+                        shared_attn_backend = (
+                            TpuPlatform._find_non_ssm_backend(
+                                self.vllm_config))
+                        total_group_page_size += shared_attn_backend.get_kv_cache_page_size_bytes(
                             spec.block_size,
                             spec.num_kv_heads,
                             spec.head_size,
@@ -6339,6 +6348,19 @@ class TPUModelRunner(GPUModelRunner):
                     else:
                         raise NotImplementedError
                 num_blocks = tensor_size // total_group_page_size
+                logger.info(
+                    "[kv-alloc] shared KV tensor for %s: size=%d B, "
+                    "per-block=%d B -> num_blocks=%d (vLLM num_blocks=%d)",
+                    list(shared_by)[:2], tensor_size, total_group_page_size,
+                    num_blocks, kv_cache_config.num_blocks)
+                if num_blocks < kv_cache_config.num_blocks:
+                    raise ValueError(
+                        "[kv-alloc] shared KV tensor would hold "
+                        f"{num_blocks} blocks but vLLM will hand out "
+                        f"{kv_cache_config.num_blocks} block ids "
+                        f"(per-block={total_group_page_size} B); block ids "
+                        "past the tensor read and write out of bounds "
+                        "(issue #845).")
             else:
                 num_blocks = kv_cache_config.num_blocks
 
