@@ -1,11 +1,7 @@
 """The sharded vocabulary projection (layers/vllm/sharded_lm_head.py): the JAX body on a one-device CPU mesh
 against a plain matmul, and the head method's padding and trimming with a stub op."""
-import os
 import types
 
-os.environ.setdefault(
-    "JAX_PLATFORMS",
-    "cpu")  # the body test needs no chip; the chips may be busy
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -60,11 +56,9 @@ def test_method_pads_and_trims(monkeypatch):
         pass
 
 
-def test_unsupported_reason_follows_the_known_limit():
-    assert sh.unsupported_reason(16, 8192) is None
-    assert sh.unsupported_reason(20, 768) is None
-    assert "20 rows" in sh.unsupported_reason(20, 1024)
-    assert "32 rows" in sh.unsupported_reason(32, 768)
+def test_the_head_needs_one_request_bucket():
+    assert sh.unsupported_reason([40]) is None
+    assert "request buckets" in sh.unsupported_reason([8, 16, 32])
 
 
 def test_install_leaves_the_head_alone_outside_the_limit():
@@ -72,5 +66,15 @@ def test_install_leaves_the_head_alone_outside_the_limit():
     model = torch.nn.Module()
     model.lm_head = head
     before = head.quant_method if hasattr(head, "quant_method") else None
-    assert sh.install(model, 32, 768) is False
+    assert sh.install(model, [8, 16, 32]) is False
+    assert getattr(head, "quant_method", None) is before
+
+
+def test_a_tensor_parallel_head_is_left_alone():
+    head = torch.nn.Linear(256, 1024, bias=False)
+    head.tp_size = 2
+    model = torch.nn.Module()
+    model.lm_head = head
+    before = getattr(head, "quant_method", None)
+    assert sh.install(model, [16]) is False
     assert getattr(head, "quant_method", None) is before

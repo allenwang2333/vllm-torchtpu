@@ -723,6 +723,14 @@ class TPUModelRunner(GPUModelRunner):
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
+        if envs.TPU_SHARDED_LM_HEAD:
+            # The sharded head runs at one fixed row count. One request
+            # bucket keeps the compiled graph from padding rows before the
+            # head's exchange and trimming them after, which the compiler
+            # gets wrong above one row tile.
+            self.num_reqs_paddings = [self.max_num_reqs]
+            logger.info("TPU_SHARDED_LM_HEAD: one request bucket, %d rows",
+                        self.max_num_reqs)
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (min(
@@ -3066,8 +3074,8 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             target_num_reqs = self.num_reqs_most_model_len
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs)
+        padded_num_reqs = _get_padded_token_len(self.num_reqs_paddings,
+                                                num_reqs)
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -4588,14 +4596,12 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
-        # TPU_SHARDED_LM_HEAD: the projection split across the engines; rows
-        # padded to the largest request bucket so every engine calls the op
-        # with one shape. The engine's largest prompt chunk decides with the
-        # row count whether the head may go on (its known limit).
+        # TPU_SHARDED_LM_HEAD: the projection split across the engines. With
+        # it on the runner runs one request bucket (set above), so every
+        # engine calls the op with one shape and the compiled graph pads and
+        # trims nothing around the op's exchange.
         from vllm_torchtpu.layers.vllm import sharded_lm_head
-        sharded_lm_head.install_if_enabled(
-            model, int(max(self.num_reqs_paddings)),
-            int(self.vllm_config.scheduler_config.max_num_batched_tokens))
+        sharded_lm_head.install_if_enabled(model, list(self.num_reqs_paddings))
         # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
         from vllm_torchtpu.layers.vllm import norm_weight_hoist
         norm_weight_hoist.install_if_enabled(model)

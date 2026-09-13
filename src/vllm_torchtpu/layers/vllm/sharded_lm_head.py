@@ -22,13 +22,13 @@ step instead of all of it. The op is a JAX shard-map op wrapped as a torch
 custom op with static shapes: the rows are padded to the largest request
 bucket (`install(model, rows)`).
 
-Known limit: the compiled serving graph reads the op's output with the wrong
-layout in some program families once the row count passes 16 (a bf16
-row-packing mismatch at the torch-to-JAX boundary; the eager op is exact at
-every row count). It is right at up to 16 rows per engine with any prompt
-chunk, and at up to 20 rows with prompt chunks of at most 768 rows; `install`
-refuses every other combination (`unsupported_reason`) until the op's output
-layout is pinned at the custom-call boundary."""
+The op is called with one fixed row count on every engine, because its
+exchange is a collective every engine joins with the same shape. The runner
+therefore keeps a single request bucket of that many rows while the head is
+on (`TPU_SHARDED_LM_HEAD`): when a smaller bucket exists, the compiled graph
+pads the rows before the op and trims them after it, and above one row tile
+the compiler reads the op's output against the wrong vocabulary positions.
+`install` refuses any other bucket list."""
 
 import jax
 import jax.numpy as jnp
@@ -139,38 +139,39 @@ class ShardedHeadMethod:
             "the sharded head is the projection only, never the embedding")
 
 
-ROWS_ANY_PROMPT = 16
-ROWS_SHORT_PROMPTS = 20
-PROMPT_ROWS_SHORT = 768
-
-
-def unsupported_reason(rows: int, prompt_rows: int) -> str | None:
-    """Why the head must stay off at this many rows per engine and prompt
-    rows per step (the known limit above), or None when it may go on."""
-    if rows <= ROWS_ANY_PROMPT:
+def unsupported_reason(buckets) -> str | None:
+    """Why the head must stay off with these request buckets, or None: the
+    runner has to run one bucket, the head's fixed row count."""
+    if len(buckets) == 1:
         return None
-    if rows <= ROWS_SHORT_PROMPTS and prompt_rows <= PROMPT_ROWS_SHORT:
-        return None
-    return (f"{rows} rows per engine with prompt chunks of {prompt_rows} "
-            f"rows: the compiled graph reads the op's output with the wrong "
-            f"layout above {ROWS_ANY_PROMPT} rows, except at up to "
-            f"{ROWS_SHORT_PROMPTS} rows with chunks of at most "
-            f"{PROMPT_ROWS_SHORT}")
+    return (f"request buckets {list(buckets)}: the head takes one fixed row "
+            "count, and a smaller bucket makes the compiled graph pad and "
+            "trim rows around its exchange, which reads the wrong vocabulary "
+            "positions")
 
 
-def install(model, rows: int, prompt_rows: int) -> bool:
-    """Replace the model's LM head with the sharded projection: `rows` is
-    the largest request count per engine, `prompt_rows` the engine's
-    largest prompt chunk (its `--max-num-batched-tokens`)."""
+def install(model, buckets) -> bool:
+    """Replace the model's LM head with the sharded projection. `buckets`
+    is the runner's request-count list; it has to be one value, the row
+    count the op runs at."""
     global _OP
     head = find_head(model)
     if head is None:
         logger.warning("sharded LM head: no head on the model; left as is")
         return False
-    reason = unsupported_reason(rows, prompt_rows)
+    reason = unsupported_reason(buckets)
     if reason is not None:
         logger.warning("sharded LM head: %s; left as is", reason)
         return False
+    tp = int(getattr(head, "tp_size", 1) or 1)
+    if tp > 1:
+        # Each rank then holds a slice of the vocabulary, and the exchange
+        # below would take the slice for the whole of it.
+        logger.warning(
+            "sharded LM head: the head is split across %d tensor-parallel "
+            "ranks; left as is", tp)
+        return False
+    rows = int(buckets[0])
     mesh = build_ep_mesh()
     idx = ep_mesh_index()
     if mesh is None or idx is None:
@@ -206,8 +207,8 @@ def install(model, rows: int, prompt_rows: int) -> bool:
     return True
 
 
-def install_if_enabled(model, rows: int, prompt_rows: int) -> bool:
+def install_if_enabled(model, buckets) -> bool:
     """Install the sharded head when TPU_SHARDED_LM_HEAD is set."""
     if not envs.TPU_SHARDED_LM_HEAD:
         return False
-    return install(model, rows, prompt_rows)
+    return install(model, buckets)
