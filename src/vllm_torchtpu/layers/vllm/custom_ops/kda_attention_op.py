@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
@@ -27,6 +28,59 @@ from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Debug knobs for the compact (dispatched) KDA path, issue #845.
+#   KDA_NO_DONATE=1     do not donate the state buffers to the fused op.
+#   KDA_STATE_CHECK=1   after every call, flag NaN/Inf in the new state and
+#                       any recurrent slot whose contents changed although it
+#                       was not scheduled in this step (slot 0 excepted).
+_KDA_NO_DONATE = envs.KDA_NO_DONATE
+_KDA_STATE_CHECK = envs.KDA_STATE_CHECK
+_KDA_CHECK_MAX_REPORTS = envs.KDA_STATE_CHECK_MAX
+
+
+class _StateChecker:
+    """Per-layer step counter and last-seen per-slot checksums."""
+
+    def __init__(self, prefix: str):
+        self.prefix = prefix
+        self.step = 0
+        self.prev_ssm: torch.Tensor | None = None
+        self.prev_conv: torch.Tensor | None = None
+        self.reports = 0
+
+    def check(self, tag: str, new_state: torch.Tensor,
+              prev: torch.Tensor | None, state_indices: torch.Tensor,
+              distribution: torch.Tensor) -> torch.Tensor:
+        flat = new_state.reshape(new_state.shape[0], -1).float()
+        chk = flat.abs().sum(dim=1)
+        nonfinite = (~torch.isfinite(flat)).sum(dim=1)
+        if prev is not None and self.reports < _KDA_CHECK_MAX_REPORTS:
+            changed = chk != prev
+            scheduled = torch.zeros_like(changed)
+            scheduled[state_indices.long().clamp(0,
+                                                 changed.shape[0] - 1)] = True
+            scheduled[0] = True
+            bad = changed & ~scheduled
+            n_bad = int(bad.sum().item())
+            n_nonfinite = int((nonfinite > 0).sum().item())
+            if n_bad or n_nonfinite:
+                self.reports += 1
+                idx = state_indices.cpu().tolist()
+                live = sorted(i for i in idx if i != 0)
+                logger.warning(
+                    "[kda-state-check] layer=%s step=%d %s: %d unscheduled "
+                    "slot(s) changed %s; %d slot(s) with NaN/Inf %s; "
+                    "scheduled slots (%d live, %d padded)=%s "
+                    "distribution=%s max_slot=%d", self.prefix, self.step, tag,
+                    n_bad,
+                    bad.nonzero().flatten().cpu().tolist()[:32], n_nonfinite,
+                    (nonfinite > 0).nonzero().flatten().cpu().tolist()[:32],
+                    len(live),
+                    len(idx) - len(live), live[:64],
+                    distribution.cpu().tolist(),
+                    max(idx) if idx else -1)
+        return chk
 
 
 def _use_fused_kda() -> bool:
@@ -708,7 +762,18 @@ def build_kimi_dispatched_kda_op(
 
     op_name = (f"pallas::kimi_dispatched_kda_{variant}_"
                f"{prefix.replace('.', '_')}")
-    dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
+    if _KDA_NO_DONATE:
+        logger.warning(
+            "KDA op %s: KDA_NO_DONATE=1, state buffers are NOT "
+            "donated to the fused op.", prefix)
+        dispatched_op = pallas.jax_op(op_name, core)
+    else:
+        dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
+    checker = _StateChecker(prefix) if _KDA_STATE_CHECK else None
+    if checker is not None:
+        logger.warning(
+            "KDA op %s: KDA_STATE_CHECK=1, checking the recurrent "
+            "and conv state after every call.", prefix)
 
     def _fake_dispatched(mixed_qkv, _raw_gate, _beta, _output_gate, conv_state,
                          recurrent_state, *args, **kwargs):
@@ -753,6 +818,23 @@ def build_kimi_dispatched_kda_op(
             seq_lens,
             distribution,
         )
+        if checker is not None:
+            checker.step += 1
+            checker.prev_ssm = checker.check("ssm", new_pool, checker.prev_ssm,
+                                             state_indices, distribution)
+            checker.prev_conv = checker.check("conv", new_conv_state,
+                                              checker.prev_conv, state_indices,
+                                              distribution)
+            if checker.reports < _KDA_CHECK_MAX_REPORTS:
+                out_nonfinite = int(
+                    (~torch.isfinite(output.float())).sum().item())
+                if out_nonfinite:
+                    checker.reports += 1
+                    logger.warning(
+                        "[kda-state-check] layer=%s step=%d output has %d "
+                        "NaN/Inf element(s); distribution=%s", prefix,
+                        checker.step, out_nonfinite,
+                        distribution.cpu().tolist())
         conv_state.copy_(new_conv_state)
         recurrent_state.copy_(new_pool)
         return output

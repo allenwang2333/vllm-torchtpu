@@ -56,6 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+rm -rf /dev/shm/torch_tpu_cache 2>/dev/null; log "torch_tpu tier-2 compile cache cleared (/dev/shm/torch_tpu_cache)"
 log "===== boot: config=$CONFIG_NAME concs=$CONC_LIST ctx=$K3_SWEEP_CTX max_num_seqs=$K3_SWEEP_MAX_NUM_SEQS max_tokens=$MAX_TOKENS pad_words=$PAD_WORDS env=[${ENVS[*]:-}] extra=[${K3_EXTRA_SERVE_ARGS:-}] ====="
 k3_boot_server "$CONFIG_NAME" || exit 1
 MODEL=$(k3_config_json_get model)
