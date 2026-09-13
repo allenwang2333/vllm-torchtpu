@@ -14,6 +14,7 @@ steps:
     timeout_in_minutes: 240
     agents:
       queue: "tpu_v7x_32_queue"
+      hostname: "tpu7x-32-ci-0-cicd-us-central1-c"
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
