@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_JOB_NAME: str = ""
     TPU_RAIDEN_ENGINE_ID: str = "0"
     TPU_RAIDEN_TRANSFER_PARALLELISM: int = 8
+    TPU_RAIDEN_POOL_TAGS_PER_LAYER: bool = False
     TPU_RAIDEN_MAX_TRANSFER_TOKENS: int | None = None
     TPU_RAIDEN_RESHARD_IMPL: str = "controller"
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
@@ -54,10 +55,13 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -92,6 +96,7 @@ if TYPE_CHECKING:
     TPU_KV_PIN_SHM: bool = False
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
+    TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
 
 
@@ -321,7 +326,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE":
     lambda: os.getenv("MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"),
-    # Specify requantization block size for MoE weights
+    # Specify requantization block size for MoE weights. When unset, NVFP4
+    # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
+    # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
+    # Other MoE paths retain their default, including explicit requantization.
     "MOE_REQUANTIZE_BLOCK_SIZE":
     lambda: int(block_size) if (block_size := os.getenv(
         "MOE_REQUANTIZE_BLOCK_SIZE")) is not None else None,
@@ -342,6 +350,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_USE_RAIDEN_KV_CACHE_MANAGER"),
     "TPU_RAIDEN_QWEN35_ADMISSION":
     env_bool("TPU_RAIDEN_QWEN35_ADMISSION"),
+    # Tag every raiden pool with its layer index so pools pair up by layer
+    # across a pipeline-parallel producer and its decode peer. Both peers
+    # must set it identically.
+    "TPU_RAIDEN_POOL_TAGS_PER_LAYER":
+    env_bool("TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
     "TPU_RAIDEN_GLM_ADMISSION":
     env_bool("TPU_RAIDEN_GLM_ADMISSION"),
     # Controller-driven PCP->DP pool resharding. The default preserves
@@ -482,6 +495,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
     env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
+    # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
+    "MOE_FUSED_EP_ENABLE_W4A8":
+    env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
     # Largest node-wide token count, out of the scheduler's cap, at or above
     # which the fused kernel is armed for the whole deployment. Decided once at
     # weight load, not per step: a per-step choice would need the token count
@@ -518,6 +535,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Pipeline parallelism: size prefill chunks by a per-step time budget
+    # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
+    "TPU_PP_DYNAMIC_CHUNKS":
+    env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
+    # Fraction above the time of a full prefix-free step that a step may
+    # take before its chunks are shortened.
+    "TPU_PP_CHUNK_SLACK":
+    lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
@@ -619,6 +644,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 means auto-size from TPU_KV_SHM_POOL_GB, split across TP ranks.
     "TPU_RAIDEN_TRANSFER_NUM_SLOTS":
     env_nonnegative_int("TPU_RAIDEN_TRANSFER_NUM_SLOTS", 0),
+    # Concurrent pool-reshard transfers to provision bounded host staging for.
+    "TPU_RAIDEN_POOL_STAGING_LEASES":
+    env_nonnegative_int("TPU_RAIDEN_POOL_STAGING_LEASES", 8),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD":
     env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
