@@ -46,7 +46,7 @@ def _candidates(rng, dcp_size, interleave_c, k, num_rows, empty_frac):
 
 
 def _one_per_rank(dcp_size, k):
-    """`idxs` for a single row, rank `r` owning `r, r + dcp_size, ...`."""
+    """`idxs` for one row; rank `r` owns positions `r + dcp_size * j`."""
     return np.stack([(r + dcp_size * np.arange(k)).astype(np.int32)
                      for r in range(dcp_size)])[:, None, :]
 

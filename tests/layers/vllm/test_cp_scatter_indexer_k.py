@@ -43,14 +43,14 @@ def _reader_rank(pos, dcp_size, interleave_size):
 
 
 def _reader_local(pos, dcp_size, interleave_size):
-    """...and the flat index it looks at inside that rank's shard."""
+    """The flat index the reader looks at inside that rank's shard."""
     return (pos //
             (dcp_size * interleave_size)) * interleave_size + (pos %
                                                                interleave_size)
 
 
 def _rows(num_tokens):
-    """One identifiable byte row per token: `[lo, hi, 7, 0...]`."""
+    """One identifiable byte row per token: `[lo, hi, 7]`, zero padded."""
     t = np.arange(num_tokens, dtype=np.int64)
     rows = np.zeros((num_tokens, K_WIDTH), np.uint8)
     rows[:, 0] = t % 251
