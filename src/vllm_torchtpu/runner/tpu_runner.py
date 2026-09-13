@@ -3667,6 +3667,41 @@ class TPUModelRunner(GPUModelRunner):
                     except Exception as e:
                         logger.warning("[TPURunner] preprocess failed for req %s: %s", req_id, e)
 
+                # Talker MTP code predictor residual token generation (pre-forward decode)
+                has_mtp = (
+                    getattr(orig_model, "has_talker_mtp", False)
+                    or hasattr(orig_model, "talker_mtp")
+                    or hasattr(getattr(orig_model, "talker", None), "talker_mtp")
+                )
+                if has_mtp:
+                    talker_obj = getattr(orig_model, "talker", orig_model)
+                    mtp_fn = getattr(orig_model, "talker_mtp", getattr(talker_obj, "talker_mtp", None))
+                    for r_i, req_id in enumerate(chunk_req_ids):
+                        s = int(self.query_start_loc_np[start_index + r_i])
+                        e = int(self.query_start_loc_np[start_index + r_i + 1])
+                        req_info = getattr(self, "model_intermediate_buffer", {}).get(req_id, {})
+                        last_talker_hidden, text_step = req_info.get("mtp_inputs", (None, None))
+                        if last_talker_hidden is not None and text_step is not None:
+                            try:
+                                r_inp_ids = preprocess_input_ids[s:e] if preprocess_input_ids is not None else None
+                                r_inp_emb = inputs_embeds[s:e] if inputs_embeds is not None else None
+                                req_embeds, code_predictor_codes = mtp_fn(
+                                    r_inp_ids,
+                                    r_inp_emb,
+                                    last_talker_hidden,
+                                    text_step,
+                                )
+                                if inputs_embeds is not None and req_embeds is not None:
+                                    p_len = min(req_embeds.shape[0], inputs_embeds.shape[0] - s)
+                                    inputs_embeds[s:s + p_len] = req_embeds[:p_len].to(
+                                        device=self.device, dtype=inputs_embeds.dtype
+                                    )
+                                req_codes = req_info.setdefault("codes", {})
+                                req_codes["audio"] = code_predictor_codes.detach().to("cpu")
+                                self.model_intermediate_buffer[req_id] = req_info
+                            except Exception as e:
+                                logger.warning("[TPURunner] talker_mtp failed for req %s: %s", req_id, e)
+
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -3711,61 +3746,74 @@ class TPUModelRunner(GPUModelRunner):
                     getattr(self, "model_intermediate_buffer", {}).get(r_id, {})
                     for r_id in chunk_req_ids
                 ] if hasattr(self, "model_intermediate_buffer") and self.model_intermediate_buffer else None
+                seq_token_counts = [
+                    int(self.query_start_loc_np[start_index + r_i + 1] - self.query_start_loc_np[start_index + r_i])
+                    for r_i in range(num_reqs)
+                ]
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     runtime_additional_information=runtime_info,
+                    seq_token_counts=seq_token_counts,
                 )
                 self._omni_last_hidden_states = hidden_states
                 self._omni_last_aux_hidden_states = aux_hidden_states
 
-                # Talker MTP code predictor residual token generation
-                has_mtp = (
-                    getattr(orig_model, "has_talker_mtp", False)
-                    or hasattr(orig_model, "talker_mtp")
-                    or hasattr(getattr(orig_model, "talker", None), "talker_mtp")
-                )
-                if has_mtp:
-                    talker_obj = getattr(orig_model, "talker", orig_model)
-                    mtp_fn = getattr(orig_model, "talker_mtp", getattr(talker_obj, "talker_mtp", None))
+            # Model postprocess (omni hidden state / intermediate propagation)
+            if getattr(orig_model, "has_postprocess", False):
+                postprocess_fn = getattr(orig_model, "postprocess", None)
+                if callable(postprocess_fn):
                     for r_i, req_id in enumerate(chunk_req_ids):
                         s = int(self.query_start_loc_np[start_index + r_i])
                         e = int(self.query_start_loc_np[start_index + r_i + 1])
+                        hidden_states_slice = hidden_states[s:e]
                         req_info = getattr(self, "model_intermediate_buffer", {}).get(req_id, {})
-                        last_talker_hidden, text_step = req_info.get("mtp_inputs", (None, None))
-                        if last_talker_hidden is not None and text_step is not None:
-                            try:
-                                r_inp_ids = preprocess_input_ids[s:e] if preprocess_input_ids is not None else None
-                                r_inp_emb = inputs_embeds[s:e] if inputs_embeds is not None else None
-                                _, code_predictor_codes = mtp_fn(
-                                    r_inp_ids,
-                                    r_inp_emb,
-                                    last_talker_hidden,
-                                    text_step,
-                                )
-                                req_codes = req_info.setdefault("codes", {})
-                                audio_t = code_predictor_codes.detach().to("cpu")
-                                req_codes["audio"] = audio_t
-                            except Exception as e:
-                                logger.warning("[TPURunner] talker_mtp failed for req %s: %s", req_id, e)
+                        postprocess_kwargs = {k: v for k, v in req_info.items() if k != "hidden_states"}
+                        try:
+                            update_dict = postprocess_fn(
+                                hidden_states_slice,
+                                **postprocess_kwargs,
+                            )
+                            if isinstance(update_dict, dict):
+                                for uk, uv in update_dict.items():
+                                    if isinstance(uv, dict) and isinstance(req_info.get(uk), dict):
+                                        for sub_k, sub_v in uv.items():
+                                            if isinstance(sub_v, torch.Tensor):
+                                                req_info[uk][sub_k] = sub_v.detach().clone()
+                                            else:
+                                                req_info[uk][sub_k] = sub_v
+                                    elif isinstance(uv, torch.Tensor):
+                                        req_info[uk] = uv.detach().clone()
+                                    else:
+                                        req_info[uk] = uv
+                            self.model_intermediate_buffer[req_id] = req_info
+                        except Exception as e:
+                            logger.warning("[TPURunner] postprocess failed for req %s: %s", req_id, e)
 
-            sequence_layout_planner = _get_sequence_layout_planner_for_runner(
-                self)
-            layout_plan = self._last_sequence_layout_plan
-            sample_hidden_states = (
-                sequence_layout_planner.maybe_select_logits_hidden_states(
-                    hidden_states, layout_plan, logits_indices))
-            if sample_hidden_states is None:
-                hidden_states = sequence_layout_planner.finalize_hidden_states(
-                    hidden_states,
-                    layout_plan,
-                )
-                logits = self.compute_selected_logits(hidden_states,
-                                                      logits_indices)
+            is_code2wav = (
+                getattr(self.model_config, "model_stage", None) == "code2wav"
+                or getattr(orig_model, "model_stage", None) == "code2wav"
+            )
+            if is_code2wav:
+                logits = torch.empty((num_reqs, 0), device=self.device)
             else:
-                logits = self.compute_logits_from_hidden_states(
-                    sample_hidden_states)
+                sequence_layout_planner = _get_sequence_layout_planner_for_runner(
+                    self)
+                layout_plan = self._last_sequence_layout_plan
+                sample_hidden_states = (
+                    sequence_layout_planner.maybe_select_logits_hidden_states(
+                        hidden_states, layout_plan, logits_indices))
+                if sample_hidden_states is None:
+                    hidden_states = sequence_layout_planner.finalize_hidden_states(
+                        hidden_states,
+                        layout_plan,
+                    )
+                    logits = self.compute_selected_logits(hidden_states,
+                                                          logits_indices)
+                else:
+                    logits = self.compute_logits_from_hidden_states(
+                        sample_hidden_states)
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -4226,6 +4274,10 @@ class TPUModelRunner(GPUModelRunner):
                 list[str],
                 self.input_batch.req_ids[:self.input_batch.num_reqs])
             all_greedy = self.input_batch.all_greedy
+            is_code2wav = (
+                getattr(self.model_config, "model_stage", None) == "code2wav"
+                or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "code2wav"
+            )
             for logits, num_reqs, mamba_indices in zip(state.logits_list,
                                                        state.num_reqs_list,
                                                        mamba_idx_list):
@@ -4234,23 +4286,26 @@ class TPUModelRunner(GPUModelRunner):
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
-                if grammar_output is not None:
-                    logits = self.structured_decoding_manager.mask_logits(
-                        logits, grammar_output, cur_start_idx, cur_end_idx)
-                if all_greedy:
-                    selected_token_ids = self._greedy_sample(logits)
+                if is_code2wav:
+                    selected_token_ids = torch.zeros((num_reqs, 1), dtype=torch.long, device=self.device)
                 else:
-                    temperatures_tpu, top_k_tpu, top_p_tpu = (
-                        self._build_padded_sampling_params(
-                            cur_start_idx, cur_end_idx, logits))
-                    u = torch.rand_like(logits, generator=sampling_generator)
-                    selected_token_ids = self.sample_from_logits_func(
-                        logits,
-                        temperatures_tpu,
-                        u,
-                        top_k_tpu,
-                        top_p_tpu,
-                        all_greedy=all_greedy)
+                    if grammar_output is not None:
+                        logits = self.structured_decoding_manager.mask_logits(
+                            logits, grammar_output, cur_start_idx, cur_end_idx)
+                    if all_greedy:
+                        selected_token_ids = self._greedy_sample(logits)
+                    else:
+                        temperatures_tpu, top_k_tpu, top_p_tpu = (
+                            self._build_padded_sampling_params(
+                                cur_start_idx, cur_end_idx, logits))
+                        u = torch.rand_like(logits, generator=sampling_generator)
+                        selected_token_ids = self.sample_from_logits_func(
+                            logits,
+                            temperatures_tpu,
+                            u,
+                            top_k_tpu,
+                            top_p_tpu,
+                            all_greedy=all_greedy)
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -6527,12 +6582,23 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
-    def forward_model(self, input_ids, positions, inputs_embeds=None, runtime_additional_information=None):
+    def forward_model(self, input_ids, positions, inputs_embeds=None, runtime_additional_information=None, seq_token_counts=None):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         extra_kwargs = {}
         if runtime_additional_information is not None:
             extra_kwargs["runtime_additional_information"] = runtime_additional_information
+        orig_model = getattr(self.model, "_orig_mod", self.model)
+        is_code2wav = (
+            getattr(self.model_config, "model_stage", None) == "code2wav"
+            or getattr(orig_model, "model_stage", None) == "code2wav"
+        )
+        if not is_code2wav and (
+            hasattr(orig_model, "make_omni_output")
+            or hasattr(self.model, "make_omni_output")
+            or getattr(self.model_config, "model_stage", None) is not None
+        ) and seq_token_counts is not None:
+            extra_kwargs["seq_token_counts"] = seq_token_counts
         out = self.model(input_ids=input_ids,
                          positions=positions,
                          inputs_embeds=inputs_embeds,
