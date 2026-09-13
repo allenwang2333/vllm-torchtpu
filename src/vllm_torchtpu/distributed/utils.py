@@ -162,6 +162,26 @@ def get_stage3_registration_wait_s() -> float:
     return min(val, float(get_p2p_wait_pull_timeout()))
 
 
+def get_stage3_reattempt_interval_s() -> float:
+    """Minimum spacing between re-attempts of one parked Stage-3 load.
+
+    This is a polling granularity sitting on the critical path: the producer's
+    registration lands at some point inside an interval and the consumer does
+    not act on it until the interval ends, so the mean cost is half of this
+    value. It matters only when the consumer submits before the producer has
+    finished, which is what the admission reorder makes the common case, so it
+    is tunable to let a run measure what that granularity is worth.
+    """
+    val_str = os.getenv("TPU_RAIDEN_STAGE3_REATTEMPT_INTERVAL_S", "0.05")
+    try:
+        val = float(val_str)
+    except ValueError:
+        val = 0.05
+    if val < 0:
+        val = 0.05
+    return val
+
+
 def get_stage3_test_registration_delay_s() -> float:
     """TEST-ONLY fault injection: delay the producer's Stage-3 request-block
     registration by this many seconds to widen the out-of-band

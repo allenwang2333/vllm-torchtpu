@@ -98,8 +98,10 @@ _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
 _STAGE3_REGISTRY_STATUS_UNKNOWN = 1
 _STAGE3_REGISTRY_STATUS_CANCELLED = 4
 # Deferred-submit re-attempts ride cheap no-forward steps, which can cycle at
-# kHz while a load waits; rate-limit the controller RPCs per parked request.
-_STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
+# kHz while a load waits, so the controller RPCs are rate-limited per parked
+# request. The interval itself lives in dist_utils because it is also a
+# critical-path polling granularity worth varying between runs; see
+# get_stage3_reattempt_interval_s().
 _STAGE3_REGISTRATION_CANCELLED_ERROR = (
     "Request block registration was cancelled")
 # Pool selection is vLLM policy expressed as request data: the connector names
@@ -194,6 +196,12 @@ class _Stage3PendingSubmit:
     defer_deadline: Optional[float]
     first_attempt_s: float
     wait_logged: bool = False
+    # Controller RPCs spent on this load, counting the one that succeeds. Every
+    # attempt beyond the first is a round trip into the producer's controller
+    # that found nothing, so this is both the wasted load on the producer and,
+    # multiplied by the re-attempt interval, the granularity cost of learning
+    # late that the registration had arrived.
+    attempts: int = 1
     # RPC rate limiting for re-attempts.
     last_attempt_s: float = 0.0
     # The prepared coordination call, staged once per submission and reused
@@ -2530,6 +2538,33 @@ class TPURaidenConnectorWorker:
                 "%.1fs for req_ids=%s", delay_s, sorted(metadata.reqs_to_send))
             time.sleep(delay_s)
 
+    def _log_stage3_registration(self, req_id: str, uuid: int, num_tokens: int,
+                                 pages: int) -> None:
+        """Records when the producer published its pages for a request.
+
+        This is the event the consumer's parked submit is waiting for, and the
+        two sit on different hosts, so pairing this timestamp with the
+        consumer's submit line is the only way to see how much of the
+        post-prefill window is the consumer not yet having noticed. Wall clock
+        rather than perf_counter for exactly that reason, with the usual
+        caveat that it is only as good as the clock sync between the pods.
+        """
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage3_blocks_registered",
+                    "req_id": req_id,
+                    "uuid": uuid,
+                    "num_tokens": num_tokens,
+                    "source_pages": pages,
+                    "rank": self.tp_rank,
+                    "wall_ts": time.time(),
+                },
+                sort_keys=True,
+            ),
+        )
+
     def _register_stage3_request_blocks(
             self, metadata: TPUConnectorMetadata) -> None:
         """Registers only this PCP rank's interleaved physical source blocks."""
@@ -2682,6 +2717,8 @@ class TPURaidenConnectorWorker:
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
             )
+            self._log_stage3_registration(req_id, uuid, num_tokens,
+                                          len(local_ids))
             if not local_ids:
                 # This PCP rank owns no physical page for the request. It has
                 # nevertheless published an empty D5 entry so controller
@@ -2863,6 +2900,8 @@ class TPURaidenConnectorWorker:
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
             )
+            self._log_stage3_registration(req_id, uuid, num_tokens,
+                                          len(registered_ids))
             if not owned_pages:
                 # No pages owned: terminal immediately, no transfer.
                 self._stage3_send_outcomes.setdefault(req_id, "done")
@@ -3576,6 +3615,7 @@ class TPURaidenConnectorWorker:
                 # scheduler step): park for a per-step re-attempt until the
                 # deadline.
                 pending.last_attempt_s = outcome.attempted_at
+                pending.attempts += 1
                 if not pending.wait_logged:
                     pending.wait_logged = True
                     logger.info(
@@ -3618,17 +3658,40 @@ class TPURaidenConnectorWorker:
             "%s",
             json.dumps(
                 {
-                    "event": "raiden_stage3_transfer_submitted",
-                    "req_id": source_req_id,
-                    "destination_req_id": destination_req_id,
-                    "uuid": uuid,
-                    "num_tokens": pending.num_tokens,
-                    "skip_tokens": task.skip_tokens,
-                    "fa_skip_bytes": task.fa_skip_bytes,
-                    "recv_armed_before_push": True,
-                    "state_group_count": self._stage3_state_group_count,
-                    "destination_pages": len(pending.local_blocks),
-                    "controller_submit_ms": outcome.submit_ms,
+                    "event":
+                    "raiden_stage3_transfer_submitted",
+                    "req_id":
+                    source_req_id,
+                    "destination_req_id":
+                    destination_req_id,
+                    "uuid":
+                    uuid,
+                    "num_tokens":
+                    pending.num_tokens,
+                    "skip_tokens":
+                    task.skip_tokens,
+                    "fa_skip_bytes":
+                    task.fa_skip_bytes,
+                    "recv_armed_before_push":
+                    True,
+                    "state_group_count":
+                    self._stage3_state_group_count,
+                    "destination_pages":
+                    len(pending.local_blocks),
+                    "controller_submit_ms":
+                    outcome.submit_ms,
+                    # How long this load sat between its first controller
+                    # attempt and the one that stuck, and how many RPCs that
+                    # cost. With the admission reorder off both are trivial,
+                    # because the consumer only submits once the producer has
+                    # already finished and registered. With it on the consumer
+                    # arrives first by design, so these two numbers are what
+                    # say whether the reorder bought latency or merely moved
+                    # the waiting somewhere less visible.
+                    "submit_attempts":
+                    pending.attempts,
+                    "submit_wait_ms":
+                    (time.perf_counter() - pending.first_attempt_s) * 1000.0,
                 },
                 sort_keys=True,
             ),
@@ -3703,10 +3766,10 @@ class TPURaidenConnectorWorker:
                     "registration req_id=%s destination_req_id=%s uuid=%d",
                     pending.source_req_id, req_id, pending.uuid)
         now = time.perf_counter()
+        reattempt_interval_s = dist_utils.get_stage3_reattempt_interval_s()
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
-            if (now - pending.last_attempt_s
-                    < _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S):
+            if now - pending.last_attempt_s < reattempt_interval_s:
                 continue
             del self._stage3_pending_submits[destination_req_id]
             self._dispatch_stage3_load_submit(pending)

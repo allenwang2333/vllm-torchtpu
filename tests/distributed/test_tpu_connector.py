@@ -2879,10 +2879,14 @@ class TestTPURaidenConnectorWorker:
             assert "dst-late" in worker._stage3_pending_submits
             assert "dst-late" not in worker._stage3_inflight_submits
             assert worker.get_block_ids_with_load_errors() == set()
+            # The park is counted. A run reads this number to tell a consumer
+            # that arrived first and waited from one that never waited at all,
+            # so an instrument stuck at 1 would quietly report the latter.
+            assert worker._stage3_pending_submits["dst-late"].attempts == 2
             # Re-attempts are paced by the interval; once it has elapsed the
             # next step re-dispatches the prepared call to a submit worker.
-            with patch(f"{_MOD}._STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S",
-                       0.0):
+            with patch(f"{_MOD}.dist_utils.get_stage3_reattempt_interval_s",
+                       lambda: 0.0):
                 assert worker.get_finished() == (set(), set())
             assert "dst-late" not in worker._stage3_pending_submits
             assert "dst-late" in worker._stage3_inflight_submits
