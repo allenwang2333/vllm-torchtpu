@@ -73,6 +73,8 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
     TPU_KV_ADMISSION_REORDER: bool = False
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
+    TPU_KV_PREFILL_SUBMIT: bool = False
+    TPU_KV_PREFILL_SUBMIT_FALLBACK_S: float = 10.0
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
@@ -508,6 +510,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where it comes from today.
     "TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S":
     lambda: float(os.getenv("TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S") or "2.0"),
+
+    # Let the producer start the transfer instead of the consumer. Raiden
+    # already requires the coordination call to reach the source controller,
+    # so today the consumer makes it across the network and, since the
+    # admission reorder puts the consumer there first, retries it every 50 ms
+    # until the producer has registered. The producer knows the instant it is
+    # done, so moving the call removes both the cross-host hop and the
+    # polling granularity. It needs the consumer's destination pages, which
+    # the consumer publishes through the proxy while the producer computes.
+    "TPU_KV_PREFILL_SUBMIT":
+    env_bool("TPU_KV_PREFILL_SUBMIT"),
+
+    # How long the consumer waits for a producer-side submit before starting
+    # its own. This is the interlock that keeps the feature independently
+    # shippable: in the normal case the transfer has long since completed and
+    # the timer never fires, and if the producer never submits, the request
+    # recovers here instead of hanging until the 120 s registration timeout.
+    "TPU_KV_PREFILL_SUBMIT_FALLBACK_S":
+    lambda: float(os.getenv("TPU_KV_PREFILL_SUBMIT_FALLBACK_S") or "10.0"),
     # Evict host page cache for checkpoint weight files via posix_fadvise
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":

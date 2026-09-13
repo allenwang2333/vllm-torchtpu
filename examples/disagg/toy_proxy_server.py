@@ -70,9 +70,25 @@ _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
 # which today arrive only in prefill's final response.
 _ADMIT_WAITERS: dict[str, "asyncio.Future[dict]"] = {}
 
+# Destination parameters decode has published but prefill has not yet
+# collected. Prefill holds one long-poll against /kv_dst_batch and drains this
+# in bulk, which keeps the relay at one connection per prefill engine rather
+# than one per in-flight request.
+_DST_PENDING: dict[str, dict] = {}
+_DST_EVENT: "asyncio.Event | None" = None
+# A prefill that reconnects between batches must not miss entries published in
+# the gap, so an unclaimed entry is kept until it ages out rather than being
+# dropped once handed over. The cap is generous; the steady state is empty.
+_DST_MAX_PENDING = 4096
+
 
 def _admission_reorder_enabled() -> bool:
     return os.getenv("TPU_KV_ADMISSION_REORDER",
+                     "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _prefill_submit_enabled() -> bool:
+    return os.getenv("TPU_KV_PREFILL_SUBMIT",
                      "0").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -418,6 +434,56 @@ async def handle_kv_admit(token: str, request: Request):
     return {"status": "ignored"}
 
 
+def _dst_event() -> "asyncio.Event":
+    """The event prefill's long poll waits on, created on the running loop."""
+    global _DST_EVENT
+    if _DST_EVENT is None:
+        _DST_EVENT = asyncio.Event()
+    return _DST_EVENT
+
+
+@app.post("/kv_dst/{token}")
+async def handle_kv_dst(token: str, request: Request):
+    """Decode's announcement of where it wants this request's KV written.
+
+    Raiden requires the coordination call to name the destination pages, so
+    prefill cannot start the transfer until it has these. Decode allocates
+    seconds before prefill finishes, so the relay has ample slack; what it
+    must not do is make prefill wait on a network round trip at the one
+    moment that is on the critical path.
+    """
+    payload = await request.json()
+    if len(_DST_PENDING) >= _DST_MAX_PENDING:
+        # Prefill is not collecting. Shedding the oldest keeps the proxy
+        # bounded, and a request whose parameters are dropped falls back to
+        # the consumer-side submit rather than failing.
+        _DST_PENDING.pop(next(iter(_DST_PENDING)), None)
+    _DST_PENDING[token] = payload
+    _dst_event().set()
+    return {"status": "ok"}
+
+
+@app.get("/kv_dst_batch")
+async def handle_kv_dst_batch(timeout: float = 25.0):
+    """Prefill's long poll for every destination announcement since its last.
+
+    Returning the whole pending set rather than one entry is what keeps this
+    to a single connection per prefill engine. Entries are removed once
+    handed over; anything published while prefill is between polls is still
+    here when it comes back.
+    """
+    if not _DST_PENDING:
+        event = _dst_event()
+        event.clear()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"entries": {}}
+    entries = dict(_DST_PENDING)
+    _DST_PENDING.clear()
+    return {"entries": entries}
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         t_request_recv_perf = time.perf_counter()
@@ -446,6 +512,12 @@ async def _handle_completions(api: str, request: Request):
             kv_params_out = dict(req_data.get("kv_transfer_params") or {})
             kv_params_out["admit_callback_url"] = (
                 f"{global_args.admit_callback_url}/kv_admit/{request_id}")
+            if _prefill_submit_enabled():
+                # Where prefill collects decode's destination pages. One URL
+                # for the engine, not one per request: prefill holds a single
+                # long poll and drains whatever has arrived.
+                kv_params_out["dst_batch_url"] = (
+                    f"{global_args.admit_callback_url}/kv_dst_batch")
             req_data["kv_transfer_params"] = kv_params_out
 
         # Send request to prefill service
@@ -522,6 +594,14 @@ async def _handle_completions(api: str, request: Request):
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
 
         if kv_transfer_params:
+            if _prefill_submit_enabled():
+                # Decode posts its destination pages back here, keyed by the
+                # producer's own request id so prefill can match them to the
+                # registration it is about to make.
+                kv_transfer_params = dict(kv_transfer_params)
+                kv_transfer_params["dst_callback_url"] = (
+                    f"{global_args.admit_callback_url}/kv_dst/"
+                    f"{kv_transfer_params.get('req_id', request_id)}")
             req_data["kv_transfer_params"] = kv_transfer_params
 
         # Get the next decode client in round-robin fashion

@@ -32,8 +32,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3LoadMeta, _Stage3RegisteredSend, _select_committed_mamba_blocks,
-    stage3_fa_raiden_id_fields)
+    _DestinationCollector, _Stage3LoadMeta, _Stage3RegisteredSend,
+    _select_committed_mamba_blocks, stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -1644,6 +1644,243 @@ class TestStage4AdmissionReorder:
 
         assert notifier.posts[0][1]["num_tokens"] == 65_024
         assert params["num_tokens"] == 65_024
+
+
+class _RecordingCollector:
+    """Stands in for the thread long-polling the proxy for destinations."""
+
+    def __init__(self, entries=None):
+        self.entries = dict(entries or {})
+        self.started: list[str] = []
+
+    def ensure_started(self, url):
+        self.started.append(url)
+
+    def take(self, req_id):
+        return self.entries.pop(req_id, None)
+
+
+def _destination_entry(uuid_value=777, **overrides):
+    """One consumer announcement as it arrives off the wire."""
+    entry = {
+        "req_id": "src-1",
+        "uuid": uuid_value,
+        "num_tokens": 65_023,
+        "dst_block_ids": [7, 8, 9],
+        "dst_mamba_state_block_ids": [3],
+        "dst_skip_tokens": 0,
+        "dst_controller_address": "decode-controller.test:28000",
+        "dst_job_name": "custom-decode-job",
+        "dst_engine_id": "consumer-engine-2",
+        "dst_data_replica_idx": 5,
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestStage5ProducerSubmitScheduler:
+    """The producer starting the transfer instead of the consumer, as far as
+    the two schedulers are concerned: the consumer publishes where it wants
+    the KV written, and the producer picks that up before it sends."""
+
+    def _producer(self, collector=None):
+        producer = _make_raiden_scheduler(is_producer=True,
+                                          block_size=4096,
+                                          pcp_size=8)
+        producer._admission_notifier = _RecordingNotifier()
+        producer._destination_collector = collector
+        return producer
+
+    def _request(self, req_id, prompt_tokens=65_024, params=None):
+        req = MagicMock()
+        req.request_id = req_id
+        req.prompt_token_ids = [0] * prompt_tokens
+        req.num_prompt_tokens = prompt_tokens
+        req.num_computed_tokens = prompt_tokens
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.kv_transfer_params = (
+            {
+                "admit_callback_url": "http://proxy.test:8000/kv_admit/r-1",
+                "dst_batch_url": "http://proxy.test:8000/kv_dst_batch",
+            } if params is None else params)
+        return req
+
+    def test_all_off_builds_neither_half_of_the_handshake(self):
+        """The stage gate. With TPU_KV_PREFILL_SUBMIT unset neither side
+        constructs its collaborator, so nothing can publish or collect."""
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", False,
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden",
+                   create=True):
+            producer = _make_raiden_scheduler(is_producer=True,
+                                              block_size=4096,
+                                              pcp_size=8)
+            consumer = _make_raiden_scheduler(is_producer=False,
+                                              block_size=4096)
+        assert producer._destination_collector is None
+        assert consumer._destination_notifier is None
+
+    def test_the_collector_starts_once_from_the_first_admission(self):
+        """It is the admission that first names the proxy, so there is
+        nowhere earlier to learn the URL. One poll serves the whole engine,
+        so a second admission must not start a second thread."""
+        collector = _DestinationCollector()
+        producer = self._producer(collector)
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            run = stack.enter_context(
+                patch.object(_DestinationCollector, "_run"))
+            producer.update_state_after_alloc(self._request("c-1"),
+                                              MagicMock(), 0)
+            producer.update_state_after_alloc(self._request("c-2"),
+                                              MagicMock(), 0)
+            collector._thread.join(timeout=5)
+        assert collector._url == "http://proxy.test:8000/kv_dst_batch"
+        assert run.call_count == 1
+
+    def test_the_collector_hands_each_entry_over_exactly_once(self):
+        collector = _DestinationCollector()
+        collector._entries["a"] = {"uuid": 1}
+        assert collector.take("a") == {"uuid": 1}
+        assert collector.take("a") is None
+        assert collector.take("never-published") is None
+
+    def test_the_finish_carries_the_consumers_pages(self):
+        collector = _RecordingCollector({"send-1": _destination_entry()})
+        producer = self._producer(collector)
+        req = self._request("send-1")
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            producer.request_finished(req, [100, 101])
+        assert producer.reqs_to_send["send-1"].dst_params == {
+            "dst_controller_address": "decode-controller.test:28000",
+            "dst_job_name": "custom-decode-job",
+            "dst_engine_id": "consumer-engine-2",
+            "dst_data_replica_idx": 5,
+            "dst_block_ids": [7, 8, 9],
+            "dst_mamba_state_block_ids": [3],
+            "dst_skip_tokens": 0,
+        }
+
+    def test_a_stale_announcement_from_before_a_preemption_is_dropped(self):
+        """A re-admitted request mints a new uuid, and the pages named by the
+        earlier attempt may since have been freed to somebody else."""
+        collector = _RecordingCollector(
+            {"stale-1": _destination_entry(uuid_value=111)})
+        producer = self._producer(collector)
+        req = self._request("stale-1")
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            producer.request_finished(req, [100, 101])
+        assert producer.reqs_to_send["stale-1"].dst_params is None
+
+    def test_an_incomplete_announcement_is_dropped(self):
+        entry = _destination_entry()
+        del entry["dst_controller_address"]
+        producer = self._producer(_RecordingCollector({"short-1": entry}))
+        req = self._request("short-1")
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            producer.request_finished(req, [100, 101])
+        assert producer.reqs_to_send["short-1"].dst_params is None
+
+    def _consumer_alloc(self,
+                        *,
+                        notifier,
+                        dst_callback=True,
+                        external_tokens=16):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=16)
+        consumer._stage3_fa_group_index = 0
+        consumer._stage3_mamba_group_indices = [1]
+        consumer._stage3_mamba_num_speculative_blocks = 3
+        consumer._destination_notifier = notifier
+        consumer._stage3_prefix_aware_load_enabled = True
+        req = MagicMock()
+        req.request_id = "dst-consumer"
+        req.kv_transfer_params = {
+            "req_id": "dst-producer",
+            "uuid": 991,
+            "num_tokens": 16,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 1,
+        }
+        if dst_callback:
+            req.kv_transfer_params["dst_callback_url"] = (
+                "http://proxy.test:8000/kv_dst/dst-producer")
+        blocks_mock = MagicMock()
+        blocks_mock.get_block_ids.return_value = ([200], [10, 11, 12, 13, 14])
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", True,
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                   "decode-controller.test:28000", create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME", "custom-decode-job",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                   "consumer-engine-2", create=True):
+            consumer.update_state_after_alloc(req, blocks_mock,
+                                              external_tokens)
+        return consumer
+
+    def test_the_consumer_publishes_its_pages_at_allocation(self):
+        """It allocates seconds before the producer finishes, so the relay
+        has ample slack and the producer never waits on a round trip."""
+        notifier = _RecordingNotifier()
+        self._consumer_alloc(notifier=notifier)
+        assert len(notifier.posts) == 1
+        url, published = notifier.posts[0]
+        assert url == "http://proxy.test:8000/kv_dst/dst-producer"
+        assert published == {
+            "req_id": "dst-producer",
+            "uuid": 991,
+            "num_tokens": 16,
+            "dst_block_ids": [200],
+            "dst_mamba_state_block_ids": [11],
+            "dst_skip_tokens": 0,
+            "dst_controller_address": "decode-controller.test:28000",
+            "dst_job_name": "custom-decode-job",
+            "dst_engine_id": "consumer-engine-2",
+            # The consumer's work unit always sits at transfer rank 0, so the
+            # engine is all the producer needs to rebuild it.
+            "dst_data_replica_idx": 0,
+        }
+
+    def test_a_request_the_proxy_did_not_opt_in_is_not_published(self):
+        notifier = _RecordingNotifier()
+        self._consumer_alloc(notifier=notifier, dst_callback=False)
+        assert notifier.posts == []
+
+    def test_a_full_local_hit_releases_instead_of_publishing(self):
+        """Decode already has every token, so it releases the producer's
+        registration. Publishing here would point the producer at pages that
+        are about to be freed."""
+        notifier = _RecordingNotifier()
+        consumer = self._consumer_alloc(notifier=notifier, external_tokens=0)
+        assert "dst-consumer" not in consumer.reqs_to_load
+        assert notifier.posts == []
+
+    def test_no_collector_leaves_the_send_exactly_as_it_was(self):
+        producer = self._producer(collector=None)
+        req = self._request("plain-1")
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(777):
+                stack.enter_context(ctx)
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            _delay, params = producer.request_finished(req, [100, 101])
+        assert producer.reqs_to_send["plain-1"].dst_params is None
+        assert params["uuid"] == 777
 
 
 class _FakeRaidenEngine:
@@ -3752,6 +3989,246 @@ class TestTPURaidenConnectorWorker:
                           return_value=False):
             worker._poll_finished(engine)
             assert worker._legacy_submitted_loads == {"req3", "req4"}
+
+
+class TestStage5ProducerSubmitWorker:
+    """The two worker halves of producer-initiated transfer: the producer
+    making the coordination call against its own controller, and the consumer
+    standing down until a fallback timer says the producer has not."""
+
+    _DST_PARAMS = {
+        "dst_controller_address": "decode-controller.test:28000",
+        "dst_job_name": "custom-decode-job",
+        "dst_engine_id": "consumer-engine-2",
+        "dst_data_replica_idx": 5,
+        "dst_block_ids": [7, 8, 9],
+        "dst_mamba_state_block_ids": [],
+        "dst_skip_tokens": 0,
+    }
+
+    def _producer(self, *, transfer_rank, dst_params):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=True,
+                                     dp_size=1,
+                                     pcp_size=8,
+                                     interleave_size=256,
+                                     block_size=4096)
+        facade = _FakeRaidenControllerFacade()
+        facade.start_transfer = MagicMock(return_value=True)
+        worker._raiden_transfer_engine = _FakeRaidenEngine()
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill-controller.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(
+            job_name="custom-prefill",
+            job_replica_id="producer-engine-rank0",
+            data_name="kv.fa",
+            data_replica_idx=0)
+        worker._local_raiden_transfer_rank = MagicMock(
+            return_value=transfer_rank)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["striped"] = MagicMock(uuid=1234,
+                                                 local_block_ids=[100, 101],
+                                                 num_tokens=65_023,
+                                                 expiration_time=1e20,
+                                                 dst_params=dst_params)
+        return worker, facade, meta
+
+    @staticmethod
+    def _producer_env(enabled):
+        return [
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                  "raiden",
+                  create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                  8,
+                  create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT",
+                  enabled,
+                  create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_JOB_NAME",
+                  "custom-prefill-job",
+                  create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID",
+                  "producer-engine",
+                  create=True),
+            patch(f"{_MOD}.TPURaidenConnectorWorker._new_raiden_id",
+                  staticmethod(lambda fields: SimpleNamespace(**fields))),
+            patch.object(TPURaidenConnectorWorker, "_raiden_hbm_memory_type",
+                         staticmethod(lambda: 3)),
+            patch.object(TPURaidenConnectorWorker, "_stage3_fa_token_bytes",
+                         lambda self, page_tokens: 1024),
+        ]
+
+    def _run_producer(self, *, enabled, transfer_rank=0, published=True):
+        worker, facade, meta = self._producer(
+            transfer_rank=transfer_rank,
+            dst_params=(self._DST_PARAMS if published else None))
+        with ExitStack() as stack:
+            for ctx in self._producer_env(enabled):
+                stack.enter_context(ctx)
+            worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
+        return worker, facade
+
+    def test_all_off_makes_no_call_from_the_producer(self):
+        """The stage gate. The registration still happens; only the transfer
+        stays where it was, on the consumer."""
+        _worker, facade = self._run_producer(enabled=False)
+        assert len(facade.register_request_blocks_calls) == 1
+        facade.start_transfer.assert_not_called()
+
+    def test_the_producer_starts_the_transfer_against_its_own_controller(self):
+        _worker, facade = self._run_producer(enabled=True)
+        facade.start_transfer.assert_called_once()
+        kwargs = facade.start_transfer.call_args.kwargs
+        # The call names the producer's own controller as the source, which
+        # is the whole point: no cross-host hop and no polling granularity.
+        assert kwargs["src_controller_address"] == (
+            "prefill-controller.test:27000")
+        assert kwargs["dst_controller_address"] == (
+            "decode-controller.test:28000")
+        assert kwargs["is_sender"] is True
+        assert kwargs["req_id"] == "striped"
+        assert kwargs["uuid"] == 1234
+        assert kwargs["num_tokens"] == 65_023
+        assert kwargs["dst_device_block_ids"] == [7, 8, 9]
+        assert kwargs["dst_block_counts"] == [3]
+        assert kwargs["transfer_pool_tags"] == ["fa"]
+        assert "dst_skip_bytes" not in kwargs
+        # The complete PCP producer set, exactly as the consumer would have
+        # rebuilt it from the wire parameters.
+        assert [unit.job_replica_id for unit in kwargs["src_units"]
+                ] == [f"producer-engine-rank{rank}" for rank in range(8)]
+        # The consumer's unit always sits at transfer rank 0, so it carries
+        # no rank suffix.
+        assert len(kwargs["dst_units"]) == 1
+        assert kwargs["dst_units"][0].job_replica_id == "consumer-engine-2"
+        assert kwargs["dst_units"][0].job_name == "custom-decode-job"
+        assert kwargs["dst_units"][0].data_replica_idx == 5
+
+    def test_only_transfer_rank_zero_calls(self):
+        """Every rank registers, but one call covers the whole request."""
+        _worker, facade = self._run_producer(enabled=True, transfer_rank=3)
+        assert len(facade.register_request_blocks_calls) == 1
+        facade.start_transfer.assert_not_called()
+
+    def test_a_send_with_no_published_destination_stays_on_the_old_path(self):
+        _worker, facade = self._run_producer(enabled=True, published=False)
+        assert len(facade.register_request_blocks_calls) == 1
+        facade.start_transfer.assert_not_called()
+
+    def test_a_rejected_producer_call_is_swallowed(self):
+        """There is no scheduler state on this side to resolve, and the
+        consumer's fallback still covers the request."""
+        worker, facade, meta = self._producer(transfer_rank=0,
+                                              dst_params=self._DST_PARAMS)
+        facade.start_transfer = MagicMock(
+            side_effect=RuntimeError("controller is down"))
+        with ExitStack() as stack:
+            for ctx in self._producer_env(True):
+                stack.enter_context(ctx)
+            worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
+        facade.start_transfer.assert_called_once()
+        assert "striped" in worker._stage3_registered_sends
+
+    # -- consumer half -----------------------------------------------------
+
+    def _consumer(self):
+        worker = _make_raiden_worker(is_producer=False, block_size=1024)
+        worker._raiden_work_unit = MagicMock()
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-1"] = _Stage3LoadMeta(
+            uuid=997,
+            source_req_id="src-1",
+            local_block_ids=[52, 53],
+            num_tokens=2047,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+        )
+        return worker, facade, meta
+
+    def _stage_consumer(self, worker, meta, enabled):
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT",
+                   enabled,
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT_FALLBACK_S",
+                   10.0,
+                   create=True), \
+             patch.object(worker,
+                          "_require_stage3_controller",
+                          return_value=(MagicMock(), "10.0.0.2:28000")), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker, "_stage3_fa_token_bytes", return_value=64):
+            worker._submit_stage3_loads(meta, MagicMock())
+            _flush_stage3_submits(worker)
+
+    def test_all_off_leaves_the_consumer_submitting_immediately(self):
+        worker, facade, meta = self._consumer()
+        self._stage_consumer(worker, meta, enabled=False)
+        facade.start_transfer.assert_called_once()
+        assert worker._stage3_pending_submits == {}
+
+    def test_the_consumer_stands_down_and_accepts_what_it_did_not_submit(self):
+        worker, facade, meta = self._consumer()
+        self._stage_consumer(worker, meta, enabled=True)
+        facade.start_transfer.assert_not_called()
+        assert "dst-1" in worker._stage3_pending_submits
+        # Without this the completion of a producer-started transfer is
+        # filtered out as a stale manager record and the request hangs.
+        assert "dst-1" in worker._stage3_controller_accepted
+        # The uuid binding still happens, so the completion can be matched.
+        assert worker._stage3_submitted_loads["dst-1"] == 997
+        assert worker._stage3_destination_req_ids["src-1"] == "dst-1"
+
+    def test_a_landed_transfer_retires_the_parked_fallback(self):
+        """Re-submitting against a released registration would fail the
+        lookup and take a request that already has its KV down with it."""
+        worker, facade, meta = self._consumer()
+        self._stage_consumer(worker, meta, enabled=True)
+        worker._stage3_terminal_loads.add("dst-1")
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", True,
+                   create=True):
+            worker._stage3_pending_submits["dst-1"].hold_until = 0.0
+            worker._drain_stage3_pending_submits(None)
+            _flush_stage3_submits(worker)
+        facade.start_transfer.assert_not_called()
+        assert worker._stage3_pending_submits == {}
+
+    def test_the_fallback_submits_once_the_hold_expires(self):
+        worker, facade, meta = self._consumer()
+        self._stage_consumer(worker, meta, enabled=True)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT",
+                   True,
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT_FALLBACK_S",
+                   10.0,
+                   create=True), \
+             patch.object(worker,
+                          "_stage3_source_work_units",
+                          return_value=[MagicMock()]), \
+             patch.object(worker,
+                          "_stage3_fa_token_bytes",
+                          return_value=64):
+            # Still held: the producer is presumed to be working on it.
+            worker._drain_stage3_pending_submits(None)
+            _flush_stage3_submits(worker)
+            facade.start_transfer.assert_not_called()
+            worker._stage3_pending_submits["dst-1"].hold_until = (
+                time.perf_counter() - 1.0)
+            worker._drain_stage3_pending_submits(None)
+            _flush_stage3_submits(worker)
+        facade.start_transfer.assert_called_once()
+        assert facade.start_transfer.call_args.kwargs["uuid"] == 997
 
 
 # ---------------------------------------------------------------------------

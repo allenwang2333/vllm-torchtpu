@@ -195,6 +195,11 @@ class _Stage3PendingSubmit:
     # None = legacy inline-poll mode (the entry is then never parked).
     defer_deadline: Optional[float]
     first_attempt_s: float
+    # Set when the producer is the side expected to start this transfer. Until
+    # this passes the consumer makes no attempt at all, so the two sides cannot
+    # both submit; past it the producer is presumed to have failed and the
+    # consumer submits as it always did.
+    hold_until: Optional[float] = None
     wait_logged: bool = False
     # Controller RPCs spent on this load, counting the one that succeeds. Every
     # attempt beyond the first is a round trip into the producer's controller
@@ -309,6 +314,70 @@ class _AdmissionNotifier:
                 logger.warning(
                     "Admission announcement to %s failed for req_id=%s: %s",
                     url, payload.get("req_id"), exc)
+
+
+class _DestinationCollector:
+    """Collects the consumer's destination pages off the scheduler thread.
+
+    The producer needs these before it can start a transfer, and it needs
+    them without a network round trip at the moment prefill ends, so a daemon
+    thread long-polls the proxy and the scheduler only ever reads a dict. One
+    poll serves the whole engine: the reply carries every announcement made
+    since the last one, so concurrency costs nothing here.
+
+    Losing an entry is not a correctness problem. The consumer still holds
+    its own deferred submit and starts the transfer itself once its fallback
+    timer expires, which is the path this feature is bypassing.
+    """
+
+    _MAX_HELD = 4096
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._url: Optional[str] = None
+        self._started = False
+        self._thread: Optional[threading.Thread] = None
+
+    def ensure_started(self, url: str) -> None:
+        """Starts polling once the first request has named the proxy."""
+        with self._lock:
+            if self._started:
+                return
+            self._url = url
+            self._started = True
+        self._thread = threading.Thread(target=self._run,
+                                        name="kv-destination-collect",
+                                        daemon=True)
+        self._thread.start()
+
+    def take(self, req_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            return self._entries.pop(req_id, None)
+
+    def _run(self) -> None:
+        url = str(self._url)
+        # Shorter than the proxy's own hold, so the poll is the side that
+        # gives up first and a stalled proxy shows as repeated reconnects
+        # rather than a thread wedged on a dead socket.
+        timeout = 30.0
+        while True:
+            try:
+                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                    payload = json.loads(resp.read().decode())
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                logger.warning("Destination collection from %s failed: %s",
+                               url, exc)
+                time.sleep(1.0)
+                continue
+            entries = payload.get("entries") or {}
+            if not entries:
+                continue
+            with self._lock:
+                for req_id, entry in entries.items():
+                    self._entries[req_id] = entry
+                while len(self._entries) > self._MAX_HELD:
+                    self._entries.popitem(last=False)
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -1020,6 +1089,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if self.is_producer and _use_raiden_stage3_transport(
         ) and tpu_envs.TPU_KV_ADMISSION_REORDER:
             self._admission_notifier = _AdmissionNotifier()
+        # The consumer's side of the producer-submit handshake: it announces
+        # its destination pages the moment it has them, over the same
+        # fire-and-forget poster the producer uses for admissions.
+        self._destination_notifier: Optional[_AdmissionNotifier] = None
+        if (not self.is_producer) and _use_raiden_stage3_transport(
+        ) and tpu_envs.TPU_KV_PREFILL_SUBMIT:
+            self._destination_notifier = _AdmissionNotifier()
+        # The producer's side: one long poll collecting whatever the consumer
+        # has published, keyed by the producer's own request id.
+        self._destination_collector: Optional[_DestinationCollector] = None
+        if self.is_producer and _use_raiden_stage3_transport(
+        ) and tpu_envs.TPU_KV_PREFILL_SUBMIT:
+            self._destination_collector = _DestinationCollector()
         self._stage3_fa_group_index = 0
         self._stage3_mamba_group_indices: list[int] = []
         self._stage3_mamba_num_speculative_blocks: int = 0
@@ -1298,6 +1380,75 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             len(local_block_ids),
             src_controller_address,
         )
+        self._maybe_publish_destination(request,
+                                        self.reqs_to_load[request.request_id])
+
+    def _maybe_publish_destination(self, request: "Request",
+                                   meta: _Stage3LoadMeta) -> None:
+        """Tell the producer where to write, so it can start the transfer.
+
+        Raiden will only accept a coordination call that names the
+        destination pages and that reaches the source controller, so the
+        producer cannot start anything until these have crossed. They cross
+        now, while the producer is still computing, rather than at the one
+        moment that is on the critical path.
+        """
+        if not tpu_envs.TPU_KV_PREFILL_SUBMIT:
+            return
+        if self._destination_notifier is None:
+            return
+        params = request.kv_transfer_params
+        if not isinstance(params, dict):
+            return
+        callback_url = params.get("dst_callback_url")
+        if not callback_url:
+            return
+        if not meta.local_block_ids:
+            # Nothing to receive. Publishing would hand the producer an empty
+            # page list to write into.
+            return
+        announcement = {
+            "req_id": meta.source_req_id,
+            "uuid": meta.uuid,
+            "num_tokens": meta.num_tokens,
+            "dst_block_ids": list(meta.local_block_ids or ()),
+            "dst_mamba_state_block_ids": list(meta.mamba_state_block_ids
+                                              or ()),
+            "dst_skip_tokens": int(meta.skip_tokens or 0),
+            **self._stage3_destination_params(),
+        }
+        self._destination_notifier.post(str(callback_url), announcement)
+        logger.info(
+            "TPURaidenConnectorScheduler Stage-3 publish destination "
+            "req_id=%s source_req_id=%s uuid=%d pages=%d", request.request_id,
+            meta.source_req_id, meta.uuid, len(meta.local_block_ids or ()))
+
+    def _stage3_destination_params(self) -> dict[str, Any]:
+        """The half of the wire parameters that says where the KV must land.
+
+        The mirror of _stage3_source_params. The consumer's work unit always
+        sits at transfer rank 0, so naming the engine is enough for the
+        producer to rebuild the unit exactly as the consumer rebuilds the
+        producer's today.
+        """
+        parallel_config = self.vllm_config.parallel_config
+        dp_rank = int(
+            (parallel_config.data_parallel_rank if parallel_config else 0)
+            or 0)
+        controller_address = _resolved_reshard_controller_address(dp_rank)
+        if not controller_address:
+            raise ValueError("Stage-3 consumer metadata requires "
+                             "TPU_RAIDEN_CONTROLLER_ADDRESS")
+        engine_id = self._raiden_engine_id()
+        if not engine_id:
+            raise ValueError("TPU_RAIDEN_ENGINE_ID must not be empty")
+        return {
+            "dst_controller_address": controller_address,
+            "dst_job_name": (str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip()
+                             or "decode"),
+            "dst_engine_id": engine_id,
+            "dst_data_replica_idx": dp_rank,
+        }
 
     def _raiden_engine_id(self) -> str:
         env_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
@@ -1443,6 +1594,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         callback_url = params.get("admit_callback_url")
         if not callback_url:
             return
+        # The first admitted request is also the first evidence of where the
+        # proxy lives, so the collector is started from here rather than from
+        # __init__. It runs for the life of the process; the URL is per engine,
+        # not per request.
+        batch_url = params.get("dst_batch_url")
+        if self._destination_collector is not None and batch_url:
+            self._destination_collector.ensure_started(str(batch_url))
         if request.request_id in self._stage3_admitted_sends:
             # A preempted request is admitted a second time, and decode is
             # already holding blocks against the uuid from the first.
@@ -1470,6 +1628,45 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 admit req_id=%s uuid=%d "
             "num_tokens=%d", request.request_id, uuid, num_tokens)
+
+    _DESTINATION_KEYS = (
+        "dst_controller_address",
+        "dst_job_name",
+        "dst_engine_id",
+        "dst_data_replica_idx",
+        "dst_block_ids",
+        "dst_mamba_state_block_ids",
+        "dst_skip_tokens",
+    )
+
+    def _collect_destination_params(self, req_id: str,
+                                    uuid: int) -> Optional[dict[str, Any]]:
+        """Takes the consumer's published pages for a finished prefill.
+
+        The uuid check is what makes a preemption safe. A re-admitted request
+        mints a new uuid, and an announcement left behind by the earlier
+        attempt names pages the consumer may since have freed, so writing to
+        them would corrupt another request. A mismatch drops the entry and
+        falls back to the consumer starting its own transfer.
+        """
+        if self._destination_collector is None:
+            return None
+        entry = self._destination_collector.take(req_id)
+        if entry is None:
+            return None
+        if int(entry.get("uuid", -1)) != int(uuid):
+            logger.warning(
+                "Discarding a destination announcement for req_id=%s: it "
+                "names uuid=%s but this prefill is sending uuid=%d.", req_id,
+                entry.get("uuid"), uuid)
+            return None
+        missing = [key for key in self._DESTINATION_KEYS if key not in entry]
+        if missing:
+            logger.warning(
+                "Discarding an incomplete destination announcement for "
+                "req_id=%s: missing %s", req_id, ", ".join(missing))
+            return None
+        return {key: entry[key] for key in self._DESTINATION_KEYS}
 
     def request_finished(
         self,
@@ -1596,12 +1793,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     request.request_id, num_tokens)
         now = time.perf_counter()
         expiration_time = (now + dist_utils.get_p2p_wait_pull_timeout())
+        # The consumer allocated seconds ago and published its pages then, so
+        # in the normal case this is already sitting in the collector and the
+        # producer can start the transfer the moment it has registered. If it
+        # is absent the send is unchanged and the consumer starts the transfer
+        # itself once its fallback timer expires.
+        dst_params = self._collect_destination_params(request.request_id, uuid)
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
             local_block_ids=list(normalized_ids),
             expiration_time=expiration_time,
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
+            dst_params=dst_params,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -2719,6 +2923,12 @@ class TPURaidenConnectorWorker:
             )
             self._log_stage3_registration(req_id, uuid, num_tokens,
                                           len(local_ids))
+            self._maybe_start_producer_transfer(req_id=req_id,
+                                                req_meta=req_meta,
+                                                uuid=uuid,
+                                                num_tokens=num_tokens,
+                                                transfer_rank=transfer_rank,
+                                                parallelism=parallelism)
             if not local_ids:
                 # This PCP rank owns no physical page for the request. It has
                 # nevertheless published an empty D5 entry so controller
@@ -3384,7 +3594,188 @@ class TPURaidenConnectorWorker:
                 defer_deadline=(None if defer_wait_s is None else now +
                                 defer_wait_s),
                 first_attempt_s=now)
+            # Inline loads block this thread on the result, so they always
+            # submit for themselves; the hold below only makes sense when the
+            # poll is free to observe a transfer somebody else started.
+            if tpu_envs.TPU_KV_PREFILL_SUBMIT and not synchronous:
+                pending.hold_until = (
+                    now + tpu_envs.TPU_KV_PREFILL_SUBMIT_FALLBACK_S)
+                pending.last_attempt_s = now
+                # Nothing else will mark this request accepted, because this
+                # side is deliberately not making the call, and an unaccepted
+                # request has its completion discarded as a stale manager
+                # record. The staging above is what earns the acceptance: the
+                # uuid and the destination pages are bound here, so a
+                # completion can only be attributed to a request this
+                # consumer really is waiting for.
+                self._stage3_controller_accepted.add(destination_req_id)
+                self._stage3_pending_submits[destination_req_id] = pending
+                continue
             self._dispatch_stage3_load_submit(pending, synchronous)
+
+    def _maybe_start_producer_transfer(self, *, req_id: str, req_meta: Any,
+                                       uuid: int, num_tokens: int,
+                                       transfer_rank: int,
+                                       parallelism: int) -> None:
+        """Starts the transfer from the producer, as soon as its pages exist.
+
+        Raiden only accepts a coordination call that reaches the source
+        controller, so today the consumer makes it across the network, and
+        because it cannot know when the producer finishes it re-attempts on a
+        50 ms timer. On the 397B attribution ladder that timer cost a mean of
+        25 ms per request and up to 93 failed lookups into the producer's
+        controller. The producer knows the instant it is done and its
+        controller is local, so both costs disappear here.
+
+        Only transfer rank 0 calls. Every rank registers and the controller
+        needs all of them before it can plan, so the call retries the precise
+        missing-registration error on a submit worker until the siblings catch
+        up. That retry spins a background thread, never the model runner.
+        """
+        if not tpu_envs.TPU_KV_PREFILL_SUBMIT or transfer_rank != 0:
+            return
+        dst_params = getattr(req_meta, "dst_params", None)
+        if not dst_params:
+            return
+        try:
+            src_units = [
+                self._new_raiden_id(self._raiden_work_unit_fields(rank))
+                for rank in range(parallelism)
+            ]
+            dst_units = [
+                self._new_raiden_id(
+                    stage3_fa_raiden_id_fields(
+                        job_name=str(dst_params["dst_job_name"]),
+                        engine_id=str(dst_params["dst_engine_id"]),
+                        dp_rank=int(dst_params["dst_data_replica_idx"]),
+                        transfer_rank=0,
+                        is_producer=False,
+                    ))
+            ]
+            mamba = dst_params.get("dst_mamba_state_block_ids") or None
+            transfer_tags, dst_blocks, dst_counts, clip_kwargs, _ = (
+                self._stage3_transfer_layout(
+                    dst_block_ids=[
+                        int(block) for block in dst_params["dst_block_ids"]
+                    ],
+                    mamba_state_block_ids=([int(slot) for slot in mamba]
+                                           if mamba else None),
+                    skip_tokens=int(dst_params.get("dst_skip_tokens", 0)
+                                    or 0)))
+            facade, src_controller_address = self._require_stage3_controller()
+            call_kwargs: dict[str, Any] = dict(
+                src_units=src_units,
+                dst_units=dst_units,
+                # The registration is keyed by the producer's own request ID,
+                # which here is simply the ID this method was handed.
+                req_id=req_id,
+                dst_device_block_ids=dst_blocks,
+                dst_mem_type=self._raiden_hbm_memory_type(),
+                use_block_chunks=True,
+                src_controller_address=src_controller_address,
+                dst_controller_address=str(
+                    dst_params["dst_controller_address"]),
+                uuid=uuid,
+                is_sender=True,
+                num_tokens=num_tokens,
+                transfer_pool_tags=transfer_tags,
+                dst_block_counts=dst_counts,
+                **clip_kwargs,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                "Could not build a producer-initiated Stage-3 transfer for "
+                "req_id=%s uuid=%d; the consumer will start it instead: %s",
+                req_id, uuid, exc)
+            return
+
+        def _submit() -> None:
+            self._run_producer_transfer(req_id, uuid, num_tokens, facade,
+                                        call_kwargs)
+
+        self._stage3_submit_queue.put(_submit)
+        self._ensure_stage3_submit_workers()
+
+    def _run_producer_transfer(self, req_id: str, uuid: int, num_tokens: int,
+                               facade: Any, call_kwargs: dict[str,
+                                                              Any]) -> None:
+        """Runs one producer-initiated coordination RPC on a submit worker.
+
+        Failure is logged and dropped rather than propagated. There is no
+        scheduler state on this side to resolve, and the consumer still holds
+        its own submit behind a fallback timer, so the cost of losing this is
+        the latency the feature was trying to save and nothing else.
+        """
+        start = time.perf_counter()
+        try:
+            if self._start_stage3_transfer_with_d5_retry(
+                    facade, **call_kwargs) is not True:
+                raise RuntimeError("source controller rejected the transfer")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                "Producer-initiated Stage-3 transfer failed req_id=%s "
+                "uuid=%d; the consumer's fallback will start it instead: %s",
+                req_id, uuid, exc)
+            return
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage3_producer_submitted",
+                    "req_id": req_id,
+                    "uuid": uuid,
+                    "num_tokens": num_tokens,
+                    "submit_ms": (time.perf_counter() - start) * 1000,
+                    "rank": self.tp_rank,
+                },
+                sort_keys=True))
+
+    def _stage3_transfer_layout(
+        self,
+        *,
+        dst_block_ids: list[int],
+        mamba_state_block_ids: Optional[list[int]],
+        skip_tokens: int,
+    ) -> tuple[list[str], list[int], list[int], dict[str, Any], int]:
+        """Lowers one request's destination pages into controller arguments.
+
+        ONE transfer carries every replicated cache class; tag order fixes the
+        H2D order ranks executor-side (the first tag = group 0 uploads first).
+        Each tag replays over the same destination pages.
+
+        Both sides of the transfer build these, and they must agree byte for
+        byte, so the two callers share this rather than each lowering the same
+        pages themselves.
+        """
+        transfer_tags = list(
+            _STAGE3_GLM_TRANSFER_POOL_TAGS if _use_raiden_glm_admission(
+            ) else _STAGE3_TRANSFER_POOL_TAGS)
+        dst_blocks = list(dst_block_ids) * len(transfer_tags)
+        dst_counts = [len(dst_block_ids)] * len(transfer_tags)
+        if self._stage3_state_group_count:
+            if not mamba_state_block_ids or len(
+                    mamba_state_block_ids) != self._stage3_state_group_count:
+                raise RuntimeError("GDN state load requires one destination "
+                                   "state block per mamba group")
+            for tag in _STAGE3_STATE_CLASS_TAGS:
+                for ordinal, slot in enumerate(mamba_state_block_ids):
+                    transfer_tags.append(f"{tag}.g{ordinal}")
+                    dst_blocks.append(int(slot))
+                    dst_counts.append(1)
+        # Prefix-aware suffix pull: clip the FA global destination byte space
+        # at the locally-cached prefix; GDN state classes are not
+        # prefix-decomposable and always transfer whole (skip 0). Omit the
+        # kwarg entirely when there is no clip so skip-free requests stay
+        # byte-identical on the wire.
+        fa_skip_bytes = 0
+        clip_kwargs: dict[str, Any] = {}
+        if skip_tokens > 0:
+            token_bytes = self._stage3_fa_token_bytes(
+                int(self.vllm_config.cache_config.block_size))
+            fa_skip_bytes = skip_tokens * token_bytes
+            clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
+                                             (len(transfer_tags) - 1))
+        return transfer_tags, dst_blocks, dst_counts, clip_kwargs, fa_skip_bytes
 
     def _stage_stage3_submit_task(
             self, pending: _Stage3PendingSubmit,
@@ -3413,43 +3804,13 @@ class TPURaidenConnectorWorker:
                     src_controller_address)
                 self._stage3_source_facades[src_controller_address] = (
                     source_facade)
-            # ONE transfer carries every replicated cache class; tag
-            # order fixes the H2D order ranks executor-side (the first
-            # tag = group 0 uploads first). Each tag replays over the
-            # same destination pages.
-            transfer_tags = list(
-                _STAGE3_GLM_TRANSFER_POOL_TAGS if _use_raiden_glm_admission(
-                ) else _STAGE3_TRANSFER_POOL_TAGS)
-            dst_blocks = list(local_blocks) * len(transfer_tags)
-            dst_counts = [len(local_blocks)] * len(transfer_tags)
-            mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids",
-                                            None)
-            if self._stage3_state_group_count:
-                if not mamba_state_block_ids or len(
-                        mamba_state_block_ids
-                ) != self._stage3_state_group_count:
-                    raise RuntimeError(
-                        "GDN state load requires one destination state "
-                        "block per mamba group")
-                for tag in _STAGE3_STATE_CLASS_TAGS:
-                    for ordinal, slot in enumerate(mamba_state_block_ids):
-                        transfer_tags.append(f"{tag}.g{ordinal}")
-                        dst_blocks.append(int(slot))
-                        dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
             skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
-            fa_skip_bytes = 0
-            clip_kwargs: dict[str, Any] = {}
-            if skip_tokens > 0:
-                token_bytes = self._stage3_fa_token_bytes(
-                    int(self.vllm_config.cache_config.block_size))
-                fa_skip_bytes = skip_tokens * token_bytes
-                clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
-                                                 (len(transfer_tags) - 1))
+            (transfer_tags, dst_blocks, dst_counts, clip_kwargs,
+             fa_skip_bytes) = self._stage3_transfer_layout(
+                 dst_block_ids=local_blocks,
+                 mamba_state_block_ids=getattr(req_meta,
+                                               "mamba_state_block_ids", None),
+                 skip_tokens=skip_tokens)
         except Exception as exc:  # pylint: disable=broad-except
             # Local staging failed before any controller contact, so no
             # receiver can have been armed and no late H2D is possible.
@@ -3769,7 +4130,25 @@ class TPURaidenConnectorWorker:
         reattempt_interval_s = dist_utils.get_stage3_reattempt_interval_s()
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
-            if now - pending.last_attempt_s < reattempt_interval_s:
+            if destination_req_id in self._stage3_terminal_loads:
+                # The producer started this transfer and it has already
+                # landed. Its registration is released, so a second submit
+                # would fail the lookup and take a live request down with it.
+                del self._stage3_pending_submits[destination_req_id]
+                continue
+            if pending.hold_until is not None:
+                if now < pending.hold_until:
+                    continue
+                # The hold is the wait, so the attempt it releases goes out
+                # now rather than a re-attempt interval later.
+                pending.hold_until = None
+                logger.warning(
+                    "The producer did not start the transfer for "
+                    "req_id=%s destination_req_id=%s uuid=%d within %.1fs; "
+                    "starting it from the consumer instead.",
+                    pending.source_req_id, destination_req_id, pending.uuid,
+                    tpu_envs.TPU_KV_PREFILL_SUBMIT_FALLBACK_S)
+            elif now - pending.last_attempt_s < reattempt_interval_s:
                 continue
             del self._stage3_pending_submits[destination_req_id]
             self._dispatch_stage3_load_submit(pending)

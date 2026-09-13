@@ -271,3 +271,115 @@ def test_a_late_admission_callback_is_ignored_rather_than_failing() -> None:
                                           _FakeRequest(dict(_ADMIT_PARAMS)))
 
     assert asyncio.run(drive()) == {"status": "ignored"}
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 — the destination relay: decode publishes where it wants its KV
+# written, and prefill collects those in bulk over one long poll.
+# ---------------------------------------------------------------------------
+
+_DST_PARAMS = {
+    "req_id": "engine-side-id",
+    "uuid": 4242,
+    "dst_block_ids": [7, 8, 9],
+    "dst_controller_address": "decode-controller.test:28000",
+}
+
+
+def _reset_dst_state() -> None:
+    _MOD._DST_PENDING.clear()
+    _MOD._DST_EVENT = None
+
+
+def test_a_published_destination_reaches_the_next_poll_once() -> None:
+    _reset_dst_state()
+
+    async def drive():
+        await _MOD.handle_kv_dst("r-1", _FakeRequest(dict(_DST_PARAMS)))
+        first = await _MOD.handle_kv_dst_batch(timeout=0.05)
+        # Handing an entry over removes it, so prefill cannot start the same
+        # transfer twice from two consecutive polls.
+        second = await _MOD.handle_kv_dst_batch(timeout=0.05)
+        return first, second
+
+    first, second = asyncio.run(drive())
+    assert first == {"entries": {"r-1": _DST_PARAMS}}
+    assert second == {"entries": {}}
+    assert _MOD._DST_PENDING == {}
+
+
+def test_one_poll_drains_every_announcement_since_the_last() -> None:
+    """This is what keeps the relay at one connection per prefill engine
+    rather than one per in-flight request."""
+    _reset_dst_state()
+
+    async def drive():
+        for index in range(3):
+            await _MOD.handle_kv_dst(f"r-{index}",
+                                     _FakeRequest({"uuid": index}))
+        return await _MOD.handle_kv_dst_batch(timeout=0.05)
+
+    assert asyncio.run(drive()) == {
+        "entries": {
+            "r-0": {
+                "uuid": 0
+            },
+            "r-1": {
+                "uuid": 1
+            },
+            "r-2": {
+                "uuid": 2
+            },
+        }
+    }
+
+
+def test_a_waiting_poll_wakes_on_the_next_publish() -> None:
+    """Prefill must not learn about a destination only on its next reconnect;
+    that announcement is on the critical path for its request."""
+    _reset_dst_state()
+
+    async def drive():
+        poll = asyncio.ensure_future(_MOD.handle_kv_dst_batch(timeout=5.0))
+        await asyncio.sleep(0.05)
+        assert not poll.done()
+        await _MOD.handle_kv_dst("r-late", _FakeRequest({"uuid": 9}))
+        return await asyncio.wait_for(poll, timeout=1.0)
+
+    assert asyncio.run(drive()) == {"entries": {"r-late": {"uuid": 9}}}
+
+
+def test_an_idle_poll_returns_empty_rather_than_hanging() -> None:
+    _reset_dst_state()
+    assert asyncio.run(_MOD.handle_kv_dst_batch(timeout=0.05)) == {
+        "entries": {}
+    }
+
+
+def test_a_publish_between_polls_is_still_there_on_reconnect() -> None:
+    _reset_dst_state()
+
+    async def drive():
+        # No poll is outstanding at this moment.
+        await _MOD.handle_kv_dst("r-gap", _FakeRequest({"uuid": 11}))
+        return await _MOD.handle_kv_dst_batch(timeout=0.05)
+
+    assert asyncio.run(drive()) == {"entries": {"r-gap": {"uuid": 11}}}
+
+
+def test_an_uncollected_backlog_is_bounded() -> None:
+    """If prefill stops collecting, the proxy sheds rather than growing. A
+    request whose parameters are dropped falls back to decode's own submit."""
+    _reset_dst_state()
+
+    async def drive():
+        for index in range(_MOD._DST_MAX_PENDING + 5):
+            await _MOD.handle_kv_dst(f"r-{index}",
+                                     _FakeRequest({"uuid": index}))
+
+    asyncio.run(drive())
+    assert len(_MOD._DST_PENDING) == _MOD._DST_MAX_PENDING
+    # The oldest go first, so the requests still likely to be in flight stay.
+    assert "r-0" not in _MOD._DST_PENDING
+    assert f"r-{_MOD._DST_MAX_PENDING + 4}" in _MOD._DST_PENDING
+    _reset_dst_state()

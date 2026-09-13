@@ -28,6 +28,11 @@ class SendMeta:
     # ordinal (the block holding the final recurrent state); None for FA-only
     # Stage-3 models and all legacy paths.
     mamba_state_block_ids: list[int] | None = None
+    # Where the consumer wants this request's KV written, as published by the
+    # consumer through the proxy while this prefill was still running. Present
+    # only when the producer is the side that starts the transfer; None means
+    # the consumer will start it itself, as it always has.
+    dst_params: dict | None = None
 
 
 @dataclass
