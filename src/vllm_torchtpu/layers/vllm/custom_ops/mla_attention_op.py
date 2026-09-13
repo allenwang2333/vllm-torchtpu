@@ -330,8 +330,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         def op(*args):
             new_cache, idxs, scores = local_op(*args)
             args[2].copy_(new_cache)
-            slots = merge_op(all_gather_candidates(scores))
-            return select_owned_winners(slots,
+            winner_cols = merge_op(all_gather_candidates(scores))
+            return select_owned_winners(winner_cols,
                                         idxs,
                                         dcp_size=dcp_size,
                                         dcp_rank=dcp_rank,

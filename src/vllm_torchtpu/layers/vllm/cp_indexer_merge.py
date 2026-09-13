@@ -69,7 +69,7 @@ def _left_pack(mine: torch.Tensor, local: torch.Tensor,
 
 
 def select_owned_winners(
-    slots: torch.Tensor,
+    winner_cols: torch.Tensor,
     idxs: torch.Tensor,
     *,
     dcp_size: int,
@@ -78,12 +78,12 @@ def select_owned_winners(
     gather=all_gather_candidates,
 ) -> torch.Tensor:
     """Keep the winners this rank owns, left-packed as local indices and `-1`
-    padded. Ownership is read out of the index value, so gather order is free."""
+    padded. `winner_cols` indexes the gathered candidates, not the KV cache."""
     merged = torch.gather(gather(idxs), 1,
-                          torch.clamp(slots, min=0).to(torch.int64))
-    merged = torch.where(slots >= 0, merged, torch.full_like(merged, -1))
+                          torch.clamp(winner_cols, min=0).to(torch.int64))
+    merged = torch.where(winner_cols >= 0, merged, torch.full_like(merged, -1))
     mine = (merged >= 0) & (cp_owner_rank(merged, dcp_size, interleave_c)
                             == dcp_rank)
     local = cp_global_to_local(torch.clamp(merged, min=0), dcp_size,
                                interleave_c).to(torch.int32)
-    return _left_pack(mine, local, slots.shape[1])
+    return _left_pack(mine, local, winner_cols.shape[1])

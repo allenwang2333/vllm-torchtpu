@@ -62,11 +62,11 @@ def _slots(rng, dcp_size, k, num_rows, empty_frac):
     return out
 
 
-def _merged(idxs, slots, order):
+def _merged(idxs, winner_cols, order):
     """The global position each winning column carries, blocks in `order`."""
     g = np.concatenate([idxs[o] for o in order], axis=1)
-    rows = np.arange(slots.shape[0])[:, None]
-    return np.where(slots >= 0, g[rows, np.maximum(slots, 0)], -1)
+    rows = np.arange(winner_cols.shape[0])[:, None]
+    return np.where(winner_cols >= 0, g[rows, np.maximum(winner_cols, 0)], -1)
 
 
 def _reference(merged, dcp_size, interleave_c, rank, k):
@@ -83,7 +83,7 @@ def _reference(merged, dcp_size, interleave_c, rank, k):
     return out
 
 
-def _run(slots, idxs, order, *, dcp_size, dcp_rank, interleave_c):
+def _run(winner_cols, idxs, order, *, dcp_size, dcp_rank, interleave_c):
     """Run the filter with the all-gather landing blocks in `order`."""
 
     def gather(x):
@@ -91,7 +91,7 @@ def _run(slots, idxs, order, *, dcp_size, dcp_rank, interleave_c):
         return torch.from_numpy(
             np.concatenate([idxs[o] for o in order], axis=1))
 
-    return select_owned_winners(torch.from_numpy(slots),
+    return select_owned_winners(torch.from_numpy(winner_cols),
                                 torch.from_numpy(idxs[dcp_rank]),
                                 dcp_size=dcp_size,
                                 dcp_rank=dcp_rank,
@@ -105,17 +105,17 @@ def test_matches_value_based_filter(dcp_size, interleave_c, k, num_rows,
                                     empty_frac):
     rng = np.random.default_rng(0xC0FFEE + dcp_size * 31 + k)
     idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, empty_frac)
-    slots = _slots(rng, dcp_size, k, num_rows, empty_frac)
+    winner_cols = _slots(rng, dcp_size, k, num_rows, empty_frac)
     order = range(dcp_size)
 
     for r in range(dcp_size):
         held = idxs[r][idxs[r] >= 0]
         assert np.all((held // interleave_c) % dcp_size == r)
 
-    merged = _merged(idxs, slots, order)
+    merged = _merged(idxs, winner_cols, order)
     for r in range(dcp_size):
         want = _reference(merged, dcp_size, interleave_c, r, k)
-        got = _run(slots,
+        got = _run(winner_cols,
                    idxs,
                    order,
                    dcp_size=dcp_size,
@@ -134,15 +134,15 @@ def test_is_order_independent(dcp_size, interleave_c, k, num_rows, shuffle):
     """
     rng = np.random.default_rng(dcp_size * 23 + k)
     idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.5)
-    slots = _slots(rng, dcp_size, k, num_rows, 0.5)
+    winner_cols = _slots(rng, dcp_size, k, num_rows, 0.5)
     order = list(range(dcp_size))
     if shuffle:
         rng.shuffle(order)
 
-    merged = _merged(idxs, slots, order)
+    merged = _merged(idxs, winner_cols, order)
     for r in range(dcp_size):
         want = _reference(merged, dcp_size, interleave_c, r, k)
-        got = _run(slots,
+        got = _run(winner_cols,
                    idxs,
                    order,
                    dcp_size=dcp_size,
@@ -156,12 +156,12 @@ def test_ranks_partition_the_winners(dcp_size, interleave_c, k, num_rows):
     """Every selected winner is claimed by exactly one rank."""
     rng = np.random.default_rng(dcp_size * 7 + k)
     idxs = _candidates(rng, dcp_size, interleave_c, k, num_rows, 0.5)
-    slots = _slots(rng, dcp_size, k, num_rows, 0.5)
+    winner_cols = _slots(rng, dcp_size, k, num_rows, 0.5)
     order = range(dcp_size)
 
     kept = np.zeros((num_rows, ), np.int64)
     for r in range(dcp_size):
-        got = _run(slots,
+        got = _run(winner_cols,
                    idxs,
                    order,
                    dcp_size=dcp_size,
@@ -173,7 +173,7 @@ def test_ranks_partition_the_winners(dcp_size, interleave_c, k, num_rows):
             assert np.all(row[:filled] >= 0) and np.all(row[filled:] == -1)
         kept += (got >= 0).sum(axis=1)
 
-    selected = _merged(idxs, slots, order)
+    selected = _merged(idxs, winner_cols, order)
     np.testing.assert_array_equal(kept, (selected >= 0).sum(axis=1))
 
 
@@ -181,9 +181,9 @@ def test_a_rank_owning_every_winner_loses_nothing():
     """A rank owning the whole winner list still fits it at width `k`."""
     dcp_size, interleave_c, k = 4, 1, 16
     idxs = _one_per_rank(dcp_size, k)
-    slots = np.arange(k, dtype=np.int32)[None, :]
+    winner_cols = np.arange(k, dtype=np.int32)[None, :]
 
-    got = _run(slots,
+    got = _run(winner_cols,
                idxs,
                range(dcp_size),
                dcp_size=dcp_size,
@@ -197,10 +197,10 @@ def test_unowned_rank_gets_an_all_minus_one_row():
     """A rank owning none of a token's winners gets an all -1 row."""
     dcp_size, interleave_c, k = 4, 1, 4
     idxs = _one_per_rank(dcp_size, k)
-    slots = np.arange(k, 2 * k, dtype=np.int32)[None, :]
+    winner_cols = np.arange(k, 2 * k, dtype=np.int32)[None, :]
 
     for r in (0, 2, 3):
-        got = _run(slots,
+        got = _run(winner_cols,
                    idxs,
                    range(dcp_size),
                    dcp_size=dcp_size,
@@ -208,7 +208,7 @@ def test_unowned_rank_gets_an_all_minus_one_row():
                    interleave_c=interleave_c)
         assert (got == -1).all()
 
-    got = _run(slots,
+    got = _run(winner_cols,
                idxs,
                range(dcp_size),
                dcp_size=dcp_size,
