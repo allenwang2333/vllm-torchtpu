@@ -383,6 +383,7 @@ run_benchmark_once() {
         --random-input-len "$bench_input_len" \
         --random-output-len "$bench_output_len" \
         --random-range-ratio "$bench_range_ratio" \
+        --trust-remote-code \
         --num-prompts "${NUM_PROMPTS:-320}" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
