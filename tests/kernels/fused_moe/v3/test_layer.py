@@ -480,8 +480,10 @@ class LayerTest(parameterized.TestCase):
                              Config(activation_block=256),
                              weight_format=WeightFormat.INT4,
                              weight_block=256)
-        self.check_reference(shape,
-                             Config(activation_block=256, stream_block=512),
+        # A streamed block-scaled expert copies eight scale rows (one sublane
+        # tile) per stream block: 2,048 columns of 256-wide blocks.
+        self.check_reference(dict(SHAPE, inter=4096),
+                             Config(activation_block=256, stream_block=2048),
                              weight_format=WeightFormat.INT4,
                              weight_block=256)
 
@@ -494,8 +496,9 @@ class LayerTest(parameterized.TestCase):
                              Config(activation_block=128),
                              weight_format=WeightFormat.FP8_BLOCK,
                              weight_block=128)
-        self.check_reference(shape,
-                             Config(activation_block=128, stream_block=256),
+        # Eight 128-wide scale blocks per stream block: 1,024 columns.
+        self.check_reference(dict(SHAPE, inter=2048),
+                             Config(activation_block=128, stream_block=1024),
                              weight_format=WeightFormat.FP8_BLOCK,
                              weight_block=128)
 
@@ -603,8 +606,7 @@ class LayerTest(parameterized.TestCase):
     # ---- streamed experts ----
     @parameterized.named_parameters(("fp8", WeightFormat.FP8, False, None),
                                     ("fp8_bias", WeightFormat.FP8, True, None),
-                                    ("bf16", WeightFormat.BF16, False, None),
-                                    ("fp4", WeightFormat.FP4, False, 256))
+                                    ("bf16", WeightFormat.BF16, False, None))
     def test_streamed_expert_is_the_whole_expert_build(self, weight_format,
                                                        bias, weight_block):
         """An expert streamed in column blocks the width of the activation
@@ -647,6 +649,22 @@ class LayerTest(parameterized.TestCase):
                    stream_rows=128,
                    token_block=512))
         np.testing.assert_array_equal(streamed, whole)
+
+    def test_streamed_four_bit_expert_in_eight_block_streams(self):
+        """A block-scaled expert streams at least eight weight blocks per
+        stream block (its scale rows travel one sublane tile at a time), so
+        its stream block is wider than its activation block and the f32 sums
+        reassociate, within the wider-blocks tolerance above."""
+        shape = dict(SHAPE, inter=4096)
+        kwargs = dict(weight_format=WeightFormat.FP4, weight_block=256)
+        whole, _ = self.run_layer(shape, Config(activation_block=256),
+                                  **kwargs)
+        streamed = self.check_reference(
+            shape,
+            Config(activation_block=256, stream_block=2048, token_block=256),
+            **kwargs)
+        error = rel_l2(streamed, whole)
+        self.assertLess(error, 1e-3, f"eight-block streams: {error:.2e}")
 
     def sorts(self, shape, config, **kwargs):
         """The layer's output and whether the sparse-core sort ran. The
