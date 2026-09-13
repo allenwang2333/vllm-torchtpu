@@ -44,7 +44,7 @@ fi
 : "${NUM_HOSTS:?NUM_HOSTS must be set}"
 INDEX="${JOB_COMPLETION_INDEX:-0}"
 REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
-cd "$REPO_DIR"
+cd "$REPO_DIR" || { echo "$0: no such directory: $REPO_DIR" >&2; exit 2; }
 
 # Where the benchmark scripts write, and the only place results can be found
 # afterwards. On a VM this is a bind mount of the data disk; a pod is deleted

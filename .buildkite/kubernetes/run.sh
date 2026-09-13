@@ -48,6 +48,8 @@ fi
 # The image and the environment that crosses into the pod, shared with
 # run_multihost.sh: leaves WORKLOAD_IMAGE exported and the launcher's --env
 # flags in `env_args`.
+# shellcheck source=.buildkite/kubernetes/common.sh
+# shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 # The prologue and epilogue run_in_docker.sh performs around the container,
@@ -59,6 +61,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 #
 # Uploaded under the same relative path `artifact_paths` produces on bare
 # metal, so a run from either lane is read the same way.
+#
+# Single-quoted on purpose: this is a program for the pod's shell, not for this
+# one, so $@ and $? have to arrive unexpanded.
+# shellcheck disable=SC2016
 IN_POD='
   set -o pipefail
   umask 000
@@ -81,6 +87,8 @@ IN_POD='
 # chip on it, which is what every single-host step is. A slice across hosts is
 # a JobSet this repo writes and passes with --manifest instead - see
 # .buildkite/kubernetes/manifests/v7x/.
+# env_args comes from common.sh, which shellcheck does not read.
+# shellcheck disable=SC2154
 exec /opt/launcher/launch \
   --machine-type "$machine_type" \
   --topology "$topology" \

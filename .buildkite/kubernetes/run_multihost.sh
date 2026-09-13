@@ -34,6 +34,8 @@ if [[ $# -lt 1 ]]; then
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.buildkite/kubernetes/common.sh
+# shellcheck disable=SC1091
 source "${HERE}/common.sh"
 
 # Passed by name rather than substituted into the manifest: the launcher's
@@ -43,6 +45,8 @@ source "${HERE}/common.sh"
 MULTIHOST_ARGS="$*"
 export MULTIHOST_ARGS
 
+# env_args comes from common.sh, which shellcheck does not read.
+# shellcheck disable=SC2154
 exec /opt/launcher/launch \
   --manifest "${HERE}/manifests/v7x/multihost.yaml" \
   "${env_args[@]}"
