@@ -407,9 +407,8 @@ def update_sparse_mla_kv_cache_dcp(
     page -- the same trick the unsharded scatter uses for padding, and it is
     why this needs no collective and no branch.
 
-    Must be called from inside a `shard_map`; `dcp_rank` is this shard's index
-    along the DCP axis as traced data, so one compiled program serves every
-    rank.
+    Operates on this rank's own shards; `dcp_rank` is an ordinary argument, so
+    a build-time constant and traced data both work.
 
     Args:
       kv_cache_nope, kv_cache_rope: this rank's shards, shaped by the specs.
@@ -417,7 +416,7 @@ def update_sparse_mla_kv_cache_dcp(
         every rank; the mask, not the data, is what differs.
       seq_lens, block_tables, query_start_loc: global sequence coordinates,
         replicated. `block_tables` holds *virtual* page ordinals.
-      dcp_rank: i32 scalar, this shard's DCP index.
+      dcp_rank: this shard's DCP index, a Python int or an i32 scalar.
       nope_spec, rope_spec: layout descriptors the shards were allocated from.
       dcp_size, interleave_size: the shard layout.
 

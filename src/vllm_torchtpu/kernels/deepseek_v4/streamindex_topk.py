@@ -46,6 +46,30 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
+# Context-parallel  helpers.
+
+
+def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
+    """Map a rank-local compressed index to its global compressed position"""
+    if cp_size == 1:
+        return local_idx
+    cycle_c = cp_size * interleave_c
+    return ((local_idx // interleave_c) * cycle_c + cp_rank * interleave_c +
+            local_idx % interleave_c)
+
+
+def cp_local_length(global_len, cp_rank, cp_size: int, interleave_c: int):
+    """Count compressed positions ``< global_len`` owned by `cp_rank`.
+    Mirrors ``_local_page_valid_len`` in pcp_streaming_rpa/schedule.py."""
+    if cp_size == 1:
+        return global_len
+    cycle_c = cp_size * interleave_c
+    full = global_len // cycle_c
+    rem = global_len - full * cycle_c
+    return full * interleave_c + jnp.clip(rem - cp_rank * interleave_c, 0,
+                                          interleave_c)
+
+
 class MlaCase(Enum):
     """Represents the different cases for MLA."""
 
@@ -70,6 +94,7 @@ def kernel(
     start_end_seq_idx_ref,  # Shape: [2], Memory: SMEM
     sem_ids_ref,  # Shape: [3], Memory: SMEM
     bo_sz_ref,  # Shape: [2], Memory: SMEM
+    cp_rank_ref,  # Shape: [1], Memory: SMEM
     # Input
     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
@@ -89,6 +114,8 @@ def kernel(
     bkv_p: int,
     bq_sz: int,
     seq_batch_size: int,
+    cp_size: int = 1,
+    interleave_c: int = 1,
 ):
     """Core kernel logic that operates on memory references."""
 
@@ -112,8 +139,11 @@ def kernel(
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * seq_batch_size
     batch_end_seq_idx = batch_start_seq_idx + seq_batch_size - 1
 
+    cp_rank = cp_rank_ref[0]
+
     q_lens = []
     kv_lens = []
+    local_kv_lens = []
     seq_lens = []
     for batch_idx in range(seq_batch_size):
         q_start = cu_q_lens_ref[batch_start_seq_idx + batch_idx]
@@ -122,8 +152,12 @@ def kernel(
         q_lens.append(q_len)
         seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
         seq_lens.append(seq_len)
+        # Global compressed length; the masks stay in global coordinates.
         kv_len = seq_len // compression_ratio
         kv_lens.append(kv_len)
+        # How many of those positions live in this rank's shard.
+        local_kv_lens.append(
+            cp_local_length(kv_len, cp_rank, cp_size, interleave_c))
 
     def wait_send_scores(bo_sem_idx):
         old_sz = bo_sz_ref[bo_sem_idx]
@@ -272,7 +306,8 @@ def kernel(
         return bkvs, bkv_scales
 
     def process():
-        kv_len_max = jnp.max(jnp.stack(kv_lens))
+        # Local, not global: each rank only walks the kv blocks it holds.
+        kv_len_max = jnp.max(jnp.stack(local_kv_lens))
         num_bkv = jnp.maximum(1, cdiv(kv_len_max, bkv_sz))
         if static_q_len is None:
             assert seq_batch_size == 1
@@ -337,8 +372,11 @@ def kernel(
             s_summed = (s_summed * scale_val_stacked
                         )  # Shape: (seq_batch_size, bq_sz, bkv_sz)
 
-            k_span = bkv_idx * bkv_sz + jnp.arange(
+            # Score columns are rank-local.
+            k_local = bkv_idx * bkv_sz + jnp.arange(
                 bkv_sz, dtype=jnp.int32)  # Shape: (bkv_sz,)
+            k_span = cp_local_to_global(k_local, cp_rank, cp_size,
+                                        interleave_c)  # Shape: (bkv_sz,)
 
             kv_lens_stacked = jnp.stack(kv_lens)  # Shape: (seq_batch_size,)
             valid_mask = (k_span[None, None, :] < kv_lens_stacked[:, None,
@@ -486,8 +524,12 @@ def _effective_row_lengths(
     num_tokens: int,
     num_positions: int,
     compression_ratio: int,
+    cp_rank=0,
+    cp_size: int = 1,
+    interleave_c: int = 1,
 ) -> jax.Array:  # i32[num_tokens]
-    """Visible compressed KV positions per token row of the score matrix."""
+    """Visible compressed KV positions per token row of the score matrix,
+    counting only the ones this rank owns when context parallel."""
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
@@ -502,6 +544,7 @@ def _effective_row_lengths(
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
     visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
@@ -516,6 +559,9 @@ def _effective_row_lengths(
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "enable_early_exit",
+        "cp_size",
+        "interleave_size",
+        "return_scores",
     ),
 )
 def streamindex_topk(
@@ -535,7 +581,11 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     enable_early_exit: bool = False,
-) -> jax.Array:
+    cp_size: int = 1,
+    cp_rank: jax.Array | int = 0,
+    interleave_size: int = 1,
+    return_scores: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
   Args:
@@ -559,10 +609,40 @@ def streamindex_topk(
     enable_early_exit: whether to enable early exit using jax.lax.cond when k >=
       kv_len for all sequences in the batch. Defaults to False.
     decode_req_batch_size: maximum decode batch size per iteration.
+    cp_size: number of context-parallel ranks the compressed KV cache is
+      sharded over. 1 (default) means no sharding and the whole CP path
+      compiles away. When > 1, `cache_kv` / `page_indices` describe only this
+      rank's shard, and the returned top-k is local -- correct only after the
+      cross-rank merge the caller performs on the returned scores.
+    cp_rank: this rank's index in the CP group, as a Python int or traced data.
+    interleave_size: CP chunk-interleave width in uncompressed tokens. Must be
+      a multiple of `compression_ratio`.
+    return_scores: also return the score of each selected position, which is
+      what makes a cross-rank merge possible. A local top-k over a sharded KV
+      axis is not the global top-k, so the merge needs the scores the same way
+      the DCP attention kernels need an LSE output.
 
   Returns:
-    Top-K indices (in compressed space).
+    Top-K indices in global compressed space, or `(indices, scores)` if
+    `return_scores`. Unfilled slots are `-1` with score `-inf`.
   """
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+    if cp_size > 1:
+        if interleave_size % compression_ratio != 0:
+            raise ValueError(
+                f"interleave_size ({interleave_size}) must be a multiple of "
+                f"compression_ratio ({compression_ratio}) for the CP chunk "
+                "boundary to fall on a compressed-row boundary.")
+        if enable_early_exit:
+            # Its identity indices 0..k are global, not this rank's subset.
+            raise NotImplementedError(
+                "enable_early_exit is not supported with cp_size > 1.")
+    if enable_early_exit and return_scores:
+        # The fast path never computes scores, so it has none to return.
+        raise NotImplementedError(
+            "return_scores is not supported with enable_early_exit.")
+    interleave_c = interleave_size // compression_ratio if cp_size > 1 else 1
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv` along the width dimension, keeping HBM transactions fused.
 
@@ -698,6 +778,7 @@ def streamindex_topk(
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
             jnp.zeros((3, ), jnp.int32),  # (bq, bkv, bo) sem indices
             jnp.full((2, ), -1, jnp.int32),  # in-flight out DMA row counts
+            jnp.asarray([cp_rank], jnp.int32),  # CP rank
         )
 
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}"
@@ -709,6 +790,8 @@ def streamindex_topk(
                 bq_sz=bq_sz,
                 bkv_p=bkv_p,
                 seq_batch_size=seq_batch_size,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -827,6 +910,9 @@ def streamindex_topk(
             num_tokens=q.shape[0],
             num_positions=scores_to_reduce.shape[1],
             compression_ratio=compression_ratio,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
         )
         topk_idxs = sparsecore_topk(
             scores_to_reduce,
@@ -834,8 +920,24 @@ def streamindex_topk(
             row_lengths=eff_row_lengths,
             write_empty_rows=True,
         )
+        topk_idxs = topk_idxs[:q.shape[0], :k]
 
-        return topk_idxs[:q.shape[0], :k]
+        if cp_size == 1 and not return_scores:
+            return topk_idxs
+
+        # Clamp the -1 pad before the gather so it cannot wrap to the last col.
+        filled = topk_idxs >= 0
+        topk_scores = jnp.take_along_axis(scores_to_reduce,
+                                          jnp.maximum(topk_idxs, 0),
+                                          axis=1)
+        topk_scores = jnp.where(filled, topk_scores, -jnp.inf)
+        # Columns are rank-local; callers (and the merge) want global positions.
+        global_idxs = jnp.where(
+            filled,
+            cp_local_to_global(topk_idxs, cp_rank, cp_size, interleave_c), -1)
+        if not return_scores:
+            return global_idxs
+        return global_idxs, topk_scores
 
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])

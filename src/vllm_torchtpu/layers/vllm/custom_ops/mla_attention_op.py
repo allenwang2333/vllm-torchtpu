@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import \
@@ -41,11 +41,16 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
+from vllm_torchtpu.distributed.dcp import get_dcp_rank
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.common.quantization import quantize_tensor
 from vllm_torchtpu.layers.vllm.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.layers.vllm.cp_indexer_merge import (all_gather_candidates,
+                                                        select_owned_winners)
 from vllm_torchtpu.layers.vllm.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -57,6 +62,57 @@ from vllm_torchtpu.utils import synchronize_tensors
 STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
+def _cp_scatter_indexer_k(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    interleave_size: int,
+) -> jax.Array:
+    """Scatter this step's indexer K rows into this rank's shard of the
+    DCP-sharded K cache. `k_packed` must be request-major."""
+    _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+    page_size = block_size_per_kv_packing * kv_packing
+    # A separate allocation from the latent cache, so check it separately.
+    if page_size % interleave_size:
+        raise ValueError(
+            f"interleave_size={interleave_size} must divide the indexer "
+            f"K cache page_size={page_size}. Otherwise an interleave "
+            "chunk straddles a page boundary and the local index "
+            "the indexer derives from a global position stops "
+            "agreeing with the (page, slot) written here.")
+    k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+
+    # Same row-placement rule as the latent-cache writers.
+    _, seq_id, pos, in_batch = _row_positions(k_packed.shape[0], seq_lens,
+                                              cu_q_lens)
+
+    virtual_page_size = jnp.int32(page_size * cp_size)
+    cycle = jnp.int32(cp_size * interleave_size)
+    interleave = jnp.int32(interleave_size)
+    offset = pos % virtual_page_size
+    owner = (offset % cycle) // interleave
+    slot = (offset // cycle) * interleave + (offset % interleave)
+
+    # Virtual ordinal -> physical block in this rank's own shard.
+    local_page_indices = jnp.mod(page_indices,
+                                 jnp.int32(cache_kv.shape[0])).reshape(
+                                     seq_lens.shape[0], -1)
+    # A padded token's `pos` can run off the page table; clip, then drop.
+    max_pages_per_seq = local_page_indices.shape[1]
+    virtual_page = jnp.clip(pos // virtual_page_size, 0, max_pages_per_seq - 1)
+
+    valid = jnp.logical_and(in_batch, owner == cp_rank)
+    page = jnp.where(valid, local_page_indices[seq_id, virtual_page],
+                     jnp.int32(OOB_PAGE))
+    return cache_kv.at[page, slot // kv_packing,
+                       slot % kv_packing].set(k_packed)
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
@@ -65,6 +121,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
+
+        parallel_config = getattr(get_current_vllm_config_or_none(),
+                                  "parallel_config", None)
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        pcp_size = pcp_size if isinstance(pcp_size, int) else 1
+        dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
+        dcp_size = dcp_size if isinstance(dcp_size, int) else 1
+        self.topk_op_dcp = None
+        self.dcp_size = dcp_size
+        if dcp_size > 1:
+            if pcp_size > 1:
+                raise NotImplementedError(
+                    f"pcp_size={pcp_size} and dcp_size={dcp_size} are both >1; "
+                    "the sparse indexer shards its K cache by position on "
+                    "whichever axis it is given and has no layout for two at "
+                    "once.")
+            self.topk_op_dcp = self._build_streamidx_dcp_op(
+                dcp_size, parallel_config.cp_kv_cache_interleave_size)
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
@@ -143,6 +217,128 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         self._streamidx_op = op
         return op
 
+    def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
+        """The DCP twin of `_build_streamidx_op`: two exported ops over this
+        rank's own shard, local candidates then a merge, all-gather between."""
+        topk = self.topk_tokens
+        dcp_rank = get_dcp_rank()
+        compression_ratio = 1
+        interleave_c = interleave_size // compression_ratio
+
+        def _local_candidates(q, weights, cache_kv, seq_lens, page_indices,
+                              cu_q_lens, distribution):
+            """This rank's `[num_tokens, topk]` candidate positions (`-1`
+            padded) and their scores (`-inf` padded)."""
+            local_page_indices = jnp.mod(page_indices,
+                                         jnp.int32(cache_kv.shape[0]))
+            return streamindex_topk(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                local_page_indices,
+                cu_q_lens,
+                distribution,
+                k=topk,
+                compression_ratio=compression_ratio,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 128, 128),
+                enable_early_exit=False,
+                cp_size=dcp_size,
+                cp_rank=dcp_rank,
+                interleave_size=interleave_size,
+                return_scores=True,
+            )
+
+        def _streamidx_topk_dcp_local_jax(
+            q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
+            weights: jax.Array,  # replicated
+            cache_kv: jax.Array,  # this rank's position shard
+            k_packed: jax.Array,  # replicated
+            seq_lens: jax.Array,
+            page_indices: jax.Array,  # virtual page ordinals
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            # The scatter pads the fp8+scale rows to 128 lanes itself.
+            cache_kv = _cp_scatter_indexer_k(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                cp_size=dcp_size,
+                cp_rank=dcp_rank,
+                interleave_size=interleave_size,
+            )
+
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            idxs, scores = _local_candidates(q, weights, cache_kv, seq_lens,
+                                             page_indices, cu_q_lens,
+                                             distribution)
+            return cache_kv, idxs, scores
+
+        def _streamidx_topk_dcp_merge_jax(scores: jax.Array) -> jax.Array:
+            return sparsecore_topk(
+                scores,
+                topk,
+                row_lengths=jnp.full((scores.shape[0], ),
+                                     scores.shape[1],
+                                     dtype=jnp.int32),
+                write_empty_rows=True,
+            )
+
+        # Rank-invariant: the rank is baked into the traced functions above,
+        # not into the name every rank registers.
+        prefix = self.k_cache.prefix.replace('.', '_')
+        local_op = pallas.jax_op(
+            f"pallas::streamidx_topk_dcp_local_{prefix}",
+            _streamidx_topk_dcp_local_jax,
+            donate_argnums=(2, ),
+            mesh=None,
+            input_partition_specs=None,
+        )
+
+        merge_op = pallas.jax_op(
+            f"pallas::streamidx_topk_dcp_merge_{prefix}",
+            _streamidx_topk_dcp_merge_jax,
+            mesh=None,
+            input_partition_specs=None,
+        )
+
+        # We must overwrite the default fake implementation as vLLM uses
+        # dynamic dimensions for the query.
+        def _fake_streamidx_topk_dcp_local(q_bytes, weights, cache_kv,
+                                           k_packed, seq_lens, page_indices,
+                                           cu_q_lens, distribution, **kwargs):
+            del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
+                 distribution, kwargs)
+            num_tokens = q_bytes.shape[0]
+            return (
+                torch.empty_like(cache_kv),
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.int32),
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.float32),
+            )
+
+        def _fake_streamidx_topk_dcp_merge(scores, **kwargs):
+            del kwargs
+            return scores.new_empty((scores.shape[0], topk), dtype=torch.int32)
+
+        local_op.register_fake(_fake_streamidx_topk_dcp_local)
+        merge_op.register_fake(_fake_streamidx_topk_dcp_merge)
+
+        def op(*args):
+            new_cache, idxs, scores = local_op(*args)
+            args[2].copy_(new_cache)
+            winner_cols = merge_op(all_gather_candidates(scores))
+            return select_owned_winners(winner_cols,
+                                        idxs,
+                                        dcp_size=dcp_size,
+                                        dcp_rank=dcp_rank,
+                                        interleave_c=interleave_c)
+
+        return op
+
     def forward_oot(
         self,
         hidden_states: torch.Tensor,
@@ -182,21 +378,35 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         rd = metadata.request_distribution
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
-        topk_indices = self.topk_op(
-            q_values.view(torch.uint8),
-            weights,
-            kv_cache,
-            k_quant_packed,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-        )
+        if self.topk_op_dcp is not None:
+            # Returns this rank's own local cache indices, not global ones.
+            topk_indices = self.topk_op_dcp(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+        else:
+            topk_indices = self.topk_op(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
 
         self.topk_indices_buffer[:hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        self.topk_indices_buffer[:num_out, :self.
-                                 topk_tokens] = topk_indices[:num_out]
+        # Both branches return `topk_tokens`-wide rows.
+        topk = self.topk_tokens
+        self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
         return self.topk_indices_buffer
 
 
@@ -421,6 +631,12 @@ class VllmTPUMLAAttention(MLAAttention):
                                               k_scale=k_scale,
                                               v_scale=v_scale)
         self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
+
+        dcp_size = getattr(self.impl, "dcp_size", 1)
+        self.sparse_mla_dcp_op = None
+        if dcp_size > 1:
+            self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
+                self, dcp_size, self.impl.dcp_interleave_size)
 
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],

@@ -404,6 +404,402 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         self._check(output, expected, valid)
 
 
+# DCP: log-sum-exp export and the cross-shard merge.
+
+DCP_TOKENS = 64  # multiple of TOKEN_PAD, fits PAGES_PER_SEQ * PAGE_SIZE
+DCP_TOPK = 64
+# Shard rule: rank `(p // interleave_c) % dcp_size` owns compressed position p.
+DCP_INTERLEAVE_C = 4
+
+
+def _shard_topk_by_owner(topk_rows: np.ndarray, dcp_size: int,
+                         interleave_c: int):
+    """Partition each token's top-k by owning rank; `(shards, counts)`."""
+    num_tokens, topk = topk_rows.shape
+    shards = np.full((dcp_size, num_tokens, topk), -1, np.int32)
+    counts = np.zeros((dcp_size, num_tokens), np.int32)
+    for t in range(num_tokens):
+        row = topk_rows[t][topk_rows[t] >= 0]
+        for r in range(dcp_size):
+            sel = row[(row // interleave_c) % dcp_size == r]
+            counts[r, t] = sel.size
+            shards[r, t, :sel.size] = sel
+            if sel.size == 0:
+                shards[r, t, 0] = 0  # dummy; masked by `counts` at merge time
+    return shards, counts
+
+
+def _merge_partials(outs: np.ndarray, lses: np.ndarray,
+                    counts: np.ndarray) -> np.ndarray:
+    """`o = sum_r softmax_r(lse) * o_r` over the DCP axis, in f32."""
+    lses = np.where(counts[:, :, None] > 0, lses, -np.inf)
+    shift = lses.max(0, keepdims=True)
+    # An unowned token would give 0/0; the guard makes it a zero, not a NaN.
+    all_empty = ~np.isfinite(shift)
+    shift = np.where(all_empty, 0.0, shift)
+    weights = np.exp(lses - shift[0])  # [D, T, N]
+    denom = weights.sum(0)
+    weights = np.where(denom[None] > 0,
+                       weights / np.where(denom == 0, 1, denom)[None], 0.0)
+    return (weights[..., None] * outs).sum(0)
+
+
+class SparseMlaLseTest(parameterized.TestCase):
+    """`return_lse` and the KV-sharded (DCP) merge it exists to enable."""
+
+    def setUp(self):
+        super().setUp()
+        self.rng = np.random.default_rng(20260906)
+        self.k_scale = 1.5
+        self.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("sparse MLA kernel requires a TPU (SparseCore).")
+
+    def _prefilled(self):
+        """One prefilled sequence: caches plus kernel-ready inputs."""
+        kv_c = self.rng.standard_normal(
+            (DCP_TOKENS, LKV_DIM)).astype(np.float32)
+        k_pe = self.rng.standard_normal(
+            (DCP_TOKENS, ROPE_DIM)).astype(np.float32)
+        kv_c_fp8 = _quantize_fp8(kv_c, self.k_scale)
+        k_pe_fp8 = _quantize_fp8(k_pe, self.k_scale)
+        ql_nope = jnp.asarray(self.rng.standard_normal(
+            (DCP_TOKENS, NUM_HEADS, LKV_DIM)).astype(np.float32),
+                              dtype=jnp.bfloat16)
+        q_pe = jnp.asarray(self.rng.standard_normal(
+            (DCP_TOKENS, NUM_HEADS, ROPE_DIM)).astype(np.float32),
+                           dtype=jnp.bfloat16)
+        topk_rows = _causal_topk(list(range(DCP_TOKENS)), DCP_TOPK)
+        block_tables = jnp.asarray(
+            self.rng.permutation(TOTAL_PAGES)[:PAGES_PER_SEQ], dtype=jnp.int32)
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("x", ))
+
+        # One layer call to insert the rows; `return_lse` is kernel-level.
+        nope_cache, rope_cache, _ = attention_interface.sparse_mla_attention(
+            ql_nope,
+            q_pe,
+            kv_c_fp8,
+            k_pe_fp8,
+            *_empty_pair(),
+            jnp.asarray(topk_rows, jnp.int32),
+            jnp.asarray([DCP_TOKENS], jnp.int32),
+            block_tables,
+            jnp.asarray([0, DCP_TOKENS], jnp.int32),
+            jnp.asarray([0, 1, 1], jnp.int32),
+            mesh,
+            NOPE_SPEC,
+            ROPE_SPEC,
+            sm_scale=self.sm_scale,
+            k_scale=self.k_scale)
+
+        return dict(
+            q=jnp.concatenate([ql_nope, q_pe], axis=-1),
+            nope_cache=nope_cache,
+            rope_cache=rope_cache,
+            topk_rows=topk_rows,
+            block_tables=block_tables,
+            cu_q_lens=jnp.asarray([0, DCP_TOKENS], jnp.int32),
+            distribution=jnp.asarray([0, 1, 1], jnp.int32),
+            kv_c_deq=_dequantize(kv_c_fp8, self.k_scale),
+            k_pe_deq=_dequantize(k_pe_fp8, self.k_scale),
+        )
+
+    def _attend(self, inp, topk_rows, return_lse):
+        return sparse_mla_kernel.sparse_ragged_paged_attention(
+            inp["q"],
+            inp["nope_cache"],
+            inp["rope_cache"],
+            jnp.asarray(topk_rows, jnp.int32),
+            inp["block_tables"],
+            inp["cu_q_lens"],
+            inp["distribution"],
+            sm_scale=self.sm_scale,
+            k_scale=self.k_scale,
+            return_lse=return_lse,
+        )
+
+    def test_return_lse_does_not_perturb_the_output(self):
+        """The flag is additive: the attention result must be bit-identical."""
+        inp = self._prefilled()
+        base = self._attend(inp, inp["topk_rows"], False)
+        out, lse = self._attend(inp, inp["topk_rows"], True)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(base))
+        self.assertEqual(lse.dtype, jnp.float32)
+        self.assertEqual(lse.shape, (DCP_TOKENS, NUM_HEADS))
+
+    def test_lse_matches_a_reference_logsumexp(self):
+        inp = self._prefilled()
+        _, lse = self._attend(inp, inp["topk_rows"], True)
+
+        keys = np.concatenate([inp["kv_c_deq"], inp["k_pe_deq"]], -1)
+        q = np.asarray(inp["q"].astype(jnp.float32))
+        expected = np.zeros((DCP_TOKENS, NUM_HEADS), np.float32)
+        for t in range(DCP_TOKENS):
+            sel = inp["topk_rows"][t][inp["topk_rows"][t] >= 0]
+            scores = q[t] @ keys[sel].T * self.sm_scale  # [N, n]
+            m = scores.max(-1)
+            expected[t] = m + np.log(np.exp(scores - m[:, None]).sum(-1))
+
+        np.testing.assert_allclose(np.asarray(lse),
+                                   expected,
+                                   rtol=2e-2,
+                                   atol=2e-2)
+
+    @parameterized.named_parameters(
+        dict(testcase_name="d2", dcp_size=2),
+        dict(testcase_name="d4", dcp_size=4),
+        dict(testcase_name="d8", dcp_size=8),
+    )
+    def test_merging_position_sharded_partials_reproduces_the_whole(
+            self, dcp_size):
+        """Splitting a token's top-k by position and merging is the whole."""
+        inp = self._prefilled()
+        whole = np.asarray(
+            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
+
+        shards, counts = _shard_topk_by_owner(inp["topk_rows"], dcp_size,
+                                              DCP_INTERLEAVE_C)
+        self.assertTrue(
+            (counts.sum(0) == (inp["topk_rows"] >= 0).sum(-1)).all(),
+            "the shard split must partition the top-k list exactly")
+
+        outs, lses = [], []
+        for r in range(dcp_size):
+            out_r, lse_r = self._attend(inp, shards[r], True)
+            outs.append(np.asarray(out_r.astype(jnp.float32)))
+            lses.append(np.asarray(lse_r))
+
+        merged = _merge_partials(np.stack(outs), np.stack(lses), counts)
+        np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
+
+    def test_an_empty_shard_contributes_nothing(self):
+        """A rank owning none of a token's top-k must not shift the merge."""
+        inp = self._prefilled()
+        whole = np.asarray(
+            self._attend(inp, inp["topk_rows"], False).astype(jnp.float32))
+        out, lse = self._attend(inp, inp["topk_rows"], True)
+
+        # Two shards: one holds the entire list, the other holds nothing.
+        empty_rows = np.full_like(inp["topk_rows"], -1)
+        empty_rows[:, 0] = 0
+        out_e, lse_e = self._attend(inp, empty_rows, True)
+        counts = np.stack([(inp["topk_rows"] >= 0).sum(-1),
+                           np.zeros(DCP_TOKENS, np.int32)])
+
+        merged = _merge_partials(
+            np.stack([
+                np.asarray(out.astype(jnp.float32)),
+                np.asarray(out_e.astype(jnp.float32))
+            ]), np.stack([np.asarray(lse), np.asarray(lse_e)]), counts)
+        np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
+
+
+# DCP: attention over a position-sharded latent cache.
+
+DCP_SEQ = 256  # positions in the (single) sequence
+DCP_ATTN_TOPK = 64
+
+
+def _owned_local_topk(merged, dcp_size, interleave_c, rank):
+    """The slice of a top-k list `rank` owns, as left-packed local indices."""
+    merged = np.asarray(merged)
+    cycle = dcp_size * interleave_c
+    mine = (merged >= 0) & ((merged // interleave_c) % dcp_size == rank)
+    local = (merged // cycle) * interleave_c + merged % interleave_c
+    order = np.argsort(~mine, axis=1, kind="stable")
+    return jnp.asarray(
+        np.where(np.take_along_axis(mine, order, axis=1),
+                 np.take_along_axis(local, order, axis=1),
+                 -1).astype(np.int32))
+
+
+def _dcp_caches():
+    """One rank's zeroed cache shards. Every rank is allocated the same."""
+    return tuple(
+        jnp.zeros(spec.shape, jnp.uint8) for spec in (NOPE_SPEC, ROPE_SPEC))
+
+
+def _merge_dcp_lse_partials(outputs, lses):
+    """Per-rank partials into the whole: `o = sum_r softmax_r(lse) * o_r`."""
+    lses = lses.astype(jnp.float32)
+    shift = jnp.max(lses, axis=0, keepdims=True)
+    # No contributor anywhere gives inf - inf; pin the shift to 0 there.
+    all_empty = ~jnp.isfinite(shift)
+    weights = jnp.exp(lses - jnp.where(all_empty, 0.0, shift))
+    weights = jnp.where(jnp.isfinite(lses), weights, 0.0)
+    denom = jnp.sum(weights, axis=0, keepdims=True)
+    weights = jnp.where(denom > 0, weights / jnp.where(denom > 0, denom, 1.0),
+                        0.0)
+    return jnp.sum(weights[..., None] * outputs.astype(jnp.float32), axis=0)
+
+
+def _random_causal_topk(rng, num_tokens, topk):
+    """Token t attends to a random subset of [0, t], `-1`-padded."""
+    rows = np.full((num_tokens, topk), -1, np.int32)
+    for t in range(num_tokens):
+        n = min(topk, t + 1)
+        rows[t, :n] = np.sort(rng.choice(t + 1, size=n, replace=False))
+    return rows
+
+
+class SparseMlaDcpTest(parameterized.TestCase):
+    """`sparse_mla_attention_dcp` + `_merge_dcp_lse_partials`, end to end."""
+
+    def setUp(self):
+        super().setUp()
+        self.rng = np.random.default_rng(20260907)
+        self.k_scale = 1.5
+        self.sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
+
+    def _require_tpu(self):
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("sparse MLA kernel requires a TPU (SparseCore).")
+
+    def _inputs(self):
+        kv_c = self.rng.standard_normal((DCP_SEQ, LKV_DIM)).astype(np.float32)
+        k_pe = self.rng.standard_normal((DCP_SEQ, ROPE_DIM)).astype(np.float32)
+        kv_c_fp8 = _quantize_fp8(kv_c, self.k_scale)
+        k_pe_fp8 = _quantize_fp8(k_pe, self.k_scale)
+        ql_nope = jnp.asarray(self.rng.standard_normal(
+            (DCP_SEQ, NUM_HEADS, LKV_DIM)).astype(np.float32),
+                              dtype=jnp.bfloat16)
+        q_pe = jnp.asarray(self.rng.standard_normal(
+            (DCP_SEQ, NUM_HEADS, ROPE_DIM)).astype(np.float32),
+                           dtype=jnp.bfloat16)
+        return dict(
+            kv_c_fp8=kv_c_fp8,
+            k_pe_fp8=k_pe_fp8,
+            ql_nope=ql_nope,
+            q_pe=q_pe,
+            topk=_random_causal_topk(self.rng, DCP_SEQ, DCP_ATTN_TOPK),
+            kv_c_deq=_dequantize(kv_c_fp8, self.k_scale),
+            k_pe_deq=_dequantize(k_pe_fp8, self.k_scale),
+            seq_lens=jnp.asarray([DCP_SEQ], jnp.int32),
+            cu_q_lens=jnp.asarray([0, DCP_SEQ], jnp.int32),
+            distribution=jnp.asarray([0, 1, 1], jnp.int32),
+        )
+
+    def _numpy_reference(self, inp):
+        """f32 MLA over exactly the selected, fp8-rounded latents."""
+        q = np.concatenate([
+            np.asarray(inp["ql_nope"].astype(jnp.float32)),
+            np.asarray(inp["q_pe"].astype(jnp.float32))
+        ], -1)
+        keys = np.concatenate([inp["kv_c_deq"], inp["k_pe_deq"]], -1)
+        out = np.zeros((DCP_SEQ, NUM_HEADS, LKV_DIM), np.float32)
+        for t in range(DCP_SEQ):
+            sel = inp["topk"][t][inp["topk"][t] >= 0]
+            scores = q[t] @ keys[sel].T * self.sm_scale
+            scores -= scores.max(-1, keepdims=True)
+            probs = np.exp(scores)
+            probs /= probs.sum(-1, keepdims=True)
+            out[t] = probs @ inp["kv_c_deq"][sel]
+        return out
+
+    def _run_ranks(self, inp, dcp_size, interleave_size, block_tables):
+        """Every rank over its own shard, results stacked rank-major."""
+        merged_topk = jnp.asarray(inp["topk"], jnp.int32)
+        nope, rope = _dcp_caches()
+        per_rank = [
+            attention_interface.sparse_mla_attention_dcp(
+                inp["ql_nope"],
+                inp["q_pe"],
+                inp["kv_c_fp8"],
+                inp["k_pe_fp8"],
+                nope,
+                rope,
+                _owned_local_topk(merged_topk, dcp_size, interleave_size, r),
+                inp["seq_lens"],
+                block_tables,
+                inp["cu_q_lens"],
+                inp["distribution"],
+                NOPE_SPEC,
+                ROPE_SPEC,
+                sm_scale=self.sm_scale,
+                k_scale=self.k_scale,
+                dcp_size=dcp_size,
+                dcp_rank=r,
+                interleave_size=interleave_size,
+            ) for r in range(dcp_size)
+        ]
+        return [jnp.stack(x) for x in zip(*per_rank)]
+
+    def _run_dcp(self, inp, dcp_size, interleave_size):
+        """Shard, attend, merge. Returns the merged output."""
+        # One virtual page spans `PAGE_SIZE * dcp_size` global positions.
+        vpages = math.ceil(DCP_SEQ / (PAGE_SIZE * dcp_size))
+        block_tables = jnp.asarray(
+            self.rng.permutation(NOPE_SPEC.num_pages)[:vpages], jnp.int32)
+        _, _, out, lse = self._run_ranks(inp, dcp_size, interleave_size,
+                                         block_tables)
+        return np.asarray(_merge_dcp_lse_partials(out, lse))
+
+    def _check_merge_matches_the_reference(self, dcp_size, interleave_size):
+        self._require_tpu()
+        inp = self._inputs()
+        merged = self._run_dcp(inp, dcp_size, interleave_size)
+        np.testing.assert_allclose(merged,
+                                   self._numpy_reference(inp),
+                                   rtol=2e-2,
+                                   atol=2e-2)
+
+    # One device: `dcp_size` is an op argument now, not a device count.
+    @parameterized.named_parameters(
+        dict(testcase_name="d2_c4", dcp_size=2, interleave_size=4),
+        dict(testcase_name="d2_c8", dcp_size=2, interleave_size=8),
+        dict(testcase_name="d4_c4", dcp_size=4, interleave_size=4),
+        dict(testcase_name="d8_c4", dcp_size=8, interleave_size=4),
+    )
+    def test_dcp_merge_matches_the_unsharded_reference(self, dcp_size,
+                                                       interleave_size):
+        self._check_merge_matches_the_reference(dcp_size, interleave_size)
+
+    def test_dcp_write_mask_partitions_the_cache(self):
+        """Each rank must hold exactly the positions it owns -- no more."""
+        self._require_tpu()
+        dcp_size, interleave_size = 4, 4
+        inp = self._inputs()
+        vpages = math.ceil(DCP_SEQ / (PAGE_SIZE * dcp_size))
+        block_tables = jnp.arange(vpages, dtype=jnp.int32)
+
+        new_nope, _, _, _ = self._run_ranks(inp, dcp_size, interleave_size,
+                                            block_tables)
+
+        # A written row is all-zero with probability ~0, so nonzero == written.
+        per_rank = np.asarray(new_nope).reshape(dcp_size, NOPE_SPEC.num_pages,
+                                                NOPE_SPEC.page_size, -1)
+        written = (per_rank != 0).any(-1)
+
+        # Identity `block_tables`, so rank r holds p iff `(p // c) % D == r`.
+        expected = np.zeros_like(written)
+        cycle = dcp_size * interleave_size
+        for pos in range(DCP_SEQ):
+            r = (pos // interleave_size) % dcp_size
+            local = (pos // cycle) * interleave_size + pos % interleave_size
+            expected[r, local // NOPE_SPEC.page_size,
+                     local % NOPE_SPEC.page_size] = True
+        np.testing.assert_array_equal(written.sum((1, 2)),
+                                      np.full(dcp_size, DCP_SEQ // dcp_size))
+        np.testing.assert_array_equal(written, expected)
+
+    def test_a_rank_owning_nothing_is_dropped_by_the_merge(self):
+        """The empty-shard path: `lse = -inf` alone must exclude a rank."""
+        self._require_tpu()
+        dcp_size, interleave_size = 4, 4
+        inp = self._inputs()
+        topk = inp["topk"].copy()
+        # interleave_size=4, dcp_size=4 -> positions 0..3 are all on rank 0.
+        topk[DCP_SEQ - 1] = -1
+        topk[DCP_SEQ - 1, :4] = [0, 1, 2, 3]
+        inp["topk"] = topk
+
+        merged = self._run_dcp(inp, dcp_size, interleave_size)
+        np.testing.assert_allclose(merged[DCP_SEQ - 1],
+                                   self._numpy_reference(inp)[DCP_SEQ - 1],
+                                   rtol=2e-2,
+                                   atol=2e-2)
+
+
 class MaskedDensePrefillTierTest(parameterized.TestCase):
     """Prefill cost tier: 0 analytic, 1 CSA bitmap, 2 sparse gather.
 

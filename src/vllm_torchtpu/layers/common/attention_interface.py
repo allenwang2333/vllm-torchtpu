@@ -24,7 +24,8 @@ from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
-    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache)
+    SparseMLAKVCacheSpec, update_sparse_mla_kv_cache,
+    update_sparse_mla_kv_cache_dcp)
 from vllm_torchtpu.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
 from vllm_torchtpu.layers.common.attention_metadata import AttentionMetadata
@@ -875,3 +876,90 @@ def sparse_mla_attention(
                                               block_tables, query_start_loc,
                                               request_distribution)
     return new_kv_cache_nope, new_kv_cache_rope, output
+
+
+def sparse_mla_attention_dcp(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    local_topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Sparse MLA attention over this rank's shard of a DCP position-sharded
+    latent cache. Returns a partial `(caches, output, lse)` for the merge."""
+    if dcp_size <= 1:
+        raise ValueError(
+            f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
+            "use sparse_mla_attention for the unsharded case.")
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError(
+            f"dcp_rank={dcp_rank} out of range for dcp_size={dcp_size}.")
+    num_tokens = ql_nope.shape[0]
+    if local_topk_indices.shape[0] != num_tokens:
+        raise ValueError(
+            "local_topk_indices must carry one row per token: expected "
+            f"{num_tokens}, got {local_topk_indices.shape[0]}.")
+
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    assert (lkv_dim == word_bytes * lane_bytes
+            and rope_dim * 2 == lane_bytes), (
+                "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+                f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+                f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+                f"{rope_dim}")
+
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+
+    kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size)
+
+    # The kernel needs `kv_len >= 1`; feed a dummy and let `owns` mask it.
+    owns = jnp.any(local_topk_indices >= 0, axis=-1)
+    topk_idx = local_topk_indices.at[:, 0].set(
+        jnp.where(owns, local_topk_indices[:, 0], jnp.int32(0)))
+
+    q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+    # Virtual page ordinal -> physical block in this rank's own shard.
+    local_block_tables = jnp.mod(block_tables, jnp.int32(nope_spec.num_pages))
+    output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+        q,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        local_block_tables,
+        query_start_loc,
+        request_distribution,
+        sm_scale=sm_scale or 1.0,
+        k_scale=dequant_scale,
+        return_lse=True,
+    )
+    lse = jnp.where(owns[:, None], lse, -jnp.inf)
+    # Drop the rope tail: only the nope part is the MLA value (P @ latent).
+    return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]], lse)
