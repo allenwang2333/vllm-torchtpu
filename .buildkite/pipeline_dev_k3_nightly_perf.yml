@@ -1,0 +1,24 @@
+# [test branch only] Runs the nightly Kimi-K3 perf case (config kimi-k3-tp32-ep,
+# 8k/1k, 1 request, no lm-eval) on tpu7x-32 to bisect a perf regression.
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "K3 nightly perf case only: kimi-k3-tp32-ep isl8192/osl1024 c1 (TPU v7x-32)"
+    key: k3_nightly_perf
+    depends_on: build_docker
+    timeout_in_minutes: 240
+    agents:
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "1"
+    commands:
+      - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --results-dir /perf_eval_results/kimi-k3-tp32-ep"
+    artifact_paths:
+      - "perf_eval_results/**/*"
