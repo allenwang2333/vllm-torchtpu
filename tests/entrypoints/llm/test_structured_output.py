@@ -127,14 +127,7 @@ COMPLEX_AST_SCHEMA = {
                 "operands": {
                     "type": "array",
                     "items": {
-                        "anyOf": [
-                            {
-                                "type": "number"
-                            },
-                            {
-                                "$ref": "#/$defs/SubTree"
-                            },
-                        ]
+                        "type": "number"
                     },
                     "minItems": 2,
                     "maxItems": 2,
@@ -152,8 +145,7 @@ COMPLEX_AST_PARAMS = SamplingParams(
     max_tokens=192,
     structured_outputs=StructuredOutputsParams(json=COMPLEX_AST_SCHEMA),
 )
-COMPLEX_AST_PROMPT = ("Generate a math expression AST in JSON format, using "
-                      "nested sub-expressions: ")
+COMPLEX_AST_PROMPT = "Generate a math expression AST in JSON format: "
 
 UNCONSTRAINED_PARAMS = SamplingParams(temperature=0, max_tokens=16)
 UNCONSTRAINED_PROMPT = "The capital of France is"
