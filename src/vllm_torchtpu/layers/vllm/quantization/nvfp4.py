@@ -50,6 +50,9 @@ from vllm.model_executor.layers.quantization import \
     register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizeMethodBase
+import vllm.model_executor.layers.quantization.modelopt as _modelopt
+if not hasattr(_modelopt, "ModelOptNvFp4LinearMethod") and hasattr(_modelopt, "ModelOptLinearMethod"):
+    _modelopt.ModelOptNvFp4LinearMethod = _modelopt.ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config, ModelOptNvFp4FusedMoE, ModelOptNvFp4LinearMethod)
 from vllm.model_executor.utils import replace_parameter

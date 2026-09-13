@@ -311,9 +311,9 @@ class TPUWorker(WorkerBase):
         else:
             dist_init_method = self.distributed_init_method
             parsed = urlparse(dist_init_method)
-            if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+            if parsed.scheme not in ("tcp", "file"):
                 raise ValueError(
-                    "Expected tcp://<host>:<port> distributed_init_method, "
+                    "Expected tcp://<host>:<port> or file:// distributed_init_method, "
                     f"got: {dist_init_method!r}")
             if pcp_size > 1:
                 logger.info(
@@ -367,8 +367,8 @@ class TPUWorker(WorkerBase):
                     binding.local_rank,
                     binding.local_world_size,
                 )
-            os.environ.setdefault("MASTER_ADDR", parsed.hostname)
-            os.environ.setdefault("MASTER_PORT", str(parsed.port))
+            os.environ.setdefault("MASTER_ADDR", parsed.hostname or "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", str(parsed.port or 29500))
 
         if not self.devices:
             self.devices = [torch.device("tpu")]

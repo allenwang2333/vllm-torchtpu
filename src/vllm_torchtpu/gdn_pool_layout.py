@@ -13,6 +13,8 @@ POOLED_GDN_ARCHITECTURES = frozenset({
     "Qwen3NextForCausalLM",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
 })
 
 # The pooled GDN kernel's state dtypes inside the unified pool are fixed for

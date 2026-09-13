@@ -783,7 +783,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  pcp_world_size,
                                                  scheduler_block_size,
                                                  hash_block_size,
-                                                 metrics_collector=None):
+                                                 metrics_collector=None,
+                                                 **kwargs):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
             if (pcp_world_size == 1 and _is_attention_mamba_hybrid(groups)):
@@ -844,6 +845,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                **kwargs,
             )
 
         hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks

@@ -421,6 +421,14 @@ def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:
 
 def _apply_model_specific_patches(
         model_config: Optional["ModelConfig"] = None) -> None:
+    try:
+        from vllm_torchtpu.layers.vllm.custom_ops.qwen4_exp_ops import (
+            register_qwen4_exp_ops,
+        )
+        register_qwen4_exp_ops()
+    except Exception:
+        logger.exception("Failed to register Qwen4Exp TPU custom ops")
+        raise
     if not _is_qwen3_vl_model(model_config):
         return
     """Apply model-specific and PyTorch XLA op-level patches for Qwen3-VL on TPU.

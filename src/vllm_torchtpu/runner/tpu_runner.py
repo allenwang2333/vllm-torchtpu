@@ -5835,7 +5835,8 @@ class TPUModelRunner(GPUModelRunner):
         if self._unified_kv_layout:
             self._build_mamba_copy_plan(kv_cache_config,
                                         materialized.raw_tensors)
-        if kv_cache_config.has_mamba_layers:
+        if kv_cache_config.has_mamba_layers and hasattr(
+                self, "_update_hybrid_attention_mamba_layout"):
             self._update_hybrid_attention_mamba_layout(kv_caches,
                                                        kernel_block_sizes)
 

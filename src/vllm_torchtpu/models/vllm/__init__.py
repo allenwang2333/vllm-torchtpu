@@ -15,9 +15,15 @@ class _TPUKimiK3Config(VerifyAndUpdateConfig):
 def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+    from vllm_torchtpu.layers.vllm.custom_ops.qwen4_exp_ops import (
+        register_qwen4_exp_ops,
+    )
 
+    register_qwen4_exp_ops()
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration",
                                  _KIMI_K3_MODEL)
     ModelRegistry.register_model("DeepseekV4ForCausalLM", _DSV4_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
+
+
