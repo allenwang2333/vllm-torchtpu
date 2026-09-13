@@ -41,8 +41,11 @@ MANIFEST
 .coverage.*
 
 # Non-runtime files excluded from container images (Fixes #820)
+#
+# .buildkite/ is not one of them. On the Kubernetes lane the pod is the
+# container and there is no checkout beside it, so a multi-host slice runs
+# .buildkite/kubernetes/multihost_entry.sh out of the image.
 docs/
-.buildkite/
 .github/
 mkdocs.yml
 .readthedocs.yaml
