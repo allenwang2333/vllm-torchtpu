@@ -612,7 +612,7 @@ def streamindex_topk(
     cp_size: number of context-parallel ranks the compressed KV cache is
       sharded over. 1 (default) means no sharding and the whole CP path
       compiles away. When > 1, `cache_kv` / `page_indices` describe only this
-      rank's shard, and the returned top-k is *local* -- correct only after the
+      rank's shard, and the returned top-k is local -- correct only after the
       cross-rank merge the caller performs on the returned scores.
     cp_rank: this rank's index in the CP group, as a Python int or traced data.
     interleave_size: CP chunk-interleave width in uncompressed tokens. Must be

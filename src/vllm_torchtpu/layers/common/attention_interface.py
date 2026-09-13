@@ -900,7 +900,7 @@ def sparse_mla_attention_dcp(
     interleave_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over this rank's shard of a DCP position-sharded
-    latent cache. Returns a *partial* `(caches, output, lse)` for the merge."""
+    latent cache. Returns a partial `(caches, output, lse)` for the merge."""
     if dcp_size <= 1:
         raise ValueError(
             f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
