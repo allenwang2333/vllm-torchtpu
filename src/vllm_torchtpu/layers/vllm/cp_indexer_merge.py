@@ -23,7 +23,9 @@ import torch
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 
 CHECK_OWNER = os.environ.get("VLLM_TORCHTPU_DCP_CHECK_OWNER", "0") == "1"
-GATHER_IDXS = os.environ.get("VLLM_TORCHTPU_DCP_GATHER_IDXS", "0") == "1"
+# Set to 0 to derive ownership from the winner's column instead, which skips the
+# `idxs` all-gather but is only correct if the gather lands in rank order.
+GATHER_IDXS = os.environ.get("VLLM_TORCHTPU_DCP_GATHER_IDXS", "1") == "1"
 
 
 def all_gather_candidates(x: torch.Tensor) -> torch.Tensor:
