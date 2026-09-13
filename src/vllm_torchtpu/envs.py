@@ -38,12 +38,16 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
+    USE_MOE_COUNTING_SORT: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    TPU_SHARDED_LM_HEAD: bool = False
+    TPU_NORM_WEIGHT_HOIST: bool = False
+    TPU_GDN_FUSED_NORM_QUANT: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
@@ -59,12 +63,19 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
+    DP_PLACEMENT: str = ""
+    DP_SCHED_BUFFER_THRESHOLD: int = 0
+    DP_SCHED_BUFFER_FLUSH_MS: int = 5000
+    DP_SCHED_BUFFER_IDLE_TRIGGER: bool = True
+    DP_SCHED_BUFFER_QUIET_MS: int = 0
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -98,6 +109,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
+    USE_FUSED_MOE_GMM: bool = False
 
 
 def env_with_choices(
@@ -406,6 +418,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    # Build the MoE routing permutations with a counting sort instead of the
+    # comparison sorts. Off by default; set to 1 to enable.
+    "USE_MOE_COUNTING_SORT":
+    env_bool("USE_MOE_COUNTING_SORT"),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
@@ -445,6 +461,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES":
     lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Split the vocabulary projection across the expert-parallel ranks: each
+    # rank keeps its share of the rows, the hidden rows of every rank are
+    # gathered, and the logits are exchanged back.
+    "TPU_SHARDED_LM_HEAD":
+    env_bool("TPU_SHARDED_LM_HEAD"),
+    # Run a gated-delta-net layer's output gated RMS norm and the per-token
+    # fp8 quantisation of the following projection as one kernel.
+    "TPU_GDN_FUSED_NORM_QUANT":
+    env_bool("TPU_GDN_FUSED_NORM_QUANT"),
+    # Keep each GemmaRMSNorm's (1 + weight) as a buffer computed once after
+    # loading instead of recomputing it in every forward.
+    "TPU_NORM_WEIGHT_HOIST":
+    env_bool("TPU_NORM_WEIGHT_HOIST"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
@@ -477,6 +506,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # A JSON table giving, per MoE layer, the global experts each
+    # expert-parallel rank holds; empty keeps the checkpoint's order.
+    "TPU_EXPERT_PLACEMENT":
+    lambda: os.getenv("TPU_EXPERT_PLACEMENT", ""),
+    # DP_PLACEMENT=release: the API server's router holds new requests and
+    # releases them as a group across the engines, at DP_SCHED_BUFFER_THRESHOLD
+    # requests, after DP_SCHED_BUFFER_FLUSH_MS, when an engine is idle
+    # (DP_SCHED_BUFFER_IDLE_TRIGGER), or after DP_SCHED_BUFFER_QUIET_MS without
+    # a new arrival.
+    "DP_PLACEMENT":
+    lambda: os.getenv("DP_PLACEMENT", ""),
+    "DP_SCHED_BUFFER_THRESHOLD":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_THRESHOLD") or 0),
+    "DP_SCHED_BUFFER_FLUSH_MS":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_FLUSH_MS") or 5000),
+    "DP_SCHED_BUFFER_IDLE_TRIGGER":
+    env_bool("DP_SCHED_BUFFER_IDLE_TRIGGER", default=True),
+    "DP_SCHED_BUFFER_QUIET_MS":
+    lambda: int(os.getenv("DP_SCHED_BUFFER_QUIET_MS") or 0),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -517,6 +565,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP":
     env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    # Compiled token shapes of at least this many rows per rank run the fused
+    # expert-parallel kernel; smaller shapes take the gather, grouped-matmul
+    # and combine path. 0 sends every shape to the kernel.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS":
+    lambda: int(os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
@@ -650,6 +703,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD":
     env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
+    # Run the two grouped matmuls of the MoE expert path as one kernel with
+    # the intermediate kept in VMEM, for the shapes whose expert weights fit;
+    # other shapes keep the two calls.
+    "USE_FUSED_MOE_GMM":
+    env_bool("USE_FUSED_MOE_GMM"),
 }
 
 

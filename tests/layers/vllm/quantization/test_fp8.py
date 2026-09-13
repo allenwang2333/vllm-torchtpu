@@ -545,6 +545,11 @@ class TestOnlineFp8Quantization:
 
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
         method._tpu_activation_str = "silu"
+        # `supports_internal_mk` is a property, and a spec'd MagicMock hands
+        # back a Mock for it, which is truthy -- so `apply_monolithic` would
+        # take the owning-dispatch branch and never reach the router. This
+        # test is about the routing path, which is the non-owning one.
+        method.supports_internal_mk = False
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
 
@@ -557,6 +562,61 @@ class TestOnlineFp8Quantization:
                                                  router_logits)
 
         mock_routing.assert_called_once()
+
+    def test_fused_ep_step_threshold_selects_static_token_shape(
+            self, monkeypatch):
+        """Large buckets use fused EP while small buckets use GMM dispatch."""
+        from unittest.mock import MagicMock, patch
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.vllm.quantization.fp8 import \
+            VllmFp8MoEMethodTPU
+
+        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 256)
+        layer = MagicMock()
+        method = object.__new__(VllmFp8MoEMethodTPU)
+        method._tpu_activation_str = "silu"
+
+        small_x = torch.randn(16, 64, dtype=torch.bfloat16)
+        small_logits = torch.randn(16, 8, dtype=torch.bfloat16)
+        large_x = torch.randn(256, 64, dtype=torch.bfloat16)
+        large_logits = torch.randn(256, 8, dtype=torch.bfloat16)
+
+        with patch.object(
+                method,
+                "_apply_owning_dispatch",
+                side_effect=(small_x, large_x),
+        ) as mock_dispatch:
+            small_actual = method.apply_monolithic(layer, small_x,
+                                                   small_logits)
+            large_actual = method.apply_monolithic(layer, large_x,
+                                                   large_logits)
+
+        torch.testing.assert_close(small_actual, small_x)
+        torch.testing.assert_close(large_actual, large_x)
+        assert [
+            call.kwargs["use_fused_kernel"]
+            for call in mock_dispatch.call_args_list
+        ] == [False, True]
+
+    def test_fused_ep_step_threshold_rejects_negative_value(self, monkeypatch):
+        """The threshold is validated once, at weight load, before the op is
+        built."""
+        from unittest.mock import MagicMock
+
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.vllm import fused_moe_ep_v3
+
+        monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", -1)
+        with pytest.raises(
+                ValueError,
+                match="TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0"):
+            fused_moe_ep_v3.prebuild_fused_moe_ep(MagicMock(),
+                                                  topk=8,
+                                                  renormalize=True,
+                                                  activation="silu")
 
 
 class FakeInt8MoEConfig:

@@ -39,7 +39,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # The fused MoE kernel body calls `lax.axis_index` on its own module constant
-# (`kernels.fused_moe.v2.AXIS`) rather than on a name from the mesh it is
+# (the kernel package's own axis-name constant) rather than on a name from the mesh it is
 # handed, so a mesh axis named anything else traces the whole kernel and then
 # dies on an unbound axis name. Any consumer that cares asserts against that
 # constant; this default is what makes it work.
@@ -98,7 +98,7 @@ def ep_rank_order() -> tuple[int, ...] | None:
     Ordering by device id means mesh index i is no longer EP rank i, so the
     shard sitting at mesh index i owns the experts of EP rank
     `ep_rank_order()[i]` rather than of rank i. The caller has to say so -- see
-    `fused_moe_ep._mesh_expert_order` -- because the kernel reads a
+    `fused_moe_ep_v3._expert_block_permutation` -- because the kernel reads a
     token's expert id as `mesh_index * experts_per_shard + j`.
 
     Returns None when EP is off.

@@ -678,32 +678,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                                   if self.block_quant else "weight_scale")
         self.fp8_backend = None
 
-    @property
-    def supports_internal_mk(self) -> bool:
-        """Whether this method owns the DP/EP dispatch and combine.
-
-        vLLM brackets `apply_monolithic` with an all-gather and a
-        reduce-scatter unless the method claims them
-        (`MoERunner.do_naive_dispatch_combine`). Two independent paths claim
-        them, and either one alone has to suppress vLLM's pair:
-
-        - chunk pipelining stages the same two collectives itself so they
-          overlap the compute;
-        - the fused EP kernel does the exchange inside its own program.
-
-        The fused half asks `fused_moe_ep_supported` about this method, not
-        `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
-        asked for the kernel, while `prebuild_fused_moe_ep` is what decides
-        whether this layer was actually armed. Claiming ownership on the
-        request would strip vLLM's collectives in every configuration prebuild
-        refuses -- TP, over the SMEM bound, under the token threshold, or
-        a weight or routing layout the kernel cannot serve.
-        """
-        from vllm_torchtpu.layers.vllm.fused_moe_ep import \
-            fused_moe_ep_supported
-        return (enable_pipelined_collective_and_compute()
-                or fused_moe_ep_supported(self))
-
     def maybe_roundup_sizes(
         self,
         hidden_size: int,
@@ -876,17 +850,40 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
-        # collective inside the compiled graph. The result is recorded on this
-        # method, which vLLM builds one of per MoE layer, so a layer the kernel
-        # cannot serve is refused on its own rather than for the process.
-        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
-        setattr(
-            self, FUSED_MOE_EP_OP_ATTR,
-            prebuild_fused_moe_ep(layer,
-                                  topk=layer.moe_config.experts_per_token,
-                                  renormalize=layer.renormalize,
-                                  activation=activation_str))
+        # collective inside the compiled graph.
+        from vllm_torchtpu.layers.vllm.fused_moe_ep_v3 import \
+            prebuild_fused_moe_ep
+        if (envs.USE_MOE_FUSED_EP_KERNEL
+                and enable_pipelined_collective_and_compute()):
+            raise ValueError(
+                "USE_MOE_FUSED_EP_KERNEL and MoE chunk pipelining both claim "
+                "the expert-parallel exchange; enable one of them.")
+        prebuild_fused_moe_ep(layer,
+                              topk=layer.moe_config.experts_per_token,
+                              renormalize=layer.renormalize,
+                              activation=activation_str)
+        # The runner patches ask the layer's quant method, so it carries the
+        # layer's answer.
+        self._tpu_fused_ep_eligible = bool(
+            getattr(layer, "_tpu_fused_ep_eligible", False))
+
+    @property
+    def supports_internal_mk(self) -> bool:
+        """Whether this method owns the expert-parallel dispatch and combine.
+
+        vLLM brackets `apply_monolithic` with an all-gather and a
+        reduce-scatter unless the method claims them (`MoERunner.
+        do_naive_dispatch_combine`). The fused EP kernel does the exchange
+        inside its own program, so when it is enabled this method takes
+        ownership: shapes at or above TPU_MOE_FUSED_EP_STEP_MIN_TOKENS run
+        the kernel, and the runner patch `_patch_moe_fused_ep_threshold_contract`
+        hands the smaller shapes to `apply_monolithic_external_dispatch`
+        between vLLM's own dispatch and combine. MoE chunk pipelining claims
+        the exchange on its own terms; the two are refused together at
+        weight loading.
+        """
+        return (enable_pipelined_collective_and_compute()
+                or envs.USE_MOE_FUSED_EP_KERNEL)
 
     def apply_monolithic(
         self,
@@ -896,19 +893,19 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        del input_ids
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer")
-        # The fused EP kernel takes this rank's own tokens and returns this
-        # rank's own tokens: it routes, exchanges, computes and combines inside
-        # one program. Keyed on the same predicate `supports_internal_mk` uses,
-        # so ownership and the path that exercises it cannot disagree.
-        from vllm_torchtpu.layers.vllm.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
-        if fused_moe_ep_supported(self):
-            return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
-                                layer.w13_weight_scale_inv,
-                                layer.w2_weight_scale_inv, router_logits)
+        fused_ep_step_min_tokens = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+        if envs.USE_MOE_FUSED_EP_KERNEL:
+            return self._apply_owning_dispatch(
+                layer,
+                x,
+                router_logits,
+                activation_str,
+                use_fused_kernel=x.shape[0] >= fused_ep_step_min_tokens,
+            )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -941,6 +938,81 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
+
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run GMM after external dispatch for small token shapes."""
+        del input_ids
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = (
+                token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights))
+        from vllm_torchtpu.layers.vllm.fused_moe_ep_v3 import \
+            retain_fused_ep_graph_inputs
+        out = fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, 'w13_bias', None),
+            w2_bias=getattr(layer, 'w2_bias', None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=self._tpu_activation_str,
+        )
+        return retain_fused_ep_graph_inputs(out)
+
+    def _apply_owning_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation_str: str,
+        *,
+        use_fused_kernel: bool = True,
+    ) -> torch.Tensor:
+        """Run the layer when this method owns the EP exchange.
+
+        `x` and `router_logits` are this rank's own tokens. Shapes the fused
+        kernel serves go through it whole; the rest reproduce exactly what
+        vLLM's naive dispatch/combine would have done, so the two paths differ
+        only in who issues the collectives.
+        """
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_torchtpu.layers.vllm.fused_moe_ep_v3 import (
+            fused_moe_ep, fused_moe_ep_supported, retain_fused_ep_graph_inputs)
+
+        if use_fused_kernel and fused_moe_ep_supported(layer):
+            out = fused_moe_ep(x, layer.w13_weight, layer.w2_weight,
+                               layer.w13_weight_scale_inv,
+                               layer.w2_weight_scale_inv, router_logits)
+            experts_start = layer._experts_start
+            if experts_start is not None:
+                value = experts_start.to(out.dtype)
+                out = out + (value - value)
+            return token_padding.retain_padding_graph_input(out)
+
+        # Below the threshold: vLLM's own dispatch and combine around the
+        # grouped-matmul path (the runner patch takes this route for those
+        # shapes; this branch serves a caller that reached apply_monolithic
+        # directly).
+        ep = get_ep_group()
+        sequence_parallel = layer.moe_config.is_sequence_parallel
+        gathered_x, gathered_logits = ep.dispatch_router_logits(
+            x, router_logits, sequence_parallel)
+        out = self.apply_monolithic_external_dispatch(layer, gathered_x,
+                                                      gathered_logits)
+        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel))
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
@@ -1126,7 +1198,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
         # Derive weight_block_size explicitly from weight_scale layout when requant_block_size is unspecified.
-        # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream linear kernels and dequantization
+        # Setting (1, ckpt_n_in) vs (ckpt_n_out, 1) guarantees downstream linear kernels and dequantization
         # pipelines properly recognize scale broadcast granularity right across tensor-parallel shards.
         if requant_block_size is None:
             # Stated in checkpoint [n_out, n_in] terms, which is what the

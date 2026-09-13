@@ -343,31 +343,35 @@ def test_sharded_jax_op_still_matches_the_line_it_replaces():
 
 def test_supports_internal_mk_tracks_both_owners():
     """`supports_internal_mk` claims vLLM's dispatch/combine. Either owner --
-    chunk pipelining or the fused kernel -- has to claim it alone, and the
-    fused half must follow what prebuild ARMED, not what the operator asked
-    for: on a refusal vLLM's collectives have to stay."""
+    chunk pipelining or the FP8 method's own exchange -- claims it alone. The
+    FP8 method owns the exchange whenever the fused EP kernel is enabled
+    (USE_MOE_FUSED_EP_KERNEL): its `apply_monolithic` then runs the fused
+    kernel on the shapes at or above TPU_MOE_FUSED_EP_STEP_MIN_TOKENS and the
+    gather/GMM/combine path below it, so ownership does not depend on an armed
+    per-layer op the way the v2 dispatch's did."""
     from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethodTPU
 
     prop = VllmFp8MoEMethodTPU.supports_internal_mk
-    armed = SimpleNamespace()
-    setattr(armed, bridge.FUSED_MOE_EP_OP_ATTR, "op")
 
-    with patch(
-            "vllm_torchtpu.layers.vllm.quantization.fp8."
-            "enable_pipelined_collective_and_compute",
-            return_value=False):
+    with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False), \
+            patch("vllm_torchtpu.layers.vllm.quantization.fp8."
+                  "enable_pipelined_collective_and_compute",
+                  return_value=False):
         assert prop.fget(SimpleNamespace()) is False
-        assert prop.fget(armed) is True
 
-    with patch(
-            "vllm_torchtpu.layers.vllm.quantization.fp8."
-            "enable_pipelined_collective_and_compute",
-            return_value=True):
+    with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False), \
+            patch("vllm_torchtpu.layers.vllm.quantization.fp8."
+                  "enable_pipelined_collective_and_compute",
+                  return_value=True):
         assert prop.fget(SimpleNamespace()) is True
 
 
-def test_env_flag_alone_does_not_claim_the_collectives():
-    """The refusals only hold if the request does not claim ownership."""
+def test_env_flag_claims_the_collectives():
+    """Enabling the fused EP kernel is what claims the exchange: the FP8
+    method serves every shape itself from then on; when `prebuild_fused_moe_ep`
+    declines to build the kernel, `_apply_owning_dispatch` runs vLLM's own
+    dispatch and combine around the grouped-matmul path, so an owner that
+    claims the collectives always has a path for them."""
     from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethodTPU
 
     prop = VllmFp8MoEMethodTPU.supports_internal_mk
@@ -375,7 +379,7 @@ def test_env_flag_alone_does_not_claim_the_collectives():
             patch("vllm_torchtpu.layers.vllm.quantization.fp8."
                   "enable_pipelined_collective_and_compute",
                   return_value=False):
-        assert prop.fget(SimpleNamespace()) is False
+        assert prop.fget(SimpleNamespace()) is True
 
 
 class TestFusedOutputIsReducedPatch:
