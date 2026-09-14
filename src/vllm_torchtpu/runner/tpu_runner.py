@@ -328,6 +328,33 @@ MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
+def _spec_warmup_barrier(tag: str) -> None:
+    """Rejoin every TP rank at the end of one spec-warmup bucket.
+
+    `_warmup_one_spec_request` catches a *rank-local* exception raised inside a
+    *collective* region: the raising rank unwinds and retries while its peers
+    carry on. The first bucket's SymInt leak out of the draft forward's cold
+    compile fires on every rank, but up to ~8s apart, so with no rejoin point a
+    fast rank can already be issuing P=32's collectives while a slow one is
+    still retrying P=16. The slice sees mismatched programs and halts -- which
+    shows up as `SLICE_FAILURE_SW_INJECT_ERROR` and an *empty* anomaly table,
+    with the surviving ranks then failing every remaining bucket on
+    "The program continuator has halted unexpectedly". None of that names the
+    real cause, which is why this is worth a barrier rather than a comment.
+
+    Barriers on the CPU (gloo) group, so it cannot itself touch the TPU.
+    """
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+        get_tp_group().barrier()
+    except Exception:
+        # Single-rank runs, and any group not initialized yet: there is nothing
+        # to synchronize, and a warmup barrier must never itself fail startup.
+        logger.debug("spec-decode warmup barrier skipped at %s",
+                     tag,
+                     exc_info=True)
+
+
 def _get_sequence_layout_planner_for_runner(runner: Any):
     return runner.sequence_layout_planner
 
@@ -763,6 +790,13 @@ class TPUModelRunner(GPUModelRunner):
         self._combined_request_distribution_cpu = torch.zeros(
             6, dtype=torch.int32)
         self._decode_device_cache_key: tuple | None = None
+        # Diagnostic: with TPU_LOG_REQ_DIST=1, _prepare_inputs reports the
+        # request_distribution it hands the RPA kernel the first time each
+        # distinct one appears. Deduped rather than per-step so a full sweep
+        # stays readable and so the logging cannot itself distort timings.
+        self._log_request_distribution = (os.environ.get(
+            "TPU_LOG_REQ_DIST", "0") == "1")
+        self._seen_request_distributions: set[tuple[int, ...]] = set()
         # Snapshot of the in-flight uploads from the host staging tensors
         # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
         # waits on it before rewriting them.
@@ -3212,6 +3246,25 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
 
+            if self._log_request_distribution:
+                # The decode segment is sized from num_decode_reqs, which
+                # counts 1-token decodes only. A speculative verify window is
+                # 1+K tokens, so this is where the whole batch is expected to
+                # fall out of the decode segment and onto the mixed path.
+                # Read off the host tensor, never the device one: a .cpu() here
+                # would sync the step being measured.
+                signature = (num_reqs, num_decode_reqs, num_windowed_reqs,
+                             *self._request_distribution_cpu.tolist())
+                if signature not in self._seen_request_distributions:
+                    self._seen_request_distributions.add(signature)
+                    logger.info(
+                        "[req_dist] num_reqs=%d decode=%d windowed=%d "
+                        "max_scheduled_tokens=%d spec_metadata=%s "
+                        "-> request_distribution=%s", num_reqs,
+                        num_decode_reqs, num_windowed_reqs,
+                        max_num_scheduled_tokens_all_reqs, spec_decode_metadata
+                        is not None, self._request_distribution_cpu.tolist())
+
             if can_cache_decode_metadata:
                 # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
@@ -5369,6 +5422,9 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_one_spec_request(int(P),
                                                       idx=i,
                                                       greedy=greedy)
+                    # Rejoin before the next bucket: a rank that took the retry
+                    # above is a whole cold compile behind its peers.
+                    _spec_warmup_barrier(f"P={int(P)} greedy={greedy}")
             # (2) The propose+verify+sampling fusions are also keyed on the
             # decode batch size (num_reqs). Only relevant when serving actually
             # batches (>1 concurrent request); sweep real multi-request batches
@@ -5377,8 +5433,11 @@ class TPUModelRunner(GPUModelRunner):
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small, greedy=True)
-                        self._warmup_spec_batch(int(R), P_small, greedy=False)
+                        for greedy in (True, False):
+                            self._warmup_spec_batch(int(R),
+                                                    P_small,
+                                                    greedy=greedy)
+                            _spec_warmup_barrier(f"R={int(R)} greedy={greedy}")
         logger.info("spec-decode warmup compiled %d graphs",
                     self.num_xla_graphs - n0)
 
