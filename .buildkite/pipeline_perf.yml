@@ -197,6 +197,8 @@ steps:
           - |
             rc=0
             bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep || rc=$$?
+            # run_multihost.sh exits before copying results back when the run fails.
+            [ "$$rc" -eq 0 ] || cp -r "$$HOME/persist/perf_eval_results"/. perf_eval_results/ || true
             bash .buildkite/scripts/upload_profile.sh perf_eval_results/deepseek-v4-pro-dp16-ep || { [ "$$rc" -ne 0 ] || rc=1; }
             exit $$rc
         artifact_paths:
