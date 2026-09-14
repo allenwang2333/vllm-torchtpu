@@ -36,9 +36,12 @@ dependencies = [
     "torch-tpu==0.1.1.dev20260910000446",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload. The
+    # package was renamed tpu-raiden-torch -> tpu-sync-torch (import name is
+    # still `tpu_sync`); Kimi-K3 PD (#857) needs tpu-sync#829 + #883, first
+    # shipped in the 2026-09-1x builds. The
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260827124357",
+    "tpu-sync-torch==0.0.1.dev20260914133043",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -53,7 +56,7 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.44.1",
+    "libtpu==0.0.47",  # tpu-sync-torch 0914 requires libtpu>=0.0.47 (PR #857 was validated on 0.0.47)
     "ray[default]",
     "ray[data]",
 ]
@@ -177,4 +180,4 @@ explicit = true
 
 [tool.uv.sources]
 torch-tpu = { index = "torch-tpu-registry" }
-tpu-raiden-torch = { index = "torch-tpu-registry" }
+tpu-sync-torch = { index = "torch-tpu-registry" }
