@@ -156,11 +156,21 @@ class _ProxyHarness:
             patch.object(
                 _MOD,
                 "global_args",
-                SimpleNamespace(admit_callback_url="http://proxy.test:8000"),
+                # Deliberately different hosts. The proxy is a sidecar in the
+                # prefill pod, so prefill dials it on localhost and decode
+                # must be handed something it can actually reach.
+                SimpleNamespace(
+                    admit_callback_url="http://127.0.0.1:10000",
+                    dst_callback_url="http://prefill-pod.test:10000"),
                 create=True),
         ]
 
-    async def run(self, *, reorder: bool, admit: bool, timeout_s: str = "30"):
+    async def run(self,
+                  *,
+                  reorder: bool,
+                  admit: bool,
+                  timeout_s: str = "30",
+                  prefill_submit: bool = False):
         self.release_prefill = asyncio.Event()
         self.prefill_started = asyncio.Event()
         stack = []
@@ -171,7 +181,11 @@ class _ProxyHarness:
             patch.object(_MOD, "_admission_reorder_enabled", lambda: reorder))
         stack[-1].start()
         stack.append(
-            patch.dict("os.environ", {"PROXY_ADMIT_TIMEOUT_S": timeout_s}))
+            patch.dict(
+                "os.environ", {
+                    "PROXY_ADMIT_TIMEOUT_S": timeout_s,
+                    "TPU_KV_PREFILL_SUBMIT": "1" if prefill_submit else "0",
+                }))
         stack[-1].start()
         try:
             # The chat API rather than /v1/completions: that one renders the
@@ -222,6 +236,33 @@ def test_admission_reorder_starts_decode_before_prefill_returns() -> None:
     assert "admit_callback_url" not in harness.decode_seen[
         "kv_transfer_params"]
     assert _MOD._ADMIT_WAITERS == {}
+
+
+def test_each_side_is_told_an_address_it_can_actually_reach() -> None:
+    """The proxy is a sidecar in the prefill pod, so the URL prefill polls
+    and the URL decode posts to are different addresses. Handing decode
+    prefill's localhost would point it at its own pod, where nothing is
+    listening, and every request would fall back."""
+    harness = _ProxyHarness()
+    asyncio.run(harness.run(reorder=True, admit=True, prefill_submit=True))
+
+    prefill_params = harness.prefill_seen["kv_transfer_params"]
+    assert prefill_params["dst_batch_url"] == (
+        "http://127.0.0.1:10000/kv_dst_batch")
+    assert prefill_params["admit_callback_url"].startswith(
+        "http://127.0.0.1:10000/kv_admit/")
+
+    decode_params = harness.decode_seen["kv_transfer_params"]
+    assert decode_params["dst_callback_url"] == (
+        f"http://prefill-pod.test:10000/kv_dst/{_ADMIT_PARAMS['req_id']}")
+
+
+def test_the_destination_relay_is_absent_when_the_feature_is_off() -> None:
+    harness = _ProxyHarness()
+    asyncio.run(harness.run(reorder=True, admit=True, prefill_submit=False))
+
+    assert "dst_batch_url" not in harness.prefill_seen["kv_transfer_params"]
+    assert "dst_callback_url" not in harness.decode_seen["kv_transfer_params"]
 
 
 def test_admission_reorder_off_waits_for_prefill() -> None:

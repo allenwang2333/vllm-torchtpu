@@ -245,6 +245,15 @@ def parse_args():
                         type=str,
                         default=os.getenv("PROXY_ADMIT_CALLBACK_URL", ""))
 
+    # Where decode should POST the pages it wants written. This is a separate
+    # address because the two sides sit in different places: the proxy is
+    # commonly a sidecar in the prefill pod, so prefill reaches it on
+    # localhost and decode cannot. Defaults to the admission URL, which is
+    # correct whenever both servers see the proxy at the same address.
+    parser.add_argument("--dst-callback-url",
+                        type=str,
+                        default=os.getenv("PROXY_DST_CALLBACK_URL", ""))
+
     # For prefiller instances
     parser.add_argument("--prefiller-hosts",
                         "--prefiller-host",
@@ -288,6 +297,9 @@ def parse_args():
     if not args.admit_callback_url:
         args.admit_callback_url = f"http://{args.host}:{args.port}"
     args.admit_callback_url = args.admit_callback_url.rstrip("/")
+    if not args.dst_callback_url:
+        args.dst_callback_url = args.admit_callback_url
+    args.dst_callback_url = args.dst_callback_url.rstrip("/")
 
     return args
 
@@ -600,7 +612,7 @@ async def _handle_completions(api: str, request: Request):
                 # registration it is about to make.
                 kv_transfer_params = dict(kv_transfer_params)
                 kv_transfer_params["dst_callback_url"] = (
-                    f"{global_args.admit_callback_url}/kv_dst/"
+                    f"{global_args.dst_callback_url}/kv_dst/"
                     f"{kv_transfer_params.get('req_id', request_id)}")
             req_data["kv_transfer_params"] = kv_transfer_params
 
