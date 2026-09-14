@@ -3298,6 +3298,14 @@ class TPUModelRunner(GPUModelRunner):
         input_ids: torch.Tensor,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ):
+        orig_model = getattr(self.model, "_orig_mod", self.model)
+        is_code2wav = (
+            getattr(self.model_config, "model_stage", None) == "code2wav"
+            or getattr(orig_model, "model_stage", None) == "code2wav"
+        )
+        if is_code2wav:
+            return input_ids, None
+
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
 
@@ -6602,10 +6610,11 @@ class TPUModelRunner(GPUModelRunner):
             getattr(self.model_config, "model_stage", None) == "code2wav"
             or getattr(orig_model, "model_stage", None) == "code2wav"
         )
-        if not is_code2wav and (
+        if (
             hasattr(orig_model, "make_omni_output")
             or hasattr(self.model, "make_omni_output")
             or getattr(self.model_config, "model_stage", None) is not None
+            or is_code2wav
         ) and seq_token_counts is not None:
             extra_kwargs["seq_token_counts"] = seq_token_counts
         out = self.model(input_ids=input_ids,

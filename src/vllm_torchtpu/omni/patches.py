@@ -508,6 +508,64 @@ def patch_qwen3_omni_models() -> None:
 
             Qwen3OmniMoeForConditionalGeneration.talker_preprocess = patched_talker_preprocess
 
+            # forward (extract real codec codes from runtime_additional_information / model_intermediate_buffer for code2wav)
+            orig_forward = Qwen3OmniMoeForConditionalGeneration.forward
+
+            def patched_forward(self, input_ids=None, positions=None, *args, **kwargs):
+                if getattr(self, "model_stage", None) == "code2wav":
+                    runtime_info = kwargs.get("runtime_additional_information")
+                    if runtime_info is None:
+                        runtime_info = kwargs.get("model_intermediate_buffer")
+                    if runtime_info is None and hasattr(self, "model_intermediate_buffer"):
+                        buf = getattr(self, "model_intermediate_buffer", {})
+                        if isinstance(buf, dict):
+                            runtime_info = list(buf.values())
+
+                    device = getattr(self, "device", None)
+                    if device is None and hasattr(self, "code2wav"):
+                        device = getattr(self.code2wav, "device", None)
+                    if device is None and hasattr(self, "parameters"):
+                        try:
+                            device = next(self.parameters()).device
+                        except Exception:
+                            device = torch.device("cpu")
+
+                    extracted_ids = None
+                    if runtime_info is not None:
+                        for info in runtime_info:
+                            if isinstance(info, dict):
+                                codes = info.get("codes")
+                                if isinstance(codes, dict):
+                                    audio = codes.get("audio")
+                                    if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                                        extracted_ids = audio.to(device=device, dtype=torch.long).reshape(-1)
+                                        break
+                                    elif isinstance(audio, (list, tuple)) and len(audio) > 0:
+                                        extracted_ids = torch.as_tensor(audio, device=device, dtype=torch.long).reshape(-1)
+                                        break
+                                if "codes.audio" in info:
+                                    audio = info["codes.audio"]
+                                    if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                                        extracted_ids = audio.to(device=device, dtype=torch.long).reshape(-1)
+                                        break
+                                    elif isinstance(audio, (list, tuple)) and len(audio) > 0:
+                                        extracted_ids = torch.as_tensor(audio, device=device, dtype=torch.long).reshape(-1)
+                                        break
+
+                    if extracted_ids is not None:
+                        input_ids = extracted_ids
+                    elif input_ids is None:
+                        input_ids = torch.zeros((16,), dtype=torch.long, device=device)
+                    else:
+                        input_ids = input_ids.to(device=device, dtype=torch.long).reshape(-1)
+
+                    if "seq_token_counts" not in kwargs or kwargs["seq_token_counts"] is None:
+                        kwargs["seq_token_counts"] = [int(input_ids.shape[0])]
+
+                return orig_forward(self, input_ids, positions, *args, **kwargs)
+
+            Qwen3OmniMoeForConditionalGeneration.forward = patched_forward
+
             # compute_logits
             orig_compute_logits = Qwen3OmniMoeForConditionalGeneration.compute_logits
 
