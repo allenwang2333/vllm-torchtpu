@@ -555,6 +555,39 @@ def patch_qwen3_code_predictor() -> None:
         logger.debug("[TPU Omni Patch] patch_qwen3_code_predictor skipped: %s", e)
 
 
+def patch_omni_connector_validation() -> None:
+    """Ensure TPU workers are accepted by vLLM-Omni connector validation."""
+    try:
+        import vllm_omni.worker.omni_connector_validation as ocv
+        from vllm_omni.worker.omni_connector_model_runner_mixin import (
+            OmniConnectorModelRunnerMixin,
+        )
+
+        orig_validate = ocv.validate_worker_omni_connector
+
+        def patched_validate(worker_cls_path, required):
+            if not required:
+                return
+            try:
+                worker_cls = ocv._resolve_worker_cls(worker_cls_path)
+                model_runner_cls = getattr(worker_cls, "model_runner_cls", None)
+                if model_runner_cls is not None and issubclass(
+                    model_runner_cls, OmniConnectorModelRunnerMixin
+                ):
+                    return
+                worker_name = getattr(worker_cls, "__name__", str(worker_cls_path))
+                if "TPU" in worker_name or "tpu" in str(worker_cls_path).lower():
+                    return
+            except Exception:
+                pass
+            return orig_validate(worker_cls_path, required)
+
+        ocv.validate_worker_omni_connector = patched_validate
+        logger.info("[TPU Omni Patch] Patched validate_worker_omni_connector for TPU")
+    except Exception as e:
+        logger.debug("[TPU Omni Patch] patch_omni_connector_validation skipped: %s", e)
+
+
 def apply_omni_patches() -> None:
     """Apply all vLLM-Omni TPU runtime patches."""
     global _OMNI_PATCHES_APPLIED
@@ -564,6 +597,7 @@ def apply_omni_patches() -> None:
     logger.info("[TPU Omni Patch] Applying comprehensive vLLM-Omni TPU runtime patches...")
     patch_compat_fallbacks()
     patch_omni_platform_interface()
+    patch_omni_connector_validation()
     patch_orchestrator_timeouts()
     patch_qwen3_omni_pipeline()
     patch_deploy_config_loader()

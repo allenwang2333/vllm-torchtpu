@@ -68,6 +68,8 @@ def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
 
 class TPUWorker(WorkerBase):
 
+    model_runner_cls = TPUModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -409,7 +411,8 @@ class TPUWorker(WorkerBase):
                 self.rank == self.parallel_config.pipeline_parallel_size - 1)
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(
+        runner_cls = getattr(self, "model_runner_cls", TPUModelRunner)
+        self.model_runner = runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,

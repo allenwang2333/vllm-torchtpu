@@ -17,8 +17,8 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        cloud.google.com/gke-tpu-accelerator: tpu7x
-        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
       tolerations:
       - key: google.com/tpu
         operator: Exists
