@@ -87,6 +87,9 @@ def patch_omni_platform_interface() -> None:
     """Equip OmniPlatform with is_tpu check."""
     try:
         import vllm_omni.platforms.interface as pi
+        import vllm_omni.platforms as platforms
+        if "vllm_omni" in sys.modules:
+            setattr(sys.modules["vllm_omni"], "platforms", platforms)
         if not hasattr(pi.OmniPlatform, "is_tpu"):
             pi.OmniPlatform.is_tpu = (
                 lambda self: getattr(self, "device_name", "") == "tpu"

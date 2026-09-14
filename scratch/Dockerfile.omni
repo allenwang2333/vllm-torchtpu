@@ -22,7 +22,7 @@ RUN uv pip install --system --no-deps -e /workspace/vllm-omni
 ENV PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-omni
 WORKDIR /workspace/vllm-omni
 
-RUN python3 -c "import torch; import vllm; import vllm_torchtpu; import vllm_omni; print('Verification success: Torch', torch.__version__, 'OmniPlatform:', vllm_omni.platforms.current_omni_platform)"
+RUN python3 -c "import torch; import vllm; import vllm_torchtpu; from vllm_omni.platforms import current_omni_platform; print('Verification success: Torch', torch.__version__, 'OmniPlatform:', current_omni_platform)"
 RUN python3 examples/offline_inference/qwen3_omni/end2end.py --help
 
 
