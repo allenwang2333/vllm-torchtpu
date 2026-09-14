@@ -125,6 +125,60 @@ def patch_compat_fallbacks() -> None:
     except Exception:
         pass
 
+    # 6. vllm_omni.request.OmniRequest session_id compatibility with vLLM 0.27
+    try:
+        import functools
+        import vllm_omni.request as omni_req
+
+        orig_init = omni_req.OmniRequest.__init__
+
+        @functools.wraps(orig_init)
+        def compatible_omni_request_init(self: Any, *args: Any, **kwargs: Any) -> None:
+            session_id = kwargs.pop("session_id", None)
+            orig_init(self, *args, **kwargs)
+            self.session_id = session_id
+
+        omni_req.OmniRequest.__init__ = compatible_omni_request_init
+
+        @classmethod
+        def compatible_from_engine_core_request(cls: Any, request: Any, block_hasher: Any = None) -> Any:
+            return cls(
+                request_id=request.request_id,
+                external_req_id=getattr(request, "external_req_id", None),
+                client_index=request.client_index,
+                prompt_token_ids=request.prompt_token_ids,
+                prompt_embeds=request.prompt_embeds,
+                prompt_is_token_ids=request.prompt_is_token_ids,
+                mm_features=request.mm_features,
+                sampling_params=request.sampling_params,
+                pooling_params=request.pooling_params,
+                arrival_time=request.arrival_time,
+                lora_request=request.lora_request,
+                cache_salt=request.cache_salt,
+                priority=request.priority,
+                trace_headers=request.trace_headers,
+                block_hasher=block_hasher,
+                additional_information=getattr(request, "additional_information", None),
+                model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+                resumable=request.resumable,
+                session_id=getattr(request, "session_id", None),
+                reasoning_ended=request.reasoning_ended,
+                reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+                abort_immediately=request.abort_immediately,
+            )
+
+        omni_req.OmniRequest.from_engine_core_request = compatible_from_engine_core_request
+        for mod in list(sys.modules.values()):
+            if getattr(mod, "OmniRequest", None) is not None:
+                mod.OmniRequest.from_engine_core_request = compatible_from_engine_core_request
+                mod.OmniRequest.__init__ = compatible_omni_request_init
+            if getattr(mod, "Request", None) is omni_req.OmniRequest:
+                mod.Request.from_engine_core_request = compatible_from_engine_core_request
+                mod.Request.__init__ = compatible_omni_request_init
+        logger.info("[TPU Omni Patch] Patched OmniRequest for vLLM 0.27 session_id compatibility")
+    except Exception as e:
+        logger.warning("[TPU Omni Patch] Failed to patch OmniRequest: %s", e)
+
 
 def patch_omni_platform_interface() -> None:
     """Equip OmniPlatform with is_tpu check."""
