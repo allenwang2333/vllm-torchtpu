@@ -1,0 +1,136 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-omni-speechmaxxxing-job
+  namespace: default
+  labels:
+    app: qwen3-omni
+spec:
+  backoffLimit: 2
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: qwen3-omni
+        job-name: qwen3-omni-speechmaxxxing-job
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: qwen3-omni-runner
+        image: us-central1-docker.pkg.dev/cloud-tpu-multipod-dev/vllm-omni/vllm-omni-tpu:speechmaxxxing-v7
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          ulimit -u unlimited 2>/dev/null || true
+          ulimit -n 65535 2>/dev/null || true
+          echo "=== Starting Qwen3-Omni TPU Multi-Stage Inference ==="
+          mkdir -p /workspace/outputs /local/hf_cache
+          python3 examples/offline_inference/qwen3_omni/end2end.py \
+            --modalities text,audio \
+            --output-wav /workspace/outputs \
+            --init-timeout 1800 \
+            --stage-init-timeout 1800 2>&1 | tee /workspace/execution.log
+
+          echo "=== Uploading Outputs to GCS Bucket gs://rishabh-maxspeechtpu/ ==="
+          python3 -c '
+          import os, glob, urllib.request, urllib.parse, json
+
+          token = os.environ.get("GCS_ACCESS_TOKEN", "")
+
+          def get_metadata_token():
+              try:
+                  req = urllib.request.Request(
+                      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                      headers={"Metadata-Flavor": "Google"}
+                  )
+                  return json.loads(urllib.request.urlopen(req, timeout=5).read().decode())["access_token"]
+              except Exception as e:
+                  return ""
+
+          if not token:
+              token = get_metadata_token()
+
+          def upload_file(f, remote_name):
+              global token
+              data = open(f, "rb").read()
+              encoded_name = urllib.parse.quote(remote_name, safe="")
+              url = f"https://storage.googleapis.com/upload/storage/v1/b/rishabh-maxspeechtpu/o?uploadType=media&name={encoded_name}"
+              for attempt in range(2):
+                  headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}
+                  try:
+                      req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                      urllib.request.urlopen(req, timeout=60)
+                      print("Uploaded", f, "to", remote_name)
+                      return
+                  except urllib.error.HTTPError as e:
+                      if e.code == 401 and attempt == 0:
+                          print("Token 401, refreshing token from metadata server...")
+                          fresh = get_metadata_token()
+                          if fresh:
+                              token = fresh
+                              continue
+                      print(f"Failed to upload {f}: {e}")
+
+          for f in glob.glob("/workspace/outputs/*"):
+              upload_file(f, "outputs/" + os.path.basename(f))
+          if os.path.exists("/workspace/execution.log"):
+              upload_file("/workspace/execution.log", "logs/execution.log")
+          '
+          echo "=== Multimodal Inference & GCS Upload Completed Successfully ==="
+          sleep 1800
+        env:
+        - name: VLLM_TARGET_DEVICE
+          value: empty
+        - name: TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+          value: "false"
+        - name: HF_HOME
+          value: /local/hf_cache
+        - name: VLLM_RPC_TIMEOUT
+          value: "1800000"
+        - name: ALLOW_MULTIPLE_LIBTPU_LOAD
+          value: "1"
+        - name: OMP_NUM_THREADS
+          value: "4"
+        - name: MKL_NUM_THREADS
+          value: "4"
+        - name: OPENBLAS_NUM_THREADS
+          value: "4"
+        - name: GCS_ACCESS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: gcs-token
+              key: token
+        resources:
+          limits:
+            google.com/tpu: "4"
+            memory: 512Gi
+          requests:
+            google.com/tpu: "4"
+            memory: 64Gi
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /local
+          name: local-storage
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: local-storage
+        emptyDir:
+          medium: Memory
+          sizeLimit: 128Gi
