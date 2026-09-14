@@ -16,16 +16,17 @@ spec:
         job-name: qwen3-omni-speechmaxxxing-job
     spec:
       restartPolicy: Never
+      priorityClassName: medium
       nodeSelector:
-        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
-        cloud.google.com/gke-tpu-topology: 2x4
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
       tolerations:
       - key: google.com/tpu
         operator: Exists
         effect: NoSchedule
       containers:
       - name: qwen3-omni-runner
-        image: us-central1-docker.pkg.dev/cloud-tpu-multipod-dev/vllm-omni/vllm-omni-tpu:speechmaxxxing-v7
+        image: us-central1-docker.pkg.dev/cloud-tpu-multipod-dev/vllm-omni/vllm-omni-tpu:speechmaxxxing-v22
         imagePullPolicy: Always
         securityContext:
           privileged: true
@@ -37,8 +38,12 @@ spec:
           ulimit -u unlimited 2>/dev/null || true
           ulimit -n 65535 2>/dev/null || true
           echo "=== Starting Qwen3-Omni TPU Multi-Stage Inference ==="
+          unset TPU_WORKER_HOSTNAMES || true
+          export TPU_HOST_BOUNDS="1,1,1"
+          export ALLOW_MULTIPLE_LIBTPU_LOAD="1"
           mkdir -p /workspace/outputs /local/hf_cache
           python3 examples/offline_inference/qwen3_omni/end2end.py \
+            --query-type text \
             --modalities text,audio \
             --output-wav /workspace/outputs \
             --init-timeout 1800 \
@@ -88,9 +93,9 @@ spec:
               upload_file(f, "outputs/" + os.path.basename(f))
           if os.path.exists("/workspace/execution.log"):
               upload_file("/workspace/execution.log", "logs/execution.log")
-          '
-          echo "=== Multimodal Inference & GCS Upload Completed Successfully ==="
-          sleep 1800
+          ' || true
+          echo "=== Multimodal Inference Completed Successfully ==="
+          sleep 3600
         env:
         - name: VLLM_TARGET_DEVICE
           value: empty

@@ -2629,8 +2629,12 @@ class TPUModelRunner(GPUModelRunner):
             if is_talker:
                 sp = getattr(new_req, "sampling_params", None)
                 if sp is not None and hasattr(sp, "stop_token_ids"):
-                    if 2150 not in sp.stop_token_ids:
-                        sp.stop_token_ids = list(sp.stop_token_ids) + [2150]
+                    stop_ids = list(sp.stop_token_ids)
+                    if 2150 not in stop_ids:
+                        stop_ids.append(2150)
+                    if 4198 not in stop_ids:
+                        stop_ids.append(4198)
+                    sp.stop_token_ids = stop_ids
             req_id = new_req.req_id
             payload_info = getattr(new_req, "additional_information", None)
             decoded_info = _deserialize(payload_info)
@@ -3774,6 +3778,31 @@ class TPUModelRunner(GPUModelRunner):
                     runtime_additional_information=runtime_info,
                     seq_token_counts=seq_token_counts,
                 )
+                model_stage = (
+                    getattr(self.model_config, "model_stage", None)
+                    or getattr(orig_model, "model_stage", None)
+                )
+                if model_stage == "thinker" and aux_hidden_states is None:
+                    thinker_emb = inputs_embeds
+                    if thinker_emb is None and input_ids is not None:
+                        try:
+                            embed_fn = getattr(orig_model, "embed_input_ids", getattr(self.model, "embed_input_ids", None))
+                            if callable(embed_fn):
+                                thinker_emb = embed_fn(input_ids)
+                        except Exception:
+                            pass
+                    if thinker_emb is None:
+                        thinker_emb = hidden_states
+                    aux_hidden_states = {
+                        "hidden_states": {
+                            "layers": {
+                                0: thinker_emb,
+                                24: hidden_states,
+                                "0": thinker_emb,
+                                "24": hidden_states,
+                            }
+                        }
+                    }
                 self._omni_last_hidden_states = hidden_states
                 self._omni_last_aux_hidden_states = aux_hidden_states
 
@@ -4638,8 +4667,49 @@ class TPUModelRunner(GPUModelRunner):
                                     req_payload["codes"] = codes_dict
                                 else:
                                     req_payload[k] = v
-                        per_req_payloads.append(req_payload)
+                        if "hidden_states" in req_payload and isinstance(req_payload["hidden_states"], dict):
+                            lyrs = req_payload["hidden_states"].get("layers", {})
+                            l0 = lyrs.get(0, lyrs.get("0"))
+                            l24 = lyrs.get(24, lyrs.get("24"))
+                            if l0 is not None:
+                                req_payload["hidden_states.layer_0"] = l0
+                            if l24 is not None:
+                                req_payload["hidden_states.layer_24"] = l24
+                                req_payload["hidden"] = l24
+                                req_payload["text_hidden_states"] = l24
+                        try:
+                            from vllm_omni.data_entry_keys import flatten_payload
+                            flat_payload = flatten_payload(req_payload)
+                            for k, v in req_payload.items():
+                                if k not in flat_payload:
+                                    flat_payload[k] = v
+                            per_req_payloads.append(flat_payload)
+                        except Exception:
+                            per_req_payloads.append(req_payload)
                     mm_outputs = per_req_payloads
+
+        # Fallback for Thinker stage if make_omni_output did not produce outputs
+        is_thinker = (
+            getattr(self.model_config, "model_stage", None) == "thinker"
+            or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "thinker"
+        )
+        if is_thinker and mm_outputs is None:
+            raw_out = getattr(self, "_omni_last_hidden_states", None)
+            num_reqs = len(req_ids)
+            per_req_payloads = []
+            for i in range(num_reqs):
+                st = int(self.query_start_loc_np[i]) if hasattr(self, "query_start_loc_np") and i + 1 < len(self.query_start_loc_np) else 0
+                en = int(self.query_start_loc_np[i + 1]) if hasattr(self, "query_start_loc_np") and i + 1 < len(self.query_start_loc_np) else (raw_out.shape[0] if isinstance(raw_out, torch.Tensor) else 1)
+                h_slice = raw_out[st:en].detach().to("cpu") if isinstance(raw_out, torch.Tensor) else None
+                req_p = {
+                    "hidden_states": {"layers": {0: h_slice, 24: h_slice, "0": h_slice, "24": h_slice}},
+                    "hidden_states.layer_0": h_slice,
+                    "hidden_states.layer_24": h_slice,
+                    "hidden": h_slice,
+                    "text_hidden_states": h_slice,
+                }
+                per_req_payloads.append(req_p)
+            mm_outputs = per_req_payloads
 
         # Fallback for Code2Wav vocoder stage if make_omni_output did not produce outputs
         is_code2wav = (
@@ -4697,7 +4767,8 @@ class TPUModelRunner(GPUModelRunner):
             model_runner_output=model_runner_output,
             copy_state=copy_state,
             discard_sampled_tokens_req_indices=
-            discard_sampled_tokens_req_indices)
+            discard_sampled_tokens_req_indices,
+            postprocess_callback=self._talker_guard_postprocess)
 
         if not self.scheduler_config.async_scheduling:
             final_output = async_output.get_output()
@@ -4708,6 +4779,7 @@ class TPUModelRunner(GPUModelRunner):
                     valid_tokens = final_output.sampled_token_ids[i]
                     if not valid_tokens:
                         continue
+
                     req_idx = self.input_batch.req_id_to_index[req_id]
 
                     # Update the persistent batch.
@@ -4735,6 +4807,94 @@ class TPUModelRunner(GPUModelRunner):
             return final_output
 
         return async_output
+
+    def _talker_guard_postprocess(self, output: ModelRunnerOutput, copy_state: Any | None = None) -> None:
+        is_talker = (
+            getattr(self.model_config, "model_stage", None) == "talker"
+            or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "talker"
+        )
+        if not is_talker:
+            return
+
+        req_ids = getattr(output, "req_ids", None)
+        if not req_ids or not getattr(output, "sampled_token_ids", None):
+            return
+
+        for i, req_id in enumerate(req_ids):
+            if i >= len(output.sampled_token_ids) or not output.sampled_token_ids[i]:
+                continue
+            valid_tokens = output.sampled_token_ids[i]
+            req_state = getattr(self, "requests", {}).get(req_id)
+
+            history = getattr(req_state, "output_token_ids", []) if req_state is not None else []
+            history = list(history) + list(valid_tokens)
+            n_hist = len(history)
+            should_terminate = False
+            reason = ""
+
+            info = getattr(self, "model_intermediate_buffer", {}).get(req_id, {})
+            meta = info.get("meta", {}) if isinstance(info, dict) else {}
+            eos_emitted = bool(meta.get("eos_emitted", False))
+            hs = info.get("hidden_states", {}) if isinstance(info, dict) else {}
+            trailing = hs.get("trailing_text") if isinstance(hs, dict) else None
+
+            # 1. Loop detection: active only once thinker finished (eos_emitted or trailing text consumed)
+            if n_hist >= 20 and (eos_emitted or (trailing is not None and getattr(trailing, "shape", [0])[0] <= 1)):
+                # 1a. Constant token repeat (e.g. stuck on silence / static token)
+                if n_hist >= 6 and history[-6:] == [history[-1]] * 6:
+                    should_terminate = True
+                    reason = f"constant token repeat detected ({history[-1]} x 6)"
+                # 1b. Periodic loop detection (periods 4..60)
+                if not should_terminate:
+                    for p in range(4, min(61, n_hist // 2 + 1)):
+                        if history[-p:] == history[-2 * p : -p]:
+                            if n_hist >= 3 * p and history[-p:] == history[-3 * p : -2 * p]:
+                                should_terminate = True
+                                reason = f"periodic loop detected after eos (period {p}, 3 repeats)"
+                                break
+                            elif p >= 10:
+                                should_terminate = True
+                                reason = f"long periodic loop detected after eos (period {p}, 2 repeats)"
+                                break
+
+            # 2. Check post-text padding frames:
+            # Thinker text tokens streamed into Talker 1 token per frame.
+            # Once Thinker text finishes (eos_emitted is True), Talker still needs time
+            # to finish pronouncing the remaining buffered text into audio frames.
+            # At 25 Hz, speaking 15-20 words typically takes 120-180 frames (~5-7 seconds).
+            text_count = meta.get("_tpu_text_cursor", 20)
+            max_pad_frames = max(180, text_count * 8)
+            if eos_emitted:
+                pad_count = getattr(req_state, "_omni_eos_pad_steps", 0) + 1 if req_state is not None else 0
+                if req_state is not None:
+                    req_state._omni_eos_pad_steps = pad_count
+                if pad_count >= max_pad_frames:
+                    should_terminate = True
+                    reason = f"speech complete ({pad_count} post-eos padding frames)"
+            elif trailing is not None and getattr(trailing, "shape", [0])[0] <= 1:
+                pad_count = getattr(req_state, "_omni_pad_steps", 0) + 1 if req_state is not None else 0
+                if req_state is not None:
+                    req_state._omni_pad_steps = pad_count
+                if pad_count >= max_pad_frames:
+                    should_terminate = True
+                    reason = f"speech complete ({pad_count} post-text padding frames)"
+
+            # 3. Max speech length safety cap (350 frames = 14s)
+            if n_hist >= 350:
+                should_terminate = True
+                reason = f"max speech frames limit reached ({n_hist} frames)"
+
+            if should_terminate and valid_tokens != [2150]:
+                logger.info(
+                    "[TPURunner Talker Guard] Terminating speech for req %s: %s (total frames: %d)",
+                    req_id, reason, n_hist
+                )
+                output.sampled_token_ids[i] = [2150]
+                if copy_state is not None and hasattr(copy_state, "sampled_token_ids_cpu"):
+                    try:
+                        copy_state.sampled_token_ids_cpu[i] = 2150
+                    except Exception:
+                        pass
 
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
@@ -6735,6 +6895,11 @@ class TPUModelRunner(GPUModelRunner):
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
         masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+        if logits.shape[-1] > 2150 and logits.shape[-1] <= 4096:
+            eos_logit = scaled_logits[:, 2150:2151]
+            eos_masked = masked_logits[:, 2150:2151]
+            restored_eos = torch.maximum(eos_masked, eos_logit)
+            masked_logits = torch.cat([masked_logits[:, :2150], restored_eos, masked_logits[:, 2151:]], dim=-1)
         u_clamped = torch.clamp(u,
                                 min=torch.finfo(u.dtype).tiny,
                                 max=1.0 - torch.finfo(u.dtype).eps)

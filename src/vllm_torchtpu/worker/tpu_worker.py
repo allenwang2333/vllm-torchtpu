@@ -68,7 +68,11 @@ def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
 
 class TPUWorker(WorkerBase):
 
-    model_runner_cls = TPUModelRunner
+    try:
+        from vllm_torchtpu.omni.runner import TPUOmniModelRunner
+        model_runner_cls = TPUOmniModelRunner
+    except Exception:
+        model_runner_cls = TPUModelRunner
 
     def __init__(
         self,
@@ -86,6 +90,11 @@ class TPUWorker(WorkerBase):
         # from the parent process are lost.
         from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
         apply_tpu_patches()
+        try:
+            from vllm_torchtpu.omni.patches import apply_omni_patches
+            apply_omni_patches()
+        except Exception:
+            pass
 
         super().__init__(vllm_config=vllm_config,
                          local_rank=local_rank,

@@ -283,26 +283,34 @@ def patch_deploy_config_loader() -> None:
             return
 
         def _inject_tpu_stages(deploy: Any) -> None:
+            deploy.async_chunk = False
+            if hasattr(deploy, "stages") and deploy.stages:
+                for stg in deploy.stages:
+                    if hasattr(stg, "async_chunk"):
+                        stg.async_chunk = False
+            logger.info("[TPU Omni Patch] Enforced deploy.async_chunk = False (full-payload mode)")
             if not hasattr(deploy, "platforms") or deploy.platforms is None:
                 deploy.platforms = {}
             if isinstance(deploy.platforms, dict):
                 if "tpu" not in deploy.platforms:
                     deploy.platforms["tpu"] = {
                         "stages": [
-                            {"stage_id": 0, "tensor_parallel_size": 1, "devices": "0"},
-                            {"stage_id": 1, "tensor_parallel_size": 1, "devices": "1"},
+                            {"stage_id": 0, "tensor_parallel_size": 1, "devices": "0", "worker_cls": "vllm_torchtpu.omni.worker.TPUOmniWorker"},
+                            {"stage_id": 1, "tensor_parallel_size": 1, "devices": "1", "worker_cls": "vllm_torchtpu.omni.worker.TPUOmniWorker"},
                             {
                                 "stage_id": 2,
                                 "tensor_parallel_size": 1,
                                 "devices": "2",
                                 "dtype": "float32",
                                 "enforce_eager": True,
+                                "worker_cls": "vllm_torchtpu.omni.worker.TPUOmniWorker",
                             },
                         ]
                     }
                     logger.info("[TPU Omni Patch] Injected TPU stage configuration into deploy config (0->0, 1->1, 2->2)")
                 elif "stages" in deploy.platforms["tpu"]:
                     for stg in deploy.platforms["tpu"]["stages"]:
+                        stg.setdefault("worker_cls", "vllm_torchtpu.omni.worker.TPUOmniWorker")
                         if stg.get("stage_id") == 2:
                             if "dtype" not in stg:
                                 stg["dtype"] = "float32"
@@ -363,9 +371,11 @@ def patch_deploy_config_loader() -> None:
 
             def patched_merge_pipeline_deploy(pipeline: Any, deploy: Any, cli_overrides: dict[str, Any] | None = None) -> list[Any]:
                 _inject_tpu_stages(deploy)
+                deploy.async_chunk = False
                 stages = orig_merge_pipeline_deploy(pipeline, deploy, cli_overrides)
                 used_devices = set()
                 for stage in stages:
+                    stage.async_chunk = False
                     rt = getattr(stage, "yaml_runtime", None)
                     if isinstance(rt, dict):
                         dev = rt.get("devices")
@@ -374,8 +384,10 @@ def patch_deploy_config_loader() -> None:
                             rt["devices"] = new_dev
                             logger.info("[TPU Omni Patch] Assigned disjoint TPU device '%s' to stage %d", new_dev, stage.stage_id)
                         used_devices.add(rt.get("devices"))
+                    ea = getattr(stage, "yaml_engine_args", None)
+                    if isinstance(ea, dict):
+                        ea["async_chunk"] = False
                     if getattr(stage, "stage_id", None) == 2:
-                        ea = getattr(stage, "yaml_engine_args", None)
                         if isinstance(ea, dict):
                             ea["dtype"] = "float32"
                             ea["enforce_eager"] = True
@@ -462,9 +474,8 @@ def patch_qwen3_omni_models() -> None:
 
     # 2. Qwen3OmniMoeForConditionalGeneration methods: generate_audio, talker_preprocess, compute_logits, make_omni_output
     try:
-        from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
-            Qwen3OmniMoeForConditionalGeneration,
-        )
+        import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni as qwen3_omni_mod
+        Qwen3OmniMoeForConditionalGeneration = qwen3_omni_mod.Qwen3OmniMoeForConditionalGeneration
 
         if not getattr(Qwen3OmniMoeForConditionalGeneration, "_tpu_patched", False):
             # generate_audio
@@ -507,6 +518,85 @@ def patch_qwen3_omni_models() -> None:
                 return ids, embeds, update_dict
 
             Qwen3OmniMoeForConditionalGeneration.talker_preprocess = patched_talker_preprocess
+
+            # _thinker_decode_to_talker_decode
+            def patched_thinker_decode_to_talker_decode(
+                self,
+                payload: Any,
+                device: torch.device,
+                update_dict: Any,
+            ):
+                embed = payload.get("embed", {}) if isinstance(payload, dict) else {}
+                meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                hs = payload.get("hidden_states", {}) if isinstance(payload, dict) else {}
+
+                cached_decode = embed.get("cached_decode", None)
+                incoming_decode = embed.get("decode", None)
+
+                # Check finished flag from thinker
+                finished_raw = meta.get("finished", False)
+                if isinstance(finished_raw, torch.Tensor):
+                    thinker_finished = bool(finished_raw.item()) if finished_raw.numel() > 0 else False
+                else:
+                    thinker_finished = bool(finished_raw)
+
+                if meta.get("_thinker_ever_finished", False):
+                    thinker_finished = True
+                elif thinker_finished:
+                    update_dict.setdefault("meta", {})["_thinker_ever_finished"] = True
+
+                # 1. Incorporate any surplus trailing_text from prefill if cached_decode not yet initialized
+                if cached_decode is None and isinstance(hs, dict):
+                    trailing = hs.get("trailing_text")
+                    if isinstance(trailing, torch.Tensor) and trailing.numel() > 0:
+                        if trailing.ndim >= 2 and trailing.shape[0] > 1:
+                            cached_decode = trailing[:-1].to(device=device, dtype=torch.bfloat16)
+                            update_dict.setdefault("embed", {})["cached_decode"] = cached_decode.detach()
+                            update_dict.setdefault("hidden_states", {})["trailing_text"] = None
+
+                # 2. Append new incoming decode embedding to cached buffer
+                if incoming_decode is not None:
+                    incoming_t = incoming_decode.to(device=device, dtype=torch.bfloat16)
+                    if incoming_t.ndim == 1:
+                        incoming_t = incoming_t.unsqueeze(0)
+                    elif incoming_t.ndim == 3:
+                        incoming_t = incoming_t.reshape(-1, incoming_t.shape[-1])
+                    if cached_decode is not None:
+                        cached_decode = torch.cat([cached_decode.to(device=device, dtype=torch.bfloat16), incoming_t], dim=0)
+                    else:
+                        cached_decode = incoming_t
+                    update_dict.setdefault("embed", {})["cached_decode"] = cached_decode.detach()
+                elif cached_decode is not None:
+                    cached_decode = cached_decode.to(device=device, dtype=torch.bfloat16)
+
+                # Always clear incoming decode so it is not re-appended in subsequent steps
+                update_dict.setdefault("embed", {})["decode"] = None
+
+                # 3. Consume from cached_decode using cursor
+                cursor = meta.get("_tpu_text_cursor", 0)
+
+                if cached_decode is not None and cursor < cached_decode.shape[0]:
+                    thinker_embed = cached_decode[cursor:cursor + 1]
+                    update_dict.setdefault("meta", {})["_tpu_text_cursor"] = cursor + 1
+                    return self.talker.text_projection(thinker_embed).to(device)
+
+                # 4. If buffer is currently exhausted:
+                if thinker_finished:
+                    if meta.get("eos_emitted", False):
+                        return self.tts_pad_embed.to(device)
+                    update_dict.setdefault("meta", {})["eos_emitted"] = True
+                    logger.info(
+                        "[TPU Talker] All %d thinker decode tokens consumed and thinker finished; emitting tts_eos_embed",
+                        cursor
+                    )
+                    return self.tts_eos_embed.to(device)
+                else:
+                    return self.tts_pad_embed.to(device)
+
+            Qwen3OmniMoeForConditionalGeneration._thinker_decode_to_talker_decode = patched_thinker_decode_to_talker_decode
+            if hasattr(qwen3_omni_mod, "Qwen3OmniForConditionalGeneration"):
+                qwen3_omni_mod.Qwen3OmniForConditionalGeneration._thinker_decode_to_talker_decode = patched_thinker_decode_to_talker_decode
+
 
             # forward (extract real codec codes from runtime_additional_information / model_intermediate_buffer for code2wav)
             orig_forward = Qwen3OmniMoeForConditionalGeneration.forward
@@ -709,8 +799,73 @@ def patch_stage_input_processors() -> None:
         # thinker2talker_async_chunk
         orig_t2t = getattr(sip, "thinker2talker_async_chunk", None)
         if orig_t2t:
-            def patched_t2t(*args, **kwargs):
-                return _call_filtered(orig_t2t, *args, **kwargs)
+            def patched_t2t(transfer_manager, multimodal_output, request, is_finished=False, *args, **kwargs):
+                if isinstance(multimodal_output, dict):
+                    # 1. Unflatten any dotted keys if present
+                    try:
+                        from vllm_omni.data_entry_keys import unflatten_payload
+                        unflat = unflatten_payload(multimodal_output)
+                        for k, v in unflat.items():
+                            if k not in multimodal_output or not multimodal_output[k]:
+                                multimodal_output[k] = v
+                            elif isinstance(v, dict) and isinstance(multimodal_output[k], dict):
+                                for sub_k, sub_v in v.items():
+                                    if sub_k not in multimodal_output[k]:
+                                        multimodal_output[k][sub_k] = sub_v
+                    except Exception:
+                        pass
+
+                    # 2. Guarantee hidden_states and layers dict exist
+                    hs = multimodal_output.setdefault("hidden_states", {})
+                    if not isinstance(hs, dict):
+                        hs = {"output": hs}
+                        multimodal_output["hidden_states"] = hs
+                    layers = hs.setdefault("layers", {})
+                    if not isinstance(layers, dict):
+                        layers = {}
+                        hs["layers"] = layers
+
+                    # Check for layer 0 / "0" (embeddings)
+                    emb = layers.get("0", layers.get(0))
+                    if emb is None:
+                        emb = (
+                            multimodal_output.get("hidden_states.layer_0")
+                            or multimodal_output.get("embed", {}).get("prefill")
+                            or multimodal_output.get("embed", {}).get("decode")
+                            or multimodal_output.get("hidden")
+                            or multimodal_output.get("text_hidden_states")
+                        )
+                    if emb is not None:
+                        layers["0"] = emb
+                        layers[0] = emb
+
+                    # Check for layer 24 / "24" (hidden states)
+                    hid = layers.get("24", layers.get(24))
+                    if hid is None:
+                        hid = (
+                            multimodal_output.get("hidden_states.layer_24")
+                            or multimodal_output.get("hidden")
+                            or multimodal_output.get("text_hidden_states")
+                            or emb
+                        )
+                    if hid is not None:
+                        layers["24"] = hid
+                        layers[24] = hid
+
+                    # 3. For decode steps (chunk_id > 0), ensure thinker_emb has shape [1, D]
+                    req_id = getattr(request, "external_req_id", getattr(request, "request_id", None))
+                    chunk_id = getattr(transfer_manager, "put_req_chunk", {}).get(req_id, 0)
+                    if chunk_id > 0:
+                        for k in ("0", 0):
+                            t = layers.get(k)
+                            if isinstance(t, torch.Tensor) and t.ndim >= 2 and t.shape[0] > 1:
+                                layers[k] = t[-1:]
+                        for k in ("24", 24):
+                            t = layers.get(k)
+                            if isinstance(t, torch.Tensor) and t.ndim >= 2 and t.shape[0] > 1:
+                                layers[k] = t[-1:]
+
+                return _call_filtered(orig_t2t, transfer_manager, multimodal_output, request, is_finished=is_finished, *args, **kwargs)
             sip.thinker2talker_async_chunk = patched_t2t
 
         # talker2code2wav_async_chunk
@@ -723,9 +878,68 @@ def patch_stage_input_processors() -> None:
         # talker2code2wav_full_payload
         orig_t2c_full = getattr(sip, "talker2code2wav_full_payload", None)
         if orig_t2c_full:
-            def patched_t2c_full(*args, **kwargs):
-                return _call_filtered(orig_t2c_full, *args, **kwargs)
+            def patched_t2c_full(transfer_manager=None, pooling_output=None, request=None, multimodal_output=None, *args, **kwargs):
+                if pooling_output is None and multimodal_output is not None:
+                    pooling_output = multimodal_output
+                res = _call_filtered(orig_t2c_full, transfer_manager, pooling_output, request, *args, **kwargs)
+                if res is None and isinstance(pooling_output, dict):
+                    codes = pooling_output.get("codes.audio")
+                    if codes is None and isinstance(pooling_output.get("codes"), dict):
+                        codes = pooling_output["codes"].get("audio")
+                    if codes is not None:
+                        t = torch.as_tensor(codes)
+                        if t.ndim >= 2 and t.numel() > 0:
+                            codec_codes = t.transpose(0, 1).cpu().reshape(-1).tolist()
+                            if codec_codes:
+                                logger.info("[TPU Omni Patch] talker2code2wav_full_payload fallback returned %d codec codes", len(codec_codes))
+                                return {
+                                    "codes": {"audio": codec_codes},
+                                    "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+                                }
+                return res
             sip.talker2code2wav_full_payload = patched_t2c_full
+
+        # thinker2talker_full_payload
+        orig_t2t_full = getattr(sip, "thinker2talker_full_payload", None)
+        if orig_t2t_full:
+            def patched_t2t_full(transfer_manager=None, pooling_output=None, request=None, multimodal_output=None, *args, **kwargs):
+                if pooling_output is None and multimodal_output is not None:
+                    pooling_output = multimodal_output
+                if isinstance(pooling_output, dict):
+                    if "hidden_states.layer_0" not in pooling_output:
+                        val = (
+                            pooling_output.get("hidden")
+                            or pooling_output.get("text_hidden_states")
+                            or pooling_output.get("hidden_states", {}).get("layers", {}).get(0)
+                            or pooling_output.get("hidden_states", {}).get("layers", {}).get("0")
+                            or pooling_output.get("embed", {}).get("prefill")
+                            or pooling_output.get("embed", {}).get("decode")
+                        )
+                        if val is not None:
+                            pooling_output["hidden_states.layer_0"] = val
+                    if "hidden_states.layer_24" not in pooling_output:
+                        val = (
+                            pooling_output.get("hidden")
+                            or pooling_output.get("text_hidden_states")
+                            or pooling_output.get("hidden_states", {}).get("layers", {}).get(24)
+                            or pooling_output.get("hidden_states", {}).get("layers", {}).get("24")
+                            or pooling_output.get("hidden_states", {}).get("output")
+                            or pooling_output.get("hidden_states.layer_0")
+                        )
+                        if val is not None:
+                            pooling_output["hidden_states.layer_24"] = val
+                    for tok in ("tts_bos", "tts_eos", "tts_pad"):
+                        k = f"embed.{tok}"
+                        if k not in pooling_output or pooling_output[k] is None:
+                            if isinstance(pooling_output.get("embed"), dict) and pooling_output["embed"].get(tok) is not None:
+                                v = pooling_output["embed"][tok]
+                                pooling_output[k] = v[0] if isinstance(v, list) and len(v) > 0 else v
+                            else:
+                                hid = pooling_output.get("hidden_states.layer_0")
+                                h_dim = int(hid.shape[-1]) if isinstance(hid, torch.Tensor) and hid.ndim >= 1 else 2048
+                                pooling_output[k] = torch.zeros((1, 1, h_dim), dtype=torch.bfloat16)
+                return _call_filtered(orig_t2t_full, transfer_manager, pooling_output, request, *args, **kwargs)
+            sip.thinker2talker_full_payload = patched_t2t_full
 
         sip._tpu_patched = True
         logger.info("[TPU Omni Patch] Patched stage_input_processors.qwen3_omni")
@@ -771,20 +985,21 @@ def patch_qwen3_code_predictor() -> None:
                     hidden_states = inputs_embeds
                     for layer in self.layers:
                         hidden_states = layer(hidden_states, position_embeddings)
-                    return hidden_states
+                    hidden_states = self.norm(hidden_states)
+                return hidden_states.to(input_dtype)
 
             cp.CodePredictorBaseModel.forward = patched_base_forward
 
-        # Patch CodePredictorWrapper.predict_codes for CPU execution when invoked on TPU
+        # Patch CodePredictorWrapper.forward for CPU execution when invoked on TPU
         if hasattr(cp, "CodePredictorWrapper"):
-            orig_predict = cp.CodePredictorWrapper.predict_codes
+            orig_forward = cp.CodePredictorWrapper.forward
 
-            def patched_predict_codes(
+            def patched_forward(
                 self,
                 layer0_code,
                 layer0_embed,
                 last_talker_hidden,
-                do_sample=False,
+                do_sample=True,
                 temperature=0.9,
                 top_k=50,
                 top_p=1.0,
@@ -792,15 +1007,21 @@ def patch_qwen3_code_predictor() -> None:
                 generators=None,
             ):
                 device = layer0_code.device
-                if device.type == "tpu":
+                if device.type in ("tpu", "xla"):
                     try:
                         torch.set_num_threads(min(4, torch.get_num_threads()))
                     except Exception:
                         pass
                     if next(self.parameters()).device.type != "cpu":
                         self.to("cpu")
+                    if getattr(self, "_compiled_model_fwd", None) is None:
+                        self._model_dtype = next(self.model.parameters()).dtype
+                        self._lm_heads_list = list(self.lm_head)
+                        self._codec_embeds_list = list(self.model.codec_embedding)
+                        self._compiled_model_fwd = self.model.forward
                     orig_device = device
-                    res = self.forward(
+                    res = orig_forward(
+                        self,
                         layer0_code=layer0_code.to("cpu"),
                         layer0_embed=layer0_embed.to("cpu"),
                         last_talker_hidden=last_talker_hidden.to("cpu"),
@@ -817,7 +1038,7 @@ def patch_qwen3_code_predictor() -> None:
                             for r in res
                         )
                     return res.to(device=orig_device)
-                return orig_predict(
+                return orig_forward(
                     self,
                     layer0_code,
                     layer0_embed,
@@ -830,7 +1051,16 @@ def patch_qwen3_code_predictor() -> None:
                     generators=generators,
                 )
 
-            cp.CodePredictorWrapper.predict_codes = patched_predict_codes
+            cp.CodePredictorWrapper.forward = patched_forward
+
+        try:
+            from vllm_omni.model_executor.models.qwen3_omni import (
+                qwen3_omni_moe_code_predictor_mtp as cp_mtp,
+            )
+            if hasattr(cp_mtp, "Qwen3OmniMoeTalkerCodePredictor"):
+                cp_mtp.Qwen3OmniMoeTalkerCodePredictor.forward = cp.CodePredictorWrapper.forward
+        except Exception as e:
+            logger.debug("[TPU Omni Patch] patch Qwen3OmniMoeTalkerCodePredictor skipped: %s", e)
 
         cp._tpu_patched = True
         logger.info("[TPU Omni Patch] Patched qwen3_code_predictor for TPU")
@@ -887,4 +1117,11 @@ def apply_omni_patches() -> None:
     patch_qwen3_omni_models()
     patch_stage_input_processors()
     patch_qwen3_code_predictor()
+    try:
+        from vllm_torchtpu.worker.tpu_worker import TPUWorker
+        from vllm_torchtpu.omni.runner import TPUOmniModelRunner
+        TPUWorker.model_runner_cls = TPUOmniModelRunner
+        logger.info("[TPU Omni Patch] Wired TPUWorker.model_runner_cls = TPUOmniModelRunner")
+    except Exception as e:
+        logger.debug("[TPU Omni Patch] TPUWorker.model_runner_cls wiring skipped: %s", e)
     logger.info("[TPU Omni Patch] All vLLM-Omni TPU runtime patches applied successfully.")

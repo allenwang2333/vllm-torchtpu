@@ -95,10 +95,12 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
+        postprocess_callback: Any | None = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
+        self.postprocess_callback = postprocess_callback
 
     def get_output(self) -> ModelRunnerOutput:
         if self.copy_state is None:
@@ -129,7 +131,18 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                 valid_sampled_token_ids[i].clear()
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
+        if self.postprocess_callback is not None:
+            try:
+                self.postprocess_callback(self._model_runner_output, self.copy_state)
+            except Exception as e:
+                pass
+        if hasattr(self, "omni_connector_output"):
+            self._model_runner_output.omni_connector_output = self.omni_connector_output
         return self._model_runner_output
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model_runner_output, name)
+
 
 
 def assemble_spec_next_tokens(next_tokens: torch.Tensor, drafts: torch.Tensor,
