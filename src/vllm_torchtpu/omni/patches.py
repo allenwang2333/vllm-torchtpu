@@ -179,6 +179,15 @@ def patch_compat_fallbacks() -> None:
     except Exception as e:
         logger.warning("[TPU Omni Patch] Failed to patch OmniRequest: %s", e)
 
+    # 7. CompletionOutput multimodal_output fallback
+    try:
+        from vllm.outputs import CompletionOutput
+        if not hasattr(CompletionOutput, "multimodal_output"):
+            CompletionOutput.multimodal_output = None
+            logger.info("[TPU Omni Patch] Injected multimodal_output fallback into CompletionOutput")
+    except Exception:
+        pass
+
 
 def patch_omni_platform_interface() -> None:
     """Equip OmniPlatform with is_tpu check."""
@@ -464,6 +473,9 @@ def patch_qwen3_omni_models() -> None:
             def patched_generate_audio(
                 self, codes, left_context_size=None, seq_token_counts=None, **kwargs
             ):
+                if codes is not None and isinstance(codes, torch.Tensor):
+                    if codes.ndim == 1 and codes.shape[0] % 16 == 0:
+                        codes = codes.view(16, -1)
                 if seq_token_counts is None and codes is not None:
                     seq_token_counts = [codes.shape[-1] * 16] * codes.shape[0]
                 return orig_generate_audio(
@@ -479,11 +491,11 @@ def patch_qwen3_omni_models() -> None:
             # talker_preprocess
             orig_talker_preprocess = Qwen3OmniMoeForConditionalGeneration.talker_preprocess
 
-            def patched_talker_preprocess(self, input_ids, input_embeds, payload):
+            def patched_talker_preprocess(self, input_ids, input_embeds=None, *args, **kwargs):
                 if input_ids is None and input_embeds is not None:
                     span_len = input_embeds.shape[0]
                     input_ids = torch.zeros((span_len,), dtype=torch.long, device=input_embeds.device)
-                ids, embeds, update_dict = orig_talker_preprocess(self, input_ids, input_embeds, payload)
+                ids, embeds, update_dict = orig_talker_preprocess(self, input_ids, input_embeds, *args, **kwargs)
                 # Ensure code_predictor_codes is on CPU to avoid allocating large unpadded tensors on TPU HBM
                 if isinstance(update_dict, dict) and "codes" in update_dict:
                     if isinstance(update_dict["codes"], dict) and "audio" in update_dict["codes"]:
@@ -519,7 +531,35 @@ def patch_qwen3_omni_models() -> None:
             orig_make_omni_output = Qwen3OmniMoeForConditionalGeneration.make_omni_output
 
             def patched_make_omni_output(self, *args, **kwargs):
-                output = orig_make_omni_output(self, *args, **kwargs)
+                if getattr(self, "model_stage", None) == "talker":
+                    info_dicts = kwargs.get("model_intermediate_buffer")
+                    if info_dicts is None:
+                        info_dicts = kwargs.get("runtime_additional_information")
+                    if info_dicts:
+                        for info in info_dicts:
+                            if isinstance(info, dict):
+                                codes = info.setdefault("codes", {})
+                                if isinstance(codes, dict) and codes.get("audio") is None:
+                                    dev = self._module_device(getattr(self, "talker", self))
+                                    num_code_groups = getattr(getattr(self, "talker", None), "num_code_groups", 16)
+                                    codes["audio"] = torch.zeros((1, num_code_groups), dtype=torch.long, device=dev)
+                try:
+                    output = orig_make_omni_output(self, *args, **kwargs)
+                except Exception as e:
+                    if getattr(self, "model_stage", None) == "talker":
+                        logger.warning("[TPU Omni Patch] orig_make_omni_output talker failed (%s), constructing fallback", e)
+                        model_outputs = args[0] if len(args) > 0 else kwargs.get("model_outputs")
+                        dev = self._module_device(getattr(self, "talker", self))
+                        num_code_groups = getattr(getattr(self, "talker", None), "num_code_groups", 16)
+                        dummy_codes = torch.zeros((1, num_code_groups), dtype=torch.long, device=dev)
+                        from vllm_omni.core.sched.output import OmniOutput
+                        output = OmniOutput(
+                            text_hidden_states=model_outputs[:1] if model_outputs is not None else None,
+                            multimodal_outputs={"codes": {"audio": dummy_codes}},
+                        )
+                    else:
+                        raise
+
                 if hasattr(output, "multimodal_outputs") and isinstance(output.multimodal_outputs, dict):
                     mm = output.multimodal_outputs
                     if "audio" not in mm:
@@ -585,48 +625,40 @@ def patch_qwen3_omni_models() -> None:
 def patch_stage_input_processors() -> None:
     """Patch stage input processors for TPU tensors and async handoffs."""
     try:
+        import inspect
         import vllm_omni.model_executor.stage_input_processors.qwen3_omni as sip
         import torch
 
         if getattr(sip, "_tpu_patched", False):
             return
 
+        def _call_filtered(fn, *args, **kwargs):
+            sig = inspect.signature(fn)
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not has_varkw:
+                valid_keys = set(sig.parameters.keys())
+                kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+            return fn(*args, **kwargs)
+
         # thinker2talker_async_chunk
         orig_t2t = getattr(sip, "thinker2talker_async_chunk", None)
         if orig_t2t:
-            def patched_t2t(request, transfer_manager, chunk_id=0, *args, **kwargs):
-                return orig_t2t(request, transfer_manager, chunk_id=chunk_id, *args, **kwargs)
+            def patched_t2t(*args, **kwargs):
+                return _call_filtered(orig_t2t, *args, **kwargs)
             sip.thinker2talker_async_chunk = patched_t2t
 
         # talker2code2wav_async_chunk
         orig_t2c_async = getattr(sip, "talker2code2wav_async_chunk", None)
         if orig_t2c_async:
-            def patched_t2c_async(request, transfer_manager, chunk_id=0, *args, **kwargs):
-                payload = orig_t2c_async(request, transfer_manager, chunk_id=chunk_id, *args, **kwargs)
-                # Ensure codes tensor is 2D, not 1D flattened
-                if payload and hasattr(payload, "codes") and isinstance(payload.codes, dict):
-                    for k, v in payload.codes.items():
-                        if isinstance(v, torch.Tensor) and v.ndim == 1:
-                            num_q = 16
-                            if v.shape[0] % num_q == 0:
-                                payload.codes[k] = v.view(-1, num_q).transpose(0, 1)
-                return payload
+            def patched_t2c_async(*args, **kwargs):
+                return _call_filtered(orig_t2c_async, *args, **kwargs)
             sip.talker2code2wav_async_chunk = patched_t2c_async
 
         # talker2code2wav_full_payload
         orig_t2c_full = getattr(sip, "talker2code2wav_full_payload", None)
         if orig_t2c_full:
-            def patched_t2c_full(request, transfer_manager, *args, **kwargs):
-                payload = orig_t2c_full(request, transfer_manager, *args, **kwargs)
-                if payload and hasattr(payload, "codes") and isinstance(payload.codes, dict):
-                    for k, v in payload.codes.items():
-                        if isinstance(v, list):
-                            payload.codes[k] = torch.tensor(v, dtype=torch.long)
-                        elif isinstance(v, torch.Tensor) and v.ndim == 1:
-                            num_q = 16
-                            if v.shape[0] % num_q == 0:
-                                payload.codes[k] = v.view(-1, num_q).transpose(0, 1)
-                return payload
+            def patched_t2c_full(*args, **kwargs):
+                return _call_filtered(orig_t2c_full, *args, **kwargs)
             sip.talker2code2wav_full_payload = patched_t2c_full
 
         sip._tpu_patched = True
