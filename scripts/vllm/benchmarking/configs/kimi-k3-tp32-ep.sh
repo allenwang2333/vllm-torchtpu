@@ -98,3 +98,6 @@ MMLU_PRO_DISABLE_MULTITURN_ARGS=true
 EXTRA_LM_EVAL_MODEL_ARGS="num_concurrent=16"
 # K3's tokenizer uses `thinking`; its default enables reasoning.
 LM_EVAL_GEN_KWARGS='{"chat_template_kwargs":{"thinking":false}}'
+
+# [test branch only] #991: force the non-pooled KDA/KV path (George's suggestion).
+export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0
