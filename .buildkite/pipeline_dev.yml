@@ -55,11 +55,6 @@
 
 steps:
 
-  # -----------------------------------------------------------------
-  # Build step (required by every demo below)
-  # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
-  # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
@@ -68,60 +63,42 @@ steps:
       - bash .buildkite/scripts/setup_docker_env.sh
 
   # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
+  # Kimi-K3-pruned75 1P1D smoke (PR #857 Raiden Stage-3 path):
+  #   node 0 = prefill TP8/EP8, node 1 = decode TP8/EP8 (dst shards 8),
+  #   the other two hosts of the v7x-32 slice idle. Weights stream from
+  #   GCS (475 GB does not fit the 100 GB boot disk). run_disagg_multihost
+  #   drives one container per host; the role script launches the
+  #   servers, a toy proxy, and a 10-prompt `vllm bench serve`.
   # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
+  - label: "Kimi-K3-pruned75 1P1D smoke: TP8 -> TP8 (TPU v7x-32)"
+    key: dev_kimi_k3_pruned75_pd_smoke
     depends_on: build_docker
+    timeout_in_minutes: 300
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "tpu_v7x_32_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+      DISAGG_ROLE_SCRIPT: "scripts/vllm/integration/run_kimi_k3_pd_smoke.sh"
+      DISAGG_RUN_ROOT: "/perf_eval_results/kimi_k3_pruned75_pd_smoke"
+      MODEL_PATH: "gs://tpu-commons-ci/moonshootai/kimi/k3-pruned75"
+      SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
+      TOKENIZER: "mgoin/Kimi-K3-pruned75"
+      PREFILL_PCP: "1"
+      PREFILL_TP: "8"
+      DECODE_DP: "1"
+      DECODE_TP: "8"
+      TPU_RAIDEN_TRANSFER_PARALLELISM: "8"
+      STARTUP_TIMEOUT_S: "5400"
+      LOAD_FORMAT: "runai_streamer"
+      ENABLE_EP_WEIGHT_FILTER: "1"
+      MODEL_LOADER_MEMORY_LIMIT: "17179869184"
+      BENCH_NUM_PROMPTS: "10"
+      BENCH_MAX_CONCURRENCY: "2"
+      BENCH_INPUT_LEN: "1024"
+      BENCH_OUTPUT_LEN: "64"
+      DISAGG_PASSTHROUGH_ENV: "TPU_ACCELERATOR_TYPE VLLM_ENGINE_READY_TIMEOUT_S TOKENIZER LOAD_FORMAT ENABLE_EP_WEIGHT_FILTER MODEL_LOADER_MEMORY_LIMIT BENCH_NUM_PROMPTS BENCH_MAX_CONCURRENCY BENCH_INPUT_LEN BENCH_OUTPUT_LEN"
     commands:
-      - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          python3 examples/offline_inference.py \
-            --model Qwen/Qwen3-0.6B \
-            --max-model-len 256 \
-            --max-num-batched-tokens 256 \
-            --max-tokens 32'
-
-  # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
-  # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    commands:
-      - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+      - bash .buildkite/scripts/run_disagg_multihost.sh
+    artifact_paths:
+      - "perf_eval_results/**/*"
