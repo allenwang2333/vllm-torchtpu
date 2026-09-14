@@ -1,0 +1,105 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# One-off dev pipeline: the DSv4 nightly perf/eval steps from this branch,
+# without NIGHTLY. Not for merge. run_eval_flow.sh skips the database upload
+# off main, so nothing lands in BigQuery.
+#
+# HOW TO TRIGGER
+# vllm-torchtpu-dev -> "New Build" on this branch with, in the build env:
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_dsv4_dev.yml
+#   DSV4_MODEL=pro (default) | flash | both
+#
+# Traces go to gs://tpu-commons-ci/tmp/dsv4-dev/<build>/, not the nightly xprof
+# prefix: dev build numbers would collide with its <build> subdirectories.
+
+steps:
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: "[dev] deepseek-v4-pro-dp16-ep perf/eval + profile (TPU v7x-16)"
+    key: dsv4_pro_dev
+    if: 'build.env("DSV4_MODEL") == null || build.env("DSV4_MODEL") == "pro" || build.env("DSV4_MODEL") == "both"'
+    depends_on: build_docker
+    timeout_in_minutes: 600
+    agents:
+      queue: "tpu_v7x_16_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "1"
+    commands:
+      - |
+        # Every host's boot disk and container /dev/shm, every 2 min, so a
+        # failure shows whether a disk filled. Detached from the step's stdout.
+        zone=$$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $$NF}')
+        tpu=$$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/description)
+        workers=$$(gcloud compute tpus tpu-vm describe "$$tpu" --zone "$$zone" --format="value(networkEndpoints[].ipAddress)" | tr ';,' '  ' | cut -d' ' -f2-)
+        ssh_opts="-o StrictHostKeyChecking=no -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -i $$HOME/.ssh/id_rsa"
+        (
+          while true; do
+            echo "=== $$(date -u '+%F %T') UTC"
+            echo "head: $$(df -h / | tail -1) | $$(docker exec node df -h /dev/shm 2>/dev/null | tail -1)"
+            for ip in $$workers; do
+              echo "$$ip: $$(ssh $$ssh_opts "$$(whoami)@$$ip" 'df -h / | tail -1; docker exec node df -h /dev/shm 2>/dev/null | tail -1' 2>/dev/null | paste -sd'|')"
+            done
+            sleep 120
+          done
+        ) >> disk_usage.log 2>&1 < /dev/null &
+        sampler=$$!
+
+        rc=0
+        bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-pro-dp16-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-pro-dp16-ep || rc=$$?
+        [ "$$rc" -eq 0 ] || cp -r "$$HOME/persist/perf_eval_results"/. perf_eval_results/ || true
+
+        pkill -P "$$sampler" 2>/dev/null || true
+        kill "$$sampler" 2>/dev/null || true
+        cp disk_usage.log perf_eval_results/ || true
+
+        traces=perf_eval_results/deepseek-v4-pro-dp16-ep/profile
+        echo "xplane files: $$(find "$$traces" -name '*.xplane.pb' 2>/dev/null | wc -l)"
+        if [ -d "$$traces" ]; then
+          gcloud storage cp -r "$$traces" "gs://tpu-commons-ci/tmp/dsv4-dev/$$BUILDKITE_BUILD_NUMBER/pro/" && rm -rf "$$traces"
+        fi
+        exit $$rc
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "[dev] deepseek-v4-flash-dp8-ep perf/eval + profile (TPU v7x-8)"
+    key: dsv4_flash_dev
+    if: 'build.env("DSV4_MODEL") == "flash" || build.env("DSV4_MODEL") == "both"'
+    depends_on: build_docker
+    timeout_in_minutes: 360
+    agents:
+      queue: "tpu_v7x_8_queue"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+    commands:
+      - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash-0731/"
+      - |
+        rc=0
+        bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config deepseek-v4-flash-dp8-ep --run-lm-eval --results-dir /perf_eval_results/deepseek-v4-flash-dp8-ep || rc=$$?
+        traces=perf_eval_results/deepseek-v4-flash-dp8-ep/profile
+        echo "xplane files: $$(find "$$traces" -name '*.xplane.pb' 2>/dev/null | wc -l)"
+        if [ -d "$$traces" ]; then
+          gcloud storage cp -r "$$traces" "gs://tpu-commons-ci/tmp/dsv4-dev/$$BUILDKITE_BUILD_NUMBER/flash/" && rm -rf "$$traces"
+        fi
+        exit $$rc
+    artifact_paths:
+      - "perf_eval_results/**/*"
