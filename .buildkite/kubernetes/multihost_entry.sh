@@ -75,6 +75,28 @@ head_listening() {
   (exec 3<>"/dev/tcp/${HEAD_HOST}/${RAY_PORT}") 2>/dev/null && exec 3>&-
 }
 
+# How many Ray nodes the head can see, or 0 if it could not ask.
+#
+# The count comes back through a file rather than on stdout because Ray's C++
+# logging writes there the moment a driver attaches: a command substitution
+# around this captures some thousands of log lines with the digit lost among
+# them, and the numeric test on the result then fails as a malformed
+# comparison - which reads as "not enough nodes" for as long as the caller is
+# willing to wait.
+alive_nodes() {
+  local report="${TMPDIR:-/tmp}/ray_alive.$$"
+  rm -f "$report"
+  python3 -c "
+import ray
+ray.init(address='auto', logging_level='error')
+open('$report', 'w').write(str(sum(1 for n in ray.nodes() if n['Alive'])))
+" >/dev/null 2>&1
+  local alive
+  alive=$(cat "$report" 2>/dev/null)
+  rm -f "$report"
+  echo "${alive:-0}"
+}
+
 publish_results() {
   mkdir -p perf_eval_results
   cp -r /perf_eval_results/. perf_eval_results/ 2>/dev/null || true
@@ -119,15 +141,21 @@ run_head() {
   ray start --head --port="${RAY_PORT}" || return 1
 
   echo "--- Waiting for ${NUM_HOSTS} Ray nodes to be alive"
-  local deadline=$((SECONDS + 1800)) alive
+  local deadline=$((SECONDS + 1800)) alive reported=-1
   while :; do
-    alive=$(python3 -c "import ray; ray.init(address='auto', logging_level='error'); print(sum(1 for n in ray.nodes() if n['Alive']))" 2>/dev/null || echo 0)
-    if [ "${alive:-0}" -ge "$NUM_HOSTS" ]; then
+    alive=$(alive_nodes)
+    if [ "$alive" -ge "$NUM_HOSTS" ]; then
       echo "Ray cluster complete: ${alive} nodes."
       break
     fi
+    # Otherwise the wait is up to thirty silent minutes, which reads the same
+    # as a hang. Only on a change, so a slow host does not bury the log.
+    if [ "$alive" != "$reported" ]; then
+      echo "  ${alive}/${NUM_HOSTS} nodes alive"
+      reported="$alive"
+    fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-      echo "ERROR: Ray cluster incomplete after 30 minutes (alive=${alive:-0}/${NUM_HOSTS})"
+      echo "ERROR: Ray cluster incomplete after 30 minutes (alive=${alive}/${NUM_HOSTS})"
       ray status || true
       return 1
     fi
