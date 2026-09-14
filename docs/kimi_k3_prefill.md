@@ -51,7 +51,7 @@ transfer to a separate decode worker remain unverified for this configuration.
 The matching MLA entry uses 512 queries, eight KV pages, two query splits,
 and a 60 MiB VMEM limit. Upstream's unified pool produces 324-token pages
 (81 packed FP8 units), despite the command-line block size of 256. The exact
-8K mixed key is tuned; smaller buckets retain their existing settings.
+8K mixed key is tuned; the subsequent sweep below adds smaller prefill keys.
 The isolated operator improved from 26.227 to 1.950 ms. Random-input tests with
 zero/1024 cached tokens matched valid cache writes exactly and had at most
 2.69% sampled relative L2 error against FP32 attention.
@@ -62,6 +62,22 @@ fixed random router bias, and random prompt. Source hashes, raw timings,
 profiles, tuning results, and reproduction details are in
 `tpu-exp/docs/K3_PREFILL_REBASE_20260914.md` and
 `tpu-exp/results/production-port/rebase-20260914-tuned/`.
+
+A subsequent PR-only sweep added matching MLA entries for smaller prefill
+buckets, using the same dummy fixture and runtime:
+
+| Prompt | HTTP median | Device median |
+| --- | ---: | ---: |
+| 1K | 190.380 ms | 183.210 ms |
+| 2K | 312.554 ms | 303.015 ms |
+| 4K | 559.657 ms | 551.247 ms |
+
+These buckets use the general TP path and fused KDA; the SP/Mega specialization
+is guarded at 8K. Thus 4K is slower than the specialized 8K path. On a
+representative core, 4K spends 155.642 ms in Attention Residual and 148.006 ms
+in all-reduces, versus 9.188 ms in tuned MLA. This is an implementation limit,
+not a fundamental restriction on sequence parallelism. The full report and
+artifacts are in `tpu-exp/docs/K3_PREFILL_SIZES_20260914.md`.
 
 | Historical configuration | 93-layer, 8K result | Qualification |
 | --- | --- | --- |

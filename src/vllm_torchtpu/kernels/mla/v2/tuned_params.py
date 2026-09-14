@@ -1199,6 +1199,69 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
         decode_batch_size=1,
         q_split=2,
     ),
+    # Kimi K3 TP32 1024-token prefill, unified pool.
+    TuningKey(
+        case='mixed',
+        max_num_tokens=1024,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype='float8_e4m3fn',
+        q_dtype='bfloat16',
+        page_size_per_kv_packing=81,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=32,
+    ):
+    TunableParams(
+        num_kv_pages_per_block=4,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    # Kimi K3 TP32 2048-token prefill, unified pool.
+    TuningKey(
+        case='mixed',
+        max_num_tokens=2048,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype='float8_e4m3fn',
+        q_dtype='bfloat16',
+        page_size_per_kv_packing=81,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=32,
+    ):
+    TunableParams(
+        num_kv_pages_per_block=8,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
+    # Kimi K3 TP32 4096-token prefill, unified pool.
+    TuningKey(
+        case='mixed',
+        max_num_tokens=4096,
+        actual_num_q_heads=3,
+        actual_lkv_dim=512,
+        actual_r_dim=64,
+        kv_dtype='float8_e4m3fn',
+        q_dtype='bfloat16',
+        page_size_per_kv_packing=81,
+        kv_packing=4,
+        max_num_seqs=8,
+        pages_per_seq=32,
+    ):
+    TunableParams(
+        num_kv_pages_per_block=8,
+        num_queries_per_block=512,
+        vmem_limit_bytes=62914560,
+        decode_batch_size=1,
+        q_split=2,
+    ),
 }
 
 
