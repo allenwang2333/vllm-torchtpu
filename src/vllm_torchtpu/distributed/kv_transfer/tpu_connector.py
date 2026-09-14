@@ -405,7 +405,13 @@ def _routed_destination_spans_supported() -> bool:
         from tpu_sync.api.torch import reshard_client as _reshard_client
 
         return hasattr(_reshard_client, "_dst_unit_ordinal")
-    except (ImportError, OSError):
+    except (ImportError, OSError) as exc:
+        # An ABI mismatch between the tpu-sync extension and the installed
+        # torch_tpu surfaces here as an import failure; say so instead of
+        # letting the caller report a missing feature.
+        logger.warning(
+            "tpu_sync.api.torch.reshard_client failed to import; treating "
+            "destination-routed byte spans as unsupported: %s", exc)
         return False
 
 
