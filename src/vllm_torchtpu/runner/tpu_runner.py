@@ -3745,6 +3745,9 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
+        from vllm_torchtpu.layers.adapter import norm_weight_hoist
+        norm_weight_hoist.install_if_enabled(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
