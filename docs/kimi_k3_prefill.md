@@ -34,10 +34,34 @@ disaggregation; KV-cache and KDA-state outputs must remain valid for handoff.
 
 ## Validation and performance
 
-The rebased Mega KDA + paged MLA combination has **not completed real-weight
-full-model validation or timing**. That work was paused for collective
-microbenchmarks. End-to-end state transfer to a separate decode worker also
-remains unverified.
+The September 14 rebase was benchmarked with the full 93-layer model, dummy
+weights, and the same tuned paged MLA configuration on both revisions:
+
+| Measurement | Main `0adbd1359` | SP PR | Main / PR |
+| --- | ---: | ---: | ---: |
+| HTTP median, 20 requests | 847.175 ms | 341.090 ms | 2.484× |
+| Device median, slowest of 32 cores | 841.127 ms | 331.992 ms | 2.534× |
+| HBM/core before KV allocation | 63.92 GiB | 78.13 GiB | — |
+
+Two warmups precede HTTP timing; device timing uses three separate profiled
+requests. Both runs passed a four-token cached-generation smoke check with
+finite log probabilities. Real-checkpoint correctness and end-to-end state
+transfer to a separate decode worker remain unverified for this configuration.
+
+The matching MLA entry uses 512 queries, eight KV pages, two query splits,
+and a 60 MiB VMEM limit. Upstream's unified pool produces 324-token pages
+(81 packed FP8 units), despite the command-line block size of 256. The exact
+8K mixed key is tuned; smaller buckets retain their existing settings.
+The isolated operator improved from 26.227 to 1.950 ms. Random-input tests with
+zero/1024 cached tokens matched valid cache writes exactly and had at most
+2.69% sampled relative L2 error against FP32 attention.
+
+The measured PR source was `b3e617cf0` with this same tuning entry applied;
+main received an identical entry. Both used the same external dummy fixture,
+fixed random router bias, and random prompt. Source hashes, raw timings,
+profiles, tuning results, and reproduction details are in
+`tpu-exp/docs/K3_PREFILL_REBASE_20260914.md` and
+`tpu-exp/results/production-port/rebase-20260914-tuned/`.
 
 | Historical configuration | 93-layer, 8K result | Qualification |
 | --- | --- | --- |
