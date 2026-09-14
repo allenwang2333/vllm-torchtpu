@@ -320,6 +320,7 @@ def sharded_ragged_paged_attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    chunk_prefill_size: int | None = None,
 ):
     """Shards along KV heads."""
 
@@ -389,9 +390,44 @@ def sharded_ragged_paged_attention(
 
         block_kwargs["d_block_sizes"] = _capped(rpa_default.RpaCase.DECODE)
         block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
-        if attention_chunk_size is not None:
+        if attention_chunk_size is not None or chunk_prefill_size is not None:
             block_kwargs["p_block_sizes"] = _capped(
                 rpa_default.RpaCase.PREFILL)
+
+    # Speculative verify lane: size the prefill block to the window. The kernel
+    # already clamps its compute width to `min(bq_sz, static_q_len)`
+    # (`v3/kernel.py:887`), but the un-clamped `bq_sz` still sizes the q/o/l/m/
+    # acc scratch buffers, and the PREFILL heuristic picks a `bq_sz` meant for
+    # real chunked prefill -- hundreds of tokens against a window of 1+K. This
+    # runs on the sharded path too, which never enters the block above.
+    #
+    # Passing global (pre-shard_map) head counts is safe here: every PREFILL
+    # block size depends only on the q:kv head ratio, max_num_tokens and
+    # pages_per_seq, and TP divides q and kv heads by the same factor. DECODE
+    # would not be safe this way -- its bkv_sz scales with the per-shard kv head
+    # count -- which is why only PREFILL is set outside the local-path block.
+    if chunk_prefill_size is not None and not use_hd64:
+        page_size = kv_cache.shape[page_size_axis]
+        max_num_seqs = kv_lens.shape[0]
+        base = rpa_default.get_default_block_sizes(
+            q.dtype,
+            kv_cache.dtype,
+            q.shape[1],  # actual_num_q_heads
+            k.shape[1],  # actual_num_kv_heads
+            q.shape[2],  # head_dim
+            page_size,
+            q.shape[0],  # max_num_tokens
+            max_num_seqs,
+            page_indices.shape[0] // max_num_seqs,  # pages_per_seq
+            case=rpa_default.RpaCase.PREFILL,
+        )
+        # Keep any cap the draft-VMEM path above already applied to bkv.
+        prev = block_kwargs.get("p_block_sizes")
+        bkv_sz = min(base["bkv_sz"], prev[1]) if prev else base["bkv_sz"]
+        bkv_csz = min(base["bkv_csz"], bkv_sz)
+        bq_sz = min(base["bq_sz"], chunk_prefill_size)
+        bq_csz = min(base["bq_csz"], bq_sz)
+        block_kwargs["p_block_sizes"] = (bq_sz, bkv_sz, bq_csz, bkv_csz)
 
     def _ragged_paged_attention(*args):
         return func(
@@ -404,6 +440,9 @@ def sharded_ragged_paged_attention(
             soft_cap=soft_cap,
             skip_kv_update=skip_kv_update,
             use_causal_mask=use_causal_mask,
+            **({
+                "chunk_prefill_size": chunk_prefill_size
+            } if chunk_prefill_size is not None else {}),
             **layout_kwargs,
             **block_kwargs,
         )
@@ -544,6 +583,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    chunk_prefill_size: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -589,6 +629,7 @@ def attention(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
+        chunk_prefill_size=chunk_prefill_size,
     )
 
     return kv_cache, output

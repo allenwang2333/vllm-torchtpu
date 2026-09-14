@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
+    TPU_SPEC_VERIFY_LANE: bool = True
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
 
@@ -456,6 +457,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Refer to `vllm_torchtpu.offload.block_major_layout` for contract details.
     "VLLM_TPU_BLOCK_MAJOR_KV":
     env_bool("VLLM_TPU_BLOCK_MAJOR_KV"),
+    # Route speculative verify windows through RPA v3's static-q_len prefill
+    # lane instead of the fully-ragged mixed lane. On by default; set to 0 to
+    # fall back to the old all-mixed routing. See
+    # `vllm_torchtpu.layers.vllm.attention.resolve_spec_verify_lane_width`.
+    "TPU_SPEC_VERIFY_LANE":
+    env_bool("TPU_SPEC_VERIFY_LANE", default=True),
 }
 
 

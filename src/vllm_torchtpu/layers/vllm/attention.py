@@ -113,6 +113,65 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
     return min_page_size
 
 
+def resolve_spec_verify_lane_width(vllm_config) -> int | None:
+    """Static query width of the speculative verify lane, or None to disable.
+
+    A verify window is `1 + num_speculative_tokens` query tokens attending over
+    the entire cached history. That is exactly the shape RPA v3's PREFILL case
+    is built for: the q-block loop is sized from a static `q_len` while the KV
+    loop stays bounded by `kv_len` (`v3/kernel.py:939-943`). Routing verify
+    windows there gets them off the fully-ragged MIXED path, which is what
+    makes per-step spec cost blow up at high concurrency.
+
+    Both sides of that routing deliberately read this one function: the runner
+    decides from it whether to open the prefill segment of
+    `request_distribution`, and `_build_rpa_kernel` decides from it whether to
+    pass `chunk_prefill_size` down. They must never disagree -- the default v3
+    kernel skips the prefill lane entirely when `chunk_prefill_size is None`
+    (`v3/kernel.py:1905`), so an opened-but-undispatched segment would leave
+    those requests with no attention computed at all, silently. Every condition
+    below is therefore config-derived, never derived from per-step metadata.
+
+    PRECONDITION: the model must already be loaded. The backend check goes
+    through `_find_non_ssm_backend`, which reads the *instantiated* attention
+    layers out of the forward context and returns None when there are none
+    yet. Called from `TPUModelRunner.__init__` -- i.e. before `load_model` --
+    it therefore answers None for every config, and the verify lane silently
+    never opens. Callers must defer to first use; see
+    `TPUModelRunner._spec_verify_lane_width`.
+    """
+    if vllm_config is None or not envs.TPU_SPEC_VERIFY_LANE:
+        return None
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is None:
+        return None
+    num_spec = getattr(spec_config, "num_speculative_tokens", 0) or 0
+    if num_spec < 1:
+        return None
+
+    # Only FLASH_ATTN reaches the v3 kernels, the ones with a cache-reading
+    # static-q_len lane. CUSTOM (batched RPA) rejects `chunk_prefill_size`
+    # outright and zeroes `bkv_p_cache` for PREFILL, so its prefill lane cannot
+    # serve a verify window at all. `get_name()` rather than an isinstance
+    # check: the CUSTOM backend subclasses the FLASH_ATTN one.
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+    backend_cls = TpuPlatform._find_non_ssm_backend(vllm_config)
+    if backend_cls is None or backend_cls.get_name() != "FLASH_ATTN":
+        return None
+
+    # PCP streaming and the block-major bundle route to different kernel
+    # entries that this plumbing does not cover. Both are excluded from config
+    # so the runner reaches the same answer without seeing a forward pass.
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if (parallel_config is not None
+            and parallel_config.prefill_context_parallel_size > 1):
+        return None
+    if envs.VLLM_TPU_BLOCK_MAJOR_KV:
+        return None
+
+    return 1 + num_spec
+
+
 def _pallas_rpa_kernel_impl(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -137,6 +196,7 @@ def _pallas_rpa_kernel_impl(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     metadata = AttentionMetadata(
         input_positions=
@@ -166,6 +226,7 @@ def _pallas_rpa_kernel_impl(
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        chunk_prefill_size=chunk_prefill_size,
     )
     return new_kv_cache, outputs
 
@@ -190,6 +251,7 @@ def _pallas_rpa_kernel_default(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -216,6 +278,7 @@ def _pallas_rpa_kernel_default(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        chunk_prefill_size=chunk_prefill_size,
     )
 
 
@@ -246,6 +309,7 @@ def _pallas_rpa_kernel_local(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    chunk_prefill_size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -253,6 +317,11 @@ def _pallas_rpa_kernel_local(
     shard_map (`shard=False`), so the output lands on the worker's own device
     instead of a global chip-0 partition. Also caps the KV-fetch block via
     `kv_block_cap` for speculative decoding draft model.
+
+    Takes `chunk_prefill_size` for the same reason the default entry does: the
+    draft's first pass reuses the target's `query_start_loc` and
+    `request_distribution` verbatim (`eagle3.py:924-925`), so if the target
+    opened a verify lane the draft sees it too and must dispatch it.
     """
     return _pallas_rpa_kernel_impl(
         kv_cache,
@@ -276,6 +345,7 @@ def _pallas_rpa_kernel_local(
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
         use_causal_mask=use_causal_mask,
+        chunk_prefill_size=chunk_prefill_size,
     )
 
 
@@ -703,9 +773,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
         max_model_len = (vllm_config.model_config.max_model_len
                          if use_pcp_streaming and vllm_config is not None else
                          None)
+        # Static q_len for the speculative verify lane. Must match what the
+        # runner used to build `request_distribution`; see
+        # `resolve_spec_verify_lane_width`. The PCP branch below does not carry
+        # it, and the resolver already returns None when PCP is configured.
+        chunk_prefill_size = resolve_spec_verify_lane_width(vllm_config)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
                       k_scale, v_scale, use_pcp_streaming,
-                      cp_kv_cache_interleave_size, max_model_len)
+                      cp_kv_cache_interleave_size, max_model_len,
+                      chunk_prefill_size)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
@@ -718,11 +794,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # layers of an otherwise-identical config.
         mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
             ctx.mesh, use_pcp_streaming)
-        registry_key = (self._kernel_op_prefix,
-                        self.sliding_window, self.scale, self.logits_soft_cap,
-                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
-                        use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask)
+        registry_key = (self._kernel_op_prefix, self.sliding_window,
+                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
+                        k_scale, v_scale, skip_kv_update, use_pcp_streaming,
+                        cp_kv_cache_interleave_size, max_model_len,
+                        self.use_causal_mask, chunk_prefill_size)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
             self._kernel_config_cache[config_key] = existing
@@ -745,6 +821,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
+            # Fail here, not at the first forward: the runner has already
+            # decided to open the verify segment on the strength of the same
+            # resolver, and an entry that silently drops `chunk_prefill_size`
+            # would leave that segment undispatched and those requests
+            # unattended rather than raising.
+            if (chunk_prefill_size is not None and "chunk_prefill_size"
+                    not in inspect.signature(self._kernel_entry).parameters):
+                raise RuntimeError(
+                    f"{self._kernel_entry.__name__} cannot take "
+                    "chunk_prefill_size, but the speculative verify lane is "
+                    "enabled. Either plumb it through that entry or exclude "
+                    "its backend in resolve_spec_verify_lane_width().")
             # Prepare wrapper function with static arguments.
             wrapped_fn = functools.partial(
                 self._kernel_entry,
@@ -761,6 +849,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "kv_layout": self.kv_layout
                 } if "kv_layout" in inspect.signature(
                     self._kernel_entry).parameters else {}),
+                **({
+                    "chunk_prefill_size": chunk_prefill_size
+                } if chunk_prefill_size is not None else {}),
             )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.

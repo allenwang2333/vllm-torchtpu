@@ -84,9 +84,9 @@ from vllm_torchtpu.layers.common.attention_metadata import (
 from vllm_torchtpu.layers.common.sequence_layout import (
     SequenceLayoutKind, create_sequence_layout_planner)
 from vllm_torchtpu.layers.vllm import token_padding
-from vllm_torchtpu.layers.vllm.attention import (TPU_STR_DTYPE_TO_TORCH_DTYPE,
-                                                 PallasAttentionBackend,
-                                                 PallasMLAttentionBackend)
+from vllm_torchtpu.layers.vllm.attention import (
+    TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend,
+    PallasMLAttentionBackend, resolve_spec_verify_lane_width)
 from vllm_torchtpu.layers.vllm.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.vllm.quantization import get_tpu_quantization_config
@@ -447,6 +447,11 @@ def _warn_if_kv_cache_is_padded(
         num_kv_heads, head_size, dtype, backend.get_name())
 
 
+# Sentinel for "the verify-lane width has not been resolved yet", which a plain
+# None cannot express: None is also the answer that disables the lane.
+_UNSET_LANE_WIDTH = object()
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -455,6 +460,30 @@ def _warn_if_kv_cache_is_padded(
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
+
+    @property
+    def _spec_verify_lane_width(self) -> int | None:
+        """Static q_len of the RPA prefill lane when it carries verify windows.
+
+        Resolved on first use rather than in `__init__`, and then cached. The
+        resolver's backend check reads the instantiated attention layers, which
+        do not exist until `load_model` has run, so asking during `__init__`
+        answers None for every config and quietly leaves the lane shut. Both
+        real call sites -- the `request_distribution` write and the kernel
+        build -- run after the model is loaded, so both see the same answer.
+        """
+        if self._spec_verify_lane_width_cached is _UNSET_LANE_WIDTH:
+            width = resolve_spec_verify_lane_width(self.vllm_config)
+            self._spec_verify_lane_width_cached = width
+            if width is not None:
+                logger.info(
+                    "Speculative verify windows routed to the RPA prefill "
+                    "lane (static q_len=%d)", width)
+            elif self.speculative_config is not None:
+                logger.info(
+                    "Speculative verify lane disabled; verify windows stay "
+                    "on the ragged mixed attention path")
+        return self._spec_verify_lane_width_cached  # type: ignore[return-value]
 
     @property
     def _is_async_drafter(self) -> bool:
@@ -806,6 +835,10 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        # Resolved lazily by the `_spec_verify_lane_width` property below;
+        # `_UNSET_LANE_WIDTH` distinguishes "not asked yet" from a real None.
+        self._spec_verify_lane_width_cached: int | None | object = (
+            _UNSET_LANE_WIDTH)
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
         self.structured_decoding_manager = StructuredDecodingManager(self)
@@ -1209,13 +1242,23 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        # A verify window is at most 1 + num_speculative_tokens queries. Both
+        # consumers of the windowed segment run it at that fixed width -- RPA's
+        # prefill lane via `chunk_prefill_size`, GDN's windowed mode via its own
+        # bound -- and RPA sizes its q-block loop from that width alone
+        # (`v3/kernel.py:887-888`), so anything wider would have its tail
+        # silently dropped. Scheduling should never produce a wider one; this
+        # keeps a stray case on the ragged mixed path instead of corrupting it.
+        max_window = (1 + self.speculative_config.num_speculative_tokens
+                      if self.speculative_config is not None else 1)
 
         def segment(req_id: str) -> int:
             # 0: 1-token decode, 1: speculative verify window,
             # 2: prefill/mixed.
-            if scheduler_output.num_scheduled_tokens[req_id] == 1:
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            if num_tokens == 1:
                 return 0
-            if req_id in spec_decode_tokens:
+            if req_id in spec_decode_tokens and num_tokens <= max_window:
                 return 1
             return 2
 
@@ -3236,21 +3279,33 @@ class TPUModelRunner(GPUModelRunner):
                         self.device, non_blocking=True)
 
             # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
+            # [decode_end, prefill_end, mixed_end] over a batch already sorted
+            # [decode][verify][prefill/mixed] by `_reorder_batch_for_rpa`.
             chunk_num_decode = max(
                 0, min(num_decode_reqs - start_index, num_reqs))
+            # The prefill segment runs a static q_len against the full cached
+            # history, which is exactly a speculative verify window. Giving the
+            # windows that lane keeps them off the fully-ragged mixed path.
+            # Without it `num_decode_reqs` counts 1-token decodes only, so a
+            # spec step routes its entire batch through mixed.
+            #
+            # Only when `_spec_verify_lane_width` is set: the same resolver
+            # decides whether the kernel is given `chunk_prefill_size`, and the
+            # default v3 kernel skips the prefill lane outright without it
+            # (`v3/kernel.py:1905`). Opening a segment nothing dispatches would
+            # silently leave those requests with no attention computed.
+            chunk_prefill_end = chunk_num_decode
+            if self._spec_verify_lane_width is not None:
+                chunk_prefill_end = max(
+                    chunk_num_decode,
+                    min(num_windowed_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
-            self._request_distribution_cpu[1] = chunk_num_decode
+            self._request_distribution_cpu[1] = chunk_prefill_end
             self._request_distribution_cpu[2] = num_reqs
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True)
 
             if self._log_request_distribution:
-                # The decode segment is sized from num_decode_reqs, which
-                # counts 1-token decodes only. A speculative verify window is
-                # 1+K tokens, so this is where the whole batch is expected to
-                # fall out of the decode segment and onto the mixed path.
                 # Read off the host tensor, never the device one: a .cpu() here
                 # would sync the step being measured.
                 signature = (num_reqs, num_decode_reqs, num_windowed_reqs,
@@ -3296,7 +3351,11 @@ class TPUModelRunner(GPUModelRunner):
             # same base tensor, matching the traced graph structure.
             combined = self._combined_request_distribution_cpu
             combined[0] = chunk_num_decode
-            combined[1] = chunk_num_decode
+            # Same verify lane as the non-hybrid branch above; this rebuild
+            # replaces that tensor, so it has to reach the same answer.
+            combined[1] = (max(chunk_num_decode, chunk_num_windowed)
+                           if self._spec_verify_lane_width is not None else
+                           chunk_num_decode)
             combined[2] = num_reqs
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
