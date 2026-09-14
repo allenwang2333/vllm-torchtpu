@@ -75,6 +75,10 @@ if TYPE_CHECKING:
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
     TPU_KV_PREFILL_SUBMIT: bool = False
     TPU_KV_PREFILL_SUBMIT_FALLBACK_S: float = 10.0
+    TPU_HOST_BURN_US: int = 0
+    TPU_HOST_STEP_LOG_EVERY: int = 0
+    TPU_HOST_BURN_FILE: str = ""
+    TPU_HOST_BURN_RANK: int = 0
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
@@ -529,6 +533,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recovers here instead of hanging until the 120 s registration timeout.
     "TPU_KV_PREFILL_SUBMIT_FALLBACK_S":
     lambda: float(os.getenv("TPU_KV_PREFILL_SUBMIT_FALLBACK_S") or "10.0"),
+
+    # Calibration probe, off by default and never set in production. Occupies
+    # the interpreter for this many microseconds at the top of every non-empty
+    # model runner step, holding the GIL the whole time.
+    #
+    # Moving the Stage-3 coordination call onto the producer put roughly 2 ms
+    # per request of Python on the prefill host and cost 0.65% of throughput at
+    # concurrency 32. Whether those two facts are related depends on how much
+    # slack the runner loop has, which nothing measures today. Injecting a
+    # known dose and reading the slope of step period against it measures that
+    # slack directly: slope 1 means the host is the constraint, slope 0 means
+    # the chip is and host work is free.
+    "TPU_HOST_BURN_US":
+    lambda: int(os.getenv("TPU_HOST_BURN_US") or "0"),
+
+    # Log step period every N steps. Pairs with TPU_HOST_BURN_US to read the
+    # slope, and is useful alone as a baseline of what a step costs.
+    "TPU_HOST_STEP_LOG_EVERY":
+    lambda: int(os.getenv("TPU_HOST_STEP_LOG_EVERY") or "0"),
+
+    # File holding a replacement burn dose, re-read at each report boundary so
+    # one server can sweep several doses. Comparing doses across separate
+    # launches would compare across compile caches and load ramps too.
+    "TPU_HOST_BURN_FILE":
+    lambda: os.getenv("TPU_HOST_BURN_FILE", ""),
+
+    # Which slice-global rank burns. Stage 5 puts its work on one worker, so
+    # burning on all of them would measure a load the feature never creates.
+    "TPU_HOST_BURN_RANK":
+    lambda: int(os.getenv("TPU_HOST_BURN_RANK") or "0"),
     # Evict host page cache for checkpoint weight files via posix_fadvise
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE":

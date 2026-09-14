@@ -8,6 +8,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import json
 import math
 import os
 import time
@@ -246,6 +247,101 @@ def _substitute_placeholder_token(
 
 
 logger = init_logger(__name__)
+
+
+class _HostSlackProbe:
+    """Measures how much of a step the host, rather than the chip, decides.
+
+    The question is whether Python time on this host converts into lost
+    throughput. Step period answers it without needing to decompose a step:
+    inject a known dose with TPU_HOST_BURN_US and see how much of it lands on
+    the period. All of it means the loop is host-bound and the dose displaced
+    real work; none of it means the loop was waiting on the chip anyway and
+    the dose fit in slack that was already there.
+
+    Period rather than wall time inside the call, because execute_model and
+    sample_tokens are two calls and the gap between them belongs to the step
+    as much as either does.
+
+    TPU_HOST_BURN_FILE names a file holding a replacement dose, re-read at
+    each report boundary. A server takes minutes to come up, and comparing
+    doses across separate launches means comparing across different compile
+    caches and different load ramps. Reading the dose live lets one server
+    run 0, 2000, 0, 4000, 0 in sequence, so the zero windows bracket every
+    treatment and drift shows up as disagreement between them.
+
+    Only TPU_HOST_BURN_RANK burns, but every rank reports. Stage 5 adds its
+    work to one worker out of eight, so burning everywhere would measure a
+    load the feature never creates. Reporting everywhere is what makes the
+    result interesting: if the ranks are held together by collectives, one
+    rank's Python shows up in all eight periods, and the cost of a single
+    worker's extra millisecond is eight times what it looks like.
+    """
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+        self.burn_us = int(envs.TPU_HOST_BURN_US)
+        self.log_every = int(envs.TPU_HOST_STEP_LOG_EVERY)
+        self.dose_file = str(envs.TPU_HOST_BURN_FILE or "")
+        self.burns_here = rank == int(envs.TPU_HOST_BURN_RANK)
+        self.enabled = bool(self.burn_us or self.log_every or self.dose_file)
+        self._last: float | None = None
+        self._periods: list[float] = []
+        self._steps = 0
+
+    def _reload_dose(self) -> None:
+        """Picks up a new dose between windows, ignoring a missing file."""
+        if not self.dose_file:
+            return
+        try:
+            with open(self.dose_file) as handle:
+                self.burn_us = int(handle.read().strip() or "0")
+        except (OSError, ValueError):
+            pass
+
+    def burn(self) -> None:
+        """Occupy the interpreter, holding the GIL, for the configured dose."""
+        if self.burn_us <= 0 or not self.burns_here:
+            return
+        deadline = time.perf_counter() + self.burn_us / 1e6
+        while time.perf_counter() < deadline:
+            pass
+
+    def tick(self, scheduled_tokens: int) -> None:
+        now = time.perf_counter()
+        last, self._last = self._last, now
+        if last is not None:
+            self._periods.append(now - last)
+        self._steps += 1
+        if not self.log_every or self._steps % self.log_every:
+            return
+        periods = sorted(self._periods)
+        self._periods = []
+        if not periods:
+            return
+        n = len(periods)
+        # A period that spans a gap in the load measures the client, not the
+        # loop, and one such gap moves the mean more than the whole effect
+        # being looked for. The trimmed mean drops the outer tenth at each
+        # end, which removes those without needing a threshold picked by eye.
+        lo, hi = int(n * 0.1), max(int(n * 0.9), int(n * 0.1) + 1)
+        trimmed = periods[lo:hi]
+        record = {
+            "event": "host_slack_step_period",
+            "rank": self.rank,
+            "burn_us": self.burn_us,
+            "burns_here": self.burns_here,
+            "steps": self._steps,
+            "n": n,
+            "trimmed_ms": round(sum(trimmed) / len(trimmed) * 1000, 4),
+            "mean_ms": round(sum(periods) / n * 1000, 4),
+            "p50_ms": round(periods[n // 2] * 1000, 4),
+            "p90_ms": round(periods[int(n * 0.9)] * 1000, 4),
+            "min_ms": round(periods[0] * 1000, 4),
+            "scheduled_tokens": scheduled_tokens,
+        }
+        logger.info("%s", json.dumps(record, sort_keys=True))
+        self._reload_dose()
 
 
 def _spec_warmup_all_token_ids(
@@ -3476,6 +3572,13 @@ class TPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
+        probe = getattr(self, "_host_slack_probe", None)
+        if probe is None:
+            probe = self._host_slack_probe = _HostSlackProbe(
+                self._profiler_rank)
+        if probe.enabled and scheduler_output.total_num_scheduled_tokens:
+            probe.tick(scheduler_output.total_num_scheduled_tokens)
+            probe.burn()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:

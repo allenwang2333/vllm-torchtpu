@@ -331,6 +331,7 @@ class _DestinationCollector:
     """
 
     _MAX_HELD = 4096
+    _REPORT_EVERY = 200
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -338,6 +339,17 @@ class _DestinationCollector:
         self._url: Optional[str] = None
         self._started = False
         self._thread: Optional[threading.Thread] = None
+        # This thread shares a GIL with the scheduler, so what matters is not
+        # how long a poll takes but how much of that time the interpreter is
+        # actually held. urlopen gives the GIL up while it waits on the socket;
+        # decoding and merging the reply do not. Stage 5 left about half its
+        # measured cost unaccounted for, and this thread is the only new work
+        # on the prefill host that submit_ms cannot see, so the split is the
+        # number that decides whether it is the culprit.
+        self._polls = 0
+        self._busy_s = 0.0
+        self._wait_s = 0.0
+        self._since = time.perf_counter()
 
     def ensure_started(self, url: str) -> None:
         """Starts polling once the first request has named the proxy."""
@@ -362,22 +374,52 @@ class _DestinationCollector:
         # rather than a thread wedged on a dead socket.
         timeout = 30.0
         while True:
+            t0 = time.perf_counter()
             try:
                 with urllib.request.urlopen(url, timeout=timeout) as resp:
-                    payload = json.loads(resp.read().decode())
+                    raw = resp.read()
+                t1 = time.perf_counter()
+                payload = json.loads(raw.decode())
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 logger.warning("Destination collection from %s failed: %s",
                                url, exc)
                 time.sleep(1.0)
                 continue
             entries = payload.get("entries") or {}
-            if not entries:
-                continue
-            with self._lock:
-                for req_id, entry in entries.items():
-                    self._entries[req_id] = entry
-                while len(self._entries) > self._MAX_HELD:
-                    self._entries.popitem(last=False)
+            if entries:
+                with self._lock:
+                    for req_id, entry in entries.items():
+                        self._entries[req_id] = entry
+                    while len(self._entries) > self._MAX_HELD:
+                        self._entries.popitem(last=False)
+            self._report(t0, t1, len(entries))
+
+    def _report(self, t0: float, t1: float, n_entries: int) -> None:
+        """Accumulates one poll and logs the running rate periodically."""
+        now = time.perf_counter()
+        self._polls += 1
+        self._wait_s += t1 - t0
+        self._busy_s += now - t1
+        if self._polls % self._REPORT_EVERY:
+            return
+        span = max(now - self._since, 1e-9)
+        every = self._REPORT_EVERY
+        # busy_frac is the fraction of wall time this thread holds the GIL,
+        # which is the quantity that competes with the scheduler.
+        record = {
+            "event": "kv_destination_collector_rate",
+            "polls": self._polls,
+            "window_s": round(span, 3),
+            "polls_per_s": round(every / span, 2),
+            "busy_frac": round(self._busy_s / span, 5),
+            "busy_ms_per_poll": round(self._busy_s / every * 1000, 4),
+            "wait_ms_per_poll": round(self._wait_s / every * 1000, 3),
+            "last_entries": n_entries,
+        }
+        logger.info("%s", json.dumps(record, sort_keys=True))
+        self._busy_s = 0.0
+        self._wait_s = 0.0
+        self._since = now
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -3637,6 +3679,10 @@ class TPURaidenConnectorWorker:
         dst_params = getattr(req_meta, "dst_params", None)
         if not dst_params:
             return
+        # Everything up to the queue put runs on the model runner thread, so
+        # it is the only part of stage 5 that can displace prefill work
+        # directly. submit_ms does not include it.
+        build_start = time.perf_counter()
         try:
             src_units = [
                 self._new_raiden_id(self._raiden_work_unit_fields(rank))
@@ -3689,16 +3735,30 @@ class TPURaidenConnectorWorker:
                 req_id, uuid, exc)
             return
 
+        queued_at = time.perf_counter()
+        build_ms = (queued_at - build_start) * 1000
+
         def _submit() -> None:
-            self._run_producer_transfer(req_id, uuid, num_tokens, facade,
-                                        call_kwargs)
+            self._run_producer_transfer(req_id,
+                                        uuid,
+                                        num_tokens,
+                                        facade,
+                                        call_kwargs,
+                                        build_ms=build_ms,
+                                        queued_at=queued_at)
 
         self._stage3_submit_queue.put(_submit)
         self._ensure_stage3_submit_workers()
 
-    def _run_producer_transfer(self, req_id: str, uuid: int, num_tokens: int,
-                               facade: Any, call_kwargs: dict[str,
-                                                              Any]) -> None:
+    def _run_producer_transfer(self,
+                               req_id: str,
+                               uuid: int,
+                               num_tokens: int,
+                               facade: Any,
+                               call_kwargs: dict[str, Any],
+                               *,
+                               build_ms: float = 0.0,
+                               queued_at: Optional[float] = None) -> None:
         """Runs one producer-initiated coordination RPC on a submit worker.
 
         Failure is logged and dropped rather than propagated. There is no
@@ -3707,6 +3767,10 @@ class TPURaidenConnectorWorker:
         the latency the feature was trying to save and nothing else.
         """
         start = time.perf_counter()
+        # How long this sat behind other requests. With four submit workers a
+        # burst of 32 should show near zero; anything else says the workers
+        # are the queue and stage 5 serialises where it looks parallel.
+        queue_ms = 0.0 if queued_at is None else (start - queued_at) * 1000
         try:
             if self._start_stage3_transfer_with_d5_retry(
                     facade, **call_kwargs) is not True:
@@ -3726,6 +3790,8 @@ class TPURaidenConnectorWorker:
                     "uuid": uuid,
                     "num_tokens": num_tokens,
                     "submit_ms": (time.perf_counter() - start) * 1000,
+                    "build_ms": round(build_ms, 4),
+                    "queue_ms": round(queue_ms, 4),
                     "rank": self.tp_rank,
                 },
                 sort_keys=True))
