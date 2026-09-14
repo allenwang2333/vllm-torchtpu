@@ -74,6 +74,11 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
+        if os.environ.get("TPU_WORKER_HOSTNAMES", "").startswith("WARNING"):
+            os.environ.pop("TPU_WORKER_HOSTNAMES", None)
+        if os.environ.get("TPU_HOST_BOUNDS") in ("1,2,1", "1,2,2", "2,2,1"):
+            os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
+        os.environ.setdefault("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
