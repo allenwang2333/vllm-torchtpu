@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -486,6 +487,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS":
     env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # A JSON table giving, per MoE layer, the global experts each
+    # expert-parallel rank holds; empty keeps the checkpoint's order.
+    "TPU_EXPERT_PLACEMENT":
+    lambda: os.getenv("TPU_EXPERT_PLACEMENT", ""),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
