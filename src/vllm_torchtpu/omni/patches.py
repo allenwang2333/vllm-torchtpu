@@ -219,6 +219,34 @@ def patch_deploy_config_loader() -> None:
         if getattr(sc, "_tpu_patched", False):
             return
 
+        def _inject_tpu_stages(deploy: Any) -> None:
+            if not hasattr(deploy, "platforms") or deploy.platforms is None:
+                deploy.platforms = {}
+            if isinstance(deploy.platforms, dict):
+                if "tpu" not in deploy.platforms:
+                    deploy.platforms["tpu"] = {
+                        "stages": [
+                            {"stage_id": 0, "tensor_parallel_size": 1, "devices": "0"},
+                            {"stage_id": 1, "tensor_parallel_size": 1, "devices": "1"},
+                            {
+                                "stage_id": 2,
+                                "tensor_parallel_size": 1,
+                                "devices": "2",
+                                "dtype": "float32",
+                                "enforce_eager": True,
+                            },
+                        ]
+                    }
+                    logger.info("[TPU Omni Patch] Injected TPU stage configuration into deploy config (0->0, 1->1, 2->2)")
+                elif "stages" in deploy.platforms["tpu"]:
+                    for stg in deploy.platforms["tpu"]["stages"]:
+                        if stg.get("stage_id") == 2:
+                            if "dtype" not in stg:
+                                stg["dtype"] = "float32"
+                            if "enforce_eager" not in stg:
+                                stg["enforce_eager"] = True
+                            logger.info("[TPU Omni Patch] Injected dtype: float32, enforce_eager: True for Code2Wav stage")
+
         orig_load_deploy_config = sc.load_deploy_config
 
         def patched_load_deploy_config(path_or_dict: Any, *args, **kwargs):
@@ -230,34 +258,94 @@ def patch_deploy_config_loader() -> None:
                 deploy = orig_load_deploy_config(tmp_name, *args, **kwargs)
             else:
                 deploy = orig_load_deploy_config(path_or_dict, *args, **kwargs)
-            if hasattr(deploy, "platforms"):
-                if deploy.platforms is None:
-                    deploy.platforms = {}
-                if isinstance(deploy.platforms, dict):
-                    # Inject TPU platform configuration if missing
-                    if "tpu" not in deploy.platforms:
-                        deploy.platforms["tpu"] = {
-                            "stages": [
-                                {"stage_id": 0, "tensor_parallel_size": 2, "devices": "0,1"},
-                                {"stage_id": 1, "tensor_parallel_size": 1, "devices": "2"},
-                                {
-                                    "stage_id": 2,
-                                    "tensor_parallel_size": 1,
-                                    "devices": "3",
-                                    "dtype": "float32",
-                                },
-                            ]
-                        }
-                        logger.info("[TPU Omni Patch] Injected TPU stage configuration into deploy config")
-                    elif "stages" in deploy.platforms["tpu"]:
-                        # Ensure stage 2 uses float32 to prevent TPU MXU reduced-precision noise
-                        for stg in deploy.platforms["tpu"]["stages"]:
-                            if stg.get("stage_id") == 2 and "dtype" not in stg:
-                                stg["dtype"] = "float32"
-                                logger.info("[TPU Omni Patch] Injected dtype: float32 for Code2Wav stage")
+            _inject_tpu_stages(deploy)
             return deploy
 
         sc.load_deploy_config = patched_load_deploy_config
+        for mod_name in (
+            "vllm_omni.config",
+            "vllm_omni.config.stage_config",
+            "vllm_omni.config.config_factory",
+            "vllm_omni.config.omni_config",
+            "vllm_omni.engine.async_omni_engine",
+            "vllm_omni.entrypoints.utils",
+        ):
+            if mod_name in sys.modules:
+                setattr(sys.modules[mod_name], "load_deploy_config", patched_load_deploy_config)
+
+        # Patch _apply_platform_overrides
+        if hasattr(sc, "_apply_platform_overrides"):
+            orig_apply_platform_overrides = sc._apply_platform_overrides
+
+            def patched_apply_platform_overrides(deploy: Any, platform: str | None = None) -> Any:
+                if platform is None:
+                    try:
+                        from vllm_omni.platforms import current_omni_platform
+                        dev = getattr(current_omni_platform, "device_name", None)
+                        platform = dev.lower() if dev is not None else "tpu"
+                    except Exception:
+                        platform = "tpu"
+                if platform == "tpu":
+                    _inject_tpu_stages(deploy)
+                return orig_apply_platform_overrides(deploy, platform)
+
+            sc._apply_platform_overrides = patched_apply_platform_overrides
+            for mod_name in ("vllm_omni.config.stage_config", "vllm_omni.config.config_factory"):
+                if mod_name in sys.modules:
+                    setattr(sys.modules[mod_name], "_apply_platform_overrides", patched_apply_platform_overrides)
+
+        # Patch merge_pipeline_deploy to guarantee disjoint TPU devices across all stages
+        if hasattr(sc, "merge_pipeline_deploy"):
+            orig_merge_pipeline_deploy = sc.merge_pipeline_deploy
+
+            def patched_merge_pipeline_deploy(pipeline: Any, deploy: Any, cli_overrides: dict[str, Any] | None = None) -> list[Any]:
+                _inject_tpu_stages(deploy)
+                stages = orig_merge_pipeline_deploy(pipeline, deploy, cli_overrides)
+                used_devices = set()
+                for stage in stages:
+                    rt = getattr(stage, "yaml_runtime", None)
+                    if isinstance(rt, dict):
+                        dev = rt.get("devices")
+                        if dev is None or dev in used_devices:
+                            new_dev = str(stage.stage_id)
+                            rt["devices"] = new_dev
+                            logger.info("[TPU Omni Patch] Assigned disjoint TPU device '%s' to stage %d", new_dev, stage.stage_id)
+                        used_devices.add(rt.get("devices"))
+                    if getattr(stage, "stage_id", None) == 2:
+                        ea = getattr(stage, "yaml_engine_args", None)
+                        if isinstance(ea, dict):
+                            ea["dtype"] = "float32"
+                            ea["enforce_eager"] = True
+                return stages
+
+            sc.merge_pipeline_deploy = patched_merge_pipeline_deploy
+            for mod_name in (
+                "vllm_omni.config",
+                "vllm_omni.config.stage_config",
+                "vllm_omni.config.config_factory",
+                "vllm_omni.config.omni_config",
+            ):
+                if mod_name in sys.modules:
+                    setattr(sys.modules[mod_name], "merge_pipeline_deploy", patched_merge_pipeline_deploy)
+
+        # Patch StageRuntime._resolve_replica_physical_devices to guarantee no device collision
+        try:
+            import vllm_omni.engine.stage_runtime as sr
+            if not getattr(sr, "_tpu_patched", False):
+                orig_resolve_dev = sr.StageRuntime._resolve_replica_physical_devices
+
+                def patched_resolve_dev(self, stage_id: int, runtime_cfg: Any) -> str | None:
+                    resolved = orig_resolve_dev(self, stage_id, runtime_cfg)
+                    if resolved == "1" and stage_id == 2:
+                        logger.info("[TPU Omni Patch] Disambiguated stage 2 physical devices from '1' to '2'")
+                        return "2"
+                    return resolved
+
+                sr.StageRuntime._resolve_replica_physical_devices = patched_resolve_dev
+                sr._tpu_patched = True
+                logger.info("[TPU Omni Patch] Patched StageRuntime._resolve_replica_physical_devices")
+        except Exception:
+            pass
 
         # Prevent global CLI dtype='auto' from clobbering per-stage float32
         orig_build_overrides = sc.build_stage_runtime_overrides
@@ -270,7 +358,7 @@ def patch_deploy_config_loader() -> None:
 
         sc.build_stage_runtime_overrides = patched_build_stage_runtime_overrides
         sc._tpu_patched = True
-        logger.info("[TPU Omni Patch] Patched load_deploy_config and build_stage_runtime_overrides")
+        logger.info("[TPU Omni Patch] Patched load_deploy_config, merge_pipeline_deploy, and build_stage_runtime_overrides")
     except Exception as e:
         logger.debug("[TPU Omni Patch] patch_deploy_config_loader skipped: %s", e)
 
