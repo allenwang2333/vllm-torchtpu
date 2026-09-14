@@ -457,6 +457,31 @@ def ring_collective(x, mesh, tables, *, gather, collective_id):
     rows = tokens // 32
     if tokens % 32 or (not gather and x.shape[0] != 32):
         raise ValueError("Invalid token or partial-shard count")
+    if rows % 64 or rows > 256:
+        # The ring's DMA tiles require 64-row alignment and bounded VMEM.
+        # XLA handles other shard sizes, preserving Torch token ownership.
+        owners = tuple(int(i) for i in tables[0, 2])
+        owner_order = tuple(sorted(range(32), key=lambda i: owners[i]))
+
+        def general(part):
+            if gather:
+                return lax.all_gather(part,
+                                      'k3_sp',
+                                      axis=0,
+                                      tiled=True,
+                                      axis_index_groups=(owner_order, ))
+            ordered = part[0].reshape(32, rows, width)[jnp.asarray(owners)]
+            return lax.psum_scatter(ordered.reshape(tokens, width),
+                                    'k3_sp',
+                                    scatter_dimension=0,
+                                    tiled=True)
+
+        return jax.shard_map(
+            general,
+            mesh=mesh,
+            in_specs=P('k3_sp', None) if gather else P('k3_sp', None, None),
+            out_specs=P() if gather else P('k3_sp', None),
+            check_vma=False)(x)
     regions = _regions(rows, width)
     streams, buffers = len(regions), 2
 
@@ -654,19 +679,31 @@ def _project_ring_kernel(
 
 
 def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
-    """Fuse the 8K, three-head BF16 attention projection with SP32 RS."""
-    if x.shape != (32, 8192, 384) or w.shape != (32, 384, 7168):
-        raise ValueError(
-            "K3 projection/RS requires 8K tokens and 3 local heads")
+    """Fuse a three-head BF16 attention projection with SP32 RS."""
+    if (x.shape[0] != 32 or x.shape[1] % 32 or x.shape[2] != 384
+            or w.shape != (32, 384, 7168)):
+        raise ValueError("K3 projection/RS requires SP32 and 3 local heads")
     if x.dtype != jnp.bfloat16 or w.dtype != jnp.bfloat16:
         raise ValueError("K3 projection/RS requires BF16 operands")
-    rows = 256
+    tokens = x.shape[1]
+    rows = tokens // 32
+    if rows % 64 or rows > 256:
+        projected = jax.shard_map(lambda a, b: a @ b,
+                                  mesh=mesh,
+                                  in_specs=(P('k3_sp', None, None), ) * 2,
+                                  out_specs=P('k3_sp', None, None),
+                                  check_vma=False)(x, w)
+        return ring_collective(projected,
+                               mesh,
+                               tables,
+                               gather=False,
+                               collective_id=collective_id)
     regions = _regions(rows, 7168)
     streams = len(regions)
     chunk = rows // 4
 
     def local(x, w):
-        x = x.reshape(8192, 384)
+        x = x.reshape(tokens, 384)
         w = w.reshape(384, 7168)
         hbm = pl.BlockSpec(memory_space=pltpu.HBM)
         scratch = (pltpu.SemaphoreType.DMA(
@@ -858,7 +895,7 @@ def _gather_project_kernel(
         def copy(owner_id):
             return pltpu.make_async_copy(
                 output_buffers.at[owner_id % 2],
-                out.at[pl.ds(owner_id * 256 + tile * 128, 128), :],
+                out.at[pl.ds(owner_id * x.shape[0] + tile * 128, 128), :],
                 output_sems.at[owner_id % 2],
             )
 
@@ -874,7 +911,8 @@ def _gather_project_kernel(
 
 
 def _gather_project(x, w, tables, collective_id):
-    assert x.shape == (256, 7168) and w.shape == (7168, 1792)
+    assert x.shape[0] % 128 == 0 and x.shape[1] == 7168 and w.shape == (7168,
+                                                                        1792)
     streams = 6
     regions = tuple((direction * 64, 64, col, width)
                     for col, width in [(0, 2432), (2432, 2432), (4864, 2304)]
@@ -895,13 +933,13 @@ def _gather_project(x, w, tables, collective_id):
     hb = pl.BlockSpec(memory_space=pltpu.HBM)
     partials = pl.pallas_call(
         functools.partial(_gather_project_kernel, regions=regions),
-        out_shape=jax.ShapeDtypeStruct((8192, 1792), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((32 * x.shape[0], 1792), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=(hb, hb),
             out_specs=hb,
             scratch_shapes=scratch,
-            grid=(2, 32),
+            grid=(x.shape[0] // 128, 32),
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=collective_id,
@@ -917,6 +955,15 @@ def gather_project(x, w, mesh, tables, *, collective_id):
     """Gather SP32 hidden states while projecting into packed KDA inputs."""
 
     def local(x, w):
+        if x.shape[0] % 128:
+            owners = tuple(int(i) for i in tables[0, 2])
+            order = tuple(sorted(range(32), key=lambda i: owners[i]))
+            gathered = lax.all_gather(x,
+                                      'k3_sp',
+                                      axis=0,
+                                      tiled=True,
+                                      axis_index_groups=(order, ))
+            return (gathered @ w[0])[None]
         return _gather_project(x, w[0], tables, collective_id)[None]
 
     return jax.shard_map(local,

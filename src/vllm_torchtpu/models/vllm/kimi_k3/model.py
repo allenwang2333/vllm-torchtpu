@@ -198,10 +198,6 @@ class KimiModel(nn.Module):
                     or parallel.data_parallel_size != 1):
                 raise ValueError(
                     "K3 SP prefill requires TP32/EP32 and PP1/DP1")
-            if vllm_config.scheduler_config.max_num_batched_tokens > 8192:
-                raise ValueError(
-                    "K3 SP prefill currently supports at most 8192 batched tokens"
-                )
             self.sp_group = get_tp_group()
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -236,16 +232,13 @@ class KimiModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = (inputs_embeds if inputs_embeds is not None else
                          self.embed_input_ids(input_ids))
-        # Restrict this first port to the measured 8K prefill bucket. Decode
-        # and other lengths retain the existing replicated-token execution.
-        sequence_parallel = self.sp_prefill and hidden_states.shape[0] >= 8192
+        num_tokens = hidden_states.shape[0]
+        sequence_parallel = (self.sp_prefill and num_tokens > 0
+                             and num_tokens % self.sp_group.world_size == 0)
         if sequence_parallel:
-            # The scheduler limit above makes this exactly the 8K bucket.
-            # Keep local sizes concrete for TorchTPU's export interpreter.
-            local_tokens = 8192 // 32
-            hidden_states = hidden_states.narrow(
-                0, self.sp_group.rank_in_group * local_tokens,
-                local_tokens).contiguous()
+            hidden_states = hidden_states.reshape(
+                self.sp_group.world_size, -1, hidden_states.shape[-1])[
+                    self.sp_group.rank_in_group].contiguous()
         # A view avoids passing a symbolic local token count to TorchTPU's
         # concrete-size allocation kernel during the dynamic trace.
         block_residuals = (hidden_states.unsqueeze(1)[:, :0, :]

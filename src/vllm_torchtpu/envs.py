@@ -263,7 +263,7 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Opt in to K3 8K TP32/EP32 sequence-parallel prefill.
+    # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL":
     env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Torch bridges for K3's 8K prefill collectives."""
+"""Torch bridges for K3's sequence-parallel prefill collectives."""
 from functools import lru_cache
 
 import jax
@@ -140,7 +140,7 @@ def _build_project_op(mesh, tables, collective_id):
         return _OPS[key]
 
     def project(x: jax.Array, w: jax.Array) -> jax.Array:
-        return project_reduce_scatter(x.reshape(32, 8192, 384),
+        return project_reduce_scatter(x.reshape(32, x.shape[0] // 32, 384),
                                       w.reshape(32, 384, 7168),
                                       mesh,
                                       tables,
@@ -175,7 +175,7 @@ def _build_gather_project_op(mesh, tables, collective_id):
                                 mesh,
                                 tables,
                                 collective_id=collective_id)
-        return result.reshape(32 * 8192, 1792)
+        return result.reshape(-1, 1792)
 
     op = sharded_jax_op(f"pallas::kimi_gather_project_{collective_id}",
                         project,
@@ -228,24 +228,23 @@ class PrefillGroup:
         return _build_mla_ops(mesh, ep_rank_order(), self.layer, eps)
 
     def all_gather(self, x, dim):
-        if (dim == 0 and x.ndim == 2 and x.shape[0] >= 256
+        if (dim == 0 and x.ndim == 2 and x.shape[0] > 0
                 and x.shape[1] in (2176, 3584, 7168)
                 and x.dtype == torch.bfloat16):
             return self.ag(x)
         return self.base.all_gather(x, dim=dim)
 
     def reduce_scatter(self, x, dim):
-        if (dim == 0 and x.ndim == 2 and x.shape[0] >= 8192
-                and x.shape[1] in (2176, 3584, 7168)
+        if (dim == 0 and x.ndim == 2 and x.shape[0] > 0
+                and x.shape[0] % 32 == 0 and x.shape[1] in (2176, 3584, 7168)
                 and x.dtype == torch.bfloat16):
             return self.rs(x)
         return self.base.reduce_scatter(x, dim=dim)
 
     def project_reduce_scatter(self, x, projection):
-        # Called only from SP prefill, whose model configuration caps the
-        # batch at 8192. Preserve the linear method for other weight formats.
+        # Preserve the linear method for other weight formats.
         weight = getattr(projection, 'weight', None)
-        if (x.shape[0] >= 8192 and x.shape[1] == 384
+        if (x.shape[0] > 0 and x.shape[0] % 32 == 0 and x.shape[1] == 384
                 and x.dtype == torch.bfloat16 and weight is not None
                 and weight.dtype == torch.bfloat16
                 and weight.shape == (384, 7168)

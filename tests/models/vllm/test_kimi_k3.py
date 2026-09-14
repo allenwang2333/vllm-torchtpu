@@ -1282,14 +1282,15 @@ def test_sp_prefill_trace_accepts_dynamic_token_dimension():
 
     # Exercise the real model's token slicing and the collective shape guard,
     # without attention/weights or a TPU client. The compiler must retain a
-    # guard that excludes shorter buckets instead of forcing mark_dynamic's
-    # token dimension to the constant 8192.
+    # divisibility guard without forcing mark_dynamic's token dimension
+    # to the initial bucket size.
     group = PrefillGroup.__new__(PrefillGroup)
     group.ag = lambda x: x.repeat(32, 1)
     model = KimiModel.__new__(KimiModel)
     nn.Module.__init__(model)
     model.sp_prefill = True
     model.sp_group = SimpleNamespace(rank_in_group=0,
+                                     world_size=32,
                                      all_gather=group.all_gather)
     model.attn_res_block_size = 12
     model.output_attn_res = _attention_residual_stub(hidden=3584, eps=1e-5)
@@ -1313,7 +1314,9 @@ def test_sp_prefill_trace_accepts_dynamic_token_dimension():
     assert out.shape == hidden.shape
     env = trace_shape_env(graphs[0])
     assert unsupported_reason(env, 8192) is None
-    for size in (1, 8, 2048, 4096):
+    for size in (2048, 4096, 16384):
+        assert unsupported_reason(env, size) is None
+    for size in (1, 8, 2049, 8191):
         assert unsupported_reason(env, size) is not None
 
 
@@ -1708,3 +1711,41 @@ def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
     assert result.shape == (2, 384)
     torch.testing.assert_close(
         calls[0], torch.full((64, 384), 0.5, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    "tokens", [0, 1, 8, 31, 32, 64, 96, 1024, 1056, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("rank", [0, 7, 31])
+def test_sp_prefill_divisible_shapes_preserve_token_ownership(tokens, rank):
+    model = KimiModel.__new__(KimiModel)
+    nn.Module.__init__(model)
+    model.sp_prefill = True
+    model.attn_res_block_size = None
+    model.norm = nn.Identity()
+    hidden = torch.arange(tokens * 4, dtype=torch.float32).reshape(tokens, 4)
+    positions = torch.arange(tokens)
+    expected_sp = tokens > 0 and tokens % 32 == 0
+    calls = []
+
+    class Layer(nn.Module):
+
+        def forward(self, pos, value, residual, *, sequence_parallel):
+            assert sequence_parallel == expected_sp
+            assert pos is positions
+            expected = hidden.reshape(32, -1,
+                                      4)[rank] if expected_sp else hidden
+            torch.testing.assert_close(value, expected)
+            return value + 1, residual
+
+    def gather(value, dim):
+        calls.append(dim)
+        torch.testing.assert_close(value, hidden.reshape(32, -1, 4)[rank] + 1)
+        return hidden + 1
+
+    model.sp_group = SimpleNamespace(world_size=32,
+                                     rank_in_group=rank,
+                                     all_gather=gather)
+    model.layers = nn.ModuleList([Layer()])
+    actual = model.forward(None, positions, inputs_embeds=hidden)
+    torch.testing.assert_close(actual, hidden + 1)
+    assert calls == ([0] if expected_sp else [])

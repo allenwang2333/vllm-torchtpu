@@ -1,9 +1,9 @@
 # Kimi K3 prefill
 
-`TPU_K3_SP_PREFILL=1` enables the optimized 8192-token prefill path on a TPU7x
-2×2×4 slice: TP32/EP32, PP1/DP1, 32 TensorCores. The scheduler must cap
-`max_num_batched_tokens` at 8192. Smaller token buckets retain the required
-non-SP execution paths. This targets prefill workers in prefill/decode
+`TPU_K3_SP_PREFILL=1` enables sequence-parallel prefill on a TPU7x 2×2×4
+slice: TP32/EP32, PP1/DP1, 32 TensorCores. Every positive token bucket divisible
+by the SP group size uses SP; other buckets retain replicated-token execution.
+There is no SP-specific 8192-token scheduler cap. This targets prefill workers in prefill/decode
 disaggregation; KV-cache and KDA-state outputs must remain valid for handoff.
 
 ## Retained implementation
@@ -16,7 +16,9 @@ disaggregation; KV-cache and KDA-state outputs must remain valid for handoff.
   Chip-local gather/reduce-scatter handles their token shards.
 - Pallas rings map physical chip coordinates, mesh indices, and Torch token
   ownership explicitly. Fused gather/input-projection and output-projection/
-  reduce-scatter avoid full intermediate activation buffers.
+  reduce-scatter avoid full intermediate activation buffers when their tile
+  alignment permits. Other shard sizes use XLA collectives with the same token
+  ownership; their use does not disable SP. Ring buffers remain bounded.
 - KDA uses the existing Mega recurrence for an opted-in single-sequence 8K
   prefill, with contiguous convolution and FP32 tap accumulation. Other batches
   use upstream's fused conv1d + GDN v3 path. Dense caches and the unified state
@@ -72,8 +74,9 @@ buckets, using the same dummy fixture and runtime:
 | 2K | 312.554 ms | 303.015 ms |
 | 4K | 559.657 ms | 551.247 ms |
 
-These buckets use the general TP path and fused KDA; the SP/Mega specialization
-is guarded at 8K. Thus 4K is slower than the specialized 8K path. On a
+These historical measurements predate generalized SP: smaller buckets used
+replicated-token TP and fused KDA, while SP was guarded at 8K. Thus 4K was slower
+than the specialized 8K path. On a
 representative core, 4K spends 155.642 ms in Attention Residual and 148.006 ms
 in all-reduces, versus 9.188 ms in tuned MLA. This is an implementation limit,
 not a fundamental restriction on sequence parallelism. The full report and
