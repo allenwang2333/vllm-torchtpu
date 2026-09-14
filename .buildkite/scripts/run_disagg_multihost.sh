@@ -148,6 +148,20 @@ BQ_EVAL_VARS=(
   -e TPU_NAME="${TPU_NAME:-}"
 )
 
+# In-container role script (ROLE=head on node 0, ROLE=decode on node 1) and
+# its results root. Defaults keep the Qwen3.5 P8D8 correctness run.
+DISAGG_ROLE_SCRIPT="${DISAGG_ROLE_SCRIPT:-scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh}"
+DISAGG_RUN_ROOT="${DISAGG_RUN_ROOT:-/perf_eval_results/qwen35_p8d8_disagg_ci}"
+# Extra env var NAMES to forward into both containers when set (values must
+# be free of spaces/quotes: the worker docker command is expanded inside an
+# ssh string).
+DISAGG_PASSTHROUGH_ENV="${DISAGG_PASSTHROUGH_ENV:-}"
+PASSTHROUGH_VARS=()
+for name in ${DISAGG_PASSTHROUGH_ENV}; do
+  if [ -n "${!name+x}" ]; then
+    PASSTHROUGH_VARS+=(-e "${name}=${!name}")
+  fi
+done
 CONTAINER_ENV_COMMON=(
   -e VLLM_DISABLE_COMPILE_CACHE=1
   -e HF_TOKEN="${HF_TOKEN:-}"
@@ -171,7 +185,7 @@ CONTAINER_ENV_COMMON=(
   -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
   -e PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-128}"
   -e STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
-  -e RUN_ROOT="/perf_eval_results/qwen35_p8d8_disagg_ci"
+  -e RUN_ROOT="${DISAGG_RUN_ROOT}"
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"}
   ${SERVED_MODEL_NAME:+-e SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"}
   ${GPU_MEMORY_UTILIZATION:+-e GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}"}
@@ -182,6 +196,7 @@ CONTAINER_ENV_COMMON=(
   ${DECODE_COMPILE_SIZES:+-e DECODE_COMPILE_SIZES="${DECODE_COMPILE_SIZES:-256,4096}"}
   ${NUM_GPU_BLOCKS_OVERRIDE:+-e NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE}"}
   ${RUN_PREFIX_CACHE_E2E_DIVERGENCE:+-e RUN_PREFIX_CACHE_E2E_DIVERGENCE="${RUN_PREFIX_CACHE_E2E_DIVERGENCE}"}
+  "${PASSTHROUGH_VARS[@]}"
 )
 
 # ---------------------------------------------------------------------------
@@ -191,7 +206,7 @@ echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
 # shellcheck disable=SC2029
-ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh'"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./${DISAGG_ROLE_SCRIPT}'"
 
 # ---------------------------------------------------------------------------
 # Start Head container (ROLE=head)
@@ -209,7 +224,7 @@ docker run --name disagg-head --privileged --net=host --shm-size=128g --device /
   "${TEST_SUITE_VARS[@]}" \
   "${BQ_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \
-  bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ./scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh'
+  bash -c "umask 000; rm -rf /perf_eval_results/*; bash ./${DISAGG_ROLE_SCRIPT}"
 HEAD_EXIT_CODE=$?
 set -e
 

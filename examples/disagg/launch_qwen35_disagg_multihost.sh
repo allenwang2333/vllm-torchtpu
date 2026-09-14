@@ -144,6 +144,20 @@ ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
 TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB:-8}"
+# Which Raiden pool admission the model needs: qwen35 (default), kimik3, glm.
+RAIDEN_ADMISSION="${RAIDEN_ADMISSION:-qwen35}"
+# Decode TP per engine for Kimi-K3 Stage-3 (TPU_RAIDEN_DST_SHARDS); unset for Qwen.
+TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS:-}"
+# Kimi-K3 pool admission requires bf16 caches (pool_manifest rejects fp8).
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Object-storage weights: LOAD_FORMAT=runai_streamer with a gs:// MODEL_PATH,
+# ENABLE_EP_WEIGHT_FILTER=1 to stream only rank-local experts, and an
+# optional per-rank streamer host-buffer cap in bytes.
+LOAD_FORMAT="${LOAD_FORMAT:-}"
+ENABLE_EP_WEIGHT_FILTER="${ENABLE_EP_WEIGHT_FILTER:-0}"
+MODEL_LOADER_MEMORY_LIMIT="${MODEL_LOADER_MEMORY_LIMIT:-}"
+# Extra flags appended verbatim (word-split) to both roles' serve command.
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}"
 TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
@@ -248,7 +262,7 @@ common_args=(
   --enable-expert-parallel
   --disable-custom-all-reduce
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
-  --kv-cache-dtype fp8
+  --kv-cache-dtype "${KV_CACHE_DTYPE}"
   --language-model-only
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --max-num-seqs "${MAX_NUM_SEQS}"
@@ -273,6 +287,19 @@ if [[ "${ASYNC_SCHEDULING}" == "1" ]]; then
   common_args+=(--async-scheduling)
 else
   common_args+=(--no-async-scheduling)
+fi
+if [[ -n "${LOAD_FORMAT}" ]]; then
+  common_args+=(--load-format "${LOAD_FORMAT}")
+fi
+if [[ "${ENABLE_EP_WEIGHT_FILTER}" == "1" ]]; then
+  common_args+=(--enable-ep-weight-filter)
+fi
+if [[ -n "${MODEL_LOADER_MEMORY_LIMIT}" ]]; then
+  common_args+=(--model-loader-extra-config "{\"memory_limit\":${MODEL_LOADER_MEMORY_LIMIT}}")
+fi
+if [[ -n "${EXTRA_SERVE_ARGS}" ]]; then
+  # shellcheck disable=SC2206  # intentional word-split, same contract as run_benchmarks.sh
+  common_args+=(${EXTRA_SERVE_ARGS})
 fi
 
 p_kv='{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}"'}'
@@ -373,6 +400,13 @@ EOF
 # ---------------------------------------------------------------------------
 # Launch servers
 # ---------------------------------------------------------------------------
+admission_qwen35=0; admission_kimik3=0; admission_glm=0
+case "${RAIDEN_ADMISSION}" in
+  qwen35) admission_qwen35=1 ;;
+  kimik3) admission_kimik3=1 ;;
+  glm) admission_glm=1 ;;
+  *) echo "ERROR: RAIDEN_ADMISSION must be qwen35, kimik3, or glm: ${RAIDEN_ADMISSION}" >&2; exit 2 ;;
+esac
 common_env_exports=(
   "export JAX_PLATFORMS=tpu,cpu"
   "export PJRT_DEVICE=TPU"
@@ -383,7 +417,10 @@ common_env_exports=(
   "export USE_MOE_SPARSE_CORE=${USE_MOE_SPARSE_CORE:-1}"
   "export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"
   "export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1"
-  "export TPU_RAIDEN_QWEN35_ADMISSION=1"
+  "export TPU_RAIDEN_QWEN35_ADMISSION=${admission_qwen35}"
+  "export TPU_RAIDEN_KIMIK3_ADMISSION=${admission_kimik3}"
+  "export TPU_RAIDEN_GLM_ADMISSION=${admission_glm}"
+  "export TPU_RAIDEN_DST_SHARDS=${TPU_RAIDEN_DST_SHARDS:-1}"
   "export TPU_KV_RESHARD_TRANSPORT=raiden"
   "export TPU_RAIDEN_TRANSFER_PARALLELISM=${TPU_RAIDEN_TRANSFER_PARALLELISM}"
   "export TPU_ENABLE_D2H_TRANSFER=1"
