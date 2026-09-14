@@ -14,6 +14,56 @@ logger = init_logger(__name__)
 _OMNI_PATCHES_APPLIED = False
 
 
+def patch_compat_fallbacks() -> None:
+    """Inject compatibility fallbacks for missing vLLM symbols in older/newer vLLM versions."""
+    # 1. vllm.entrypoints.serve.create_error_response
+    try:
+        import vllm.entrypoints.serve as vllm_serve
+        if not hasattr(vllm_serve, "create_error_response"):
+            try:
+                from vllm.entrypoints.utils import create_error_response
+                vllm_serve.create_error_response = create_error_response
+            except ImportError:
+                def create_error_response(*args, **kwargs):
+                    pass
+                vllm_serve.create_error_response = create_error_response
+            logger.info("[TPU Omni Patch] Injected create_error_response fallback into vllm.entrypoints.serve")
+    except Exception:
+        pass
+
+    # 2. vllm.v1.outputs.RoutedExpertsLists
+    try:
+        import vllm.v1.outputs as v1_out
+        if not hasattr(v1_out, "RoutedExpertsLists"):
+            from typing import Any
+            v1_out.RoutedExpertsLists = Any
+            logger.info("[TPU Omni Patch] Injected RoutedExpertsLists fallback into vllm.v1.outputs")
+    except Exception:
+        pass
+
+    # 3. vllm.v1.metrics.stats.PrefillStats
+    try:
+        import vllm.v1.metrics.stats as v1_stats
+        if not hasattr(v1_stats, "PrefillStats"):
+            from dataclasses import dataclass
+            @dataclass
+            class PrefillStats:
+                pass
+            v1_stats.PrefillStats = PrefillStats
+            logger.info("[TPU Omni Patch] Injected PrefillStats fallback into vllm.v1.metrics.stats")
+    except Exception:
+        pass
+
+    # 4. vllm.model_executor.models.registry._resolve_module_name
+    try:
+        import vllm.model_executor.models.registry as mr
+        if not hasattr(mr, "_resolve_module_name"):
+            mr._resolve_module_name = lambda mod_relname: f"vllm.model_executor.models.{mod_relname}"
+            logger.info("[TPU Omni Patch] Injected _resolve_module_name fallback into vllm.model_executor.models.registry")
+    except Exception:
+        pass
+
+
 def patch_omni_platform_interface() -> None:
     """Equip OmniPlatform with is_tpu check."""
     try:
@@ -107,29 +157,39 @@ def patch_deploy_config_loader() -> None:
         orig_load_deploy_config = sc.load_deploy_config
 
         def patched_load_deploy_config(path_or_dict: Any, *args, **kwargs):
-            deploy = orig_load_deploy_config(path_or_dict, *args, **kwargs)
-            if hasattr(deploy, "platforms") and isinstance(deploy.platforms, dict):
-                # Inject TPU platform configuration if missing
-                if "tpu" not in deploy.platforms:
-                    deploy.platforms["tpu"] = {
-                        "stages": [
-                            {"stage_id": 0, "tensor_parallel_size": 2, "devices": "0,1"},
-                            {"stage_id": 1, "tensor_parallel_size": 1, "devices": "2"},
-                            {
-                                "stage_id": 2,
-                                "tensor_parallel_size": 1,
-                                "devices": "3",
-                                "dtype": "float32",
-                            },
-                        ]
-                    }
-                    logger.info("[TPU Omni Patch] Injected TPU stage configuration into deploy config")
-                elif "stages" in deploy.platforms["tpu"]:
-                    # Ensure stage 2 uses float32 to prevent TPU MXU reduced-precision noise
-                    for stg in deploy.platforms["tpu"]["stages"]:
-                        if stg.get("stage_id") == 2 and "dtype" not in stg:
-                            stg["dtype"] = "float32"
-                            logger.info("[TPU Omni Patch] Injected dtype: float32 for Code2Wav stage")
+            if isinstance(path_or_dict, dict):
+                import tempfile, yaml
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+                    yaml.dump(path_or_dict, f)
+                    tmp_name = f.name
+                deploy = orig_load_deploy_config(tmp_name, *args, **kwargs)
+            else:
+                deploy = orig_load_deploy_config(path_or_dict, *args, **kwargs)
+            if hasattr(deploy, "platforms"):
+                if deploy.platforms is None:
+                    deploy.platforms = {}
+                if isinstance(deploy.platforms, dict):
+                    # Inject TPU platform configuration if missing
+                    if "tpu" not in deploy.platforms:
+                        deploy.platforms["tpu"] = {
+                            "stages": [
+                                {"stage_id": 0, "tensor_parallel_size": 2, "devices": "0,1"},
+                                {"stage_id": 1, "tensor_parallel_size": 1, "devices": "2"},
+                                {
+                                    "stage_id": 2,
+                                    "tensor_parallel_size": 1,
+                                    "devices": "3",
+                                    "dtype": "float32",
+                                },
+                            ]
+                        }
+                        logger.info("[TPU Omni Patch] Injected TPU stage configuration into deploy config")
+                    elif "stages" in deploy.platforms["tpu"]:
+                        # Ensure stage 2 uses float32 to prevent TPU MXU reduced-precision noise
+                        for stg in deploy.platforms["tpu"]["stages"]:
+                            if stg.get("stage_id") == 2 and "dtype" not in stg:
+                                stg["dtype"] = "float32"
+                                logger.info("[TPU Omni Patch] Injected dtype: float32 for Code2Wav stage")
             return deploy
 
         sc.load_deploy_config = patched_load_deploy_config
@@ -471,28 +531,6 @@ def patch_qwen3_code_predictor() -> None:
         logger.info("[TPU Omni Patch] Patched qwen3_code_predictor for TPU")
     except Exception as e:
         logger.debug("[TPU Omni Patch] patch_qwen3_code_predictor skipped: %s", e)
-
-
-def patch_compat_fallbacks() -> None:
-    """Inject compatibility fallbacks for missing vLLM v1 symbols."""
-    try:
-        import vllm.v1.outputs as v1_out
-        if not hasattr(v1_out, "RoutedExpertsLists"):
-            from typing import Any
-            v1_out.RoutedExpertsLists = Any
-    except Exception:
-        pass
-
-    try:
-        import vllm.v1.metrics.stats as v1_stats
-        if not hasattr(v1_stats, "PrefillStats"):
-            from dataclasses import dataclass
-            @dataclass
-            class PrefillStats:
-                pass
-            v1_stats.PrefillStats = PrefillStats
-    except Exception:
-        pass
 
 
 def apply_omni_patches() -> None:
