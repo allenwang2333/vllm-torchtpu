@@ -3745,6 +3745,10 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
+        # TPU_GDN_FUSED_NORM_QUANT: the GDN output's gated norm and fp8
+        # quantisation as one op, built here.
+        from vllm_torchtpu.layers.adapter import gated_norm_quant_op
+        gated_norm_quant_op.install_if_enabled(model)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
