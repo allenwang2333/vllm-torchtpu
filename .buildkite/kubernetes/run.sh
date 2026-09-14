@@ -16,7 +16,6 @@
 # The Kubernetes counterpart of .buildkite/scripts/run_in_docker.sh.
 #
 #   .buildkite/kubernetes/run.sh <machine-type>/<topology> <command> [args...]
-#   .buildkite/kubernetes/run.sh --prewarm <machine-type>/<topology>
 #
 # run_in_docker.sh picks an image, mounts the caches and forwards a long -e list
 # into a container on a long-lived VM. Here the pod is the container, the
@@ -28,19 +27,8 @@
 # this repo's: the image repository, /perf_eval_results, TPU_MULTIHOST_BACKEND.
 set -euo pipefail
 
-# Prewarm runs the build's image on a chip-less node in the region the shape
-# names, so the per-digest image conversion is done before a test waits on it.
-# Here rather than in a script of its own because everything above the launcher
-# call is the same - the same shape token, the same image lookup - and the two
-# drifting apart would mean prewarming an image no step then runs.
-prewarm=""
-if [[ "${1:-}" == "--prewarm" ]]; then
-  prewarm=1
-  shift
-fi
-
-if [[ $# -lt 2 && -z "$prewarm" ]] || [[ $# -lt 1 ]]; then
-  echo "usage: $0 [--prewarm] <machine-type>/<topology> [command [args...]]" >&2
+if [[ $# -lt 2 ]]; then
+  echo "usage: $0 <machine-type>/<topology> <command> [args...]" >&2
   exit 2
 fi
 
@@ -63,15 +51,6 @@ fi
 # shellcheck source=.buildkite/kubernetes/common.sh
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-
-# Nothing below this point applies to a prewarm: it runs no command, so there is
-# no result to collect and no environment for it to carry.
-if [[ -n "$prewarm" ]]; then
-  exec /opt/launcher/launch \
-    --machine-type "$machine_type" \
-    --topology "$topology" \
-    --prewarm
-fi
 
 # The prologue and epilogue run_in_docker.sh performs around the container,
 # moved inside it. /perf_eval_results is a path the benchmark scripts hardcode;

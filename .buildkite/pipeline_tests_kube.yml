@@ -127,36 +127,6 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  # Image Streaming converts an image once per digest, and this image has a new
-  # digest every build, so the first TPU pod to schedule pays for the rest: 80
-  # to 120 seconds on measured builds against 12 to 45 once converted. This runs
-  # the same image on a node that holds no chips, which pays it somewhere the
-  # tests are not waiting - and on this lane that matters twice over, because a
-  # chip-holding prewarm would be competing for the eight v7x chips the tests
-  # are already queueing on.
-  #
-  # Nothing depends on it, deliberately. The TPU steps spend one to four minutes
-  # creating nodes before their containers start, which is the window this has
-  # to finish in, so gating them on it would add its own startup to the serial
-  # path to save them the same thing. Losing the race costs the build nothing -
-  # the conversion happens either way - which is also why it soft-fails.
-  - label: ":fire: Prewarm image"
-    key: "prewarm_kube"
-    depends_on: "build_docker"
-    soft_fail: true
-    timeout_in_minutes: 30
-    agents:
-      queue: "kube"
-    env:
-      # The shape names the region to warm, not hardware to hold - the pod it
-      # submits asks for no chips. The one-chip shape because it is the one
-      # every lane here shares; the queue it picks is what selects the cluster.
-      SHAPE: *shape_1_chip
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run.sh --prewarm "$$SHAPE"
-
   - label: "Unit Tests - CPU (PR)"
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
