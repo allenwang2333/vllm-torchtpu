@@ -66,7 +66,7 @@ Retry requires another `apply` call to one of the patch's registered stages.
 
 With `model_config=True`, check model eligibility inside the callback. Return
 `False` when a missing or nonmatching configuration should allow a later attempt.
-For example, `_apply_model_specific_patches` returns `False` for a non-Qwen3-VL
+For example, `maybe_patch_qwen3_vl` returns `False` for a non-Qwen3-VL
 configuration and is registered at `platform_activation` and `model_load`.
 Completion is keyed by target, not by model configuration, so a completed callback
 does not run again for a different model in the same process.

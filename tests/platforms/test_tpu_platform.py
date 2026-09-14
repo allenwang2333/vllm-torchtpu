@@ -742,6 +742,8 @@ def test_multimodal_stage_refreshes_direct_imports(isolated_registry,
 def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     import builtins
 
+    from vllm_torchtpu.models.vllm import qwen3_vl_patch
+
     original_import = builtins.__import__
     original_cumsum = torch.cumsum
 
@@ -752,7 +754,7 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", unavailable)
     config = SimpleNamespace(hf_config=None, model="Qwen/Qwen3-VL-4B")
-    assert tpu_platform._apply_model_specific_patches(config) is None
+    assert qwen3_vl_patch.maybe_patch_qwen3_vl(config) is None
     assert torch.cumsum is original_cumsum
 
 

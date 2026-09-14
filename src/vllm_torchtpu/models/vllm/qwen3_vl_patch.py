@@ -393,7 +393,3 @@ def maybe_patch_qwen3_vl(
     _patch_qwen3_vl_vision_attention(modeling)
     _patch_qwen3_vl_vision_transformer(modeling)
     return None
-
-
-# Backward-compatible alias
-_apply_model_specific_patches = maybe_patch_qwen3_vl

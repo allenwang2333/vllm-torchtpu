@@ -327,13 +327,6 @@ def _register_tpu_kv_connectors() -> None:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
-def _apply_model_specific_patches(
-        model_config: Optional["ModelConfig"] = None) -> bool | None:
-    """Apply model-specific patches for TPU execution."""
-    from vllm_torchtpu.models.vllm.qwen3_vl_patch import maybe_patch_qwen3_vl
-    return maybe_patch_qwen3_vl(model_config)
-
-
 class TpuPlatform(Platform):
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
