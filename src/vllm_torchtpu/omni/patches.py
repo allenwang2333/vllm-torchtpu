@@ -16,6 +16,9 @@ _OMNI_PATCHES_APPLIED = False
 
 def patch_compat_fallbacks() -> None:
     """Inject compatibility fallbacks for missing vLLM symbols in older/newer vLLM versions."""
+    from typing import Any
+    from dataclasses import dataclass
+
     # 1. vllm.entrypoints.serve.create_error_response
     try:
         import vllm.entrypoints.serve as vllm_serve
@@ -35,7 +38,6 @@ def patch_compat_fallbacks() -> None:
     try:
         import vllm.v1.outputs as v1_out
         if not hasattr(v1_out, "RoutedExpertsLists"):
-            from typing import Any
             v1_out.RoutedExpertsLists = Any
             logger.info("[TPU Omni Patch] Injected RoutedExpertsLists fallback into vllm.v1.outputs")
     except Exception:
@@ -45,7 +47,6 @@ def patch_compat_fallbacks() -> None:
     try:
         import vllm.v1.metrics.stats as v1_stats
         if not hasattr(v1_stats, "PrefillStats"):
-            from dataclasses import dataclass
             @dataclass
             class PrefillStats:
                 pass
@@ -53,6 +54,24 @@ def patch_compat_fallbacks() -> None:
             logger.info("[TPU Omni Patch] Injected PrefillStats fallback into vllm.v1.metrics.stats")
     except Exception:
         pass
+
+    # 5. vllm.v1.engine.utils.CoreEngineLaunch
+    try:
+        import vllm.v1.engine.utils as eng_utils
+        if not hasattr(eng_utils, "CoreEngineLaunch"):
+            @dataclass
+            class CoreEngineLaunch:
+                engine_manager: Any = None
+                coordinator: Any = None
+                addresses: Any = None
+                tensor_queue: Any = None
+            eng_utils.CoreEngineLaunch = CoreEngineLaunch
+            setattr(eng_utils, "CoreEngineLaunch", CoreEngineLaunch)
+            if "vllm.v1.engine.utils" in sys.modules:
+                setattr(sys.modules["vllm.v1.engine.utils"], "CoreEngineLaunch", CoreEngineLaunch)
+            logger.info("[TPU Omni Patch] Injected CoreEngineLaunch fallback into vllm.v1.engine.utils")
+    except Exception as e:
+        logger.warning("[TPU Omni Patch] Failed to inject CoreEngineLaunch fallback: %s", e)
 
     # 4. vllm.model_executor.models.registry._resolve_module_name
     try:

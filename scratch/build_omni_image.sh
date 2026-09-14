@@ -4,7 +4,13 @@ set -euo pipefail
 # Determine directory paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_OMNI_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-WORKSPACE_DIR="$(cd "${VLLM_OMNI_DIR}/.." && pwd)"
+if [ -d "${SCRIPT_DIR}/../vllm-torchtpu" ]; then
+  WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+elif [ -d "${SCRIPT_DIR}/../../vllm-torchtpu" ]; then
+  WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+else
+  WORKSPACE_DIR="/usr/local/google/home/sarthakdev/tpu-omni-workspace"
+fi
 
 # Default settings
 DEFAULT_TAG="us-central1-docker.pkg.dev/cloud-tpu-multipod-dev/vllm-omni/vllm-omni-tpu:speechmaxxxing-v6"

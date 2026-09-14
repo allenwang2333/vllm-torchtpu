@@ -23,5 +23,7 @@ ENV PYTHONPATH=/workspace/vllm-torchtpu/src:/workspace/vllm-omni
 WORKDIR /workspace/vllm-omni
 
 RUN python3 -c "import torch; import vllm; import vllm_torchtpu; import vllm_omni; print('Verification success: Torch', torch.__version__, 'OmniPlatform:', vllm_omni.platforms.current_omni_platform)"
+RUN python3 examples/offline_inference/qwen3_omni/end2end.py --help
+
 
 CMD ["/bin/bash"]

@@ -8,3 +8,11 @@ import os
 os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
                       "false")
 os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
+# Auto-apply TPU omni runtime patches at startup so unmodified vllm-omni works
+try:
+    from vllm_torchtpu.omni.patches import apply_omni_patches
+    apply_omni_patches()
+except Exception:
+    pass
+
