@@ -55,8 +55,9 @@ def patch_compat_fallbacks() -> None:
     except Exception:
         pass
 
-    # 5. vllm.v1.engine.utils.CoreEngineLaunch
+    # 5. vllm.v1.engine.utils.CoreEngineLaunch & wait_for_engine_startup adapter
     try:
+        import functools
         import vllm.v1.engine.utils as eng_utils
         if not hasattr(eng_utils, "CoreEngineLaunch"):
             @dataclass
@@ -70,8 +71,50 @@ def patch_compat_fallbacks() -> None:
             if "vllm.v1.engine.utils" in sys.modules:
                 setattr(sys.modules["vllm.v1.engine.utils"], "CoreEngineLaunch", CoreEngineLaunch)
             logger.info("[TPU Omni Patch] Injected CoreEngineLaunch fallback into vllm.v1.engine.utils")
+
+        if hasattr(eng_utils, "wait_for_engine_startup"):
+            orig_wait_for_engine_startup = eng_utils.wait_for_engine_startup
+
+            @functools.wraps(orig_wait_for_engine_startup)
+            def compatible_wait_for_engine_startup(*args: Any, **kwargs: Any) -> Any:
+                # Adapts vllm-omni 6-argument call:
+                # (handshake_socket, core_engines, parallel_config, coordinated_dp, cache_config, launch_info)
+                # to vllm 8-argument call:
+                # (handshake_socket, addresses, core_engines, parallel_config, coordinated_dp, cache_config, proc_manager, coord_process)
+                if len(args) == 6:
+                    handshake_socket = args[0]
+                    core_engines = args[1]
+                    parallel_config = args[2]
+                    coordinated_dp = args[3]
+                    cache_config = args[4]
+                    launch_info = args[5]
+
+                    addresses = getattr(launch_info, "addresses", None)
+                    proc_manager = getattr(launch_info, "engine_manager", None)
+                    coord_process = getattr(launch_info, "coordinator", None)
+
+                    return orig_wait_for_engine_startup(
+                        handshake_socket,
+                        addresses,
+                        core_engines,
+                        parallel_config,
+                        coordinated_dp,
+                        cache_config,
+                        proc_manager,
+                        coord_process,
+                        **kwargs,
+                    )
+                return orig_wait_for_engine_startup(*args, **kwargs)
+
+            eng_utils.wait_for_engine_startup = compatible_wait_for_engine_startup
+            if "vllm.v1.engine.utils" in sys.modules:
+                setattr(sys.modules["vllm.v1.engine.utils"], "wait_for_engine_startup", compatible_wait_for_engine_startup)
+            for mod_name in ("vllm_omni.engine.stage_engine_startup", "vllm_omni.diffusion.stage_diffusion_proc"):
+                if mod_name in sys.modules:
+                    setattr(sys.modules[mod_name], "wait_for_engine_startup", compatible_wait_for_engine_startup)
+            logger.info("[TPU Omni Patch] Injected compatible wait_for_engine_startup adapter into vllm.v1.engine.utils")
     except Exception as e:
-        logger.warning("[TPU Omni Patch] Failed to inject CoreEngineLaunch fallback: %s", e)
+        logger.warning("[TPU Omni Patch] Failed to inject CoreEngineLaunch / wait_for_engine_startup fallback: %s", e)
 
     # 4. vllm.model_executor.models.registry._resolve_module_name
     try:
