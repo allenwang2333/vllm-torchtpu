@@ -401,6 +401,11 @@ def apply_tpu_patches() -> None:
     _configure_torchtpu_eager_mode()
     _unwrap_dynamic_compile_fns()
     _patch_api_server_kernel_reload_endpoint()
+    try:
+        from vllm_torchtpu.omni.patches import apply_omni_patches
+        apply_omni_patches()
+    except Exception:
+        pass
 
 
 def _is_qwen3_vl_model(model_config: Optional["ModelConfig"]) -> bool:

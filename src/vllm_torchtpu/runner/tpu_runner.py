@@ -2621,7 +2621,16 @@ class TPUModelRunner(GPUModelRunner):
                 logger.warning("[TPURunner] deserialize_additional_information error: %s", e)
                 return {}
 
+        is_talker = (
+            getattr(self.model_config, "model_stage", None) == "talker"
+            or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None) == "talker"
+        )
         for new_req in scheduler_output.scheduled_new_reqs:
+            if is_talker:
+                sp = getattr(new_req, "sampling_params", None)
+                if sp is not None and hasattr(sp, "stop_token_ids"):
+                    if 2150 not in sp.stop_token_ids:
+                        sp.stop_token_ids = list(sp.stop_token_ids) + [2150]
             req_id = new_req.req_id
             payload_info = getattr(new_req, "additional_information", None)
             decoded_info = _deserialize(payload_info)

@@ -9,8 +9,12 @@ from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+from vllm_torchtpu.omni.patches import apply_omni_patches
 
 logger = init_logger(__name__)
+
+# Apply TPU patches for vLLM-Omni models and configurations
+apply_omni_patches()
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
