@@ -559,7 +559,15 @@ def patch_qwen3_omni_models() -> None:
                     else:
                         input_ids = input_ids.to(device=device, dtype=torch.long).reshape(-1)
 
-                    if "seq_token_counts" not in kwargs or kwargs["seq_token_counts"] is None:
+                    seq_counts = kwargs.get("seq_token_counts")
+                    if seq_counts is not None and len(seq_counts) > 0:
+                        total_valid = sum(int(c) for c in seq_counts)
+                        # Trim off TPU bucket padding so torch.split(input_ids, seq_token_counts) matches exactly
+                        if input_ids.shape[0] > total_valid:
+                            input_ids = input_ids[:total_valid]
+                        elif input_ids.shape[0] < total_valid:
+                            kwargs["seq_token_counts"] = [int(input_ids.shape[0])]
+                    elif "seq_token_counts" not in kwargs or kwargs["seq_token_counts"] is None:
                         kwargs["seq_token_counts"] = [int(input_ids.shape[0])]
 
                 return orig_forward(self, input_ids, positions, *args, **kwargs)
