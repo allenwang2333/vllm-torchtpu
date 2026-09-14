@@ -2122,9 +2122,12 @@ class TPURaidenConnectorWorker:
             return
         if self._local_raiden_transfer_rank() != 0:
             return
-        from tpu_sync.api.torch.kv_cache_store import \
-            RaidenId as _StoreRaidenId
-        from tpu_sync.api.torch.reshard_store import ReshardStore
+        # tpu-sync wheels from 2026-09-13 on no longer ship
+        # tpu_sync.api.torch.kv_cache_store (non-OSS global-registry
+        # dependency); reshard_store exports the RaidenId type it accepts
+        # (native when the extension provides one, else the common dataclass).
+        from tpu_sync.api.torch.reshard_store import (
+            RaidenId as _StoreRaidenId, ReshardStore)
 
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job

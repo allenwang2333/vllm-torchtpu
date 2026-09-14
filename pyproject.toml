@@ -33,7 +33,10 @@ dependencies = [
     # matching our torch==2.13.0 constraint to prevent the CI Docker base image
     # from leaking structurally incompatible pre-compiled nms operators!
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260910000446",
+    # tpu-sync-torch 0.0.1.dev20260914133043 links torch_tpu's TensorBufferHandle
+    # ABI and was built against exactly this torch-tpu (tpu-sync torch_tpu.version);
+    # an older torch-tpu fails at import with an undefined symbol.
+    "torch-tpu==0.1.1.dev20260912075415",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # package was renamed tpu-raiden-torch -> tpu-sync-torch (import name is
