@@ -1188,6 +1188,7 @@ def test_chip_shared_expert_matches_full_projection(sequence_parallel):
         module = KimiMLP.__new__(KimiMLP)
         nn.Module.__init__(module)
         module.tp_group = Group()
+        module.sp_group = None
         module.gate_up_proj = Projection()
         module.act_fn = lambda value: (torch.nn.functional.silu(
             value.chunk(2, -1)[0]) * value.chunk(2, -1)[1])
