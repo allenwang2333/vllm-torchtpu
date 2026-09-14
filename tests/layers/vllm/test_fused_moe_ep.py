@@ -35,6 +35,14 @@ from vllm_torchtpu.layers.vllm import fused_moe_ep as bridge
 # count against it, because the kernel requires one equal block per shard.
 _STUB_EP = 2
 
+# Positions in `_build_op`'s positional argument list, which is what the tests
+# below inspect: (mesh, topk, renormalize, activation, mesh_expert_order,
+# sharded_plan, weight_format, rhs_qb, scoring_fn, has_score_bias,
+# routed_scaling_factor).
+_MESH_ORDER_ARG = 4
+_SHARDED_PLAN_ARG = 5
+_WEIGHT_FORMAT_ARG = 6
+
 
 def _layer(experts=4, hidden=8, inter=16, **overrides):
     """A layer whose weights and routing the kernel would accept."""
@@ -111,7 +119,7 @@ def test_sharded_plan_flag_reaches_the_built_op():
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
         assert _prebuild(
             _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-1] is True
+    assert seen and seen[0][_SHARDED_PLAN_ARG] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
@@ -120,7 +128,7 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert _prebuild(_layer(),
                      ep_order=order,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-2] == order
+    assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
 def test_refused_without_the_env_flag():
@@ -200,7 +208,13 @@ def test_refused_when_the_expert_blocks_are_not_equal():
     assert _prebuild(_layer(global_num_experts=4 * _STUB_EP)) == "op"
 
 
-def test_refused_on_a_non_silu_activation():
+@pytest.mark.parametrize("activation",
+                         ["silu", "swigluoai", "silu_and_mul_with_clamp"])
+def test_arms_on_every_activation_the_kernel_fuses(activation):
+    assert _prebuild(_layer(), activation=activation) == "op"
+
+
+def test_refused_on_an_activation_the_kernel_does_not_fuse():
     assert _prebuild(_layer(), activation="gelu") is None
 
 
@@ -213,17 +227,49 @@ def test_refused_when_the_layer_carries_expert_biases():
 
 @pytest.mark.parametrize("routing", [
     dict(custom_routing_function=lambda **_: None),
-    dict(scoring_func="sigmoid"),
-    dict(e_score_correction_bias=torch.zeros(8)),
     dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
     dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
-    dict(routed_scaling_factor=2.5),
 ])
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
-    """The fused path never calls `moe_routing.route`: the kernel scores with
-    a plain softmax and selects top-k itself. Anything else routes tokens to a
-    different set of experts, so it is refused rather than run."""
+    """The fused path never calls `moe_routing.route`: the kernel selects
+    top-k itself. Anything it cannot reproduce routes tokens to a different
+    set of experts, so it is refused rather than run."""
     assert _prebuild(_layer(**routing)) is None
+
+
+@pytest.mark.parametrize("routing", [
+    dict(scoring_func="sigmoid"),
+    dict(scoring_func="sqrtsoftplus"),
+    dict(e_score_correction_bias=torch.zeros(8)),
+    dict(routed_scaling_factor=2.5),
+    # DeepSeek-V4's non-hash layers, which is what these three are for.
+    dict(scoring_func="sqrtsoftplus",
+         e_score_correction_bias=torch.zeros(8),
+         routed_scaling_factor=2.5),
+])
+def test_arms_on_routing_the_kernel_reproduces(routing):
+    """Scoring function, `noaux_tc` score bias and routed scaling are the
+    router's own, so a layer that uses them is served rather than refused."""
+    assert _prebuild(_layer(**routing)) == "op"
+
+
+def test_the_routing_knobs_reach_the_built_op():
+    """The op closes over them, so a layer whose routing differs must not be
+    served by an op built for another layer's."""
+    seen = []
+    layer = _layer(scoring_func="sqrtsoftplus",
+                   e_score_correction_bias=torch.zeros(8),
+                   routed_scaling_factor=2.5)
+    assert _prebuild(layer,
+                     build_op=lambda *args: seen.append(args) or "op") == "op"
+    assert seen[0][-3:] == ("sqrtsoftplus", True, 2.5)
+
+
+@pytest.mark.parametrize("bias", [torch.zeros(7), torch.zeros(2, 8)])
+def test_refused_on_a_score_bias_that_is_not_per_global_expert(bias):
+    """The bias is a replicated operand indexed by global expert id, so a
+    shape this rank cannot hand over whole is a refusal, not a reshape."""
+    assert _prebuild(_layer(e_score_correction_bias=bias)) is None
 
 
 def test_refused_while_the_routing_simulator_is_on():
@@ -497,7 +543,7 @@ def test_nvfp4_aligned_block_arms_and_passes_format(block):
                      weight_format="fp4",
                      rhs_qb=block,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen[0][-2:] == ("fp4", block)
+    assert seen[0][_WEIGHT_FORMAT_ARG:_WEIGHT_FORMAT_ARG + 2] == ("fp4", block)
 
 
 @pytest.mark.parametrize("block", [None, 0, -64, 16, 32, 96, 192, 1024])
@@ -521,7 +567,7 @@ def test_nvfp4_refuses_invalid_contract(fault, block):
     elif fault == "dtype":
         layer.w2_weight = torch.empty((1, 512, 512), dtype=torch.float8_e4m3fn)
     elif fault == "routing":
-        layer.scoring_func = "sigmoid"
+        layer.hash_indices_table = torch.zeros(8, dtype=torch.int32)
     else:
         layer.w2_bias = torch.zeros(1, 512)
     assert _prebuild(layer, weight_format="fp4", rhs_qb=block) is None
@@ -552,6 +598,70 @@ def test_nvfp4_communication_ownership(armed, pipelined):
                       "enable_pipelined_collective_and_compute",
                       return_value=pipelined):
         assert method.supports_internal_mk == (armed or pipelined)
+
+
+@pytest.mark.parametrize("armed,pipelined", [(False, False), (True, False),
+                                             (False, True), (True, True)])
+def test_dsv4_mxfp4_communication_ownership(armed, pipelined):
+    from vllm_torchtpu.layers.vllm.quantization import mxfp4
+    method = object.__new__(mxfp4.VllmDeepseekV4Mxfp4MoEMethod)
+    setattr(method, bridge.FUSED_MOE_EP_OP_ATTR, "op" if armed else None)
+    with patch.object(mxfp4,
+                      "enable_pipelined_collective_and_compute",
+                      return_value=pipelined):
+        assert method.supports_internal_mk == (armed or pipelined)
+
+
+@pytest.mark.parametrize("armed", [True, False])
+def test_dsv4_mxfp4_admission_describes_the_requantized_layout(armed):
+    """Admission runs on meta tensors shaped like what
+    `_requantize_native_fp4` goes on to produce, so that the choice between
+    the packed uint8 GMM form and the kernel's native fp4 one can be made
+    before the weights are quantized to either. Torch stores two fp4 values
+    per element of a `float4_e2m1fn_x2` tensor, so each weight's LAST axis is
+    halved against the logical one and the f32 scales keep theirs.
+
+    An intermediate size below the block is the one shape refused here rather
+    than downstream: w2 would be quantized at `min(block, inter)` while w13
+    used `block`, and the op closes over one `rhs_qb` for both matmuls.
+    """
+    from vllm_torchtpu.layers.vllm.quantization import mxfp4
+    block = mxfp4.REQUANTIZED_BLOCK_SIZE
+    hidden, inter = 2 * block, (block if armed else block // 2)
+    method = object.__new__(mxfp4.VllmDeepseekV4Mxfp4MoEMethod)
+    layer = _layer(experts=1, hidden=hidden, inter=inter)
+    layer.renormalize = True
+    seen = {}
+
+    def prebuild(candidate, **kwargs):
+        assert candidate is layer
+        seen.update(kwargs)
+        return "op"
+
+    with patch.object(bridge, "prebuild_fused_moe_ep", prebuild):
+        op = method._prebuild_w4a8(layer, "silu_and_mul_with_clamp",
+                                   torch.zeros(1, hidden, 2 * inter),
+                                   torch.zeros(1, inter, hidden), inter)
+
+    if not armed:
+        assert op is None and seen == {}
+        return
+    assert op == "op"
+    assert seen["weight_format"] == "fp4" and seen["rhs_qb"] == block
+    assert seen["activation"] == "silu_and_mul_with_clamp"
+    w1, w2, w1_scale, w2_scale = seen["weights"]
+    assert w1.dtype == w2.dtype == torch.float4_e2m1fn_x2
+    assert tuple(w1.shape) == (1, hidden, inter)
+    assert tuple(w2.shape) == (1, inter, hidden // 2)
+    assert tuple(w1_scale.shape) == (1, hidden // block, 1, 2 * inter)
+    assert tuple(w2_scale.shape) == (1, inter // block, 1, hidden)
+    # The same validator the prepared tensors face after installation.
+    assert bridge.fused_moe_ep_unsupported_reason(
+        layer,
+        seen["weights"],
+        "silu_and_mul_with_clamp",
+        weight_format="fp4",
+        rhs_qb=block) is None
 
 
 def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
@@ -790,7 +900,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     elif refusal == "smem":
         admission["smem_bytes"] = 1
     elif refusal == "routing":
-        layer.scoring_func = "sigmoid"
+        layer.hash_indices_table = torch.zeros(8, dtype=torch.int32)
     elif refusal == "experts":
         layer.global_num_experts = 3
     elif refusal == "activation":

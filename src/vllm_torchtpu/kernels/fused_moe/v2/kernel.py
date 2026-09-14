@@ -16,6 +16,7 @@ expert half of an MoE layer for one expert-parallel shard and pushes each
 result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 import functools
+import os
 import threading
 
 import jax
@@ -34,7 +35,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (FP4, FP8, FP8_MAX,
                                                      WEIGHT_PREFETCH_DISTANCE)
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
-from vllm_torchtpu.kernels.megablox.gmm_v2 import swigluoai
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (silu_and_mul_with_clamp,
+                                                   swigluoai)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -43,8 +45,9 @@ DN = (((1, ), (0, )), ((), ()))
 # The single-axis mesh name the layer's shard_map uses.
 AXIS = "d"
 # Columns of the intermediate the requantization does at a time. Chunking
-# it keeps the live bf16 intermediate down; the width is a tuned choice.
-QCHUNK = 512
+# it keeps the live bf16 intermediate down; the width is a tuned choice, so
+# it is overridable to let a deployment sweep it without a source edit.
+QCHUNK = int(os.environ.get("TPU_MOE_FUSED_EP_QCHUNK") or 512)
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -91,22 +94,29 @@ N_SCALE_TABLES = 2  # a weight scale table per matmul, where the format has
 
 # The FFN activations this kernel can fuse. "silu" is the default and the
 # only one the kernel carried before the selector existed; "swigluoai" is
-# the clamped GPT-OSS form, whose math is the grouped-matmul kernel's
-# function imported above rather than a second copy.
-ACT_FNS = ("silu", "swigluoai")
+# the clamped GPT-OSS form and "silu_and_mul_with_clamp" the DeepSeek-V4
+# one, whose math is the grouped-matmul kernel's function imported above
+# rather than a second copy.
+ACT_FNS = ("silu", "swigluoai", "silu_and_mul_with_clamp")
 
 
 def _apply_act(gate, up, act_fn):
     """The FFN activation, on the POST-SCALE gate and up halves.
 
     Both weight forms reach here with the accumulator already multiplied
-    by its scales, which the clamped form requires: its clip is defined on
-    the true activation value, not on a raw accumulator.
+    by its scales, which the clamped forms require: their clip is defined
+    on the true activation value, not on a raw accumulator.
     """
     if act_fn == "silu":
         return jax.nn.silu(gate) * up
     if act_fn == "swigluoai":
         return swigluoai(gate, up)
+    if act_fn == "silu_and_mul_with_clamp":
+        # The limit is `gmm_v2`'s own default, which is DeepSeek-V4's
+        # `swiglu_limit: 10.0`. Deliberately not re-declared here: two copies
+        # of a model constant drift, and the grouped-matmul path this has to
+        # agree with numerically reads the same default.
+        return silu_and_mul_with_clamp(gate, up)
     raise NotImplementedError(
         f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}")
 
@@ -497,10 +507,15 @@ def _build_fused_ep_moe_kernel(*,
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
-    assert 0 < WEIGHT_PREFETCH_DISTANCE < NBUF, (
+    assert 0 <= WEIGHT_PREFETCH_DISTANCE < NBUF, (
         f"weight prefetch distance {WEIGHT_PREFETCH_DISTANCE} must satisfy "
-        f"0 < distance < NBUF={NBUF}, so that distance + 1 consecutive "
+        f"0 <= distance < NBUF={NBUF}, so that distance + 1 consecutive "
         "experts occupy distinct weight slots")
+    # Distance zero has no runway: one slot, and a visit starts its own
+    # weights and then waits on them. Every prefetch site below is switched
+    # on this rather than deleted, because the two schedules differ only in
+    # WHERE the start happens -- a visit ahead, or at the visit's own head.
+    prefetches = WEIGHT_PREFETCH_DISTANCE > 0
     # Everything from here to the ragged-stride check below tests a value
     # that came IN from the caller -- a model shape, a mesh width, a serving
     # config -- so each one refuses rather than asserts. An assert is the
@@ -588,10 +603,17 @@ def _build_fused_ep_moe_kernel(*,
     # The only thing standing between an over-budget model and a kernel that
     # will not fit. It must not be strippable.
     if est > limit:
+        # The weight slabs are NBUF deep and they dominate, so the prefetch
+        # distance is the lever that moves this most; name it, because an
+        # operator who reads only this line should be able to act on it.
         raise ValueError(
             f"the kernel's VMEM buffers need {est/2**20:.1f}MiB, over the "
             f"{limit/2**20:.1f}MiB budget, for {g_local} local experts of "
-            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}")
+            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}. The "
+            f"weight slabs are {NBUF}x one expert here; lowering "
+            f"TPU_MOE_FUSED_EP_PREFETCH_DISTANCE (now "
+            f"{WEIGHT_PREFETCH_DISTANCE}, floor 0) trades prefetch runway "
+            "for exactly that multiple")
     # ragged_rows_alloc must cover every tile READ as well as every commit
     # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
     # tail tile reads a full window.
@@ -713,7 +735,9 @@ def _build_fused_ep_moe_kernel(*,
         out_vm = next(it)
         oscl_vm = next(it)  # [parities, tile blocks, ROWBLK, scale lanes] f32
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
-        lhs_sems, w1_sems, w2_sems, cp_sem = (next(it) for _ in range(4))
+        lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
+        w1s_sems, w2s_sems = (next(it) for _ in range(2))
+        cp_sem = next(it)
         # One commit sem per out_vm parity: with a shared sem the other
         # parity's bytes could satisfy a wait, and order is not promised.
         commit_sems, send_sem, recv_sem = (next(it) for _ in range(3))
@@ -740,11 +764,35 @@ def _build_fused_ep_moe_kernel(*,
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
+        # The scale tables ride the slot their slab rides in, so they are
+        # started, waited and read exactly where the slab is -- one more DMA
+        # per weight, on its own semaphore because a wait is per buffer.
+        def w1s_copy(expert, slot):
+            """The gate/up scale table of `expert`, into slot `slot`."""
+            return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
+
+        def w2s_copy(expert, slot):
+            """The down scale table of `expert`, into slot `slot`."""
+            return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
+
+        def weight_starts(expert, slot):
+            """Start every per-expert weight transfer into slot `slot`."""
+            w1_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+            w2_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+            if has_scales:
+                w1s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                w2s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def weight_waits(expert, slot):
+            """Wait every transfer `weight_starts` issued for that slot."""
+            w1_copy(expert, slot).wait()
+            w2_copy(expert, slot).wait()
+            if has_scales:
+                w1s_copy(expert, slot).wait()
+                w2s_copy(expert, slot).wait()
+
         def prologue():
             """Land the resident tables and start the first weight refills."""
-            if has_scales:
-                sync(w1s_hbm, w1s_vm)
-                sync(w2s_hbm, w2s_vm)
             if has_w1_bias:
                 sync(w1b_hbm, w1b_vm)
             if has_w2_bias:
@@ -752,13 +800,13 @@ def _build_fused_ep_moe_kernel(*,
             # Guarded on b < n_visit, matching the head waits. The range is
             # clamped to the visit-list length: at one local expert,
             # visit_sm[1] would be a statically out-of-bounds read before
-            # the predicate could save it.
+            # the predicate could save it. At distance zero the range is
+            # empty and every start moves to its own visit's head.
             for b in range(min(WEIGHT_PREFETCH_DISTANCE, g_local)):
 
                 @pl.when(jnp.int32(b) < n_visit)
                 def _(b=b):
-                    w1_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
-                    w2_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
+                    weight_starts(visit_sm[b], b)
 
         prologue()
         _all_pairs_barrier(ep)
@@ -929,21 +977,29 @@ def _build_fused_ep_moe_kernel(*,
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
             slot = lax.rem(visit_i, jnp.int32(NBUF))
-            w1_copy(e, slot).wait()
-            w2_copy(e, slot).wait()
+            if not prefetches:
+                # No runway: nobody started this visit's weights, so it
+                # starts them itself and waits on the line below. Refilling
+                # the one slot cannot race the previous visit's reads of it,
+                # because those reads feed accumulators whose results are
+                # stored into out_vm inside the tile loop -- so they have all
+                # retired by the loop's back edge, which is before this.
+                weight_starts(e, slot)
+            weight_waits(e, slot)
 
             # Refill the slot for the expert DISTANCE ahead: the previous
             # expert last read it, and DISTANCE < NBUF keeps it off both live
             # readers, so no wait is needed.
-            @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
-            def _():
-                refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
-                                      jnp.int32(NBUF))
-                ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
-                # Weight refills take their own DMA priority to stay off the
-                # in-order token-gather queue.
-                w1_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
-                w2_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
+            if prefetches:
+
+                @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
+                def _():
+                    refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
+                                          jnp.int32(NBUF))
+                    ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
+                    # Weight refills take their own DMA priority to stay off
+                    # the in-order token-gather queue.
+                    weight_starts(ahead, refill_slot)
 
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
@@ -1050,8 +1106,10 @@ def _build_fused_ep_moe_kernel(*,
                 if rhs_packed4:
                     # The block scales apply inside expert_ffn_blockscale,
                     # so the epilogues below must not apply w2s again.
-                    w1s_blocks = w1s_vm[e]  # [nb1, 2*inter] f32
-                    w2s_blocks = w2s_vm[e]  # [nb2, hidden] f32
+                    # Slot-indexed, like the slabs they scale: these landed
+                    # in the same refill and were waited beside it.
+                    w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
+                    w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
                     w1_block, w2_block = _fp4_block_readers(slot)
                     acc2, mid_scale = expert_ffn_blockscale(act_rows,
                                                             act_scales,
@@ -1068,7 +1126,7 @@ def _build_fused_ep_moe_kernel(*,
                         act_rows,
                         w1_chunk,
                         w2_chunk,
-                        w1s_vm[pl.ds(e, 1), :],
+                        w1s_vm[pl.ds(slot, 1), :],
                         n_chunks1=hidden // host.WIDEN_KCHUNK,
                         n_chunks2=inter // host.WIDEN_KCHUNK,
                         act_fn=act_fn,
@@ -1084,7 +1142,7 @@ def _build_fused_ep_moe_kernel(*,
                                                      act_scales,
                                                      w1_vm[slot],
                                                      w2_vm[slot],
-                                                     w1s_vm[pl.ds(e, 1), :],
+                                                     w1s_vm[pl.ds(slot, 1), :],
                                                      act_fn=act_fn,
                                                      w1b=w1b_row)
                 # The destination applies the router weight, not this. Four-bit
@@ -1098,7 +1156,7 @@ def _build_fused_ep_moe_kernel(*,
                 wire_rows, wire_scales = wire_row_and_scale(
                     acc2,
                     mid_scale,
-                    w2s=(w2s_vm[pl.ds(e, 1), :] if
+                    w2s=(w2s_vm[pl.ds(slot, 1), :] if
                          (has_scales and not rhs_packed4) else None),
                     w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
                     wire_dtype=form.wire_dtype,
@@ -1280,6 +1338,12 @@ def _build_fused_ep_moe_kernel(*,
         pltpu.SemaphoreType.DMA((OUT_PARITIES, )),
         pltpu.SemaphoreType.DMA((NBUF, )),  # w1_sems
         pltpu.SemaphoreType.DMA((NBUF, )),  # w2_sems
+        # The scale tables' slot semaphores. Declared on every build, unlike
+        # the tables themselves, because a semaphore costs nothing to carry
+        # and a conditional one would make this list's positions depend on
+        # the weight format on the unpacking side too.
+        pltpu.SemaphoreType.DMA((NBUF, )),  # w1s_sems
+        pltpu.SemaphoreType.DMA((NBUF, )),  # w2s_sems
         pltpu.SemaphoreType.DMA,  # cp_sem
         pltpu.SemaphoreType.DMA((OUT_PARITIES, )),  # commit_sems
         pltpu.SemaphoreType.DMA,  # send_sem

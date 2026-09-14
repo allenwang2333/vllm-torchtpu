@@ -17,6 +17,7 @@ enters the kernel, and the VMEM accounting that answers whether a build
 fits. Nothing here runs inside the Pallas body."""
 import enum
 import math
+import os
 from typing import NamedTuple
 
 import jax
@@ -48,10 +49,34 @@ WIDEN_KCHUNK = 512
 # out: at expert e's head the kernel issues the refill for expert e + 2.
 # Two is a schedule choice -- one refill in flight per weight buffer, one
 # expert of slack -- not a hardware fact.
-WEIGHT_PREFETCH_DISTANCE = 2
+#
+# It is also the kernel's largest VMEM lever, because the weight slabs are
+# its largest buffers and they are NBUF deep. A shard whose experts only
+# just miss the budget then builds at distance 1 -- one refill in flight, no
+# slack -- rather than not building at all, and the trade is a legible one:
+# less prefetch runway, not a different computation. DeepSeek-V4-Flash at
+# EP4 (64 local experts of 4096x2048, four-bit) is exactly that shard --
+# 64.4MiB of the 62.7MiB budget at distance 2, 52.4MiB at distance 1.
+WEIGHT_PREFETCH_DISTANCE = int(
+    os.environ.get("TPU_MOE_FUSED_EP_PREFETCH_DISTANCE") or 2)
+if WEIGHT_PREFETCH_DISTANCE < 0:
+    raise ValueError(
+        "TPU_MOE_FUSED_EP_PREFETCH_DISTANCE is "
+        f"{WEIGHT_PREFETCH_DISTANCE}; a negative prefetch distance is not a "
+        "schedule")
 # Weight buffer slots. A refill writes its slot while the readers of the
 # prefetch distance's worth of earlier experts are still live, so the slot
 # count has to exceed the distance for all of them to stay distinct.
+#
+# Distance zero is the degenerate schedule: one slot, and each expert's
+# weights are started and then waited at the head of its own visit, with no
+# runway at all. It exists because past a certain model size there is no
+# other option -- two of DeepSeek-V4-Pro's expert slabs are 63MiB against a
+# 62.7MiB budget, so double-buffering them is not somewhere a tuning knob
+# can reach. What it costs is bounded by how much compute there was to hide
+# the fetch behind, and a shard that reads ~264us of weights per layer to do
+# ~25us of arithmetic on them has under a tenth of a fetch to lose. Prefer a
+# real distance on any shard whose weights fit twice.
 NBUF = WEIGHT_PREFETCH_DISTANCE + 1
 # Every transport moves whole 8-row blocks; dynamic DMA offsets are
 # block-aligned.
@@ -62,22 +87,46 @@ HIDDEN_LANE_BLOCK = 128
 # The token-gather table stays in HBM and is streamed through two scalar-memory
 # windows. One window covers this many activation tiles; grouping amortizes
 # the metadata DMA without making the scalar footprint grow with the request.
-TOKEN_GATHER_TILES_PER_WINDOW = 4
+# Overridable to let a deployment trade that amortization against the SMEM
+# the two windows hold, which is `this * tile_m` rows of table.
+TOKEN_GATHER_TILES_PER_WINDOW = int(
+    os.environ.get("TPU_MOE_FUSED_EP_GATHER_TILES") or 4)
 # HBM int32 rows are tiled in 128-element units. Expert slabs are only
 # ROWBLK-aligned, so a window may start up to 120 rows before its logical base
 # and needs one extra HBM tile of overfetch.
 TOKEN_GATHER_DMA_ALIGNMENT = HIDDEN_LANE_BLOCK
-# The most of those blocks the kernel's row staging holds.
-HIDDEN_MAX_BLOCKS = 32
+# The most of those blocks the kernel's row staging holds. A chosen ceiling
+# rather than a hardware one: every array the row geometry shapes -- lhs_vm,
+# out_vm, the scale mirror, and the arrival and contribution buffers -- is
+# sized from the block count and is already counted by `vmem_estimate_bytes`,
+# so what a wide model actually runs out of is the VMEM budget, and that
+# check names the buffers. This bound exists to fail a nonsense hidden size
+# by its own name instead of somewhere downstream. It was 32 -- exactly
+# DeepSeek-V4-Flash's 4096-wide rows, which is why nothing noticed -- and
+# DeepSeek-V4-Pro's 7168 is 56.
+HIDDEN_MAX_BLOCKS = 64
 # The share of the chip's VMEM the kernel may claim.
 VMEM_FRACTION = 0.98
 # The routing tables pack an arrival position and an alignment slot into
 # one word as position * this + slot, so the slot field is this wide and
 # the alignment slots a mesh needs have to fit under it.
-ALIGNMENT_SLOT_FIELD = 64
-# The widest block the routing tables bin routed pairs over. The rank pass
-# inside a block is quadratic in it, so this is a chosen ceiling.
-MAX_ROUTING_BLOCK = 256
+#
+# A slot is the padding that has accumulated ahead of one expert's run:
+# each of the `ep` runs rounds up to ROWBLK, so the last one can sit
+# (ROWBLK - 1) * (ep - 1) rows late, and that is what has to be
+# representable. It was 64, which covers ep up to 10 -- above every mesh
+# this kernel had run on and just under DeepSeek-V4-Pro's EP16, which
+# needs 105. Widening costs position headroom, since the two fields split
+# one int32: at 128 the packed word still carries 16.7M arrival rows per
+# shard, which is 2.8M all-gathered tokens at Pro's top-6 over 384
+# experts, and `_refuse_bad_plan_args` fails by name long before that.
+ALIGNMENT_SLOT_FIELD = 128
+# The widest block the routing tables bin routed pairs over, and the top-k
+# select block. The rank pass inside a block is quadratic in it, so this is a
+# chosen ceiling -- and the reason it is worth sweeping: halving it quarters
+# the rank work per block while only doubling the block count. Both use sites
+# halve this down until it divides their extent, so any power of two is safe.
+MAX_ROUTING_BLOCK = int(os.environ.get("TPU_MOE_FUSED_EP_ROUTING_BLOCK") or 256)
 
 
 def _pow2_shift(m, what):
@@ -1015,16 +1064,21 @@ def vmem_scratch_arrays(g_local,
     # The tile height IS the capacity, and the out pair is in tile units.
     tile_m = capacity
     tile_blocks = tile_m // ROWBLK
-    # Every local expert's scale table is resident. At four-bit block scales
-    # that makes the two scale tables some of the largest buffers here.
+    # A scale table rides in the weight slot its slab rides in, so both are
+    # nbuf-deep and indexed by slot rather than by expert. Residency for all
+    # g_local experts is what the tables used to have, and at four-bit block
+    # scales it made them some of the largest buffers here: DeepSeek-V4-Pro
+    # at EP16 spent 14.2MiB of a 62.7MiB budget on scale tables it read one
+    # expert of at a time. Streaming them costs nothing the slabs beside them
+    # were not already paying -- same DMA, same slot, same wait.
     if weight_format == WeightFormat.FP4:
         # Four-bit weights stream as PACKED u32 words ([K/8, N]), so the
         # transfer moves half the bytes an eight-bit slab would.
         weights = [
             ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
             ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
-            ("w1s_vm", (g_local, hidden // rhs_qb, 2 * inter), jnp.float32),
-            ("w2s_vm", (g_local, inter // rhs_qb, hidden), jnp.float32),
+            ("w1s_vm", (nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
+            ("w2s_vm", (nbuf, inter // rhs_qb, hidden), jnp.float32),
         ]
     else:
         weights = [
@@ -1033,13 +1087,15 @@ def vmem_scratch_arrays(g_local,
         ]
         if form.has_scales:
             weights += [
-                ("w1s_vm", (g_local, 2 * inter), jnp.float32),
-                ("w2s_vm", (g_local, hidden), jnp.float32),
+                ("w1s_vm", (nbuf, 2 * inter), jnp.float32),
+                ("w2s_vm", (nbuf, hidden), jnp.float32),
             ]
-    # The optional expert biases are resident for every local expert, one
-    # row per expert on each matmul's output channels. They carry no block
-    # dimension, so they take the same shape on every weight format -- the
-    # shape and the cost of the per-channel scale tables beside them.
+    # The optional expert biases ARE resident for every local expert, one row
+    # per expert on each matmul's output channels -- unlike the scale tables
+    # above, which they otherwise match in shape on the eight-bit formats.
+    # They stay resident because they are per-channel on every weight format,
+    # so they never carry the block dimension that made the four-bit scale
+    # tables worth streaming.
     biases = []
     if has_w1_bias:
         biases.append(("w1b_vm", (g_local, 2 * inter), jnp.float32))

@@ -34,6 +34,27 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel, rowquant_fp8)
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 
+# The scoring functions the router can apply to the gate logits. These
+# mirror `layers/vllm/moe_routing._apply_scoring_fn` exactly, because a
+# layer served here and the same layer served by the grouped-matmul path
+# have to route identically -- the two are A/B'd against each other, and a
+# scoring difference shows up as a quality regression with no other symptom.
+SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
+
+
+def _apply_scoring_fn(logits, scoring_fn):
+    """Gate logits -> f32 routing scores. Mirrors the torch reference."""
+    scores = logits.astype(jnp.float32)
+    if scoring_fn == "softmax":
+        return jax.nn.softmax(scores, axis=-1)
+    if scoring_fn == "sigmoid":
+        return jax.nn.sigmoid(scores)
+    if scoring_fn == "sqrtsoftplus":
+        return jnp.sqrt(jax.nn.softplus(scores))
+    raise NotImplementedError(
+        f"the fused EP MoE router scores with {SCORING_FNS}; got "
+        f"{scoring_fn!r}")
+
 
 def _combine_arrivals(arrivals, arrival_scales, pos, topk_weights, out_dtype):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden]."""
@@ -138,7 +159,10 @@ def fused_ep_moe_v2(x,
                     act_fn="silu",
                     rank=None,
                     mesh_ep_ranks=None,
-                    sharded_plan=False):
+                    sharded_plan=False,
+                    scoring_fn="softmax",
+                    score_bias=None,
+                    routed_scaling_factor=1.0):
     """Run one MoE layer through the fused expert-parallel kernel.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
@@ -179,6 +203,18 @@ def fused_ep_moe_v2(x,
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
     router-logit tensor in its original order.
+
+    scoring_fn, score_bias and routed_scaling_factor are the router's shape,
+    and together they have to reproduce whatever `select_experts` would have
+    done for this layer -- the fused path never calls it. scoring_fn picks
+    from SCORING_FNS. score_bias [e_total] is DeepSeek-V4's `noaux_tc`
+    per-expert correction: it is added to the scores that DECIDE the top-k
+    and left out of the weights those selections carry, so it needs both
+    tables and cannot be folded into the logits. It is the one operand that
+    is replicated rather than sharded on the expert-parallel axis: every
+    shard scores the full expert set for its own tokens, because which shard
+    owns an expert is not known until after the selection. routed_scaling
+    _factor multiplies the final weights, after any renormalization.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -252,6 +288,14 @@ def fused_ep_moe_v2(x,
             f"next. Pass {stride_bound} or more.")
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
+    has_score_bias = score_bias is not None
+    if scoring_fn not in SCORING_FNS:
+        raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got "
+                         f"{scoring_fn!r}")
+    if has_score_bias and score_bias.shape != (e_total, ):
+        raise ValueError(
+            f"score_bias must be one value per global expert, [{e_total}]; "
+            f"got {tuple(score_bias.shape)}")
     kfn = build_fused_ep_moe_kernel(g_local=g_local,
                                     capacity=capacity,
                                     hidden=hidden,
@@ -274,6 +318,7 @@ def fused_ep_moe_v2(x,
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
         gate_l = next(operands)
+        score_bias_l = next(operands) if has_score_bias else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
@@ -291,13 +336,23 @@ def fused_ep_moe_v2(x,
                              axis=0,
                              tiled=True)
 
-        scores = jax.nn.softmax(gate_l, axis=-1)
+        scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
-        topk_weights, topk_idx = pallas_select(scores,
-                                               topk=topk,
-                                               block_rows=select_rows)
+        if score_bias_l is None:
+            topk_weights, topk_idx = pallas_select(scores,
+                                                   topk=topk,
+                                                   block_rows=select_rows)
+        else:
+            # The bias orders the selection; the weights come from the
+            # unbiased table. Broadcast over tokens, not over experts: the
+            # bias is one value per expert for the whole batch.
+            topk_weights, topk_idx = pallas_select(
+                scores + score_bias_l.astype(jnp.float32)[None, :],
+                topk=topk,
+                block_rows=select_rows,
+                weight_scores=scores)
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks)
         # A row of scores carrying no real value routes nowhere. It was
@@ -311,8 +366,17 @@ def fused_ep_moe_v2(x,
         # routed at full weight to expert zero. Mask it explicitly instead.
         row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
         if renormalize:
-            denom = topk_weights.sum(axis=-1, keepdims=True)
+            # The floor is the torch reference's `clamp(min=1e-20)`. It is a
+            # no-op under softmax, whose live rows sum into (0, 1], and it
+            # matters under the unnormalized scorers: sqrtsoftplus is
+            # non-negative and underflows to exactly zero below about -88,
+            # so a row of very negative logits divides by zero here and by
+            # 1e-20 in the path this has to match.
+            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True),
+                                1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
@@ -461,8 +525,16 @@ def fused_ep_moe_v2(x,
     # default keeps the device tests and any JAX-native caller working.
     if rank is None:
         rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
-    in_specs = (P(ax), ) * (5 + len(scale_args) + len(bias_args))
-    args = (x, rank, w1, w2) + scale_args + (gating, ) + bias_args
+    # The score bias is the one operand that is NOT sharded on the mesh axis:
+    # it is indexed by GLOBAL expert id and every shard scores the full
+    # expert set, so `P()` hands each shard the whole [e_total] vector.
+    # Sharding it would give each shard a 1/ep slice of the experts and
+    # silently bias the wrong ones.
+    score_bias_args = (score_bias, ) if has_score_bias else ()
+    in_specs = ((P(ax), ) * (5 + len(scale_args)) + (P(), ) *
+                len(score_bias_args) + (P(ax), ) * len(bias_args))
+    args = ((x, rank, w1, w2) + scale_args + (gating, ) + score_bias_args +
+            bias_args)
     NS = jax.sharding.NamedSharding
     args = tuple(
         jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
@@ -472,7 +544,8 @@ def fused_ep_moe_v2(x,
            block, ragged_stride, weight_format, rhs_qb, act_fn, mesh_ep_ranks,
            bool(sharded_plan), x.dtype, w1.dtype, w2.dtype, form.has_scales
            and w1_scale.dtype, gating.dtype, has_w1_bias
-           and w1_bias.dtype, has_w2_bias and w2_bias.dtype)
+           and w1_bias.dtype, has_w2_bias and w2_bias.dtype, scoring_fn,
+           has_score_bias and score_bias.dtype, float(routed_scaling_factor))
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
         with _LAYER_SM_CACHE_LOCK:

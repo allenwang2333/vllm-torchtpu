@@ -55,10 +55,18 @@ def _cpu_backend():
 
 # One decode-sized and one prefill-sized geometry, both at the 397B expert
 # layout the serving path uses (512 experts over 8 shards, top-10).
+#
+# The EP16 row is DeepSeek-V4-Pro's layout (384 experts over 16 shards,
+# top-6) and is here for the width itself rather than the expert count: the
+# alignment slot a routed pair carries grows with `ep`, and every geometry
+# above is narrow enough that it fits a field two shards' worth too small
+# for Pro. A plan built at EP8 cannot fail that way, so it also cannot
+# notice the field is too narrow.
 GEOMETRIES = [
     pytest.param(8, 64, 64, 10, id="decode_t64_ep8_g64"),
     pytest.param(8, 512, 64, 10, id="prefill_t512_ep8_g64"),
     pytest.param(4, 128, 32, 8, id="ep4_g32_topk8"),
+    pytest.param(16, 64, 24, 6, id="pro_t64_ep16_g24_topk6"),
 ]
 
 
@@ -252,3 +260,47 @@ def test_receive_offsets_are_block_aligned(ep, t_local, g_local, topk, skew):
         assert not rem.any(), (
             f"receive row offsets are not {host.ROWBLK}-row aligned on shard "
             f"{me}: {np.unique(rem)}")
+
+
+@pytest.mark.parametrize("ep,t_local,g_local,topk", GEOMETRIES)
+@pytest.mark.parametrize("skew", [False, True], ids=["uniform", "skewed"])
+@pytest.mark.parametrize("seed", [0, 3])
+def test_every_routed_pair_gets_a_row_of_its_own(ep, t_local, g_local, topk,
+                                                 skew, seed):
+    """No two routed pairs are assigned the same row, on either side.
+
+    This is what the packed routing word has to survive, and the reason it
+    gets its own test rather than being left to the sharded-vs-whole
+    comparison above: both of those paths pack an arrival position and an
+    alignment slot into one int32 with the same code, so a slot field too
+    narrow for the mesh corrupts them identically and they still agree.
+    What it cannot do is stay injective -- a slot that overflows its field
+    carries into the position, and two pairs land on one row. Silently:
+    the kernel then computes both and commits one.
+    """
+    routing, e_total = _routing(ep, t_local, g_local, topk, skew=skew,
+                                seed=seed)
+    slab = np.asarray(routing.slab_row).reshape(-1)
+    assert len(np.unique(slab)) == slab.size, (
+        f"{slab.size - len(np.unique(slab))} of {slab.size} routed pairs "
+        f"share a slab row at ep={ep}; the alignment slot needs up to "
+        f"{(host.ROWBLK - 1) * (ep - 1)} and the packed word gives it "
+        f"{host.ALIGNMENT_SLOT_FIELD}")
+
+    assert slab.min() >= 0 and slab.max() < routing.rows_alloc, (
+        f"a routed pair lands outside the {routing.rows_alloc}-row slab "
+        f"allocation at ep={ep}: [{slab.min()}, {slab.max()}]")
+
+    # Arrival rows are per source shard: a shard's receive buffer is indexed
+    # independently, so uniqueness is within a source, not across all of them.
+    arrival = np.asarray(routing.arrival_row)
+    recv_rows = np.asarray(routing.recv_rows)
+    T = arrival.shape[0]
+    for d in range(ep):
+        mine = arrival[d * (T // ep):(d + 1) * (T // ep)].reshape(-1)
+        assert len(np.unique(mine)) == mine.size, (
+            f"two pairs from source shard {d} arrive at the same row at "
+            f"ep={ep}")
+        assert mine.min() >= 0 and mine.max() < recv_rows[d], (
+            f"source shard {d} arrives outside its {recv_rows[d]}-row "
+            f"receive buffer at ep={ep}: [{mine.min()}, {mine.max()}]")

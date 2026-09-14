@@ -84,6 +84,13 @@ SMALL = dict(hidden=512, inter=256, e_total=32, topk=4, tokens=256)
 PROD = dict(hidden=4096, inter=1024, e_total=512, topk=10)
 PROD_TOKENS = (2048, 16384)
 
+# DeepSeek-V4-Pro's row width, which is the widest thing this kernel is asked
+# to serve and is wider than every shape above: 7168 is 56 lane blocks where
+# 4096 is 32. Everything else here is cut to the bone, because the row
+# geometry is what is under test and expert weights at this width are not
+# free -- one expert, one block of intermediate, four bits.
+WIDE = dict(hidden=7168, inter=512, e_total=8, topk=4, tokens=256)
+
 # How far the layer may sit from the dense reference, as a batch-wide
 # relative L2 and as the worst single token's. Taken from the kernel's own
 # suite, where they are stated against an fp8 wire: the routed rows travel
@@ -495,15 +502,22 @@ def test_any_mesh_axis_name_works():
                                  token_bound=FP8_TOKEN_BOUND)
 
 
-def test_fp4_block512_tracks_dense_reference_and_routing_plan():
-    """FP4 block scales and FP8 transport, including a single-block W2."""
-    mesh = _mesh()
+def _make_fp4_weights(mesh, seed, shapes, qb=512):
+    """Block-scaled four-bit (w1, w2), their scales, and their exact decode.
+
+    Each [E, K, N] slab is drawn dense, split into `qb`-row blocks along the
+    contraction, and scaled so the block's largest magnitude lands at the
+    format's top finite value. The decode is taken back off the rounded
+    four-bit array rather than off the draw, so the reference the layer is
+    held to differs from it by the transport and the arithmetic and not by
+    the quantization.
+    """
     shard = NamedSharding(mesh, P(AXIS))
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     weights, scales, decoded = [], [], []
-    for shape in ((32, 1024, 1024), (32, 512, 1024)):
+    for shape in shapes:
         raw = rng.normal(0, 0.1, shape).astype(np.float32)
-        grouped = raw.reshape(shape[0], shape[1] // 512, 512, shape[2])
+        grouped = raw.reshape(shape[0], shape[1] // qb, qb, shape[2])
         scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
         normalized = (grouped / scale[:, :, None, :]).reshape(shape)
         w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
@@ -513,6 +527,15 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
         weights.append(w)
         scales.append(s)
         decoded.append(dequant)
+    return weights, scales, decoded
+
+
+def test_fp4_block512_tracks_dense_reference_and_routing_plan():
+    """FP4 block scales and FP8 transport, including a single-block W2."""
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(mesh, 42,
+                                                 ((32, 1024, 1024),
+                                                  (32, 512, 1024)))
     x, gating = _make_inputs(mesh, 43, tokens=256, hidden=1024, e_total=32)
     common = dict(topk=4,
                   renormalize=True,
@@ -547,4 +570,66 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
                              None,
                              gating,
                              topk=4)
+    assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
+
+
+def test_wide_rows_track_a_dense_reference():
+    """Rows past 32 lane blocks: DeepSeek-V4-Pro's 7168-wide hidden.
+
+    The per-row transport stages a row as [lane blocks, 128] and moves it at
+    row granularity, and every buffer that geometry shapes -- the activation
+    staging, the output pair and its scale mirror, the arrival and
+    contribution buffers -- takes its width from the block count. A ceiling
+    on that count therefore reads as a property of the transport, and the
+    one this kernel carried, 32 blocks, sat exactly on the width of the two
+    models it was brought up against. Pro's rows are 56 blocks and were
+    refused; nothing in the kernel other than the ceiling itself knew the
+    number, so this is the test that says so, and says it where a wrong
+    answer shows up as wrong output rather than as a raise.
+    """
+    mesh = _mesh()
+    hidden, inter, e_total = WIDE["hidden"], WIDE["inter"], WIDE["e_total"]
+    weights, scales, decoded = _make_fp4_weights(mesh, 44,
+                                                 ((e_total, hidden, 2 * inter),
+                                                  (e_total, inter, hidden)))
+    x, gating = _make_inputs(mesh,
+                             45,
+                             tokens=WIDE["tokens"],
+                             hidden=hidden,
+                             e_total=e_total)
+    out = fused_ep_moe_v2(x,
+                          *weights,
+                          *scales,
+                          gating,
+                          topk=WIDE["topk"],
+                          renormalize=True,
+                          mesh=mesh,
+                          capacity=CAPACITY,
+                          weight_format=WeightFormat.FP4,
+                          rhs_qb=512)
+    assert out.shape == x.shape
+    ref = _dense_reference(mesh,
+                           x,
+                           *decoded,
+                           None,
+                           None,
+                           gating,
+                           topk=WIDE["topk"])
+    error = _relative_l2(out, ref)
+    worst = _worst_token_relative_l2(out, ref)
+    print(f"wide rows ({hidden // 128} lane blocks) relative_l2={error} "
+          f"worst_token={worst}")
+    assert error < FP8_RELATIVE_BOUND
+    assert worst < FP8_TOKEN_BOUND
+    # A row that arrived at the wrong offset would still be a row, and both
+    # bands above are wide enough to be cleared by one. The control is what
+    # rules that out.
+    wrong = _dense_reference(mesh,
+                             x,
+                             jnp.roll(decoded[0], 1, axis=0),
+                             jnp.roll(decoded[1], 1, axis=0),
+                             None,
+                             None,
+                             gating,
+                             topk=WIDE["topk"])
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
