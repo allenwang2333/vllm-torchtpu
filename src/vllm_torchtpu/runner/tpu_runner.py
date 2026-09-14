@@ -263,6 +263,12 @@ class _HostSlackProbe:
     sample_tokens are two calls and the gap between them belongs to the step
     as much as either does.
 
+    Prefill and decode steps are kept apart. A prefill step of 8192 tokens
+    costs several times what a decode step costs, so pooling them gives a
+    distribution with two humps whose spread swamps the few milliseconds
+    being injected. The split is exact rather than a threshold: a step is
+    decode exactly when every scheduled request contributes one token.
+
     TPU_HOST_BURN_FILE names a file holding a replacement dose, re-read at
     each report boundary. A server takes minutes to come up, and comparing
     doses across separate launches means comparing across different compile
@@ -286,7 +292,8 @@ class _HostSlackProbe:
         self.burns_here = rank == int(envs.TPU_HOST_BURN_RANK)
         self.enabled = bool(self.burn_us or self.log_every or self.dose_file)
         self._last: float | None = None
-        self._periods: list[float] = []
+        self._last_kind: str | None = None
+        self._periods: dict[str, list[float]] = {"prefill": [], "decode": []}
         self._steps = 0
 
     def _reload_dose(self) -> None:
@@ -307,39 +314,46 @@ class _HostSlackProbe:
         while time.perf_counter() < deadline:
             pass
 
-    def tick(self, scheduled_tokens: int) -> None:
+    def tick(self, scheduled_tokens: int, num_reqs: int) -> None:
         now = time.perf_counter()
         last, self._last = self._last, now
-        if last is not None:
-            self._periods.append(now - last)
+        kind = "decode" if scheduled_tokens == num_reqs else "prefill"
+        # The period ending here covers the previous step's execution and the
+        # previous step's burn, so it belongs to that step's kind. Labelling
+        # it with this step's kind inverts the two whenever they alternate.
+        prev, self._last_kind = self._last_kind, kind
+        if last is not None and prev is not None:
+            self._periods[prev].append(now - last)
         self._steps += 1
         if not self.log_every or self._steps % self.log_every:
             return
-        periods = sorted(self._periods)
-        self._periods = []
-        if not periods:
-            return
-        n = len(periods)
-        # A period that spans a gap in the load measures the client, not the
-        # loop, and one such gap moves the mean more than the whole effect
-        # being looked for. The trimmed mean drops the outer tenth at each
-        # end, which removes those without needing a threshold picked by eye.
-        lo, hi = int(n * 0.1), max(int(n * 0.9), int(n * 0.1) + 1)
-        trimmed = periods[lo:hi]
         record = {
             "event": "host_slack_step_period",
             "rank": self.rank,
             "burn_us": self.burn_us,
             "burns_here": self.burns_here,
             "steps": self._steps,
-            "n": n,
-            "trimmed_ms": round(sum(trimmed) / len(trimmed) * 1000, 4),
-            "mean_ms": round(sum(periods) / n * 1000, 4),
-            "p50_ms": round(periods[n // 2] * 1000, 4),
-            "p90_ms": round(periods[int(n * 0.9)] * 1000, 4),
-            "min_ms": round(periods[0] * 1000, 4),
-            "scheduled_tokens": scheduled_tokens,
         }
+        for name, raw in self._periods.items():
+            self._periods[name] = []
+            if not raw:
+                continue
+            periods = sorted(raw)
+            n = len(periods)
+            # A period that spans a gap in the load measures the client, not
+            # the loop, and one such gap moves the mean more than the effect
+            # being looked for. The trimmed mean drops the outer tenth at
+            # each end, which removes those without a threshold picked by eye.
+            lo, hi = int(n * 0.1), max(int(n * 0.9), int(n * 0.1) + 1)
+            trimmed = periods[lo:hi]
+            record[name] = {
+                "n": n,
+                "trimmed_ms": round(sum(trimmed) / len(trimmed) * 1000, 4),
+                "mean_ms": round(sum(periods) / n * 1000, 4),
+                "p50_ms": round(periods[n // 2] * 1000, 4),
+                "min_ms": round(periods[0] * 1000, 4),
+                "max_ms": round(periods[-1] * 1000, 4),
+            }
         logger.info("%s", json.dumps(record, sort_keys=True))
         self._reload_dose()
 
@@ -3577,7 +3591,8 @@ class TPUModelRunner(GPUModelRunner):
             probe = self._host_slack_probe = _HostSlackProbe(
                 self._profiler_rank)
         if probe.enabled and scheduler_output.total_num_scheduled_tokens:
-            probe.tick(scheduler_output.total_num_scheduled_tokens)
+            probe.tick(scheduler_output.total_num_scheduled_tokens,
+                       len(scheduler_output.num_scheduled_tokens))
             probe.burn()
         # Update cached state
         self._update_states(scheduler_output)
