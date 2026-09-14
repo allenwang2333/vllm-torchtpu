@@ -5,7 +5,6 @@
 # size and serve flags as kimi-k3-tp32-ep, but max-num-seqs high enough that
 # lm_eval's num_concurrent up to 256 is really served concurrently.
 # Knobs (build env): K3_SWEEP_CTX (default 16384), K3_SWEEP_MAX_NUM_SEQS (256).
-# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-tp32-ep.sh"
 
 MAX_MODEL_LEN="${K3_SWEEP_CTX:-16384}"
@@ -22,3 +21,6 @@ if [ "$EXTRA_SERVE_ARGS" = "$_before" ]; then
     echo "ERROR: kimi-k3-tp32-ep-concsweep.sh: the nightly config no longer sets compile_sizes [1,8,8192]; update the substitution above" >&2
     return 1
 fi
+
+# Extra serve flags for probes, appended last so they override the flags above.
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS}${K3_EXTRA_SERVE_ARGS:+ $K3_EXTRA_SERVE_ARGS}"
