@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.kimi_k3.mega_kda import (_layout_supported,
                                                     kda_forward_inference)
 
@@ -243,3 +244,290 @@ def test_mega_kda_forward_matches_recurrence(seed: int,
         atol=5e-3,
         err_msg="mega_kda final state diverges from recurrence reference",
     )
+
+
+def test_mega_kda_multichunk_continuity_with_initial_state() -> None:
+    """Validate mega-KDA multi-chunk continuity (T=128) with non-zero initial state.
+
+    Tests that an initial memory state H0 is correctly loaded into Chunk 0,
+    accumulated across the chunk, seamlessly carried across the chunk boundary
+    into Chunk 1 via the kernel's VMEM state scratch, and that the final state
+    HT is properly output and matches float64 recurrence.
+    """
+    rng = np.random.default_rng(42)
+    B, T, H, K, V = 1, 128, 1, 128, 128
+    shape_q = (B, T, H, K)
+    shape_v = (B, T, H, V)
+
+    q_np = rng.standard_normal(shape_q).astype(np.float32)
+    k_np = rng.standard_normal(shape_q).astype(np.float32)
+    v_np = rng.standard_normal(shape_v).astype(np.float32)
+    g_np = (rng.standard_normal(shape_q) - 4.0).astype(np.float32)
+    beta_np = rng.uniform(0.1, 0.9, (B, T, H)).astype(np.float32)
+    seg_np = np.ones((B, T), dtype=np.int32)
+    A_log_np = rng.standard_normal((H, )).astype(np.float32) * 0.1
+    dt_bias_np = rng.standard_normal((H * K, )).astype(np.float32) * 0.1
+    h0_np = rng.standard_normal((B, 1, H, K, V)).astype(np.float32) * 0.1
+
+    ref_out, ref_state = _reference_kda_recurrence(
+        q=q_np,
+        k=k_np,
+        v=v_np,
+        g=g_np,
+        beta=beta_np,
+        segment_ids=seg_np,
+        A_log=A_log_np,
+        dt_bias=dt_bias_np,
+        initial_state=h0_np,
+        lower_bound=-5.0,
+        N_max=1,
+    )
+
+    inputs = {
+        "q": jnp.asarray(q_np, dtype=jnp.bfloat16),
+        "k": jnp.asarray(k_np, dtype=jnp.bfloat16),
+        "v": jnp.asarray(v_np, dtype=jnp.bfloat16),
+        "g": jnp.asarray(g_np, dtype=jnp.bfloat16),
+        "beta": jnp.asarray(beta_np, dtype=jnp.bfloat16),
+        "segment_ids": jnp.asarray(seg_np, dtype=jnp.int32),
+        "A_log": jnp.asarray(A_log_np, dtype=jnp.float32),
+        "dt_bias": jnp.asarray(dt_bias_np, dtype=jnp.float32),
+        "initial_state": jnp.asarray(h0_np, dtype=jnp.float32),
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "safe_gate": True,
+        "lower_bound": -5.0,
+        "N_max": 1,
+    }
+
+    act_out, act_state = _run_mega_kda(**inputs)
+
+    np.testing.assert_allclose(
+        np.asarray(act_out, dtype=np.float64),
+        ref_out,
+        rtol=1e-3,
+        atol=1e-3,
+        err_msg="mega_kda multi-chunk forward diverges from recurrence",
+    )
+    np.testing.assert_allclose(
+        np.asarray(act_state, dtype=np.float64),
+        ref_state,
+        rtol=6e-3,
+        atol=6e-3,
+        err_msg="mega_kda multi-chunk final state diverges from recurrence",
+    )
+
+
+@pytest.mark.parametrize("packed_mode",
+                         ["chunk_aligned", "intra_chunk_boundary"])
+def test_mega_kda_multisegment_packed(packed_mode: str) -> None:
+    """Validate mega-KDA with packed multi-segment sequences.
+
+    Exercises both:
+    1. 'chunk_aligned': Two full chunks belonging to distinct requests
+       (Segment 1 on tokens 0..63, Segment 2 on tokens 64..127), each with
+       independent initial states H0, verifying cross-segment state isolation.
+    2. 'intra_chunk_boundary': Two distinct requests packed within a single
+       chunk (tokens 0..31 for Segment 1, tokens 32..63 for Segment 2),
+       verifying intra-chunk boundary isolation (CHUNK_KIND_BOUNDARY).
+    """
+    rng = np.random.default_rng(42)
+    B, H, K, V = 1, 1, 128, 128
+    N_max = 2
+
+    if packed_mode == "chunk_aligned":
+        T = 128
+        seg_np = np.array([[1] * 64 + [2] * 64], dtype=np.int32)
+        h0_np = rng.standard_normal(
+            (B, N_max, H, K, V)).astype(np.float32) * 0.1
+    else:
+        T = 64
+        seg_np = np.array([[1] * 32 + [2] * 32], dtype=np.int32)
+        h0_np = None
+
+    shape_q = (B, T, H, K)
+    shape_v = (B, T, H, V)
+
+    q_np = rng.standard_normal(shape_q).astype(np.float32)
+    k_np = rng.standard_normal(shape_q).astype(np.float32)
+    v_np = rng.standard_normal(shape_v).astype(np.float32)
+    g_np = (rng.standard_normal(shape_q) - 4.0).astype(np.float32)
+    beta_np = rng.uniform(0.1, 0.9, (B, T, H)).astype(np.float32)
+    A_log_np = rng.standard_normal((H, )).astype(np.float32) * 0.1
+    dt_bias_np = rng.standard_normal((H * K, )).astype(np.float32) * 0.1
+
+    ref_out, ref_state = _reference_kda_recurrence(
+        q=q_np,
+        k=k_np,
+        v=v_np,
+        g=g_np,
+        beta=beta_np,
+        segment_ids=seg_np,
+        A_log=A_log_np,
+        dt_bias=dt_bias_np,
+        initial_state=h0_np,
+        lower_bound=-5.0,
+        N_max=N_max,
+    )
+
+    inputs = {
+        "q":
+        jnp.asarray(q_np, dtype=jnp.bfloat16),
+        "k":
+        jnp.asarray(k_np, dtype=jnp.bfloat16),
+        "v":
+        jnp.asarray(v_np, dtype=jnp.bfloat16),
+        "g":
+        jnp.asarray(g_np, dtype=jnp.bfloat16),
+        "beta":
+        jnp.asarray(beta_np, dtype=jnp.bfloat16),
+        "segment_ids":
+        jnp.asarray(seg_np, dtype=jnp.int32),
+        "A_log":
+        jnp.asarray(A_log_np, dtype=jnp.float32),
+        "dt_bias":
+        jnp.asarray(dt_bias_np, dtype=jnp.float32),
+        "initial_state":
+        jnp.asarray(h0_np, dtype=jnp.float32) if h0_np is not None else None,
+        "output_final_state":
+        True,
+        "use_qk_l2norm_in_kernel":
+        True,
+        "use_gate_in_kernel":
+        True,
+        "safe_gate":
+        True,
+        "lower_bound":
+        -5.0,
+        "N_max":
+        N_max,
+    }
+
+    act_out, act_state = _run_mega_kda(**inputs)
+
+    np.testing.assert_allclose(
+        np.asarray(act_out, dtype=np.float64),
+        ref_out,
+        rtol=1e-3,
+        atol=1e-3,
+        err_msg=f"mega_kda multi-segment ({packed_mode}) output diverges",
+    )
+    np.testing.assert_allclose(
+        np.asarray(act_state, dtype=np.float64),
+        ref_state,
+        rtol=6e-3,
+        atol=6e-3,
+        err_msg=f"mega_kda multi-segment ({packed_mode}) state diverges",
+    )
+
+
+@pytest.mark.parametrize(
+    ("manual_state_dma", "overlap_h0_dma", "overlap_ht_dma"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+def test_mega_kda_dma_toggles(manual_state_dma: bool, overlap_h0_dma: bool,
+                              overlap_ht_dma: bool) -> None:
+    """Validate mega-KDA across all DMA knob configurations (#776).
+
+    Uses jax.clear_caches() to prevent JAX from latching compiled kernels
+    across calls, ensuring each DMA toggle actively re-traces the kernel and
+    configures the corresponding Pallas DMA lowering parameters. On TPU,
+    verifies numerical equivalence against the float64 recurrence reference.
+    """
+    rng = np.random.default_rng(42)
+    B, T, H, K, V = 1, 128, 1, 128, 128
+    shape_q = (B, T, H, K)
+    shape_v = (B, T, H, V)
+
+    q_np = rng.standard_normal(shape_q).astype(np.float32)
+    k_np = rng.standard_normal(shape_q).astype(np.float32)
+    v_np = rng.standard_normal(shape_v).astype(np.float32)
+    g_np = (rng.standard_normal(shape_q) - 4.0).astype(np.float32)
+    beta_np = rng.uniform(0.1, 0.9, (B, T, H)).astype(np.float32)
+    seg_np = np.ones((B, T), dtype=np.int32)
+    A_log_np = rng.standard_normal((H, )).astype(np.float32) * 0.1
+    dt_bias_np = rng.standard_normal((H * K, )).astype(np.float32) * 0.1
+    h0_np = rng.standard_normal((B, 1, H, K, V)).astype(np.float32) * 0.1
+
+    ref_out, ref_state = _reference_kda_recurrence(
+        q=q_np,
+        k=k_np,
+        v=v_np,
+        g=g_np,
+        beta=beta_np,
+        segment_ids=seg_np,
+        A_log=A_log_np,
+        dt_bias=dt_bias_np,
+        initial_state=h0_np,
+        lower_bound=-5.0,
+        N_max=1,
+    )
+
+    inputs = {
+        "q": jnp.asarray(q_np, dtype=jnp.bfloat16),
+        "k": jnp.asarray(k_np, dtype=jnp.bfloat16),
+        "v": jnp.asarray(v_np, dtype=jnp.bfloat16),
+        "g": jnp.asarray(g_np, dtype=jnp.bfloat16),
+        "beta": jnp.asarray(beta_np, dtype=jnp.bfloat16),
+        "segment_ids": jnp.asarray(seg_np, dtype=jnp.int32),
+        "A_log": jnp.asarray(A_log_np, dtype=jnp.float32),
+        "dt_bias": jnp.asarray(dt_bias_np, dtype=jnp.float32),
+        "initial_state": jnp.asarray(h0_np, dtype=jnp.float32),
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "safe_gate": True,
+        "lower_bound": -5.0,
+        "N_max": 1,
+    }
+
+    with mock.patch.object(envs, "KDA_MANUAL_STATE_DMA", manual_state_dma), \
+         mock.patch.object(envs, "KDA_OVERLAP_H0_DMA", overlap_h0_dma), \
+         mock.patch.object(envs, "KDA_OVERLAP_HT_DMA", overlap_ht_dma):
+        jax.clear_caches()
+        if jax.default_backend() == "cpu":
+            captured_flags: dict = {}
+
+            def _spy_pallas_call(kernel_fn, *args, **kwargs):
+                captured_flags.update(kernel_fn.keywords)
+
+                def _dummy_runner(*call_args):
+                    out_shapes = kwargs.get("out_shape", [])
+                    return tuple(
+                        jnp.zeros(s.shape, dtype=s.dtype
+                                  ) if s is not None else None
+                        for s in out_shapes)
+
+                return _dummy_runner
+
+            with mock.patch("jax.experimental.pallas.pallas_call",
+                            side_effect=_spy_pallas_call):
+                kda_forward_inference(**inputs)
+
+            assert captured_flags["MANUAL_HT_DMA"] == manual_state_dma
+            assert captured_flags["OVERLAP_H0_DMA"] == overlap_h0_dma
+            assert captured_flags["OVERLAP_HT_DMA"] == overlap_ht_dma
+        else:
+            act_out, act_state = _run_mega_kda(**inputs)
+            np.testing.assert_allclose(
+                np.asarray(act_out, dtype=np.float64),
+                ref_out,
+                rtol=1e-3,
+                atol=1e-3,
+                err_msg=(f"DMA mode ({manual_state_dma=}, {overlap_h0_dma=}, "
+                         f"{overlap_ht_dma=}) output diverges"),
+            )
+            np.testing.assert_allclose(
+                np.asarray(act_state, dtype=np.float64),
+                ref_state,
+                rtol=6e-3,
+                atol=6e-3,
+                err_msg=(f"DMA mode ({manual_state_dma=}, {overlap_h0_dma=}, "
+                         f"{overlap_ht_dma=}) state diverges"),
+            )
