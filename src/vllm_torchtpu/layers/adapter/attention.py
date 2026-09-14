@@ -392,6 +392,7 @@ def _pallas_rpa_kernel_batched(
     skip_kv_update: bool,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout,
+    decode_query_size: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
     return _pallas_rpa_kernel_impl(
@@ -410,7 +411,9 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=ragged_paged_attention_batched,
+        rpa_func=(functools.partial(ragged_paged_attention_batched,
+                                    decode_query_size=decode_query_size) if
+                  decode_query_size > 1 else ragged_paged_attention_batched),
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
@@ -572,6 +575,32 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     `--block-size` given) stays at 256. Under `VLLM_KV_CACHE_LAYOUT=HND` a page
     is one 128-lane tile and 128 is the only accepted size.
     """
+
+    @staticmethod
+    def get_decode_query_size(vllm_config: VllmConfig | None) -> int:
+        """Shared kernel/routing contract for longctx speculative verification."""
+        if vllm_config is None or not envs.USE_BATCHED_RPA_LONGCTX:
+            return 1
+        spec = vllm_config.speculative_config
+        model = vllm_config.model_config
+        parallel = vllm_config.parallel_config
+        if (spec is None or model is None
+                or vllm_config.attention_config.backend
+                != AttentionBackendEnum.CUSTOM
+                or get_kv_cache_layout() != "HND"
+                or parallel.prefill_context_parallel_size != 1
+                or parallel.decode_context_parallel_size != 1
+                or envs.VLLM_TPU_BLOCK_MAJOR_KV or model.is_mla
+                or model.get_head_size() == 64):
+            return 1
+        if spec.method in ("eagle", "eagle3", "mtp"):
+            # The first draft forward reuses target query metadata. A local
+            # TP=1 draft or hd64/MLA draft cannot consume a widened decode prefix.
+            draft = spec.draft_model_config
+            if (spec.draft_tensor_parallel_size == 1 or draft is None
+                    or draft.is_mla or draft.get_head_size() == 64):
+                return 1
+        return next_power_of_2(spec.num_speculative_tokens + 1)
 
     @staticmethod
     def get_name() -> str:
@@ -1294,6 +1323,18 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
     """Impl variant that dispatches to the batched RPA Pallas kernel."""
     _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
     _kernel_op_prefix = "pallas::rpa_kernel_batched"
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        decode_query_size = PallasBatchedRPAAttentionBackend.get_decode_query_size(
+            get_current_vllm_config_or_none())
+        if decode_query_size > 1:
+            self._kernel_entry = functools.partial(
+                _pallas_rpa_kernel_batched,
+                decode_query_size=decode_query_size)
+            # Width is static in JAX; keep distinct widths out of the same op cache.
+            self._kernel_op_prefix = (
+                f"pallas::rpa_kernel_batched_spec_q{decode_query_size}")
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

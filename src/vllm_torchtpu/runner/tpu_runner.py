@@ -81,7 +81,7 @@ from vllm_torchtpu.kv_cache_spec_normalizer import \
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, PallasAttentionBackend,
-    PallasMLAttentionBackend)
+    PallasBatchedRPAAttentionBackend, PallasMLAttentionBackend)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import \
     copy_mamba_state_blocks
 from vllm_torchtpu.layers.adapter.quantization import \
@@ -774,6 +774,9 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        self._rpa_decode_query_size = (
+            PallasBatchedRPAAttentionBackend.get_decode_query_size(
+                self.vllm_config))
         self.spec_decode_manager = SpeculativeDecodingManager(self)
         self._init_speculative_decoding()
         self.structured_decoding_manager = StructuredDecodingManager(self)
@@ -2925,6 +2928,9 @@ class TPUModelRunner(GPUModelRunner):
                         num_windowed_reqs: int | None = None):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
+        # Reordering already places verify immediately after one-token decode.
+        rpa_num_decode_reqs = (num_windowed_reqs if self._rpa_decode_query_size
+                               > 1 else num_decode_reqs)
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -3048,7 +3054,7 @@ class TPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_per_req)
         self._check_attention_schedule(
             num_reqs, num_scheduled_tokens_per_req,
-            max(0, min(num_decode_reqs - start_index, num_reqs)))
+            max(0, min(rpa_num_decode_reqs - start_index, num_reqs)))
 
         request_major_input_ids_cpu: torch.Tensor
         if self._pcp_mtp_k1_enabled:
@@ -3225,7 +3231,7 @@ class TPUModelRunner(GPUModelRunner):
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
             # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
             chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+                0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
@@ -3250,13 +3256,13 @@ class TPUModelRunner(GPUModelRunner):
         # Spec decode with mamba layers: the GDN kernel's windowed segment
         # covers 1-token decodes AND speculative verify windows (the batch is
         # ordered [decode][verify][prefill/mixed] by _reorder_batch_for_rpa),
-        # while RPA keeps its 1-token-decode-only front segment.
+        # while RPA includes verify only when its decode tile supports it.
         mamba_request_distribution = None
         if self.mamba_slot_read_offsets is not None:
             chunk_num_windowed = max(
                 0, min(num_windowed_reqs - start_index, num_reqs))
             chunk_num_decode = max(
-                0, min(num_decode_reqs - start_index, num_reqs))
+                0, min(rpa_num_decode_reqs - start_index, num_reqs))
             # One H2D copy, two views (see the staging tensor's comment for
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
