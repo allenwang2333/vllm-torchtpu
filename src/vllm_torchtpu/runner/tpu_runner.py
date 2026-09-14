@@ -4761,7 +4761,7 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output.inter_stage_outputs = None
             else:
                 model_runner_output.inter_stage_outputs = mm_outputs
-                model_runner_output.multimodal_outputs = None
+                model_runner_output.multimodal_outputs = mm_outputs
 
         async_output = AsyncTPUModelRunnerOutput(
             model_runner_output=model_runner_output,

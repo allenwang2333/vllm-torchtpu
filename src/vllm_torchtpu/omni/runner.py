@@ -2,6 +2,8 @@
 """TPU model runner with Omni connector mixin support."""
 
 import contextlib
+import multiprocessing
+import os
 from typing import Any
 import numpy as np
 import torch
@@ -26,11 +28,92 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
         self.omni_prefix_cache = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+
+        # Resolve Stage ID robustly
+        stage_id = None
+        proc_name = multiprocessing.current_process().name
+        proc_title = ""
+        try:
+            import setproctitle
+            proc_title = setproctitle.getproctitle()
+        except Exception:
+            pass
+
+        for cand in (0, 1, 2):
+            if (
+                f"stage{cand}" in proc_name
+                or f"stage{cand}" in proc_title
+                or f"stage_{cand}" in proc_name
+                or f"stage_{cand}" in proc_title
+            ):
+                stage_id = cand
+                break
+        if stage_id is None:
+            env_stage = os.environ.get("VLLM_OMNI_STAGE_ID")
+            if env_stage is not None:
+                try:
+                    stage_id = int(env_stage)
+                except ValueError:
+                    pass
+        if stage_id is None and hasattr(self, "model_config"):
+            model_stage = getattr(self.model_config, "model_stage", None)
+            if model_stage == "thinker":
+                stage_id = 0
+            elif model_stage == "talker":
+                stage_id = 1
+            elif model_stage == "code2wav":
+                stage_id = 2
+        if stage_id is None and hasattr(self, "model_config"):
+            stage_id = getattr(self.model_config, "stage_id", 0)
+
         if hasattr(self, "model_config"):
+            if stage_id is not None:
+                self.model_config.stage_id = stage_id
             try:
                 self.init_omni_connectors(self.model_config)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[TPUOmniModelRunner] init_omni_connectors error: %s", e)
+
+        if stage_id is not None:
+            self._stage_id = stage_id
+
+        if self._stage_id == 0:
+            self._next_stage_id = 1
+            if getattr(self, "_custom_process_func", None) is None:
+                try:
+                    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+                        thinker2talker_full_payload,
+                    )
+                    self._custom_process_func = thinker2talker_full_payload
+                    self._custom_process_func_path = (
+                        "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_full_payload"
+                    )
+                except Exception as e:
+                    logger.warning("[TPUOmniModelRunner] Could not import thinker2talker_full_payload: %s", e)
+        elif self._stage_id == 1:
+            self._next_stage_id = 2
+            if getattr(self, "_custom_process_func", None) is None:
+                try:
+                    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+                        talker2code2wav_full_payload,
+                    )
+                    self._custom_process_func = talker2code2wav_full_payload
+                    self._custom_process_func_path = (
+                        "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_full_payload"
+                    )
+                except Exception as e:
+                    logger.warning("[TPUOmniModelRunner] Could not import talker2code2wav_full_payload: %s", e)
+        elif self._stage_id == 2:
+            self._next_stage_id = None
+            self._custom_process_func = None
+
+        logger.info(
+            "[TPUOmniModelRunner] Initialized Stage %s: next_stage=%s, custom_func=%s, connector=%s",
+            self._stage_id,
+            self._next_stage_id,
+            getattr(self, "_custom_process_func_path", None),
+            type(getattr(self, "_omni_connector", None)).__name__,
+        )
 
     def _store_value(self, dest: dict, key: str, value: Any, gpu_keys: set) -> None:
         if isinstance(value, torch.Tensor):
@@ -65,7 +148,7 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
         if req_state is not None:
             setattr(req_state, "additional_information_cpu", existing)
 
-    def _sync_local_stage_payloads(self) -> None:
+    def _sync_local_stage_payloads(self, scheduler_output: Any = None) -> None:
         """Move received full-payload stage inputs into model_intermediate_buffer."""
         cache = getattr(self, "_local_stage_payload_cache", None)
         if not cache:
@@ -79,6 +162,10 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
             if hasattr(self, "input_batch") and hasattr(self.input_batch, "req_ids"):
                 num_reqs = getattr(self.input_batch, "num_reqs", len(self.input_batch.req_ids))
                 active_req_ids.update(self.input_batch.req_ids[:num_reqs])
+            if scheduler_output is not None:
+                active_reqs = getattr(scheduler_output, "scheduled_new_reqs", []) or []
+                active_req_ids.update([req.req_id for req in active_reqs if hasattr(req, "req_id")])
+                active_req_ids.update(getattr(scheduler_output, "num_scheduled_tokens", {}).keys())
             pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
             staged = {
                 req_id: payload
@@ -99,6 +186,10 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
         """Gate send-side full-payload output accumulation on TPU."""
         if getattr(self, "_omni_connector", None) is None:
             return False
+        if getattr(self, "_stage_id", None) == 2:
+            return False
+        if getattr(self, "_stage_id", None) in (0, 1):
+            return True
         if getattr(self, "_custom_process_func", None) is not None:
             return True
         model_config = getattr(self, "model_config", None)
@@ -107,12 +198,37 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
             return True
         return False
 
+    def _update_states(self, scheduler_output: Any) -> Any:
+        ret = super()._update_states(scheduler_output)
+        if hasattr(self, "_omni_connector") and self._omni_connector is not None:
+            finished_ids = set(getattr(scheduler_output, "finished_req_ids", []))
+            pending_ids = set(getattr(self, "_pending_full_payload_send", {}).keys())
+            to_flush = finished_ids & pending_ids
+            if to_flush:
+                logger.info("[TPUOmniModelRunner] _update_states flushing full-payload outputs for %s", to_flush)
+                active_reqs = getattr(self, "requests", {})
+                for rid in to_flush:
+                    req_state = active_reqs.get(rid)
+                    if req_state is not None:
+                        p_ids = getattr(req_state, "prompt_token_ids", []) or []
+                        o_ids = getattr(req_state, "output_token_ids", []) or []
+                        req_state.all_token_ids = list(p_ids) + list(o_ids)
+                self.flush_full_payload_outputs(to_flush)
+            cleanup_fn = getattr(self, "cleanup_finished_request", None)
+            if cleanup_fn is not None and getattr(self, "_omni_connector_initialized", False):
+                for rid in finished_ids:
+                    try:
+                        cleanup_fn(rid)
+                    except Exception as e:
+                        logger.debug("[TPUOmniModelRunner] cleanup_finished_request error: %s", e)
+        return ret
+
     def execute_model(self, scheduler_output: Any) -> Any:
         if hasattr(self, "_omni_connector") and self._omni_connector is not None:
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)
-            self._sync_local_stage_payloads()
+            self._sync_local_stage_payloads(scheduler_output)
             if getattr(self, "_pending_full_payload_send", None):
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in getattr(self, "requests", {})})
@@ -130,8 +246,26 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
         output = super().execute_model(scheduler_output)
 
         if hasattr(self, "_omni_connector") and self._omni_connector is not None:
+            self._sync_local_stage_payloads(scheduler_output)
+
+        if output is not None and hasattr(self, "attach_omni_connector_output"):
+            try:
+                output = self.attach_omni_connector_output(output)
+            except Exception as e:
+                logger.debug("[TPUOmniModelRunner] attach_omni_connector_output error in execute_model: %s", e)
+        return output
+
+    def sample_tokens(self, grammar_output: Any) -> Any:
+        output = super().sample_tokens(grammar_output)
+        if output is None:
+            return None
+
+        if hasattr(self, "_omni_connector") and self._omni_connector is not None:
             real_output = getattr(output, "_model_runner_output", output)
             inter_stage_outputs = getattr(real_output, "inter_stage_outputs", None)
+            if inter_stage_outputs is None:
+                inter_stage_outputs = getattr(real_output, "multimodal_outputs", None)
+
             if inter_stage_outputs and self._should_accumulate_full_payload_output():
                 req_ids = getattr(real_output, "req_ids", [])
                 logger.info(
@@ -140,9 +274,10 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
                     req_ids,
                     len(inter_stage_outputs),
                 )
+                active_reqs = getattr(self, "requests", {})
                 for i, rid in enumerate(req_ids):
                     if i < len(inter_stage_outputs) and inter_stage_outputs[i]:
-                        req_state = getattr(self, "requests", {}).get(rid)
+                        req_state = active_reqs.get(rid)
                         if req_state is not None:
                             if not hasattr(req_state, "request_id"):
                                 req_state.request_id = rid
@@ -154,14 +289,46 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
                         self.accumulate_full_payload_output(rid, inter_stage_outputs[i], req_state)
 
             if getattr(self, "_pending_full_payload_send", None):
-                finished_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 active_reqs = getattr(self, "requests", {})
+                finished_ids = set()
                 for rid in list(self._pending_full_payload_send.keys()):
                     req_state = active_reqs.get(rid)
-                    if req_state is not None and getattr(req_state, "is_finished", False):
+                    if req_state is None:
                         finished_ids.add(rid)
-                    elif req_state is None:
+                    elif getattr(req_state, "is_finished", False):
                         finished_ids.add(rid)
+                    else:
+                        sp = getattr(req_state, "sampling_params", None)
+                        stop_token_ids = set()
+                        if sp is not None:
+                            if hasattr(sp, "stop_token_ids") and sp.stop_token_ids:
+                                stop_token_ids.update(sp.stop_token_ids)
+                            if getattr(sp, "stop_token_id", None) is not None:
+                                stop_token_ids.add(sp.stop_token_id)
+                        if getattr(self, "_stage_id", None) == 0:
+                            stop_token_ids.update({151643, 151645})
+                        elif getattr(self, "_stage_id", None) == 1:
+                            stop_token_ids.update({2150, 4198})
+
+                        out_ids = getattr(req_state, "output_token_ids", []) or []
+                        if out_ids and out_ids[-1] in stop_token_ids:
+                            logger.info(
+                                "[TPUOmniModelRunner] Detected stop token %s for req %s",
+                                out_ids[-1],
+                                rid,
+                            )
+                            finished_ids.add(rid)
+                            req_state.is_finished = True
+                        elif sp is not None and getattr(sp, "max_tokens", None) is not None:
+                            if len(out_ids) >= sp.max_tokens:
+                                logger.info(
+                                    "[TPUOmniModelRunner] Max tokens (%d) reached for req %s",
+                                    sp.max_tokens,
+                                    rid,
+                                )
+                                finished_ids.add(rid)
+                                req_state.is_finished = True
+
                 for rid in finished_ids:
                     req_state = active_reqs.get(rid)
                     if req_state is not None:
@@ -176,5 +343,6 @@ class TPUOmniModelRunner(OmniConnectorModelRunnerMixin, TPUModelRunner):
             try:
                 output = self.attach_omni_connector_output(output)
             except Exception as e:
-                logger.debug("[TPUOmniModelRunner] attach_omni_connector_output error: %s", e)
+                logger.debug("[TPUOmniModelRunner] attach_omni_connector_output error in sample_tokens: %s", e)
+
         return output
