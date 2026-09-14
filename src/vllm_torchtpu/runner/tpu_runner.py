@@ -4742,8 +4742,12 @@ class TPUModelRunner(GPUModelRunner):
             getattr(self.model_config, "model_stage", None)
             or getattr(getattr(self.model, "_orig_mod", self.model), "model_stage", None)
         )
+        is_code2wav = (
+            model_stage == "code2wav"
+            or getattr(self, "_stage_id", None) == 2
+        )
         if mm_outputs is not None:
-            if model_stage == "code2wav":
+            if is_code2wav:
                 clean_mm_outputs = []
                 for p in mm_outputs:
                     clean_p = {}
@@ -4752,16 +4756,14 @@ class TPUModelRunner(GPUModelRunner):
                             clean_p[k] = v[0].detach().to("cpu")
                         elif isinstance(v, torch.Tensor):
                             clean_p[k] = v.detach().to("cpu")
-                        elif isinstance(v, int):
-                            clean_p[k] = torch.tensor(v, dtype=torch.int32)
-                        else:
-                            clean_p[k] = v
+                        elif isinstance(v, (int, float, bool)):
+                            clean_p[k] = torch.tensor(v)
                     clean_mm_outputs.append(clean_p)
                 model_runner_output.multimodal_outputs = clean_mm_outputs
                 model_runner_output.inter_stage_outputs = None
             else:
                 model_runner_output.inter_stage_outputs = mm_outputs
-                model_runner_output.multimodal_outputs = mm_outputs
+                model_runner_output.multimodal_outputs = None
 
         async_output = AsyncTPUModelRunnerOutput(
             model_runner_output=model_runner_output,
