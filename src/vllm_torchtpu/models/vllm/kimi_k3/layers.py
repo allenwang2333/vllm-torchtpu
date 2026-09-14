@@ -19,6 +19,10 @@ from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+from vllm_torchtpu import envs
+
+from .parallel import TokenGroup
+
 
 @lru_cache(maxsize=None)
 def _build_attention_residual_op(eps: float):
@@ -76,6 +80,8 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_group = tp_group
+        self.sp_group = (TokenGroup(tp_group or get_tp_group())
+                         if envs.TPU_K3_SP_PREFILL else None)
         # Reuse the existing merged/row weight loaders with chip-local rank
         # metadata. Scope the override to construction of these two layers.
         with ExitStack() as stack:
@@ -116,8 +122,8 @@ class KimiMLP(nn.Module):
                 hidden_states: torch.Tensor,
                 sequence_parallel: bool = False) -> torch.Tensor:
         group = self.tp_group
-        if sequence_parallel and group is None:
-            group = get_tp_group()
+        if sequence_parallel:
+            group = self.sp_group or group or get_tp_group()
         if sequence_parallel:
             hidden_states = group.all_gather(hidden_states, dim=0)
         hidden_states, _ = self.gate_up_proj(hidden_states)

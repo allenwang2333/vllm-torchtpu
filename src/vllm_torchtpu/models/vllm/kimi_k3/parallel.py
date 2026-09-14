@@ -205,6 +205,71 @@ def _mesh_and_tables():
     return mesh, ring_tables(list(mesh.devices.flat), owners)
 
 
+@lru_cache(maxsize=4)
+def _build_token_op(world_size, gather):
+    mesh, tables = _mesh_and_tables()
+    owners = tuple(int(i) for i in tables[0, 2])
+    if world_size == 2:
+        groups, _, _ = mla_chip_layout(list(mesh.devices.flat), owners)
+    elif world_size == 32:
+        groups = (tuple(sorted(range(32), key=lambda i: owners[i])), )
+    else:
+        raise ValueError("K3 SP token collectives require TP2 or TP32")
+
+    def collective(x: jax.Array) -> jax.Array:
+
+        def local(part):
+            if gather:
+                return jax.lax.all_gather(part,
+                                          'k3_sp',
+                                          axis=0,
+                                          tiled=True,
+                                          axis_index_groups=groups)
+            return jax.lax.psum_scatter(part,
+                                        'k3_sp',
+                                        scatter_dimension=0,
+                                        tiled=True,
+                                        axis_index_groups=groups)
+
+        return jax.shard_map(local,
+                             mesh=mesh,
+                             in_specs=P('k3_sp', None),
+                             out_specs=P('k3_sp', None),
+                             check_vma=False)(x)
+
+    op = sharded_jax_op(
+        f"pallas::kimi_token_{world_size}_{'ag' if gather else 'rs'}",
+        collective,
+        mesh=mesh,
+        input_partition_specs=(P('k3_sp', None), ),
+        output_partition_specs=P('k3_sp', None))
+
+    def fake(x):
+        rows = x.shape[0] * world_size if gather else x.shape[0] // world_size
+        return x.new_empty((rows, x.shape[1]))
+
+    op.register_fake(fake)
+    return op
+
+
+class TokenGroup:
+    """Keep symbolic token allocations inside the JAX collective bridge."""
+
+    def __init__(self, base):
+        self.world_size = base.world_size
+        self.rank_in_group = base.rank_in_group
+        self.ag = _build_token_op(self.world_size, True)
+        self.rs = _build_token_op(self.world_size, False)
+
+    def all_gather(self, x, dim):
+        assert dim == 0
+        return self.ag(x)
+
+    def reduce_scatter(self, x, dim):
+        assert dim == 0
+        return self.rs(x)
+
+
 class PrefillGroup:
     """Use physical rings for large BF16 payloads; retain normal small ops."""
 

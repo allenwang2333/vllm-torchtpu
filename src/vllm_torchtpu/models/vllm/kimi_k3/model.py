@@ -54,6 +54,7 @@ from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
+from .parallel import TokenGroup
 
 logger = init_logger(__name__)
 
@@ -198,7 +199,7 @@ class KimiModel(nn.Module):
                     or parallel.data_parallel_size != 1):
                 raise ValueError(
                     "K3 SP prefill requires TP32/EP32 and PP1/DP1")
-            self.sp_group = get_tp_group()
+            self.sp_group = TokenGroup(get_tp_group())
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
