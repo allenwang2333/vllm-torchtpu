@@ -17,6 +17,7 @@ anyway, so nothing here depends on annotation style.
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
 # What `support_torch_compile` infers for `DeepSeekMTP.forward`: dim 0, the
@@ -35,7 +36,14 @@ MTP_DYNAMIC_ARG_DIMS = {
 class MtpLoopStepModel(nn.Module):
     """Runs an MTP draft's own ``forward`` as a separately compiled program."""
 
-    def __init__(self, *, prefix: str = "", mtp: nn.Module) -> None:
+    def __init__(self,
+                 *,
+                 vllm_config: VllmConfig,
+                 prefix: str = "",
+                 mtp: nn.Module) -> None:
+        # vllm_config is unused here: the compile decorator reads it and sets
+        # self.vllm_config. Declaring it lets type checkers see the keyword the
+        # decorator's wrapper accepts.
         super().__init__()
         # Read by the plugin's compile_prefix patch (vllm_torchtpu/__init__.py):
         # this program gets its own compile-cache folder, with the same name on
