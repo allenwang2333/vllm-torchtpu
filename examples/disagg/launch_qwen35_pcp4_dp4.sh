@@ -109,12 +109,32 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
 
+# Where the reshard service lives. "controller" runs it as two sidecar
+# processes, which is what this script has always done. "store" hosts it in
+# each engine's rank-0 worker, which is what the multihost and p4d2 launchers
+# do and what the CDK recipes do. The distinction is not cosmetic: the
+# stage-3 raiden transport calls register_request_blocks, and only the C++
+# store implements it, so the raiden path cannot run under "controller" at
+# all. The default stays "controller" so existing callers see no change.
+RAIDEN_RESHARD_IMPL="${RAIDEN_RESHARD_IMPL:-controller}"
+PREFILL_CTRL_PORT="${PREFILL_CTRL_PORT:-27000}"
+DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
+
 mkdir -p "${RUN_DIR}/logs"
 ln -sfn "${RUN_DIR}" "${RUN_ROOT}/latest_qwen35_pd_v1_pcp4dp4"
 echo "RUN_DIR=${RUN_DIR}"
 echo "latest=${RUN_ROOT}/latest_qwen35_pd_v1_pcp4dp4"
 
-managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" 27000 28000)
+managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" "${PREFILL_CTRL_PORT}" "${DECODE_CTRL_PORT}")
+if [[ "${RAIDEN_RESHARD_IMPL}" == "store" ]]; then
+  # In store mode each engine hosts its own reshard service, so decode's DP
+  # group needs one service port per rank, and each side needs a dispatch
+  # port a hundred above its base.
+  managed_ports+=("$((PREFILL_CTRL_PORT + 100))" "$((DECODE_CTRL_PORT + 100))")
+  for ((i = 0; i < DECODE_DP; i++)); do
+    managed_ports+=("$((DECODE_CTRL_PORT + i))" "$((DECODE_CTRL_PORT + 100 + i))")
+  done
+fi
 for offset in 0 1 2 3; do
   managed_ports+=("$((TPU_KV_TRANSFER_PORT + offset))")
   managed_ports+=("$((9200 + offset))")
@@ -190,6 +210,29 @@ EOF
 
 printf '%q ' "${common_args[@]}" >"${RUN_DIR}/vllm_args.quoted"
 
+# Every server here starts under `bash -lc`, which sources the login profile
+# and then runs a command string that was fixed at build time. Nothing the
+# caller exports reaches the server unless it is written into that string, so
+# forward the variables a caller legitimately needs to control: where python
+# and the package come from, where the caches live, and which experimental
+# paths are on. A variable that is unset stays unset and the launcher's own
+# default applies.
+passthrough_vars=(
+  PATH PYTHONPATH
+  VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR JAX_COMPILATION_CACHE_DIR
+  HF_HOME HF_HUB_CACHE TPU_LOG_DIR TMPDIR
+  VLLM_DISABLE_COMPILE_CACHE
+  TPU_KV_ADMISSION_REORDER TPU_KV_PREFILL_SUBMIT
+  TPU_HOST_STEP_LOG_EVERY TPU_HOST_BURN_US TPU_HOST_BURN_RANK TPU_HOST_BURN_FILE
+)
+passthrough_env=""
+for name in "${passthrough_vars[@]}"; do
+  if [[ -n "${!name+set}" ]]; then
+    passthrough_env+="export ${name}=$(printf '%q' "${!name}");"$'\n'
+  fi
+done
+printf '%s' "${passthrough_env}" >"${RUN_DIR}/passthrough_env.sh"
+
 common_env=$(cat <<EOF
 export JAX_PLATFORMS=tpu,cpu PJRT_DEVICE=TPU TPU_BACKEND_TYPE=jax;
 export VLLM_XLA_CHECK_RECOMPILATION=0;
@@ -197,6 +240,7 @@ export USE_MOE_SPARSE_CORE=1;
 export TPUMISC_HMA_CHECKSUM_TRACE=0;
 export XLA_PYTHON_CLIENT_PREALLOCATE=false VLLM_ALLOW_LONG_MAX_MODEL_LEN=1;
 unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR;
+${passthrough_env}
 export LIBTPU_INIT_ARGS="\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=65536";
 export ONEHOT_MOE_PERMUTE_THRESHOLD=32768;
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
@@ -221,32 +265,45 @@ ctrl_common_env=$(cat <<EOF
 EOF
 )
 
+# How each side reaches its reshard service. Under "controller" the server
+# dials a sidecar by address; under "store" it hosts the service itself and
+# only needs to know which host and ports to advertise.
+if [[ "${RAIDEN_RESHARD_IMPL}" == "store" ]]; then
+  prefill_reshard_env="export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))';"
+  decode_reshard_env="export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))';"
+else
+  prefill_reshard_env="export TPU_RAIDEN_CONTROLLER_ADDRESS=${SERVE_HOST}:${PREFILL_CTRL_PORT};"
+  decode_reshard_env="export TPU_RAIDEN_CONTROLLER_ADDRESS=${SERVE_HOST}:${DECODE_CTRL_PORT};"
+fi
+
 prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --block-size "${BLOCK_SIZE_PREFILL}" --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE_PREFILL}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --cp-kv-cache-interleave-size 256 --kv-transfer-config "${p_kv}")
 
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --block-size "${BLOCK_SIZE_DECODE}" --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE_DECODE}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}" --kv-transfer-config "${d_kv}")
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:27000; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; ${prefill_reshard_env} export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_CONTROLLER_ADDRESS=127.0.0.1:28000; export TPU_KV_TRANSFER_PORT=9200; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; ${decode_reshard_env} export TPU_KV_TRANSFER_PORT=9200; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; python -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
-prefill_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port 27000"
+prefill_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port ${PREFILL_CTRL_PORT}"
 
-decode_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port 28000"
+decode_ctrl_cmd="${ctrl_common_env}"$'\n'"python ${script_dir}/run_raiden_controller.py --port ${DECODE_CTRL_PORT}"
 
-printf '%s\n' "${prefill_ctrl_cmd}" >"${RUN_DIR}/prefill_ctrl_cmd.sh"
-printf '%s\n' "${decode_ctrl_cmd}" >"${RUN_DIR}/decode_ctrl_cmd.sh"
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"
 
-# Launch prefill controller:
-setsid bash -lc "${prefill_ctrl_cmd}" >"${RUN_DIR}/logs/prefill_controller.log" 2>&1 &
-echo $! >"${RUN_DIR}/prefill_controller.pid"
-
-# Launch decode controller:
-setsid bash -lc "${decode_ctrl_cmd}" >"${RUN_DIR}/logs/decode_controller.log" 2>&1 &
-echo $! >"${RUN_DIR}/decode_controller.pid"
-
-sleep 2
+# In store mode the reshard service is part of the engine, so there is
+# nothing to launch here and nothing to watch for later.
+if [[ "${RAIDEN_RESHARD_IMPL}" == "store" ]]; then
+  echo "RAIDEN_RESHARD_IMPL=store, hosting reshard in-engine (no sidecars)"
+else
+  printf '%s\n' "${prefill_ctrl_cmd}" >"${RUN_DIR}/prefill_ctrl_cmd.sh"
+  printf '%s\n' "${decode_ctrl_cmd}" >"${RUN_DIR}/decode_ctrl_cmd.sh"
+  setsid bash -lc "${prefill_ctrl_cmd}" >"${RUN_DIR}/logs/prefill_controller.log" 2>&1 &
+  echo $! >"${RUN_DIR}/prefill_controller.pid"
+  setsid bash -lc "${decode_ctrl_cmd}" >"${RUN_DIR}/logs/decode_controller.log" 2>&1 &
+  echo $! >"${RUN_DIR}/decode_controller.pid"
+  sleep 2
+fi
 
 # Launch prefill and decode API servers:
 setsid bash -lc "${prefill_cmd}" >"${RUN_DIR}/logs/prefill.log" 2>&1 &
@@ -254,8 +311,13 @@ echo $! >"${RUN_DIR}/prefill.pid"
 setsid bash -lc "${decode_cmd}" >"${RUN_DIR}/logs/decode.log" 2>&1 &
 echo $! >"${RUN_DIR}/decode.pid"
 
-echo "prefill controller pid $(cat "${RUN_DIR}/prefill_controller.pid")"
-echo "decode controller pid $(cat "${RUN_DIR}/decode_controller.pid")"
+watched_pid_files=("${RUN_DIR}/prefill.pid" "${RUN_DIR}/decode.pid")
+if [[ "${RAIDEN_RESHARD_IMPL}" != "store" ]]; then
+  watched_pid_files+=("${RUN_DIR}/prefill_controller.pid"
+                      "${RUN_DIR}/decode_controller.pid")
+  echo "prefill controller pid $(cat "${RUN_DIR}/prefill_controller.pid")"
+  echo "decode controller pid $(cat "${RUN_DIR}/decode_controller.pid")"
+fi
 echo "prefill pid $(cat "${RUN_DIR}/prefill.pid")"
 echo "decode pid $(cat "${RUN_DIR}/decode.pid")"
 
@@ -267,10 +329,13 @@ for ((attempt = 1; attempt <= 120; attempt++)); do
   if [[ "${p_code}" == "200" && "${d_code}" == "200" ]]; then
     break
   fi
-  if ! kill -0 "$(cat "${RUN_DIR}/prefill.pid" 2>/dev/null)" 2>/dev/null \
-     || ! kill -0 "$(cat "${RUN_DIR}/decode.pid" 2>/dev/null)" 2>/dev/null \
-     || ! kill -0 "$(cat "${RUN_DIR}/prefill_controller.pid" 2>/dev/null)" 2>/dev/null \
-     || ! kill -0 "$(cat "${RUN_DIR}/decode_controller.pid" 2>/dev/null)" 2>/dev/null; then
+  all_alive=1
+  for pid_file in "${watched_pid_files[@]}"; do
+    if ! kill -0 "$(cat "${pid_file}" 2>/dev/null)" 2>/dev/null; then
+      all_alive=0
+    fi
+  done
+  if [[ "${all_alive}" -eq 0 ]]; then
     if grep -E "Traceback|RuntimeError|ValueError|LLVM ERROR|registered memory region overlaps|strided KV pull failed" "${RUN_DIR}/logs/prefill.log" "${RUN_DIR}/logs/decode.log" >/tmp/pd_pcp4dp4_launch_err.$$ 2>/dev/null; then
       cat /tmp/pd_pcp4dp4_launch_err.$$
       rm -f /tmp/pd_pcp4dp4_launch_err.$$
@@ -298,9 +363,19 @@ setsid bash -lc "${proxy_cmd}" >"${RUN_DIR}/logs/proxy.log" 2>&1 &
 echo $! >"${RUN_DIR}/proxy.pid"
 
 sleep 2
-python "${script_dir}/../../scripts/vllm/integration/smoke_prefix_cache_correctness.py" \
-  --host "${SERVE_HOST}" \
-  --port "${PROXY_PORT}" \
-  --model "${SERVED_MODEL_NAME}" \
-  --quick-probe-only \
-  | tee "${RUN_DIR}/logs/proxy_probe.log"
+# The quick probe sends prompts a few tokens long. With a 4096-token block
+# those round down to nothing transferable, decode raises on the empty
+# stage-3 metadata, and the exception escapes into its scheduler and takes
+# the whole decode server with it. That is worth fixing on its own, but a
+# caller measuring throughput with long prompts should be able to opt out of
+# tripping it.
+if [[ "${RUN_SMOKE_PROBE:-1}" == "1" ]]; then
+  python "${script_dir}/../../scripts/vllm/integration/smoke_prefix_cache_correctness.py" \
+    --host "${SERVE_HOST}" \
+    --port "${PROXY_PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    --quick-probe-only \
+    | tee "${RUN_DIR}/logs/proxy_probe.log"
+else
+  echo "RUN_SMOKE_PROBE=0, skipping the quick probe"
+fi

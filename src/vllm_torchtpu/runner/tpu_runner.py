@@ -295,6 +295,15 @@ class _HostSlackProbe:
         self._last_kind: str | None = None
         self._periods: dict[str, list[float]] = {"prefill": [], "decode": []}
         self._steps = 0
+        # Log on every rank whether or not the probe turned on. A previous run
+        # produced no records at all and the three candidate explanations, a
+        # stale module, an env var lost between the container and the worker,
+        # and a probe that never reached its first report, all look identical
+        # from the outside. This line separates them.
+        logger.info(
+            "host_slack_probe rank=%d enabled=%s burn_us=%d log_every=%d "
+            "burns_here=%s dose_file=%r", rank, self.enabled, self.burn_us,
+            self.log_every, self.burns_here, self.dose_file)
 
     def _reload_dose(self) -> None:
         """Picks up a new dose between windows, ignoring a missing file."""
@@ -353,6 +362,14 @@ class _HostSlackProbe:
                 "p50_ms": round(periods[n // 2] * 1000, 4),
                 "min_ms": round(periods[0] * 1000, 4),
                 "max_ms": round(periods[-1] * 1000, 4),
+                # The effect being chased is a couple of milliseconds on a
+                # step of a few hundred, which no summary statistic separates
+                # from noise on its own. Carrying the periods themselves lets
+                # the comparison between two runs be a test over every step
+                # rather than a difference of two means. Sorted, because the
+                # arrival order within a window is not used and sorting makes
+                # a long line easier to read.
+                "raw_ms": [round(value * 1000, 3) for value in periods],
             }
         logger.info("%s", json.dumps(record, sort_keys=True))
         self._reload_dose()
