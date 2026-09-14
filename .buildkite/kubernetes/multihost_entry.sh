@@ -89,7 +89,8 @@ alive_nodes() {
   python3 -c "
 import ray
 ray.init(address='auto', logging_level='error')
-open('$report', 'w').write(str(sum(1 for n in ray.nodes() if n['Alive'])))
+with open('$report', 'w') as f:
+    f.write(str(sum(1 for n in ray.nodes() if n['Alive'])))
 " >/dev/null 2>&1
   local alive
   alive=$(cat "$report" 2>/dev/null)
