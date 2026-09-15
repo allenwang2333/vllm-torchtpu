@@ -58,14 +58,33 @@ def find_head(model):
     if not heads:
         return None
     name, head = heads[0]
-    tied = any(m is head and n.split(".")[-1] != "lm_head" for n, m in modules)
+    tied = any((m is head and n.split(".")[-1] != "lm_head") or (
+        m is not head and getattr(m, "weight", None) is head.weight)
+               for n, m in modules)
     if tied:
         logger.warning(
-            "sharded LM head: %s shares its module with the token embedding; "
+            "sharded LM head: %s shares its module or weights with another layer; "
             "left as is", name)
         return None
     logger.info("sharded LM head: found %s", name)
     return head
+
+
+def unsupported_head_reason(head) -> str | None:
+    """Check the head format before replacing its projection method."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead, UnquantizedEmbeddingMethod)
+
+    if not isinstance(head, ParallelLMHead):
+        return "the head does not use vLLM's ParallelLMHead interface"
+    if type(getattr(head, "quant_method",
+                    None)) is not UnquantizedEmbeddingMethod:
+        return "the head requires a quantized or custom projection method"
+    weight = head.weight
+    if (weight.ndim != 2 or weight.layout != torch.strided or weight.dtype
+            not in (torch.bfloat16, torch.float16, torch.float32)):
+        return "the head requires a dense BF16, FP16, or FP32 weight matrix"
+    return None
 
 
 def head_fn(mesh):
@@ -170,6 +189,10 @@ def install(model, buckets) -> bool:
         logger.warning(
             "sharded LM head: the head is split across %d tensor-parallel "
             "ranks; left as is", tp)
+        return False
+    reason = unsupported_head_reason(head)
+    if reason is not None:
+        logger.warning("sharded LM head: %s; left as is", reason)
         return False
     rows = int(buckets[0])
     mesh = build_ep_mesh()

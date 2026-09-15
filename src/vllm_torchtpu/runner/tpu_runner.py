@@ -659,15 +659,6 @@ class TPUModelRunner(GPUModelRunner):
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs)
-        if envs.TPU_SHARDED_LM_HEAD:
-            # The sharded head runs at one fixed row count. One request
-            # bucket keeps the compiled graph from padding rows before the
-            # head's exchange and trimming them after, which the compiler
-            # gets wrong above one row tile.
-            self.num_reqs_paddings = [self.max_num_reqs]
-            logger.info("TPU_SHARDED_LM_HEAD: one request bucket, %d rows",
-                        self.max_num_reqs)
-
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (min(
             PallasAttentionBackend.get_max_num_seqs(
@@ -3753,12 +3744,13 @@ class TPUModelRunner(GPUModelRunner):
             model = model_loader.load_model(vllm_config=self.vllm_config,
                                             model_config=self.model_config)
         self.model = model
-        # TPU_SHARDED_LM_HEAD: the projection split across the engines. With
-        # it on the runner runs one request bucket (set above), so every
-        # engine calls the op with one shape and the compiled graph pads and
-        # trims nothing around the op's exchange.
+        # Select a fixed request bucket only after the head is installed.
+        # Unsupported models keep the normal request buckets.
         from vllm_torchtpu.layers.adapter import sharded_lm_head
-        sharded_lm_head.install_if_enabled(model, list(self.num_reqs_paddings))
+        if sharded_lm_head.install_if_enabled(model, [self.max_num_reqs]):
+            self.num_reqs_paddings = [self.max_num_reqs]
+            logger.info("TPU_SHARDED_LM_HEAD: one request bucket, %d rows",
+                        self.max_num_reqs)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
