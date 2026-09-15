@@ -369,18 +369,40 @@ def _hybrid_groups(cfg: KVCacheConfig) -> list[list[AttentionGroup]]:
     return [[attn_group], [mamba_group]]
 
 
-def test_pool_fp8_is_born_uninitialized_without_zero_fill(monkeypatch):
-    # fp8 pools cannot zero-fill on TPU (and slots are overwritten before
-    # use), so the pool must be allocated via torch.empty; the monkeypatch
-    # makes any fp8 torch.zeros call fail loudly.
-    torch_zeros = torch.zeros
+def test_pool_fp8_is_zero_filled(monkeypatch):
+    """The fp8 pool must be zeroed, and the pool layout must survive it.
 
-    def zeros_without_fp8(*args, **kwargs):
+    This test previously asserted the opposite -- that the fp8 pool is born
+    uninitialized via ``torch.empty``, on the stated grounds that "fp8 pools
+    cannot zero-fill on TPU (and slots are overwritten before use)". Both
+    halves were wrong, and measurement is what settled it:
+
+    * ``torch.zeros`` works fine for both fp8 dtypes on a v7x pod --
+      0 non-zero bytes, and 1.855 ms for the whole 1.930 GiB 48-tensor pool
+      (``j-73a8aaba``). Not free, not remotely a startup problem.
+    * The slots are *not* all overwritten before use. A page holds more rows
+      than the sequence occupying it, and the attention kernel reads the whole
+      page. RPA v3's default ``RPA_V_MASK_MODE=none`` relies on ``p == 0`` to
+      annihilate the rows past ``effective_kv_len``, which annihilates a
+      finite V and nothing else -- and ``torch.empty`` on TPU fp8 returns
+      524288/524288 non-finite bytes, because ``0xFF`` is a NaN in
+      ``f8e4m3fn`` (``j-761bc2df``, reproduced in ``j-f636426b`` and
+      ``j-d329490e``). That combination is NaN on every decode.
+
+    See ``tests/test_kv_cache_zero_init.py`` for the invariant this upholds
+    and ``mask_v()`` in the RPA v3 kernel for who depends on it.
+    """
+    # Zeroing is the property under test, so prove the fp8 path reaches
+    # torch.zeros rather than trusting that it did.
+    torch_zeros = torch.zeros
+    fp8_zero_calls = []
+
+    def counting_zeros(*args, **kwargs):
         if kwargs.get("dtype") in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise RuntimeError("fp8 pool must not require zero_")
+            fp8_zero_calls.append(kwargs["dtype"])
         return torch_zeros(*args, **kwargs)
 
-    monkeypatch.setattr(torch, "zeros", zeros_without_fp8)
+    monkeypatch.setattr(torch, "zeros", counting_zeros)
     cfg = make_hybrid_config(num_blocks=4, attn_dtype=torch.float8_e4m3fn)
 
     materialized = materialize_kv_cache_tensors(
@@ -400,6 +422,13 @@ def test_pool_fp8_is_born_uninitialized_without_zero_fill(monkeypatch):
     assert isinstance(mamba_cache, list)
     assert len(mamba_cache) == 1
     assert mamba_cache[0] is attn_cache
+
+    assert fp8_zero_calls == [torch.float8_e4m3fn], (
+        f"the fp8 pool was not allocated through torch.zeros (saw "
+        f"{fp8_zero_calls}); RPA v3's V-mask elision requires finite padding")
+    assert not attn_cache.view(torch.uint8).any(), (
+        "the fp8 pool came up with non-zero bytes; uninitialized fp8 is "
+        "100% non-finite on TPU and 0 * NaN is NaN")
 
 
 def test_pool_layout_summary_shows_single_pool_state():
