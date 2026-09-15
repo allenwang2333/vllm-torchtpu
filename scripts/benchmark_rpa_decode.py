@@ -152,20 +152,54 @@ def _call(wl, d_block_sizes, sm_scale):
     )
 
 
-def _closed_over(wl):
+class _Bound:
+    """Binds `distribution` so a traced-distribution chain still takes only the
+    KV cache, preserving `.lower()` for `_compiled_scopes`."""
+
+    def __init__(self, fn, distribution):
+        self._fn = fn
+        self._distribution = distribution
+
+    def __call__(self, kv_cache):
+        return self._fn(kv_cache, self._distribution)
+
+    def lower(self, kv_cache):
+        return self._fn.lower(kv_cache, self._distribution)
+
+
+def _closed_over(wl, trace_distribution=False):
     """Everything but the KV cache, to be captured rather than passed.
 
-    ``distribution`` must reach the kernel as a *concrete* array: both
-    `dynamic_validate_inputs` and `RpaCase.get_range` do Python-level
-    comparisons on its entries (``if not (i <= j <= k)``,
-    `v3/kernel.py:1311`), which raises `TracerBoolConversionError` if it
-    arrives as a jit argument.  Closing over the workload makes it a compile
-    time constant.  Nothing here varies across iterations anyway.
+    Closing over the workload makes it a compile time constant, and nothing
+    here varies across iterations anyway.
+
+    ``distribution`` is the one entry where that choice is not neutral, and it
+    is controlled by ``trace_distribution``:
+
+    * Closed over (the default), it is a compile-time constant, so XLA folds
+      away every pass whose sequence range is statically empty.  On a
+      decode-only workload the compiled HLO then contains ``RPAd`` alone.
+    * Traced, it reaches the kernel as a value, which is what production does
+      -- the batch composition is not known at compile time.  All the passes
+      `ragged_paged_attention` launches survive into the HLO, including the
+      MIXED one whose range is empty on a decode-only step.
+
+    So the default is the faster measurement and the traced one is the
+    *representative* one; anything about per-pass launch overhead has to be
+    measured with ``trace_distribution=True`` or there is no empty pass left
+    to observe.
+
+    Note this only applies to the timed path.  The XLA reference still needs a
+    concrete ``distribution``: `dynamic_validate_inputs` branches on it in
+    Python (``if not (i <= j <= k)``, `v3/kernel.py:1311`) and raises
+    `TracerBoolConversionError` on a tracer.  `_reference` runs eagerly for
+    that reason and is unaffected by this flag.
     """
-    return {k: v for k, v in wl.items() if k != "kv_cache"}
+    drop = {"kv_cache"} | ({"distribution"} if trace_distribution else set())
+    return {k: v for k, v in wl.items() if k not in drop}
 
 
-def _build_chain(wl, d_block_sizes, sm_scale, chain):
+def _build_chain(wl, d_block_sizes, sm_scale, chain, trace_distribution=False):
     """A jit of `chain` back-to-back decode calls, threading the KV cache.
 
     Chaining inside a single jit is what keeps the measurement off the host
@@ -173,17 +207,31 @@ def _build_chain(wl, d_block_sizes, sm_scale, chain):
     the thing being measured.  The cache is threaded because the kernel donates
     and updates it; q/k/v are loop-invariant and tiny (64 x 4 x 128).
     """
-    static = _closed_over(wl)
+    static = _closed_over(wl, trace_distribution)
+
+    if not trace_distribution:
+
+        @jax.jit
+        def run(kv_cache):
+            out = None
+            for _ in range(chain):
+                args = dict(static, kv_cache=kv_cache)
+                out, kv_cache = _call(args, d_block_sizes, sm_scale)
+            return out, kv_cache
+
+        return run
 
     @jax.jit
-    def run(kv_cache):
+    def run_traced(kv_cache, distribution):
         out = None
         for _ in range(chain):
-            args = dict(static, kv_cache=kv_cache)
+            args = dict(static, kv_cache=kv_cache, distribution=distribution)
             out, kv_cache = _call(args, d_block_sizes, sm_scale)
         return out, kv_cache
 
-    return run
+    # Keep the one-argument calling convention the timing loop and the scope
+    # dump both expect, rather than threading the flag through each of them.
+    return _Bound(run_traced, wl["distribution"])
 
 
 def _compiled_scopes(run, kv_cache):
@@ -296,6 +344,14 @@ def main():
                    help="if set, bkv_csz values crossed with --sweep-bkv")
     p.add_argument("--kv-len-sweep", default="",
                    help="comma-separated kv_lens; fits the affine intercept")
+    p.add_argument("--trace-distribution", action="store_true",
+                   help="pass `distribution` as a jit argument instead of "
+                        "closing over it. Production does not know the batch "
+                        "composition at compile time, so this is the "
+                        "representative mode: every pass survives into the "
+                        "HLO, including ones whose sequence range is empty. "
+                        "Closed over (the default), XLA folds those away and "
+                        "a decode-only run compiles to RPAd alone.")
     p.add_argument("--assert-kernel", action="store_true",
                    help="exit non-zero if the compiled RPAd scope is not the "
                         "block size that was requested")
@@ -357,7 +413,8 @@ def main():
                             args.total_pages, args.num_q_heads,
                             args.num_kv_heads, args.head_dim, q_dtype,
                             kv_dtype, args.seed)
-        run = _build_chain(wl, d_block_sizes, sm_scale, args.chain)
+        run = _build_chain(wl, d_block_sizes, sm_scale, args.chain,
+                           args.trace_distribution)
         return wl, run
 
     failures = []
@@ -403,6 +460,11 @@ def main():
               f"spread {100.0*(max(samples)-min(samples))/med:5.1f}%")
         print(f"[{label}] {gib_s:7.1f} GiB/s materialized")
         print(f"[{label}] compiled scopes: {decode}")
+        # Print every pass, not just RPAd. `ragged_paged_attention` launches
+        # DECODE and MIXED unconditionally, so on a decode-only workload the
+        # MIXED one is an empty launch -- and filtering it out of this line is
+        # what made it invisible here for four jobs.
+        print(f"[{label}] all passes    : {scopes}")
 
         ok, detail = (True, "skipped (--skip-check)")
         if not args.skip_check:

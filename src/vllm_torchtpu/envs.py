@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
+    RPA_SKIP_EMPTY_PASS: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -590,6 +591,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Skip an RPA v3 pass whose sequence range is empty, rather than paying a
+    # full launch and teardown for a kernel whose body never runs. Set to 0 to
+    # restore the unconditional launches for an A/B.
+    "RPA_SKIP_EMPTY_PASS":
+    env_bool("RPA_SKIP_EMPTY_PASS", default=True),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
     "USE_RPA_PIPELINED_DMA_STAGING":

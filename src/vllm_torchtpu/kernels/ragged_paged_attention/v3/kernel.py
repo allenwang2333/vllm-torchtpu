@@ -1923,8 +1923,44 @@ def ragged_paged_attention(
             "bkv_csz": block_sizes[3],
         }
 
+    def launch(q, kv_cache, *, case, **kwargs):
+        """Run ``case``, skipping the launch when its sequence range is empty.
+
+        All the passes below are otherwise launched unconditionally, so a batch
+        that is all one kind still pays a full launch and teardown for the
+        others: a decode-only step runs MIXED over the empty range
+        ``[distribution[1], distribution[2])``, and a prefill-only step runs
+        DECODE over an empty ``[0, distribution[0])``. That pass plans zero
+        pipeline steps, its body never executes, and it writes nothing --
+        ``do_writeback`` is per-step inside the pipeline body -- so the cost is
+        pure overhead, and it is paid once per layer per step.
+
+        ``distribution`` is traced, so this is `lax.cond` rather than a Python
+        branch: deciding in Python would recompile per batch composition. The
+        false branch returns the buffers untouched, which is what the kernel
+        would have left behind anyway.
+
+        The risk to watch is aliasing: the true branch's custom call updates
+        the KV cache in place, and if XLA cannot prove the conditional
+        preserves that, it will copy a multi-gigabyte buffer instead of
+        eliding a few microseconds. That shows up instantly as a
+        several-millisecond regression rather than as a subtle one, so it is
+        measured before it is believed. ``RPA_SKIP_EMPTY_PASS=0`` restores the
+        unconditional launches for the A/B.
+        """
+        if not envs.RPA_SKIP_EMPTY_PASS:
+            return run_rpa_kernel(q, kv_cache, case=case, **kwargs)
+        start, end = case.get_range(distribution)
+        return lax.cond(
+            end > start,
+            lambda q, c: run_rpa_kernel(q, c, case=case, **kwargs),
+            lambda q, c: (q, c),
+            q,
+            kv_cache,
+        )
+
     # Decode-only
-    q, kv_cache = run_rpa_kernel(
+    q, kv_cache = launch(
         q,
         kv_cache,
         **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
@@ -1933,7 +1969,7 @@ def ragged_paged_attention(
     )
     if chunk_prefill_size is not None:
         # Prefill-only
-        q, kv_cache = run_rpa_kernel(
+        q, kv_cache = launch(
             q,
             kv_cache,
             **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
@@ -1941,7 +1977,7 @@ def ragged_paged_attention(
             case=RpaCase.PREFILL,
         )
     # Mixed
-    q, kv_cache = run_rpa_kernel(
+    q, kv_cache = launch(
         q,
         kv_cache,
         **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
