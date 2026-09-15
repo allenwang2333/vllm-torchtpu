@@ -65,6 +65,7 @@ import re
 import statistics
 import sys
 import time
+import traceback
 
 import jax
 import jax.numpy as jnp
@@ -120,10 +121,14 @@ def _make_workload(num_seqs, kv_len, page_size, pages_per_seq, total_pages,
     return dict(
         q=jnp.asarray(_rand((num_tokens, num_q_heads, head_dim)),
                       dtype=q_dtype),
+        # The kernel requires k/v to match the cache dtype -- it asserts
+        # `kv_cache.dtype == k.dtype == v.dtype` (v3/kernel.py:1425), because
+        # KV quantization happens outside RPA. These are the new tokens this
+        # decode step writes into the cache, so they are already quantized.
         k=jnp.asarray(_rand((num_tokens, num_kv_heads, head_dim)),
-                      dtype=q_dtype),
+                      dtype=kv_dtype),
         v=jnp.asarray(_rand((num_tokens, num_kv_heads, head_dim)),
-                      dtype=q_dtype),
+                      dtype=kv_dtype),
         kv_cache=kv_cache,
         kv_lens=jnp.asarray(kv_lens),
         page_indices=jnp.asarray(page_indices),
@@ -174,7 +179,11 @@ def _compiled_scopes(run, kv_cache):
     try:
         text = run.lower(kv_cache).compile().as_text()
     except Exception as exc:  # pragma: no cover - diagnostic path
-        return None, f"<could not compile for inspection: {exc}>"
+        # Print the stack rather than only the message: a compile failure here
+        # is a bug in the harness or the block sizes, and the one-line message
+        # rarely says which.
+        traceback.print_exc()
+        return None, f"{type(exc).__name__}: {exc}"
     return sorted(set(re.findall(r"RPA[dpm]-p_\d+-bq_\d+_\d+-bkv_\d+_\d+",
                                  text))), None
 
@@ -321,7 +330,13 @@ def main():
         wl, run = build(kv_len, d_block_sizes)
         scopes, err = _compiled_scopes(run, wl["kv_cache"])
         if err:
-            print(f"[{label}] SKIP: {err}")
+            # A variant that would not compile is a failure, not a skip. The
+            # timing, the correctness check and --assert-kernel all live below
+            # this point, so returning quietly here would let a run in which
+            # nothing was measured exit 0 -- which is precisely the outcome
+            # --assert-kernel exists to make impossible.
+            print(f"[{label}] FAILED TO COMPILE: {err}")
+            failures.append(f"{label}: did not compile: {err}")
             return None
         samples = _time(run, wl["kv_cache"], args.iters, args.warmup,
                         args.chain)
