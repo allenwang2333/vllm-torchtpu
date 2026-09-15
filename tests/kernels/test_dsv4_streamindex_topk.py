@@ -18,12 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-try:
-    from google3.experimental.users.hwanginho.deepseek_v4.streamindex_topk.streamindex_topk import \
-        streamindex_topk
-except ImportError:
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
-        streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
+    streamindex_topk
 
 
 # =====================================================================
