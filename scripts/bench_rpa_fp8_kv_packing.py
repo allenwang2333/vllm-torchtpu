@@ -127,7 +127,54 @@ ARMS = {
     "C1536": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 1536)),
     "C1024": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 1024)),
     "C512": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 512)),
+    # MEASURED (job j-aaf016ab, serial, one chip, spread_pct <= 1.40):
+    #   C9216 144.81  C4608 153.96  C2304 181.07
+    #   C1536 212.16  C1024 239.83  C512  404.11
+    # Monotone increasing, no interior minimum -- the hypothesis above is
+    # refuted at every point. The per-trip flash-attention rescale costs far
+    # more than the 11% of mask-killed columns it would avoid, and blows up at
+    # the small end. The production default bkv_csz=9216 is already optimal.
+    # (A_fp8_1kvh landed at 145.25, within spread of C9216, so passing
+    # d_block_sizes explicitly is equivalent to the default path.)
+    #
+    # ---- Separating the two costs C* could not ----
+    # C* moved bkv_csz, which changes *both* the padded-column count and the
+    # trip count at once, and the trip count dominated. These two arms hold the
+    # trip count at 1 and move the other two variables one at a time.
+    #
+    # bkv_sz = bkv_csz = 8192 = kv_len exactly: still a single trip (so no
+    # rescale penalty), but the pass is 8192 columns instead of 9216, dropping
+    # the 1024 mask-killed columns that max_model_len forces. Isolates the
+    # padded-column cost -- predicted ~11% if the block is issue-bound.
+    "M8192_masked": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 8192, 1, 8192),
+                     False),
+    # Same block sizes, but with the kv-length mask compiled out entirely.
+    # `/xprof-llo` attributed 3170 int16 instructions -- ~25% of the hot block --
+    # to building a 4x9216 iota and comparing it elementwise, to enforce what is
+    # a single scalar bound. At bkv_csz == kv_len there is nothing to mask, so
+    # `skip_kv_mask` is legal (its contract is use_causal_mask=False and every
+    # dynamic kv_len % bkv_csz == 0, both of which hold here) and the result must
+    # be numerically IDENTICAL to M8192_masked. The printed `checksum` is that
+    # correctness gate: if the two arms disagree, the delta is the kernel
+    # skipping work, not the mask being free, and must not be read as a speedup.
+    #
+    # NOTE this arm is a measurement, not a shippable config: in production the
+    # per-sequence kv_lens differ and grow with each decoded token, so
+    # `kv_len % bkv_csz == 0` does not hold and skip_kv_mask cannot be set. What
+    # it prices is how much a *cheaper* mask would be worth -- the shippable
+    # version of which is computing the bound on the scalar core instead of
+    # materializing a 4x9216 iota, which is a kernel change, not a flag.
+    "M8192_nomask": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 8192, 1, 8192),
+                     True),
 }
+
+
+def arm_spec(name):
+    """Unpack an ARMS entry, defaulting the optional skip_mask field to False."""
+    spec = ARMS[name]
+    kv_dtype, num_kv_heads, kv_len, page_size, d_block_sizes = spec[:5]
+    skip_mask = spec[5] if len(spec) > 5 else False
+    return kv_dtype, num_kv_heads, kv_len, page_size, d_block_sizes, skip_mask
 
 
 def build(kv_dtype, num_kv_heads, kv_len, page_size, seed=0):
@@ -173,10 +220,11 @@ def build(kv_dtype, num_kv_heads, kv_len, page_size, seed=0):
 
 
 @functools.partial(jax.jit,
-                   static_argnames=("is_fp8", "inner", "d_block_sizes"),
+                   static_argnames=("is_fp8", "inner", "d_block_sizes",
+                                    "skip_mask"),
                    donate_argnames=("kv_cache", ))
 def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
-        is_fp8, inner, d_block_sizes):
+        is_fp8, inner, d_block_sizes, skip_mask):
     """Run the kernel ``inner`` times inside a single dispatch.
 
     A one-call-per-`block_until_ready` loop measures the host round trip, not
@@ -193,6 +241,9 @@ def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
     harness. The caller must thread the returned cache into the next call.
     """
     scales = dict(k_scale=1.0, v_scale=1.0) if is_fp8 else {}
+    # skip_kv_mask's contract requires use_causal_mask=False alongside it.
+    mask_kw = dict(use_causal_mask=False,
+                   skip_kv_mask=True) if skip_mask else {}
 
     def body(_, carry):
         acc, cache = carry
@@ -206,6 +257,7 @@ def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
                                             distribution,
                                             sm_scale=HEAD_DIM**-0.5,
                                             d_block_sizes=d_block_sizes,
+                                            **mask_kw,
                                             **scales)
         # Keep `out` live so the attention compute cannot be dead-coded; the
         # reduction is ~32K elements against a 256 MiB KV read.
@@ -225,7 +277,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()
 
-    kv_dtype, num_kv_heads, kv_len, page_size, d_block_sizes = ARMS[args.arm]
+    (kv_dtype, num_kv_heads, kv_len, page_size, d_block_sizes,
+     skip_mask) = arm_spec(args.arm)
     is_fp8 = kv_dtype == jnp.float8_e4m3fn
     wl, cache_shape = build(kv_dtype, num_kv_heads, kv_len, page_size)
     pages_per_seq = (MAX_MODEL_LEN + page_size - 1) // page_size
@@ -242,10 +295,14 @@ def main():
                              **wl,
                              is_fp8=is_fp8,
                              inner=args.inner,
-                             d_block_sizes=d_block_sizes)
+                             d_block_sizes=d_block_sizes,
+                             skip_mask=skip_mask)
 
     acc, cache = call(kv_cache=cache)
     jax.block_until_ready((acc, cache))
+    # Captured from the very first call, before the cache has been mutated by
+    # any later one, so it is comparable across arms that share a shape.
+    checksum = float(acc)
 
     for _ in range(args.warmup):
         acc, cache = call(kv_cache=cache)
@@ -273,6 +330,11 @@ def main():
     print(f"d_block_sizes       : {d_block_sizes or 'kernel default (1,9216,1,9216)'}")
     if d_block_sizes is not None:
         print(f"bkv compute trips   : {-(-kv_len // d_block_sizes[3])}")
+    print(f"skip_kv_mask        : {skip_mask}")
+    # Arms sharing a shape and seed must agree here. A masked and an unmasked
+    # arm whose bkv_csz equals kv_len have nothing to mask, so a mismatch means
+    # the faster one dropped work and its time is not a speedup.
+    print(f"checksum            : {checksum:.6f}")
     print(f"cache_shape         : {tuple(cache_shape)}")
     print(f"packing slots       : {packed_slots} "
           f"(useful {num_kv_heads * 2}, padding {packed_slots - num_kv_heads * 2})")
