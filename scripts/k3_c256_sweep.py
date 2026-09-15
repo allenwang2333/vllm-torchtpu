@@ -1,0 +1,84 @@
+"""Resumable PR898 FP8 local-TP32 geometry sweep on a 32-device slice."""
+import json
+import os
+import statistics
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main():
+    rank = int(
+        os.getenv("FALCON_JAX_PROCESS_ID", os.getenv("FALCON_RANK", "0")))
+    root = Path(os.environ["OUT"]) / "benchmark"
+    root.mkdir(parents=True, exist_ok=True)
+    contexts = (128, 512, 1000, 4096)
+    winners = []
+    cs = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+    buckets = (8, 16, 32, 48, 96, 192, 384, 768, 1536)
+    for window in (1, 6):
+        for c, bucket in zip(cs, buckets):
+            tokens = c if window == 1 else bucket
+            tiles = ([(1, 3, 4), (1, 16, 1), (1, 16, 2), (1, 16, 4),
+                      (1, 16, 8), (1, 32, 2),
+                      (1, 32, 4)] if window == 1 else [(16, 1, 1), (16, 16, 1),
+                                                       (8, 16, 1), (32, 16, 1),
+                                                       (16, 8, 1), (16, 32, 1),
+                                                       (32, 16, 2)])
+            valid = []
+            for index, tile in enumerate(tiles):
+                label = f"w{window}-c{c}-tile" + "-".join(map(str, tile))
+                path = root / (label + ".json")
+                # All hosts launch the same child to rendezvous distributed JAX.
+                print("CANDIDATE_START", label, flush=True)
+                result = subprocess.run([
+                    sys.executable,
+                    str(Path(__file__).with_name("k3_fp8_mla_tuner.py")),
+                    "--case",
+                    json.dumps([c, window, tokens]), "--tile",
+                    json.dumps(tile), "--output",
+                    str(path)
+                ],
+                                        check=False,
+                                        timeout=2400)
+                if result.returncode or not path.exists():
+                    if index == 0:
+                        raise RuntimeError(
+                            f"Baseline failed: {label}, exit={result.returncode}"
+                        )
+                    print("CANDIDATE_FAILED",
+                          label,
+                          result.returncode,
+                          flush=True)
+                    continue
+                rows = json.loads(path.read_text())
+                assert len(rows) == len(contexts)
+                assert all(r["status"] == "success" and r["cache_valid"]
+                           and r["next_output_max_abs_error"] == 0
+                           for r in rows)
+                # Benchmark stays <=1001 KV tokens; 4096 is correctness-only.
+                score = statistics.fmean(r["latency_ms"] for r in rows
+                                         if r["kv_len"] <= 1000)
+                valid.append((score, tile, rows[0]["tuning_key"]))
+                with (root / "metrics.jsonl").open("a") as f:
+                    for row in rows:
+                        f.write(json.dumps(row) + "\n")
+                print("CANDIDATE_VALIDATED", label, score, flush=True)
+            valid.sort()
+            assert valid
+            score, tile, key = valid[0]
+            winners.append(
+                dict(key=key,
+                     tile=tile,
+                     latency_ms=score,
+                     timing="host_dispatch_plus_synchronized_kernel"))
+            (root / "winners.partial.json").write_text(
+                json.dumps(winners, indent=2))
+    (root / "winners.json").write_text(json.dumps(winners, indent=2))
+    if rank == 0:
+        Path("/coord/winners.json").write_text(json.dumps(winners, indent=2))
+    print("TUNE_COMPLETE", len(winners), flush=True)
+
+
+if __name__ == "__main__":
+    main()
