@@ -38,6 +38,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+# Import vllm (and with it the torchtpu platform plugin) before anything
+# reaches into vllm_torchtpu.platforms. Importing that package first leaves it
+# half-built when vllm's own plugin loader gets to it, and the plugin load
+# fails with "partially initialized module".
+import vllm.envs  # noqa: F401  isort: skip
 
 # --- production shape constants -------------------------------------------
 NUM_RANKS = 16  # DP=16 / EP=16
@@ -100,6 +105,15 @@ def _make_real_rows(seed=1):
                            dtype=jnp.float32) / 10).astype(jnp.bfloat16)
     ids = jax.random.randint(ik, (NUM_RANKS, REAL_PER_RANK, TOPK), 0,
                              GLOBAL_EXPERTS, jnp.int32)
+    # With 256 global experts and 16 local ones, a uniformly routed token has
+    # a 60% chance of no local expert at all and would produce an all-zero
+    # output row in *both* arms -- a row that compares equal no matter what
+    # the kernel does. Pin slot 0 of every token to a local expert so all 736
+    # compared rows carry real work. The remaining 7 slots stay uniform over
+    # the 256 global experts, so the shard still sees the production mix.
+    local_slot0 = (jnp.arange(NUM_RANKS * REAL_PER_RANK, dtype=jnp.int32) %
+                   LOCAL_EXPERTS).reshape(NUM_RANKS, REAL_PER_RANK)
+    ids = ids.at[..., 0].set(EXPERTS_START + local_slot0)
     w = jax.nn.softmax(jax.random.normal(
         wk, (NUM_RANKS, REAL_PER_RANK, TOPK), dtype=jnp.float32),
                        axis=-1)
@@ -199,20 +213,25 @@ def test_decode_moe_48_bucket_matches_64_bucket():
     max_rel = max_abs / float(denom)
     nan64 = int(np.isnan(a).sum())
     nan48 = int(np.isnan(b).sum())
+    nonzero_rows = int((np.abs(a).max(axis=1) > 0).sum())
     print(f"real rows compared: {a.shape[0]} x {a.shape[1]}")
+    print(f"rows with non-zero output (i.e. rows the check can see): "
+          f"{nonzero_rows}/{a.shape[0]}")
     print(f"|out64| max = {float(np.abs(a).max()):.6f}")
     print(f"max_abs_diff(48 vs 64, real rows) = {max_abs:.6e}")
     print(f"max_rel_diff(48 vs 64, real rows) = {max_rel:.6e}")
     print(f"NaNs: 64-arm={nan64} 48-arm={nan48}")
 
-    # --- negative control: the same comparison must go red on a real change
-    bad_h = h48.at[3].set(h48[3] + jnp.bfloat16(0.5))
-    out_bad = _run_moe(bad_h, i48, w48, w1, w2, threshold)
+    # --- negative control: the same comparison must go red on a real change.
+    # Perturb every real row, not one row: a single row may route to no local
+    # expert and then contributes nothing to the comparison either way.
+    h48b, i48b, w48b = _lay_out(48, real_h + jnp.bfloat16(0.5), real_ids,
+                                real_w, junk_seed=22)
+    out_bad = _run_moe(h48b, i48b, w48b, w1, w2, threshold)
     c = np.asarray(_real_rows(out_bad, 48).astype(jnp.float32))
     ctrl = float(np.abs(a - c).max())
-    print(f"NEGATIVE CONTROL max_abs_diff (row 3 perturbed) = {ctrl:.6e}")
-    assert ctrl > 100 * max(max_abs, 1e-6), (
-        "negative control did not move the comparison; the check is hollow")
+    print(f"NEGATIVE CONTROL max_abs_diff (all real rows perturbed) "
+          f"= {ctrl:.6e}")
 
     # --- timing, at the MoE-layer level only
     t64 = _time(lambda: _run_moe(h64, i64, w64, w1, w2, threshold))
@@ -260,6 +279,10 @@ def test_decode_moe_48_bucket_matches_64_bucket():
         print(f"memory_stats unavailable: {exc!r}")
 
     assert nan48 == 0 and nan64 == 0, "NaN in the MoE output"
+    assert nonzero_rows == a.shape[0], (
+        f"only {nonzero_rows}/{a.shape[0]} compared rows carry work")
+    assert ctrl > 100 * max(max_abs, 1e-6), (
+        "negative control did not move the comparison; the check is hollow")
     assert max_rel < 2e-2, f"48-row MoE disagrees with 64-row MoE: {max_rel}"
 
 
