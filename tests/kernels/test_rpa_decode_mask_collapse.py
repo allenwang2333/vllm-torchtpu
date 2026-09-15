@@ -50,15 +50,45 @@ a tolerance 30x looser, and on fp8 the price is more than the signal is worth
 that the reference comparison actually *fails* when the bound is loose.
 Without it, a green suite here would be as uninformative as the bundled one.
 
-If you inject a fault into the kernel to re-check this suite's teeth, do not
-inject it into `v_bound`. `v` is deliberately bounded by `effective_kv_len`
-rather than by the causal bound, because positions the causal mask kills
-already carry `p == 0` and zeroing their `v` would change nothing -- the
-kernel says so in its own comment. Loosening `v_bound` is therefore a no-op by
-construction, and job j-8f5b7415 confirmed it empirically: a `+ 1` there left
-the output bit-identical in every one of twelve cases. Inject into the
-`s_bound` causal term (`processed_q_len - processed_kv_len + 1`) or delete the
-`jnp.minimum` clamp instead; those are load-bearing.
+Where to inject a fault, if you are re-checking this suite's teeth
+-----------------------------------------------------------------
+Two of the three lines in the collapsed path are *not* load-bearing, each for
+a different reason, and both have burned a TPU job here already.
+
+1. Not `v_bound`. `v` is deliberately bounded by `effective_kv_len` rather than
+   by the causal bound, because positions the causal mask kills already carry
+   `p == 0` and zeroing their `v` would change nothing -- the kernel says so in
+   its own comment. Job j-8f5b7415 confirmed it: a `+ 1` there left the output
+   bit-identical in all twelve cases.
+
+2. Not the causal clamp, *if what you care about is decode*. This is the one
+   that matters and it is invisible from the collapsed path itself:
+
+       kernel.py:346-347      if case == RpaCase.DECODE:
+                                  use_causal_mask = False
+
+   `case` is a static Python argument, so in the DECODE dispatch
+   (kernel.py:1983-1990, `static_q_len=1`) the whole `if use_causal_mask:`
+   block is a trace-time-false branch that emits *nothing*. The production op
+   `RPAd-p_256-bq_1_1-bkv_9216_9216` is that dispatch -- the `d` is
+   `RpaCase.DECODE.symbol`. Mutating the clamp therefore cannot perturb the
+   shipping compile at all, and job j-6e0fe029 demonstrated exactly that: two
+   clamp mutations were caught only by the `specdecode`/`mixed` cases, which
+   run the MIXED dispatch, while every pure-decode case passed both. That was
+   read at the time as "the clamp cannot bind in decode"; the truth is
+   stronger and worse -- the clamp is not there.
+
+That leaves the one line that *is* live in the decode compile, and which every
+mutation before j-<pending> had missed:
+
+       v_bound_i32 = effective_kv_len - processed_kv_len
+       s_bound_i32 = v_bound_i32
+
+In DECODE this single subtraction is the entire mask. Inject there. Note that
+the causal clamp *masks* a loose kv bound wherever the clamp is live, so the
+`specdecode`/`mixed` cases -- the ones with teeth against the clamp -- are the
+ones least able to catch a kv-term error. The two regimes need different cases,
+which is why both are present below.
 """
 
 from __future__ import annotations
@@ -172,10 +202,37 @@ CASES = {
     dict(seqs=[(128, 1), (128, 1), (200, 4), (256, 6)],
          distribution=(2, 2, 4),
          bkv=64),
+    # THE SHIPPING COMPILE. Everything above runs at toy page and block sizes;
+    # this one reproduces the production decode op end to end --
+    # `RPAd-p_256-bq_1_1-bkv_9216_9216` at kv_len 8192 -- so that the collapsed
+    # path is gated in the exact configuration the benchmark measures:
+    #
+    #   * DECODE dispatch (q_len == 1, distribution routes all four seqs to it),
+    #     hence `use_causal_mask = False` and the causal clamp is not emitted.
+    #     The kv term is the whole mask here; see the module docstring.
+    #   * page_size 256, not 16.
+    #   * bkv_csz 9216 >= kv_len, so this runs a SINGLE trip with
+    #     processed_kv_len == 0 throughout, exactly as production does.
+    #   * max_kv_len = 33 * 256 = 8448 <= 32767, with a packed q dtype on
+    #     TPU >= 6, so `int_ty` narrows to i16 -- the same narrowing production
+    #     takes, and the one the `.astype(int_ty)` in the collapsed path exists
+    #     to serve.
+    #
+    # The single trip means this case cannot detect a *dropped* subtraction
+    # (processed_kv_len is 0, so subtracting it is the identity). That is what
+    # the multi-trip cases above are for. This one detects a wrong *bound*: at
+    # kv_len 8192 the new token sits at position 8191 and position 8192 is
+    # poisoned, so +1 reads poison and -1 drops the new token. The two kinds of
+    # coverage are complementary and neither substitutes for the other.
+    "decode_production_shape":
+    dict(seqs=[(8192, 1)] * 4,
+         distribution=(4, 4, 4),
+         bkv=9216,
+         page_size=256),
 }
 
 
-def _build(seqs, distribution, kv_dtype, seed=0):
+def _build(seqs, distribution, kv_dtype, seed=0, page_size=PAGE_SIZE):
     """Build the workload as *host* numpy arrays.
 
     Deliberately not device arrays: `ragged_paged_attention` donates its inputs,
@@ -192,7 +249,7 @@ def _build(seqs, distribution, kv_dtype, seed=0):
     # and without the slack a kv_len that is an exact multiple of PAGE_SIZE
     # overflows the page table (`Require page_cnt=17 <= pages_per_seq=16`)
     # before any numerics run.
-    pages_per_seq = int(np.ceil((max(kv_lens) + 1) / PAGE_SIZE))
+    pages_per_seq = int(np.ceil((max(kv_lens) + 1) / page_size))
     num_blocks = num_seqs * pages_per_seq
 
     cu_q_lens = np.cumsum([0] + q_lens, dtype=np.int32)
@@ -213,25 +270,32 @@ def _build(seqs, distribution, kv_dtype, seed=0):
     pool = np.arange(num_blocks, dtype=np.int32)
     rng.shuffle(pool)
 
-    cache_shape = K.get_kv_cache_shape(num_blocks, PAGE_SIZE, NUM_KV_HEADS,
+    cache_shape = K.get_kv_cache_shape(num_blocks, page_size, NUM_KV_HEADS,
                                        HEAD_DIM, kv_dtype)
     # Along the num_kv_heads_x2 axis the cache interleaves (K, V) per head:
     # index 2h is head h's key, 2h+1 its value. `ref_ragged_paged_attention`
     # reshapes (num_kv_heads_x2, head_dim) -> (num_kv_heads, head_dim * 2) and
     # splits at head_dim, which is what fixes that order.
-    flat = np.empty((num_blocks, PAGE_SIZE, NUM_KV_HEADS * 2, cache_shape[-1]),
+    flat = np.empty((num_blocks, page_size, NUM_KV_HEADS * 2, cache_shape[-1]),
                     np.float32)
     # Poison first, everywhere -- including pages no sequence maps to.
     flat[:, :, 0::2, :] = 0.0
     flat[:, :, 1::2, :] = POISON_V
     # Then write real history back over the live range of each sequence. The
     # slots left poisoned are exactly those a correct mask must never read.
+    #
+    # Vectorized per sequence rather than per position: the production-shape
+    # case has 4 x 8192 positions and a Python loop over them costs more than
+    # the TPU work it sets up. `both` is drawn as (p, {k,v}, head, dim) in C
+    # order, which is the same draw sequence the per-position loop made (K_p
+    # then V_p), so the data is bit-identical to what the earlier jobs ran.
     for s, kv_len in enumerate(kv_lens):
-        for p in range(kv_len):
-            pg = pool[s * pages_per_seq + p // PAGE_SIZE]
-            off = p % PAGE_SIZE
-            flat[pg, off, 0::2, :] = r(NUM_KV_HEADS, HEAD_DIM)
-            flat[pg, off, 1::2, :] = r(NUM_KV_HEADS, HEAD_DIM)
+        pos = np.arange(kv_len)
+        pgs = pool[s * pages_per_seq + pos // page_size]
+        offs = pos % page_size
+        both = r(kv_len, 2, NUM_KV_HEADS, HEAD_DIM)
+        flat[pgs, offs, 0::2, :] = both[:, 0]
+        flat[pgs, offs, 1::2, :] = both[:, 1]
     cache = np.asarray(
         jnp.asarray(flat.reshape(cache_shape), dtype=kv_dtype))
 
@@ -312,7 +376,10 @@ def test_collapsed_and_general_paths_agree(case, kv_dtype):
     """
     _require_tpu()
     spec = CASES[case]
-    wl = _build(spec["seqs"], spec["distribution"], kv_dtype)
+    wl = _build(spec["seqs"],
+                spec["distribution"],
+                kv_dtype,
+                page_size=spec.get("page_size", PAGE_SIZE))
     scales = dict(k_scale=1.0,
                   v_scale=1.0) if kv_dtype == jnp.float8_e4m3fn else {}
     wide = int(max(kv for kv, _ in spec["seqs"])) + 1
@@ -360,7 +427,10 @@ def test_pallas_matches_reference(case):
     """
     _require_tpu()
     spec = CASES[case]
-    wl = _build(spec["seqs"], spec["distribution"], jnp.bfloat16)
+    wl = _build(spec["seqs"],
+                spec["distribution"],
+                jnp.bfloat16,
+                page_size=spec.get("page_size", PAGE_SIZE))
 
     got, got_cache = _call(K.ragged_paged_attention, wl, spec["bkv"])
     want, want_cache = _call(K.ref_ragged_paged_attention, wl, spec["bkv"])
