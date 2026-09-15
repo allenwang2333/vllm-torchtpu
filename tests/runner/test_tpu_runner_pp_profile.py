@@ -247,20 +247,30 @@ def test_profile_refuses_a_step_one_request_cannot_run():
 
 def _capacity_runner():
     runner = MagicMock(spec=TPUModelRunner)
-    runner._attention_capacity = None
-    runner._attention_capacity_known = False
+    runner._attention_capacity = {}
+    runner._attention_runs_batched_kernel = None
     runner.parallel_config = SimpleNamespace()
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config)
     runner.head_size = 128
     runner.num_kv_heads = 2
-    runner.max_num_reqs = 8
-    runner.max_model_len = 4096
-    runner._attention_kernel_block_size = 256
-    runner.cache_config = SimpleNamespace(block_size=4096)
+    # The kernel is called with the bucket's request cap and the block
+    # table's width, not with the engine-wide maxima.
+    runner.max_num_reqs = 64
+    runner.max_model_len = 262144
+    runner.num_reqs_max_model_len = 8
+    runner.most_model_len = None
+    runner.num_reqs_most_model_len = None
+    runner._attention_kernel_block_size = 128
+    runner._attention_kv_cache_group_id = 0
+    runner.input_batch = SimpleNamespace(
+        block_table=[SimpleNamespace(max_num_blocks_per_req=2079)])
+    runner.cache_config = SimpleNamespace(block_size=4224)
     runner.model_config = SimpleNamespace(
         dtype=torch.bfloat16, get_num_attention_heads=lambda _config: 8)
     runner.kv_cache_dtype = torch.bfloat16
+    runner._attention_kernel_shapes = (
+        TPUModelRunner._attention_kernel_shapes.__get__(runner))
     return runner
 
 
@@ -285,8 +295,9 @@ def _attention_layers(monkeypatch, batched):
     sized = []
 
     def schedule_capacity(*, mode, **kwargs):
-        sized.append((mode.name, kwargs["page_size"], kwargs["pages_per_seq"]))
-        return (100, 256, 256)
+        sized.append((mode.name, kwargs["num_seqs"], kwargs["pages_per_seq"],
+                      kwargs["page_size"]))
+        return (100 + kwargs["num_seqs"], 256, 256)
 
     monkeypatch.setattr(rpa_batched, "schedule_capacity", schedule_capacity)
     return sized
@@ -297,10 +308,28 @@ def test_schedule_capacity_comes_from_the_batched_kernel(monkeypatch):
     sized = _attention_layers(monkeypatch, [False, True])
     runner = _capacity_runner()
     capacity = TPUModelRunner._attention_schedule_capacity(runner)
-    assert capacity == {"decode": (100, 256, 256), "mixed": (100, 256, 256)}
-    # Sized at the kernel's page size, not the KV manager's block.
-    assert sized == [("DECODE", 256, 16), ("MIXED", 256, 16)]
-    assert runner._attention_capacity_known
+    assert capacity == {"decode": (108, 256, 256), "mixed": (108, 256, 256)}
+    # Sized by the max-model-len bucket's 8 sequences and the block table's
+    # 2079 kernel pages, not by 64 requests x 262144 / 128.
+    assert sized == [("DECODE", 8, 2079, 128), ("MIXED", 8, 2079, 128)]
+    assert runner._attention_runs_batched_kernel
+    # Cached per bucket shape.
+    assert TPUModelRunner._attention_schedule_capacity(runner) is capacity
+    assert len(sized) == 2
+
+
+def test_schedule_capacity_follows_the_most_model_len_bucket(monkeypatch):
+    sized = _attention_layers(monkeypatch, [True])
+    runner = _capacity_runner()
+    runner.most_model_len = 65536
+    runner.num_reqs_most_model_len = 32
+    capacity = TPUModelRunner._attention_schedule_capacity(
+        runner, use_max_model_len=False)
+    assert capacity == {"decode": (132, 256, 256), "mixed": (132, 256, 256)}
+    assert sized == [("DECODE", 32, 512, 128), ("MIXED", 32, 512, 128)]
+    # The max bucket keeps its own entry.
+    TPUModelRunner._attention_schedule_capacity(runner, use_max_model_len=True)
+    assert sized[2:] == [("DECODE", 8, 2079, 128), ("MIXED", 8, 2079, 128)]
 
 
 def test_schedule_capacity_is_unbounded_when_no_layer_runs_the_batched_kernel(
@@ -309,7 +338,7 @@ def test_schedule_capacity_is_unbounded_when_no_layer_runs_the_batched_kernel(
     runner = _capacity_runner()
     assert TPUModelRunner._attention_schedule_capacity(runner) is None
     assert sized == []
-    assert runner._attention_capacity_known
+    assert runner._attention_runs_batched_kernel is False
 
 
 def test_check_passes_a_long_context_step_without_the_batched_kernel(

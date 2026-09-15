@@ -896,6 +896,8 @@ class KVCacheManager:
                     if isinstance(kv_cache_spec, FullAttentionSpec):
                         self.runner._attention_kernel_block_size = (
                             kernel_block_size)
+                        self.runner._attention_kv_cache_group_id = (
+                            group.kv_cache_group_id)
                 builder = AttentionMetadataBuilder(
                     kv_cache_spec,
                     group.layer_names,

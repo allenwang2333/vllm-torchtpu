@@ -120,8 +120,8 @@ def _make_runner(*,
     runner._pp_is_last = True
     # The real schedule check; the stub registers no attention layer, so no
     # kernel bounds the step.
-    runner._attention_capacity = None
-    runner._attention_capacity_known = False
+    runner._attention_capacity = {}
+    runner._attention_runs_batched_kernel = None
     runner._attention_schedule_capacity = types.MethodType(
         TPUModelRunner._attention_schedule_capacity, runner)
     runner._check_attention_schedule = types.MethodType(
