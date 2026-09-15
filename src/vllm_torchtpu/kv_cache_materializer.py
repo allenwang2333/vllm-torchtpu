@@ -9,8 +9,6 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.worker.utils import AttentionGroup
 
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
-
 LayerKVCache: TypeAlias = torch.Tensor | list[torch.Tensor]
 
 
@@ -151,10 +149,15 @@ def allocate_raw_kv_cache_tensors(
             spec.head_size,
             cache_dtype_str=cache_dtype,
         )
-        if spec.dtype in _FP8_DTYPES:
-            raw = torch.empty(tuple(shape), dtype=spec.dtype, device=device)
-        else:
-            raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
+        # Zeroed, including fp8, which used to take a torch.empty fast path.
+        # A page holds more rows than the sequence occupying it, and the
+        # attention kernel reads the whole page: RPA v3 relies on p == 0 to
+        # annihilate the rows past effective_kv_len rather than masking V, so
+        # those rows must be finite. 0xFF is a NaN in f8e4m3fn and 0 * NaN is
+        # NaN, so a single junk byte from uninitialized HBM poisons an output
+        # row. This is once per pool at startup against a read on every
+        # kernel invocation. See mask_v() in the RPA v3 kernel.
+        raw = torch.zeros(tuple(shape), dtype=spec.dtype, device=device)
         fa_page_bytes = (raw.numel() * raw.element_size() //
                          (num_blocks * split))
         if fa_page_bytes * split != pool_page_bytes:

@@ -897,22 +897,35 @@ def _ragged_paged_attention_kernel_loop(
         Dropping it measured **-8.35% median / -8.49% min** in ``j-30133ae0``,
         over three same-chip pairs, one with the order reversed, against a
         cross-chip median reproducibility of 1.0-4.2% and a min
-        reproducibility of 0.08-0.85%. Correctness: 18 passed under ``none``
-        in the same job.
+        reproducibility of 0.08-0.85%. n=3, so the min is the tight statistic
+        (95% CI [-9.51%, -7.48%]) and the median is not: its 95% CI is
+        [-13.74%, -2.95%]. Do not quote the median as "8-9%".
 
-        Two hazards were considered and are not reachable here:
+        **What this correctness rests on: the padding rows must be finite.**
+        ``p == 0`` annihilates a finite V and nothing else -- ``0 * NaN`` is
+        ``NaN``, and ``0xFF`` is a NaN in ``f8e4m3fn``, so one junk byte from
+        uninitialized HBM poisons an output row for the whole sequence. That
+        invariant is enforced at the allocator: ``kv_cache_materializer.py``
+        zeroes every pool, fp8 included, where it used to take a
+        ``torch.empty`` fast path. Zeroing once per pool at startup buys the
+        same guarantee this mask bought on every invocation.
+        ``tests/kernels/test_rpa_v_mask_padding.py`` pins it by filling the
+        padding with NaN / +-inf / 3e38 and comparing against
+        ``ref_ragged_paged_attention``, which slices ``kv[:kv_len]`` and so
+        cannot see the junk. (Measured there: ``f8e4m3fn`` does not saturate,
+        so all three of inf, -inf and 3e38 land in the cache as NaN.)
 
-        * **A fully masked block** would collapse ``m_curr`` onto
-          ``mask_value``, making ``s - m_curr == 0`` and ``p`` *one* rather
-          than zero. But that corrupts ``l_ref`` via ``p_rowsum``, which the V
-          zeroing never touched -- it only ever zeroed ``o``. Such a block is
-          therefore already wrong today, with or without this mask, so the
-          kernel cannot be relying on it.
-        * **A non-finite V** would survive ``p == 0``, since ``0 * NaN`` is
-          ``NaN`` and ``0xFF`` is a NaN in ``f8e4m3fn``. But every KV cache
-          allocation in ``runner/kv_cache_manager.py`` is ``torch.zeros``, not
-          ``torch.empty``, so the rows past the sequence end read as 0.0. The
-          only route to a NaN is one the model itself wrote.
+        The same invariant, not a separate argument, is what makes a **fully
+        masked block** safe. Such a block collapses ``m_curr`` onto
+        ``mask_value``, so ``s - m_curr == 0`` and ``p`` is *one* rather than
+        zero, and ``o`` accumulates the raw padding. It is not left wrong:
+        on the next block ``exp_m_diff = exp(mask_value - real_rowmax)`` is
+        exactly 0 and annihilates both ``l_prev`` and ``o_prev``. But that
+        recovery multiplies ``o_prev`` by zero -- so it heals a finite ``o``
+        and propagates a non-finite one. (An earlier version of this comment
+        argued such a block was "already wrong today with or without this
+        mask". That was wrong, and it was the load-bearing half of the
+        argument: the zeroing was what kept ``o_prev`` finite.)
 
         Set ``full`` to restore the zeroing for an A/B. ``broadcast`` is kept
         only because it is a measured dead end: the predicate is ``iota``

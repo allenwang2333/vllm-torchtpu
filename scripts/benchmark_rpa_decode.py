@@ -297,8 +297,17 @@ def _check(wl, d_block_sizes, sm_scale, rtol, atol):
     absd = np.abs(g - r)
     rel = absd / np.maximum(np.abs(r), 1e-6)
     close = (absd <= atol) | (rel <= rtol)
+    # Report max_rel only where the denominator is a real value rather than
+    # the 1e-6 floor. Otherwise a reference element at ~0 divides a
+    # perfectly-fine absolute error by 1e-6 and prints a headline number six
+    # orders of magnitude too big -- max_rel=5585 was exactly 0.005585/1e-6.
+    # The pass criterion above is untouched; this only fixes what is printed.
+    scored = np.abs(r) > 1e-6
+    max_rel = f"{rel[scored].max():.4g}" if scored.any() else "n/a"
     return bool(close.all()), (f"max_abs={absd.max():.4g} "
-                               f"max_rel={rel.max():.4g} "
+                               f"max_rel={max_rel} "
+                               f"(over |ref|>1e-6, {100.0*scored.mean():.1f}% "
+                               f"of elements) "
                                f"mismatch={100.0*(~close).mean():.4f}%")
 
 
