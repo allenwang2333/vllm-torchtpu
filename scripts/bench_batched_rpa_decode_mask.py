@@ -22,7 +22,18 @@ What this measures, and what it cannot
 --------------------------------------
 This is a **paired, interleaved A/B in a single process**. The two arms differ
 only in the trace-time constant ``flash_attention._COLLAPSE_DECODE_MASK``;
-every array, block size, seed and page table is shared. The expected effect is
+every array, block size, seed and page table is shared.
+
+Separating the arms is harder than it looks, and the first version of this
+script failed at it: the flag is read inside a *nested* ``@jax.jit``
+(``wrapper.ragged_paged_attention``) whose cache key does not include it, so
+both arms ran one binary and the resulting -0.662% was the difference between
+two HBM allocations. ``compile_arms`` now clears the cache between lowerings and
+**refuses to run unless the two arms' compiled HLO differs**. A benchmark whose
+control cannot fail is not a benchmark; treat that assertion as the first
+result, not as setup.
+
+The expected effect is
 low single-digit percent, which is the regime where one-arm-per-process
 benchmarking measures process placement rather than the kernel -- so the arms
 alternate within a pair, and the pair order flips every other pair to cancel
@@ -124,12 +135,16 @@ def build(seed: int = 0):
 
 
 def make_runner():
-    """Build a *fresh* jitted callable.
+    """Build a *fresh* jitted callable, one per arm.
 
-    One per arm, deliberately. ``_COLLAPSE_DECODE_MASK`` is read at trace time,
-    so the arm is baked into the compiled binary -- and `jax.jit` caches on the
-    function object, so reusing a single runner for both arms would silently
-    hand the second arm the first arm's binary and report a 0.0% delta.
+    A fresh outer object is **necessary but not sufficient**, and an earlier
+    version of this script got that wrong and reported a number for it. The flag
+    is read inside ``KB.ragged_paged_attention``, which is itself ``@jax.jit`` at
+    module scope (``wrapper.py:375``) with ``static_argnames`` that contain
+    nothing varying between arms. Both arms therefore hit the *inner* cache on
+    the same key, the second arm silently reuses the first arm's kernel, and the
+    reported delta is the difference between two copies of one binary. See
+    ``compile_arms`` for the part that actually separates them.
     """
 
     @functools.partial(jax.jit,
@@ -169,6 +184,40 @@ def make_runner():
     return run
 
 
+def compile_arms(runners, wl, caches, inner):
+    """Compile each arm to its own executable, and prove they differ.
+
+    ``jax.clear_caches()`` between the two lowerings is what forces a second
+    trace: it drops the inner ``ragged_paged_attention`` cache entry that would
+    otherwise be reused. Compiling ahead of time rather than clearing around
+    every call is deliberate -- clearing inside the timing loop would recompile
+    on each call and time the compiler. An already-built ``Compiled`` holds its
+    own executable and survives a later ``clear_caches``.
+
+    The HLO comparison is the assertion this script most needed and did not
+    have. It is a *negative control on the harness*: if the two arms are the
+    same binary it fails here, loudly, instead of reporting the difference
+    between two allocations as a speedup.
+    """
+    compiled = {}
+    for name in ARMS:
+        flash_attention._COLLAPSE_DECODE_MASK = ARMS[name]
+        jax.clear_caches()
+        compiled[name] = runners[name].lower(**wl,
+                                             kv_cache=caches[name],
+                                             inner=inner).compile()
+
+    texts = {name: compiled[name].as_text() for name in ARMS}
+    if texts["collapsed"] == texts["general"]:
+        raise SystemExit(
+            "FAIL: both arms compiled to byte-identical HLO, so the flag never "
+            "reached a second trace and any delta below would be noise between "
+            "two copies of one binary. Do not report a number from this run.")
+    print(f"arms differ (HLO)   : True  "
+          f"({len(texts['collapsed'])} vs {len(texts['general'])} chars)")
+    return compiled
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pairs", type=int, default=10,
@@ -189,13 +238,13 @@ def main():
     }
     checksums: dict[str, float] = {}
 
+    compiled = compile_arms(runners, wl, caches, args.inner)
+
     def call(name):
-        # Set before the call because it is read while tracing; after the first
-        # call per arm the binary is cached and this is a no-op.
-        flash_attention._COLLAPSE_DECODE_MASK = ARMS[name]
-        acc, caches[name] = runners[name](**wl,
-                                          kv_cache=caches[name],
-                                          inner=args.inner)
+        # `inner` was static at lowering time and is baked into the executable,
+        # so it must *not* be passed again here -- an AOT `Compiled` matches the
+        # caller's pytree against the lowered one and rejects the extra arg.
+        acc, caches[name] = compiled[name](**wl, kv_cache=caches[name])
         jax.block_until_ready((acc, caches[name]))
         return float(acc)
 
@@ -263,12 +312,19 @@ def main():
     if len(deltas) > 1:
         sd = statistics.stdev(deltas)
         se = sd / len(deltas)**0.5
-        # t(0.975) for small n; table rather than a scipy dependency.
-        tcrit = {
-            2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571, 7: 2.447,
-            8: 2.365, 9: 2.306, 10: 2.262, 11: 2.228, 12: 2.201, 15: 2.145,
-            20: 2.093, 30: 2.045,
-        }.get(len(deltas) - 1, 1.96)
+        # t(0.975), keyed by *degrees of freedom*; a table rather than a scipy
+        # dependency. An earlier version keyed this table by n but looked it up
+        # by n-1, and fell back to the normal 1.96 for any df it did not list --
+        # which at n=40 quietly reported a z-interval under a "t-based" label.
+        # Missing df now takes the largest tabulated df below it, so the
+        # fallback is always conservative rather than anti-conservative.
+        df = len(deltas) - 1
+        table = {
+            1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+            7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 14: 2.145,
+            19: 2.093, 29: 2.045, 39: 2.023, 59: 2.001, 119: 1.980,
+        }
+        tcrit = table[max(k for k in table if k <= df)] if df >= 1 else 12.706
         lo, hi = mean_d - tcrit * se, mean_d + tcrit * se
         print(f"mean delta          : {mean_d:+.3f}%  "
               f"95% CI [{lo:+.3f}%, {hi:+.3f}%]  (n={len(deltas)} pairs)")

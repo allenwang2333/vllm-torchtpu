@@ -25,9 +25,22 @@ not "close enough" but **bit-identical output**. `_COLLAPSE_DECODE_MASK` exists
 to make that testable: flipping it off forces the general path at an otherwise
 identical shape and identical block sizes, so the two can be compared exactly.
 
-Three things this file is built to catch, all of which a random-data allclose
+Getting the two arms to be two arms is the hard part, and the first version of
+this file did not manage it. `KB.ragged_paged_attention` is `@jax.jit` at module
+scope and the flag is not one of its `static_argnames`, so flipping the flag
+between two calls leaves the cache key unchanged: the second call reused the
+first's binary and all ten equality assertions compared an array with itself.
+`_run_arm` clears the cache and *reports back which flag each trace saw*, and
+every value comparison asserts that separation first. A control that cannot
+fail is worse than no control, because it is reported as evidence.
+
+Four things this file is built to catch, all of which a random-data allclose
 would miss:
 
+0. The two arms being one arm. `_assert_arms_were_separate` gates every value
+   comparison, and `test_flipping_the_flag_without_clearing_caches_is_a_no_op`
+   pins the underlying jax behaviour so the guard is not later removed as
+   superstition.
 1. A bound one column too loose. Positions at and beyond `kv_len` are poisoned
    in the cache, so reading one extra column changes the output far outside any
    tolerance. `test_a_loose_bound_is_detectable` proves the poison has teeth
@@ -47,6 +60,7 @@ fp8 is covered because fp8 is what ships: this checkpoint serves with
 kernel against an fp8 cache at all.
 """
 
+import contextlib
 from unittest.mock import MagicMock, patch
 
 import jax
@@ -196,9 +210,65 @@ def _run(inp, q_dtype=jnp.bfloat16, skip_kv_update=False):
             np.asarray(cache.astype(jnp.float32)))
 
 
+@contextlib.contextmanager
+def _record_traces():
+    """Record the flag value seen at each *trace* of the masking function.
+
+    `kernel.py` reaches it as a module attribute, so patching the attribute
+    intercepts every trace. One entry per trace, none if the binary was reused
+    from cache -- which is exactly the discriminator the tests below need.
+    """
+    seen: list[bool] = []
+    real = flash_attention.flash_attention_qk_softmax
+
+    def spy(*a, **kw):
+        seen.append(flash_attention._COLLAPSE_DECODE_MASK)
+        return real(*a, **kw)
+
+    with patch.object(flash_attention, "flash_attention_qk_softmax", spy):
+        yield seen
+
+
+def _run_arm(inp, collapse, **kwargs):
+    """Run one arm, forcing a genuine retrace, and report that it happened.
+
+    `KB.ragged_paged_attention` is `@jax.jit` at module scope (`wrapper.py:375`)
+    and `_COLLAPSE_DECODE_MASK` is not among its `static_argnames`, so flipping
+    the flag does not change its cache key. Without `jax.clear_caches()` the
+    second arm silently reuses the first arm's binary and every comparison in
+    this file degenerates into comparing an array with itself -- which is what
+    the first version of these tests did, passing 10 assertions that could not
+    fail. Returning `seen` lets each test prove the separation rather than
+    assume it.
+    """
+    with patch.object(flash_attention, "_COLLAPSE_DECODE_MASK", collapse):
+        jax.clear_caches()
+        with _record_traces() as seen:
+            result = _run(inp, **kwargs)
+    return result, seen
+
+
+def _assert_arms_were_separate(seen_collapsed, seen_general, what):
+    """The harness's own negative control.
+
+    Without this the entire file is vacuous, so it is asserted before any
+    comparison of values rather than alongside them.
+    """
+    assert seen_collapsed, (
+        f"{what}: the collapsed arm never traced the masking function, so no "
+        f"kernel was built for it")
+    assert seen_general, (
+        f"{what}: the general arm never traced the masking function -- it "
+        f"reused the collapsed arm's cached binary, so any comparison below "
+        f"would compare that binary's output with itself")
+    assert all(seen_collapsed) and not any(seen_general), (
+        f"{what}: the arms traced with the wrong flag values "
+        f"(collapsed={seen_collapsed}, general={seen_general})")
+
+
 @pytest.mark.parametrize("case", list(CASES))
 @pytest.mark.parametrize("kv_dtype", list(DTYPES), ids=list(DTYPES))
-def test_collapsed_matches_general_bitwise(case, kv_dtype, monkeypatch):
+def test_collapsed_matches_general_bitwise(case, kv_dtype):
     """The collapsed mask must be a bit-identical rewrite of the general one.
 
     Exact equality is the right bar here and a tolerance would be the wrong one:
@@ -212,11 +282,12 @@ def test_collapsed_matches_general_bitwise(case, kv_dtype, monkeypatch):
     spec = CASES[case]
     inp = _build_inputs(spec["kv_lens"], spec["bkv_sz"], DTYPES[kv_dtype])
 
-    monkeypatch.setattr(flash_attention, "_COLLAPSE_DECODE_MASK", True)
-    collapsed, collapsed_cache = _run(inp)
+    (collapsed, collapsed_cache), seen_c = _run_arm(inp, True)
+    (general, general_cache), seen_g = _run_arm(inp, False)
 
-    monkeypatch.setattr(flash_attention, "_COLLAPSE_DECODE_MASK", False)
-    general, general_cache = _run(inp)
+    # Before comparing anything: prove the two arms are actually two kernels.
+    # If they are not, everything below passes for free.
+    _assert_arms_were_separate(seen_c, seen_g, f"{case}/{kv_dtype}")
 
     # Finiteness before comparison, and as its own assertion rather than a flag
     # on the comparison. `assert_allclose` defaults to `equal_nan=True`, so
@@ -237,6 +308,45 @@ def test_collapsed_matches_general_bitwise(case, kv_dtype, monkeypatch):
     np.testing.assert_array_equal(
         collapsed_cache, general_cache,
         err_msg=f"collapsed != general cache for {case}/{kv_dtype}")
+
+
+def test_flipping_the_flag_without_clearing_caches_is_a_no_op():
+    """Pin the trap, so nobody removes `jax.clear_caches()` as redundant.
+
+    This asserts the *defect* directly: flip the flag the obvious way, with no
+    cache clear, and the second arm does not trace at all. It is the reason
+    `_run_arm` exists, and it fails the day `ragged_paged_attention` gains the
+    flag as a `static_argname` -- at which point `_run_arm`'s clear really is
+    redundant and this test should be deleted along with it.
+
+    Needs no TPU and runs no kernel: `make_jaxpr` on a two-level jit reproduces
+    the cache behaviour exactly, and a deliberately different second branch
+    makes the reuse visible as a wrong value rather than as a missing trace.
+    """
+    flag = {"on": True}
+    traced: list[bool] = []
+
+    @jax.jit
+    def inner(x):  # stands in for the module-scope `ragged_paged_attention`
+        traced.append(flag["on"])
+        return x * 2.0 if flag["on"] else x * 3.0
+
+    def make_outer():  # a fresh object per arm, as the bench harness does
+        return jax.jit(lambda x: inner(x))
+
+    x = jnp.ones((4, ))
+    arms = {}
+    for name, value in (("collapsed", True), ("general", False)):
+        flag["on"] = value
+        arms[name] = np.asarray(make_outer()(x))
+
+    assert traced == [True], (
+        f"expected the nested jit to trace once and reuse, got {traced}; if "
+        f"jax no longer caches this way, `_run_arm` can be simplified")
+    np.testing.assert_array_equal(
+        arms["collapsed"], arms["general"],
+        err_msg="the two arms produced different values, so the nested-jit "
+        "cache no longer hides the flag -- re-check `_run_arm`")
 
 
 @pytest.mark.parametrize("kv_dtype", list(DTYPES), ids=list(DTYPES))
