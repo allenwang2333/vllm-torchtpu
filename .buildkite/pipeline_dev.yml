@@ -46,8 +46,11 @@ steps:
     artifact_paths:
       - "perf_eval_results/**/*"
 
+  # Takes a whole v7x-8 agent for the better part of an hour, so it is opt-in:
+  # trigger with RUN_E2E=1 in the build env.
   - label: "KDA e2e: baseline + profile + perturbed, Kimi-Linear-48B TP8 (v7x-8)"
     key: kda_e2e
+    if: 'build.env("RUN_E2E") == "1"'
     depends_on: build_docker
     timeout_in_minutes: 150
     agents:

@@ -71,6 +71,7 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 
 import numpy as np
 
@@ -150,7 +151,9 @@ def load_kernel(src: str):
             raise SystemExit(
                 f"arm was told to measure {root} but imported {mod.__name__} "
                 f"from {got}")
-    _log(f"arm imports {os.path.realpath(compute_kda.__file__)}")
+    import jax
+    _log(f"arm imports {os.path.realpath(compute_kda.__file__)} "
+         f"(jax {jax.__version__}, {jax.devices()[0].device_kind})")
     return wrapper, config
 
 
@@ -476,6 +479,7 @@ def run_worker(src: str, configs: list[str]) -> dict:
         try:
             got = measure(wrapper, cfgmod, name)
         except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
             # An omission is the only honest report of a config this process
             # could not measure: `declined` means the KERNEL refused the shape,
             # and saying that about a harness failure would be a clean,
@@ -500,9 +504,12 @@ def run_driver(job_id: str, arms: list[tuple[str, str, bool]],
     for name, src, control in arms:
         _log(f"--- arm {name} ({'control' if control else 'candidate'}) "
              f"from {src}")
+        argv = [sys.executable, "-u", os.path.abspath(__file__), "--worker",
+                "--src", src]
+        for cfg in configs:
+            argv += ["--config", cfg]
         proc = subprocess.run(
-            [sys.executable, "-u", os.path.abspath(__file__), "--worker",
-             "--src", src, "--config", *configs],
+            argv,
             capture_output=True, text=True,
             env=dict(os.environ, PYTHONPATH=os.path.join(src, "src"),
                      PYTHONDONTWRITEBYTECODE="1"))
