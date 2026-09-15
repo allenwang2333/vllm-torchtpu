@@ -510,11 +510,22 @@ def _ragged_paged_attention_kernel_loop(
             # causal mask kills already carry p == 0, so zeroing their `v` would
             # change nothing, and keeping the bound identical keeps this path
             # bit-for-bit equal to the general one.
-            v_bound = effective_kv_len_int - processed_kv_len_int
-            s_bound = v_bound
+            # Both bounds are scalars, so this is scalar-core arithmetic and its
+            # width costs nothing on the vector units. Keep it in i32 and narrow
+            # once at the end: Mosaic implements `arith.subi` for i32 only
+            # ("Only i32 arith.subi is supported, but got 'i16'"), and `int_ty`
+            # narrows to i16 on exactly this configuration -- packed q dtype,
+            # TPU >= 6, max_kv_len <= 32767. The general path never hit this
+            # because it only ever added and compared in `int_ty`; this path
+            # introduces the first subtraction. The comparisons below are still
+            # `int_ty` vector against `int_ty` scalar, as before.
+            v_bound_i32 = effective_kv_len - processed_kv_len
+            s_bound_i32 = v_bound_i32
             if use_causal_mask:
-                s_bound = jnp.minimum(
-                    s_bound, processed_q_len_int - processed_kv_len_int + 1)
+                s_bound_i32 = jnp.minimum(
+                    s_bound_i32, processed_q_len - processed_kv_len + 1)
+            v_bound = v_bound_i32.astype(int_ty)
+            s_bound = s_bound_i32.astype(int_ty)
             s = jnp.where(
                 lax.broadcasted_iota(int_ty, s.shape, 1) < s_bound, s,
                 mask_value)
