@@ -717,6 +717,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
+        # Set by initialize_kernel() when PCP routes this layer to the
+        # streaming kernel.
+        self._pcp_streaming = False
         # DCP (Decode Context Parallelism) state. Populated by initialize_kernel()
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
@@ -1068,6 +1071,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                           parallel_config.prefill_context_parallel_size > 1)
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
+            self._pcp_streaming = True
             self.rpa_kernel = self._build_rpa_kernel(
                 q_scale,
                 k_scale,
@@ -1101,6 +1105,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                                  k_scale,
                                                  v_scale,
                                                  skip_kv_update=skip_kv_update)
+
+    def runs_batched_rpa_schedule(self) -> bool:
+        """Whether forward runs the batched RPA kernel, which keeps a whole
+        step's (query block, KV block) schedule in SMEM. The PCP streaming
+        kernel, the DCP kernels, the long-context fork, the head-dim-64
+        kernel and the bundled kernel keep no such table."""
+        # TODO(#1015): remove, with the runner's schedule check, once the
+        # batched RPA kernel enforces its own schedule bound.
+        return (self._kernel_entry is _pallas_rpa_kernel_batched
+                and not self._pcp_streaming and self.dcp_world_size == 1
+                and self.rpa_kernel_bundled is None
+                and not envs.USE_BATCHED_RPA_LONGCTX and self.head_size != 64)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""

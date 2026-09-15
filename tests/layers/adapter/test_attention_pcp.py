@@ -257,6 +257,52 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
     assert calls == [(True, 4)]
 
 
+def test_initialize_kernel_marks_the_layer_as_streaming_under_pcp(
+        monkeypatch, vllm_config_context):
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_build_rpa_kernel",
+                        lambda self, *args, **kwargs: MagicMock())
+    impl = _batched_impl()
+    assert impl.runs_batched_rpa_schedule()
+
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        impl.initialize_kernel(_layer())
+
+    assert not impl.runs_batched_rpa_schedule()
+
+
+def test_only_the_batched_kernel_keeps_a_schedule_in_smem(
+        monkeypatch, vllm_config_context):
+    from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
+    monkeypatch.delenv("USE_BATCHED_RPA_LONGCTX", raising=False)
+    assert _batched_impl().runs_batched_rpa_schedule()
+    assert not _impl().runs_batched_rpa_schedule()
+    hd64 = PallasBatchedRPAAttentionBackendImpl(num_heads=2,
+                                                head_size=64,
+                                                scale=1.0,
+                                                num_kv_heads=1,
+                                                alibi_slopes=None,
+                                                sliding_window=None,
+                                                kv_cache_dtype="bfloat16")
+    assert not hd64.runs_batched_rpa_schedule()
+
+    dcp = _batched_impl()
+    dcp.dcp_world_size = 2
+    assert not dcp.runs_batched_rpa_schedule()
+
+    bundled = _batched_impl()
+    bundled.rpa_kernel_bundled = MagicMock()
+    assert not bundled.runs_batched_rpa_schedule()
+
+    draft = _batched_impl()
+    draft._kernel_entry = _pallas_rpa_kernel_local
+    assert not draft.runs_batched_rpa_schedule()
+
+    monkeypatch.setenv("USE_BATCHED_RPA_LONGCTX", "1")
+    assert not _batched_impl().runs_batched_rpa_schedule()
+
+
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
         monkeypatch, vllm_config_context):
     impl = _impl()

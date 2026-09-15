@@ -76,7 +76,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import \
@@ -4087,17 +4086,19 @@ class TPUModelRunner(GPUModelRunner):
     def _attention_schedule_capacity(
             self) -> dict[str, tuple[int, int, int]] | None:
         """(pairs, bq, bkv) the batched attention kernel can schedule in
-        one step, per kernel mode ("decode", "mixed"); None when the model
-        runs another attention kernel."""
+        one step, per kernel mode ("decode", "mixed"); None when no
+        attention layer runs that kernel."""
         if self._attention_capacity_known:
             return self._attention_capacity
         from vllm_torchtpu.layers.adapter.attention import \
-            PallasBatchedRPAAttentionBackend
-        backend = TpuPlatform._find_non_ssm_backend(self.vllm_config)
+            PallasAttentionBackendImpl
+        layers = get_layers_from_vllm_config(self.vllm_config,
+                                             AttentionLayerBase)
+        impls = [getattr(layer, "impl", None) for layer in layers.values()]
+        batched = any(impl.runs_batched_rpa_schedule() for impl in impls
+                      if isinstance(impl, PallasAttentionBackendImpl))
         capacity = None
-        if (backend is not None
-                and issubclass(backend, PallasBatchedRPAAttentionBackend)
-                and not envs.USE_BATCHED_RPA_LONGCTX and self.head_size != 64):
+        if batched:
             from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
             from vllm_torchtpu.kernels.experimental.batched_rpa import \

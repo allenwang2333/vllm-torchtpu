@@ -6,6 +6,7 @@ import importlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 from vllm.sequence import IntermediateTensors
@@ -242,3 +243,84 @@ def test_profile_refuses_a_step_one_request_cannot_run():
     runner = _profile_runner([16, 32768, 65536], 65536, capacity)
     with pytest.raises(RuntimeError, match="32896 .* holds 13436"):
         TPUModelRunner.profile_pipeline_chunks(runner)
+
+
+def _capacity_runner():
+    runner = MagicMock(spec=TPUModelRunner)
+    runner._attention_capacity = None
+    runner._attention_capacity_known = False
+    runner.parallel_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=runner.parallel_config)
+    runner.head_size = 128
+    runner.num_kv_heads = 2
+    runner.max_num_reqs = 8
+    runner.max_model_len = 4096
+    runner._attention_kernel_block_size = 256
+    runner.cache_config = SimpleNamespace(block_size=4096)
+    runner.model_config = SimpleNamespace(
+        dtype=torch.bfloat16, get_num_attention_heads=lambda _config: 8)
+    runner.kv_cache_dtype = torch.bfloat16
+    return runner
+
+
+def _attention_layers(monkeypatch, batched):
+    """Stub the model's attention layers; ``batched`` says per layer whether
+    its kernel keeps the batched SMEM schedule. Returns the schedule sizings
+    the runner asked the kernel for."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import \
+        wrapper as rpa_batched
+    from vllm_torchtpu.layers.adapter.attention import \
+        PallasAttentionBackendImpl
+    layers = {}
+    for i, runs_batched in enumerate(batched):
+        impl = MagicMock(spec=PallasAttentionBackendImpl)
+        impl.runs_batched_rpa_schedule.return_value = runs_batched
+        layers[f"layer.{i}"] = SimpleNamespace(impl=impl)
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.tpu_runner.get_layers_from_vllm_config",
+        lambda _config, _layer_type: layers)
+    monkeypatch.setattr("vllm.v1.attention.backends.utils.get_kv_cache_layout",
+                        lambda: "NHD")
+    sized = []
+
+    def schedule_capacity(*, mode, **kwargs):
+        sized.append((mode.name, kwargs["page_size"], kwargs["pages_per_seq"]))
+        return (100, 256, 256)
+
+    monkeypatch.setattr(rpa_batched, "schedule_capacity", schedule_capacity)
+    return sized
+
+
+def test_schedule_capacity_comes_from_the_batched_kernel(monkeypatch):
+    # One layer on the batched kernel is enough to bound the step.
+    sized = _attention_layers(monkeypatch, [False, True])
+    runner = _capacity_runner()
+    capacity = TPUModelRunner._attention_schedule_capacity(runner)
+    assert capacity == {"decode": (100, 256, 256), "mixed": (100, 256, 256)}
+    # Sized at the kernel's page size, not the KV manager's block.
+    assert sized == [("DECODE", 256, 16), ("MIXED", 256, 16)]
+    assert runner._attention_capacity_known
+
+
+def test_schedule_capacity_is_unbounded_when_no_layer_runs_the_batched_kernel(
+        monkeypatch):
+    sized = _attention_layers(monkeypatch, [False, False])
+    runner = _capacity_runner()
+    assert TPUModelRunner._attention_schedule_capacity(runner) is None
+    assert sized == []
+    assert runner._attention_capacity_known
+
+
+def test_check_passes_a_long_context_step_without_the_batched_kernel(
+        monkeypatch):
+    _attention_layers(monkeypatch, [False])
+    runner = _capacity_runner()
+    runner._attention_schedule_capacity = (
+        TPUModelRunner._attention_schedule_capacity.__get__(runner))
+    # A 64K-token request behind a 192K prefix: far past the batched
+    # kernel's SMEM schedule.
+    runner.seq_lens_np = np.array([262144], dtype=np.int32)
+    TPUModelRunner._check_attention_schedule(runner, 1,
+                                             np.array([65536], dtype=np.int32),
+                                             0)
