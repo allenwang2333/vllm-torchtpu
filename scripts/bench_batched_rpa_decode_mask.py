@@ -33,6 +33,14 @@ two HBM allocations. ``compile_arms`` now clears the cache between lowerings and
 control cannot fail is not a benchmark; treat that assertion as the first
 result, not as setup.
 
+That fix removed the mechanism but did not, by itself, retire the number: the
+retracted A/A reported -0.662% with two provably identical binaries, so the
+harness has a demonstrated bias of the same sign and size as the effect being
+claimed. ``--mode aa`` measures that null directly, and ``--swap-alloc``
+exchanges the arm->buffer binding, which the pair-order flip does not touch
+because it is bound to the arm rather than to the call position. **Run both
+before believing an A/B number from this script.**
+
 The expected effect is
 low single-digit percent, which is the regime where one-arm-per-process
 benchmarking measures process placement rather than the kernel -- so the arms
@@ -184,7 +192,7 @@ def make_runner():
     return run
 
 
-def compile_arms(runners, wl, caches, inner):
+def compile_arms(runners, wl, caches, inner, arm_flags, require_equal=False):
     """Compile each arm to its own executable, and prove they differ.
 
     ``jax.clear_caches()`` between the two lowerings is what forces a second
@@ -200,21 +208,33 @@ def compile_arms(runners, wl, caches, inner):
     between two allocations as a speedup.
     """
     compiled = {}
-    for name in ARMS:
-        flash_attention._COLLAPSE_DECODE_MASK = ARMS[name]
-        jax.clear_caches()
-        compiled[name] = runners[name].lower(**wl,
-                                             kv_cache=caches[name],
-                                             inner=inner).compile()
+    original = flash_attention._COLLAPSE_DECODE_MASK
+    try:
+        for name in ARMS:
+            flash_attention._COLLAPSE_DECODE_MASK = arm_flags[name]
+            jax.clear_caches()
+            compiled[name] = runners[name].lower(**wl,
+                                                 kv_cache=caches[name],
+                                                 inner=inner).compile()
+    finally:
+        # Leave the module as found. Harmless while everything downstream is
+        # AOT-compiled, but a landmine for anything added after this point.
+        flash_attention._COLLAPSE_DECODE_MASK = original
 
     texts = {name: compiled[name].as_text() for name in ARMS}
-    if texts["collapsed"] == texts["general"]:
+    same = texts["collapsed"] == texts["general"]
+    if require_equal and not same:
+        raise SystemExit(
+            "FAIL: the A/A arms compiled to *different* HLO. They were given "
+            "the same flag, so this run cannot measure the harness's null.")
+    if not require_equal and same:
         raise SystemExit(
             "FAIL: both arms compiled to byte-identical HLO, so the flag never "
             "reached a second trace and any delta below would be noise between "
             "two copies of one binary. Do not report a number from this run.")
-    print(f"arms differ (HLO)   : True  "
-          f"({len(texts['collapsed'])} vs {len(texts['general'])} chars)")
+    print(f"arms differ (HLO)   : {not same}  "
+          f"({len(texts['collapsed'])} vs {len(texts['general'])} chars)"
+          f"{'  [A/A: equality required and held]' if require_equal else ''}")
     return compiled
 
 
@@ -225,20 +245,42 @@ def main():
     ap.add_argument("--inner", type=int, default=20,
                     help="kernel calls per dispatch, to amortize host overhead")
     ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument(
+        "--mode", choices=("ab", "aa"), default="ab",
+        help="'aa' gives both arms the same flag, so the true delta is zero "
+             "and whatever this reports is the harness's own bias. Run it "
+             "before believing any 'ab' number: a null of the same sign and "
+             "size as the effect means the effect is not established.")
+    ap.add_argument(
+        "--swap-alloc", action="store_true",
+        help="allocate the arms' caches in reverse order. The arm->buffer "
+             "binding is otherwise fixed ('collapsed' is always allocated "
+             "first), so a bias tied to allocation order rather than to code "
+             "would survive the pair-order flip and masquerade as the effect. "
+             "If the delta reverses sign under this flag, it is allocation.")
     args = ap.parse_args()
+
+    # In A/A both arms get the *collapsed* flag: the null must be measured on
+    # the arm whose number is being claimed.
+    arm_flags = dict(ARMS) if args.mode == "ab" else {n: True for n in ARMS}
 
     wl, cache_np, cache_shape = build()
     runners = {name: make_runner() for name in ARMS}
     # Independent device copies of identical data: identical so the checksums
     # are comparable, independent so one arm's donation cannot invalidate the
-    # other's buffer.
-    caches = {
-        name: jnp.asarray(cache_np, dtype=KV_DTYPE)
-        for name in ARMS
-    }
+    # other's buffer. Allocation order is a real variable, not bookkeeping --
+    # two 302 MB buffers land at different addresses against a shuffled page
+    # table, and whichever is allocated first keeps that advantage for the
+    # whole run regardless of which order the *calls* are made in.
+    caches = {}
+    for name in (list(ARMS)[::-1] if args.swap_alloc else list(ARMS)):
+        caches[name] = jnp.asarray(cache_np, dtype=KV_DTYPE)
     checksums: dict[str, float] = {}
 
-    compiled = compile_arms(runners, wl, caches, args.inner)
+    print(f"mode                : {args.mode}"
+          f"{' (swapped allocation order)' if args.swap_alloc else ''}")
+    compiled = compile_arms(runners, wl, caches, args.inner, arm_flags,
+                            require_equal=(args.mode == "aa"))
 
     def call(name):
         # `inner` was static at lowering time and is baked into the executable,
@@ -330,6 +372,14 @@ def main():
               f"95% CI [{lo:+.3f}%, {hi:+.3f}%]  (n={len(deltas)} pairs)")
         print(f"SIGNIFICANT         : {hi < 0}  "
               f"(negative = collapsed is faster)")
+        if args.mode == "aa":
+            # In A/A the true delta is zero by construction, so a significant
+            # result is a statement about the harness, not the kernel.
+            biased = hi < 0 or lo > 0
+            print(f"HARNESS BIAS        : {biased}  "
+                  f"(A/A: the true delta is 0, so a CI excluding 0 is bias; "
+                  f"any 'ab' effect inside [{lo:+.3f}%, {hi:+.3f}%] is not "
+                  f"established)")
     else:
         print(f"mean delta          : {mean_d:+.3f}%  (n=1, no CI)")
 
