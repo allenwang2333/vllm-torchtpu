@@ -74,11 +74,13 @@ KV_LEN = 8192  # --random-input-len=8192
 MAX_MODEL_LEN = 9216  # --max-model-len=9216
 
 ARMS = {
-    # name: (kv_dtype, num_kv_heads, kv_len, page_size)
-    "A_fp8_1kvh": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE),
-    "B_fp8_2kvh": (jnp.float8_e4m3fn, 2, KV_LEN, PAGE_SIZE),
-    "C_bf16_1kvh": (jnp.bfloat16, 1, KV_LEN, PAGE_SIZE),
-    "D_fp8_1kvh_halfkv": (jnp.float8_e4m3fn, 1, KV_LEN // 2, PAGE_SIZE),
+    # name: (kv_dtype, num_kv_heads, kv_len, page_size, d_block_sizes)
+    # d_block_sizes is (bq_sz, bkv_sz, bq_csz, bkv_csz); None = kernel default,
+    # which for this shape resolves to (1, 9216, 1, 9216).
+    "A_fp8_1kvh": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, None),
+    "B_fp8_2kvh": (jnp.float8_e4m3fn, 2, KV_LEN, PAGE_SIZE, None),
+    "C_bf16_1kvh": (jnp.bfloat16, 1, KV_LEN, PAGE_SIZE, None),
+    "D_fp8_1kvh_halfkv": (jnp.float8_e4m3fn, 1, KV_LEN // 2, PAGE_SIZE, None),
     # Page-size sweep. Arms A/B/C/D showed ~85% of this op's time is
     # byte-independent: halving the bytes (D) bought 7.4%, and fp8 costs the
     # same as bf16 (A vs C). The fetch is a *static* `for i in range(bkv_p)`
@@ -90,10 +92,41 @@ ARMS = {
     # The prior experiment log measured 16 -> 256 as +31.7% end-to-end and
     # called it saturated "between p128 and p256"; that conclusion was drawn
     # without testing past 256, which is what these arms do.
-    "P128": (jnp.float8_e4m3fn, 1, KV_LEN, 128),
-    "P256": (jnp.float8_e4m3fn, 1, KV_LEN, 256),
-    "P512": (jnp.float8_e4m3fn, 1, KV_LEN, 512),
-    "P1024": (jnp.float8_e4m3fn, 1, KV_LEN, 1024),
+    "P128": (jnp.float8_e4m3fn, 1, KV_LEN, 128, None),
+    "P256": (jnp.float8_e4m3fn, 1, KV_LEN, 256, None),
+    "P512": (jnp.float8_e4m3fn, 1, KV_LEN, 512, None),
+    "P1024": (jnp.float8_e4m3fn, 1, KV_LEN, 1024, None),
+    # bkv compute-size sweep. `/xprof-llo` on arm P256 (job j-e3eade3f) found
+    # that 67.8% of the kernel is a single 2173-bundle *straight-line* block:
+    # the score matrix is materialized at the full bkv_csz and the kv axis is
+    # unrolled into bkv_csz/128 chunks. Two consequences the earlier arms could
+    # not separate, because both P* and A-D held bkv_csz fixed at 9216:
+    #
+    #   1. `num_loops = cdiv(effective_bkv_sz, bkv_csz)` is 1 for every page
+    #      size, since bkv_csz = bkv_sz = pages_per_seq * page_size = 9216
+    #      regardless of how the 9216 is divided into pages. That is why an 8x
+    #      span in DMA count moved the clock 1.7%: every P* arm ran the
+    #      *identical* 4x9216 VPU pass.
+    #   2. 9216 is max_model_len, not kv_len. At kv_len 8192 the block computes
+    #      1024 columns of mask-killed scores -- 11% of the pass -- and the cost
+    #      does not fall when the sequence is shorter.
+    #
+    # Shrinking bkv_csz turns that one unrolled pass into `cdiv(kv_len, bkv_csz)`
+    # trips of a rolled `pl.loop`, which both tracks the actual kv_len and cuts
+    # the straight-line block (and its 749 spill stores) proportionally. It pays
+    # for that with one flash-attention running-max/sum rescale per extra trip,
+    # so the curve should be U-shaped and the minimum is an empirical question.
+    #
+    # bkv_sz is held at 9216 throughout, so the DMA/fetch path is byte-for-byte
+    # unchanged and any delta is attributable to the compute block alone.
+    # Constraint from _verify_block_sizes: bkv_sz % bkv_csz == 0 and
+    # bkv_csz % page_size == 0.
+    "C9216": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 9216)),
+    "C4608": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 4608)),
+    "C2304": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 2304)),
+    "C1536": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 1536)),
+    "C1024": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 1024)),
+    "C512": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE, (1, 9216, 1, 512)),
 }
 
 
@@ -139,9 +172,11 @@ def build(kv_dtype, num_kv_heads, kv_len, page_size, seed=0):
                 distribution=distribution), cache_shape
 
 
-@functools.partial(jax.jit, static_argnames=("is_fp8", "inner"))
+@functools.partial(jax.jit,
+                   static_argnames=("is_fp8", "inner", "d_block_sizes"),
+                   donate_argnames=("kv_cache", ))
 def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
-        is_fp8, inner):
+        is_fp8, inner, d_block_sizes):
     """Run the kernel ``inner`` times inside a single dispatch.
 
     A one-call-per-`block_until_ready` loop measures the host round trip, not
@@ -150,6 +185,12 @@ def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
     and the half-bytes arm came out *slower* than the full-bytes one. Chaining
     the calls through ``kv_cache`` inside ``fori_loop`` serializes them (so XLA
     cannot overlap or hoist iterations) and amortizes the dispatch away.
+
+    ``kv_cache`` is donated. Without it XLA inserts a defensive `copy.21` of the
+    whole 302 MB cache because the buffer is an undonated input that the kernel
+    mutates; `/xprof-llo` measured that copy at 335.9 us, i.e. 16.8 us amortized
+    over --inner 20 -- about 10% of the reported per-call figure, and entirely
+    harness. The caller must thread the returned cache into the next call.
     """
     scales = dict(k_scale=1.0, v_scale=1.0) if is_fp8 else {}
 
@@ -164,6 +205,7 @@ def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
                                             cu_q_lens,
                                             distribution,
                                             sm_scale=HEAD_DIM**-0.5,
+                                            d_block_sizes=d_block_sizes,
                                             **scales)
         # Keep `out` live so the attention compute cannot be dead-coded; the
         # reduction is ~32K elements against a 256 MiB KV read.
@@ -183,10 +225,12 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()
 
-    kv_dtype, num_kv_heads, kv_len, page_size = ARMS[args.arm]
+    kv_dtype, num_kv_heads, kv_len, page_size, d_block_sizes = ARMS[args.arm]
     is_fp8 = kv_dtype == jnp.float8_e4m3fn
     wl, cache_shape = build(kv_dtype, num_kv_heads, kv_len, page_size)
     pages_per_seq = (MAX_MODEL_LEN + page_size - 1) // page_size
+    # Donated, so it must be threaded call to call rather than reused from `wl`.
+    cache = wl.pop("kv_cache")
 
     itemsize = jnp.dtype(kv_dtype).itemsize
     # Bytes the kernel must stream for the KV it attends to, padding included.
@@ -194,20 +238,26 @@ def main():
     bytes_moved = BATCH * kv_len * packed_slots * HEAD_DIM * itemsize
     useful = BATCH * kv_len * (num_kv_heads * 2) * HEAD_DIM * itemsize
 
-    out = run(**wl, is_fp8=is_fp8, inner=args.inner)
-    jax.block_until_ready(out)
+    call = functools.partial(run,
+                             **wl,
+                             is_fp8=is_fp8,
+                             inner=args.inner,
+                             d_block_sizes=d_block_sizes)
+
+    acc, cache = call(kv_cache=cache)
+    jax.block_until_ready((acc, cache))
 
     for _ in range(args.warmup):
-        out = run(**wl, is_fp8=is_fp8, inner=args.inner)
-    jax.block_until_ready(out)
+        acc, cache = call(kv_cache=cache)
+    jax.block_until_ready((acc, cache))
 
     # Time each sample separately rather than averaging one long loop, so a
     # single contended outlier is visible instead of silently inflating a mean.
     samples = []
     for _ in range(args.iters):
         t0 = time.perf_counter()
-        out = run(**wl, is_fp8=is_fp8, inner=args.inner)
-        jax.block_until_ready(out)
+        acc, cache = call(kv_cache=cache)
+        jax.block_until_ready((acc, cache))
         samples.append((time.perf_counter() - t0) * 1e6 / args.inner)
 
     samples = np.array(samples)
@@ -220,6 +270,9 @@ def main():
     print(f"page_size           : {page_size}")
     print(f"pages/seq           : {pages_per_seq}")
     print(f"page DMAs/call      : {pages_per_seq * BATCH}")
+    print(f"d_block_sizes       : {d_block_sizes or 'kernel default (1,9216,1,9216)'}")
+    if d_block_sizes is not None:
+        print(f"bkv compute trips   : {-(-kv_len // d_block_sizes[3])}")
     print(f"cache_shape         : {tuple(cache_shape)}")
     print(f"packing slots       : {packed_slots} "
           f"(useful {num_kv_heads * 2}, padding {packed_slots - num_kv_heads * 2})")
@@ -237,6 +290,11 @@ def main():
     # at 123.64 us/call in production. If arm A does not land near that, the
     # harness is measuring something other than the kernel and no cross-arm
     # comparison from this run should be believed.
+    #
+    # NOTE: donating kv_cache removed a ~16.8 us/call harness copy, so numbers
+    # from this revision are NOT comparable to the A/B/C/D and P* figures in the
+    # module docstring (job j-35ccee08, j-cdf62466), which were taken without
+    # donation. Compare within a run only; C9216 is the baseline for the C* arms.
     if args.arm == "A_fp8_1kvh":
         print(f"xprof reference     : 123.64 us/call (j-bf2efb16, decode_only)")
         print(f"ratio to reference  : {med / 123.64:.2f}x")
