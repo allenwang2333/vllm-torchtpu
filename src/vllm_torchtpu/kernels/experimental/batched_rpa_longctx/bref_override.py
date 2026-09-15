@@ -486,6 +486,8 @@ class BatchingLSERef(pltpu.BufferedRef):
             q_src, q_sz, b = dma_list[i]
             q_src = q_src * self.cfgs.aligned_num_q_heads_per_kv_head
             q_sz = q_sz * self.cfgs.aligned_num_q_heads_per_kv_head
+            q_src = pl.multiple_of(q_src, 8)
+            q_sz = pl.multiple_of(q_sz, 8)
             pltpu.make_async_copy(
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 lse_hbm.at[:, pl.ds(q_src, q_sz)],
