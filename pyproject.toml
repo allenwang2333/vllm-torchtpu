@@ -38,7 +38,7 @@ dependencies = [
     # raiden KV connector (disaggregated serving) and host KV offload. The
     # wheel bundles one extension per supported torch ABI and dispatches to
     # the variant matching the installed torch at import time.
-    "tpu-raiden-torch==0.0.1.dev20260827124357",
+    "tpu-raiden-torch==0.0.1.dev20260909072531",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -53,7 +53,7 @@ dependencies = [
     # (SC-offload threshold gate) and the per-config LIBTPU_INIT_ARGS additions
     # under scripts/vllm/benchmarking/configs/. Re-verify those runs before
     # bumping.
-    "libtpu==0.0.44.1",
+    "libtpu==0.0.47",
     "ray[default]",
     "ray[data]",
 ]
