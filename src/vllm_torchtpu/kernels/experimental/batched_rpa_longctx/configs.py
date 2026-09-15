@@ -286,7 +286,8 @@ class RpaConfigs:
     @property
     def aligned_num_q_heads_per_kv_head(self) -> int:
         packing_q = self.serve.packing_q
-        return utils.align_to(self.model.num_q_heads_per_kv_head, packing_q)
+        alignment = max(packing_q, 8)
+        return utils.align_to(self.model.num_q_heads_per_kv_head, alignment)
 
     @property
     def kv_hbm_stride(self) -> int:

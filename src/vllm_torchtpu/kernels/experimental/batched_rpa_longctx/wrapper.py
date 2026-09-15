@@ -30,6 +30,7 @@ scheduler.py kernel. Kernel is calculated once and ammortized across different l
 Note: batched_rpa is build on top / derived from RPA3.
 """
 
+import os
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -57,7 +58,7 @@ def prepare_inputs(
     kv_packing = utils.get_dtype_packing(kv_dtype)
 
     aligned_num_q_heads_per_kv_head = utils.align_to(num_q_heads_per_kv_head,
-                                                     q_packing)
+                                                     max(q_packing, 8))
     num_lanes = pltpu.get_tpu_info().num_lanes
     num_sublanes = pltpu.get_tpu_info().num_sublanes
     aligned_q_head_dim = utils.align_to(actual_head_dim, num_lanes)
@@ -184,7 +185,7 @@ def calculate_block_sizes(
     # Calculate aligned model dimensions.
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
-        model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
+        model_cfgs.num_q_heads_per_kv_head, max(serve_cfgs.packing_q, 8))
     aligned_num_q_heads = (aligned_num_q_heads_per_kv_head *
                            model_cfgs.num_kv_heads)
 
@@ -274,8 +275,11 @@ def calculate_block_sizes(
         """Loop through different block sizes to find the most optimal one."""
 
         # Even if we loose some potential performance, we want to avoid OOM at all
-        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
-        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
+        # costs. Therefore, we conservatively only use a fraction of the VMEM budget.
+        # For large kernels (e.g. mixed prefill), XLA register spill slots can consume
+        # 20+ MB of scoped VMEM, so a lower fraction (default 0.55) avoids VMEM exhaustion.
+        vmem_fraction = float(os.getenv("RPA_VMEM_SAFETY_FACTOR", "0.55"))
+        capped_vmem_limit_bytes = vmem_limit_bytes * vmem_fraction
 
         bkv_sz = bkv_stride = mxu_column_size
         if fixed_bq_sz is None:
@@ -563,7 +567,7 @@ def ragged_paged_attention(
         q_packing = utils.get_dtype_packing(queries.dtype)
         num_q_heads_per_kv_head = num_q_heads // num_kv_heads
         aligned_num_q_heads_per_kv_head = utils.align_to(
-            num_q_heads_per_kv_head, q_packing)
+            num_q_heads_per_kv_head, max(q_packing, 8))
         max_tokens = queries.shape[0]
         lse_hbm_init = jnp.full(
             [
