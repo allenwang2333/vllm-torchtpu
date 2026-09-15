@@ -429,17 +429,37 @@ def _chained(wrapper, cfgmod, chain_len: int):
     return jax.jit(chain)
 
 
-#: Where an arm's source lives, as it appears inside the IR. Mosaic carries the
-#: Python source locations of the kernel it lowered, so two copies of the same
-#: kernel under two paths produce two different modules, and every hash below
-#: would separate arms that are running identical code. That is the dangerous
-#: direction for the dispatch rule: the check fires when two arms are the SAME,
-#: so noise that makes everything look different silently turns it off.
-_ARM_PATH = re.compile(r"/tmp/kda-arms/[^/\"\\ ]+")
+#: Every arm is measured from THIS path, whichever directory it came from.
+#:
+#: Mosaic carries the Python source locations of the kernel it lowered, so two
+#: copies of the same kernel under two directories produce two different
+#: modules -- and then every identity below separates arms that are running
+#: identical code. That is the dangerous direction for the dispatch rule: the
+#: rule fires when two arms are the SAME, so noise that makes everything look
+#: different turns the check off without saying so. Rewriting the paths out of
+#: the IR afterwards was tried and was not enough (a second copy of golden
+#: still reported its own artifact). Staging every arm at one path removes the
+#: difference at its source instead of trying to subtract it later: after this,
+#: two arms differ in their IR only if they differ in their code.
+#:
+#: Safe because arms are measured one process at a time, by construction.
+STAGE = "/tmp/kda-arm-under-test"
+
+_ARM_PATH = re.compile(r"/tmp/kda-arm[^/\"\\ ]*")
 
 
 def _canonical(text: str) -> str:
     return _ARM_PATH.sub("<arm>", text)
+
+
+def stage(src: str) -> str:
+    """Copy one arm's tree to STAGE and return it."""
+    if os.path.isdir(STAGE):
+        shutil.rmtree(STAGE)
+    shutil.copytree(os.path.join(os.path.abspath(src), "src"),
+                    os.path.join(STAGE, "src"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    return STAGE
 
 
 def _dispatch_identity(lowered_text: str) -> str:
@@ -464,6 +484,9 @@ def _dispatch_identity(lowered_text: str) -> str:
         _log("  NOTE: no tpu_custom_call payload in the lowered IR; the "
              "dispatch identity falls back to the whole lowered module")
         blobs = [lowered_text]
+    per_blob = [hashlib.sha256(_canonical(b).encode()).hexdigest()[:8]
+                for b in blobs]
+    _log(f"    mosaic payloads: {len(blobs)} x {per_blob}")
     digest = hashlib.sha256(
         "\n".join(_canonical(b) for b in blobs).encode()).hexdigest()[:32]
     return f"mosaic:{digest}"
@@ -564,13 +587,14 @@ def run_worker(src: str, configs: list[str]) -> dict:
 
 def _measure_arm(name: str, src: str, configs: list[str]) -> dict | None:
     """One process, one arm, every config. None if it produced nothing."""
+    staged = stage(src)
     argv = [sys.executable, "-u", os.path.abspath(__file__), "--worker",
-            "--src", src]
+            "--src", staged]
     for cfg in configs:
         argv += ["--config", cfg]
     proc = subprocess.run(
         argv, capture_output=True, text=True,
-        env=dict(os.environ, PYTHONPATH=os.path.join(src, "src"),
+        env=dict(os.environ, PYTHONPATH=os.path.join(staged, "src"),
                  PYTHONDONTWRITEBYTECODE="1"))
     sys.stderr.write(proc.stderr)
     if proc.returncode != 0:
