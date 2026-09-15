@@ -29,33 +29,63 @@ def main():
             for index, tile in enumerate(tiles):
                 label = f"w{window}-c{c}-tile" + "-".join(map(str, tile))
                 path = root / (label + ".json")
-                # All hosts launch the same child to rendezvous distributed JAX.
-                print("CANDIDATE_START", label, flush=True)
-                result = subprocess.run([
-                    sys.executable,
-                    str(Path(__file__).with_name("k3_fp8_mla_tuner.py")),
-                    "--case",
-                    json.dumps([c, window, tokens]), "--tile",
-                    json.dumps(tile), "--output",
-                    str(path)
-                ],
-                                        check=False,
-                                        timeout=2400)
-                if result.returncode or not path.exists():
-                    if index == 0:
-                        raise RuntimeError(
-                            f"Baseline failed: {label}, exit={result.returncode}"
-                        )
-                    print("CANDIDATE_FAILED",
-                          label,
-                          result.returncode,
-                          flush=True)
-                    continue
+                resume = os.getenv("TUNER_RESUME_ROOT")
+                prior = ([
+                    Path(resume) / f"rank-{r}/benchmark/{label}.json"
+                    for r in range(4)
+                ] if resume else [])
+                bundles = None
+                if prior and all(p.is_file() for p in prior):
+                    try:
+                        loaded = [json.loads(p.read_text()) for p in prior]
+                        if all(
+                                len(batch) == len(contexts) and all(
+                                    r["status"] == "success"
+                                    and r["cache_valid"]
+                                    and r["next_output_max_abs_error"] == 0
+                                    and r["concurrency"] == c
+                                    and r["verify_tokens"] == window and
+                                    r["tokens"] == tokens and r["max_num_seqs"]
+                                    == 256 and r["pages_per_seq"] == 256
+                                    for r in batch) for batch in loaded):
+                            bundles = loaded
+                    except (ValueError, KeyError, OSError):
+                        pass
+                # Every host makes the same decision, preserving JAX rendezvous.
+                if bundles is not None:
+                    path.write_text(json.dumps(bundles[rank]))
+                    print("CANDIDATE_RESUMED", label, flush=True)
+                else:
+                    print("CANDIDATE_START", label, flush=True)
+                    result = subprocess.run([
+                        sys.executable,
+                        str(Path(__file__).with_name("k3_fp8_mla_tuner.py")),
+                        "--case",
+                        json.dumps([c, window, tokens]), "--tile",
+                        json.dumps(tile), "--output",
+                        str(path)
+                    ],
+                                            check=False,
+                                            timeout=2400)
+                    if result.returncode or not path.exists():
+                        if index == 0:
+                            raise RuntimeError(
+                                f"Baseline failed: {label}, exit={result.returncode}"
+                            )
+                        print("CANDIDATE_FAILED",
+                              label,
+                              result.returncode,
+                              flush=True)
+                        continue
                 rows = json.loads(path.read_text())
                 assert len(rows) == len(contexts)
                 assert all(r["status"] == "success" and r["cache_valid"]
                            and r["next_output_max_abs_error"] == 0
                            for r in rows)
+                assert all(
+                    r["concurrency"] == c and r["verify_tokens"] == window
+                    and r["tokens"] == tokens and r["max_num_seqs"] == 256
+                    and r["pages_per_seq"] == 256 for r in rows)
                 # Benchmark stays <=1001 KV tokens; 2000 is correctness-only.
                 score = statistics.fmean(r["latency_ms"] for r in rows
                                          if r["kv_len"] <= 1000)
