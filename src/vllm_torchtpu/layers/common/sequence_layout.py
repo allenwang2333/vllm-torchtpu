@@ -284,10 +284,13 @@ class AllSequenceLayoutPlanner:
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan:
         del (scheduler_output, start_index, num_reqs,
-             num_scheduled_tokens_per_req, use_max_model_len, target_num_reqs,
-             padded_num_reqs)
+             use_max_model_len, target_num_reqs, padded_num_reqs)
+        is_pure_decode = all(int(x) == 1 for x in num_scheduled_tokens_per_req)
+        effective_tokens = (int(total_num_scheduled_tokens)
+                            if is_pure_decode else max(
+                                int(total_num_scheduled_tokens), 16))
         padded_num_tokens = _first_ge(runner.num_tokens_paddings,
-                                      int(total_num_scheduled_tokens))
+                                      effective_tokens)
         dp_target_bucket = runner._dp_target_bucket
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
             padded_num_tokens = int(dp_target_bucket)

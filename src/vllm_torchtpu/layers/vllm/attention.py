@@ -413,6 +413,10 @@ class PallasAttentionBackend(AttentionBackend):
         return PallasAttentionBackendImpl
 
     @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [128, 256, 512, 1024, 2048, 2304, 4096]
+
+    @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
@@ -591,10 +595,10 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         # Needs a current vLLM config: the layout falls through to the KV
         # connector when `VLLM_KV_CACHE_LAYOUT` is unset.
         if envs.USE_BATCHED_RPA_LONGCTX:
-            return [128, 256, 512, 1024, 2048, 4096]
+            return [128, 256, 512, 1024, 2048, 2304, 4096]
         # SEQ_ALONG_LANE maps a page onto one 128-lane tile.
         if get_kv_cache_layout() == "HND":
-            return [128]
+            return [128, 256, 512, 1024, 2048, 2304, 4096]
         return [256]
 
 

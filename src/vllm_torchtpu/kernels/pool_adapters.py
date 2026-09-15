@@ -42,15 +42,17 @@ from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 
 
-def is_seq_along_lane_pool() -> bool:
+def is_seq_along_lane_pool(pool=None) -> bool:
     """True if pool uses the SEQ_ON_LANE (nb, heads2, packed_d, pack, page_size) layout."""
+    if pool is not None and pool.ndim == 5 and pool.shape[1] >= 128 and pool.shape[2] <= 16:
+        return False
     return envs.VLLM_KV_CACHE_LAYOUT == "HND"
 
 
 def _pool_geometry(pool):
     """(block_size, payload dims between token and lane, lanes)."""
     assert pool.ndim >= 3, pool.shape
-    if is_seq_along_lane_pool():
+    if is_seq_along_lane_pool(pool):
         page_size = pool.shape[-1]
         return page_size, tuple(pool.shape[1:-1]), pool.shape[-1]
     return pool.shape[1], tuple(pool.shape[2:-1]), pool.shape[-1]
@@ -400,11 +402,15 @@ def copy_blocks(pool, src_indices, dst_indices):
     no-ops used as padding.
     """
     na = src_indices.shape[0]
-    block_shape = (1, ) + pool.shape[1:]
+    copy_rows = min(pool.shape[1], 1056) if not is_seq_along_lane_pool(pool) else pool.shape[1]
+    block_shape = (1, copy_rows) + pool.shape[2:]
     pad = (0, ) * (pool.ndim - 1)
 
     def _copy_kernel(src_ref, dst_ref, pool_in_ref, pool_out_ref):
-        pool_out_ref[...] = pool_in_ref[...]
+        nrows = pool_in_ref.shape[1]
+        for r in range(0, nrows, 256):
+            sz = min(256, nrows - r)
+            pool_out_ref[0, pl.ds(r, sz)] = pool_in_ref[0, pl.ds(r, sz)]
 
     return pl.pallas_call(
         _copy_kernel,
@@ -496,7 +502,7 @@ def v3_state_source(
     independent of ``num_speculative_tokens``.
     """
     block_size, payload, lanes = _pool_geometry(pool)
-    if is_seq_along_lane_pool():
+    if is_seq_along_lane_pool(pool):
         tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
     else:
         tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
@@ -576,5 +582,5 @@ def v3_state_source(
         stride=split,
         conv=conv,
         recurrent=ssm,
-        whole_block_dma=is_seq_along_lane_pool(),
+        whole_block_dma=is_seq_along_lane_pool(pool),
     )

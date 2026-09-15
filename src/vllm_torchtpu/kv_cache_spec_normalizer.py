@@ -46,6 +46,16 @@ def normalize_kv_cache_specs_for_tpu(
             page_size = max(
                 _required_page_size_bytes(spec)
                 for spec in non_exempt_specs.values())
+            attn_specs = [
+                s for s in non_exempt_specs.values()
+                if isinstance(s, AttentionSpec)
+            ]
+            if attn_specs:
+                bytes_per_tok = (attn_specs[0].page_size_bytes //
+                                 attn_specs[0].block_size)
+                align_bytes = 256 * bytes_per_tok
+                page_size = (((page_size + align_bytes - 1) // align_bytes) *
+                             align_bytes)
             normalized = {
                 layer_name: (spec if layer_name in exempt else _pad_page_size(
                     spec, page_size))
