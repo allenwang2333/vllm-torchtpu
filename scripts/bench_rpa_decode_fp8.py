@@ -56,6 +56,20 @@ kernel win under constant per-call overhead: measured at these shapes, `lat_ms`
 barely moves across a 4.5x change in KV bytes moved, so it is nearly blind to
 exactly the thing this benchmark exists to detect.
 
+`dev_ms` is not pure device time even so -- it is an upper bound. Measured at
+kv_len 9216, `--chain 1/20/100` gives 0.377 / 0.149 / 0.141 ms, so a 20-call
+chain still carries ~5% host dispatch and even 100 has not fully converged. The
+residue is common-mode across arms, so A/B comparisons hold; absolute figures,
+and any intercept fitted from them, are inflated.
+
+Do not read the kv_len slope of `dev_ms` as bandwidth. Both the bytes moved and
+the per-token attention work scale with kv_len, so the slope conflates them.
+The experiment that separates them is `--num-kv-heads 1` vs `2` at fp8, which
+materializes *identical* bytes (`align_to(2,4) == align_to(4,4) == 4`) while
+doubling the real data: nkv=2 measured 15-32% slower at matched bytes, i.e. this
+kernel is not purely HBM-bound at nkv=1 and removing the padding is worth
+materially less than the halved byte count suggests.
+
 The arms, and why there are three
 ---------------------------------
 `kernels/experimental/batched_rpa` already implements a layout that removes this
@@ -374,8 +388,11 @@ def main() -> None:
     p.add_argument("--kv-dtype", choices=sorted(_DTYPES), default="fp8")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--chain", type=int, default=20,
-                   help="Calls issued per block for the device-time measurement.")
+    p.add_argument("--chain", type=int, default=100,
+                   help="Calls issued per block for the device-time measurement. "
+                        "Measured on tpu7x at kv_len 9216: chain 1 -> 0.377 ms, "
+                        "20 -> 0.149, 100 -> 0.141. 20 still carries ~5%% host "
+                        "dispatch, so the default is 100.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", type=str, default=None)
     p.add_argument("--report-bytes", action="store_true",
