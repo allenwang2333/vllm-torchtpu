@@ -95,11 +95,23 @@ CASES = {
 
 
 def _build(seqs, distribution, kv_dtype, seed=0):
+    """Build the workload as *host* numpy arrays.
+
+    Deliberately not device arrays: `ragged_paged_attention` donates its inputs,
+    so every device buffer it is handed is deleted on return and a second call
+    against the same buffers dies with `RuntimeError: Array has been deleted`.
+    Every test here calls twice (kernel vs reference, or collapsed vs general),
+    so the device arrays are materialized per call by `_call` instead.
+    """
     rng = np.random.default_rng(seed)
     kv_lens = [kv for kv, _ in seqs]
     q_lens = [q for _, q in seqs]
     num_seqs = len(seqs)
-    pages_per_seq = int(np.ceil(max(kv_lens) / PAGE_SIZE))
+    # One page of slack per sequence: the negative control bumps a kv_len by 1,
+    # and without the slack a kv_len that is an exact multiple of PAGE_SIZE
+    # overflows the page table (`Require page_cnt=17 <= pages_per_seq=16`)
+    # before any numerics run.
+    pages_per_seq = int(np.ceil((max(kv_lens) + 1) / PAGE_SIZE))
     num_blocks = num_seqs * pages_per_seq
 
     cu_q_lens = np.cumsum([0] + q_lens, dtype=np.int32)
@@ -124,15 +136,18 @@ def _build(seqs, distribution, kv_dtype, seed=0):
     pool = np.arange(num_blocks, dtype=np.int32)
     rng.shuffle(pool)
 
+    def host(x, dtype):
+        return np.asarray(jnp.asarray(x, dtype))
+
     return dict(
-        queries=jnp.asarray(q, jnp.bfloat16),
-        keys=jnp.asarray(k, kv_dtype),
-        values=jnp.asarray(v, kv_dtype),
-        kv_cache=jnp.asarray(cache),
-        kv_lens=jnp.asarray(np.asarray(kv_lens, np.int32)),
-        page_indices=jnp.asarray(pool),
-        cu_q_lens=jnp.asarray(cu_q_lens),
-        distribution=jnp.asarray(np.asarray(distribution, np.int32)),
+        queries=host(q, jnp.bfloat16),
+        keys=host(k, kv_dtype),
+        values=host(v, kv_dtype),
+        kv_cache=cache,
+        kv_lens=np.asarray(kv_lens, np.int32),
+        page_indices=pool,
+        cu_q_lens=cu_q_lens,
+        distribution=np.asarray(distribution, np.int32),
     )
 
 
@@ -143,18 +158,22 @@ def _call(fn, wl, bkv, **kw):
     decode/prefill/mixed the `distribution` selects, the collapsed path is the
     one under test. `ref_ragged_paged_attention` takes no block sizes -- it is
     a plain dense implementation -- so they are dropped for it.
+
+    `wl` holds host arrays and is uploaded fresh here on every call, because the
+    callee donates (and therefore deletes) what it is given. See `_build`.
     """
+    d = {k: jnp.asarray(v) for k, v in wl.items()}
     blocks = (1, bkv, 1, bkv)
     extra = {} if fn is K.ref_ragged_paged_attention else dict(
         d_block_sizes=blocks, p_block_sizes=blocks, m_block_sizes=blocks)
-    out, cache = fn(wl["queries"],
-                    wl["keys"],
-                    wl["values"],
-                    wl["kv_cache"],
-                    wl["kv_lens"],
-                    wl["page_indices"],
-                    wl["cu_q_lens"],
-                    wl["distribution"],
+    out, cache = fn(d["queries"],
+                    d["keys"],
+                    d["values"],
+                    d["kv_cache"],
+                    d["kv_lens"],
+                    d["page_indices"],
+                    d["cu_q_lens"],
+                    d["distribution"],
                     sm_scale=HEAD_DIM**-0.5,
                     **extra,
                     **kw)
@@ -164,7 +183,7 @@ def _call(fn, wl, bkv, **kw):
 
 def _valid_rows(wl, seqs):
     """Row mask over the q axis; padding rows past cu_q_lens[-1] are undefined."""
-    total_q = int(np.asarray(wl["cu_q_lens"])[-1])
+    total_q = int(wl["cu_q_lens"][-1])
     return slice(0, total_q)
 
 
@@ -221,9 +240,9 @@ def test_parity_resolves_a_one_column_bound_error():
     got, _ = _call(K.ragged_paged_attention, wl, spec["bkv"])
 
     perturbed = dict(wl)
-    bumped = np.asarray(wl["kv_lens"]).copy()
+    bumped = wl["kv_lens"].copy()
     bumped[0] += 1
-    perturbed["kv_lens"] = jnp.asarray(bumped)
+    perturbed["kv_lens"] = bumped
     want, _ = _call(K.ref_ragged_paged_attention, perturbed, spec["bkv"])
 
     rows = _valid_rows(wl, spec["seqs"])
