@@ -81,6 +81,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra test \
       --extra benchmarking
 
+# Bisect-only workaround: torch-tpu wheels built between torch_tpu b256d993 and
+# e1c0da37 read an absl flag before flags are parsed; mark flags parsed at
+# interpreter start so those wheels can be exercised.
+RUN printf 'try:\n    import absl.flags\n    absl.flags.FLAGS.mark_as_parsed()\nexcept Exception:\n    pass\n' \
+      > /usr/local/lib/python3.12/site-packages/sitecustomize.py
+
 COPY . .
 # Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
