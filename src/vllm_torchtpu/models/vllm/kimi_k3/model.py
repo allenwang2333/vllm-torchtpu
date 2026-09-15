@@ -51,10 +51,10 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention import (KimiDeltaAttention, MultiHeadLatentAttention,
                         kda_state_dtype)
+from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
 from .moe import KimiMoE
-from .parallel import TokenGroup
 
 logger = init_logger(__name__)
 
@@ -199,7 +199,7 @@ class KimiModel(nn.Module):
                     or parallel.data_parallel_size != 1):
                 raise ValueError(
                     "K3 SP prefill requires TP32/EP32 and PP1/DP1")
-            self.sp_group = TokenGroup(get_tp_group())
+            self.sp_group = TokenShardCollectives(get_tp_group())
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -347,7 +347,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             elif isinstance(module, KimiMoE):
                 module.initialize_dummy_router()
             elif isinstance(module, MultiHeadLatentAttention):
-                module.pack_prefill_weights()
+                module.prepare_sp_mla_gate()
 
     @classmethod
     def get_mamba_state_dtype_from_config(

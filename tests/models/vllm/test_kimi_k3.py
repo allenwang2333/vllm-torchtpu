@@ -1240,7 +1240,8 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(
     nn.Module.__init__(model)
     model.prefill_group = Group()
     if gather_mode != 'plain':
-        group = module.PrefillGroup.__new__(module.PrefillGroup)
+        group = module.FusedPrefillCollectives.__new__(
+            module.FusedPrefillCollectives)
         group.all_gather = model.prefill_group.all_gather
         group.reduce_scatter = model.prefill_group.reduce_scatter
 
@@ -1278,14 +1279,15 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(
 
 
 def test_sp_prefill_trace_accepts_dynamic_token_dimension():
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        FusedPrefillCollectives
     from vllm_torchtpu.models.vllm.kimi_k3.model import KimiModel
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import PrefillGroup
 
     # Exercise the real model's token slicing and the collective shape guard,
     # without attention/weights or a TPU client. The compiler must retain a
     # divisibility guard without forcing mark_dynamic's token dimension
     # to the initial bucket size.
-    group = PrefillGroup.__new__(PrefillGroup)
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
     group.ag = lambda x: x.repeat(32, 1)
     model = KimiModel.__new__(KimiModel)
     nn.Module.__init__(model)
@@ -1329,14 +1331,14 @@ def test_attention_project_rs_preserves_linear_layout(flipped):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import (PrefillGroup,
-                                                            _build_project_op)
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
+        FusedPrefillCollectives, _build_project_op)
 
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
     tables = np.zeros((3, 3, 32), np.int32)
     op = _build_project_op(mesh, tables, 29000)
     assert _build_project_op(mesh, tables, 29000) is op
-    group = PrefillGroup.__new__(PrefillGroup)
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
     group.project_rs = op
     calls = []
 
@@ -1367,11 +1369,13 @@ def test_attention_project_rs_preserves_linear_layout(flipped):
 
 def test_kda_prefill_packing_preserves_projection_and_reload():
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import PrefillGroup
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        FusedPrefillCollectives
 
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
-    layer.prefill_group = PrefillGroup.__new__(PrefillGroup)
+    layer.prefill_group = FusedPrefillCollectives.__new__(
+        FusedPrefillCollectives)
     layer.use_full_rank_gate = True
     layer.num_heads, layer.head_dim = 3, 128
     generator = torch.Generator().manual_seed(19)
@@ -1409,7 +1413,7 @@ def test_gather_projection_bridge_has_rank_local_output():
     from jax.sharding import Mesh
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import \
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
         _build_gather_project_op
 
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
@@ -1429,7 +1433,8 @@ def test_moe_gather_bridge_shapes_and_registration_cache():
     from jax.sharding import Mesh
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import _build_moe_gather_op
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        _build_moe_gather_op
 
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
     tables = np.zeros((3, 3, 32), np.int32)
@@ -1473,12 +1478,12 @@ def test_packed_kda_keeps_parameter_abi_across_token_buckets(monkeypatch):
     from jax.sharding import Mesh
 
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import (
-        PrefillGroup, _build_gather_project_op, _build_project_op)
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
+        FusedPrefillCollectives, _build_gather_project_op, _build_project_op)
 
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
     tables = np.zeros((3, 3, 32), np.int32)
-    group = PrefillGroup.__new__(PrefillGroup)
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
     group.gather_project = _build_gather_project_op(mesh, tables, 29002)
     group.project_rs = _build_project_op(mesh, tables, 29003)
     group.base = SimpleNamespace(all_reduce=lambda x: x)
@@ -1631,7 +1636,8 @@ def test_mla_preprocess_keeps_prefill_parameter_abi(monkeypatch):
 
 def test_mla_tp2_gate_buffer_refresh_preserves_checkpoint_parameters():
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
-    from vllm_torchtpu.models.vllm.kimi_k3.parallel import PrefillGroup
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import \
+        FusedPrefillCollectives
 
     layer = kimi_attention.MultiHeadLatentAttention.__new__(
         kimi_attention.MultiHeadLatentAttention)
@@ -1645,7 +1651,7 @@ def test_mla_tp2_gate_buffer_refresh_preserves_checkpoint_parameters():
     layer.kv_a_layernorm = SimpleNamespace(variance_epsilon=1e-5)
     layer.mla_attn = nn.Module()
     layer.mla_attn.register_buffer('kimi_gate_weight', None, persistent=False)
-    group = PrefillGroup.__new__(PrefillGroup)
+    group = FusedPrefillCollectives.__new__(FusedPrefillCollectives)
     calls = []
 
     def op(*args):
@@ -1659,7 +1665,7 @@ def test_mla_tp2_gate_buffer_refresh_preserves_checkpoint_parameters():
     layer.prefill_group = group
     original = layer.fused_qkv_a_proj.weight
     for expected in (1, 2):
-        layer.pack_prefill_weights()
+        layer.prepare_sp_mla_gate()
         assert layer.mla_attn.kimi_gate_weight.item() == expected
         assert layer.mla_attn.kimi_preprocess is op
         assert layer.fused_qkv_a_proj.weight is original

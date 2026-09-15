@@ -24,8 +24,8 @@ from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import \
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config, hierarchical_split_or_none)
 
+from .collective_ops import FusedPrefillCollectives
 from .layers import KimiMLP
-from .parallel import PrefillGroup
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -111,7 +111,7 @@ class KimiMoE(nn.Module):
         self.prefill_group = None
         self.shared_group = None
         if envs.TPU_K3_SP_PREFILL:
-            self.prefill_group = PrefillGroup(prefix)
+            self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
             if self.shared_group is None or self.shared_group.world_size != 2:
                 raise ValueError(
@@ -239,7 +239,7 @@ class KimiMoE(nn.Module):
         if sequence_parallel:
             weights, ids = moe_routing.route(routed, latent, router_logits)
             weights, ids = weights.to(latent.dtype), ids.to(torch.int32)
-            if (isinstance(group, PrefillGroup)
+            if (isinstance(group, FusedPrefillCollectives)
                     and self.gate.output_size <= 32768
                     and weights.dtype == torch.bfloat16):
                 latent, weights, ids = group.gather_moe_inputs(

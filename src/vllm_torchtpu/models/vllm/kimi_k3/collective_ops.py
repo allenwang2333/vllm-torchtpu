@@ -252,8 +252,8 @@ def _build_token_op(world_size, gather):
     return op
 
 
-class TokenGroup:
-    """Keep symbolic token allocations inside the JAX collective bridge."""
+class TokenShardCollectives:
+    """Gather/scatter token shards over TP2 or TP32 without concrete allocations."""
 
     def __init__(self, base):
         self.world_size = base.world_size
@@ -270,8 +270,8 @@ class TokenGroup:
         return self.rs(x)
 
 
-class PrefillGroup:
-    """Use physical rings for large BF16 payloads; retain normal small ops."""
+class FusedPrefillCollectives:
+    """Fused prefill projections and MoE collectives, with standard fallbacks."""
 
     def __init__(self, prefix):
         self.base = get_tp_group()

@@ -21,7 +21,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
 
-from .parallel import TokenGroup
+from .collective_ops import TokenShardCollectives
 
 
 @lru_cache(maxsize=None)
@@ -80,7 +80,7 @@ class KimiMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.tp_group = tp_group
-        self.sp_group = (TokenGroup(tp_group or get_tp_group())
+        self.sp_group = (TokenShardCollectives(tp_group or get_tp_group())
                          if envs.TPU_K3_SP_PREFILL else None)
         # Reuse the existing merged/row weight loaders with chip-local rank
         # metadata. Scope the override to construction of these two layers.

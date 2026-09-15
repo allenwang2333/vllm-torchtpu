@@ -39,7 +39,7 @@ from vllm_torchtpu.layers.core.sequence_layout import \
     is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 
-from .parallel import PrefillGroup
+from .collective_ops import FusedPrefillCollectives
 
 logger = init_logger(__name__)
 
@@ -289,7 +289,7 @@ class MultiHeadLatentAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
             reduce_results=False,
         )
-        self.prefill_group = (PrefillGroup(prefix)
+        self.prefill_group = (FusedPrefillCollectives(prefix)
                               if envs.TPU_K3_SP_PREFILL else None)
         mla_modules = MLAModules(
             g_proj=self.g_proj,
@@ -322,7 +322,7 @@ class MultiHeadLatentAttention(nn.Module):
             gate_is_fused=self.mla_gate_is_fused,
         )
 
-    def pack_prefill_weights(self):
+    def prepare_sp_mla_gate(self):
         """Refresh the TP2 MLA gate buffer after checkpoint loading or reload."""
         group = self.prefill_group
         projection = self.fused_qkv_a_proj
@@ -330,9 +330,9 @@ class MultiHeadLatentAttention(nn.Module):
         wrapper = self.mla_attn
         wrapper.kimi_preprocess = None
         wrapper.kimi_gate_weight = None
-        if not (isinstance(group, PrefillGroup) and self.mla_gate_is_fused
-                and weight is not None and weight.dtype == torch.bfloat16
-                and weight.shape == (7168, 2496)
+        if not (isinstance(group, FusedPrefillCollectives)
+                and self.mla_gate_is_fused and weight is not None and
+                weight.dtype == torch.bfloat16 and weight.shape == (7168, 2496)
                 and getattr(projection, WEIGHT_FLIPPED_ATTR, False)):
             return
         eps = self.q_a_layernorm.variance_epsilon
@@ -353,7 +353,7 @@ class MultiHeadLatentAttention(nn.Module):
         if (sequence_parallel
                 and getattr(self.mla_attn, 'kimi_preprocess', None) is None):
             hidden_states = group.all_gather(hidden_states, dim=0)
-        if sequence_parallel and isinstance(group, PrefillGroup):
+        if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return self.mla_attn(positions, hidden_states, prefill_group=group)
         output = self.mla_attn(positions, hidden_states)
         return (group.reduce_scatter(output, dim=0)
@@ -506,7 +506,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             prefix=f"{prefix}.o_proj",
             reduce_results=False,
         )
-        self.prefill_group = (PrefillGroup(prefix)
+        self.prefill_group = (FusedPrefillCollectives(prefix)
                               if envs.TPU_K3_SP_PREFILL else None)
         self.register_buffer("packed_prefill_weight", None, persistent=False)
         self.kv_cache = None
@@ -592,9 +592,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     def _pack_prefill_projection(self):
         """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
-        if not (isinstance(getattr(self, 'prefill_group', None), PrefillGroup)
-                and self.use_full_rank_gate and self.num_heads == 3
-                and self.head_dim == 128):
+        if not (isinstance(getattr(self, 'prefill_group', None),
+                           FusedPrefillCollectives) and self.use_full_rank_gate
+                and self.num_heads == 3 and self.head_dim == 128):
             return
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
         expected = ((7168, 1155), (7168, 384), (7168, 128))
@@ -624,7 +624,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
-            if sequence_parallel and isinstance(group, PrefillGroup):
+            if sequence_parallel and isinstance(group,
+                                                FusedPrefillCollectives):
                 packed = group.gather_project(hidden_states,
                                               self.packed_prefill_weight)
             else:
@@ -691,7 +692,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 metadata.request_distribution,
             ).flatten(1)
 
-        if sequence_parallel and isinstance(group, PrefillGroup):
+        if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return group.project_reduce_scatter(output, self.o_proj)
         output, _ = self.o_proj(output)
         return (group.reduce_scatter(output, dim=0)
