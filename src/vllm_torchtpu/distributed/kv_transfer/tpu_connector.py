@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu import host_gate
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta, ReqId, SendMeta, TPUConnectorMetadata)
@@ -297,8 +298,13 @@ def _stage5_runtime_enabled() -> bool:
             mode = handle.read().strip()
     except OSError:
         return _stage5_mode != "off"
-    if (mode == "off" or mode == "on" or mode.startswith("delay")) and (
-            mode != _stage5_mode):
+    known = mode in ("on", "off", "gate") or mode.startswith("delay")
+    if mode and not known:
+        logger.warning(
+            "Ignoring unknown stage-5 mode %r from %s; staying on %r. An arm "
+            "that silently does not switch reads as an effect of zero.", mode,
+            path, _stage5_mode)
+    if known and mode != _stage5_mode:
         _stage5_mode = mode
         logger.info("%s", json.dumps({
             "event": "kv_stage5_mode",
@@ -336,6 +342,30 @@ def _stage5_submit_delay_s() -> float:
         return float(mode[5:]) / 1000.0
     except ValueError:
         return 0.0
+
+
+def _stage5_gate_enabled() -> bool:
+    """Whether the submit waits for the model runner to finish dispatching.
+
+    A fixed delay fixes the collision and breaks the feature: it gave back all
+    1.29 ms at concurrency 32 and cost 29.5 ms of TTFT at concurrency 1, where
+    there is no queue to hide in. Waiting on the runner's own dispatch flag
+    costs the remainder of a 7 ms window instead of a fixed 30 ms, and costs it
+    only when the runner is actually mid-step.
+
+    The mode file wins over the env var so one launch can measure both arms.
+    """
+    if _stage5_mode == "gate":
+        return True
+    if _stage5_mode in ("on", "off") or _stage5_mode.startswith("delay"):
+        return False
+    return os.getenv("TPU_KV_PREFILL_SUBMIT_GATE", "0") == "1"
+
+
+# Long enough that it never fires while the runner is stepping normally, since
+# a dispatch window is about 7 ms, and short enough that a runner which stops
+# stepping delays a transfer rather than stranding it.
+_STAGE5_GATE_TIMEOUT_S = 0.05
 
 
 class _AdmissionNotifier:
@@ -3816,12 +3846,15 @@ class TPURaidenConnectorWorker:
         build_ms = (queued_at - build_start) * 1000
 
         delay_s = _stage5_submit_delay_s()
+        gate = _stage5_gate_enabled()
 
         def _submit() -> None:
+            # Both of these hold a submit worker, never the model runner.
+            # Four workers take one job every 500 ms at this concurrency, so
+            # holding one for a few milliseconds cannot make the pool a queue.
+            if gate:
+                host_gate.wait_for_gap(_STAGE5_GATE_TIMEOUT_S)
             if delay_s:
-                # On a submit worker, not the model runner. Four workers take
-                # one job every 500 ms at this concurrency, so holding one for
-                # 30 ms cannot make the pool the queue.
                 time.sleep(delay_s)
             self._run_producer_transfer(req_id,
                                         uuid,

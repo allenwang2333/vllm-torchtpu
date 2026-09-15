@@ -74,7 +74,7 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   add_kv_sharing_layers_to_kv_cache_groups,
                                   prepare_kernel_block_sizes)
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, host_gate, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer import doorbell
@@ -3863,6 +3863,11 @@ class TPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
+        # Everything from here to the handover is host work that the step
+        # waits on, and the KV connector's start_load_kv runs inside it. See
+        # vllm_torchtpu.host_gate for why the transfer submit has to sit this
+        # window out. Unconditional, because the gate is not instrumentation.
+        host_gate.mark_dispatching()
         probe = getattr(self, "_host_slack_probe", None)
         if probe is None:
             _apply_gil_switch_interval()
@@ -3878,6 +3883,12 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            # Nothing goes to the chip on this step, so there is no handover to
+            # protect and both exits below skip sample_tokens. Release the gate
+            # here or it stays shut until some future step happens to run, and
+            # at low load the thing waiting on it is often the reason no
+            # further step arrives.
+            host_gate.mark_dispatched()
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
@@ -4494,6 +4505,9 @@ class TPUModelRunner(GPUModelRunner):
             # Nothing to do (PP non-final rank case), output isn't used.
             return None  # type: ignore[return-value]
 
+        # The step is on the chip now, so the host is free until it returns.
+        # Anything the connector parked during dispatch is released here.
+        host_gate.mark_dispatched()
         probe = getattr(self, "_host_slack_probe", None)
         if probe is not None:
             probe.stamp()
