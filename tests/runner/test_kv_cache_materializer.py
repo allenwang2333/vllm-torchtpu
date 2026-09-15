@@ -378,8 +378,10 @@ def test_pool_fp8_is_zero_filled(monkeypatch):
     halves were wrong, and measurement is what settled it:
 
     * ``torch.zeros`` works fine for both fp8 dtypes on a v7x pod --
-      0 non-zero bytes, and 1.855 ms for the whole 1.930 GiB 48-tensor pool
-      (``j-73a8aaba``). Not free, not remotely a startup problem.
+      0 non-zero bytes, and 2.078 ms median for the whole 1.930 GiB 48-tensor
+      pool, 1.855 ms more than ``torch.empty`` (``j-4e2906de``), plus a
+      one-time ~394 ms fill-kernel compile. Not free, not remotely a startup
+      problem.
     * The slots are *not* all overwritten before use. A page holds more rows
       than the sequence occupying it, and the attention kernel reads the whole
       page. RPA v3's default ``RPA_V_MASK_MODE=none`` relies on ``p == 0`` to
@@ -387,7 +389,12 @@ def test_pool_fp8_is_zero_filled(monkeypatch):
       finite V and nothing else -- and ``torch.empty`` on TPU fp8 returns
       524288/524288 non-finite bytes, because ``0xFF`` is a NaN in
       ``f8e4m3fn`` (``j-761bc2df``, reproduced in ``j-f636426b`` and
-      ``j-d329490e``). That combination is NaN on every decode.
+      ``j-d329490e``). That combination is NaN on every decode *of a model
+      that takes this route*, which is the narrower claim: the ``torch.empty``
+      fast path lived only in ``allocate_raw_kv_cache_tensors``, reached only
+      when ``_can_allocate_attention_cache_directly()`` is False -- i.e.
+      hybrid attention+mamba. Qwen3-Coder-30B takes the direct route, which
+      was already zeroed (``j-73a8aaba``: ``AFFECTED_BY_CHANGE = False``).
 
     See ``tests/test_kv_cache_zero_init.py`` for the invariant this upholds
     and ``mask_v()`` in the RPA v3 kernel for who depends on it.

@@ -17,8 +17,16 @@ uninitialized cache. RPA v3 does. Measured on a v7x pod (``j-761bc2df``),
 
 Every byte non-zero, every value non-finite, on all three trials of both
 dtypes -- because ``0xFF`` is a NaN in ``f8e4m3fn`` and uninitialized HBM is
-full of high bytes. That combination shipped as the default for two commits
-and would have made every decode NaN.
+full of high bytes. That combination shipped as the default for two commits.
+
+Scope it honestly: the ``torch.empty`` fast path existed only in
+``allocate_raw_kv_cache_tensors``, which is reached only when
+``_can_allocate_attention_cache_directly()`` is False -- hybrid
+attention+mamba. Every non-hybrid model, Qwen3-Coder-30B included, already
+went through ``make_attention_cache_tensor`` and its ``torch.zeros``. So the
+window was "NaN on every decode of a hybrid fp8 model", not of every model.
+The guard below still covers both routes, because the cheap thing to defend
+is the invariant rather than the list of models that currently satisfy it.
 
 Paired with ``tests/kernels/test_rpa_v_mask_padding.py``, which pins what the
 kernel needs; this pins that the allocator supplies it.
