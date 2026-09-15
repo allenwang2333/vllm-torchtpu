@@ -45,7 +45,12 @@ than as a mysterious latency.
 import threading
 import time
 
-from vllm.logger import init_logger
+# vllm_torchtpu's own init_logger, not vllm's. The vllm one hands back a logger
+# whose effective level is WARNING in this package, so the first version of
+# these counters logged nothing at all and the run that was supposed to prove
+# the timeouts were gone proved only that grep found no lines. This module
+# imports nothing else from the package, so it stays a leaf.
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
