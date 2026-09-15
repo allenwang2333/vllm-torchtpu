@@ -8,10 +8,11 @@ used here.  Heavy dependencies (ZMQ sockets, shared-memory pool, TPU device
 queries) are mocked at construction time so that all tests run without a real
 TPU.
 """
+import os
 import threading
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -32,8 +33,9 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _DestinationCollector, _Stage3LoadMeta, _Stage3RegisteredSend,
-    _select_committed_mamba_blocks, stage3_fa_raiden_id_fields)
+    _DestinationCollector, _dispatch_stage3_transfer, _Stage3LoadMeta,
+    _Stage3RegisteredSend, _select_committed_mamba_blocks,
+    stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -4229,6 +4231,125 @@ class TestStage5ProducerSubmitWorker:
             _flush_stage3_submits(worker)
         facade.start_transfer.assert_called_once()
         assert facade.start_transfer.call_args.kwargs["uuid"] == 997
+
+
+# ---------------------------------------------------------------------------
+# TestStage6PrepareFire — the coordination call split in two
+# ---------------------------------------------------------------------------
+
+
+class TestStage6PrepareFire:
+    """Stage 6 splits start_transfer into a prepare and a fire.
+
+    Both halves still run back to back at the end of prefill, so the only
+    thing that can go wrong here is bookkeeping: sending the wrong half,
+    sending a half twice, or leaving a prepared plan behind when the fire
+    fails. Those are what these cover.
+    """
+
+    _KWARGS = dict(req_id="split-me", uuid=4242, num_tokens=65_536)
+
+    @staticmethod
+    def _facade():
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        facade.prepare_transfer.return_value = None
+        facade.fire_transfer.return_value = None
+        return facade
+
+    @contextmanager
+    def _stage6(self, *, requested=True, supported=True):
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_STAGE6_PREPARE",
+                   requested,
+                   create=True), patch(
+                       f"{_MOD}._stage6_prepare_fire_supported",
+                       return_value=supported):
+            yield
+
+    def test_off_sends_exactly_the_stage5_call(self):
+        # The plan's all-off requirement: with the flag clear, stage 6 is not
+        # in the path at all, not merely equivalent to not being in it.
+        facade = self._facade()
+        with self._stage6(requested=False):
+            assert _dispatch_stage3_transfer(facade, **self._KWARGS) is True
+        facade.start_transfer.assert_called_once_with(**self._KWARGS)
+        facade.prepare_transfer.assert_not_called()
+        facade.fire_transfer.assert_not_called()
+
+    def test_split_sends_the_block_list_once_and_the_trigger_bare(self):
+        facade = self._facade()
+        timings = {}
+        with self._stage6():
+            assert _dispatch_stage3_transfer(facade, timings,
+                                             **self._KWARGS) is True
+        facade.start_transfer.assert_not_called()
+        facade.prepare_transfer.assert_called_once_with(**self._KWARGS)
+        # Two arguments, positionally. Everything that scales with context
+        # length stays in prepare, which is the entire point of the stage.
+        facade.fire_transfer.assert_called_once_with("split-me", 4242)
+        assert set(timings) == {"prepare_ms", "fire_ms"}
+
+    def test_unsupported_client_falls_back_to_one_call(self):
+        facade = self._facade()
+        with self._stage6(supported=False):
+            assert _dispatch_stage3_transfer(facade, **self._KWARGS) is True
+        facade.start_transfer.assert_called_once_with(**self._KWARGS)
+        facade.prepare_transfer.assert_not_called()
+
+    def test_failed_fire_discards_the_prepared_plan(self):
+        facade = self._facade()
+        facade.fire_transfer.side_effect = RuntimeError("controller refused")
+        with self._stage6():
+            with pytest.raises(RuntimeError, match="controller refused"):
+                _dispatch_stage3_transfer(facade, **self._KWARGS)
+        # Without this the plan keeps its source registration claim until the
+        # controller's sweep ages it out, and the consumer's fallback submit
+        # is refused as a duplicate.
+        facade.discard_prepared_transfer.assert_called_once_with(
+            "split-me", 4242)
+
+    def test_failed_prepare_leaves_nothing_to_discard(self):
+        facade = self._facade()
+        facade.prepare_transfer.side_effect = RuntimeError("no plan")
+        with self._stage6():
+            with pytest.raises(RuntimeError, match="no plan"):
+                _dispatch_stage3_transfer(facade, **self._KWARGS)
+        facade.fire_transfer.assert_not_called()
+        facade.discard_prepared_transfer.assert_not_called()
+
+    def test_d5_retry_reaches_the_prepare_half(self):
+        # The missing-registration retry predates stage 6 and has to keep
+        # working, which it only does if the error surfaces from prepare and
+        # a failed prepare leaves no plan behind to collide with the retry.
+        facade = self._facade()
+        facade.prepare_transfer.side_effect = (
+            RuntimeError("Missing producer block registration for rank 7"),
+            None,
+        )
+        with self._stage6(), \
+             patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                   return_value=30.0), \
+             patch(f"{_MOD}.time.sleep") as sleep:
+            accepted = (
+                TPURaidenConnectorWorker._start_stage3_transfer_with_d5_retry(
+                    facade, None, **self._KWARGS))
+        assert accepted is True
+        assert facade.prepare_transfer.call_count == 2
+        facade.fire_transfer.assert_called_once_with("split-me", 4242)
+        facade.discard_prepared_transfer.assert_not_called()
+        sleep.assert_called_once_with(0.01)
+
+    def test_fault_injection_exercises_discard_on_every_nth_fire(self):
+        facade = self._facade()
+        with self._stage6(), \
+             patch.dict(os.environ, {"TPU_KV_STAGE6_FAULT_EVERY": "2"}), \
+             patch(f"{_MOD}._STAGE6_FIRE_ATTEMPTS", 0):
+            assert _dispatch_stage3_transfer(facade, **self._KWARGS) is True
+            with pytest.raises(RuntimeError, match="TEST INJECTION"):
+                _dispatch_stage3_transfer(facade, **self._KWARGS)
+        assert facade.fire_transfer.call_count == 1
+        facade.discard_prepared_transfer.assert_called_once_with(
+            "split-me", 4242)
 
 
 # ---------------------------------------------------------------------------

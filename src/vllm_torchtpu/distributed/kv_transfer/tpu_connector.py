@@ -120,6 +120,11 @@ _STAGE3_GLM_TRANSFER_POOL_TAGS = ("mla.nope", "mla.rope", "dsa.idx")
 # pool keeps an admission burst from queueing behind one slow peer.
 _STAGE3_SUBMIT_WORKERS = 4
 
+# Counts fire attempts so the stage-6 fault injector can fail every Nth one.
+# Submit workers share it, hence the lock; it is only read under the test knob.
+_STAGE6_FAULT_LOCK = threading.Lock()
+_STAGE6_FIRE_ATTEMPTS = 0
+
 
 def _select_committed_mamba_blocks(
     block_tables: list[list[int]],
@@ -653,6 +658,115 @@ def _prefix_aware_load_supported() -> bool:
 def _prefix_aware_load_enabled() -> bool:
     """Whether suffix-only Stage-3 loads are requested and supported."""
     return (_prefix_aware_load_requested() and _prefix_aware_load_supported())
+
+
+@lru_cache(maxsize=1)
+def _stage6_prepare_fire_supported() -> bool:
+    """Whether the installed reshard client can split coordinate into two.
+
+    Probed rather than assumed for the same reason as the clip support above:
+    the connector has to keep running against a wheel built before the split
+    existed. On one of those the transfer still goes out, as a single call.
+    """
+    try:
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+
+        return bool(getattr(_reshard_client, "SUPPORTS_PREPARE_FIRE", False))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Could not probe tpu-sync prepare/fire support; Stage-3 "
+            "coordination will use the single-call path: %s", exc)
+        return False
+
+
+@lru_cache(maxsize=1)
+def _warn_stage6_unsupported_once() -> None:
+    logger.warning(
+        "TPU_KV_STAGE6_PREPARE is set but the installed tpu-sync has no "
+        "prepare/fire split; coordination stays on the single call. A stage-6 "
+        "measurement taken here would be measuring stage 5.")
+
+
+def _stage6_prepare_fire_enabled() -> bool:
+    if not tpu_envs.TPU_KV_STAGE6_PREPARE:
+        return False
+    if _stage6_prepare_fire_supported():
+        return True
+    # Worth shouting about: the fallback is silent and correct, so a CDK arm
+    # running an old wheel would look like a clean stage-6 result.
+    _warn_stage6_unsupported_once()
+    return False
+
+
+def _maybe_fail_stage6_fire_for_test(req_id: str) -> None:
+    """TEST-ONLY fault injection (TPU_KV_STAGE6_FAULT_EVERY): fail the fire.
+
+    Discard only runs when something goes wrong between prepare and fire,
+    which in a healthy run is never, so without this the cleanup path ships
+    untested and stage 6.5 inherits it. Raising here leaves a plan armed and
+    claiming its source registration; if discard does not release that claim,
+    the consumer's fallback submit hits AlreadyExists and the request hangs
+    instead of recovering, which is loud and easy to see.
+    """
+    every = int(os.getenv("TPU_KV_STAGE6_FAULT_EVERY", "0") or 0)
+    if every <= 0:
+        return
+    global _STAGE6_FIRE_ATTEMPTS
+    with _STAGE6_FAULT_LOCK:
+        _STAGE6_FIRE_ATTEMPTS += 1
+        attempt = _STAGE6_FIRE_ATTEMPTS
+    if attempt % every:
+        return
+    raise RuntimeError(
+        f"TEST INJECTION: failing Stage-6 fire for req_id={req_id} "
+        f"(attempt {attempt})")
+
+
+def _dispatch_stage3_transfer(facade: Any,
+                              timings: Optional[dict[str, float]] = None,
+                              **kwargs: Any) -> bool:
+    """Sends one coordination call, as one RPC or as a prepare and a fire.
+
+    The two forms have to be interchangeable for callers, and that turns on
+    the split form leaving nothing behind when it fails. A prepare that raises
+    built no plan, so the caller's retry is as safe as it was before. A fire
+    that raises leaves a plan armed and holding its source registration claim
+    until the controller's sweep ages it out, so discard it here; otherwise
+    the retry would come back to AlreadyExists.
+
+    Fills timings with prepare_ms and fire_ms when the split runs. That is the
+    number stage 6 exists to produce: every later stage assumes fire is flat
+    in context length, and this is where that gets checked rather than
+    assumed.
+    """
+    if not _stage6_prepare_fire_enabled():
+        return bool(facade.start_transfer(**kwargs))
+    prepare_start = time.perf_counter()
+    facade.prepare_transfer(**kwargs)
+    fire_start = time.perf_counter()
+    if timings is not None:
+        timings["prepare_ms"] = (fire_start - prepare_start) * 1000
+    req_id = str(kwargs.get("req_id") or "")
+    uuid = int(kwargs.get("uuid") or 0)
+    try:
+        _maybe_fail_stage6_fire_for_test(req_id)
+        facade.fire_transfer(req_id, uuid)
+    except BaseException:
+        try:
+            facade.discard_prepared_transfer(req_id, uuid)
+        except Exception as discard_exc:  # pylint: disable=broad-except
+            logger.error(
+                "Stage-6 could not discard a prepared plan after a failed "
+                "fire req_id=%s uuid=%d; the consumer's fallback submit will "
+                "be refused as a duplicate: %s", req_id, uuid, discard_exc)
+        else:
+            logger.warning(
+                "Stage-6 discarded a prepared plan after a failed fire "
+                "req_id=%s uuid=%d", req_id, uuid)
+        raise
+    if timings is not None:
+        timings["fire_ms"] = (time.perf_counter() - fire_start) * 1000
+    return True
 
 
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
@@ -3566,6 +3680,8 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _start_stage3_transfer_with_d5_retry(facade: Any,
+                                             timings: Optional[dict[
+                                                 str, float]] = None,
                                              **kwargs: Any) -> bool:
         """Bridges the one-step P scheduler-to-worker registration window.
 
@@ -3574,6 +3690,11 @@ class TPURaidenConnectorWorker:
         scheduler step. The source controller fails before receiver arming
         when those registrations are incomplete, so retry only that precise,
         side-effect-free error for a short bounded interval.
+
+        Under stage 6 that error still comes from the prepare half, which is
+        where the plan gets built, and a prepare that raises built nothing.
+        The dispatcher discards on its own if the fire half fails. Either way
+        the retry stays side-effect-free.
         """
         configured_timeout = float(dist_utils.get_p2p_wait_pull_timeout())
         deadline = time.perf_counter() + min(max(configured_timeout, 0.0),
@@ -3582,7 +3703,7 @@ class TPURaidenConnectorWorker:
         while True:
             attempts += 1
             try:
-                return facade.start_transfer(**kwargs)
+                return _dispatch_stage3_transfer(facade, timings, **kwargs)
             except RuntimeError as exc:
                 if ("Missing producer block registration" not in str(exc)
                         or time.perf_counter() >= deadline):
@@ -3892,9 +4013,10 @@ class TPURaidenConnectorWorker:
         # burst of 32 should show near zero; anything else says the workers
         # are the queue and stage 5 serialises where it looks parallel.
         queue_ms = 0.0 if queued_at is None else (start - queued_at) * 1000
+        timings: dict[str, float] = {}
         try:
             if self._start_stage3_transfer_with_d5_retry(
-                    facade, **call_kwargs) is not True:
+                    facade, timings, **call_kwargs) is not True:
                 raise RuntimeError("source controller rejected the transfer")
         except Exception as exc:  # pylint: disable=broad-except
             logger.error(
@@ -3914,6 +4036,12 @@ class TPURaidenConnectorWorker:
                     "build_ms": round(build_ms, 4),
                     "queue_ms": round(queue_ms, 4),
                     "rank": self.tp_rank,
+                    # Absent under stage 5, so a record that carries them is
+                    # itself the proof the split ran rather than fell back.
+                    **{
+                        key: round(value, 4)
+                        for key, value in timings.items()
+                    },
                 },
                 sort_keys=True))
 
@@ -4110,7 +4238,8 @@ class TPURaidenConnectorWorker:
                 # Deferred mode: one attempt. A missing registration is
                 # handed back as an outcome and the request is re-attempted
                 # from a later step instead of spinning here.
-                accepted = task.facade.start_transfer(**task.call_kwargs)
+                accepted = _dispatch_stage3_transfer(task.facade,
+                                                     **task.call_kwargs)
             if accepted is not True:
                 raise RuntimeError(
                     "source controller rejected Stage-3 transfer")

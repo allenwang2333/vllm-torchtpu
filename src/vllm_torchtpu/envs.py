@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
     TPU_KV_PREFILL_SUBMIT: bool = False
     TPU_KV_PREFILL_SUBMIT_FALLBACK_S: float = 10.0
+    TPU_KV_STAGE6_PREPARE: bool = False
     TPU_HOST_BURN_US: int = 0
     TPU_HOST_STEP_LOG_EVERY: int = 0
     TPU_HOST_BURN_FILE: str = ""
@@ -533,6 +534,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # recovers here instead of hanging until the 120 s registration timeout.
     "TPU_KV_PREFILL_SUBMIT_FALLBACK_S":
     lambda: float(os.getenv("TPU_KV_PREFILL_SUBMIT_FALLBACK_S") or "10.0"),
+
+    # Send the coordination call as a prepare followed by a fire instead of a
+    # single start_transfer. Both halves still run back to back at the end of
+    # prefill, so nothing observable changes and this is expected to be flat on
+    # every metric. It exists because prepare is where the cost lives: it
+    # carries the destination block list, and submit cost on 397B fits
+    # 7.5 ms fixed plus 0.16 ms per 1000 tokens, so a 64K prompt pays 18 ms of
+    # which 10.5 ms is the list. Fire carries two fields and stays flat however
+    # long the context is. Later stages ring more than once per request, which
+    # is only affordable if the repeated half is the cheap one.
+    "TPU_KV_STAGE6_PREPARE":
+    env_bool("TPU_KV_STAGE6_PREPARE"),
 
     # Calibration probe, off by default and never set in production. Occupies
     # the interpreter for this many microseconds at the top of every non-empty
