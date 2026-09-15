@@ -54,12 +54,6 @@
 #   out and uploaded as a Buildkite artifact.
 
 steps:
-
-  # -----------------------------------------------------------------
-  # Build step (required by every demo below)
-  # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
-  # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
@@ -67,61 +61,16 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  # -----------------------------------------------------------------
-  # Demo 1: offline_inference.py
-  # The simplest pattern — run a Python script inside the image.
-  # Starting point for any offline batch-inference experiment.
-  # -----------------------------------------------------------------
-  - label: "[demo] offline_inference.py (Qwen3-0.6B)"
-    key: demo_offline_inference
+  # P0 bisect of torch-tpu between 0910000446 (good) and 0912075415 (bad) with libtpu 0.0.47.
+  - label: "p8d8 disagg, torch-tpu 0910150446 + libtpu 0.0.47 (TPU v7x-16)"
+    key: dev_p8d8_bisect
     depends_on: build_docker
+    timeout_in_minutes: 90
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "tpu_v7x_16_queue"
+    env:
+      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
     commands:
-      - |
-        # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          python3 examples/offline_inference.py \
-            --model Qwen/Qwen3-0.6B \
-            --max-model-len 256 \
-            --max-num-batched-tokens 256 \
-            --max-tokens 32'
-
-  # -----------------------------------------------------------------
-  # Demo 2: run one specific unit test
-  # The fastest way to iterate on a single test instead of waiting for the
-  # full "Unit Tests - General (PR)" job in CI.
-  # -----------------------------------------------------------------
-  - label: "[demo] pytest one file"
-    key: demo_pytest
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    commands:
-      - |
-        # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
-        # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
-
-  # -----------------------------------------------------------------
-  # Demo 3: repeat a test N times (flake hunting / A-B rate comparison)
-  # Use Buildkite's matrix instead of copy-pasting the step N times —
-  # {{matrix}} interpolates into the label so each parallel job is uniquely
-  # named. To prove "commit X caused a flake", run this at X and at X^ and
-  # compare the pass RATES, not a single run.
-  # -----------------------------------------------------------------
-  - label: "[demo] stress: pytest one file (run {{matrix}})"
-    key: demo_stress
-    depends_on: build_docker
-    agents:
-      queue: tpu_v7x_2_queue
-    matrix: ["1", "2", "3", "4", "5"]
-    commands:
-      - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
-          pytest -sv --timeout=600 -m "not nightly" \
-            tests/runner/test_tpu_runner.py'
+      - "bash .buildkite/scripts/run_disagg_multihost.sh"
+    artifact_paths:
+      - "perf_eval_results/**/*"
