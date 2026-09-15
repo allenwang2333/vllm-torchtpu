@@ -192,9 +192,10 @@ steps:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"
-          # Compile writes ~40 GB of AOTAutograd cache per host; the boot disk
-          # (the only disk on these agents) has ~30 GB free.
-          TORCHINDUCTOR_CACHE_DIR: "/dev/shm/torchinductor_cache"
+          # The boot disk (the only disk on these agents) has ~30 GB free, but
+          # compile writes ~40 GB of TorchInductor cache per host and the
+          # profile run ~30 GB of temp trace JSON.
+          CONTAINER_TMPDIR: "/dev/shm"
         commands:
           # Traces upload even when a gate fails; those are the nights to read.
           - |

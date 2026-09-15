@@ -192,9 +192,10 @@ CONTAINER_ENV_COMMON=(
   -e TQDM_MININTERVAL="30"
   -e SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0"
   ${USE_MOE_SPARSE_CORE:+-e USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}"}
-  # On the container, not in a benchmark config: Ray workers import torch, which
-  # pins the default /tmp path, before they apply the driver's env.
-  ${TORCHINDUCTOR_CACHE_DIR:+-e TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR}"}
+  # Moves the container's temp files (including TorchInductor's default cache)
+  # off the boot disk. Set on the container because Ray workers resolve temp
+  # paths before applying the driver's env. Ray keeps /tmp for its logs.
+  ${CONTAINER_TMPDIR:+-e TMPDIR="${CONTAINER_TMPDIR}" -e RAY_TMPDIR=/tmp}
   ${TPU_ACCELERATOR_TYPE:+-e TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"}
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"}
 )
