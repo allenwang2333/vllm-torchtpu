@@ -57,9 +57,11 @@ steps:
     if: 'build.env("RUN_E2E") == "1"'
     depends_on: build_docker
     timeout_in_minutes: 150
+    # No agent pin: any v7x-8 agent can run this. One whose model cache is
+    # cold pays a 98 GB download before the first boot, so allow for it in the
+    # timeout rather than pinning the job to the machine that happens to be warm.
     agents:
       queue: tpu_v7x_8_queue
-      hostname: "tpu7x-8-ci-10-cicd-us-central1-c"
     env:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "7200"
