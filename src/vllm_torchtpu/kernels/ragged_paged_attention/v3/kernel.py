@@ -885,29 +885,42 @@ def _ragged_paged_attention_kernel_loop(
         the production decode point (kv_len 8192, ``bkv_9216_9216``) that is
         1024 of 9216 rows.
 
-        **Why this is not simply deleted.** The score mask on the previous
-        line already sends the same positions to ``mask_value``, and after the
+        **Why the default is ``none``.** The score mask on the previous line
+        already sends the same positions to ``mask_value``, and after the
         softmax ``p = exp(s - m_curr)`` is exactly zero there, so ``p @ v``
-        cannot see those rows -- which makes the zeroing look redundant, and
-        LLO (``j-98fbef66``) measures it at roughly 23% of the decode kernel's
-        hot-span issue slots. It is redundant in the common case and
-        load-bearing in two others:
+        cannot see those rows. The zeroing is redundant, and it is not cheap:
+        LLO (``j-98fbef66``) puts it at ~23% of this kernel's hot-span issue
+        slots, because Mosaic materializes the predicate at full
+        ``bkv_csz x head_dim`` width -- 576 ``vadd.s16`` + 576
+        ``vcmp.lt.s16`` + 576 ``vmpackc.even`` to narrow the i16 mask to fp8
+        byte lanes, plus ~864 slots of ``vsel``/``vcombine``/``vnez``.
+        Dropping it measured **-8.35% median / -8.49% min** in ``j-30133ae0``,
+        over three same-chip pairs, one with the order reversed, against a
+        cross-chip median reproducibility of 1.0-4.2% and a min
+        reproducibility of 0.08-0.85%. Correctness: 18 passed under ``none``
+        in the same job.
 
-        * **A fully masked block.** ``m_ref`` starts at ``-inf`` and
-          ``m_curr`` is a running max, so if every column of a row is masked
-          then ``m_curr == mask_value``, ``s - m_curr == 0``, and ``p`` is
-          *one* everywhere rather than zero. The row then accumulates
-          ``sum(v)`` over junk. Zeroed V makes that contribute nothing.
-        * **A non-finite V.** ``p == 0`` kills any finite garbage, but
-          ``0 * NaN`` is ``NaN``, and ``0xFF`` is a NaN in ``f8e4m3fn``. The
-          rows past the sequence end are whatever the pager last left there.
+        Two hazards were considered and are not reachable here:
 
-        So ``none`` is an experiment, not a default. What is always sound is
-        ``broadcast``: the predicate is ``iota`` along the sublane axis only,
-        constant across lanes, so evaluating it at ``[bkv_csz, 1]`` and
-        letting the select broadcast it computes the identical mask with
-        1/head_dim of the iota, add and compare work -- and skips the i16
-        mask narrowing that fp8 otherwise needs at full width.
+        * **A fully masked block** would collapse ``m_curr`` onto
+          ``mask_value``, making ``s - m_curr == 0`` and ``p`` *one* rather
+          than zero. But that corrupts ``l_ref`` via ``p_rowsum``, which the V
+          zeroing never touched -- it only ever zeroed ``o``. Such a block is
+          therefore already wrong today, with or without this mask, so the
+          kernel cannot be relying on it.
+        * **A non-finite V** would survive ``p == 0``, since ``0 * NaN`` is
+          ``NaN`` and ``0xFF`` is a NaN in ``f8e4m3fn``. But every KV cache
+          allocation in ``runner/kv_cache_manager.py`` is ``torch.zeros``, not
+          ``torch.empty``, so the rows past the sequence end read as 0.0. The
+          only route to a NaN is one the model itself wrote.
+
+        Set ``full`` to restore the zeroing for an A/B. ``broadcast`` is kept
+        only because it is a measured dead end: the predicate is ``iota``
+        along the sublane axis alone and so is constant across lanes, which
+        makes a ``[bkv_csz, 1]`` evaluation look free, but a one-lane value
+        still occupies a whole ``(8, 128)`` vreg -- so none of the arithmetic
+        is saved and the select gains an explicit lane broadcast. It measured
+        **+41.6%** in ``j-428e5216``. Do not re-propose it.
         """
         mode = envs.RPA_V_MASK_MODE
         if mode == "none":
