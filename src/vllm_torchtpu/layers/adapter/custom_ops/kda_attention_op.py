@@ -19,7 +19,6 @@ from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
-from vllm_torchtpu.kernels.kimi_k3.mega_kda import kda_forward_inference
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -116,42 +115,6 @@ def kimi_short_conv_scan(
                                    first_token, total_tokens),
         lambda: (jnp.zeros_like(x), conv_state),
     )
-
-
-def _single_prefill_conv(x: jax.Array, conv_state: jax.Array,
-                         conv_weight: jax.Array, state_index: jax.Array,
-                         length: jax.Array, has_initial_state: jax.Array):
-    """One sequence: concatenate its carried window once, then slice taps.
-
-    The ragged path gathers a carried window for every token and every tap.
-    A single prefill has only one window, so contiguous slices preserve the
-    same FP32 tap reduction without those full-token gathers.
-    """
-    tokens = x.shape[0]
-    history = conv_weight.shape[0] - 1
-    window = jnp.where(has_initial_state, conv_state[state_index], 0)
-    combined = jnp.concatenate((window.reshape(history, -1).astype(
-        jnp.float32), x.astype(jnp.float32)),
-                               axis=0)
-    # Add taps directly to avoid materializing a stacked FP32 token tensor.
-    # Keep products and the balanced reduction in FP32 until output storage.
-    products = [
-        combined[j:j + tokens] * conv_weight[j].astype(jnp.float32)
-        for j in range(history + 1)
-    ]
-    while len(products) > 1:
-        products = [
-            products[j] + products[j + 1]
-            for j in range(0,
-                           len(products) - 1, 2)
-        ] + (products[-1:] if len(products) % 2 else [])
-    output = jnp.where((jnp.arange(tokens) < length)[:, None], products[0],
-                       0).astype(x.dtype)
-    new_window = jax.lax.dynamic_slice_in_dim(combined, length, history)
-    new_window = new_window.reshape(conv_state.shape[1:]).astype(
-        conv_state.dtype)
-    new_window = jnp.where(length > 0, new_window, conv_state[state_index])
-    return output, conv_state.at[state_index].set(new_window)
 
 
 def _short_conv_tokens(
@@ -354,81 +317,37 @@ def _build_fused_core(lower_bound: float | None, eps: float):
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
 
-        def run_fused():
-            (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
-                qkv=mixed_qkv,
-                # Raw: the kernel applies sigmoid to `b` and the gate activation
-                # to `a` itself.
-                b=beta,
-                a=raw_gate,
-                conv_state=conv_state,
-                recurrent_state=recurrent_state,
-                conv_weight=conv_weight_flat,
-                # Kimi's short convolution is bias-free.
-                conv_bias=None,
-                a_log=a_log,
-                # Per-channel under KDA, and Mosaic rejects the flat form.
-                dt_bias=dt_bias.reshape(num_heads, head_dim),
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                distribution=distribution,
-                seq_lens=seq_lens,
-                n_kq=num_heads,
-                n_v=num_heads,
-                d_k=head_dim,
-                d_v=head_dim,
-                kernel_size=kernel_size,
-                attention_mode=gdn_config.AttentionMode.KDA,
-                gate_lower_bound=lower_bound,
-            )
+        (new_conv_state, new_pool), out = gdn_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            # Raw: the kernel applies sigmoid to `b` and the gate activation
+            # to `a` itself.
+            b=beta,
+            a=raw_gate,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            conv_weight=conv_weight_flat,
+            # Kimi's short convolution is bias-free.
+            conv_bias=None,
+            a_log=a_log,
+            # Per-channel under KDA, and Mosaic rejects the flat form.
+            dt_bias=dt_bias.reshape(num_heads, head_dim),
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+            attention_mode=gdn_config.AttentionMode.KDA,
+            gate_lower_bound=lower_bound,
+        )
 
-            output = out.reshape(num_tokens, num_heads, head_dim)
-            output = _gated_output_norm(output, output_gate, norm_weight, eps,
-                                        mixed_qkv.dtype)
-            return output, new_conv_state, new_pool
-
-        # Mega requires complete 64-token tiles and a single contiguous prefill.
-        # Mixed, padded, and unsupported cases retain the fused kernel.
-        if not (num_tokens > 0 and num_tokens % 64 == 0 and head_dim == 128
-                and mixed_qkv.dtype == jnp.bfloat16 and lower_bound is not None
-                and -5 <= lower_bound < 0):
-            return run_fused()
-
-        def run_mega():
-            slot = state_indices[0]
-            carry = seq_lens[0] > num_tokens
-            conv, new_conv = _single_prefill_conv(
-                mixed_qkv, conv_state, conv_weight.reshape(kernel_size, -1),
-                slot, jnp.int32(num_tokens), carry)
-            qkv = jax.nn.silu(conv).reshape(num_tokens, 3, num_heads, head_dim)
-            initial = jnp.where(carry, recurrent_state[slot], 0)[None, None]
-            out, state = kda_forward_inference(
-                qkv[None, :, 0],
-                qkv[None, :, 1],
-                qkv[None, :, 2],
-                raw_gate.reshape(1, num_tokens, num_heads, head_dim),
-                jax.nn.sigmoid(beta.astype(jnp.float32)).astype(
-                    beta.dtype)[None],
-                A_log=a_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                use_gate_in_kernel=True,
-                use_qk_l2norm_in_kernel=True,
-                segment_ids=jnp.ones((1, num_tokens), jnp.int32),
-                N_max=1,
-                initial_state=initial,
-                output_final_state=True,
-                safe_gate=True)
-            output = _gated_output_norm(out[0], output_gate, norm_weight, eps,
-                                        mixed_qkv.dtype)
-            return output, new_conv, recurrent_state.at[slot].set(state[0, 0])
-
-        single_prefill = ((distribution[0] == 0)
-                          & (query_start_loc[0] == 0)
-                          & (query_start_loc[1] == num_tokens)
-                          & jnp.all(query_start_loc[1:] == num_tokens)
-                          & (state_indices[0] > 0))
-        return jax.lax.cond(single_prefill, run_mega, run_fused)
+        output = out.reshape(num_tokens, num_heads, head_dim)
+        output = _gated_output_norm(output, output_gate, norm_weight, eps,
+                                    mixed_qkv.dtype)
+        return output, new_conv_state, new_pool
 
     return fused_core
 
@@ -452,10 +371,9 @@ def build_kimi_dispatched_kda_op(
     # vLLM's compile cache is keyed on the model config, so the variant goes in
     # the op name. If this line disagrees with the kernels in a profile, the
     # run came from cache.
-    logger.info("KDA op %s: Mega prefill with fused conv1d + GDN v3 fallback.",
-                prefix)
+    logger.info("KDA op %s: using the fused conv1d + GDN v3 path.", prefix)
 
-    op_name = f"pallas::kimi_dispatched_kda_mega_{prefix.replace('.', '_')}"
+    op_name = f"pallas::kimi_dispatched_kda_fused_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
 
     def _fake_dispatched(mixed_qkv, _raw_gate, _beta, _output_gate, conv_state,
@@ -709,7 +627,7 @@ def build_kimi_pooled_kda_op(
     # body, so the kernel variant goes in the op name (see
     # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
     # era would otherwise be served stale.
-    op_name = f"pallas::kimi_pooled_kda_mega_{prefix.replace('.', '_')}"
+    op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))
 
     def _fake_pooled(mixed_qkv, _raw_gate, _beta, _output_gate, pool,

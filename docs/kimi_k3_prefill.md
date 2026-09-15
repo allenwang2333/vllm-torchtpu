@@ -19,11 +19,9 @@ disaggregation; KV-cache and KDA-state outputs must remain valid for handoff.
   reduce-scatter avoid full intermediate activation buffers when their tile
   alignment permits. Other shard sizes use XLA collectives with the same token
   ownership; their use does not disable SP. Ring buffers remain bounded.
-- KDA uses the existing Mega recurrence for single-sequence prefills with
-  complete 64-token tiles, using contiguous convolution with FP32 tap
-  accumulation. Other batches use upstream's fused conv1d + GDN v3 path. Dense caches and the unified state
-  pool use the same selection. Upstream's removed manual/chunked dispatcher
-  and its environment selectors are not restored.
+- KDA uses upstream's fused conv1d + GDN v3 path unchanged. The existing Mega
+  kernel remains available, but this model adds no Mega dispatch or convolution
+  adapter. The 8K comparison below found only a 1.5% operator-level benefit.
 - MLA uses the existing paged attention kernel, including for queries with
   earlier KV-cache context. SP preprocessing, the TP2 gate buffer, and fused
   output projection remain; there is no separate Splash attention path.
@@ -101,9 +99,8 @@ All sizes passed four-token cached-generation checks with finite log
 probabilities. HBM before KV allocation was 78.23 GiB/core. At 16K, the current
 XLA RS fallback and larger MLA workload are material costs: a representative
 core records 335 ms in XLA RS events (including waits) and 131.480 ms in MLA.
-This sweep predates generalized Mega KDA dispatch: only 8K used Mega here.
-Current dispatch accepts supported single-sequence prefills at any length
-with complete 64-token tiles; the timings above do not measure that change.
+This sweep used Mega KDA at 8K; the current model uses upstream fused KDA.
+The full-model timings above have not been remeasured after that simplification.
 
 Cold engine setup took 56.80 minutes, including 51.18 minutes reported as
 compilation. Smaller SP buckets compile more slowly than their earlier
@@ -138,6 +135,35 @@ CPU regression coverage includes checkpoint layouts, token-bucket parameter
 consistency, SP latent reduction order, chip-local shared experts, and fake
 shapes for Torch/JAX bridges. Kernel tests cover physical topology, collective
 ownership, Attention Residual, and the existing KDA implementations.
+
+## 8K KDA microbenchmark (2026-09-15)
+
+The complete KDA operator was compared through the production Torch/Pallas
+boundary on TPU7x, with BF16 activations, three local 128-wide heads, 64 state
+slots, FP32 recurrent state, and donated state buffers. Timings include
+convolution, recurrence, gated output normalization, dispatch, and state writes;
+linear projections and collectives are outside this operator.
+
+| 8K case | Mega device median | Upstream fused device median | Mega speedup |
+| --- | ---: | ---: | ---: |
+| Fresh prefill | 483.043 µs | 490.278 µs | 1.015× |
+| With existing state | 483.025 µs | 490.237 µs | 1.015× |
+
+All 32 cores ran the comparison. Device medians use 20 invocations per variant
+from each of 16 complete device-plane captures (320 samples); partial sibling
+captures are excluded. Execution order alternated. Fresh-prefill host medians
+were 0.838 ms and 0.844 ms respectively, across 1,280 samples per variant.
+Outputs and live recurrent states differed by approximately 0.65% relative L2;
+convolution states matched exactly and all outputs were finite. This is a
+random-input comparison, not an independent reference or real-weight validation.
+
+The 7.2 µs operator difference extrapolates to about 0.5 ms over 69 KDA layers,
+not a measured full-model gain. This small benefit does not justify the extra
+adapter code, so the PR retains upstream KDA. Mega source was `2e53b7725` and
+upstream source was `0adbd1359`, using the same installed runtime. Raw results
+and reproduction scripts are in the benchmark workspace under
+`results/production-port/kda-mega-vs-fused-20260915/`. Further performance
+iteration is limited to 8K prefill.
 
 ## Reproduction
 
