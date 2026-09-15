@@ -477,27 +477,73 @@ def _ragged_paged_attention_kernel_loop(
         processed_q_len_int = processed_q_len.astype(int_ty)
         processed_kv_len_int = processed_kv_len.astype(int_ty)
         effective_kv_len_int = effective_kv_len.astype(int_ty)
-        q_span = processed_q_len_int + (lax.broadcasted_iota(
-            jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(int_ty)
-        k_span = processed_kv_len_int + lax.broadcasted_iota(
-            int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(
-            int_ty, v.shape, 0)
 
-        mask = None
-        if use_causal_mask:
-            assert not skip_kv_mask
-            mask = mask_and(mask, q_span >= k_span)
+        # Decode fast path. When the block holds a single query token, every row
+        # of `s` is a different head of that *same* token, so
+        # `iota(s.shape, 0) // num_q_heads_per_kv_head` is identically zero and
+        # `q_span` is a scalar. Both surviving bounds are then conditions on the
+        # kv index alone and collapse into one comparison against one scalar:
+        #
+        #   causal  q_span >= k_span          <=>  i < processed_q_len
+        #                                            - processed_kv_len + 1
+        #   kv len  k_span < effective_kv_len <=>  i < effective_kv_len
+        #                                            - processed_kv_len
+        #
+        # The general path below spends, on a bq_csz*num_q_heads_per_kv_head x
+        # bkv_csz matrix, a full i32 iota plus an integer divide plus a narrowing
+        # cast for `q_span`, a second iota and add for `k_span`, two compares and
+        # an `and`. This path spends one iota and one compare. `/xprof-llo` on
+        # job j-e3eade3f put mask and span arithmetic at 3170 instructions --
+        # ~25% of the kernel's hot block -- and job j-44546506 measured the whole
+        # mask at 7.49% of this op by compiling it out with `skip_kv_mask`
+        # (checksums identical, so that bound is real work and not dropped work).
+        #
+        # Excluded deliberately: `sliding_window`, which adds a lower bound and
+        # so does not collapse to a single `<`; and `skip_kv_mask`, which already
+        # elides everything this path would build.
+        collapse_bounds = (actual_bq_csz == 1 and sliding_window is None
+                           and not skip_kv_mask)
 
-        if not skip_kv_mask:
-            mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+        if collapse_bounds:
+            # `v`'s bound is left at effective_kv_len exactly as in the general
+            # path, rather than tightened to the causal bound: positions the
+            # causal mask kills already carry p == 0, so zeroing their `v` would
+            # change nothing, and keeping the bound identical keeps this path
+            # bit-for-bit equal to the general one.
+            v_bound = effective_kv_len_int - processed_kv_len_int
+            s_bound = v_bound
+            if use_causal_mask:
+                s_bound = jnp.minimum(
+                    s_bound, processed_q_len_int - processed_kv_len_int + 1)
+            s = jnp.where(
+                lax.broadcasted_iota(int_ty, s.shape, 1) < s_bound, s,
+                mask_value)
+            v = jnp.where(
+                lax.broadcasted_iota(int_ty, v.shape, 0) < v_bound, v, 0.0)
+        else:
+            q_span = processed_q_len_int + (lax.broadcasted_iota(
+                jnp.int32, s.shape, 0) //
+                                            num_q_heads_per_kv_head).astype(
+                                                int_ty)
+            k_span = processed_kv_len_int + lax.broadcasted_iota(
+                int_ty, s.shape, 1)
+            v_span = processed_kv_len_int + lax.broadcasted_iota(
+                int_ty, v.shape, 0)
 
-        if sliding_window is not None:
-            mask = mask_and(mask, q_span < k_span + sliding_window)
+            mask = None
+            if use_causal_mask:
+                assert not skip_kv_mask
+                mask = mask_and(mask, q_span >= k_span)
 
-        if mask is not None:
-            s = jnp.where(mask, s, mask_value)
+            if not skip_kv_mask:
+                mask = mask_and(mask, k_span < effective_kv_len_int)
+                v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+
+            if sliding_window is not None:
+                mask = mask_and(mask, q_span < k_span + sliding_window)
+
+            if mask is not None:
+                s = jnp.where(mask, s, mask_value)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = m_ref[...]
