@@ -11,7 +11,9 @@ import dataclasses
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import time
 from collections.abc import Collection
 from contextlib import contextmanager
@@ -289,6 +291,99 @@ def _apply_gil_switch_interval() -> None:
                 sys.getswitchinterval())
 
 
+_gil_wait_probe_started = False
+
+
+def _gil_wait_loop(period_s: float, report_s: float) -> None:
+    """Measures how long a thread in this process waits for its turn.
+
+    Stage 5 moved a call into prefill's worker process, and the part of that
+    call that grew is not work but waiting: on CDK the time inside the call
+    that the controller does not account for goes from about 1 ms at
+    concurrency 1 to about 2.3 ms at concurrency 32, while the controller's
+    own time goes down. Decode makes the same call at the same concurrency
+    and stays flat, so the suspect is contention for the interpreter inside
+    the busy process rather than anything about the call.
+
+    The simplest version of that story does not survive arithmetic. If the
+    interpreter were held only for the 6.7 ms per 175 ms step that the host
+    spends dispatching, a thread waking at a random moment would wait
+    (6.7/175) * (6.7/2) = 0.13 ms, which is ten times too small. Getting to
+    1.5 ms needs the interpreter held roughly 23 ms per step, which is
+    plausible only if sampling and the trip back through the engine hold it
+    too, and those sit on the far side of the dispatch boundary.
+
+    So measure it instead of arguing about it. Sleeping releases the
+    interpreter and waking demands it back, so a sleep that asks for
+    period_s and returns late by d was blocked for d, minus whatever the
+    kernel timer itself costs. The kernel's share shows up as a floor in the
+    idle part of the run, which is why the loop starts before the benchmark
+    does and reports continuously rather than only under load.
+
+    A prediction worth being held to: a median near the idle floor, because
+    most wakeups should find the interpreter free, with a mean near 1.5 to
+    2.5 ms pulled up by a tail as long as the longest Python stretch. A mean
+    that comes back at 0.1 ms kills the story.
+    """
+    late: list[float] = []
+    next_report = time.perf_counter() + report_s
+    while True:
+        start = time.perf_counter()
+        time.sleep(period_s)
+        late.append(time.perf_counter() - start - period_s)
+        now = time.perf_counter()
+        if now < next_report:
+            continue
+        next_report = now + report_s
+        batch, late = sorted(late), []
+        if not batch:
+            continue
+        n = len(batch)
+
+        def at(q: float) -> float:
+            return batch[min(n - 1, int(n * q))] * 1000
+
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "gil_wait": True,
+                    "n": n,
+                    "mean_ms": round(sum(batch) / n * 1000, 4),
+                    "p50_ms": round(at(0.50), 4),
+                    "p90_ms": round(at(0.90), 4),
+                    "p99_ms": round(at(0.99), 4),
+                    "max_ms": round(batch[-1] * 1000, 4),
+                    # How often a wakeup found the interpreter busy at all.
+                    # Under the story above this tracks the fraction of the
+                    # step that Python holds it, which is the number the
+                    # arithmetic needs and the dispatch split cannot give.
+                    "frac_over_0p5ms": round(
+                        sum(1 for v in batch if v > 0.0005) / n, 4),
+                },
+                sort_keys=True))
+
+
+def _maybe_start_gil_wait_probe(rank: int) -> None:
+    global _gil_wait_probe_started
+    if _gil_wait_probe_started:
+        return
+    if os.getenv("TPU_HOST_GIL_WAIT_PROBE", "0") != "1":
+        return
+    if rank != 0:
+        return
+    _gil_wait_probe_started = True
+    period_s = float(os.getenv("TPU_HOST_GIL_WAIT_PERIOD_US", "5000")) / 1e6
+    report_s = float(os.getenv("TPU_HOST_GIL_WAIT_REPORT_S", "2"))
+    thread = threading.Thread(target=_gil_wait_loop,
+                              args=(period_s, report_s),
+                              name="gil-wait-probe",
+                              daemon=True)
+    thread.start()
+    logger.info("gil_wait_probe started period_us=%.0f report_s=%.1f",
+                period_s * 1e6, report_s)
+
+
 class _HostSlackProbe:
     """Measures how much of a step the host, rather than the chip, decides.
 
@@ -330,7 +425,21 @@ class _HostSlackProbe:
         self.log_every = int(envs.TPU_HOST_STEP_LOG_EVERY)
         self.dose_file = str(envs.TPU_HOST_BURN_FILE or "")
         self.burns_here = rank == int(envs.TPU_HOST_BURN_RANK)
-        self.enabled = bool(self.burn_us or self.log_every or self.dose_file)
+        self.mimic_file = os.getenv("TPU_HOST_MIMIC_FILE", "")
+        self.mimic_mode = os.getenv("TPU_HOST_MIMIC_MODE", "off")
+        self.mimic_work_us = float(os.getenv("TPU_HOST_MIMIC_WORK_US", "85"))
+        self.mimic_sleep_us = float(
+            os.getenv("TPU_HOST_MIMIC_SLEEP_US", "8000"))
+        self._mimic_queue: queue.Queue = queue.Queue()
+        self._mimic_thread: threading.Thread | None = None
+        # The connector owns this file; the probe only reads it, so every
+        # window of step periods is labelled with the arm that produced it
+        # and the analysis never has to line log timestamps up against a
+        # driver's idea of when it flipped the switch.
+        self.stage5_file = os.getenv("TPU_KV_STAGE5_MODE_FILE", "")
+        self.stage5_mode = "n/a"
+        self.enabled = bool(self.burn_us or self.log_every or self.dose_file
+                            or self.mimic_file or self.stage5_file)
         self._last: float | None = None
         self._last_kind: str | None = None
         self._periods: dict[str, list[float]] = {"prefill": [], "decode": []}
@@ -357,6 +466,22 @@ class _HostSlackProbe:
 
     def _reload_dose(self) -> None:
         """Picks up a new dose between windows, ignoring a missing file."""
+        if self.stage5_file:
+            try:
+                with open(self.stage5_file) as handle:
+                    mode = handle.read().strip()
+                if mode in ("on", "off"):
+                    self.stage5_mode = mode
+            except OSError:
+                pass
+        if self.mimic_file:
+            try:
+                with open(self.mimic_file) as handle:
+                    mode = handle.read().strip()
+                if mode in ("off", "thread", "inline"):
+                    self.mimic_mode = mode
+            except OSError:
+                pass
         if not self.dose_file:
             return
         try:
@@ -364,6 +489,54 @@ class _HostSlackProbe:
                 self.burn_us = int(handle.read().strip() or "0")
         except (OSError, ValueError):
             pass
+
+    def _mimic_work(self) -> None:
+        """Holds the interpreter for the dose the real submit path holds it."""
+        deadline = time.perf_counter() + self.mimic_work_us / 1e6
+        while time.perf_counter() < deadline:
+            pass
+
+    def _mimic_loop(self) -> None:
+        """Stands in for a submit worker, with the network call removed.
+
+        The real worker wakes, runs a little Python, drops the interpreter for
+        an 8 ms call to the controller, then demands it back to log and
+        return. Two acquisitions, and each one can land while the model runner
+        is mid-sentence. Everything here is that shape with the call replaced
+        by a sleep, because the claim under test is about the shape and not
+        about the transfer.
+        """
+        while True:
+            self._mimic_queue.get()
+            self._mimic_work()
+            time.sleep(self.mimic_sleep_us / 1e6)
+            self._mimic_work()
+
+    def mimic(self, kind: str) -> None:
+        """Reproduces stage 5's effect on the interpreter without stage 5.
+
+        Three modes, switched from a file so one launch can visit all of them
+        and launch-to-launch drift cannot masquerade as the effect. "off" is
+        the baseline. "thread" hands the work to a Python thread, which is
+        today's shape. "inline" does the same work on the model-runner thread,
+        which is the shape a C++ fire-and-forget produces, since that thread
+        already holds the interpreter and never has to ask for it.
+
+        Predicted: thread costs about 2 ms of step period and inline costs
+        almost nothing. If thread costs nothing the story is wrong, and that
+        is worth knowing before anyone writes the C++.
+        """
+        if self.mimic_mode == "off" or kind != "prefill" or not self.burns_here:
+            return
+        if self.mimic_mode == "inline":
+            self._mimic_work()
+            return
+        if self._mimic_thread is None:
+            self._mimic_thread = threading.Thread(target=self._mimic_loop,
+                                                  name="mimic-submit",
+                                                  daemon=True)
+            self._mimic_thread.start()
+        self._mimic_queue.put(None)
 
     def burn(self) -> None:
         """Occupy the interpreter, holding the GIL, for the configured dose."""
@@ -399,6 +572,10 @@ class _HostSlackProbe:
             if stamp is not None and last <= stamp <= now:
                 self._dispatch[prev].append(stamp - last)
                 self._finish[prev].append(now - stamp)
+        # Fired here rather than from execute_model because this is where the
+        # step's kind is already known, and it lands inside the next period,
+        # which is where added work belongs.
+        self.mimic(kind)
         self._steps += 1
         if not self.log_every or self._steps % self.log_every:
             return
@@ -408,6 +585,11 @@ class _HostSlackProbe:
             "burn_us": self.burn_us,
             "burns_here": self.burns_here,
             "steps": self._steps,
+            # Every record carries the mode it was measured under, so the
+            # analysis buckets by what was actually running rather than by
+            # wall-clock windows the driver believes it set.
+            "mimic": self.mimic_mode,
+            "stage5": self.stage5_mode,
         }
         for name, raw in self._periods.items():
             self._periods[name] = []
@@ -3684,6 +3866,7 @@ class TPUModelRunner(GPUModelRunner):
         probe = getattr(self, "_host_slack_probe", None)
         if probe is None:
             _apply_gil_switch_interval()
+            _maybe_start_gil_wait_probe(self._profiler_rank)
             probe = self._host_slack_probe = _HostSlackProbe(
                 self._profiler_rank)
         if probe.enabled and scheduler_output.total_num_scheduled_tokens:

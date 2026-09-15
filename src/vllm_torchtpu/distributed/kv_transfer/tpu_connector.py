@@ -18,6 +18,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 """
 
 import json
+import os
 import queue
 import threading
 import time
@@ -261,6 +262,49 @@ class _Stage3Admission:
 
     uuid: int
     num_tokens: int
+
+
+_stage5_mode = "on"
+
+
+def _stage5_runtime_enabled() -> bool:
+    """Lets one launch measure stage 5 both on and off, alternating.
+
+    Every comparison so far has put each arm in its own launch, and a
+    relaunch moves prefill's step period by about a millisecond on its own,
+    which is the size of the effect being chased. Two launches showed +1.9
+    and +1.4 ms; a third showed nothing. That spread is what a launch-level
+    offset looks like, so the only way to settle it is to switch the arm
+    while the server keeps running.
+
+    Only this gate moves. The destination notifier and collector stay up in
+    both arms, so their cost is common to both and cancels. With the gate
+    shut, prefill declines to submit and the consumer's deferred submit fires
+    on its own timer instead, which is precisely the stage-4 behaviour this
+    change replaced. Set TPU_KV_PREFILL_SUBMIT_FALLBACK_S low enough that the
+    timer stands in for stage 4 rather than for an outage.
+
+    Read from a file rather than an env var because the process cannot be
+    restarted, and read on every call because that is once per request at a
+    handful per second.
+    """
+    path = os.getenv("TPU_KV_STAGE5_MODE_FILE", "")
+    if not path:
+        return True
+    global _stage5_mode
+    try:
+        with open(path) as handle:
+            mode = handle.read().strip()
+    except OSError:
+        return _stage5_mode != "off"
+    if mode in ("on", "off") and mode != _stage5_mode:
+        _stage5_mode = mode
+        logger.info("%s", json.dumps({
+            "event": "kv_stage5_mode",
+            "mode": mode,
+            "t": time.time(),
+        }, sort_keys=True))
+    return _stage5_mode != "off"
 
 
 class _AdmissionNotifier:
@@ -3675,6 +3719,8 @@ class TPURaidenConnectorWorker:
         up. That retry spins a background thread, never the model runner.
         """
         if not tpu_envs.TPU_KV_PREFILL_SUBMIT or transfer_rank != 0:
+            return
+        if not _stage5_runtime_enabled():
             return
         dst_params = getattr(req_meta, "dst_params", None)
         if not dst_params:
