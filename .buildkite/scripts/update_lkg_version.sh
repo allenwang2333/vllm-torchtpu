@@ -21,7 +21,7 @@ if [ -z "${NEW_LKG_HASH}" ]; then
   exit 1
 fi
 
-TARGET_BRANCH="main"
+TARGET_BRANCH="${TARGET_BRANCH:-main}"
 MAX_ATTEMPTS=3
 LKG_PROMOTE_ENABLED="${LKG_PROMOTE_ENABLED:-false}"
 
