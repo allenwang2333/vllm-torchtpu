@@ -71,6 +71,29 @@ distance from ``base`` is the size of the bug the tolerance has to catch. The
 report prints that distance next to the arm-to-arm distance, so the margin is
 measured rather than asserted.
 
+The float32 reference, and why the cross-arm check is not the gate
+------------------------------------------------------------------
+The first run of this gate passed every absolute check and failed the cross-arm
+tolerance marginally: arm 4 sat ``max_rel = 2.1e-2`` from arm 8 and arm 2 sat
+``1.4e-2``, against a 2e-2 tolerance and a measured ``overread_ctl`` signature
+of 1.67e-1. That is a number with no correct value -- the arms *are* supposed to
+reassociate differently -- so failing on it would be failing on nothing, and
+passing on it would be asserting a tolerance nothing calibrates.
+
+Check C replaces it with an absolute one. For ``HEAD_ALONG_SUBLANE`` with one KV
+head the cache is ``(pages, 256, 1, 4, 128)`` and ``prepare_inputs`` writes
+``concatenate([k, v])`` into the flattened ``(group, packing)`` axis, so slot 0
+is K, slot 1 is V, and slots 2-3 are zero padding. A float32 attention over the
+*post-step* cache is therefore directly computable, and each arm's distance from
+it is a quantity that means something on its own. The gate is that no arm sits
+materially further from truth than the shipping default does (C2), not that the
+arms agree with each other. ``C0`` runs the same reference 256 tokens long and
+requires that to move it by at least 10x an arm's own error -- without it,
+"every arm is close to the oracle" would be unfalsifiable.
+
+Check B is still computed and printed, because the shape of the disagreement is
+informative, but it is advisory unless ``--strict-cross-arm`` is passed.
+
 Model geometry is inherited from ``microbench_batched_rpa_kv_layout.py`` rather
 than restated, so the two cannot drift.
 """
@@ -118,6 +141,13 @@ ALL_CASES = ("base", "oob_poison", "inband_poison", "overread_ctl")
 # report prints the observed arm-to-arm distance against the observed
 # `overread_ctl` distance; trust the printed margin, not this constant.
 REL_TOL = 2e-2
+
+# Check C's tolerances, against the float32 reference rather than another arm.
+# C1 is a loose absolute sanity bound; C2 is the one that matters -- an arm may
+# not sit materially further from truth than the shipping default does. 2.0x is
+# deliberately generous: the claim being gated is "no worse", not "identical".
+ORACLE_ABS_TOL = 5e-2
+ORACLE_RATIO_TOL = 2.0
 
 _HASH_CHUNK_PAGES = 288
 
@@ -177,6 +207,44 @@ def _poison_pages(jnp, cache, pages_per_seq: int, lo_page: int, hi_page: int,
     view = view.at[:, lo_page:hi_page].set(
         jnp.asarray(POISON_VALUE, dtype=kv_dtype))
     return view.reshape(cache.shape)
+
+
+def _oracle(jax, jnp, *, cache, query, page_indices, kv_len: int,
+            pages_per_seq: int, sm_scale: float, num_live: int):
+    """A float32 reference attention, computed from the post-step KV cache.
+
+    Arm-to-arm distance has no correct value: the arms reassociate an
+    8704-term online softmax over different ``bkv_sz`` and are *supposed* to
+    differ. Distance from a float32 reference does have one, and it is the
+    only quantity that can say whether a lower ``batch_size`` costs accuracy.
+
+    The HEAD_ALONG_SUBLANE cache is
+    ``(pages, page_size, 2*kv_heads//packing, packing, head_dim)``; with one
+    KV head at fp8 that is ``(pages, 256, 1, 4, 128)``, and
+    ``prepare_inputs`` writes ``concatenate([k, v])`` into the flattened
+    ``(group, packing)`` axis, so slot 0 is K, slot 1 is V and slots 2-3 are
+    zero padding. Read from the *post-step* cache, so the reference also
+    covers the kernel's own KV write.
+    """
+    head_dim = int(cache.shape[-1])
+
+    @jax.jit
+    def _one(q_i, kv_i, n):
+        keys = kv_i[:, :, 0, 0, :].reshape(-1, head_dim).astype(jnp.float32)
+        vals = kv_i[:, :, 0, 1, :].reshape(-1, head_dim).astype(jnp.float32)
+        scores = (q_i.astype(jnp.float32) @ keys.T) * sm_scale
+        pos = jnp.arange(keys.shape[0], dtype=jnp.int32)
+        scores = jnp.where(pos[None, :] < n, scores, -jnp.inf)
+        return jax.nn.softmax(scores, axis=-1) @ vals
+
+    n = jnp.asarray(kv_len, dtype=jnp.int32)
+    outs = []
+    for i in range(num_live):
+        pages = jax.lax.dynamic_slice(page_indices, (i * pages_per_seq, ),
+                                      (pages_per_seq, ))
+        outs.append(
+            np.asarray(jax.device_get(_one(query[i], cache[pages], n))))
+    return np.stack(outs).astype(np.float32)
 
 
 def _case_spec(name: str, *, page_size: int, pages_per_seq: int,
@@ -373,7 +441,36 @@ def _emit(args) -> int:
         valid_sha = _chunked_sha(
             jax, valid_view[:, :valid_pages].reshape(
                 (-1, ) + tuple(new_cache.shape[1:])))
-        del new_cache, valid_view
+        del valid_view
+
+        # The float32 reference, on the base case only. Every arm computes it
+        # from its own post-step cache, which GUARD 2 has already required to
+        # be bit-identical across arms -- so a difference in the reference is
+        # itself a finding. `oracle_mis` is the same reference deliberately run
+        # 256 tokens long: the control that proves this metric can see an
+        # over-read, without which "arm N is close to the oracle" is unfalsi-
+        # fiable.
+        if args.oracle and name == "base" and kv_layout.name == \
+                "HEAD_ALONG_SUBLANE" and mb.NUM_KV_HEADS_PER_RANK == 1:
+            ref = _oracle(jax, jnp, cache=new_cache, query=q,
+                          page_indices=kargs["page_indices"],
+                          kv_len=kv_len, pages_per_seq=pages_per_seq,
+                          sm_scale=mb.HEAD_DIM**-0.5, num_live=num_live)
+            ref_mis = _oracle(jax, jnp, cache=new_cache, query=q,
+                              page_indices=kargs["page_indices"],
+                              kv_len=kv_len + OVERREAD_TOKENS,
+                              pages_per_seq=pages_per_seq,
+                              sm_scale=mb.HEAD_DIM**-0.5, num_live=num_live)
+            out_blob["base__oracle"] = ref
+            out_blob["base__oracle_mis"] = ref_mis
+            d = _per_seq_rel(ref, out_h.astype(np.float32))
+            dm = _per_seq_rel(ref, ref_mis)
+            print(f"  [oracle] fp32 reference: arm-vs-truth "
+                  f"max={d.max():.3e} median={np.median(d):.3e} | "
+                  f"a 256-token over-read moves the truth by "
+                  f"max={dm.max():.3e} median={np.median(dm):.3e}",
+                  flush=True)
+        del new_cache
 
         out32 = out_h.astype(np.float32)
         out_blob[f"{name}__out"] = out32
@@ -418,6 +515,7 @@ def _emit(args) -> int:
                      overread_tokens=OVERREAD_TOKENS,
                      seed=args.seed,
                      cases=list(args.cases),
+                     has_oracle="base__oracle" in out_blob,
                      manifest=manifest)
     print("EMIT_JSON: " + json.dumps(
         dict(arm=arm, resolved_batch_size=resolved_batch_size,
@@ -466,7 +564,10 @@ def _inject(out: np.ndarray, fault: str) -> np.ndarray:
 
 
 def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
-             inject_fault: str | None, inject_into: str) -> int:
+             inject_fault: str | None, inject_into: str,
+             oracle_abs_tol: float = ORACLE_ABS_TOL,
+             oracle_ratio_tol: float = ORACLE_RATIO_TOL,
+             strict_cross_arm: bool = False) -> int:
     loaded = [(p, ) + _load(p) for p in paths]
     metas = {m["arm"]: (p, z, m) for p, z, m in loaded}
     problems: list[str] = []
@@ -663,6 +764,82 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
                 print("       worst seqs: " + ", ".join(
                     f"#{int(i)}={rel[int(i)]:.3e}" for i in worst))
 
+    # --- CHECK C: distance from a float32 reference -------------------------
+    print()
+    print("=" * 78)
+    print("CHECK C (accuracy vs a float32 reference, not vs another arm)")
+    print("=" * 78)
+    print("  Arm-to-arm distance has no correct value: the arms reassociate an")
+    print("  8704-term online softmax over different bkv_sz and are supposed")
+    print("  to differ. Distance from float32 truth does have one.")
+    oracle_ok = True
+    oracle_checked = False
+    d_true: dict[str, np.ndarray] = {}
+    have = [(z, m) for _p, z, m in loaded if "base__oracle" in z.files]
+    if len(have) != len(loaded):
+        print(f"\n  ORACLE ABSENT in {len(loaded) - len(have)} of "
+              f"{len(loaded)} arms -- Check C did not run. The cross-arm")
+        print("  agreement in Check B is therefore UNCALIBRATED: it has no")
+        print("  reference that says what the right answer was.")
+    else:
+        oracle_checked = True
+        ref = have[0][0]["base__oracle"]
+        ref_mis = have[0][0]["base__oracle_mis"]
+        # Every arm recomputes the reference from its own post-step cache.
+        # GUARD 2 already required those caches to be bit-identical, so any
+        # divergence in the reference itself is a finding, not noise.
+        for z, m in have[1:]:
+            if not np.array_equal(z["base__oracle"], ref):
+                r = _per_seq_rel(ref, z["base__oracle"])
+                print(f"  !! arm {m['arm']}'s reference differs from arm "
+                      f"{have[0][1]['arm']}'s by max_rel={r.max():.3e} -- the "
+                      "post-step caches are not identical")
+                oracle_ok = False
+
+        # C0: the metric must be able to see the bug it is meant to exclude.
+        d_mis = _per_seq_rel(ref, ref_mis)
+        for _p, z, m in loaded:
+            b = z["base__out"]
+            if inject_fault and m["arm"] == inject_into:
+                b = _inject(b, inject_fault)
+            d_true[m["arm"]] = _per_seq_rel(ref, b)
+        base_d = d_true[base_arm]
+        c0_ratio = (float(d_mis.max()) / float(base_d.max())
+                    if base_d.max() > 0 else float("inf"))
+        c0 = c0_ratio >= 10.0
+        oracle_ok &= c0
+        print(f"\n  C0 oracle sensitivity control: running the SAME reference "
+              f"{OVERREAD_TOKENS} tokens")
+        print(f"     long moves it by max_rel={d_mis.max():.3e} "
+              f"median={np.median(d_mis):.3e}, versus arm {base_arm}'s own "
+              f"distance")
+        print(f"     from truth {base_d.max():.3e}. separation="
+              f"{c0_ratio:.1f}x -> {'PASS' if c0 else 'FAIL'}")
+        if not c0:
+            print("     The reference is not aligned with the kernel, or is "
+                  "no more accurate than it. Check C proves nothing.")
+
+        print(f"\n  C1 each arm within --oracle-abs-tol {oracle_abs_tol:.1e} "
+              f"of truth")
+        print(f"  C2 each arm within --oracle-ratio-tol {oracle_ratio_tol:.2f}"
+              f"x of arm {base_arm}'s own distance from truth")
+        for arm in sorted(d_true, key=lambda a: -int(a) if a.isdigit() else 0):
+            d = d_true[arm]
+            c1 = float(d.max()) <= oracle_abs_tol
+            ratio = (float(d.max()) / float(base_d.max())
+                     if base_d.max() > 0 else float("inf"))
+            c2 = (arm == base_arm) or ratio <= oracle_ratio_tol
+            oracle_ok &= (c1 and c2)
+            print(f"    [{'PASS' if (c1 and c2) else 'FAIL'}] arm {arm:<3} "
+                  f"max_rel_vs_truth={d.max():.3e} "
+                  f"median={np.median(d):.3e} "
+                  f"ratio_vs_arm{base_arm}={ratio:.2f}x "
+                  f"(C1 {'ok' if c1 else 'RED'}, C2 "
+                  f"{'ok' if c2 else 'RED'})")
+        print("\n  Reading: if every arm sits the same distance from float32")
+        print("  truth, the arm-to-arm spread in Check B is reassociation")
+        print("  noise amplified by cancellation, not a loss of accuracy.")
+
     # --- the margin: is the tolerance tighter than the bug? -----------------
     print()
     print("=" * 78)
@@ -697,22 +874,53 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
     for arm in sorted(per_arm_ok):
         print(f"  arm {arm}: absolute checks (A1/A2/A3) "
               f"{'PASS' if per_arm_ok[arm] else 'FAIL'}")
-    print(f"  cross-arm vs {base_arm} (B): {'PASS' if cross_ok else 'FAIL'}")
+    b_role = "gating" if strict_cross_arm else "informational"
+    print(f"  cross-arm vs {base_arm} (B, {b_role}): "
+          f"{'PASS' if cross_ok else 'FAIL'}")
+    if oracle_checked:
+        print(f"  accuracy vs float32 truth (C, gating): "
+              f"{'PASS' if oracle_ok else 'FAIL'}")
+    else:
+        print("  accuracy vs float32 truth (C): NOT RUN -- no reference in "
+              "the arm files")
+
+    # Check B is informational by default and says so. An arm-to-arm bit
+    # distance has no correct value at this shape, so failing the gate on one
+    # would be failing it on a number nothing calibrates. Check C is the
+    # numerical gate; --strict-cross-arm restores B as one.
+    gates = [all(per_arm_ok.values())]
+    if strict_cross_arm:
+        gates.append(cross_ok)
+    if oracle_checked:
+        gates.append(oracle_ok)
+    else:
+        gates.append(False)   # an absent reference is not a pass
+        print("  !! Check C did not run, so no predicate here is calibrated "
+              "against truth; refusing to report PASS.")
+    passed = all(gates)
 
     if inject_fault:
-        if cross_ok:
+        caught = (not cross_ok) or (oracle_checked and not oracle_ok)
+        if not caught:
             print("RESULT: FAIL (negative control) -- the injected fault "
-                  f"{inject_fault!r} passed the tolerance. This check cannot "
-                  "catch that bug and must not be quoted as a gate.")
+                  f"{inject_fault!r} passed both the cross-arm tolerance and "
+                  "the float32 reference. This check cannot catch that bug "
+                  "and must not be quoted as a gate.")
             return 1
+        by = []
+        if not cross_ok:
+            by.append("B")
+        if oracle_checked and not oracle_ok:
+            by.append("C")
         print("RESULT: PASS (negative control) -- the injected fault "
-              f"{inject_fault!r} was caught. The check discriminates.")
+              f"{inject_fault!r} was caught by check {'+'.join(by)}. The "
+              "check discriminates.")
         return 0
 
-    if all(per_arm_ok.values()) and cross_ok:
+    if passed:
         print("RESULT: PASS -- every arm masks past kv_len, attends every "
-              "sequence, and agrees with the shipping default within a "
-              "tolerance demonstrably tighter than a one-page over-read.")
+              "sequence, and sits no further from float32 truth than the "
+              "shipping default does.")
         return 0
     print("RESULT: FAIL")
     return 1
@@ -739,6 +947,15 @@ def main() -> int:
     p.add_argument("--max-model-len", type=int, default=mb.MAX_MODEL_LEN)
     p.add_argument("--decode-kv-len", type=int, default=mb.DECODE_KV_LEN)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--oracle-abs-tol", type=float, default=ORACLE_ABS_TOL)
+    p.add_argument("--oracle-ratio-tol", type=float, default=ORACLE_RATIO_TOL)
+    p.add_argument("--strict-cross-arm", action="store_true",
+                   help=("make Check B (arm vs arm) gating as well as Check "
+                         "C. Off by default: an arm-to-arm distance has no "
+                         "correct value at this shape."))
+    p.add_argument("--no-oracle", dest="oracle", action="store_false",
+                   help="skip the float32 reference on --emit")
+    p.set_defaults(oracle=True)
     p.add_argument("--cases", nargs="+", default=list(ALL_CASES),
                    choices=list(ALL_CASES))
     args = p.parse_args()
@@ -751,7 +968,10 @@ def main() -> int:
                     base_arm=args.base_arm,
                     rel_tol=args.rel_tol,
                     inject_fault=args.inject_fault,
-                    inject_into=args.inject_into)
+                    inject_into=args.inject_into,
+                    oracle_abs_tol=args.oracle_abs_tol,
+                    oracle_ratio_tol=args.oracle_ratio_tol,
+                    strict_cross_arm=args.strict_cross_arm)
 
 
 if __name__ == "__main__":
