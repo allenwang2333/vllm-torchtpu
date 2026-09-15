@@ -612,6 +612,91 @@ def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
     torch.testing.assert_close(layer.weight, expected)
 
 
+def _mla_config(**overrides) -> KimiLinearConfig:
+    kwargs = dict(
+        hidden_size=16,
+        num_attention_heads=4,
+        q_lora_rank=None,
+        kv_lora_rank=8,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        mla_use_nope=True,
+    )
+    kwargs.update(overrides)
+    return KimiLinearConfig(**kwargs)
+
+
+def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(current_platform, "check_and_update_config",
+                        lambda _: None)
+    config = _mla_config(mla_use_nope=False)
+    with pytest.raises(ValueError, match="NoPE MLA only"):
+        MultiHeadLatentAttention(config, VllmConfig(), prefix="a")
+
+
+def test_mla_rejects_incomplete_config(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(current_platform, "check_and_update_config",
+                        lambda _: None)
+    config = _mla_config(kv_lora_rank=None)
+    with pytest.raises(ValueError, match="Incomplete Kimi K3 MLA config"):
+        MultiHeadLatentAttention(config, VllmConfig(), prefix="b")
+
+
+def test_mla_rejects_heads_not_divisible_by_tp(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(current_platform, "check_and_update_config",
+                        lambda _: None)
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 3)
+    config = _mla_config(num_attention_heads=4)
+    with pytest.raises(ValueError, match="divisible by TP size"):
+        MultiHeadLatentAttention(config, VllmConfig(), prefix="c")
+
+
+def test_mixed_parallel_merged_linear_rejects_length_mismatch() -> None:
+    with pytest.raises(ValueError, match="sharding mode"):
+        kimi_attention.MixedParallelMergedLinear(2, [4, 3], [False],
+                                                 bias=False,
+                                                 quant_config=None,
+                                                 prefix="mismatch")
+
+
+def test_mixed_parallel_merged_linear_rejects_tp_indivisible_output(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 2)
+    with pytest.raises(ValueError, match="must divide TP"):
+        kimi_attention.MixedParallelMergedLinear(2, [3, 4], [False, True],
+                                                 bias=False,
+                                                 quant_config=None,
+                                                 prefix="indivisible")
+
+
+def test_kda_state_dtype_reads_model_and_cache_config() -> None:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(mamba_cache_dtype="auto"),
+    )
+    conv_dtype, recurrent_dtype = kimi_attention.kda_state_dtype(vllm_config)
+    assert conv_dtype == torch.float32
+    assert recurrent_dtype == torch.float32
+
+
+def test_load_a_log_flattens_legacy_layout_and_shards_by_rank(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_rank",
+                        lambda: 1)
+    param = torch.empty(2)
+    # Legacy [1, 1, H, 1] layout, H=4: rank 1's shard is entries [2, 4).
+    loaded = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1)
+
+    kimi_attention._load_a_log(param, loaded)
+
+    torch.testing.assert_close(param, torch.tensor([2.0, 3.0]))
+
+
 class _Projection(nn.Module):
 
     def __init__(self, output_size: int) -> None:
@@ -758,6 +843,254 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
         output,
         torch.tensor([[0, 1, 2, 3], [14, 15, 16, 17]], dtype=torch.float32),
     )
+
+
+def _kda_config(**linear_attn_overrides) -> KimiLinearConfig:
+    linear_attn_config = dict(
+        head_dim=4,
+        num_heads=2,
+        short_conv_kernel_size=3,
+        gate_lower_bound=None,
+        use_full_rank_gate=False,
+        kda_layers=[1],
+        full_attn_layers=[],
+    )
+    linear_attn_config.update(linear_attn_overrides)
+    return KimiLinearConfig(
+        hidden_size=16,
+        num_attention_heads=4,
+        num_hidden_layers=1,
+        linear_attn_config=linear_attn_config,
+    )
+
+
+def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`KimiDeltaAttention.__init__` builds real vLLM linear layers and
+    registers real dispatched/pooled Pallas ops; for a construction-only
+    test, both get faked the same way `MultiHeadLatentAttention`'s
+    constructor tests fake theirs.
+    """
+
+    class FakeLinear(nn.Module):
+
+        def __init__(self, input_size, output_size, *args, **kwargs) -> None:
+            super().__init__()
+            del args
+            del kwargs
+            self.output_size = (sum(output_size) if isinstance(
+                output_size, list) else output_size)
+            self.weight = nn.Parameter(
+                torch.empty(self.output_size, input_size))
+
+    for name in ("ColumnParallelLinear", "MergedColumnParallelLinear",
+                 "ReplicatedLinear", "RowParallelLinear"):
+        monkeypatch.setattr(kimi_attention, name, FakeLinear)
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 1)
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_rank",
+                        lambda: 0)
+    monkeypatch.setattr(kimi_attention, "build_kimi_dispatched_kda_op",
+                        lambda *a, **k: (lambda *args, **kwargs: None))
+    monkeypatch.setattr(kimi_attention, "build_kimi_pooled_kda_op",
+                        lambda *a, **k: (lambda *args, **kwargs: None))
+
+
+def test_kda_construction_wires_projections_and_state(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_kda_construction_deps(monkeypatch)
+    config = _kda_config()
+    vllm_config = VllmConfig()
+
+    with set_current_vllm_config(vllm_config):
+        layer = kimi_attention.KimiDeltaAttention(config,
+                                                  vllm_config,
+                                                  prefix="model.layers.0.kda")
+
+    assert layer.num_heads == 2
+    assert layer.head_dim == 4
+    assert layer.fused_fa_ga_proj is not None
+    assert layer.f_a_proj is None
+    assert layer.g_proj is None
+    assert layer.get_state_shape() == ((2, 3, 2, 4), (2, 4, 4))
+    assert vllm_config.compilation_config.static_forward_context[
+        "model.layers.0.kda"] is layer
+
+
+def test_kda_construction_full_rank_gate_builds_separate_projections(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_kda_construction_deps(monkeypatch)
+    config = _kda_config(use_full_rank_gate=True, gate_lower_bound=1.0)
+    vllm_config = VllmConfig()
+
+    with set_current_vllm_config(vllm_config):
+        layer = kimi_attention.KimiDeltaAttention(config,
+                                                  vllm_config,
+                                                  prefix="model.layers.0.kda")
+
+    assert layer.f_a_proj is not None
+    assert layer.g_proj is not None
+    assert layer.fused_fa_ga_proj is None
+    assert layer.g_b_proj is None
+
+
+def test_kda_construction_rejects_duplicate_prefix(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_kda_construction_deps(monkeypatch)
+    config = _kda_config()
+    vllm_config = VllmConfig()
+
+    with set_current_vllm_config(vllm_config):
+        kimi_attention.KimiDeltaAttention(config,
+                                          vllm_config,
+                                          prefix="model.layers.0.kda")
+        with pytest.raises(ValueError, match="Duplicate layer name"):
+            kimi_attention.KimiDeltaAttention(config,
+                                              vllm_config,
+                                              prefix="model.layers.0.kda")
+
+
+def test_kda_construction_rejects_speculative_decode() -> None:
+    config = _kda_config()
+    fake_vllm_config = SimpleNamespace(speculative_config=object())
+
+    with pytest.raises(NotImplementedError, match="speculative decode"):
+        kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="x")
+
+
+def test_kda_construction_rejects_missing_linear_attn_config() -> None:
+    config = KimiLinearConfig(hidden_size=16,
+                              num_attention_heads=4,
+                              num_hidden_layers=1,
+                              linear_attn_config=None)
+    fake_vllm_config = SimpleNamespace(speculative_config=None)
+
+    with pytest.raises(ValueError, match="requires linear_attn_config"):
+        kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="y")
+
+
+def test_kda_construction_rejects_heads_not_divisible_by_tp(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
+                        lambda: 3)
+    config = _kda_config(num_heads=2)
+    fake_vllm_config = SimpleNamespace(speculative_config=None)
+
+    with pytest.raises(ValueError, match="divisible by TP size"):
+        kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="z")
+
+
+def _make_bare_kda_layer(use_full_rank_gate: bool = False):
+    """A `KimiDeltaAttention` with `__init__` skipped, matching the pattern
+    the existing forward-dispatch tests use, extended to cover the
+    full-rank-gate branch and the empty-cache zeros branch."""
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.fused_qkvb_proj = _Projection(14)
+    layer.local_projection_size = 4
+    layer.num_heads = 2
+    layer.head_dim = 2
+    layer.f_b_proj = _Projection(4)
+    layer.o_proj = _IdentityProjection()
+    layer.o_norm = SimpleNamespace(weight=torch.ones(2))
+    layer.use_full_rank_gate = use_full_rank_gate
+    if use_full_rank_gate:
+        layer.f_a_proj = _Projection(2)
+        layer.g_proj = _Projection(4)
+        layer.fused_fa_ga_proj = None
+        layer.g_b_proj = None
+    else:
+        layer.fused_fa_ga_proj = _Projection(4)
+        layer.f_a_proj = None
+        layer.g_proj = None
+        layer.g_b_proj = _Projection(4)
+    layer._metadata = lambda: None
+    layer.kv_cache = None
+    return layer
+
+
+def test_kda_forward_returns_zeros_without_a_bound_cache() -> None:
+    layer = _make_bare_kda_layer()
+    output = layer(torch.arange(2), torch.ones(2, 4))
+    torch.testing.assert_close(output, torch.zeros(2, 4))
+
+
+def test_kda_forward_full_rank_gate_uses_separate_projections() -> None:
+    layer = _make_bare_kda_layer(use_full_rank_gate=True)
+    output = layer(torch.arange(2), torch.ones(2, 4))
+    assert output.shape == (2, 4)
+
+
+def test_metadata_returns_none_without_a_forward_context(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefix = "p"
+    monkeypatch.setattr(kimi_attention, "is_forward_context_available",
+                        lambda: False)
+
+    assert layer._metadata() is None
+
+
+def test_metadata_returns_none_for_a_non_dict_attn_metadata(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefix = "p"
+    monkeypatch.setattr(kimi_attention, "is_forward_context_available",
+                        lambda: True)
+    monkeypatch.setattr(kimi_attention, "get_forward_context",
+                        lambda: SimpleNamespace(attn_metadata="not-a-dict"))
+
+    assert layer._metadata() is None
+
+
+def test_metadata_rejects_wrong_layer_metadata_type(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
+    nn.Module.__init__(layer)
+    layer.prefix = "p"
+    monkeypatch.setattr(kimi_attention, "is_forward_context_available",
+                        lambda: True)
+    monkeypatch.setattr(
+        kimi_attention, "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"p": "wrong-type"}))
+
+    with pytest.raises(TypeError, match="incompatible attention metadata"):
+        layer._metadata()
+
+
+def test_core_attention_pooled_rejects_pcp_streaming(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = _make_bare_kda_layer()
+    monkeypatch.setattr(kimi_attention, "is_pcp_streaming_attention_metadata",
+                        lambda md: True)
+    metadata = SimpleNamespace(mamba_slot_read_offsets=None)
+
+    with pytest.raises(NotImplementedError, match="PCP streaming prefill"):
+        layer._core_attention_pooled(None, None, None, None, None, metadata)
+
+
+def test_core_attention_pooled_rejects_speculative_verify(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = _make_bare_kda_layer()
+    monkeypatch.setattr(kimi_attention, "is_pcp_streaming_attention_metadata",
+                        lambda md: False)
+    metadata = SimpleNamespace(mamba_slot_read_offsets=torch.zeros(1))
+
+    with pytest.raises(NotImplementedError, match="Speculative decoding"):
+        layer._core_attention_pooled(None, None, None, None, None, metadata)
+
+
+def test_core_attention_pooled_requires_state_indices(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    layer = _make_bare_kda_layer()
+    monkeypatch.setattr(kimi_attention, "is_pcp_streaming_attention_metadata",
+                        lambda md: False)
+    metadata = SimpleNamespace(mamba_slot_read_offsets=None,
+                               mamba_state_indices=None)
+
+    with pytest.raises(RuntimeError, match="requires mamba_state_indices"):
+        layer._core_attention_pooled(None, None, None, None, None, metadata)
 
 
 def test_kda_custom_ops_compile_as_one_full_graph(

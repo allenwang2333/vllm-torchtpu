@@ -33,6 +33,7 @@ import numpy as np
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
@@ -474,6 +475,102 @@ class SparseMlaAttentionTest(parameterized.TestCase):
                                           list(range(num_seqs + 1)), kv_c_deq,
                                           k_pe_deq)
         self._check(output, expected, valid)
+
+
+class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
+    """`sparse_mla_attention_dcp` rejects a bad DCP mesh/shape before it ever
+    builds the sharded kernel dispatch, so these run without a real DCP-sized
+    mesh or kernel call."""
+
+    def _mesh(self, axis_name, size):
+        devices = jax.local_devices()
+        if len(devices) < size:
+            self.skipTest(f"needs {size} local devices, got {len(devices)}")
+        return jax.sharding.Mesh(np.array(devices[:size]), (axis_name, ))
+
+    def test_dcp_size_must_exceed_one(self):
+        with self.assertRaisesRegex(ValueError, "dcp_size > 1"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=None,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=1,
+                                                         interleave_size=1)
+
+    def test_mesh_missing_dcp_axis_raises(self):
+        mesh = self._mesh("x", 1)
+        with self.assertRaisesRegex(ValueError, "requires a mesh with"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=mesh,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
+
+    def test_mesh_axis_size_mismatch_raises(self):
+        mesh = self._mesh(streamindex_topk.DCP_AXIS_NAME, 1)
+        with self.assertRaisesRegex(ValueError, "does not match mesh axis"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=mesh,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
+
+    def test_local_topk_indices_row_count_mismatch_raises(self):
+        mesh = self._mesh(streamindex_topk.DCP_AXIS_NAME, 2)
+        num_tokens = 4
+        ql_nope = jnp.zeros((num_tokens, 2, 8))
+        # One row short of the required dcp_size * num_tokens.
+        bad_topk = jnp.zeros((2 * num_tokens - 1, 8), jnp.int32)
+
+        with self.assertRaisesRegex(ValueError, "one row per"):
+            attention_interface.sparse_mla_attention_dcp(ql_nope,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         bad_topk,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=mesh,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
 
 
 class MaskedDensePrefillTierTest(parameterized.TestCase):
