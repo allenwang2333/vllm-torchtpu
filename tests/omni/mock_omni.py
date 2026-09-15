@@ -114,6 +114,8 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
     lambda *args, **kwargs: None)
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = (
     _MockLTXRuntime)
+vllm_omni_mock.diffusion.models.flux2_klein.flux2_klein_transformer.Flux2Transformer2DModel = (
+    MagicMock())
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -136,3 +138,8 @@ sys.modules["vllm_omni.diffusion.models.ltx2"] = (
     vllm_omni_mock.diffusion.models.ltx2)
 sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
     vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime)
+sys.modules["vllm_omni.diffusion.models.flux2_klein"] = (
+    vllm_omni_mock.diffusion.models.flux2_klein)
+sys.modules[
+    "vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer"] = (
+        vllm_omni_mock.diffusion.models.flux2_klein.flux2_klein_transformer)
