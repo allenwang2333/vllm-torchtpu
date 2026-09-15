@@ -538,6 +538,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # first because _ensure_tuple_output rewrites the output node in place
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
+        graph_orig = copy.deepcopy(graph)
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
@@ -576,7 +577,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # refuses it reuses this runnable instead of building a second
         # executable for it (see shape_variants.BucketExecutables).
         if key is not None and size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            shape_variants.remember(self.cache_dir, key, graph_orig,
+                                    compiled_fn)
         return compiled_fn, handle
 
     def load(
@@ -617,6 +619,7 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
+        graph_orig = copy.deepcopy(graph)
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
@@ -636,5 +639,6 @@ class TpuCompilerAdaptor(CompilerInterface):
         # one, so a graph that refuses this bucket reuses this runnable instead
         # of replaying the artifact into a second HBM program region.
         if size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            shape_variants.remember(self.cache_dir, key, graph_orig,
+                                    compiled_fn)
         return compiled_fn
