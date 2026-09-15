@@ -61,17 +61,15 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  # P0 bisect: CI job "Integration: qwen35-pcp8-dp8-disagg-correctness" with
-  # only the dependency pins named in the label changed relative to main.
-  - label: "qwen35 p8d8 disagg, main + torch-tpu 0912 + libtpu 0.0.47, raiden 0827 (TPU v7x-16)"
-    key: dev_p8d8_bisect
+  # P0: does PCP8 prefill compute alone (no disagg, single host) produce
+  # correct tokens on torch-tpu 0912 + libtpu 0.0.47?
+  - label: "pcp8 correctness (no disagg), torch-tpu 0912 + libtpu 0.0.47 (TPU v7x-8)"
+    key: dev_pcp8_compute
     depends_on: build_docker
-    timeout_in_minutes: 90
+    timeout_in_minutes: 60
     agents:
-      queue: "tpu_v7x_16_queue"
-    env:
-      TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+      queue: "tpu_v7x_8_queue"
     commands:
-      - "bash .buildkite/scripts/run_disagg_multihost.sh"
+      - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_pcp_correctness.sh"
     artifact_paths:
       - "perf_eval_results/**/*"
