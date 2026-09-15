@@ -60,7 +60,6 @@ Usage:
 """
 
 import argparse
-import functools
 import re
 import statistics
 import sys
@@ -153,6 +152,19 @@ def _call(wl, d_block_sizes, sm_scale):
     )
 
 
+def _closed_over(wl):
+    """Everything but the KV cache, to be captured rather than passed.
+
+    ``distribution`` must reach the kernel as a *concrete* array: both
+    `dynamic_validate_inputs` and `RpaCase.get_range` do Python-level
+    comparisons on its entries (``if not (i <= j <= k)``,
+    `v3/kernel.py:1311`), which raises `TracerBoolConversionError` if it
+    arrives as a jit argument.  Closing over the workload makes it a compile
+    time constant.  Nothing here varies across iterations anyway.
+    """
+    return {k: v for k, v in wl.items() if k != "kv_cache"}
+
+
 def _build_chain(wl, d_block_sizes, sm_scale, chain):
     """A jit of `chain` back-to-back decode calls, threading the KV cache.
 
@@ -161,7 +173,7 @@ def _build_chain(wl, d_block_sizes, sm_scale, chain):
     the thing being measured.  The cache is threaded because the kernel donates
     and updates it; q/k/v are loop-invariant and tiny (64 x 4 x 128).
     """
-    static = {k: v for k, v in wl.items() if k != "kv_cache"}
+    static = _closed_over(wl)
 
     @jax.jit
     def run(kv_cache):
@@ -203,18 +215,28 @@ def _time(run, kv_cache, iters, warmup, chain):
 
 
 def _reference(wl, sm_scale):
-    return jax.jit(
-        functools.partial(ref_ragged_paged_attention, sm_scale=sm_scale))(
-            wl["q"], wl["k"], wl["v"], wl["kv_cache"], wl["kv_lens"],
-            wl["page_indices"], wl["cu_q_lens"], wl["distribution"])
+    s = _closed_over(wl)
+
+    @jax.jit
+    def run(kv_cache):
+        return ref_ragged_paged_attention(s["q"], s["k"], s["v"], kv_cache,
+                                          s["kv_lens"], s["page_indices"],
+                                          s["cu_q_lens"], s["distribution"],
+                                          sm_scale=sm_scale)
+
+    return run(wl["kv_cache"])
 
 
 def _check(wl, d_block_sizes, sm_scale, rtol, atol):
     """Single (unchained) call compared against the XLA reference."""
+    s = _closed_over(wl)
+
+    @jax.jit
+    def run(kv_cache):
+        return _call(dict(s, kv_cache=kv_cache), d_block_sizes, sm_scale)
+
     ref, _ = _reference(wl, sm_scale)
-    got, _ = jax.jit(functools.partial(_call,
-                                       d_block_sizes=d_block_sizes,
-                                       sm_scale=sm_scale))(wl)
+    got, _ = run(wl["kv_cache"])
     r = np.asarray(ref, dtype=np.float32)
     g = np.asarray(got, dtype=np.float32)
     if r.shape != g.shape:
@@ -327,6 +349,18 @@ def main():
     failures = []
 
     def measure(label, kv_len, d_block_sizes, want_scope=None):
+        """Time one variant. Records a failure rather than raising, so that a
+        single bad block size costs its own row and not the rest of the sweep.
+        """
+        try:
+            return _measure(label, kv_len, d_block_sizes, want_scope)
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            traceback.print_exc()
+            print(f"[{label}] ERROR: {type(exc).__name__}: {exc}\n")
+            failures.append(f"{label}: raised {type(exc).__name__}: {exc}")
+            return None
+
+    def _measure(label, kv_len, d_block_sizes, want_scope=None):
         wl, run = build(kv_len, d_block_sizes)
         scopes, err = _compiled_scopes(run, wl["kv_cache"])
         if err:
@@ -342,11 +376,10 @@ def main():
                         args.chain)
         med = statistics.median(samples)
 
-        ok, detail = (True, "skipped")
-        if not args.skip_check:
-            ok, detail = _check(wl, d_block_sizes, sm_scale, args.rtol,
-                                args.atol)
-
+        # Print the timing before running the correctness check. The check is
+        # the more fragile of the two -- it traces a second, different program
+        # -- and a throw there would otherwise discard a measurement that has
+        # already been taken, losing the whole arm instead of one column.
         step_bytes = (args.num_seqs * (-(-kv_len // page_size)) * page_size *
                       bytes_per_token)
         gib_s = step_bytes / (med * 1e-6) / 2**30
@@ -354,9 +387,18 @@ def main():
         print(f"[{label}] median {med:9.2f} us   min {min(samples):9.2f}   "
               f"p90 {np.percentile(samples, 90):9.2f}   "
               f"spread {100.0*(max(samples)-min(samples))/med:5.1f}%")
-        print(f"[{label}] {gib_s:7.1f} GiB/s materialized   "
-              f"correctness {'PASS' if ok else 'FAIL'} {detail}")
+        print(f"[{label}] {gib_s:7.1f} GiB/s materialized")
         print(f"[{label}] compiled scopes: {decode}")
+
+        ok, detail = (True, "skipped (--skip-check)")
+        if not args.skip_check:
+            try:
+                ok, detail = _check(wl, d_block_sizes, sm_scale, args.rtol,
+                                    args.atol)
+            except Exception as exc:  # pragma: no cover - diagnostic path
+                traceback.print_exc()
+                ok, detail = False, f"check raised {type(exc).__name__}: {exc}"
+        print(f"[{label}] correctness {'PASS' if ok else 'FAIL'}  {detail}")
         print()
 
         if not ok:
