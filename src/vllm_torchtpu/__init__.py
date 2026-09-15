@@ -698,11 +698,13 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 _has_spec_type(group.kv_cache_spec, AttentionSpec)
                 for group in groups)
 
-    def _with_effective_block_size(spec: KVCacheSpec, pcp: int) -> KVCacheSpec:
+    def _with_effective_block_size(spec: KVCacheSpec,
+                                   pcp: int,
+                                   dcp: int = 1) -> KVCacheSpec:
         """Restate a rank-local spec in the logical (all-ranks) page size."""
         if isinstance(spec, UniformTypeKVCacheSpecs):
             effective_specs = {
-                name: _with_effective_block_size(leaf, pcp)
+                name: _with_effective_block_size(leaf, pcp, dcp)
                 for name, leaf in spec.kv_cache_specs.items()
             }
             effective_block_size = math.lcm(
@@ -710,12 +712,14 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             return replace(spec,
                            block_size=effective_block_size,
                            kv_cache_specs=effective_specs)
-        if isinstance(spec, (AttentionSpec, MambaSpec)):
+        if isinstance(spec, AttentionSpec):
+            return replace(spec, block_size=spec.block_size * pcp * dcp)
+        if isinstance(spec, MambaSpec):
             return replace(spec, block_size=spec.block_size * pcp)
         return spec
 
-    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
-        return _with_effective_block_size(spec, pcp).block_size
+    def _effective_block_size(spec: KVCacheSpec, pcp: int, dcp: int = 1) -> int:
+        return _with_effective_block_size(spec, pcp, dcp).block_size
 
     def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         cache_config = vllm_config.cache_config
@@ -789,7 +793,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 # constructing KVCacheManager. Recover the folded PCP factor
                 # from the logical scheduler block and the rank-local specs.
                 physical_scheduler_block_size = math.lcm(
-                    *(_effective_block_size(group.kv_cache_spec, 1)
+                    *(_effective_block_size(group.kv_cache_spec, 1, dcp_world_size)
                       for group in groups))
                 if scheduler_block_size % physical_scheduler_block_size != 0:
                     raise ValueError(
