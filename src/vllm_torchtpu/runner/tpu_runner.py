@@ -1962,8 +1962,6 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Compact mamba sizing skipped.")
             return
         cache_config = self.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
-            return
         if group_size <= 0:
             return
 
@@ -1996,8 +1994,11 @@ class TPUModelRunner(GPUModelRunner):
                 f"per-tensor KV budget is {avail_per_tensor} B. Raise "
                 f"`gpu_memory_utilization` or lower `max_num_seqs`.")
 
-        attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
-                                                    attn_page_size_bytes)
+        if cache_config.num_gpu_blocks_override is not None:
+            attn_num_blocks = int(cache_config.num_gpu_blocks_override)
+        else:
+            attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
+                                                        attn_page_size_bytes)
         if attn_num_blocks <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: no attention blocks "
@@ -2075,6 +2076,18 @@ class TPUModelRunner(GPUModelRunner):
         condense/swap reordering automatically because the map is keyed on the
         stable req_id, not the moving persistent-batch position.
         """
+        req_ids = self.input_batch.req_ids
+        num_live = max(0, min(num_reqs, len(req_ids) - start_index))
+        cache_key = (
+            start_index,
+            num_reqs,
+            target_num_reqs,
+            tuple(req_ids[start_index:start_index + num_live]),
+            len(self.input_batch.req_id_to_index),
+        )
+        if getattr(self, "_mamba_state_indices_cache_key", None) == cache_key:
+            return self._cached_mamba_state_indices
+
         live_req_ids = set(self.input_batch.req_id_to_index.keys())
         # Free slots for requests that left the batch.
         for req_id in list(self._mamba_slot_by_req_id.keys()):
@@ -2084,8 +2097,6 @@ class TPUModelRunner(GPUModelRunner):
 
         indices = self.mamba_state_indices_cpu[:target_num_reqs]
         indices.fill_(0)
-        req_ids = self.input_batch.req_ids
-        num_live = max(0, min(num_reqs, len(req_ids) - start_index))
         for i in range(num_live):
             req_id = req_ids[start_index + i]
             assert req_id is not None
@@ -2097,7 +2108,10 @@ class TPUModelRunner(GPUModelRunner):
                 slot = self._free_mamba_slots.pop()
                 self._mamba_slot_by_req_id[req_id] = slot
             indices[i] = slot
-        return indices.to(self.device, non_blocking=True)
+        dev_indices = indices.to(self.device, non_blocking=True)
+        self._mamba_state_indices_cache_key = cache_key
+        self._cached_mamba_state_indices = dev_indices
+        return dev_indices
 
     def _build_mamba_copy_plan(
         self,
@@ -2141,8 +2155,11 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_copy_plan = plan
         for raw in raw_tensors:
             if raw.dim() > 1:
-                kernel_block_size = (raw.shape[-1] if get_kv_cache_layout()
-                                     == "HND" else raw.shape[1])
+                is_seq_lane = (get_kv_cache_layout() == "HND"
+                               and not (raw.dim() == 5 and raw.shape[1] >= 128
+                                        and raw.shape[2] <= 16))
+                kernel_block_size = (raw.shape[-1] if is_seq_lane else
+                                     raw.shape[1])
                 self._pool_block_split = (self.cache_config.block_size //
                                           kernel_block_size)
                 break
@@ -2988,13 +3005,20 @@ class TPUModelRunner(GPUModelRunner):
             )
 
         # Prepare the attention metadata.
-        self.query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens_per_req,
-                  out=self.query_start_loc_np[1:num_reqs + 1])
-        # Keep padded entries equal to the last valid location so padded
-        # requests have zero length instead of a negative q_len.
-        self.query_start_loc_np[num_reqs +
-                                1:] = self.query_start_loc_np[num_reqs]
+        is_decode_only_step = (max_num_scheduled_tokens_all_reqs == 1)
+        if is_decode_only_step and getattr(
+                self, "_last_query_start_loc_decode_reqs", -1) == num_reqs:
+            pass
+        else:
+            self.query_start_loc_np[0] = 0
+            np.cumsum(num_scheduled_tokens_per_req,
+                      out=self.query_start_loc_np[1:num_reqs + 1])
+            # Keep padded entries equal to the last valid location so padded
+            # requests have zero length instead of a negative q_len.
+            self.query_start_loc_np[num_reqs + 1:self.max_num_reqs +
+                                    2] = self.query_start_loc_np[num_reqs]
+            self._last_query_start_loc_decode_reqs = (
+                num_reqs if is_decode_only_step else -1)
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[start_index:start_index +
@@ -3137,12 +3161,16 @@ class TPUModelRunner(GPUModelRunner):
                                      and spec_decode_metadata is None and
                                      layout_plan.logits_indices_cpu is None)
 
-        if (can_cache_decode_metadata
-                and decode_cache_key == self._decode_device_cache_key):
+        decode_cache_dict = getattr(self, "_decode_device_cache_dict", None)
+        if decode_cache_dict is None:
+            decode_cache_dict = {}
+            self._decode_device_cache_dict = decode_cache_dict
+
+        cached_tuple = decode_cache_dict.get(
+            decode_cache_key) if can_cache_decode_metadata else None
+        if cached_tuple is not None:
             # Reuse cached device tensors — skip 3 H2D copies.
-            query_start_loc = self._cached_query_start_loc
-            logits_indices = self._cached_logits_indices
-            request_distribution = self._cached_request_distribution
+            query_start_loc, logits_indices, request_distribution = cached_tuple
         else:
             # Compute and copy to device (first call or shape changed).
             if use_max_model_len:
@@ -3184,11 +3212,12 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True)
 
             if can_cache_decode_metadata:
-                # Cache for future decode steps.
-                self._decode_device_cache_key = decode_cache_key
-                self._cached_query_start_loc = query_start_loc
-                self._cached_logits_indices = logits_indices
-                self._cached_request_distribution = request_distribution
+                # Cache for future decode steps across all batch size buckets.
+                decode_cache_dict[decode_cache_key] = (
+                    query_start_loc,
+                    logits_indices,
+                    request_distribution,
+                )
 
         # Compact-mamba: per-request recurrent-slot ids for this chunk. Only
         # built for hybrid models (slot pool initialized in
@@ -3490,13 +3519,18 @@ class TPUModelRunner(GPUModelRunner):
 
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output)
+        effective_total_scheduled_tokens = (
+            scheduler_output.total_num_scheduled_tokens
+            if num_decode_reqs == self.input_batch.num_reqs else
+            max(scheduler_output.total_num_scheduled_tokens, 16)
+        )
 
         # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
         if self.phase_based_profiler:
             self.batch_counter += 1
             padded_total_tokens = _get_padded_token_len(
                 self.num_tokens_paddings,
-                scheduler_output.total_num_scheduled_tokens)
+                effective_total_scheduled_tokens)
             batch_composition_stats = runner_utils.get_batch_composition_stats(
                 batch_id=self.batch_counter,
                 input_batch=self.input_batch,
@@ -3538,7 +3572,7 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
+            effective_total_scheduled_tokens,
             local_num_chunks,
             # Exact per-chunk request bound on this rank; the DP-wide MAX of
             # it sizes every rank's draft forwards.
