@@ -734,7 +734,7 @@ def _build_v3_pool_state_plan(
                          f"pool kernel block size: {pool_block_tokens} and "
                          f"{block_size}.")
     split = pool_block_tokens // block_size
-    if pool_adapters.is_seq_along_lane_pool():
+    if pool_adapters.is_seq_along_lane_pool(pool):
         tok_bytes = math.prod(payload) * jnp.dtype(pool.dtype).itemsize
     else:
         tok_bytes = math.prod(payload) * lanes * jnp.dtype(pool.dtype).itemsize
