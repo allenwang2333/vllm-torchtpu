@@ -34,8 +34,18 @@ decode shape does not:
   * A partial final block (`kv_len % bkv_csz != 0`) and ragged per-sequence
     `kv_len`, so the tail is exercised at an offset rather than on a boundary.
 
-`test_parity_resolves_a_one_column_bound_error` is the negative control: it
-asserts that this comparison actually *fails* when the kv bound is off by one.
+Two checks, and the order matters. `test_collapsed_and_general_paths_agree` is
+the PRIMARY gate: it runs the same kernel twice on the same inputs, once down
+the collapsed path and once down the general path (a `sliding_window` wider
+than any kv_len excludes the collapse while masking nothing), so quantization
+and accumulation order are identical on both sides and it can assert at 1e-3
+on fp8 as well as bf16. `test_pallas_matches_reference` is the secondary
+check: it is the only one independent of the kernel, but it pays for that with
+a tolerance 30x looser, and on fp8 the price is more than the signal is worth
+-- see its docstring.
+
+`test_parity_resolves_a_kv_bound_error` is the negative control: it asserts
+that the reference comparison actually *fails* when the bound is loose.
 Without it, a green suite here would be as uninformative as the bundled one.
 
 If you inject a fault into the kernel to re-check this suite's teeth, do not
@@ -89,8 +99,15 @@ PAGE_SIZE = 16
 POISON_V = 64.0
 NEW_V = 16.0
 
+# Reference comparison (bf16 only): absorbs the online-softmax vs dense
+# accumulation-order difference. Loose, and held honest by
+# `test_parity_resolves_a_kv_bound_error`.
 RTOL = 3e-2
 ATOL = 5e-2
+# Same-kernel A/B: no dtype or accumulation asymmetry on either side, so this
+# is where the real resolving power lives.
+AB_RTOL = 1e-3
+AB_ATOL = 1e-3
 
 
 def _require_tpu() -> None:
@@ -247,50 +264,112 @@ def _valid_rows(wl, seqs):
 @pytest.mark.parametrize("case", sorted(CASES))
 @pytest.mark.parametrize("kv_dtype", [jnp.bfloat16, jnp.float8_e4m3fn],
                          ids=["bf16", "fp8"])
-def test_pallas_matches_reference(case, kv_dtype):
-    """The Pallas kernel must agree with the dense reference on every shape.
+def test_collapsed_and_general_paths_agree(case, kv_dtype):
+    """PRIMARY GATE. The collapsed path must match the general path exactly.
 
-    This is the assertion `test_rpa_bundled.py` cannot make, because both of its
-    sides route through `ragged_paged_attention`.
+    `sliding_window` is excluded from the collapse, so passing one routes the
+    identical workload down the general path. The window is set wider than any
+    kv_len here, so it masks nothing and the two calls are mathematically the
+    same attention -- the only difference is which branch computes the bounds,
+    which is precisely the code under test.
+
+    This is the primary gate rather than the reference comparison below, for
+    one reason: both sides are the *same kernel* on the *same inputs* in the
+    *same dtype*, so there is no quantization asymmetry and no online-vs-dense
+    accumulation-order difference to absorb. The tolerance can therefore be
+    ~30x tighter than the reference comparison can afford, and -- unlike that
+    comparison -- it stays tight on fp8, which is the configuration the
+    optimization actually ships on. Any error in the collapsed bounds shows up
+    here at full amplitude.
     """
     _require_tpu()
     spec = CASES[case]
     wl = _build(spec["seqs"], spec["distribution"], kv_dtype)
     scales = dict(k_scale=1.0,
                   v_scale=1.0) if kv_dtype == jnp.float8_e4m3fn else {}
+    wide = int(max(kv for kv, _ in spec["seqs"])) + 1
 
-    got, got_cache = _call(K.ragged_paged_attention, wl, spec["bkv"], **scales)
-    want, want_cache = _call(K.ref_ragged_paged_attention, wl, spec["bkv"],
-                             **scales)
+    collapsed, collapsed_cache = _call(K.ragged_paged_attention, wl,
+                                       spec["bkv"], **scales)
+    general, general_cache = _call(K.ragged_paged_attention,
+                                   wl,
+                                   spec["bkv"],
+                                   sliding_window=wide,
+                                   **scales)
 
     rows = _valid_rows(wl, spec["seqs"])
-    # Tolerance absorbs fp8 quantization and the accumulation-order difference
-    # between an online-softmax kernel and a dense reference; it is not what
-    # gives the suite its teeth. The planted signals do that, and
-    # `test_parity_resolves_a_one_column_bound_error` is what holds these two
-    # numbers honest -- if they are ever loosened far enough to hide a
-    # one-column error, that test goes red.
+    np.testing.assert_allclose(collapsed[rows],
+                               general[rows],
+                               rtol=AB_RTOL,
+                               atol=AB_ATOL,
+                               err_msg=f"output mismatch for {case}/{kv_dtype}")
+    np.testing.assert_allclose(collapsed_cache,
+                               general_cache,
+                               rtol=AB_RTOL,
+                               atol=AB_ATOL,
+                               err_msg=f"cache mismatch for {case}/{kv_dtype}")
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_pallas_matches_reference(case):
+    """The Pallas kernel must agree with the dense reference on every shape.
+
+    This is the assertion `test_rpa_bundled.py` cannot make, because both of
+    its sides route through `ragged_paged_attention`. It is the only check here
+    that is independent of the kernel entirely, which is why it is kept even
+    though the A/B above is the sharper instrument.
+
+    bf16 only, and that is a real limitation rather than an oversight. Job
+    j-18bdb2f9 ran this against fp8 with the planted signal and got up to 13.9%
+    of elements out of tolerance on the *pristine* kernel: `float8_e4m3fn` has
+    three mantissa bits, so a cache holding both POISON_V-scale values and
+    N(0, 0.5) history quantizes coarsely at the top of that range, and the
+    online-softmax and dense accumulations then diverge at the scale of the
+    large term. Shrinking the signal to fit fp8 shrinks it below what a
+    one-column error plants, so the two requirements are in direct conflict and
+    there is no scale that satisfies both. fp8 is covered by the A/B above,
+    where quantization is symmetric and cancels.
+    """
+    _require_tpu()
+    spec = CASES[case]
+    wl = _build(spec["seqs"], spec["distribution"], jnp.bfloat16)
+
+    got, got_cache = _call(K.ragged_paged_attention, wl, spec["bkv"])
+    want, want_cache = _call(K.ref_ragged_paged_attention, wl, spec["bkv"])
+
+    rows = _valid_rows(wl, spec["seqs"])
     np.testing.assert_allclose(got[rows],
                                want[rows],
                                rtol=RTOL,
                                atol=ATOL,
-                               err_msg=f"output mismatch for {case}/{kv_dtype}")
+                               err_msg=f"output mismatch for {case}")
     np.testing.assert_allclose(got_cache,
                                want_cache,
                                rtol=RTOL,
                                atol=ATOL,
-                               err_msg=f"cache mismatch for {case}/{kv_dtype}")
+                               err_msg=f"cache mismatch for {case}")
 
 
-def test_parity_resolves_a_one_column_bound_error():
-    """Negative control: the comparison above must catch an off-by-one bound.
+def test_parity_resolves_a_kv_bound_error():
+    """Negative control: the reference comparison must catch a loose kv bound.
 
     A green parity suite proves nothing unless the comparison can resolve the
-    error class it is meant to guard. Here the *reference* is given a kv_len one
-    larger than the kernel's for a single sequence, which is exactly the
-    observable effect of a `+ 1` slipping into (or out of) the collapsed bound.
-    If this test starts passing -- i.e. the mismatch stops being detected -- the
-    tolerances above have gone slack and the suite is no longer a gate.
+    error class it is meant to guard. The *reference* is given a larger kv_len
+    than the kernel for one sequence, so it reads a slot the kernel's bound
+    correctly excludes. That slot is poisoned, so the deviation is ~POISON_V /
+    kv_len rather than ~0.4%.
+
+    The bump is 2, not 1, and it has to be. The new tokens are written at
+    `kv_len - q_len`, so bumping kv_len by one advances the write position onto
+    the very slot the extra read would have covered: the perturbed reference
+    overwrites the poison with its own token before attending to it, and the
+    only residue is one ordinary history column at weight ~1/kv_len, which is
+    a deviation of order 0.002. Job j-18bdb2f9 measured exactly that and the
+    control reported DID NOT RAISE. A bump of 2 leaves one poisoned slot inside
+    the read extent and outside the write position. Decoupling the read extent
+    from the write position to get a true one-column control is not expressible
+    through `kv_lens` alone; the one-column case is covered instead by injecting
+    the fault into the kernel and running the A/B above.
     """
     _require_tpu()
     spec = CASES["decode_multi_trip"]
@@ -300,7 +379,7 @@ def test_parity_resolves_a_one_column_bound_error():
 
     perturbed = dict(wl)
     bumped = wl["kv_lens"].copy()
-    bumped[0] += 1
+    bumped[0] += 2
     perturbed["kv_lens"] = bumped
     want, _ = _call(K.ref_ragged_paged_attention, perturbed, spec["bkv"])
 
@@ -309,32 +388,3 @@ def test_parity_resolves_a_one_column_bound_error():
         np.testing.assert_allclose(got[rows], want[rows], rtol=RTOL, atol=ATOL)
 
 
-def test_collapsed_and_general_paths_agree():
-    """The collapsed path and the general path must produce the same answer.
-
-    `sliding_window` is excluded from the collapse, so passing one routes the
-    identical workload down the general path. Agreement between the two is a
-    direct A/B of the collapse itself, independent of the reference: the window
-    is set wider than any kv_len here, so it masks nothing and the two calls are
-    mathematically the same attention.
-    """
-    _require_tpu()
-    spec = CASES["specdecode_causal_vs_kv"]
-    wl = _build(spec["seqs"], spec["distribution"], jnp.bfloat16)
-    wide = int(max(kv for kv, _ in spec["seqs"])) + 1
-
-    collapsed, collapsed_cache = _call(K.ragged_paged_attention, wl,
-                                       spec["bkv"])
-    general, general_cache = _call(K.ragged_paged_attention,
-                                   wl,
-                                   spec["bkv"],
-                                   sliding_window=wide)
-
-    rows = _valid_rows(wl, spec["seqs"])
-    # Both sides are the same kernel on the same inputs, differing only in
-    # which branch computes the bounds, so this is far tighter than the
-    # reference comparison above.
-    np.testing.assert_allclose(collapsed[rows], general[rows], rtol=1e-3,
-                               atol=1e-3)
-    np.testing.assert_allclose(collapsed_cache, general_cache, rtol=1e-3,
-                               atol=1e-3)
