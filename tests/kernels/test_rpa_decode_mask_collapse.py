@@ -27,7 +27,9 @@ decode shape does not:
     `bkv_csz >= kv_len` runs a single trip with `processed_kv_len == 0`, where
     dropping the subtraction entirely is undetectable. Every case here forces
     at least two trips.
-  * `q_len > 1` with `bq_csz == 1`. In pure decode `processed_q_len + 1` and
+  * `q_len > 1` with `bq_csz == 1` *and `bq_sz > 1`*. The last of those three
+    is easy to miss and voids the other two: see BQ_SZ. In pure decode
+    `processed_q_len + 1` and
     `effective_kv_len` are *equal* at every `bkv_start`, so `jnp.minimum` is a
     no-op and dropping either term -- or the `minimum` itself -- changes
     nothing. Only a multi-token query block separates them.
@@ -98,6 +100,29 @@ PAGE_SIZE = 16
 # of ~0.1, i.e. tens of percent, against tolerances of a few percent.
 POISON_V = 64.0
 NEW_V = 16.0
+
+# The q *fetch* block size. It must be > 1 while bq_csz stays 1, and job
+# j-329615f6 is the reason: with both pinned to 1 the collapsed bounds cannot
+# be wrong, so the suite passed two deliberately broken kernels.
+#
+# `effective_kv_len` is computed once per bq block (kernel.py:996-998) as
+#   min(kv_len, processed_q_len + actual_bq_sz)
+# while the causal clamp inside the collapsed path uses the *chunk's* offset,
+#   processed_q_len + bq_start                    (kernel.py:1093)
+# with bq_start stepping by actual_bq_csz. When actual_bq_sz == 1 there is one
+# chunk at bq_start == 0, so the block bound and the chunk bound coincide and
+# `jnp.minimum` returns its first argument unchanged -- deleting the clamp or
+# loosening it to +2 are then no-ops by construction, in the same way the
+# earlier v_bound mutation was. Pinning bq_sz to 1, as this file previously
+# did, put every case in exactly that regime.
+#
+# With bq_sz > 1 and q_len > 1 the early chunks of a block have a causal bound
+# strictly tighter than the block's effective_kv_len, the clamp binds, and a
+# wrong bound reads future tokens of the same sequence -- which is what NEW_V
+# is scaled to expose. Note this regime is not reachable in pure decode
+# (q_len == 1 forces actual_bq_sz == 1 via `min(bq_sz, static_q_len)`), so the
+# cases that exercise it are the speculative-decode and mixed ones.
+BQ_SZ = 8
 
 # Reference comparison (bf16 only): absorbs the online-softmax vs dense
 # accumulation-order difference. Loose, and held honest by
@@ -226,7 +251,10 @@ def _build(seqs, distribution, kv_dtype, seed=0):
 
 
 def _call(fn, wl, bkv, **kw):
-    """Invoke `fn` with bq_csz pinned to 1 and bkv_csz pinned to `bkv`.
+    """Invoke `fn` with bq_csz pinned to 1, bq_sz at BQ_SZ, bkv_csz at `bkv`.
+
+    bq_csz == 1 is what selects the collapsed path; bq_sz > 1 is what makes the
+    causal clamp inside it able to bind. See BQ_SZ.
 
     All three case block-size tuples are set identically so that whichever of
     decode/prefill/mixed the `distribution` selects, the collapsed path is the
@@ -237,7 +265,7 @@ def _call(fn, wl, bkv, **kw):
     callee donates (and therefore deletes) what it is given. See `_build`.
     """
     d = {k: jnp.asarray(v) for k, v in wl.items()}
-    blocks = (1, bkv, 1, bkv)
+    blocks = (BQ_SZ, bkv, 1, bkv)
     extra = {} if fn is K.ref_ragged_paged_attention else dict(
         d_block_sizes=blocks, p_block_sizes=blocks, m_block_sizes=blocks)
     out, cache = fn(d["queries"],
