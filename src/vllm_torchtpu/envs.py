@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
-    RPA_SKIP_EMPTY_PASS: bool = True
+    RPA_SKIP_EMPTY_PASS: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -592,10 +592,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
     # Skip an RPA v3 pass whose sequence range is empty, rather than paying a
-    # full launch and teardown for a kernel whose body never runs. Set to 0 to
-    # restore the unconditional launches for an A/B.
+    # full launch and teardown for a kernel whose body never runs.
+    #
+    # OFF by default, and measured: j-62883531 clocked this at 5649.81 us
+    # against a 157.71 us baseline, a 36x regression. The `lax.cond` defeats
+    # `input_output_aliases={7: 0, 9: 1}`, so XLA copies the whole 1.93 GB KV
+    # cache per call instead of eliding a ~6 us launch. It is not the traced
+    # predicate: the same job's constant-distribution arm paid 5604.42 us, the
+    # same cost. Do not turn this on without fixing the aliasing first.
     "RPA_SKIP_EMPTY_PASS":
-    env_bool("RPA_SKIP_EMPTY_PASS", default=True),
+    env_bool("RPA_SKIP_EMPTY_PASS", default=False),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
     "USE_RPA_PIPELINED_DMA_STAGING":

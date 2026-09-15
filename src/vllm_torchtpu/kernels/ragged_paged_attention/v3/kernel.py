@@ -1940,13 +1940,25 @@ def ragged_paged_attention(
         false branch returns the buffers untouched, which is what the kernel
         would have left behind anyway.
 
-        The risk to watch is aliasing: the true branch's custom call updates
-        the KV cache in place, and if XLA cannot prove the conditional
-        preserves that, it will copy a multi-gigabyte buffer instead of
-        eliding a few microseconds. That shows up instantly as a
-        several-millisecond regression rather than as a subtle one, so it is
-        measured before it is believed. ``RPA_SKIP_EMPTY_PASS=0`` restores the
-        unconditional launches for the A/B.
+        The risk to watch was aliasing, and it is what happened. The true
+        branch's custom call updates the KV cache in place under
+        ``input_output_aliases={7: 0, 9: 1}``; XLA cannot prove the conditional
+        preserves that, so it copies the whole 1.93 GB cache per call rather
+        than eliding a ~6.45 us launch. Measured in ``j-62883531``: 5649.81 us
+        against a 157.71 us baseline, a 36x regression, on a byte-identical
+        binary differing only by this flag. The constant-distribution arm of
+        the same job paid 5604.42 us, within 0.81% -- so the cost belongs to
+        the conditional itself, not to the traced predicate, and XLA does not
+        fold the cond away even on a statically empty range. Correctness was
+        clean throughout (18 passed, max_abs 0.005585).
+
+        The flag therefore defaults to **off** and this code is dead by
+        default. Turning it on requires preserving the alias through the
+        conditional first -- declaring it on the cond rather than the inner
+        custom call, or pushing the predicate into the kernel's grid so there
+        is one custom call with zero pipeline steps instead of two branches.
+        Note the prize is small either way: 6.45 us of 157.71 us caps this arm
+        at ~4%, under the ~8% this harness can resolve.
         """
         if not envs.RPA_SKIP_EMPTY_PASS:
             return run_rpa_kernel(q, kv_cache, case=case, **kwargs)
