@@ -613,6 +613,8 @@ def test_mixed_parallel_merged_linear_loads_replicated_and_tp_slices(
 
 
 def _mla_config(**overrides) -> KimiLinearConfig:
+    """A small, valid NoPE MLA config. Tests override one field at a time
+    to hit a specific rejection in `MultiHeadLatentAttention.__init__`."""
     kwargs = dict(
         hidden_size=16,
         num_attention_heads=4,
@@ -628,6 +630,8 @@ def _mla_config(**overrides) -> KimiLinearConfig:
 
 
 def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The TPU MLA layer only implements the NoPE variant. A config that
+    asks for the RoPE-inside-MLA variant is rejected up front."""
     monkeypatch.setattr(current_platform, "check_and_update_config",
                         lambda _: None)
     config = _mla_config(mla_use_nope=False)
@@ -637,6 +641,9 @@ def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_mla_rejects_incomplete_config(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """All four MLA head dimensions must be set. Leaving one as `None`
+    produces an error that lists every field, so the user can see which
+    one is missing."""
     monkeypatch.setattr(current_platform, "check_and_update_config",
                         lambda _: None)
     config = _mla_config(kv_lora_rank=None)
@@ -646,6 +653,8 @@ def test_mla_rejects_incomplete_config(
 
 def test_mla_rejects_heads_not_divisible_by_tp(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Attention heads are split evenly across tensor-parallel ranks, so
+    4 heads cannot be spread over 3 ranks."""
     monkeypatch.setattr(current_platform, "check_and_update_config",
                         lambda _: None)
     monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
@@ -656,6 +665,9 @@ def test_mla_rejects_heads_not_divisible_by_tp(
 
 
 def test_mixed_parallel_merged_linear_rejects_length_mismatch() -> None:
+    """`MixedParallelMergedLinear` takes one output size and one
+    replicate/shard flag per fused output. Two sizes with only one flag is
+    a caller bug and is rejected."""
     with pytest.raises(ValueError, match="sharding mode"):
         kimi_attention.MixedParallelMergedLinear(2, [4, 3], [False],
                                                  bias=False,
@@ -665,6 +677,10 @@ def test_mixed_parallel_merged_linear_rejects_length_mismatch() -> None:
 
 def test_mixed_parallel_merged_linear_rejects_tp_indivisible_output(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """An output marked as column-parallel is split across TP ranks, so its
+    size must divide evenly. Here the first output (size 3, sharded) does
+    not divide by TP=2; the second (size 4, replicated) is never split and
+    would have been fine."""
     monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
                         lambda: 2)
     with pytest.raises(ValueError, match="must divide TP"):
@@ -675,6 +691,10 @@ def test_mixed_parallel_merged_linear_rejects_tp_indivisible_output(
 
 
 def test_kda_state_dtype_reads_model_and_cache_config() -> None:
+    """`kda_state_dtype` returns the storage dtypes for a KDA layer's two
+    state tensors. The conv state is always fp32 (the fused conv1d kernel
+    needs it), regardless of the model dtype or `mamba_cache_dtype`; the
+    recurrent state follows vLLM's usual KDA rule."""
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.bfloat16),
         cache_config=SimpleNamespace(mamba_cache_dtype="auto"),
@@ -686,10 +706,13 @@ def test_kda_state_dtype_reads_model_and_cache_config() -> None:
 
 def test_load_a_log_flattens_legacy_layout_and_shards_by_rank(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_load_a_log` is the weight loader for the KDA `A_log` parameter.
+    Older checkpoints store it as `[1, 1, H, 1]` and newer ones as `[H]`;
+    either way each TP rank keeps only its own slice of the H heads. With
+    H=4 and a 2-head local parameter, rank 1 gets heads 2 and 3."""
     monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_rank",
                         lambda: 1)
     param = torch.empty(2)
-    # Legacy [1, 1, H, 1] layout, H=4: rank 1's shard is entries [2, 4).
     loaded = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1)
 
     kimi_attention._load_a_log(param, loaded)
@@ -846,6 +869,9 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache() -> None:
 
 
 def _kda_config(**linear_attn_overrides) -> KimiLinearConfig:
+    """A small, valid Kimi K3 config with one KDA layer. Tests override
+    fields of `linear_attn_config` to hit a specific branch or rejection in
+    `KimiDeltaAttention.__init__`."""
     linear_attn_config = dict(
         head_dim=4,
         num_heads=2,
@@ -865,10 +891,15 @@ def _kda_config(**linear_attn_overrides) -> KimiLinearConfig:
 
 
 def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`KimiDeltaAttention.__init__` builds real vLLM linear layers and
-    registers real dispatched/pooled Pallas ops; for a construction-only
-    test, both get faked the same way `MultiHeadLatentAttention`'s
-    constructor tests fake theirs.
+    """Swap out the heavy dependencies of `KimiDeltaAttention.__init__`.
+
+    The real constructor builds vLLM tensor-parallel linear layers (which
+    need an initialized distributed group) and registers two Pallas custom
+    ops (which register with `torch.library` by name). Neither is what a
+    constructor test is checking, so both are replaced: the linear layers
+    with a minimal module that just records its output size, and the op
+    builders with a stub that returns a no-op callable. This is the same
+    approach the `MultiHeadLatentAttention` constructor tests above use.
     """
 
     class FakeLinear(nn.Module):
@@ -897,6 +928,14 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_kda_construction_wires_projections_and_state(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the real `KimiDeltaAttention.__init__` end to end for the default
+    (fused-gate) config and check what it built: the local head count after
+    TP, the fused gate projection in place of the separate ones, the per-layer
+    state shapes the cache manager will allocate, and that the layer registered
+    itself under its prefix in the static forward context.
+
+    The existing forward tests below skip `__init__` with `__new__`, so this is
+    the only test that runs the constructor itself."""
     _patch_kda_construction_deps(monkeypatch)
     config = _kda_config()
     vllm_config = VllmConfig()
@@ -918,6 +957,9 @@ def test_kda_construction_wires_projections_and_state(
 
 def test_kda_construction_full_rank_gate_builds_separate_projections(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """With `use_full_rank_gate=True` the layer builds separate `f_a_proj`
+    and `g_proj` projections instead of the fused `fused_fa_ga_proj`, and
+    drops `g_b_proj`. This is the other branch of the constructor."""
     _patch_kda_construction_deps(monkeypatch)
     config = _kda_config(use_full_rank_gate=True, gate_lower_bound=1.0)
     vllm_config = VllmConfig()
@@ -935,6 +977,9 @@ def test_kda_construction_full_rank_gate_builds_separate_projections(
 
 def test_kda_construction_rejects_duplicate_prefix(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each layer registers itself in the static forward context under its
+    prefix. Building a second layer with the same prefix would silently
+    overwrite the first, so it is rejected."""
     _patch_kda_construction_deps(monkeypatch)
     config = _kda_config()
     vllm_config = VllmConfig()
@@ -950,6 +995,9 @@ def test_kda_construction_rejects_duplicate_prefix(
 
 
 def test_kda_construction_rejects_speculative_decode() -> None:
+    """TPU KDA does not support speculative decoding. This is the very first
+    check in the constructor, so a bare object with a `speculative_config`
+    attribute is enough to reach it."""
     config = _kda_config()
     fake_vllm_config = SimpleNamespace(speculative_config=object())
 
@@ -958,6 +1006,8 @@ def test_kda_construction_rejects_speculative_decode() -> None:
 
 
 def test_kda_construction_rejects_missing_linear_attn_config() -> None:
+    """A Kimi config without `linear_attn_config` has no KDA layers to
+    describe, so the KDA layer cannot be built from it."""
     config = KimiLinearConfig(hidden_size=16,
                               num_attention_heads=4,
                               num_hidden_layers=1,
@@ -970,6 +1020,8 @@ def test_kda_construction_rejects_missing_linear_attn_config() -> None:
 
 def test_kda_construction_rejects_heads_not_divisible_by_tp(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """KDA heads are split evenly across tensor-parallel ranks, so 2 heads
+    cannot be spread over 3 ranks."""
     monkeypatch.setattr(kimi_attention, "get_tensor_model_parallel_world_size",
                         lambda: 3)
     config = _kda_config(num_heads=2)
@@ -980,9 +1032,14 @@ def test_kda_construction_rejects_heads_not_divisible_by_tp(
 
 
 def _make_bare_kda_layer(use_full_rank_gate: bool = False):
-    """A `KimiDeltaAttention` with `__init__` skipped, matching the pattern
-    the existing forward-dispatch tests use, extended to cover the
-    full-rank-gate branch and the empty-cache zeros branch."""
+    """Build a `KimiDeltaAttention` without running `__init__`.
+
+    Same approach as the forward-dispatch tests above: create the object
+    with `__new__` and set just the attributes `forward` reads, using small
+    stand-in projections. `use_full_rank_gate` picks which of the two gate
+    layouts to install. The layer starts with no cache bound and no
+    forward-context metadata, so `forward` takes the zeros path unless a
+    test overrides those."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.fused_qkvb_proj = _Projection(14)
@@ -1009,12 +1066,19 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
 
 
 def test_kda_forward_returns_zeros_without_a_bound_cache() -> None:
+    """Before the runner binds a KV cache to the layer (`kv_cache is None`),
+    `forward` must not touch either KDA op and instead returns zeros of the
+    right shape. This is what happens during profiling and warmup."""
     layer = _make_bare_kda_layer()
     output = layer(torch.arange(2), torch.ones(2, 4))
     torch.testing.assert_close(output, torch.zeros(2, 4))
 
 
 def test_kda_forward_full_rank_gate_uses_separate_projections() -> None:
+    """With `use_full_rank_gate=True`, `forward` takes the branch that reads
+    `f_a_proj` and `g_proj` directly rather than splitting a fused gate
+    projection. Still no cache is bound, so the output is just shape-checked;
+    this covers the gate branch, not the KDA op."""
     layer = _make_bare_kda_layer(use_full_rank_gate=True)
     output = layer(torch.arange(2), torch.ones(2, 4))
     assert output.shape == (2, 4)
@@ -1022,6 +1086,8 @@ def test_kda_forward_full_rank_gate_uses_separate_projections() -> None:
 
 def test_metadata_returns_none_without_a_forward_context(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_metadata` returns `None` when there is no active forward context at
+    all, which is the case outside of a model forward pass."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.prefix = "p"
@@ -1033,6 +1099,8 @@ def test_metadata_returns_none_without_a_forward_context(
 
 def test_metadata_returns_none_for_a_non_dict_attn_metadata(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_metadata` also returns `None` when a forward context exists but its
+    `attn_metadata` is not the per-layer dict the runner normally provides."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.prefix = "p"
@@ -1046,6 +1114,8 @@ def test_metadata_returns_none_for_a_non_dict_attn_metadata(
 
 def test_metadata_rejects_wrong_layer_metadata_type(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the per-layer entry exists but is not an `AttentionMetadata`, the
+    layer raises rather than trying to read fields off an unknown object."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.prefix = "p"
@@ -1061,6 +1131,8 @@ def test_metadata_rejects_wrong_layer_metadata_type(
 
 def test_core_attention_pooled_rejects_pcp_streaming(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """The unified-pool KDA path does not support prefill-context-parallel
+    streaming metadata and says so up front."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(kimi_attention, "is_pcp_streaming_attention_metadata",
                         lambda md: True)
@@ -1072,6 +1144,9 @@ def test_core_attention_pooled_rejects_pcp_streaming(
 
 def test_core_attention_pooled_rejects_speculative_verify(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """`mamba_slot_read_offsets` is only set for speculative-decode verify
+    steps, which the pooled path cannot handle (it keeps one state per block,
+    not the per-window checkpoints verify needs)."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(kimi_attention, "is_pcp_streaming_attention_metadata",
                         lambda md: False)
@@ -1083,6 +1158,8 @@ def test_core_attention_pooled_rejects_speculative_verify(
 
 def test_core_attention_pooled_requires_state_indices(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pooled op gathers and scatters state by `mamba_state_indices`;
+    metadata without them is an error, not a silent no-op."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(kimi_attention, "is_pcp_streaming_attention_metadata",
                         lambda md: False)
