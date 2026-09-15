@@ -218,8 +218,8 @@ class KimiMoE(nn.Module):
                 hidden_states: torch.Tensor,
                 sequence_parallel: bool = False) -> torch.Tensor:
         if sequence_parallel or self.shared_group is not None:
-            return self._forward_sequence_parallel(hidden_states,
-                                                   sequence_parallel)
+            return self._forward_expert_parallel(hidden_states,
+                                                 sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
@@ -227,9 +227,9 @@ class KimiMoE(nn.Module):
                               router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
 
-    def _forward_sequence_parallel(self, hidden_states: torch.Tensor,
-                                   sequence_parallel: bool) -> torch.Tensor:
-        """Route local tokens; reduce the EP output in latent space."""
+    def _forward_expert_parallel(self, hidden_states: torch.Tensor,
+                                 sequence_parallel: bool) -> torch.Tensor:
+        """Run EP experts with sharded or replicated tokens, then add shared experts."""
         group = self.prefill_group
         router_logits, _ = self.gate(hidden_states)
         latent = hidden_states
@@ -238,16 +238,8 @@ class KimiMoE(nn.Module):
         routed = self.experts.routed_experts
         if sequence_parallel:
             weights, ids = moe_routing.route(routed, latent, router_logits)
-            weights, ids = weights.to(latent.dtype), ids.to(torch.int32)
-            if (isinstance(group, FusedPrefillCollectives)
-                    and self.gate.output_size <= 32768
-                    and weights.dtype == torch.bfloat16):
-                latent, weights, ids = group.gather_moe_inputs(
-                    latent, weights, ids)
-            else:
-                latent = group.all_gather(latent, dim=0)
-                weights = group.all_gather(weights, dim=0)
-                ids = group.all_gather(ids, dim=0)
+            latent, weights, ids = group.gather_moe_inputs(
+                latent, weights, ids, num_experts=self.gate.output_size)
             output = routed.quant_method.apply_with_routing(
                 routed, latent, weights, ids)
         else:

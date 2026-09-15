@@ -285,8 +285,14 @@ class FusedPrefillCollectives:
         self.project_rs = _build_project_op(mesh, tables, 22000 + layer)
         self.gather_project = _build_gather_project_op(mesh, tables,
                                                        23000 + layer)
-        self.gather_moe_inputs = _build_moe_gather_op(mesh, tables,
-                                                      24000 + layer)
+        self._moe_gather_op = _build_moe_gather_op(mesh, tables, 24000 + layer)
+
+    def gather_moe_inputs(self, latent, weights, ids, *, num_experts):
+        """Gather token activations and routes, packing compatible BF16 inputs."""
+        weights, ids = weights.to(latent.dtype), ids.to(torch.int32)
+        if num_experts <= 32768 and weights.dtype == torch.bfloat16:
+            return self._moe_gather_op(latent, weights, ids)
+        return tuple(self.all_gather(x, dim=0) for x in (latent, weights, ids))
 
     def mla_ops(self, eps):
         mesh, _ = _mesh_and_tables()

@@ -1238,19 +1238,17 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(
 
     model = module.KimiMoE.__new__(module.KimiMoE)
     nn.Module.__init__(model)
-    model.prefill_group = Group()
-    if gather_mode != 'plain':
-        group = module.FusedPrefillCollectives.__new__(
-            module.FusedPrefillCollectives)
-        group.all_gather = model.prefill_group.all_gather
-        group.reduce_scatter = model.prefill_group.reduce_scatter
+    group = module.FusedPrefillCollectives.__new__(
+        module.FusedPrefillCollectives)
+    group.all_gather = Group().all_gather
+    group.reduce_scatter = Group().reduce_scatter
 
-        def gather_joint(latent, weights, ids):
-            calls.append(('joint', latent.shape, latent.dtype))
-            return tuple(a.repeat(32, 1) for a in (latent, weights, ids))
+    def gather_joint(latent, weights, ids):
+        calls.append(('joint', latent.shape, latent.dtype))
+        return tuple(a.repeat(32, 1) for a in (latent, weights, ids))
 
-        group.gather_moe_inputs = gather_joint
-        model.prefill_group = group
+    group._moe_gather_op = gather_joint
+    model.prefill_group = group
     model.gate = Projection(lambda x: torch.zeros(x.shape[0], 896))
     model.gate.output_size = 65536 if gather_mode == 'wide_ids' else 896
     model.routed_expert_down_proj = Projection(lambda x: x[:, :2])
@@ -1265,7 +1263,7 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(
             (1, 2), .5), torch.tensor([[3, 9]])))
     dtype = torch.float32 if gather_mode == 'plain' else torch.bfloat16
     x = torch.tensor([[1., 3., 4., 6.]], dtype=dtype)
-    actual = model._forward_sequence_parallel(x, True)
+    actual = model._forward_expert_parallel(x, True)
     expected = (x[:, :2] /
                 (x[:, :2].square().mean(-1, keepdim=True).sqrt())).repeat(
                     1, 2)
@@ -1586,15 +1584,16 @@ def test_mla_preprocess_keeps_prefill_parameter_abi(monkeypatch):
     from jax.sharding import Mesh
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from vllm_torchtpu.models.vllm.kimi_k3 import parallel
+    from vllm_torchtpu.models.vllm.kimi_k3 import collective_ops
 
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('k3_sp', ))
     pairs = tuple((2 * i, 2 * i + 1) for i in range(16))
-    monkeypatch.setattr(parallel, 'mla_chip_layout', lambda devices, owners:
-                        (pairs, (), ()))
-    pack, op = parallel._build_mla_ops(mesh, tuple(range(32)), 29005, 1e-5)
-    assert parallel._build_mla_ops(mesh, tuple(range(32)), 29005,
-                                   1e-5) == (pack, op)
+    monkeypatch.setattr(collective_ops, 'mla_chip_layout',
+                        lambda devices, owners: (pairs, (), ()))
+    pack, op = collective_ops._build_mla_ops(mesh, tuple(range(32)), 29005,
+                                             1e-5)
+    assert collective_ops._build_mla_ops(mesh, tuple(range(32)), 29005,
+                                         1e-5) == (pack, op)
     with FakeTensorMode():
         weight = torch.empty(7168, 2496, dtype=torch.bfloat16)
         gate = pack(weight)
