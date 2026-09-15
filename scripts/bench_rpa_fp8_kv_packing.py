@@ -24,19 +24,29 @@ much of that traffic is useful:
   C  bf16, 1 kv head  -> kv_packing=2, axis [K, V]       <- same bytes, 0 padding
   D  fp8,  1 kv head, half the kv_len                    <- half the bytes
 
-Reading the result:
+MEASURED (job j-35ccee08, serial, one chip; arm A reproduces the production
+xprof figure of 123.64 us/call to within 1.32x, so the harness is credible):
 
-  * A ~= B ~= C  => the kernel is bandwidth-bound on *physical* bytes, so the
-    padding is pure waste and removing it is worth up to ~2x on this op. Note
-    that A ~= C also means the fp8 KV cache is currently buying nothing over
-    bf16 on this model -- identical bytes per token.
-  * A >> B       => the cost tracks *useful* work, not bytes moved, and the
-    padding is much cheaper than the byte count suggests. The layout change
-    would then not be worth its risk.
-  * D ~= A/2     => time scales with bytes, corroborating the A~=B~=C reading.
+    A 163.75us   B 198.60us   C 159.17us   D 151.71us     (spread_pct < 0.65)
 
-D is the closest thing to a direct estimate of the post-fix cost, since a
-depadded fp8 cache moves exactly the bytes D moves.
+**The depadding hypothesis is falsified.** D halves the bytes and buys only
+7.4%, not the ~2x a bandwidth-bound kernel would give. Fitting A and D, ~85%
+of this op's time is byte-independent. A ~= C confirms fp8 KV currently costs
+the same as bf16 -- but depadding it would not fix that, because bytes are not
+what this kernel is spending its time on. B, at identical bytes and identical
+FLOPs, is 21% *slower* than A, which no bandwidth story explains.
+
+Where the time actually goes: the fetch is a **static** ``for i in
+range(bkv_p)`` loop of guarded per-page DMAs, with ``bkv_p = bkv_sz //
+page_size``. At page 256 and max_model_len 9216 that is 36 DMA issues per
+sequence x 64 sequences = 2304 per call, whether or not each one moves data --
+which is exactly why D, whose DMAs are predicated off, still pays the floor.
+This op is DMA-issue-bound, not bandwidth-bound.
+
+The P* arms follow from that: doubling page_size halves the DMA count while
+moving identical bytes. The prior experiment log measured page 16 -> 256 as
++31.7% end-to-end and described it as saturating "between p128 and p256", but
+that was concluded without testing beyond 256.
 
 Run one arm per chip; see --arm.
 """
@@ -64,20 +74,35 @@ KV_LEN = 8192  # --random-input-len=8192
 MAX_MODEL_LEN = 9216  # --max-model-len=9216
 
 ARMS = {
-    # name: (kv_dtype, num_kv_heads, kv_len)
-    "A_fp8_1kvh": (jnp.float8_e4m3fn, 1, KV_LEN),
-    "B_fp8_2kvh": (jnp.float8_e4m3fn, 2, KV_LEN),
-    "C_bf16_1kvh": (jnp.bfloat16, 1, KV_LEN),
-    "D_fp8_1kvh_halfkv": (jnp.float8_e4m3fn, 1, KV_LEN // 2),
+    # name: (kv_dtype, num_kv_heads, kv_len, page_size)
+    "A_fp8_1kvh": (jnp.float8_e4m3fn, 1, KV_LEN, PAGE_SIZE),
+    "B_fp8_2kvh": (jnp.float8_e4m3fn, 2, KV_LEN, PAGE_SIZE),
+    "C_bf16_1kvh": (jnp.bfloat16, 1, KV_LEN, PAGE_SIZE),
+    "D_fp8_1kvh_halfkv": (jnp.float8_e4m3fn, 1, KV_LEN // 2, PAGE_SIZE),
+    # Page-size sweep. Arms A/B/C/D showed ~85% of this op's time is
+    # byte-independent: halving the bytes (D) bought 7.4%, and fp8 costs the
+    # same as bf16 (A vs C). The fetch is a *static* `for i in range(bkv_p)`
+    # loop of guarded per-page DMAs, bkv_p = bkv_sz // page_size, so the floor
+    # scales with the number of pages, not their contents: at page 256 and
+    # max_model_len 9216 that is 36 DMA issues per sequence x 64 sequences.
+    # Doubling the page halves the DMA count without changing bytes moved.
+    #
+    # The prior experiment log measured 16 -> 256 as +31.7% end-to-end and
+    # called it saturated "between p128 and p256"; that conclusion was drawn
+    # without testing past 256, which is what these arms do.
+    "P128": (jnp.float8_e4m3fn, 1, KV_LEN, 128),
+    "P256": (jnp.float8_e4m3fn, 1, KV_LEN, 256),
+    "P512": (jnp.float8_e4m3fn, 1, KV_LEN, 512),
+    "P1024": (jnp.float8_e4m3fn, 1, KV_LEN, 1024),
 }
 
 
-def build(kv_dtype, num_kv_heads, kv_len, seed=0):
+def build(kv_dtype, num_kv_heads, kv_len, page_size, seed=0):
     """Build a pure-decode workload: BATCH sequences, one query token each."""
-    pages_per_seq = (MAX_MODEL_LEN + PAGE_SIZE - 1) // PAGE_SIZE
+    pages_per_seq = (MAX_MODEL_LEN + page_size - 1) // page_size
     num_blocks = BATCH * pages_per_seq
 
-    cache_shape = get_kv_cache_shape(num_blocks, PAGE_SIZE, num_kv_heads,
+    cache_shape = get_kv_cache_shape(num_blocks, page_size, num_kv_heads,
                                      HEAD_DIM, kv_dtype)
 
     rng = np.random.default_rng(seed)
@@ -158,9 +183,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()
 
-    kv_dtype, num_kv_heads, kv_len = ARMS[args.arm]
+    kv_dtype, num_kv_heads, kv_len, page_size = ARMS[args.arm]
     is_fp8 = kv_dtype == jnp.float8_e4m3fn
-    wl, cache_shape = build(kv_dtype, num_kv_heads, kv_len)
+    wl, cache_shape = build(kv_dtype, num_kv_heads, kv_len, page_size)
+    pages_per_seq = (MAX_MODEL_LEN + page_size - 1) // page_size
 
     itemsize = jnp.dtype(kv_dtype).itemsize
     # Bytes the kernel must stream for the KV it attends to, padding included.
@@ -191,6 +217,9 @@ def main():
     print(f"kv_dtype            : {jnp.dtype(kv_dtype).name}")
     print(f"num_kv_heads        : {num_kv_heads}")
     print(f"kv_len              : {kv_len}")
+    print(f"page_size           : {page_size}")
+    print(f"pages/seq           : {pages_per_seq}")
+    print(f"page DMAs/call      : {pages_per_seq * BATCH}")
     print(f"cache_shape         : {tuple(cache_shape)}")
     print(f"packing slots       : {packed_slots} "
           f"(useful {num_kv_heads * 2}, padding {packed_slots - num_kv_heads * 2})")
