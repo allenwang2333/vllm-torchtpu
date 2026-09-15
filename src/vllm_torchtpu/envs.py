@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_EXACT: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -67,6 +68,17 @@ if TYPE_CHECKING:
     USE_BATCHED_RPA_LONGCTX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
+    ENABLE_RPA_PV_FP8: bool = False
+    VLLM_TPU_PREFILL_GROUP_CHUNKS: int = 9
+    VLLM_TPU_DECODE_BKV_SZ: int | None = None
+    VLLM_TPU_DECODE_BKV_CSZ: int = 2304
+    VLLM_TPU_DECODE_BS4_BKV_SZ: int | None = None
+    VLLM_TPU_DECODE_BS4_BKV_CSZ: int | None = None
+    VLLM_TPU_PREFILL_BQ_SZ: int | None = None
+    VLLM_TPU_PREFILL_BQ_CSZ: int | None = None
+    VLLM_TPU_PREFILL_BKV_SZ: int = 4608
+    VLLM_TPU_PREFILL_BKV_CSZ: int = 1152
+    VLLM_TPU_PURE_DECODE_MAX_TOKENS: int = 8
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
@@ -518,6 +530,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",")
         if v.strip()
     ],
+    # Use only the exact buckets specified in TPU_TOKEN_BUCKET_EXTRA without exponential defaults.
+    "TPU_TOKEN_BUCKET_EXACT":
+    env_bool("TPU_TOKEN_BUCKET_EXACT", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE":
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
@@ -542,6 +557,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "USE_PIPELINED_DMA_STAGING":
     lambda: env_bool("USE_PIPELINED_DMA_STAGING")
     () or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    # Enable FP8 PV matmul in RPA v3 when V cache is float8_e4m3fn.
+    "ENABLE_RPA_PV_FP8":
+    env_bool("ENABLE_RPA_PV_FP8", default=False),
+    # RPA v3 prefill and decode tiling overrides.
+    "VLLM_TPU_PREFILL_GROUP_CHUNKS":
+    env_int("VLLM_TPU_PREFILL_GROUP_CHUNKS", 9),
+    "VLLM_TPU_DECODE_BKV_SZ":
+    env_optional_int("VLLM_TPU_DECODE_BKV_SZ"),
+    "VLLM_TPU_DECODE_BKV_CSZ":
+    env_int("VLLM_TPU_DECODE_BKV_CSZ", 2304),
+    "VLLM_TPU_DECODE_BS4_BKV_SZ":
+    env_optional_int("VLLM_TPU_DECODE_BS4_BKV_SZ"),
+    "VLLM_TPU_DECODE_BS4_BKV_CSZ":
+    env_optional_int("VLLM_TPU_DECODE_BS4_BKV_CSZ"),
+    "VLLM_TPU_PREFILL_BQ_SZ":
+    env_optional_int("VLLM_TPU_PREFILL_BQ_SZ"),
+    "VLLM_TPU_PREFILL_BQ_CSZ":
+    env_optional_int("VLLM_TPU_PREFILL_BQ_CSZ"),
+    "VLLM_TPU_PREFILL_BKV_SZ":
+    env_int("VLLM_TPU_PREFILL_BKV_SZ", 4608),
+    "VLLM_TPU_PREFILL_BKV_CSZ":
+    env_int("VLLM_TPU_PREFILL_BKV_CSZ", 1152),
+    "VLLM_TPU_PURE_DECODE_MAX_TOKENS":
+    env_int("VLLM_TPU_PURE_DECODE_MAX_TOKENS", 8),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.
