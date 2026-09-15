@@ -88,6 +88,8 @@ Each timed arm emits one ``RESULT_JSON: {...}`` line per phase.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import math
 import os
@@ -541,6 +543,26 @@ def _run_phase(jax, jnp, wrapper, configs, *, arm, kv_layout, phase,
     print(f"  kv bytes / step     = unique {kv_bytes_unique / 1e6:.1f} MB, "
           f"streamed {streamed_mb}")
 
+    # Build identity. Without this an A/B across a trace-time env var is
+    # circular: the timing difference is the only evidence the two arms are
+    # different programs, and "the arms differ because they timed differently"
+    # is not evidence. The hash covers the compiled HLO, which carries the
+    # Mosaic payload in the custom call's backend_config, so a kernel-body
+    # change moves it. Two arms printing the same hash is a void A/B.
+    guard_env = os.environ.get("VLLM_RPA_GUARD_EMPTY_MEMSET", "<unset>")
+    try:
+        compiled_text = step.lower(query, new_k, new_v, kv_cache,
+                                   **kernel_args).compile().as_text()
+        build_hash = hashlib.sha256(
+            compiled_text.encode("utf-8")).hexdigest()[:16]
+        build_bytes = len(compiled_text)
+    except Exception as exc:  # noqa: BLE001 - identity only, never fatal
+        build_hash = f"<unavailable: {exc!r}>"
+        build_bytes = -1
+    print(f"  VLLM_RPA_GUARD_EMPTY_MEMSET = {guard_env}")
+    print(f"  BUILD HASH          = {build_hash}  "
+          f"(sha256/16 of compiled HLO, {build_bytes} B)")
+
     compile_start = time.perf_counter()
     out, kv_cache = step(query, new_k, new_v, kv_cache, **kernel_args)
     jax.block_until_ready((out, kv_cache))
@@ -550,12 +572,15 @@ def _run_phase(jax, jnp, wrapper, configs, *, arm, kv_layout, phase,
         out, kv_cache = step(query, new_k, new_v, kv_cache, **kernel_args)
         jax.block_until_ready((out, kv_cache))
 
+    profile_ctx = (jax.profiler.trace(args.profile_out)
+                   if args.profile_out else contextlib.nullcontext())
     samples_ms: list[float] = []
-    for _ in range(args.iters):
-        start_ns = time.perf_counter_ns()
-        out, kv_cache = step(query, new_k, new_v, kv_cache, **kernel_args)
-        jax.block_until_ready((out, kv_cache))
-        samples_ms.append((time.perf_counter_ns() - start_ns) / 1e6)
+    with profile_ctx:
+        for _ in range(args.iters):
+            start_ns = time.perf_counter_ns()
+            out, kv_cache = step(query, new_k, new_v, kv_cache, **kernel_args)
+            jax.block_until_ready((out, kv_cache))
+            samples_ms.append((time.perf_counter_ns() - start_ns) / 1e6)
 
     median_ms = statistics.median(samples_ms)
     min_ms = min(samples_ms)
@@ -583,6 +608,8 @@ def _run_phase(jax, jnp, wrapper, configs, *, arm, kv_layout, phase,
         "kv_layout_enum": kv_layout.name,
         "vllm_kv_cache_layout": os.environ.get("VLLM_KV_CACHE_LAYOUT"),
         "phase": phase,
+        "build_hash": build_hash,
+        "guard_env": guard_env,
         "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
         "num_q_heads": NUM_Q_HEADS_PER_RANK,
         "num_kv_heads": NUM_KV_HEADS_PER_RANK,
@@ -838,6 +865,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--q-scale", type=float, default=None)
     parser.add_argument("--k-scale", type=float, default=None)
     parser.add_argument("--v-scale", type=float, default=None)
+    parser.add_argument(
+        "--profile-out",
+        default=None,
+        help=("Capture an xprof trace of the timing loop into this directory. "
+              "Device time is the only way to see an effect smaller than this "
+              "harness's ~0.25 ms of host dispatch per call."))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device-index",
                         type=int,
