@@ -45,11 +45,6 @@ export VLLM_SHM_BROADCAST_TIMEOUT_S=1200
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=1200
 export VLLM_ENGINE_READY_TIMEOUT_S=14400
 
-# Inductor's cache goes to /dev/shm, as in kimik-2.6-w4a16-tp8-ep: v7x-16
-# agents have only a ~96 GB boot disk, and the head reached 97% during the
-# 09-14 nightly's compile.
-export TORCHINDUCTOR_CACHE_DIR=/dev/shm/torchinductor_cache
-
 # REQUIRED on the Ray path, silent if omitted: vllm only copies prefixed vars
 # into DP engine actors, so the model-defining vars above are dropped and the
 # actors build a different model without failing.
