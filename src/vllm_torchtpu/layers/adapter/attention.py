@@ -1892,8 +1892,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             if output is None:
                 # Preserve symbolic token dimensions during the memory probe.
-                template = q_nope[..., :1].expand(-1, -1, layer.v_head_dim)
-                return torch.ones_like(template).flatten(1)
+                template = q_nope.flatten(1)[:, :1].expand(
+                    -1, layer.num_heads * layer.v_head_dim)
+                return torch.ones_like(template)
             output.fill_(1)
             return output
 
