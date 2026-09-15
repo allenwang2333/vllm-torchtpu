@@ -175,10 +175,14 @@ def _build_inputs(kv_lens, bkv_sz, kv_dtype, seed=0):
 
 
 def _run(inp, q_dtype=jnp.bfloat16, skip_kv_update=False):
+    # K/V must be handed in at the *cache* dtype -- `RpaConfigs.validate_inputs`
+    # rejects a mismatch outright. Queries are the exception: the kernel reads
+    # `queries.dtype` as `dtype_q` and quantizes them itself, so they stay
+    # bf16, which is what the served model passes.
     out, cache = KB.ragged_paged_attention(
         jnp.asarray(inp["q"], q_dtype),
-        jnp.asarray(inp["k"], q_dtype),
-        jnp.asarray(inp["v"], q_dtype),
+        jnp.asarray(inp["k"], inp["cache_dtype"]),
+        jnp.asarray(inp["v"], inp["cache_dtype"]),
         jnp.asarray(inp["cache"], inp["cache_dtype"]),
         jnp.asarray(inp["kv_lens"]),
         jnp.asarray(inp["page_indices"]),

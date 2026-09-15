@@ -95,10 +95,14 @@ def build(seed: int = 0):
 
     q = jnp.asarray(rng.uniform(-1.0, 1.0, (BATCH, NUM_Q_HEADS, HEAD_DIM)),
                     dtype=Q_DTYPE)
+    # K/V at the cache dtype, not the query dtype: `validate_inputs` requires
+    # them to match the cache. Queries are the exception -- the kernel reads
+    # `queries.dtype` as `dtype_q` and quantizes them internally, so bf16 here
+    # is what the served model actually passes.
     k = jnp.asarray(rng.uniform(-1.0, 1.0, (BATCH, NUM_KV_HEADS, HEAD_DIM)),
-                    dtype=Q_DTYPE)
+                    dtype=KV_DTYPE)
     v = jnp.asarray(rng.uniform(-1.0, 1.0, (BATCH, NUM_KV_HEADS, HEAD_DIM)),
-                    dtype=Q_DTYPE)
+                    dtype=KV_DTYPE)
 
     kv_lens = jnp.full((BATCH, ), KV_LEN, dtype=jnp.int32)
     # Shuffled so the page walk is not artificially sequential -- a contiguous
