@@ -489,14 +489,41 @@ def _ragged_paged_attention_kernel_loop(
         #   kv len  k_span < effective_kv_len <=>  i < effective_kv_len
         #                                            - processed_kv_len
         #
-        # The general path below spends, on a bq_csz*num_q_heads_per_kv_head x
-        # bkv_csz matrix, a full i32 iota plus an integer divide plus a narrowing
-        # cast for `q_span`, a second iota and add for `k_span`, two compares and
-        # an `and`. This path spends one iota and one compare. `/xprof-llo` on
+        # What this actually saves depends on `case`, and for DECODE -- the
+        # dispatch that ships -- it is NOT the `q_span` arithmetic. Line ~346
+        # sets `use_causal_mask = False` whenever `case == RpaCase.DECODE`, and
+        # `case` is a *static* Python argument, so in the decode compile the
+        # general path's `q_span` has no live consumer (both the causal compare
+        # and the sliding-window compare are trace-time-false branches) and is
+        # dead-code-eliminated before lowering. An earlier version of this
+        # comment justified the change by `q_span`'s iota + divide + cast; that
+        # cost is real only in the MIXED and PREFILL dispatches.
+        #
+        # In decode the saving is the two surviving broadcast adds. The general
+        # path materializes `processed_kv_len_int + iota` twice -- once over
+        # `s.shape` (bq_csz*num_q_heads_per_kv_head x bkv_csz, 36,864 elements
+        # at the production shape) and once over `v.shape` (bkv_csz x head_dim,
+        # 1,179,648 elements, 32x the s-side term and the dominant cost) -- then
+        # compares each against a scalar. This path folds the offset into the
+        # bound instead: one scalar i32 subtract on the scalar core, and the
+        # same two compares against a bare iota. 1.2M vector adds become one
+        # scalar subtract.
+        #
+        # Measured at the production shape (`RPAd-p_256-bq_1_1-bkv_9216_9216`,
+        # 8192 kv_len, fp8 cache): -1.78% per call, 95% CI [-2.42%, -1.14%], on
+        # a 10-pair interleaved microbenchmark (job j-759b3567); -2.06% per call
+        # in an end-to-end profile A/B over 8 chip-cores (jobs j-d115cf76 vs
+        # j-e887a9b7), where 48/48 layer instances got faster and ~81 non-target
+        # op groups moved a median +0.02%.
+        #
+        # Two older numbers are ceilings on the whole mask, not this change's
+        # headroom, and should not be read as its expected gain: `/xprof-llo` on
         # job j-e3eade3f put mask and span arithmetic at 3170 instructions --
         # ~25% of the kernel's hot block -- and job j-44546506 measured the whole
         # mask at 7.49% of this op by compiling it out with `skip_kv_mask`
         # (checksums identical, so that bound is real work and not dropped work).
+        # This path removes neither the mask nor the span arithmetic; it removes
+        # two adds from them, and the measured ~2% sits under both ceilings.
         #
         # Excluded deliberately: `sliding_window`, which adds a lower bound and
         # so does not collapse to a single `<`; and `skip_kv_mask`, which already

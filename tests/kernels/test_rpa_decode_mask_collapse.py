@@ -393,6 +393,24 @@ def test_collapsed_and_general_paths_agree(case, kv_dtype):
                                    **scales)
 
     rows = _valid_rows(wl, spec["seqs"])
+
+    # Finiteness first, and as its own assertion rather than a flag on the
+    # comparison below. `np.testing.assert_allclose` defaults to
+    # `equal_nan=True`, so a NaN at the same index in both arms compares *equal*
+    # and this A/B would pass while comparing garbage to garbage. That is not
+    # hypothetical here: under the `kv_bound_plus1` mutation the fp8
+    # `decode_production_shape` case fails with a bare "nan location mismatch"
+    # and no element statistics at all, which means NaNs are reachable in this
+    # kernel one column past `kv_len`. Whether the *pristine* output is already
+    # carrying them was untested until this line existed -- and if it is, every
+    # NaN element is one the gate above was silently excusing.
+    for name, arr in (("collapsed", collapsed[rows]), ("general",
+                                                       general[rows])):
+        bad = int((~np.isfinite(np.asarray(arr, np.float32))).sum())
+        assert bad == 0, (f"{name} output has {bad} non-finite element(s) for "
+                          f"{case}/{kv_dtype}; assert_allclose would have "
+                          f"compared them as equal")
+
     np.testing.assert_allclose(collapsed[rows],
                                general[rows],
                                rtol=AB_RTOL,
