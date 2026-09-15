@@ -470,7 +470,7 @@ class _HostSlackProbe:
             try:
                 with open(self.stage5_file) as handle:
                     mode = handle.read().strip()
-                if mode in ("on", "off"):
+                if mode:
                     self.stage5_mode = mode
             except OSError:
                 pass

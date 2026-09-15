@@ -297,7 +297,8 @@ def _stage5_runtime_enabled() -> bool:
             mode = handle.read().strip()
     except OSError:
         return _stage5_mode != "off"
-    if mode in ("on", "off") and mode != _stage5_mode:
+    if (mode == "off" or mode == "on" or mode.startswith("delay")) and (
+            mode != _stage5_mode):
         _stage5_mode = mode
         logger.info("%s", json.dumps({
             "event": "kv_stage5_mode",
@@ -305,6 +306,36 @@ def _stage5_runtime_enabled() -> bool:
             "t": time.time(),
         }, sort_keys=True))
     return _stage5_mode != "off"
+
+
+def _stage5_submit_delay_s() -> float:
+    """Holds the submit back so it stops landing on the step boundary.
+
+    Stage 5 costs prefill 1.29 ms of step period, and by elimination that is
+    not host Python: the interpreter is free, nothing new runs on the model
+    runner beyond 0.085 ms of argument building, and the controller's C++ ran
+    on this host under stage 4 too. The one thing left that stage 5 changed is
+    when the transfer starts. Stage 4 could not know when prefill finished, so
+    it retried on a 50 ms timer and arrived a mean of 25 ms late at a
+    scattered point in the next step. Stage 5 fires the instant prefill ends,
+    which puts the controller's arming and dispatch exactly on the boundary
+    where the host is already finishing a step, sampling, and enqueuing the
+    next one, on every single request.
+
+    A fixed delay separates that claim from every other one. If the step
+    period comes back to the stage-4 level with the transfer merely moved off
+    the boundary, the cost is the collision and nothing about the call itself.
+    If it stays, timing is innocent and the transfer's own execution is the
+    suspect. Judge this on step period only. The delay pushes TTFT out by
+    construction, so TTFT cannot answer the question.
+    """
+    mode = _stage5_mode
+    if not mode.startswith("delay"):
+        return 0.0
+    try:
+        return float(mode[5:]) / 1000.0
+    except ValueError:
+        return 0.0
 
 
 class _AdmissionNotifier:
@@ -3784,7 +3815,14 @@ class TPURaidenConnectorWorker:
         queued_at = time.perf_counter()
         build_ms = (queued_at - build_start) * 1000
 
+        delay_s = _stage5_submit_delay_s()
+
         def _submit() -> None:
+            if delay_s:
+                # On a submit worker, not the model runner. Four workers take
+                # one job every 500 ms at this concurrency, so holding one for
+                # 30 ms cannot make the pool the queue.
+                time.sleep(delay_s)
             self._run_producer_transfer(req_id,
                                         uuid,
                                         num_tokens,
