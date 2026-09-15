@@ -55,29 +55,50 @@ def test_zeros_is_actually_zero_on_the_target_device(device, dtype):
         f"the KV pool cannot rely on it and RPA_V_MASK_MODE=none is unsafe")
 
 
+def _torch_calls(fn) -> set[str]:
+    """Names of `torch.<name>(...)` calls actually made in `fn`'s body.
+
+    An AST walk rather than a substring scan, because the first version of
+    this test searched the source text and failed on the *comment* explaining
+    why torch.empty was removed (j-f636426b). A guard that cannot tell code
+    from prose about the code is worse than none: it fires on the fix.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+    }
+
+
 def test_the_materializer_has_no_uninitialized_kv_pool_path():
     """No allocation route into the KV pool may use `torch.empty`.
 
     A behavioural test cannot reach every branch here -- the pooled path is
     gated on `_can_allocate_attention_cache_directly`, which depends on a
-    KVCacheConfig that varies by model -- so this reads the module instead.
-    Crude, and it is the only check that covers *both* routes at once.
+    KVCacheConfig that varies by model -- so this inspects the two allocators
+    instead. It is the only check that covers both routes at once.
     """
-    import inspect
-
     from vllm_torchtpu import kv_cache_materializer
 
     for fn in (kv_cache_materializer.allocate_raw_kv_cache_tensors,
                kv_cache_materializer.make_attention_cache_tensor):
-        src = inspect.getsource(fn)
-        assert "torch.empty" not in src, (
+        calls = _torch_calls(fn)
+        assert "empty" not in calls, (
             f"{fn.__name__} allocates the KV pool with torch.empty. On TPU "
-            f"that is 100% non-finite for fp8 (j-761bc2df), and RPA v3's "
-            f"default V-mask elision requires finite padding. Use "
+            f"that is 100% non-finite for fp8 (j-761bc2df, j-f636426b), and "
+            f"RPA v3's default V-mask elision requires finite padding. Use "
             f"torch.zeros, or set RPA_V_MASK_MODE=full and re-measure.")
-        assert "torch.zeros" in src, (
-            f"{fn.__name__} no longer allocates with torch.zeros; if the "
-            f"allocation moved, move this guard with it")
+        assert "zeros" in calls, (
+            f"{fn.__name__} no longer allocates with torch.zeros (saw "
+            f"{sorted(calls)}); if the allocation moved, move this guard "
+            f"with it rather than deleting it")
 
 
 @pytest.mark.parametrize("dtype", FP8_DTYPES, ids=FP8_IDS)

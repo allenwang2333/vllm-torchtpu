@@ -48,10 +48,19 @@ Q_DTYPE = jnp.bfloat16
 KV_DTYPES = [jnp.bfloat16, jnp.float8_e4m3fn]
 KV_DTYPE_IDS = ["bf16", "fp8"]
 
-# Finite, and as far from zero as the dtype goes. `p == 0` must annihilate
-# these exactly. fp8 e4m3fn maxes out at 448.
-FINITE_POISONS = {"zero": 0.0, "huge_bf16": 3.0e38, "large_fp8": 240.0}
-# Not finite. `p == 0` cannot annihilate these -- 0 * NaN is NaN.
+# Finite, and as far from zero as the dtype goes -- `p == 0` must annihilate
+# these exactly, however large. Resolved against the dtype rather than fixed,
+# because "large" is not a dtype-independent notion: bf16 tops out near
+# 3.39e38 and f8e4m3fn at 448, and 3e38 written into an fp8 cache is not a big
+# finite number, it is NaN (f8e4m3fn has no infinity and does not saturate).
+# Measured the hard way in j-f636426b, where a fixed 3e38 turned this into a
+# non-finite case and failed.
+FINITE_POISONS = {
+    "zero": lambda dt: 0.0,
+    "dtype_max": lambda dt: float(jnp.finfo(dt).max),
+    "neg_dtype_max": lambda dt: -float(jnp.finfo(dt).max),
+}
+# Not finite in any dtype. `p == 0` cannot annihilate these -- 0 * NaN is NaN.
 NONFINITE_POISONS = {"nan": np.nan, "posinf": np.inf, "neginf": -np.inf}
 
 
@@ -134,11 +143,18 @@ def test_finite_padding_is_annihilated_under_both_modes(
     """
     _require_tpu()
     _set_mode(monkeypatch, mode)
-    got, want = _attend(mode, FINITE_POISONS[poison], kv_dtype)
+    value = FINITE_POISONS[poison](kv_dtype)
+    # If the value is not finite once it is in the cache, this test is
+    # measuring the wrong thing and would read as a kernel bug.
+    assert np.isfinite(
+        np.asarray(jnp.asarray(value, kv_dtype).astype(jnp.float32))), (
+            f"{poison} resolved to {value!r}, which is not finite in "
+            f"{kv_dtype.__name__}; fix the parametrization, not the kernel")
+    got, want = _attend(mode, value, kv_dtype)
 
     assert np.isfinite(got).all(), (
-        f"finite padding ({poison}) produced a non-finite output under "
-        f"RPA_V_MASK_MODE={mode}: "
+        f"finite padding ({poison}={value:g}) produced a non-finite output "
+        f"under RPA_V_MASK_MODE={mode}: "
         f"{np.count_nonzero(~np.isfinite(got))}/{got.size} non-finite")
     np.testing.assert_allclose(got, want, atol=2e-2, rtol=0)
 
