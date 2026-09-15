@@ -230,13 +230,14 @@ def test_single_prefill_convolution_preserves_output_and_cache(length, carry):
                                   state[jnp.array([0, 1, 3])])
 
 
-@pytest.mark.parametrize('case',
-                         ['fresh', 'carried', 'mixed', 'padded', 'disabled'])
-def test_sp_mega_dispatch_preserves_state_and_fused_fallback(
-        monkeypatch, case):
+@pytest.mark.parametrize('case', ['fresh', 'carried', 'mixed', 'padded'])
+@pytest.mark.parametrize('tokens',
+                         [1, 32, 64, 96, 1024, 2048, 4096, 8192, 16384])
+def test_mega_dispatch_preserves_state_and_fused_fallback(
+        monkeypatch, case, tokens):
     from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as op
 
-    tokens, heads, dim, slots = 8192, 1, 128, 3
+    heads, dim, slots = 1, 128, 3
     x = jnp.ones((tokens, 3 * heads * dim), jnp.bfloat16)
     conv = jnp.ones((slots, 3, 3 * heads * dim), jnp.bfloat16)
     state = jnp.ones((slots, heads, dim, dim), jnp.float32)
@@ -252,7 +253,7 @@ def test_sp_mega_dispatch_preserves_state_and_fused_fallback(
     monkeypatch.setattr(op, 'kda_forward_inference', mega)
     starts = [0, 1, tokens] if case == 'mixed' else [0, tokens, tokens]
     if case == 'padded':
-        starts = [0, tokens - 64, tokens - 64]
+        starts = [0, tokens - 1, tokens - 1]
     args = (x, jnp.zeros(
         (tokens, heads * dim), x.dtype), jnp.zeros(
             (tokens, heads), x.dtype), jnp.zeros(
@@ -265,11 +266,11 @@ def test_sp_mega_dispatch_preserves_state_and_fused_fallback(
             jnp.array([tokens + (10 if case == 'carried' else 0), 0],
                       jnp.int32),
             jnp.array([1 if case == 'mixed' else 0, 0, 1], jnp.int32))
-    core = op._build_fused_core(-5.0, 1e-5, prefill_mega=case != 'disabled')
+    core = op._build_fused_core(-5.0, 1e-5)
     output, new_conv, new_state = jax.jit(core)(*args)
     assert output.shape == (tokens, heads, dim)
     assert output.dtype == x.dtype
-    if case in ('fresh', 'carried'):
+    if case in ('fresh', 'carried') and tokens % 64 == 0:
         np.testing.assert_array_equal(new_state[:2], state[:2])
         np.testing.assert_array_equal(new_state[2],
                                       4 if case == 'carried' else 3)

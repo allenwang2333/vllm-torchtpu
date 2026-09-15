@@ -518,7 +518,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
-            prefill_mega=self.prefill_group is not None,
         )
         # Unified-pool variant: reads and writes both state regions through
         # the single attention-shaped buffer; used when the runner binds the
@@ -533,7 +532,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
-            prefill_mega=self.prefill_group is not None,
         )
 
         context = vllm_config.compilation_config.static_forward_context

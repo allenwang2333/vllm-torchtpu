@@ -19,9 +19,9 @@ disaggregation; KV-cache and KDA-state outputs must remain valid for handoff.
   reduce-scatter avoid full intermediate activation buffers when their tile
   alignment permits. Other shard sizes use XLA collectives with the same token
   ownership; their use does not disable SP. Ring buffers remain bounded.
-- KDA uses the existing Mega recurrence for an opted-in single-sequence 8K
-  prefill, with contiguous convolution and FP32 tap accumulation. Other batches
-  use upstream's fused conv1d + GDN v3 path. Dense caches and the unified state
+- KDA uses the existing Mega recurrence for single-sequence prefills with
+  complete 64-token tiles, using contiguous convolution with FP32 tap
+  accumulation. Other batches use upstream's fused conv1d + GDN v3 path. Dense caches and the unified state
   pool use the same selection. Upstream's removed manual/chunked dispatcher
   and its environment selectors are not restored.
 - MLA uses the existing paged attention kernel, including for queries with
@@ -101,7 +101,9 @@ All sizes passed four-token cached-generation checks with finite log
 probabilities. HBM before KV allocation was 78.23 GiB/core. At 16K, the current
 XLA RS fallback and larger MLA workload are material costs: a representative
 core records 335 ms in XLA RS events (including waits) and 131.480 ms in MLA.
-The 8K-only Mega KDA recurrence remains separate from generalized SP.
+This sweep predates generalized Mega KDA dispatch: only 8K used Mega here.
+Current dispatch accepts supported single-sequence prefills at any length
+with complete 64-token tiles; the timings above do not measure that change.
 
 Cold engine setup took 56.80 minutes, including 51.18 minutes reported as
 compilation. Smaller SP buckets compile more slowly than their earlier

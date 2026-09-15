@@ -313,10 +313,7 @@ def _check_kda_abi(
     return num_tokens, num_sequences, num_heads, head_dim
 
 
-def _build_fused_core(lower_bound: float | None,
-                      eps: float,
-                      *,
-                      prefill_mega: bool = False):
+def _build_fused_core(lower_bound: float | None, eps: float):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     One Pallas call replaces the four-stage manual pipeline: the fused kernel
@@ -390,9 +387,9 @@ def _build_fused_core(lower_bound: float | None,
                                         mixed_qkv.dtype)
             return output, new_conv_state, new_pool
 
-        # Only the opted-in SP model uses Mega, and only for a full single
-        # prefill. Mixed, short, padded, and unsupported cases retain upstream.
-        if not (prefill_mega and num_tokens == 8192 and head_dim == 128
+        # Mega requires complete 64-token tiles and a single contiguous prefill.
+        # Mixed, padded, and unsupported cases retain the fused kernel.
+        if not (num_tokens > 0 and num_tokens % 64 == 0 and head_dim == 128
                 and mixed_qkv.dtype == jnp.bfloat16 and lower_bound is not None
                 and -5 <= lower_bound < 0):
             return run_fused()
@@ -442,7 +439,6 @@ def build_kimi_dispatched_kda_op(
     lower_bound: float | None,
     eps: float,
     state_dim_first: bool,
-    prefill_mega: bool = False,
 ):
     """Build the KDA op on the fused conv1d + GDN v3 kernel.
 
@@ -451,16 +447,15 @@ def build_kimi_dispatched_kda_op(
     both recurrences and the state write-back, and dispatches decode against
     prefill/mixed off ``distribution`` inside the kernel.
     """
-    core = _build_fused_core(lower_bound, eps, prefill_mega=prefill_mega)
+    core = _build_fused_core(lower_bound, eps)
 
     # vLLM's compile cache is keyed on the model config, so the variant goes in
     # the op name. If this line disagrees with the kernels in a profile, the
     # run came from cache.
-    logger.info("KDA op %s: fused conv1d + GDN v3; Mega 8K prefill=%s.",
-                prefix, prefill_mega)
+    logger.info("KDA op %s: Mega prefill with fused conv1d + GDN v3 fallback.",
+                prefix)
 
-    variant = "mega8k" if prefill_mega else "fused"
-    op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
+    op_name = f"pallas::kimi_dispatched_kda_mega_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
 
     def _fake_dispatched(mixed_qkv, _raw_gate, _beta, _output_gate, conv_state,
@@ -531,7 +526,6 @@ def _pooled_kda_core(
     lower_bound: float | None,
     eps: float,
     pool_block_tokens: int,
-    prefill_mega: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     num_heads = a_log.shape[0]
@@ -604,7 +598,7 @@ def _pooled_kda_core(
     # and zero-length sequences are safe under identity indices because the
     # kernel gates their state DMAs to zero size rather than redirecting them
     # to the null slot.
-    fused_core = _build_fused_core(lower_bound, eps, prefill_mega=prefill_mega)
+    fused_core = _build_fused_core(lower_bound, eps)
     output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,
@@ -657,7 +651,6 @@ def build_kimi_pooled_kda_op(
     lower_bound: float | None,
     eps: float,
     vllm_config: VllmConfig,
-    prefill_mega: bool = False,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -710,15 +703,13 @@ def build_kimi_pooled_kda_op(
             distribution,
             lower_bound=lower_bound,
             eps=eps,
-            pool_block_tokens=vllm_config.cache_config.block_size,
-            prefill_mega=prefill_mega)
+            pool_block_tokens=vllm_config.cache_config.block_size)
 
     # vLLM's compile cache is keyed on the model config and not on the op
     # body, so the kernel variant goes in the op name (see
     # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
     # era would otherwise be served stale.
-    variant = "mega8k" if prefill_mega else "fused"
-    op_name = f"pallas::kimi_pooled_kda_{variant}_{prefix.replace('.', '_')}"
+    op_name = f"pallas::kimi_pooled_kda_mega_{prefix.replace('.', '_')}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4, ))
 
     def _fake_pooled(mixed_qkv, _raw_gate, _beta, _output_gate, pool,
