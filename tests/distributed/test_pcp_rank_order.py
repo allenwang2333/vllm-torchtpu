@@ -23,6 +23,19 @@ from vllm_torchtpu.distributed import pcp_rank_order as order_mod
 pytestmark = pytest.mark.cpu_test
 
 
+# Global rank -> the chip's index in pjrt_client->devices(), as measured on
+# the v7 2x2x1 host these tests describe (job j-e4a95b4c). Natural binding puts
+# rank 2 on chip 4 and rank 6 on chip 2, so ring position and chip position
+# disagree until the ring is reordered -- which is the whole subject here.
+_MEASURED_CHIP_POSITIONS = {0: 0, 1: 1, 2: 4, 3: 5, 4: 6, 5: 7, 6: 2, 7: 3}
+
+
+def _chip_positions(monkeypatch, positions=None):
+    """Stand in for the world-group gather, which needs a live runtime."""
+    monkeypatch.setattr(order_mod, "_rank_to_device_position",
+                        lambda: dict(positions or _MEASURED_CHIP_POSITIONS))
+
+
 def _config(**kwargs):
     parallel = SimpleNamespace(
         prefill_context_parallel_size=kwargs.pop("pcp", 8),
@@ -102,10 +115,13 @@ def test_returns_both_axes_from_one_mesh(monkeypatch):
         "tpu",
         SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
         raising=False)
+    _chip_positions(monkeypatch)
     got = order_mod.resolve_pcp_topology_order(_config(pcp=4, tp=2))
 
+    # The mesh's rings are [[0, 6, 4, 2], [1, 7, 5, 3]]; reordering by chip
+    # position moves rank 2 ahead of rank 4, in both rings alike.
     assert got == {
-        "pcp": [[0, 6, 4, 2], [1, 7, 5, 3]],
+        "pcp": [[0, 6, 2, 4], [1, 7, 3, 5]],
         "tp": [[0, 1], [6, 7], [4, 5], [2, 3]],
     }
     assert set(got) == {"pcp", "tp"}, "keys must be vLLM group_name values"
@@ -129,9 +145,81 @@ def test_matches_the_order_measured_on_hardware(monkeypatch):
         "tpu",
         SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
         raising=False)
+    _chip_positions(monkeypatch)
     got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
 
-    assert got["pcp"] == [[0, 1, 6, 7, 4, 5, 2, 3]]
+    # The topology mesh asks for [0, 1, 6, 7, 4, 5, 2, 3], whose chips are
+    # [0, 1, 2, 3, 6, 7, 4, 5] -- the last four out of order, which is exactly
+    # the permutation the failing e2e runs showed. Reordering swaps the two
+    # trailing pairs so the chips run 0..7 and ring position == partition id.
+    assert got["pcp"] == [[0, 1, 6, 7, 2, 3, 4, 5]]
+    assert [_MEASURED_CHIP_POSITIONS[rank]
+            for rank in got["pcp"][0]] == list(range(8))
+
+
+# --- ordering the ring by chip position ------------------------------------
+
+
+def test_ring_order_is_unchanged_when_chips_already_ascend(monkeypatch):
+    """A ring whose chips already run 0..7 is left exactly as the mesh built
+    it, so the reordering is a no-op wherever the invariant already holds."""
+    import torch
+
+    mesh = numpy.array([0, 1, 6, 7, 2, 3, 4, 5]).reshape(1, 8, 1)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False)
+    _chip_positions(monkeypatch)
+    got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
+
+    assert got["pcp"] == [[0, 1, 6, 7, 2, 3, 4, 5]]
+
+
+def test_one_ring_takes_chip_order_over_the_topology_order(monkeypatch):
+    """With a single ring the two orderings compete, and chips win.
+
+    Worth stating as its own case: at tp=1 the topology mesh no longer decides
+    anything, because the reordering below sorts the whole ring. Under an
+    identity binding that collapses #414's ring to plain arange.
+    """
+    import torch
+
+    mesh = numpy.array([0, 1, 6, 7, 4, 5, 2, 3]).reshape(1, 8, 1)
+    monkeypatch.setattr(
+        torch,
+        "tpu",
+        SimpleNamespace(topology_aware_mesh=lambda _shape: mesh),
+        raising=False)
+    _chip_positions(monkeypatch, {rank: rank for rank in range(8)})
+    got = order_mod.resolve_pcp_topology_order(_config(pcp=8, tp=1))
+
+    assert got["pcp"] == [[0, 1, 2, 3, 4, 5, 6, 7]]
+
+
+def test_every_ring_gets_the_same_permutation():
+    """Sorting rings independently would scatter a TP lane across positions.
+
+    A rank's TP partners are the ranks at its position in the other rings, so
+    the lane invariant survives one shared permutation and nothing else. Here
+    ring 1's chips are already ascending; sorting it on its own would leave it
+    untouched and break the pairing with ring 0.
+    """
+    rings = [[0, 6, 4, 2], [1, 7, 5, 3]]
+    positions = _MEASURED_CHIP_POSITIONS
+    got = order_mod._order_rings_by_device(rings, positions)
+
+    assert got == [[0, 6, 2, 4], [1, 7, 3, 5]]
+    pcp_of = {rank: i for ring in got for i, rank in enumerate(ring)}
+    for lane in ([0, 1], [6, 7], [4, 5], [2, 3]):
+        assert len({pcp_of[rank] for rank in lane}) == 1
+
+
+def test_ring_order_raises_when_a_rank_has_no_chip():
+    """A partial gather would silently sort the ring by a stale mapping."""
+    with pytest.raises(RuntimeError, match="no device position|No device"):
+        order_mod._order_rings_by_device([[0, 1, 2, 3]], {0: 0, 1: 1})
 
 
 # --- pcp_topology_order ----------------------------------------------------
@@ -323,17 +411,25 @@ def test_context_manager_replaces_both_axes():
 # --- verify_pcp_topology_order ---------------------------------------------
 
 
-def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None):
+def _patch_groups(monkeypatch, *, rank, pcp=None, tp=None, positions=None):
     """Point the verifier at synthetic groups without a live torch world."""
     import torch.distributed as dist
     from vllm.distributed import parallel_state
 
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     for name, ranks in (("get_pcp_group", pcp), ("get_tp_group", tp)):
-        monkeypatch.setattr(parallel_state,
-                            name,
-                            lambda ranks=ranks: SimpleNamespace(ranks=ranks),
-                            raising=False)
+        monkeypatch.setattr(
+            parallel_state,
+            name,
+            lambda ranks=ranks: SimpleNamespace(
+                ranks=ranks, world_size=len(ranks or ())),
+            raising=False)
+    # The chip check runs unconditionally, so every verifier test has to say
+    # where the chips are. Default to "already in order" so the tests about
+    # the requested order are not also testing this one.
+    if positions is None:
+        positions = {rank_: i for i, rank_ in enumerate(pcp or ())}
+    _chip_positions(monkeypatch, positions)
 
 
 def test_verify_does_nothing_when_no_order_was_applied(monkeypatch):
@@ -392,6 +488,53 @@ def test_verify_raises_for_an_axis_it_cannot_read_back(monkeypatch):
 
     with pytest.raises(RuntimeError, match="No group accessor"):
         order_mod.verify_pcp_topology_order({"ep": [[0, 1]]})
+
+
+# --- the ring must sit on the chips in order -------------------------------
+
+
+def test_verify_raises_when_the_ring_is_not_in_chip_order(monkeypatch):
+    """The layout the failing e2e runs actually had.
+
+    Ring [0, 1, 6, 7, 4, 5, 2, 3] on the measured binding sits on chips
+    [0, 1, 2, 3, 6, 7, 4, 5]: positions 4..7 permuted, which is precisely the
+    swap that reordered GDN's token blocks.
+    """
+    _patch_groups(monkeypatch,
+                  rank=6,
+                  pcp=[0, 1, 6, 7, 4, 5, 2, 3],
+                  positions=_MEASURED_CHIP_POSITIONS)
+
+    with pytest.raises(RuntimeError, match="chip positions"):
+        order_mod.verify_pcp_topology_order(
+            {"pcp": [[0, 1, 6, 7, 4, 5, 2, 3]]})
+
+
+def test_verify_checks_chip_order_even_when_no_order_was_requested(
+        monkeypatch):
+    """Whether the ring matches the chips is not this module's to opt out of.
+
+    ``TPU_PCP_TOPOLOGY_AWARE_MESH=0`` leaves vLLM's arithmetic layout in
+    place, which on a non-identity binding violates the invariant just as
+    badly -- and silently, since no order was requested to check against.
+    """
+    _patch_groups(monkeypatch,
+                  rank=0,
+                  pcp=[0, 1, 2, 3, 4, 5, 6, 7],
+                  positions=_MEASURED_CHIP_POSITIONS)
+
+    with pytest.raises(RuntimeError, match="chip positions"):
+        order_mod.verify_pcp_topology_order(None)
+
+
+def test_verify_accepts_a_ring_that_sits_on_the_chips_in_order(monkeypatch):
+    """The order this change produces: ranks sorted by chip position."""
+    _patch_groups(monkeypatch,
+                  rank=0,
+                  pcp=[0, 1, 6, 7, 2, 3, 4, 5],
+                  positions=_MEASURED_CHIP_POSITIONS)
+
+    order_mod.verify_pcp_topology_order(None)
 
 
 @pytest.mark.parametrize("field", [

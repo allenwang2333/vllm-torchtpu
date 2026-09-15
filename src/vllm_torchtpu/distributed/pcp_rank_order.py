@@ -33,6 +33,18 @@ Only ``tp``, ``pcp`` and (degenerately) ``dp``/``pp`` exist at the supported
 scope, and at ``dp == 1, pp == 1`` the DP and PP groups are singletons and the
 EP group is the whole world, so no other group constrains this layout.
 
+One ordering constraint outranks topology, though, and is applied last. A
+kernel reads ``lax.axis_index``, which is a partition id -- a chip's index in
+``pjrt_client->devices()`` -- and uses it to index tables the host built per
+``rank_in_group``. Those are the same number only if ring position equals chip
+position. Before #414 a ``LOCAL_RANK`` remap forced that; #414 removed the
+remap, correctly, and nothing took over the invariant, so GDN has been reading
+another rank's schedule ever since. ``_order_rings_by_device`` takes it over
+here, which is where ``tpu_rank_binding``'s docstring says it belongs. On one
+ring that overrides the topology order outright and costs 2 ICI hops; the two
+stop competing once the DeviceAssignment can follow the mesh, and at that
+point the reordering should be removed, not kept alongside.
+
 """
 
 import contextlib
@@ -44,6 +56,87 @@ import numpy
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _rank_to_device_position() -> dict[int, int]:
+    """Global rank -> its chip's index in ``pjrt_client->devices()``.
+
+    That index is the partition id the kernel will see. ``torch_tpu`` fills
+    the DeviceAssignment with ``pjrt_client->devices()`` in enumeration order
+    (``SetDefaultDeviceAssignment``), so ``lax.axis_index`` returns a chip's
+    position in that list and nothing else. It is the one numbering this
+    module cannot choose, which is why the ring is sorted to match it rather
+    than the other way round.
+
+    Gathered rather than read locally: a worker only knows its own chip.
+    ``init_distributed_environment`` has run by the time
+    ``resolve_pcp_topology_order`` is called, so the world group exists and
+    has the gloo side ``all_gather_object`` needs.
+    """
+    import torch.distributed as dist
+    from torch_tpu._internal.distributed import tpu_distributed
+    from vllm.distributed.parallel_state import get_world_group
+
+    device_id = int(tpu_distributed.global_device_id())
+    pjrt_order = [
+        int(value) for value in tpu_distributed.all_global_device_ids()
+    ]
+    if device_id not in pjrt_order:
+        raise RuntimeError(
+            f"This worker's TPU device id {device_id} is not in torch_tpu's "
+            f"device list {pjrt_order}, so its partition id is undefined.")
+
+    world = get_world_group()
+    payload = (int(dist.get_rank()), pjrt_order.index(device_id))
+    gathered: list[tuple[int, int] | None] = [None] * int(world.world_size)
+    dist.all_gather_object(gathered, payload, group=world.cpu_group)
+
+    rank_to_position: dict[int, int] = {}
+    for item in gathered:
+        if item is None:
+            raise RuntimeError(
+                "PCP device position gather returned an empty entry.")
+        rank, position = item
+        rank_to_position[int(rank)] = int(position)
+    return rank_to_position
+
+
+def _order_rings_by_device(
+        rings: list[list[int]],
+        rank_to_position: dict[int, int]) -> list[list[int]]:
+    """Relabel the rings so ring position i is the rank on the i-th chip.
+
+    The host slices tokens by ``rank_in_group`` (pcp_sequence_layout), while a
+    kernel indexes the per-rank schedule it was handed with
+    ``lax.axis_index`` -- a partition id. GDN does this literally:
+    ``stage_metadata_ref.rank_active_row_end[rank]`` in
+    ``kernels/gdn/v3/pcp_wrapper.py``. The two are the same number only when
+    ring position == partition id. A remap used to force that and #414 removed
+    it, on the correct grounds that permuting ``LOCAL_RANK`` solves a data
+    placement problem in the device binding layer. This does it the way
+    ``tpu_rank_binding``'s docstring says it should be done -- "the fix belongs
+    in the PCP group's rank order, not here" -- by moving the label instead of
+    the chip. The binding is untouched; only which ring position each rank
+    occupies changes.
+
+    One permutation of the positions is applied to every ring, never one sort
+    per ring. A rank's TP partners are the ranks at its position in the other
+    rings, so sorting rings independently would scatter a lane across
+    positions and break the invariant this module's docstring is about.
+    """
+    if not rings:
+        return rings
+    missing = sorted({
+        rank
+        for ring in rings for rank in ring if rank not in rank_to_position
+    })
+    if missing:
+        raise RuntimeError(
+            f"No device position was gathered for PCP ranks {missing}; "
+            f"gathered={rank_to_position}.")
+    order = sorted(range(len(rings[0])),
+                   key=lambda index: rank_to_position[rings[0][index]])
+    return [[ring[index] for index in order] for ring in rings]
 
 
 def resolve_pcp_topology_order(
@@ -145,6 +238,35 @@ def resolve_pcp_topology_order(
                 f"{groups} whose ranks {flat} are not a permutation of "
                 f"{expected}.")
 
+    # Sorting the ring by chip position is what keeps `lax.axis_index` equal
+    # to `rank_in_group`. It is applied on top of the topology order rather
+    # than instead of it: the mesh still decides *which* ranks share a ring
+    # (and, under tp>1, which lane), this only decides where in the ring each
+    # one sits. With one ring the two orderings cannot both be honoured, and
+    # correctness wins -- the ring becomes chip-enumeration order, which on
+    # 2x2x1 costs 6 ICI hops rather than 4. That trade goes away once the
+    # DeviceAssignment can follow the mesh (google-pytorch/torch_tpu#3522
+    # plus the collectives half of it), at which point this reordering should
+    # be deleted rather than kept.
+    rank_to_position = _rank_to_device_position()
+    group_ranks_by_name["pcp"] = _order_rings_by_device(
+        group_ranks_by_name["pcp"], rank_to_position)
+    for ring in group_ranks_by_name["pcp"]:
+        logger.info("PCP ring by device | ranks=%s chip_positions=%s", ring,
+                    [rank_to_position[rank] for rank in ring])
+    if tp_size != 1:
+        # Each ring is now a proper subgroup of the slice, so its positions
+        # run 0..pcp_size-1 while partition ids run 0..world_size-1. No
+        # ordering can make those equal; only a DeviceAssignment built from
+        # the mesh can. Said here rather than left to the reader, because the
+        # reordering above still runs and still looks like it did something.
+        logger.warning(
+            "PCP ring reordered by chip position, but tensor_parallel_"
+            "size=%d means a ring does not span the slice: partition ids "
+            "run 0..%d while ring positions run 0..%d, so they cannot be "
+            "made equal here. verify_pcp_topology_order will reject this.",
+            tp_size, dp_size * pcp_size * tp_size - 1, pcp_size - 1)
+
     logger.info("Topology mesh | mesh_shape=%s -> %s", mesh_shape,
                 group_ranks_by_name)
     return group_ranks_by_name
@@ -234,6 +356,60 @@ def pcp_topology_order(
             torch.distributed.new_group = original_new_group
 
 
+def _verify_ring_sits_on_chips_in_order() -> None:
+    """Fail startup unless ring position i is the worker on the i-th chip.
+
+    ``lax.axis_index`` returns a partition id, and the host builds its
+    per-rank tables by ``rank_in_group``. Every PCP kernel reads one with the
+    other -- GDN indexes its stage schedule with ``lax.axis_index`` directly,
+    in ``kernels/gdn/v3/pcp_wrapper.py`` -- so the two have to be the same
+    number. They were, by construction, until #414 removed the remap that
+    arranged it, and nothing has checked since.
+
+    Nothing checking is the reason it mattered. A permuted schedule keeps
+    every shape correct, completes every collective, and changes no timing;
+    it reached end-to-end output twice before anyone could say which number
+    was wrong. This is the check that turns that into a startup failure.
+
+    Distinct from the verification above, which asks whether vLLM adopted the
+    order this module requested. This asks whether that order is the right
+    one, and so runs even when no order was requested at all.
+    """
+    from vllm.distributed.parallel_state import get_pcp_group
+
+    try:
+        group = get_pcp_group()
+    except (AssertionError, ImportError):
+        return
+    if group is None or int(group.world_size) <= 1:
+        return
+
+    ranks = [int(rank) for rank in group.ranks]
+    rank_to_position = _rank_to_device_position()
+    missing = [rank for rank in ranks if rank not in rank_to_position]
+    if missing:
+        raise RuntimeError(
+            f"No chip position was gathered for PCP ranks {missing}, so "
+            f"whether the ring matches the partition order is unknown.")
+
+    positions = [rank_to_position[rank] for rank in ranks]
+    if positions == list(range(len(ranks))):
+        logger.info("PCP ring | verified position == partition for %s", ranks)
+        return
+
+    raise RuntimeError(
+        "The PCP group does not sit on the chips in enumeration order, so "
+        "lax.axis_index inside a kernel is not rank_in_group and every "
+        "per-rank table the host builds is read by the wrong worker. Ring "
+        f"{ranks} sits on chip positions {positions}, which should have been "
+        f"{list(range(len(ranks)))}. resolve_pcp_topology_order sorts the "
+        "ring to match, so reaching here means the ring came from somewhere "
+        "it does not run -- TPU_PCP_TOPOLOGY_AWARE_MESH=0, or a PCP group "
+        "smaller than the slice, which cannot satisfy this at all because "
+        "its positions run 0..pcp_size-1 while partition ids run over every "
+        "chip.")
+
+
 def verify_pcp_topology_order(
         group_ranks_by_name: dict[str, list[list[int]]] | None) -> None:
     """Assert vLLM adopted the mesh's order, by reading the built groups back.
@@ -255,7 +431,13 @@ def verify_pcp_topology_order(
     ``GroupCoordinator.ranks`` is the same attribute ``get_pcp_group_layout``
     builds the device mesh from, so this asserts the literal input to the
     kernel's ring rather than a proxy for it.
+
+    ``_verify_ring_sits_on_chips_in_order`` below runs whether or not any
+    order was requested, because the invariant it checks is not this module's
+    to opt out of.
     """
+    _verify_ring_sits_on_chips_in_order()
+
     if not group_ranks_by_name:
         return
 
