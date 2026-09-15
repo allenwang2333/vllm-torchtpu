@@ -21,6 +21,13 @@ and broken:
     two arms sharing one build hash (GUARD1 red)    -> rc 2
     arms fed different caches       (GUARD2 red)    -> rc 2
     the env var not honoured        (GUARD1 red)    -> rc 2
+    a no-op injection (scale_one_seq:1.0)           -> NOT caught (rc 1);
+                                                       the comparator used to
+                                                       credit Check B, which
+                                                       fails on clean data, and
+                                                       report a catch for a
+                                                       multiply by one
+    an injection into an absent arm                 -> rc 2, never a catch
     an arm 4x further from float32 truth (C2 red)   -> rc 1
     a reference blind to a 1-page over-read (C0)    -> rc 1
     no float32 reference at all                     -> rc 1, never PASS
@@ -146,6 +153,16 @@ def main():
               ["--compare", str(a8), str(a4), str(a2),
                "--inject-fault", "scale_one_seq:1.00002",
                "--inject-into", "2"], 1)
+    # The attribution bug, pinned. `scale_one_seq:1.0` is a multiply by one:
+    # it perturbs nothing, so no check can have caught it. The comparator used
+    # to credit Check B -- which fails on clean data -- and report "caught".
+    ok &= run("no-op injection scale_one_seq:1.0 (must NOT be caught)",
+              ["--compare", str(a8), str(a4), str(a2),
+               "--inject-fault", "scale_one_seq:1.0", "--inject-into", "2"], 1)
+    ok &= run("injection into an arm that is not present -> INVALID",
+              ["--compare", str(a8), str(a4),
+               "--inject-fault", "scale_one_seq:1.05", "--inject-into", "2"],
+              2)
     ok &= run("vacuity: same file twice", ["--compare", str(a8), str(a8)], 2)
 
     # Kernel-bug simulations: the gate must go red.

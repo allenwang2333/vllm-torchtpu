@@ -92,7 +92,28 @@ requires that to move it by at least 10x an arm's own error -- without it,
 "every arm is close to the oracle" would be unfalsifiable.
 
 Check B is still computed and printed, because the shape of the disagreement is
-informative, but it is advisory unless ``--strict-cross-arm`` is passed.
+informative, but it is advisory unless ``--strict-cross-arm`` is passed. **Only
+Check C may credit a negative control.** Check B fails on clean data at this
+shape, so ``not cross_ok`` is true before any injection; crediting it marked
+every planted fault "caught", including ``scale_one_seq:1.0``, a multiply by
+one. A control is also refused outright if the injection moved nothing.
+
+The sensitivity floor is printed, not asserted
+----------------------------------------------
+C2 is the binding predicate -- C1 is deliberately loose -- so the gate is blind
+to a fault until it pushes an arm past ``oracle_ratio_tol x`` the default's own
+distance from truth. At the measured 1.504e-02 that is 3.0e-2: **roughly a 3%
+single-sequence error**. A 0.1% rescale is caught by nothing here. Check C
+prints the figure from the run's own data under ``SENSITIVITY FLOOR``.
+
+Partial batch blocks
+--------------------
+``num_live`` defaults to ``min(CONCURRENCY, max_num_seqs) = 64``, which is
+divisible by 8, 4 *and* 2 -- so at the default no arm enters a partial batch
+block and none has a padded slot, which leaves the exact path
+``BlockSizes.batch_size`` controls untested. ``--num-live`` reaches it; 63, 33
+and 7 give a partial tail on at least one arm each, with 1, 31 and 57 padded
+slots respectively.
 
 Model geometry is inherited from ``microbench_batched_rpa_kv_layout.py`` rather
 than restated, so the two cannot drift.
@@ -331,7 +352,17 @@ def _emit(args) -> int:
     pages_per_seq = math.ceil(args.max_model_len / page_size)
     total_pages = args.max_num_seqs * pages_per_seq
     q_dtype, kv_dtype = jnp.bfloat16, jnp.float8_e4m3fn
-    num_live = min(mb.CONCURRENCY, args.max_num_seqs)
+    # The tail-block path is the one `BlockSizes.batch_size` controls, and the
+    # default 64 live sequences is divisible by 8, 4 AND 2 -- so at the default
+    # no arm ever enters a partial batch block and none has a padded slot. In
+    # production `max_num_seqs` is 64 but the live count varies continuously,
+    # which makes the partial block the common case. `--num-live` is how the
+    # gate reaches it.
+    num_live = (args.num_live if args.num_live is not None
+                else min(mb.CONCURRENCY, args.max_num_seqs))
+    if not 1 <= num_live <= args.max_num_seqs:
+        raise SystemExit(f"FATAL: --num-live {num_live} outside "
+                         f"1..{args.max_num_seqs}")
 
     cache_shape = wrapper.get_kv_cache_shape(total_pages, page_size,
                                              mb.NUM_KV_HEADS_PER_RANK,
@@ -388,11 +419,17 @@ def _emit(args) -> int:
           f"resolved batch_size={resolved_batch_size}  "
           f"kernel={kernel_name}  bkv={int(dec_blocks.bkv_sz)}",
           flush=True)
+    n_blocks = math.ceil(num_live / resolved_batch_size)
+    tail = num_live - (n_blocks - 1) * resolved_batch_size
     print(f"  layout={args.layout} page_size={page_size} "
           f"pages_per_seq={pages_per_seq} cache_shape={tuple(cache_shape)} "
           f"{np.dtype(kv_dtype).name} bytes/token={bytes_per_token:.0f} "
           f"live_seqs={num_live} kv_len={args.decode_kv_len}",
           flush=True)
+    print(f"  batch blocks: {n_blocks} of {resolved_batch_size}, last block "
+          f"holds {tail} live seq(s) "
+          f"({'PARTIAL' if tail != resolved_batch_size else 'full'}); "
+          f"{args.max_num_seqs - num_live} padded slot(s)", flush=True)
     if arm != "<unset>" and str(resolved_batch_size) != arm:
         print(f"  !! requested {arm} but resolved {resolved_batch_size} -- "
               "the value was clamped or ignored", flush=True)
@@ -548,13 +585,16 @@ def _inject(out: np.ndarray, fault: str) -> np.ndarray:
     """Synthesise the bug the tolerance must catch, to prove it catches it."""
     out = out.copy()
     kind, _, param = fault.partition(":")
-    if kind == "drop_last_seqs":
+    if kind in ("drop_last_seqs", "drop_first_seqs"):
         n = int(param or 2)
-        out[-n:] = 0.0
-        return out
-    if kind == "drop_first_seqs":
-        n = int(param or 2)
-        out[:n] = 0.0
+        if n <= 0:
+            # out[-0:] is out[0:], which zeroes everything. Refuse rather than
+            # silently turn "drop nothing" into "drop all".
+            raise SystemExit(f"--inject-fault {fault!r}: n must be >= 1")
+        if kind == "drop_last_seqs":
+            out[-n:] = 0.0
+        else:
+            out[:n] = 0.0
         return out
     if kind == "scale_one_seq":
         # A single mis-rescaled sequence: the m/l/acc bug shape.
@@ -571,6 +611,21 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
     loaded = [(p, ) + _load(p) for p in paths]
     metas = {m["arm"]: (p, z, m) for p, z, m in loaded}
     problems: list[str] = []
+
+    # How far the injected fault actually moved the data. A negative control
+    # that changed nothing cannot have been "caught", and crediting one is the
+    # exact way a control becomes decorative -- `scale_one_seq:1.0` is a
+    # multiply by one and must come back NOT CAUGHT.
+    injected_delta: float | None = None
+
+    def _apply(out: np.ndarray) -> np.ndarray:
+        nonlocal injected_delta
+        new = _inject(out, inject_fault)
+        d = float(np.abs(new.astype(np.float64) -
+                         out.astype(np.float64)).max())
+        injected_delta = d if injected_delta is None else max(injected_delta,
+                                                              d)
+        return new
 
     print("=" * 78)
     print("ARMS")
@@ -746,7 +801,7 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
             a = rz[f"{case}__out"]
             b = z[f"{case}__out"]
             if inject_fault and arm == inject_into and case == "base":
-                b = _inject(b, inject_fault)
+                b = _apply(b)
             if a.shape != b.shape:
                 print(f"    [{case}] SHAPE MISMATCH {a.shape} vs {b.shape}")
                 cross_ok = False
@@ -801,7 +856,7 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
         for _p, z, m in loaded:
             b = z["base__out"]
             if inject_fault and m["arm"] == inject_into:
-                b = _inject(b, inject_fault)
+                b = _apply(b)
             d_true[m["arm"]] = _per_seq_rel(ref, b)
         base_d = d_true[base_arm]
         c0_ratio = (float(d_mis.max()) / float(base_d.max())
@@ -836,6 +891,18 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
                   f"ratio_vs_arm{base_arm}={ratio:.2f}x "
                   f"(C1 {'ok' if c1 else 'RED'}, C2 "
                   f"{'ok' if c2 else 'RED'})")
+        # The gate's floor, computed rather than asserted. C2 is the binding
+        # predicate (C1 is deliberately loose), so a fault is invisible to this
+        # check until it pushes an arm's distance from truth past this figure.
+        trip = min(oracle_abs_tol, oracle_ratio_tol * float(base_d.max()))
+        print(f"\n  SENSITIVITY FLOOR: C2 binds at {oracle_ratio_tol:.2f} x "
+              f"{base_d.max():.3e} = {oracle_ratio_tol * base_d.max():.3e}; "
+              f"C1 binds at {oracle_abs_tol:.3e}.")
+        print(f"     A fault is invisible to this gate until it moves some "
+              f"sequence's output by more")
+        print(f"     than {trip:.3e} relative to that sequence's own scale -- "
+              f"about a {100.0 * trip:.1f}% single-sequence error. Anything "
+              "smaller is NOT covered.")
         print("\n  Reading: if every arm sits the same distance from float32")
         print("  truth, the arm-to-arm spread in Check B is reassociation")
         print("  noise amplified by cancellation, not a loss of accuracy.")
@@ -900,21 +967,47 @@ def _compare(paths: list[str], *, base_arm: str, rel_tol: float,
     passed = all(gates)
 
     if inject_fault:
-        caught = (not cross_ok) or (oracle_checked and not oracle_ok)
-        if not caught:
-            print("RESULT: FAIL (negative control) -- the injected fault "
-                  f"{inject_fault!r} passed both the cross-arm tolerance and "
-                  "the float32 reference. This check cannot catch that bug "
-                  "and must not be quoted as a gate.")
+        # Only Check C may credit a catch. Check B fails on clean data at this
+        # shape -- the arms legitimately disagree by ~1e-2 against a 2e-2
+        # tolerance -- so `not cross_ok` is already true before any injection,
+        # and crediting it would mark every fault "caught" including a
+        # multiply by one. That bug made sections 3a-3c and 5b of the first two
+        # gate runs vacuous; only the --rel-tol 1e9 runs were real.
+        print()
+        print(f"  negative control: {inject_fault!r} into arm {inject_into}")
+        if injected_delta is None:
+            print("  !! the fault was never applied -- no such arm in this "
+                  "comparison. The control did not run.")
+            print("RESULT: INVALID (negative control)")
+            return 2
+        print(f"  the injection moved the data by max_abs="
+              f"{injected_delta:.6e}")
+        if injected_delta == 0.0:
+            print("  !! the injection changed NOTHING. A control that does "
+                  "not perturb the data cannot be caught, and reporting a "
+                  "catch here would be crediting the check for noticing an "
+                  "identity.")
+            print("RESULT: FAIL (negative control) -- no-op injection, "
+                  "NOT CAUGHT (correctly).")
             return 1
-        by = []
-        if not cross_ok:
-            by.append("B")
-        if oracle_checked and not oracle_ok:
-            by.append("C")
+        if not oracle_checked:
+            print("  !! Check C did not run, so nothing gating could have "
+                  "caught this.")
+            print("RESULT: FAIL (negative control) -- NOT CAUGHT.")
+            return 1
+        if oracle_ok:
+            print("RESULT: FAIL (negative control) -- the injected fault "
+                  f"{inject_fault!r} passed the float32 reference. It is "
+                  "below this gate's sensitivity floor, printed above. The "
+                  "gate does not cover that bug and must not be quoted as "
+                  "though it did.")
+            print(f"     (Check B reports {'FAIL' if not cross_ok else 'PASS'}"
+                  " here, but B fails on clean data too and cannot attribute "
+                  "a catch.)")
+            return 1
         print("RESULT: PASS (negative control) -- the injected fault "
-              f"{inject_fault!r} was caught by check {'+'.join(by)}. The "
-              "check discriminates.")
+              f"{inject_fault!r} was caught by check C, the float32 "
+              "reference. The check discriminates.")
         return 0
 
     if passed:
@@ -946,6 +1039,12 @@ def main() -> int:
     p.add_argument("--max-num-seqs", type=int, default=mb.MAX_NUM_SEQS)
     p.add_argument("--max-model-len", type=int, default=mb.MAX_MODEL_LEN)
     p.add_argument("--decode-kv-len", type=int, default=mb.DECODE_KV_LEN)
+    p.add_argument("--num-live", type=int, default=None,
+                   help=("live sequences in the batch. Defaults to "
+                         "min(CONCURRENCY, max_num_seqs) = 64, which is "
+                         "divisible by 8, 4 and 2 and so never exercises a "
+                         "partial batch block. Use 63 / 33 / 7 to reach the "
+                         "tail-block path this knob controls."))
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--oracle-abs-tol", type=float, default=ORACLE_ABS_TOL)
     p.add_argument("--oracle-ratio-tol", type=float, default=ORACLE_RATIO_TOL)
