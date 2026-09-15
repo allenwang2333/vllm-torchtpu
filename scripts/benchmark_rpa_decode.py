@@ -215,16 +215,21 @@ def _time(run, kv_cache, iters, warmup, chain):
 
 
 def _reference(wl, sm_scale):
-    s = _closed_over(wl)
+    """The XLA reference, run eagerly.
 
-    @jax.jit
-    def run(kv_cache):
-        return ref_ragged_paged_attention(s["q"], s["k"], s["v"], kv_cache,
-                                          s["kv_lens"], s["page_indices"],
-                                          s["cu_q_lens"], s["distribution"],
-                                          sm_scale=sm_scale)
-
-    return run(wl["kv_cache"])
+    It must not be wrapped in `jax.jit`: `dynamic_validate_inputs` unstacks
+    `distribution` and branches on it in Python (`if not (i <= j <= k)`,
+    `v3/kernel.py:1311`), and under a trace even an op on a closed-over
+    constant yields a tracer, so jitting it raises
+    `TracerBoolConversionError` however the argument is passed.  Eagerly the
+    entries are concrete and the check does what it was written to do.  This
+    costs per-op dispatch, which does not matter: the reference is computed
+    once per variant and is never the thing being timed.
+    """
+    return ref_ragged_paged_attention(wl["q"], wl["k"], wl["v"],
+                                      wl["kv_cache"], wl["kv_lens"],
+                                      wl["page_indices"], wl["cu_q_lens"],
+                                      wl["distribution"], sm_scale=sm_scale)
 
 
 def _check(wl, d_block_sizes, sm_scale, rtol, atol):
@@ -306,10 +311,19 @@ def main():
     pages_per_seq = -(-args.max_model_len // page_size)
     sm_scale = 1.0 / (args.head_dim**0.5)
 
-    default_bs = get_default_block_sizes(
-        q_dtype, kv_dtype, args.num_q_heads, args.num_kv_heads, args.head_dim,
-        page_size, args.num_seqs, args.num_seqs, pages_per_seq,
-        case=RpaCase.DECODE)
+    # Off-TPU this raises NotImplementedError(tpu_version=-1). That is not
+    # fatal for an explicit --sweep, and being able to smoke-test the harness
+    # on a CPU host is worth more than insisting on the label, so it degrades
+    # instead of exiting: only the paths that need the default will complain.
+    try:
+        default_bs = get_default_block_sizes(
+            q_dtype, kv_dtype, args.num_q_heads, args.num_kv_heads,
+            args.head_dim, page_size, args.num_seqs, args.num_seqs,
+            pages_per_seq, case=RpaCase.DECODE)
+    except NotImplementedError as exc:
+        print(f"note: default block sizes unavailable here ({exc}); "
+              f"--sweep still works with explicit sizes")
+        default_bs = None
 
     print(f"device          : {jax.devices()[0].device_kind} "
           f"x{jax.device_count()}")
@@ -446,7 +460,7 @@ def main():
                     results[label] = med
         if results:
             base_label = (f"bkv={default_bs['bkv_sz']},"
-                          f"csz={default_bs['bkv_csz']}")
+                          f"csz={default_bs['bkv_csz']}") if default_bs else ""
             base = results.get(base_label, min(results.values()))
             print("--- relative (lower is better) ---")
             for label, med in sorted(results.items(), key=lambda kv: kv[1]):
@@ -456,6 +470,10 @@ def main():
                       f"({100.0*(med-base)/base:+.1f}% time){tag}")
         return 1 if failures else 0
 
+    if default_bs is None:
+        print("error: the default arm needs a TPU to resolve block sizes; "
+              "use --sweep with explicit --sweep-bkv off-TPU")
+        return 1
     measure("default", args.kv_len, None,
             want_scope=f"bkv_{default_bs['bkv_sz']}_{default_bs['bkv_csz']}")
 
