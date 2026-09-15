@@ -365,7 +365,17 @@ def calculate_block_sizes(
     # Default to triple buffer as its almost always beneficial.
     n_buffer = 3
     # Fixed value based on experimental results.
-    decode_batch_size = 8
+    #
+    # Overridable so the choice can be re-measured. It is worth re-measuring:
+    # an LLO dump of RPAd at the decode shape shows vreg pressure of 2202
+    # against 64 architectural registers, because Step 1 of `rpa_body` unrolls
+    # over `batch_size` and holds every sequence's m/l/acc live at once. The
+    # resulting spill/refill traffic is 24.1% of the hot loop's issue slots.
+    # Lowering this shrinks the live set and shrinks `kv_vmem_shape`, which
+    # frees VMEM that `find_best_block_sizes` may spend on a larger bkv_sz --
+    # so it does not necessarily cost step count. Read at trace time and baked
+    # into the compiled kernel: set it per process, not per call.
+    decode_batch_size = int(os.getenv("VLLM_RPA_DECODE_BATCH_SIZE", "8"))
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
