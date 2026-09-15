@@ -11,6 +11,7 @@ import dataclasses
 import json
 import math
 import os
+import sys
 import time
 from collections.abc import Collection
 from contextlib import contextmanager
@@ -249,6 +250,45 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+_gil_switch_applied = False
+
+
+def _apply_gil_switch_interval() -> None:
+    """Shortens how long a thread may hold the GIL before it must yield.
+
+    Stage 5 costs prefill about two milliseconds of step period per request,
+    and the payload it sends is around sixty integers, which cannot account
+    for that. What can is the handover itself. When the submit worker wants
+    the GIL, the model runner has to give it up and then wait to get it back,
+    and CPython's default lets that wait run the full five milliseconds of
+    sys.getswitchinterval(). A handover costs the same regardless of payload,
+    which is also why the penalty was the same on a 397B model and a 35B one.
+
+    Setting this small trades more frequent switching for a shorter worst-case
+    wait. It is a diagnostic first: if the step period comes back toward the
+    stage-5-off baseline, the cost is handover latency and not work.
+    """
+    global _gil_switch_applied
+    if _gil_switch_applied:
+        return
+    _gil_switch_applied = True
+    raw = os.getenv("TPU_HOST_GIL_SWITCH_US", "").strip()
+    if not raw:
+        return
+    try:
+        micros = float(raw)
+    except ValueError:
+        logger.warning("TPU_HOST_GIL_SWITCH_US=%r is not a number, ignoring",
+                       raw)
+        return
+    if micros <= 0:
+        return
+    before = sys.getswitchinterval()
+    sys.setswitchinterval(micros / 1e6)
+    logger.info("gil_switch_interval before=%.6fs after=%.6fs", before,
+                sys.getswitchinterval())
+
+
 class _HostSlackProbe:
     """Measures how much of a step the host, rather than the chip, decides.
 
@@ -294,6 +334,16 @@ class _HostSlackProbe:
         self._last: float | None = None
         self._last_kind: str | None = None
         self._periods: dict[str, list[float]] = {"prefill": [], "decode": []}
+        # Splits the period at the boundary between dispatching a step and
+        # waiting for it. Everything before the boundary is the host deciding
+        # what to run and handing it to the chip, which is where extra Python
+        # would land. Everything after is sampling and waiting on the device,
+        # which is where contention with a transfer would land. Two arms that
+        # differ by two milliseconds must differ in one of the two, and which
+        # one it is decides whether the cause is on the host at all.
+        self._stamp: float | None = None
+        self._dispatch: dict[str, list[float]] = {"prefill": [], "decode": []}
+        self._finish: dict[str, list[float]] = {"prefill": [], "decode": []}
         self._steps = 0
         # Log on every rank whether or not the probe turned on. A previous run
         # produced no records at all and the three candidate explanations, a
@@ -323,9 +373,19 @@ class _HostSlackProbe:
         while time.perf_counter() < deadline:
             pass
 
+    def stamp(self) -> None:
+        """Marks where the step stops dispatching and starts waiting.
+
+        Called at the top of sample_tokens, which is the first thing to run
+        after execute_model has handed the step to the chip.
+        """
+        if self.enabled:
+            self._stamp = time.perf_counter()
+
     def tick(self, scheduled_tokens: int, num_reqs: int) -> None:
         now = time.perf_counter()
         last, self._last = self._last, now
+        stamp, self._stamp = self._stamp, None
         kind = "decode" if scheduled_tokens == num_reqs else "prefill"
         # The period ending here covers the previous step's execution and the
         # previous step's burn, so it belongs to that step's kind. Labelling
@@ -333,6 +393,12 @@ class _HostSlackProbe:
         prev, self._last_kind = self._last_kind, kind
         if last is not None and prev is not None:
             self._periods[prev].append(now - last)
+            # A step with no stamp never reached sample_tokens, so it has no
+            # boundary to split on and is left out of the two segment lists
+            # rather than being charged entirely to one of them.
+            if stamp is not None and last <= stamp <= now:
+                self._dispatch[prev].append(stamp - last)
+                self._finish[prev].append(now - stamp)
         self._steps += 1
         if not self.log_every or self._steps % self.log_every:
             return
@@ -371,6 +437,18 @@ class _HostSlackProbe:
                 # a long line easier to read.
                 "raw_ms": [round(value * 1000, 3) for value in periods],
             }
+        # The two halves of the period, carried raw for the same reason the
+        # period is. Reported separately from the period rather than nested
+        # under it because a step that never reached sample_tokens has a
+        # period but no split, so the counts do not have to match.
+        for label, source in (("dispatch", self._dispatch), ("finish",
+                                                             self._finish)):
+            for name, raw in source.items():
+                source[name] = []
+                if raw:
+                    record[f"{label}_{name}_ms"] = [
+                        round(value * 1000, 3) for value in sorted(raw)
+                    ]
         logger.info("%s", json.dumps(record, sort_keys=True))
         self._reload_dose()
 
@@ -3605,6 +3683,7 @@ class TPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
         probe = getattr(self, "_host_slack_probe", None)
         if probe is None:
+            _apply_gil_switch_interval()
             probe = self._host_slack_probe = _HostSlackProbe(
                 self._profiler_rank)
         if probe.enabled and scheduler_output.total_num_scheduled_tokens:
@@ -4231,6 +4310,10 @@ class TPUModelRunner(GPUModelRunner):
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             return None  # type: ignore[return-value]
+
+        probe = getattr(self, "_host_slack_probe", None)
+        if probe is not None:
+            probe.stamp()
 
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
