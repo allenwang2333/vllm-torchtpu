@@ -144,6 +144,10 @@ def cmd_route(args: argparse.Namespace) -> int:
 
 
 def cmd_alloc(args: argparse.Namespace) -> int:
+    if args.device.startswith("tpu"):
+        # Registers the "tpu" device string, exactly as tests/conftest.py's
+        # `device` fixture does under --use-tpu.
+        import torch_tpu  # noqa: F401
     device = torch.device(args.device)
     dtype = FP8_DTYPES[args.dtype]
     elem = torch.empty(0, dtype=dtype).element_size()
