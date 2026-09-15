@@ -49,9 +49,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.utils import replace_parameter
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.common.quant_methods import (UNQUANTIZED,
                                                        get_tpu_quant_method)
-from vllm_torchtpu.layers.vllm import moe_routing
+from vllm_torchtpu.layers.vllm import moe_routing, token_padding
 from vllm_torchtpu.layers.vllm.fused_moe import (TpuMoEActivationMixin,
                                                  fused_moe_gmm,
                                                  prebuild_fused_moe_kernel)
@@ -311,6 +312,12 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids,
+                topk_weights,
+                is_local_tensor=enable_pipelined_collective_and_compute())
 
         kwargs = {
             "hidden_states": x,

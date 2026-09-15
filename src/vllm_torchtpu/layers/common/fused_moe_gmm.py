@@ -421,6 +421,8 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    if num_tokens <= envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS:
+        skip_padded_tokens = False
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the

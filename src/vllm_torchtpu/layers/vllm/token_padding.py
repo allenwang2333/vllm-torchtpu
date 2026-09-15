@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 
 import torch
+from vllm_torchtpu import envs
 
 _padding_state: "TokenPaddingState | None" = None
 
@@ -23,21 +24,28 @@ _padding_state: "TokenPaddingState | None" = None
 class TokenPaddingState:
     """Track token padding."""
     local_padding_mask: torch.Tensor
+    last_padding_range: tuple[int, int] = (0, 0)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(max_local_tokens,
                                          dtype=torch.bool,
                                          device=device)
-        return cls(local_padding_mask=local_padding_mask)
+        return cls(local_padding_mask=local_padding_mask,
+                   last_padding_range=(0, 0))
 
     def update(self, local_valid_tokens: int,
                local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        cur_range = ((local_valid_tokens, local_padded_tokens)
+                     if local_valid_tokens < local_padded_tokens else (0, 0))
+        if cur_range == self.last_padding_range:
+            return
+        self.last_padding_range = cur_range
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
-        self.local_padding_mask.copy_(host)
+        if cur_range != (0, 0):
+            host[local_valid_tokens:local_padded_tokens] = True
+        self.local_padding_mask.copy_(host, non_blocking=True)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
@@ -86,6 +94,13 @@ def zero_routing_weights_for_padding(
             is_padding = gathered_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)
+    if num_tokens <= envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS:
+        # Reference `is_padding` so Dynamo preserves `local_padding_mask` in
+        # the FX graph input signature (required by `shape_variants` across
+        # token buckets), while XLA's algebraic simplifier eliminates the op.
+        topk_weights = topk_weights + is_padding[:1, None].to(
+            topk_weights.dtype) * 0.0
+        return topk_ids, topk_weights
     topk_weights = torch.where(is_padding[:, None],
                                torch.zeros_like(topk_weights), topk_weights)
     return topk_ids, topk_weights
