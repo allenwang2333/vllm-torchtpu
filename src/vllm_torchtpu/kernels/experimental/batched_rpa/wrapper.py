@@ -612,7 +612,19 @@ def ragged_paged_attention(
             kv_cache,
         )
 
-    if os.getenv("VLLM_RPA_SKIP_EMPTY_PASS", "1") == "1":
+    # Off by default: the gate is a measured end-to-end regression. It removes
+    # 440.9 us/step/core of device time on a decode-only step (48 x 8.99 us of
+    # RPAm, plus a metadata call and its staging copies that XLA already CSEs
+    # to once per step) and is 3.4% faster in a one-layer microbenchmark, yet
+    # costs 4.10% of output throughput on Qwen3-Coder-30B-A3B-FP8 at 8192/1024
+    # -- 20x the run-to-run spread, reproduced on two node pools. Jobs
+    # j-e89bb545 / j-5a7d2dda (off) vs j-ff453814 / j-bb672ae4 (on).
+    #
+    # Outputs are bit-identical either way (j-996ac32c), so this is not a
+    # correctness problem -- the conditional itself costs more than the launch
+    # it elides, plausibly by blocking fusion across 96 lax.conds per step.
+    # A one-layer microbenchmark cannot see that and got the sign wrong.
+    if os.getenv("VLLM_RPA_SKIP_EMPTY_PASS", "0") == "1":
         launch = maybe_run_rpa_kernel
     else:
         launch = run_rpa_kernel
