@@ -82,6 +82,39 @@ in all-reduces, versus 9.188 ms in tuned MLA. This is an implementation limit,
 not a fundamental restriction on sequence parallelism. The full report and
 artifacts are in `tpu-exp/docs/K3_PREFILL_SIZES_20260914.md`.
 
+### Generalized SP sweep (September 15)
+
+The full 93-layer dummy-weight model now uses SP for all five sizes below.
+MLA was tuned for the 64-entry page tables required by the 18,432-token model
+limit. HTTP medians use 20 requests after two warmups; device medians use three
+requests, taking the slowest of 32 cores per request.
+
+| Prompt | HTTP median | Device median | Device speedup vs earlier PR |
+| --- | ---: | ---: | ---: |
+| 1K | 120.602 ms | 115.335 ms | 1.589× |
+| 2K | 160.108 ms | 153.602 ms | 1.973× |
+| 4K | 192.016 ms | 183.063 ms | 3.011× |
+| 8K | 341.082 ms | 331.897 ms | 1.000× |
+| 16K | 997.885 ms | 983.268 ms | — |
+
+All sizes passed four-token cached-generation checks with finite log
+probabilities. HBM before KV allocation was 78.23 GiB/core. At 16K, the current
+XLA RS fallback and larger MLA workload are material costs: a representative
+core records 335 ms in XLA RS events (including waits) and 131.480 ms in MLA.
+The 8K-only Mega KDA recurrence remains separate from generalized SP.
+
+Cold engine setup took 56.80 minutes, including 51.18 minutes reported as
+compilation. Smaller SP buckets compile more slowly than their earlier
+replicated-token graphs; each rank builds a full model executable per bucket.
+A live sample found the active work in an `xla_tpu_thread`, but the exact
+compiler pass has not been profiled. Persistent caching was disabled for this
+run. Compilation is excluded from the runtime numbers above.
+
+The measured source was `206589637`. Raw samples (including a first-profile
+1K outlier and 16K HTTP outliers), tuning checks, compile timings, and
+reproduction details are in `tpu-exp/docs/K3_SP_PREFILL_SIZES_20260915.md` and
+`tpu-exp/results/production-port/sp-generalize-20260914/`.
+
 | Historical configuration | 93-layer, 8K result | Qualification |
 | --- | --- | --- |
 | Mega KDA + Splash MLA | 330.335 ms HTTP median; 318.338 ms device; 78.24 GiB/core before KV cache | Dummy weights; preceding configuration, not current paged MLA |
