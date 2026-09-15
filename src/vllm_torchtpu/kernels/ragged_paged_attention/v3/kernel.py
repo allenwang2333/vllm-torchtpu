@@ -901,19 +901,31 @@ def _ragged_paged_attention_kernel_loop(
         (95% CI [-9.51%, -7.48%]) and the median is not: its 95% CI is
         [-13.74%, -2.95%]. Do not quote the median as "8-9%".
 
-        **What this correctness rests on: the padding rows must be finite.**
-        ``p == 0`` annihilates a finite V and nothing else -- ``0 * NaN`` is
-        ``NaN``, and ``0xFF`` is a NaN in ``f8e4m3fn``, so one junk byte from
-        uninitialized HBM poisons an output row for the whole sequence. That
-        invariant is enforced at the allocator: ``kv_cache_materializer.py``
-        zeroes every pool, fp8 included, where it used to take a
-        ``torch.empty`` fast path. Zeroing once per pool at startup buys the
-        same guarantee this mask bought on every invocation.
-        ``tests/kernels/test_rpa_v_mask_padding.py`` pins it by filling the
-        padding with NaN / +-inf / 3e38 and comparing against
-        ``ref_ragged_paged_attention``, which slices ``kv[:kv_len]`` and so
-        cannot see the junk. (Measured there: ``f8e4m3fn`` does not saturate,
-        so all three of inf, -inf and 3e38 land in the cache as NaN.)
+        **What this rests on: the padding rows must be finite.** Not zeroed --
+        finite. ``p`` is exactly 0.0 there, and ``0 * 3e38`` is 0, so
+        magnitude is irrelevant; but ``0 * NaN`` and ``0 * inf`` are both
+        ``NaN``. Measured in ``j-761bc2df``: ``mode=none`` matches the
+        reference on padding of 0.0, 240.0 and 3e38, and returns 512/512 NaN
+        on padding of NaN, +inf or -inf, where ``full`` matches throughout.
+
+        That invariant is enforced at the allocator, not here.
+        ``kv_cache_materializer.py`` zeroes every pool, fp8 included, where it
+        used to take a ``torch.empty`` fast path -- and on a v7x pod that path
+        was not merely unspecified but maximally hostile: 524288 of 524288
+        bytes non-zero and every value non-finite, on both fp8 dtypes, all
+        three trials (``j-761bc2df``), because ``0xFF`` is a NaN in
+        ``f8e4m3fn``. Paired with ``full`` that was harmless; paired with
+        ``none`` it is NaN on every decode, and it shipped as the default for
+        two commits before ``/critical-review`` caught it. Zeroing once per
+        pool at startup buys what this mask was buying on every invocation.
+
+        Both halves are pinned: ``tests/kernels/test_rpa_v_mask_padding.py``
+        for what the kernel requires -- against ``ref_ragged_paged_attention``,
+        which slices ``kv[:kv_len]`` and so cannot see the junk by
+        construction -- and ``tests/test_kv_cache_zero_init.py`` for the
+        allocator supplying it. The second direction is asserted too: a test
+        fails if ``none`` ever *absorbs* non-finite padding, since that means
+        the zeroing crept back and this -8.5% is gone.
 
         The same invariant, not a separate argument, is what makes a **fully
         masked block** safe. Such a block collapses ``m_curr`` onto
