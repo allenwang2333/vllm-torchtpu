@@ -56,10 +56,30 @@ kernel win under constant per-call overhead: measured at these shapes, `lat_ms`
 barely moves across a 4.5x change in KV bytes moved, so it is nearly blind to
 exactly the thing this benchmark exists to detect.
 
+The arms, and why there are three
+---------------------------------
+`kernels/experimental/batched_rpa` already implements a layout that removes this
+padding: `KVLayout.SEQ_ALONG_LANE` fills the 32-bit packing word with head_dim
+slices instead of KV-head slots, so the merged-KV axis is never padded (256
+B/token here instead of 512). It is not a drop-in swap -- it rejects any
+page_size but 128, while the production config runs 256. So a two-arm
+"v3@256 vs SEQ_ALONG_LANE@128" comparison confounds the layout with the page
+size and cannot say which one moved the number. Measure three:
+
+  --kernel v3      --page-size 256               production baseline
+  --kernel v3      --page-size 128               isolates the page-size change
+  --kernel batched --kv-layout sal --page-size 128   layout, on top of that
+
+A fourth, `--kernel batched --kv-layout has --page-size 128`, separates "the
+batched kernel is different" from "the layout is better"; it is worth running
+before attributing any win to the layout.
+
 Usage:
   python scripts/bench_rpa_decode_fp8.py                       # default sweep
   python scripts/bench_rpa_decode_fp8.py --kv-lens 8192 --num-seqs 64
   python scripts/bench_rpa_decode_fp8.py --json out.json --report-bytes
+  python scripts/bench_rpa_decode_fp8.py --kernel batched --kv-layout sal \
+      --page-size 128 --report-bytes
 """
 
 from __future__ import annotations
@@ -75,10 +95,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs as brpa_configs
+from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as brpa
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     get_kv_cache_shape, ragged_paged_attention)
 from vllm_torchtpu.kernels.ragged_paged_attention.v3.util import (
     cdiv, get_dtype_packing)
+
+# Arms. `v3` is the production kernel (PallasAttentionBackend); `batched` is the
+# experimental batched RPA reachable via --attention-backend CUSTOM.
+#
+# SEQ_ALONG_LANE fills the 32-bit fp8 packing word with head_dim slices instead of
+# KV-head slots, so the merged-KV axis is never padded -- which is the whole point
+# of measuring it here. It accepts page_size 128 only (configs.py:359-363), so a
+# fair read needs v3 measured at 128 too, to separate the layout effect from the
+# page-size effect.
+_LAYOUTS = {
+    "has": brpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    "sal": brpa_configs.KVLayout.SEQ_ALONG_LANE,
+}
 
 # Per-rank production shape at TP=8. See module docstring.
 DEFAULT_NUM_Q_HEADS = 4
@@ -104,6 +139,29 @@ class Spec:
     page_size: int = DEFAULT_PAGE_SIZE
     kv_dtype: str = "fp8"
     q_dtype: str = "bf16"
+    kernel: str = "v3"      # v3 | batched
+    kv_layout: str = "has"  # has | sal   (batched only)
+
+    def __post_init__(self):
+        if self.kernel == "v3" and self.kv_layout != "has":
+            raise SystemExit("--kv-layout sal requires --kernel batched")
+        if self.layout_enum == brpa_configs.KVLayout.SEQ_ALONG_LANE \
+                and self.page_size != 128:
+            # configs.py:359-363 rejects this, but it would surface as an opaque
+            # trace from inside jit; refuse here where the message can say why.
+            raise SystemExit(
+                f"SEQ_ALONG_LANE requires page_size=128, got {self.page_size}. "
+                "Compare it against --kernel v3 --page-size 128, not 256.")
+
+    @property
+    def layout_enum(self) -> brpa_configs.KVLayout:
+        return _LAYOUTS[self.kv_layout]
+
+    @property
+    def arm(self) -> str:
+        return (f"{self.kernel}@{self.page_size}"
+                if self.kernel == "v3"
+                else f"{self.kernel}/{self.kv_layout}@{self.page_size}")
 
     @property
     def pages_per_seq(self) -> int:
@@ -116,26 +174,37 @@ class Spec:
         return self.num_seqs * self.pages_per_seq
 
     def kv_cache_shape(self) -> tuple[int, ...]:
-        return get_kv_cache_shape(self.total_num_pages, self.page_size,
-                                  self.num_kv_heads, self.head_dim,
-                                  _DTYPES[self.kv_dtype])
+        if self.kernel == "v3":
+            return get_kv_cache_shape(self.total_num_pages, self.page_size,
+                                      self.num_kv_heads, self.head_dim,
+                                      _DTYPES[self.kv_dtype])
+        return brpa.get_kv_cache_shape(self.total_num_pages, self.page_size,
+                                       self.num_kv_heads, self.head_dim,
+                                       _DTYPES[self.kv_dtype],
+                                       kv_layout=self.layout_enum)
 
     def traffic(self) -> dict[str, float]:
-        """Real vs materialized KV bytes touched by one decode step."""
-        packing = get_dtype_packing(_DTYPES[self.kv_dtype])
+        """Real vs materialized KV bytes touched by one decode step.
+
+        `moved` is derived from the *actual* cache shape rather than from a model
+        of the padding rule, so it stays correct across layouts whose padding
+        works differently -- which is the comparison this script exists to make.
+        """
         itemsize = jnp.dtype(_DTYPES[self.kv_dtype]).itemsize
-        padded_heads_x2 = int(math.ceil(self.num_kv_heads * 2 / packing)) * packing
-        real_heads_x2 = self.num_kv_heads * 2
-        padded_hd = cdiv(self.head_dim, 128) * 128
-        per_tok_real = real_heads_x2 * padded_hd * itemsize
-        per_tok_padded = padded_heads_x2 * padded_hd * itemsize
+        shape = self.kv_cache_shape()
+        per_page = math.prod(shape[1:]) * itemsize
+        per_tok_moved = per_page / self.page_size
+        # What the attention math actually needs: K and V, at the lane-aligned
+        # head_dim the MXU would read anyway.
+        per_tok_real = self.num_kv_heads * 2 * cdiv(self.head_dim, 128) * 128 * itemsize
         toks = self.num_seqs * self.kv_len
+        packing = get_dtype_packing(_DTYPES[self.kv_dtype])
         return {
             "real_bytes": float(toks * per_tok_real),
-            "moved_bytes": float(toks * per_tok_padded),
-            "waste_frac": 1.0 - (per_tok_real / per_tok_padded),
-            "padded_heads_x2": padded_heads_x2,
-            "real_heads_x2": real_heads_x2,
+            "moved_bytes": float(toks * per_tok_moved),
+            "waste_frac": 1.0 - (per_tok_real / per_tok_moved),
+            "bytes_per_token": per_tok_moved,
+            "kv_packing": packing,
         }
 
 
@@ -209,9 +278,16 @@ def run_spec(spec: Spec, iters: int, warmup: int, chain: int,
     n_buf = warmup + iters + iters * chain
     ring = [new_qkv(i) for i in range(n_buf)]
 
+    # Both entry points take the same eight positional args and return
+    # (out, new_kv_cache); only the layout kwarg differs.
+    if spec.kernel == "v3":
+        fn, extra = ragged_paged_attention, {}
+    else:
+        fn, extra = brpa.ragged_paged_attention, {"kv_layout": spec.layout_enum}
+
     def call(idx, cache):
         q, k, v = ring[idx]
-        out, cache = ragged_paged_attention(
+        out, cache = fn(
             q,
             k,
             v,
@@ -225,6 +301,7 @@ def run_spec(spec: Spec, iters: int, warmup: int, chain: int,
             # microbenchmark measures kernel time, not quantization accuracy.
             k_scale=1.0,
             v_scale=1.0,
+            **extra,
         )
         return out, cache
 
@@ -289,6 +366,11 @@ def main() -> None:
     p.add_argument("--num-kv-heads", type=int, default=DEFAULT_NUM_KV_HEADS)
     p.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
     p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    p.add_argument("--kernel", choices=["v3", "batched"], default="v3",
+                   help="v3 = production PallasAttentionBackend; "
+                        "batched = kernels/experimental/batched_rpa.")
+    p.add_argument("--kv-layout", choices=sorted(_LAYOUTS), default="has",
+                   help="batched only. sal = SEQ_ALONG_LANE (unpadded KV axis).")
     p.add_argument("--kv-dtype", choices=sorted(_DTYPES), default="fp8")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=10)
@@ -313,11 +395,13 @@ def main() -> None:
         for kv in args.kv_lens:
             spec = Spec(num_seqs=ns, kv_len=kv, num_q_heads=args.num_q_heads,
                         num_kv_heads=args.num_kv_heads, head_dim=args.head_dim,
-                        page_size=args.page_size, kv_dtype=args.kv_dtype)
+                        page_size=args.page_size, kv_dtype=args.kv_dtype,
+                        kernel=args.kernel, kv_layout=args.kv_layout)
             r = run_spec(spec, args.iters, args.warmup, args.chain, args.seed)
             r["label"] = args.label
+            r["arm"] = spec.arm
             rows.append(r)
-            print(f"[seqs={ns:4d} kv_len={kv:6d}] "
+            print(f"[{spec.arm:>22s} seqs={ns:4d} kv_len={kv:6d}] "
                   f"dev={r['dev_ms']:8.3f} ms (iqr={r['dev']['iqr_pct']:5.2f}%)  "
                   f"lat={r['lat_ms']:8.3f} ms  "
                   f"disp={r['dispatch_overhead_ms']:6.3f} ms  "
@@ -327,7 +411,7 @@ def main() -> None:
                 print(f"    real={r['real_bytes']/2**20:9.1f} MiB  "
                       f"moved={r['moved_bytes']/2**20:9.1f} MiB  "
                       f"waste={r['waste_frac']*100:.1f}%  "
-                      f"heads_x2 {r['real_heads_x2']}->{r['padded_heads_x2']}")
+                      f"{r['bytes_per_token']:.0f} B/token")
 
     if args.json:
         with open(args.json, "w") as f:
