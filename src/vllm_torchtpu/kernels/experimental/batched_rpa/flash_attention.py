@@ -18,6 +18,13 @@ from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 
+# Set False to force the general mask path even where the collapsed one
+# applies. Exists so the two can be A/B'd at an identical shape and identical
+# block sizes -- monkeypatch it in a test and the kernel must produce
+# bit-identical output, which is a strictly stronger check than a tolerance.
+# Read at trace time, so flipping it costs nothing at runtime.
+_COLLAPSE_DECODE_MASK = True
+
 
 def flash_attention_qk_softmax(
     q: jax.Array,  # [B, KV, TQ, H]
@@ -75,23 +82,75 @@ def flash_attention_qk_softmax(
     qk_masked = []
 
     int_ty = cfgs.serve.int_ty
+    sliding_window = cfgs.model.sliding_window
 
-    for b_idx in range(cfgs.block.batch_size):
-        kv_idx_b = (lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2) +
-                    processed_kv_len[b_idx])
-        q_idx_b = (lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) //
-                   cfgs.aligned_num_q_heads_per_kv_head +
-                   bq_start).astype(int_ty) + processed_q_len[b_idx]
+    # Decode fast path. `tq == bq_c_sz * aligned_num_q_heads_per_kv_head`,
+    # because kernel.py slices q in units of the aligned head count, so
+    # `bq_c_sz == 1` makes `iota(axis=1) // aligned_num_q_heads_per_kv_head`
+    # identically zero and the whole of `q_idx_b` a *scalar*. Every mask term
+    # then folds into a bound on the kv iota: the iota is built once and shared
+    # by all `batch_size` lanes, instead of two broadcast adds, a compare and a
+    # logical_and per lane.
+    #
+    # Unlike RPA v3, this kernel has no decode specialisation that kills the
+    # causal term -- there is no `use_causal_mask` here at all (the wrapper
+    # documents the argument as unused and rejects False), so the q-side iota,
+    # divide, cast and adds this removes are live work in decode rather than a
+    # trace-time-false branch. That is why the collapse is worth more here than
+    # it was in v3, where only the kv-side adds survived to be removed.
+    #
+    # Gate on the structural property rather than on `cfgs.mode`: a caller can
+    # pass `decode_block_sizes` explicitly, and the shape is what the rewrite
+    # actually depends on.
+    collapse_bounds = (_COLLAPSE_DECODE_MASK and cfgs.bq_c_sz == 1
+                       and tq == cfgs.aligned_num_q_heads_per_kv_head
+                       and sliding_window is None)
 
-        eff_kv_len_b = effective_kv_len[b_idx]
-        mask_b = q_idx_b < eff_kv_len_b
-        mask_b = jnp.logical_and(mask_b, q_idx_b >= kv_idx_b)
+    if collapse_bounds:
+        kv_iota = lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2)
+        for b_idx in range(cfgs.block.batch_size):
+            # Widen to i32 before subtracting: Mosaic implements `arith.subi`
+            # for i32 only ("Only i32 arith.subi is supported, but got i16"),
+            # and kernel.py hands these in already narrowed to `int_ty`, which
+            # is i16 whenever q is packed and max_kv_len fits. These are scalar
+            # ops on the scalar core, so the wider type costs nothing.
+            pq = processed_q_len[b_idx].astype(jnp.int32) + bq_start
+            pk = processed_kv_len[b_idx].astype(jnp.int32)
+            eff = effective_kv_len[b_idx].astype(jnp.int32)
 
-        if (sliding_window := cfgs.model.sliding_window) is not None:
-            mask_b = jnp.logical_and(mask_b, q_idx_b
-                                     < kv_idx_b + sliding_window)
+            # q_idx_b >= kv_idx_b  <=>  iota < processed_q_len - processed_kv_len + 1
+            bound = pq - pk + 1
+            # `q_idx_b < eff_kv_len_b` is constant across the tile once q_idx_b
+            # is scalar, so a false one masks the entire lane. It must be kept,
+            # not dropped as implied by causality: on a padded step
+            # `mask_out_steps` writes s_idx=-1, which yields pq == pk == eff == 0
+            # and leaves `bound == 1` -- unmasking kv column 0 of a dead lane.
+            bound = jnp.where(pq < eff, bound, 0)
+            # Clamp before narrowing so the cast is total for any `int_ty`, and
+            # so the comparison cannot wrap the way `iota + processed_kv_len`
+            # could in i16.
+            bound = jnp.clip(bound, 0, s).astype(int_ty)
 
-        qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+            qk_masked.append(
+                jnp.where(kv_iota < bound, qk[b_idx], cfgs.model.mask_value))
+    else:
+        for b_idx in range(cfgs.block.batch_size):
+            kv_idx_b = (lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2) +
+                        processed_kv_len[b_idx])
+            q_idx_b = (lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) //
+                       cfgs.aligned_num_q_heads_per_kv_head +
+                       bq_start).astype(int_ty) + processed_q_len[b_idx]
+
+            eff_kv_len_b = effective_kv_len[b_idx]
+            mask_b = q_idx_b < eff_kv_len_b
+            mask_b = jnp.logical_and(mask_b, q_idx_b >= kv_idx_b)
+
+            if sliding_window is not None:
+                mask_b = jnp.logical_and(mask_b, q_idx_b
+                                         < kv_idx_b + sliding_window)
+
+            qk_masked.append(
+                jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)
 
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
