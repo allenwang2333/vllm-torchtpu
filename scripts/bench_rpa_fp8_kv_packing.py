@@ -114,27 +114,48 @@ def build(kv_dtype, num_kv_heads, kv_len, seed=0):
                 distribution=distribution), cache_shape
 
 
-@functools.partial(jax.jit, static_argnames=("is_fp8", ))
+@functools.partial(jax.jit, static_argnames=("is_fp8", "inner"))
 def run(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
-        is_fp8):
+        is_fp8, inner):
+    """Run the kernel ``inner`` times inside a single dispatch.
+
+    A one-call-per-`block_until_ready` loop measures the host round trip, not
+    the kernel: the first version of this script clocked every arm at ~700 us
+    against the 123.64 us/call the production xprof reports for the same op,
+    and the half-bytes arm came out *slower* than the full-bytes one. Chaining
+    the calls through ``kv_cache`` inside ``fori_loop`` serializes them (so XLA
+    cannot overlap or hoist iterations) and amortizes the dispatch away.
+    """
     scales = dict(k_scale=1.0, v_scale=1.0) if is_fp8 else {}
-    return ragged_paged_attention(q,
-                                  k,
-                                  v,
-                                  kv_cache,
-                                  kv_lens,
-                                  page_indices,
-                                  cu_q_lens,
-                                  distribution,
-                                  sm_scale=HEAD_DIM**-0.5,
-                                  **scales)
+
+    def body(_, carry):
+        acc, cache = carry
+        out, cache = ragged_paged_attention(q,
+                                            k,
+                                            v,
+                                            cache,
+                                            kv_lens,
+                                            page_indices,
+                                            cu_q_lens,
+                                            distribution,
+                                            sm_scale=HEAD_DIM**-0.5,
+                                            **scales)
+        # Keep `out` live so the attention compute cannot be dead-coded; the
+        # reduction is ~32K elements against a 256 MiB KV read.
+        return acc + out.astype(jnp.float32).sum(), cache
+
+    return jax.lax.fori_loop(0, inner, body,
+                             (jnp.float32(0.0), kv_cache))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True, choices=sorted(ARMS))
-    ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--iters", type=int, default=20,
+                    help="timed outer samples; each is --inner kernel calls")
+    ap.add_argument("--inner", type=int, default=20,
+                    help="kernel calls per dispatch, to amortize host overhead")
+    ap.add_argument("--warmup", type=int, default=3)
     args = ap.parse_args()
 
     kv_dtype, num_kv_heads, kv_len = ARMS[args.arm]
@@ -147,21 +168,21 @@ def main():
     bytes_moved = BATCH * kv_len * packed_slots * HEAD_DIM * itemsize
     useful = BATCH * kv_len * (num_kv_heads * 2) * HEAD_DIM * itemsize
 
-    out = run(**wl, is_fp8=is_fp8)
+    out = run(**wl, is_fp8=is_fp8, inner=args.inner)
     jax.block_until_ready(out)
 
     for _ in range(args.warmup):
-        out = run(**wl, is_fp8=is_fp8)
+        out = run(**wl, is_fp8=is_fp8, inner=args.inner)
     jax.block_until_ready(out)
 
-    # Time each iteration separately rather than averaging one long loop, so a
+    # Time each sample separately rather than averaging one long loop, so a
     # single contended outlier is visible instead of silently inflating a mean.
     samples = []
     for _ in range(args.iters):
         t0 = time.perf_counter()
-        out = run(**wl, is_fp8=is_fp8)
+        out = run(**wl, is_fp8=is_fp8, inner=args.inner)
         jax.block_until_ready(out)
-        samples.append((time.perf_counter() - t0) * 1e6)
+        samples.append((time.perf_counter() - t0) * 1e6 / args.inner)
 
     samples = np.array(samples)
     med = float(np.median(samples))
@@ -175,7 +196,7 @@ def main():
           f"(useful {num_kv_heads * 2}, padding {packed_slots - num_kv_heads * 2})")
     print(f"KV bytes/call       : {bytes_moved / 2**20:.1f} MiB "
           f"(useful {useful / 2**20:.1f} MiB)")
-    print(f"iters               : {args.iters}")
+    print(f"iters x inner       : {args.iters} x {args.inner}")
     print(f"median us/call      : {med:.2f}")
     print(f"mean   us/call      : {samples.mean():.2f}")
     print(f"min    us/call      : {samples.min():.2f}")
@@ -183,6 +204,13 @@ def main():
     print(f"stdev  us/call      : {samples.std():.2f}")
     print(f"spread_pct (p90/med): {100 * (np.percentile(samples, 90) / med - 1):.2f}")
     print(f"eff GiB/s (moved)   : {bytes_moved / (med * 1e-6) / 2**30:.1f}")
+    # Sanity gate. xprof on j-bf2efb16 measured this exact op (arm A's shape)
+    # at 123.64 us/call in production. If arm A does not land near that, the
+    # harness is measuring something other than the kernel and no cross-arm
+    # comparison from this run should be believed.
+    if args.arm == "A_fp8_1kvh":
+        print(f"xprof reference     : 123.64 us/call (j-bf2efb16, decode_only)")
+        print(f"ratio to reference  : {med / 123.64:.2f}x")
     print(f"RESULT {args.arm} median_us={med:.2f} "
           f"bytes_mib={bytes_moved / 2**20:.1f}")
 
