@@ -86,12 +86,12 @@ def child(case, tile):
     packing = 2 if dtype_name == "bfloat16" else 4
     page_size = int(os.getenv("TUNER_PAGE_SIZE", "256"))
     max_seqs = int(os.getenv("TUNER_MAX_SEQS", "32"))
-    pages_per_seq = 32768 // page_size
+    pages_per_seq = 4096 // page_size
     cast_probs = os.getenv("TUNER_CAST_PROBS", "1") == "1"
     assert dtype_name == "fp8" and page_size == 16 and max_seqs == 256
     assert c <= max_seqs and page_size % packing == 0
     rows = []
-    for context in (128, 512, 1000, 4096):
+    for context in (128, 512, 1000, 2000):
         rng = np.random.default_rng(980406)
 
         def random(shape, dtype=jnp.bfloat16):

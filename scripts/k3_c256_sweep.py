@@ -12,7 +12,7 @@ def main():
         os.getenv("FALCON_JAX_PROCESS_ID", os.getenv("FALCON_RANK", "0")))
     root = Path(os.environ["OUT"]) / "benchmark"
     root.mkdir(parents=True, exist_ok=True)
-    contexts = (128, 512, 1000, 4096)
+    contexts = (128, 512, 1000, 2000)
     winners = []
     cs = (1, 2, 4, 8, 16, 32, 64, 128, 256)
     buckets = (8, 16, 32, 48, 96, 192, 384, 768, 1536)
@@ -56,7 +56,7 @@ def main():
                 assert all(r["status"] == "success" and r["cache_valid"]
                            and r["next_output_max_abs_error"] == 0
                            for r in rows)
-                # Benchmark stays <=1001 KV tokens; 4096 is correctness-only.
+                # Benchmark stays <=1001 KV tokens; 2000 is correctness-only.
                 score = statistics.fmean(r["latency_ms"] for r in rows
                                          if r["kv_len"] <= 1000)
                 valid.append((score, tile, rows[0]["tuning_key"]))

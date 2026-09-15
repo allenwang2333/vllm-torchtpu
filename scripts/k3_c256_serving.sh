@@ -439,7 +439,7 @@ run_service() {
     --kv-cache-dtype fp8
     --attention-backend CUSTOM
     --async-scheduling
-    --max-model-len 32768
+    --max-model-len 4096
     --max-num-seqs 256
     --max-num-batched-tokens 1536
     --block-size 16
