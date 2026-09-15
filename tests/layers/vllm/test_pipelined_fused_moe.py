@@ -961,6 +961,10 @@ def _run_routing_arm(unchunked, fused, hs, weights, ids, parallel_size,
             w1_bias=None, w2_bias=None, topk_weights=weights, topk_ids=ids,
             experts_start=None, topk=_TOPK, activation="silu")
 
+    # Classify by trailing dim: routing gathers carry topk (unfused) or 2*topk
+    # (fused) columns. The caller must keep `hidden` clear of both -- a collision
+    # silently counts the hidden-state gathers as routing gathers.
+    assert hidden not in (_TOPK, 2 * _TOPK), "hidden collides with the classifier"
     routing_gathers = [c for c in calls if c[-1] in (_TOPK, 2 * _TOPK)]
     return len(routing_gathers), seen, out, calls
 
@@ -973,7 +977,8 @@ def test_routing_gather_arms_are_equivalent_and_cheaper():
     so cost and equivalence are asserted in the same test -- a cheaper arm that
     quietly reroutes tokens is the failure mode worth catching.
     """
-    parallel_size, seq_len, hidden = _P, _S, 16
+    # hidden must differ from _TOPK and 2*_TOPK; see _run_routing_arm.
+    parallel_size, seq_len, hidden = _P, _S, 5
     hs = torch.randn(seq_len, hidden)
     weights = torch.randn(seq_len, _TOPK).to(torch.bfloat16)
     ids = torch.randint(0, 200, (seq_len, _TOPK)).to(torch.int32)
@@ -1014,7 +1019,7 @@ def test_routing_gather_arms_are_equivalent_and_cheaper():
 
 def test_routing_knobs_are_inert_without_both_tensors():
     """topk_weights/topk_ids may be None; packing them must not be attempted then."""
-    parallel_size, seq_len, hidden = _P, _S, 16
+    parallel_size, seq_len, hidden = _P, _S, 5
     hs = torch.randn(seq_len, hidden)
     group = MagicMock()
     group.world_size = parallel_size
