@@ -63,6 +63,8 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_UNCHUNKED_ROUTING_GATHER: bool = False
+    TPU_MOE_FUSED_ROUTING_GATHER: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     USE_BATCHED_RPA_LONGCTX: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -424,6 +426,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    # All-gather the routing tensors once for the whole local sequence instead of
+    # once per chunk, slicing them in gathered space afterwards. The routing
+    # tensors are ~0.06% of the dispatch bytes, so chunking them buys no overlap
+    # and only multiplies a per-collective fixed cost. No effect when
+    # TPU_MOE_COLLECTION_CHUNK_SIZE yields a single chunk.
+    "TPU_MOE_UNCHUNKED_ROUTING_GATHER":
+    env_bool("TPU_MOE_UNCHUNKED_ROUTING_GATHER"),
+    # Carry topk_weights and topk_ids in a single all-gather rather than two.
+    # Independent of TPU_MOE_UNCHUNKED_ROUTING_GATHER; both apply on any chunk count.
+    "TPU_MOE_FUSED_ROUTING_GATHER":
+    env_bool("TPU_MOE_FUSED_ROUTING_GATHER"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
     env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa

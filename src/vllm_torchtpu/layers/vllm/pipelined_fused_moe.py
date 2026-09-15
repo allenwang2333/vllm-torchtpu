@@ -106,6 +106,54 @@ def _log_active_chunk_pipeline() -> None:
         envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
 
 
+def _pack_routing(topk_weights: Optional[torch.Tensor],
+                  topk_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    """Pack the two routing tensors into one f32 buffer so one all-gather carries both.
+
+    f32 is chosen over a bitcast because it is exact for both operands and needs no
+    layout assumptions: widening bf16/f16 weights to f32 is lossless, and expert ids
+    are integers far below 2**24, the last f32 integer with an exact successor. The
+    packed buffer is 33% larger than the two it replaces (64 vs 48 bytes/row at
+    topk=8), which does not matter -- these gathers are fixed-cost bound, not
+    bandwidth bound, so one larger collective beats two smaller ones.
+
+    Both operands must be present; the caller checks.
+    """
+    return torch.cat(
+        [topk_weights.to(torch.float32),
+         topk_ids.to(torch.float32)], dim=-1)
+
+
+def _unpack_routing(
+    packed: torch.Tensor,
+    num_weights: int,
+    weights_dtype: torch.dtype,
+    ids_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of `_pack_routing`, splitting on the trailing dimension."""
+    return (packed[..., :num_weights].to(weights_dtype),
+            packed[..., num_weights:].to(ids_dtype))
+
+
+def _slice_gathered(gathered: torch.Tensor, parallel_size: int, seq_len: int,
+                    start: int, stop: int) -> torch.Tensor:
+    """Take rows [start, stop) of every rank's block out of an already-gathered tensor.
+
+    This is the whole reason a single gather can stand in for per-chunk gathers, and
+    it is the one place the change can silently corrupt routing, so state the identity:
+
+        all_gather(x[start:stop])
+            == all_gather(x).view(P, S, -1)[:, start:stop].reshape(-1, K)
+
+    An all-gather is rank-major, so chunk i of the gathered tensor is *not* the flat
+    row range [i*P*S_c, (i+1)*P*S_c) -- that range spans ranks. The per-rank block has
+    to be sliced inside the rank dimension, which is what the reshape exposes.
+    """
+    trailing = gathered.shape[1:]
+    return gathered.view(parallel_size, seq_len,
+                         *trailing)[:, start:stop].reshape(-1, *trailing)
+
+
 def pipelined_fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -165,14 +213,27 @@ def pipelined_fused_moe_gmm(
     num_chunks, chunk_size_local = calculate_moe_chunks(
         seq_len, parallel_size, chunk_size)
 
+    # Both routing tensors must be present for either to be fused or hoisted; the
+    # kernel tolerates them being None and the packing does not.
+    have_routing = topk_weights is not None and topk_ids is not None
+    fuse_routing = have_routing and envs.TPU_MOE_FUSED_ROUTING_GATHER
+
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             ag_hidden_states = collective_group.all_gather(hidden_states,
                                                            dim=0)
-            ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
-                               if topk_weights is not None else None)
-            ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
-                           if topk_ids is not None else None)
+            if fuse_routing:
+                ag_packed = collective_group.all_gather(_pack_routing(
+                    topk_weights, topk_ids),
+                                                        dim=0)
+                ag_topk_weights, ag_topk_ids = _unpack_routing(
+                    ag_packed, topk_weights.shape[-1], topk_weights.dtype,
+                    topk_ids.dtype)
+            else:
+                ag_topk_weights = (collective_group.all_gather(
+                    topk_weights, dim=0) if topk_weights is not None else None)
+                ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
+                               if topk_ids is not None else None)
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
@@ -215,12 +276,51 @@ def pipelined_fused_moe_gmm(
         for i in range(num_chunks)
     ] if topk_ids is not None else [None] * num_chunks
 
+    # Hoist the routing gather out of the pipeline: gather the whole local sequence
+    # once, then hand each chunk a slice of the result. The routing tensors are
+    # ~0.06% of the dispatch bytes, so there is no overlap to win by chunking them --
+    # only num_chunks times the per-collective fixed cost to pay. See _slice_gathered
+    # for why the slice is not a flat row range.
+    # The two knobs are independent, giving routing gathers per prefill step of
+    # (num_chunks x 2), (num_chunks x 1), 2, or 1 -- 4, 2, 2, 1 at num_chunks=2.
+    hoist_routing = have_routing and envs.TPU_MOE_UNCHUNKED_ROUTING_GATHER
+    num_weights = topk_weights.shape[-1] if have_routing else 0
+
+    if hoist_routing and fuse_routing:
+        ag_routing_all = collective_group.all_gather(_pack_routing(
+            topk_weights, topk_ids),
+                                                     dim=0)
+    elif hoist_routing:
+        ag_tw_all = collective_group.all_gather(topk_weights, dim=0)
+        ag_ti_all = collective_group.all_gather(topk_ids, dim=0)
+
+    def _gather_routing(i: int):
+        """Gathered (topk_weights, topk_ids) for chunk i, under the active strategy."""
+        start, stop = i * chunk_size_local, (i + 1) * chunk_size_local
+        if hoist_routing and fuse_routing:
+            return _unpack_routing(
+                _slice_gathered(ag_routing_all, parallel_size, seq_len, start,
+                                stop), num_weights, topk_weights.dtype,
+                topk_ids.dtype)
+        if hoist_routing:
+            return (_slice_gathered(ag_tw_all, parallel_size, seq_len, start,
+                                    stop),
+                    _slice_gathered(ag_ti_all, parallel_size, seq_len, start,
+                                    stop))
+        if fuse_routing:
+            return _unpack_routing(
+                collective_group.all_gather(_pack_routing(
+                    weights_slices[i], ids_slices[i]),
+                                            dim=0), num_weights,
+                topk_weights.dtype, topk_ids.dtype)
+        return ((collective_group.all_gather(weights_slices[i], dim=0)
+                 if weights_slices[i] is not None else None),
+                (collective_group.all_gather(ids_slices[i], dim=0)
+                 if ids_slices[i] is not None else None))
+
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
-                  if weights_slices[0] is not None else None)
-    ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
-                  if ids_slices[0] is not None else None)
+    ag_tw_curr, ag_ti_curr = _gather_routing(0)
 
     rs_outputs = []
 
@@ -228,11 +328,7 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
-                                                      dim=0)
-                          if weights_slices[i + 1] is not None else None)
-            ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
-                          if ids_slices[i + 1] is not None else None)
+            ag_tw_next, ag_ti_next = _gather_routing(i + 1)
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(

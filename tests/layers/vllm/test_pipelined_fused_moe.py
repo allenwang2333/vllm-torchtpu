@@ -24,8 +24,8 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
-    calculate_moe_chunks, enable_pipelined_collective_and_compute,
-    pipelined_fused_moe_gmm)
+    _pack_routing, _slice_gathered, _unpack_routing, calculate_moe_chunks,
+    enable_pipelined_collective_and_compute, pipelined_fused_moe_gmm)
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a16 import \
     VllmCompressedTensorsW4A16MoEMethod
 from vllm_torchtpu.layers.vllm.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import \
@@ -817,3 +817,225 @@ def test_pipelined_moe_four_stage_pipeline():
     assert len(ag_calls) == 12
     # 4 reduce_scatter calls
     assert len(rs_calls) == 4
+
+
+# --------------------------------------------------------------------------
+# Routing-gather strategies: TPU_MOE_UNCHUNKED_ROUTING_GATHER and
+# TPU_MOE_FUSED_ROUTING_GATHER.
+#
+# These change *which* collective carries the routing tensors, so the only way
+# they can fail is by silently handing the MoE kernel correct-looking routing
+# for the wrong tokens. Nothing else in this file exercises gathered row order,
+# so the ordering identity is asserted directly.
+# --------------------------------------------------------------------------
+
+_P, _S, _TOPK = 4, 12, 8
+
+
+def _fake_all_gather(per_rank):
+    """What collective_group.all_gather(x, dim=0) returns: rank-major concatenation."""
+    return torch.cat(per_rank, dim=0)
+
+
+def test_slice_gathered_matches_gathering_the_slice():
+    """all_gather(x[a:b]) == _slice_gathered(all_gather(x), P, S, a, b).
+
+    The property the hoisted routing gather rests on. A flat row slice of the
+    gathered tensor would pass a same-shape, same-dtype, entirely wrong tensor.
+    """
+    per_rank = [torch.randn(_S, _TOPK) for _ in range(_P)]
+    gathered = _fake_all_gather(per_rank)
+
+    for chunk_size_local in (1, 2, 3, 4, 6, 12):
+        for i in range(_S // chunk_size_local):
+            a, b = i * chunk_size_local, (i + 1) * chunk_size_local
+            want = _fake_all_gather([x[a:b] for x in per_rank])
+            got = _slice_gathered(gathered, _P, _S, a, b)
+            assert got.shape == want.shape
+            torch.testing.assert_close(got, want)
+
+
+def test_flat_row_slice_would_have_been_wrong():
+    """Guard the guard: show the naive slice really does differ, so the test has teeth."""
+    per_rank = [torch.full((_S, _TOPK), float(r)) for r in range(_P)]
+    gathered = _fake_all_gather(per_rank)
+    chunk_size_local = _S // 2
+    a, b = chunk_size_local, 2 * chunk_size_local
+    correct = _slice_gathered(gathered, _P, _S, a, b)
+    naive = gathered[_P * a:_P * b]
+    assert correct.shape == naive.shape
+    assert not torch.equal(correct, naive)
+    # correct holds one block per rank; naive holds only the last two ranks.
+    assert set(correct.flatten().tolist()) == {0.0, 1.0, 2.0, 3.0}
+    assert set(naive.flatten().tolist()) == {2.0, 3.0}
+
+
+def test_slice_gathered_preserves_trailing_dims():
+    """Routing tensors are 2-D here, but the helper must not assume it."""
+    per_rank = [torch.randn(_S, 3, 5) for _ in range(_P)]
+    gathered = _fake_all_gather(per_rank)
+    want = _fake_all_gather([x[2:6] for x in per_rank])
+    torch.testing.assert_close(_slice_gathered(gathered, _P, _S, 2, 6), want)
+
+
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_pack_unpack_routing_is_exact(weights_dtype, ids_dtype):
+    """f32 packing must be lossless for both operands, not merely close.
+
+    Weights: bf16/f32 -> f32 widens. Ids: integers well below 2**24, the last
+    f32 integer with an exact successor. Asserted with equality, not a tolerance.
+    """
+    weights = torch.randn(_S, _TOPK).to(weights_dtype)
+    # 256 routed experts; include both endpoints and a -1 "no expert" sentinel.
+    ids = torch.randint(0, 256, (_S, _TOPK)).to(ids_dtype)
+    ids[0, 0], ids[0, 1], ids[1, 0] = 0, 255, -1
+
+    packed = _pack_routing(weights, ids)
+    assert packed.dtype == torch.float32
+    assert packed.shape == (_S, 2 * _TOPK)
+
+    got_w, got_i = _unpack_routing(packed, _TOPK, weights_dtype, ids_dtype)
+    assert got_w.dtype == weights_dtype and got_i.dtype == ids_dtype
+    assert torch.equal(got_w, weights)
+    assert torch.equal(got_i, ids)
+
+
+def test_pack_unpack_survives_the_gather_and_the_slice():
+    """The two helpers compose: pack -> gather -> slice -> unpack == gather the slice."""
+    per_rank_w = [torch.randn(_S, _TOPK).to(torch.bfloat16) for _ in range(_P)]
+    per_rank_i = [torch.randint(0, 256, (_S, _TOPK)) for _ in range(_P)]
+
+    gathered = _fake_all_gather(
+        [_pack_routing(w, i) for w, i in zip(per_rank_w, per_rank_i)])
+
+    chunk_size_local = _S // 3
+    for c in range(3):
+        a, b = c * chunk_size_local, (c + 1) * chunk_size_local
+        got_w, got_i = _unpack_routing(
+            _slice_gathered(gathered, _P, _S, a, b), _TOPK, torch.bfloat16,
+            torch.int32)
+        assert torch.equal(got_w, _fake_all_gather([w[a:b] for w in per_rank_w]))
+        assert torch.equal(got_i,
+                           _fake_all_gather([i[a:b]
+                                             for i in per_rank_i]).to(torch.int32))
+
+
+def _run_routing_arm(unchunked, fused, hs, weights, ids, parallel_size,
+                     seq_len, hidden, chunk_divisor=2):
+    """Drive pipelined_fused_moe_gmm once, returning (routing gather count, kernel inputs)."""
+    calls = []
+
+    def all_gather(x, dim=0):
+        calls.append(tuple(x.shape))
+        # Emulate a rank-major gather with *distinguishable* per-rank content. If
+        # every rank held the same rows, a wrong slice of the gathered tensor would
+        # be indistinguishable from a right one and this test would prove nothing.
+        return torch.cat([x + r for r in range(parallel_size)], dim=dim)
+
+    group = MagicMock()
+    group.world_size = parallel_size
+    group.all_gather.side_effect = all_gather
+    group.reduce_scatter.side_effect = (
+        lambda x, dim=0: x[:x.shape[0] // parallel_size])
+
+    seen = []
+
+    def fake_kernel(**kw):
+        seen.append((kw["topk_weights"].clone(), kw["topk_ids"].clone()))
+        return torch.zeros(kw["hidden_states"].shape[0], hidden)
+
+    env = {
+        "TPU_MOE_COLLECTION_CHUNK_SIZE":
+        str(parallel_size * seq_len // chunk_divisor),
+        "TPU_MOE_UNCHUNKED_ROUTING_GATHER": "1" if unchunked else "0",
+        "TPU_MOE_FUSED_ROUTING_GATHER": "1" if fused else "0",
+    }
+    with patch.dict(os.environ, env), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe."
+               "_get_moe_collective_group", return_value=(group, "dp")), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm",
+               side_effect=fake_kernel):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hs, w1=None, w2=None, w1_scale=None, w2_scale=None,
+            w1_bias=None, w2_bias=None, topk_weights=weights, topk_ids=ids,
+            experts_start=None, topk=_TOPK, activation="silu")
+
+    routing_gathers = [c for c in calls if c[-1] in (_TOPK, 2 * _TOPK)]
+    return len(routing_gathers), seen, out, calls
+
+
+def test_routing_gather_arms_are_equivalent_and_cheaper():
+    """All four knob settings must feed the kernel byte-identical routing.
+
+    num_chunks=2, so the unmodified path issues 4 routing gathers per call. The
+    whole point of the change is to reach 1 without altering what the kernel sees,
+    so cost and equivalence are asserted in the same test -- a cheaper arm that
+    quietly reroutes tokens is the failure mode worth catching.
+    """
+    parallel_size, seq_len, hidden = _P, _S, 16
+    hs = torch.randn(seq_len, hidden)
+    weights = torch.randn(seq_len, _TOPK).to(torch.bfloat16)
+    ids = torch.randint(0, 200, (seq_len, _TOPK)).to(torch.int32)
+
+    expected_counts = {
+        (False, False): 4,
+        (False, True): 2,
+        (True, False): 2,
+        (True, True): 1,
+    }
+
+    reference = None
+    for (unchunked, fused), want in expected_counts.items():
+        n, seen, out, calls = _run_routing_arm(unchunked, fused, hs, weights,
+                                               ids, parallel_size, seq_len,
+                                               hidden)
+        assert len(seen) == 2, f"{unchunked=} {fused=}: expected two chunks"
+        assert n == want, (f"{unchunked=} {fused=}: {n} routing gathers, "
+                           f"expected {want}; all gathers were {calls}")
+        assert out.shape == (seq_len, hidden)
+        for got_w, got_i in seen:
+            assert got_w.dtype == weights.dtype, f"{unchunked=} {fused=}"
+            assert got_i.dtype == ids.dtype, f"{unchunked=} {fused=}"
+            assert got_w.shape == (parallel_size * seq_len // 2, _TOPK)
+
+        if reference is None:
+            reference = seen
+        else:
+            for c, ((rw, ri), (gw, gi)) in enumerate(zip(reference, seen)):
+                assert torch.equal(gw, rw), (
+                    f"{unchunked=} {fused=} chunk {c}: topk_weights differ from "
+                    "the unmodified path")
+                assert torch.equal(gi, ri), (
+                    f"{unchunked=} {fused=} chunk {c}: topk_ids differ from "
+                    "the unmodified path -- tokens are being routed to the "
+                    "wrong experts")
+
+
+def test_routing_knobs_are_inert_without_both_tensors():
+    """topk_weights/topk_ids may be None; packing them must not be attempted then."""
+    parallel_size, seq_len, hidden = _P, _S, 16
+    hs = torch.randn(seq_len, hidden)
+    group = MagicMock()
+    group.world_size = parallel_size
+    group.all_gather.side_effect = lambda x, dim=0: torch.cat(
+        [x] * parallel_size, dim=dim)
+    group.reduce_scatter.side_effect = (
+        lambda x, dim=0: x[:x.shape[0] // parallel_size])
+
+    env = {
+        "TPU_MOE_COLLECTION_CHUNK_SIZE": str(parallel_size * seq_len // 2),
+        "TPU_MOE_UNCHUNKED_ROUTING_GATHER": "1",
+        "TPU_MOE_FUSED_ROUTING_GATHER": "1",
+    }
+    with patch.dict(os.environ, env), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe."
+               "_get_moe_collective_group", return_value=(group, "dp")), \
+         patch("vllm_torchtpu.layers.vllm.pipelined_fused_moe.fused_moe_gmm",
+               side_effect=lambda **kw: torch.zeros(
+                   kw["hidden_states"].shape[0], hidden)):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hs, w1=None, w2=None, w1_scale=None, w2_scale=None,
+            w1_bias=None, w2_bias=None, topk_weights=None, topk_ids=None,
+            experts_start=None, topk=_TOPK, activation="silu")
+    assert out.shape == (seq_len, hidden)
