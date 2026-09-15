@@ -68,6 +68,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -101,8 +102,8 @@ CONFIGS = {
 #: of device work and the host round trip behind it rounds away. The calls are
 #: chained inside one jit -- each iteration's state feeds the next, exactly as
 #: the decode loop does.
-CHAIN = {"prefill1024": 32, "decode1": 128}
-WARMUP, BURSTS = 2, 7
+CHAIN = {"prefill1024": 64, "decode1": 512}
+WARMUP, BURSTS = 2, 9
 
 #: Rounds of the whole arm set. Every arm is measured once per round, in a
 #: rotated order, and its score is the median across rounds.
@@ -428,21 +429,43 @@ def _chained(wrapper, cfgmod, chain_len: int):
     return jax.jit(chain)
 
 
-def _dispatch_identity(hlo_text: str) -> str:
-    """A digest of the custom-call payloads in the executable, in launch order.
+#: Where an arm's source lives, as it appears inside the IR. Mosaic carries the
+#: Python source locations of the kernel it lowered, so two copies of the same
+#: kernel under two paths produce two different modules, and every hash below
+#: would separate arms that are running identical code. That is the dangerous
+#: direction for the dispatch rule: the check fires when two arms are the SAME,
+#: so noise that makes everything look different silently turns it off.
+_ARM_PATH = re.compile(r"/tmp/kda-arms/[^/\"\\ ]+")
 
-    The Pallas kernels reach the executable as `tpu_custom_call` targets
-    carrying their lowered Mosaic module, so this is the runtime's own answer
-    to which kernels the program launched -- not a label the arm chose. Two
-    arms that lower to the same set ran the same code whatever their source
-    said, which is the claim this has to support.
+
+def _canonical(text: str) -> str:
+    return _ARM_PATH.sub("<arm>", text)
+
+
+def _dispatch_identity(lowered_text: str) -> str:
+    """A digest of the Mosaic modules this config launched, in launch order.
+
+    A Pallas kernel reaches the program as a `tpu_custom_call` whose
+    backend_config carries the whole lowered Mosaic module, so this is the
+    kernel's own body rather than a name, a shape or a flag. The first version
+    of this file hashed the custom-call LINES of the compiled HLO, which turned
+    out to be shape-and-target boilerplate: the wrong-kernel arm, whose output
+    checksum differs from golden's on every config, reported golden's dispatch
+    identity on every config. That is precisely the label this field exists not
+    to be.
     """
-    lines = [ln.strip() for ln in hlo_text.splitlines()
-             if "custom_call_target" in ln or "tpu_custom_call" in ln]
-    if not lines:
-        raise RuntimeError("no custom call in the compiled program: the "
-                           "Pallas kernel did not reach the executable")
-    digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()[:32]
+    blobs = re.findall(r'backend_config\s*=\s*"((?:[^"\\]|\\.)*)"',
+                       lowered_text)
+    # The Mosaic payload is the long one; a short backend_config is a flag.
+    blobs = [b for b in blobs if "custom_call_config" in b or len(b) > 256]
+    if not blobs:
+        # Not an error, but the reader has to know which claim this is:
+        # the whole program rather than the kernels inside it.
+        _log("  NOTE: no tpu_custom_call payload in the lowered IR; the "
+             "dispatch identity falls back to the whole lowered module")
+        blobs = [lowered_text]
+    digest = hashlib.sha256(
+        "\n".join(_canonical(b) for b in blobs).encode()).hexdigest()[:32]
     return f"mosaic:{digest}"
 
 
@@ -466,8 +489,9 @@ def measure(wrapper, cfgmod, name: str) -> dict:
     order = ("qkv", "b", "a", "conv_state", "recurrent_state", "conv_weight",
              "a_log", "dt_bias", "query_start_loc", "state_indices",
              "distribution", "seq_lens")
-    compiled = chain.lower(*[device_args(raw, meta, dt)[k]
-                             for k in order]).compile()
+    lowered = chain.lower(*[device_args(raw, meta, dt)[k] for k in order])
+    lowered_text = lowered.as_text()
+    compiled = lowered.compile()
     text = compiled.as_text()
 
     def burst() -> float:
@@ -499,9 +523,12 @@ def measure(wrapper, cfgmod, name: str) -> dict:
         "checksum": _sha(
             np.ascontiguousarray(got_out.astype(np.float32)).tobytes() +
             np.ascontiguousarray(got_state.astype(np.float32)).tobytes()),
-        "dispatched": _dispatch_identity(text),
+        "dispatched": _dispatch_identity(lowered_text),
         "declined": False,
-        "_binary": _sha(text.encode()),
+        # Canonicalized for the same reason as the dispatch identity: the arm's
+        # own path is in the compiled text, and hashing it made two copies of
+        # golden report two different artifacts.
+        "_binary": _sha(_canonical(text).encode()),
     }
 
 
