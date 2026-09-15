@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import os
 
 import jax
 import jax.experimental.pallas as pl
@@ -558,8 +559,16 @@ def rpa_kernel(
             # so every decode-only step launches a MIXED kernel whose sequence
             # range is empty, and this multi-megabyte memset is the whole of
             # what that launch costs.
-            @pl.when(safe_steps > 0)
-            def _init_kv_scratch():
+            #
+            # The env var restores the unguarded behaviour so the two can be
+            # A/B'd from one image. It is read at trace time and therefore
+            # baked into the compiled kernel: set it per process, not per call.
+            if os.getenv("VLLM_RPA_GUARD_EMPTY_MEMSET", "1") == "1":
+
+                @pl.when(safe_steps > 0)
+                def _init_kv_scratch():
+                    kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
+            else:
                 kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
 
             jax.tree.map(lambda x: x.wait(), dma_list)

@@ -239,6 +239,7 @@ def _resolve_page_size(arm: str, requested: int | None) -> int:
 class Phase:
     DECODE = "decode"
     PREFILL = "prefill"
+    EMPTY = "empty"
 
 
 def _build_phase_inputs(jnp, jax, *, phase: str, page_size: int,
@@ -270,6 +271,19 @@ def _build_phase_inputs(jnp, jax, *, phase: str, page_size: int,
         kv_lens_list = [prefill_context + prefill_q_tokens]
         # All mixed: the kernel's MIXED pass handles chunked prefill.
         distribution = [0, 0, 1]
+    elif phase == Phase.EMPTY:
+        # No sequence falls in any range, so both the DECODE and the MIXED
+        # kernel plan zero steps and their pipeline bodies never execute. What
+        # remains is exactly the per-launch fixed cost of the pair -- which is
+        # the quantity the `safe_steps > 0` memset guard targets, and which is
+        # otherwise buried under a 1.4 ms floor of padded KV streaming.
+        #
+        # One sequence is still described so the query tensor is non-empty;
+        # `distribution = [0, 0, 0]` is what excludes it from every range.
+        num_seqs = 1
+        q_lens = [1]
+        kv_lens_list = [page_size]
+        distribution = [0, 0, 0]
     else:
         raise ValueError(f"unknown phase {phase!r}")
 
@@ -491,6 +505,14 @@ def _run_phase(jax, jnp, wrapper, configs, *, arm, kv_layout, phase,
         for kv_len in meta["kv_lens"])
     kv_bytes_unique = unique_tokens * bytes_per_token
     kv_bytes_streamed = (pairs * bkv * bytes_per_token) if pairs else None
+
+    if phase == Phase.EMPTY:
+        # Both kernels plan zero steps, so no KV is read at all. Reporting the
+        # schedule's nominal volume here would manufacture a bandwidth figure
+        # for traffic that never happens.
+        kv_bytes_unique = 0.0
+        kv_bytes_streamed = 0.0
+        pairs = 0
 
     step = _make_step(
         jax,
@@ -771,7 +793,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=(Phase.DECODE, Phase.PREFILL, "both"),
+        choices=(Phase.DECODE, Phase.PREFILL, Phase.EMPTY, "both"),
         default="both",
         help="which step shape to time",
     )
