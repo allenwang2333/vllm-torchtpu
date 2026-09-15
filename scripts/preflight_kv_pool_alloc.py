@@ -215,30 +215,35 @@ def cmd_backend(args: argparse.Namespace) -> int:
     ``run_benchmarks.sh`` defaults ``ATTENTION_BACKEND`` to ``CUSTOM``, so which
     one a benchmark actually selects decides whether a v3 change is live at all.
     """
-    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
 
-    engine_args = EngineArgs(
-        model=args.model,
-        tensor_parallel_size=args.tp,
+    # Importing this module is what runs the @register_backend decorators that
+    # point FLASH_ATTN at PallasAttentionBackend (RPA v3) and CUSTOM at
+    # PallasBatchedRPAAttentionBackend. Without it the registry still answers,
+    # but with upstream vLLM's CUDA backends -- which is a wrong answer that
+    # looks like a right one.
+    import vllm_torchtpu.layers.adapter.attention  # noqa: F401
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    # Qwen3-Coder-30B-A3B-Instruct-FP8: head_dim 128, fp8 KV cache, no MLA.
+    selector = AttentionSelectorConfig(
+        head_size=args.head_size,
+        dtype=torch.bfloat16,
         kv_cache_dtype=args.kv_cache_dtype,
-        max_model_len=args.max_model_len,
-        load_format="dummy",
-        trust_remote_code=True,
-        enforce_eager=True,
-        attention_backend=args.attention_backend,
+        block_size=args.block_size,
+        use_mla=False,
     )
-    vllm_config = engine_args.create_engine_config()
-    from vllm.attention.selector import get_attn_backend
+    path = TpuPlatform.get_attn_backend_cls(
+        AttentionBackendEnum[args.attention_backend], selector)
 
-    backend = get_attn_backend(
-        vllm_config.model_config.get_head_size(),
-        vllm_config.model_config.dtype,
-        vllm_config.cache_config.cache_dtype,
-        vllm_config.cache_config.block_size,
-    )
-    name = getattr(backend, "get_name", lambda: type(backend).__name__)()
+    module_name, _, cls_name = path.rpartition(".")
+    import importlib
+    cls = getattr(importlib.import_module(module_name), cls_name)
+    name = cls.get_name()
+
     print("requested_backend =", args.attention_backend)
-    print("resolved_class    =", f"{backend.__module__}.{backend.__qualname__}")
+    print("resolved_path     =", path)
     print("resolved_name     =", name)
     print("USES_RPA_V3       =", name == "FLASH_ATTN")
     return 0
@@ -273,10 +278,9 @@ def main() -> int:
     p_prov.set_defaults(func=cmd_provenance)
 
     b = sub.add_parser("backend", help="which attention backend resolves")
-    b.add_argument("--model", default="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
-    b.add_argument("--tp", type=int, default=8)
+    b.add_argument("--head-size", type=int, default=128)
     b.add_argument("--kv-cache-dtype", default="fp8")
-    b.add_argument("--max-model-len", type=int, default=16384)
+    b.add_argument("--block-size", type=int, default=16)
     b.add_argument("--attention-backend", default="CUSTOM")
     b.set_defaults(func=cmd_backend)
 
