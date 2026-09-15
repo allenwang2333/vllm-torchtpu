@@ -234,6 +234,17 @@ class TestStructuredDecode:
         # 2. Hardware-padded slots are masked to -inf to prevent invalid token selection.
         assert torch.isinf(out[:, vocab_size:]).all()
 
+    def test_apply_grammar_bitmask_raises_on_undersized_logits(self):
+        """Verify apply_grammar_bitmask raises ValueError when logits last dimension is smaller than vocab_size."""
+        manager = make_manager(vocab_size=64)
+        logits = torch.randn(2, 32)
+        bitmask = torch.zeros(2, 2, dtype=torch.int32)
+        arange = torch.arange(32)
+
+        with pytest.raises(ValueError,
+                           match=r"cannot be smaller than vocab_size"):
+            manager.apply_grammar_bitmask(logits, bitmask, arange)
+
     def test_unstructured_rows_pass_through(self):
         torch.manual_seed(0)
         manager = make_manager()
