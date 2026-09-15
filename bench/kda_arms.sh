@@ -21,10 +21,16 @@
 #   golden-aa      a second copy of golden, measured on the same clock. Golden
 #                  against itself is the only way to know what a ratio of 1.0
 #                  looks like on this machine today.
-#   wrong-kernel   golden with one k-block dropped from the chunked solve
-#   pessimal-tile  golden with the prefill tile size forced from 64 to 16
+#   wrong-kernel   golden with the last k-block dropped from every q/k vector
+#                  -- wrong on both the chunked and the recurrent path
+#   pessimal-tile  golden with the prefill tile size forced from 64 to 16. It
+#                  changes the chunked path only, which is also what makes it
+#                  the demonstration of what the harness does with a candidate
+#                  that leaves one frozen config's kernel untouched.
+#   pessimal-pipe  golden with the pipeline's buffer count forced from 2 to 1,
+#                  which changes both paths
 #
-# The last two are injected faults: a benchmark nobody has caught detecting a
+# The last three are injected faults: a benchmark nobody has caught detecting a
 # fault is a benchmark nobody should trust.
 
 set -euo pipefail
@@ -37,7 +43,7 @@ REPLICATE="${REPLICATE:-1}"
 mkdir -p "${OUT}"
 rm -rf "${ARMS}"
 
-for arm in golden golden-aa wrong-kernel pessimal-tile; do
+for arm in golden golden-aa wrong-kernel pessimal-tile pessimal-pipe; do
   mkdir -p "${ARMS}/${arm}"
   cp -a "${REPO}/src" "${ARMS}/${arm}/src"
   # Bytecode from the image's install would land in the tree hash and differ
@@ -47,13 +53,16 @@ done
 
 patch -p1 -s -d "${ARMS}/wrong-kernel" < "${REPO}/bench/faults/wrong_kernel.patch"
 patch -p1 -s -d "${ARMS}/pessimal-tile" < "${REPO}/bench/faults/pessimal_tile.patch"
+patch -p1 -s -d "${ARMS}/pessimal-pipe" < "${REPO}/bench/faults/pessimal_pipeline.patch"
 
 # A patch that did not apply is a fault arm that is secretly golden, which is
 # the one failure this whole exercise exists to catch.
-grep -q "0 < c_b < r_b" \
+grep -q "out.shape\[-1\] - 8" \
   "${ARMS}/wrong-kernel/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py"
 grep -q "mixed_tile_size: int = 16" \
   "${ARMS}/pessimal-tile/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py"
+grep -q "num_buffers: int = 1" \
+  "${ARMS}/pessimal-pipe/src/vllm_torchtpu/kernels/gdn/v3/config.py"
 
 echo "--- scoring replicate ${REPLICATE} on $(python3 -c 'import jax; print(jax.devices())')" >&2
 
@@ -63,7 +72,9 @@ python3 "${REPO}/bench/kda_scorer.py" \
   --arm "golden-aa=${ARMS}/golden-aa" \
   --arm "wrong-kernel=${ARMS}/wrong-kernel" \
   --arm "pessimal-tile=${ARMS}/pessimal-tile" \
+  --arm "pessimal-pipe=${ARMS}/pessimal-pipe" \
   --config prefill1024 --config decode1 \
+  --rounds "${ROUNDS:-3}" \
   > "${OUT}/scoring-r${REPLICATE}.json"
 
 echo "--- payload" >&2

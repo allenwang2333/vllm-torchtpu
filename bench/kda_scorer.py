@@ -49,11 +49,13 @@ Usage
     python3 bench/kda_scorer.py --job-id JOB \
         --arm golden=/arms/golden:control --arm golden-aa=/arms/aa \
         --arm cand=/arms/cand \
-        --config prefill1024 --config decode1
+        --config prefill1024 --config decode1 --rounds 3
 
 Each arm is measured in its own process -- tracing two Pallas kernels in one
 process trips XLA's memory_space_assignment -- and each process imports the
-kernel from its own tree and refuses to run if it resolved to another one.
+kernel from its own tree and refuses to run if it resolved to another one. The
+whole set is measured `--rounds` times in a rotated order, and each arm's time
+is the median of its rounds.
 
 stdout is exactly one JSON value. Everything human-readable goes to stderr.
 There is no exit-code channel: an arm, a config or a whole job this file cannot
@@ -95,11 +97,24 @@ CONFIGS = {
     "decode1": {"tokens": 1, "seqs": 1, "decode": True, "ctx": 1024},
 }
 
-#: Timed calls per burst, warmup bursts, and bursts the median is taken over.
-#: The calls are chained inside one jit -- each iteration's state feeds the
-#: next, exactly as the decode loop does -- so the ~150 us host round trip is
-#: paid once per burst instead of once per call.
-CHAIN, WARMUP, BURSTS = 32, 2, 5
+#: Chained calls per burst, per config: enough that one burst is milliseconds
+#: of device work and the host round trip behind it rounds away. The calls are
+#: chained inside one jit -- each iteration's state feeds the next, exactly as
+#: the decode loop does.
+CHAIN = {"prefill1024": 32, "decode1": 128}
+WARMUP, BURSTS = 2, 7
+
+#: Rounds of the whole arm set. Every arm is measured once per round, in a
+#: rotated order, and its score is the median across rounds.
+#:
+#: One process per arm is forced (two Pallas kernels traced in one process trip
+#: XLA's memory_space_assignment), and the first version of this file measured
+#: each arm in exactly one process, back to back. That reads whatever the
+#: machine was doing during that process as a property of the arm: two copies
+#: of golden came out 24% apart and an arm whose kernel is bit-identical to
+#: golden's on a config came out 2.2x faster there. Interleaving and taking the
+#: median is what makes the ratio a fact about the code.
+ROUNDS = 3
 
 #: One seed for every arm. Two arms on different inputs are measuring different
 #: work, and the difference reads as a speedup.
@@ -370,11 +385,26 @@ def _call_once(wrapper, cfgmod, args):
         gate_lower_bound=None)
 
 
-def _chained(wrapper, cfgmod):
-    """CHAIN calls under one jit, each one fed the state the last one wrote.
+def _persistent_compile_cache() -> None:
+    """Keep compiled programs across the job's processes.
+
+    Every arm is a process and every round re-runs every arm, so without this
+    the loop spends its time in Mosaic rather than on the device. Golden's
+    program is identical every round by construction, which is what a cache is
+    for; two arms with different source have different keys and cannot share an
+    entry.
+    """
+    import jax
+    jax.config.update("jax_compilation_cache_dir", "/tmp/kda-jaxcache")
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+
+
+def _chained(wrapper, cfgmod, chain_len: int):
+    """chain_len calls under one jit, each fed the state the last one wrote.
 
     The shape of the real loop, and the reason the number below is device time
-    rather than host dispatch: one round trip covers CHAIN kernel launches.
+    rather than host dispatch: one round trip covers chain_len kernel launches.
     """
     import jax
 
@@ -392,7 +422,7 @@ def _chained(wrapper, cfgmod):
                 dict(args, conv_state=cs, recurrent_state=rs))
             return (cs2.astype(cs.dtype), rs2.astype(rs.dtype))
 
-        return jax.lax.fori_loop(0, CHAIN, body,
+        return jax.lax.fori_loop(0, chain_len, body,
                                  (conv_state, recurrent_state))
 
     return jax.jit(chain)
@@ -431,7 +461,8 @@ def measure(wrapper, cfgmod, name: str) -> dict:
     ref_out, ref_state = reference(raw, meta)
     worst = worst_sequence_error(got_out, got_state, ref_out, ref_state, meta)
 
-    chain = _chained(wrapper, cfgmod)
+    chain_len = CHAIN[name]
+    chain = _chained(wrapper, cfgmod, chain_len)
     order = ("qkv", "b", "a", "conv_state", "recurrent_state", "conv_weight",
              "a_log", "dt_bias", "query_start_loc", "state_indices",
              "distribution", "seq_lens")
@@ -440,17 +471,22 @@ def measure(wrapper, cfgmod, name: str) -> dict:
     text = compiled.as_text()
 
     def burst() -> float:
+        # Built AND LANDED before the clock starts. jnp.asarray is async, and
+        # with several megabytes of activations a transfer that is still in
+        # flight at t0 finishes inside the timed region -- which is most of
+        # what the first version of this file was measuring.
         fresh = device_args(raw, meta, dt)
+        jax.block_until_ready(list(fresh.values()))
         t0 = time.perf_counter()
         jax.block_until_ready(chain(*[fresh[k] for k in order]))
-        return (time.perf_counter() - t0) * 1e6 / CHAIN
+        return (time.perf_counter() - t0) * 1e6 / chain_len
 
     for _ in range(WARMUP):
         burst()
     samples = [burst() for _ in range(BURSTS)]
     latency = statistics.median(samples)
     _log(f"  {name}: {latency:.1f} us/call  (min {min(samples):.1f}, "
-         f"max {max(samples):.1f}, n={BURSTS}x{CHAIN})  "
+         f"max {max(samples):.1f}, n={BURSTS}x{chain_len})  "
          f"worst_error {worst:.3e}")
 
     return {
@@ -473,6 +509,7 @@ def run_worker(src: str, configs: list[str]) -> dict:
     # Hashed before anything imports from it: an import writes __pycache__ into
     # the tree it is hashing, and the answer has to be a fact about the source.
     arm = {"tree": tree_hash(src), "configs": {}}
+    _persistent_compile_cache()
     wrapper, cfgmod = load_kernel(src)
     binaries = []
     for name in configs:
@@ -498,30 +535,90 @@ def run_worker(src: str, configs: list[str]) -> dict:
 # the driver
 # ---------------------------------------------------------------------------
 
-def run_driver(job_id: str, arms: list[tuple[str, str, bool]],
-               configs: list[str]) -> dict:
-    out = {"scorer_hash": scorer_hash(), "job_id": job_id, "arms": []}
-    for name, src, control in arms:
-        _log(f"--- arm {name} ({'control' if control else 'candidate'}) "
-             f"from {src}")
-        argv = [sys.executable, "-u", os.path.abspath(__file__), "--worker",
-                "--src", src]
-        for cfg in configs:
-            argv += ["--config", cfg]
-        proc = subprocess.run(
-            argv,
-            capture_output=True, text=True,
-            env=dict(os.environ, PYTHONPATH=os.path.join(src, "src"),
-                     PYTHONDONTWRITEBYTECODE="1"))
-        sys.stderr.write(proc.stderr)
-        if proc.returncode != 0:
-            _log(f"--- arm {name} produced nothing (exit {proc.returncode}); "
-                 f"it is left out of the payload")
+def _measure_arm(name: str, src: str, configs: list[str]) -> dict | None:
+    """One process, one arm, every config. None if it produced nothing."""
+    argv = [sys.executable, "-u", os.path.abspath(__file__), "--worker",
+            "--src", src]
+    for cfg in configs:
+        argv += ["--config", cfg]
+    proc = subprocess.run(
+        argv, capture_output=True, text=True,
+        env=dict(os.environ, PYTHONPATH=os.path.join(src, "src"),
+                 PYTHONDONTWRITEBYTECODE="1"))
+    sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        _log(f"--- arm {name} produced nothing (exit {proc.returncode})")
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        _log(f"--- arm {name} printed no readable result ({exc})")
+        return None
+
+
+def _merge_rounds(name: str, rounds: list[dict], configs: list[str]):
+    """One arm's rounds into one arm, timing by median and the rest by consent.
+
+    Everything except the latency is a claim about the code -- the tree it was
+    built from, the artifact that was loaded, the kernel that ran, the bytes it
+    produced, its error against the reference. Those must be the same in every
+    round, and an arm whose rounds disagree about one of them is an arm nobody
+    can describe: it is dropped rather than averaged into a number that
+    describes none of the rounds.
+    """
+    first = rounds[0]
+    identity = ("tree", "binary_hash")
+    for r in rounds[1:]:
+        for key in identity:
+            if r.get(key) != first.get(key):
+                _log(f"--- arm {name} changed its {key} between rounds; "
+                     f"it is left out of the payload")
+                return None
+    arm = {"tree": first["tree"], "binary_hash": first["binary_hash"],
+           "configs": {}}
+    for cfg in configs:
+        seen = [r["configs"][cfg] for r in rounds if cfg in r["configs"]]
+        if len(seen) != len(rounds):
+            _log(f"--- arm {name}: config {cfg} was measured in "
+                 f"{len(seen)}/{len(rounds)} rounds, so it is not reported")
             continue
-        try:
-            arm = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            _log(f"--- arm {name} printed no readable result ({exc})")
+        for key in ("checksum", "dispatched", "correct"):
+            if len({json.dumps(s[key]) for s in seen}) != 1:
+                _log(f"--- arm {name}: config {cfg} disagrees on {key} "
+                     f"between rounds; it is not reported")
+                break
+        else:
+            times = [s["latency_us"] for s in seen]
+            arm["configs"][cfg] = dict(
+                seen[0], latency_us=statistics.median(times),
+                worst_error=max(s["worst_error"] for s in seen))
+            _log(f"    {name} {cfg}: median {statistics.median(times):.1f} us "
+                 f"of {[round(t, 1) for t in times]}")
+    return arm if arm["configs"] else None
+
+
+def run_driver(job_id: str, arms: list[tuple[str, str, bool]],
+               configs: list[str], rounds: int) -> dict:
+    collected: dict[str, list[dict]] = {name: [] for name, _, _ in arms}
+    for r in range(rounds):
+        # Rotated, so a machine that drifts over the job does not spend the
+        # whole drift on whichever arm is always measured last.
+        order = arms[r % len(arms):] + arms[:r % len(arms)]
+        for name, src, control in order:
+            _log(f"--- round {r + 1}/{rounds} arm {name} "
+                 f"({'control' if control else 'candidate'}) from {src}")
+            got = _measure_arm(name, src, configs)
+            if got is not None:
+                collected[name].append(got)
+
+    out = {"scorer_hash": scorer_hash(), "job_id": job_id, "arms": []}
+    for name, _, control in arms:
+        if len(collected[name]) != rounds:
+            _log(f"--- arm {name} produced {len(collected[name])}/{rounds} "
+                 f"rounds; it is left out of the payload")
+            continue
+        arm = _merge_rounds(name, collected[name], configs)
+        if arm is None:
             continue
         arm["name"], arm["control"] = name, control
         out["arms"].append(arm)
@@ -536,6 +633,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--arm", action="append", default=[],
                     help="NAME=PATH[:control]")
     ap.add_argument("--config", action="append", default=[])
+    ap.add_argument("--rounds", type=int, default=ROUNDS)
     args = ap.parse_args(argv)
     configs = args.config or list(CONFIGS)
     for name in configs:
@@ -554,7 +652,8 @@ def main(argv: list[str]) -> int:
                      control))
     if not arms:
         raise SystemExit("nothing to measure: pass --arm NAME=PATH[:control]")
-    json.dump(run_driver(args.job_id, arms, configs), sys.stdout)
+    json.dump(run_driver(args.job_id, arms, configs, args.rounds),
+              sys.stdout)
     sys.stdout.write("\n")
     return 0
 
