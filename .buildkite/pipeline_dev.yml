@@ -16,12 +16,13 @@
 #
 #   kda_micro  the multi-arm microbenchmark that would be the campaign's
 #              fitness function: golden as the control, a second copy of golden
-#              on the same clock, and two injected faults it has to catch.
+#              on the same clock, and five injected faults it has to catch.
 #              Three replicates, because one A/A pair is not a noise floor.
 #   kda_e2e    the workload the campaign exists to improve: the reproduce
 #              recipe verbatim, the same recipe under the profiler (for the
 #              kernel's share of step time), and the same recipe with the
-#              kernel perturbed (does the micro number predict this one).
+#              kernel's two launches replaced by a zero of the same shape --
+#              the latency floor an infinitely fast kernel would reach.
 
 steps:
 
@@ -32,8 +33,11 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
-  - label: "KDA scorer: 4 arms x 2 configs (replicate {{matrix}}) (v7x-2)"
+  # Three agents at once, which is the whole of this run's share of the queue,
+  # so the e2e step below is a separate build rather than a fourth job here.
+  - label: "KDA scorer: 7 arms x 2 configs (replicate {{matrix}}) (v7x-2)"
     key: kda_micro
+    if: 'build.env("RUN_MICRO") != "0"'
     depends_on: build_docker
     timeout_in_minutes: 60
     agents:
@@ -48,7 +52,7 @@ steps:
 
   # Takes a whole v7x-8 agent for the better part of an hour, so it is opt-in:
   # trigger with RUN_E2E=1 in the build env.
-  - label: "KDA e2e: baseline + profile + perturbed, Kimi-Linear-48B TP8 (v7x-8)"
+  - label: "KDA e2e: baseline + profile + null kernel, Kimi-Linear-48B TP8 (v7x-8)"
     key: kda_e2e
     if: 'build.env("RUN_E2E") == "1"'
     depends_on: build_docker
@@ -60,6 +64,6 @@ steps:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "7200"
     commands:
-      - .buildkite/scripts/run_in_docker.sh bash -c 'bash bench/kda_e2e.sh; rc=$$?; python3 bench/xplane_op_share.py --dir /perf_eval_results/kda-e2e/profile --match "kda|gdn|conv1d" --out /perf_eval_results/kda-e2e/op-share.json || echo "no op shares"; rm -rf /perf_eval_results/kda-e2e/profile; exit $$rc'
+      - .buildkite/scripts/run_in_docker.sh bash -c 'PHASES="baseline profile nullkernel" bash bench/kda_e2e.sh; rc=$$?; python3 bench/xplane_op_share.py --dir /perf_eval_results/kda-e2e/profile --match "fused_conv1d_kda" --top 30 --out /perf_eval_results/kda-e2e/op-share.json || echo "no op shares"; rm -rf /perf_eval_results/kda-e2e/profile; exit $$rc'
     artifact_paths:
       - "perf_eval_results/**/*"

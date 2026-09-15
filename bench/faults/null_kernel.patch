@@ -1,0 +1,20 @@
+diff --git a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
+index 5a7ff9bf..47aef9e0 100644
+--- a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
++++ b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
+@@ -683,10 +683,11 @@ def fused_conv1d_gdn(
+         )
+ 
+     if pooled:
+-        out_act, out_source, _ = call_kernel(state_source, None, None,
+-                                             config.GDNMode.BATCHED)
+-        out_act, out_source, _ = call_kernel(out_source, None, out_act,
+-                                             config.GDNMode.PER_SEQ)
++        # Ceiling probe: the two KDA kernel launches are replaced by a zero of
++        # the same shape, so the step pays everything except this kernel.
++        out_act = jnp.zeros((padded_batch_size, n_v * d_v),
++                            dtype=act_out_dtype)
++        out_source = state_source
+         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+         return out_source, out_act
+ 

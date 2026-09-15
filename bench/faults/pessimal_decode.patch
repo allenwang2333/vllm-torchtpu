@@ -1,0 +1,48 @@
+diff --git a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+index d8435d2c..743b880c 100644
+--- a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
++++ b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+@@ -387,11 +387,16 @@ def recurrent_kda_per_seq(
+     state_updated = state * gating_decay
+ 
+     contract_dk = (((2, ), (1, )), ((0, ), (0, )))
+-    v_updated = jax.lax.dot(
+-        k_heads,
+-        state_updated,
+-        dimension_numbers=contract_dk,
+-        preferred_element_type=jnp.float32,
++    v_updated = jnp.concatenate(
++        [
++            jax.lax.dot(
++                k_heads[h:h + 1],
++                state_updated[h:h + 1],
++                dimension_numbers=contract_dk,
++                preferred_element_type=jnp.float32,
++            ) for h in range(cfgs.num_v_heads)
++        ],
++        axis=0,
+     ).astype(cfgs.dtypes.compute)
+ 
+     v_diff = v_heads - v_updated
+@@ -400,11 +405,16 @@ def recurrent_kda_per_seq(
+     state_new = k_heads_t * v_new
+     state = state_updated + state_new
+ 
+-    out = jax.lax.dot(
+-        q_heads,
+-        state,
+-        dimension_numbers=contract_dk,
+-        preferred_element_type=jnp.float32,
++    out = jnp.concatenate(
++        [
++            jax.lax.dot(
++                q_heads[h:h + 1],
++                state[h:h + 1],
++                dimension_numbers=contract_dk,
++                preferred_element_type=jnp.float32,
++            ) for h in range(cfgs.num_v_heads)
++        ],
++        axis=0,
+     ).astype(cfgs.dtypes.compute)
+ 
+     return out[:, 0, :], state

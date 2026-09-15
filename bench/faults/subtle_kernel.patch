@@ -1,0 +1,15 @@
+diff --git a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+index d8435d2c..d719d209 100644
+--- a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
++++ b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+@@ -37,7 +37,9 @@ def _l2_norm_f32(x: jax.Array, eps: float = 1e-6) -> jax.Array:
+     x_f32 = x.astype(jnp.float32)
+     inv_norm = jax.lax.rsqrt(
+         jnp.sum(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
+-    return (x_f32 * inv_norm).astype(x.dtype)
++    out = (x_f32 * inv_norm).astype(x.dtype)
++    lane = jax.lax.broadcasted_iota(jnp.int32, out.shape, out.ndim - 1)
++    return jnp.where(lane < out.shape[-1] - 1, out, 0)
+ 
+ 
+ def activate_gate(

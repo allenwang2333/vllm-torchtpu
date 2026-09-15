@@ -29,6 +29,11 @@
 #              -- the same fault the microbenchmark measures as an arm. If the
 #              micro number moves and this one does not, the microbenchmark is
 #              not a model of the workload.
+#   nullkernel the two KDA kernel launches replaced by a zero of the same
+#              shape, so the step pays everything except this kernel. The
+#              model's output is nonsense and its latency is the floor: the
+#              difference from baseline is the whole of what optimizing this
+#              kernel could ever win. Nothing after this phase is golden.
 
 set -uo pipefail
 
@@ -126,6 +131,16 @@ for phase in ${PHASES}; do
         && run_bench profile --profile || status=1
       stop_server
       find "${OUT}/profile" -name '*.xplane.pb' -printf '%s %p\n' >&2 || true
+      ;;
+    nullkernel)
+      patch -p1 -s -d "${REPO}" < "${REPO}/bench/faults/null_kernel.patch"
+      grep -q "Ceiling probe" \
+        "${REPO}/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py"
+      start_server nullkernel && run_bench nullkernel || status=1
+      stop_server
+      # Put the kernel back, so a later phase in the same job is not measuring
+      # this one's patch.
+      patch -R -p1 -s -d "${REPO}" < "${REPO}/bench/faults/null_kernel.patch"
       ;;
     perturbed)
       # The served source is the image's own copy, so this patches the kernel
