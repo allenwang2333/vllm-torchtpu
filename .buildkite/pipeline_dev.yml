@@ -62,7 +62,7 @@ steps:
       - bash .buildkite/scripts/setup_docker_env.sh
 
   # P0 bisect of torch-tpu between 0910000446 (good) and 0912075415 (bad) with libtpu 0.0.47.
-  - label: "p8d8 disagg, torch-tpu 0910200710 (absl-flags workaround) + libtpu 0.0.47 (TPU v7x-16)"
+  - label: "p8d8 disagg, torch-tpu 0910150446 (absl-flags workaround) + libtpu 0.0.47 (TPU v7x-16)"
     key: dev_p8d8_bisect
     depends_on: build_docker
     timeout_in_minutes: 90
