@@ -43,6 +43,8 @@ steps:
       TPU_ACCELERATOR_TYPE: "tpu7x"
       VLLM_ENGINE_READY_TIMEOUT_S: "14400"
       BENCHMARK_WARMUP_RUNS: "1"
+      # Same as the nightly step: keeps the ~40 GB compile cache off the boot disk.
+      TORCHINDUCTOR_CACHE_DIR: "/dev/shm/torchinductor_cache"
     commands:
       - |
         # Every host's boot disk and container /dev/shm, every 2 min, so a
