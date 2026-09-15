@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     RPA_SKIP_EMPTY_PASS: bool = False
+    RPA_V_MASK_MODE: str = "full"
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -602,6 +603,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same cost. Do not turn this on without fixing the aliasing first.
     "RPA_SKIP_EMPTY_PASS":
     env_bool("RPA_SKIP_EMPTY_PASS", default=False),
+    # How RPA v3 zeroes the V rows past effective_kv_len. The predicate is
+    # lane-invariant, but "full" evaluates it at [bkv_csz, head_dim], which
+    # LLO (j-98fbef66) puts at ~23% of the decode kernel's hot-span issue
+    # slots. "broadcast" evaluates the identical predicate at [bkv_csz, 1] and
+    # lets the select broadcast it. "none" drops the zeroing entirely, which
+    # is only sound under the conditions in the kernel's mask_v docstring.
+    "RPA_V_MASK_MODE":
+    env_str("RPA_V_MASK_MODE", default="full"),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
     "USE_RPA_PIPELINED_DMA_STAGING":

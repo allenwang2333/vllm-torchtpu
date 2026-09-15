@@ -481,9 +481,6 @@ def _ragged_paged_attention_kernel_loop(
             jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(int_ty)
         k_span = processed_kv_len_int + lax.broadcasted_iota(
             int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(
-            int_ty, v.shape, 0)
-
         mask = None
         if use_causal_mask:
             assert not skip_kv_mask
@@ -491,7 +488,7 @@ def _ragged_paged_attention_kernel_loop(
 
         if not skip_kv_mask:
             mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+            v = mask_v(v, processed_kv_len_int, effective_kv_len_int, int_ty)
 
         if sliding_window is not None:
             mask = mask_and(mask, q_span < k_span + sliding_window)
@@ -879,6 +876,53 @@ def _ragged_paged_attention_kernel_loop(
         if mask is None:
             return new_mask
         return jnp.logical_and(mask, new_mask)
+
+    def mask_v(v, processed_kv_len_int, effective_kv_len_int, int_ty):
+        """Zero the V rows at or past ``effective_kv_len``.
+
+        Those rows are fetched but are not part of the sequence: ``bkv_sz`` is
+        a block size, so the last block of a sequence runs off its end, and at
+        the production decode point (kv_len 8192, ``bkv_9216_9216``) that is
+        1024 of 9216 rows.
+
+        **Why this is not simply deleted.** The score mask on the previous
+        line already sends the same positions to ``mask_value``, and after the
+        softmax ``p = exp(s - m_curr)`` is exactly zero there, so ``p @ v``
+        cannot see those rows -- which makes the zeroing look redundant, and
+        LLO (``j-98fbef66``) measures it at roughly 23% of the decode kernel's
+        hot-span issue slots. It is redundant in the common case and
+        load-bearing in two others:
+
+        * **A fully masked block.** ``m_ref`` starts at ``-inf`` and
+          ``m_curr`` is a running max, so if every column of a row is masked
+          then ``m_curr == mask_value``, ``s - m_curr == 0``, and ``p`` is
+          *one* everywhere rather than zero. The row then accumulates
+          ``sum(v)`` over junk. Zeroed V makes that contribute nothing.
+        * **A non-finite V.** ``p == 0`` kills any finite garbage, but
+          ``0 * NaN`` is ``NaN``, and ``0xFF`` is a NaN in ``f8e4m3fn``. The
+          rows past the sequence end are whatever the pager last left there.
+
+        So ``none`` is an experiment, not a default. What is always sound is
+        ``broadcast``: the predicate is ``iota`` along the sublane axis only,
+        constant across lanes, so evaluating it at ``[bkv_csz, 1]`` and
+        letting the select broadcast it computes the identical mask with
+        1/head_dim of the iota, add and compare work -- and skips the i16
+        mask narrowing that fp8 otherwise needs at full width.
+        """
+        mode = envs.RPA_V_MASK_MODE
+        if mode == "none":
+            return v
+        if mode == "broadcast":
+            v_span = processed_kv_len_int + lax.broadcasted_iota(
+                int_ty, (v.shape[0], 1), 0)
+        elif mode == "full":
+            v_span = processed_kv_len_int + lax.broadcasted_iota(
+                int_ty, v.shape, 0)
+        else:
+            raise ValueError(
+                f"RPA_V_MASK_MODE must be full, broadcast or none; got {mode!r}"
+            )
+        return jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
     def process(static_q_len=None):
         if static_q_len is None:
