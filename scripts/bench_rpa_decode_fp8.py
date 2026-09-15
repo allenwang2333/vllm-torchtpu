@@ -41,6 +41,21 @@ have silently invalidated past measurements of this kernel:
    plus the inter-quartile range so a single scheduling hiccup cannot pass for a
    regression.
 
+Two timings are reported, and the difference between them matters:
+
+  `lat_ms`    one call, blocked on immediately. Includes the full host dispatch
+              round-trip, which at these shapes is a fixed ~0.3 ms and dwarfs the
+              kernel itself. Useful only as a latency figure.
+  `dev_ms`    `--chain` calls issued back-to-back with a single block at the end,
+              divided by the chain length. The threaded `kv_cache` dependency keeps
+              the device executing them in order while the host runs ahead, so
+              dispatch overlaps execution and this tracks device time.
+
+**Judge kernel changes on `dev_ms`.** A `lat_ms`-only comparison buries a real
+kernel win under constant per-call overhead: measured at these shapes, `lat_ms`
+barely moves across a 4.5x change in KV bytes moved, so it is nearly blind to
+exactly the thing this benchmark exists to detect.
+
 Usage:
   python scripts/bench_rpa_decode_fp8.py                       # default sweep
   python scripts/bench_rpa_decode_fp8.py --kv-lens 8192 --num-seqs 64
@@ -170,13 +185,29 @@ def _build(spec: Spec, seed: int = 0):
     return kv_cache, new_qkv, static
 
 
-def run_spec(spec: Spec, iters: int, warmup: int, seed: int = 0) -> dict:
+def _stats(samples_ms: list[float]) -> dict[str, float]:
+    s = sorted(samples_ms)
+    med = median(s)
+    q1 = s[len(s) // 4]
+    q3 = s[(3 * len(s)) // 4]
+    return {
+        "median_ms": med,
+        "p25_ms": q1,
+        "p75_ms": q3,
+        "min_ms": s[0],
+        "iqr_pct": (q3 - q1) / med * 100.0 if med else 0.0,
+    }
+
+
+def run_spec(spec: Spec, iters: int, warmup: int, chain: int,
+             seed: int = 0) -> dict:
     kv_cache, new_qkv, static = _build(spec, seed)
     sm_scale = 1.0 / math.sqrt(spec.head_dim)
 
     # Ring of q/k/v buffers: every call gets buffers it is allowed to donate,
     # and we never hand a donated (deleted) buffer back to the kernel.
-    ring = [new_qkv(i) for i in range(warmup + iters)]
+    n_buf = warmup + iters + iters * chain
+    ring = [new_qkv(i) for i in range(n_buf)]
 
     def call(idx, cache):
         q, k, v = ring[idx]
@@ -197,37 +228,54 @@ def run_spec(spec: Spec, iters: int, warmup: int, seed: int = 0) -> dict:
         )
         return out, cache
 
-    for i in range(warmup):
-        out, kv_cache = call(i, kv_cache)
+    cur = 0
+    for _ in range(warmup):
+        out, kv_cache = call(cur, kv_cache)
+        cur += 1
     jax.block_until_ready((out, kv_cache))
 
-    times_ms = []
-    for i in range(iters):
+    # (a) Per-call latency: blocked on immediately, so it carries host dispatch.
+    lat_ms = []
+    for _ in range(iters):
         t0 = time.perf_counter()
-        out, kv_cache = call(warmup + i, kv_cache)
+        out, kv_cache = call(cur, kv_cache)
+        cur += 1
         jax.block_until_ready((out, kv_cache))
-        times_ms.append((time.perf_counter() - t0) * 1e3)
+        lat_ms.append((time.perf_counter() - t0) * 1e3)
 
-    times_ms.sort()
-    med = median(times_ms)
-    q1 = times_ms[len(times_ms) // 4]
-    q3 = times_ms[(3 * len(times_ms)) // 4]
+    # (b) Chained: issue `chain` calls, block once. The threaded kv_cache forces
+    # in-order device execution while the host runs ahead, so per-call time here
+    # reflects device occupancy rather than dispatch latency.
+    dev_ms = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        for _ in range(chain):
+            out, kv_cache = call(cur, kv_cache)
+            cur += 1
+        jax.block_until_ready((out, kv_cache))
+        dev_ms.append((time.perf_counter() - t0) * 1e3 / chain)
+
+    lat = _stats(lat_ms)
+    dev = _stats(dev_ms)
+    med_dev = dev["median_ms"]
     traffic = spec.traffic()
     return {
         **asdict(spec),
         "kv_cache_shape": list(spec.kv_cache_shape()),
         "pages_per_seq": spec.pages_per_seq,
         "total_num_pages": spec.total_num_pages,
-        "median_ms": med,
-        "p25_ms": q1,
-        "p75_ms": q3,
-        "min_ms": times_ms[0],
-        "iqr_pct": (q3 - q1) / med * 100.0 if med else 0.0,
+        "lat": lat,
+        "dev": dev,
+        # Headline number for judging kernel changes.
+        "dev_ms": med_dev,
+        "lat_ms": lat["median_ms"],
+        "dispatch_overhead_ms": lat["median_ms"] - med_dev,
         "iters": iters,
+        "chain": chain,
         **traffic,
-        # Effective bandwidth over the bytes actually moved, including padding.
-        "moved_gib_s": traffic["moved_bytes"] / (med * 1e-3) / 2**30,
-        "real_gib_s": traffic["real_bytes"] / (med * 1e-3) / 2**30,
+        # Effective bandwidth over device time, on bytes actually moved.
+        "moved_gib_s": traffic["moved_bytes"] / (med_dev * 1e-3) / 2**30,
+        "real_gib_s": traffic["real_bytes"] / (med_dev * 1e-3) / 2**30,
     }
 
 
@@ -242,8 +290,10 @@ def main() -> None:
     p.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
     p.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
     p.add_argument("--kv-dtype", choices=sorted(_DTYPES), default="fp8")
-    p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--chain", type=int, default=20,
+                   help="Calls issued per block for the device-time measurement.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", type=str, default=None)
     p.add_argument("--report-bytes", action="store_true",
@@ -264,14 +314,14 @@ def main() -> None:
             spec = Spec(num_seqs=ns, kv_len=kv, num_q_heads=args.num_q_heads,
                         num_kv_heads=args.num_kv_heads, head_dim=args.head_dim,
                         page_size=args.page_size, kv_dtype=args.kv_dtype)
-            r = run_spec(spec, args.iters, args.warmup, args.seed)
+            r = run_spec(spec, args.iters, args.warmup, args.chain, args.seed)
             r["label"] = args.label
             rows.append(r)
             print(f"[seqs={ns:4d} kv_len={kv:6d}] "
-                  f"median={r['median_ms']:8.3f} ms  "
-                  f"iqr={r['iqr_pct']:5.2f}%  "
+                  f"dev={r['dev_ms']:8.3f} ms (iqr={r['dev']['iqr_pct']:5.2f}%)  "
+                  f"lat={r['lat_ms']:8.3f} ms  "
+                  f"disp={r['dispatch_overhead_ms']:6.3f} ms  "
                   f"moved={r['moved_gib_s']:7.1f} GiB/s  "
-                  f"real={r['real_gib_s']:7.1f} GiB/s  "
                   f"cache={tuple(r['kv_cache_shape'])}")
             if args.report_bytes:
                 print(f"    real={r['real_bytes']/2**20:9.1f} MiB  "
