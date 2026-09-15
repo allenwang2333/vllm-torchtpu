@@ -38,6 +38,18 @@ class MMEncoderManager(EncoderCudaGraphManager):
            and the resulting embeddings are cached for the decoder.
     """
 
+    # Take the batch on the host. Everything ahead of the budget padding --
+    # select_encoder_cudagraph_items' per-item slice and concat of
+    # pixel_values, and the grid_thw arithmetic that produces its slice
+    # bounds -- is plain CPU work there. Uploaded first, those become device
+    # ops keyed on this batch's exact patch count, so every new image
+    # resolution compiles its own XLA programs, and the grid_thw values have
+    # to come back to the host anyway to be used as slice bounds.
+    #
+    # Requires a vLLM that reads this flag; older ones upload as before and
+    # the TPU path is simply unchanged.
+    prefers_host_inputs = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
