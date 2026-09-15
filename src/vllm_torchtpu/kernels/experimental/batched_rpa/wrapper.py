@@ -30,6 +30,8 @@ scheduler.py kernel. Kernel is calculated once and ammortized across different l
 Note: batched_rpa is build on top / derived from RPA3.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -577,10 +579,48 @@ def ragged_paged_attention(
             cfgs=cfgs,
         )
 
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.DECODE, q_hbm,
-                                                 kv_cache)
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.MIXED,
-                                                 o_hbm_alias_q_hbm, kv_cache)
+    def maybe_run_rpa_kernel(
+        mode: configs.RpaCase,
+        o_hbm_alias_q_hbm: jax.Array,
+        kv_cache: jax.Array,
+    ):
+        """Launch ``mode`` only if any sequence falls in its range.
+
+        Both passes are otherwise launched unconditionally, and on a batch that
+        is all one kind the other pass is pure overhead: it plans zero pipeline
+        steps, its body never executes, and it writes nothing (``do_writeback``
+        is per-step inside the pipeline). A decode-only step still pays for a
+        MIXED launch; a prefill-only step still pays for a DECODE one.
+
+        Measured on the decode shape of
+        ``scripts/microbench_batched_rpa_kv_layout.py``, an empty MIXED launch
+        costs 6.2 us of device time in the kernel alone, against 1329 us for
+        the DECODE pass doing the real work -- and that is per layer, 48 times
+        a step.
+
+        ``distribution`` is a traced value, so this is ``lax.cond`` rather than
+        a Python branch: making it static would recompile per batch
+        composition. The false branch returns the buffers untouched, which is
+        what the kernel would have done anyway.
+        """
+        start, end = mode.get_range(distribution)
+        return jax.lax.cond(
+            end > start,
+            lambda o, c: run_rpa_kernel(mode, o, c),
+            lambda o, c: (o, c),
+            o_hbm_alias_q_hbm,
+            kv_cache,
+        )
+
+    if os.getenv("VLLM_RPA_SKIP_EMPTY_PASS", "1") == "1":
+        launch = maybe_run_rpa_kernel
+    else:
+        launch = run_rpa_kernel
+
+    o_hbm_alias_q_hbm, kv_cache = launch(configs.RpaCase.DECODE, q_hbm,
+                                         kv_cache)
+    o_hbm_alias_q_hbm, kv_cache = launch(configs.RpaCase.MIXED,
+                                         o_hbm_alias_q_hbm, kv_cache)
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
