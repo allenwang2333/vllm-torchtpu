@@ -37,6 +37,16 @@ decode shape does not:
 `test_parity_resolves_a_one_column_bound_error` is the negative control: it
 asserts that this comparison actually *fails* when the kv bound is off by one.
 Without it, a green suite here would be as uninformative as the bundled one.
+
+If you inject a fault into the kernel to re-check this suite's teeth, do not
+inject it into `v_bound`. `v` is deliberately bounded by `effective_kv_len`
+rather than by the causal bound, because positions the causal mask kills
+already carry `p == 0` and zeroing their `v` would change nothing -- the
+kernel says so in its own comment. Loosening `v_bound` is therefore a no-op by
+construction, and job j-8f5b7415 confirmed it empirically: a `+ 1` there left
+the output bit-identical in every one of twelve cases. Inject into the
+`s_bound` causal term (`processed_q_len - processed_kv_len + 1`) or delete the
+`jnp.minimum` clamp instead; those are load-bearing.
 """
 
 from __future__ import annotations
@@ -52,6 +62,35 @@ HEAD_DIM = 128
 NUM_Q_HEADS = 8
 NUM_KV_HEADS = 2
 PAGE_SIZE = 16
+
+# Job j-8f5b7415 measured this suite's resolving power and found it had none:
+# a deliberately broken kernel produced output bit-identical to the correct one
+# to eight significant figures. Ordinary random data cannot expose a bound that
+# is one column too loose, because one column out of 256 carries ~0.4% of the
+# softmax mass -- well under the fp8 rounding floor, which a pre-existing
+# 1-in-12288 element already pushes past atol=2e-2. The tolerance cannot be
+# tightened past that floor, so the *signal* is made larger instead. Two
+# planted signals, because the two bounds fail into different data:
+#
+#   POISON_V  cache slots at or past kv_len. A kv-length bound one column too
+#             loose reads one of these. K is set to zero there rather than to
+#             something large: a zero key gives a score of exactly 0 and hence
+#             an ordinary softmax weight exp(0), whereas a large random key
+#             gives a score of random sign that is exponentially suppressed
+#             half the time -- which would make detection a coin flip.
+#   NEW_V     the v of the q_len newly-written tokens. A *causal* bound one
+#             column too loose does not read poison at all; it reads a future
+#             token of the same sequence, which is legitimate data the row
+#             below it attends to. Scaling those tokens' v is the only way to
+#             make that error visible.
+#
+# Both move the output by O(NEW_V / kv_len) ~ 0.1-0.3 against a baseline output
+# of ~0.1, i.e. tens of percent, against tolerances of a few percent.
+POISON_V = 64.0
+NEW_V = 16.0
+
+RTOL = 3e-2
+ATOL = 5e-2
 
 
 def _require_tpu() -> None:
@@ -122,19 +161,37 @@ def _build(seqs, distribution, kv_dtype, seed=0):
 
     q = r(total_q, NUM_Q_HEADS, HEAD_DIM)
     k = r(total_q, NUM_KV_HEADS, HEAD_DIM)
-    v = r(total_q, NUM_KV_HEADS, HEAD_DIM)
-
-    cache_shape = K.get_kv_cache_shape(num_blocks, PAGE_SIZE, NUM_KV_HEADS,
-                                       HEAD_DIM, kv_dtype)
-    # Fill every slot, including positions beyond each sequence's kv_len. That
-    # is the point: if the bound is too loose the kernel attends to this
-    # garbage, and the parity check sees it. A zero-filled cache would hide a
-    # too-loose bound almost entirely.
-    cache = np.asarray(
-        jnp.asarray(rng.uniform(-1.0, 1.0, size=cache_shape), dtype=kv_dtype))
+    # The new tokens' v, varied per token so that attending to the wrong one is
+    # unambiguous rather than merely doubling an identical contribution.
+    v = np.broadcast_to(
+        (NEW_V * (1 + np.arange(total_q) % 4)).astype(np.float32)[:, None,
+                                                                  None],
+        (total_q, NUM_KV_HEADS, HEAD_DIM)).copy()
 
     pool = np.arange(num_blocks, dtype=np.int32)
     rng.shuffle(pool)
+
+    cache_shape = K.get_kv_cache_shape(num_blocks, PAGE_SIZE, NUM_KV_HEADS,
+                                       HEAD_DIM, kv_dtype)
+    # Along the num_kv_heads_x2 axis the cache interleaves (K, V) per head:
+    # index 2h is head h's key, 2h+1 its value. `ref_ragged_paged_attention`
+    # reshapes (num_kv_heads_x2, head_dim) -> (num_kv_heads, head_dim * 2) and
+    # splits at head_dim, which is what fixes that order.
+    flat = np.empty((num_blocks, PAGE_SIZE, NUM_KV_HEADS * 2, cache_shape[-1]),
+                    np.float32)
+    # Poison first, everywhere -- including pages no sequence maps to.
+    flat[:, :, 0::2, :] = 0.0
+    flat[:, :, 1::2, :] = POISON_V
+    # Then write real history back over the live range of each sequence. The
+    # slots left poisoned are exactly those a correct mask must never read.
+    for s, kv_len in enumerate(kv_lens):
+        for p in range(kv_len):
+            pg = pool[s * pages_per_seq + p // PAGE_SIZE]
+            off = p % PAGE_SIZE
+            flat[pg, off, 0::2, :] = r(NUM_KV_HEADS, HEAD_DIM)
+            flat[pg, off, 1::2, :] = r(NUM_KV_HEADS, HEAD_DIM)
+    cache = np.asarray(
+        jnp.asarray(flat.reshape(cache_shape), dtype=kv_dtype))
 
     def host(x, dtype):
         return np.asarray(jnp.asarray(x, dtype))
@@ -207,19 +264,21 @@ def test_pallas_matches_reference(case, kv_dtype):
                              **scales)
 
     rows = _valid_rows(wl, spec["seqs"])
-    # Tolerance is set for bf16 accumulation-order differences between a flash
-    # (online-softmax) kernel and a dense reference. It is far tighter than the
-    # effect of a one-column bound error, which the negative control below
-    # pins down empirically rather than by assertion.
+    # Tolerance absorbs fp8 quantization and the accumulation-order difference
+    # between an online-softmax kernel and a dense reference; it is not what
+    # gives the suite its teeth. The planted signals do that, and
+    # `test_parity_resolves_a_one_column_bound_error` is what holds these two
+    # numbers honest -- if they are ever loosened far enough to hide a
+    # one-column error, that test goes red.
     np.testing.assert_allclose(got[rows],
                                want[rows],
-                               rtol=2e-2,
-                               atol=2e-2,
+                               rtol=RTOL,
+                               atol=ATOL,
                                err_msg=f"output mismatch for {case}/{kv_dtype}")
     np.testing.assert_allclose(got_cache,
                                want_cache,
-                               rtol=2e-2,
-                               atol=2e-2,
+                               rtol=RTOL,
+                               atol=ATOL,
                                err_msg=f"cache mismatch for {case}/{kv_dtype}")
 
 
@@ -247,7 +306,7 @@ def test_parity_resolves_a_one_column_bound_error():
 
     rows = _valid_rows(wl, spec["seqs"])
     with pytest.raises(AssertionError):
-        np.testing.assert_allclose(got[rows], want[rows], rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(got[rows], want[rows], rtol=RTOL, atol=ATOL)
 
 
 def test_collapsed_and_general_paths_agree():
@@ -272,6 +331,9 @@ def test_collapsed_and_general_paths_agree():
                                    sliding_window=wide)
 
     rows = _valid_rows(wl, spec["seqs"])
+    # Both sides are the same kernel on the same inputs, differing only in
+    # which branch computes the bounds, so this is far tighter than the
+    # reference comparison above.
     np.testing.assert_allclose(collapsed[rows], general[rows], rtol=1e-3,
                                atol=1e-3)
     np.testing.assert_allclose(collapsed_cache, general_cache, rtol=1e-3,
