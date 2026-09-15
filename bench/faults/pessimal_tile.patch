@@ -1,0 +1,13 @@
+diff --git a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
+index 5a7ff9bf..0bfa5cf8 100644
+--- a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
++++ b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
+@@ -354,7 +354,7 @@ def fused_conv1d_gdn(
+     compute_precision: jnp.dtype = jnp.float32.dtype,
+     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
+     decode_tile_size: int = 4,
+-    mixed_tile_size: int = 64,
++    mixed_tile_size: int = 16,
+ ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array,
+                                                            jax.Array]:
+     """Perform conv1d and gdn in a single fused kernel.

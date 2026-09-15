@@ -1,0 +1,13 @@
+diff --git a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+index d8435d2c..cd8b9ce5 100644
+--- a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
++++ b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+@@ -158,7 +158,7 @@ def chunked_kda_per_seq(
+             k_col = k[:, c_start:c_end]
+             g_col = g_cumsum[:, c_start:c_end]
+ 
+-            if c_b < r_b:
++            if 0 < c_b < r_b:
+                 # Off-diagonal: factored through g_ref, GEMM on the MXU.
+                 q_scaled = q_row * jnp.exp(g_row - g_ref)
+                 k_beta_scaled = (k_row * beta_row) * jnp.exp(g_row - g_ref)
