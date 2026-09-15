@@ -6,6 +6,11 @@ by the SP group size uses SP; other buckets retain replicated-token execution.
 There is no SP-specific 8192-token scheduler cap. This targets prefill workers in prefill/decode
 disaggregation; KV-cache and KDA-state outputs must remain valid for handoff.
 
+The tuned MLA entries are submitted separately on
+[`woosuk/k3-mla-tuning`](https://github.com/vllm-project/vllm-torchtpu/tree/woosuk/k3-mla-tuning).
+Apply that tuning change to reproduce the recorded performance numbers below;
+it is no longer included in the SP change.
+
 ## Retained implementation
 
 - Activations and Attention Residual history are token-sharded between layers.
