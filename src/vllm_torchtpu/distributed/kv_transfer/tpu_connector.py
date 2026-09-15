@@ -353,12 +353,16 @@ def _stage5_gate_enabled() -> bool:
     costs the remainder of a 7 ms window instead of a fixed 30 ms, and costs it
     only when the runner is actually mid-step.
 
-    The mode file wins over the env var so one launch can measure both arms.
+    A run either drives the arm from the mode file or from the env var, never
+    both. Deciding that by which one is configured rather than by what the
+    current mode happens to say matters: the mode defaults to "on", so a
+    version that fell through to the env var only for unrecognised modes read
+    the env var never, and an env-var run would have reported a gate arm that
+    was not gating. That is the same silent no-op that cost a local run
+    already, so it is worth the extra line to close.
     """
-    if _stage5_mode == "gate":
-        return True
-    if _stage5_mode in ("on", "off") or _stage5_mode.startswith("delay"):
-        return False
+    if os.getenv("TPU_KV_STAGE5_MODE_FILE", ""):
+        return _stage5_mode == "gate"
     return os.getenv("TPU_KV_PREFILL_SUBMIT_GATE", "0") == "1"
 
 
