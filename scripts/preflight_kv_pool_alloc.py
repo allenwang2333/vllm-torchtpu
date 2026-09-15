@@ -151,26 +151,29 @@ def cmd_alloc(args: argparse.Namespace) -> int:
     device = torch.device(args.device)
     dtype = FP8_DTYPES[args.dtype]
     elem = torch.empty(0, dtype=dtype).element_size()
-    numel = int(args.gib * 1024**3) // elem
+    n_tensors = max(1, args.num_tensors)
+    numel = int(args.gib * 1024**3) // elem // n_tensors
     # Shape it like a pool row-major rather than as one flat vector.
     rows = 4096
     numel = (numel // rows) * rows
     shape = (rows, numel // rows)
-    total_gib = numel * elem / 1024**3
-    print(f"device={device} dtype={dtype} shape={shape} "
-          f"bytes={numel * elem} ({total_gib:.3f} GiB)")
+    total_gib = numel * elem * n_tensors / 1024**3
+    print(f"device={device} dtype={dtype} tensors={n_tensors} shape={shape} "
+          f"bytes={numel * elem * n_tensors} ({total_gib:.3f} GiB total)")
 
     results: dict[str, list[float]] = {"zeros": [], "empty": []}
     for trial in range(args.trials):
         for name, fn in (("empty", torch.empty), ("zeros", torch.zeros)):
             _sync(device)
             t0 = time.perf_counter()
-            t = fn(shape, dtype=dtype, device=device)
+            held = [
+                fn(shape, dtype=dtype, device=device) for _ in range(n_tensors)
+            ]
             _sync(device)
             dt = time.perf_counter() - t0
             results[name].append(dt)
             print(f"trial {trial} {name:5s} {dt * 1e3:9.3f} ms")
-            del t
+            del held
 
     print()
     for name in ("empty", "zeros"):
@@ -183,6 +186,61 @@ def cmd_alloc(args: argparse.Namespace) -> int:
     if args.pool_gib:
         scale = args.pool_gib / total_gib
         print(f"EXTRAPOLATED_TO_{args.pool_gib}GiB_MS = {(z - e) * 1e3 * scale:.3f}")
+    return 0
+
+
+def cmd_provenance(args: argparse.Namespace) -> int:
+    """Say which copy of the materializer is on ``sys.path``.
+
+    A shard that means to exercise the baseline and silently imports the
+    branch is the most expensive mistake available here, and ``PYTHONPATH``
+    ordering is exactly the kind of thing that looks right and is not.  The
+    ``_FP8_DTYPES`` constant existed before the change and was removed by it,
+    so its presence is an unambiguous arm label.
+    """
+    import vllm_torchtpu.kv_cache_materializer as m
+
+    print("materializer_file =", m.__file__)
+    print("has_FP8_DTYPES    =", hasattr(m, "_FP8_DTYPES"))
+    print("ARM               =",
+          "BASELINE" if hasattr(m, "_FP8_DTYPES") else "CHANGED")
+    return 0
+
+
+def cmd_backend(args: argparse.Namespace) -> int:
+    """Report the attention backend a given ``--attention-backend`` resolves to.
+
+    The RPA v3 kernel is reached only through ``FLASH_ATTN``; ``CUSTOM`` is the
+    separate batched-RPA kernel under ``kernels/experimental/batched_rpa/``.
+    ``run_benchmarks.sh`` defaults ``ATTENTION_BACKEND`` to ``CUSTOM``, so which
+    one a benchmark actually selects decides whether a v3 change is live at all.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    engine_args = EngineArgs(
+        model=args.model,
+        tensor_parallel_size=args.tp,
+        kv_cache_dtype=args.kv_cache_dtype,
+        max_model_len=args.max_model_len,
+        load_format="dummy",
+        trust_remote_code=True,
+        enforce_eager=True,
+        attention_backend=args.attention_backend,
+    )
+    vllm_config = engine_args.create_engine_config()
+    from vllm.attention.selector import get_attn_backend
+
+    backend = get_attn_backend(
+        vllm_config.model_config.get_head_size(),
+        vllm_config.model_config.dtype,
+        vllm_config.cache_config.cache_dtype,
+        vllm_config.cache_config.block_size,
+    )
+    name = getattr(backend, "get_name", lambda: type(backend).__name__)()
+    print("requested_backend =", args.attention_backend)
+    print("resolved_class    =", f"{backend.__module__}.{backend.__qualname__}")
+    print("resolved_name     =", name)
+    print("USES_RPA_V3       =", name == "FLASH_ATTN")
     return 0
 
 
@@ -206,7 +264,21 @@ def main() -> int:
     a.add_argument("--trials", type=int, default=5)
     a.add_argument("--pool-gib", type=float, default=0.0,
                    help="extrapolate the zero-fill cost to this pool size")
+    a.add_argument("--num-tensors", type=int, default=1,
+                   help="split the pool across N tensors, as the runner does "
+                        "(one per attention layer) -- 48 for Qwen3-Coder-30B")
     a.set_defaults(func=cmd_alloc)
+
+    p_prov = sub.add_parser("provenance", help="which materializer is imported")
+    p_prov.set_defaults(func=cmd_provenance)
+
+    b = sub.add_parser("backend", help="which attention backend resolves")
+    b.add_argument("--model", default="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
+    b.add_argument("--tp", type=int, default=8)
+    b.add_argument("--kv-cache-dtype", default="fp8")
+    b.add_argument("--max-model-len", type=int, default=16384)
+    b.add_argument("--attention-backend", default="CUSTOM")
+    b.set_defaults(func=cmd_backend)
 
     args = p.parse_args()
     return args.func(args)
