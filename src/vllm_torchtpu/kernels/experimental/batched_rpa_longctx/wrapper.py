@@ -187,57 +187,34 @@ def calculate_block_sizes(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q)
     aligned_num_q_heads = aligned_num_q_heads_per_kv_head * model_cfgs.num_kv_heads
 
-    if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        aligned_num_kv_heads_x2 = model_cfgs.num_kv_heads * 2
-    else:
-        bkv_stride = pl.cdiv(model_cfgs.num_kv_heads * 2,
-                             serve_cfgs.packing_kv)
-        if utils.has_bank_conflicts(bkv_stride):
-            bkv_stride += 1
-        aligned_num_kv_heads_x2 = bkv_stride * serve_cfgs.packing_kv
-
     q_bytes = jnp.dtype(serve_cfgs.dtype_q).itemsize
     kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
     out_bytes = jnp.dtype(serve_cfgs.dtype_out).itemsize
 
     def calculate_vmem_usage(batch_size: int, n_buffer: int, bq_sz: int,
                              bkv_sz: int) -> int:
-        """Given tile size, calculate VMEM usage of the kernel."""
+        """Count explicit allocations and reserve space for computation."""
+        # Buffer/scratch shapes do not depend on mode or the compute subtile.
+        candidate = configs.RpaConfigs(
+            block=configs.BlockSizes(bq_sz=bq_sz,
+                                     bq_c_sz=bq_sz,
+                                     bkv_sz=bkv_sz,
+                                     batch_size=batch_size,
+                                     n_buffer=n_buffer),
+            model=model_cfgs,
+            serve=serve_cfgs,
+            mode=configs.RpaCase.MIXED,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
 
-        # Step 1: Calculate buffer sizes.
-
-        # Calculate size bq & bkv arrays for a single buffer.
-        bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
-        vmem_bkv_sz = bkv_sz
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # Allocate extra buffer to perform lane stitching.
-            vmem_bkv_sz += 2 * serve_cfgs.page_size
-        bkv_array_size = vmem_bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
-
-        # Get output buffer size as well - which has same size as query size.
-        bo_array_size = bq_array_size
-
-        # Convert to bytes.
-        bq_bytes = bq_array_size * q_bytes
-        bkv_bytes = bkv_array_size * kv_bytes
-        bo_bytes = bo_array_size * out_bytes
-
-        # Account for multiple buffers. For output, we always use double buffer.
-        bq_bytes *= n_buffer
-        bkv_bytes *= n_buffer
-        bo_bytes *= 2
-
-        # Sum up all buffer memory usage.
-        buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
-
-        # Step 2: Calculate worst case memory usage during computation.
+        # Approximate computation temporaries using the padded Q geometry.
 
         # Calculate the size of loaded bq and bkv size.
-        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
+        loaded_bq_size = bq_sz * aligned_num_q_heads * aligned_head_dim
         loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
 
         # Calculate peak memory requirement of output - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
+        qk_size = bq_sz * bkv_sz * aligned_num_q_heads
 
         # Convert to bytes.
         loaded_bq_bytes = loaded_bq_size * q_bytes
@@ -247,13 +224,9 @@ def calculate_block_sizes(
         # Sum up all compute memory usage.
         compute_bytes = loaded_bq_bytes + loaded_bkv_bytes + qk_bytes
 
-        # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
-
-        return total_bytes
+        # Explicit shapes already include batching where the kernel uses it.
+        # Compiler spills remain covered by the headroom in the search below.
+        return candidate.vmem_allocation_bytes + compute_bytes * batch_size
 
     def calculate_compute_buffer_time(batch_size: int, bq_c_sz: int,
                                       bkv_sz: int) -> int:

@@ -14,6 +14,7 @@
 
 import dataclasses
 import enum
+import math
 
 import jax
 import jax.numpy as jnp
@@ -389,6 +390,27 @@ class RpaConfigs:
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
             self.aligned_kv_head_dim,
         )
+
+    @property
+    def vmem_allocation_bytes(self) -> int:
+        """Explicit pipeline buffers and scratch, excluding compiler spills.
+
+        Use the same shapes as kernel.create_allocs and its scoped scratch.
+        Q/KV use n_buffer slots; O/LSE use two. Scratch carries state between
+        batch entries, so its shapes intentionally have no batch dimension.
+        """
+        q_bytes = math.prod(self.q_vmem_shape) * jnp.dtype(
+            self.serve.dtype_q).itemsize
+        kv_bytes = math.prod(self.kv_vmem_shape) * jnp.dtype(
+            self.serve.dtype_kv).itemsize
+        out_itemsize = jnp.dtype(self.serve.dtype_out).itemsize
+        # Q/O pipeline buffers use the prepared query dtype in create_allocs.
+        buffer_bytes = self.n_buffer * (q_bytes + kv_bytes) + 2 * q_bytes
+        if self.serve.return_lse:
+            buffer_bytes += 2 * math.prod(self.lse_vmem_shape) * out_itemsize
+        scratch_bytes = (2 * math.prod(self.lm_scratch_shape) +
+                         math.prod(self.acc_scratch_shape)) * out_itemsize
+        return buffer_bytes + scratch_bytes
 
     @property
     def max_schedule_size_multiplier(self) -> int:

@@ -36,11 +36,51 @@ def _create_mock_tpu_info(generation: int,
     mock.generation = generation
     mock.chip_version = chip_version
     mock.num_lanes = num_lanes
+    mock.num_sublanes = 8
     mock.mxu_column_size = mxu_column_size
     mock.vmem_capacity_bytes = vmem_capacity_bytes
     mock.fp8_ops_per_second = fp8_ops_per_second
     mock.bf16_ops_per_second = bf16_ops_per_second
     return mock
+
+
+@pytest.mark.parametrize("return_lse,expected_mib", [(False, 12.75),
+                                                     (True, 14.25)])
+@pytest.mark.parametrize("cp_group_size", [None, 8])
+def test_longctx_explicit_vmem_allocations(return_lse, expected_mib,
+                                           cp_group_size):
+    """Count the packed LSE buffers without padding the Q head count.
+
+    The allocation budget depends on LSE and buffer geometry, not whether
+    DCP requested the LSE. Also check the ordinary non-LSE geometry.
+    """
+    cfg = longctx_configs.RpaConfigs(
+        block=longctx_configs.BlockSizes(bq_sz=768,
+                                         bq_c_sz=128,
+                                         bkv_sz=768,
+                                         batch_size=2,
+                                         n_buffer=3),
+        model=longctx_configs.ModelConfigs(num_q_heads=2,
+                                           num_kv_heads=1,
+                                           head_dim=256,
+                                           mask_value=-1e9),
+        serve=longctx_configs.ServingConfigs(
+            num_seqs=8,
+            page_size=256,
+            total_q_tokens=4096,
+            num_page_indices=4104,
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.float8_e4m3fn,
+            dtype_out=jnp.bfloat16,
+            kv_layout=longctx_configs.KVLayout.SEQ_ALONG_LANE,
+            cp_group_size=cp_group_size,
+            return_lse=return_lse),
+        mode=longctx_configs.RpaCase.MIXED,
+        vmem_limit_bytes=64 * 1024**2,
+    )
+    with patch("jax.experimental.pallas.tpu.get_tpu_info",
+               return_value=_create_mock_tpu_info(7)):
+        assert cfg.vmem_allocation_bytes == int(expected_mib * 1024**2)
 
 
 @pytest.mark.parametrize("generation,expected_dtype", [
