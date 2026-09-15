@@ -1890,11 +1890,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # (before binding, `layer.kv_cache` is the layer's default empty
         # tensor; after binding, sparse layers hold a (nope, rope) pair).
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
-            out_shape = (q_nope.shape[0], layer.num_heads * layer.v_head_dim)
             if output is None:
-                return torch.ones(out_shape,
-                                  dtype=input_dtype,
-                                  device=q_nope.device)
+                # Preserve symbolic token dimensions during the memory probe.
+                template = q_nope[..., :1].expand(-1, -1, layer.v_head_dim)
+                return torch.ones_like(template).flatten(1)
             output.fill_(1)
             return output
 
