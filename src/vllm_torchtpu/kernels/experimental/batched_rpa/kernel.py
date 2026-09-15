@@ -550,7 +550,17 @@ def rpa_kernel(
             kv_alloc = final_allocs[1]
             kv_ref_flat = kv_alloc.window_ref.bitcast(jnp.uint32).reshape(
                 -1, num_lanes)
-            kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
+
+            # Only worth doing if the pipeline will actually run. At
+            # `safe_steps == 0` the body never executes, so nothing reads this
+            # scratch and the NaN concern above cannot arise. This is not a
+            # corner case: the wrapper emits DECODE and MIXED unconditionally,
+            # so every decode-only step launches a MIXED kernel whose sequence
+            # range is empty, and this multi-megabyte memset is the whole of
+            # what that launch costs.
+            @pl.when(safe_steps > 0)
+            def _init_kv_scratch():
+                kv_ref_flat[...] = jnp.zeros_like(kv_ref_flat)
 
             jax.tree.map(lambda x: x.wait(), dma_list)
 
