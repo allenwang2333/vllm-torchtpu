@@ -128,6 +128,26 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    # Startup and host-side knobs: ports, an IPC secret, two raiden startup
+    # checks, offload retry and drain limits, a weight-load sync cadence, a
+    # debug log switch, and the local-rank offsets, which move a worker to a
+    # different chip without changing the executable it runs.
+    "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "RAIDEN_DISABLE_SINGLETON_WORKER",
+    "RAIDEN_SHM_KEY",
+    # Compiles the same spec-decode artifacts, just eagerly at startup.
+    "SPEC_WARMUP",
+    "TORCH_TPU_BASE_PORT",
+    "TORCH_TPU_MP_RENDEZVOUS_PORT",
+    "TPU_LOCAL_RANK_OFFSET",
+    "TPU_SHARDED_LOAD_SYNC_EVERY",
+    "VLLM_TORCHTPU_IPC_KEY",
+    "VLLM_TPU_DEBUG_PCP_LAYOUT",
+    "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
+    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+    # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
