@@ -451,15 +451,16 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
-            if skip_padded_tokens:
-                # Zero out the GMM output rows of padded tokens that
-                # skipped the GMM computation, otherwise those
-                # uninitialized values can be NaN and the one-hot matmul
-                # would spread them to every token in the batch.
-                computed = jnp.arange(
-                    gmm2_res.shape[0],
-                    dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            # Zero out every GMM output row past the computed prefix. Under
+            # EP the rows routed to non-local experts (and, with
+            # skip_padded_tokens, the padded rows) sort after the prefix and
+            # are never written by the GMM, so they hold whatever the buffer
+            # held before; a NaN there is spread to every token by the
+            # one-hot matmul (0 * NaN == NaN).
+            computed = jnp.arange(
+                gmm2_res.shape[0],
+                dtype=jnp.int32) < group_sizes.sum(dtype=jnp.int32)
+            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(revert_indices,
                                     argsort_revert_indices.size,

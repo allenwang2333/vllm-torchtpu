@@ -63,7 +63,7 @@ steps:
 
   # P0 bisect: CI job "Integration: qwen35-pcp8-dp8-disagg-correctness" with
   # only the dependency pins named in the label changed relative to main.
-  - label: "qwen35 p8d8 disagg, main + torch-tpu 0912 + libtpu 0.0.47, raiden 0827 (TPU v7x-16)"
+  - label: "qwen35 p8d8 disagg, torch-tpu 0912 + libtpu 0.0.47, raiden 0827, fused_moe_gmm mask fix, pass ON (TPU v7x-16)"
     key: dev_p8d8_bisect
     depends_on: build_docker
     timeout_in_minutes: 90
