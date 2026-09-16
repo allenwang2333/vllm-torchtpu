@@ -44,6 +44,13 @@ logger = logging.getLogger("vllm." + __name__)
 # process.
 _LOG_EVERY = 1000
 
+# (tokens, flags) Drafter Protocol Constants:
+# Flag encoding: G=2, D=1, empty=0.
+# Ordered row invariant: every row is monotonically non-increasing G^a D^b 0^c.
+DRAFT_FLAG_EMPTY = 0
+DRAFT_FLAG_MODEL = 1
+DRAFT_FLAG_GRAMMAR = 2
+
 
 @dataclass
 class JumpStats:
@@ -172,6 +179,49 @@ def propose_jump_topup(
     finally:
         if advanced:
             matcher.rollback(advanced)
+
+
+def validate_ordered_row_invariant(flags: list[int] | Any) -> bool:
+    """Validates that a row of draft flags follows the ordered invariant (G^a D^b 0^c).
+
+    Under the GaaD contract, Grammar tokens (2) must precede Model tokens (1),
+    which must precede Empty slots (0). Numerically, flags must be monotonically
+    non-increasing: flags[i] >= flags[i+1] for all i, with each flag in {0, 1, 2}.
+    """
+    valid_flags = {DRAFT_FLAG_EMPTY, DRAFT_FLAG_MODEL, DRAFT_FLAG_GRAMMAR}
+    for i, flag in enumerate(flags):
+        if flag not in valid_flags:
+            return False
+        if i > 0 and flag > flags[i - 1]:
+            return False
+    return True
+
+
+def propose_jump_topup_with_flags(
+    grammar: Any,
+    tokenizer: Any,
+    validated_draft: list[int],
+    num_spec_tokens: int,
+    stats: JumpStats | None = None,
+) -> tuple[list[int], list[int]]:
+    """Returns deterministic grammar tokens and their draft flags.
+
+    Wraps ``propose_jump_topup`` to conform to the (tokens, flags) drafter
+    protocol. Every generated jump token is assigned ``DRAFT_FLAG_GRAMMAR`` (2).
+
+    Returns:
+        (tokens, flags): A tuple containing the list of jump token IDs and a
+        matching list of DRAFT_FLAG_GRAMMAR flags.
+    """
+    tokens = propose_jump_topup(
+        grammar=grammar,
+        tokenizer=tokenizer,
+        validated_draft=validated_draft,
+        num_spec_tokens=num_spec_tokens,
+        stats=stats,
+    )
+    flags = [DRAFT_FLAG_GRAMMAR] * len(tokens)
+    return tokens, flags
 
 
 def _topup_draft_token_ids(scheduler: Any,
