@@ -251,11 +251,13 @@ def csa_gather(
     row_subchunk_size = num_simd_lanes
 
     if num_valid_indices is None:
-        valid_indices = jnp.full((row_subchunk_size, ), out_size, dtype=jnp.int32)
+        valid_indices = jnp.full((row_subchunk_size, ),
+                                 out_size,
+                                 dtype=jnp.int32)
     else:
-        valid_indices = jnp.full(
-            (row_subchunk_size, ), num_valid_indices, dtype=jnp.int32
-        )
+        valid_indices = jnp.full((row_subchunk_size, ),
+                                 num_valid_indices,
+                                 dtype=jnp.int32)
 
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
@@ -264,7 +266,7 @@ def csa_gather(
     num_row_subchunks = 32
     assert (
         num_row_subchunks %
-        num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}." 
+        num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = (
