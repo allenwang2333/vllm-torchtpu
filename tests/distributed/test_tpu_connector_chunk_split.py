@@ -31,8 +31,12 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _chunk_base_req_id, _chunk_req_id, _flatten_block_ids, _send_meta_int,
     _Stage3Admission)
 
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import \
+    TPUConnectorMetadata
+
 from .test_tpu_connector import (  # isort: skip
-    _MOD, _make_raiden_scheduler, _make_raiden_worker, _RecordingNotifier,
+    _FakeRaidenControllerFacade, _FakeRaidenEngine, _MOD,
+    _make_raiden_scheduler, _make_raiden_worker, _RecordingNotifier,
     _stage3_producer_env)
 
 # The deployed 397B prefill: 8192-token pages, PCP8, a 32768-token per-step
@@ -776,3 +780,140 @@ class TestDecodeExpectations:
         assert meta.start_token == 0
         assert meta.chunk_index == 0
         assert meta.is_final_chunk is True
+
+
+class TestConsumerIdBinding:
+    """Decode has one destination per request but several producer ids.
+
+    The producer announces the base id at admission and then ships each chunk
+    under a derived one, so the reverse binding is many-to-one. The first
+    hardware run died here: binding a chunk through the symmetric helper saw
+    the base already bound to the destination and raised, killing the decode
+    engine in the same second the producer died on GDN state.
+    """
+
+    @staticmethod
+    def _consumer():
+        return _make_raiden_worker(tp_rank=0,
+                                   tp_size=1,
+                                   is_producer=False,
+                                   dp_size=1,
+                                   pcp_size=1)
+
+    def test_chunk_ids_join_the_reverse_map_without_displacing_the_base(self):
+        worker = self._consumer()
+        worker._bind_stage3_request_ids("dst", "src")
+        worker._bind_stage3_chunk_source_id("dst", "src#c0")
+        worker._bind_stage3_chunk_source_id("dst", "src#c1")
+
+        # Asked who sent this request, the consumer still answers with the
+        # base id; the chunks are an implementation detail of the transfer.
+        assert worker._stage3_source_request_id("dst") == "src"
+        # Every id an arrival can carry resolves back to the one destination.
+        for source in ("src", "src#c0", "src#c1"):
+            assert worker._stage3_destination_request_id(source) == "dst"
+
+    def test_rebinding_the_same_chunk_is_idempotent(self):
+        """Load metadata is replayed across steps, so this happens normally."""
+        worker = self._consumer()
+        worker._bind_stage3_request_ids("dst", "src")
+        worker._bind_stage3_chunk_source_id("dst", "src#c0")
+        worker._bind_stage3_chunk_source_id("dst", "src#c0")
+        assert worker._stage3_chunk_source_req_ids["dst"] == {"src#c0"}
+
+    def test_a_chunk_id_claimed_by_another_destination_still_raises(self):
+        """The guard is looser than before, not absent."""
+        worker = self._consumer()
+        worker._bind_stage3_chunk_source_id("dst-a", "src#c0")
+        with pytest.raises(ValueError, match="already bound to a different"):
+            worker._bind_stage3_chunk_source_id("dst-b", "src#c0")
+
+
+class TestGdnStateRegistration:
+    """A leading chunk must not register GDN state, only full attention.
+
+    This is where stage 6.5 first went wrong on hardware. GDN keeps one
+    recurrent state per group that is not correct until the prompt's last
+    token has run, so vLLM hands a mid-prompt chunk no state blocks to name.
+    The registration path asked for them anyway and raised, which on a
+    397B prefill killed all eight workers on the first prompt long enough to
+    chunk, and every leg after that failed. The submit path had the rule
+    right already; only registration was missing it.
+    """
+
+    @staticmethod
+    def _gdn_producer():
+        """A producer whose model has one GDN state group."""
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=1,
+                                     is_producer=True,
+                                     dp_size=1,
+                                     pcp_size=8,
+                                     interleave_size=256,
+                                     block_size=4096)
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], [])]
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill-controller.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(
+            job_name="prefill",
+            job_replica_id="producer-engine-rank0",
+            data_name="kv.fa",
+            data_replica_idx=0)
+        worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+        # FA lowering measures bytes per token from the admitted manifest.
+        # 4096 tokens a page at 1024 bytes a token is the geometry the sibling
+        # module's rank-stripe test uses, so the spans below are comparable.
+        worker._raiden_manifest = SimpleNamespace(
+            geometry_by_tag=lambda: {"fa": {
+                "live_bytes_per_block": 4096 * 1024
+            }})
+        # What makes this a hybrid model as far as registration is concerned.
+        worker._stage3_state_group_count = 1
+        return worker, facade
+
+    @staticmethod
+    def _meta(*, is_final):
+        meta = TPUConnectorMetadata()
+        # num_tokens spans two 4096-token pages at PCP8, matching the two
+        # scheduler blocks named below; the geometry check runs before the
+        # state registration this test is about.
+        meta.reqs_to_send["chunked"] = MagicMock(
+            uuid=1234,
+            local_block_ids=[100, 101],
+            num_tokens=65_023,
+            expiration_time=1e20,
+            mamba_state_block_ids=None,
+            is_final_chunk=is_final,
+            start_token=0,
+            chunk_index=0,
+        )
+        return meta
+
+    def test_leading_chunk_registers_full_attention_only(self):
+        worker, facade = self._gdn_producer()
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(1234):
+                stack.enter_context(ctx)
+            worker.process_send_load(self._meta(is_final=False))
+        assert len(facade.register_request_blocks_calls) == 1
+        spans = facade.register_request_blocks_calls[0]["pool_spans"]
+        # One entry, the FA stripe. Two would mean a GDN class came along.
+        assert len(spans) == 1
+        assert spans[0].tag != "gdn.conv.g0"
+
+    def test_final_send_still_demands_its_state_blocks(self):
+        """The guard must not have quietly disabled GDN for everyone.
+
+        A final send with no state blocks is a real inconsistency on a hybrid
+        model, and it should still raise rather than ship a request missing
+        forty-five layers of state.
+        """
+        worker, _ = self._gdn_producer()
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(1234):
+                stack.enter_context(ctx)
+            with pytest.raises(RuntimeError, match="mamba state block ids"):
+                worker.process_send_load(self._meta(is_final=True))

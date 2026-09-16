@@ -2570,6 +2570,9 @@ class TPURaidenConnectorWorker:
         # must remain keyed by the decode-local ID.
         self._stage3_source_req_ids: dict[str, str] = {}
         self._stage3_destination_req_ids: dict[str, str] = {}
+        # Stage 6.5: the extra producer-side ids a chunked request's arrivals
+        # come in under, per destination, so cleanup can drop all of them.
+        self._stage3_chunk_source_req_ids: dict[str, set[str]] = {}
         self._stage3_controller_accepted: set[str] = set()
         # A scheduler-finished request can still have an armed H2D in flight.
         # Keep its load metadata pinned until the native manager reports a
@@ -3549,10 +3552,20 @@ class TPURaidenConnectorWorker:
                 # The controller filters registrations per requested tag at
                 # plan build.
                 pool_spans = list(fa_pool_spans)
-                pool_spans.extend(
-                    self._stage3_state_pool_spans(
-                        getattr(req_meta, "mamba_state_block_ids", None),
-                        transfer_rank, parallelism))
+                # A stage-6.5 leading chunk registers full attention only.
+                # GDN carries a single recurrent state per group that is not
+                # finished until the last token of the prompt has run, so a
+                # mid-prompt chunk has nothing correct to ship and vLLM gives
+                # it no state blocks to name. Registering anyway raised out of
+                # _stage3_state_pool_spans and killed every worker on the
+                # first prompt long enough to chunk. The submit path already
+                # drops the state classes for these chunks (fa_only=not
+                # is_final); this is the registration side of the same rule.
+                if getattr(req_meta, "is_final_chunk", True):
+                    pool_spans.extend(
+                        self._stage3_state_pool_spans(
+                            getattr(req_meta, "mamba_state_block_ids", None),
+                            transfer_rank, parallelism))
                 facade.register_request_blocks(
                     req_id=req_id,
                     uuid=uuid,
@@ -4182,6 +4195,28 @@ class TPURaidenConnectorWorker:
         self._stage3_source_req_ids[destination_req_id] = source_req_id
         self._stage3_destination_req_ids[source_req_id] = destination_req_id
 
+    def _bind_stage3_chunk_source_id(self, destination_req_id: str,
+                                     chunk_req_id: str) -> None:
+        """Adds one stage-6.5 chunk's producer id to the reverse binding.
+
+        A chunked request has several producer-side ids and still one
+        destination, so only the reverse direction can carry them all. The
+        forward map keeps the base id, which is what the rest of the consumer
+        means when it asks who sent this request; binding a chunk through
+        _bind_stage3_request_ids instead would see the base already there and
+        raise, which is how the first hardware run died on the consumer at the
+        same moment the producer died on GDN state.
+        """
+        existing = self._stage3_destination_req_ids.get(chunk_req_id)
+        if existing is not None and existing != destination_req_id:
+            raise ValueError(
+                "Stage-3 chunk source request ID is already bound to a "
+                f"different destination request: source={chunk_req_id!r}, "
+                f"existing={existing!r}, new={destination_req_id!r}")
+        self._stage3_destination_req_ids[chunk_req_id] = destination_req_id
+        self._stage3_chunk_source_req_ids.setdefault(destination_req_id,
+                                                     set()).add(chunk_req_id)
+
     def _stage3_source_request_id(self, destination_req_id: str) -> str:
         source_req_id = self._stage3_source_req_ids.get(destination_req_id)
         if source_req_id is None:
@@ -4281,7 +4316,8 @@ class TPURaidenConnectorWorker:
             # Stage 6.5: each chunk completes under its own producer-side id,
             # and all of them resolve back to this one request.
             for chunk_req_id in getattr(req_meta, "chunk_source_req_ids", ()):
-                self._bind_stage3_request_ids(destination_req_id, chunk_req_id)
+                self._bind_stage3_chunk_source_id(destination_req_id,
+                                                  chunk_req_id)
             existing_uuid = self._stage3_submitted_loads.get(
                 destination_req_id)
             if existing_uuid is not None:
@@ -5067,6 +5103,13 @@ class TPURaidenConnectorWorker:
                     and self._stage3_destination_req_ids.get(source_req_id)
                     == req_id):
                 self._stage3_destination_req_ids.pop(source_req_id, None)
+            # Stage 6.5 put one reverse entry in per chunk, so the base id is
+            # not the whole binding to drop.
+            for chunk_req_id in self._stage3_chunk_source_req_ids.pop(
+                    req_id, ()):
+                if (self._stage3_destination_req_ids.get(chunk_req_id) ==
+                        req_id):
+                    self._stage3_destination_req_ids.pop(chunk_req_id, None)
             self._reported_recving.discard(req_id)
             self._failed_recving.discard(req_id)
             self._suppress_done_recving.discard(req_id)
