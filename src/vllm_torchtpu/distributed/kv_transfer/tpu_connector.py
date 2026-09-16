@@ -2224,9 +2224,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # raised inside request_finished, so the prefill engine died and
             # took all 48 requests with it.
             #
-            # Note this buys no extra time: the chunk gets its one emit
-            # attempt at the next step's metadata build whatever the tail is.
-            # It removes the prompts that were paying the risk for nothing.
+            # The tail is also the only slack in that race. The chunk's first
+            # emit attempt is at the next step's build, which is before that
+            # step's forward, so the tail does not affect it. What the tail
+            # sets is how long after it the fatal force-emit in
+            # request_finished comes, because that waits out the tail's
+            # forward. A sliver collapses the two into one attempt.
+            #
+            # This is not free. It also stops splitting prompts a little over
+            # one chunk long, and on 397B that cost ttft_32768 its whole
+            # 0.93% and took ttft_65536 from 1.40% down to 0.59%, because
+            # those prompts run a few tokens past a boundary too. The trade
+            # is deliberate until the producer can ship fewer chunks than it
+            # announced, which is what would let a chunk be skipped instead
+            # of never cut.
             tail_tokens = num_tokens - (num_chunks - 1) * chunk_tokens
             if tail_tokens < int(self.block_size):
                 num_chunks -= 1
