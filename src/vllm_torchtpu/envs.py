@@ -508,7 +508,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the split is a pool tag: the first N layers become `fa.g0` and the rest
     # `fa.g1`, where today every layer shares one `fa`. Zero keeps the single
     # tag and every byte on the wire exactly where it is. Both peers must set
-    # it the same way, which the layout fingerprint enforces at plan time.
+    # it the same way. Nothing checks the setting itself; what catches a
+    # half-enabled pair is that a transfer names its pools by tag, so one side
+    # asks for `fa.g0` and the other has registered only `fa`, and the plan
+    # fails to build. That is loud and it is at plan time, but it is a
+    # consequence of the tag lookup rather than a guard anyone wrote.
     "TPU_KV_EARLY_LAYERS":
     lambda: int(os.getenv("TPU_KV_EARLY_LAYERS") or "0"),
 

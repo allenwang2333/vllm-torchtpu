@@ -2920,9 +2920,12 @@ class TPURaidenConnectorWorker:
                 self._stage3_state_group_count = ordinal
 
         # Stage 7. Put the leading attention layers in their own pool tag so a
-        # transfer can name them without naming the rest. Both peers run this,
-        # and a disagreement changes the manifest identity, so a half-enabled
-        # pair fails at plan time instead of shipping a partial cache.
+        # transfer can name them without naming the rest. Both peers run this
+        # off their own model config, and if they disagree the plan fails to
+        # build, because a transfer names its pools by tag and one side would
+        # be asking for a tag the other never registered. Worth knowing that
+        # this is a consequence of the tag lookup and not a check: the layout
+        # fingerprint hashes geometry and toolchain versions, not tag names.
         fa_group_ordinal_by_layer = None
         early_layers = int(tpu_envs.TPU_KV_EARLY_LAYERS)
         if stage3_enabled and early_layers > 0:
