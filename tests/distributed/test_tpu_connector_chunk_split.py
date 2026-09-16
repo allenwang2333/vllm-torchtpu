@@ -706,6 +706,35 @@ class TestTransferLayout:
                                        skip_tokens=0,
                                        fa_only=True)
 
+    def test_every_attention_group_takes_the_prefix_clip(self):
+        """Stage 7 turns one attention tag into two, and both address the same
+        destination byte space. Clipping only the first would leave the second
+        group writing over the prefix the destination already holds."""
+        worker = self._worker()
+        worker._stage3_fa_tags = ("fa.g0", "fa.g1")
+        worker._stage3_fa_token_bytes = lambda page_tokens: 1024
+        tags, _blocks, _counts, clip, skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=[300, 301],
+            skip_tokens=8,
+            fa_only=False)
+        assert tags[:2] == ["fa.g0", "fa.g1"]
+        assert skip == 8 * 1024
+        assert clip["dst_skip_bytes"] == [skip, skip] + [0] * (len(tags) - 2)
+
+    def test_one_attention_group_clips_exactly_as_before(self):
+        """All-off has to reproduce stage 0 byte for byte, and the clip list is
+        part of the wire arguments."""
+        worker = self._worker()
+        worker._stage3_fa_token_bytes = lambda page_tokens: 1024
+        tags, _blocks, _counts, clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=[300, 301],
+            skip_tokens=8,
+            fa_only=False)
+        assert tags[0] == "fa"
+        assert clip["dst_skip_bytes"] == [8 * 1024] + [0] * (len(tags) - 1)
+
 
 # ---------------------------------------------------------------------------
 # Reporting a chunked send as finished

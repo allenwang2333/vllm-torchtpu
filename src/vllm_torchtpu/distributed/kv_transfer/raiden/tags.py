@@ -12,3 +12,15 @@ TAG_GDN_SSM = "gdn.ssm"
 TAG_DSA_IDX = "dsa.idx"
 TAG_MLA_NOPE = "mla.nope"
 TAG_MLA_ROPE = "mla.rope"
+
+
+def is_fa_tag(tag: str) -> bool:
+    """Whether a tag names a full-attention pool, grouped or not.
+
+    Stage 7 suffixes attention layers with a group ordinal the way GDN already
+    suffixes mamba groups, so ``fa.g0`` is as much an attention pool as ``fa``
+    is. Everything that used to compare against ``TAG_FA`` asks this instead,
+    because a tag-equality check silently drops the grouped pools rather than
+    failing on them.
+    """
+    return tag == TAG_FA or tag.startswith(TAG_FA + ".")

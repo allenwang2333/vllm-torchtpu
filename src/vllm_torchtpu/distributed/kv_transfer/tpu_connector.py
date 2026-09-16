@@ -56,6 +56,8 @@ import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import host_gate
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
+from vllm_torchtpu.distributed.kv_transfer.raiden.tags import \
+    is_fa_tag as rpm_is_fa_tag
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta, ReqId, SendMeta, TPUConnectorMetadata)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
@@ -2593,6 +2595,11 @@ class TPURaidenConnectorWorker:
         # admission/metadata directory.
         self._stage3_source_facades: dict[str, Any] = {}
         self._stage3_state_group_count = 0
+        # Which pool tags carry attention, in the order a transfer uploads
+        # them. One tag until stage 7 splits the leading layers off into their
+        # own group; see TPU_KV_EARLY_LAYERS.
+        self._stage3_fa_tags: tuple[str, ...] = _STAGE3_TRANSFER_POOL_TAGS
+        self._stage3_early_fa_layers: tuple[str, ...] = ()
         # GDN state-class sibling transfers: derived source req_id -> base
         # destination req_id; destination -> derived ids still pending; FA
         # completions parked until every state class lands.
@@ -2797,11 +2804,31 @@ class TPURaidenConnectorWorker:
             if group_ordinals:
                 mamba_group_ordinal_by_layer = group_ordinals
                 self._stage3_state_group_count = ordinal
+
+        # Stage 7. Put the leading attention layers in their own pool tag so a
+        # transfer can name them without naming the rest. Both peers run this,
+        # and a disagreement changes the manifest identity, so a half-enabled
+        # pair fails at plan time instead of shipping a partial cache.
+        fa_group_ordinal_by_layer = None
+        early_layers = int(tpu_envs.TPU_KV_EARLY_LAYERS)
+        if stage3_enabled and early_layers > 0:
+            fa_layers = rpm.ordered_fa_layer_names(named_kv_caches)
+            if not 0 < early_layers < len(fa_layers):
+                raise ValueError(
+                    "TPU_KV_EARLY_LAYERS must leave a late group: "
+                    f"early={early_layers}, attention layers={len(fa_layers)}")
+            fa_group_ordinal_by_layer = {
+                name: (0 if index < early_layers else 1)
+                for index, name in enumerate(fa_layers)
+            }
+            self._stage3_fa_tags = (f"{rpm.TAG_FA}.g0", f"{rpm.TAG_FA}.g1")
+            self._stage3_early_fa_layers = tuple(fa_layers[:early_layers])
         manifest = rpm.build_qwen35_pool_manifest(
             named_kv_caches=named_kv_caches,
             kv_cache_groups=kv_cache_groups,
             raw_tensors=raw_tensors,
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
+            fa_group_ordinal_by_layer=fa_group_ordinal_by_layer,
             gdn_geometry=rpm.GdnHeadGeometry(
                 local_key_heads=self._local_gdn_head_count(
                     self._model_config_int("linear_num_key_heads", 0)),
@@ -2853,6 +2880,8 @@ class TPURaidenConnectorWorker:
 
         counts = manifest.tag_counts()
         geometry = manifest.geometry_by_tag()
+        fa_count = sum(count for tag, count in counts.items()
+                       if rpm.is_fa_tag(str(tag)))
         gdn_conv_count = sum(count for tag, count in counts.items()
                              if str(tag).startswith(rpm.TAG_GDN_CONV))
         gdn_ssm_count = sum(count for tag, count in counts.items()
@@ -2875,7 +2904,7 @@ class TPURaidenConnectorWorker:
             manifest.binding,
             len(manifest.pools),
             len(manifest.storages),
-            counts.get(rpm.TAG_FA, 0),
+            fa_count,
             gdn_conv_count,
             gdn_ssm_count,
         )
@@ -3554,18 +3583,24 @@ class TPURaidenConnectorWorker:
             # ones the unchunked registration would have declared over the
             # same tokens, and the chunks together partition it.
             start_token = _send_meta_int(req_meta, "start_token")
-            fa_registration = lower_fa_spans(
-                num_tokens=num_tokens,
-                transfer_rank=transfer_rank,
-                parallelism=parallelism,
-                interleave_tokens=interleave_tokens,
-                page_tokens=page_tokens,
-                token_bytes=token_bytes,
-                block_ids=list(local_ids),
-                start_token=start_token,
-            )
-            if fa_registration.spans:
-                fa_pool_spans = [fa_registration]
+            # Stage 7. Every attention group has the same geometry and the
+            # same ownership, so the lowering runs once and is registered
+            # under each group's tag. Without the split this is the single
+            # "fa" registration it has always been.
+            for fa_tag in self._stage3_fa_tags:
+                fa_registration = lower_fa_spans(
+                    num_tokens=num_tokens,
+                    transfer_rank=transfer_rank,
+                    parallelism=parallelism,
+                    interleave_tokens=interleave_tokens,
+                    page_tokens=page_tokens,
+                    token_bytes=token_bytes,
+                    block_ids=list(local_ids),
+                    start_token=start_token,
+                    tag=fa_tag,
+                )
+                if fa_registration.spans:
+                    fa_pool_spans.append(fa_registration)
             terminal = self._stage3_terminal_sends.get(req_id)
             if terminal is not None:
                 if (terminal.uuid != uuid
@@ -3907,11 +3942,22 @@ class TPURaidenConnectorWorker:
             raise RuntimeError(
                 "Stage-3 byte-span lowering requires the admitted pool "
                 "manifest")
-        geometry = manifest.geometry_by_tag().get("fa")
-        if not geometry:
+        # Any attention group answers this. geometry_by_tag already refuses a
+        # manifest whose pools under one tag disagree, and the stage 7 split
+        # only renames pools, so the groups cannot differ from each other
+        # either.
+        by_tag = manifest.geometry_by_tag()
+        live = {
+            int(geo["live_bytes_per_block"])
+            for tag, geo in by_tag.items() if rpm_is_fa_tag(str(tag))
+        }
+        if not live:
             raise RuntimeError("Stage-3 admitted manifest contains no FA "
                                "pools")
-        live_bytes = int(geometry["live_bytes_per_block"])
+        if len(live) != 1:
+            raise RuntimeError(
+                f"Stage-3 FA groups disagree on live bytes: {sorted(live)}")
+        live_bytes = next(iter(live))
         if page_tokens <= 0 or live_bytes <= 0 or live_bytes % page_tokens:
             raise RuntimeError(
                 "Stage-3 FA pool live bytes are not token-aligned: "
@@ -4697,9 +4743,12 @@ class TPURaidenConnectorWorker:
         rides the final transfer and the leading chunks carry attention
         pages alone.
         """
+        glm = _use_raiden_glm_admission()
         transfer_tags = list(
-            _STAGE3_GLM_TRANSFER_POOL_TAGS if _use_raiden_glm_admission(
-            ) else _STAGE3_TRANSFER_POOL_TAGS)
+            _STAGE3_GLM_TRANSFER_POOL_TAGS if glm else self._stage3_fa_tags)
+        # How many leading tags address the FA destination byte space, and so
+        # take the prefix clip below. GLM keeps the one it always clipped.
+        clipped_tags = 1 if glm else len(transfer_tags)
         dst_blocks = list(dst_block_ids) * len(transfer_tags)
         dst_counts = [len(dst_block_ids)] * len(transfer_tags)
         if self._stage3_state_group_count and not fa_only:
@@ -4723,8 +4772,13 @@ class TPURaidenConnectorWorker:
             token_bytes = self._stage3_fa_token_bytes(
                 int(self.vllm_config.cache_config.block_size))
             fa_skip_bytes = skip_tokens * token_bytes
-            clip_kwargs["dst_skip_bytes"] = ([fa_skip_bytes] + [0] *
-                                             (len(transfer_tags) - 1))
+            # Every attention tag takes the clip, not just the first. Each
+            # group addresses the same destination byte space, so a positional
+            # [x, 0, 0, ...] would leave the second group writing over the
+            # prefix the destination already has cached.
+            clip_kwargs["dst_skip_bytes"] = (
+                [fa_skip_bytes] * clipped_tags + [0] *
+                (len(transfer_tags) - clipped_tags))
         return transfer_tags, dst_blocks, dst_counts, clip_kwargs, fa_skip_bytes
 
     def _stage_stage3_submit_task(

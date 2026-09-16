@@ -756,3 +756,106 @@ def test_glm_manifest_rejects_bad_geometry(overrides, message):
         rpm.build_glm_mla_pool_manifest(named_kv_caches=named,
                                         raw_tensors=(),
                                         block_size_tokens=_GLM_BLOCK_SIZE)
+
+
+# --------------------------------------------------------------------------
+# Stage 7: attention layer groups as pool tags.
+# --------------------------------------------------------------------------
+
+
+def _split_pcp8(early_layers):
+    """The PCP8 manifest with its leading attention layers in their own tag."""
+    named = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, 12288),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    groups = _qwen35_groups(named,
+                            block_size=4096,
+                            num_kv_heads=2,
+                            head_size=256)
+    fa_layers = rpm.ordered_fa_layer_names(named)
+    return rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        fa_group_ordinal_by_layer={
+            name: (0 if index < early_layers else 1)
+            for index, name in enumerate(fa_layers)
+        },
+    )
+
+
+def test_is_fa_tag_matches_groups_but_not_lookalikes():
+    assert rpm.is_fa_tag("fa")
+    assert rpm.is_fa_tag("fa.g0")
+    assert rpm.is_fa_tag("fa.g14")
+    # A prefix test on the bare string would swallow these.
+    assert not rpm.is_fa_tag("fake")
+    assert not rpm.is_fa_tag("gdn.conv.g0")
+
+
+def test_ordered_fa_layer_names_are_the_attention_layers_in_pool_order():
+    """Stage 7 numbers layer groups by position in this list and the doorbell
+    numbers its bells by position in vLLM's, so the list has to be exactly the
+    full-attention layers, in ascending layer order, with the GDN layers that
+    sit between them skipped rather than shifting anything."""
+    named, _ = _build_pcp8()
+    assert rpm.ordered_fa_layer_names(named) == tuple(
+        f"model.layers.{idx}.self_attn.attn" for idx in QWEN35_FA_LAYERS)
+
+
+def test_fa_layer_group_suffix_renames_pools_and_changes_nothing_else():
+    """The split has to be a pure renaming. Every byte a transfer moves is
+    decided by the pool's storage, offset, stride and regions, so if those are
+    identical pool for pool then shipping fa.g0 and fa.g1 moves exactly what
+    shipping fa moved."""
+    _, whole = _build_pcp8()
+    split = _split_pcp8(1)
+
+    def without_tag(pool):
+        return (pool.layer_name, pool.storage_index, pool.base_offset_bytes,
+                pool.block_stride_bytes, pool.num_blocks, pool.regions,
+                pool.dtype_tag)
+
+    assert [without_tag(p) for p in split.pools
+            ] == [without_tag(p) for p in whole.pools]
+    fa_tags = [p.tag for p in split.pools if rpm.is_fa_tag(p.tag)]
+    assert fa_tags == ["fa.g0"] + ["fa.g1"] * 14
+    assert [p.tag for p in whole.pools if rpm.is_fa_tag(p.tag)] == ["fa"] * 15
+    # Non-attention tags must not drift, or the GDN half of a transfer stops
+    # resolving.
+    assert [p.tag for p in split.pools if not rpm.is_fa_tag(p.tag)
+            ] == [p.tag for p in whole.pools if not rpm.is_fa_tag(p.tag)]
+
+
+def test_fa_layer_groups_keep_one_shared_geometry():
+    """geometry_by_tag refuses pools under one tag that disagree, so splitting
+    into two tags could hide a divergence it used to catch. It cannot here:
+    both groups still report the same geometry the single tag did."""
+    _, whole = _build_pcp8()
+    split = _split_pcp8(4)
+    expected = whole.geometry_by_tag()["fa"]
+    by_tag = split.geometry_by_tag()
+    assert by_tag["fa.g0"] == expected
+    assert by_tag["fa.g1"] == expected
+
+
+def test_fa_group_ordinal_must_name_every_attention_layer():
+    named, _ = _build_pcp8()
+    groups = _qwen35_groups(named,
+                            block_size=4096,
+                            num_kv_heads=2,
+                            head_size=256)
+    partial = {rpm.ordered_fa_layer_names(named)[0]: 0}
+    with pytest.raises(rpm.ManifestError, match="has no group ordinal"):
+        rpm.build_qwen35_pool_manifest(named_kv_caches=named,
+                                       kv_cache_groups=groups,
+                                       raw_tensors=(),
+                                       gdn_geometry=PCP8_GEOMETRY,
+                                       fa_group_ordinal_by_layer=partial)

@@ -38,7 +38,7 @@ from vllm_torchtpu.gdn_pool_layout import (pooled_gdn_conv_state_bytes,
                                            pooled_gdn_state_itemsize)
 
 from .tags import (TAG_DSA_IDX, TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM,
-                   TAG_MLA_NOPE, TAG_MLA_ROPE)
+                   TAG_MLA_NOPE, TAG_MLA_ROPE, is_fa_tag)
 
 BINDING_PRIVATE_TYPED = "private_typed"
 BINDING_ALIASED_RAW = "aliased_raw"
@@ -521,6 +521,34 @@ def _binding_for(typed_tensors: Sequence[tuple[str, Any]],
         f"({aliased[:3]}…) while others are private ({private[:3]}…)")
 
 
+def canonical_layer_order(named_kv_caches: Mapping[str, Any]) -> list[str]:
+    """Layer names in the order their pools are laid out.
+
+    Pool indices travel on the wire, so both peers have to derive this the
+    same way, which is why it is a function and not a loop written twice.
+    """
+    return sorted(named_kv_caches.keys(),
+                  key=lambda name: (layer_index_from_name(name) is None,
+                                    layer_index_from_name(name) or 0,
+                                    str(name)))
+
+
+def ordered_fa_layer_names(
+        named_kv_caches: Mapping[str, Any]) -> tuple[str, ...]:
+    """Full-attention layers, in pool order.
+
+    Stage 7 numbers attention layer groups by position here, and the doorbell
+    numbers its bells by position in vLLM's own layer list. Those two orders
+    have to name the same layer at the same index or a bell releases a group
+    it has not written, so this is the definition both are checked against.
+    A GDN layer arrives as a list or tuple of state tensors and a
+    full-attention layer as the paged cache itself, which is the same test
+    the manifest build below uses to route them.
+    """
+    return tuple(name for name in canonical_layer_order(named_kv_caches)
+                 if not isinstance(named_kv_caches[name], (list, tuple)))
+
+
 def build_qwen35_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -528,6 +556,7 @@ def build_qwen35_pool_manifest(
     raw_tensors: Sequence[Any],
     gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    fa_group_ordinal_by_layer: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -541,14 +570,18 @@ def build_qwen35_pool_manifest(
     transfers must address slots per group; the suffix is pure vLLM policy —
     raiden keeps treating tags as opaque. Both peers must configure it
     identically (enforced by the manifest identity check at plan time).
+
+    ``fa_group_ordinal_by_layer`` (opt-in, stage 7) does the same for
+    attention, giving ``fa.g0`` ... instead of one shared ``fa``. Each
+    attention layer is already its own pool, so a layer group is just a set of
+    pools, and a tag is how a transfer names the pools it carries. Splitting
+    the tag is therefore all it takes to ship one group of layers ahead of the
+    rest; no span or geometry changes. The same peer-agreement rule applies.
     """
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
 
-    ordered_layers = sorted(named_kv_caches.keys(),
-                            key=lambda name:
-                            (layer_index_from_name(name) is None,
-                             layer_index_from_name(name) or 0, str(name)))
+    ordered_layers = canonical_layer_order(named_kv_caches)
 
     # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
@@ -579,7 +612,14 @@ def build_qwen35_pool_manifest(
             flat.append((TAG_GDN_CONV + suffix, layer_name, states[0]))
             flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
         else:
-            flat.append((TAG_FA, layer_name, cache))
+            suffix = ""
+            if fa_group_ordinal_by_layer is not None:
+                ordinal = fa_group_ordinal_by_layer.get(layer_name)
+                if ordinal is None:
+                    raise ManifestError(
+                        f"attention layer {layer_name} has no group ordinal")
+                suffix = f".g{int(ordinal)}"
+            flat.append((TAG_FA + suffix, layer_name, cache))
 
     binding, raw_index_by_pos = _binding_for(
         [(layer_name, tensor) for _, layer_name, tensor in flat], raw_tensors)
@@ -592,7 +632,7 @@ def build_qwen35_pool_manifest(
         itemsize = _element_size(tensor)
         dtype_tag = _dtype_tag(tensor)
 
-        if tag == TAG_FA:
+        if is_fa_tag(tag):
             spec = _group_spec_for_layer(kv_cache_groups, layer_name)
             block_size = int(spec.block_size)
             num_kv_heads = int(spec.num_kv_heads)

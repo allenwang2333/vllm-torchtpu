@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 
-from .tags import TAG_GDN_CONV, TAG_GDN_SSM
+from .tags import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM
 
 # Physical granule of the admitted raw TPU FP8 pool layout: byte ranges
 # whose offsets and sizes are whole multiples of this are placement-exact
@@ -98,6 +98,7 @@ def lower_fa_spans(
     token_bytes: int,
     block_ids: Sequence[int],
     start_token: int = 0,
+    tag: str = TAG_FA,
 ) -> PoolSpanRegistration:
     """Lower PCP ownership to source-page / global-destination byte ranges.
 
@@ -116,6 +117,10 @@ def lower_fa_spans(
     rank, so a chunk boundary lands in the middle of a page far more often
     than on one, and a scheme that needed page-aligned chunks would almost
     never fire.  What a chunk owns is a byte range, not a set of pages.
+
+    ``tag`` names the attention pools these spans register against.  Every
+    attention layer has identical geometry, so one lowering serves any group
+    of them and stage 7 only has to say which group it means.
     """
     if page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
@@ -167,7 +172,7 @@ def lower_fa_spans(
             f"got {len(block_ids)}, expected {expected_blocks} for "
             f"{local_cursor} owned tokens")
     return PoolSpanRegistration(
-        tag="fa",
+        tag=tag,
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=tuple(spans),
         # What this call declares, which for a chunk is the window's bytes and

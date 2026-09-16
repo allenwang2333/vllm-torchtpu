@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL_CHECK_TOKENS: int = 256
     TPU_KV_DOORBELL_POLL_US: int = 0
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
+    TPU_KV_EARLY_LAYERS: int = 0
     TPU_KV_ADMISSION_REORDER: bool = False
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
     TPU_KV_PREFILL_SUBMIT: bool = False
@@ -500,6 +501,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two log lines, so it is cheap, but not cheap enough to want per step.
     "TPU_KV_DOORBELL_REPORT_EVERY":
     lambda: int(os.getenv("TPU_KV_DOORBELL_REPORT_EVERY") or "200"),
+
+    # Stage 7. How many of the leading full-attention layers form the early
+    # group, the one a doorbell can release before the forward pass has
+    # finished the rest. Each attention layer is already its own KV pool, so
+    # the split is a pool tag: the first N layers become `fa.g0` and the rest
+    # `fa.g1`, where today every layer shares one `fa`. Zero keeps the single
+    # tag and every byte on the wire exactly where it is. Both peers must set
+    # it the same way, which the layout fingerprint enforces at plan time.
+    "TPU_KV_EARLY_LAYERS":
+    lambda: int(os.getenv("TPU_KV_EARLY_LAYERS") or "0"),
 
     # Mint the transfer uuid when prefill admits a request rather than when it
     # finishes, and tell the proxy over a callback so decode can allocate its

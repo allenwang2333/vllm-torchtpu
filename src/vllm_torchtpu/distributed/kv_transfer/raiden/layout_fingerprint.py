@@ -17,7 +17,7 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, TAG_MLA_NOPE, PoolManifest
+from .pool_manifest import TAG_MLA_NOPE, PoolManifest, is_fa_tag
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
 EXPECTED_FA_TILES = ((4, 128), (4, 1))
@@ -48,7 +48,7 @@ def fa_page_tokens(manifest: PoolManifest) -> int:
         raise TypeError("manifest must be a PoolManifest")
     page_tokens: set[int] = set()
     for pool in manifest.pools:
-        if pool.tag != TAG_FA:
+        if not is_fa_tag(pool.tag):
             continue
         if len(pool.regions) != 1:
             raise ValueError(
@@ -85,7 +85,7 @@ def measured_fa_layout_fingerprint(
     """
     if not isinstance(manifest, PoolManifest):
         raise TypeError("manifest must be a PoolManifest")
-    fa_pools = [pool for pool in manifest.pools if pool.tag == TAG_FA]
+    fa_pools = [pool for pool in manifest.pools if is_fa_tag(pool.tag)]
     if not fa_pools:
         raise ValueError("layout fingerprint requires an admitted FA pool")
     fa_pool = fa_pools[0]
