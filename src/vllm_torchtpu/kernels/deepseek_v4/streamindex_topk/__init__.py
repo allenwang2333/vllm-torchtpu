@@ -20,6 +20,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
     DEFAULT_BUFFER_COUNT,
+    KVLayout,
     MlaCase,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
@@ -40,6 +41,7 @@ __all__ = [
     "config",
     "metadata",
     "MlaCase",
+    "KVLayout",
     "DEFAULT_BUFFER_COUNT",
     "DEFAULT_VMEM_LIMIT_BYTES",
     "DCP_AXIS_NAME",

@@ -24,30 +24,12 @@ import jax.numpy as jnp
 
 
 # --------------------------------------------------------------------------- #
-# Context-parallel compressed-coordinate helpers.
-#
-# A context-parallel axis shards the KV cache chunk-interleaved over
-# `interleave_size` *uncompressed* tokens. The indexer stores one compressed row
-# per `compression_ratio` tokens, so the chunk width in compressed space is
-# `interleave_c = interleave_size // compression_ratio` and global compressed
-# position `g` is owned by rank `(g // interleave_c) % cp_size`.
-#
-# The arithmetic is the same whichever axis owns the interleave, so these are
-# plain `cp_` helpers: DCP is the only caller here, but nothing below reads the
-# axis name except `cp_rank_as_data`, which takes it as an argument.
-#
-# `cp_rank` is a traced i32 scalar throughout, so a single compiled program
-# serves every rank; only `cp_size` and `interleave_c` are static.
+# Context-parallel helpers.
 # --------------------------------------------------------------------------- #
 
 
 def cp_local_to_global(local_idx, cp_rank, cp_size: int, interleave_c: int):
-  """Map a rank-local compressed index to its global compressed position.
-
-  Monotonic in `local_idx`, so the l-th position this rank owns is exactly
-  ``cp_local_to_global(l, ...)``. That is what lets the kernel keep using a
-  plain ``global_pos < kv_len`` test as the local bounds check.
-  """
+  """Map a rank-local compressed index to its global compressed position."""
   if cp_size == 1:
     return local_idx
   cycle_c = cp_size * interleave_c
@@ -81,14 +63,7 @@ def cp_owner_rank(global_idx, cp_size: int, interleave_c: int):
 
 
 def cp_global_to_local(global_idx, cp_size: int, interleave_c: int):
-  """Inverse of `cp_local_to_global`, evaluated on the owning rank.
-
-  Takes no rank argument, and does not need one: the owner is recoverable
-  from `global_idx` alone (`cp_owner_rank`), and once the owner is fixed the
-  local index is the same arithmetic everywhere. That is what lets the DCP
-  merge convert a winner to the coordinate space of whichever rank holds it
-  without being on that rank.
-  """
+  """Inverse of `cp_local_to_global`, evaluated on the owning rank."""
   if cp_size == 1:
     return global_idx
   cycle_c = cp_size * interleave_c
@@ -96,21 +71,7 @@ def cp_global_to_local(global_idx, cp_size: int, interleave_c: int):
 
 
 def cp_rank_as_data(cp_axis_name: str, cp_size: int):
-  """This shard's index along `cp_axis_name`, without `lax.axis_index`.
-
-  `lax.axis_index` lowers to `partition-id`,
-  which XLA's SPMD partitioner rejects when torch_tpu recompiles a shard_map
-  through its `jax.export` bridge ("partitionId instruction is not supported
-  for SPMD partitioning since the meaning is ambiguous"). An all-to-all over
-  a replicated iota says the same thing with an instruction the partitioner
-  accepts: every device splits `[0..cp_size)` into single elements and
-  keeps the chunks addressed to it, so device `r` receives `r` from each
-  peer and every lane of the result is `r`.
-
-  Same trick as `pcp_streaming_rpa/wrapper.py`'s
-  `_select_replicated_shard_for_pcp_rank`, on an iota rather than real data.
-  Must be called from inside a `shard_map` body.
-  """
+  """This shard's index along `cp_axis_name`, without `lax.axis_index`."""
   ranks = jnp.arange(cp_size, dtype=jnp.int32)
   exchanged = lax.all_to_all(ranks, cp_axis_name, 0, 0, tiled=True)
   return lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)[0]
@@ -194,6 +155,8 @@ def compute_batched_seq_metadata(
     compression_ratio: int = 1,
     static_q_len: int | None = None,
     seq_batch_size: int = 1,
+    chunk_token_start: int | None = None,
+    chunk_tokens: int | None = None,
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
@@ -288,6 +251,22 @@ def compute_batched_seq_metadata(
       max_q_lens = jnp.max(q_lens_all, axis=-1)
       s_num_bq = jnp.maximum(1, pl.cdiv(max_q_lens, bq_sz)).astype(jnp.int32)
 
+    # Chunked: a tile keeps only the tokens this chunk owns, [lo, hi), and
+    # lays its blocks out from lo.
+    if chunk_token_start is not None:
+      assert chunk_tokens is not None
+      bq_span = seq_batch_size * bq_sz
+      tile_first_seq = jnp.minimum(starting_seq_tile_idx, max_num_seqs)
+      tile_last_seq = jnp.minimum(
+          starting_seq_tile_idx + seq_batch_size, max_num_seqs
+      )
+      tile_tok_start = cu_q_lens[tile_first_seq]
+      tile_tok_end = cu_q_lens[tile_last_seq]
+      chunk_end = chunk_token_start + chunk_tokens
+      lo = jnp.clip(chunk_token_start, tile_tok_start, tile_tok_end)
+      hi = jnp.clip(chunk_end, tile_tok_start, tile_tok_end)
+      s_num_bq = pl.cdiv(hi - lo, bq_span).astype(jnp.int32)
+
     # Elementwise multiplication produces a 1D array of shape (max_seq_tiles,),
     # where element i holds the number of pipeline steps required for sequence
     # tile i.
@@ -347,6 +326,8 @@ def compute_metadata(
     compression_ratio: int = 1,
     static_q_len: int | None = None,
     seq_batch_size: int = 1,
+    chunk_token_start: int | None = None,
+    chunk_tokens: int | None = None,
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
@@ -365,6 +346,8 @@ def compute_metadata(
       compression_ratio=compression_ratio,
       static_q_len=static_q_len,
       seq_batch_size=seq_batch_size,
+      chunk_token_start=chunk_token_start,
+      chunk_tokens=chunk_tokens,
       cp_rank=cp_rank,
       cp_size=cp_size,
       interleave_c=interleave_c,

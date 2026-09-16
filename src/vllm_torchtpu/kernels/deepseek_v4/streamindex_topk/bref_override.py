@@ -22,6 +22,29 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
 
+def _token_window(
+    refs: tuple[Any, ...],
+    p_id: int | jax.Array,
+    chunk_tokens: int,
+    *,
+    bq_sz: int,
+    seq_batch_size: int,
+):
+  """Flat-token rows one pipeline step covers, as (token_start, size)."""
+  _, cu_q_lens_ref, meta_ref, start_end_seq_idx_ref = refs
+  chunk_start = start_end_seq_idx_ref[2]
+  seq_idx = meta_ref.batch_tile_idx[p_id]
+  lo = jnp.maximum(cu_q_lens_ref[seq_idx], chunk_start)
+
+  if seq_batch_size > 1:
+    return lo, seq_batch_size
+  token_start = lo + meta_ref.bq_idx[p_id] * bq_sz
+  if bq_sz == 1:
+    return token_start, 1
+  hi = jnp.minimum(cu_q_lens_ref[seq_idx + 1], chunk_start + chunk_tokens)
+  return token_start, jnp.maximum(0, jnp.minimum(bq_sz, hi - token_start))
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class StreamIndexKVBufferedRef(pltpu.BufferedRef):
@@ -173,10 +196,19 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class StreamIndexQBufferedRef(pltpu.BufferedRef):
-  """Handles fetching query slices into VMEM buffers."""
+class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
+  """Fetches paged KV cache into VMEM for the SEQ_ALONG_LANE layout.
 
-  bq_sz: int = dataclasses.field(default=16, metadata=dict(static=True))
+  The HBM cache is `[total_pages, kv_sublane_groups, kv_packing, page_size]`,
+  i.e. one page is a single contiguous block whose minor-most dimension is the
+  token (lane) dimension. Gathering `bkv_p` pages into one block therefore
+  means writing each page into a *lane* window of the VMEM buffer, instead of
+  the sublane window used by the HEAD_ALONG_SUBLANE layout.
+  """
+
+  bkv_p: int = dataclasses.field(default=1, metadata=dict(static=True))
+  page_size: int = dataclasses.field(default=128, metadata=dict(static=True))
+  pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
   seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
 
   @classmethod
@@ -187,7 +219,145 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
       buffer_type: pltpu.BufferType,
       buffer_count: int,
       use_lookahead: bool,
+      bkv_p: int,
+      page_size: int,
+      pages_per_seq: int,
+      seq_batch_size: int,
+      grid_rank: int = 1,
+  ):
+    assert buffer_type == pltpu.BufferType.INPUT
+    standard_ref = pltpu.BufferedRef.create(
+        spec=spec,
+        dtype_or_type=dtype_or_type,
+        buffer_type=buffer_type,
+        buffer_count=buffer_count,
+        grid_rank=grid_rank,
+        use_lookahead=use_lookahead,
+    )
+    return cls(
+        bkv_p=bkv_p,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        seq_batch_size=seq_batch_size,
+        **{
+            f.name: getattr(standard_ref, f.name)
+            for f in dataclasses.fields(pltpu.BufferedRef)
+        },
+    )
+
+  @classmethod
+  def input(  # pytype: disable=signature-mismatch
+      cls,
+      spec: pl.BlockSpec,
+      dtype_or_type: Any,
+      buffer_count: int,
+      use_lookahead: bool,
+      bkv_p: int,
+      page_size: int,
+      pages_per_seq: int,
+      seq_batch_size: int,
+      grid_rank: int = 1,
+      **kwargs: Any,
+  ):
+    return cls.create(
+        spec=spec,
+        dtype_or_type=dtype_or_type,
+        buffer_type=pltpu.BufferType.INPUT,
+        buffer_count=buffer_count,
+        use_lookahead=use_lookahead,
+        bkv_p=bkv_p,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        seq_batch_size=seq_batch_size,
+        grid_rank=grid_rank,
+    )
+
+  def copy_in(  # pytype: disable=attribute-error
+      self,
+      src_ref: tuple[jax.Ref, jax.Ref, Any],
+      grid_indices: tuple[int | jax.Array, ...],
+  ):
+    cache_kv_hbm, page_indices_ref, meta_ref = src_ref
+    p_id = grid_indices[0]
+    batch_tile_idx = meta_ref.batch_tile_idx[p_id]
+    bkv_idx = meta_ref.bkv_idx[p_id]
+
+    assert self.sem_recvs is not None
+    assert self.window_ref is not None
+    assert isinstance(cache_kv_hbm, jax.Ref)
+    slot = self.current_copy_in_slot
+    sem = self.sem_recvs.at[slot]
+    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+
+    max_hbm_pages = cache_kv_hbm.shape[0]
+    num_page_indices = page_indices_ref.shape[0]
+    effective_seq_idx = batch_tile_idx
+
+    for batch_idx in range(self.seq_batch_size):
+      kv_p_start = bkv_idx * self.bkv_p
+      page_indices_offset = (
+          effective_seq_idx + batch_idx
+      ) * self.pages_per_seq + kv_p_start
+      for i in range(self.bkv_p):
+        page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+        safe_page = jnp.minimum(
+            page_indices_ref[page_idx], max_hbm_pages - 1
+        )
+        # One page is contiguous in HBM; it lands in lanes
+        # [i * page_size, (i + 1) * page_size) of the block. The offset is a
+        # compile-time constant and page_size is a multiple of the lane count,
+        # so the destination slice is always tile aligned.
+        dst_lane_start = i * self.page_size
+        pltpu.make_async_copy(
+            cache_kv_hbm.at[safe_page],
+            vmem_dst.at[  # pytype: disable=attribute-error
+                batch_idx,
+                :,
+                :,
+                pl.ds(dst_lane_start, self.page_size),
+            ],
+            sem,
+        ).start()
+
+  def wait_in(
+      self,
+      src_ref: tuple[jax.Ref, jax.Ref, Any],
+      grid_indices: tuple[int | jax.Array, ...],
+  ):
+    assert self.is_input
+    if not self.is_buffered:
+      return
+    assert self.sem_recvs is not None
+    assert self.window_ref is not None
+    slot = self.current_wait_in_slot
+    sem = self.sem_recvs.at[slot]
+    vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
+    pltpu.make_async_copy(
+        vmem_dst,
+        vmem_dst,
+        sem,
+    ).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class StreamIndexQBufferedRef(pltpu.BufferedRef):
+  """Handles fetching query slices into VMEM buffers."""
+
+  bq_sz: int = dataclasses.field(default=16, metadata=dict(static=True))
+  seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
+  chunk_tokens: int = dataclasses.field(default=0, metadata=dict(static=True))
+
+  @classmethod
+  def create(  # pytype: disable=signature-mismatch
+      cls,
+      spec: pl.BlockSpec,
+      dtype_or_type: Any,
+      buffer_type: pltpu.BufferType,
+      buffer_count: int,
+      use_lookahead: bool,
       bq_sz: int,
+      chunk_tokens: int,
       seq_batch_size: int = 1,
       grid_rank: int = 1,
   ):
@@ -203,6 +373,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
     return cls(
         bq_sz=bq_sz,
         seq_batch_size=seq_batch_size,
+        chunk_tokens=chunk_tokens,
         **{
             f.name: getattr(standard_ref, f.name)
             for f in dataclasses.fields(pltpu.BufferedRef)
@@ -217,6 +388,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
       buffer_count: int,
       use_lookahead: bool,
       bq_sz: int,
+      chunk_tokens: int,
       seq_batch_size: int = 1,
       grid_rank: int = 1,
       **kwargs: Any,
@@ -229,6 +401,7 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         use_lookahead=use_lookahead,
         bq_sz=bq_sz,
         seq_batch_size=seq_batch_size,
+        chunk_tokens=chunk_tokens,
         grid_rank=grid_rank,
     )
 
@@ -237,30 +410,20 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
       src_ref: tuple[Any, ...],
       grid_indices: tuple[int | jax.Array, ...],
   ):
-    q_hbm, cu_q_lens_ref, meta_ref = src_ref
-    p_id = grid_indices[0]
-    batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-    bq_idx = meta_ref.bq_idx[p_id]
-
+    q_hbm = src_ref[0]
     assert self.sem_recvs is not None
     assert self.window_ref is not None
     slot = self.current_copy_in_slot
     sem = self.sem_recvs.at[slot]
     vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
-    effective_seq_idx = batch_tile_idx
 
-    if self.seq_batch_size > 1:
-      sz = 1
-      q_len_start = cu_q_lens_ref[effective_seq_idx]
-    elif self.bq_sz == 1:
-      sz = 1
-      q_len_start = cu_q_lens_ref[effective_seq_idx] + bq_idx * self.bq_sz
-    else:
-      q_len_start = cu_q_lens_ref[effective_seq_idx] + bq_idx * self.bq_sz
-      curr_q_end = cu_q_lens_ref[effective_seq_idx + 1]
-      sz = jnp.maximum(0, jnp.minimum(self.bq_sz, curr_q_end - q_len_start))
-
-    total_sz = self.seq_batch_size * sz
+    q_len_start, total_sz = _token_window(
+        src_ref,
+        grid_indices[0],
+        self.chunk_tokens,
+        bq_sz=self.bq_sz,
+        seq_batch_size=self.seq_batch_size,
+    )
 
     pltpu.make_async_copy(
         q_hbm.at[pl.ds(q_len_start, total_sz)],
@@ -281,22 +444,14 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
     slot = self.current_wait_in_slot
     sem = self.sem_recvs.at[slot]
     vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
-    p_id = grid_indices[0]
-    meta_ref = src_ref[2]
-    batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-    bq_idx = meta_ref.bq_idx[p_id]
-    effective_seq_idx = batch_tile_idx
-
-    if self.seq_batch_size > 1:
-      total_sz = self.seq_batch_size
-    elif self.bq_sz == 1:
-      total_sz = self.seq_batch_size * self.bq_sz
-    else:
-      _, cu_q_lens_ref, _ = src_ref
-      q_len_start = cu_q_lens_ref[effective_seq_idx] + bq_idx * self.bq_sz
-      curr_q_end = cu_q_lens_ref[effective_seq_idx + 1]
-      sz = jnp.maximum(0, jnp.minimum(self.bq_sz, curr_q_end - q_len_start))
-      total_sz = self.seq_batch_size * sz
+    # Must match copy_in's size exactly or the semaphore never clears.
+    _, total_sz = _token_window(
+        src_ref,
+        grid_indices[0],
+        self.chunk_tokens,
+        bq_sz=self.bq_sz,
+        seq_batch_size=self.seq_batch_size,
+    )
 
     pltpu.make_async_copy(
         vmem_dst.at[pl.ds(0, total_sz)],
@@ -376,37 +531,30 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
       dst_ref: tuple[Any, ...],
       grid_indices: tuple[int | jax.Array, ...],
   ):
-    scores_hbm, cu_q_lens_ref, meta_ref = dst_ref
-    p_id = grid_indices[0]
-    batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-    bq_idx = meta_ref.bq_idx[p_id]
-    bkv_idx = meta_ref.bkv_idx[p_id]
+    scores_hbm, _, meta_ref, start_end_seq_idx_ref = dst_ref
+    bkv_idx = meta_ref.bkv_idx[grid_indices[0]]
 
     assert self.sem_sends is not None
     assert self.window_ref is not None
     slot = self.current_copy_out_slot
     sem = self.sem_sends.at[slot]
     vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
-    effective_seq_idx = batch_tile_idx
 
-    if self.seq_batch_size > 1:
-      sz = 1
-      token_start = cu_q_lens_ref[effective_seq_idx]
-    elif self.bq_sz == 1:
-      sz = 1
-      token_start = cu_q_lens_ref[effective_seq_idx] + bq_idx * self.bq_sz
-    else:
-      token_start = cu_q_lens_ref[effective_seq_idx] + bq_idx * self.bq_sz
-      curr_q_end = cu_q_lens_ref[effective_seq_idx + 1]
-      sz = jnp.maximum(0, jnp.minimum(self.bq_sz, curr_q_end - token_start))
-
-    total_sz = self.seq_batch_size * sz
+    token_start, total_sz = _token_window(
+        dst_ref,
+        grid_indices[0],
+        scores_hbm.shape[0],
+        bq_sz=self.bq_sz,
+        seq_batch_size=self.seq_batch_size,
+    )
+    # HBM scores hold one chunk, so rebase the write onto the chunk's start.
+    dst_start = token_start - start_end_seq_idx_ref[2]
     sublane_start = bkv_idx * self.num_sublanes
 
     pltpu.make_async_copy(
         vmem_src.at[pl.ds(0, total_sz)],  # pytype: disable=attribute-error
         scores_hbm.at[
-            pl.ds(token_start, total_sz),
+            pl.ds(dst_start, total_sz),
             pl.ds(sublane_start, self.num_sublanes),
         ],
         sem,
@@ -425,22 +573,15 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
     slot = self.current_wait_out_slot
     sem = self.sem_sends.at[slot]
     vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
-    p_id = grid_indices[0]
-    meta_ref = dst_ref[2]
-    batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-    bq_idx = meta_ref.bq_idx[p_id]
-    effective_seq_idx = batch_tile_idx
 
-    if self.seq_batch_size > 1:
-      total_sz = self.seq_batch_size
-    elif self.bq_sz == 1:
-      total_sz = self.seq_batch_size * self.bq_sz
-    else:
-      _, cu_q_lens_ref, _ = dst_ref
-      token_start = cu_q_lens_ref[effective_seq_idx] + bq_idx * self.bq_sz
-      curr_q_end = cu_q_lens_ref[effective_seq_idx + 1]
-      sz = jnp.maximum(0, jnp.minimum(self.bq_sz, curr_q_end - token_start))
-      total_sz = self.seq_batch_size * sz
+    # Must match copy_out's size exactly or the semaphore never clears.
+    _, total_sz = _token_window(
+        dst_ref,
+        grid_indices[0],
+        dst_ref[0].shape[0],
+        bq_sz=self.bq_sz,
+        seq_batch_size=self.seq_batch_size,
+    )
 
     pltpu.make_async_copy(
         vmem_src.at[pl.ds(0, total_sz)],
