@@ -60,9 +60,9 @@ run_ray_multihost() {
   # Start Ray worker containers over ssh
   for worker_ip in "${WORKER_IPS_ARRAY[@]}"; do
     echo "--- Starting Ray worker on ${worker_ip}"
-    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node abtest >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home"
-    base64 < "${RUN_CLUSTER}" > /tmp/run_cluster.b64
-    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster.sh" < /tmp/run_cluster.b64
+    ssh_retry "${SSH_USER}@${worker_ip}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker rm -f node abtest >/dev/null 2>&1 || true; mkdir -p ~/multihost ~/hf_home" || return 1
+    base64 < "${RUN_CLUSTER}" > /tmp/run_cluster.b64 || return 1
+    ssh_retry "${SSH_USER}@${worker_ip}" "base64 -d > ~/multihost/run_cluster.sh" < /tmp/run_cluster.b64 || return 1
     # shellcheck disable=SC2029
     (
       for _attempt in 1 2 3; do
