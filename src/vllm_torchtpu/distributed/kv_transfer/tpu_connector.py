@@ -4058,6 +4058,16 @@ class TPURaidenConnectorWorker:
                     bucket.add(req_id)
                 continue
             self._chunk_part_outcomes.setdefault(base, {})[req_id] = outcome
+            # Release this part's registration on this part's own terminal.
+            # The buckets returned here are collapsed to base ids so vLLM
+            # hears one finish per request, and the caller drives registration
+            # cleanup off those same buckets, so a part named only here was
+            # never released at all. Its row then sat in the source store
+            # until the expiry probe cancelled it ten minutes later, and on
+            # the first 397B run all eight ranks reached that point in the
+            # same second, at the start of the heaviest leg. Cancelled is the
+            # one outcome that must not force-release, matching the base.
+            self._stage3_terminal_cleanup[req_id] = outcome != "cancelled"
         for base, seen in list(self._chunk_part_outcomes.items()):
             parts = self._chunk_send_parts.get(base, set())
             # The base's own part registers last, so its presence is what says
@@ -5263,7 +5273,14 @@ class TPURaidenConnectorWorker:
                     sorted(cancelled_sends))
         native_terminal_sends = set(done_sending) | sender_failures
         terminal_sends = native_terminal_sends | cancelled_sends
-        self._done_sending.update(terminal_sends)
+        # Report base ids only. A terminal that arrives for one chunk after
+        # its request already aggregated is bucketed under the derived id,
+        # and handing that to vLLM is a finish for a request it has never
+        # heard of. Duplicates are dropped by _stage3_reported_sends. The
+        # cleanup below keeps the derived ids, because registrations are
+        # keyed by the id they were registered under.
+        self._done_sending.update(
+            _chunk_base_req_id(req_id) for req_id in terminal_sends)
         for req_id in done_recving:
             count = self._recv_arrivals.get(req_id, 0) + 1
             self._recv_arrivals[req_id] = count

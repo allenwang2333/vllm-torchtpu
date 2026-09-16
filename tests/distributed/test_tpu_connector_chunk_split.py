@@ -755,6 +755,79 @@ class TestProducerTerminals:
         assert worker._chunk_part_outcomes == {}
 
 
+class TestPartRegistrationRelease:
+    """A part's registration is released on that part's own terminal.
+
+    get_finished releases registrations by walking the buckets this function
+    returns, and those hold base ids only. So before this, a chunk's row was
+    never released: it sat in the source store until the expiry probe
+    cancelled it ten minutes later. On the first 397B run all eight ranks
+    reached that point in the same second, at the start of conc_8192_c32,
+    and every transfer after it timed out.
+    """
+
+    def _worker(self):
+        return _make_raiden_worker(is_producer=True, block_size=PAGE)
+
+    def test_a_finished_part_is_marked_for_release(self):
+        worker = self._worker()
+        worker._chunk_send_parts["long"] = {"long#c0", "long"}
+        worker._stage3_send_outcomes = {"long#c0": "done"}
+        worker._stage3_ready_producer_send_terminals()
+        assert worker._stage3_terminal_cleanup["long#c0"] is True
+
+    def test_every_part_including_the_base_is_marked(self):
+        worker = self._worker()
+        worker._chunk_send_parts["long"] = {"long#c0", "long#c1", "long"}
+        worker._stage3_send_outcomes = {
+            "long#c0": "done",
+            "long#c1": "done",
+            "long": "done",
+        }
+        worker._stage3_ready_producer_send_terminals()
+        assert set(worker._stage3_terminal_cleanup) == {
+            "long#c0", "long#c1", "long"
+        }
+
+    def test_a_cancelled_part_is_released_without_forcing(self):
+        """A force-release retires the controller's D5 row, and an expiry is
+        terminal only once the controller has confirmed nobody claimed it.
+        The base path makes the same distinction."""
+        worker = self._worker()
+        worker._chunk_send_parts["long"] = {"long#c0", "long"}
+        worker._stage3_send_outcomes = {"long#c0": "cancelled"}
+        worker._stage3_ready_producer_send_terminals()
+        assert worker._stage3_terminal_cleanup["long#c0"] is False
+
+    def test_a_failed_part_is_still_released(self):
+        worker = self._worker()
+        worker._chunk_send_parts["long"] = {"long#c0", "long"}
+        worker._stage3_send_outcomes = {"long#c0": "failed"}
+        worker._stage3_ready_producer_send_terminals()
+        assert worker._stage3_terminal_cleanup["long#c0"] is True
+
+    def test_an_unchunked_request_is_left_to_the_caller(self):
+        """Its id reaches the buckets, so get_finished releases it the way it
+        always did, and marking it here too would be a second owner."""
+        worker = self._worker()
+        worker._stage3_send_outcomes = {"plain": "done"}
+        worker._stage3_ready_producer_send_terminals()
+        assert worker._stage3_terminal_cleanup == {}
+
+    def test_a_late_part_terminal_surfaces_under_its_derived_id(self):
+        """Pins the precondition that makes get_finished map buckets back to
+        base ids. Once the request has aggregated, _chunk_send_parts has
+        forgotten the part, so a terminal arriving after that is bucketed
+        raw and would otherwise be reported to vLLM under an id it has never
+        heard of."""
+        worker = self._worker()
+        worker._stage3_send_outcomes = {"long#c0": "cancelled"}
+        _done, _failed, cancelled = (
+            worker._stage3_ready_producer_send_terminals())
+        assert cancelled == {"long#c0"}
+        assert _chunk_base_req_id("long#c0") == "long"
+
+
 # ---------------------------------------------------------------------------
 # What decode expects
 # ---------------------------------------------------------------------------
