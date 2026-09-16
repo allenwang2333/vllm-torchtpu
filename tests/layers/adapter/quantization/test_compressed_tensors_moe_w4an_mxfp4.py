@@ -32,7 +32,7 @@ class FakeRoutedExperts(RoutedExperts):
 
 @pytest.mark.parametrize("runtime_scale_cast", [False, True])
 def test_mxfp4_create_weights_and_process(monkeypatch, runtime_scale_cast):
-    monkeypatch.setenv("TPU_FP4_GMM_DEFER_SCALE_DECODE",
+    monkeypatch.setenv("TPU_FP4_GMM_LAZY_SCALE_EXPANSION",
                        str(int(runtime_scale_cast)))
     monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
     moe_config = MagicMock()
@@ -199,7 +199,7 @@ def test_mxfp4_apply_masks_padded_token_routes():
 def test_mxfp4_duplicate_active_rows_with_padding_are_identical(
         monkeypatch, runtime_scale_cast):
     """The decode-shaped MoE call must not mix otherwise identical rows."""
-    monkeypatch.setenv("TPU_FP4_GMM_DEFER_SCALE_DECODE",
+    monkeypatch.setenv("TPU_FP4_GMM_LAZY_SCALE_EXPANSION",
                        str(int(runtime_scale_cast)))
     monkeypatch.delenv("MOE_REQUANTIZE_BLOCK_SIZE", raising=False)
     moe_config = MagicMock()
@@ -467,7 +467,7 @@ def test_mxfp4_neutralizes_only_unloaded_padded_scales():
 
 @pytest.mark.parametrize("runtime_scale_cast", [False, True])
 def test_mxfp4_requantize_block(monkeypatch, runtime_scale_cast):
-    monkeypatch.setenv("TPU_FP4_GMM_DEFER_SCALE_DECODE",
+    monkeypatch.setenv("TPU_FP4_GMM_LAZY_SCALE_EXPANSION",
                        str(int(runtime_scale_cast)))
     from vllm_torchtpu.layers.core.quantization import (
         dequantize_mxfp4_packed, fp4_indices_to_float, quantize_tensor_to_fp4)
