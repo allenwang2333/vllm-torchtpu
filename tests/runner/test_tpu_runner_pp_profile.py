@@ -381,3 +381,22 @@ def test_check_passes_a_long_context_step_without_the_batched_kernel(
     TPUModelRunner._check_attention_schedule(runner, 1,
                                              np.array([65536], dtype=np.int32),
                                              0)
+
+
+def test_check_passes_a_long_context_step_with_a_widened_query_block(
+        monkeypatch):
+    # With the query tile widened to 512 at long context (prefix > 131,072):
+    # - 4096 tokens behind 135,168 prefix needs 4,296 pairs (vs 8,584 at bq=256).
+    # - 4096 tokens behind 258,048 prefix (262,144 total context) needs 8,136
+    #   pairs (vs 16,264 at bq=256).
+    # Both fit within the 8,445 pair capacity of the batched kernel on TPU7x.
+    widened_capacity = {"decode": (2672, 1, 1536), "mixed": (8445, 512, 256)}
+    _attention_layers(monkeypatch, [True], capacity=widened_capacity)
+    runner = _capacity_runner()
+    runner._attention_schedule_capacity = (
+        TPUModelRunner._attention_schedule_capacity.__get__(runner))
+    step = np.array([4096], dtype=np.int32)
+    runner.seq_lens_np = np.array([135168 + 4096], dtype=np.int32)
+    TPUModelRunner._check_attention_schedule(runner, 1, step, 0)
+    runner.seq_lens_np = np.array([262144], dtype=np.int32)
+    TPUModelRunner._check_attention_schedule(runner, 1, step, 0)

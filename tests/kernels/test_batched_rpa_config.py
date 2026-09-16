@@ -15,8 +15,11 @@
 
 from unittest.mock import MagicMock, patch
 
+import jax
 import jax.numpy as jnp
 import pytest
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import AbstractDevice, AbstractMesh
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import \
@@ -30,6 +33,7 @@ def _create_mock_tpu_info(generation: int,
                           num_lanes: int = 128,
                           mxu_column_size: int = 128,
                           vmem_capacity_bytes: int = 64 * 1024 * 1024,
+                          smem_capacity_bytes: int = 1024 * 1024,
                           fp8_ops_per_second: int = 2,
                           bf16_ops_per_second: int = 1):
     mock = MagicMock()
@@ -38,6 +42,7 @@ def _create_mock_tpu_info(generation: int,
     mock.num_lanes = num_lanes
     mock.mxu_column_size = mxu_column_size
     mock.vmem_capacity_bytes = vmem_capacity_bytes
+    mock.smem_capacity_bytes = smem_capacity_bytes
     mock.fp8_ops_per_second = fp8_ops_per_second
     mock.bf16_ops_per_second = bf16_ops_per_second
     return mock
@@ -136,3 +141,110 @@ def test_calculate_block_sizes_longctx_generation(generation, chip_version,
             model_cfg, serve_cfg, vmem_limit)
         assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+def test_calculate_block_sizes_widens_prefill_query_tile_at_long_context():
+    with jax.sharding.use_abstract_mesh(
+            AbstractMesh((1, ), ("x", ),
+                         abstract_device=AbstractDevice("TPU7x", 1, "tpu"))):
+        info = pltpu.get_tpu_info()
+        model_cfgs = configs.ModelConfigs(
+            num_q_heads=32,
+            num_kv_heads=2,
+            head_dim=256,
+            mask_value=-1e9,
+        )
+        serve_cfgs = configs.ServingConfigs(
+            num_seqs=8,
+            page_size=128,
+            total_q_tokens=4096,
+            num_page_indices=16632,
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.float8_e4m3fn,
+            dtype_out=jnp.bfloat16,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        )
+        _, prefill_block_sizes = wrapper.calculate_block_sizes(
+            model_cfgs, serve_cfgs, info.vmem_capacity_bytes)
+        assert prefill_block_sizes.bq_sz == 512
+        assert prefill_block_sizes.bq_c_sz == 64
+        assert prefill_block_sizes.bkv_sz == 256
+        assert prefill_block_sizes.batch_size == 1
+        assert prefill_block_sizes.n_buffer == 2
+
+
+def test_calculate_block_sizes_preserves_default_tile_at_short_context():
+    with jax.sharding.use_abstract_mesh(
+            AbstractMesh((1, ), ("x", ),
+                         abstract_device=AbstractDevice("TPU7x", 1, "tpu"))):
+        info = pltpu.get_tpu_info()
+        model_cfgs = configs.ModelConfigs(
+            num_q_heads=32,
+            num_kv_heads=2,
+            head_dim=256,
+            mask_value=-1e9,
+        )
+        serve_cfgs = configs.ServingConfigs(
+            num_seqs=8,
+            page_size=128,
+            total_q_tokens=4096,
+            num_page_indices=64 * 8,
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.float8_e4m3fn,
+            dtype_out=jnp.bfloat16,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        )
+        _, prefill_block_sizes = wrapper.calculate_block_sizes(
+            model_cfgs, serve_cfgs, info.vmem_capacity_bytes)
+        assert prefill_block_sizes.bq_sz == 256
+        assert prefill_block_sizes.bq_c_sz == 64
+        assert prefill_block_sizes.bkv_sz == 256
+        assert prefill_block_sizes.batch_size == 1
+        assert prefill_block_sizes.n_buffer == 3
+
+
+def test_calculate_block_sizes_rejects_widening_when_double_buffer_unsupported(
+):
+    with jax.sharding.use_abstract_mesh(
+            AbstractMesh((1, ), ("x", ),
+                         abstract_device=AbstractDevice("TPU7x", 1, "tpu"))):
+        info = pltpu.get_tpu_info()
+        model_cfgs = configs.ModelConfigs(
+            num_q_heads=32,
+            num_kv_heads=2,
+            head_dim=256,
+            mask_value=-1e9,
+        )
+        serve_cfgs = configs.ServingConfigs(
+            num_seqs=8,
+            page_size=128,
+            total_q_tokens=4096,
+            num_page_indices=16632,
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.bfloat16,
+            dtype_out=jnp.bfloat16,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        )
+        _, prefill_block_sizes = wrapper.calculate_block_sizes(
+            model_cfgs, serve_cfgs, info.vmem_capacity_bytes)
+        assert prefill_block_sizes.bq_sz == 256
+        assert prefill_block_sizes.n_buffer == 3
+
+
+def test_schedule_capacity_reports_widened_query_tile_for_prefill():
+    with jax.sharding.use_abstract_mesh(
+            AbstractMesh((1, ), ("x", ),
+                         abstract_device=AbstractDevice("TPU7x", 1, "tpu"))):
+        cap = wrapper.schedule_capacity(
+            mode=configs.RpaCase.MIXED,
+            num_q_heads=32,
+            num_kv_heads=2,
+            head_dim=256,
+            num_seqs=8,
+            pages_per_seq=2079,
+            page_size=128,
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.float8_e4m3fn,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+        )
+        assert cap == (8445, 512, 256)

@@ -231,3 +231,23 @@ def test_fit_keeps_the_schedule_capacity():
 def test_describe_names_target_buckets_and_granularity():
     text = _model().describe()
     assert "16384:" in text and "target" in text and "granularity 4096" in text
+
+
+def test_the_schedule_capacity_bounds_a_chunk_deep_in_a_prompt_with_widened_query_tile(
+):
+    model = _model(granularity=2048)
+    # With widened query tile (bq=512), 10,240 tokens behind 49,152 prefix needs
+    # 4,260 pairs (vs 8,500 pairs at bq=256). With 10,000 capacity, the schedule
+    # does not constrain the chunk, returning the full timing-model chunk of 10,240 tokens.
+    model.schedule = (10000, 512, 256)
+    got = model.chunk(49152, 16384, 0, 0.0, 0.0)
+    assert got == 10240
+    assert model.pairs(got, 49152) == 4260
+
+    # With tighter capacity (4,000 pairs), 10,240 tokens (4,260 pairs) exceeds
+    # capacity, so the chunk is backed off by one granule to 8,192 tokens (3,344 pairs).
+    model.schedule = (4000, 512, 256)
+    shrunk = model.chunk(49152, 16384, 0, 0.0, 0.0)
+    assert shrunk == 8192
+    assert model.pairs(shrunk, 49152) == 3344
+    assert model.pairs(shrunk + 2048, 49152) == 4260

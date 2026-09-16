@@ -170,6 +170,43 @@ def get_kv_cache_shape(
     )
 
 
+def _should_widen_prefill_for_schedule(
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    prefill_block_sizes: configs.BlockSizes,
+    vmem_limit_bytes: int,
+) -> bool:
+    """Makes prefill tile sizing SMEM-schedule-aware for long-context steps.
+
+  calculate_block_sizes() tunes strictly against VMEM. However, prefill schedule
+  demand scales as ceil(q/bq) * ceil(P/bkv), while SMEM step capacity
+  (max_steps_ub) is invariant to bq. Widening bq to 512 halves schedule demand
+  at zero SMEM cost, allowing 262K context (e.g. Qwen3.5-397B on HND) to fit
+  within the static 8,445-pair schedule table at C<=4096.
+
+  TODO(brianseung): Widening bq saturates physical VMEM limits on v7x (bq=1024
+  is physically unviable). Supporting unbounded context (>262K) or larger batch
+  token budgets requires migrating to batched_rpa_longctx to stream the schedule
+  table from HBM into SMEM via DMA windows.
+  """
+    max_context = serve_cfgs.pages_per_seq * serve_cfgs.page_size
+    q_chunk = min(max_context, max(serve_cfgs.total_q_tokens, 4096))
+    worst_case_demand = schedule_pairs(
+        [q_chunk],
+        [max_context],
+        prefill_block_sizes.bq_sz,
+        prefill_block_sizes.bkv_sz,
+    )
+    rpa_cfg = configs.RpaConfigs(
+        block=prefill_block_sizes,
+        model=model_cfgs,
+        serve=serve_cfgs,
+        mode=configs.RpaCase.MIXED,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    return worst_case_demand > rpa_cfg.max_steps_ub
+
+
 def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
@@ -369,6 +406,14 @@ def calculate_block_sizes(
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
+
+    if _should_widen_prefill_for_schedule(model_cfgs, serve_cfgs,
+                                          prefill_block_sizes,
+                                          vmem_limit_bytes):
+        widened = find_best_block_sizes(prefill_batch_size, n_buffer,
+                                        2 * mxu_column_size)
+        if widened.n_buffer >= 2:
+            prefill_block_sizes = widened
 
     return decode_block_sizes, prefill_block_sizes
 
