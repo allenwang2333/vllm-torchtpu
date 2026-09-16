@@ -432,7 +432,10 @@ def ragged_paged_attention(
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
-    skip_kv_update: bool = True,
+    # Mainline `batched_rpa` defaults this to False, and False is the only safe
+    # default now that the flag is actually honored: True would suppress the KV
+    # writeback for every caller that does not pass it explicitly.
+    skip_kv_update: bool = False,
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     decode_query_size: int = 1,
     cp_group_size: int | None = None,
@@ -540,6 +543,7 @@ def ragged_paged_attention(
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
         return_lse=return_lse,
+        skip_kv_update=skip_kv_update,
     )
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
@@ -639,6 +643,7 @@ def ragged_paged_attention(
             cfgs=cfgs,
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
+            skip_kv_update=skip_kv_update,
         )
         result = kernel.rpa_kernel(
             cu_q_lens,

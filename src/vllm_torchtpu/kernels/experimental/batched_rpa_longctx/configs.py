@@ -101,6 +101,11 @@ class ServingConfigs:
     decode_query_size: int = 1
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
+    # Cross-layer KV sharing: this layer reads the source layer's cache and
+    # writes nothing. The schedule then loads *every* token from the cache
+    # region, so the kernel must not also try to stitch in a separately
+    # fetched "new" token -- see `fetch_step_metadata`.
+    skip_kv_update: bool = False
     return_lse: bool = False
 
     @property

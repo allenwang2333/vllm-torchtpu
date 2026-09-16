@@ -527,20 +527,22 @@ class BaseMetadataComputer:
         )
 
     def __init__(
-            self,
-            schedule: RpaSchedule,
-            schedule_hbm_ref: RpaSchedule,
-            dma_sem: jax.Ref,
-            *,
-            cfgs: configs.RpaConfigs,
-            extra_refs: Sequence[jax.Ref] = (),
-            **kwargs,
+        self,
+        schedule: RpaSchedule,
+        schedule_hbm_ref: RpaSchedule,
+        dma_sem: jax.Ref,
+        *,
+        cfgs: configs.RpaConfigs,
+        extra_refs: Sequence[jax.Ref] = (),
+        skip_kv_update: bool = False,
+        **kwargs,
     ):
         self.schedule = schedule
         self.schedule_hbm_ref = schedule_hbm_ref
         self.dma_sem = dma_sem
         self.cfgs = cfgs
         self.extra_refs = extra_refs
+        self.skip_kv_update = skip_kv_update
 
     @jax.named_scope("k_loop")
     def k_loop(
@@ -576,7 +578,16 @@ class BaseMetadataComputer:
         kv_p_start = k_idx * cfgs.bkv_p
         k_len = kv_cache_len + kv_new_len
         kv_left = k_len - kv_len_start
-        kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
+        if self.skip_kv_update:
+            # Cross-layer KV sharing: read everything from the cache. The
+            # source (target) layer's call ran earlier in this step and already
+            # wrote the current-step K/V into the (redirected) cache slot, so
+            # this shared layer's locally-computed k/v is unused and must NOT
+            # be written back -- doing so corrupts the target's cache. Drives
+            # kv_left_frm_new -> 0 -> new_sz -> 0 -> do_writeback -> 0.
+            kv_left_frm_cache = kv_left
+        else:
+            kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
         for i in range(cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
@@ -813,6 +824,7 @@ def rpa_metadata_schedule_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
+    skip_kv_update: bool = False,
 ):
     """Generates the HBM-to-VMEM DMA schedule.
 
@@ -852,6 +864,7 @@ def rpa_metadata_schedule_kernel(
         dma_sem=dma_sem,
         cfgs=cfgs,
         extra_refs=extra_scalars_ref,
+        skip_kv_update=skip_kv_update,
     )
     loop_carry = computer.compute(
         cu_q_lens_ref=cu_q_lens_ref,
@@ -876,16 +889,17 @@ def rpa_metadata_schedule_kernel(
 
 
 def generate_rpa_metadata(
-        cu_q_lens: jax.Array,
-        q_offsets: jax.Array,
-        kv_cache_lens: jax.Array,
-        kv_new_lens: jax.Array,
-        distribution: jax.Array,
-        cfgs: configs.RpaConfigs,
-        *,
-        computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
-        extra_scalars: Sequence[jax.Array] = (),
-        interpret=False,
+    cu_q_lens: jax.Array,
+    q_offsets: jax.Array,
+    kv_cache_lens: jax.Array,
+    kv_new_lens: jax.Array,
+    distribution: jax.Array,
+    cfgs: configs.RpaConfigs,
+    *,
+    computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
+    extra_scalars: Sequence[jax.Array] = (),
+    interpret=False,
+    skip_kv_update: bool = False,
 ) -> RpaSchedule:
     """Generates RPA metadata schedule using the specified computer_cls."""
     schedule_shaped_dtype = computer_cls.get_rpa_schedule(cfgs)
@@ -896,6 +910,7 @@ def generate_rpa_metadata(
             rpa_metadata_schedule_kernel,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            skip_kv_update=skip_kv_update,
         ),
         out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
