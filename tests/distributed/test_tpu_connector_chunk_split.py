@@ -15,6 +15,11 @@ sliced and its skip page-aligned. And vLLM must not be told a request's send
 is finished until every one of its chunks is, or it frees pages still being
 read.
 
+Stage 7 cuts the same request along the other axis, by layer instead of by
+token, and its tests are here too. They reuse this harness, and the two splits
+have to compose: a chunked prompt with the layer split on sends chunks, then
+the early layers, then the rest.
+
 Helpers come from the sibling module rather than being duplicated; this file
 is separate only because that one is already five thousand lines.
 """
@@ -28,8 +33,8 @@ from vllm.v1.request import RequestStatus
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import SendMeta
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
-    _chunk_base_req_id, _chunk_req_id, _flatten_block_ids, _send_meta_int,
-    _Stage3Admission)
+    _chunk_base_req_id, _chunk_req_id, _flatten_block_ids, _send_meta_fa_group,
+    _send_meta_int, _Stage3Admission)
 
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import \
     TPUConnectorMetadata
@@ -1055,3 +1060,238 @@ class TestGdnStateRegistration:
                 stack.enter_context(ctx)
             with pytest.raises(RuntimeError, match="mamba state block ids"):
                 worker.process_send_load(self._meta(is_final=True))
+
+
+# ---------------------------------------------------------------------------
+# Stage 7: the early attention group as a transfer of its own
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _early_layers_on(count: int = 1):
+    """Both flags, because only the producer can start the extra transfer."""
+    with patch(f"{_MOD}.tpu_envs.TPU_KV_EARLY_LAYERS", count, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", True, create=True):
+        yield
+
+
+class TestEarlyLayerGroupSend:
+    """One request, two transfers: the early attention layers and the rest.
+
+    Stage 7 splits a request by layer the way stage 6.5 splits it by token.
+    Decode is told at admission how many transfers to expect and derives each
+    one's id from its position, so the early group rides the announcement as
+    one more leading transfer and decode needs no change at all. Nothing goes
+    early yet; both transfers are built in the same step.
+    """
+
+    def _admitted(self, *, early: int = 1, uuids=(900, 901)):
+        producer, notifier = _producer()
+        req = _request("short", PAGE + 1)
+        with _early_layers_on(early):
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(uuids[0]):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=list(uuids)))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        return producer, req, notifier
+
+    def _finish(self, producer, req, *, early: int = 1):
+        with _early_layers_on(early):
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                return producer.request_finished(req, [100])
+
+    def test_the_announcement_asks_decode_for_one_more_arrival(self):
+        """Decode counts arrivals against len(chunk_uuids) + 1, so the early
+        group has to be in that list or decode stops one transfer early and
+        reads fifteen layers of KV that never landed."""
+        _producer_, _req, notifier = self._admitted()
+        payload = notifier.posts[0][1]
+        assert payload["uuid"] == 900
+        assert payload["chunk_uuids"] == [901]
+
+    def test_with_the_split_off_the_announcement_is_unchanged(self):
+        producer, notifier = _producer()
+        req = _request("short", PAGE + 1)
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(900):
+                stack.enter_context(ctx)
+            stack.enter_context(patch(f"{_MOD}.get_uuid", return_value=900))
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+        assert "chunk_uuids" not in notifier.posts[0][1]
+
+    def test_the_early_group_ships_as_its_own_send(self):
+        producer, req = self._admitted()[:2]
+        _give_destination(producer, "short",
+                          _published_destination(900, [200]))
+        self._finish(producer, req)
+
+        early = producer.reqs_to_send["short#c0"]
+        assert early.uuid == 901
+        assert early.fa_group == 0
+        assert early.is_final_chunk is False
+        # The whole prompt, one group of layers. That is the axis this send is
+        # split on, and it is why the token window is the same as the final
+        # send's.
+        assert early.start_token == 0
+        assert early.num_tokens == PAGE
+
+    def test_the_final_send_keeps_the_rest(self):
+        producer, req = self._admitted()[:2]
+        _give_destination(producer, "short",
+                          _published_destination(900, [200]))
+        self._finish(producer, req)
+
+        final = producer.reqs_to_send["short"]
+        assert final.uuid == 900
+        assert final.fa_group == 1
+        assert final.is_final_chunk is True
+        assert final.num_tokens == PAGE
+
+    def test_with_the_split_off_there_is_one_send_carrying_everything(self):
+        """All-off has to reproduce stage 0, and fa_group=None is what tells
+        the worker to name every attention tag on the one transfer."""
+        producer, notifier = _producer()
+        req = _request("short", PAGE + 1)
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(900):
+                stack.enter_context(ctx)
+            stack.enter_context(patch(f"{_MOD}.get_uuid", return_value=900))
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+        _give_destination(producer, "short",
+                          _published_destination(900, [200]))
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(900):
+                stack.enter_context(ctx)
+            producer.request_finished(req, [100])
+
+        assert set(producer.reqs_to_send) == {"short"}
+        assert producer.reqs_to_send["short"].fa_group is None
+
+    def test_pages_decode_never_published_fail_loudly(self):
+        """The announced arrival can only come from the producer, and by the
+        time the prompt is over there is nothing left to wait for. A silent
+        drop here would hang the request until decode's timeout."""
+        producer, req = self._admitted()[:2]
+        with pytest.raises(ValueError, match="never published"):
+            self._finish(producer, req)
+
+    def test_a_chunk_and_the_early_group_share_the_id_space(self):
+        """Both splits number their sends off the same counter, so the early
+        group takes the index after the last chunk. A collision would have one
+        send overwrite the other in reqs_to_send and lose it."""
+        producer, _notifier = _producer()
+        req = _request("long", PROMPT)
+        with _chunk_split_on(), _early_layers_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=[900, 901, 902]))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        _give_destination(producer, "long",
+                          _published_destination(900, list(range(200, 208))))
+        with _chunk_split_on(), _early_layers_on():
+            with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                       return_value=30.0):
+                first = _step(new=[("long", [100])],
+                              scheduled={"long": BUDGET})
+                second = _step(cached=[("long", [101])],
+                               scheduled={"long": BUDGET})
+                producer.build_connector_meta(first)
+                producer.build_connector_meta(second)
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                producer.request_finished(req, [100, 101])
+
+        # Chunk zero went out in an earlier step and was drained with its
+        # metadata, so what is left is the early group at index one and the
+        # final send.
+        early = producer.reqs_to_send["long#c1"]
+        assert early.uuid == 902
+        assert early.fa_group == 0
+        # The chunk already carried both groups over [0, BUDGET), so the early
+        # group only owes the tokens behind it.
+        assert (early.start_token, early.num_tokens) == (BUDGET, SENT)
+        assert producer.reqs_to_send["long"].fa_group == 1
+
+
+class TestEarlyLayerGroupLayout:
+    """What the worker puts on the wire for a send that names one group."""
+
+    def _worker(self):
+        worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
+        worker._stage3_state_group_count = 0
+        worker._stage3_fa_tags = ("fa.g0", "fa.g1")
+        return worker
+
+    def test_a_group_send_names_exactly_its_own_tag(self):
+        worker = self._worker()
+        tags, blocks, counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200, 201],
+            mamba_state_block_ids=None,
+            skip_tokens=0,
+            fa_only=True,
+            fa_group=0)
+        assert tags == ["fa.g0"]
+        # One tag replays over the destination pages once, so the block list
+        # is not repeated the way it is when both groups ride together.
+        assert blocks == [200, 201]
+        assert counts == [2]
+
+    def test_the_late_group_names_the_other_tag(self):
+        worker = self._worker()
+        tags, _blocks, _counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=None,
+            skip_tokens=0,
+            fa_only=True,
+            fa_group=1)
+        assert tags == ["fa.g1"]
+
+    def test_no_group_still_names_both(self):
+        worker = self._worker()
+        tags, blocks, _counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=None,
+            skip_tokens=0,
+            fa_only=True)
+        assert tags == ["fa.g0", "fa.g1"]
+        assert blocks == [200, 200]
+
+    def test_a_group_index_the_worker_does_not_have_is_refused(self):
+        """A send naming group 1 on a worker that admitted one attention tag
+        means the peers read TPU_KV_EARLY_LAYERS differently. Silently
+        clamping would ship one group's bytes under the other's name."""
+        worker = self._worker()
+        worker._stage3_fa_tags = ("fa", )
+        with pytest.raises(RuntimeError, match="TPU_KV_EARLY_LAYERS"):
+            worker._stage3_transfer_layout(dst_block_ids=[200],
+                                           mamba_state_block_ids=None,
+                                           skip_tokens=0,
+                                           fa_only=True,
+                                           fa_group=1)
+
+    def test_a_group_send_still_takes_the_prefix_clip(self):
+        worker = self._worker()
+        worker._stage3_fa_token_bytes = lambda page_tokens: 1024
+        tags, _blocks, _counts, clip, skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=None,
+            skip_tokens=8,
+            fa_only=True,
+            fa_group=0)
+        assert tags == ["fa.g0"]
+        assert clip["dst_skip_bytes"] == [skip]
+
+    def test_a_test_double_is_not_a_group_index(self):
+        """Legacy send metadata has never heard of fa_group, and a mock
+        answers every attribute. Either one reading as group zero would drop
+        the late layers off a transfer that is meant to carry everything."""
+        assert _send_meta_fa_group(MagicMock()) is None
+        assert _send_meta_fa_group(SimpleNamespace()) is None
+        assert _send_meta_fa_group(SimpleNamespace(fa_group=1)) == 1

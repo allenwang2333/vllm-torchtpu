@@ -288,6 +288,11 @@ class _Stage3Admission:
     # just with less of the overlap the split exists to buy.
     chunk_tokens: int = 0
     chunk_uuids: tuple[int, ...] = ()
+    # Stage 7. The uuid of the extra transfer carrying the early attention
+    # group over the whole prompt, or 0 when the layer split is off. It is not
+    # in chunk_uuids because it is not a token window: the chunk bookkeeping
+    # walks boundaries, and this one has none.
+    early_uuid: int = 0
 
     def chunk_start(self, index: int) -> int:
         return index * self.chunk_tokens
@@ -796,6 +801,18 @@ def _send_meta_int(meta: Any, name: str) -> int:
     return value if isinstance(value, int) else 0
 
 
+def _send_meta_fa_group(meta: Any) -> Optional[int]:
+    """Which attention layer group a send carries, or None for all of them.
+
+    Type-checked for the same reason _send_meta_int is, and the failure is
+    worse here: a test double answers every attribute, and a group index that
+    is not an int would be compared against the admitted tag count and read as
+    a peer disagreement.
+    """
+    value = getattr(meta, "fa_group", None)
+    return value if isinstance(value, int) else None
+
+
 def _flatten_block_ids(block_ids: Any) -> list[int]:
     """Normalises vLLM's per-kv-cache-group block tuples to one flat list.
 
@@ -809,6 +826,20 @@ def _flatten_block_ids(block_ids: Any) -> list[int]:
     if block_ids and isinstance(block_ids[0], (list, tuple)):
         return [int(b) for group in block_ids for b in group]
     return [int(b) for b in block_ids]
+
+
+def _early_layer_split_enabled() -> bool:
+    """Whether a request ships its leading attention layers as their own
+    transfer. See TPU_KV_EARLY_LAYERS.
+
+    Gated on the producer-submit path for the same reason the chunk split is,
+    and a little more sharply: the consumer's fallback timer only ever starts
+    the base uuid, so under consumer-initiated transfers the early group is a
+    transfer nobody would start and the request would never complete.
+    """
+    return bool(
+        int(tpu_envs.TPU_KV_EARLY_LAYERS) > 0
+        and tpu_envs.TPU_KV_PREFILL_SUBMIT)
 
 
 def _chunk_split_enabled() -> bool:
@@ -2169,6 +2200,70 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         progress.shipped_through = end_token
         return True
 
+    def _emit_early_group_send(self, req_id: str,
+                               announced: Optional["_Stage3Admission"],
+                               block_ids: tuple[int, ...], num_tokens: int,
+                               start_token: int, expiration_time: float,
+                               dst_params: Optional[dict]) -> bool:
+        """Queue the early attention group as a send of its own.
+
+        A chunk splits a request by token and this splits it by layer, so the
+        two compose: the early send covers whichever tokens the chunks have
+        not already carried, but only the layers in group 0. It returns
+        whether it queued anything, which is what tells the caller the final
+        send is now carrying group 1 rather than everything.
+
+        Nothing actually goes early yet. This send is built in the same step
+        as the final one and lands beside it. The point of landing it now is
+        that stage 7c then has a transfer to move onto the doorbell instead of
+        a transfer to invent, and that the cost of two transfers per request
+        gets measured on its own before a bell can be blamed for it.
+        """
+        if announced is None or not announced.early_uuid:
+            return False
+        if not dst_params:
+            # Decode was told at admission how many arrivals make this request
+            # complete, and this is one of them, so a send that never goes out
+            # is a request that never finishes. Only the producer can start it:
+            # decode's fallback timer knows the base uuid alone. Stage 6.5's
+            # leading chunks have the same requirement and fail the same way,
+            # the difference being that a chunk can wait a few steps for
+            # decode to publish and this cannot, because the prompt is over.
+            raise ValueError(
+                f"Stage-7 early attention group of req_id={req_id} cannot "
+                "ship: the consumer never published its destination pages, "
+                "and decode is waiting for "
+                f"{len(announced.chunk_uuids) + 2} transfers")
+        index = len(announced.chunk_uuids)
+        self.reqs_to_send[_chunk_req_id(req_id, index)] = SendMeta(
+            uuid=announced.early_uuid,
+            local_block_ids=[int(block) for block in block_ids],
+            expiration_time=expiration_time,
+            num_tokens=num_tokens,
+            dst_params=dst_params,
+            start_token=start_token,
+            chunk_index=index,
+            # Not final in the sense the flag actually means: do not ship the
+            # recurrent state and do not retire the request. The final send
+            # behind this one does both.
+            is_final_chunk=False,
+            fa_group=0,
+        )
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage7_early_group_send",
+                    "req_id": req_id,
+                    "chunk_index": index,
+                    "uuid": announced.early_uuid,
+                    "start_token": start_token,
+                    "end_token": num_tokens,
+                    "t": time.time(),
+                },
+                sort_keys=True))
+        return True
+
     def _maybe_announce_admission(self, request: "Request") -> None:
         """Tell the proxy this request's uuid now, not when prefill ends.
 
@@ -2244,14 +2339,25 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if tail_tokens < int(self.block_size):
                 num_chunks -= 1
         chunk_uuids = tuple(get_uuid() for _ in range(num_chunks - 1))
+        # Stage 7. One more transfer, carrying the early attention group over
+        # the whole prompt. Decode counts arrivals and derives each one's id
+        # from its position, so to decode this is simply one more transfer
+        # arriving before the final one and no consumer change is needed.
+        early_uuid = get_uuid() if _early_layer_split_enabled() else 0
         admission = _Stage3Admission(uuid=uuid,
                                      num_tokens=num_tokens,
                                      chunk_tokens=chunk_tokens,
-                                     chunk_uuids=chunk_uuids)
+                                     chunk_uuids=chunk_uuids,
+                                     early_uuid=early_uuid)
         self._stage3_admitted_sends[request.request_id] = admission
         if chunk_uuids:
             self._chunk_progress[request.request_id] = _ChunkProgress(
                 admission=admission)
+        # Every transfer this request will send except the final one, in the
+        # order their derived ids are numbered: the token chunks first, then
+        # the early layer group.
+        leading_uuids = list(chunk_uuids) + ([early_uuid]
+                                             if early_uuid else [])
         announcement: dict[str, Any] = {
             "req_id": request.request_id,
             "uuid": uuid,
@@ -2261,9 +2367,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # absent for a single-chunk request, which is what keeps the
             # announcement wire-identical to stage 6 in the common case.
             **({
-                "chunk_uuids": list(chunk_uuids),
+                "chunk_uuids": leading_uuids,
                 "chunk_tokens": chunk_tokens,
-            } if chunk_uuids else {}),
+            } if leading_uuids else {}),
             **self._stage3_source_params(pcp_size),
         }
         self._admission_notifier.post(str(callback_url), announcement)
@@ -2496,6 +2602,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "resending the whole prompt under the base uuid", num_tokens,
                 request.request_id)
             start_token = 0
+        early_group = self._emit_early_group_send(request.request_id,
+                                                  announced, normalized_ids,
+                                                  num_tokens, start_token,
+                                                  expiration_time, dst_params)
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
             local_block_ids=list(normalized_ids),
@@ -2505,6 +2615,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             dst_params=dst_params,
             start_token=start_token,
             chunk_index=0 if progress is None else progress.next_chunk,
+            # With the early group gone ahead, the final send carries the late
+            # group and the recurrent state. Without it, it carries everything,
+            # which is fa_group=None and the single tag list.
+            fa_group=1 if early_group else None,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -4542,7 +4656,8 @@ class TPURaidenConnectorWorker:
                     mamba_state_block_ids=([int(slot) for slot in mamba]
                                            if mamba and is_final else None),
                     skip_tokens=skip_tokens,
-                    fa_only=not is_final))
+                    fa_only=not is_final,
+                    fa_group=_send_meta_fa_group(req_meta)))
             facade, src_controller_address = self._require_stage3_controller()
             call_kwargs: dict[str, Any] = dict(
                 src_units=src_units,
@@ -4726,6 +4841,7 @@ class TPURaidenConnectorWorker:
         mamba_state_block_ids: Optional[list[int]],
         skip_tokens: int,
         fa_only: bool = False,
+        fa_group: Optional[int] = None,
     ) -> tuple[list[str], list[int], list[int], dict[str, Any], int]:
         """Lowers one request's destination pages into controller arguments.
 
@@ -4742,10 +4858,21 @@ class TPURaidenConnectorWorker:
         the value at the end of the prompt is the one decode needs, so it
         rides the final transfer and the leading chunks carry attention
         pages alone.
+
+        ``fa_group`` narrows the attention tags to one group, which is how a
+        stage-7 send carries some layers and not others. None means all of
+        them, which is every send with the layer split off.
         """
         glm = _use_raiden_glm_admission()
         transfer_tags = list(
             _STAGE3_GLM_TRANSFER_POOL_TAGS if glm else self._stage3_fa_tags)
+        if fa_group is not None and not glm:
+            if not 0 <= fa_group < len(transfer_tags):
+                raise RuntimeError(
+                    f"Stage-7 send names attention group {fa_group}, but this "
+                    f"worker admitted the tags {transfer_tags}; the two peers "
+                    "disagree about TPU_KV_EARLY_LAYERS")
+            transfer_tags = [transfer_tags[fa_group]]
         # How many leading tags address the FA destination byte space, and so
         # take the prefix clip below. GLM keeps the one it always clipped.
         clipped_tags = 1 if glm else len(transfer_tags)

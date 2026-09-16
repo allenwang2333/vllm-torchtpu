@@ -43,6 +43,12 @@ class SendMeta:
     start_token: int = 0
     chunk_index: int = 0
     is_final_chunk: bool = True
+    # Stage 7. Which attention layer group this send carries, as an index into
+    # the worker's FA pool tags. None means all of them, which is every send
+    # until the layer split is turned on. The early group's send covers the
+    # whole prompt but only its own layers, so it is split on a different axis
+    # from a chunk and the two compose.
+    fa_group: int | None = None
 
 
 @dataclass
