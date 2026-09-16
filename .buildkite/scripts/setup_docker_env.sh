@@ -24,8 +24,9 @@ COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
 IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
 
 echo "--- Building Docker Image: ${IMAGE_TAG}"
-# Run the existing build_image.sh script with target dev
-./docker/build_image.sh --target dev -t "${IMAGE_TAG}"
+# Run the existing build_image.sh script with target dev. BASE_IMAGE pins the
+# torch-tpu base when the floating nightly-latest tag is broken; unset keeps it.
+./docker/build_image.sh --target dev -t "${IMAGE_TAG}" ${BASE_IMAGE:+--base-image "${BASE_IMAGE}"}
 
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"
