@@ -262,10 +262,10 @@ class TestAnnouncement:
         assert notifier.posts[0][1]["chunk_uuids"] == [901]
 
     def test_a_tail_shorter_than_a_page_is_not_worth_a_boundary(self):
-        """The sliver would be the step that ends the prefill, so the chunk
-        overlaps nothing and still commits decode to a second arrival it
-        cannot be sure of getting. One of these took down the prefill engine
-        in long_32768_c8."""
+        """A chunk hides in the compute that follows it, so one with a sliver
+        of a tail hides nothing, and it still commits decode to a second
+        arrival the producer cannot be sure it can send. One of these took
+        down the prefill engine in long_32768_c8."""
         producer, notifier = _producer()
         req = _request("sliver", BUDGET + 2)
         with _chunk_split_on():
@@ -515,10 +515,10 @@ class TestChunkSends:
         request_finished has to emit it, or decode waits forever for an
         arrival that was announced and never sent.
 
-        Since the tail rule, this is the only way to reach the flush: one
-        step can no longer both cross a boundary and finish, because a
-        boundary now leaves at least a page behind it and a step computes at
-        most the budget, which is the boundary itself.
+        Since the tail rule, this is the only way to reach the flush. A step
+        can no longer both cross a boundary and finish, because a boundary
+        leaves at least a page behind it and a step computes at most the
+        budget, which is the boundary itself.
         """
         producer, _notifier = _producer()
         req = _request("long", PROMPT)

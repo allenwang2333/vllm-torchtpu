@@ -2210,19 +2210,23 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                       (num_tokens + chunk_tokens - 1) // chunk_tokens)
         if num_chunks > 1:
             # Drop the last boundary when it would leave a tail shorter than a
-            # page. A prompt a few tokens past a multiple of the budget splits
-            # into a full chunk plus a sliver, and that sliver is the step
-            # that finishes the prefill, so the chunk is armed and then
-            # force-emitted one step later having overlapped nothing. It is
-            # not merely useless. The announcement has already told decode to
-            # expect two arrivals, and a leading chunk can only ship once
-            # decode has published its destination pages, so if decode is
-            # still busy the chunk cannot go out and the request can never
-            # complete. In long_32768_c8 the prompts run a few tokens past
-            # 32768, two of them split that way, and one of the two had no
-            # destination yet and took the prefill engine down with it.
-            # Requiring a page of tail gives the boundary back the step of
-            # slack it is supposed to have.
+            # page. A chunk overlaps only the compute that comes after it, so
+            # a chunk whose tail is a sliver has a sliver of a step to hide
+            # in and hides nothing, however many bytes it carries.
+            #
+            # It is not merely useless. Admission has already told decode to
+            # expect one arrival per chunk, and a leading chunk can only ship
+            # once decode has published its destination pages, which decode
+            # does when it allocates. So a chunk nobody can ship is a request
+            # nobody can complete. long_32768_c8 sends prompts a few tokens
+            # past 32768, two of the 52 split that way, and for one of the two
+            # decode had not allocated yet; _emit_chunk_send raised, and it
+            # raised inside request_finished, so the prefill engine died and
+            # took all 48 requests with it.
+            #
+            # Note this buys no extra time: the chunk gets its one emit
+            # attempt at the next step's metadata build whatever the tail is.
+            # It removes the prompts that were paying the risk for nothing.
             tail_tokens = num_tokens - (num_chunks - 1) * chunk_tokens
             if tail_tokens < int(self.block_size):
                 num_chunks -= 1
