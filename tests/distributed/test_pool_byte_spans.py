@@ -10,8 +10,7 @@ packed row (4 tokens: 2560 B of latent, 1024 B of indexer).
 """
 
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
-    PoolByteSpan, lower_fa_spans, lower_gdn_state_shard_spans,
-    lower_glm_row_spans)
+    PoolByteSpan, lower_gdn_state_shard_spans, lower_glm_row_spans)
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import \
     RegionSpec
 
@@ -465,102 +464,3 @@ def test_glm_row_spans_validation_failures():
             assert message in str(exc), (overrides, exc)
         else:
             raise AssertionError(f"accepted invalid input: {overrides}")
-
-
-# Stage 7: one attention layer group ships ahead of the rest. Fifteen layers
-# of 1024 bytes each is the shape that matters, because the FA pool is
-# block-major and a group is therefore a slice of every token rather than a
-# range of them.
-_LAYER_BYTES = 1024
-_LAYERS = 15
-_TOKEN_BYTES = _LAYER_BYTES * _LAYERS
-
-
-def _fa_spans(**overrides):
-    kwargs = dict(
-        num_tokens=16,
-        transfer_rank=0,
-        parallelism=1,
-        interleave_tokens=0,
-        page_tokens=8,
-        token_bytes=_TOKEN_BYTES,
-        block_ids=(10, 11),
-    )
-    kwargs.update(overrides)
-    return lower_fa_spans(**kwargs)
-
-
-def test_fa_whole_token_lowering_stays_contiguous():
-    """The default must not become strided. One contiguous copy per source
-    page is the single DMA the block-major layout exists to enable, so stage 7
-    may add a form, not replace the one already shipping."""
-    registration = _fa_spans()
-    assert registration.declared_bytes == 16 * _TOKEN_BYTES
-    assert [(s.size_bytes, s.count, s.src_stride_bytes)
-            for s in registration.spans] == [(8 * _TOKEN_BYTES, 1, 0),
-                                             (8 * _TOKEN_BYTES, 1, 0)]
-
-
-def test_fa_layer_window_strides_once_per_token():
-    """A layer group repeats a 1024-byte slice at each token's offset, so the
-    span count is the token count and the stride is the whole token."""
-    registration = _fa_spans(token_byte_window=(_LAYER_BYTES,
-                                                2 * _LAYER_BYTES))
-    assert registration.declared_bytes == 16 * _LAYER_BYTES
-    assert registration.spans == (
-        PoolByteSpan(src_block_ordinal=0,
-                     src_offset_bytes=_LAYER_BYTES,
-                     dst_block_index=0,
-                     dst_offset_bytes=_LAYER_BYTES,
-                     size_bytes=_LAYER_BYTES,
-                     src_stride_bytes=_TOKEN_BYTES,
-                     dst_stride_bytes=_TOKEN_BYTES,
-                     count=8),
-        PoolByteSpan(src_block_ordinal=1,
-                     src_offset_bytes=_LAYER_BYTES,
-                     dst_block_index=0,
-                     dst_offset_bytes=8 * _TOKEN_BYTES + _LAYER_BYTES,
-                     size_bytes=_LAYER_BYTES,
-                     src_stride_bytes=_TOKEN_BYTES,
-                     dst_stride_bytes=_TOKEN_BYTES,
-                     count=8),
-    )
-
-
-def test_fa_layer_windows_partition_the_whole_token():
-    """Every byte the unwindowed call declares is claimed by exactly one
-    group, which is what lets one group ship early and the rest ship late
-    without the two overlapping or leaving a hole."""
-    covered = set()
-    for layer in range(_LAYERS):
-        window = (layer * _LAYER_BYTES, (layer + 1) * _LAYER_BYTES)
-        for span in _fa_spans(token_byte_window=window).spans:
-            for index in range(span.count):
-                base = span.dst_offset_bytes + index * span.dst_stride_bytes
-                for byte in range(base, base + span.size_bytes):
-                    assert byte not in covered, f"byte {byte} declared twice"
-                    covered.add(byte)
-    assert covered == set(range(16 * _TOKEN_BYTES))
-
-
-def test_fa_layer_window_must_be_whole_physical_tokens():
-    """A slice that starts or ends mid-granule is not addressable under the
-    tiled layout, and shipping it would read as corrupt KV rather than as an
-    error, so the lowering refuses it."""
-    for window in ((512, 1024), (0, 1536)):
-        try:
-            _fa_spans(token_byte_window=window)
-        except ValueError as exc:
-            assert "whole physical tokens" in str(exc), (window, exc)
-        else:
-            raise AssertionError(f"accepted misaligned window: {window}")
-
-
-def test_fa_layer_window_must_lie_inside_the_token():
-    for window in ((0, _TOKEN_BYTES + _LAYER_BYTES), (2048, 1024)):
-        try:
-            _fa_spans(token_byte_window=window)
-        except ValueError as exc:
-            assert "is outside" in str(exc), (window, exc)
-        else:
-            raise AssertionError(f"accepted out-of-range window: {window}")

@@ -98,7 +98,6 @@ def lower_fa_spans(
     token_bytes: int,
     block_ids: Sequence[int],
     start_token: int = 0,
-    token_byte_window: tuple[int, int] | None = None,
 ) -> PoolSpanRegistration:
     """Lower PCP ownership to source-page / global-destination byte ranges.
 
@@ -117,40 +116,11 @@ def lower_fa_spans(
     rank, so a chunk boundary lands in the middle of a page far more often
     than on one, and a scheme that needed page-aligned chunks would almost
     never fire.  What a chunk owns is a byte range, not a set of pages.
-
-    ``token_byte_window`` declares only ``[lo, hi)`` of each token's bytes,
-    which is how stage 7 ships one layer group.  The FA pool is block-major:
-    a token's fifteen attention layers sit together, so a layer group is a
-    slice repeated once per token rather than a range.  That is the strided
-    form ``PoolByteSpan`` already carries for GDN state, so the window costs
-    a stride and a count and nothing on the wire.  Whole-token callers keep
-    emitting one contiguous span per run, which is both byte-identical to
-    before and the single DMA the block-major layout exists to enable.
     """
     if page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
     if token_bytes <= 0:
         raise ValueError("token_bytes must be positive")
-
-    window_lo, window_hi = (0, token_bytes) if token_byte_window is None else (
-        int(token_byte_window[0]), int(token_byte_window[1]))
-    if not 0 <= window_lo < window_hi <= token_bytes:
-        raise ValueError(
-            f"token_byte_window {(window_lo, window_hi)} is outside "
-            f"[0, {token_bytes})")
-    # Same placement-exactness rule the GDN lowering enforces: a raw span that
-    # starts or ends mid-granule is not addressable under the tiled physical
-    # layout, and a layer group only lands on a granule if the per-layer byte
-    # size happens to be a multiple of one.  Fail closed rather than ship a
-    # misplaced slice, which reads as corrupt KV and not as an error.
-    if (window_lo % _TPU_PHYSICAL_TOKEN_BYTES
-            or window_hi % _TPU_PHYSICAL_TOKEN_BYTES):
-        raise ValueError(
-            "raw TPU FA layer window must be whole physical tokens: "
-            f"window={(window_lo, window_hi)}, "
-            f"granule={_TPU_PHYSICAL_TOKEN_BYTES}")
-    window_bytes = window_hi - window_lo
-    partial = window_bytes != token_bytes
 
     prior_owned = 0
     if start_token > 0:
@@ -182,15 +152,10 @@ def lower_fa_spans(
             spans.append(
                 PoolByteSpan(
                     src_block_ordinal=block_ordinal,
-                    src_offset_bytes=(block_token_offset * token_bytes +
-                                      window_lo),
+                    src_offset_bytes=block_token_offset * token_bytes,
                     dst_block_index=0,
-                    dst_offset_bytes=cursor * token_bytes + window_lo,
-                    size_bytes=(window_bytes if partial else
-                                (source_end - cursor) * token_bytes),
-                    src_stride_bytes=token_bytes if partial else 0,
-                    dst_stride_bytes=token_bytes if partial else 0,
-                    count=(source_end - cursor) if partial else 1,
+                    dst_offset_bytes=cursor * token_bytes,
+                    size_bytes=(source_end - cursor) * token_bytes,
                 ))
             local_cursor += source_end - cursor
             cursor = source_end
@@ -206,9 +171,8 @@ def lower_fa_spans(
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=tuple(spans),
         # What this call declares, which for a chunk is the window's bytes and
-        # not everything the rank owns up to its end, and for a layer group is
-        # that narrowed to the slice of each token it carries.
-        declared_bytes=(local_cursor - prior_owned) * window_bytes,
+        # not everything the rank owns up to its end.
+        declared_bytes=(local_cursor - prior_owned) * token_bytes,
         dst_space_version=1,
     )
 
