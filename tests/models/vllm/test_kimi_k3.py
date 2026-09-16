@@ -1031,28 +1031,72 @@ def test_kda_construction_rejects_heads_not_divisible_by_tp(
         kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="z")
 
 
+class _ConstantProjection(nn.Module):
+    """Returns a tensor filled with one value, so a test can tell which
+    projection produced a given argument."""
+
+    def __init__(self, value: float, output_size: int) -> None:
+        super().__init__()
+        self.value = value
+        self.output_size = output_size
+
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return inputs.new_full((inputs.shape[0], self.output_size),
+                               self.value), None
+
+
+def _kda_metadata() -> SimpleNamespace:
+    """Minimal per-layer metadata for a one-sequence, two-token step."""
+    return SimpleNamespace(
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([0], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_slot_read_offsets=None,
+    )
+
+
+def _failing_op(name: str):
+    """A KDA op stand-in that fails the test if `forward` ever calls it."""
+
+    def op(*args, **kwargs):
+        raise AssertionError(f"{name} must not run on this path")
+
+    return op
+
+
 def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     """Build a `KimiDeltaAttention` without running `__init__`.
 
     Same approach as the forward-dispatch tests above: create the object
     with `__new__` and set just the attributes `forward` reads, using small
     stand-in projections. `use_full_rank_gate` picks which of the two gate
-    layouts to install. The layer starts with no cache bound and no
-    forward-context metadata, so `forward` takes the zeros path unless a
-    test overrides those."""
+    layouts to install.
+
+    The layer comes back with valid metadata, no cache bound, and both KDA
+    ops set to fail the test if called. That way a test that expects the
+    zeros path proves it got there because of the cache check, and a test
+    that expects a dispatch has to bind a cache and install a real stub.
+    """
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.fused_qkvb_proj = _Projection(14)
     layer.local_projection_size = 4
-    layer.num_heads = 2
-    layer.head_dim = 2
+    layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
     layer.f_b_proj = _Projection(4)
     layer.o_proj = _IdentityProjection()
+    layer.q_conv1d = _ConvWeight()
+    layer.k_conv1d = _ConvWeight()
+    layer.v_conv1d = _ConvWeight()
+    KimiDeltaAttention.process_weights_after_loading(layer,
+                                                     act_dtype=torch.bfloat16)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
+    layer.A_log = nn.Parameter(torch.zeros(2))
+    layer.dt_bias = nn.Parameter(torch.zeros(4))
     layer.use_full_rank_gate = use_full_rank_gate
     if use_full_rank_gate:
         layer.f_a_proj = _Projection(2)
-        layer.g_proj = _Projection(4)
+        layer.g_proj = _ConstantProjection(7.0, 4)
         layer.fused_fa_ga_proj = None
         layer.g_b_proj = None
     else:
@@ -1060,28 +1104,69 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
         layer.f_a_proj = None
         layer.g_proj = None
         layer.g_b_proj = _Projection(4)
-    layer._metadata = lambda: None
+    layer._metadata = _kda_metadata
     layer.kv_cache = None
+    layer.dispatched_kda_op = _failing_op("dispatched_kda_op")
+    layer.pooled_kda_op = _failing_op("pooled_kda_op")
     return layer
 
 
-def test_kda_forward_returns_zeros_without_a_bound_cache() -> None:
-    """Before the runner binds a KV cache to the layer (`kv_cache is None`),
-    `forward` must not touch either KDA op and instead returns zeros of the
-    right shape. This is what happens during profiling and warmup."""
+@pytest.mark.parametrize(
+    "setup",
+    ["no_metadata", "no_cache", "empty_cache"],
+)
+def test_kda_forward_returns_zeros_when_it_cannot_run_the_op(
+        setup: str) -> None:
+    """`forward` has three reasons to skip the KDA op and return zeros: no
+    per-layer metadata, no cache bound yet, or a cache bound with no
+    storage (what the runner hands out during profiling). Each case is set
+    up so only that one condition holds, and both ops are tripwires, so the
+    test fails if `forward` reaches a dispatch.
+    """
     layer = _make_bare_kda_layer()
+    if setup == "no_metadata":
+        layer._metadata = lambda: None
+        layer.kv_cache = (torch.zeros(1, 8, 3), torch.zeros(1, 2, 2, 2))
+    elif setup == "no_cache":
+        layer.kv_cache = None
+    else:
+        layer.kv_cache = (torch.empty(0), torch.empty(0))
+
     output = layer(torch.arange(2), torch.ones(2, 4))
+
     torch.testing.assert_close(output, torch.zeros(2, 4))
 
 
-def test_kda_forward_full_rank_gate_uses_separate_projections() -> None:
-    """With `use_full_rank_gate=True`, `forward` takes the branch that reads
-    `f_a_proj` and `g_proj` directly rather than splitting a fused gate
-    projection. Still no cache is bound, so the output is just shape-checked;
-    this covers the gate branch, not the KDA op."""
+def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op() -> None:
+    """With `use_full_rank_gate=True`, `forward` computes the output gate
+    from `g_proj` directly (not from a `g_b_proj` over a split of a fused
+    projection) and the recurrence gate from `f_b_proj(f_a_proj(x))`. A
+    two-tensor cache is bound so `forward` reaches the dispatched op, and
+    the op stub checks it was handed exactly those two tensors."""
     layer = _make_bare_kda_layer(use_full_rank_gate=True)
-    output = layer(torch.arange(2), torch.ones(2, 4))
-    assert output.shape == (2, 4)
+    sconv_cache = torch.zeros(1, 8, 3)
+    recurrent_cache = torch.zeros(1, 2, 2, 2)
+    layer.kv_cache = (sconv_cache, recurrent_cache)
+    hidden_states = torch.ones(2, 4)
+    received: dict[str, torch.Tensor] = {}
+
+    def dispatched_kda_op(mixed_qkv, raw_gate, beta, output_gate, *args):
+        received["raw_gate"] = raw_gate
+        received["output_gate"] = output_gate
+        assert args[0] is sconv_cache
+        assert args[1] is recurrent_cache
+        return mixed_qkv[:, :4].view(-1, 2, 2)
+
+    layer.dispatched_kda_op = dispatched_kda_op
+
+    layer(torch.arange(2), hidden_states)
+
+    # g_proj is the constant-7 stub; nothing else in the layer produces 7s.
+    torch.testing.assert_close(received["output_gate"], torch.full((2, 4),
+                                                                   7.0))
+    f_a, _ = layer.f_a_proj(hidden_states)
+    expected_raw_gate, _ = layer.f_b_proj(f_a)
+    torch.testing.assert_close(received["raw_gate"], expected_raw_gate)
 
 
 def test_metadata_returns_none_without_a_forward_context(
