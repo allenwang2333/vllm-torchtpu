@@ -40,7 +40,11 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "sequence_layout_protocol",
         "sequence_layout_version",
     ],
-    drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
+    drop_fields=[
+        "query_start_loc_cpu", "seq_lens_cpu",
+        "pcp_request_major_to_packed_token_indices",
+        "pcp_packed_to_request_major_token_indices", "pcp_local_token_slice"
+    ],
 )
 @dataclass
 class AttentionMetadata:
@@ -92,6 +96,12 @@ class AttentionMetadata:
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
 
+    # Torch-side only (see `drop_fields` above). See
+    # layers/core/pcp_dcp_token_remap.py; None unless pcp_size == dcp_size.
+    pcp_request_major_to_packed_token_indices: torch.Tensor | None = None
+    pcp_packed_to_request_major_token_indices: torch.Tensor | None = None
+    pcp_local_token_slice: slice | None = None
+
 
 @dataclass
 class AttentionMetadataBuilderContext:
@@ -124,6 +134,10 @@ class AttentionMetadataBuilderContext:
     # emits no `mamba_ckpt_indices`.
     mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
+    # See AttentionMetadata's fields of the same names.
+    pcp_request_major_to_packed_token_indices: torch.Tensor | None = None
+    pcp_packed_to_request_major_token_indices: torch.Tensor | None = None
+    pcp_local_token_slice: slice | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
     # block ids it derived from its block table, so the post-sampling
@@ -433,6 +447,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            pcp_request_major_to_packed_token_indices=(
+                ctx.pcp_request_major_to_packed_token_indices),
+            pcp_packed_to_request_major_token_indices=(
+                ctx.pcp_packed_to_request_major_token_indices),
+            pcp_local_token_slice=ctx.pcp_local_token_slice,
         )
 
 

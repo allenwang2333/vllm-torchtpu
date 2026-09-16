@@ -58,7 +58,10 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.pcp_dcp_token_remap import \
+    gather_to_request_major
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.runner.cp_utils import is_pcp_dcp_compatible
 from vllm_torchtpu.utils import synchronize_tensors
 
 # Skip indexer scoring when every sequence in the batch is shorter than
@@ -163,23 +166,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
 
-        parallel_config = getattr(
-            get_current_vllm_config_or_none(), "parallel_config", None
-        )
-        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-        pcp_size = pcp_size if isinstance(pcp_size, int) else 1
+        parallel_config = getattr(get_current_vllm_config_or_none(),
+                                  "parallel_config", None)
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         dcp_size = dcp_size if isinstance(dcp_size, int) else 1
         self.topk_op_dcp = None
         self.dcp_size = dcp_size
         if dcp_size > 1:
-            if pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={dcp_size} are both >1; "
-                    "the sparse indexer shards its K cache by position on "
-                    "whichever axis it is given and has no layout for two at "
-                    "once."
-                )
+            # pcp_size == dcp_size ratio and backend support are validated
+            # by runner/cp_utils.py, not here.
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
@@ -427,16 +422,34 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         if self.topk_op_dcp is not None:
-            # DCP replicates the queries, so the token
-            # inputs are already the whole batch in request-major order. What
-            # comes back is not global positions but this rank's own local
-            # cache indices, left-packed and `-1` padded -- the attention side
-            # consumes them directly and merges across ranks by log-sum-exp.
-            topk_indices = self.topk_op_dcp(
+            # topk_op_dcp needs replicated, request-major inputs; under
+            # pcp_size == dcp_size this rank only has its own PCP chunk, so
+            # gather first (no-op when remap_idx is None, i.e. plain DCP or an
+            # empty chunk). What comes back is this rank's own local cache
+            # indices, not global positions -- the attention side merges
+            # across ranks by LSE.
+            #
+            # The result stays request-major and is *not* scattered back to
+            # this rank's chunk. It is the one DCP-sharded tensor in the flow:
+            # every rank holds a different slice of the same tokens' top-k, so
+            # a scatter here plus the matching gather on the attention side
+            # would keep only the slice belonging to whichever rank owns each
+            # token and broadcast it to all of them. See the note at
+            # `_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS`.
+            remap_idx = metadata.pcp_request_major_to_packed_token_indices
+            dcp_q_values = gather_to_request_major(
                 q_values.view(torch.uint8),
-                weights,
+                remap_idx,
+                pad_to_multiple_of=self.dcp_size)
+            dcp_weights = gather_to_request_major(
+                weights, remap_idx, pad_to_multiple_of=self.dcp_size)
+            dcp_k_quant_packed = gather_to_request_major(
+                k_quant_packed, remap_idx, pad_to_multiple_of=self.dcp_size)
+            topk_indices = self.topk_op_dcp(
+                dcp_q_values,
+                dcp_weights,
                 kv_cache,
-                k_quant_packed,
+                dcp_k_quant_packed,
                 seq_lens,
                 page_indices,
                 cu_q_lens,
@@ -454,8 +467,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
+        # Under pcp_size == dcp_size the rows are request-major, so there are
+        # more of them than this rank has hidden states; clear whichever span
+        # is longer so no stale row survives either way.
+        self.topk_indices_buffer[:max(hidden_states.shape[0], num_out)] = -1
         # Both branches return `topk_tokens`-wide rows.
         topk = self.topk_tokens
         self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
@@ -837,6 +853,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
         self.topk_indices_buffer = mla_modules.topk_indices_buffer
+        # Under pcp_size == dcp_size the indexer leaves its rows request-major
+        # -- more of them than this rank has hidden states -- so the buffer
+        # cannot be cut to the local chunk here. The attention impl narrows it
+        # to match the tensors it gathered.
+        _parallel_config = getattr(get_current_vllm_config_or_none(),
+                                   "parallel_config", None)
+        self.topk_is_request_major = _parallel_config is not None and (
+            is_pcp_dcp_compatible(
+                _parallel_config.prefill_context_parallel_size,
+                _parallel_config.decode_context_parallel_size))
 
         if self.indexer is not None and not self.skip_topk:
             assert hasattr(self.indexer, "topk_tokens")
@@ -973,7 +999,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
-            topk_indices = topk_index[: hidden_states.shape[0]]
+            topk_indices = (topk_index if self.topk_is_request_major else
+                            topk_index[:hidden_states.shape[0]])
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 
