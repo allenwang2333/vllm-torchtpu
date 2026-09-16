@@ -566,6 +566,14 @@ class DoorbellWatcher:
         # the wrong memory, which is worth saying out loud exactly once.
         self._saw_anything = False
         self._warned_stale = False
+        # Every client any watch was ever armed against. The callback holds a
+        # raw pointer into the client, so the client has to outlive the reader
+        # thread, and the connector's own reference to it lives on a different
+        # object with a different lifetime. Holding it here makes the
+        # requirement local to the thing that depends on it. There is one
+        # client per worker, so the set never grows.
+        self._armed_clients: set[int] = set()
+        self._client_refs: list[object] = []
 
         self._reader = _make_reader(bells.bells)
         self._reader.start(poll_interval_ns)
@@ -583,6 +591,9 @@ class DoorbellWatcher:
 
         Returns the watch id, for `cancel`.
         """
+        if id(client) not in self._armed_clients:
+            self._armed_clients.add(id(client))
+            self._client_refs.append(client)
         return int(
             self._reader.arm_transfer(group=group,
                                       generation=generation,
