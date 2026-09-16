@@ -3,12 +3,15 @@
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_torchtpu.runner.cp_utils import validate_pcp_dcp_ratio
+
 
 @dataclass(frozen=True)
 class PcpStaticConfig:
     pcp_size: int
     interleave_size: int
     dcp_size: int
+    tp_size: int
     pipeline_parallel_size: int
     async_scheduling: bool
     speculative_enabled: bool
@@ -39,6 +42,7 @@ class PcpStaticSupportValidator:
                 pcp_size=1,
                 interleave_size=1,
                 dcp_size=1,
+                tp_size=1,
                 pipeline_parallel_size=1,
                 async_scheduling=False,
                 speculative_enabled=False,
@@ -72,6 +76,7 @@ class PcpStaticSupportValidator:
             pcp_size=parallel_config.prefill_context_parallel_size,
             interleave_size=parallel_config.cp_kv_cache_interleave_size,
             dcp_size=parallel_config.decode_context_parallel_size,
+            tp_size=parallel_config.tensor_parallel_size,
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
             speculative_enabled=speculative_config is not None,
@@ -104,9 +109,8 @@ class PcpStaticSupportValidator:
             raise NotImplementedError(
                 "PCP runner path does not support KV consumer/decode workers "
                 "yet. Disable PCP on decode workers.")
-        if config.dcp_size > 1:
-            raise NotImplementedError(
-                "PCP runner path does not support DCP yet.")
+        validate_pcp_dcp_ratio(config.pcp_size, config.dcp_size,
+                               config.tp_size)
         if config.pipeline_parallel_size != 1:
             raise NotImplementedError(
                 "PCP runner path does not support pipeline parallelism yet.")

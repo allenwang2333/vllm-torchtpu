@@ -45,6 +45,8 @@ from vllm_torchtpu.layers.core.attention_interface import (
     attention, attention_bundled, mla_attention, ragged_paged_attention,
     ragged_paged_attention_batched)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.pcp_dcp_token_remap import (
+    gather_to_request_major, scatter_to_local_chunk)
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.layers.core.sequence_layout import \
     is_pcp_streaming_attention_metadata
@@ -73,6 +75,10 @@ _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
     P(),  # k_pe
     # This rank's slice of every token's global top-k, already local indices.
     # Sharded, so the global leading dim is `dcp_size * num_tokens`.
+    #
+    # The only token-major input here that is not replicated, which is why it
+    # is the only one that must stay clear of the PCP token remap: see the
+    # comment at its use in `forward` below.
     P(DCP_AXIS_NAME),  # local_topk_indices
     P(),  # seq_lens
     P(),  # block_tables (virtual page ordinals)
@@ -1066,6 +1072,16 @@ class PallasAttentionBackendImpl(AttentionImpl):
                            vllm_config.parallel_config)
         pcp_configured = (parallel_config is not None and
                           parallel_config.prefill_context_parallel_size > 1)
+        dcp_configured = (parallel_config is not None and getattr(
+            parallel_config, 'decode_context_parallel_size', 1) > 1)
+        if pcp_configured and dcp_configured:
+            raise NotImplementedError(
+                f"prefill_context_parallel_size="
+                f"{parallel_config.prefill_context_parallel_size} and "
+                f"decode_context_parallel_size="
+                f"{parallel_config.decode_context_parallel_size} are both "
+                ">1; dense GQA attention does not support pcp_size>1 and "
+                "dcp_size>1 together. See runner/cp_utils.py.")
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.rpa_kernel = self._build_rpa_kernel(
@@ -1079,8 +1095,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
             return
 
-        dcp_configured = (parallel_config is not None and getattr(
-            parallel_config, 'decode_context_parallel_size', 1) > 1)
         if dcp_configured:
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
@@ -1555,15 +1569,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                            "cp_kv_cache_interleave_size", 1)
         self._dcp_mesh = None
         if self.dcp_size > 1:
-            # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`)
-            pcp_size = getattr(parallel_config,
-                               "prefill_context_parallel_size", 1)
-            if isinstance(pcp_size, int) and pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
-                    "both >1; sparse MLA has one KV-position interleave, "
-                    "not two.")
+            # pcp_size == dcp_size ratio and backend support are validated
+            # by runner/cp_utils.py, not here.
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
                 raise ValueError(
                     "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
@@ -1941,11 +1948,41 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # rank attends with the whole DCP group's heads over its own
                 # KV shard, and the head axis is scattered back after the
                 # merge.
+                remap_idx = None
+                if self.pcp_size > 1:
+                    # Under pcp_size == dcp_size these tensors are still
+                    # PCP-chunked by token -- gather to replicated, request-major
+                    # first (no-op when remap_idx is None, i.e. plain DCP or an
+                    # empty chunk); see layers/core/pcp_dcp_token_remap.py.
+                    remap_idx = attn_metadata.pcp_request_major_to_packed_token_indices
+                    ql_nope_flat = gather_to_request_major(
+                        ql_nope_flat, remap_idx, pad_to_multiple_of=self.dcp_size)
+                    q_pe_flat = gather_to_request_major(
+                        q_pe_flat, remap_idx, pad_to_multiple_of=self.dcp_size)
+                    kv_c_normed_flat = gather_to_request_major(
+                        kv_c_normed_flat,
+                        remap_idx,
+                        pad_to_multiple_of=self.dcp_size)
+                    k_pe_flat = gather_to_request_major(
+                        k_pe_flat, remap_idx, pad_to_multiple_of=self.dcp_size)
+
                 ql_nope_dcp = all_gather_heads(ql_nope_flat)
                 q_pe_dcp = all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
+                #
+                # It must NOT take the gather the query tensors took. Those are
+                # replicated across the DCP group, so a PCP all-gather leaves
+                # them unchanged; this one is `P(DCP_AXIS_NAME)` -- every rank
+                # holds a different slice of the same tokens. Routing it
+                # through the PCP token remap would keep, for each token, only
+                # the slice held by the rank that owns it in the PCP layout,
+                # and then hand that one slice to all `dcp_size` ranks, each of
+                # which resolves those indices against its own shard. The
+                # indexer therefore leaves it request-major and this only has
+                # to narrow it to the row count the gathers above produced.
+                topk_indices = topk_indices[:ql_nope_flat.shape[0]]
                 partial, lse = layer.sparse_mla_dcp_op(
                     kv_cache,
                     ql_nope_dcp,
@@ -1960,6 +1997,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 )
                 # The scatter undoes the head all-gather above.
                 outputs = merge_lse_partials_scatter_heads(partial, lse)
+                # Scatter back down to this rank's own local PCP chunk (see
+                # the gather above); no-op under plain DCP.
+                outputs = scatter_to_local_chunk(
+                    outputs, attn_metadata.pcp_local_token_slice,
+                    attn_metadata.pcp_packed_to_request_major_token_indices)
             else:
                 if (not hasattr(layer, "sparse_mla_op")
                         or layer.sparse_mla_op is None):

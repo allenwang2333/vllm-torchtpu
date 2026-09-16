@@ -78,6 +78,8 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.cp_utils import (check_pcp_dcp_backend_compatibility,
+                                           is_pcp_dcp_compatible)
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
@@ -416,6 +418,9 @@ class TPUModelRunner(GPUModelRunner):
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.sequence_layout_planner = sequence_layout_planner
+        self._pcp_dcp_compatible = is_pcp_dcp_compatible(
+            vllm_config.parallel_config.prefill_context_parallel_size,
+            vllm_config.parallel_config.decode_context_parallel_size)
         _validate_libtpu_version()
         self.is_pooling_model = (self.model_config is not None and
                                  self.model_config.runner_type == "pooling")
@@ -1268,6 +1273,9 @@ class TPUModelRunner(GPUModelRunner):
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        # Must run after the model is built (layers register in
+        # static_forward_context at construction).
+        check_pcp_dcp_backend_compatibility(self.vllm_config)
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -2238,6 +2246,21 @@ class TPUModelRunner(GPUModelRunner):
             padded_num_reqs=padded_num_reqs,
         )
         self._last_sequence_layout_plan = layout_plan
+
+        pcp_request_major_to_packed_token_indices = None
+        pcp_packed_to_request_major_token_indices = None
+        pcp_local_token_slice = None
+        if (self._pcp_dcp_compatible
+                and layout_plan._request_major_to_packed_token_indices
+                is not None):
+            # See layers/core/pcp_dcp_token_remap.py.
+            pcp_request_major_to_packed_token_indices = torch.from_numpy(
+                layout_plan._request_major_to_packed_token_indices).to(
+                    self.device, dtype=torch.long, non_blocking=True)
+            pcp_packed_to_request_major_token_indices = torch.from_numpy(
+                layout_plan._packed_to_request_major_token_indices).to(
+                    self.device, dtype=torch.long, non_blocking=True)
+            pcp_local_token_slice = layout_plan.token_slice
         padded_total_num_scheduled_tokens = (
             layout_plan.global_padded_num_tokens)
         request_major_input_ids = None
@@ -2451,6 +2474,11 @@ class TPUModelRunner(GPUModelRunner):
                 [] if self._unified_kv_layout
                 and self.mamba_slot_read_offsets is not None else None),
             sequence_layout_descriptor=layout_plan.descriptor,
+            pcp_request_major_to_packed_token_indices=(
+                pcp_request_major_to_packed_token_indices),
+            pcp_packed_to_request_major_token_indices=(
+                pcp_packed_to_request_major_token_indices),
+            pcp_local_token_slice=pcp_local_token_slice,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = self._build_attention_metadata(

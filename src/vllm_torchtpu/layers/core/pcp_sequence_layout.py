@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor, SequenceLayoutKind, SequenceLayoutPlan,
     _first_ge)
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.cp_utils import validate_pcp_dcp_ratio
 
 logger = init_logger(__name__)
 
@@ -95,6 +96,7 @@ class PcpSequenceLayoutEligibility:
         pcp_size: int = 1,
         interleave_size: int = 1,
         dcp_size: int = 1,
+        tp_size: int = 1,
         pipeline_parallel_size: int = 1,
         async_scheduling: bool = False,
         is_kv_producer: bool | None = None,
@@ -102,6 +104,7 @@ class PcpSequenceLayoutEligibility:
         self.pcp_size = pcp_size
         self.interleave_size = interleave_size
         self.dcp_size = dcp_size
+        self.tp_size = tp_size
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
         self.is_kv_producer = is_kv_producer
@@ -124,6 +127,11 @@ class PcpSequenceLayoutEligibility:
             pcp_size=parallel_config.prefill_context_parallel_size,
             interleave_size=parallel_config.cp_kv_cache_interleave_size,
             dcp_size=parallel_config.decode_context_parallel_size,
+            # getattr: a real ParallelConfig always carries this, but the
+            # eligibility object is also built from partial stand-ins. A
+            # missing value can only ever narrow `dcp == tp * pcp` into a
+            # loud startup rejection, never into wrong numerics.
+            tp_size=getattr(parallel_config, "tensor_parallel_size", 1),
             pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             async_scheduling=bool(scheduler_config.async_scheduling),
             is_kv_producer=is_kv_producer,
@@ -246,9 +254,7 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support KV "
                 "consumer/decode workers yet. Disable PCP on decode workers.")
-        if self.dcp_size > 1:
-            raise NotImplementedError(
-                "PCP partial sequence layout does not support DCP yet.")
+        validate_pcp_dcp_ratio(self.pcp_size, self.dcp_size, self.tp_size)
         if self.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support pipeline "
