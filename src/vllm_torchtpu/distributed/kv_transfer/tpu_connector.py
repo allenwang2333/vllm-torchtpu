@@ -2259,14 +2259,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             consume: bool = True) -> Optional[dict[str, Any]]:
         """Takes the consumer's published pages for a finished prefill.
 
-        The uuid check is what makes a preemption safe. A re-admitted request
-        mints a new uuid, and an announcement left behind by the earlier
-        attempt names pages the consumer may since have freed, so writing to
-        them would corrupt another request. A mismatch drops the entry and
-        falls back to the consumer starting its own transfer.
+        The uuid check is what keeps a stale announcement from being written
+        into. Decode names the uuid it allocated its pages against, and an
+        entry naming any other one describes pages this prefill has no claim
+        on, which may since have been freed and handed to another request.
+        Such an entry is ignored and the transfer falls back to the consumer
+        starting it. Note that a preempted request is not one of these cases:
+        it is admitted a second time under its original uuid, so the
+        announcement decode already published still matches.
 
         ``consume`` is False for a stage-6.5 leading chunk, which needs the
-        same pages the chunks after it will need.
+        same pages the chunks behind it will need. That also means a rejected
+        announcement is only dropped from the collector on a consuming read;
+        a chunk's read leaves it for the final send, which will reject it
+        again and then drop it.
         """
         if self._destination_collector is None:
             return None
