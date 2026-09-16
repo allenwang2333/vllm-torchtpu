@@ -39,7 +39,7 @@ from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention, run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
     run_jax_gdn_attention_pooled_pcp_prefill_projection)
-from vllm_torchtpu.layers.core.sequence_layout import \
+from vllm_torchtpu.layers.core.sequence_layout import is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
