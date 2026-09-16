@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -28,7 +29,8 @@ from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
-                                        KVCacheConfig, KVCacheSpec, MambaSpec,
+                                        KVCacheConfig, KVCacheSpec,
+                                        KVCacheTensor, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.worker.kv_connector_model_runner_mixin import \
@@ -69,6 +71,62 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     return isinstance(attn_module,
                       (DeepseekV4Attention, DeepseekV4SWACache,
                        DeepseekV4IndexerCache, CompressorStateCache))
+
+
+def check_kv_caches_cover_block_ids(
+    kv_caches: dict[str, torch.Tensor],
+    kv_cache_tensors: Iterable[KVCacheTensor],
+    num_blocks: int,
+    spec_for_layer: Callable[[str], KVCacheSpec],
+) -> None:
+    """Refuse to start when a layer cannot address every block id it may get.
+
+    The scheduler sizes each pool as `num_blocks` pages and issues ids across
+    that whole range, handing the layers that share a pool disjoint slices of
+    it. The allocation decides `shape[0]` independently, and until this check
+    existed nothing compared the two.
+
+    The mismatch is not caught downstream either: Pallas computes
+    `base + block_id * page_elems` with no bounds check, so an over-range id
+    is DMA'd out of the tensor and into a neighbouring allocation. That is
+    silent corruption, it only appears once occupancy climbs past the
+    allocated fraction, and it surfaces as garbage output or a core halt
+    (#838) rather than as an exception. #845 and #986 were both this.
+
+    Scope matches the shared-pool allocation branch: MLA keeps its own layouts
+    (and sparse MLA binds a tuple), Mamba sizes its state pool off
+    `_mamba_num_blocks` rather than `num_blocks`, and the block-major bundle
+    binds upstream-shaped views whose `shape[0]` this function has no claim
+    over. Callers exclude the last one; the spec test excludes the first two.
+
+    Args:
+      kv_caches: layer name -> the tensor about to be bound to that layer.
+      kv_cache_tensors: the pools, each naming the layers that share it.
+      num_blocks: the block-id range the scheduler will draw from.
+      spec_for_layer: resolves a layer name to its per-layer spec.
+
+    Raises:
+      ValueError: if an attention layer's tensor does not hold exactly
+        `num_blocks` pages.
+    """
+    for kv_cache_tensor in kv_cache_tensors:
+        for layer_name in kv_cache_tensor.shared_by:
+            spec = spec_for_layer(layer_name)
+            if (not isinstance(spec, AttentionSpec)
+                    or isinstance(spec, MLAAttentionSpec)):
+                continue
+            kv_cache = kv_caches.get(layer_name)
+            if kv_cache is None:
+                continue
+            if kv_cache.shape[0] != num_blocks:
+                raise ValueError(
+                    f"KV cache for {layer_name} holds {kv_cache.shape[0]} "
+                    f"blocks, but the scheduler issues block ids up to "
+                    f"{num_blocks - 1} ({len(kv_cache_tensor.shared_by)} "
+                    f"layer(s) share this {kv_cache_tensor.size}-byte "
+                    f"tensor). Out-of-range ids are not bounds-checked on "
+                    f"TPU and corrupt a neighbouring allocation instead of "
+                    f"raising.")
 
 
 def _warn_if_kv_cache_is_padded(
@@ -1333,6 +1391,21 @@ class KVCacheManager:
                         kv_caches[layer_name] = tpu_kv_cache
                 else:
                     raise NotImplementedError
+
+        # Everything above has decided `shape[0]` for each layer. Confirm it
+        # matches the block-id range the scheduler will draw from before any
+        # of it reaches a kernel that cannot bounds-check it.
+        #
+        # `use_block_major` is excluded because those views come from
+        # upstream's `allocate_uniform_kv_caches`, and DS-V4 never populates
+        # `kv_cache_tensors` here.
+        if not use_block_major:
+            check_kv_caches_cover_block_ids(
+                kv_caches,
+                [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors,
+                kv_cache_config.num_blocks,
+                _per_layer_spec,
+            )
 
         self._add_shared_kv_cache_aliases(kv_caches)
 
