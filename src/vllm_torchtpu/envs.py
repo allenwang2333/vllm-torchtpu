@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     TPU_KV_PREFILL_SUBMIT: bool = False
     TPU_KV_PREFILL_SUBMIT_FALLBACK_S: float = 10.0
     TPU_KV_STAGE6_PREPARE: bool = False
+    TPU_KV_CHUNK_SPLIT: bool = False
     TPU_HOST_BURN_US: int = 0
     TPU_HOST_STEP_LOG_EVERY: int = 0
     TPU_HOST_BURN_FILE: str = ""
@@ -546,6 +547,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is only affordable if the repeated half is the cheap one.
     "TPU_KV_STAGE6_PREPARE":
     env_bool("TPU_KV_STAGE6_PREPARE"),
+
+    # Stage 6.5. Ship each prefill chunk's KV as its own transfer instead of
+    # holding the whole prompt until the last chunk is computed. A 64K prompt
+    # at a 32K budget is two chunks, so the first half's 503 MB moves while the
+    # second half is still being computed.
+    #
+    # One uuid per chunk rather than one plan fired in pieces: vLLM allocates
+    # blocks a chunk at a time, so at the end of chunk 1 the blocks chunk 2
+    # will land in do not exist and a whole-prompt plan cannot be built. Each
+    # chunk therefore carries its own plan over its own block slice. The
+    # leading chunks get fresh uuids, announced at admission so decode knows
+    # how many arrivals to wait for; the last chunk keeps the admission uuid,
+    # which is what makes a single-chunk request byte-identical to stage 6.
+    #
+    # Requires TPU_KV_PREFILL_SUBMIT: the producer is the only side that knows
+    # when a chunk's pages are done.
+    "TPU_KV_CHUNK_SPLIT":
+    env_bool("TPU_KV_CHUNK_SPLIT"),
 
     # Calibration probe, off by default and never set in production. Occupies
     # the interpreter for this many microseconds at the top of every non-empty

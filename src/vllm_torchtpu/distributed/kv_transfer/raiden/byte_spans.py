@@ -55,8 +55,16 @@ def owned_token_ranges(
     transfer_rank: int,
     parallelism: int,
     interleave_tokens: int,
+    start_token: int = 0,
 ) -> list[tuple[int, int]]:
-    """Return this producer rank's PCP-owned destination token ranges."""
+    """Return this producer rank's PCP-owned destination token ranges.
+
+    The ranges are absolute request-global token coordinates.  A non-zero
+    ``start_token`` restricts them to the window ``[start_token, num_tokens)``,
+    which is how a chunked prefill declares only the tokens the chunk just
+    computed.  Ownership is a function of the absolute token index, so the
+    window never shifts which rank owns what.
+    """
     from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import pcp_layout
 
     if num_tokens <= 0:
@@ -67,12 +75,16 @@ def owned_token_ranges(
         raise ValueError(
             f"transfer_rank {transfer_rank} is outside parallelism "
             f"{parallelism}")
+    if not 0 <= start_token < num_tokens:
+        raise ValueError(
+            f"start_token {start_token} is outside [0, {num_tokens})")
     if parallelism == 1:
-        return [(0, num_tokens)]
+        return [(start_token, num_tokens)]
     if interleave_tokens <= 0:
         raise ValueError("interleave_tokens must be positive")
     return list(
-        pcp_layout.pcp_query_chunk_ranges(num_tokens, 0, transfer_rank,
+        pcp_layout.pcp_query_chunk_ranges(num_tokens - start_token,
+                                          start_token, transfer_rank,
                                           parallelism, interleave_tokens))
 
 
@@ -85,6 +97,7 @@ def lower_fa_spans(
     page_tokens: int,
     token_bytes: int,
     block_ids: Sequence[int],
+    start_token: int = 0,
 ) -> PoolSpanRegistration:
     """Lower PCP ownership to source-page / global-destination byte ranges.
 
@@ -93,20 +106,43 @@ def lower_fa_spans(
     controller, which holds the destination manifest, splits them at
     destination page boundaries at plan build. The producer only splits at
     its OWN page boundaries (source geometry it authoritatively knows).
+
+    A non-zero ``start_token`` declares only the window
+    ``[start_token, num_tokens)``, which is one chunk of a chunked prefill.
+    Both the source ordinals and the destination offsets stay absolute, so
+    ``block_ids`` is the same whole-request list the unchunked call passes and
+    the receiver needs no notion of chunks at all.  Deliberately not a slice:
+    at the deployed page size of 8192 tokens a 64K request is one page per
+    rank, so a chunk boundary lands in the middle of a page far more often
+    than on one, and a scheme that needed page-aligned chunks would almost
+    never fire.  What a chunk owns is a byte range, not a set of pages.
     """
     if page_tokens <= 0:
         raise ValueError("page_tokens must be positive")
     if token_bytes <= 0:
         raise ValueError("token_bytes must be positive")
 
+    prior_owned = 0
+    if start_token > 0:
+        prior_owned = sum(
+            end - start for start, end in owned_token_ranges(
+                num_tokens=start_token,
+                transfer_rank=transfer_rank,
+                parallelism=parallelism,
+                interleave_tokens=interleave_tokens,
+            ))
+
     ranges = owned_token_ranges(
         num_tokens=num_tokens,
         transfer_rank=transfer_rank,
         parallelism=parallelism,
         interleave_tokens=interleave_tokens,
+        start_token=start_token,
     )
     spans: list[PoolByteSpan] = []
-    local_cursor = 0
+    # Absolute within this rank's dense packing, so a chunk's first span picks
+    # up exactly where the previous chunk's last one stopped.
+    local_cursor = prior_owned
     for start, end in ranges:
         cursor = start
         while cursor < end:
@@ -134,7 +170,9 @@ def lower_fa_spans(
         tag="fa",
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=tuple(spans),
-        declared_bytes=local_cursor * token_bytes,
+        # What this call declares, which for a chunk is the window's bytes and
+        # not everything the rank owns up to its end.
+        declared_bytes=(local_cursor - prior_owned) * token_bytes,
         dst_space_version=1,
     )
 

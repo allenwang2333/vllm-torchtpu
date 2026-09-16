@@ -33,6 +33,16 @@ class SendMeta:
     # only when the producer is the side that starts the transfer; None means
     # the consumer will start it itself, as it always has.
     dst_params: dict | None = None
+    # Stage 6.5. A chunked prefill ships one request as several sends, and
+    # these three say which one this is. The send covers tokens
+    # [start_token, num_tokens): 0 and the whole prompt for an unchunked
+    # request, which is why the defaults reproduce the single-send behaviour
+    # exactly. ``chunk_index`` only ever appears in logs. ``is_final_chunk``
+    # is what tells the producer this send closes the request out, so the
+    # registration can be retired and the blocks freed.
+    start_token: int = 0
+    chunk_index: int = 0
+    is_final_chunk: bool = True
 
 
 @dataclass

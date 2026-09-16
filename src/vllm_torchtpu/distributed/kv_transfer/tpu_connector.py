@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
@@ -177,6 +177,13 @@ class _Stage3LoadMeta:
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
     release_only: bool = False
+    # Stage 6.5: how many separate transfers this request arrives in, and the
+    # producer-side request ids the leading ones travel under. Decode learns
+    # both from the admission announcement, before the first one lands,
+    # because it has to know how many arrivals make the request complete. One
+    # and empty is an unchunked request.
+    num_chunks: int = 1
+    chunk_source_req_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -268,6 +275,49 @@ class _Stage3Admission:
 
     uuid: int
     num_tokens: int
+    # Stage 6.5. The prompt is cut into chunks at fixed multiples of
+    # chunk_tokens, and every chunk but the last ships under its own uuid from
+    # this tuple; the last keeps ``uuid`` above so a request that turns out to
+    # be a single chunk is byte-identical to stage 6. The boundaries are fixed
+    # rather than read off whatever the scheduler actually did, because decode
+    # has to know how many arrivals to wait for before the first one lands and
+    # it only ever hears from this announcement. A step that computes straight
+    # past a boundary therefore still produces the same number of transfers,
+    # just with less of the overlap the split exists to buy.
+    chunk_tokens: int = 0
+    chunk_uuids: tuple[int, ...] = ()
+
+    def chunk_start(self, index: int) -> int:
+        return index * self.chunk_tokens
+
+    def chunk_end(self, index: int) -> int:
+        if index >= len(self.chunk_uuids):
+            return self.num_tokens
+        return min((index + 1) * self.chunk_tokens, self.num_tokens)
+
+
+@dataclass
+class _ChunkProgress:
+    """Producer-scheduler bookkeeping for one chunked prefill in flight."""
+
+    admission: _Stage3Admission
+    # Every scheduler block vLLM has handed this request so far, in order.
+    block_ids: list[int] = field(default_factory=list)
+    # Prompt tokens the producer has computed, summed over the steps it has
+    # been scheduled in. This is what crossing a boundary is measured against.
+    computed_tokens: int = 0
+    # Index of the next leading chunk to ship. Stops at len(chunk_uuids),
+    # after which request_finished() ships the remainder.
+    next_chunk: int = 0
+    # Where the leading chunks have got to. The final send starts here, so a
+    # prefill that ended before every leading chunk shipped still covers the
+    # whole prompt exactly once.
+    shipped_through: int = 0
+    # A chunk whose boundary the last step crossed, held one step so the
+    # worker picks it up after the forward that wrote its pages. Carries
+    # (chunk index, blocks at the time of the crossing, steps held). It is
+    # held longer than one step only while decode's pages are still missing.
+    pending: Optional[tuple[int, list[int], int]] = None
 
 
 _stage5_mode = "on"
@@ -480,6 +530,16 @@ class _DestinationCollector:
     def take(self, req_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
             return self._entries.pop(req_id, None)
+
+    def peek(self, req_id: str) -> Optional[dict[str, Any]]:
+        """Reads an entry without consuming it, for stage 6.5.
+
+        A chunked request reads the same announcement once per chunk, so all
+        but the last read has to leave it behind. The entry is still bounded
+        by _MAX_HELD, and the final send takes it.
+        """
+        with self._lock:
+            return self._entries.get(req_id)
 
     def _run(self) -> None:
         url = str(self._url)
@@ -698,6 +758,69 @@ def _stage6_prepare_fire_enabled() -> bool:
     return False
 
 
+@lru_cache(maxsize=1)
+def _warn_chunk_fence_unavailable(reason: str) -> None:
+    logger.error(
+        "Stage-6.5 cannot record a device event, so a leading chunk's "
+        "transfer may read pages its forward has not finished writing: %s",
+        reason)
+
+
+_CHUNK_ID_SEP = "#c"
+
+
+def _chunk_req_id(req_id: str, chunk_index: int) -> str:
+    """The derived request id one leading chunk's transfer travels under."""
+    return f"{req_id}{_CHUNK_ID_SEP}{chunk_index}"
+
+
+def _chunk_base_req_id(req_id: str) -> str:
+    """Undoes _chunk_req_id, and leaves any other id alone."""
+    base, sep, suffix = req_id.rpartition(_CHUNK_ID_SEP)
+    if sep and suffix.isdigit():
+        return base
+    return req_id
+
+
+def _send_meta_int(meta: Any, name: str) -> int:
+    """Reads an optional integer field off send metadata, defaulting to zero.
+
+    Type-checked rather than coerced because the legacy send paths pass their
+    own metadata types that have never heard of these fields, and because
+    int() of a test double is 1, which would read as a chunk boundary one
+    token into the prompt.
+    """
+    value = getattr(meta, name, 0)
+    return value if isinstance(value, int) else 0
+
+
+def _flatten_block_ids(block_ids: Any) -> list[int]:
+    """Normalises vLLM's per-kv-cache-group block tuples to one flat list.
+
+    Scheduler output gives block ids as a tuple with one list per KV cache
+    group. Stage 3 is a single FA group on the producer, so the tuple has one
+    element, but the shape differs between the new-request and cached-request
+    paths and this flattens both.
+    """
+    if block_ids is None:
+        return []
+    if block_ids and isinstance(block_ids[0], (list, tuple)):
+        return [int(b) for group in block_ids for b in group]
+    return [int(b) for b in block_ids]
+
+
+def _chunk_split_enabled() -> bool:
+    """Whether a chunked prefill ships each chunk as its own transfer.
+
+    Gated on the producer-submit path as well as its own flag because only the
+    producer knows when a chunk's pages are finished. The consumer starts its
+    transfer when it is ready, which for a chunk is far too early, so a chunk
+    split under consumer-initiated transfers would read pages the forward has
+    not written yet.
+    """
+    return bool(tpu_envs.TPU_KV_CHUNK_SPLIT and tpu_envs.TPU_KV_PREFILL_SUBMIT)
+
+
 def _maybe_fail_stage6_fire_for_test(req_id: str) -> None:
     """TEST-ONLY fault injection (TPU_KV_STAGE6_FAULT_EVERY): fail the fire.
 
@@ -866,6 +989,11 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
     ) -> TPUConnectorMetadata:
         assert self.connector_scheduler is not None
+        # Passed through only where the subclass wants it. The base scheduler
+        # keeps its no-argument signature, which every other caller uses.
+        if isinstance(self.connector_scheduler, TPURaidenConnectorScheduler):
+            return self.connector_scheduler.build_connector_meta(
+                scheduler_output)
         return self.connector_scheduler.build_connector_meta()
 
     def request_finished(
@@ -1350,6 +1478,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # reuses the uuid rather than minting a second one.
         self._stage3_admitted_sends: OrderedDict[
             str, _Stage3Admission] = OrderedDict()
+        # Stage 6.5, producer side: req_id -> how far its chunked prefill has
+        # got. Only populated for requests long enough to be cut in two.
+        self._chunk_progress: dict[str, _ChunkProgress] = {}
         self._admission_notifier: Optional[_AdmissionNotifier] = None
         if self.is_producer and _use_raiden_stage3_transport(
         ) and tpu_envs.TPU_KV_ADMISSION_REORDER:
@@ -1568,6 +1699,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             raise ValueError(
                 "Stage-3 source transfer parallelism must be positive")
 
+        # Stage 6.5: the producer cut this prompt into chunks and told us so
+        # at admission. Each chunk is a transfer of its own, so the request is
+        # not loaded until all of them have landed.
+        num_chunks = len(params.get("chunk_uuids") or ()) + 1
+        if num_chunks > 1 and self._stage3_prefix_aware_load_enabled:
+            raise ValueError(
+                "Stage-6.5 chunk splitting and prefix-aware loads cannot both "
+                "be on: a prefix hit trims the destination page list decode "
+                "publishes, and the producer slices that list by absolute "
+                "token to place each chunk")
+        chunk_source_req_ids = tuple(
+            _chunk_req_id(source_req_id, index)
+            for index in range(num_chunks - 1))
+
         grouped_block_ids = blocks.get_block_ids()
         if self._stage3_fa_group_index >= len(grouped_block_ids):
             raise ValueError(
@@ -1632,6 +1777,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_parallelism=src_parallelism,
             mamba_state_block_ids=mamba_state_block_ids,
             skip_tokens=skip_tokens,
+            num_chunks=num_chunks,
+            chunk_source_req_ids=chunk_source_req_ids,
         )
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
@@ -1843,6 +1990,183 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return None
         return num_tokens
 
+    def _chunk_tokens(self) -> int:
+        """The prompt length at which the producer cuts one chunk from the
+        next, or 0 when chunk splitting is off.
+
+        This is the scheduler's own per-step token budget, rounded down to a
+        whole page. The budget is what makes a boundary free: in an
+        uncontended batch a prefill chunk already ends there, so nothing has
+        to be computed twice or held back. The rounding is what makes the
+        boundary expressible, because the destination clip that places a
+        chunk's bytes only moves in whole destination pages.
+        """
+        if not _chunk_split_enabled():
+            return 0
+        budget = int(
+            getattr(self.vllm_config.scheduler_config,
+                    "max_num_batched_tokens", 0) or 0)
+        page_tokens = int(self.block_size)
+        if budget <= 0 or page_tokens <= 0:
+            return 0
+        return (budget // page_tokens) * page_tokens
+
+    def build_connector_meta(
+        self,
+        scheduler_output: Any = None,
+    ) -> TPUConnectorMetadata:
+        """Adds this step's finished prefill chunks to the base metadata.
+
+        A chunk is announced one step after the step that computed it. The
+        worker reads this metadata at the start of a step, before that step's
+        forward, so metadata built for step N reaches the worker once step
+        N-1's forward has been issued. Issued is not finished, which is why
+        the worker still fences on a device event before it lets the transfer
+        read the pages.
+        """
+        if scheduler_output is not None and self._chunk_progress:
+            self._collect_chunk_sends(scheduler_output)
+        return super().build_connector_meta()
+
+    def _collect_chunk_sends(self, scheduler_output: Any) -> None:
+        """Tracks each chunked prefill's blocks and emits its finished chunks.
+
+        Two things happen per request per step. The block list grows by
+        whatever the scheduler just allocated, because a chunk's registration
+        needs every block up to its own end and vLLM only ever hands those
+        over a chunk at a time. And the token count advances, which is what
+        says a boundary has been crossed.
+        """
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()):
+            progress = self._chunk_progress.get(new_req.req_id)
+            if progress is not None:
+                progress.block_ids = _flatten_block_ids(new_req.block_ids)
+
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is not None:
+            for index, req_id in enumerate(getattr(cached, "req_ids", ())):
+                progress = self._chunk_progress.get(req_id)
+                if progress is None:
+                    continue
+                new_blocks = getattr(cached, "new_block_ids", None)
+                if new_blocks is None or index >= len(new_blocks):
+                    continue
+                entry = new_blocks[index]
+                if entry is not None:
+                    progress.block_ids.extend(_flatten_block_ids(entry))
+
+        scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+        for req_id, progress in list(self._chunk_progress.items()):
+            # Held one step on purpose; see build_connector_meta.
+            if progress.pending is not None:
+                chunk_index, block_ids, waited = progress.pending
+                progress.pending = None
+                if not self._emit_chunk_send(req_id, progress, chunk_index,
+                                             block_ids, waited):
+                    progress.pending = (chunk_index, block_ids, waited + 1)
+            num_tokens = int(scheduled.get(req_id, 0))
+            if num_tokens <= 0:
+                continue
+            progress.computed_tokens += num_tokens
+            if progress.next_chunk >= len(progress.admission.chunk_uuids):
+                continue
+            boundary = progress.admission.chunk_end(progress.next_chunk)
+            if progress.computed_tokens >= boundary:
+                progress.pending = (progress.next_chunk,
+                                    list(progress.block_ids), 0)
+                progress.next_chunk += 1
+
+    def _emit_chunk_send(self, req_id: str, progress: _ChunkProgress,
+                         chunk_index: int, block_ids: list[int],
+                         waited: int) -> bool:
+        """Queues one finished chunk as its own send, if it can yet be sent.
+
+        The chunk rides a derived request id rather than the base one so that
+        every req_id-keyed piece of send bookkeeping, on both sides, keeps
+        treating one transfer as one request. The worker maps the derived ids
+        back onto the base before anything is reported to vLLM.
+
+        Returns False when decode has not published its pages yet and the
+        caller should hold the chunk for another step. ``waited`` is how many
+        steps it has already been held.
+        """
+        admission = progress.admission
+        start_token = admission.chunk_start(chunk_index)
+        end_token = admission.chunk_end(chunk_index)
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+            or 1)
+        scheduler_block_tokens = self.block_size * pcp_size
+        needed = ((end_token + scheduler_block_tokens - 1) //
+                  scheduler_block_tokens)
+        if len(block_ids) < needed:
+            # Not recoverable by skipping the chunk: decode is waiting on the
+            # announced number of arrivals, so one that never ships hangs the
+            # request until its timeout. vLLM allocates a chunk's blocks
+            # before computing it, so reaching here means the block
+            # accounting above has drifted from the scheduler's.
+            raise ValueError(
+                f"Stage-6.5 chunk {chunk_index} of req_id={req_id} has "
+                f"{len(block_ids)} scheduler blocks but needs {needed} to "
+                f"cover {end_token} tokens at {scheduler_block_tokens} tokens "
+                "per block")
+        uuid = admission.chunk_uuids[chunk_index]
+        # Decode publishes one destination announcement per request, under the
+        # base req_id and the admission uuid, because it knows nothing about
+        # chunks beyond how many to expect. So a chunk matches against the
+        # admission uuid rather than its own, and leaves the entry in place
+        # for the chunks behind it. The final send is the one that takes it.
+        dst_params = self._collect_destination_params(req_id,
+                                                      admission.uuid,
+                                                      consume=False)
+        if not dst_params:
+            # Without decode's pages there is nothing to write into, and a
+            # producer-initiated transfer is the only way a leading chunk can
+            # ship: decode's own fallback only ever starts the base uuid. So
+            # the chunk waits. Decode publishes as soon as it allocates, which
+            # is triggered by the admission announcement this prefill sent
+            # before its first step, so in practice the pages are already here
+            # by the first boundary and the wait is zero steps.
+            if waited < self._CHUNK_DST_WAIT_STEPS:
+                return False
+            # Out of patience. Decode is counting arrivals against the number
+            # this prefill announced, so a chunk that never ships leaves the
+            # request waiting for a transfer nobody will start. Failing here
+            # turns a silent hang into something with a stack trace.
+            raise ValueError(
+                f"Stage-6.5 chunk {chunk_index} of req_id={req_id} has waited "
+                f"{waited} steps for the consumer to publish its destination "
+                "pages and they have not arrived; the request cannot complete "
+                "because decode is expecting "
+                f"{len(admission.chunk_uuids) + 1} transfers")
+        self.reqs_to_send[_chunk_req_id(req_id, chunk_index)] = SendMeta(
+            uuid=uuid,
+            local_block_ids=[int(b) for b in block_ids[:needed]],
+            expiration_time=(time.perf_counter() +
+                             dist_utils.get_p2p_wait_pull_timeout()),
+            num_tokens=end_token,
+            dst_params=dst_params,
+            start_token=start_token,
+            chunk_index=chunk_index,
+            is_final_chunk=False,
+        )
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage65_chunk_send",
+                    "req_id": req_id,
+                    "chunk_index": chunk_index,
+                    "uuid": uuid,
+                    "start_token": start_token,
+                    "end_token": end_token,
+                    "blocks": needed,
+                    "t": time.time(),
+                },
+                sort_keys=True))
+        progress.shipped_through = end_token
+        return True
+
     def _maybe_announce_admission(self, request: "Request") -> None:
         """Tell the proxy this request's uuid now, not when prefill ends.
 
@@ -1881,12 +2205,30 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "Stage-3 admission announcement capacity exhausted: "
                 f"limit={_STAGE3_FINISH_DEDUP_LIMIT}")
         uuid = get_uuid()
-        self._stage3_admitted_sends[request.request_id] = _Stage3Admission(
-            uuid=uuid, num_tokens=num_tokens)
+        chunk_tokens = self._chunk_tokens()
+        num_chunks = (1 if chunk_tokens <= 0 else
+                      (num_tokens + chunk_tokens - 1) // chunk_tokens)
+        chunk_uuids = tuple(get_uuid() for _ in range(num_chunks - 1))
+        admission = _Stage3Admission(uuid=uuid,
+                                     num_tokens=num_tokens,
+                                     chunk_tokens=chunk_tokens,
+                                     chunk_uuids=chunk_uuids)
+        self._stage3_admitted_sends[request.request_id] = admission
+        if chunk_uuids:
+            self._chunk_progress[request.request_id] = _ChunkProgress(
+                admission=admission)
         announcement: dict[str, Any] = {
             "req_id": request.request_id,
             "uuid": uuid,
             "num_tokens": num_tokens,
+            # Decode needs the count to know how many arrivals make a request
+            # complete, and the uuids so it can attribute each one. Both are
+            # absent for a single-chunk request, which is what keeps the
+            # announcement wire-identical to stage 6 in the common case.
+            **({
+                "chunk_uuids": list(chunk_uuids),
+                "chunk_tokens": chunk_tokens,
+            } if chunk_uuids else {}),
             **self._stage3_source_params(pcp_size),
         }
         self._admission_notifier.post(str(callback_url), announcement)
@@ -1904,8 +2246,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         "dst_skip_tokens",
     )
 
-    def _collect_destination_params(self, req_id: str,
-                                    uuid: int) -> Optional[dict[str, Any]]:
+    # How many scheduler steps a stage-6.5 leading chunk will wait for decode
+    # to publish its pages before giving up. Eight steps of a batch that is
+    # running 32K-token prefill chunks is on the order of a second, which is
+    # far longer than the proxy round trip that publishes them.
+    _CHUNK_DST_WAIT_STEPS = 8
+
+    def _collect_destination_params(
+            self,
+            req_id: str,
+            uuid: int,
+            consume: bool = True) -> Optional[dict[str, Any]]:
         """Takes the consumer's published pages for a finished prefill.
 
         The uuid check is what makes a preemption safe. A re-admitted request
@@ -1913,10 +2264,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         attempt names pages the consumer may since have freed, so writing to
         them would corrupt another request. A mismatch drops the entry and
         falls back to the consumer starting its own transfer.
+
+        ``consume`` is False for a stage-6.5 leading chunk, which needs the
+        same pages the chunks after it will need.
         """
         if self._destination_collector is None:
             return None
-        entry = self._destination_collector.take(req_id)
+        if consume:
+            entry = self._destination_collector.take(req_id)
+        else:
+            entry = self._destination_collector.peek(req_id)
         if entry is None:
             return None
         if int(entry.get("uuid", -1)) != int(uuid):
@@ -1948,6 +2305,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # declines the transfer, does not leave its announcement behind.
         announced = self._stage3_admitted_sends.pop(request.request_id, None)
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+            self._chunk_progress.pop(request.request_id, None)
             return False, None
 
         # Decode deliberately computes the final prompt token locally to
@@ -1972,6 +2330,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     "(num_tokens=%d, blocks=%d); decode will wait out its "
                     "registration budget.", announced.uuid, request.request_id,
                     num_tokens, len(block_ids))
+            self._chunk_progress.pop(request.request_id, None)
             return False, {}
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
@@ -2064,6 +2423,38 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # is absent the send is unchanged and the consumer starts the transfer
         # itself once its fallback timer expires.
         dst_params = self._collect_destination_params(request.request_id, uuid)
+        # Whatever the leading chunks already shipped, the final send picks up
+        # from there. Zero for an unchunked request, which is every request
+        # with the split off and every prompt short enough to fit one chunk.
+        progress = self._chunk_progress.pop(request.request_id, None)
+        if progress is not None and progress.pending is not None:
+            # A chunk whose boundary the last step crossed is normally emitted
+            # by the next step's metadata, but there is no next step now. It
+            # has to go out here or decode waits forever for an arrival that
+            # was announced and never sent. Emitting it late is safe for the
+            # same reason the whole-request send is: the forward has run.
+            # Reachable only when max_num_batched_tokens is not a multiple of
+            # the page size, which lets one step overshoot a boundary and
+            # finish the prompt together. The overlap is lost, the bytes are
+            # not. This runs before the final send takes the destination
+            # announcement, because the chunk only peeks at it.
+            chunk_index, block_ids, _waited = progress.pending
+            progress.pending = None
+            self._emit_chunk_send(request.request_id, progress, chunk_index,
+                                  block_ids, self._CHUNK_DST_WAIT_STEPS)
+        start_token = 0 if progress is None else progress.shipped_through
+        if start_token >= num_tokens:
+            # A leading chunk already covered the whole prompt, which happens
+            # when the prefill turned out shorter than admission predicted.
+            # Shipping a zero-byte final transfer is not a thing raiden can
+            # do, so fall back to sending the lot again under the base uuid:
+            # decode gets one arrival too many, which its counter tolerates,
+            # and the bytes are identical.
+            logger.warning(
+                "Stage-6.5 leading chunks covered all %d tokens of req_id=%s; "
+                "resending the whole prompt under the base uuid", num_tokens,
+                request.request_id)
+            start_token = 0
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
             local_block_ids=list(normalized_ids),
@@ -2071,6 +2462,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
             dst_params=dst_params,
+            start_token=start_token,
+            chunk_index=0 if progress is None else progress.next_chunk,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -2225,6 +2618,12 @@ class TPURaidenConnectorWorker:
         # decoding on a complete cache and decoding on a partial one.
         self._recv_arrivals: dict[str, int] = {}
         self._recv_expected: dict[str, int] = {}
+        # Stage 6.5, producer side. base req_id -> the derived ids its chunks
+        # ship under, and the outcome each has reached. Both stay empty for
+        # every request that is not chunked, which with the split off is all
+        # of them.
+        self._chunk_send_parts: dict[str, set[str]] = {}
+        self._chunk_part_outcomes: dict[str, dict[str, str]] = {}
         self._suppress_done_recving: set[str] = set()
         # Report each req's recv-completion to the scheduler at most once. vLLM's
         # _update_from_kv_xfer_finished asserts a finished_recving req is still
@@ -3107,6 +3506,12 @@ class TPURaidenConnectorWorker:
             local_ids = scheduler_ids[:owned_blocks]
             fa_pool_spans = []
             token_bytes = self._stage3_fa_token_bytes(page_tokens)
+            # Stage 6.5. A leading chunk declares only the window it just
+            # computed. The block list and the source ordinals stay
+            # whole-request, so the spans a chunk declares are exactly the
+            # ones the unchunked registration would have declared over the
+            # same tokens, and the chunks together partition it.
+            start_token = _send_meta_int(req_meta, "start_token")
             fa_registration = lower_fa_spans(
                 num_tokens=num_tokens,
                 transfer_rank=transfer_rank,
@@ -3115,6 +3520,7 @@ class TPURaidenConnectorWorker:
                 page_tokens=page_tokens,
                 token_bytes=token_bytes,
                 block_ids=list(local_ids),
+                start_token=start_token,
             )
             if fa_registration.spans:
                 fa_pool_spans = [fa_registration]
@@ -3171,7 +3577,12 @@ class TPURaidenConnectorWorker:
                     num_tokens=num_tokens,
                     expiration_time=tombstone_deadline,
                 )
-                self._done_sending.add(req_id)
+                # Reported against the base id because that is the only one
+                # vLLM knows. On a chunked request this can free blocks while
+                # a sibling chunk is still reading them, which is a real but
+                # narrow hazard: reaching here at all means another rank won
+                # an expiry race, so the transfer was already being torn down.
+                self._done_sending.add(_chunk_base_req_id(req_id))
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> Stage-3 request "
                     "registration was already cancelled req_id=%s uuid=%d",
@@ -3186,6 +3597,13 @@ class TPURaidenConnectorWorker:
                 num_tokens=num_tokens,
                 expiration_time=expiration_time,
             )
+            # Stage 6.5: remember which parts a chunked request was cut into,
+            # so its terminal can wait for all of them. A request that is
+            # never chunked never gets an entry and never pays for this.
+            base_req_id = _chunk_base_req_id(req_id)
+            if base_req_id != req_id or base_req_id in self._chunk_send_parts:
+                self._chunk_send_parts.setdefault(base_req_id,
+                                                  set()).add(req_id)
             self._log_stage3_registration(req_id, uuid, num_tokens,
                                           len(local_ids))
             self._maybe_start_producer_transfer(req_id=req_id,
@@ -3599,14 +4017,43 @@ class TPURaidenConnectorWorker:
 
     def _stage3_ready_producer_send_terminals(
             self) -> tuple[set[str], set[str], set[str]]:
-        """Returns terminal base requests (T3.1: no sibling aggregation)."""
+        """Returns terminal base requests.
+
+        One request is one transfer unless stage 6.5 cut it into chunks, and
+        then it is several, each under a derived request id vLLM has never
+        heard of. vLLM frees a request's blocks when it is told the send
+        finished, so the base id is held back until every chunk of it is
+        terminal; reporting it on the first chunk would free pages the
+        remaining chunks are still reading.
+        """
         outcomes, self._stage3_send_outcomes = self._stage3_send_outcomes, {}
-        done = {r for r, outcome in outcomes.items() if outcome == "done"}
-        failed = {r for r, outcome in outcomes.items() if outcome == "failed"}
-        cancelled = {
-            r
-            for r, outcome in outcomes.items() if outcome == "cancelled"
-        }
+        done: set[str] = set()
+        failed: set[str] = set()
+        cancelled: set[str] = set()
+        buckets = {"done": done, "failed": failed, "cancelled": cancelled}
+        for req_id, outcome in outcomes.items():
+            base = _chunk_base_req_id(req_id)
+            if base not in self._chunk_send_parts:
+                bucket = buckets.get(outcome)
+                if bucket is not None:
+                    bucket.add(req_id)
+                continue
+            self._chunk_part_outcomes.setdefault(base, {})[req_id] = outcome
+        for base, seen in list(self._chunk_part_outcomes.items()):
+            parts = self._chunk_send_parts.get(base, set())
+            # The base's own part registers last, so its presence is what says
+            # the set of parts is complete and not merely all-terminal-so-far.
+            if base not in seen or not parts.issubset(seen.keys()):
+                continue
+            self._chunk_send_parts.pop(base, None)
+            self._chunk_part_outcomes.pop(base, None)
+            values = set(seen.values())
+            if "failed" in values:
+                failed.add(base)
+            elif values == {"cancelled"}:
+                cancelled.add(base)
+            else:
+                done.add(base)
         return done, failed, cancelled
 
     def _probe_stage3_registrations(self, facade: Any, now: float) -> None:
@@ -3831,6 +4278,10 @@ class TPURaidenConnectorWorker:
             num_tokens = int(req_meta.num_tokens)
             source_req_id = req_meta.source_req_id
             self._bind_stage3_request_ids(destination_req_id, source_req_id)
+            # Stage 6.5: each chunk completes under its own producer-side id,
+            # and all of them resolve back to this one request.
+            for chunk_req_id in getattr(req_meta, "chunk_source_req_ids", ()):
+                self._bind_stage3_request_ids(destination_req_id, chunk_req_id)
             existing_uuid = self._stage3_submitted_loads.get(
                 destination_req_id)
             if existing_uuid is not None:
@@ -3845,9 +4296,11 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
             self._stage3_load_start_times[
                 destination_req_id] = time.perf_counter()
-            # One whole-cache transfer per request, for now. Stage 7 raises
-            # this to one per early-shipped layer group plus the final one.
-            self._recv_expected[destination_req_id] = 1
+            # One whole-cache transfer per request, or one per prefill chunk
+            # when stage 6.5 split it. Stage 7 raises this again, to one per
+            # early-shipped layer group plus the final one.
+            self._recv_expected[destination_req_id] = max(
+                1, _send_meta_int(req_meta, "num_chunks"))
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
             now = time.perf_counter()
@@ -3931,15 +4384,34 @@ class TPURaidenConnectorWorker:
                     ))
             ]
             mamba = dst_params.get("dst_mamba_state_block_ids") or None
+            dst_ids = [int(block) for block in dst_params["dst_block_ids"]]
+            skip_tokens = int(dst_params.get("dst_skip_tokens", 0) or 0)
+            start_token = _send_meta_int(req_meta, "start_token")
+            is_final = getattr(req_meta, "is_final_chunk", True) is not False
+            if start_token > 0:
+                dst_ids, skip_tokens = self._chunk_dst_window(
+                    req_id=req_id,
+                    dst_block_ids=dst_ids,
+                    start_token=start_token,
+                    end_token=num_tokens,
+                    local_skip_tokens=skip_tokens)
+            elif not is_final:
+                # A leading chunk starting at zero still names only the pages
+                # its own tokens reach, because the pages past them hold
+                # nothing yet and the planner would reject them as uncovered.
+                dst_ids, skip_tokens = self._chunk_dst_window(
+                    req_id=req_id,
+                    dst_block_ids=dst_ids,
+                    start_token=0,
+                    end_token=num_tokens,
+                    local_skip_tokens=skip_tokens)
             transfer_tags, dst_blocks, dst_counts, clip_kwargs, _ = (
                 self._stage3_transfer_layout(
-                    dst_block_ids=[
-                        int(block) for block in dst_params["dst_block_ids"]
-                    ],
+                    dst_block_ids=dst_ids,
                     mamba_state_block_ids=([int(slot) for slot in mamba]
-                                           if mamba else None),
-                    skip_tokens=int(dst_params.get("dst_skip_tokens", 0)
-                                    or 0)))
+                                           if mamba and is_final else None),
+                    skip_tokens=skip_tokens,
+                    fa_only=not is_final))
             facade, src_controller_address = self._require_stage3_controller()
             call_kwargs: dict[str, Any] = dict(
                 src_units=src_units,
@@ -3967,6 +4439,16 @@ class TPURaidenConnectorWorker:
                 req_id, uuid, exc)
             return
 
+        # The whole-request send goes out after the request has finished,
+        # which forces a device sync and is why stage 6 needs no fence. A
+        # leading chunk has no such point: its metadata reaches this thread
+        # one step after the forward that wrote its pages was issued, and
+        # issued is not finished. Recording an event here costs nothing on
+        # this thread and completes once that forward has, so waiting on it
+        # from a submit worker keeps the transfer off pages that are still
+        # being written without making the model runner wait for anything.
+        fence = None if is_final else self._record_chunk_fence(req_id)
+
         queued_at = time.perf_counter()
         build_ms = (queued_at - build_start) * 1000
 
@@ -3977,6 +4459,8 @@ class TPURaidenConnectorWorker:
             # Both of these hold a submit worker, never the model runner.
             # Four workers take one job every 500 ms at this concurrency, so
             # holding one for a few milliseconds cannot make the pool a queue.
+            if fence is not None:
+                fence.synchronize()
             if gate:
                 host_gate.wait_for_gap(_STAGE5_GATE_TIMEOUT_S)
             if delay_s:
@@ -4045,12 +4529,72 @@ class TPURaidenConnectorWorker:
                 },
                 sort_keys=True))
 
+    def _record_chunk_fence(self, req_id: str) -> Any:
+        """Marks the device queue so a chunk's transfer can wait for it.
+
+        Returns None when events are unavailable, which loses the guarantee
+        rather than the transfer, so it is logged once and loudly. Callers
+        treat None as no fence.
+        """
+        try:
+            import torch
+
+            fence = torch.tpu.Event()
+            fence.record()
+            return fence
+        except Exception as exc:  # pylint: disable=broad-except
+            _warn_chunk_fence_unavailable(str(exc))
+            del req_id
+            return None
+
+    def _chunk_dst_window(self, *, req_id: str, dst_block_ids: list[int],
+                          start_token: int, end_token: int,
+                          local_skip_tokens: int) -> tuple[list[int], int]:
+        """Narrows a request's destination pages to one chunk's window.
+
+        The planner insists that every destination block a transfer names is
+        covered from its first byte, and that only the last of them may be
+        partial. A chunk covers a window in the middle of the request, so it
+        has to name only the pages that window touches and declare the bytes
+        before them as skipped. That is the same clip the prefix-cache suffix
+        pull already uses, which is why the planner needs nothing new.
+
+        The skip has to land on a destination page boundary, so the chunk
+        boundary does too. _chunk_tokens() rounds to the page size to
+        guarantee it.
+        """
+        page_tokens = int(self.vllm_config.cache_config.block_size)
+        skip_tokens = max(start_token, local_skip_tokens)
+        if skip_tokens % page_tokens:
+            raise ValueError(
+                f"Stage-6.5 chunk of req_id={req_id} starts at token "
+                f"{skip_tokens}, which is not a whole destination page of "
+                f"{page_tokens} tokens")
+        if skip_tokens >= end_token:
+            # Only reachable with prefix-aware loads on, where decode may
+            # already hold the whole window. Decode counts arrivals from the
+            # announcement, so a chunk that silently does not ship leaves it
+            # waiting; failing here says so rather than hanging.
+            raise ValueError(
+                f"Stage-6.5 chunk of req_id={req_id} is entirely below the "
+                f"destination's cached prefix: skip={skip_tokens}, "
+                f"end={end_token}")
+        first = skip_tokens // page_tokens
+        last = (end_token + page_tokens - 1) // page_tokens
+        if last > len(dst_block_ids):
+            raise ValueError(
+                f"Stage-6.5 chunk of req_id={req_id} needs destination pages "
+                f"up to {last} but decode published {len(dst_block_ids)}; the "
+                "two engines disagree about the page size")
+        return dst_block_ids[first:last], skip_tokens
+
     def _stage3_transfer_layout(
         self,
         *,
         dst_block_ids: list[int],
         mamba_state_block_ids: Optional[list[int]],
         skip_tokens: int,
+        fa_only: bool = False,
     ) -> tuple[list[str], list[int], list[int], dict[str, Any], int]:
         """Lowers one request's destination pages into controller arguments.
 
@@ -4061,13 +4605,19 @@ class TPURaidenConnectorWorker:
         Both sides of the transfer build these, and they must agree byte for
         byte, so the two callers share this rather than each lowering the same
         pages themselves.
+
+        ``fa_only`` drops the GDN state classes, which is what a stage-6.5
+        leading chunk wants. Recurrent state is not a prefix of itself: only
+        the value at the end of the prompt is the one decode needs, so it
+        rides the final transfer and the leading chunks carry attention
+        pages alone.
         """
         transfer_tags = list(
             _STAGE3_GLM_TRANSFER_POOL_TAGS if _use_raiden_glm_admission(
             ) else _STAGE3_TRANSFER_POOL_TAGS)
         dst_blocks = list(dst_block_ids) * len(transfer_tags)
         dst_counts = [len(dst_block_ids)] * len(transfer_tags)
-        if self._stage3_state_group_count:
+        if self._stage3_state_group_count and not fa_only:
             if not mamba_state_block_ids or len(
                     mamba_state_block_ids) != self._stage3_state_group_count:
                 raise RuntimeError("GDN state load requires one destination "
