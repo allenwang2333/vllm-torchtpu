@@ -144,7 +144,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         # Preserve the one-byte checkpoint representation until the GMM
         # pipeline loads a scale tile into VMEM. Requantization needs decoded
         # input scales and produces general (not E8M0) FP32 output scales.
-        if envs.TPU_MOE_RUNTIME_SCALE_CAST and requant_block is None:
+        if envs.TPU_FP4_GMM_DEFER_SCALE_DECODE and requant_block is None:
             w13_scale = w13_weight_scale
             w2_scale = w2_weight_scale
         else:
