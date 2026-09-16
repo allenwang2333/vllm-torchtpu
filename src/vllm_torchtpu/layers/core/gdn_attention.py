@@ -803,12 +803,34 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
 
-    # Pool's second dim refers to physical block size while pool_block_tokens
-    # refers to logical block size. Therefore, we perform reshape so that first
-    # dim can refer to number of logical blocks.
-    # NOTE: reshape along non last two dims is free.
+    # The kernel's StateBufferedRef accesses the pool via
+    # `granule_view(src_ref, src_ref.shape[:1])`, which only preserves `dim 0`
+    # (`num_logical_blocks`, indexed by `state_indices`) and flattens all
+    # trailing dimensions (`dim 1..N`) into a contiguous 128-lane granule stream
+    # `(-1, 1, 128)`.
+    #
+    # To keep this `reshape` a zero-cost metadata view in XLA (no physical
+    # relayout/copy across HBM), we MUST NOT modify the last two hardware-tiling
+    # dimensions (`*pool_shape[-2:]`).
+    # - In NHD layout, `pool_shape[1]` is `block_size // split`, so folding
+    #   `split` from `dim 0` into `dim 1` naturally gives `pool_block_tokens`.
+    # - In HND (`SEQ_ALONG_LANE`) layout, `block_size // split` sits at
+    #   `pool_shape[-1]` (lanes) while `pool_shape[1]` is `2 * num_kv_heads`.
+    #   We fold `split` from `dim 0` into `dim 1` (`pool_shape[1] * split`)
+    #   purely as a carrier dimension so that:
+    #     (1) `dim 0` equals `num_logical_blocks` (`pool_shape[0] // split`),
+    #     (2) each logical block's contiguous byte footprint is preserved, and
+    #     (3) `*pool_shape[-2:]` remains untouched for a free 0-copy reshape.
     pool_shape = recurrent_state.shape
-    pool = recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
+    if pool_adapters.is_seq_along_lane_pool():
+        split = pool_block_tokens // pool_shape[-1]
+        pool = recurrent_state.reshape(
+            pool_shape[0] // split,
+            pool_shape[1] * split,
+            *pool_shape[2:],
+        )
+    else:
+        pool = recurrent_state.reshape(-1, pool_block_tokens, *pool_shape[2:])
 
     pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
