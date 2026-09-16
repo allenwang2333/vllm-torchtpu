@@ -2208,6 +2208,24 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         chunk_tokens = self._chunk_tokens()
         num_chunks = (1 if chunk_tokens <= 0 else
                       (num_tokens + chunk_tokens - 1) // chunk_tokens)
+        if num_chunks > 1:
+            # Drop the last boundary when it would leave a tail shorter than a
+            # page. A prompt a few tokens past a multiple of the budget splits
+            # into a full chunk plus a sliver, and that sliver is the step
+            # that finishes the prefill, so the chunk is armed and then
+            # force-emitted one step later having overlapped nothing. It is
+            # not merely useless. The announcement has already told decode to
+            # expect two arrivals, and a leading chunk can only ship once
+            # decode has published its destination pages, so if decode is
+            # still busy the chunk cannot go out and the request can never
+            # complete. In long_32768_c8 the prompts run a few tokens past
+            # 32768, two of them split that way, and one of the two had no
+            # destination yet and took the prefill engine down with it.
+            # Requiring a page of tail gives the boundary back the step of
+            # slack it is supposed to have.
+            tail_tokens = num_tokens - (num_chunks - 1) * chunk_tokens
+            if tail_tokens < int(self.block_size):
+                num_chunks -= 1
         chunk_uuids = tuple(get_uuid() for _ in range(num_chunks - 1))
         admission = _Stage3Admission(uuid=uuid,
                                      num_tokens=num_tokens,

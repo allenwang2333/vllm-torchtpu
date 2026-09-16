@@ -251,14 +251,38 @@ class TestAnnouncement:
         assert announced["num_tokens"] == SENT
 
     def test_the_count_is_ceiling_not_floor(self):
-        """A prompt one token past a boundary is still two chunks, and decode
-        sizing its wait by the floor would stop one transfer early."""
+        """A prompt past a boundary is two chunks, and decode sizing its wait
+        by the floor would stop one transfer early. A page of tail is the
+        smallest one that survives the sliver rule below."""
         producer, notifier = _producer()
-        req = _request("edge", BUDGET + 2)
+        req = _request("edge", BUDGET + PAGE + 1)
         with _chunk_split_on():
             self._announce(producer, req, [900, 901])
 
         assert notifier.posts[0][1]["chunk_uuids"] == [901]
+
+    def test_a_tail_shorter_than_a_page_is_not_worth_a_boundary(self):
+        """The sliver would be the step that ends the prefill, so the chunk
+        overlaps nothing and still commits decode to a second arrival it
+        cannot be sure of getting. One of these took down the prefill engine
+        in long_32768_c8."""
+        producer, notifier = _producer()
+        req = _request("sliver", BUDGET + 2)
+        with _chunk_split_on():
+            self._announce(producer, req, [900])
+
+        assert "chunk_uuids" not in notifier.posts[0][1]
+        assert producer._chunk_progress == {}
+
+    def test_the_sliver_rule_gives_up_one_boundary_and_no_more(self):
+        """Folding the sliver into the chunk before it leaves that chunk over
+        a page long, so there is never a second boundary to drop."""
+        producer, notifier = _producer()
+        req = _request("nearly_four", BUDGET * 3 + 2)
+        with _chunk_split_on():
+            self._announce(producer, req, [900, 901, 902])
+
+        assert notifier.posts[0][1]["chunk_uuids"] == [901, 902]
 
     def test_a_prompt_exactly_one_chunk_long_is_not_chunked(self):
         producer, notifier = _producer()
@@ -486,11 +510,18 @@ class TestChunkSends:
         assert meta.reqs_to_send["long#c0"].num_tokens == BUDGET
 
     def test_a_chunk_pending_when_the_prefill_ends_is_flushed(self):
-        """A step can cross a boundary and finish the prompt together when
-        the budget is not a whole number of pages. There is no next step to
-        carry the chunk, so request_finished has to emit it."""
-        producer, _notifier = _producer(budget=30000)
-        req = _request("long", 28000)
+        """A chunk held back because decode had not published yet is still
+        pending when the prompt ends, and there is no next step to carry it.
+        request_finished has to emit it, or decode waits forever for an
+        arrival that was announced and never sent.
+
+        Since the tail rule, this is the only way to reach the flush: one
+        step can no longer both cross a boundary and finish, because a
+        boundary now leaves at least a page behind it and a step computes at
+        most the budget, which is the boundary itself.
+        """
+        producer, _notifier = _producer()
+        req = _request("long", PROMPT)
         with _chunk_split_on():
             with ExitStack() as stack:
                 for ctx in _stage3_producer_env(900):
@@ -498,22 +529,27 @@ class TestChunkSends:
                 stack.enter_context(
                     patch(f"{_MOD}.get_uuid", side_effect=[900, 901]))
                 producer.update_state_after_alloc(req, MagicMock(), 0)
-        _give_destination(producer, "long",
-                          _published_destination(900, list(range(200, 208))))
 
         self._build(producer,
-                    _step(new=[("long", [100])], scheduled={"long": 28000}))
+                    _step(new=[("long", [100])], scheduled={"long": BUDGET}))
+        # The step that would ship it finds no destination and shelves it.
+        self._build(
+            producer,
+            _step(cached=[("long", [101])],
+                  scheduled={"long": SENT - BUDGET}))
         assert producer._chunk_progress["long"].pending is not None
 
+        _give_destination(producer, "long",
+                          _published_destination(900, list(range(200, 208))))
         with _chunk_split_on():
             with ExitStack() as stack:
                 for ctx in _stage3_producer_env(900):
                     stack.enter_context(ctx)
-                producer.request_finished(req, [100])
+                producer.request_finished(req, [100, 101])
 
         assert set(producer.reqs_to_send) == {"long#c0", "long"}
-        assert producer.reqs_to_send["long#c0"].num_tokens == 24576
-        assert producer.reqs_to_send["long"].start_token == 24576
+        assert producer.reqs_to_send["long#c0"].num_tokens == BUDGET
+        assert producer.reqs_to_send["long"].start_token == BUDGET
 
     def test_an_abort_drops_the_progress(self):
         producer, req = self._admitted()
