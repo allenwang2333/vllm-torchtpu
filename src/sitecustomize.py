@@ -11,4 +11,5 @@ os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 
 # Bisect-only hypothesis test: disable torch_tpu's reassociate_norm_weights
 # pass (torch_tpu b256d993) on the otherwise unchanged bad stack.
-os.environ.setdefault("TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", "0")
+if os.environ.get("ROLE") == "decode":
+    os.environ.setdefault("TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", "0")
