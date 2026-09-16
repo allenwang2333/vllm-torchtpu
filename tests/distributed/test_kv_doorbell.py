@@ -352,6 +352,10 @@ class _FakeReader:
         self.queued = []
         self.started_with = None
         self.stopped = False
+        self.fired = []
+        self.armed = []
+        self.cancelled = []
+        self.next_watch_id = 1
 
     def start(self, poll_interval_nanos):
         self.started_with = poll_interval_nanos
@@ -365,6 +369,20 @@ class _FakeReader:
     def drain_sightings(self):
         out, self.queued = self.queued, []
         return out
+
+    def drain_firings(self):
+        out, self.fired = self.fired, []
+        return out
+
+    def arm_transfer(self, group, generation, client, req_id, uuid):
+        watch_id = self.next_watch_id
+        self.next_watch_id += 1
+        self.armed.append((group, generation, client, req_id, uuid, watch_id))
+        return watch_id
+
+    def cancel_watch(self, watch_id):
+        self.cancelled.append(watch_id)
+        return watch_id in {entry[5] for entry in self.armed}
 
     def stats(self):
         return _FakeStats(polls=1000)

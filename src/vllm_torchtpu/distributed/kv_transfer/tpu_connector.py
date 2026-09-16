@@ -27,7 +27,7 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 from uuid import uuid4
 
 import torch
@@ -97,6 +97,10 @@ class _DoneFuture:
 _DONE_FUTURE = _DoneFuture()
 _STAGE3_FINISH_DEDUP_LIMIT = 4096
 _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
+# How many doorbell watches the worker remembers, so that an abort arriving
+# within a few hundred requests can still take its transfer back. Far more
+# than any plausible in-flight count, and each entry is a pair and an int.
+_STAGE7_WATCH_HISTORY = 1024
 # tpu_sync GetRequestBlockStatusResponse.Status values reported by the
 # reshard client's get_request_block_status probe.
 _STAGE3_REGISTRY_STATUS_UNKNOWN = 1
@@ -325,6 +329,14 @@ class _ChunkProgress:
     # (chunk index, blocks at the time of the crossing, steps held). It is
     # held longer than one step only while decode's pages are still missing.
     pending: Optional[tuple[int, list[int], int]] = None
+    # The prompt length the scheduler will report as computed, which is one
+    # more than the transfer covers when the producer drops the final token.
+    # Crossing it is what says the step being built is the last one.
+    prompt_tokens: int = 0
+    # Whether the early attention group has already been queued, by whichever
+    # of the two paths got there: the doorbell path in the step that computes
+    # it, or request_finished afterwards.
+    early_emitted: bool = False
 
 
 _stage5_mode = "on"
@@ -813,6 +825,18 @@ def _send_meta_fa_group(meta: Any) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
+def _send_meta_arm_group(meta: Any) -> Optional[int]:
+    """Which bell releases a send, or None if it ships as soon as it is ready.
+
+    Type-checked like the two above, and here a wrong answer is the expensive
+    kind in both directions: a None read as a group makes a finished transfer
+    wait for a bell that has already rung, and a group read as None fires a
+    transfer over pages the model has not written.
+    """
+    value = getattr(meta, "arm_on_bell", None)
+    return value if isinstance(value, int) else None
+
+
 def _flatten_block_ids(block_ids: Any) -> list[int]:
     """Normalises vLLM's per-kv-cache-group block tuples to one flat list.
 
@@ -840,6 +864,25 @@ def _early_layer_split_enabled() -> bool:
     return bool(
         int(tpu_envs.TPU_KV_EARLY_LAYERS) > 0
         and tpu_envs.TPU_KV_PREFILL_SUBMIT)
+
+
+def _doorbell_arm_enabled() -> bool:
+    """Whether the early group's transfer waits on a bell instead of a step.
+
+    Three settings have to agree, so all three are checked in one place. The
+    split has to exist for there to be an early group at all, the bells have
+    to be rung, and the reader has to be polling them. Any one of them missing
+    and the early group takes stage 7b's path, which ships it at the end of
+    the pass along with everything else.
+
+    The scheduler and the worker read this from the same environment in the
+    same launch, which is what lets the scheduler build a send the worker is
+    obliged to arm rather than fire.
+    """
+    return bool(_early_layer_split_enabled() and tpu_envs.TPU_KV_DOORBELL_ARM
+                and tpu_envs.TPU_KV_DOORBELL
+                and int(tpu_envs.TPU_KV_DOORBELL_POLL_US) > 0
+                and _stage6_prepare_fire_enabled())
 
 
 def _chunk_split_enabled() -> bool:
@@ -880,6 +923,8 @@ def _maybe_fail_stage6_fire_for_test(req_id: str) -> None:
 
 def _dispatch_stage3_transfer(facade: Any,
                               timings: Optional[dict[str, float]] = None,
+                              arm: Optional[Callable[[str, int],
+                                                     None]] = None,
                               **kwargs: Any) -> bool:
     """Sends one coordination call, as one RPC or as a prepare and a fire.
 
@@ -894,8 +939,19 @@ def _dispatch_stage3_transfer(facade: Any,
     number stage 6 exists to produce: every later stage assumes fire is flat
     in context length, and this is where that gets checked rather than
     assumed.
+
+    ``arm`` replaces the fire with handing the prepared plan to something else
+    that will fire it later, which is stage 7c handing it to a doorbell. The
+    cleanup contract is the same and is why it goes here rather than in the
+    caller: an arm that raises leaves the same armed plan holding the same
+    source registration claim as a fire that raises, and it has to be
+    discarded for the same reason.
     """
     if not _stage6_prepare_fire_enabled():
+        if arm is not None:
+            raise RuntimeError(
+                "Stage-7c cannot hand a doorbell a transfer that was never "
+                "prepared; it needs TPU_KV_STAGE6_PREPARE")
         return bool(facade.start_transfer(**kwargs))
     prepare_start = time.perf_counter()
     facade.prepare_transfer(**kwargs)
@@ -906,7 +962,10 @@ def _dispatch_stage3_transfer(facade: Any,
     uuid = int(kwargs.get("uuid") or 0)
     try:
         _maybe_fail_stage6_fire_for_test(req_id)
-        facade.fire_transfer(req_id, uuid)
+        if arm is None:
+            facade.fire_transfer(req_id, uuid)
+        else:
+            arm(req_id, uuid)
     except BaseException:
         try:
             facade.discard_prepared_transfer(req_id, uuid)
@@ -921,7 +980,8 @@ def _dispatch_stage3_transfer(facade: Any,
                 "req_id=%s uuid=%d", req_id, uuid)
         raise
     if timings is not None:
-        timings["fire_ms"] = (time.perf_counter() - fire_start) * 1000
+        key = "fire_ms" if arm is None else "arm_ms"
+        timings[key] = (time.perf_counter() - fire_start) * 1000
     return True
 
 
@@ -2101,13 +2161,91 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if num_tokens <= 0:
                 continue
             progress.computed_tokens += num_tokens
-            if progress.next_chunk >= len(progress.admission.chunk_uuids):
-                continue
-            boundary = progress.admission.chunk_end(progress.next_chunk)
-            if progress.computed_tokens >= boundary:
-                progress.pending = (progress.next_chunk,
-                                    list(progress.block_ids), 0)
-                progress.next_chunk += 1
+            if progress.next_chunk < len(progress.admission.chunk_uuids):
+                boundary = progress.admission.chunk_end(progress.next_chunk)
+                if progress.computed_tokens >= boundary:
+                    progress.pending = (progress.next_chunk,
+                                        list(progress.block_ids), 0)
+                    progress.next_chunk += 1
+            self._maybe_emit_early_group(req_id, progress)
+
+    def _maybe_emit_early_group(self, req_id: str,
+                                progress: _ChunkProgress) -> None:
+        """Queue the early attention group in the step that computes it.
+
+        Stage 7b emitted this send from request_finished, which is where every
+        other send here is emitted and is one step after the forward that
+        wrote its pages. That is correct and it is too late to use a bell: by
+        then all fifteen groups have rung, and on 397B group 0's rang about
+        1.3 s earlier. Emitted from here the send reaches the worker at the
+        start of the step whose forward will finish the prompt, which is early
+        enough for the worker to register the transfer and hand it to the
+        polling thread before the layer it waits on has run.
+
+        Building a send before its pages exist is only safe because of the
+        arm_on_bell flag it carries: the worker will not fire it, the bell
+        will. So this runs only with arming configured, and without it the
+        request takes stage 7b's path unchanged.
+
+        The two splits compose. By the last step the leading chunks have
+        shipped their tokens with every layer, so the early group owes only
+        the tokens behind them, and the forward this step is about to run is
+        what writes exactly those. The one case that has to wait is a step
+        that crosses a chunk boundary and finishes the prompt together: that
+        chunk has not shipped, so the token range is not settled yet, and the
+        request falls back to stage 7b rather than guessing.
+        """
+        admission = progress.admission
+        if (progress.early_emitted or not admission.early_uuid
+                or not _doorbell_arm_enabled()):
+            return
+        if (progress.pending is not None
+                or progress.next_chunk < len(admission.chunk_uuids)):
+            return
+        if not progress.prompt_tokens:
+            return
+        if progress.computed_tokens < progress.prompt_tokens:
+            return
+        # Peeked, not consumed: the final send is still the one that takes the
+        # destination announcement, exactly as it is for a leading chunk.
+        dst_params = self._collect_destination_params(req_id,
+                                                      admission.uuid,
+                                                      consume=False)
+        if not dst_params:
+            # Decode allocates off the admission announcement, which went out
+            # before this prefill's first step, so in practice its pages have
+            # been here for the length of the prompt. If they are somehow not,
+            # there is no waiting available: this is the last step. Fall
+            # through to request_finished, which raises if they are still
+            # missing then.
+            return
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+            or 1)
+        scheduler_block_tokens = self.block_size * pcp_size
+        needed = ((admission.num_tokens + scheduler_block_tokens - 1) //
+                  scheduler_block_tokens)
+        if len(progress.block_ids) < needed:
+            # vLLM allocates a step's blocks before computing it, so the last
+            # step's allocation is already in hand and this should not happen.
+            # If it does, the block accounting has drifted from the
+            # scheduler's, and the late path rebuilds the list from vLLM's own
+            # rather than from this running total.
+            logger.warning(
+                "Stage-7c has %d scheduler blocks for req_id=%s but needs %d "
+                "to cover %d tokens; leaving the early group to the late path",
+                len(progress.block_ids), req_id, needed, admission.num_tokens)
+            return
+        if self._emit_early_group_send(
+                req_id,
+                admission,
+                tuple(progress.block_ids[:needed]),
+                admission.num_tokens,
+                progress.shipped_through,
+                time.perf_counter() + dist_utils.get_p2p_wait_pull_timeout(),
+                dst_params,
+                arm_on_bell=0):
+            progress.early_emitted = True
 
     def _emit_chunk_send(self, req_id: str, progress: _ChunkProgress,
                          chunk_index: int, block_ids: list[int],
@@ -2204,7 +2342,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                announced: Optional["_Stage3Admission"],
                                block_ids: tuple[int, ...], num_tokens: int,
                                start_token: int, expiration_time: float,
-                               dst_params: Optional[dict]) -> bool:
+                               dst_params: Optional[dict],
+                               arm_on_bell: Optional[int] = None) -> bool:
         """Queue the early attention group as a send of its own.
 
         A chunk splits a request by token and this splits it by layer, so the
@@ -2213,11 +2352,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         whether it queued anything, which is what tells the caller the final
         send is now carrying group 1 rather than everything.
 
-        Nothing actually goes early yet. This send is built in the same step
-        as the final one and lands beside it. The point of landing it now is
-        that stage 7c then has a transfer to move onto the doorbell instead of
-        a transfer to invent, and that the cost of two transfers per request
-        gets measured on its own before a bell can be blamed for it.
+        Two callers, and the difference between them is the whole of stage 7c.
+        request_finished emits after the prompt is over, which lands this send
+        beside the final one and ships it no sooner. _maybe_emit_early_group
+        emits during the step that finishes the prompt and passes arm_on_bell,
+        which makes the send's pages a promise the worker has to wait on
+        rather than bytes already written.
         """
         if announced is None or not announced.early_uuid:
             return False
@@ -2248,6 +2388,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # behind this one does both.
             is_final_chunk=False,
             fa_group=0,
+            arm_on_bell=arm_on_bell,
         )
         logger.info(
             "%s",
@@ -2259,6 +2400,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     "uuid": announced.early_uuid,
                     "start_token": start_token,
                     "end_token": num_tokens,
+                    "arm_on_bell": arm_on_bell,
                     "t": time.time(),
                 },
                 sort_keys=True))
@@ -2350,9 +2492,16 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                      chunk_uuids=chunk_uuids,
                                      early_uuid=early_uuid)
         self._stage3_admitted_sends[request.request_id] = admission
-        if chunk_uuids:
+        if chunk_uuids or early_uuid:
+            # An unchunked request with an early group needs the same per-step
+            # bookkeeping, not to find a chunk boundary but to find the step
+            # that finishes the prompt. The chunk half of it sits out when
+            # there are no chunk uuids to advance through, and the fields the
+            # final send reads stay at the values it uses when there is no
+            # progress object at all.
             self._chunk_progress[request.request_id] = _ChunkProgress(
-                admission=admission)
+                admission=admission,
+                prompt_tokens=int(request.num_prompt_tokens))
         # Every transfer this request will send except the final one, in the
         # order their derived ids are numbered: the token chunks first, then
         # the early layer group.
@@ -2602,10 +2751,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "resending the whole prompt under the base uuid", num_tokens,
                 request.request_id)
             start_token = 0
-        early_group = self._emit_early_group_send(request.request_id,
-                                                  announced, normalized_ids,
-                                                  num_tokens, start_token,
-                                                  expiration_time, dst_params)
+        if progress is not None and progress.early_emitted:
+            # Stage 7c already queued it, during the step whose forward has
+            # just run, and it may already be on the wire. The final send
+            # still has to know, because what it carries depends on it.
+            early_group = True
+        else:
+            early_group = self._emit_early_group_send(request.request_id,
+                                                      announced,
+                                                      normalized_ids,
+                                                      num_tokens, start_token,
+                                                      expiration_time,
+                                                      dst_params)
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
             local_block_ids=list(normalized_ids),
@@ -2687,6 +2844,9 @@ class TPURaidenConnectorWorker:
         self._raiden_layout_fingerprint_payload: dict[str, Any] | None = None
         self._raiden_controller_facade: Any | None = None
         self._raiden_controller_address: str | None = None
+        # Stage 7c. Transfers prepared and handed to a doorbell, keyed by
+        # (req_id, uuid), so an abort can take one back before it fires.
+        self._stage7_watches: dict[tuple[str, int], int] = {}
         # In-engine store hosting: set only on the engine's rank-0 worker.
         self._reshard_store: Any | None = None
         self._raiden_work_unit: Any | None = None
@@ -4335,6 +4495,13 @@ class TPURaidenConnectorWorker:
                               _STAGE3_REGISTRY_STATUS_UNKNOWN):
                 continue
             self._stage3_send_outcomes[req_id] = "cancelled"
+            # A send waiting on a bell has to be taken back here, because
+            # nothing else will. The bell is a counter that keeps rising, so
+            # an abandoned watch does not expire; it fires on some later
+            # request's forward and ships that request's pages under this
+            # request's uuid.
+            self._cancel_bell_watch(
+                req_id, int(self._stage3_registered_sends[req_id].uuid))
             logger.info(
                 "%s",
                 json.dumps(
@@ -4354,6 +4521,8 @@ class TPURaidenConnectorWorker:
     def _start_stage3_transfer_with_d5_retry(facade: Any,
                                              timings: Optional[dict[
                                                  str, float]] = None,
+                                             arm: Optional[Callable[
+                                                 [str, int], None]] = None,
                                              **kwargs: Any) -> bool:
         """Bridges the one-step P scheduler-to-worker registration window.
 
@@ -4375,7 +4544,8 @@ class TPURaidenConnectorWorker:
         while True:
             attempts += 1
             try:
-                return _dispatch_stage3_transfer(facade, timings, **kwargs)
+                return _dispatch_stage3_transfer(facade, timings, arm,
+                                                 **kwargs)
             except RuntimeError as exc:
                 if ("Missing producer block registration" not in str(exc)
                         or time.perf_counter() >= deadline):
@@ -4586,6 +4756,96 @@ class TPURaidenConnectorWorker:
                 continue
             self._dispatch_stage3_load_submit(pending, synchronous)
 
+    def _arm_generation(self) -> int:
+        """The generation whose group-0 bell this step's last forward rings.
+
+        Called on the model runner thread, before the step's forwards are
+        issued, which is the only place the answer is knowable. A step can run
+        several forwards: the DP coordinator splits the batch into chunks and
+        every chunk is a forward of its own that rings the bells again. A
+        request's tokens may be in any of them, so the safe generation to wait
+        for is the last one, after which every chunk this step will run has
+        written what it is going to write.
+
+        Waiting for the last chunk costs a request whose tokens were all in an
+        earlier one the difference between them. It cannot be wrong, which is
+        the property worth having: firing a chunk early ships pages that hold
+        the previous request's KV, and that is the failure the first attempt
+        at this hit and never explained.
+
+        Returns 0 when there is no reader, which the caller treats as a
+        misconfiguration rather than a fallback.
+        """
+        runner = getattr(self, "runner", None)
+        bells = getattr(runner, "_doorbells", None)
+        if runner is None or bells is None:
+            return 0
+        if getattr(runner, "_doorbell_watcher", None) is None:
+            return 0
+        chunks = max(1, int(getattr(runner, "_dp_step_num_chunks", 1) or 1))
+        return int(bells.coming_generation()) + chunks - 1
+
+    def _bell_arm(self, group: int,
+                  generation: int) -> Callable[[str, int], None]:
+        """Builds the callable that hands one prepared transfer to a bell."""
+
+        def _arm(req_id: str, uuid: int) -> None:
+            watcher = self.runner._doorbell_watcher  # noqa: SLF001
+            facade, _ = self._require_stage3_controller()
+            watch_id = watcher.arm(group, generation, facade.native, req_id,
+                                   uuid)
+            # Kept so an abort can take the transfer back. The key is the pair
+            # because a request has several uuids once it is split and only
+            # one of them is waiting on a bell. A watch that fires normally
+            # leaves its entry behind, since the firing happens in C++ and
+            # says nothing about which request it was; the entries are dropped
+            # oldest-first instead. Anything that old has certainly fired,
+            # because an armed watch belongs to a request the scheduler is
+            # still holding and there are only so many of those.
+            while len(self._stage7_watches) >= _STAGE7_WATCH_HISTORY:
+                self._stage7_watches.pop(next(iter(self._stage7_watches)))
+            self._stage7_watches[(req_id, int(uuid))] = watch_id
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage7_armed",
+                        "req_id": req_id,
+                        "uuid": int(uuid),
+                        "group": group,
+                        "generation": generation,
+                        "watch_id": watch_id,
+                        "t": time.time(),
+                    },
+                    sort_keys=True))
+
+        return _arm
+
+    def _cancel_bell_watch(self, req_id: str, uuid: int) -> None:
+        """Take back a transfer a bell has not fired yet.
+
+        The plan has to be discarded as well as the watch dropped, because a
+        prepared plan holds its source registration claim until something
+        releases it, and a later retry of the same pair would come back as a
+        duplicate. If the watch had already fired there is nothing to take
+        back: the transfer is on the wire and the consumer will see it.
+        """
+        watch_id = self._stage7_watches.pop((req_id, int(uuid)), None)
+        if watch_id is None:
+            return
+        watcher = getattr(getattr(self, "runner", None), "_doorbell_watcher",
+                          None)
+        if watcher is None or not watcher.cancel(watch_id):
+            return
+        try:
+            facade, _ = self._require_stage3_controller()
+            facade.discard_prepared_transfer(req_id, int(uuid))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                "Stage-7c cancelled watch %d for req_id=%s uuid=%d but could "
+                "not discard its plan; a retry of the same pair will be "
+                "refused as a duplicate: %s", watch_id, req_id, int(uuid), exc)
+
     def _maybe_start_producer_transfer(self, *, req_id: str, req_meta: Any,
                                        uuid: int, num_tokens: int,
                                        transfer_rank: int,
@@ -4696,7 +4956,30 @@ class TPURaidenConnectorWorker:
         # this thread and completes once that forward has, so waiting on it
         # from a submit worker keeps the transfer off pages that are still
         # being written without making the model runner wait for anything.
-        fence = None if is_final else self._record_chunk_fence(req_id)
+        #
+        # A send waiting on a bell takes neither. Its forward has not been
+        # issued yet, so there is nothing for an event recorded here to
+        # complete behind; the bell is the fence.
+        arm_group = _send_meta_arm_group(req_meta)
+        if arm_group is None:
+            fence = None if is_final else self._record_chunk_fence(req_id)
+            arm_generation = 0
+        else:
+            fence = None
+            arm_generation = self._arm_generation()
+            if arm_generation <= 0:
+                # The scheduler built this send on the promise that a bell
+                # would release it, and there is no reader to release it. Not
+                # firing it is the only safe answer, because the pages it
+                # names are not written; the cost is that decode waits out its
+                # timeout for an arrival that was announced and never sent.
+                logger.error(
+                    "Stage-7c send for req_id=%s uuid=%d asks to wait on "
+                    "group %d but this worker has no doorbell reader, so it "
+                    "cannot be fired; check that TPU_KV_DOORBELL and "
+                    "TPU_KV_DOORBELL_POLL_US are set on the worker as well as "
+                    "the scheduler", req_id, uuid, arm_group)
+                return
 
         queued_at = time.perf_counter()
         build_ms = (queued_at - build_start) * 1000
@@ -4720,7 +5003,9 @@ class TPURaidenConnectorWorker:
                                         facade,
                                         call_kwargs,
                                         build_ms=build_ms,
-                                        queued_at=queued_at)
+                                        queued_at=queued_at,
+                                        arm_group=arm_group,
+                                        arm_generation=arm_generation)
 
         self._stage3_submit_queue.put(_submit)
         self._ensure_stage3_submit_workers()
@@ -4733,13 +5018,22 @@ class TPURaidenConnectorWorker:
                                call_kwargs: dict[str, Any],
                                *,
                                build_ms: float = 0.0,
-                               queued_at: Optional[float] = None) -> None:
+                               queued_at: Optional[float] = None,
+                               arm_group: Optional[int] = None,
+                               arm_generation: int = 0) -> None:
         """Runs one producer-initiated coordination RPC on a submit worker.
 
         Failure is logged and dropped rather than propagated. There is no
         scheduler state on this side to resolve, and the consumer still holds
         its own submit behind a fallback timer, so the cost of losing this is
         the latency the feature was trying to save and nothing else.
+
+        With ``arm_group`` set the RPC is only the prepare half, and what
+        replaces the fire is a watch on the reader's polling thread. The
+        request then leaves this host without the interpreter being involved
+        again, which is the point: on a prefill worker the GIL belongs to the
+        model's own step for most of a pass, and a fire that waits for it
+        would give back the window the bell just opened.
         """
         start = time.perf_counter()
         # How long this sat behind other requests. With four submit workers a
@@ -4748,8 +5042,10 @@ class TPURaidenConnectorWorker:
         queue_ms = 0.0 if queued_at is None else (start - queued_at) * 1000
         timings: dict[str, float] = {}
         try:
+            arm = (None if arm_group is None else self._bell_arm(
+                arm_group, arm_generation))
             if self._start_stage3_transfer_with_d5_retry(
-                    facade, timings, **call_kwargs) is not True:
+                    facade, timings, arm, **call_kwargs) is not True:
                 raise RuntimeError("source controller rejected the transfer")
         except Exception as exc:  # pylint: disable=broad-except
             logger.error(

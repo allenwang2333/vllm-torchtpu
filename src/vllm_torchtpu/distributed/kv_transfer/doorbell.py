@@ -20,11 +20,14 @@ A doorbell breaks that into fifteen smaller signals: each full-attention layer
 stores a counter into HBM right after it writes its slice of the cache, so
 progress becomes visible while the pass is still running.
 
-Nothing acts on the value yet, and deliberately so. The way this idea fails is
-cost rather than correctness: the store sits in the compiled graph, where it
-may serialize work XLA would otherwise overlap. That is a throughput question
-and it wants answering on its own, against a baseline, before anything is
-built on top.
+Nothing acted on the value until the cost of ringing had been measured on its
+own, because the way this idea fails is cost rather than correctness: the
+store sits in the compiled graph, where it may serialize work XLA would
+otherwise overlap. On Qwen3.5-397B ringing and polling moved mean TTFT between
+-0.58% and +0.25% across eight legs with mixed signs, which is noise, and the
+fifteen groups arrived a median of 1334 ms apart. So there is a window and it
+is free to watch, and `DoorbellWatcher.arm` now hands a prepared transfer to
+the polling thread to fire inside it.
 
 The reading is done by raiden's `DoorbellReader`, a C++ thread that copies the
 buffer to the host on a fixed cadence and records when each counter first rose.
@@ -65,6 +68,8 @@ in place, which any reader would take for progress that has not happened yet.
 A counter that only ever rises cannot be misread that way.
 """
 
+import json
+import time
 from typing import Optional, Sequence
 
 import jax
@@ -330,6 +335,11 @@ class DoorbellSet:
                                      FIRST_GENERATION - 1,
                                      dtype=torch.int32,
                                      device=device)
+        # A host mirror of the same number. Anyone arming a watch needs to
+        # name the generation the next forward will stamp, and reading it off
+        # the device tensor to find out would be a synchronous device read on
+        # the model runner's own thread.
+        self._generation = FIRST_GENERATION - 1
 
         # Set by `prebuild`. Held here rather than in a module-level cache
         # because under PCP the mesh comes from `get_pcp_streaming_mesh()`,
@@ -422,7 +432,18 @@ class DoorbellSet:
     def next_generation(self) -> int:
         """Advance the counter. Host-side, between steps, never under trace."""
         self.generation += 1
-        return int(self.generation[0, 0, 0])
+        self._generation += 1
+        return self._generation
+
+    def coming_generation(self) -> int:
+        """What the next forward will write. Free, and never a device read.
+
+        A watch armed for this value releases when the forward about to be
+        issued reaches the group it names. Arming for anything earlier fires
+        against pages that forward has not written yet, so callers that
+        cannot promise their request is in the next forward must not use it.
+        """
+        return self._generation + 1
 
     def read(self) -> list[int]:
         """This chip's value per group. Costs one 60 KiB device read.
@@ -551,13 +572,66 @@ class DoorbellWatcher:
         logger.info("KV doorbell reader polling %d groups every %.0f us",
                     self._reader.num_groups(), poll_interval_ns / 1000.0)
 
+    def arm(self, group: int, generation: int, client, req_id: str,
+            uuid: int) -> int:
+        """Have the polling thread fire a prepared transfer when a bell rings.
+
+        The callback is built in C++ over the client, the request id and the
+        uuid, so the fire never waits on the interpreter. On a prefill worker
+        the GIL is held by the model's own step for most of a pass, which is
+        the entire window this is trying to claim.
+
+        Returns the watch id, for `cancel`.
+        """
+        return int(
+            self._reader.arm_transfer(group=group,
+                                      generation=generation,
+                                      client=client,
+                                      req_id=str(req_id),
+                                      uuid=int(uuid)))
+
+    def cancel(self, watch_id: int) -> bool:
+        """Drop a watch. True if it was still armed, so it will never fire."""
+        return bool(self._reader.cancel_watch(int(watch_id)))
+
     def after_step(self) -> None:
         """Called once per forward pass, from the host, between steps."""
         self._steps += 1
+        self._drain_firings()
         if self._steps % self._report_every:
             return
         self._collect()
         self._report()
+
+    def _drain_firings(self) -> None:
+        """Log what the polling thread fired, one line per transfer.
+
+        Every step rather than every report, because a firing is a transfer
+        that has already left and its timestamps are the only record of when.
+        A failure is logged loudly: the fire is what makes decode's arrival
+        count add up, so one that never happened is a request that hangs
+        until the consumer's fallback timer notices.
+        """
+        for fired in self._reader.drain_firings():
+            if fired.failed:
+                logger.error(
+                    "KV doorbell fire failed for watch %d on group %d: %s",
+                    fired.id, fired.group, fired.error)
+                continue
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage7_doorbell_fired",
+                        "watch_id": fired.id,
+                        "group": fired.group,
+                        "generation": fired.generation,
+                        "armed_to_fired_ms":
+                        (fired.fired_nanos - fired.armed_nanos) / 1e6,
+                        "fire_ms": fired.fire_nanos / 1e6,
+                        "t": time.time(),
+                    },
+                    sort_keys=True))
 
     def _collect(self) -> None:
         for sighting in self._reader.drain_sightings():

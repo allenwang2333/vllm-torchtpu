@@ -1295,3 +1295,217 @@ class TestEarlyLayerGroupLayout:
         assert _send_meta_fa_group(MagicMock()) is None
         assert _send_meta_fa_group(SimpleNamespace()) is None
         assert _send_meta_fa_group(SimpleNamespace(fa_group=1)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage 7c: the early group emitted in the step that computes it
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _arming_on(on: bool = True):
+    """Everything _doorbell_arm_enabled checks, in one place.
+
+    All four have to agree before a send is built ahead of its pages, so a
+    test that flips one of them off is testing the gate rather than the
+    feature.
+    """
+    with _early_layers_on(), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL_ARM", on, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL", True, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL_POLL_US", 200, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_STAGE6_PREPARE", True, create=True), \
+         patch(f"{_MOD}._stage6_prepare_fire_supported", return_value=True):
+        yield
+
+
+class TestEarlyGroupEmittedBeforeItsForward:
+    """The send is built during the step whose forward will write its pages.
+
+    Stage 7b built it afterwards, in request_finished, which is where every
+    other send here is built and is one step too late to use a bell: by then
+    all fifteen groups have rung, and on 397B group 0's rang about 1.3 s
+    earlier. Building it beforehand is only safe because of the arm_on_bell
+    flag it carries, which is the worker's instruction not to fire it.
+    """
+
+    def _admitted(self, prompt=PAGE + 1, uuids=(900, 901)):
+        producer, notifier = _producer()
+        req = _request("short", prompt)
+        with _arming_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(uuids[0]):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=list(uuids)))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        _give_destination(producer, "short",
+                          _published_destination(900, [200]))
+        return producer, req, notifier
+
+    def _build(self, producer, step, *, on=True):
+        with _arming_on(on):
+            with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                       return_value=30.0):
+                return producer.build_connector_meta(step)
+
+    def _finish(self, producer, req):
+        with _arming_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                return producer.request_finished(req, [100])
+
+    def test_the_early_group_is_in_the_metadata_of_the_last_step(self):
+        producer, _req, _n = self._admitted()
+        meta = self._build(
+            producer,
+            _step(new=[("short", [100])], scheduled={"short": PAGE + 1}))
+        early = meta.reqs_to_send["short#c0"]
+        assert early.uuid == 901
+        assert early.fa_group == 0
+        # The instruction that makes building it here legitimate.
+        assert early.arm_on_bell == 0
+        assert (early.start_token, early.num_tokens) == (0, PAGE)
+
+    def test_a_step_that_does_not_finish_the_prompt_emits_nothing(self):
+        """The test that says this is not simply 'emit earlier'. Group 0's
+        bell rings in every forward, so a send armed in a step that is not
+        the last would fire against a prompt that is only part written."""
+        producer, _req, _n = self._admitted(prompt=BUDGET * 2)
+        meta = self._build(
+            producer,
+            _step(new=[("short", [100])], scheduled={"short": BUDGET}))
+        assert meta.reqs_to_send == {}
+
+    def test_request_finished_does_not_send_it_a_second_time(self):
+        producer, req, _n = self._admitted()
+        self._build(
+            producer,
+            _step(new=[("short", [100])], scheduled={"short": PAGE + 1}))
+        producer.reqs_to_send.clear()
+        self._finish(producer, req)
+        # Only the final send, and it still knows the early group went
+        # without it, because what it carries depends on that.
+        assert set(producer.reqs_to_send) == {"short"}
+        assert producer.reqs_to_send["short"].fa_group == 1
+
+    def test_with_arming_off_it_waits_for_request_finished(self):
+        """The stage gate. Off, this is stage 7b to the byte: nothing is built
+        before its pages exist, so nothing depends on a bell to be correct."""
+        producer, req, _n = self._admitted()
+        meta = self._build(producer,
+                           _step(new=[("short", [100])],
+                                 scheduled={"short": PAGE + 1}),
+                           on=False)
+        assert meta.reqs_to_send == {}
+        self._finish(producer, req)
+        early = producer.reqs_to_send["short#c0"]
+        assert early.arm_on_bell is None
+
+    def test_without_decodes_pages_it_falls_through_to_the_late_path(self):
+        """There is no waiting available here; this is the last step. Leaving
+        it alone hands request_finished a request in exactly the state stage
+        7b expects, which is a working fallback rather than a lost send."""
+        producer, notifier = _producer()
+        req = _request("short", PAGE + 1)
+        with _arming_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=[900, 901]))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        meta = self._build(
+            producer,
+            _step(new=[("short", [100])], scheduled={"short": PAGE + 1}))
+        assert meta.reqs_to_send == {}
+
+        _give_destination(producer, "short",
+                          _published_destination(900, [200]))
+        self._finish(producer, req)
+        assert producer.reqs_to_send["short#c0"].arm_on_bell is None
+
+    def test_the_bell_and_the_chunks_compose(self):
+        """The two splits are on different axes and they meet cleanly here.
+
+        By the last step the leading chunks have shipped tokens [0, BUDGET)
+        with every layer, so the early group owes only the tokens behind them
+        and only its own layers. The forward this step is about to run is what
+        writes those tokens, and its group-0 bell is exactly the signal that
+        the part the early send names is finished."""
+        producer, notifier = _producer()
+        req = _request("long", BUDGET * 2)
+        with _arming_on(), _chunk_split_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=[900, 901, 902]))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        _give_destination(producer, "long",
+                          _published_destination(900, list(range(200, 208))))
+        with _arming_on(), _chunk_split_on():
+            with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                       return_value=30.0):
+                producer.build_connector_meta(
+                    _step(new=[("long", list(range(100, 108)))],
+                          scheduled={"long": BUDGET}))
+                meta = producer.build_connector_meta(
+                    _step(cached=[("long", [])], scheduled={"long": BUDGET}))
+        # Chunk 0, held one step and emitted now, plus the early group at the
+        # next index. Decode was told to expect both and derives each id from
+        # its position, so this is the announcement coming true.
+        assert set(meta.reqs_to_send) == {"long#c0", "long#c1"}
+        early = meta.reqs_to_send["long#c1"]
+        assert early.arm_on_bell == 0
+        assert early.fa_group == 0
+        assert early.start_token == BUDGET
+        # Chunk 0 carries every layer and waits on a device event, because the
+        # forward that wrote it has already been issued. Only the send whose
+        # forward has not run yet waits on a bell.
+        assert meta.reqs_to_send["long#c0"].arm_on_bell is None
+
+
+class TestArmGeneration:
+    """Which forward's bell a send waits for.
+
+    The whole risk of stage 7c is in this number. Naming a generation the
+    request's KV is not finished in ships pages that still hold the previous
+    request's data, which is the failure the first attempt at doorbells hit
+    and never explained. Naming one too late costs a pass and nothing else,
+    so every case here resolves towards later.
+    """
+
+    def _worker(self, *, generation=7, chunks=1, reader=True):
+        worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
+        bells = SimpleNamespace(coming_generation=lambda: generation + 1)
+        worker.runner = SimpleNamespace(
+            _doorbells=bells,
+            _doorbell_watcher=object() if reader else None,
+            _dp_step_num_chunks=chunks)
+        return worker
+
+    def test_a_single_chunk_step_waits_for_the_next_forward(self):
+        assert self._worker(generation=7)._arm_generation() == 8
+
+    def test_a_multi_chunk_step_waits_for_the_last_of_them(self):
+        """Each chunk is a forward of its own and rings the bells again. A
+        request's tokens can be in any of them, so the only generation that
+        is certainly after all of this request's KV is the last."""
+        assert self._worker(generation=7, chunks=4)._arm_generation() == 11
+
+    def test_no_reader_answers_zero_rather_than_guessing(self):
+        """Zero is what tells the caller not to send at all. Firing without a
+        bell would ship pages the forward has not written, and there is no
+        third option that both ships and waits."""
+        assert self._worker(reader=False)._arm_generation() == 0
+
+    def test_no_runner_at_all_answers_zero(self):
+        worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
+        assert worker._arm_generation() == 0
+
+    def test_a_zero_chunk_count_is_read_as_one(self):
+        """The runner leaves it at zero until the first step sets it, and a
+        count of zero would name the generation before the coming one."""
+        assert self._worker(generation=7, chunks=0)._arm_generation() == 8

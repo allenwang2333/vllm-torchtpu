@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL_CHECK_TOKENS: int = 256
     TPU_KV_DOORBELL_POLL_US: int = 0
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
+    TPU_KV_DOORBELL_ARM: bool = False
     TPU_KV_EARLY_LAYERS: int = 0
     TPU_KV_ADMISSION_REORDER: bool = False
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
@@ -501,6 +502,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two log lines, so it is cheap, but not cheap enough to want per step.
     "TPU_KV_DOORBELL_REPORT_EVERY":
     lambda: int(os.getenv("TPU_KV_DOORBELL_REPORT_EVERY") or "200"),
+
+    # Stage 7c. Let the early attention group's transfer be fired by the
+    # reader's polling thread when group 0's bell rings, instead of after the
+    # forward pass that rang it has finished. This is the whole point of the
+    # bells; everything before it only established that the window exists and
+    # costs nothing. Off leaves the early group shipping at the end of the
+    # pass alongside the late group, which is stage 7b.
+    #
+    # Needs TPU_KV_DOORBELL, a non-zero TPU_KV_DOORBELL_POLL_US and a
+    # TPU_KV_EARLY_LAYERS split to do anything, and silently does nothing
+    # without them: the arming path only ever runs for a send the early-layer
+    # split created, and only when the reader exists to arm against.
+    "TPU_KV_DOORBELL_ARM":
+    lambda: bool(int(os.getenv("TPU_KV_DOORBELL_ARM", "0"))),
 
     # Stage 7. How many of the leading full-attention layers form the early
     # group, the one a doorbell can release before the forward pass has

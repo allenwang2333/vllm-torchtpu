@@ -4352,6 +4352,76 @@ class TestStage6PrepareFire:
             "split-me", 4242)
 
 
+class TestStage7cArmInsteadOfFire:
+    """Stage 7c hands the prepared plan to a doorbell rather than firing it.
+
+    From the dispatcher's point of view this is one substitution: something
+    other than fire_transfer closes out the prepare. What has to survive the
+    substitution is the cleanup contract, because an arm that raises leaves
+    exactly the same armed plan holding the same source registration claim as
+    a fire that raises, and the retry behind it would come back to
+    AlreadyExists.
+    """
+
+    _KWARGS = dict(req_id="ring-me", uuid=77, num_tokens=8192)
+
+    @staticmethod
+    def _facade():
+        facade = MagicMock()
+        facade.prepare_transfer.return_value = None
+        facade.fire_transfer.return_value = None
+        return facade
+
+    @contextmanager
+    def _stage6(self, *, requested=True):
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_STAGE6_PREPARE",
+                   requested,
+                   create=True), patch(
+                       f"{_MOD}._stage6_prepare_fire_supported",
+                       return_value=True):
+            yield
+
+    def test_the_bell_takes_the_fire_half_and_nothing_else(self):
+        facade = self._facade()
+        armed = []
+        timings = {}
+        with self._stage6():
+            assert _dispatch_stage3_transfer(facade,
+                                             timings,
+                                             lambda r, u: armed.append((r, u)),
+                                             **self._KWARGS) is True
+        # The whole block list still goes out once, up front, exactly as it
+        # does without a bell. Only the trigger moved.
+        facade.prepare_transfer.assert_called_once_with(**self._KWARGS)
+        facade.fire_transfer.assert_not_called()
+        assert armed == [("ring-me", 77)]
+        # arm_ms rather than fire_ms, so a log line says which path ran.
+        assert set(timings) == {"prepare_ms", "arm_ms"}
+
+    def test_a_failed_arm_discards_the_plan_like_a_failed_fire(self):
+        facade = self._facade()
+
+        def _explode(req_id, uuid):
+            raise RuntimeError("no reader")
+
+        with self._stage6():
+            with pytest.raises(RuntimeError, match="no reader"):
+                _dispatch_stage3_transfer(facade, None, _explode,
+                                          **self._KWARGS)
+        facade.discard_prepared_transfer.assert_called_once_with("ring-me", 77)
+
+    def test_arming_without_the_split_refuses_rather_than_firing(self):
+        """The one way this could ship unwritten pages. Without stage 6 there
+        is no prepared plan to hand over, and the single-call path would send
+        the transfer on the spot, before the forward that fills it."""
+        facade = self._facade()
+        with self._stage6(requested=False):
+            with pytest.raises(RuntimeError, match="TPU_KV_STAGE6_PREPARE"):
+                _dispatch_stage3_transfer(facade, None, lambda r, u: None,
+                                          **self._KWARGS)
+        facade.start_transfer.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestTPUConnectorWorkerInit — construction-time state
 # ---------------------------------------------------------------------------

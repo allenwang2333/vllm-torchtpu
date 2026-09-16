@@ -49,6 +49,14 @@ class SendMeta:
     # whole prompt but only its own layers, so it is split on a different axis
     # from a chunk and the two compose.
     fa_group: int | None = None
+    # Stage 7c. Set when this send was built before the forward that writes
+    # its pages, to be released by that group's doorbell rather than fired on
+    # arrival. It is the whole difference between building the transfer early
+    # and shipping it early. The worker must honour it: firing a send marked
+    # this way without waiting for the bell ships pages the model has not
+    # written, which is why it is a field on the send rather than a choice the
+    # worker makes for itself.
+    arm_on_bell: int | None = None
 
 
 @dataclass
