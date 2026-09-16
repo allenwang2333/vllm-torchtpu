@@ -13,10 +13,9 @@
 # limitations under the License.
 """Tests for batch_tile_idx, bq_idx, and bkv_idx metadata (GDN v3 style)."""
 
-from absl.testing import absltest
-from absl.testing import parameterized
 import jax.numpy as jnp
 import numpy as np
+from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
@@ -183,13 +182,10 @@ class MetadataTest(parameterized.TestCase):
 
     def test_mixed_config_and_print_schedule(self):
         """Test config with B=13 from streamindex_topk_test.py."""
-        B = 13
-        T_list = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 256, 2, 8]
         S_list = [128, 64, 32, 256, 128, 128, 64, 32, 256, 128, 32, 64, 256]
         seq_lens = jnp.array(S_list, dtype=jnp.int32)
         cu_q_lens = jnp.array(
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 266, 268, 276],
-            dtype=jnp.int32)
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 266, 268, 276], dtype=jnp.int32)
         bq_sz = 64
         bkv_p = 2
         page_size = 64
@@ -295,9 +291,8 @@ class MetadataTest(parameterized.TestCase):
                 start_s = int(meta.start_seq_idx[p])
                 bq = int(meta.bq_idx[p])
                 bkv = int(meta.bkv_idx[p])
-                seq_str = (
-                    f"seqs {s_idx}..{s_idx + 3}"
-                    if "Batched" in label else f"seq {s_idx}")
+                seq_str = (f"seqs {s_idx}..{s_idx + 3}"
+                           if "Batched" in label else f"seq {s_idx}")
                 schedule.append((
                     tile_count,
                     f"{label} ({seq_str}) [start_seq={start_s}]",

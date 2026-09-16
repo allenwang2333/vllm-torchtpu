@@ -410,14 +410,14 @@ def test_comparison_detects_a_wrong_index(corruption):
     "b,n,k",
     [
         (32, 2048, 256),  # single_stage
-        (4, 8192, 256),   # two_stage
+        (4, 8192, 256),  # two_stage
     ],
 )
 def test_return_scores(b: int, n: int, k: int):
     """Verifies that return_scores=True returns matching scores for winners and -inf for pad."""
     np.random.seed(800 + b + n + k)
     scores = np.random.randn(b, n).astype(np.float32)
-    row_lengths = np.random.randint(k, n + 1, size=(b,), dtype=np.int32)
+    row_lengths = np.random.randint(k, n + 1, size=(b, ), dtype=np.int32)
 
     actual_idxs, actual_scores_bits = sparsecore_topk(
         jnp.array(scores),
@@ -428,14 +428,14 @@ def test_return_scores(b: int, n: int, k: int):
     assert _mismatch(scores, actual_idxs, k, row_lengths) is None
 
     actual_scores = np.asarray(
-        jax.lax.bitcast_convert_type(actual_scores_bits, jnp.float32)
-    )
+        jax.lax.bitcast_convert_type(actual_scores_bits, jnp.float32))
     for r in range(b):
         for i in range(k):
             idx = int(actual_idxs[r, i])
             score_val = actual_scores[r, i]
             if idx >= 0:
-                np.testing.assert_allclose(score_val, scores[r, idx], rtol=1e-5)
+                np.testing.assert_allclose(score_val,
+                                           scores[r, idx],
+                                           rtol=1e-5)
             else:
                 assert score_val == -np.inf
-

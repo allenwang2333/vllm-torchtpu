@@ -732,9 +732,7 @@ def test_streamindex_topk_early_exit_keeps_causal_mask():
 
 def test_pallas_smem_oom_when_unclamped(monkeypatch):
     """Verifies that Pallas compilation of _scores_kernel fails with SMEM OOM"""
-    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-        metadata,
-    )
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
     orig_compute_metadata = metadata.compute_metadata
 
@@ -744,9 +742,9 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
         # In Pallas, 100,000 steps require ~2.4 MB of SMEM.
         return metadata.MetadataRef.create(
             num_steps=res.num_steps,
-            batch_tile_idx=jnp.zeros((100000,), dtype=jnp.int32),
-            bq_idx=jnp.zeros((100000,), dtype=jnp.int32),
-            bkv_idx=jnp.zeros((100000,), dtype=jnp.int32),
+            batch_tile_idx=jnp.zeros((100000, ), dtype=jnp.int32),
+            bq_idx=jnp.zeros((100000, ), dtype=jnp.int32),
+            bkv_idx=jnp.zeros((100000, ), dtype=jnp.int32),
         )
 
     monkeypatch.setattr(
@@ -764,9 +762,11 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
     q = jnp.zeros((num_seqs * seq_len, 1, head_dim), dtype=jnp.float32)
     weights = jnp.ones((num_seqs * seq_len, 1), dtype=jnp.float32)
     cache_kv = jnp.zeros((total_pages, 32, 4, width), dtype=np.uint8)
-    seq_lens = jnp.full((num_seqs,), seq_len, dtype=jnp.int32)
+    seq_lens = jnp.full((num_seqs, ), seq_len, dtype=jnp.int32)
     page_indices = jnp.arange(total_pages, dtype=jnp.int32)
-    cu_q_lens = jnp.arange(0, (num_seqs + 1) * seq_len, seq_len, dtype=jnp.int32)
+    cu_q_lens = jnp.arange(0, (num_seqs + 1) * seq_len,
+                           seq_len,
+                           dtype=jnp.int32)
     distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
 
     with pytest.raises(Exception) as exc_info:
@@ -808,11 +808,12 @@ def test_streamindex_topk_buffer_count():
     width = ((record_width + 127) // 128) * 128
 
     rng = np.random.default_rng(42)
-    q = jnp.array(rng.standard_normal((total_tokens, H_I, D)), dtype=jnp.float32)
-    weights = jnp.array(
-        rng.standard_normal((total_tokens, H_I)), dtype=jnp.float32
-    )
-    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width), dtype=jnp.uint8)
+    q = jnp.array(rng.standard_normal((total_tokens, H_I, D)),
+                  dtype=jnp.float32)
+    weights = jnp.array(rng.standard_normal((total_tokens, H_I)),
+                        dtype=jnp.float32)
+    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width),
+                         dtype=jnp.uint8)
     seq_lens = jnp.array([S] * B, dtype=jnp.int32)
     page_indices = jnp.arange(num_pages, dtype=jnp.int32)
     cu_q_lens = jnp.array([0, T, 2 * T], dtype=jnp.int32)
@@ -872,51 +873,32 @@ def test_streamindex_topk_buffer_count():
 
 
 def test_streamindex_topk_return_scores_and_validation():
-  q_dtype = jnp.float8_e4m3fn
-  kv_dtype = jnp.uint8
-  b = 2
-  t = 4
-  s = 128
-  total_tokens = b * t
-  h_i = 4
-  d_i = 128
-  k = 16
-  comp_ratio = 1
-  page_size = 64
-  bkv_p = 2
-  bq_sz = 4
-  width = 256
+    q_dtype = jnp.float8_e4m3fn
+    kv_dtype = jnp.uint8
+    b = 2
+    t = 4
+    s = 128
+    total_tokens = b * t
+    h_i = 4
+    d_i = 128
+    k = 16
+    comp_ratio = 1
+    page_size = 64
+    bkv_p = 2
+    bq_sz = 4
+    width = 256
 
-  num_pages = b * (s // page_size)
-  q = jnp.ones((total_tokens, h_i, d_i), dtype=q_dtype)
-  weights = jnp.ones((total_tokens, h_i), dtype=jnp.float32)
-  cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width), dtype=kv_dtype)
-  seq_lens = jnp.array([s] * b, dtype=jnp.int32)
-  page_indices = jnp.arange(num_pages, dtype=jnp.int32)
-  cu_q_lens = jnp.array([0, t, 2 * t], dtype=jnp.int32)
-  distribution = jnp.array([0, 0, b], dtype=jnp.int32)
+    num_pages = b * (s // page_size)
+    q = jnp.ones((total_tokens, h_i, d_i), dtype=q_dtype)
+    weights = jnp.ones((total_tokens, h_i), dtype=jnp.float32)
+    cache_kv = jnp.zeros((num_pages, page_size // 4, 4, width), dtype=kv_dtype)
+    seq_lens = jnp.array([s] * b, dtype=jnp.int32)
+    page_indices = jnp.arange(num_pages, dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, t, 2 * t], dtype=jnp.int32)
+    distribution = jnp.array([0, 0, b], dtype=jnp.int32)
 
-  # 1. return_scores=True
-  idxs, scores = streamindex_topk(
-      q=q,
-      indexer_weights=weights,
-      cache_kv=cache_kv,
-      seq_lens=seq_lens,
-      page_indices=page_indices,
-      cu_q_lens=cu_q_lens,
-      distribution=distribution,
-      k=k,
-      compression_ratio=comp_ratio,
-      num_kv_pages_per_block=bkv_p,
-      num_queries_per_block=bq_sz,
-      return_scores=True,
-  )
-  assert idxs.shape == (total_tokens, k)
-  assert scores.shape == (total_tokens, k)
-
-  # 2. cp_size < 1 raises ValueError
-  with pytest.raises(ValueError, match="cp_size must be >= 1"):
-    streamindex_topk(
+    # 1. return_scores=True
+    idxs, scores = streamindex_topk(
         q=q,
         indexer_weights=weights,
         cache_kv=cache_kv,
@@ -928,70 +910,88 @@ def test_streamindex_topk_return_scores_and_validation():
         compression_ratio=comp_ratio,
         num_kv_pages_per_block=bkv_p,
         num_queries_per_block=bq_sz,
-        cp_size=0,
-    )
-
-  # 3. interleave_size not multiple of compression_ratio
-  with pytest.raises(
-      ValueError, match="must be a multiple of compression_ratio"
-  ):
-    streamindex_topk(
-        q=q,
-        indexer_weights=weights,
-        cache_kv=cache_kv,
-        seq_lens=seq_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        k=k,
-        compression_ratio=2,
-        num_kv_pages_per_block=bkv_p,
-        num_queries_per_block=bq_sz,
-        cp_size=2,
-        interleave_size=3,
-    )
-
-  # 4. enable_early_exit with cp_size > 1
-  with pytest.raises(
-      NotImplementedError,
-      match="enable_early_exit is not supported with cp_size > 1",
-  ):
-    streamindex_topk(
-        q=q,
-        indexer_weights=weights,
-        cache_kv=cache_kv,
-        seq_lens=seq_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        k=k,
-        compression_ratio=comp_ratio,
-        num_kv_pages_per_block=bkv_p,
-        num_queries_per_block=bq_sz,
-        enable_early_exit=True,
-        cp_size=2,
-    )
-
-  # 5. return_scores with enable_early_exit
-  with pytest.raises(
-      NotImplementedError,
-      match="return_scores is not supported with enable_early_exit",
-  ):
-    streamindex_topk(
-        q=q,
-        indexer_weights=weights,
-        cache_kv=cache_kv,
-        seq_lens=seq_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        k=k,
-        compression_ratio=comp_ratio,
-        num_kv_pages_per_block=bkv_p,
-        num_queries_per_block=bq_sz,
-        enable_early_exit=True,
         return_scores=True,
     )
+    assert idxs.shape == (total_tokens, k)
+    assert scores.shape == (total_tokens, k)
+
+    # 2. cp_size < 1 raises ValueError
+    with pytest.raises(ValueError, match="cp_size must be >= 1"):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            cp_size=0,
+        )
+
+    # 3. interleave_size not multiple of compression_ratio
+    with pytest.raises(ValueError,
+                       match="must be a multiple of compression_ratio"):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=2,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            cp_size=2,
+            interleave_size=3,
+        )
+
+    # 4. enable_early_exit with cp_size > 1
+    with pytest.raises(
+            NotImplementedError,
+            match="enable_early_exit is not supported with cp_size > 1",
+    ):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            enable_early_exit=True,
+            cp_size=2,
+        )
+
+    # 5. return_scores with enable_early_exit
+    with pytest.raises(
+            NotImplementedError,
+            match="return_scores is not supported with enable_early_exit",
+    ):
+        streamindex_topk(
+            q=q,
+            indexer_weights=weights,
+            cache_kv=cache_kv,
+            seq_lens=seq_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            k=k,
+            compression_ratio=comp_ratio,
+            num_kv_pages_per_block=bkv_p,
+            num_queries_per_block=bq_sz,
+            enable_early_exit=True,
+            return_scores=True,
+        )
 
 
 def main(argv):
