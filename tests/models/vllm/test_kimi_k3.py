@@ -1077,15 +1077,30 @@ def test_kda_construction_rejects_duplicate_prefix(
                                               prefix="model.layers.0.kda")
 
 
-def test_kda_construction_rejects_speculative_decode() -> None:
-    """TPU KDA does not support speculative decoding. This is the very first
-    check in the constructor, so a bare object with a `speculative_config`
-    attribute is enough to reach it."""
+@pytest.mark.parametrize("num_spec_tokens", [0, 5, 7])
+def test_kda_construction_passes_speculative_window_to_op(
+        monkeypatch: pytest.MonkeyPatch, num_spec_tokens: int) -> None:
+    """Ordinary decode and speculative decode pass their window to the op."""
+    _patch_kda_construction_deps(monkeypatch)
     config = _kda_config()
-    fake_vllm_config = SimpleNamespace(speculative_config=object())
+    vllm_config = VllmConfig()
+    vllm_config.speculative_config = (SimpleNamespace(
+        num_speculative_tokens=num_spec_tokens) if num_spec_tokens else None)
+    received = {}
 
-    with pytest.raises(NotImplementedError, match="speculative decode"):
-        kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="x")
+    def build_op(prefix, **kwargs):
+        received.update(kwargs)
+        return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(kimi_attention, "build_kimi_dispatched_kda_op",
+                        build_op)
+    with set_current_vllm_config(vllm_config):
+        layer = kimi_attention.KimiDeltaAttention(config,
+                                                  vllm_config,
+                                                  prefix="model.layers.0.kda")
+
+    assert layer.num_spec_tokens == num_spec_tokens
+    assert received["num_spec_tokens"] == num_spec_tokens
 
 
 def test_kda_construction_rejects_missing_linear_attn_config() -> None:
@@ -1135,6 +1150,7 @@ def _kda_metadata() -> SimpleNamespace:
         mamba_state_indices=torch.tensor([0], dtype=torch.int32),
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=None,
         mamba_slot_read_offsets=None,
     )
 
@@ -1232,6 +1248,8 @@ def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op(
     monkeypatch.setattr(kimi_attention, "get_tp_group",
                         lambda: SimpleNamespace(all_reduce=lambda x: x))
     layer = _make_bare_kda_layer(use_full_rank_gate=True)
+    metadata = layer._metadata()
+    layer._metadata = lambda: metadata
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
     layer.kv_cache = (sconv_cache, recurrent_cache)
@@ -1243,6 +1261,8 @@ def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op(
         received["output_gate"] = output_gate
         assert args[0] is sconv_cache
         assert args[1] is recurrent_cache
+        assert args[-2] is metadata.request_distribution
+        assert args[-1] is metadata.mamba_state_indices
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     layer.dispatched_kda_op = dispatched_kda_op
