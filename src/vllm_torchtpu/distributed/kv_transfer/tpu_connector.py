@@ -3081,6 +3081,11 @@ class TPURaidenConnectorWorker:
         self._stage3_submitted_loads: dict[str, int] = {}
         self._stage3_submitted_load_tokens: dict[str, int] = {}
         self._stage3_load_start_times: dict[str, float] = {}
+        # Same instant as the line above, on the wall clock rather than the
+        # monotonic one. perf_counter cannot be compared against the proxy's
+        # timestamps, so without this the post-prefill window can be measured
+        # end to end but never split at the point the transfer begins.
+        self._stage3_load_start_wall: dict[str, float] = {}
         self._legacy_registered_sends: set[str] = set()
         self._legacy_submitted_loads: set[str] = set()
         # Consumer-side facades for the producers' controllers, keyed by
@@ -4929,6 +4934,7 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
             self._stage3_load_start_times[
                 destination_req_id] = time.perf_counter()
+            self._stage3_load_start_wall[destination_req_id] = time.time()
             # One whole-cache transfer per request, or one per prefill chunk
             # when stage 6.5 split it. Stage 7 raises this again, to one per
             # early-shipped layer group plus the final one.
@@ -5970,6 +5976,8 @@ class TPURaidenConnectorWorker:
                     pending.attempts,
                     "submit_wait_ms":
                     (time.perf_counter() - pending.first_attempt_s) * 1000.0,
+                    "t":
+                    time.time(),
                 },
                 sort_keys=True,
             ),
@@ -6133,6 +6141,10 @@ class TPURaidenConnectorWorker:
             self._load_block_ids.pop(req_id, None)
             self._stage3_submitted_loads.pop(req_id, None)
             self._stage3_submitted_load_tokens.pop(req_id, None)
+            # Both start-time dicts were retained for the life of the process
+            # until now, which is a slow leak on a long-running decode engine.
+            self._stage3_load_start_times.pop(req_id, None)
+            self._stage3_load_start_wall.pop(req_id, None)
             self._stage3_controller_accepted.discard(req_id)
             self._stage3_pending_controller_failures.pop(req_id, None)
             self._stage3_pending_submits.pop(req_id, None)
@@ -6351,6 +6363,15 @@ class TPURaidenConnectorWorker:
                                 "uuid": uuid,
                                 "num_tokens": num_tokens,
                                 "reshard_e2e_latency_ms": latency_ms,
+                                # Wall clock at both ends of the transfer, so
+                                # the proxy's decode_send and first_chunk can
+                                # be differenced against them. What is left on
+                                # either side is admission before the transfer
+                                # and the first decode step after it, which is
+                                # the split nothing in the tree has measured.
+                                "t": time.time(),
+                                "load_start_t":
+                                self._stage3_load_start_wall.get(req_id),
                             },
                             sort_keys=True,
                         ),
