@@ -150,6 +150,8 @@ DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-CUSTOM}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
+TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD:-0}"
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
 TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB:-8}"
 TPUMISC_HMA_CHECKSUM_TRACE="${TPUMISC_HMA_CHECKSUM_TRACE:-0}"
@@ -223,6 +225,7 @@ if [[ -z "${python_bin}" || ! -x "${python_bin}" ]]; then
 fi
 
 version_log="${RUN_DIR}/logs/version_check.log"
+set +e
 {
   if [[ "${USE_CURRENT_PY_ENV}" == "1" ]]; then
     echo "python_env=current"
@@ -243,13 +246,26 @@ import vllm
 import vllm_torchtpu
 
 expected = ${EXPECTED_VLLM_VERSION@Q}
+
 print("vllm.__version__", vllm.__version__)
 print("vllm.__file__", vllm.__file__)
 print("vllm_torchtpu.__file__", vllm_torchtpu.__file__)
-if vllm.__version__ != expected:
+
+# Strip the empty device suffix from both sides
+clean_expected = expected.replace("+empty", "").replace(".empty", "")
+clean_actual = vllm.__version__.replace("+empty", "").replace(".empty", "")
+
+if clean_actual != clean_expected:
     raise SystemExit(f"vLLM version must be {expected}, got {vllm.__version__}")
 PY
 } >"${version_log}" 2>&1
+check_status=$?
+set -e
+if ((check_status != 0)); then
+  echo "ERROR: Preflight vLLM version check failed (exit ${check_status}). Output from ${version_log}:" >&2
+  cat "${version_log}" >&2
+  exit "${check_status}"
+fi
 
 prefill_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":['"${PREFILL_COMPILE_SIZES}"'],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
 decode_compilation_config='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":['"${DECODE_COMPILE_SIZES}"'],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
@@ -325,6 +341,8 @@ NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING}
 MAMBA_CACHE_MODE=${MAMBA_CACHE_MODE}
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}
+TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD}
 TPU_PREMAPPED_BUFFER_SIZE=${TPU_PREMAPPED_BUFFER_SIZE:-<plugin-default>}
 TPU_PARALLEL_PRECOMPILE=${TPU_PARALLEL_PRECOMPILE:-<plugin-default>}
 ASYNC_SCHEDULING=${ASYNC_SCHEDULING}
@@ -365,6 +383,8 @@ export VLLM_XLA_CHECK_RECOMPILATION=0;
 export USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}";
 export TPUMISC_HMA_CHECKSUM_TRACE="${TPUMISC_HMA_CHECKSUM_TRACE}";
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}";
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}";
+export TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD}";
 export XLA_PYTHON_CLIENT_PREALLOCATE=false VLLM_ALLOW_LONG_MAX_MODEL_LEN=1;
 unset VLLM_DISABLE_COMPILE_CACHE VLLM_CACHE_ROOT TORCHINDUCTOR_CACHE_DIR;
 export LIBTPU_INIT_ARGS="\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=65536";

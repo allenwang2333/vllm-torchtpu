@@ -13,7 +13,7 @@
 # limitations under the License.
 """PCP projection/communication fused with the GDN v3 compute pipeline.
 
-The Qwen3.5 FP8 entry projects QKVZ in-kernel and interleaves all but the first
+The Qwen3.5 BF16/FP8 entry projects QKVZ in-kernel and interleaves all but the first
 projection block with GDN tiles. BA exchange, gated normalization, and the
 final output projection remain outside. GDN state streams directly to and from
 the unified KV pool through a StateSourcePlan. QKV is written directly into a
@@ -39,6 +39,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import (config, memory_ref, pcp_metadata,
                                           wrapper)
+from vllm_torchtpu.kernels.gdn.v3.projection_scale import \
+    normalize_projection_scale
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,7 +211,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     stage_metadata_ref: pcp_metadata.PcpStageMetadata,
     hidden_ref: jax.Array,
     projection_weight_ref: jax.Array,
-    projection_weight_scale_ref: jax.Array,
+    projection_weight_scale_ref: jax.Array | None,
     b_ref: jax.Array,
     a_ref: jax.Array,
     state_source_ref: jax.Array,
@@ -237,13 +239,13 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     output_stage_ref: jax.Array,
     projection_x_sem: jax.Array,
     projection_weight_sem: jax.Array,
-    projection_scale_sem: jax.Array,
+    projection_scale_sem: jax.Array | None,
     projection_out_sem: jax.Array,
     projection_x_ref: jax.Array,
-    projection_x_q_ref: jax.Array,
-    projection_x_scale_ref: jax.Array,
+    projection_x_prepared_ref: jax.Array,
+    projection_x_scale_ref: jax.Array | None,
     projection_weight_vmem_ref: jax.Array,
-    projection_weight_scale_vmem_ref: jax.Array,
+    projection_weight_scale_vmem_ref: jax.Array | None,
     projection_out_ref: jax.Array,
     projection_z_out_ref: jax.Array,
     active_rows_smem_ref: jax.Array,
@@ -258,6 +260,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 ) -> None:
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
     del packed_out_hbm_ref
+    is_fp8_projection = projection_weight_ref.dtype == jnp.float8_e4m3fn
 
     rank = lax.axis_index(pcp_axis_name)
     active_rows_smem_ref[0] = stage_metadata_ref.rank_active_row_end[rank]
@@ -544,13 +547,17 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 ],
                 sem=projection_weight_sem,
             ).start()
-            pltpu.make_async_copy(
-                src_ref=projection_weight_scale_ref.at[pl.ds(
-                    source_row, width)],
-                dst_ref=projection_weight_scale_vmem_ref.at[pl.ds(
-                    destination_row, width)],
-                sem=projection_scale_sem,
-            ).start()
+            if is_fp8_projection:
+                source = (pl.ds(source_row, width), )
+                target = (pl.ds(destination_row, width), )
+                if projection_weight_scale_ref.ndim == 2:
+                    source = (slice(None), ) + source
+                    target = (slice(None), ) + target
+                pltpu.make_async_copy(
+                    src_ref=projection_weight_scale_ref.at[source],
+                    dst_ref=projection_weight_scale_vmem_ref.at[target],
+                    sem=projection_scale_sem,
+                ).start()
 
         @pl.when(is_qkv)
         def _start_qkv() -> None:
@@ -610,23 +617,30 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 _previous_projection_out_block(out_block), )
 
         @pl.when(out_block == 0)
-        def _quantize_projection_x() -> None:
+        def _prepare_projection_x() -> None:
             pltpu.make_async_copy(
                 src_ref=projection_x_ref,
                 dst_ref=projection_x_ref,
                 sem=projection_x_sem,
             ).wait()
             x = projection_x_ref[...]
-            dtype_info = jnp.finfo(projection_weight_ref.dtype)
-            x_abs_max = jnp.max(jnp.abs(x), axis=1)
-            x_scale = (x_abs_max.astype(jnp.float32) / float(dtype_info.max))
-            x_scale = jnp.where(x_scale == 0, 1.0, x_scale)
-            projection_x_q_ref[...] = jnp.clip(
-                x.astype(jnp.float32) / x_scale[:, None],
-                float(dtype_info.min),
-                float(dtype_info.max),
-            ).astype(projection_weight_ref.dtype)
-            projection_x_scale_ref[...] = x_scale
+            if is_fp8_projection:
+                dtype_info = jnp.finfo(projection_weight_ref.dtype)
+                x_abs_max = jnp.max(jnp.abs(x), axis=1)
+                x_scale = (x_abs_max.astype(jnp.float32) /
+                           float(dtype_info.max))
+                x_scale = jnp.where(x_scale == 0, 1.0, x_scale)
+                projection_x_prepared_ref[...] = jnp.clip(
+                    x.astype(jnp.float32) / x_scale[:, None],
+                    float(dtype_info.min),
+                    float(dtype_info.max),
+                ).astype(projection_weight_ref.dtype)
+                projection_x_scale_ref[...] = x_scale
+            else:
+                # Keep the operand reused across the interleaved GDN pipeline
+                # separate from the short-lived DMA destination, just as the
+                # FP8 path does after quantizing its staging tile.
+                projection_x_prepared_ref[...] = x
 
         is_qkv, destination, z_group = _projection_job(out_block)
 
@@ -635,26 +649,50 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 pl.ds(0, width),
                 :,
             ]
-            scale_ref = projection_weight_scale_vmem_ref.at[pl.ds(0, width)]
             pltpu.make_async_copy(
                 src_ref=weight_ref,
                 dst_ref=weight_ref,
                 sem=projection_weight_sem,
             ).wait()
-            pltpu.make_async_copy(
-                src_ref=scale_ref,
-                dst_ref=scale_ref,
-                sem=projection_scale_sem,
-            ).wait()
-
-            acc = jax.lax.dot_general(
-                projection_x_q_ref[...],
-                projection_weight_vmem_ref[pl.ds(0, width), :],
-                dimension_numbers=(((1, ), (1, )), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            acc *= projection_x_scale_ref[...][:, None]
-            acc *= projection_weight_scale_vmem_ref[pl.ds(0, width)][None, :]
+            blocked = (is_fp8_projection
+                       and projection_weight_scale_vmem_ref.ndim == 2)
+            if is_fp8_projection:
+                scale_slice = (pl.ds(0, width), )
+                if blocked:
+                    scale_slice = (slice(None), ) + scale_slice
+                scale_ref = projection_weight_scale_vmem_ref.at[scale_slice]
+                pltpu.make_async_copy(
+                    src_ref=scale_ref,
+                    dst_ref=scale_ref,
+                    sem=projection_scale_sem,
+                ).wait()
+            if blocked:
+                num_blocks = projection_weight_scale_vmem_ref.shape[0]
+                block_k = projection_weight_vmem_ref.shape[1] // num_blocks
+                acc = jnp.zeros((projection_token_block_size, width),
+                                jnp.float32)
+                for block in range(num_blocks):
+                    k_slice = pl.ds(block * block_k, block_k)
+                    part = jax.lax.dot_general(
+                        projection_x_prepared_ref[:, k_slice],
+                        projection_weight_vmem_ref[pl.ds(0, width), k_slice],
+                        dimension_numbers=(((1, ), (1, )), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
+                    acc += part * projection_weight_scale_vmem_ref[
+                        pl.ds(block, 1), pl.ds(0, width)]
+                acc *= projection_x_scale_ref[...][:, None]
+            else:
+                acc = jax.lax.dot_general(
+                    projection_x_prepared_ref[...],
+                    projection_weight_vmem_ref[pl.ds(0, width), :],
+                    dimension_numbers=(((1, ), (1, )), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                if is_fp8_projection:
+                    acc *= projection_x_scale_ref[...][:, None]
+                    acc *= projection_weight_scale_vmem_ref[pl.ds(
+                        0, width)][None, :]
             return acc.astype(hidden_ref.dtype)
 
         @pl.when(is_qkv)
@@ -763,7 +801,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     )
     num_z_out_blocks = num_projection_out_blocks - num_qkv_out_blocks
     # QKV for token block zero is the only unconditional prologue work.  The
-    # remaining queue keeps the original block-major order so the quantized X
+    # remaining queue keeps the original block-major order so the prepared X
     # tile is reused: block-zero Z, then every later block's QKV followed by Z.
     num_projection_work_tiles = lax.select(
         active_projection_token_blocks > 0,
@@ -1126,6 +1164,7 @@ def _scatter_compact_state_updates(
     *,
     state_stride: int,
     region: config.StateRegion,
+    whole_block_dma: bool,
 ) -> jax.Array:
     """Apply raw per-sequence state tiles to a donated unified pool.
 
@@ -1149,8 +1188,11 @@ def _scatter_compact_state_updates(
         )
 
         def _write(pool):
-            start_indices = (block_start, region.row0,
-                             *(0, ) * (state_source.ndim - 2))
+            if whole_block_dma:
+                start_indices = (block_start, *(0, ) * (state_source.ndim - 1))
+            else:
+                start_indices = (block_start, region.row0,
+                                 *(0, ) * (state_source.ndim - 2))
             return lax.dynamic_update_slice(pool, updates[sequence_id],
                                             start_indices)
 
@@ -1159,6 +1201,56 @@ def _scatter_compact_state_updates(
     # A runtime loop scales the update work with the live request count rather
     # than the compile bucket's maximum sequence capacity.
     return lax.fori_loop(0, active_bound, _apply_one, state_source)
+
+
+def _compact_state_updates_shape(
+    state_source: jax.Array,
+    num_sequences: int,
+    region: config.StateRegion,
+    *,
+    whole_block_dma: bool,
+) -> jax.ShapeDtypeStruct:
+    """Shape of one compact external-state update per sequence.
+
+    NHD can address a token-row subregion directly. HND stores tokens on the
+    minormost lane, so the V3 state seam copies complete source pages and keeps
+    all of their inner dimensions, matching ``ExternalStateBufferedRef``.
+    """
+    if whole_block_dma:
+        region_shape = (region.nblocks, *state_source.shape[1:])
+    else:
+        region_shape = (region.nblocks, region.nrows, *state_source.shape[2:])
+    return jax.ShapeDtypeStruct((num_sequences, *region_shape),
+                                state_source.dtype)
+
+
+def _validate_compact_state_writeback_plan(
+        state_plan: config.StateSourcePlan) -> None:
+    """Reject whole-page state plans that cannot be scattered independently.
+
+    The PCP kernel emits separate compact Conv and recurrent updates. With HND
+    each update contains complete source pages, so both regions must start at a
+    page boundary and must not cover the same page. Otherwise the later
+    full-page scatter would overwrite state written by the earlier one.
+    """
+    if not state_plan.whole_block_dma:
+        return
+
+    regions = (("conv", state_plan.conv), ("recurrent", state_plan.recurrent))
+    for name, region in regions:
+        if region.row0 != 0:
+            raise NotImplementedError(
+                "PCP HND state writeback requires page-aligned state regions; "
+                f"{name} starts at row {region.row0}.")
+
+    conv_end = state_plan.conv.kb0 + state_plan.conv.nblocks
+    recurrent_end = (state_plan.recurrent.kb0 + state_plan.recurrent.nblocks)
+    regions_overlap = (state_plan.conv.kb0 < recurrent_end
+                       and state_plan.recurrent.kb0 < conv_end)
+    if regions_overlap:
+        raise NotImplementedError(
+            "PCP HND state writeback requires non-overlapping Conv and "
+            "recurrent state pages.")
 
 
 @functools.partial(
@@ -1182,7 +1274,7 @@ def _scatter_compact_state_updates(
 def fused_qkvz_projection_pcp_gdn(
     hidden_states: jax.Array,
     qkvz_weight: jax.Array,
-    qkvz_weight_scale: jax.Array,
+    qkvz_weight_scale: jax.Array | None,
     b: jax.Array,
     a: jax.Array,
     state_source: jax.Array,
@@ -1270,18 +1362,21 @@ def fused_qkvz_projection_pcp_gdn(
     if hidden_states.ndim != 2 or qkvz_weight.ndim != 2:
         raise ValueError("Projection fusion requires rank-2 hidden states "
                          "and QKVZ weight.")
-    if qkvz_weight_scale.ndim != 1:
-        raise ValueError("Projection fusion requires a per-channel rank-1 "
-                         "weight scale.")
     if hidden_states.dtype != jnp.bfloat16:
         raise ValueError("Projection fusion requires BF16 hidden states, got "
                          f"{hidden_states.dtype}.")
-    if qkvz_weight.dtype != jnp.float8_e4m3fn:
-        raise ValueError("Projection fusion requires float8_e4m3fn weights, "
-                         f"got {qkvz_weight.dtype}.")
-    if qkvz_weight_scale.dtype != jnp.float32:
-        raise ValueError("Projection fusion requires FP32 weight scales, got "
-                         f"{qkvz_weight_scale.dtype}.")
+    is_fp8_projection = qkvz_weight.dtype == jnp.float8_e4m3fn
+    if is_fp8_projection:
+        if qkvz_weight_scale is None or qkvz_weight_scale.dtype != jnp.float32:
+            raise ValueError("FP8 projection requires an FP32 weight scale.")
+        qkvz_weight_scale = normalize_projection_scale(qkvz_weight.shape,
+                                                       qkvz_weight_scale)
+    elif qkvz_weight.dtype == jnp.bfloat16:
+        if qkvz_weight_scale is not None:
+            raise ValueError("BF16 projection weights must not have a scale.")
+    else:
+        raise ValueError("Projection fusion requires BF16 or float8_e4m3fn "
+                         f"weights, got {qkvz_weight.dtype}.")
     if hidden_states.shape[1] != qkvz_weight.shape[1]:
         raise ValueError("Projection input and weight K dimensions differ: "
                          f"{hidden_states.shape[1]} and "
@@ -1290,11 +1385,6 @@ def fused_qkvz_projection_pcp_gdn(
         raise ValueError("Unexpected QKVZ projection width: "
                          f"expected={expected_qkvz_dim}, "
                          f"got={qkvz_weight.shape[0]}.")
-    if qkvz_weight_scale.shape[0] != expected_qkvz_dim:
-        raise ValueError(
-            "QKVZ scale width differs from the projection weight: "
-            f"{qkvz_weight_scale.shape[0]} and "
-            f"{expected_qkvz_dim}.")
     if local_num_tokens % projection_token_block_size != 0:
         raise ValueError("Rank-local tokens must be divisible by two "
                          "communication chunks for projection fusion: "
@@ -1327,6 +1417,7 @@ def fused_qkvz_projection_pcp_gdn(
     if state_source.ndim < 3:
         raise ValueError("The unified state source must have at least three "
                          f"dimensions, got {state_source.shape}.")
+    _validate_compact_state_writeback_plan(state_plan)
 
     global_stage_tokens = pcp_size * comm_chunk_size
     tile_size = min(mixed_tile_size, global_stage_tokens, global_batch_size)
@@ -1451,29 +1542,22 @@ def fused_qkvz_projection_pcp_gdn(
         ),
         act_out_dtype,
     )
-    state_update_tail = state_source.shape[2:]
-    conv_state_updates_shape = jax.ShapeDtypeStruct(
-        (
-            state_indices.shape[0],
-            state_plan.conv.nblocks,
-            state_plan.conv.nrows,
-            *state_update_tail,
-        ),
-        state_source.dtype,
+    conv_state_updates_shape = _compact_state_updates_shape(
+        state_source,
+        state_indices.shape[0],
+        state_plan.conv,
+        whole_block_dma=state_plan.whole_block_dma,
     )
-    recurrent_state_updates_shape = jax.ShapeDtypeStruct(
-        (
-            state_indices.shape[0],
-            state_plan.recurrent.nblocks,
-            state_plan.recurrent.nrows,
-            *state_update_tail,
-        ),
-        state_source.dtype,
+    recurrent_state_updates_shape = _compact_state_updates_shape(
+        state_source,
+        state_indices.shape[0],
+        state_plan.recurrent,
+        whole_block_dma=state_plan.whole_block_dma,
     )
     projection_scratch_shapes = (
         pltpu.SemaphoreType.DMA,
         pltpu.SemaphoreType.DMA,
-        pltpu.SemaphoreType.DMA,
+        pltpu.SemaphoreType.DMA if is_fp8_projection else None,
         pltpu.SemaphoreType.DMA,
         pltpu.VMEM(
             (projection_cfg.token_block_size, hidden_states.shape[1]),
@@ -1486,15 +1570,17 @@ def fused_qkvz_projection_pcp_gdn(
         pltpu.VMEM(
             (projection_cfg.token_block_size, ),
             jnp.float32,
-        ),
+        ) if is_fp8_projection else None,
         pltpu.VMEM(
             (projection_cfg.out_block_size, hidden_states.shape[1]),
             qkvz_weight.dtype,
         ),
         pltpu.VMEM(
-            (projection_cfg.out_block_size, ),
+            ((qkvz_weight_scale.shape[0], projection_cfg.out_block_size)
+             if qkvz_weight_scale.ndim == 2 else
+             (projection_cfg.out_block_size, )),
             qkvz_weight_scale.dtype,
-        ),
+        ) if is_fp8_projection else None,
         pltpu.VMEM(
             (
                 projection_cfg.token_block_size // _TPU_TILE_ROWS,
@@ -1513,12 +1599,15 @@ def fused_qkvz_projection_pcp_gdn(
             act_out_dtype,
         ),
     )
-    metadata_leaves = len(metadata_obj)
-    stage_metadata_leaves = len(jax.tree_util.tree_leaves(stage_metadata_obj))
-    state_input_offset = metadata_leaves + stage_metadata_leaves
+    # Pallas aliases index flattened array leaves; a missing BF16 scale has
+    # no leaf. Derive the output-buffer positions from the actual prefix.
+    output_input_offset = len(
+        jax.tree_util.tree_leaves(
+            (metadata_obj, stage_metadata_obj, hidden_states, qkvz_weight,
+             qkvz_weight_scale, b, a, state_source)))
     input_output_aliases = {
-        state_input_offset + 6: 0,
-        state_input_offset + 7: 1,
+        output_input_offset: 0,
+        output_input_offset + 1: 1,
     }
     carry_shapes = cfg.get_scratch_shape_dict()
     kernel_name = ("fused_pcp_qkvz_projection_gdn_per_seq_compact_qkv"
@@ -1552,7 +1641,7 @@ def fused_qkvz_projection_pcp_gdn(
              stage_metadata_spec,
              hbm_spec,
              hbm_spec,
-             hbm_spec,
+             hbm_spec if qkvz_weight_scale is not None else None,
              hbm_spec,
              hbm_spec,
              hbm_spec,
@@ -1629,6 +1718,7 @@ def fused_qkvz_projection_pcp_gdn(
         num_active_seqs,
         state_stride=state_plan.stride,
         region=state_plan.conv,
+        whole_block_dma=state_plan.whole_block_dma,
     )
     state_source = _scatter_compact_state_updates(
         state_source,
@@ -1638,6 +1728,7 @@ def fused_qkvz_projection_pcp_gdn(
         num_active_seqs,
         state_stride=state_plan.stride,
         region=state_plan.recurrent,
+        whole_block_dma=state_plan.whole_block_dma,
     )
 
     packed_out = packed_out.reshape(local_num_tokens, n_v, d_v)
