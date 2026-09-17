@@ -4,13 +4,22 @@
 import math
 
 import pytest
+
+pytest.importorskip("vllm_omni")
+
 import torch
+from vllm_omni.diffusion import diffusion_engine
+from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
+from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import \
+    Flux2KleinPipeline
+from vllm_omni.diffusion.models.flux.flux_transformer import FluxPosEmbed
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import (apply_omni_model_specific_patches,
                                         apply_omni_tpu_patches)
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.omni]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -34,9 +43,11 @@ class TestFluxTpuSDPAAttention:
         num_heads = 24
         head_size = 128
 
-        impl = TpuSDPAImpl(num_heads=num_heads,
-                           head_size=head_size,
-                           softmax_scale=1.0 / math.sqrt(head_size))
+        impl = TpuSDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=1.0 / math.sqrt(head_size),
+        )
 
         query = torch.randn(batch_size, seq_len, num_heads, head_size)
         key = torch.randn(batch_size, seq_len, num_heads, head_size)
@@ -56,9 +67,11 @@ class TestFluxTpuSDPAAttention:
         num_heads = 24
         head_size = 128
 
-        impl = TpuSDPAImpl(num_heads=num_heads,
-                           head_size=head_size,
-                           softmax_scale=1.0 / math.sqrt(head_size))
+        impl = TpuSDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=1.0 / math.sqrt(head_size),
+        )
         query = torch.randn(batch_size, q_len, num_heads, head_size)
         key = torch.randn(batch_size, kv_len, num_heads, head_size)
         value = torch.randn(batch_size, kv_len, num_heads, head_size)
@@ -74,10 +87,12 @@ class TestFluxTpuSDPAAttention:
         num_kv_heads = 4
         head_size = 64
 
-        impl = TpuSDPAImpl(num_heads=num_heads,
-                           head_size=head_size,
-                           softmax_scale=1.0 / math.sqrt(head_size),
-                           num_kv_heads=num_kv_heads)
+        impl = TpuSDPAImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=1.0 / math.sqrt(head_size),
+            num_kv_heads=num_kv_heads,
+        )
 
         query = torch.randn(batch_size, seq_len, num_heads, head_size)
         key = torch.randn(batch_size, seq_len, num_kv_heads, head_size)
@@ -95,9 +110,6 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         axes_dim = [16, 56, 56]
         theta = 10000
         seq_len = 20
-
-        from vllm_omni.diffusion.models.flux.flux_transformer import \
-            FluxPosEmbed
 
         embedder = FluxPosEmbed(theta=theta, axes_dim=axes_dim)
         ids = torch.randint(0, 100, (seq_len, 3))
@@ -122,29 +134,25 @@ class TestFluxRoPEPositionEmbeddingPrecision:
 
     def test_flux_rope_float32_precision(self):
         """Ensure FLUX.1 RoPE position embeddings produce float32/float64 tensors."""
-        from vllm_omni.diffusion.models.flux.flux_transformer import \
-            FluxPosEmbed
-
         embedder = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
         ids = torch.randint(0, 50, (10, 3))
         cos, sin = embedder(ids)
         assert cos.shape == (10, sum([16, 32, 32]) // 2)
-        assert cos.dtype in (torch.float32,
-                             torch.float64) and sin.dtype in (torch.float32,
-                                                              torch.float64)
+        assert cos.dtype in (torch.float32, torch.float64) and sin.dtype in (
+            torch.float32,
+            torch.float64,
+        )
 
     def test_flux2_rope_float32_precision(self):
         """Ensure FLUX.2 RoPE position embeddings produce float32/float64 tensors."""
-        from vllm_omni.diffusion.models.flux2.flux2_transformer import \
-            Flux2PosEmbed
-
         embedder = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
         ids = torch.randint(0, 50, (8, 4))
         cos, sin = embedder(ids)
         assert cos.shape == (8, sum([32, 32, 32, 32]) // 2)
-        assert cos.dtype in (torch.float32,
-                             torch.float64) and sin.dtype in (torch.float32,
-                                                              torch.float64)
+        assert cos.dtype in (torch.float32, torch.float64) and sin.dtype in (
+            torch.float32,
+            torch.float64,
+        )
 
 
 class TestFluxRuntimePatches:
@@ -153,8 +161,6 @@ class TestFluxRuntimePatches:
     def test_omni_tpu_patches_configuration(self):
         apply_omni_tpu_patches.cache_clear()
         apply_omni_tpu_patches()
-
-        from vllm_omni.diffusion import diffusion_engine
         assert diffusion_engine._ASYNC_OUTPUT_TIMEOUT == 1800.0
 
 
@@ -162,8 +168,6 @@ class TestFluxInputValidationAndSanitization:
     """Test input checking and sampling params contracts for FLUX models."""
 
     def test_flux_sampling_params_defaults(self):
-        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
         # Schnell defaults: distilled 4 steps, guidance=0.0
         params_schnell = OmniDiffusionSamplingParams(
             height=512,
@@ -185,9 +189,6 @@ class TestFluxInputValidationAndSanitization:
         assert params_dev.guidance_scale == 3.5
 
     def test_flux_empty_prompt_rejection(self):
-        from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import \
-            Flux2KleinPipeline
-
         pipe = object.__new__(Flux2KleinPipeline)
         pipe.vae_scale_factor = 8
         pipe.is_distilled = True

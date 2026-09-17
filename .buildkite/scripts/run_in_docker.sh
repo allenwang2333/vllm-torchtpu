@@ -40,7 +40,7 @@ source "${SCRIPT_DIR}/ci_image.sh"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then
-  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" --default "" 2>/dev/null || true)"
 fi
 
 # Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
@@ -54,7 +54,7 @@ if [ -z "${IMAGE_TAG:-}" ]; then
     echo "ERROR: Could not parse the vLLM pin from ${REPO_ROOT}/pyproject.toml" >&2
     exit 1
   fi
-  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}"
+  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}${DOCKER_IMAGE_SUFFIX:-}"
 fi
 
 # Buildkite expands the last `---` group whenever a log contains no `+++` group

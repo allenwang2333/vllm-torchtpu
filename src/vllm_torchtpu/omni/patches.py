@@ -36,6 +36,11 @@ def apply_omni_tpu_patches() -> None:
     import os
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
+    try:
+        from vllm_omni.diffusion import diffusion_engine
+        diffusion_engine._ASYNC_OUTPUT_TIMEOUT = 1800.0
+    except (ImportError, AttributeError):
+        pass
     logger.info(
         "Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
@@ -137,3 +142,49 @@ def apply_omni_model_specific_patches() -> None:
 
     ltx2_runtime.LTXRuntime._decode_output = _safe_decode_output
     logger.info("Applied TPU patch: safe LTX-2 CPU decode output.")
+    # Patch FLUX.2-klein RoPE position embedding alignment when upstream duplicates image_latent_ids.
+    # Note: Upstream PR https://github.com/vllm-project/vllm-omni/pull/6130 fixes this in v0.28.0+.
+    # This patch can be removed once vllm-omni is bumped to >= 0.28.0.
+    from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import \
+        Flux2Transformer2DModel
+
+    orig_flux2_forward = Flux2Transformer2DModel.forward
+
+    def _safe_flux2_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        seq_len = hidden_states.shape[1]
+        if img_ids.shape[-2] > seq_len:
+            img_ids = img_ids[..., :seq_len, :]
+        return orig_flux2_forward(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            timestep,
+            img_ids,
+            txt_ids,
+            *args,
+            **kwargs,
+        )
+
+    Flux2Transformer2DModel.forward = _safe_flux2_forward
+    logger.info(
+        "Applied TPU patch: safe FLUX.2-klein RoPE position embedding alignment."
+    )
+
+
+def maybe_apply_omni_patches() -> None:
+    """Entry point for vllm_torchtpu patch registry lifecycle."""
+    try:
+        import vllm_omni  # noqa: F401
+    except ImportError:
+        return
+    apply_omni_tpu_patches()
+    apply_omni_model_specific_patches()

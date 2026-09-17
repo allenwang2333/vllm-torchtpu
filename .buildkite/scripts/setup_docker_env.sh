@@ -19,6 +19,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
+TARGET="${1:-dev}"
+IMAGE_SUFFIX=""
+if [ "${TARGET}" = "omni" ] || [ "${TARGET}" = "--omni" ]; then
+  TARGET="omni"
+  IMAGE_SUFFIX="-omni"
+fi
+
 # shellcheck source=.buildkite/scripts/ci_image.sh
 source "${SCRIPT_DIR}/ci_image.sh"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
@@ -30,14 +37,14 @@ if [ -z "${VLLM_COMMIT_HASH}" ]; then
 fi
 
 # Include vLLM commit SHA in the image tag for registry isolation
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}"
+IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
 
-echo "--- Building Docker Image: ${IMAGE_TAG}"
+echo "--- Building Docker Image: ${IMAGE_TAG} (target: ${TARGET})"
 # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
-./docker/build_image.sh --target dev -t "${IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+./docker/build_image.sh --target "${TARGET}" -t "${IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
 
 # Publish image tag metadata for downstream test steps
-buildkite-agent meta-data set "CI_IMAGE_TAG" "${IMAGE_TAG}"
+buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${IMAGE_TAG}"
 
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"
@@ -49,7 +56,7 @@ docker push "${IMAGE_TAG}"
 MIRROR_TAGS=()
 # shellcheck disable=SC2086  # the list is space separated on purpose
 for MIRROR_REPO in ${CI_IMAGE_MIRROR_REPOS}; do
-  MIRROR_TAG="${MIRROR_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}"
+  MIRROR_TAG="${MIRROR_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
   MIRROR_TAGS+=("${MIRROR_TAG}")
   echo "--- Mirroring Docker Image: ${MIRROR_TAG}"
   docker tag "${IMAGE_TAG}" "${MIRROR_TAG}"

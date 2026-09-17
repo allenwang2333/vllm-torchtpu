@@ -6,83 +6,91 @@ Covers fast inference with FLUX.1-schnell, in-code expected_slice validation,
 deterministic seed parity, and HBM memory metrics without file writes.
 """
 
-import os
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
+
+pytest.importorskip("vllm_omni")
+
 import torch
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-# Ensure repository root is on sys.path for test utilities
-_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+from tests.distributed.tpu_test_utils import run_in_isolated_process
+from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-from tests.distributed.tpu_test_utils import \
-    run_in_isolated_process  # noqa: E402
-from vllm_torchtpu.omni.platform import OmniTpuPlatform  # noqa: E402
-
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.omni]
 
 # ==============================================================================
 # Golden Multi-Patch Reference Constants
 #
 # 1. Independent CPU Diffusers reference (ground truth baseline):
-#    Generated with Hugging Face diffusers FluxPipeline on CPU (bfloat16 + float32 VAE).
+#    Generated with Hugging Face diffusers FluxPipeline on CPU (bfloat16 + float32 VAE):
+#
+#      from diffusers import FluxPipeline
+#      pipe = FluxPipeline.from_pretrained(
+#          "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
+#      ).to("cpu")
+#      generator = torch.Generator(device="cpu").manual_seed(0)
+#      arr = np.array(pipe(
+#          prompt="A vibrant green leaf with glistening morning water droplets",
+#          height=512, width=512, num_inference_steps=2, guidance_scale=0.0,
+#          max_sequence_length=256, generator=generator
+#      ).images[0].convert("RGB"), dtype=np.float32) / 255.0
+#      # Slices on Channel 0 (Red):
+#      center_patch = arr[254:257, 254:257, 0]
+#      high_var_patch = arr[208:211, 272:275, 0]
+#      top_right_patch = arr[126:129, 382:385, 0]
+#
 #    Full reference array saved in gs://mehdy/vllm/omni/golden/flux_schnell_cpu_golden_img.npy
 # 2. Native TPU v7x expectation (strict PR CI regression guard).
 # ==============================================================================
-DIFFUSERS_PATCH_CENTER = np.array([
-    [0.15574795, 0.15044659, 0.27011064],
-    [0.28999740, 0.34247899, 0.30188876],
-    [0.33087501, 0.43038124, 0.33332568],
-],
-                                  dtype=np.float32)
+DIFFUSERS_PATCH_CENTER = np.array(
+    [
+        [0.15574795, 0.15044659, 0.27011064],
+        [0.28999740, 0.34247899, 0.30188876],
+        [0.33087501, 0.43038124, 0.33332568],
+    ],
+    dtype=np.float32,
+)
 
-DIFFUSERS_PATCH_HIGH_VAR = np.array([
-    [0.16544730, 0.20743600, 0.19300953],
-    [0.20389146, 0.14982936, 0.21267194],
-    [0.84121597, 0.83013960, 0.18811190],
-],
-                                    dtype=np.float32)
+DIFFUSERS_PATCH_HIGH_VAR = np.array(
+    [
+        [0.16544730, 0.20743600, 0.19300953],
+        [0.20389146, 0.14982936, 0.21267194],
+        [0.84121597, 0.83013960, 0.18811190],
+    ],
+    dtype=np.float32,
+)
 
-DIFFUSERS_PATCH_TOP_RIGHT = np.array([
-    [0.29085350, 0.27446980, 0.25844613],
-    [0.35081630, 0.34825307, 0.34749365],
-    [0.43005502, 0.42972776, 0.43195513],
-],
-                                     dtype=np.float32)
+DIFFUSERS_PATCH_TOP_RIGHT = np.array(
+    [
+        [0.29085350, 0.27446980, 0.25844613],
+        [0.35081630, 0.34825307, 0.34749365],
+        [0.43005502, 0.42972776, 0.43195513],
+    ],
+    dtype=np.float32,
+)
 
 # Native TPU v7x expectation (Center patch [254:257, 254:257, 0])
-TPU_V7X_PATCH_CENTER = np.array([
-    [0.196078, 0.235294, 0.337255],
-    [0.200000, 0.266667, 0.309804],
-    [0.313726, 0.317647, 0.196078],
-],
-                                dtype=np.float32)
+TPU_V7X_PATCH_CENTER = np.array(
+    [
+        [0.196078, 0.235294, 0.337255],
+        [0.200000, 0.266667, 0.309804],
+        [0.313726, 0.317647, 0.196078],
+    ],
+    dtype=np.float32,
+)
 
 
 def _resolve_model_path(model_id: str) -> str:
-    """Resolve local cached snapshot directory or fall back to HF model ID."""
-    candidate_roots = []
-    if "HF_HUB_CACHE" in os.environ:
-        candidate_roots.append(Path(os.environ["HF_HUB_CACHE"]))
-    if "HF_HOME" in os.environ:
-        candidate_roots.append(Path(os.environ["HF_HOME"]) / "hub")
-    candidate_roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    """Resolve cached model snapshot directory via standard HF resolution or fall back to HF model ID."""
+    try:
+        from huggingface_hub import snapshot_download
 
-    safe_name = "models--" + model_id.replace("/", "--")
-    for root in candidate_roots:
-        snapshot_dir = root / safe_name / "snapshots"
-        if snapshot_dir.is_dir():
-            snapshots = sorted(list(snapshot_dir.iterdir()))
-            if snapshots:
-                return str(snapshots[0])
-    return model_id
+        return snapshot_download(model_id, local_files_only=True)
+    except (OSError, ValueError, RuntimeError):
+        return model_id
 
 
 def _extract_image(output) -> Image.Image:
@@ -129,7 +137,9 @@ class TestFluxPrCiOnTpu:
         assert np.all(
             np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
         variance = float(np.var(arr))
-        assert variance > 10.0, f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
+        assert variance > 10.0, (
+            f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
+        )
 
     @pytest.mark.spawns_tpu_workers
     def test_flux_deterministic_seed_parity_tpu(self, schnell_engine):
@@ -186,9 +196,8 @@ class TestFluxPrCiOnTpu:
         )
 
         # Distinct seed must diverge
-        assert not np.array_equal(
-            arr1,
-            arr3), "Different seeds should produce divergent pixel values"
+        assert not np.array_equal(arr1, arr3), (
+            "Different seeds should produce divergent pixel values")
 
     @pytest.mark.spawns_tpu_workers
     def test_flux_golden_multi_patch_parity_tpu(self, schnell_engine):
@@ -217,10 +226,10 @@ class TestFluxPrCiOnTpu:
 
         assert np.all(
             np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
-        assert 0.10 < float(
-            np.mean(arr)) < 0.35, f"Suspicious image mean: {np.mean(arr):.4f}"
-        assert float(np.var(
-            arr)) > 0.01, f"Suspicious image variance: {np.var(arr):.4f}"
+        assert 0.10 < float(np.mean(arr)) < 0.35, (
+            f"Suspicious image mean: {np.mean(arr):.4f}")
+        assert float(np.var(arr)) > 0.01, (
+            f"Suspicious image variance: {np.var(arr):.4f}")
 
         # Tier 1: Native TPU v7x Regression Guard (Strict atol=1e-2)
         actual_center = arr[254:257, 254:257, 0]
@@ -249,8 +258,8 @@ class TestFluxPrCiOnTpu:
             a_flat = actual.flatten().astype(np.float64)
             e_flat = expected.flatten().astype(np.float64)
             norm_prod = float(np.linalg.norm(a_flat) * np.linalg.norm(e_flat))
-            cos_sim = float(np.dot(a_flat, e_flat) /
-                            norm_prod) if norm_prod > 0 else 0.0
+            cos_sim = (float(np.dot(a_flat, e_flat) /
+                             norm_prod) if norm_prod > 0 else 0.0)
 
             # Diffusers standard: Cosine similarity >= 0.90 (cosine distance <= 0.10)
             # and mean absolute error <= 0.16 (accommodating sub-pixel edge shifts on high-contrast textures)
@@ -261,21 +270,18 @@ class TestFluxPrCiOnTpu:
 
         assert not patch_failures, "\n".join(patch_failures)
 
+    @run_in_isolated_process(timeout=60)
     def test_flux_tpu_memory_stats(self):
         """Verify TPU device detection, memory querying, and statistics resetting."""
-        run_in_isolated_process(_run_flux_tpu_memory_stats, timeout=60)
+        import torch_tpu  # noqa: F401
 
+        device_name = OmniTpuPlatform.get_device_name()
+        assert "tpu" in device_name.lower()
 
-def _run_flux_tpu_memory_stats() -> None:
-    """Isolated target verifying TPU device detection and memory querying."""
-    import torch_tpu  # noqa: F401
+        # TPU v7x memory limits (e.g. 16/32/64/96/128 GiB per chip/slice)
+        total_mem = OmniTpuPlatform.get_device_total_memory()
+        assert total_mem > 0, "Device total memory must be positive"
+        assert total_mem <= 128 * 1024**3, (
+            f"Unexpected HBM size: {total_mem / 1024**3:.1f} GiB")
 
-    device_name = OmniTpuPlatform.get_device_name()
-    assert "tpu" in device_name.lower()
-
-    # TPU v7x memory limits (e.g. 16/32/64/96/128 GiB per chip/slice)
-    total_mem = OmniTpuPlatform.get_device_total_memory()
-    assert total_mem > 0, "Device total memory must be positive"
-    assert total_mem <= 128 * 1024**3, f"Unexpected HBM size: {total_mem / 1024**3:.1f} GiB"
-
-    torch.accelerator.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()

@@ -16,7 +16,7 @@ def _isolated_test_worker(target: Callable[[], None],
         target()
     except pytest.skip.Exception as exc:
         result_queue.put(("SKIP", str(exc)))
-    except BaseException:
+    except Exception:  # noqa: BLE001
         result_queue.put(("ERROR", traceback.format_exc()))
     else:
         result_queue.put(("OK", None))
@@ -25,8 +25,13 @@ def _isolated_test_worker(target: Callable[[], None],
 class _TargetRunner:
     """Pickleable target invoker for functions and methods across process spawn."""
 
-    def __init__(self, mod_name: str, qualname: str, args: tuple[Any, ...],
-                 kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        mod_name: str,
+        qualname: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
         self.mod_name = mod_name
         self.qualname = qualname
         self.args = args
@@ -34,6 +39,7 @@ class _TargetRunner:
 
     def __call__(self) -> None:
         import importlib
+
         mod = importlib.import_module(self.mod_name)
         obj: Any = mod
         for part in self.qualname.split("."):
@@ -101,6 +107,3 @@ def run_in_isolated_process(target: Callable[..., Any] | None = None,
     if process.exitcode != 0:
         raise AssertionError(
             f"Isolated TPU test crashed (exitcode={process.exitcode})")
-
-
-isolated_process = run_in_isolated_process
