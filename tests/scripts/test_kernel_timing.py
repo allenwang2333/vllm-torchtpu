@@ -27,10 +27,8 @@ import types
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-# The clock lives in scripts/, not in the installed package: it is dev-only and
-# `packages.find include = ["vllm_torchtpu*"]` would otherwise ship it to every
-# user. scripts/ is not a package, so load it by path the way
-# test_k3_sweep_summary.py loads its subject.
+# Dev-only, so it lives in scripts/ rather than the installed package.
+# scripts/ is not importable, so load it by path.
 CLOCK = REPO / "scripts" / "kernel_timing.py"
 
 
@@ -46,9 +44,7 @@ def fake_jax(monkeypatch):
     monkeypatch.setitem(sys.modules, "jax",
                         types.SimpleNamespace(
                             block_until_ready=block_until_ready))
-    # Each test re-execs the module (see _mod) so it binds to this test's fake
-    # jax and its own block counter.
-    sys.modules.pop("kernel_timing", None)
+    sys.modules.pop("kernel_timing", None)   # _mod re-execs it per test
     return calls
 
 
@@ -110,6 +106,20 @@ def test_both_returns_pipelined_first(fake_jax):
     assert pipe > 0 and wall > 0
 
 
+def test_slope_cancels_a_fixed_per_burst_cost(fake_jax):
+    """A constant added to every burst must not survive the subtraction."""
+    kt = _mod()
+    calls = {"n": 0}
+
+    def work():
+        calls["n"] += 1
+
+    # Pins that slope times both n and 2n, i.e. that it is a difference.
+    kt.slope_ms(work, iters=20, warmup=1, bursts=1)
+    assert calls["n"] == 1 + 20 + 40, (
+        f"slope must time both n and 2n bursts, saw {calls['n']} calls")
+
+
 def test_short_bursts_are_refused(fake_jax):
     """Below MIN_ITERS the burst has not converged, so it must not run."""
     kt = _mod()
@@ -117,6 +127,8 @@ def test_short_bursts_are_refused(fake_jax):
         kt.pipelined_ms(lambda: None, iters=kt.MIN_ITERS - 1)
     with pytest.raises(ValueError, match="MIN_ITERS"):
         kt.paired_ms(lambda: None, lambda: None, iters=1)
+    with pytest.raises(ValueError, match="MIN_ITERS"):
+        kt.slope_ms(lambda: None, iters=1)
 
 
 def test_paired_alternates_arm_order(fake_jax):

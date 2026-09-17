@@ -13,39 +13,22 @@
 # limitations under the License.
 """The clock for standalone JAX/Pallas kernel microbenchmarks.
 
-**Never call ``jax.block_until_ready`` inside a timing loop.** Doing so charges
-a full host round trip to every sample. Measured on this tpu7x host
-(2026-09-17, jax 0.10.2 / libtpu 0.0.44.1) the round trip is **146-190 us**:
+Never call ``jax.block_until_ready`` inside a timing loop. It charges a host
+round trip -- ~150 us on tpu7x -- to every sample. The cost is additive, so it
+inflates fast kernels most (1.8x on a 0.22 ms kernel, 1.07x on a 2.35 ms one),
+drags every A/B ratio toward 1, and is ~8x noisier than the alternative.
 
-===========================  =========  =========  ==========
-arm                          blocking   pipelined  inflation
-===========================  =========  =========  ==========
-decode gather (0.22 ms)        403.8       224.2      1.80x
-prefill bitmap (0.70 ms)       873.3       700.6      1.25x
-prefill gather (2.35 ms)      2510.7      2349.4      1.07x
-===========================  =========  =========  ==========
+Instead dispatch a burst and block once, so JAX's async dispatch overlaps call
+i+1's host cost with call i's device execution:
 
-Three consequences, all of which have bitten this repo's benchmarks:
+    pipelined_ms   the default
+    slope_ms       (t(2n)-t(n))/n; cancels the fixed cost exactly, ~2x closer
+                   to true device time, for ~3x the calls
+    both_ms        (pipelined, blocking) to expose the gap as a diagnostic
+    paired_ms      an A/B with alternating arm order
 
-1. Anything under ~1 ms is materially wrong; decode reads 80% high.
-2. The offset is **additive**, so it inflates the faster arm proportionally
-   more. Every A/B ratio is biased toward 1 -- the winner is reported as
-   winning by less than it does, and a block-size tuner comparing candidates
-   will call real differences a tie.
-3. It is ~8x noisier: 10.8% run-to-run on decode versus 1.4% pipelined.
-
-Dispatching a burst and blocking once at the end lets JAX's async dispatch
-overlap call i+1's host cost with call i's device execution, so per-call time
-converges on device time. Sweeping burst length on the decode gather gave
-425/304/250/235/224/219/218 us at iters=1/2/5/10/20/50/100 -- flat past 20,
-hence ``MIN_ITERS``. Cross-checked against the xplane device clock: pipelined
-runs 10-40 us (0.6-5%) above true per-call kernel time, which is the residual
-dispatch gap and the error bar to quote.
-
-The device clock itself needs jax 0.11.0; jax 0.10.2 SIGSEGVs in
-``PluginTracer::Start()`` because jaxlib expects an 80-byte
-``PLUGIN_Profiler_Api`` and libtpu 0.0.44.1 supplies 104. See docs/profiling.md
-for the serving-path profiler, which is a different mechanism.
+MIN_ITERS is measured, not chosen: per-call time is flat past 20 calls and a
+burst of 10 still reads ~8% high.
 """
 
 import statistics
@@ -54,9 +37,8 @@ from typing import Any, Callable, Sequence
 
 import jax
 
-# Below 20 the burst has not converged: iters=10 reads 7.6% above the plateau
-# on the fastest arm here.
-MIN_ITERS = 20
+MIN_ITERS = 20      # see module docstring
+
 DEFAULT_ITERS = 50
 DEFAULT_BURSTS = 3
 DEFAULT_WARMUP = 3
@@ -85,29 +67,42 @@ def pipelined_ms(fn: Callable[..., Any],
                  iters: int = DEFAULT_ITERS,
                  warmup: int = DEFAULT_WARMUP,
                  bursts: int = DEFAULT_BURSTS) -> float:
-    """Median per-call time of ``fn(*args)`` in ms. The clock to use.
-
-    Median over ``bursts`` so one scheduling hiccup does not set the number.
-    """
+    """Median per-call ms over `bursts`. The clock to use."""
     _check_iters(iters)
     for _ in range(max(warmup, 1)):
         jax.block_until_ready(fn(*args))
     return statistics.median(burst_ms(fn, args, iters) for _ in range(bursts))
 
 
+def slope_ms(fn: Callable[..., Any],
+             *args: Any,
+             iters: int = DEFAULT_ITERS,
+             warmup: int = DEFAULT_WARMUP,
+             bursts: int = DEFAULT_BURSTS) -> float:
+    """Marginal per-call ms: (t(2n) - t(n)) / n. Fixed cost cancels exactly.
+
+    Measurably closer to true device time than pipelined_ms, for ~3x the calls.
+    Use it when the number feeds a roofline or a close A/B.
+    """
+    _check_iters(iters)
+    for _ in range(max(warmup, 1)):
+        jax.block_until_ready(fn(*args))
+    out = []
+    for _ in range(bursts):
+        one = burst_ms(fn, args, iters) * iters
+        two = burst_ms(fn, args, 2 * iters) * 2 * iters
+        out.append((two - one) / iters)
+    return statistics.median(out)
+
+
 def blocking_ms(fn: Callable[..., Any],
                 *args: Any,
                 iters: int = DEFAULT_ITERS,
                 warmup: int = DEFAULT_WARMUP) -> float:
-    """Median per-call time with a sync after every call. **Not a kernel time.**
+    """Per-call time with a sync every call. NOT a kernel time -- diagnostic only.
 
-    This is the clock this module exists to replace, kept only so callers can
-    report it *alongside* `pipelined_ms` and expose the gap. Never rank or gate
-    on it: it adds a full host round trip to every sample, and that offset is
-    additive, so it biases ratios between arms of different speed toward 1.
-
-    Unlike `pipelined_ms` this honours `warmup=0` rather than forcing one call,
-    so `both_ms` does not re-warm a kernel the pipelined arm just ran.
+    Kept so callers can show the gap beside `pipelined_ms`. Never rank on it.
+    Honours warmup=0, unlike `pipelined_ms`, so `both_ms` does not re-warm.
     """
     for _ in range(warmup):
         jax.block_until_ready(fn(*args))
@@ -124,14 +119,10 @@ def both_ms(fn: Callable[..., Any],
             iters: int = DEFAULT_ITERS,
             warmup: int = DEFAULT_WARMUP,
             bursts: int = DEFAULT_BURSTS) -> tuple[float, float]:
-    """`(pipelined_ms, blocking_ms)`. Their difference is this host's dispatch cost.
+    """(pipelined, blocking); the gap is this host's dispatch cost, ~0.15 ms.
 
-    Costs ~1% more than `pipelined_ms` alone and makes every recorded result
-    carry the evidence of its own clock health: the gap should sit near 0.15 ms
-    on tpu7x, and a result where it has drifted is telling you the measurement
+    Costs ~1% extra. Quote the pipelined value; a drifted gap means the
     environment changed, not the kernel.
-
-    Report the pipelined value; keep the blocking one as a diagnostic.
     """
     pipe = pipelined_ms(fn, *args, iters=iters, warmup=warmup, bursts=bursts)
     wall = blocking_ms(fn, *args, iters=iters, warmup=0)
@@ -144,11 +135,7 @@ def paired_ms(first: Callable[..., Any],
               iters: int = DEFAULT_ITERS,
               warmup: int = DEFAULT_WARMUP,
               bursts: int = DEFAULT_BURSTS) -> tuple[float, float]:
-    """Two arms timed with alternating order, to cancel drift between them.
-
-    Use for an A/B: the arms interleave, so a device that warms or throttles
-    part-way through penalizes both equally instead of whichever ran second.
-    """
+    """A/B with alternating arm order, so drift penalises both arms equally."""
     _check_iters(iters)
     for _ in range(max(warmup, 1)):
         jax.block_until_ready(first(*args))

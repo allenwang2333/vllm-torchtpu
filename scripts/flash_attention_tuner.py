@@ -128,11 +128,8 @@ def _benchmark_candidate(spec: FlashAttentionTuningSpec, inputs: _TuningInputs,
     jax.block_until_ready(out)
     compile_and_warmup_seconds = time.perf_counter() - start
 
-    # Pipelined, not per-call blocking: a blocking clock adds a ~150 us host
-    # round trip to every sample (scripts/kernel_timing). Additive overhead is
-    # ruinous for a tuner specifically -- it compresses the gaps between
-    # candidates, so the fastest block size stops being distinguishable from
-    # a mediocre one and selection degrades toward arbitrary.
+    # Pipelined: a blocking clock adds ~150 us per sample, which compresses
+    # the gaps between candidates and makes selection near-arbitrary.
     def candidate():
         return flash_attention(
             inputs.q,
@@ -249,9 +246,8 @@ def main() -> None:
         "--iterations",
         type=int,
         default=kernel_timing.DEFAULT_ITERS,
-        # Was 5, which is below kernel_timing.MIN_ITERS and would now be
-        # refused: a burst that short has not converged and reads high on the
-        # fast candidates, which are exactly the ones a tuner must separate.
+        # Was 5, below MIN_ITERS: unconverged, and reads high on exactly the
+        # fast candidates a tuner must separate.
         help=(f"calls per pipelined burst, at least "
               f"{kernel_timing.MIN_ITERS} "
               f"(default: {kernel_timing.DEFAULT_ITERS})"),
