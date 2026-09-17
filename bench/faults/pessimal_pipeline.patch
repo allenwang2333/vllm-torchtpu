@@ -1,0 +1,13 @@
+diff --git a/src/vllm_torchtpu/kernels/gdn/v3/config.py b/src/vllm_torchtpu/kernels/gdn/v3/config.py
+index 5d18b000..612f8318 100644
+--- a/src/vllm_torchtpu/kernels/gdn/v3/config.py
++++ b/src/vllm_torchtpu/kernels/gdn/v3/config.py
+@@ -108,7 +108,7 @@ class GDNConfig:
+     # KDA only, and must be negative. Selects the bounded gate form over the
+     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
+     gate_lower_bound: float | None = None
+-    num_buffers: int = 2
++    num_buffers: int = 1
+     state_plan: StateSourcePlan | None = None
+     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
+     # which is also the number of state checkpoints kept per sequence. The

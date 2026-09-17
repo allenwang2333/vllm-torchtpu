@@ -1,0 +1,45 @@
+diff -u -r -x __pycache__ a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py
+--- a/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py	2026-09-17 05:17:16.735309233 +0000
++++ b/src/vllm_torchtpu/kernels/gdn/v3/compute_kda.py	2026-09-17 05:46:25.612532942 +0000
+@@ -400,21 +400,31 @@
+         decay = gating_decay[:, c_idx, :, None]
+ 
+         state_updated = state * decay
+-        v_updated = jax.lax.dot(
+-            k_heads,
+-            state_updated,
+-            dimension_numbers=contract_dk,
+-            preferred_element_type=jnp.float32,
++        v_updated = jnp.concatenate(
++            [
++                jax.lax.dot(
++                    k_heads[h:h + 1],
++                    state_updated[h:h + 1],
++                    dimension_numbers=contract_dk,
++                    preferred_element_type=jnp.float32,
++                ) for h in range(cfgs.num_v_heads)
++            ],
++            axis=0,
+         ).astype(cfgs.dtypes.compute)
+ 
+         v_new = beta_heads * (v_heads - v_updated)
+         state = state_updated + k_heads_t * v_new
+ 
+-        out = jax.lax.dot(
+-            q_heads,
+-            state,
+-            dimension_numbers=contract_dk,
+-            preferred_element_type=jnp.float32,
++        out = jnp.concatenate(
++            [
++                jax.lax.dot(
++                    q_heads[h:h + 1],
++                    state[h:h + 1],
++                    dimension_numbers=contract_dk,
++                    preferred_element_type=jnp.float32,
++                ) for h in range(cfgs.num_v_heads)
++            ],
++            axis=0,
+         ).astype(cfgs.dtypes.compute)
+         out_list.append(out[:, 0, :])
+ 

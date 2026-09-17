@@ -1,0 +1,22 @@
+diff -u -r -x __pycache__ a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
+--- a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py	2026-09-17 05:17:16.735309233 +0000
++++ b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py	2026-09-17 05:46:25.563532992 +0000
+@@ -708,13 +708,11 @@
+             "batched_only and prefill_only are mutually exclusive")
+ 
+     if pooled:
+-        out_act, out_source = None, state_source
+-        if not prefill_only:
+-            out_act, out_source, _ = call_kernel(state_source, None, None,
+-                                                 config.GDNMode.BATCHED)
+-        if not batched_only:
+-            out_act, out_source, _ = call_kernel(out_source, None, out_act,
+-                                                 config.GDNMode.PER_SEQ)
++        # Ceiling probe: the two KDA kernel launches are replaced by a zero of
++        # the same shape, so the step pays everything except this kernel.
++        out_act = jnp.zeros((padded_batch_size, n_v * d_v),
++                            dtype=act_out_dtype)
++        out_source = state_source
+         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+         return out_source, out_act
+ 
