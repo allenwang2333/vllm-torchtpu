@@ -101,6 +101,20 @@ def _mesh_device_id(
         for axis_name in mesh_axis_names)
 
 
+def _plan_position(order: tuple[int, ...], coordinate: jax.Array) -> jax.Array:
+    """Invert ``order``: mesh coordinate -> position in the host's plan.
+
+    Pallas rejects a closed-over constant array, and SPMD forbids handing each
+    device its own scalar, so the permutation is unrolled into selects over a
+    table every device shares.
+    """
+    position = jnp.zeros((), dtype=jnp.int32)
+    for plan_index, mesh_coordinate in enumerate(order):
+        position = jnp.where(coordinate == mesh_coordinate,
+                             jnp.int32(plan_index), position)
+    return position
+
+
 def _all_rank_barrier(
     barrier_sem: jax.Array,
     rank: jax.Array,
@@ -261,6 +275,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_cfg: _ProjectionConfig,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
+    pcp_partition_order: tuple[int, ...],
 ) -> None:
     """Schedule QKVZ projection, QKV remote DMA, and per-sequence GDN."""
     del packed_out_hbm_ref
@@ -268,7 +283,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     projection_pending_out_ref[0] = -1
 
     rank = lax.axis_index(pcp_axis_name)
-    active_rows_smem_ref[0] = stage_metadata_ref.rank_active_row_end[rank]
+    plan_rank = _plan_position(pcp_partition_order, rank)
+    active_rows_smem_ref[0] = (
+        stage_metadata_ref.rank_active_row_end[plan_rank])
     active_rows_store = pltpu.make_async_copy(
         src_ref=active_rows_smem_ref.at[:],
         dst_ref=active_rows_out_ref.at[:],
@@ -292,7 +309,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
         for destination in range(pcp_size):
             valid_rows = stage_metadata_ref.rank_valid_rows[stage, destination]
-            is_local = rank == destination
+            is_local = rank == pcp_partition_order[destination]
             local_rows = lax.select(is_local, valid_rows, 0)
             remote_rows = lax.select(is_local, 0, valid_rows)
             src_row = stage_metadata_ref.rank_recv_start[stage, destination]
@@ -331,7 +348,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 device_id=_mesh_device_id(
                     mesh_axis_names,
                     pcp_axis_name,
-                    destination,
+                    pcp_partition_order[destination],
                 ),
                 device_id_type=pl.DeviceIdType.MESH,
             ).start()
@@ -346,7 +363,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     ) -> None:
         is_valid = jnp.logical_and(stage >= 0, stage < active_stages)
         safe_stage = jnp.maximum(stage, 0)
-        rank_rows = stage_metadata_ref.rank_valid_rows[safe_stage, rank]
+        rank_rows = stage_metadata_ref.rank_valid_rows[safe_stage, plan_rank]
         receive_rows = lax.select(
             is_valid,
             rank_rows,
@@ -405,9 +422,12 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         slot,
         destination: int,
     ) -> None:
+        # `destination` selects a head shard, so it is already the mesh
+        # coordinate of the device that owns it; only the rows being sent are
+        # described in the host's plan.
         is_local = rank == destination
-        valid_rows = stage_metadata_ref.rank_valid_rows[stage, rank]
-        src_row = stage_metadata_ref.rank_row_start[stage, rank]
+        valid_rows = stage_metadata_ref.rank_valid_rows[stage, plan_rank]
+        src_row = stage_metadata_ref.rank_row_start[stage, plan_rank]
         src_prefix = lax.rem(src_row, _TPU_TILE_ROWS)
         valid_groups = lax.select(
             valid_rows > 0,
@@ -417,7 +437,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         local_groups = lax.select(is_local, valid_groups, 0)
         remote_groups = lax.select(is_local, 0, valid_groups)
         src_group = src_row // _TPU_TILE_ROWS
-        dst_group = rank * receive_group_stride
+        dst_group = plan_rank * receive_group_stride
 
         pltpu.make_async_copy(
             src_ref=projected_qkv_ref.at[
@@ -498,8 +518,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         is_valid = jnp.logical_and(stage >= 0, stage < active_stages)
         safe_stage = jnp.maximum(stage, 0)
         slot = lax.rem(safe_stage, 2)
-        valid_rows = stage_metadata_ref.rank_valid_rows[safe_stage, rank]
-        src_row = stage_metadata_ref.rank_row_start[safe_stage, rank]
+        valid_rows = stage_metadata_ref.rank_valid_rows[safe_stage, plan_rank]
+        src_row = stage_metadata_ref.rank_row_start[safe_stage, plan_rank]
         src_prefix = lax.rem(src_row, _TPU_TILE_ROWS)
         valid_groups = lax.select(
             valid_rows > 0,
@@ -802,7 +822,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     # end follows only the real requests.  At most one projection token block
     # of tail padding is therefore computed for a short invocation.
     active_projection_token_blocks = pl.cdiv(
-        stage_metadata_ref.rank_active_row_end[rank],
+        stage_metadata_ref.rank_active_row_end[plan_rank],
         projection_token_block_size,
     )
     num_z_out_blocks = num_projection_out_blocks - num_qkv_out_blocks
@@ -1274,6 +1294,7 @@ def _validate_compact_state_writeback_plan(
         "compute_precision",
         "mesh_axis_names",
         "pcp_axis_name",
+        "pcp_partition_order",
         "state_plan",
     ),
 )
@@ -1303,6 +1324,7 @@ def fused_qkvz_projection_pcp_gdn(
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
     state_plan: config.StateSourcePlan,
+    pcp_partition_order: tuple[int, ...] | None = None,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1325,6 +1347,16 @@ def fused_qkvz_projection_pcp_gdn(
         raise ValueError(
             f"PCP axis {pcp_axis_name!r} must occur exactly once in mesh axes "
             f"{mesh_axis_names!r}.")
+    # Position i of the host's plan is addressed by mesh coordinate
+    # pcp_partition_order[i]. They differ whenever the PCP group is not laid
+    # out in device order, and the default keeps the old behaviour for callers
+    # that have not been taught the difference.
+    if pcp_partition_order is None:
+        pcp_partition_order = tuple(range(pcp_size))
+    pcp_partition_order = tuple(int(value) for value in pcp_partition_order)
+    if sorted(pcp_partition_order) != list(range(pcp_size)):
+        raise ValueError("pcp_partition_order must be a permutation of "
+                         f"0..{pcp_size - 1}, got {pcp_partition_order}.")
     if comm_chunk_size <= 0:
         raise ValueError("comm_chunk_size must be positive.")
     dma_row_alignment = 8 * (4 // hidden_states.dtype.itemsize)
@@ -1634,6 +1666,7 @@ def fused_qkvz_projection_pcp_gdn(
              projection_cfg=projection_cfg,
              mesh_axis_names=mesh_axis_names,
              pcp_axis_name=pcp_axis_name,
+             pcp_partition_order=pcp_partition_order,
          ),
          out_shape=(
              zero_gdn_out,

@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed import mesh_utils
 from vllm_torchtpu.gdn_pool_layout import (derive_pooled_gdn_state_layout,
                                            pooled_gdn_conv_state_bytes,
                                            pooled_gdn_ssm_state_bytes)
@@ -205,6 +206,30 @@ def _exchange_pcp_token_shards_for_head_shards(
                               split_axis=head_axis,
                               concat_axis=0,
                               tiled=True)
+
+
+def _plan_major_from_mesh_major(
+    tensor: jnp.ndarray,
+    partition_order: tuple[int, ...],
+) -> jnp.ndarray:
+    """Reorder axis-0 sender blocks from mesh order into the host's plan order.
+
+    A collective concatenates its participants in device-assignment order, so
+    block ``p`` of the result came from the device at mesh coordinate ``p``.
+    Anything indexed by position in the PCP group has to be told that.
+    """
+    pcp_size = len(partition_order)
+    if tuple(partition_order) == tuple(range(pcp_size)):
+        return tensor
+    if tensor.shape[0] % pcp_size != 0:
+        raise ValueError(
+            f"Cannot split axis 0 of {tensor.shape} into {pcp_size} blocks.")
+    blocks = tensor.reshape(pcp_size, tensor.shape[0] // pcp_size,
+                            *tensor.shape[1:])
+    blocks = jnp.take(blocks,
+                      jnp.asarray(partition_order, dtype=jnp.int32),
+                      axis=0)
+    return blocks.reshape(tensor.shape)
 
 
 def _select_replicated_shard_for_pcp_rank(
@@ -1066,6 +1091,9 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
     local_n_v = geometry.local_num_v_heads
     local_conv_dim = geometry.local_conv_dim(d_k, d_v)
+    # Position i of the host's PCP plan answers to mesh coordinate
+    # pcp_partition_order[i]; collectives and the kernel speak the latter.
+    pcp_partition_order = mesh_utils.partition_order_for_axis(mesh, pcp_axis)
 
     token_spec = P(pcp_axis, None)
     replicated_spec = P()
@@ -1111,6 +1139,11 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                              axis=-1).reshape(local_b.shape[0], -1)
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
             local_ba, pcp_axis, pcp_size)
+        # The exchange above is a collective, so it stacked the senders in
+        # device-assignment order; the reorder below is expressed in plan
+        # order.
+        packed_ba_shard = _plan_major_from_mesh_major(packed_ba_shard,
+                                                      pcp_partition_order)
         # PCP ownership follows the batch-flat request-major coordinate.
         # State semantics remain request-absolute through ``seq_lens_`` below.
         token_owner_starts = query_start_loc_[:-1]
@@ -1201,6 +1234,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
             state_plan=state_plan,
+            pcp_partition_order=pcp_partition_order,
         )
 
     mapped_fn = jax.shard_map(
