@@ -9,12 +9,13 @@ Every mode writes XPlane protobuf (`*.xplane.pb`), readable in
 modes also write Chrome-format JSON. See [Trace formats](#trace-formats) for
 which mode produces what.
 
-There are three ways to profile a workload:
+There are four ways to profile a workload:
 
 | Approach | Also called | Best for |
 |---|---|---|
 | [`examples/tpu_profiling.py`](#offline-profiling-with-examplestpu_profilingpy) | non-phased, on-demand profiling | Isolating a single shape — one prefill or one decode batch, offline |
 | [Server-side capture](#server-side-capture-vllm-serve) | end-to-end (e2e) profiling | A real serving window under `vllm bench serve` or your own client |
+| [Structured decoding benchmark](#structured-decoding-benchmark) | SD sweep | Throughput and `SD:` scope attribution across batch sizes and grammars |
 | [Phased profiling](#phased-profiling) | phased profiling | One trace per inference phase from a single mixed benchmark run |
 
 ## Prerequisites
@@ -202,6 +203,50 @@ the run would silently produce no traces. Set `CAPTURE_PROFILE=0` to opt back
 out.
 
 Prefer a single ISL/OSL cell so the trace maps to one workload shape.
+
+## Structured decoding benchmark
+
+[`benchmarks/benchmark_structured_decoding.py`](../benchmarks/benchmark_structured_decoding.py)
+is a purpose-built sweep for grammar-constrained decoding. It drives the offline
+`LLM` API over a (batch size x schema) matrix and reports throughput, time per
+output token, and — with `--enable-trace-report` — the per-invocation cost of the
+two scopes the masking path emits:
+
+* `SD:PrepareInput` — host-side work: mapping the scheduler's bitmask rows onto
+  the runner's chunk-local batch rows, and the transfer to the device.
+* `SD:MaskLogits` — the compiled kernel that unpacks the bitmask and drives the
+  disallowed logits to `-inf`.
+
+Three workloads ship with it: `unconstrained` (the baseline to diff against),
+`flat_json` (a flat key/value object) and `complex_ast` (a recursive expression
+tree using `$ref`/`anyOf`, which keeps the grammar in states with large,
+frequently changing allowed-token sets).
+
+```bash
+python benchmarks/benchmark_structured_decoding.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --batch-sizes 1 8 32 64 \
+  --output-len 512 \
+  --schemas unconstrained flat_json complex_ast \
+  --enable-trace-report \
+  --output-json sd_results.json
+```
+
+`--enable-trace-report` runs one extra, profiled iteration per structured point:
+the script arms the workers with `start_profile()`/`stop_profile()`, then reads
+the Chrome-format traces they wrote under `--trace-dir` and aggregates every
+`SD:` scope it finds. Traces from all ranks in the run directory are counted, so
+the numbers hold for `--tensor-parallel-size > 1`. The unconstrained baseline is
+never profiled — with no grammar there are no `SD:` scopes to attribute.
+
+`--output-json` writes the same numbers in machine-readable form (per-point
+throughput, TPOT, scope count/mean/p50/p99, and packed-vs-dense mask bytes) for
+regression tracking in CI.
+
+> [!NOTE]
+> `--ignore-eos` defaults to on so every step exercises the masking path and
+> token counts stay comparable across schemas. Pass `--no-ignore-eos` to measure
+> natural, grammar-terminated completions instead.
 
 ## Phased profiling
 

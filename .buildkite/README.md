@@ -29,3 +29,29 @@ Run the CPU tests locally with the project's test dependencies installed:
 ```bash
 JAX_PLATFORMS=cpu pytest tests/ -m cpu_test
 ```
+
+## Perf benchmarks
+
+Tests marked `benchmark` gate on measured throughput rather than
+correctness. They live in `pipeline_perf.yml` rather than
+`pipeline_tests.yml`, so a slow sweep does not serialize behind the general
+suite, and the general nightly step excludes them
+(`-m '... and not benchmark'`) so they do not run twice. A benchmark step
+declares `artifact_paths: perf_eval_results/**/*`; write results under
+`/perf_eval_results` inside the container and `run_in_docker.sh` copies
+them back to the workspace for upload.
+
+`tests/benchmarks/test_structured_decoding_nightly.py` is the current
+example: it drives
+[`benchmarks/benchmark_structured_decoding.py`](../benchmarks/benchmark_structured_decoding.py)
+and compares each grammar against the unconstrained baseline measured in
+the same run. Each grammar must hold at least 40% of that baseline;
+override the floor with `SD_MIN_THROUGHPUT_RATIO`.
+
+Its step uploads the results twice: `structured_decoding_benchmark.json`
+under the fixed name the test asserts on, and a
+`structured_decoding_benchmark_<YYYY-MM-DD>.json` copy so a downloaded
+artifact still says which nightly produced it. The step archives the JSON
+before re-raising a failed gate, so a regression's numbers survive the red
+build. To rehearse the step before it reaches a nightly, run it from
+`pipeline_dev.yml` on your branch (see that file's header).
