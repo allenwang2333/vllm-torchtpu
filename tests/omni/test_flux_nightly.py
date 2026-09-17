@@ -9,6 +9,9 @@ All tests run in-memory without PNG writes.
 
 import numpy as np
 import pytest
+
+pytest.importorskip("vllm_omni", reason="vllm_omni is required for FLUX tests")
+
 import vllm_omni  # noqa: F401
 from PIL import Image
 from vllm_omni import Omni

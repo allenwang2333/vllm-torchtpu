@@ -2,7 +2,6 @@
 """Unit tests for FLUX models on TPU platform (hermetic, CPU/mock)."""
 
 import math
-
 import pytest
 
 pytest.importorskip("vllm_omni")

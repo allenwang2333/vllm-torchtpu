@@ -8,6 +8,9 @@ deterministic seed parity, and HBM memory metrics without file writes.
 
 import numpy as np
 import pytest
+
+pytest.importorskip("vllm_omni", reason="vllm_omni is required for FLUX tests")
+
 import torch
 import vllm_omni  # noqa: F401
 from PIL import Image
