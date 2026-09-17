@@ -77,8 +77,8 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
-    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
-    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "tensorcore"
+    TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -333,11 +333,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE":
     env_bool("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False),
     # NoPE and RoPE KV cache layouts allocated for sparse MLA.
+    # EXPERIMENT (annyan/sparsecore_layout): defaults flipped from "tensorcore"
+    # to "sparsecore". Changed here rather than exported through
+    # VLLM_SERVER_CMD because the 2-node bench recipe evals that string on the
+    # head only (generic-bench-2node.yaml:196) while node 1 just runs
+    # `ray start --address=... --block` (:212), and node 0's raylet starts at
+    # :178 before the export. An env-var arm is therefore a silent no-op on
+    # multi-node; a changed default reaches every worker process.
     "TPU_SPARSE_MLA_NOPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore",
+    env_with_choices("TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     "TPU_SPARSE_MLA_ROPE_LAYOUT":
-    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore",
+    env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
