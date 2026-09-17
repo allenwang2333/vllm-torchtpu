@@ -423,6 +423,17 @@ def _pallas_rpa_kernel_batched(
     )
 
 
+def _tokamax_kv_layout(kv_layout: batched_rpa_configs.KVLayout):
+    """Maps this repo's `KVLayout` onto tokamax's identically-valued enum.
+
+    Both are `StrEnum`s over the same member values, so the conversion is by
+    value; it raises if tokamax ever drops a layout this repo still uses.
+    """
+    from tokamax._src.ops.experimental.batched_rpa.kernel import \
+        configs as tokamax_configs
+    return tokamax_configs.KVLayout(kv_layout)
+
+
 # =========================================================================================
 # VLLM Attention Backend
 # =========================================================================================
@@ -747,6 +758,94 @@ class PallasAttentionBackendImpl(AttentionImpl):
         cls._kernel_instance_counter += 1
         return kernel_instance_id
 
+    def _build_tokamax_rpa_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool = False,
+    ):
+        """Adapts tokamax's batched-RPA `TorchOp` to this class's kernel contract.
+
+        `tokamax.experimental.torch_tpu.ops.batched_rpa.BatchedRpa` registers
+        its own custom op through the same `torch_tpu` `pallas.jax_op` that
+        `_build_rpa_kernel` calls, so it replaces that op rather than the
+        kernel function inside it: no `functools.partial` over
+        `_kernel_entry`, no mesh, no `input_partition_specs`, no
+        `register_fake`. The returned callable keeps the `rpa_kernel(...)`
+        signature `forward` already calls, so nothing downstream changes.
+        """
+        # Imported lazily: tokamax is an optional dependency, and importing
+        # the module instantiates the singleton, whose constructor registers
+        # the custom op as a side effect.
+        from tokamax.experimental.torch_tpu.ops.batched_rpa.base import \
+            BatchedRpa
+
+        config_key = ("tokamax", self.sliding_window, self.scale,
+                      self.logits_soft_cap, q_scale, k_scale, v_scale,
+                      skip_kv_update, self.kv_layout, self.decode_query_size,
+                      self.use_causal_mask)
+        existing = self._kernel_config_cache.get(config_key)
+        if existing is not None:
+            return existing
+
+        # The tokamax op is registered without `mesh`/`input_partition_specs`
+        # and its `op_impl_call` holds no `shard_map`, so it cannot shard over
+        # KV heads the way `sharded_ragged_paged_attention` does.
+        mesh = get_vllm_model_wrapper_context().mesh
+        model_axis = dict(getattr(mesh, "shape", {}) or {}).get("model", 1)
+        if model_axis > 1:
+            raise NotImplementedError(
+                "USE_BATCHED_RPA_TOKAMAX=1: tokamax's batched RPA TorchOp is "
+                "registered without a mesh and shards nothing, but this run "
+                f"spreads attention over {model_axis} model-axis devices.")
+
+        kv_layout = _tokamax_kv_layout(self.kv_layout)
+
+        def tokamax_rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
+                                    block_tables, query_start_loc,
+                                    request_distribution, sinks):
+            if sinks is not None:
+                raise NotImplementedError(
+                    "USE_BATCHED_RPA_TOKAMAX=1: attention sinks are not part "
+                    "of tokamax's batched RPA signature.")
+            # Argument order differs from `_kernel_entry`: tokamax takes q/k/v
+            # first with the KV cache fourth, takes no `sinks`, and returns
+            # (output, kv_cache) rather than (kv_cache, output).
+            outputs, new_kv_cache = BatchedRpa(
+                query,
+                key,
+                value,
+                kv_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                use_causal_mask=self.use_causal_mask,
+                sm_scale=self.scale,
+                sliding_window=self.sliding_window,
+                soft_cap=self.logits_soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                skip_kv_update=skip_kv_update,
+                kv_layout=kv_layout,
+                decode_query_size=self.decode_query_size,
+            )
+            if new_kv_cache.shape != kv_cache.shape:
+                raise RuntimeError(
+                    "Tokamax RPA op returned an incompatible KV cache shape: "
+                    f"expected {tuple(kv_cache.shape)}, got "
+                    f"{tuple(new_kv_cache.shape)}.")
+            # `TorchOp._register_ops` passes no `donate_argnums`, so unlike
+            # `rpa_kernel_impl` this writeback is a real copy, not an aliased
+            # in-place pool update.
+            kv_cache.copy_(new_kv_cache)
+            return outputs
+
+        self._kernel_config_cache[config_key] = tokamax_rpa_kernel_impl
+        return tokamax_rpa_kernel_impl
+
     def _build_rpa_kernel(
         self,
         q_scale: float | None,
@@ -756,6 +855,17 @@ class PallasAttentionBackendImpl(AttentionImpl):
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
     ):
+        if (envs.USE_BATCHED_RPA_TOKAMAX
+                and self._kernel_entry is _pallas_rpa_kernel_batched):
+            if use_pcp_streaming:
+                raise NotImplementedError(
+                    "USE_BATCHED_RPA_TOKAMAX=1: tokamax's batched RPA TorchOp "
+                    "has no PCP streaming path; unset the flag to use "
+                    "`make_pcp_streaming_rpa_kernel`.")
+            return self._build_tokamax_rpa_kernel(q_scale,
+                                                  k_scale,
+                                                  v_scale,
+                                                  skip_kv_update=skip_kv_update)
         ctx = get_vllm_model_wrapper_context()
         vllm_config = ctx.vllm_config
         max_model_len = (vllm_config.model_config.max_model_len
@@ -1132,6 +1242,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             or self.dcp_world_size > 1  # DCP: the long-context kernels
             or self.rpa_kernel_bundled is not None  # block-major KV: bundled
             or envs.USE_BATCHED_RPA_LONGCTX  # the long-context fork
+            or envs.USE_BATCHED_RPA_TOKAMAX  # tokamax's op: spills to HBM
             or self.head_size == 64  # the head-dim-64 kernel (see use_hd64)
         )
         return (self._kernel_entry is _pallas_rpa_kernel_batched

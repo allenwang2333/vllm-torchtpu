@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
+    USE_BATCHED_RPA_TOKAMAX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -616,6 +617,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
     "USE_BATCHED_RPA_LONGCTX":
     env_bool("USE_BATCHED_RPA_LONGCTX"),
+    # Temporary: routes the CUSTOM backend's batched RPA through tokamax's
+    # TorchOp (tokamax.experimental.torch_tpu.ops.batched_rpa) instead of
+    # building the op here with pallas.jax_op. Single-device only; see
+    # `_build_tokamax_rpa_kernel`.
+    "USE_BATCHED_RPA_TOKAMAX":
+    env_bool("USE_BATCHED_RPA_TOKAMAX"),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
     "USE_RPA_PIPELINED_DMA_STAGING":
