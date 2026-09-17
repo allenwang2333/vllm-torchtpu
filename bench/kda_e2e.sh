@@ -143,10 +143,19 @@ for phase in ${PHASES}; do
       ;;
     nullkernel)
       patch -p1 -s -d "${REPO}" < "${REPO}/bench/faults/null_kernel.patch"
-      grep -q "Ceiling probe" \
+      grep -q "KDA ceiling probe" \
         "${REPO}/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py"
       start_server "${tag}" && run_bench "${tag}" || status=1
       stop_server
+      # The patch being in the file does not make it the code that ran. The
+      # branch it replaces is chosen at trace time and prints when it is, so
+      # the server log is the proof; without it this phase measured the
+      # baseline twice and would have said the kernel was free.
+      if ! grep -q "KDA ceiling probe" "${OUT}/server-${tag}.log"; then
+        echo "+++ [${tag}] the probe never traced: this phase measured the" \
+             "unpatched kernel and its numbers mean nothing" >&2
+        status=1
+      fi
       # Put the kernel back, so a later phase in the same job is not measuring
       # this one's patch.
       patch -R -p1 -s -d "${REPO}" < "${REPO}/bench/faults/null_kernel.patch"

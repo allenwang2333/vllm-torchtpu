@@ -1,22 +1,40 @@
 diff -u -r -x __pycache__ a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py
 --- a/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py	2026-09-17 05:17:16.735309233 +0000
-+++ b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py	2026-09-17 05:46:25.563532992 +0000
-@@ -708,13 +708,11 @@
-             "batched_only and prefill_only are mutually exclusive")
++++ b/src/vllm_torchtpu/kernels/gdn/v3/wrapper.py	2026-09-17 06:22:35.097331073 +0000
+@@ -13,6 +13,7 @@
+ # limitations under the License.
  
-     if pooled:
--        out_act, out_source = None, state_source
--        if not prefill_only:
--            out_act, out_source, _ = call_kernel(state_source, None, None,
--                                                 config.GDNMode.BATCHED)
--        if not batched_only:
--            out_act, out_source, _ = call_kernel(out_source, None, out_act,
--                                                 config.GDNMode.PER_SEQ)
-+        # Ceiling probe: the two KDA kernel launches are replaced by a zero of
-+        # the same shape, so the step pays everything except this kernel.
-+        out_act = jnp.zeros((padded_batch_size, n_v * d_v),
-+                            dtype=act_out_dtype)
-+        out_source = state_source
-         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-         return out_source, out_act
+ import functools
++import sys
  
+ import jax
+ import jax.numpy as jnp
+@@ -720,14 +721,20 @@
+ 
+     # The first segment holds verify windows of up to `num_spec_tokens + 1`
+     # tokens, or plain 1-token decodes without speculative decoding.
+-    out_act, out_conv_state, out_recurrent_state = None, conv_state, recurrent_state
+-    if not prefill_only:
+-        out_act, out_conv_state, out_recurrent_state = call_kernel(
+-            conv_state, recurrent_state, None, config.GDNMode.BATCHED)
+-    if not batched_only:
+-        out_act, out_conv_state, out_recurrent_state = call_kernel(
+-            out_conv_state, out_recurrent_state, out_act,
+-            config.GDNMode.PER_SEQ)
++    # Ceiling probe: both KDA kernel launches are replaced by a zero of the
++    # same shape, so the step pays everything except this kernel and the gap
++    # to the unpatched run is the whole of what optimizing it could win.
++    #
++    # Printed, not assumed. This branch is chosen at TRACE time, so the line
++    # below appears in the server log exactly when the served program is the
++    # patched one -- and a probe nobody can prove ran is the failure this
++    # measurement exists to avoid. A cache-key change is not that proof: the
++    # key covers every file under kernels/, so an edit to a branch the model
++    # never enters recompiles just as loudly.
++    print("KDA ceiling probe: both fused_conv1d KDA launches replaced by zero",
++          file=sys.stderr, flush=True)
++    out_act = jnp.zeros((padded_batch_size, n_v * d_v), dtype=act_out_dtype)
++    out_conv_state, out_recurrent_state = conv_state, recurrent_state
+ 
+     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
+     out_conv_state = out_conv_state.astype(conv_out_dtype)
