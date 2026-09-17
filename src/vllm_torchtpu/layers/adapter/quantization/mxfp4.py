@@ -330,15 +330,7 @@ REQUANTIZED_BLOCK_SIZE = (int(envs.MOE_REQUANTIZE_BLOCK_SIZE)
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
-    """DeepSeek-V4 MXFP4 MoE quantization and weight loading method.
-
-    The requantized weight this produces is already the fused EP kernel's FP4
-    form -- K-major fp4 with a per-(contraction block, output channel) fp32
-    scale -- so a layer whose routing the kernel can reproduce is armed for
-    W4A8 fused EP and the rest stay on the grouped-matmul path. Arming is per
-    layer because DeepSeek-V4's first `num_hash_layers` route by token id,
-    which the kernel does not implement.
-    """
+    """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
     rhs_quant_dtype = jnp.float4_e2m1fn
 
     @property
