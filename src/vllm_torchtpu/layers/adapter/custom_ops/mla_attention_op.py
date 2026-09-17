@@ -50,6 +50,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.quantization.configs import \
+    should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.utils import synchronize_tensors
@@ -588,6 +590,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
         # For compatibility reasons.
+        self.prefix = prefix
         self.kv_sharing_target_layer_name = None
         self.attn_type = AttentionType.DECODER
         self.sliding_window = None
@@ -620,14 +623,30 @@ class VllmTPUMLAAttention(MLAAttention):
 
         device = torch.device("tpu")
 
+        if should_quantize_on_load(self.prefix):
+            W_UK_T, w_uk_scale = quantize_tensor(self.W_UK_T.to(torch.float32),
+                                                 torch.float8_e4m3fn,
+                                                 axis=1)
+            W_UV, w_uv_scale = quantize_tensor(self.W_UV.to(torch.float32),
+                                               torch.float8_e4m3fn,
+                                               axis=1)
+            self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
+            self.W_UV = Parameter(W_UV, requires_grad=False)
+            self.W_UK_T_scale = Parameter(_fresh(
+                w_uk_scale.to(act_dtype)).to(device),
+                                          requires_grad=False)
+            self.W_UV_scale = Parameter(_fresh(
+                w_uv_scale.to(act_dtype)).to(device),
+                                        requires_grad=False)
+
         # move W_UK_T and W_UV into fresh contiguous buffers
         self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
         self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
 
-        # Keep `W_UK_T`/`W_UV` in the activation dtype, matching upstream vLLM's
-        # `MLAAttention.process_weights_after_loading`: there is no quantized bmm
-        # for these two, so `forward_mla` upcasts them back to the activation
-        # dtype before `torch.bmm` anyway. Quantizing here only cost precision.
+        # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
+        # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
+        # forward_mla upcasts them back to the activation dtype before torch.bmm
+        # anyway; quantizing them on load is strictly a memory-saving technique
         # `kv_cache_quantized_dtype` still governs the KV cache itself.
         self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
         self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
@@ -641,7 +660,10 @@ class VllmTPUMLAAttention(MLAAttention):
                 delattr(self.kv_b_proj, key)
 
         if self.W_UK_T.device.type == "tpu":
-            synchronize_tensors([self.W_UK_T, self.W_UV])
+            tensors = [self.W_UK_T, self.W_UV]
+            if hasattr(self, "W_UK_T_scale"):
+                tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
+            synchronize_tensors(tensors)
 
         q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
         self.mla_op = self.impl._build_mla_op(self,
@@ -662,10 +684,6 @@ class VllmTPUMLAAttention(MLAAttention):
                 k_pe: torch.Tensor,
                 output: torch.Tensor | None = None,
                 **kwargs) -> torch.Tensor:
-        if self.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe,
-                                                self.layer_name)
-
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
         return self.impl.forward(
@@ -734,6 +752,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 "Fused MLA gating requires fused_qkv_a_proj")
             assert self.g_proj is None, (
                 "Fused MLA gating cannot also use g_proj")
+        self.kimi_preprocess = None
+        self.register_buffer('kimi_gate_weight', None, persistent=False)
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
         # place. The mutation is visible through every reference to the object,
@@ -784,12 +804,19 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        prefill_group=None,
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
         output_gate = None
 
-        if self.q_lora_rank is not None:
+        if self.kimi_preprocess is not None:
+            q_c, kv_c_normed, k_pe, output_gate = self.kimi_preprocess(
+                hidden_states, self.fused_qkv_a_proj.weight,
+                self.kimi_gate_weight, self.q_a_layernorm.weight,
+                self.kv_a_layernorm.weight, prefill_group is not None)
+            q = self.q_b_proj(q_c)[0]
+        elif self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
                 "fused_qkv_a_proj is required when q_lora_rank is not None")
             assert self.q_a_layernorm is not None, (
@@ -825,9 +852,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
-                                   dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        if self.kimi_preprocess is None:
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
@@ -859,8 +887,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(hidden_states.shape[0],
-                          self.num_heads * self.v_head_dim),
+            output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
         )
 
@@ -868,6 +895,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             attn_out *= output_gate.sigmoid()
         elif self.g_proj is not None:
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+        if prefill_group is not None:
+            return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]
 
 

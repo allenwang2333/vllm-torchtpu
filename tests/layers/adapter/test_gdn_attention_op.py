@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+import vllm.envs as vllm_envs
 from jax.sharding import PartitionSpec
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -49,8 +50,10 @@ def _vllm_config(*,
             mamba_block_size=4096,
             mamba_page_size_padded=mamba_page_size_padded,
             mamba_cache_mode=None,
+            use_kda_recoverssm=False,
         ),
         speculative_config=None,
+        num_speculative_tokens=0,
     )
 
 
@@ -159,6 +162,8 @@ class TestVllmGatedDeltaNetAttention:
             ("bfloat16", jnp.bfloat16),
         ],
     )
+    @pytest.mark.parametrize("projection_dtype",
+                             [torch.bfloat16, torch.float8_e4m3fn])
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
         return_value=8)
@@ -167,7 +172,7 @@ class TestVllmGatedDeltaNetAttention:
     )
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
             self, mock_get_pcp_mesh, _mock_get_pcp_world_size, ssm_cache_dtype,
-            expected_dtype, vllm_config_context):
+            expected_dtype, projection_dtype, vllm_config_context):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
@@ -191,13 +196,16 @@ class TestVllmGatedDeltaNetAttention:
                  "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
                  "run_jax_gdn_attention_pooled_pcp_prefill_projection",
              ) as mock_run:
+            mock_run.return_value = (MagicMock(), MagicMock(), MagicMock())
             pooled_pcp_impl = attn._build_pooled_pcp_gdn_op()
             mock_pcp_jax_op.call_args.args[1](*([MagicMock()] * 14))
 
+        weight_scale = (torch.ones(192)
+                        if projection_dtype == torch.float8_e4m3fn else None)
         output, z = pooled_pcp_impl(
             torch.zeros((2, 64)),
-            torch.zeros((192, 64), dtype=torch.float8_e4m3fn),
-            torch.ones(192),
+            torch.zeros((192, 64), dtype=projection_dtype),
+            weight_scale,
             torch.zeros((2, 64)),
             torch.zeros((2, 64)),
             pool,
@@ -211,13 +219,69 @@ class TestVllmGatedDeltaNetAttention:
             torch.zeros(2, dtype=torch.int32),
         )
 
-        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (5, )
+        assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (4, )
         assert mock_run.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
             expected_dtype)
+        op_args = fake_jax_op.call_args.args
+        assert op_args[4] is pool
+        assert op_args[-1] is weight_scale
+        # Optional bias/scale must not shift the runtime pool donation index.
+        assert [arg for arg in op_args if arg is not None][4] is pool
+        fake_pool, fake_output, fake_z = (
+            fake_jax_op.register_fake.call_args.args[0](*op_args))
+        assert fake_pool.shape == pool.shape
+        assert fake_output.shape == fake_z.shape == output.shape
         assert pool.untyped_storage().data_ptr() == original_storage
         assert torch.all(pool_alias == 7)
         assert torch.all(output == 1)
         assert torch.all(z == 2)
+
+    @patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
+        return_value=8)
+    @patch(
+        "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
+    )
+    def test_pooled_pcp_seq_on_lane_uses_native_pool_layout(
+            self, mock_get_pcp_mesh, _mock_get_pcp_world_size, monkeypatch):
+        vllm_envs.disable_envs_cache()
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        attn = _qwen35_397b_gdn_attn("seq_on_lane_test_layer")
+        mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8})
+        vllm_config = _vllm_config(pcp_size=8, block_size=4096)
+        captured = {}
+
+        def fake_pcp_jax_op(_name, wrapped_fn, **_kwargs):
+            captured["wrapped_fn"] = wrapped_fn
+            return MagicMock()
+
+        raw_pool = jnp.zeros((8, 2, 32, 4, 256), dtype=jnp.float8_e4m3fn)
+
+        def fake_run(*args, **kwargs):
+            captured["pooled_state"] = args[5]
+            captured["pool_block_tokens"] = kwargs["pool_block_tokens"]
+            return args[5], MagicMock(), MagicMock()
+
+        with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                            vllm_config=vllm_config), \
+             patch(
+                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                 "pcp_streaming_jax_op",
+                 side_effect=fake_pcp_jax_op,
+             ), \
+             patch(
+                 "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+                 "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+                 side_effect=fake_run,
+             ):
+            attn._build_pooled_pcp_gdn_op()
+            args = [MagicMock()] * 14
+            args[4] = raw_pool  # Pool is the donated argument; scale is last.
+            new_pool, _, _ = captured["wrapped_fn"](*args)
+
+        assert captured["pooled_state"].shape == raw_pool.shape
+        assert captured["pool_block_tokens"] == 4096
+        assert new_pool.shape == raw_pool.shape
 
     def test_get_kv_cache_spec_localizes_gdn_state_for_pcp(self):
         attn = _qwen35_397b_gdn_attn(
@@ -879,6 +943,39 @@ class TestVllmGatedDeltaNetAttention:
         assert torch.equal(attn.norm.call_args[0][0], expected_local)
         assert torch.all(output == 5)
 
+    @pytest.mark.parametrize("shape", [(), (1, ), (192, ), (6, 2),
+                                       (1, 2, 1, 192)])
+    def test_pcp_projection_accepts_fp8_scale_layouts(self, shape):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.gqa_interleaved_layout = False
+        weight = torch.ones((192, 256), dtype=torch.float8_e4m3fn)
+        scale = torch.ones(shape, dtype=torch.float32)
+        attn.in_proj_qkvz = SimpleNamespace(weight=weight,
+                                            weight_scale=scale,
+                                            bias=None)
+        result = attn._require_pcp_projection_parameters()
+        assert result[0] is weight and result[1] is scale
+
+    @pytest.mark.parametrize("dtype,scale_size,bias,error", [
+        (torch.bfloat16, 192, False, "must not have a scale"),
+        (torch.float8_e4m3fn, None, False, "FP32 scale"),
+        (torch.float8_e4m3fn, 3, False, "scale must"),
+        (torch.float32, None, False, "BF16 or"),
+        (torch.bfloat16, None, True, "bias-free"),
+    ])
+    def test_pcp_projection_rejects_invalid_parameters(self, dtype, scale_size,
+                                                       bias, error):
+        attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+        attn.gqa_interleaved_layout = False
+        attn.in_proj_qkvz = SimpleNamespace(
+            weight=torch.ones((192, 64), dtype=dtype),
+            weight_scale=None
+            if scale_size is None else torch.ones(scale_size),
+            bias=torch.zeros(192) if bias else None,
+        )
+        with pytest.raises(RuntimeError, match=error):
+            attn._require_pcp_projection_parameters()
+
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
@@ -923,11 +1020,13 @@ class TestVllmGatedDeltaNetAttention:
         attn.gdn_op.assert_not_called()
         attn.gdn_pcp_op.assert_not_called()
 
+    @pytest.mark.parametrize("projection_dtype",
+                             [torch.bfloat16, torch.float8_e4m3fn])
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context"
     )
     def test_forward_uses_fused_projection_for_pooled_pcp_prefill(
-            self, mock_get_forward_context):
+            self, mock_get_forward_context, projection_dtype):
         attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
         attn.num_spec = 1
         attn.head_v_dim = 16
@@ -947,8 +1046,9 @@ class TestVllmGatedDeltaNetAttention:
         attn.gdn_pooled_op = MagicMock()
         attn.gdn_pooled_pcp_op = MagicMock()
 
-        qkvz_weight = torch.ones((192, 64), dtype=torch.float8_e4m3fn)
-        qkvz_weight_scale = torch.ones(192, dtype=torch.float32)
+        qkvz_weight = torch.ones((192, 64), dtype=projection_dtype)
+        qkvz_weight_scale = (torch.ones(192, dtype=torch.float32) if
+                             projection_dtype == torch.float8_e4m3fn else None)
         attn.in_proj_qkvz = SimpleNamespace(
             weight=qkvz_weight,
             weight_scale=qkvz_weight_scale,

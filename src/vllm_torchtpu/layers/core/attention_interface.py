@@ -688,15 +688,18 @@ def mla_attention(
         )
         mixed_tuned = get_tuned_params(mixed_key)
 
+        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
         num_kv_pages_per_blocks = (
             decode_tuned.num_kv_pages_per_block,
             1,
-            mixed_tuned.num_kv_pages_per_block,
+            envs.MIXED_NUM_KV_PAGES_PER_BLOCK
+            or mixed_tuned.num_kv_pages_per_block,
         )
         num_queries_per_blocks = (
             decode_tuned.num_queries_per_block,
             16,
-            mixed_tuned.num_queries_per_block,
+            envs.MIXED_NUM_QUERIES_PER_BLOCK
+            or mixed_tuned.num_queries_per_block,
         )
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
@@ -718,7 +721,7 @@ def mla_attention(
             vmem_limit_bytes=min(decode_tuned.vmem_limit_bytes,
                                  mixed_tuned.vmem_limit_bytes),
             decode_batch_size=decode_tuned.decode_batch_size,
-            mixed_q_split=mixed_tuned.q_split,
+            mixed_q_split=envs.MIXED_Q_SPLIT or mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale)
@@ -796,9 +799,9 @@ def sparse_mla_attention(
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
     """
-    # dsa_gather moves one (`WORD_BYTES`, `TILE_LANE_BYTES`) uint8 tile of
-    # nope and one `TILE_LANE_BYTES`-byte lane row of rope per token; other
-    # head dims don't fit its address arithmetic.
+    # Both gather implementations move 512 NoPE bytes and one padded
+    # 128-byte RoPE row per token; other head dims do not fit their address
+    # arithmetic.
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
     word_bytes = kv_cache_utils.WORD_BYTES
     lane_bytes = kv_cache_utils.TILE_LANE_BYTES
@@ -829,6 +832,11 @@ def sparse_mla_attention(
     )
 
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    if nope_spec.layout is not rope_spec.layout:
+        raise ValueError(
+            "sparse MLA attention requires matching NoPE and RoPE layouts; "
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}")
+    cache_layout = nope_spec.layout.value
 
     def _sparse_mla_ragged_paged_attention(ql_nope, q_pe, kv_c_normed, k_pe,
                                            kv_cache_nope, kv_cache_rope,
@@ -858,6 +866,7 @@ def sparse_mla_attention(
             request_distribution_,
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
+            cache_layout=cache_layout,
         )
 
         lkv_dim = ql_nope.shape[-1]

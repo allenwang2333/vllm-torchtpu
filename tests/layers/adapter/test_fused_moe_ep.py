@@ -35,6 +35,14 @@ from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 # count against it, because the kernel requires one equal block per shard.
 _STUB_EP = 2
 
+# Positions in `_build_op`'s positional argument list, which is what the tests
+# below inspect: (mesh, topk, renormalize, activation, mesh_expert_order,
+# sharded_plan, weight_format, rhs_qb, scoring_fn, has_score_bias,
+# routed_scaling_factor).
+_MESH_ORDER_ARG = 4
+_SHARDED_PLAN_ARG = 5
+_WEIGHT_FORMAT_ARG = 6
+
 
 def _layer(experts=4, hidden=8, inter=16, **overrides):
     """A layer whose weights and routing the kernel would accept."""
@@ -70,7 +78,6 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
 def _prebuild(layer,
               *,
               has_mesh=True,
-              tp=1,
               node_tokens=4096,
               smem_bytes=1024 * 1024,
               ep_order=None,
@@ -92,7 +99,6 @@ def _prebuild(layer,
             patch.object(bridge, "_max_node_tokens", return_value=node_tokens), \
             patch.object(bridge, "_smem_capacity_bytes",
                          return_value=smem_bytes), \
-            patch.object(bridge, "_tensor_parallel_size", return_value=tp), \
             patch.object(bridge, "_build_op", side_effect=build_op):
         defaults = dict(topk=2, renormalize=True, activation="silu")
         defaults.update(kwargs)
@@ -118,7 +124,7 @@ def test_sharded_plan_flag_reaches_the_built_op():
     with patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", True):
         assert _prebuild(
             _layer(), build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-1] is True
+    assert seen and seen[0][_SHARDED_PLAN_ARG] is True
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
@@ -127,7 +133,7 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert _prebuild(_layer(),
                      ep_order=order,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen and seen[0][-2] == order
+    assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
 def test_refused_without_the_env_flag():
@@ -159,10 +165,6 @@ def test_pcp_threshold_counts_one_logical_scheduler_batch():
     with patch("vllm.config.get_current_vllm_config", return_value=cfg):
         assert bridge._max_node_tokens(ep=8, pcp=8) == 4096
         assert bridge._max_node_tokens(ep=8, pcp=1) == 32768
-
-
-def test_refused_under_tensor_parallelism():
-    assert _prebuild(_layer(), tp=8) is None
 
 
 def test_refused_without_an_ep_group():
@@ -220,17 +222,13 @@ def test_refused_when_the_layer_carries_expert_biases():
 
 @pytest.mark.parametrize("routing", [
     dict(custom_routing_function=lambda **_: None),
-    dict(scoring_func="sigmoid"),
-    dict(e_score_correction_bias=torch.zeros(8)),
     dict(use_grouped_topk=True, num_expert_group=8, topk_group=2),
     dict(hash_indices_table=torch.zeros(8, dtype=torch.int32)),
-    dict(routed_scaling_factor=2.5),
-    dict(routed_scaling_factor=0.0),
 ])
 def test_refused_on_routing_the_kernel_does_not_implement(routing):
-    """The fused path never calls `moe_routing.route`: the kernel scores with
-    a plain softmax and selects top-k itself. Anything else routes tokens to a
-    different set of experts, so it is refused rather than run."""
+    """The fused path never calls `moe_routing.route`: the kernel selects
+    top-k itself. Anything it cannot reproduce routes tokens to a different
+    set of experts, so it is refused rather than run."""
     assert _prebuild(_layer(**routing)) is None
 
 
@@ -507,7 +505,7 @@ def test_nvfp4_aligned_block_arms_and_passes_format(block):
                      weight_format="fp4",
                      rhs_qb=block,
                      build_op=lambda *args: seen.append(args) or "op") == "op"
-    assert seen[0][-2:] == ("fp4", block)
+    assert seen[0][_WEIGHT_FORMAT_ARG:_WEIGHT_FORMAT_ARG + 2] == ("fp4", block)
 
 
 @pytest.mark.parametrize("block", [None, 0, -64, 16, 32, 96, 192, 1024])
@@ -531,7 +529,7 @@ def test_nvfp4_refuses_invalid_contract(fault, block):
     elif fault == "dtype":
         layer.w2_weight = torch.empty((1, 512, 512), dtype=torch.float8_e4m3fn)
     elif fault == "routing":
-        layer.scoring_func = "sigmoid"
+        layer.hash_indices_table = torch.zeros(8, dtype=torch.int32)
     else:
         layer.w2_bias = torch.zeros(1, 512)
     assert _prebuild(layer, weight_format="fp4", rhs_qb=block) is None
@@ -785,8 +783,8 @@ def test_nvfp4_default_block_and_explicit_override(monkeypatch, fused_enabled,
 
 @pytest.mark.parametrize("configured_block", [None, 128])
 @pytest.mark.parametrize("refusal", [
-    "tp", "mesh", "tokens", "smem", "routing", "experts", "activation",
-    "simulation", "prepared_scales"
+    "mesh", "tokens", "smem", "routing", "experts", "activation", "simulation",
+    "prepared_scales"
 ])
 def test_nvfp4_admission_and_prepared_weight_validation(
         monkeypatch, refusal, configured_block):
@@ -799,16 +797,14 @@ def test_nvfp4_admission_and_prepared_weight_validation(
     method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
     method.group_size = 16
     admission = {}
-    if refusal == "tp":
-        admission["tp"] = 8
-    elif refusal == "mesh":
+    if refusal == "mesh":
         admission["has_mesh"] = False
     elif refusal == "tokens":
         admission["node_tokens"] = 1
     elif refusal == "smem":
         admission["smem_bytes"] = 1
     elif refusal == "routing":
-        layer.scoring_func = "sigmoid"
+        layer.hash_indices_table = torch.zeros(8, dtype=torch.int32)
     elif refusal == "experts":
         layer.global_num_experts = 3
     elif refusal == "activation":
