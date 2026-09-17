@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
-    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 8192
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -616,8 +616,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
+    # EXPERIMENT (annyan/sparsecore_layout_moe_chunk): default flipped 0 ->
+    # 8192, stacked on the sparsecore MLA layout change. Changed here rather
+    # than exported through VLLM_SERVER_CMD for the same reason as that one:
+    # the 2-node bench recipe evals that string on the head only, so an
+    # env-var arm is a silent no-op on multi-node.
+    # NOTE this is not only a chunk size. `> 0` makes
+    # `enable_pipelined_collective_and_compute()` true, which makes the MoE
+    # method claim `supports_internal_mk`, which turns
+    # `MoERunner.do_naive_dispatch_combine` off -- so vLLM's naive DP
+    # all-gather / reduce-scatter pair is suppressed and the chunked path
+    # stages those collectives itself.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
-    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "8192"),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
