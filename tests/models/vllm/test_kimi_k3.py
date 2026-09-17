@@ -1135,13 +1135,15 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     ["no_metadata", "no_cache", "empty_cache"],
 )
 def test_kda_forward_returns_zeros_when_it_cannot_run_the_op(
-        setup: str) -> None:
+        setup: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """`forward` has three reasons to skip the KDA op and return zeros: no
     per-layer metadata, no cache bound yet, or a cache bound with no
     storage (what the runner hands out during profiling). Each case is set
     up so only that one condition holds, and both ops are tripwires, so the
     test fails if `forward` reaches a dispatch.
     """
+    monkeypatch.setattr(kimi_attention, "get_tp_group",
+                        lambda: SimpleNamespace(all_reduce=lambda x: x))
     layer = _make_bare_kda_layer()
     if setup == "no_metadata":
         layer._metadata = lambda: None
@@ -1156,12 +1158,15 @@ def test_kda_forward_returns_zeros_when_it_cannot_run_the_op(
     torch.testing.assert_close(output, torch.zeros(2, 4))
 
 
-def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op() -> None:
+def test_kda_forward_full_rank_gate_feeds_separate_gates_to_the_op(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """With `use_full_rank_gate=True`, `forward` computes the output gate
     from `g_proj` directly (not from a `g_b_proj` over a split of a fused
     projection) and the recurrence gate from `f_b_proj(f_a_proj(x))`. A
     two-tensor cache is bound so `forward` reaches the dispatched op, and
     the op stub checks it was handed exactly those two tensors."""
+    monkeypatch.setattr(kimi_attention, "get_tp_group",
+                        lambda: SimpleNamespace(all_reduce=lambda x: x))
     layer = _make_bare_kda_layer(use_full_rank_gate=True)
     sconv_cache = torch.zeros(1, 8, 3)
     recurrent_cache = torch.zeros(1, 2, 2, 2)
