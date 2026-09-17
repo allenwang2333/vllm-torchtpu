@@ -19,7 +19,7 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     cp_local_to_global
-from vllm_torchtpu.layers.vllm.cp_indexer_merge import cp_global_to_local
+from vllm_torchtpu.layers.adapter.cp_indexer_merge import cp_global_to_local
 
 # numpy, not jnp: an eager jnp call claims the TPU in the pytest parent and
 # breaks every later spawn-based test in the session.

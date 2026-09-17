@@ -596,6 +596,7 @@ class SparseMlaDcpTest(parameterized.TestCase):
                 block_tables,
                 inp["cu_q_lens"],
                 inp["distribution"],
+                None,
                 NOPE_SPEC,
                 ROPE_SPEC,
                 sm_scale=self.sm_scale,
@@ -794,6 +795,72 @@ class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
                                                          nope_spec=None,
                                                          rope_spec=None,
                                                          dcp_size=2,
+                                                         interleave_size=1)
+
+    def test_no_mesh_requires_an_explicit_rank(self):
+        """With `mesh=None` there is no axis to read the rank off."""
+        with self.assertRaisesRegex(ValueError, "requires an explicit"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=None,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         interleave_size=1)
+
+    def test_no_mesh_rank_must_be_in_range(self):
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            attention_interface.sparse_mla_attention_dcp(None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=None,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         dcp_rank=2,
+                                                         interleave_size=1)
+
+    def test_no_mesh_wants_one_row_per_token(self):
+        """The mesh-free path is handed this rank's rows alone, so the table
+        is `num_tokens` tall, not `dcp_size * num_tokens`."""
+        num_tokens = 4
+        ql_nope = jnp.zeros((num_tokens, 2, 8))
+        bad_topk = jnp.zeros((2 * num_tokens, 8), jnp.int32)
+
+        with self.assertRaisesRegex(ValueError, "one row per token"):
+            attention_interface.sparse_mla_attention_dcp(ql_nope,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         bad_topk,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         None,
+                                                         mesh=None,
+                                                         nope_spec=None,
+                                                         rope_spec=None,
+                                                         dcp_size=2,
+                                                         dcp_rank=0,
                                                          interleave_size=1)
 
 

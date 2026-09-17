@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_DCP_USE_MESH: bool = True
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -455,6 +456,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path (functionally equivalent; valid-mask gating unchanged). Mirrors
     # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
+    # Export the DCP ops as multi-device SPMD modules over a JAX mesh. Set to 0
+    # on builds that drive one device per worker: the DCP path then runs
+    # unsharded JAX per rank and does its collectives in torch instead.
+    "TPU_DCP_USE_MESH":
+    lambda: bool(int(os.getenv("TPU_DCP_USE_MESH") or "1")),
     "USE_MOE_SPARSE_CORE":
     lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row

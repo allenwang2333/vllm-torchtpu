@@ -22,7 +22,8 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (get_dcp_mesh_if_enabled,
+                                           get_dcp_rank)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
@@ -1611,7 +1612,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     f"{self.dcp_interleave_size}. It is also the best value for "
                     "top-k load balance across the shards -- coarser cycles "
                     "let a contiguous run of winners land on fewer ranks.")
-            self._dcp_mesh = get_or_create_dcp_mesh()
+            self._dcp_mesh = get_dcp_mesh_if_enabled()
 
     def _get_kv_scales(
             self,
@@ -1817,6 +1818,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             sparse_mla_attention_dcp
 
         mesh = self._dcp_mesh
+        dcp_rank = get_dcp_rank() if mesh is None else None
 
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
@@ -1855,18 +1857,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                dcp_rank=dcp_rank,
             )
 
         op_name = ("pallas::sparse_mla_attention_dcp_"
                    f"{layer.layer_name.replace('.', '_')}")
-        sparse_mla_jax_op = pcp_streaming_jax_op(
-            op_name,
-            sparse_mla_attention_core_tpu_dcp,
-            donate_argnums=(0, 1),
-            mesh=mesh,
-            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
-            output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
-        )
+        if mesh is None:
+            # Unsharded export: the rank is a build-time constant baked into
+            # the traced function, so the op name stays rank-invariant.
+            sparse_mla_jax_op = pallas.jax_op(
+                op_name,
+                sparse_mla_attention_core_tpu_dcp,
+                donate_argnums=(0, 1),
+                mesh=None,
+                input_partition_specs=None,
+            )
+        else:
+            sparse_mla_jax_op = pcp_streaming_jax_op(
+                op_name,
+                sparse_mla_attention_core_tpu_dcp,
+                donate_argnums=(0, 1),
+                mesh=mesh,
+                input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+                output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+            )
 
         # We must overwrite the default fake implementation as vLLM uses
         # dynamic dimensions for the query.

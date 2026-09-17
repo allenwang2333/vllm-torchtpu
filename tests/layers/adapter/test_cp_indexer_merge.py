@@ -19,7 +19,7 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import \
     cp_local_to_global
-from vllm_torchtpu.layers.vllm.cp_indexer_merge import select_owned_winners
+from vllm_torchtpu.layers.adapter.cp_indexer_merge import select_owned_winners
 
 pytestmark = pytest.mark.cpu_test
 

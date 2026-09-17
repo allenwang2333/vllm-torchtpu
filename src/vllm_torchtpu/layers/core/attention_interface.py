@@ -900,7 +900,7 @@ def sparse_mla_attention_dcp(
     block_tables: jax.Array,
     query_start_loc: jax.Array,
     request_distribution: jax.Array,
-    mesh: Mesh,
+    mesh: Mesh | None,
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
     sm_scale: float | None = None,
@@ -908,6 +908,7 @@ def sparse_mla_attention_dcp(
     *,
     dcp_size: int,
     interleave_size: int,
+    dcp_rank: int | None = None,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
@@ -925,6 +926,7 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      dcp_rank: required when `mesh` is None, ignored otherwise.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -934,24 +936,41 @@ def sparse_mla_attention_dcp(
       before `W_UV`. `lse` is `-inf` wherever a rank owns none of a token's
       top-k, which is what makes that merge a plain softmax with no separate
       count channel.
+
+      With `mesh=None` the same body runs unsharded over this rank's own shard:
+      `local_topk_indices` then carries one row per token rather than one per
+      (rank, token), the results are this rank's partials alone, and the merge
+      is the caller's to do in torch.
     """
     if dcp_size <= 1:
         raise ValueError(
             f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
             "use sparse_mla_attention for the unsharded case.")
-    if dcp_axis_name not in mesh.axis_names:
-        raise ValueError(f"dcp_size={dcp_size} requires a mesh with a "
-                         f"{dcp_axis_name!r} axis, got {mesh.axis_names}.")
-    if mesh.shape[dcp_axis_name] != dcp_size:
-        raise ValueError(
-            f"dcp_size={dcp_size} does not match mesh axis "
-            f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
     num_tokens = ql_nope.shape[0]
-    if local_topk_indices.shape[0] != dcp_size * num_tokens:
-        raise ValueError(
-            "local_topk_indices must carry one row per (rank, token): "
-            f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
-            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}.")
+    if mesh is None:
+        if dcp_rank is None:
+            raise ValueError("mesh=None requires an explicit dcp_rank.")
+        if not 0 <= dcp_rank < dcp_size:
+            raise ValueError(
+                f"dcp_rank={dcp_rank} out of range for dcp_size={dcp_size}.")
+        if local_topk_indices.shape[0] != num_tokens:
+            raise ValueError(
+                "local_topk_indices must carry one row per token: expected "
+                f"{num_tokens}, got {local_topk_indices.shape[0]}.")
+    else:
+        if dcp_axis_name not in mesh.axis_names:
+            raise ValueError(f"dcp_size={dcp_size} requires a mesh with a "
+                             f"{dcp_axis_name!r} axis, got {mesh.axis_names}.")
+        if mesh.shape[dcp_axis_name] != dcp_size:
+            raise ValueError(
+                f"dcp_size={dcp_size} does not match mesh axis "
+                f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+        if local_topk_indices.shape[0] != dcp_size * num_tokens:
+            raise ValueError(
+                "local_topk_indices must carry one row per (rank, token): "
+                f"expected {dcp_size * num_tokens} rows for {num_tokens} "
+                f"tokens at dcp_size={dcp_size}, got "
+                f"{local_topk_indices.shape[0]}.")
 
     lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
     word_bytes = kv_cache_utils.WORD_BYTES
@@ -988,7 +1007,8 @@ def sparse_mla_attention_dcp(
     def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
                topk_idx, seq_lens_, block_tables_, query_start_loc_,
                request_distribution_):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        rank = (dcp_rank if mesh is None else
+                streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size))
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
@@ -997,7 +1017,7 @@ def sparse_mla_attention_dcp(
             seq_lens_,
             block_tables_,
             query_start_loc_,
-            dcp_rank,
+            rank,
             nope_spec=nope_spec,
             rope_spec=rope_spec,
             dcp_size=dcp_size,
@@ -1034,13 +1054,15 @@ def sparse_mla_attention_dcp(
         return (kv_cache_nope, kv_cache_rope, output[..., :ql_nope.shape[-1]],
                 lse)
 
+    operands = (ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
+                local_topk_indices, seq_lens, block_tables, query_start_loc,
+                request_distribution)
+    if mesh is None:
+        return _local(*operands)
+
     return jax.jit(
         shard_map.shard_map(_local,
                             mesh=mesh,
                             in_specs=in_specs,
                             out_specs=out_specs,
-                            check_rep=False))(ql_nope, q_pe, kv_c_normed, k_pe,
-                                              kv_cache_nope, kv_cache_rope,
-                                              local_topk_indices, seq_lens,
-                                              block_tables, query_start_loc,
-                                              request_distribution)
+                            check_rep=False))(*operands)

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
                                                   get_cp_group_layout,
                                                   get_or_create_cp_mesh)
@@ -71,3 +72,11 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     if axis_name is None:
         axis_name = DCP_AXIS_NAME
     return get_or_create_cp_mesh(axis_name=axis_name, group=get_dcp_group())
+
+
+def get_dcp_mesh_if_enabled(axis_name: str | None = None) -> Any | None:
+    """The DCP mesh, or None when `TPU_DCP_USE_MESH=0` selects the mesh-free
+    path: unsharded JAX per rank, with the DCP collectives done in torch."""
+    if not envs.TPU_DCP_USE_MESH:
+        return None
+    return get_or_create_dcp_mesh(axis_name)

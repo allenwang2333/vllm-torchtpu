@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.layers.vllm.custom_ops.mla_attention_op import \
+from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import \
     _cp_scatter_indexer_k
 
 KV_PACKING = 4

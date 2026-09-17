@@ -41,7 +41,9 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (get_dcp_mesh_if_enabled,
+                                           get_dcp_rank)
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
@@ -49,6 +51,8 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.layers.adapter.cp_indexer_merge import (
+    all_gather_candidates, select_owned_winners)
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import \
     should_quantize_on_load
@@ -71,9 +75,10 @@ def _cp_scatter_indexer_k(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     *,
-    mesh,
     cp_size: int,
     interleave_size: int,
+    mesh=None,
+    cp_rank: int | None = None,
     axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
@@ -89,11 +94,15 @@ def _cp_scatter_indexer_k(
     `k_packed` must already be in request-major order, since the positions
     come from `cu_q_lens`/`seq_lens`.
 
-    `axis_name`/`cp_size` name the axis the cache is split over.
+    `axis_name`/`cp_size` name the axis the cache is split over. With
+    `mesh=None` there is no axis to read the rank off, so `cp_rank` supplies it
+    and the body runs unsharded over this rank's own shard.
     """
+    if mesh is None and cp_rank is None:
+        raise ValueError("mesh=None requires an explicit cp_rank.")
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
-        rank = cp_rank_as_data(axis_name, cp_size)
+        rank = cp_rank if mesh is None else cp_rank_as_data(axis_name, cp_size)
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
         # The latent cache is guarded on its own page size in
@@ -138,6 +147,9 @@ def _cp_scatter_indexer_k(
                          jnp.int32(OOB_PAGE))
         return cache_kv.at[page, slot // kv_packing,
                            slot % kv_packing].set(k_packed)
+
+    if mesh is None:
+        return _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
@@ -261,9 +273,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         replicated, so there is no rank-major token packing to undo. Every
         token-major input arrives already in request-major order and stays
         replicated across the op boundary. Only the cache is split.
+
+        Without a mesh the candidate all-gather cannot live inside the JAX
+        program, so `_build_streamidx_dcp_op_no_mesh` splits the same pipeline
+        across two unsharded ops with the collective in torch between them.
         """
         topk = self.topk_tokens
-        mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
+        mesh = get_dcp_mesh_if_enabled(axis_name=DCP_AXIS_NAME)
+        if mesh is None:
+            return self._build_streamidx_dcp_op_no_mesh(
+                dcp_size, interleave_size)
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -355,6 +374,117 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             new_cache, local_topk = jax_op(*args)
             args[2].copy_(new_cache)
             return local_topk
+
+        return op
+
+    def _build_streamidx_dcp_op_no_mesh(self, dcp_size: int,
+                                        interleave_size: int):
+        """The mesh-free DCP indexer: two unsharded ops over this rank's own
+        shard, with the candidate all-gather done in torch between them."""
+        topk = self.topk_tokens
+        dcp_rank = get_dcp_rank()
+        compression_ratio = 1
+        interleave_c = interleave_size // compression_ratio
+
+        def _local_candidates_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            cache_kv = _cp_scatter_indexer_k(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                mesh=None,
+                cp_size=dcp_size,
+                interleave_size=interleave_size,
+                cp_rank=dcp_rank,
+            )
+
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            local_page_indices = jnp.mod(page_indices,
+                                         jnp.int32(cache_kv.shape[0]))
+            idxs, scores = streamindex_topk(
+                q,
+                weights,
+                cache_kv,
+                seq_lens,
+                local_page_indices,
+                cu_q_lens,
+                distribution,
+                k=topk,
+                compression_ratio=compression_ratio,
+                num_kv_pages_per_block=(2, 2, 2),
+                num_queries_per_block=(1, 128, 128),
+                enable_early_exit=False,
+                cp_size=dcp_size,
+                cp_rank=dcp_rank,
+                interleave_size=interleave_size,
+                return_scores=True,
+            )
+            return cache_kv, idxs, scores
+
+        def _merge_jax(scores: jax.Array) -> jax.Array:
+            return sparsecore_topk(
+                scores,
+                topk,
+                row_lengths=jnp.full((scores.shape[0], ),
+                                     scores.shape[1],
+                                     dtype=jnp.int32),
+                write_empty_rows=True,
+            )
+
+        # Every rank registers the same op name: the rank is baked into the
+        # traced function as a constant, so the name stays rank-invariant.
+        prefix = self.k_cache.prefix.replace('.', '_')
+        local_op = pallas.jax_op(
+            f"pallas::streamidx_topk_dcp_local_{prefix}",
+            _local_candidates_jax,
+            donate_argnums=(2, ),
+            mesh=None,
+            input_partition_specs=None,
+        )
+        merge_op = pallas.jax_op(
+            f"pallas::streamidx_topk_dcp_merge_{prefix}",
+            _merge_jax,
+            mesh=None,
+            input_partition_specs=None,
+        )
+
+        def _fake_local(q_bytes, weights, cache_kv, k_packed, seq_lens,
+                        page_indices, cu_q_lens, distribution, **kwargs):
+            del (weights, k_packed, seq_lens, page_indices, cu_q_lens,
+                 distribution, kwargs)
+            num_tokens = q_bytes.shape[0]
+            return (
+                torch.empty_like(cache_kv),
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.int32),
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.float32),
+            )
+
+        def _fake_merge(scores, **kwargs):
+            del kwargs
+            return scores.new_empty((scores.shape[0], topk), dtype=torch.int32)
+
+        local_op.register_fake(_fake_local)
+        merge_op.register_fake(_fake_merge)
+
+        def op(*args):
+            new_cache, idxs, scores = local_op(*args)
+            args[2].copy_(new_cache)
+            winner_cols = merge_op(all_gather_candidates(scores))
+            return select_owned_winners(winner_cols,
+                                        idxs,
+                                        dcp_size=dcp_size,
+                                        dcp_rank=dcp_rank,
+                                        interleave_c=interleave_c)
 
         return op
 
