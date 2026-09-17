@@ -22,10 +22,14 @@ def test_moe_gather_preserves_bits_and_token_owners(monkeypatch):
     mesh = Mesh(np.asarray(devices), ('k3_sp', ))
     owners = np.random.default_rng(913).permutation(len(devices))
     # NaN payloads can be canonicalized by host BF16 transport. Router
-    # weights are finite; retain signed zero, subnormals and infinities.
+    # weights are finite; retain signed zero and infinities. CPU also checks
+    # subnormals, which TPU floating-point operations flush to signed zero.
     bits = np.arange(65536, dtype=np.uint16).reshape(4096, 16)
     bits = np.where(((bits & 0x7f80) == 0x7f80) & ((bits & 0x7f) != 0), 0,
                     bits).astype(np.uint16)
+    if any(device.platform == "tpu" for device in devices):
+        bits = np.where((bits & 0x7f80) == 0, bits & 0x8000,
+                        bits).astype(np.uint16)
     ids = np.arange(65536, dtype=np.uint16).view(np.int16).astype(
         np.int32).reshape(bits.shape)
     sharding = NamedSharding(mesh, P('k3_sp', None))
@@ -49,7 +53,7 @@ def test_moe_gather_preserves_bits_and_token_owners(monkeypatch):
 
         return local(payload)
 
-    # Isolate packing/ownership on CPU; physical Pallas rings have TPU tests.
+    # Isolate packing/ownership with native collectives; test Pallas rings separately.
     monkeypatch.setattr(collectives, 'ring_collective', native_gather)
     actual_x, actual_w, actual_i = jax.jit(
         lambda x, w, i: collectives.gather_moe_inputs(
