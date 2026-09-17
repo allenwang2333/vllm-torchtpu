@@ -38,8 +38,10 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import SendMeta
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _chunk_base_req_id, _chunk_req_id, _DestinationCollector,
-    _flatten_block_ids, _send_meta_fa_group, _send_meta_int, _Stage3Admission,
-    _STAGE7_ARM_DEADLINE_S, _maybe_strand_stage7_watch_for_test)
+    _early_group_bells, _early_layer_split_enabled, _fa_group_cuts,
+    _fa_group_ordinals, _flatten_block_ids, _send_meta_fa_group,
+    _send_meta_int, _Stage3Admission, _STAGE7_ARM_DEADLINE_S,
+    _maybe_strand_stage7_watch_for_test)
 
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import \
     TPUConnectorMetadata
@@ -1275,11 +1277,11 @@ class TestEarlyLayerGroupLayout:
 
     def test_a_group_index_the_worker_does_not_have_is_refused(self):
         """A send naming group 1 on a worker that admitted one attention tag
-        means the peers read TPU_KV_EARLY_LAYERS differently. Silently
-        clamping would ship one group's bytes under the other's name."""
+        means the peers read the layer cuts differently. Silently clamping
+        would ship one group's bytes under the other's name."""
         worker = self._worker()
         worker._stage3_fa_tags = ("fa", )
-        with pytest.raises(RuntimeError, match="TPU_KV_EARLY_LAYERS"):
+        with pytest.raises(RuntimeError, match="disagree about the attention"):
             worker._stage3_transfer_layout(dst_block_ids=[200],
                                            mamba_state_block_ids=None,
                                            skip_tokens=0,
@@ -2019,3 +2021,351 @@ class TestAWatchThatNeverFiresIsSweptAndSent:
             armed = [_maybe_strand_stage7_watch_for_test(8) for _ in range(4)]
         assert armed.count(8) == 2
         assert all(g > 8 for g in armed if g != 8)
+
+
+# ---------------------------------------------------------------------------
+# Stage 8: every attention group ships on its own bell
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _cuts_on(spec: str):
+    """The stage 8 knob, plus the producer-submit flag it needs.
+
+    TPU_KV_GROUP_BOUNDS names the cuts directly, so unlike _early_layers_on
+    this does not have to say how wide each group is. "1,4,8" is four groups
+    and three of them ship early.
+    """
+    with patch(f"{_MOD}.tpu_envs.TPU_KV_GROUP_BOUNDS", spec, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", True, create=True):
+        yield
+
+
+@contextmanager
+def _cuts_arming_on(spec: str):
+    """_arming_on, but with the cuts spelled as stage 8 spells them."""
+    with _cuts_on(spec), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL_ARM", True, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL", True, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL_POLL_US", 200, create=True), \
+         patch(f"{_MOD}.tpu_envs.TPU_KV_STAGE6_PREPARE", True, create=True), \
+         patch(f"{_MOD}._stage6_prepare_fire_supported", return_value=True):
+        yield
+
+
+class TestTheCutsAreReadTheWayTheyAreWritten:
+    """Where the layers are cut, before anything is sent anywhere.
+
+    The cuts decide three separate things that all have to agree: how many
+    uuids admission mints, which bell each send waits for, and how many pool
+    tags the worker registers. Getting this wrong is not a slow run. Too few
+    uuids and decode waits forever for an arrival nobody sends; the wrong bell
+    and a transfer ships pages the forward has not written yet.
+    """
+
+    def test_nothing_set_is_no_split_at_all(self):
+        """The floor the whole design promised: every knob off reproduces
+        stage 6, one transfer carrying every layer."""
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_GROUP_BOUNDS", "", create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_EARLY_LAYERS", 0, create=True):
+            assert _fa_group_cuts() == ()
+            assert _early_group_bells() == ()
+
+    def test_early_layers_is_the_one_cut_spelling(self):
+        """Stage 7's knob still means what it meant, because stage 7's
+        measurements were taken with it and they have to stay comparable."""
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_GROUP_BOUNDS", "", create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_EARLY_LAYERS", 3, create=True):
+            assert _fa_group_cuts() == (3, )
+
+    def test_the_cut_list_wins_over_the_old_knob(self):
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_GROUP_BOUNDS", "2,5",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_EARLY_LAYERS", 9, create=True):
+            assert _fa_group_cuts() == (2, 5)
+
+    @pytest.mark.parametrize("spec,cuts", [
+        ("1", (1, )),
+        ("1,4,8", (1, 4, 8)),
+        (" 2 , 6 ", (2, 6)),
+        ("1,2,3,4,5,6,7,8,9,10,11,12,13,14", tuple(range(1, 15))),
+    ])
+    def test_a_well_formed_list_parses(self, spec, cuts):
+        with _cuts_on(spec):
+            assert _fa_group_cuts() == cuts
+
+    @pytest.mark.parametrize("spec", ["0", "0,3", "4,2", "2,2", "-1", "3,3,5"])
+    def test_a_malformed_list_is_refused_rather_than_repaired(self, spec):
+        """Sorting it here would be guessing at an intent the operator did not
+        express, and the guess is invisible until a transfer ships the wrong
+        layers under the right tag."""
+        with _cuts_on(spec):
+            with pytest.raises(ValueError, match="strictly increasing"):
+                _fa_group_cuts()
+
+    @pytest.mark.parametrize("spec,bells", [
+        ("1", (0, )),
+        ("1,4,8", (0, 3, 7)),
+        ("14", (13, )),
+    ])
+    def test_a_group_waits_on_the_layer_that_finishes_it(self, spec, bells):
+        """A group ending just before cut C is finished by layer C-1. Waiting
+        on the group's first layer instead fires while the rest is still being
+        written, which is stale bytes rather than a slow run."""
+        with _cuts_on(spec):
+            assert _early_group_bells() == bells
+
+    def test_the_split_still_needs_the_producer_to_be_the_one_sending(self):
+        """Decode's fallback timer only ever starts the base uuid, so under
+        consumer-initiated transfers an early group is a transfer nobody would
+        start and the request would never finish."""
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_GROUP_BOUNDS", "1,4",
+                   create=True), \
+             patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", False,
+                   create=True):
+            assert _fa_group_cuts() == (1, 4)
+            assert not _early_layer_split_enabled()
+
+
+class TestManyGroupsShipAsManyTransfers:
+    """One request, N+1 transfers: N early groups and the rest.
+
+    Stage 7 proved one group can leave before the forward finishes. Stage 8 is
+    the same mechanism at every width, and the thing it has to get right is
+    bookkeeping rather than timing. Decode derives each arrival's id from its
+    position in the announced list, so the uuids, the send ids and the group
+    indices have to be three views of one ordering.
+    """
+
+    CUTS = "1,4,8"
+    UUIDS = (900, 901, 902, 903)
+
+    def _admitted(self, spec=CUTS, uuids=UUIDS, prompt=PAGE + 1):
+        producer, notifier = _producer()
+        req = _request("short", prompt, dst_batch_url=_DST_URL)
+        with _cuts_arming_on(spec):
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(uuids[0]):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=list(uuids)))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        _give_destination(producer, "short",
+                          _published_destination(uuids[0], [200]))
+        return producer, req, notifier
+
+    def _build(self, producer, spec=CUTS, prompt=PAGE + 1):
+        with _cuts_arming_on(spec):
+            with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                       return_value=30.0):
+                return producer.build_connector_meta(
+                    _step(new=[("short", [100])], scheduled={"short": prompt}))
+
+    def test_admission_mints_one_uuid_per_early_group(self):
+        _p, _req, notifier = self._admitted()
+        announced = notifier.posts[-1][1]
+        # Three early groups, no chunks: decode is told to expect four
+        # arrivals, which is the three leading uuids plus the final one.
+        assert announced["chunk_uuids"] == [901, 902, 903]
+
+    def test_the_admission_remembers_which_bell_each_one_waits_on(self):
+        """Frozen at admission rather than re-read when the send is built, so
+        the count decode was promised and the count actually sent come from
+        one place and cannot drift apart."""
+        producer, _req, _n = self._admitted()
+        admission = producer._chunk_progress["short"].admission
+        assert admission.early_uuids == (901, 902, 903)
+        assert admission.early_bells == (0, 3, 7)
+
+    def test_each_group_ships_under_its_own_id_group_and_bell(self):
+        producer, _req, _n = self._admitted()
+        meta = self._build(producer)
+        for index, (uuid, group, bell) in enumerate([(901, 0, 0), (902, 1, 3),
+                                                     (903, 2, 7)]):
+            send = meta.reqs_to_send[_chunk_req_id("short", index)]
+            assert (send.uuid, send.fa_group,
+                    send.arm_on_bell) == (uuid, group, bell)
+            # None of them retires the request or carries recurrent state;
+            # the final send behind them does both.
+            assert send.is_final_chunk is False
+
+    def test_the_final_send_carries_the_one_group_nobody_cut_away(self):
+        """Three cuts make four groups, so the last is group 3. Naming any
+        other index would ship a group twice and leave one on the floor."""
+        producer, req, _n = self._admitted()
+        self._build(producer)
+        with _cuts_arming_on(self.CUTS):
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                producer.request_finished(req, [100])
+        assert producer.reqs_to_send["short"].fa_group == 3
+
+    def test_fifteen_groups_is_fourteen_early_sends(self):
+        """The width the design is aiming at, where every attention layer is
+        its own transfer and only the last waits for the forward to end."""
+        spec = ",".join(str(cut) for cut in range(1, 15))
+        uuids = tuple(range(900, 915))
+        producer, _req, _n = self._admitted(spec=spec, uuids=uuids)
+        meta = self._build(producer, spec=spec)
+        assert len(meta.reqs_to_send) == 14
+        sends = [
+            meta.reqs_to_send[_chunk_req_id("short", i)] for i in range(14)
+        ]
+        assert [s.fa_group for s in sends] == list(range(14))
+        assert [s.arm_on_bell for s in sends] == list(range(14))
+        assert [s.uuid for s in sends] == list(range(901, 915))
+
+    def test_every_transfer_gets_a_uuid_of_its_own(self):
+        """Two sends sharing a uuid is one transfer as far as raiden is
+        concerned, and the second registration comes back a duplicate."""
+        producer, _req, _n = self._admitted()
+        meta = self._build(producer)
+        uuids = [
+            meta.reqs_to_send[_chunk_req_id("short", i)].uuid for i in range(3)
+        ]
+        assert len(set(uuids)) == 3
+
+    def test_the_late_path_ships_the_same_groups_without_the_bells(self):
+        """request_finished emits after the prompt is over, so there is
+        nothing left to wait for and every send goes out unarmed. It is the
+        fallback for a step that crosses a chunk boundary and finishes the
+        prompt together."""
+        producer, req, _n = self._admitted()
+        with _cuts_on(self.CUTS):
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                producer.request_finished(req, [100])
+        sends = [
+            producer.reqs_to_send[_chunk_req_id("short", i)] for i in range(3)
+        ]
+        assert [s.fa_group for s in sends] == [0, 1, 2]
+        assert all(s.arm_on_bell is None for s in sends)
+        assert producer.reqs_to_send["short"].fa_group == 3
+
+
+class TestTheTwoSplitsStillCompose:
+    """Chunks cut by token, groups cut by layer, and the ids stay in order.
+
+    Decode walks one list. The chunks come first and the groups after, so a
+    request with two chunks and three groups announces five leading uuids and
+    the group that the worker puts on the wire for #c3 has to be group 1, not
+    chunk 3.
+    """
+
+    def test_the_groups_are_numbered_after_the_chunks(self):
+        # A budget of two pages cuts a four-page prompt into two chunks, so
+        # this request sends two chunk transfers and two group transfers.
+        producer, notifier = _producer(budget=2 * PAGE)
+        req = _request("long", 4 * PAGE, dst_batch_url=_DST_URL)
+        uuids = list(range(900, 910))
+        with _cuts_arming_on("1,4"), _chunk_split_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=uuids))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        admission = producer._stage3_admitted_sends["long"]
+        announced = notifier.posts[-1][1]["chunk_uuids"]
+        # The chunk uuids lead and the group uuids follow, which is the order
+        # the derived ids are numbered in and the only thing decode knows.
+        assert announced == list(admission.chunk_uuids) + list(
+            admission.early_uuids)
+        assert len(admission.chunk_uuids) == 1
+        assert len(admission.early_uuids) == 2
+        # Two chunks means one leading chunk transfer, so the groups start at
+        # #c1 and the final send is still the base id.
+        assert announced == [900 + i for i in range(1, 4)]
+
+
+class TestTheWorkerRegistersOneTagPerGroup:
+    """What the worker puts on the wire for a send naming one of N groups."""
+
+    def _worker(self, groups: int):
+        worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
+        worker._stage3_state_group_count = 0
+        worker._stage3_fa_tags = tuple(f"fa.g{i}" for i in range(groups))
+        return worker
+
+    @pytest.mark.parametrize("group", [0, 2, 3])
+    def test_a_group_send_names_exactly_its_own_tag(self, group):
+        worker = self._worker(4)
+        tags, blocks, counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200, 201],
+            mamba_state_block_ids=None,
+            skip_tokens=0,
+            fa_only=True,
+            fa_group=group)
+        assert tags == [f"fa.g{group}"]
+        # One tag replays over the destination pages once, however many other
+        # groups exist, because the bytes it carries are its own layers only.
+        assert blocks == [200, 201]
+        assert counts == [2]
+
+    def test_a_group_past_the_end_is_refused(self):
+        """Group 4 on a worker holding four tags means the peers read the cut
+        list differently, and clamping would ship one group's bytes under
+        another's name."""
+        worker = self._worker(4)
+        with pytest.raises(RuntimeError, match="disagree about the attention"):
+            worker._stage3_transfer_layout(dst_block_ids=[200],
+                                           mamba_state_block_ids=None,
+                                           skip_tokens=0,
+                                           fa_only=True,
+                                           fa_group=4)
+
+    def test_no_group_named_still_names_all_of_them(self):
+        """The unsplit send, which is what the final transfer is when the
+        layer split is off entirely."""
+        worker = self._worker(4)
+        tags, blocks, _counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=None,
+            skip_tokens=0,
+            fa_only=True)
+        assert tags == ["fa.g0", "fa.g1", "fa.g2", "fa.g3"]
+        assert blocks == [200] * 4
+
+
+class TestEveryLayerLandsInExactlyOneGroup:
+    """The partition, which is where a cut list becomes pool tags.
+
+    The layers arrive in pool order, so a layer's position is also the bell it
+    rings, and the whole scheme rests on that. A layer in the wrong group
+    means its bytes go out under another group's tag: the transfer succeeds,
+    decode is happy, and the KV is wrong.
+    """
+
+    LAYERS = tuple(f"layer{i}" for i in range(15))
+
+    def test_one_cut_is_the_stage_seven_split(self):
+        ordinals = _fa_group_ordinals(self.LAYERS, (1, ))
+        assert ordinals["layer0"] == 0
+        assert all(ordinals[f"layer{i}"] == 1 for i in range(1, 15))
+
+    def test_the_boundaries_land_where_the_cuts_say(self):
+        """(1, 4, 8) reads as four groups holding layers 0, 1-3, 4-7 and
+        8 onward, so the layer at each cut starts the next group rather than
+        ending the previous one."""
+        ordinals = _fa_group_ordinals(self.LAYERS, (1, 4, 8))
+        assert [ordinals[f"layer{i}"]
+                for i in range(15)] == ([0] + [1] * 3 + [2] * 4 + [3] * 7)
+
+    def test_every_layer_its_own_group(self):
+        ordinals = _fa_group_ordinals(self.LAYERS, tuple(range(1, 15)))
+        assert [ordinals[f"layer{i}"] for i in range(15)] == list(range(15))
+
+    def test_a_cut_past_the_last_layer_is_refused(self):
+        """An empty final group is a request that never finishes: that group
+        is the one carrying the recurrent state and retiring the request."""
+        with pytest.raises(ValueError, match="leave a late group"):
+            _fa_group_ordinals(self.LAYERS, (1, 15))
+
+    def test_a_cut_on_the_last_layer_is_fine(self):
+        """Fourteen cuts of fifteen layers leaves the fifteenth alone, which
+        is the widest split the model allows."""
+        ordinals = _fa_group_ordinals(self.LAYERS, (14, ))
+        assert ordinals["layer14"] == 1
+        assert ordinals["layer13"] == 0

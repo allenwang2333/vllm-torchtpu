@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL_REPORT_EVERY: int = 200
     TPU_KV_DOORBELL_ARM: bool = False
     TPU_KV_EARLY_LAYERS: int = 0
+    TPU_KV_GROUP_BOUNDS: str = ""
     TPU_KV_ADMISSION_REORDER: bool = False
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
     TPU_KV_PREFILL_SUBMIT: bool = False
@@ -530,6 +531,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # consequence of the tag lookup rather than a guard anyone wrote.
     "TPU_KV_EARLY_LAYERS":
     lambda: int(os.getenv("TPU_KV_EARLY_LAYERS") or "0"),
+
+    # Stage 8. Every place the attention layers are cut, as a comma-separated
+    # list of layer indices, so "1,4,8" makes four groups holding layers 0,
+    # 1-3, 4-7 and 8 onward. The last group is whatever is left over and has
+    # no entry: it rides the final send with the recurrent state, so it is
+    # never one of the early transfers. Empty falls back to
+    # TPU_KV_EARLY_LAYERS, which is the one-cut spelling of the same thing,
+    # and an unset pair leaves every byte on the wire where stage 6 put it.
+    #
+    # Cuts rather than a group count because the scheduler mints one uuid per
+    # early group and arms each on the bell its last layer rings, and it has
+    # to do that without knowing how many attention layers the model has.
+    # That number comes from the KV cache spec, which only the worker sees.
+    # Both peers must set this identically, for the same reason and with the
+    # same failure mode as TPU_KV_EARLY_LAYERS.
+    "TPU_KV_GROUP_BOUNDS":
+    lambda: os.getenv("TPU_KV_GROUP_BOUNDS", ""),
 
     # Mint the transfer uuid when prefill admits a request rather than when it
     # finishes, and tell the proxy over a callback so decode can allocate its

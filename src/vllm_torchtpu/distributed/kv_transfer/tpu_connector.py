@@ -17,6 +17,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import bisect
 import copy
 import json
 import os
@@ -99,9 +100,11 @@ _DONE_FUTURE = _DoneFuture()
 _STAGE3_FINISH_DEDUP_LIMIT = 4096
 _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
 # How many doorbell watches the worker remembers, so that an abort arriving
-# within a few hundred requests can still take its transfer back. Far more
-# than any plausible in-flight count, and each entry is a pair and an int.
-_STAGE7_WATCH_HISTORY = 1024
+# within a few hundred requests can still take its transfer back. Each entry
+# is a pair and an int, so the cost of being generous is nothing, and stage 8
+# spends it fourteen times faster: a request arms one watch per early group
+# rather than one in total, and at concurrency 32 that is 448 live at once.
+_STAGE7_WATCH_HISTORY = 8192
 # Stage 7d. How long the worker holds an armed send whose destination has not
 # arrived. The measured wait on 397B is about 1.4 s, so this is two orders of
 # magnitude of headroom; what it really bounds is the damage from a consumer
@@ -340,11 +343,18 @@ class _Stage3Admission:
     # just with less of the overlap the split exists to buy.
     chunk_tokens: int = 0
     chunk_uuids: tuple[int, ...] = ()
-    # Stage 7. The uuid of the extra transfer carrying the early attention
-    # group over the whole prompt, or 0 when the layer split is off. It is not
-    # in chunk_uuids because it is not a token window: the chunk bookkeeping
-    # walks boundaries, and this one has none.
-    early_uuid: int = 0
+    # Stage 7, widened in stage 8. One uuid per early attention group, each
+    # carrying its own layers over the whole prompt, and the bell that
+    # releases it. Both empty when the layer split is off. They are not in
+    # chunk_uuids because they are not token windows: the chunk bookkeeping
+    # walks boundaries, and these have none.
+    #
+    # The bells are frozen here rather than read from the environment when the
+    # send is built, because this tuple is also what was promised to the
+    # proxy. One source for the count and the release point means the send can
+    # never disagree with the announcement about how many transfers there are.
+    early_uuids: tuple[int, ...] = ()
+    early_bells: tuple[int, ...] = ()
 
     def chunk_start(self, index: int) -> int:
         return index * self.chunk_tokens
@@ -931,34 +941,76 @@ def _flatten_block_ids(block_ids: Any) -> list[int]:
     return [int(b) for b in block_ids]
 
 
+def _fa_group_cuts() -> tuple[int, ...]:
+    """Where the attention layers are cut into transfer groups.
+
+    Each entry is the first layer of a new group, so (1, 4, 8) makes four
+    groups holding layers 0, 1-3, 4-7 and 8 onward. The tuple names only the
+    early groups; the last group is whatever is left over, it rides the final
+    send with the recurrent state, and it has no cut of its own. So the number
+    of early transfers a request sends is exactly the length of this tuple.
+
+    An empty tuple means no split at all. TPU_KV_EARLY_LAYERS=N is the
+    one-cut spelling, kept so stage 7 keeps working unchanged, and
+    TPU_KV_GROUP_BOUNDS wins when both are set. See the envs entry for why
+    stage 8 is spelled as cuts rather than as a group count.
+    """
+    raw = str(tpu_envs.TPU_KV_GROUP_BOUNDS or "").strip()
+    if not raw:
+        early = int(tpu_envs.TPU_KV_EARLY_LAYERS)
+        return (early, ) if early > 0 else ()
+    cuts = tuple(int(part) for part in raw.split(",") if part.strip())
+    if not cuts or cuts[0] < 1 or list(cuts) != sorted(set(cuts)):
+        raise ValueError("TPU_KV_GROUP_BOUNDS must be strictly increasing "
+                         f"layer indices starting at 1 or more: {raw!r}")
+    return cuts
+
+
+def _fa_group_ordinals(fa_layers: tuple[str, ...],
+                       cuts: tuple[int, ...]) -> dict[str, int]:
+    """Which transfer group each attention layer belongs to.
+
+    The layers arrive in pool order, which is ascending layer order with the
+    GDN layers between them skipped, so a layer's position in this list is
+    also the index of the bell it rings. That is the whole reason the cuts can
+    be written as layer indices at all.
+
+    The last cut has to leave something behind it. A cut at or past the end
+    would make the final group empty, and the final group is the one that
+    carries the recurrent state and retires the request, so an empty one is a
+    request that never finishes rather than a configuration that does nothing.
+    """
+    if cuts[-1] >= len(fa_layers):
+        raise ValueError("the attention layer cuts must leave a late group: "
+                         f"cuts={cuts}, attention layers={len(fa_layers)}")
+    return {
+        name: bisect.bisect_right(cuts, index)
+        for index, name in enumerate(fa_layers)
+    }
+
+
 def _early_layer_split_enabled() -> bool:
     """Whether a request ships its leading attention layers as their own
-    transfer. See TPU_KV_EARLY_LAYERS.
+    transfers. See TPU_KV_GROUP_BOUNDS and TPU_KV_EARLY_LAYERS.
 
     Gated on the producer-submit path for the same reason the chunk split is,
     and a little more sharply: the consumer's fallback timer only ever starts
-    the base uuid, so under consumer-initiated transfers the early group is a
-    transfer nobody would start and the request would never complete.
+    the base uuid, so under consumer-initiated transfers the early groups are
+    transfers nobody would start and the request would never complete.
     """
-    return bool(
-        int(tpu_envs.TPU_KV_EARLY_LAYERS) > 0
-        and tpu_envs.TPU_KV_PREFILL_SUBMIT)
+    return bool(_fa_group_cuts() and tpu_envs.TPU_KV_PREFILL_SUBMIT)
 
 
-def _early_group_last_bell() -> int:
-    """The bell index the early transfer's last layer rings.
+def _early_group_bells() -> tuple[int, ...]:
+    """The bell each early group's send has to wait for, in group order.
 
-    A bell is one attention layer and there are fifteen of them; a transfer
-    group is a span of layers. The early group holds layers 0 through
-    TPU_KV_EARLY_LAYERS-1, so the one that finishes it is the last, and that
-    is the bell the send has to wait for. Arming on layer 0 fires while the
-    rest of the group is still being written, which ships whatever those pages
-    held before and reads as wrong output rather than a slow run.
-
-    The two indices coincide at the width stage 7 runs, one layer, so this
-    changes no behaviour today. It matters at every width stage 8 adds.
+    A bell is one attention layer; a transfer group is a span of them. A group
+    ending just before cut C is finished by layer C-1, so that is the bell.
+    Arming on the group's first layer instead fires while the rest of it is
+    still being written, which ships whatever those pages held before and
+    reads as a wrong answer rather than a slow run.
     """
-    return max(0, int(tpu_envs.TPU_KV_EARLY_LAYERS) - 1)
+    return tuple(cut - 1 for cut in _fa_group_cuts())
 
 
 def _doorbell_arm_enabled() -> bool:
@@ -2320,7 +2372,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         request falls back to stage 7b rather than guessing.
         """
         admission = progress.admission
-        if (progress.early_emitted or not admission.early_uuid
+        if (progress.early_emitted or not admission.early_uuids
                 or not _doorbell_arm_enabled()):
             return
         if (progress.pending is not None
@@ -2365,15 +2417,15 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "to cover %d tokens; leaving the early group to the late path",
                 len(progress.block_ids), req_id, needed, admission.num_tokens)
             return
-        if self._emit_early_group_send(
-                req_id,
-                admission,
-                tuple(progress.block_ids[:needed]),
-                admission.num_tokens,
-                progress.shipped_through,
-                time.perf_counter() + dist_utils.get_p2p_wait_pull_timeout(),
-                dst_params,
-                                       arm_on_bell=_early_group_last_bell(),
+        if self._emit_early_group_send(req_id,
+                                       admission,
+                                       tuple(progress.block_ids[:needed]),
+                                       admission.num_tokens,
+                                       progress.shipped_through,
+                                       time.perf_counter() +
+                                       dist_utils.get_p2p_wait_pull_timeout(),
+                                       dst_params,
+                                       arm_on_bells=True,
                                        dst_batch_url=dst_batch_url):
             progress.early_emitted = True
 
@@ -2473,24 +2525,29 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                block_ids: tuple[int, ...], num_tokens: int,
                                start_token: int, expiration_time: float,
                                dst_params: Optional[dict],
-                               arm_on_bell: Optional[int] = None,
+                               arm_on_bells: bool = False,
                                dst_batch_url: Optional[str] = None) -> bool:
-        """Queue the early attention group as a send of its own.
+        """Queue each early attention group as a send of its own.
 
         A chunk splits a request by token and this splits it by layer, so the
-        two compose: the early send covers whichever tokens the chunks have
-        not already carried, but only the layers in group 0. It returns
-        whether it queued anything, which is what tells the caller the final
-        send is now carrying group 1 rather than everything.
+        two compose: the early sends cover whichever tokens the chunks have
+        not already carried, but each one covers only its own layers. It
+        returns whether it queued anything, which is what tells the caller the
+        final send is now carrying the last group rather than everything.
+
+        Either all of them are queued or none are. They go out together, they
+        are announced together, and a partial emission would leave decode
+        waiting on an arrival nothing will send, so the caller's one flag is
+        an honest summary of what happened here.
 
         Two callers, and the difference between them is the whole of stage 7c.
-        request_finished emits after the prompt is over, which lands this send
-        beside the final one and ships it no sooner. _maybe_emit_early_group
-        emits during the step that finishes the prompt and passes arm_on_bell,
-        which makes the send's pages a promise the worker has to wait on
-        rather than bytes already written.
+        request_finished emits after the prompt is over, which lands these
+        sends beside the final one and ships them no sooner.
+        _maybe_emit_early_group emits during the step that finishes the prompt
+        and sets arm_on_bells, which makes each send's pages a promise the
+        worker has to wait on rather than bytes already written.
         """
-        if announced is None or not announced.early_uuid:
+        if announced is None or not announced.early_uuids:
             return False
         if not dst_params and not dst_batch_url:
             # Decode was told at admission how many arrivals make this request
@@ -2504,43 +2561,48 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # Naming dst_batch_url is how the caller says it has somewhere to
             # wait. Then the send carries no destination on purpose and the
             # worker holds it until one arrives.
+            awaited = (len(announced.chunk_uuids) +
+                       len(announced.early_uuids) + 1)
             raise ValueError(
-                f"Stage-7 early attention group of req_id={req_id} cannot "
+                f"Stage-7 early attention groups of req_id={req_id} cannot "
                 "ship: the consumer never published its destination pages, "
-                "and decode is waiting for "
-                f"{len(announced.chunk_uuids) + 2} transfers")
-        index = len(announced.chunk_uuids)
-        self.reqs_to_send[_chunk_req_id(req_id, index)] = SendMeta(
-            uuid=announced.early_uuid,
-            local_block_ids=[int(block) for block in block_ids],
-            expiration_time=expiration_time,
-            num_tokens=num_tokens,
-            dst_params=dst_params,
-            start_token=start_token,
-            chunk_index=index,
-            # Not final in the sense the flag actually means: do not ship the
-            # recurrent state and do not retire the request. The final send
-            # behind this one does both.
-            is_final_chunk=False,
-            fa_group=0,
-            arm_on_bell=arm_on_bell,
-            dst_batch_url=dst_batch_url,
-        )
-        logger.info(
-            "%s",
-            json.dumps(
-                {
-                    "event": "raiden_stage7_early_group_send",
-                    "req_id": req_id,
-                    "chunk_index": index,
-                    "uuid": announced.early_uuid,
-                    "start_token": start_token,
-                    "end_token": num_tokens,
-                    "arm_on_bell": arm_on_bell,
-                    "deferred_dst": bool(dst_batch_url),
-                    "t": time.time(),
-                },
-                sort_keys=True))
+                f"and decode is waiting for {awaited} transfers")
+        base = len(announced.chunk_uuids)
+        for group, (uuid, bell) in enumerate(
+                zip(announced.early_uuids, announced.early_bells)):
+            index = base + group
+            self.reqs_to_send[_chunk_req_id(req_id, index)] = SendMeta(
+                uuid=uuid,
+                local_block_ids=[int(block) for block in block_ids],
+                expiration_time=expiration_time,
+                num_tokens=num_tokens,
+                dst_params=dst_params,
+                start_token=start_token,
+                chunk_index=index,
+                # Not final in the sense the flag actually means: do not ship
+                # the recurrent state and do not retire the request. The final
+                # send behind these does both.
+                is_final_chunk=False,
+                fa_group=group,
+                arm_on_bell=bell if arm_on_bells else None,
+                dst_batch_url=dst_batch_url,
+            )
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage7_early_group_send",
+                        "req_id": req_id,
+                        "chunk_index": index,
+                        "fa_group": group,
+                        "uuid": uuid,
+                        "start_token": start_token,
+                        "end_token": num_tokens,
+                        "arm_on_bell": bell if arm_on_bells else None,
+                        "deferred_dst": bool(dst_batch_url),
+                        "t": time.time(),
+                    },
+                    sort_keys=True))
         return True
 
     def _maybe_announce_admission(self, request: "Request") -> None:
@@ -2622,18 +2684,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if tail_tokens < int(self.block_size):
                 num_chunks -= 1
         chunk_uuids = tuple(get_uuid() for _ in range(num_chunks - 1))
-        # Stage 7. One more transfer, carrying the early attention group over
-        # the whole prompt. Decode counts arrivals and derives each one's id
-        # from its position, so to decode this is simply one more transfer
-        # arriving before the final one and no consumer change is needed.
-        early_uuid = get_uuid() if _early_layer_split_enabled() else 0
+        # Stage 7, widened in stage 8. One more transfer per early attention
+        # group, each carrying its own layers over the whole prompt. Decode
+        # counts arrivals and derives each one's id from its position, so to
+        # decode these are simply more transfers arriving before the final one
+        # and no consumer change is needed at any group count.
+        early_bells = (_early_group_bells()
+                       if _early_layer_split_enabled() else ())
+        early_uuids = tuple(get_uuid() for _ in early_bells)
         admission = _Stage3Admission(uuid=uuid,
                                      num_tokens=num_tokens,
                                      chunk_tokens=chunk_tokens,
                                      chunk_uuids=chunk_uuids,
-                                     early_uuid=early_uuid)
+                                     early_uuids=early_uuids,
+                                     early_bells=early_bells)
         self._stage3_admitted_sends[request.request_id] = admission
-        if chunk_uuids or early_uuid:
+        if chunk_uuids or early_uuids:
             # An unchunked request with an early group needs the same per-step
             # bookkeeping, not to find a chunk boundary but to find the step
             # that finishes the prompt. The chunk half of it sits out when
@@ -2645,9 +2711,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 prompt_tokens=int(request.num_prompt_tokens))
         # Every transfer this request will send except the final one, in the
         # order their derived ids are numbered: the token chunks first, then
-        # the early layer group.
-        leading_uuids = list(chunk_uuids) + ([early_uuid]
-                                             if early_uuid else [])
+        # the early layer groups in group order.
+        leading_uuids = list(chunk_uuids) + list(early_uuids)
         announcement: dict[str, Any] = {
             "req_id": request.request_id,
             "uuid": uuid,
@@ -2893,9 +2958,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 request.request_id)
             start_token = 0
         if progress is not None and progress.early_emitted:
-            # Stage 7c already queued it, during the step whose forward has
-            # just run, and it may already be on the wire. The final send
-            # still has to know, because what it carries depends on it.
+            # Stage 7c already queued them, during the step whose forward has
+            # just run, and they may already be on the wire. The final send
+            # still has to know, because what it carries depends on it. The
+            # admission is what says how many went, and it is always present:
+            # a progress object only exists because one was made.
+            announced = progress.admission
             early_group = True
         else:
             early_group = self._emit_early_group_send(request.request_id,
@@ -2913,10 +2981,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             dst_params=dst_params,
             start_token=start_token,
             chunk_index=0 if progress is None else progress.next_chunk,
-            # With the early group gone ahead, the final send carries the late
-            # group and the recurrent state. Without it, it carries everything,
-            # which is fa_group=None and the single tag list.
-            fa_group=1 if early_group else None,
+            # With the early groups gone ahead, the final send carries the one
+            # group nobody cut away, which is the last, plus the recurrent
+            # state. Without them it carries everything, which is fa_group=None
+            # and the single tag list.
+            fa_group=len(announced.early_uuids) if early_group else None,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -3022,8 +3091,8 @@ class TPURaidenConnectorWorker:
         self._stage3_source_facades: dict[str, Any] = {}
         self._stage3_state_group_count = 0
         # Which pool tags carry attention, in the order a transfer uploads
-        # them. One tag until stage 7 splits the leading layers off into their
-        # own group; see TPU_KV_EARLY_LAYERS.
+        # them. One tag until the layer split cuts them into groups; see
+        # TPU_KV_GROUP_BOUNDS.
         self._stage3_fa_tags: tuple[str, ...] = _STAGE3_TRANSFER_POOL_TAGS
         self._stage3_early_fa_layers: tuple[str, ...] = ()
         # GDN state-class sibling transfers: derived source req_id -> base
@@ -3239,19 +3308,13 @@ class TPURaidenConnectorWorker:
         # this is a consequence of the tag lookup and not a check: the layout
         # fingerprint hashes geometry and toolchain versions, not tag names.
         fa_group_ordinal_by_layer = None
-        early_layers = int(tpu_envs.TPU_KV_EARLY_LAYERS)
-        if stage3_enabled and early_layers > 0:
+        cuts = _fa_group_cuts()
+        if stage3_enabled and cuts:
             fa_layers = rpm.ordered_fa_layer_names(named_kv_caches)
-            if not 0 < early_layers < len(fa_layers):
-                raise ValueError(
-                    "TPU_KV_EARLY_LAYERS must leave a late group: "
-                    f"early={early_layers}, attention layers={len(fa_layers)}")
-            fa_group_ordinal_by_layer = {
-                name: (0 if index < early_layers else 1)
-                for index, name in enumerate(fa_layers)
-            }
-            self._stage3_fa_tags = (f"{rpm.TAG_FA}.g0", f"{rpm.TAG_FA}.g1")
-            self._stage3_early_fa_layers = tuple(fa_layers[:early_layers])
+            fa_group_ordinal_by_layer = _fa_group_ordinals(fa_layers, cuts)
+            self._stage3_fa_tags = tuple(
+                f"{rpm.TAG_FA}.g{ordinal}" for ordinal in range(len(cuts) + 1))
+            self._stage3_early_fa_layers = tuple(fa_layers[:cuts[-1]])
         manifest = rpm.build_qwen35_pool_manifest(
             named_kv_caches=named_kv_caches,
             kv_cache_groups=kv_cache_groups,
@@ -5593,7 +5656,7 @@ class TPURaidenConnectorWorker:
                 raise RuntimeError(
                     f"Stage-7 send names attention group {fa_group}, but this "
                     f"worker admitted the tags {transfer_tags}; the two peers "
-                    "disagree about TPU_KV_EARLY_LAYERS")
+                    "disagree about the attention layer cuts")
             transfer_tags = [transfer_tags[fa_group]]
         # How many leading tags address the FA destination byte space, and so
         # take the prefix clip below. GLM keeps the one it always clipped.
