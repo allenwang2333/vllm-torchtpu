@@ -57,6 +57,15 @@ class SendMeta:
     # written, which is why it is a field on the send rather than a choice the
     # worker makes for itself.
     arm_on_bell: int | None = None
+    # Stage 7d. Set on an armed send that left the scheduler before the
+    # consumer had published its destination, naming the proxy endpoint the
+    # worker should watch for it. The two halves of a transfer arrive
+    # independently now, the bell from the model and the destination from the
+    # network, and the send goes out when the later of them lands. Without
+    # this the scheduler has to refuse any request whose prefill finishes
+    # before the consumer answers, which on 397B is every prompt of 16k
+    # tokens or shorter.
+    dst_batch_url: str | None = None
 
 
 @dataclass

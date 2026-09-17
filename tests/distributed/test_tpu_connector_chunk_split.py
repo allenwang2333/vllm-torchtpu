@@ -23,7 +23,9 @@ the early layers, then the rest.
 Helpers come from the sibling module rather than being duplicated; this file
 is separate only because that one is already five thousand lines.
 """
+import json
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,8 +35,8 @@ from vllm.v1.request import RequestStatus
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import SendMeta
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
-    _chunk_base_req_id, _chunk_req_id, _flatten_block_ids, _send_meta_fa_group,
-    _send_meta_int, _Stage3Admission)
+    _chunk_base_req_id, _chunk_req_id, _DestinationCollector,
+    _flatten_block_ids, _send_meta_fa_group, _send_meta_int, _Stage3Admission)
 
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import \
     TPUConnectorMetadata
@@ -76,7 +78,7 @@ def _producer(*, budget: int = BUDGET, page: int = PAGE):
     return producer, notifier
 
 
-def _request(req_id: str, prompt_tokens: int):
+def _request(req_id: str, prompt_tokens: int, dst_batch_url: str = ""):
     req = MagicMock()
     req.request_id = req_id
     req.prompt_token_ids = [0] * prompt_tokens
@@ -86,6 +88,11 @@ def _request(req_id: str, prompt_tokens: int):
     req.kv_transfer_params = {
         "admit_callback_url": f"http://proxy.test:8000/kv_admit/{req_id}"
     }
+    # Stage 7d. Present in a real deployment; left out by default so the
+    # tests that predate the worker-side collector still describe a producer
+    # with nowhere to wait for a late destination.
+    if dst_batch_url:
+        req.kv_transfer_params["dst_batch_url"] = dst_batch_url
     return req
 
 
@@ -1403,10 +1410,11 @@ class TestEarlyGroupEmittedBeforeItsForward:
         early = producer.reqs_to_send["short#c0"]
         assert early.arm_on_bell is None
 
-    def test_without_decodes_pages_it_falls_through_to_the_late_path(self):
-        """There is no waiting available here; this is the last step. Leaving
-        it alone hands request_finished a request in exactly the state stage
-        7b expects, which is a working fallback rather than a lost send."""
+    def test_with_nowhere_to_wait_it_falls_through_to_the_late_path(self):
+        """A producer that was never told where the proxy is cannot hold the
+        send, so it leaves it alone and request_finished picks it up in
+        exactly the state stage 7b expects. That is a working fallback rather
+        than a lost send."""
         producer, notifier = _producer()
         req = _request("short", PAGE + 1)
         with _arming_on():
@@ -1509,3 +1517,336 @@ class TestArmGeneration:
         """The runner leaves it at zero until the first step sets it, and a
         count of zero would name the generation before the coming one."""
         assert self._worker(generation=7, chunks=0)._arm_generation() == 8
+
+
+# ---------------------------------------------------------------------------
+# Stage 7d: the destination arrives after the send does
+# ---------------------------------------------------------------------------
+
+_DST_URL = "http://proxy.test:8000/kv_dst_batch"
+
+
+class TestEarlyGroupShipsBeforeTheDestination:
+    """The scheduler stops requiring a destination it usually cannot have.
+
+    Stage 7c checked for decode's pages in the step that finishes the prompt
+    and gave up if they were missing. On 397B decode takes about 1.4 s to
+    allocate and answer, and a prompt of 16384 tokens or fewer prefills in one
+    scheduler step, so the check ran roughly 50 ms after decode was first told
+    the request existed and failed every time. Coverage came out at 26%, and
+    the requests it missed were the short ones, which are the majority.
+
+    So the send goes out naming the proxy instead. The worker holds it, and
+    the transfer starts when the bell and the destination have both arrived.
+    """
+
+    def _admitted(self, *, url=_DST_URL, destination=True, prompt=PAGE + 1):
+        producer, notifier = _producer()
+        req = _request("short", prompt, dst_batch_url=url)
+        with _arming_on():
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=[900, 901]))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+        if destination:
+            _give_destination(producer, "short",
+                              _published_destination(900, [200]))
+        return producer, req, notifier
+
+    def _build(self, producer, prompt=PAGE + 1):
+        with _arming_on():
+            with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                       return_value=30.0):
+                return producer.build_connector_meta(
+                    _step(new=[("short", [100])], scheduled={"short": prompt}))
+
+    def test_a_missing_destination_no_longer_cancels_the_early_group(self):
+        producer, _req, _n = self._admitted(destination=False)
+        early = self._build(producer).reqs_to_send["short#c0"]
+        assert early.arm_on_bell == 0
+        assert early.dst_params is None
+        # The whole content of the send's promise: there is somewhere to wait.
+        assert early.dst_batch_url == _DST_URL
+
+    def test_a_destination_already_in_hand_is_still_carried(self):
+        """The long-prompt case, which stage 7c already handled. Nothing
+        defers when there is nothing to wait for."""
+        producer, _req, _n = self._admitted()
+        early = self._build(producer).reqs_to_send["short#c0"]
+        assert early.dst_params is not None
+        assert early.dst_batch_url is None
+
+    def test_the_url_is_learned_from_admission_not_from_the_send(self):
+        """It is one address per engine, not per request, so a producer that
+        has admitted anything at all knows where to point the worker."""
+        producer, _req, _n = self._admitted(destination=False)
+        assert producer._dst_batch_url == _DST_URL
+
+    def test_the_late_path_still_refuses_to_ship_without_a_destination(self):
+        """request_finished has no worker holding anything for it, so a
+        missing destination there is still a request decode will wait out.
+        Raising names the cause; shipping nothing would not."""
+        producer, req, _n = self._admitted(destination=False)
+        with pytest.raises(ValueError, match="never published"):
+            producer._emit_early_group_send(
+                "short",
+                producer._chunk_progress["short"].admission,
+                (100, ),
+                PAGE,
+                0,
+                30.0,
+                None,
+            )
+
+
+class TestWorkerHoldsASendForItsDestination:
+    """The worker's half: register now, build when the answer lands.
+
+    Only the generation can be read on the model runner thread, because it
+    counts steps and reading it later would name a bell that has not rung.
+    Everything else waits, which is safe because the doorbell reader compares
+    each bell against the armed generation on every poll rather than only
+    when a bell moves. A watch armed after its bell has rung fires on the next
+    poll, so the send goes out when the later of the two arrives.
+    """
+
+    def _worker(self, *, generation=7, reader=True):
+        worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
+        worker.runner = SimpleNamespace(
+            _doorbells=SimpleNamespace(
+                coming_generation=lambda: generation + 1),
+            _doorbell_watcher=object() if reader else None,
+            _dp_step_num_chunks=1)
+        worker._ensure_stage3_submit_workers = MagicMock()
+        return worker
+
+    def _meta(self, *, url=_DST_URL, arm=0):
+        return SendMeta(uuid=901,
+                        local_block_ids=[100],
+                        expiration_time=30.0,
+                        num_tokens=PAGE,
+                        dst_params=None,
+                        fa_group=0,
+                        arm_on_bell=arm,
+                        dst_batch_url=url)
+
+    def _defer(self, worker, meta, req_id="short#c0"):
+        with patch.object(_DestinationCollector, "ensure_started"):
+            worker._defer_until_destination(req_id=req_id,
+                                            req_meta=meta,
+                                            uuid=901,
+                                            num_tokens=PAGE,
+                                            parallelism=PCP)
+        return worker._worker_destination_collector
+
+    def test_a_held_send_records_the_generation_read_at_defer_time(self):
+        worker = self._worker(generation=7)
+        self._defer(worker, self._meta())
+        held = worker._stage7_pending_dst["short#c0"]
+        # Eight, not whatever the counter says when the answer arrives several
+        # steps later. This is the only field that cannot be recomputed.
+        assert held.arm_generation == 8
+        assert held.uuid == 901
+
+    def test_an_unarmed_send_is_not_held(self):
+        """Stage 6.5's chunks reach the same branch with no destination, and
+        they have always been the consumer's problem to start. Holding them
+        would change a path this stage is not touching."""
+        worker = self._worker()
+        self._defer(worker, self._meta(arm=None))
+        assert worker._stage7_pending_dst == {}
+        assert worker._worker_destination_collector is None
+
+    def test_a_send_with_no_url_is_not_held(self):
+        worker = self._worker()
+        self._defer(worker, self._meta(url=None))
+        assert worker._stage7_pending_dst == {}
+
+    def test_a_worker_without_a_doorbell_reader_refuses_to_hold(self):
+        """Nothing would ever release it, and firing it unreleased would ship
+        pages the forward has not written. Dropping it costs decode its
+        timeout, which is the only safe answer."""
+        worker = self._worker(reader=False)
+        self._defer(worker, self._meta())
+        assert worker._stage7_pending_dst == {}
+
+    def test_the_arriving_destination_starts_the_transfer(self):
+        worker = self._worker(generation=7)
+        collector = self._defer(worker, self._meta())
+        dst = _published_destination(901, [200])
+        collector._entries["short"] = dst
+
+        worker._maybe_start_producer_transfer = MagicMock()
+        worker._release_pending_destinations(["short"])
+        assert worker._stage3_submit_queue.qsize() == 1
+        worker._stage3_submit_queue.get()()
+
+        kwargs = worker._maybe_start_producer_transfer.call_args.kwargs
+        assert kwargs["req_id"] == "short#c0"
+        assert kwargs["arm_generation_override"] == 8
+        assert kwargs["req_meta"].dst_params == dst
+        # Taken out of the table by the release, so a second batch naming the
+        # same request cannot start it again.
+        assert worker._stage7_pending_dst == {}
+
+    def test_the_held_send_is_matched_on_the_base_request_id(self):
+        """Decode publishes against the id it was admitted under. The send
+        travels under a derived one, because every chunk does."""
+        worker = self._worker()
+        collector = self._defer(worker, self._meta(), req_id="short#c3")
+        collector._entries["short"] = _published_destination(901, [200])
+        worker._maybe_start_producer_transfer = MagicMock()
+        worker._release_pending_destinations(["short"])
+        assert worker._stage7_pending_dst == {}
+        assert worker._stage3_submit_queue.qsize() == 1
+
+    def test_an_answer_that_beat_the_send_is_picked_up_at_defer_time(self):
+        """The 1.4 s wait is a measurement, not a guarantee, and a long prompt
+        finishes well after it. Without this check that request waits for the
+        next unrelated batch to wake the callback."""
+        worker = self._worker()
+        collector = _DestinationCollector(name="worker")
+        collector._entries["short"] = _published_destination(901, [200])
+        worker._worker_destination_collector = collector
+        worker._maybe_start_producer_transfer = MagicMock()
+        with patch.object(_DestinationCollector, "ensure_started"):
+            worker._defer_until_destination(req_id="short#c0",
+                                            req_meta=self._meta(),
+                                            uuid=901,
+                                            num_tokens=PAGE,
+                                            parallelism=PCP)
+        assert worker._stage7_pending_dst == {}
+        assert worker._stage3_submit_queue.qsize() == 1
+
+    def test_a_destination_for_someone_else_leaves_the_send_held(self):
+        worker = self._worker()
+        collector = self._defer(worker, self._meta())
+        collector._entries["other"] = _published_destination(901, [200])
+        worker._release_pending_destinations(["other"])
+        assert set(worker._stage7_pending_dst) == {"short#c0"}
+        assert worker._stage3_submit_queue.qsize() == 0
+
+    def test_a_send_held_past_its_deadline_is_dropped(self):
+        """A consumer that dies between allocating and publishing would
+        otherwise pin the entry for the life of the process. Dropping it
+        leaves the request to decode's own timeout, which is what stage 7c
+        gave every late destination anyway."""
+        worker = self._worker()
+        self._defer(worker, self._meta())
+        held = worker._stage7_pending_dst["short#c0"]
+        worker._stage7_pending_dst["short#c0"] = replace(held, deadline=0.0)
+        worker._release_pending_destinations(["nobody"])
+        assert worker._stage7_pending_dst == {}
+        assert worker._stage3_submit_queue.qsize() == 0
+
+    def test_only_transfer_rank_zero_ever_holds_anything(self):
+        """One arm covers the whole eight-way transfer, so one worker polls.
+        Measured on 397B: 443 of 444 dispatches came from rank 0."""
+        worker = self._worker()
+        worker._maybe_start_producer_transfer(req_id="short#c0",
+                                              req_meta=self._meta(),
+                                              uuid=901,
+                                              num_tokens=PAGE,
+                                              transfer_rank=3,
+                                              parallelism=PCP)
+        assert worker._stage7_pending_dst == {}
+
+
+class TestCollectorSharesEntriesWithASecondReader:
+    """Two collectors now read the same proxy, so neither may consume.
+
+    The engine core needs a destination to build an ordinary send and the
+    worker needs one to release a held send, and they run in different
+    processes. The proxy therefore keeps entries and each reader asks for what
+    is newer than the cursor it last saw.
+    """
+
+    def _poll(self, collector, replies):
+        """Runs _run against a canned sequence, stopping after the last."""
+        seen = []
+
+        class _Resp:
+
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return json.dumps(self._body).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def _open(url, timeout=None):
+            seen.append(url)
+            if len(seen) > len(replies):
+                raise _Stop()
+            return _Resp(replies[len(seen) - 1])
+
+        class _Stop(Exception):
+            pass
+
+        with patch(f"{_MOD}.urllib.request.urlopen", side_effect=_open):
+            try:
+                collector._run()
+            except _Stop:
+                pass
+        return seen
+
+    def test_the_poll_carries_the_cursor_the_proxy_last_returned(self):
+        collector = _DestinationCollector(name="worker")
+        collector._url = _DST_URL
+        urls = self._poll(collector, [
+            {
+                "entries": {
+                    "a": {
+                        "x": 1
+                    }
+                },
+                "cursor": 7
+            },
+            {
+                "entries": {},
+                "cursor": 7
+            },
+        ])
+        assert urls[0].endswith("after=0")
+        assert urls[1].endswith("after=7")
+
+    def test_a_proxy_that_returns_no_cursor_leaves_it_alone(self):
+        """An older proxy consumes on read and says nothing about cursors.
+        One collector against it still works, which is what makes the two
+        sides independently deployable."""
+        collector = _DestinationCollector(name="engine")
+        collector._url = _DST_URL
+        self._poll(collector, [{"entries": {"a": {"x": 1}}}])
+        assert collector._cursor == 0
+        assert collector.peek("a") == {"x": 1}
+
+    def test_arrivals_are_announced_once_the_entries_are_readable(self):
+        """The callback starts transfers that immediately peek, so the merge
+        has to be finished before it runs."""
+        seen = {}
+        collector = _DestinationCollector(
+            name="worker",
+            on_arrival=lambda ids: seen.update(
+                {i: collector.peek(i)
+                 for i in ids}))
+        collector._url = _DST_URL
+        self._poll(collector, [{"entries": {"a": {"x": 1}}, "cursor": 1}])
+        assert seen == {"a": {"x": 1}}
+
+    def test_a_failing_callback_does_not_kill_the_poll_thread(self):
+        """Losing a release costs one request its timeout. Losing the thread
+        costs every request after it."""
+        collector = _DestinationCollector(
+            name="worker", on_arrival=MagicMock(side_effect=RuntimeError))
+        collector._url = _DST_URL
+        urls = self._poll(collector, [{"entries": {"a": {}}, "cursor": 1}])
+        # It polled again, and with the cursor advanced, so the failure cost
+        # one release and not the entries behind it.
+        assert urls[1].endswith("after=1")

@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -70,16 +71,24 @@ _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
 # which today arrive only in prefill's final response.
 _ADMIT_WAITERS: dict[str, "asyncio.Future[dict]"] = {}
 
-# Destination parameters decode has published but prefill has not yet
-# collected. Prefill holds one long-poll against /kv_dst_batch and drains this
-# in bulk, which keeps the relay at one connection per prefill engine rather
-# than one per in-flight request.
-_DST_PENDING: dict[str, dict] = {}
+# Destination parameters decode has published. Prefill long-polls
+# /kv_dst_batch and drains this in bulk, which keeps the relay at one
+# connection per collector rather than one per in-flight request.
+#
+# Two collectors read this: prefill's scheduler, which needs a destination to
+# build a send, and prefill's transfer rank, which needs one to release a send
+# the doorbell has already fired. So an entry is not consumed on delivery.
+# Each collector reports the sequence number it last saw and gets whatever is
+# newer, and entries age out by count and by clock rather than by
+# acknowledgement. The value is (sequence, publish time, payload).
+_DST_PENDING: "OrderedDict[str, tuple[int, float, dict]]" = OrderedDict()
+_DST_SEQ = 0
 _DST_EVENT: "asyncio.Event | None" = None
-# A prefill that reconnects between batches must not miss entries published in
-# the gap, so an unclaimed entry is kept until it ages out rather than being
-# dropped once handed over. The cap is generous; the steady state is empty.
+# The cap and the age limit are both generous. A destination that nobody has
+# claimed within five minutes belongs to a request that has long since timed
+# out on both sides.
 _DST_MAX_PENDING = 4096
+_DST_TTL_S = 300.0
 
 
 def _admission_reorder_enabled() -> bool:
@@ -447,11 +456,52 @@ async def handle_kv_admit(token: str, request: Request):
 
 
 def _dst_event() -> "asyncio.Event":
-    """The event prefill's long poll waits on, created on the running loop."""
+    """The event a collector's long poll waits on, created on the loop."""
     global _DST_EVENT
     if _DST_EVENT is None:
         _DST_EVENT = asyncio.Event()
     return _DST_EVENT
+
+
+def _dst_publish() -> None:
+    """Wake every waiting collector and install a fresh event behind them.
+
+    Replacing the event is what makes a second collector safe. If they shared
+    one event and each cleared it before waiting, one collector's clear could
+    erase a set the other had not yet observed, and that collector would then
+    sit out its whole timeout with an entry already waiting for it here.
+    """
+    global _DST_EVENT
+    event = _DST_EVENT
+    _DST_EVENT = None
+    if event is not None:
+        event.set()
+
+
+def _dst_prune(now: float) -> None:
+    """Drop entries that are too old or too many, oldest sequence first."""
+    while _DST_PENDING:
+        token = next(iter(_DST_PENDING))
+        if (len(_DST_PENDING) <= _DST_MAX_PENDING
+                and now - _DST_PENDING[token][1] <= _DST_TTL_S):
+            return
+        _DST_PENDING.pop(token, None)
+
+
+def _dst_since(after: int) -> tuple[dict[str, dict], int]:
+    """Entries published after the caller's cursor, and the new cursor.
+
+    Insertion order is sequence order, so walking backwards stops at the
+    first entry the caller has already seen and the steady-state cost is the
+    number of new entries rather than the size of the table.
+    """
+    fresh: dict[str, dict] = {}
+    for token in reversed(_DST_PENDING):
+        seq, _, payload = _DST_PENDING[token]
+        if seq <= after:
+            break
+        fresh[token] = payload
+    return fresh, _DST_SEQ
 
 
 @app.post("/kv_dst/{token}")
@@ -459,41 +509,43 @@ async def handle_kv_dst(token: str, request: Request):
     """Decode's announcement of where it wants this request's KV written.
 
     Raiden requires the coordination call to name the destination pages, so
-    prefill cannot start the transfer until it has these. Decode allocates
-    seconds before prefill finishes, so the relay has ample slack; what it
-    must not do is make prefill wait on a network round trip at the one
-    moment that is on the critical path.
+    prefill cannot start a transfer until it has these. Measured on 397B,
+    decode takes about 1.4 seconds to answer, which is longer than an 8192
+    token prompt spends in prefill. So this is not slack the critical path
+    can spend, and prefill's transfer rank waits on the arrival instead of
+    requiring it up front.
     """
+    global _DST_SEQ
     payload = await request.json()
-    if len(_DST_PENDING) >= _DST_MAX_PENDING:
-        # Prefill is not collecting. Shedding the oldest keeps the proxy
-        # bounded, and a request whose parameters are dropped falls back to
-        # the consumer-side submit rather than failing.
-        _DST_PENDING.pop(next(iter(_DST_PENDING)), None)
-    _DST_PENDING[token] = payload
-    _dst_event().set()
+    now = time.time()
+    _DST_SEQ += 1
+    _DST_PENDING.pop(token, None)
+    _DST_PENDING[token] = (_DST_SEQ, now, payload)
+    _dst_prune(now)
+    _dst_publish()
     return {"status": "ok"}
 
 
 @app.get("/kv_dst_batch")
-async def handle_kv_dst_batch(timeout: float = 25.0):
-    """Prefill's long poll for every destination announcement since its last.
+async def handle_kv_dst_batch(timeout: float = 25.0, after: int = 0):
+    """A collector's long poll for every announcement newer than its cursor.
 
-    Returning the whole pending set rather than one entry is what keeps this
-    to a single connection per prefill engine. Entries are removed once
-    handed over; anything published while prefill is between polls is still
-    here when it comes back.
+    Returning the whole new set rather than one entry is what keeps this to a
+    single connection per collector. The reply carries the cursor to send
+    back next time; a collector that reconnects with a stale or zero cursor
+    is re-sent whatever is still in the window, which is harmless because
+    entries are keyed by request and applying one twice is a no-op.
     """
-    if not _DST_PENDING:
-        event = _dst_event()
-        event.clear()
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return {"entries": {}}
-    entries = dict(_DST_PENDING)
-    _DST_PENDING.clear()
-    return {"entries": entries}
+    entries, cursor = _dst_since(after)
+    if entries:
+        return {"entries": entries, "cursor": cursor}
+    event = _dst_event()
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return {"entries": {}, "cursor": cursor}
+    entries, cursor = _dst_since(after)
+    return {"entries": entries, "cursor": cursor}
 
 
 async def _handle_completions(api: str, request: Request):

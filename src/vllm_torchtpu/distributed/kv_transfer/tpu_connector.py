@@ -17,6 +17,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 ``kv_connector_extra_config.use_hma_connector``.
 """
 
+import copy
 import json
 import os
 import queue
@@ -101,6 +102,13 @@ _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
 # within a few hundred requests can still take its transfer back. Far more
 # than any plausible in-flight count, and each entry is a pair and an int.
 _STAGE7_WATCH_HISTORY = 1024
+# Stage 7d. How long the worker holds an armed send whose destination has not
+# arrived. The measured wait on 397B is about 1.4 s, so this is two orders of
+# magnitude of headroom; what it really bounds is the damage from a consumer
+# that dies between allocating and publishing. Giving up costs the request the
+# consumer's own 120 s timeout, so the limit should be generous rather than
+# tight.
+_STAGE7_DESTINATION_WAIT_S = 60.0
 # tpu_sync GetRequestBlockStatusResponse.Status values reported by the
 # reshard client's get_request_block_status probe.
 _STAGE3_REGISTRY_STATUS_UNKNOWN = 1
@@ -273,6 +281,31 @@ class _Stage3RegisteredSend:
     local_block_ids: tuple[int, ...]
     num_tokens: int
     expiration_time: float
+
+
+@dataclass(frozen=True)
+class _PendingDestination:
+    """Stage 7d. An armed send the worker is holding for a destination.
+
+    The scheduler emits the early group during the step that computes it,
+    which on a one-step prefill is about 50 ms after the consumer was first
+    told the request exists, and the consumer takes roughly 1.4 s to allocate
+    and answer. Refusing the send in that window is what capped stage 7c at
+    26% coverage, so it goes out without a destination and the worker keeps
+    it here until one lands.
+
+    ``arm_generation`` is the reason this is a record rather than a retry.
+    It has to be read on the model runner thread before the forward is
+    issued, because it counts steps; read later, off the collector thread, it
+    would name a bell that has not rung and the send would never fire.
+    """
+
+    req_meta: Any
+    uuid: int
+    num_tokens: int
+    parallelism: int
+    arm_generation: int
+    deadline: float
 
 
 @dataclass(frozen=True)
@@ -511,17 +544,32 @@ class _DestinationCollector:
     Losing an entry is not a correctness problem. The consumer still holds
     its own deferred submit and starts the transfer itself once its fallback
     timer expires, which is the path this feature is bypassing.
+
+    Two of these run in a stage-7 deployment, one in the engine core and one
+    in the worker holding transfer rank 0, so the poll carries a cursor and
+    the proxy keeps entries rather than handing them to whoever asks first.
     """
 
     _MAX_HELD = 4096
     _REPORT_EVERY = 200
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        name: str = "engine",
+        on_arrival: Optional[Callable[[list[str]], None]] = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._url: Optional[str] = None
         self._started = False
         self._thread: Optional[threading.Thread] = None
+        self._name = name
+        # Called on the poll thread with the request ids in the reply. The
+        # worker uses it to release sends whose doorbell has already fired;
+        # the engine core leaves it unset and reads the dict on its own
+        # schedule.
+        self._on_arrival = on_arrival
+        self._cursor = 0
         # This thread shares a GIL with the scheduler, so what matters is not
         # how long a poll takes but how much of that time the interpreter is
         # actually held. urlopen gives the GIL up while it waits on the socket;
@@ -542,7 +590,7 @@ class _DestinationCollector:
             self._url = url
             self._started = True
         self._thread = threading.Thread(target=self._run,
-                                        name="kv-destination-collect",
+                                        name=f"kv-dst-collect-{self._name}",
                                         daemon=True)
         self._thread.start()
 
@@ -561,7 +609,8 @@ class _DestinationCollector:
             return self._entries.get(req_id)
 
     def _run(self) -> None:
-        url = str(self._url)
+        base = str(self._url)
+        sep = "&" if "?" in base else "?"
         # Shorter than the proxy's own hold, so the poll is the side that
         # gives up first and a stalled proxy shows as repeated reconnects
         # rather than a thread wedged on a dead socket.
@@ -569,15 +618,19 @@ class _DestinationCollector:
         while True:
             t0 = time.perf_counter()
             try:
+                url = f"{base}{sep}after={self._cursor}"
                 with urllib.request.urlopen(url, timeout=timeout) as resp:
                     raw = resp.read()
                 t1 = time.perf_counter()
                 payload = json.loads(raw.decode())
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 logger.warning("Destination collection from %s failed: %s",
-                               url, exc)
+                               base, exc)
                 time.sleep(1.0)
                 continue
+            # A proxy that predates the cursor omits it and consumes entries
+            # on read, which is still correct for a single collector.
+            self._cursor = int(payload.get("cursor") or self._cursor)
             entries = payload.get("entries") or {}
             if entries:
                 with self._lock:
@@ -585,6 +638,16 @@ class _DestinationCollector:
                         self._entries[req_id] = entry
                     while len(self._entries) > self._MAX_HELD:
                         self._entries.popitem(last=False)
+                if self._on_arrival is not None:
+                    # Outside the lock: the callback starts transfers, and
+                    # nothing it does should be able to block a peek.
+                    try:
+                        self._on_arrival(list(entries))
+                    except Exception:
+                        logger.exception(
+                            "Destination arrival callback failed for %d "
+                            "entries; the affected sends fall back to the "
+                            "consumer-side submit.", len(entries))
             self._report(t0, t1, len(entries))
 
     def _report(self, t0: float, t1: float, n_entries: int) -> None:
@@ -601,6 +664,7 @@ class _DestinationCollector:
         # which is the quantity that competes with the scheduler.
         record = {
             "event": "kv_destination_collector_rate",
+            "collector": self._name,
             "polls": self._polls,
             "window_s": round(span, 3),
             "polls_per_s": round(every / span, 2),
@@ -1587,6 +1651,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             self._destination_notifier = _AdmissionNotifier()
         # The producer's side: one long poll collecting whatever the consumer
         # has published, keyed by the producer's own request id.
+        # Learned from the first admitted request, then put on armed sends so
+        # the worker can run a collector of its own.
+        self._dst_batch_url: Optional[str] = None
         self._destination_collector: Optional[_DestinationCollector] = None
         if self.is_producer and _use_raiden_stage3_transport(
         ) and tpu_envs.TPU_KV_PREFILL_SUBMIT:
@@ -2211,14 +2278,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         dst_params = self._collect_destination_params(req_id,
                                                       admission.uuid,
                                                       consume=False)
+        dst_batch_url = None
         if not dst_params:
-            # Decode allocates off the admission announcement, which went out
-            # before this prefill's first step, so in practice its pages have
-            # been here for the length of the prompt. If they are somehow not,
-            # there is no waiting available: this is the last step. Fall
-            # through to request_finished, which raises if they are still
-            # missing then.
-            return
+            # Decode takes about 1.4 s on 397B to allocate and publish, which
+            # a prompt of 16k tokens or shorter beats: with a 32768 token
+            # scheduler budget it prefills in one step, so this is both the
+            # first check and the last. Refusing here is what held stage 7c to
+            # 26% coverage. Instead the send goes out naming the proxy, and
+            # the worker waits for the destination on its own thread. The bell
+            # and the destination then arrive independently and the send fires
+            # on the later of them.
+            if not self._dst_batch_url:
+                return
+            dst_batch_url = self._dst_batch_url
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
             or 1)
@@ -2244,7 +2316,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 progress.shipped_through,
                 time.perf_counter() + dist_utils.get_p2p_wait_pull_timeout(),
                 dst_params,
-                arm_on_bell=0):
+                                       arm_on_bell=0,
+                                       dst_batch_url=dst_batch_url):
             progress.early_emitted = True
 
     def _emit_chunk_send(self, req_id: str, progress: _ChunkProgress,
@@ -2343,7 +2416,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                block_ids: tuple[int, ...], num_tokens: int,
                                start_token: int, expiration_time: float,
                                dst_params: Optional[dict],
-                               arm_on_bell: Optional[int] = None) -> bool:
+                               arm_on_bell: Optional[int] = None,
+                               dst_batch_url: Optional[str] = None) -> bool:
         """Queue the early attention group as a send of its own.
 
         A chunk splits a request by token and this splits it by layer, so the
@@ -2361,7 +2435,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         """
         if announced is None or not announced.early_uuid:
             return False
-        if not dst_params:
+        if not dst_params and not dst_batch_url:
             # Decode was told at admission how many arrivals make this request
             # complete, and this is one of them, so a send that never goes out
             # is a request that never finishes. Only the producer can start it:
@@ -2369,6 +2443,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # leading chunks have the same requirement and fail the same way,
             # the difference being that a chunk can wait a few steps for
             # decode to publish and this cannot, because the prompt is over.
+            #
+            # Naming dst_batch_url is how the caller says it has somewhere to
+            # wait. Then the send carries no destination on purpose and the
+            # worker holds it until one arrives.
             raise ValueError(
                 f"Stage-7 early attention group of req_id={req_id} cannot "
                 "ship: the consumer never published its destination pages, "
@@ -2389,6 +2467,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             is_final_chunk=False,
             fa_group=0,
             arm_on_bell=arm_on_bell,
+            dst_batch_url=dst_batch_url,
         )
         logger.info(
             "%s",
@@ -2401,6 +2480,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     "start_token": start_token,
                     "end_token": num_tokens,
                     "arm_on_bell": arm_on_bell,
+                    "deferred_dst": bool(dst_batch_url),
                     "t": time.time(),
                 },
                 sort_keys=True))
@@ -2427,8 +2507,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # __init__. It runs for the life of the process; the URL is per engine,
         # not per request.
         batch_url = params.get("dst_batch_url")
-        if self._destination_collector is not None and batch_url:
-            self._destination_collector.ensure_started(str(batch_url))
+        if batch_url:
+            # Also handed to the worker on an armed send, so it can wait for a
+            # destination that has not landed yet.
+            self._dst_batch_url = str(batch_url)
+            if self._destination_collector is not None:
+                self._destination_collector.ensure_started(str(batch_url))
         if request.request_id in self._stage3_admitted_sends:
             # A preempted request is admitted a second time, and decode is
             # already holding blocks against the uuid from the first.
@@ -2847,6 +2931,13 @@ class TPURaidenConnectorWorker:
         # Stage 7c. Transfers prepared and handed to a doorbell, keyed by
         # (req_id, uuid), so an abort can take one back before it fires.
         self._stage7_watches: dict[tuple[str, int], int] = {}
+        # Stage 7d. Armed sends the scheduler released before the consumer had
+        # published a destination, keyed by the base request id the consumer
+        # announces against. A collector thread fills these in.
+        self._stage7_pending_dst: dict[str, _PendingDestination] = {}
+        self._stage7_pending_lock = threading.Lock()
+        self._worker_destination_collector: Optional[
+            _DestinationCollector] = None
         # In-engine store hosting: set only on the engine's rank-0 worker.
         self._reshard_store: Any | None = None
         self._raiden_work_unit: Any | None = None
@@ -4846,10 +4937,168 @@ class TPURaidenConnectorWorker:
                 "not discard its plan; a retry of the same pair will be "
                 "refused as a duplicate: %s", watch_id, req_id, int(uuid), exc)
 
-    def _maybe_start_producer_transfer(self, *, req_id: str, req_meta: Any,
-                                       uuid: int, num_tokens: int,
-                                       transfer_rank: int,
-                                       parallelism: int) -> None:
+    def _ensure_worker_destination_collector(self, url: str) -> None:
+        """Starts this worker's own long poll for consumer destinations.
+
+        The engine core runs one of these already, but it can only hand what
+        it collects to a worker through connector metadata, and metadata only
+        moves at a step boundary. A send waiting on a bell needs its
+        destination inside the step, so the worker subscribes directly. Only
+        transfer rank 0 reaches here, so a deployment adds one poll, not one
+        per worker.
+        """
+        if self._worker_destination_collector is None:
+            self._worker_destination_collector = _DestinationCollector(
+                name="worker", on_arrival=self._release_pending_destinations)
+        self._worker_destination_collector.ensure_started(url)
+
+    def _defer_until_destination(self, *, req_id: str, req_meta: Any,
+                                 uuid: int, num_tokens: int,
+                                 parallelism: int) -> None:
+        """Holds an armed send until the consumer says where to write it.
+
+        This send arrived with no destination on purpose, and the proxy URL
+        it carries is how the scheduler says so. Two things have to happen
+        before it can go out and they are independent: its layer group's bell
+        rings a few tens of milliseconds into this step's forward, and the
+        consumer's answer arrives over the network about 1.4 s after
+        admission. The later of the two releases the send.
+
+        Only the generation is read here, and it has to be read here, on the
+        model runner thread, before the forward is issued. Everything else
+        waits. That works because the reader compares each bell's current
+        value against the armed generation on every poll rather than only
+        when a bell moves, so a watch armed after its bell has already rung
+        fires within one poll interval instead of never.
+        """
+        arm_group = _send_meta_arm_group(req_meta)
+        batch_url = getattr(req_meta, "dst_batch_url", None)
+        if arm_group is None or not isinstance(batch_url,
+                                               str) or not batch_url:
+            # An ordinary send with nowhere to wait. The consumer starts this
+            # one itself off its fallback timer, as it did before stage 5.
+            return
+        arm_generation = self._arm_generation()
+        if arm_generation <= 0:
+            logger.error(
+                "Stage-7d send for req_id=%s uuid=%d asks to wait on group %d "
+                "but this worker has no doorbell reader, so nothing would ever "
+                "release it; check that TPU_KV_DOORBELL and "
+                "TPU_KV_DOORBELL_POLL_US are set on the worker as well as the "
+                "scheduler", req_id, uuid, arm_group)
+            return
+        # Started from the model runner thread, which is single, so the pool
+        # exists before the collector can enqueue against it and the two
+        # cannot race into spawning it twice.
+        self._ensure_stage3_submit_workers()
+        self._ensure_worker_destination_collector(batch_url)
+        pending = _PendingDestination(req_meta=req_meta,
+                                      uuid=uuid,
+                                      num_tokens=num_tokens,
+                                      parallelism=parallelism,
+                                      arm_generation=arm_generation,
+                                      deadline=time.monotonic() +
+                                      _STAGE7_DESTINATION_WAIT_S)
+        with self._stage7_pending_lock:
+            self._stage7_pending_dst[req_id] = pending
+            while len(self._stage7_pending_dst) > _STAGE7_WATCH_HISTORY:
+                self._stage7_pending_dst.pop(
+                    next(iter(self._stage7_pending_dst)))
+        # The answer may already be here: the poll that carried it can easily
+        # land before the send does. Checking now costs a dict lookup, and
+        # the pop under the lock is what keeps this from racing the arrival
+        # callback into starting the same transfer twice.
+        self._release_pending_destinations([_chunk_base_req_id(req_id)])
+
+    def _release_pending_destinations(self, base_ids: Any) -> None:
+        """Starts every held send whose destination has now arrived.
+
+        Called from the collector thread on each batch, and once from the
+        deferral itself to cover an answer that beat the send. Both take the
+        entry out of the table under the lock, so exactly one of them starts
+        any given transfer.
+        """
+        collector = self._worker_destination_collector
+        if collector is None:
+            return
+        wanted = set(base_ids)
+        now = time.monotonic()
+        ready: list[tuple[str, _PendingDestination, dict]] = []
+        expired: list[tuple[str, _PendingDestination]] = []
+        with self._stage7_pending_lock:
+            for req_id, pending in list(self._stage7_pending_dst.items()):
+                base = _chunk_base_req_id(req_id)
+                entry = (collector.peek(base) if base in wanted else None)
+                if entry:
+                    del self._stage7_pending_dst[req_id]
+                    ready.append((req_id, pending, entry))
+                elif pending.deadline <= now:
+                    del self._stage7_pending_dst[req_id]
+                    expired.append((req_id, pending))
+        for req_id, pending in expired:
+            # The consumer announced this arrival at admission and is still
+            # counting it, so dropping the send costs the request the
+            # consumer's own timeout. That is the same outcome stage 7c gave
+            # a request whose destination was late, and it is what this whole
+            # path exists to make rare.
+            logger.error(
+                "Stage-7d gave up holding req_id=%s uuid=%d after %.0f s "
+                "without a destination from the consumer; the request will "
+                "wait out its transfer timeout", req_id, pending.uuid,
+                _STAGE7_DESTINATION_WAIT_S)
+        for req_id, pending, dst_params in ready:
+            self._start_deferred_transfer(req_id, pending, dst_params)
+
+    def _start_deferred_transfer(self, req_id: str,
+                                 pending: _PendingDestination,
+                                 dst_params: dict) -> None:
+        """Re-enters the ordinary send path with the destination filled in.
+
+        Building on a submit worker rather than here keeps the collector
+        thread to decoding JSON. It shares a GIL with the model runner, and
+        laying out a 64k token transfer on it would put stage 5's build cost
+        back on the prefill host by a different route.
+        """
+        req_meta = copy.copy(pending.req_meta)
+        try:
+            req_meta.dst_params = dict(dst_params)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "Stage-7d could not attach the consumer's destination to the "
+                "held send for req_id=%s uuid=%d", req_id, pending.uuid)
+            return
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage7_destination_landed",
+                    "req_id": req_id,
+                    "uuid": pending.uuid,
+                    "arm_generation": pending.arm_generation,
+                    "t": time.time(),
+                },
+                sort_keys=True))
+        self._stage3_submit_queue.put(
+            lambda: self._maybe_start_producer_transfer(
+                req_id=req_id,
+                req_meta=req_meta,
+                uuid=pending.uuid,
+                num_tokens=pending.num_tokens,
+                transfer_rank=0,
+                parallelism=pending.parallelism,
+                arm_generation_override=pending.arm_generation))
+        self._ensure_stage3_submit_workers()
+
+    def _maybe_start_producer_transfer(
+            self,
+            *,
+            req_id: str,
+            req_meta: Any,
+            uuid: int,
+            num_tokens: int,
+            transfer_rank: int,
+            parallelism: int,
+            arm_generation_override: Optional[int] = None) -> None:
         """Starts the transfer from the producer, as soon as its pages exist.
 
         Raiden only accepts a coordination call that reaches the source
@@ -4864,6 +5113,12 @@ class TPURaidenConnectorWorker:
         needs all of them before it can plan, so the call retries the precise
         missing-registration error on a submit worker until the siblings catch
         up. That retry spins a background thread, never the model runner.
+
+        ``arm_generation_override`` is set on the second pass at a stage-7d
+        send, once its destination has arrived. The generation was read on the
+        model runner thread during the first pass and cannot be read again
+        here, because this pass runs on a collector thread several steps
+        later.
         """
         if not tpu_envs.TPU_KV_PREFILL_SUBMIT or transfer_rank != 0:
             return
@@ -4871,6 +5126,11 @@ class TPURaidenConnectorWorker:
             return
         dst_params = getattr(req_meta, "dst_params", None)
         if not dst_params:
+            self._defer_until_destination(req_id=req_id,
+                                          req_meta=req_meta,
+                                          uuid=uuid,
+                                          num_tokens=num_tokens,
+                                          parallelism=parallelism)
             return
         # Everything up to the queue put runs on the model runner thread, so
         # it is the only part of stage 5 that can displace prefill work
@@ -4966,7 +5226,8 @@ class TPURaidenConnectorWorker:
             arm_generation = 0
         else:
             fence = None
-            arm_generation = self._arm_generation()
+            arm_generation = (self._arm_generation() if arm_generation_override
+                              is None else arm_generation_override)
             if arm_generation <= 0:
                 # The scheduler built this send on the promise that a bell
                 # would release it, and there is no reader to release it. Not

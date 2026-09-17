@@ -329,29 +329,52 @@ _DST_PARAMS = {
 
 def _reset_dst_state() -> None:
     _MOD._DST_PENDING.clear()
+    _MOD._DST_SEQ = 0
     _MOD._DST_EVENT = None
 
 
 def test_a_published_destination_reaches_the_next_poll_once() -> None:
+    """Once per collector, not once in total.
+
+    A collector reports the cursor it last saw and gets what is newer, so a
+    second poll from the same one returns nothing while the entry itself
+    stays. That is what lets prefill's scheduler and prefill's transfer rank
+    read the same relay without stealing from each other.
+    """
     _reset_dst_state()
 
     async def drive():
         await _MOD.handle_kv_dst("r-1", _FakeRequest(dict(_DST_PARAMS)))
         first = await _MOD.handle_kv_dst_batch(timeout=0.05)
-        # Handing an entry over removes it, so prefill cannot start the same
-        # transfer twice from two consecutive polls.
-        second = await _MOD.handle_kv_dst_batch(timeout=0.05)
+        second = await _MOD.handle_kv_dst_batch(timeout=0.05,
+                                                after=first["cursor"])
         return first, second
 
     first, second = asyncio.run(drive())
-    assert first == {"entries": {"r-1": _DST_PARAMS}}
-    assert second == {"entries": {}}
-    assert _MOD._DST_PENDING == {}
+    assert first == {"entries": {"r-1": _DST_PARAMS}, "cursor": 1}
+    assert second == {"entries": {}, "cursor": 1}
+    assert "r-1" in _MOD._DST_PENDING
+
+
+def test_a_second_collector_gets_everything_the_first_did() -> None:
+    """The stage 7d requirement. The scheduler needs a destination to build
+    an ordinary send and the worker needs one to release a held send, and
+    neither may consume what the other is waiting for."""
+    _reset_dst_state()
+
+    async def drive():
+        await _MOD.handle_kv_dst("r-1", _FakeRequest(dict(_DST_PARAMS)))
+        engine = await _MOD.handle_kv_dst_batch(timeout=0.05)
+        worker = await _MOD.handle_kv_dst_batch(timeout=0.05)
+        return engine, worker
+
+    engine, worker = asyncio.run(drive())
+    assert engine == worker == {"entries": {"r-1": _DST_PARAMS}, "cursor": 1}
 
 
 def test_one_poll_drains_every_announcement_since_the_last() -> None:
-    """This is what keeps the relay at one connection per prefill engine
-    rather than one per in-flight request."""
+    """This is what keeps the relay at one connection per collector rather
+    than one per in-flight request."""
     _reset_dst_state()
 
     async def drive():
@@ -371,7 +394,27 @@ def test_one_poll_drains_every_announcement_since_the_last() -> None:
             "r-2": {
                 "uuid": 2
             },
-        }
+        },
+        "cursor": 3,
+    }
+
+
+def test_a_poll_past_the_cursor_skips_what_it_already_has() -> None:
+    _reset_dst_state()
+
+    async def drive():
+        for index in range(3):
+            await _MOD.handle_kv_dst(f"r-{index}",
+                                     _FakeRequest({"uuid": index}))
+        return await _MOD.handle_kv_dst_batch(timeout=0.05, after=2)
+
+    assert asyncio.run(drive()) == {
+        "entries": {
+            "r-2": {
+                "uuid": 2
+            }
+        },
+        "cursor": 3,
     }
 
 
@@ -387,13 +430,47 @@ def test_a_waiting_poll_wakes_on_the_next_publish() -> None:
         await _MOD.handle_kv_dst("r-late", _FakeRequest({"uuid": 9}))
         return await asyncio.wait_for(poll, timeout=1.0)
 
-    assert asyncio.run(drive()) == {"entries": {"r-late": {"uuid": 9}}}
+    assert asyncio.run(drive()) == {
+        "entries": {
+            "r-late": {
+                "uuid": 9
+            }
+        },
+        "cursor": 1,
+    }
+
+
+def test_two_waiting_polls_both_wake_on_one_publish() -> None:
+    """With a single event that each collector cleared before waiting, one
+    collector's clear could erase a set the other had not seen and leave it
+    sitting out its whole timeout. Replacing the event instead of clearing it
+    is what fixes that, and this is the test that would catch a regression."""
+    _reset_dst_state()
+
+    async def drive():
+        engine = asyncio.ensure_future(_MOD.handle_kv_dst_batch(timeout=5.0))
+        worker = asyncio.ensure_future(_MOD.handle_kv_dst_batch(timeout=5.0))
+        await asyncio.sleep(0.05)
+        await _MOD.handle_kv_dst("r-both", _FakeRequest({"uuid": 12}))
+        return await asyncio.wait_for(asyncio.gather(engine, worker),
+                                      timeout=1.0)
+
+    engine, worker = asyncio.run(drive())
+    assert engine == worker == {
+        "entries": {
+            "r-both": {
+                "uuid": 12
+            }
+        },
+        "cursor": 1,
+    }
 
 
 def test_an_idle_poll_returns_empty_rather_than_hanging() -> None:
     _reset_dst_state()
     assert asyncio.run(_MOD.handle_kv_dst_batch(timeout=0.05)) == {
-        "entries": {}
+        "entries": {},
+        "cursor": 0,
     }
 
 
@@ -405,7 +482,32 @@ def test_a_publish_between_polls_is_still_there_on_reconnect() -> None:
         await _MOD.handle_kv_dst("r-gap", _FakeRequest({"uuid": 11}))
         return await _MOD.handle_kv_dst_batch(timeout=0.05)
 
-    assert asyncio.run(drive()) == {"entries": {"r-gap": {"uuid": 11}}}
+    assert asyncio.run(drive()) == {
+        "entries": {
+            "r-gap": {
+                "uuid": 11
+            }
+        },
+        "cursor": 1,
+    }
+
+
+def test_an_entry_nobody_claimed_ages_out() -> None:
+    """Nothing acknowledges an entry now, so the clock is what bounds the
+    table when traffic is too light for the count cap to bite."""
+    _reset_dst_state()
+
+    async def drive():
+        await _MOD.handle_kv_dst("r-stale", _FakeRequest({"uuid": 13}))
+        seq, published, payload = _MOD._DST_PENDING["r-stale"]
+        _MOD._DST_PENDING["r-stale"] = (seq, published - _MOD._DST_TTL_S - 1.0,
+                                        payload)
+        await _MOD.handle_kv_dst("r-fresh", _FakeRequest({"uuid": 14}))
+
+    asyncio.run(drive())
+    assert "r-stale" not in _MOD._DST_PENDING
+    assert "r-fresh" in _MOD._DST_PENDING
+    _reset_dst_state()
 
 
 def test_an_uncollected_backlog_is_bounded() -> None:
