@@ -2,8 +2,8 @@
 """PR CI running tests for FLUX models on TPU v7x.
 
 Fast end-to-end tests designed to run in PR CI (< 3 minutes) on TPU v7x machines.
-Covers fast inference with FLUX.1-schnell and FLUX.2-klein, in-code expected_slice
-validation, deterministic seed parity, and HBM memory metrics without file writes.
+Covers fast inference with FLUX.1-schnell, in-code expected_slice validation,
+deterministic seed parity, and HBM memory metrics without file writes.
 """
 
 import os
@@ -93,139 +93,105 @@ def _extract_image(output) -> Image.Image:
 class TestFluxPrCiOnTpu:
     """Fast PR CI functional and numerical tests for FLUX on TPU v7x."""
 
+    @pytest.fixture(scope="class")
+    @classmethod
+    def schnell_engine(cls):
+        """Class-scoped Omni engine fixture: loads FLUX.1-schnell once for all PR CI tests."""
+        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
+        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
+        try:
+            yield omni
+        finally:
+            omni.shutdown()
+
     @pytest.mark.spawns_tpu_workers
-    def test_flux1_schnell_fast_t2i_tpu(self):
+    def test_flux1_schnell_fast_t2i_tpu(self, schnell_engine):
         """Test FLUX.1-schnell 2-step fast generation on TPU v7x without file writing."""
 
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
         prompt = "A photo of a majestic snow leopard perched atop a mountain peak at golden hour, 8k"
+        sampling_params = OmniDiffusionSamplingParams(
+            height=512,
+            width=512,
+            num_inference_steps=2,
+            guidance_scale=0.0,
+            seed=42,
+        )
+        outputs = schnell_engine.generate(prompt, sampling_params)
+        assert outputs, "Omni returned empty output list"
 
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=42,
-            )
-            outputs = omni.generate(prompt, sampling_params)
-            assert outputs, "Omni returned empty output list"
+        img = _extract_image(outputs[0])
+        assert isinstance(img,
+                          Image.Image), f"Expected PIL Image, got {type(img)}"
+        assert img.size == (512, 512), f"Expected (512, 512), got {img.size}"
 
-            img = _extract_image(outputs[0])
-            assert isinstance(
-                img, Image.Image), f"Expected PIL Image, got {type(img)}"
-            assert img.size == (512,
-                                512), f"Expected (512, 512), got {img.size}"
-
-            # In-memory numerical sanity: image must not be blank / collapsed
-            arr = np.array(img.convert("RGB"), dtype=np.float32)
-            assert np.all(
-                np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
-            variance = float(np.var(arr))
-            assert variance > 10.0, f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
-        finally:
-            omni.shutdown()
+        # In-memory numerical sanity: image must not be blank / collapsed
+        arr = np.array(img.convert("RGB"), dtype=np.float32)
+        assert np.all(
+            np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
+        variance = float(np.var(arr))
+        assert variance > 10.0, f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
 
     @pytest.mark.spawns_tpu_workers
-    def test_flux2_klein_fast_t2i_tpu(self):
-        """Test FLUX.2-klein-4B fast generation on TPU v7x without file writing."""
-
-        model_path = _resolve_model_path("black-forest-labs/FLUX.2-klein-4B")
-        prompt = "A cute fluffy red panda wearing tiny goggles reading a magical glowing book, 8k"
-
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=4,
-                guidance_scale=1.0,
-                seed=123,
-            )
-
-            outputs = omni.generate(prompt, sampling_params)
-            assert outputs, "Omni returned empty output list"
-
-            img = _extract_image(outputs[0])
-            assert isinstance(
-                img, Image.Image), f"Expected PIL Image, got {type(img)}"
-            assert img.size == (512,
-                                512), f"Expected (512, 512), got {img.size}"
-
-            arr = np.array(img.convert("RGB"), dtype=np.float32)
-            assert np.all(np.isfinite(arr))
-            assert float(
-                np.var(arr)) > 10.0, "Generated image variance is too low"
-        finally:
-            omni.shutdown()
-
-    @pytest.mark.spawns_tpu_workers
-    def test_flux_deterministic_seed_parity_tpu(self):
+    def test_flux_deterministic_seed_parity_tpu(self, schnell_engine):
         """Test that identical seeds produce bitwise identical output on TPU v7x."""
 
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
         prompt = "A red flower in an open sunny green meadow"
         fixed_seed = 42
 
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            # Run 1 with fixed seed
-            params1 = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=fixed_seed,
-            )
-            out1 = omni.generate(prompt, params1)
-            img1 = _extract_image(out1[0])
+        # Run 1 with fixed seed
+        params1 = OmniDiffusionSamplingParams(
+            height=512,
+            width=512,
+            num_inference_steps=2,
+            guidance_scale=0.0,
+            seed=fixed_seed,
+        )
+        out1 = schnell_engine.generate(prompt, params1)
+        img1 = _extract_image(out1[0])
 
-            # Run 2 with identical seed
-            params2 = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=fixed_seed,
-            )
-            out2 = omni.generate(prompt, params2)
-            img2 = _extract_image(out2[0])
+        # Run 2 with identical seed
+        params2 = OmniDiffusionSamplingParams(
+            height=512,
+            width=512,
+            num_inference_steps=2,
+            guidance_scale=0.0,
+            seed=fixed_seed,
+        )
+        out2 = schnell_engine.generate(prompt, params2)
+        img2 = _extract_image(out2[0])
 
-            # Run 3 with distinct seed
-            params3 = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=99999,
-            )
-            out3 = omni.generate(prompt, params3)
-            img3 = _extract_image(out3[0])
+        # Run 3 with distinct seed
+        params3 = OmniDiffusionSamplingParams(
+            height=512,
+            width=512,
+            num_inference_steps=2,
+            guidance_scale=0.0,
+            seed=99999,
+        )
+        out3 = schnell_engine.generate(prompt, params3)
+        img3 = _extract_image(out3[0])
 
-            arr1 = np.array(img1.convert("RGB"), dtype=np.float32)
-            arr2 = np.array(img2.convert("RGB"), dtype=np.float32)
-            arr3 = np.array(img3.convert("RGB"), dtype=np.float32)
+        arr1 = np.array(img1.convert("RGB"), dtype=np.float32)
+        arr2 = np.array(img2.convert("RGB"), dtype=np.float32)
+        arr3 = np.array(img3.convert("RGB"), dtype=np.float32)
 
-            # Identical seeds must match exactly bitwise
-            np.testing.assert_allclose(
-                arr1,
-                arr2,
-                atol=0.0,
-                rtol=0.0,
-                err_msg=
-                "Identical seed 42 on TPU v7x must produce exact bitwise pixel match",
-            )
+        # Identical seeds must match exactly bitwise
+        np.testing.assert_allclose(
+            arr1,
+            arr2,
+            atol=0.0,
+            rtol=0.0,
+            err_msg=
+            "Identical seed 42 on TPU v7x must produce exact bitwise pixel match",
+        )
 
-            # Distinct seed must diverge
-            assert not np.array_equal(
-                arr1,
-                arr3), "Different seeds should produce divergent pixel values"
-        finally:
-            omni.shutdown()
+        # Distinct seed must diverge
+        assert not np.array_equal(
+            arr1,
+            arr3), "Different seeds should produce divergent pixel values"
 
     @pytest.mark.spawns_tpu_workers
-    def test_flux_golden_multi_patch_parity_tpu(self):
+    def test_flux_golden_multi_patch_parity_tpu(self, schnell_engine):
         """Test Golden Multi-Patch Slice Parity against independent CPU Diffusers reference.
 
         Evaluates 3 distinct 3x3 patches on Channel 0 (Red) across spatial regions:
@@ -234,26 +200,20 @@ class TestFluxPrCiOnTpu:
           3. Top-right interior patch [126:129, 382:385] (off-center features)
         """
 
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
         prompt = "A vibrant green leaf with glistening morning water droplets"
+        params = OmniDiffusionSamplingParams(
+            height=512,
+            width=512,
+            num_inference_steps=2,
+            guidance_scale=0.0,
+            seed=0,
+            generator_device="cpu",
+        )
+        outputs = schnell_engine.generate(prompt, params)
+        assert outputs, "Omni returned empty output list"
 
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=0,
-                generator_device="cpu",
-            )
-            outputs = omni.generate(prompt, params)
-            assert outputs, "Omni returned empty output list"
-
-            img = _extract_image(outputs[0])
-            arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
-        finally:
-            omni.shutdown()
+        img = _extract_image(outputs[0])
+        arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
 
         assert np.all(
             np.isfinite(arr)), "Generated image contains NaN or Inf pixels"

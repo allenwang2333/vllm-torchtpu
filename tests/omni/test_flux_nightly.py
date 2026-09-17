@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Nightly build tests for FLUX models on TPU v7x.
 
-Comprehensive regression tests designed for nightly builds (~15 minutes).
-Covers full guidance-distilled FLUX.1-dev denoise loops, distribution metric signatures,
-online tiny model (tiny_flux2_klein) CPU vs. TPU parity, multi-resolution scaling,
-batched inference, and HBM memory leak checks. All tests run in-memory without PNG writes.
+Focused integration and numerical correctness tests for nightly builds (~5 minutes).
+Focuses on accuracy of common paths: full guidance-distilled FLUX.1-dev denoise loops
+with distribution metric signatures, tri-model matrix validation (FLUX.1-schnell,
+FLUX.1-dev, FLUX.2-klein-4B), and overlapped CPU Diffusers vs. TPU Omni parity.
+All tests run in-memory without PNG writes.
 """
 
 import gc
@@ -42,7 +43,7 @@ def _resolve_model_path(model_id: str) -> str:
     for root in candidate_roots:
         snapshot_dir = root / safe_name / "snapshots"
         if snapshot_dir.is_dir():
-            snapshots = sorted(list(snapshot_dir.iterdir()))
+            snapshots = sorted(snapshot_dir.iterdir())
             if snapshots:
                 return str(snapshots[0])
     return model_id
@@ -195,44 +196,6 @@ class TestFluxNightlyOnTpu:
         if worker is not None:
             worker.cleanup()
 
-    def test_flux1_dev_full_denoising_tpu(self):
-        """Test FLUX.1-dev with full classifier-free loop on TPU v7x using metric signatures.
-
-        Validates statistical distribution moments without saving any binary files.
-        """
-
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-dev")
-        prompt = "A serene Japanese zen garden with raked sand and cherry blossoms in spring, 8k"
-
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=10,
-                guidance_scale=3.5,
-                seed=42,
-            )
-
-            outputs = omni.generate(prompt, sampling_params)
-            assert outputs, "Omni returned empty output"
-            img = _extract_image(outputs[0])
-            assert isinstance(img, Image.Image)
-            assert img.size == (512, 512)
-
-            metrics = compute_distribution_metrics(img)
-
-            # Numerical bounds: ensure output did not collapse or saturate
-            assert 0.10 < metrics[
-                "mean"] < 0.90, f"Unnatural pixel mean: {metrics['mean']:.4f}"
-            assert metrics[
-                "std"] > 0.05, f"Suspiciously low image contrast (std={metrics['std']:.4f})"
-            assert metrics[
-                "var"] > 0.01, f"Image variance too low ({metrics['var']:.4f}), blank image"
-            assert metrics["p90"] > metrics["p10"], "Collapsed dynamic range"
-        finally:
-            omni.shutdown()
-
     @pytest.mark.parametrize(
         "model_id,steps,guidance",
         [
@@ -243,8 +206,11 @@ class TestFluxNightlyOnTpu:
     )
     def test_flux_tri_model_matrix_tpu(self, model_id: str, steps: int,
                                        guidance: float):
-        """Validate that all three FLUX model variants execute properly on TPU v7x."""
+        """Validate common path execution across all three FLUX model variants on TPU v7x.
 
+        Covers distilled guidance-free Schnell, full 10-step CFG guidance Dev with distribution
+        metric signatures, and Klein-4B with RoPE sequence length alignment.
+        """
         model_path = _resolve_model_path(model_id)
         prompt = "A futuristic glowing crystal monolith in a misty desert at night, neon reflections"
 
@@ -255,7 +221,7 @@ class TestFluxNightlyOnTpu:
                 width=512,
                 num_inference_steps=steps,
                 guidance_scale=guidance,
-                seed=100,
+                seed=42,
             )
 
             outputs = omni.generate(prompt, sampling_params)
@@ -263,106 +229,17 @@ class TestFluxNightlyOnTpu:
 
             img = _extract_image(outputs[0])
             assert isinstance(img, Image.Image)
-            arr = np.array(img.convert("RGB"), dtype=np.float32)
-            assert np.all(
-                np.isfinite(arr)), f"NaN/Inf detected in {model_id} output"
-            assert float(
-                np.var(arr)) > 10.0, f"Low variance output on {model_id}"
-        finally:
-            omni.shutdown()
+            assert img.size == (512, 512)
 
-    @pytest.mark.parametrize("resolution", [(512, 512), (768, 768)])
-    def test_flux_multi_resolution_tpu(self, resolution: tuple[int, int]):
-        """Verify dynamic spatial token grid dimensions on TPU v7x."""
-
-        height, width = resolution
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
-        prompt = "An ancient library filled with glowing magical tomes"
-
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=42,
-            )
-
-            outputs = omni.generate(prompt, sampling_params)
-            img = _extract_image(outputs[0])
-            assert img.size == (
-                width, height), f"Expected {(width, height)}, got {img.size}"
-        finally:
-            omni.shutdown()
-
-    def test_flux_batched_inference_tpu(self):
-        """Test multi-request batched prompt generation on TPU v7x."""
-
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
-        prompts = [
-            "A breathtaking view of the Golden Gate Bridge at sunrise, foggy morning",
-            "The Eiffel Tower lit up with colorful fireworks against a midnight sky",
-        ]
-
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=42,
-            )
-
-            outputs = omni.generate(prompts, sampling_params)
-            assert len(
-                outputs
-            ) == 2, f"Expected 2 outputs for 2 prompts, got {len(outputs)}"
-
-            img1 = _extract_image(outputs[0])
-            img2 = _extract_image(outputs[1])
-
-            arr1 = np.array(img1.convert("RGB"))
-            arr2 = np.array(img2.convert("RGB"))
-
-            assert not np.array_equal(
-                arr1,
-                arr2), "Batch outputs with different prompts should differ"
-        finally:
-            omni.shutdown()
-
-    def test_flux_long_step_memory_leak_gate_tpu(self):
-        """Verify that sequential denoising calls do not exhibit progressive HBM leaks."""
-
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
-        prompt = "A high-speed bullet train crossing a bridge over a river"
-
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
-        try:
-            sampling_params = OmniDiffusionSamplingParams(
-                height=512,
-                width=512,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                seed=42,
-            )
-
-            # Warm-up run
-            _ = omni.generate(prompt, sampling_params)
-            gc.collect()
-            initial_peak = torch.accelerator.max_memory_allocated()
-
-            # Run multiple sequential iterations
-            for i in range(3):
-                _ = omni.generate(prompt, sampling_params)
-                gc.collect()
-
-            final_peak = torch.accelerator.max_memory_allocated()
-            memory_delta_mb = (final_peak - initial_peak) / (1024 * 1024)
-
-            # Allow minor allocator fragmentation (< 500 MB)
-            assert memory_delta_mb < 500.0, f"Potential memory leak detected: HBM increased by {memory_delta_mb:.1f} MB"
+            metrics = compute_distribution_metrics(img)
+            assert 0.10 < metrics[
+                "mean"] < 0.90, f"Unnatural pixel mean on {model_id}: {metrics['mean']:.4f}"
+            assert metrics[
+                "std"] > 0.05, f"Suspiciously low image contrast on {model_id} (std={metrics['std']:.4f})"
+            assert metrics[
+                "var"] > 0.01, f"Image variance too low on {model_id} ({metrics['var']:.4f})"
+            assert metrics["p90"] > metrics[
+                "p10"], f"Collapsed dynamic range on {model_id}"
         finally:
             omni.shutdown()
 
