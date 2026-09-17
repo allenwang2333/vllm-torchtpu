@@ -8,10 +8,8 @@ deterministic seed parity, and HBM memory metrics without file writes.
 
 import numpy as np
 import pytest
-
-pytest.importorskip("vllm_omni")
-
 import torch
+import vllm_omni  # noqa: F401
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -19,7 +17,10 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-pytestmark = [pytest.mark.omni]
+pytestmark = [
+    pytest.mark.omni,
+    pytest.mark.spawns_tpu_workers,
+]
 
 # ==============================================================================
 # Golden Multi-Patch Reference Constants
@@ -42,7 +43,7 @@ pytestmark = [pytest.mark.omni]
 #      high_var_patch = arr[208:211, 272:275, 0]
 #      top_right_patch = arr[126:129, 382:385, 0]
 #
-#    Full reference array saved in gs://mehdy/vllm/omni/golden/flux_schnell_cpu_golden_img.npy
+#    Full reference array verified against independent CPU Diffusers golden generation.
 # 2. Native TPU v7x expectation (strict PR CI regression guard).
 # ==============================================================================
 DIFFUSERS_PATCH_CENTER = np.array(
@@ -83,16 +84,6 @@ TPU_V7X_PATCH_CENTER = np.array(
 )
 
 
-def _resolve_model_path(model_id: str) -> str:
-    """Resolve cached model snapshot directory via standard HF resolution or fall back to HF model ID."""
-    try:
-        from huggingface_hub import snapshot_download
-
-        return snapshot_download(model_id, local_files_only=True)
-    except (OSError, ValueError, RuntimeError):
-        return model_id
-
-
 def _extract_image(output) -> Image.Image:
     """Extract PIL Image from Omni generate output."""
     return output.images[0]
@@ -105,14 +96,16 @@ class TestFluxPrCiOnTpu:
     @classmethod
     def schnell_engine(cls):
         """Class-scoped Omni engine fixture: loads FLUX.1-schnell once for all PR CI tests."""
-        model_path = _resolve_model_path("black-forest-labs/FLUX.1-schnell")
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
+        omni = Omni(
+            "black-forest-labs/FLUX.1-schnell",
+            init_timeout=600,
+            stage_init_timeout=600,
+        )
         try:
             yield omni
         finally:
             omni.shutdown()
 
-    @pytest.mark.spawns_tpu_workers
     def test_flux1_schnell_fast_t2i_tpu(self, schnell_engine):
         """Test FLUX.1-schnell 2-step fast generation on TPU v7x without file writing."""
 
@@ -141,7 +134,6 @@ class TestFluxPrCiOnTpu:
             f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
         )
 
-    @pytest.mark.spawns_tpu_workers
     def test_flux_deterministic_seed_parity_tpu(self, schnell_engine):
         """Test that identical seeds produce bitwise identical output on TPU v7x."""
 
@@ -199,7 +191,6 @@ class TestFluxPrCiOnTpu:
         assert not np.array_equal(arr1, arr3), (
             "Different seeds should produce divergent pixel values")
 
-    @pytest.mark.spawns_tpu_workers
     def test_flux_golden_multi_patch_parity_tpu(self, schnell_engine):
         """Test Golden Multi-Patch Slice Parity against independent CPU Diffusers reference.
 

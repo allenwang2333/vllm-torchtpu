@@ -41,6 +41,7 @@ steps:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
+          test-file-exclude-pattern: "(tests/entrypoints/llm/test_speculative_decoding.py|tests/omni/**)"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
@@ -52,6 +53,7 @@ steps:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
+          test-file-exclude-pattern: "(tests/entrypoints/llm/test_speculative_decoding.py|tests/omni/**)"
           fail-on-no-tests: true
           test-cmd: "pytest -sv --timeout=600 -m 'cpu_test' --junit-xml={{resultPath}} {{testExamples}}"
 

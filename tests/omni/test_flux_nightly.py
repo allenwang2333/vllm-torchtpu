@@ -9,9 +9,7 @@ All tests run in-memory without PNG writes.
 
 import numpy as np
 import pytest
-
-pytest.importorskip("vllm_omni")
-
+import vllm_omni  # noqa: F401
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -21,16 +19,6 @@ pytestmark = [
     pytest.mark.omni,
     pytest.mark.spawns_tpu_workers,
 ]
-
-
-def _resolve_model_path(model_id: str) -> str:
-    """Resolve cached model snapshot directory via standard HF resolution or fall back to HF model ID."""
-    try:
-        from huggingface_hub import snapshot_download
-
-        return snapshot_download(model_id, local_files_only=True)
-    except (OSError, ValueError, RuntimeError):
-        return model_id
 
 
 def _extract_image(output) -> Image.Image:
@@ -70,10 +58,9 @@ class TestFluxNightlyOnTpu:
         Covers distilled guidance-free Schnell, full 10-step CFG guidance Dev with distribution
         metric signatures, and Klein-4B with RoPE sequence length alignment.
         """
-        model_path = _resolve_model_path(model_id)
         prompt = "A futuristic glowing crystal monolith in a misty desert at night, neon reflections"
 
-        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
+        omni = Omni(model_id, init_timeout=600, stage_init_timeout=600)
         try:
             sampling_params = OmniDiffusionSamplingParams(
                 height=512,
