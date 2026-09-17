@@ -61,7 +61,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pages-per-seq", type=int, default=520)
     parser.add_argument("--total-pages", type=int, default=2112)
     parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--iterations", type=int, default=5)
+    # Calls per pipelined burst. 5 was the old per-call-blocking default and
+    # is far below convergence: on this host a burst reads 425/250/224/219 us
+    # per call at 1/5/20/50 calls. kernel_timing.MIN_ITERS rejects under 20.
+    # Literals, not kernel_timing.DEFAULT_*: that module imports jax, and the
+    # parent process builds this parser without wanting a TPU (jax is imported
+    # lazily in the child, below).
+    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--bursts", type=int, default=3,
+                        help="bursts to median over, to reject a hiccup")
     parser.add_argument("--output",
                         type=Path,
                         help="Write aggregate JSON results here")
@@ -100,6 +108,7 @@ def _run_child(args: argparse.Namespace) -> None:
     import numpy as np
 
     from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
+    import kernel_timing
 
     if args.result_path is None:
         raise ValueError("--result-path is required in child mode")
@@ -162,15 +171,25 @@ def _run_child(args: argparse.Namespace) -> None:
         output, cache_kv = invoke(cache_kv)
         jax.block_until_ready((output, cache_kv))
         result["compile_and_first_s"] = time.perf_counter() - compile_start
+
+        # The carried cache makes each step depend on the last, so the burst
+        # chains on device; blocking per step instead charges a ~150 us host
+        # round trip to every sample (scripts/kernel_timing). That offset is
+        # additive, so it compresses the spread between candidates -- exactly
+        # what a tuner must not do.
+        state = {"cache": cache_kv, "out": output}
+
+        def step():
+            state["out"], state["cache"] = invoke(state["cache"])
+            return state["out"], state["cache"]
+
         for _ in range(args.warmups):
-            output, cache_kv = invoke(cache_kv)
-            jax.block_until_ready((output, cache_kv))
-        samples_ms = []
-        for _ in range(args.iterations):
-            start = time.perf_counter_ns()
-            output, cache_kv = invoke(cache_kv)
-            jax.block_until_ready((output, cache_kv))
-            samples_ms.append((time.perf_counter_ns() - start) / 1e6)
+            jax.block_until_ready(step())
+        samples_ms = [
+            kernel_timing.burst_ms(step, (), args.iterations)
+            for _ in range(args.bursts)
+        ]
+        output = state["out"]
 
         # All values use V=1, so causal attention must produce one everywhere.
         # This cheaply rejects candidates with silent numerical corruption.
@@ -215,6 +234,7 @@ def _run_parent(args: argparse.Namespace) -> int:
         f"--total-pages={args.total_pages}",
         f"--warmups={args.warmups}",
         f"--iterations={args.iterations}",
+        f"--bursts={args.bursts}",
     ]
     results = []
     with tempfile.TemporaryDirectory(prefix="mla-mixed-tuner-") as temp_dir:

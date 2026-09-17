@@ -32,6 +32,7 @@ from vllm_torchtpu.kernels.flash_attention.kernel import (BlockSizes,
                                                           SegmentIds,
                                                           flash_attention)
 from vllm_torchtpu.logger import init_logger
+import kernel_timing
 
 logger = init_logger(__name__)
 
@@ -127,10 +128,13 @@ def _benchmark_candidate(spec: FlashAttentionTuningSpec, inputs: _TuningInputs,
     jax.block_until_ready(out)
     compile_and_warmup_seconds = time.perf_counter() - start
 
-    samples_ns = []
-    for _ in range(benchmark_iterations):
-        start_ns = time.perf_counter_ns()
-        out = flash_attention(
+    # Pipelined, not per-call blocking: a blocking clock adds a ~150 us host
+    # round trip to every sample (scripts/kernel_timing). Additive overhead is
+    # ruinous for a tuner specifically -- it compresses the gaps between
+    # candidates, so the fastest block size stops being distinguishable from
+    # a mediocre one and selection degrades toward arbitrary.
+    def candidate():
+        return flash_attention(
             inputs.q,
             inputs.k,
             inputs.v,
@@ -140,15 +144,17 @@ def _benchmark_candidate(spec: FlashAttentionTuningSpec, inputs: _TuningInputs,
             block_sizes=block_sizes,
             vmem_limit_bytes=spec.vmem_limit_bytes,
         )
-        jax.block_until_ready(out)
-        samples_ns.append(time.perf_counter_ns() - start_ns)
-    return median(samples_ns), compile_and_warmup_seconds
+
+    latency_ms = kernel_timing.pipelined_ms(candidate,
+                                            iters=benchmark_iterations,
+                                            warmup=1)
+    return latency_ms * 1e6, compile_and_warmup_seconds
 
 
 def tune_flash_attention(
     spec: FlashAttentionTuningSpec,
     *,
-    benchmark_iterations: int = 3,
+    benchmark_iterations: int = kernel_timing.DEFAULT_ITERS,
 ) -> BlockSizes | None:
     """Benchmark ``spec`` and return its fastest successful candidate.
 
@@ -156,8 +162,11 @@ def tune_flash_attention(
     mutation is intentionally unsupported because all enclosing JIT and Pallas
     caches must observe the selected parameters before their first trace.
     """
-    if benchmark_iterations < 1:
-        raise ValueError("benchmark_iterations must be at least 1")
+    if benchmark_iterations < kernel_timing.MIN_ITERS:
+        raise ValueError(
+            f"benchmark_iterations must be at least "
+            f"{kernel_timing.MIN_ITERS}; a shorter pipelined burst has not "
+            "converged and reads high on fast candidates")
     if not spec.candidates:
         logger.warning("No flash-attention candidates configured for %s",
                        spec.name)
@@ -239,8 +248,13 @@ def main() -> None:
     parser.add_argument(
         "--iterations",
         type=int,
-        default=5,
-        help="timed executions per candidate (default: 5)",
+        default=kernel_timing.DEFAULT_ITERS,
+        # Was 5, which is below kernel_timing.MIN_ITERS and would now be
+        # refused: a burst that short has not converged and reads high on the
+        # fast candidates, which are exactly the ones a tuner must separate.
+        help=(f"calls per pipelined burst, at least "
+              f"{kernel_timing.MIN_ITERS} "
+              f"(default: {kernel_timing.DEFAULT_ITERS})"),
     )
     parser.add_argument(
         "--device-index",

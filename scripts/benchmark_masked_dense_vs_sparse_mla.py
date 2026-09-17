@@ -62,6 +62,7 @@ from vllm_torchtpu.kernels.mla.masked_dense import csa_mask  # noqa: E402
 from vllm_torchtpu.kernels.mla.masked_dense import \
     kernel as masked_dense  # noqa: E402
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse  # noqa: E402
+import kernel_timing  # noqa: E402
 
 # GLM-5.2-FP8, read off the checkpoint config.
 LKV_DIM = 512  # kv_lora_rank
@@ -81,37 +82,8 @@ MAX_NUM_SEQS = 64
 KV_LENS = (512, 1024, 2048, 3072, 4096, 6144, 8192, 9216)
 
 
-def _time(fn, *args, warmup: int = 3, iters: int = 10) -> float:
-    """Median wall time of `fn` in milliseconds, device-synchronized."""
-    for _ in range(warmup):
-        jax.block_until_ready(fn(*args))
-    samples = []
-    for _ in range(iters):
-        start = time.perf_counter()
-        jax.block_until_ready(fn(*args))
-        samples.append((time.perf_counter() - start) * 1e3)
-    return statistics.median(samples)
-
-
-def _time_pair(first,
-               second,
-               *args,
-               warmup: int = 3,
-               iters: int = 10) -> tuple[float, float]:
-    """Paired medians with alternating arm order to reduce TPU drift."""
-    for _ in range(warmup):
-        jax.block_until_ready(first(*args))
-        jax.block_until_ready(second(*args))
-    samples = ([], [])
-    for iteration in range(iters):
-        arms = ((first, samples[0]), (second, samples[1]))
-        if iteration % 2:
-            arms = arms[::-1]
-        for fn, values in arms:
-            start = time.perf_counter()
-            jax.block_until_ready(fn(*args))
-            values.append((time.perf_counter() - start) * 1e3)
-    return statistics.median(samples[0]), statistics.median(samples[1])
+_time = kernel_timing.pipelined_ms
+_time_pair = kernel_timing.paired_ms
 
 
 def _build_caches(rng, total_pages):
@@ -309,9 +281,16 @@ def _time_prefill_requests(num_requests: int):
     sparse_only = _build_wrapper(False)
 
     def run_request(fn):
+        # Dispatch all eight stages, block once -- see scripts/kernel_timing.
+        # The stages carry independent pre-built args and their outputs are
+        # discarded, so nothing here depends on the previous stage having
+        # landed; blocking per stage would just add eight ~150 us host round
+        # trips to both arms and pull their ratio toward 1.
         start = time.perf_counter()
+        out = None
         for stage_args in args:
-            jax.block_until_ready(fn(*stage_args))
+            out = fn(*stage_args)
+        jax.block_until_ready(out)
         return (time.perf_counter() - start) * 1e3
 
     for _ in range(2):
@@ -381,26 +360,40 @@ def _run_point(shape: str, kv_len: int, bkv_p: int, bq_sz: int, iters: int,
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)
 
+    # Every arm is timed on both clocks. `<arm>_ms` is the pipelined figure and
+    # the only one to quote; `<arm>_wall_ms` is the same kernel with a sync
+    # after every call, recorded so each result carries the evidence of its own
+    # clock health. The gap should sit near 0.15 ms on tpu7x -- if it has
+    # drifted, the measurement environment changed, not the kernel. Costs ~1%.
+    def timed(fn, available=True):
+        if not available:
+            return float("nan"), float("nan")
+        return kernel_timing.both_ms(fn, iters=iters)
+
+    dense_available = shape == "prefill" and 0 < kv_len <= bitmap_bound
+    bitmap_ms, bitmap_wall = timed(functools.partial(dense_fn, bitmap_bound),
+                                   dense_available)
+    gather_ms, gather_wall = timed(sparse_fn)
+    mask_ms, mask_wall = timed(mask_fn, dense_available)
+
     row = dict(
         shape=shape,
         kv_len=kv_len,
         bkv_p=bkv_p,
         bq_sz=bq_sz,
         num_tokens=c["num_tokens"],
-        bitmap_ms=(_time(functools.partial(dense_fn, bitmap_bound),
-                         iters=iters) if shape == "prefill"
-                   and 0 < kv_len <= bitmap_bound else float("nan")),
-        gather_ms=_time(sparse_fn, iters=iters),
-        mask_only_ms=(_time(mask_fn, iters=iters) if shape == "prefill"
-                      and 0 < kv_len <= bitmap_bound else float("nan")),
+        bitmap_ms=bitmap_ms,
+        bitmap_wall_ms=bitmap_wall,
+        gather_ms=gather_ms,
+        gather_wall_ms=gather_wall,
+        mask_only_ms=mask_ms,
+        mask_only_wall_ms=mask_wall,
     )
     # The analytic mask needs its static bound at or under `topk`, and the
     # bound must cover every sequence in the call.
-    if shape == "prefill" and 0 < kv_len <= analytic_bound:
-        row["analytic_ms"] = _time(functools.partial(dense_fn, analytic_bound),
-                                   iters=iters)
-    else:
-        row["analytic_ms"] = float("nan")
+    row["analytic_ms"], row["analytic_wall_ms"] = timed(
+        functools.partial(dense_fn, analytic_bound),
+        shape == "prefill" and 0 < kv_len <= analytic_bound)
     row["wrapper_dispatch_ms"] = float("nan")
     row["wrapper_sparse_ms"] = float("nan")
     if measure_wrapper:
@@ -423,7 +416,12 @@ def main():
     parser.add_argument("--kv-lens", nargs="+", type=int, default=KV_LENS)
     parser.add_argument("--num-kv-pages-per-block", type=int, default=1)
     parser.add_argument("--num-queries-per-block", type=int, default=32)
-    parser.add_argument("--iters", type=int, default=10)
+    # 50, not 10: a burst of 10 still reads 7.6% above the converged per-call
+    # time on the fastest arm here (decode gather). Sweeping burst length on
+    # tpu7x 2026-09-16 gave 425/304/250/235/224/219/218 us per call at
+    # iters=1/2/5/10/20/50/100 -- flat past 20, and 50 lands within 0.5 us of
+    # the iters=100 plateau for a few hundred ms per point.
+    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
         "--measure-wrapper",
         action="store_true",
@@ -451,8 +449,8 @@ def main():
     for shape in args.shapes:
         print(f"{shape:>8} | {'kv_len':>7} | {'analytic':>9} | "
               f"{'bitmap':>9} | {'gather':>9} | {'mask':>8} | "
-              f"{'best/gather':>11} | win")
-        print("-" * 88)
+              f"{'best/gather':>11} | {'win':<8} | {'dispatch':>7}")
+        print("-" * 100)
         for kv_len in args.kv_lens:
             if shape == "mixed" and kv_len < 1024:
                 continue
@@ -466,11 +464,15 @@ def main():
                                if not math.isnan(m))
             row["ratio"] = best_ms / row["gather_ms"]
             row["win"] = win
+            # Dispatch cost this point actually saw, from the paired clocks.
+            # It is a host property, so it should be ~flat down the column;
+            # a row that departs is a warning about the environment.
+            row["dispatch_ms"] = row["gather_wall_ms"] - row["gather_ms"]
             rows.append(row)
             print(f"{shape:>8} | {kv_len:>7} | {row['analytic_ms']:>9.3f} | "
                   f"{row['bitmap_ms']:>9.3f} | {row['gather_ms']:>9.3f} | "
                   f"{row['mask_only_ms']:>8.3f} | {row['ratio']:>11.3f} | "
-                  f"{win}")
+                  f"{win:<8} | {row['dispatch_ms']:>7.3f}")
             if args.measure_wrapper:
                 wrapper_ratio = (row["wrapper_dispatch_ms"] /
                                  row["wrapper_sparse_ms"])
