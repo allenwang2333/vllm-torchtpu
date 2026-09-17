@@ -767,19 +767,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
     ):
         """Adapts tokamax's batched-RPA `TorchOp` to this class's kernel contract.
 
-        `tokamax.experimental.torch_tpu.ops.batched_rpa.BatchedRpa` registers
-        its own custom op through the same `torch_tpu` `pallas.jax_op` that
-        `_build_rpa_kernel` calls, so it replaces that op rather than the
-        kernel function inside it: no `functools.partial` over
-        `_kernel_entry`, no mesh, no `input_partition_specs`, no
-        `register_fake`. The returned callable keeps the `rpa_kernel(...)`
-        signature `forward` already calls, so nothing downstream changes.
+        tokamax's `BatchedRpa` registers its own custom op through the same
+        `torch_tpu` `pallas.jax_op` that `_build_rpa_kernel` calls, so it
+        replaces that op rather than the kernel function inside it: no mesh,
+        no `input_partition_specs`, no `register_fake`. The returned callable
+        keeps the `rpa_kernel(...)` signature `forward` already calls, so
+        nothing downstream changes.
+
+        The attention config is bound when the op is built, not passed per
+        call, for the same reason `_build_rpa_kernel` binds it with
+        `functools.partial`: `pallas.jax_op` only turns positional arguments
+        into traced placeholders and only feeds those to the compiled kernel.
+        `get_batched_rpa` is the tokamax-side equivalent of the
+        `_kernel_registry` lookup below, so equal configs share one op.
         """
-        # Imported lazily: tokamax is an optional dependency, and importing
-        # the module instantiates the singleton, whose constructor registers
-        # the custom op as a side effect.
+        # Imported lazily: tokamax is an optional dependency, and building an
+        # op registers a torch custom op as a side effect.
         from tokamax.experimental.torch_tpu.ops.batched_rpa.base import \
-            BatchedRpa
+            get_batched_rpa
 
         config_key = ("tokamax", self.sliding_window, self.scale,
                       self.logits_soft_cap, q_scale, k_scale, v_scale,
@@ -800,7 +805,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "registered without a mesh and shards nothing, but this run "
                 f"spreads attention over {model_axis} model-axis devices.")
 
-        kv_layout = _tokamax_kv_layout(self.kv_layout)
+        rpa_op = get_batched_rpa(
+            use_causal_mask=self.use_causal_mask,
+            sm_scale=self.scale,
+            sliding_window=self.sliding_window,
+            soft_cap=self.logits_soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            skip_kv_update=skip_kv_update,
+            kv_layout=_tokamax_kv_layout(self.kv_layout),
+            decode_query_size=self.decode_query_size,
+        )
 
         def tokamax_rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
                                     block_tables, query_start_loc,
@@ -811,8 +827,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "of tokamax's batched RPA signature.")
             # Argument order differs from `_kernel_entry`: tokamax takes q/k/v
             # first with the KV cache fourth, takes no `sinks`, and returns
-            # (output, kv_cache) rather than (kv_cache, output).
-            outputs, new_kv_cache = BatchedRpa(
+            # (output, kv_cache) rather than (kv_cache, output). Tensors only
+            # -- the rest of the config is bound into `rpa_op`.
+            outputs, new_kv_cache = rpa_op(
                 query,
                 key,
                 value,
@@ -821,16 +838,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 block_tables,
                 query_start_loc,
                 request_distribution,
-                use_causal_mask=self.use_causal_mask,
-                sm_scale=self.scale,
-                sliding_window=self.sliding_window,
-                soft_cap=self.logits_soft_cap,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                skip_kv_update=skip_kv_update,
-                kv_layout=kv_layout,
-                decode_query_size=self.decode_query_size,
             )
             if new_kv_cache.shape != kv_cache.shape:
                 raise RuntimeError(
