@@ -61,6 +61,7 @@ dependencies = [
 [project.optional-dependencies]
 # Required for running tests
 test = [
+    "pytest-cov",
     "pytest",
     "pytest-mock",
     "pytest-timeout",
