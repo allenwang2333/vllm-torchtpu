@@ -946,13 +946,13 @@ def sparse_mla_attention_dcp(
         raise ValueError(
             f"sparse_mla_attention_dcp requires dcp_size > 1, got {dcp_size}; "
             "use sparse_mla_attention for the unsharded case.")
-    num_tokens = ql_nope.shape[0]
     if mesh is None:
         if dcp_rank is None:
             raise ValueError("mesh=None requires an explicit dcp_rank.")
         if not 0 <= dcp_rank < dcp_size:
             raise ValueError(
                 f"dcp_rank={dcp_rank} out of range for dcp_size={dcp_size}.")
+        num_tokens = ql_nope.shape[0]
         if local_topk_indices.shape[0] != num_tokens:
             raise ValueError(
                 "local_topk_indices must carry one row per token: expected "
@@ -965,6 +965,7 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"dcp_size={dcp_size} does not match mesh axis "
                 f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}.")
+        num_tokens = ql_nope.shape[0]
         if local_topk_indices.shape[0] != dcp_size * num_tokens:
             raise ValueError(
                 "local_topk_indices must carry one row per (rank, token): "
