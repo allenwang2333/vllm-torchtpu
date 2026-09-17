@@ -41,8 +41,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu.distributed.dcp import (get_dcp_mesh_if_enabled,
-                                           get_dcp_rank)
+from vllm_torchtpu.distributed.dcp import get_dcp_mesh_if_enabled, get_dcp_rank
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)

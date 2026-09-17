@@ -81,7 +81,6 @@ def test_early_exit_is_rejected_under_cp():
 H_IDX, D_IDX, K = 32, 128, 2048
 
 
-
 def _filter_all_ranks(merged, dcp_size, interleave_c):
     """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
     return np.stack([
@@ -210,7 +209,6 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
         want = set(reference[t][reference[t] >= 0].tolist())
         assert got == want, (f"token {t}: {len(want - got)} missing, "
                              f"{len(got - want)} spurious")
-
 
 
 def _local_candidates(q, weights, shard, seq_lens, page_indices, cu_q_lens,

@@ -22,8 +22,7 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import (get_dcp_mesh_if_enabled,
-                                           get_dcp_rank)
+from vllm_torchtpu.distributed.dcp import get_dcp_mesh_if_enabled, get_dcp_rank
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs

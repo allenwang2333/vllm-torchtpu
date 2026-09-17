@@ -1007,8 +1007,8 @@ def sparse_mla_attention_dcp(
     def _local(ql_nope, q_pe, kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope,
                topk_idx, seq_lens_, block_tables_, query_start_loc_,
                request_distribution_):
-        rank = (dcp_rank if mesh is None else
-                streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size))
+        rank = (dcp_rank if mesh is None else streamindex_topk.cp_rank_as_data(
+            dcp_axis_name, dcp_size))
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,
             kv_cache_rope,
