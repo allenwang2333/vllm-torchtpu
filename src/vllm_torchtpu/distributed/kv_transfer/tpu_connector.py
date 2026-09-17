@@ -109,6 +109,20 @@ _STAGE7_WATCH_HISTORY = 1024
 # consumer's own 120 s timeout, so the limit should be generous rather than
 # tight.
 _STAGE7_DESTINATION_WAIT_S = 60.0
+# Stage 7e. How long a watch may stay armed before the worker fires it itself,
+# and how often it looks. _arm_generation predicts the generation the step's
+# last forward will ring, and a step that runs fewer forwards than predicted
+# leaves the watch naming a generation nothing will ever reach.
+#
+# The two errors are not symmetric, so this errs long. Expiring early fires a
+# transfer whose pages the forward has not written, which is silent corruption;
+# expiring late only makes a request that was going to hang forever take
+# longer to recover. Thirty seconds is many multiples of a 397B prefill step,
+# even a multi-chunk one, and it is still well inside decode's own 120 s
+# fallback, so the swept transfer lands in time to be the thing that completes
+# the request rather than arriving after the consumer has given up.
+_STAGE7_ARM_DEADLINE_S = 30.0
+_STAGE7_ARM_SWEEP_S = 1.0
 # tpu_sync GetRequestBlockStatusResponse.Status values reported by the
 # reshard client's get_request_block_status probe.
 _STAGE3_REGISTRY_STATUS_UNKNOWN = 1
@@ -138,6 +152,7 @@ _STAGE3_SUBMIT_WORKERS = 4
 # Submit workers share it, hence the lock; it is only read under the test knob.
 _STAGE6_FAULT_LOCK = threading.Lock()
 _STAGE6_FIRE_ATTEMPTS = 0
+_STAGE7_ARM_ATTEMPTS = 0
 
 
 def _select_committed_mamba_blocks(
@@ -930,6 +945,22 @@ def _early_layer_split_enabled() -> bool:
         and tpu_envs.TPU_KV_PREFILL_SUBMIT)
 
 
+def _early_group_last_bell() -> int:
+    """The bell index the early transfer's last layer rings.
+
+    A bell is one attention layer and there are fifteen of them; a transfer
+    group is a span of layers. The early group holds layers 0 through
+    TPU_KV_EARLY_LAYERS-1, so the one that finishes it is the last, and that
+    is the bell the send has to wait for. Arming on layer 0 fires while the
+    rest of the group is still being written, which ships whatever those pages
+    held before and reads as wrong output rather than a slow run.
+
+    The two indices coincide at the width stage 7 runs, one layer, so this
+    changes no behaviour today. It matters at every width stage 8 adds.
+    """
+    return max(0, int(tpu_envs.TPU_KV_EARLY_LAYERS) - 1)
+
+
 def _doorbell_arm_enabled() -> bool:
     """Whether the early group's transfer waits on a bell instead of a step.
 
@@ -983,6 +1014,32 @@ def _maybe_fail_stage6_fire_for_test(req_id: str) -> None:
     raise RuntimeError(
         f"TEST INJECTION: failing Stage-6 fire for req_id={req_id} "
         f"(attempt {attempt})")
+
+
+def _maybe_strand_stage7_watch_for_test(generation: int) -> int:
+    """TEST-ONLY fault injection (TPU_KV_STAGE7_STRAND_EVERY): arm on a bell
+    that will never ring.
+
+    The expiry it exercises is a race that showed up once in 344 transfers, on
+    the last prefill of a run, so waiting for it costs a full benchmark and
+    still might not see it. Arming for a generation far past anything the run
+    will reach makes it certain and immediate: the sweep is the only thing
+    that can complete such a request, so the leg either passes because the
+    sweep works or hangs exactly the way the unfixed code did.
+    """
+    every = int(os.getenv("TPU_KV_STAGE7_STRAND_EVERY", "0") or 0)
+    if every <= 0:
+        return generation
+    global _STAGE7_ARM_ATTEMPTS
+    with _STAGE6_FAULT_LOCK:
+        _STAGE7_ARM_ATTEMPTS += 1
+        attempt = _STAGE7_ARM_ATTEMPTS
+    if attempt % every:
+        return generation
+    logger.warning(
+        "TEST INJECTION: stranding Stage-7 watch %d on an unreachable "
+        "generation; only the sweep can complete it", attempt)
+    return generation + 1_000_000
 
 
 def _dispatch_stage3_transfer(facade: Any,
@@ -2316,7 +2373,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 progress.shipped_through,
                 time.perf_counter() + dist_utils.get_p2p_wait_pull_timeout(),
                 dst_params,
-                                       arm_on_bell=0,
+                                       arm_on_bell=_early_group_last_bell(),
                                        dst_batch_url=dst_batch_url):
             progress.early_emitted = True
 
@@ -2929,8 +2986,12 @@ class TPURaidenConnectorWorker:
         self._raiden_controller_facade: Any | None = None
         self._raiden_controller_address: str | None = None
         # Stage 7c. Transfers prepared and handed to a doorbell, keyed by
-        # (req_id, uuid), so an abort can take one back before it fires.
-        self._stage7_watches: dict[tuple[str, int], int] = {}
+        # (req_id, uuid), so an abort can take one back before it fires. The
+        # value is the watch id and the deadline stage 7e fires it by. Written
+        # from the submit workers and read from the sweep thread, hence a lock.
+        self._stage7_watches: dict[tuple[str, int], tuple[int, float]] = {}
+        self._stage7_watch_lock = threading.Lock()
+        self._stage7_watch_sweeper: Optional[threading.Thread] = None
         # Stage 7d. Armed sends the scheduler released before the consumer had
         # published a destination, keyed by the base request id the consumer
         # announces against. A collector thread fills these in.
@@ -4883,19 +4944,23 @@ class TPURaidenConnectorWorker:
         def _arm(req_id: str, uuid: int) -> None:
             watcher = self.runner._doorbell_watcher  # noqa: SLF001
             facade, _ = self._require_stage3_controller()
-            watch_id = watcher.arm(group, generation, facade.native, req_id,
+            armed_gen = _maybe_strand_stage7_watch_for_test(generation)
+            watch_id = watcher.arm(group, armed_gen, facade.native, req_id,
                                    uuid)
-            # Kept so an abort can take the transfer back. The key is the pair
+            # Kept so an abort can take the transfer back, and so stage 7e's
+            # sweep can fire one whose bell never rang. The key is the pair
             # because a request has several uuids once it is split and only
             # one of them is waiting on a bell. A watch that fires normally
             # leaves its entry behind, since the firing happens in C++ and
-            # says nothing about which request it was; the entries are dropped
-            # oldest-first instead. Anything that old has certainly fired,
-            # because an armed watch belongs to a request the scheduler is
-            # still holding and there are only so many of those.
-            while len(self._stage7_watches) >= _STAGE7_WATCH_HISTORY:
-                self._stage7_watches.pop(next(iter(self._stage7_watches)))
-            self._stage7_watches[(req_id, int(uuid))] = watch_id
+            # says nothing about which request it was; the sweep retires those
+            # by asking the reader to cancel them, which fails on a watch that
+            # has already fired, and the bound below is the backstop.
+            deadline = time.monotonic() + _STAGE7_ARM_DEADLINE_S
+            with self._stage7_watch_lock:
+                while len(self._stage7_watches) >= _STAGE7_WATCH_HISTORY:
+                    self._stage7_watches.pop(next(iter(self._stage7_watches)))
+                self._stage7_watches[(req_id, int(uuid))] = (watch_id, deadline)
+            self._ensure_stage7_watch_sweeper()
             logger.info(
                 "%s",
                 json.dumps(
@@ -4904,7 +4969,7 @@ class TPURaidenConnectorWorker:
                         "req_id": req_id,
                         "uuid": int(uuid),
                         "group": group,
-                        "generation": generation,
+                        "generation": armed_gen,
                         "watch_id": watch_id,
                         "t": time.time(),
                     },
@@ -4921,9 +4986,11 @@ class TPURaidenConnectorWorker:
         duplicate. If the watch had already fired there is nothing to take
         back: the transfer is on the wire and the consumer will see it.
         """
-        watch_id = self._stage7_watches.pop((req_id, int(uuid)), None)
-        if watch_id is None:
+        with self._stage7_watch_lock:
+            entry = self._stage7_watches.pop((req_id, int(uuid)), None)
+        if entry is None:
             return
+        watch_id = entry[0]
         watcher = getattr(getattr(self, "runner", None), "_doorbell_watcher",
                           None)
         if watcher is None or not watcher.cancel(watch_id):
@@ -4936,6 +5003,101 @@ class TPURaidenConnectorWorker:
                 "Stage-7c cancelled watch %d for req_id=%s uuid=%d but could "
                 "not discard its plan; a retry of the same pair will be "
                 "refused as a duplicate: %s", watch_id, req_id, int(uuid), exc)
+
+    def _ensure_stage7_watch_sweeper(self) -> None:
+        """Starts the thread that fires watches whose bell never rang.
+
+        Its own thread rather than a hook in the step loop, because the case
+        it exists for is the one where there are no more steps. The watch that
+        hung a run was armed on the last prefill of the leg: nothing followed
+        it to ring the generation it named, and nothing followed it to run a
+        sweep either.
+        """
+        if self._stage7_watch_sweeper is not None:
+            return
+        self._stage7_watch_sweeper = threading.Thread(
+            target=self._stage7_watch_sweep_loop,
+            name="kv-watch-sweep",
+            daemon=True)
+        self._stage7_watch_sweeper.start()
+
+    def _stage7_watch_sweep_loop(self) -> None:
+        while True:
+            time.sleep(_STAGE7_ARM_SWEEP_S)
+            try:
+                self._sweep_expired_watches()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Stage-7e watch sweep failed")
+
+    def _sweep_expired_watches(self) -> None:
+        """Send, from here, any transfer whose bell has not rung in time.
+
+        _arm_generation predicts the generation the step's last forward will
+        ring. The prediction can overshoot, and when it does the watch names a
+        generation no forward will ever reach. With traffic behind it a later
+        request's forward rings that generation and the watch fires late but
+        fires; at the tail of a run there is nothing behind it and the watch
+        waits forever. Before this the request waited with it, because an
+        armed watch was never retried, never swept, and never handed back, and
+        the consumer's own 120 s fallback did not rescue it either.
+
+        Firing here is safe rather than merely better than hanging. The watch
+        was armed before the step's forward was issued and the deadline is
+        several steps long, so a bell that has not rung by now is one whose
+        forward already ran under a different generation, and the pages it
+        would have announced are written. Cancel is what makes it exactly
+        once: the reader refuses to cancel a watch that has already fired, so
+        either it hands the transfer back here or it sent it itself.
+        """
+        now = time.monotonic()
+        with self._stage7_watch_lock:
+            expired = [(key, watch_id)
+                       for key, (watch_id,
+                                 deadline) in self._stage7_watches.items()
+                       if deadline <= now]
+            for key, _ in expired:
+                self._stage7_watches.pop(key, None)
+        if not expired:
+            return
+        watcher = getattr(getattr(self, "runner", None), "_doorbell_watcher",
+                          None)
+        for (req_id, uuid), watch_id in expired:
+            if watcher is None or not watcher.cancel(watch_id):
+                # Already fired, between the deadline check and here. The
+                # transfer is on the wire and there is nothing owed.
+                continue
+            logger.error(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage7_watch_expired",
+                        "req_id": req_id,
+                        "uuid": int(uuid),
+                        "watch_id": watch_id,
+                        "waited_s": _STAGE7_ARM_DEADLINE_S,
+                        "t": time.time(),
+                    },
+                    sort_keys=True))
+            try:
+                facade, _ = self._require_stage3_controller()
+                facade.fire_transfer(req_id, int(uuid))
+            except Exception as exc:  # pylint: disable=broad-except
+                # The plan is still prepared and still holding its source
+                # claim. Discarding it lets the consumer's fallback submit
+                # through, which is stage 0's behaviour and the floor this
+                # whole design promised never to go below.
+                logger.error(
+                    "Stage-7e could not send the expired watch for req_id=%s "
+                    "uuid=%d; falling back to the consumer's own submit: %s",
+                    req_id, int(uuid), exc)
+                try:
+                    facade, _ = self._require_stage3_controller()
+                    facade.discard_prepared_transfer(req_id, int(uuid))
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        "Stage-7e could not discard the expired plan for "
+                        "req_id=%s uuid=%d either; the consumer's submit will "
+                        "be refused as a duplicate", req_id, int(uuid))
 
     def _ensure_worker_destination_collector(self, url: str) -> None:
         """Starts this worker's own long poll for consumer destinations.

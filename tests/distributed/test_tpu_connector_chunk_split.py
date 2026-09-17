@@ -24,6 +24,8 @@ Helpers come from the sibling module rather than being duplicated; this file
 is separate only because that one is already five thousand lines.
 """
 import json
+import os
+import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -36,7 +38,8 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import SendMeta
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _chunk_base_req_id, _chunk_req_id, _DestinationCollector,
-    _flatten_block_ids, _send_meta_fa_group, _send_meta_int, _Stage3Admission)
+    _flatten_block_ids, _send_meta_fa_group, _send_meta_int, _Stage3Admission,
+    _STAGE7_ARM_DEADLINE_S, _maybe_strand_stage7_watch_for_test)
 
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import \
     TPUConnectorMetadata
@@ -1310,14 +1313,14 @@ class TestEarlyLayerGroupLayout:
 
 
 @contextmanager
-def _arming_on(on: bool = True):
+def _arming_on(on: bool = True, layers: int = 1):
     """Everything _doorbell_arm_enabled checks, in one place.
 
     All four have to agree before a send is built ahead of its pages, so a
     test that flips one of them off is testing the gate rather than the
     feature.
     """
-    with _early_layers_on(), \
+    with _early_layers_on(layers), \
          patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL_ARM", on, create=True), \
          patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL", True, create=True), \
          patch(f"{_MOD}.tpu_envs.TPU_KV_DOORBELL_POLL_US", 200, create=True), \
@@ -1850,3 +1853,169 @@ class TestCollectorSharesEntriesWithASecondReader:
         # It polled again, and with the cursor advanced, so the failure cost
         # one release and not the entries behind it.
         assert urls[1].endswith("after=1")
+
+
+class TestTheEarlyGroupWaitsOnItsLastLayer:
+    """A bell is a layer, a transfer group is a span of them.
+
+    The two indices are equal only while the early group is one layer wide,
+    which is the only width stage 7 runs, so the literal zero stage 7c passed
+    has always been right and has always been right by accident. Widen the
+    split and it fires on the first layer of the group while the rest is still
+    being written, shipping whatever those pages held before. That is a wrong
+    answer rather than a slow one, and it is the failure mode the first
+    attempt at this hit and never explained.
+    """
+
+    def _early(self, layers):
+        producer, _notifier = _producer()
+        req = _request("short", PAGE + 1, dst_batch_url=_DST_URL)
+        with _arming_on(layers=layers):
+            with ExitStack() as stack:
+                for ctx in _stage3_producer_env(900):
+                    stack.enter_context(ctx)
+                stack.enter_context(
+                    patch(f"{_MOD}.get_uuid", side_effect=[900, 901]))
+                producer.update_state_after_alloc(req, MagicMock(), 0)
+            with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout",
+                       return_value=30.0):
+                meta = producer.build_connector_meta(
+                    _step(new=[("short", [100])],
+                          scheduled={"short": PAGE + 1}))
+        return meta.reqs_to_send["short#c0"]
+
+    def test_one_layer_still_waits_on_bell_zero(self):
+        """The width stage 7 shipped and measured. This has to be unchanged,
+        or the fix is a behaviour change dressed as a correctness fix."""
+        assert self._early(1).arm_on_bell == 0
+
+    @pytest.mark.parametrize("layers,bell", [(2, 1), (3, 2), (8, 7)])
+    def test_a_wider_group_waits_on_its_last_layer(self, layers, bell):
+        assert self._early(layers).arm_on_bell == bell
+
+
+class TestAWatchThatNeverFiresIsSweptAndSent:
+    """The request that hung a 397B run, and why it hung forever.
+
+    _arm_generation predicts the generation the step's last forward will ring.
+    It can overshoot, and then the watch names a generation no forward reaches.
+    With traffic behind it a later request's forward rings that generation and
+    the watch fires late but fires. On the last prefill of a run there is no
+    traffic behind it. Before stage 7e nothing noticed: an armed watch was
+    never retried, never swept and never handed back, so decode sat in
+    WAITING_FOR_REMOTE_KVS for as long as anyone let it.
+
+    The sweep makes the worst case today's behaviour again, which is what the
+    design promised. Cancel is the handoff that keeps it exactly once, because
+    the reader refuses to cancel a watch it has already fired.
+    """
+
+    def _worker(self, *, cancels=True):
+        worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
+        worker.runner = SimpleNamespace(
+            _doorbell_watcher=SimpleNamespace(cancel=MagicMock(
+                return_value=cancels)))
+        facade = MagicMock()
+        worker._require_stage3_controller = MagicMock(
+            return_value=(facade, None))
+        return worker, facade
+
+    def _arm(self, worker, *, overdue, req_id="short#c0", uuid=901):
+        """Puts one watch in the table, already past its deadline or not."""
+        offset = -1.0 if overdue else _STAGE7_ARM_DEADLINE_S
+        worker._stage7_watches[(req_id, uuid)] = (77,
+                                                  time.monotonic() + offset)
+
+    def test_an_expired_watch_is_cancelled_and_sent_from_here(self):
+        worker, facade = self._worker()
+        self._arm(worker, overdue=True)
+        worker._sweep_expired_watches()
+        worker.runner._doorbell_watcher.cancel.assert_called_once_with(77)
+        facade.fire_transfer.assert_called_once_with("short#c0", 901)
+        assert worker._stage7_watches == {}
+
+    def test_a_watch_still_within_its_deadline_is_left_alone(self):
+        worker, facade = self._worker()
+        self._arm(worker, overdue=False)
+        worker._sweep_expired_watches()
+        worker.runner._doorbell_watcher.cancel.assert_not_called()
+        facade.fire_transfer.assert_not_called()
+        assert ("short#c0", 901) in worker._stage7_watches
+
+    def test_a_watch_that_fired_first_is_not_sent_twice(self):
+        """The reader refuses the cancel, which is how the sweep learns the
+        transfer is already on the wire. Sending it again would be a duplicate
+        the controller rejects and, worse, a second write into pages the
+        consumer may have started reading."""
+        worker, facade = self._worker(cancels=False)
+        self._arm(worker, overdue=True)
+        worker._sweep_expired_watches()
+        facade.fire_transfer.assert_not_called()
+        assert worker._stage7_watches == {}
+
+    def test_a_send_that_fails_falls_back_to_the_consumer(self):
+        """Discarding the plan releases its source registration claim. Without
+        that the consumer's own fallback submit comes back as a duplicate and
+        the request is no better off than it was hanging."""
+        worker, facade = self._worker()
+        facade.fire_transfer.side_effect = RuntimeError("controller is gone")
+        self._arm(worker, overdue=True)
+        worker._sweep_expired_watches()
+        facade.discard_prepared_transfer.assert_called_once_with(
+            "short#c0", 901)
+
+    def test_the_sweep_does_nothing_without_a_reader(self):
+        worker, facade = self._worker()
+        worker.runner = SimpleNamespace(_doorbell_watcher=None)
+        self._arm(worker, overdue=True)
+        worker._sweep_expired_watches()
+        facade.fire_transfer.assert_not_called()
+
+    def test_sweeping_an_empty_table_touches_no_controller(self):
+        """It runs once a second forever, so the common case has to be free."""
+        worker, _facade = self._worker()
+        worker._sweep_expired_watches()
+        worker._require_stage3_controller.assert_not_called()
+
+    def test_only_the_expired_entry_leaves_the_table(self):
+        worker, facade = self._worker()
+        self._arm(worker, overdue=True, req_id="a#c0", uuid=1)
+        self._arm(worker, overdue=False, req_id="b#c0", uuid=2)
+        worker._sweep_expired_watches()
+        assert list(worker._stage7_watches) == [("b#c0", 2)]
+        facade.fire_transfer.assert_called_once_with("a#c0", 1)
+
+    def test_an_abort_still_takes_a_watch_back_before_the_deadline(self):
+        """_cancel_bell_watch reads the same table the sweep now writes, so
+        the pair it stores has to stay readable by both."""
+        worker, facade = self._worker()
+        self._arm(worker, overdue=False)
+        worker._cancel_bell_watch("short#c0", 901)
+        worker.runner._doorbell_watcher.cancel.assert_called_once_with(77)
+        facade.discard_prepared_transfer.assert_called_once_with(
+            "short#c0", 901)
+        assert worker._stage7_watches == {}
+
+    def test_the_sweeper_thread_starts_once_and_is_a_daemon(self):
+        """It has to outlive the step loop, because the case it exists for is
+        a watch armed by the last prefill of a run with no step after it."""
+        worker, _facade = self._worker()
+        with patch(f"{_MOD}.threading.Thread") as thread:
+            worker._ensure_stage7_watch_sweeper()
+            worker._ensure_stage7_watch_sweeper()
+        thread.assert_called_once()
+        assert thread.call_args.kwargs["daemon"] is True
+        thread.return_value.start.assert_called_once()
+
+    def test_the_strand_injection_is_inert_unless_asked_for(self):
+        """It rewrites the generation a watch arms on, so a stray default
+        would silently route every transfer through the sweep."""
+        assert _maybe_strand_stage7_watch_for_test(8) == 8
+
+    def test_the_strand_injection_moves_the_bell_out_of_reach(self):
+        """Every second watch, so a leg run with it set has both paths in it
+        and the ordinary one is still the one being compared against."""
+        with patch.dict(os.environ, {"TPU_KV_STAGE7_STRAND_EVERY": "2"}):
+            armed = [_maybe_strand_stage7_watch_for_test(8) for _ in range(4)]
+        assert armed.count(8) == 2
+        assert all(g > 8 for g in armed if g != 8)
