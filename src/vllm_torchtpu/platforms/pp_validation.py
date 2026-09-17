@@ -12,8 +12,16 @@ def _legacy_ray_executor() -> bool:
             and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND)
 
 
-def _stage_without_full_attention(vllm_config: Any) -> str | None:
-    """Describe the first stage holding no full-attention layer, or None.
+# Layer kinds that keep no KV cache: their state lives in the mamba/GDN
+# pools rather than an attention pool, so a stage made only of these has
+# nothing for the KV connector to pair with its peer. Every other kind keeps
+# a cache -- sparse attention (GLM-5.2's ``deepseek_sparse_attention``) as
+# much as full attention.
+_STATE_ONLY_LAYER_TYPES = frozenset({"linear_attention", "mamba"})
+
+
+def _stage_without_attention_cache(vllm_config: Any) -> str | None:
+    """Describe the first stage holding no KV-cached attention layer, or None.
 
     Only hybrid models declare ``layer_types``; every layer of the others
     has a KV cache.
@@ -28,7 +36,7 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     for stage in range(stages):
         start, end = get_pp_indices(len(layer_types), stage, stages)
         kinds = layer_types[start:end]
-        if "full_attention" not in kinds:
+        if all(kind in _STATE_ONLY_LAYER_TYPES for kind in kinds):
             return (f"stage {stage} holds layers {start}-{end - 1}, "
                     f"{'/'.join(sorted(set(kinds)))} only")
     return None
@@ -65,12 +73,12 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         unsupported = ("KV transfer connectors other than "
                        "TPURaidenConnector")
     elif (vllm_config.kv_transfer_config is not None
-          and (stage := _stage_without_full_attention(vllm_config))):
+          and (stage := _stage_without_attention_cache(vllm_config))):
         # The raiden connector pairs a stage with its peer through the
-        # measured layout of a full-attention KV pool, so a stage made of
-        # linear-attention layers alone has nothing to register.
+        # measured layout of an attention KV pool, so a stage made of
+        # recurrent layers alone has nothing to register.
         unsupported = ("TPURaidenConnector with a stage holding no "
-                       f"full-attention layer ({stage})")
+                       f"KV-cached attention layer ({stage})")
         remedy = (" Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "
                   "gives every stage a full-attention layer.")
     elif _legacy_ray_executor():

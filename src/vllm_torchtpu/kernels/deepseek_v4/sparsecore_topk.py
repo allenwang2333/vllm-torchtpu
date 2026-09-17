@@ -511,6 +511,43 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     return p
 
 
+@functools.lru_cache(maxsize=1)
+def sparsecore_topk_supported() -> bool:
+    """Whether this chip's SparseCore has the geometry this kernel assumes.
+
+    ``_topk_body`` is written for 16-lane vector subcores, 32 of them across
+    both cores (TPU v7): the lane iota, the histogram slabs and the wave
+    stride are all sized by ``LANES``. Earlier generations have 8-lane
+    subcores, where a 16-wide iota does not lower at all ("Unsupported iota
+    shape for SC vector subcore"), so there the reduction runs on TensorCore
+    instead. Off a TPU (CPU tests) the answer is False.
+    """
+    try:
+        sparse_core = pltpu.get_tpu_info().sparse_core
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return (sparse_core is not None and sparse_core.num_lanes == LANES
+            and sparse_core.num_cores * sparse_core.num_subcores == 32)
+
+
+def _tensorcore_topk(scores: jax.Array, k: int,
+                     row_lengths: jax.Array) -> jax.Array:
+    """The same contract on TensorCore, for chips the kernel cannot lower on.
+
+    ``approx_max_k`` at ``recall_target=1.0`` is an exact top-k. Columns past
+    a row's length are excluded by scoring them -inf, and a row with fewer
+    than ``k`` live columns keeps the kernel's -1 padding.
+    """
+    columns = jnp.arange(scores.shape[1], dtype=jnp.int32)[None, :]
+    live = columns < row_lengths[:, None]
+    masked = jnp.where(live, scores, -jnp.inf)
+    values, indices = jax.lax.approx_max_k(masked,
+                                           k,
+                                           reduction_dimension=-1,
+                                           recall_target=1.0)
+    return jnp.where(values == -jnp.inf, -1, indices).astype(jnp.int32)
+
+
 @functools.partial(jax.jit,
                    static_argnames=("k", "write_empty_rows",
                                     "_reference_stage2_gather"))
@@ -553,6 +590,9 @@ def sparsecore_topk(
         row_lengths = jnp.full((b, ), n, jnp.int32)
     else:
         row_lengths = row_lengths.astype(jnp.int32)
+
+    if not sparsecore_topk_supported():
+        return _tensorcore_topk(scores, k, row_lengths)
 
     p = _pick_partition(b, n, k)
 

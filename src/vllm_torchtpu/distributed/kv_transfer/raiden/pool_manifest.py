@@ -800,7 +800,7 @@ def _glm_row_region(tag: str, *, row_bytes: int,
                     num_rows: int) -> tuple[RegionSpec, ...]:
     """One dense region of whole packed rows covering the full page."""
     return (RegionSpec(
-        name=_GLM_REGION_NAMES[tag],
+        name=_GLM_REGION_NAMES[class_tag(tag)],
         offset_bytes=0,
         stride_bytes=row_bytes,
         unit_bytes=row_bytes,
@@ -814,6 +814,7 @@ def build_glm_mla_pool_manifest(
     named_kv_caches: Mapping[str, Any],
     raw_tensors: Sequence[Any],
     block_size_tokens: int,
+    per_layer_tags: bool = False,
 ) -> PoolManifest:
     """Builds the Pool Manifest for GLM MLA models.
 
@@ -822,11 +823,21 @@ def build_glm_mla_pool_manifest(
     The packed [blocks, rows, packing, width] layout is declared as
     row-granular regions; a nope cache carries one row per token,
     every other class packs `packing` tokens per row.
+
+    ``per_layer_tags`` suffixes every tag with the layer index
+    (``mla.nope.l3`` ...) so pools pair up by layer rather than by position
+    in the manifest: a pipeline-parallel stage registers only the layers it
+    holds, and only a tag can say which ones those are. It also lets a stage
+    whose layers all reuse an earlier layer's sparse indices register no
+    ``dsa.idx`` pool at all, since the peer matches the tags that are there.
     """
     if block_size_tokens <= 0:
         raise ManifestError("block_size_tokens must be positive")
     flat: list[tuple[str, str, str, Any]] = []
-    for layer_name in sorted(named_kv_caches):
+    for layer_name in sorted(named_kv_caches,
+                             key=lambda name:
+                             (layer_index_from_name(name) is None,
+                              layer_index_from_name(name) or 0, str(name))):
         cache = named_kv_caches[layer_name]
         if isinstance(cache, (list, tuple)):
             if len(cache) != 2:
@@ -842,6 +853,16 @@ def build_glm_mla_pool_manifest(
     if not any(tag == TAG_MLA_NOPE for tag, _, _, _ in flat):
         raise ManifestError(
             "GLM MLA admission found no latent (mla.nope) caches")
+    if per_layer_tags:
+        tagged = []
+        for tag, layer_name, dtype_tag, tensor in flat:
+            layer_index = layer_index_from_name(layer_name)
+            if layer_index is None:
+                raise ManifestError(
+                    f"per-layer pool tags need a layer index in {layer_name}")
+            tagged.append(
+                (layer_tag(tag, layer_index), layer_name, dtype_tag, tensor))
+        flat = tagged
 
     binding, _ = _binding_for([(layer_name, tensor)
                                for _, layer_name, _, tensor in flat],
@@ -867,7 +888,7 @@ def build_glm_mla_pool_manifest(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
                 f"num_blocks {num_blocks}")
         live_stride = nbytes // num_blocks
-        if tag == TAG_MLA_NOPE:
+        if class_tag(tag) == TAG_MLA_NOPE:
             # One packed row per token in the nope layout.
             if rows != block_size_tokens:
                 raise ManifestError(

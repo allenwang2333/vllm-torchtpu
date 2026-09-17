@@ -80,6 +80,26 @@ def test_raiden_accepts_stages_that_each_hold_full_attention(monkeypatch):
         _config(pp=4, kv_transfer=RAIDEN, layer_types=HYBRID_24))
 
 
+def test_raiden_accepts_sparse_attention_stages(monkeypatch):
+    """A sparse-attention layer keeps a KV cache, so a stage of them
+    registers pools like any other; only recurrent layers do not."""
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    validate_pipeline_parallel_config(
+        _config(pp=8,
+                kv_transfer=RAIDEN,
+                layer_types=["deepseek_sparse_attention"] * 8))
+
+
+def test_raiden_accepts_a_stage_mixing_recurrent_with_sparse_attention(
+        monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    validate_pipeline_parallel_config(
+        _config(pp=2,
+                kv_transfer=RAIDEN,
+                layer_types=["linear_attention", "deepseek_sparse_attention"] *
+                2))
+
+
 def test_raiden_partition_check_honors_the_layer_partition(monkeypatch):
     monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "4,4,4,4,4,4")
     validate_pipeline_parallel_config(

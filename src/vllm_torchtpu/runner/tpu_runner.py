@@ -85,6 +85,9 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import \
     unified_kv_layout_enabled
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.dsa_topk import (TOPK_INDICES,
+                                           find_topk_indices_buffer,
+                                           model_uses_sparse_indexer)
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
@@ -361,6 +364,12 @@ def _torch_tpu_wrapper():
                     delattr(torch.cuda, k)
             else:
                 setattr(torch.cuda, k, v)
+
+
+# Hand-off lanes that carry indices rather than activations, and the
+# neutral value that stands in for a run with no real table (warmup,
+# profiling): -1 is "no token", so such a row attends to nothing.
+_PP_LANE_FILL: dict[str, int] = {TOPK_INDICES: -1}
 
 
 # Recompilation-avoidance contract:
@@ -738,6 +747,9 @@ class TPUModelRunner(GPUModelRunner):
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
         self._pp_wave: PPWave | None = None
+        # A sparse model's shared top-k index table, when this stage's layers
+        # cannot all recompute it; set at load time under a pipeline.
+        self._pp_topk_buffer: torch.Tensor | None = None
         # Token granule the pipeline chunk scheduler cuts at; set with the
         # extra buckets once the KV block size is final.
         self._pp_chunk_granularity: int | None = None
@@ -2877,6 +2889,8 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(
                     num_tokens_padded)
+                self._pp_take_topk_indices(intermediate_tensors,
+                                           num_tokens_padded)
 
             trace_kwargs = {}
             if TraceAnnotation.is_enabled():
@@ -2934,8 +2948,10 @@ class TPUModelRunner(GPUModelRunner):
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
-                self._pp_wave.end_forward(hidden_states.tensors,
-                                          num_tokens_padded)
+                self._pp_wave.end_forward(
+                    self._pp_outgoing_tensors(hidden_states.tensors,
+                                              num_tokens_padded),
+                    num_tokens_padded)
                 start_index = end_index
                 chunk_index += 1
                 continue
@@ -3766,6 +3782,23 @@ class TPUModelRunner(GPUModelRunner):
                                             model_config=self.model_config)
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.parallel_config.pipeline_parallel_size > 1:
+            # A sparse model's layers share one top-k index table, and under a
+            # pipeline the layer that writes it and the layers that reuse it
+            # can sit on different chips. Hand the table between stages
+            # instead (see runner/dsa_topk.py).
+            self._pp_topk_buffer = find_topk_indices_buffer(self.model)
+            if self._pp_topk_buffer is not None:
+                # -1 is "no token": a row of it attends to nothing, which a
+                # warmup or profile forward can run. Anything else, including
+                # whatever an uninitialized allocation holds, would send the
+                # attention kernel gathering at a real cache offset.
+                self._pp_topk_buffer.fill_(-1)
+            elif model_uses_sparse_indexer(self.vllm_config):
+                raise RuntimeError(
+                    "this model picks its attended tokens with a sparse "
+                    "indexer but exposes no shared top-k table, so a "
+                    "pipeline stage cannot hand one to the next")
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -4033,6 +4066,9 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling)
+            # A stage whose layers all reuse the table reads it during this
+            # forward, warmup included.
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4058,6 +4094,8 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 if intermediate_tensors is not None:
                     inputs += list(intermediate_tensors.tensors.values())
+                if self._pp_topk_buffer is not None:
+                    inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
             out, _ = self.forward_model(
@@ -4569,6 +4607,12 @@ class TPUModelRunner(GPUModelRunner):
                 and self._pp_wave is None):
             self._pp_intermediate_tensors(1, zeros=True)
             assert self._pp_intermediate_template is not None
+            if (self._pp_topk_buffer is not None
+                    and self._pp_topk_buffer.shape[0] < self.max_num_tokens):
+                raise RuntimeError(
+                    "the shared top-k table holds "
+                    f"{self._pp_topk_buffer.shape[0]} rows, fewer than the "
+                    f"{self.max_num_tokens} tokens a hand-off carries")
             self._pp_wave = PPWave(self.device, self.max_num_tokens,
                                    self._pp_intermediate_template)
             self._pp_wave.warmup()
@@ -5312,24 +5356,67 @@ class TPUModelRunner(GPUModelRunner):
                 batch_size=1,
                 dtype=self.model_config.dtype,
                 device=self.device)
-            self._pp_intermediate_template = {
+            template = {
                 key: (tuple(tensor.shape[1:]), tensor.dtype)
                 for key, tensor in probe.items()
             }
-        if random:
-            return IntermediateTensors({
-                key:
-                self._profile_input(key, (self.max_num_tokens, *shape),
-                                    dtype)[:num_tokens].to(self.device)
-                for key, (shape,
-                          dtype) in self._pp_intermediate_template.items()
-            })
-        alloc = torch.zeros if zeros else torch.empty
-        return IntermediateTensors({
-            key:
-            alloc((num_tokens, *shape), dtype=dtype, device=self.device)
-            for key, (shape, dtype) in self._pp_intermediate_template.items()
-        })
+            if self._pp_topk_buffer is not None:
+                template[TOPK_INDICES] = (tuple(
+                    self._pp_topk_buffer.shape[1:]),
+                                          self._pp_topk_buffer.dtype)
+            self._pp_intermediate_template = template
+        tensors: dict[str, torch.Tensor] = {}
+        for key, (shape, dtype) in self._pp_intermediate_template.items():
+            fill = _PP_LANE_FILL.get(key)
+            if fill is not None:
+                # A lane the model reads as indices rather than as
+                # activations: random or uninitialized values would address
+                # real memory, so every run gets the same neutral table.
+                tensors[key] = torch.full((num_tokens, *shape),
+                                          fill,
+                                          dtype=dtype,
+                                          device=self.device)
+            elif random:
+                tensors[key] = self._profile_input(
+                    key, (self.max_num_tokens, *shape),
+                    dtype)[:num_tokens].to(self.device)
+            else:
+                alloc = torch.zeros if zeros else torch.empty
+                tensors[key] = alloc((num_tokens, *shape),
+                                     dtype=dtype,
+                                     device=self.device)
+        return IntermediateTensors(tensors)
+
+    def _pp_take_topk_indices(self,
+                              intermediate_tensors: IntermediateTensors | None,
+                              rows: int) -> None:
+        """Take the incoming top-k table into the buffer this stage's sparse
+        layers read from.
+
+        The table is removed from the model's arguments on the way: it is a
+        hand-off lane, not something a model's forward accepts.
+        """
+        if self._pp_topk_buffer is None or intermediate_tensors is None:
+            return
+        received = intermediate_tensors.tensors.pop(TOPK_INDICES, None)
+        if received is None:
+            raise RuntimeError(
+                "a pipeline stage of a sparse model was handed no top-k "
+                "indices; every stage passes them on")
+        self._pp_topk_buffer[:rows].copy_(received)
+
+    def _pp_outgoing_tensors(self, tensors: dict[str, torch.Tensor],
+                             rows: int) -> dict[str, torch.Tensor]:
+        """What this stage hands the next one: the model's activations, plus
+        the top-k table whether this stage chose it or passed it through.
+
+        The copy matters. An intermediate stage holds its hand-off until its
+        next forward, and by then the layers here may have written the table
+        again.
+        """
+        if self._pp_topk_buffer is None:
+            return tensors
+        return {**tensors, TOPK_INDICES: self._pp_topk_buffer[:rows].clone()}
 
     def pp_push(self) -> None:
         """A pipeline hand-off that carries nothing, so the forwards in
@@ -5577,6 +5664,5 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     num_slices_per_block = vmem_limit // page_size_bytes
     assert num_slices_per_block > 0, "Number of slices should be positive"
     num_slices_per_block = _prev_power_of_2(num_slices_per_block)
-    if num_slices_per_block > 64:
-        num_slices_per_block = 64
+    num_slices_per_block = min(num_slices_per_block, 64)
     return num_slices_per_block

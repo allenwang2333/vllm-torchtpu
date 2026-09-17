@@ -3,6 +3,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
@@ -16,7 +17,9 @@ def _runner(**attrs):
     runner.model_config = MagicMock()
     runner.model_config.dtype = torch.bfloat16
     runner._pp_intermediate_template = None
+    runner._pp_topk_buffer = None
     for name in ("forward_model", "_pp_intermediate_tensors",
+                 "_pp_take_topk_indices", "_pp_outgoing_tensors",
                  "_sample_tokens_pp_intermediate_stage", "sample_tokens"):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     for name, value in attrs.items():
@@ -83,6 +86,87 @@ class TestIntermediateBuffers:
         assert all(t.shape == (32, 8) for t in empties.tensors.values())
         runner.model.make_empty_intermediate_tensors.assert_called_once_with(
             batch_size=1, dtype=torch.bfloat16, device=runner.device)
+
+    def test_a_sparse_model_adds_a_top_k_lane_that_attends_to_nothing(self):
+        """Every allocation of the lane is -1: an uninitialized or random
+        index would address the KV cache during a warmup or profile run."""
+        runner = _runner(model=self._model(),
+                         max_num_tokens=64,
+                         _profile_inputs={},
+                         _pp_topk_buffer=torch.zeros(64, 4, dtype=torch.int32))
+        runner._profile_input = TPUModelRunner._profile_input.__get__(runner)
+
+        modes = (runner._pp_intermediate_tensors(16, zeros=True),
+                 runner._pp_intermediate_tensors(16, zeros=False),
+                 runner._pp_intermediate_tensors(16, zeros=False, random=True))
+
+        for tensors in modes:
+            assert set(tensors.tensors) == {
+                "hidden_states", "residual", "topk_indices"
+            }
+            lane = tensors["topk_indices"]
+            assert lane.shape == (16, 4) and lane.dtype == torch.int32
+            assert torch.equal(lane, torch.full((16, 4), -1,
+                                                dtype=torch.int32))
+
+
+class TestTopkHandoff:
+    """The lane that carries a sparse model's shared index table between
+    stages, in and out of the buffer its layers read."""
+
+    def _runner_with_buffer(self):
+        buffer = torch.zeros(64, 4, dtype=torch.int32)
+        return _runner(_pp_topk_buffer=buffer), buffer
+
+    def test_incoming_indices_land_in_the_buffer_and_leave_the_arguments(self):
+        runner, buffer = self._runner_with_buffer()
+        received = torch.full((16, 4), 7, dtype=torch.int32)
+        tensors = IntermediateTensors({
+            "hidden_states": torch.zeros(16, 8),
+            "residual": torch.zeros(16, 8),
+            "topk_indices": received,
+        })
+
+        runner._pp_take_topk_indices(tensors, 16)
+
+        # the model's forward never sees the lane
+        assert set(tensors.tensors) == {"hidden_states", "residual"}
+        assert torch.equal(buffer[:16], received)
+        # rows this forward does not cover are untouched
+        assert torch.equal(buffer[16:], torch.zeros(48, 4, dtype=torch.int32))
+
+    def test_a_stage_handed_no_indices_is_refused(self):
+        runner, _ = self._runner_with_buffer()
+        tensors = IntermediateTensors({"hidden_states": torch.zeros(16, 8)})
+
+        with pytest.raises(RuntimeError, match="no top-k indices"):
+            runner._pp_take_topk_indices(tensors, 16)
+
+    def test_outgoing_indices_are_a_copy_of_the_buffer(self):
+        """A stage holds its hand-off until its next forward, by which time
+        its own layers may have written the table again."""
+        runner, buffer = self._runner_with_buffer()
+        buffer[:16] = 3
+
+        outgoing = runner._pp_outgoing_tensors(
+            {
+                "hidden_states": torch.zeros(16, 8),
+                "residual": torch.zeros(16, 8),
+            }, 16)
+        buffer[:16] = 9
+
+        assert torch.equal(outgoing["topk_indices"],
+                           torch.full((16, 4), 3, dtype=torch.int32))
+
+    def test_a_model_without_the_table_is_untouched(self):
+        runner = _runner()
+        tensors = IntermediateTensors({"hidden_states": torch.zeros(16, 8)})
+        original = {"hidden_states": torch.zeros(16, 8)}
+
+        runner._pp_take_topk_indices(tensors, 16)
+
+        assert set(tensors.tensors) == {"hidden_states"}
+        assert runner._pp_outgoing_tensors(original, 16) is original
 
 
 class TestIntermediateStageSampleTokens:

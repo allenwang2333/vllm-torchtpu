@@ -8,6 +8,7 @@ used here.  Heavy dependencies (ZMQ sockets, shared-memory pool, TPU device
 queries) are mocked at construction time so that all tests run without a real
 TPU.
 """
+import contextlib
 import threading
 import time
 import unittest
@@ -4277,6 +4278,189 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
     with pytest.raises(ValueError, match=message):
         worker._raiden_glm_admission_topology()
+
+
+class TestPipelineParallelGlmProducer:
+    """GLM sparse-MLA prefill on a pipeline (PP x TP1) as a Stage-3 source:
+    each stage owns a slice of the layers and every page of them, and the
+    pools say which layers those are."""
+
+    @staticmethod
+    def _stage_manifest(layers, indexer_layers=()):
+        from vllm_torchtpu.distributed.kv_transfer.raiden import \
+            pool_manifest as rpm
+
+        from .raiden_test_utils import FakeTensor
+        named = {
+            f"model.layers.{layer}.self_attn.mla_attn": (
+                FakeTensor((16, 1024, 4, 128), 1, dtype="torch.uint8"),
+                FakeTensor((16, 256, 4, 128), 1, dtype="torch.uint8"),
+            )
+            for layer in layers
+        }
+        for layer in indexer_layers:
+            named[f"model.layers.{layer}.self_attn.indexer"] = FakeTensor(
+                (16, 256, 4, 256), 1, dtype="torch.uint8")
+        return rpm.build_glm_mla_pool_manifest(named_kv_caches=named,
+                                               raw_tensors=(),
+                                               block_size_tokens=1024,
+                                               per_layer_tags=True)
+
+    def _glm_env(self, **extra):
+        patches = {
+            "TPU_RAIDEN_GLM_ADMISSION": True,
+            "TPU_USE_RAIDEN_KV_CACHE_MANAGER": True,
+            "TPU_RAIDEN_POOL_TAGS_PER_LAYER": True,
+            **extra,
+        }
+        return [
+            patch(f"{_MOD}.tpu_envs.{name}", value, create=True)
+            for name, value in patches.items()
+        ]
+
+    @contextlib.contextmanager
+    def _env(self, **extra):
+        with contextlib.ExitStack() as stack:
+            for ctx in self._glm_env(**extra):
+                stack.enter_context(ctx)
+            yield
+
+    def test_topology_names_the_stage_count(self):
+        with self._env():
+            producer = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+            assert producer._raiden_glm_admission_topology() == "pp8_prefill"
+            consumer = _make_raiden_worker(tp_rank=0,
+                                           tp_size=1,
+                                           is_producer=False,
+                                           dp_size=8)
+            assert consumer._raiden_glm_admission_topology() == "dp8_decode"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            # An unmatched stage count has no rank set the peer can enumerate.
+            (dict(tp_rank=0, tp_size=1, pp_size=3), "pipeline_parallel_size=3"
+             ),
+            # TP inside a stage is not supported by the pipeline itself.
+            (dict(tp_rank=0, tp_size=2, pp_size=4), "pipeline_parallel_size=4"
+             ),
+            # A pipeline decode would tie both engines to one stage count.
+            (dict(tp_rank=0, tp_size=1, pp_size=8,
+                  is_producer=False), "consumer pipeline_parallel_size=8"),
+        ])
+    def test_topology_rejects_unsupported_pipelines(self, kwargs, message):
+        with self._env():
+            worker = _make_raiden_worker(**kwargs)
+            with pytest.raises(ValueError, match=message):
+                worker._raiden_glm_admission_topology()
+
+    def test_parallelism_is_the_stage_count_not_the_tp_size(self):
+        """Without a pipeline GLM stripes pages over its TP ranks; with one
+        the ranks are the stages, and TP is 1."""
+        with self._env():
+            worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+            worker._validate_stage3_transfer_parallelism(8)
+            with pytest.raises(ValueError, match="PP stage count"):
+                worker._validate_stage3_transfer_parallelism(1)
+        with self._env(TPU_RAIDEN_POOL_TAGS_PER_LAYER=False):
+            worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+            with pytest.raises(ValueError,
+                               match="TPU_RAIDEN_POOL_TAGS_PER_LAYER"):
+                worker._validate_stage3_transfer_parallelism(8)
+
+    def test_a_stage_without_an_indexer_layer_still_measures(self):
+        """Only the layers that choose the sparse indices hold an indexer
+        cache, so a stage of reusing layers registers latent pools alone."""
+        measure = TPURaidenConnectorWorker._measure_glm_tag_geometry
+        reusing = measure(self._stage_manifest([3]))
+        choosing = measure(self._stage_manifest([2], indexer_layers=[2]))
+
+        assert list(reusing) == ["mla.nope.l3", "mla.rope.l3"]
+        assert reusing["mla.nope.l3"] == (1024 * 512, 512)
+        assert list(choosing) == ["mla.nope.l2", "mla.rope.l2", "dsa.idx.l2"]
+
+    def test_a_stage_without_latent_caches_is_an_error(self):
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+            PoolEntry, PoolManifest, RegionSpec)
+        manifest = PoolManifest(binding="private_typed",
+                                storages=[object()],
+                                pools=[
+                                    PoolEntry(tag="dsa.idx.l0",
+                                              layer_name="model.layers.0.x",
+                                              storage_index=0,
+                                              base_offset_bytes=0,
+                                              block_stride_bytes=1024,
+                                              num_blocks=4,
+                                              regions=(RegionSpec(
+                                                  "dsa_rows", 0, 1024, 1024,
+                                                  1), ),
+                                              dtype_tag="uint8")
+                                ])
+        with pytest.raises(RuntimeError, match="missing tag 'mla.nope'"):
+            TPURaidenConnectorWorker._measure_glm_tag_geometry(manifest)
+
+    def test_registration_tags_follow_the_stage_manifest(self):
+        with self._env():
+            worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        worker._stage3_glm_geometry = (
+            TPURaidenConnectorWorker._measure_glm_tag_geometry(
+                self._stage_manifest([3])))
+        assert worker._stage3_glm_registration_tags() == [
+            "mla.nope.l3", "mla.rope.l3"
+        ]
+
+    def test_registration_before_admission_is_refused(self):
+        with self._env():
+            worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        with pytest.raises(RuntimeError, match="admitted"):
+            worker._stage3_glm_registration_tags()
+
+    def test_a_stage_registers_every_page_of_its_own_layers(self):
+        """TP ranks share the layers and split the pages; a stage splits the
+        layers and keeps every page."""
+        with self._env():
+            worker = _make_raiden_worker(tp_rank=0,
+                                         tp_size=1,
+                                         pp_size=8,
+                                         block_size=1024)
+        worker._stage3_glm_geometry = (
+            TPURaidenConnectorWorker._measure_glm_tag_geometry(
+                self._stage_manifest([3])))
+        worker._raiden_work_unit = MagicMock()
+        facade = MagicMock()
+        worker._require_stage3_controller = MagicMock(return_value=(facade,
+                                                                    "addr"))
+        group = SimpleNamespace(rank_in_group=3)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send = {
+            "req-0":
+            SimpleNamespace(uuid=11,
+                            num_tokens=2100,
+                            expiration_time=time.perf_counter() + 60,
+                            local_block_ids=[4, 5, 6])
+        }
+
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8,
+                   create=True), \
+             patch("vllm.distributed.parallel_state.get_pp_group",
+                   return_value=group), \
+             self._env():
+            worker._register_stage3_request_blocks_glm(meta)
+
+        (call, ) = facade.register_request_blocks.call_args_list
+        pool_spans = call.kwargs["pool_spans"]
+        assert [s.tag for s in pool_spans] == ["mla.nope.l3", "mla.rope.l3"]
+        # every page of this stage's layers, not a stripe of them
+        assert all(len(s.spans) == 3 for s in pool_spans)
+        assert list(call.kwargs["block_ids"]) == [4, 5, 6]
+
+    def test_the_scheduler_expects_one_report_per_stage(self):
+        cfg = _make_vllm_config(is_producer=True, pp_size=8, tp_size=1)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True), self._env():
+            scheduler = TPURaidenConnectorScheduler(cfg)
+            assert scheduler.get_finished_count() == 8
 
 
 class TestPipelineParallelProducer:

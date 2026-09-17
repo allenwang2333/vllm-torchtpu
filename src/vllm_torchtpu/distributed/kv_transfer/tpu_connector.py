@@ -110,6 +110,10 @@ _STAGE3_REGISTRATION_CANCELLED_ERROR = (
 # (FA first = H2D order rank 0).
 _STAGE3_STATE_CLASS_TAGS = ("gdn.conv", "gdn.ssm")
 _STAGE3_GLM_TRANSFER_POOL_TAGS = ("mla.nope", "mla.rope", "dsa.idx")
+# Only the layers that choose the sparse indices hold an indexer cache; the
+# layers that reuse an earlier layer's choice hold none, so a pipeline stage
+# made of those alone registers no pool of this class.
+_STAGE3_GLM_OPTIONAL_CLASS_TAGS = ("dsa.idx", )
 # Concurrent Stage-3 coordination RPCs per worker. The source controller
 # handles concurrent coordinations (plan claims are per request), so a small
 # pool keeps an admission burst from queueing behind one slow peer.
@@ -320,6 +324,26 @@ def _engine_is_pipeline(vllm_config: VllmConfig) -> bool:
     """A pipeline-parallel engine: each stage transfers its own layers,
     every token of them, so the transfer ranks are the pipeline stages."""
     return _pipeline_parallel_size(vllm_config) > 1
+
+
+def _stage3_producer_rank_count(vllm_config: VllmConfig,
+                                tp_size: int) -> tuple[int, str]:
+    """How many ranks a producer shards a transfer over, and their name.
+
+    The byte-span lowering, the rank a worker claims and the number of
+    completion reports a finish waits for must all agree on this. A pipeline
+    stage owns a slice of the layers whatever else the engine does, so the
+    stage count decides first; a GLM engine without a pipeline replicates its
+    caches across TP ranks and stripes pages over them; everything else
+    shards by context-parallel rank.
+    """
+    if _engine_is_pipeline(vllm_config):
+        return _pipeline_parallel_size(vllm_config), "PP stage count"
+    if _use_raiden_glm_admission():
+        return int(tp_size), "TP rank count"
+    parallel_config = vllm_config.parallel_config
+    return int(parallel_config.prefill_context_parallel_size
+               or 1), "PCP rank count"
 
 
 def _reshard_store_mode() -> bool:
@@ -1381,24 +1405,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if src_parallelism <= 0:
             raise ValueError(
                 "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
-        if _use_raiden_glm_admission():
-            tp_size = int(parallel_config.tensor_parallel_size or 1)
-            if src_parallelism != tp_size:
-                raise ValueError(
-                    "Stage-3 GLM producer transfer parallelism must equal "
-                    f"TP size: parallelism={src_parallelism}, "
-                    f"tp_size={tp_size}")
-        elif _engine_is_pipeline(self.vllm_config):
-            pp_size = _pipeline_parallel_size(self.vllm_config)
-            if src_parallelism != pp_size:
-                raise ValueError(
-                    "Stage-3 pipeline producer transfer parallelism must "
-                    f"equal PP size: parallelism={src_parallelism}, "
-                    f"pp_size={pp_size}")
-        elif src_parallelism != pcp_size:
+        rank_count, rank_name = _stage3_producer_rank_count(
+            self.vllm_config, parallel_config.tensor_parallel_size or 1)
+        if src_parallelism != rank_count:
             raise ValueError(
-                "Stage-3 producer transfer parallelism must equal PCP size: "
-                f"parallelism={src_parallelism}, pcp_size={pcp_size}")
+                "Stage-3 producer transfer parallelism must equal the "
+                f"{rank_name}: parallelism={src_parallelism}, "
+                f"expected={rank_count}")
         if src_data_replica_idx < 0:
             raise ValueError(
                 "Producer data-parallel rank must be non-negative")
@@ -1479,11 +1492,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # engine loads each stage's layers on that stage.
             return _pipeline_parallel_size(self.vllm_config)
         parallel_config = self.vllm_config.parallel_config
-        if _use_raiden_glm_admission():
-            return int(parallel_config.tensor_parallel_size or 1)
-        if _engine_is_pipeline(self.vllm_config):
-            return _pipeline_parallel_size(self.vllm_config)
-        return int(parallel_config.prefill_context_parallel_size or 1)
+        rank_count, _ = _stage3_producer_rank_count(
+            self.vllm_config, parallel_config.tensor_parallel_size or 1)
+        return rank_count
 
 
 class TPURaidenConnectorWorker:
@@ -1509,6 +1520,10 @@ class TPURaidenConnectorWorker:
         self.named_kv_caches: Optional[dict[str, Any]] = None
         self._raiden_admission_summary: dict[str, Any] | None = None
         self._raiden_manifest: Any | None = None
+        # Per-tag (live bytes per block, row bytes) of the admitted GLM
+        # manifest; the tag list doubles as what this engine registers.
+        self._stage3_glm_geometry: dict[str, tuple[int, int]] | None = \
+            None
         self._raiden_layout_fingerprint: str | None = None
         self._raiden_layout_fingerprint_payload: dict[str, Any] | None = None
         self._raiden_controller_facade: Any | None = None
@@ -1850,6 +1865,7 @@ class TPURaidenConnectorWorker:
             named_kv_caches=named_kv_caches,
             raw_tensors=raw_tensors,
             block_size_tokens=int(self.vllm_config.cache_config.block_size),
+            per_layer_tags=_use_per_layer_pool_tags(),
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -1910,13 +1926,21 @@ class TPURaidenConnectorWorker:
             )
 
     def _raiden_glm_admission_topology(self) -> str:
-        """Validates the one supported topology. Anything else fails closed here."""
+        """Validates the supported topologies. Anything else fails closed here.
+
+        A prefill either replicates every layer across its TP ranks and
+        stripes the pages of a request over them (``tp{N}_prefill``), or runs
+        one slice of the layers per pipeline stage and gives each stage every
+        page of its own layers (``pp{N}_prefill``). Both hand off to a
+        data-parallel decode, where one replica holds the whole model.
+        """
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
-        supported = ("Raiden GLM admission supports prefill tp{N}/dp1 -> "
-                     "decode tp1/dp{M} only")
+        pp_size = _pipeline_parallel_size(self.vllm_config)
+        supported = ("Raiden GLM admission supports prefill tp{N}/dp1 or "
+                     "pp{2,4,8}/tp1/dp1 -> decode tp1/dp{M} only")
         if pcp_size != 1:
             raise ValueError(f"{supported}; got "
                              f"prefill_context_parallel_size={pcp_size}")
@@ -1925,7 +1949,19 @@ class TPURaidenConnectorWorker:
                 raise ValueError(f"{supported}; got producer "
                                  f"tensor_parallel_size={tp_size}, "
                                  f"data_parallel_size={dp_size}")
+            if pp_size > 1:
+                if tp_size != 1 or pp_size not in (2, 4, 8):
+                    raise ValueError(f"{supported}; got producer "
+                                     f"pipeline_parallel_size={pp_size}, "
+                                     f"tensor_parallel_size={tp_size}")
+                return f"pp{pp_size}_prefill"
             return f"tp{tp_size}_prefill"
+        if pp_size > 1:
+            # A pipeline decode would have to pull each stage's layers from
+            # the prefill stage holding them, which ties the two engines to
+            # one stage count; nothing needs that yet.
+            raise ValueError(f"{supported}; got consumer "
+                             f"pipeline_parallel_size={pp_size}")
         if tp_size != 1:
             raise ValueError(f"{supported}; got consumer "
                              f"tensor_parallel_size={tp_size}, "
@@ -1965,35 +2001,20 @@ class TPURaidenConnectorWorker:
     def _validate_stage3_transfer_parallelism(
             self, transfer_parallelism: int) -> None:
         """The producer must shard the transfer over exactly the rank set its
-        byte-span lowering assumes: TP ranks for GLM, PCP ranks otherwise."""
-        if _use_raiden_glm_admission():
-            if transfer_parallelism != self.tp_size:
-                raise ValueError(
-                    "GLM producer transfer parallelism must equal the "
-                    "complete TP rank count: "
-                    f"parallelism={transfer_parallelism}, "
-                    f"tp_size={self.tp_size}")
-            return
-        if _engine_is_pipeline(self.vllm_config):
-            pp_size = _pipeline_parallel_size(self.vllm_config)
-            if transfer_parallelism != pp_size:
-                raise ValueError(
-                    "Pipeline producer transfer parallelism must equal the "
-                    "complete PP stage count: "
-                    f"parallelism={transfer_parallelism}, pp_size={pp_size}")
-            if not _use_per_layer_pool_tags():
-                raise ValueError(
-                    "A pipeline-parallel producer pairs pools by layer; set "
-                    "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 on both peers")
-            return
-        pcp_size = int(
-            self.vllm_config.parallel_config.prefill_context_parallel_size
-            or 1)
-        if transfer_parallelism != pcp_size:
+        byte-span lowering assumes: pipeline stages, else TP ranks for GLM,
+        else PCP ranks."""
+        rank_count, rank_name = _stage3_producer_rank_count(
+            self.vllm_config, self.tp_size)
+        if transfer_parallelism != rank_count:
             raise ValueError(
                 "Producer transfer parallelism must equal the complete "
-                "PCP rank count: "
-                f"parallelism={transfer_parallelism}, pcp_size={pcp_size}")
+                f"{rank_name}: parallelism={transfer_parallelism}, "
+                f"expected={rank_count}")
+        if (_engine_is_pipeline(self.vllm_config)
+                and not _use_per_layer_pool_tags()):
+            raise ValueError(
+                "A pipeline-parallel producer pairs pools by layer; set "
+                "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 on both peers")
 
     @staticmethod
     def _new_raiden_controller_facade(controller_address: str) -> Any:
@@ -2630,26 +2651,53 @@ class TPURaidenConnectorWorker:
     @staticmethod
     def _measure_glm_tag_geometry(manifest: Any) -> dict[str, tuple[int, int]]:
         """Per-tag (live_bytes_per_block, row_bytes) of an admitted GLM
-        manifest."""
+        manifest, in class order and then manifest (layer) order.
+
+        Without per-layer tags this is one entry per class, as before. With
+        them a class spreads over one tag per layer, and a pipeline stage
+        holding no indexer layer registers no indexer pool at all -- a shape
+        of the stage rather than a broken manifest. Every layer has latent
+        caches, so a manifest missing those is still an error.
+        """
         geometry = manifest.geometry_by_tag()
         result: dict[str, tuple[int, int]] = {}
-        for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS:
-            geo = geometry.get(tag)
-            if not geo:
+        for class_value in _STAGE3_GLM_TRANSFER_POOL_TAGS:
+            pools = manifest.pools_of_class(class_value)
+            if not pools:
+                if class_value in _STAGE3_GLM_OPTIONAL_CLASS_TAGS:
+                    continue
                 raise RuntimeError(
-                    f"Stage-3 GLM manifest is missing tag {tag!r}")
-            pool = next(p for p in manifest.pools if p.tag == tag)
-            (region, ) = pool.regions
-            result[tag] = (int(geo["live_bytes_per_block"]),
-                           int(region.unit_bytes))
+                    f"Stage-3 GLM manifest is missing tag {class_value!r}")
+            geo = geometry[class_value]
+            for pool in pools:
+                if pool.tag in result:
+                    continue
+                (region, ) = pool.regions
+                result[pool.tag] = (int(geo["live_bytes_per_block"]),
+                                    int(region.unit_bytes))
         return result
+
+    def _stage3_glm_registration_tags(self) -> list[str]:
+        """GLM pool tags this worker declares spans for: the class tags, or
+        one tag per layer this engine holds under per-layer tags.
+
+        Measured at admission, so the order is the one the geometry was taken
+        in and both roles derive it the same way from their own manifest.
+        """
+        if self._stage3_glm_geometry is None:
+            raise RuntimeError("Stage-3 registration requires the admitted "
+                               "GLM pool geometry")
+        return list(self._stage3_glm_geometry)
 
     def _register_stage3_request_blocks_glm(
             self, metadata: TPUConnectorMetadata) -> None:
-        """Registers this producer rank's row-granular span stripe.
+        """Registers the row-granular spans this producer rank owns.
 
-        The caches are TP-replicated: every producer rank shares the full
-        scheduler block table and owns a round-robin stripe of its pages.
+        Without a pipeline the caches are TP-replicated: every rank shares
+        the full scheduler block table and owns a round-robin stripe of its
+        pages. A pipeline stage instead holds a slice of the layers and every
+        token of them, so it lowers its spans as a single contiguous owner
+        and the layer subset is expressed through per-layer pool tags.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import \
             lower_glm_row_spans
@@ -2659,6 +2707,14 @@ class TPURaidenConnectorWorker:
             raise RuntimeError("Stage-3 producer work unit is not registered")
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
+        if transfer_rank < 0 or transfer_rank >= parallelism:
+            raise ValueError(
+                "Stage-3 producer transfer rank is outside parallelism: "
+                f"rank={transfer_rank}, parallelism={parallelism}")
+        pipeline = _engine_is_pipeline(self.vllm_config)
+        lowering_parallelism = 1 if pipeline else parallelism
+        lowering_rank = 0 if pipeline else transfer_rank
+        transfer_tags = self._stage3_glm_registration_tags()
         self._maybe_delay_stage3_registration_for_test(metadata)
 
         now = time.perf_counter()
@@ -2691,16 +2747,16 @@ class TPURaidenConnectorWorker:
                 lower_glm_row_spans(
                     tag=tag,
                     num_tokens=num_tokens,
-                    transfer_rank=transfer_rank,
-                    parallelism=parallelism,
+                    transfer_rank=lowering_rank,
+                    parallelism=lowering_parallelism,
                     page_tokens=page_tokens,
                     live_bytes_per_block=tag_geometry[tag][0],
                     row_bytes=tag_geometry[tag][1],
                     block_ids=list(scheduler_ids),
-                ) for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS
+                ) for tag in transfer_tags
             ]
             # Every tag stripes identically, so one tag's span count is this
-            # rank's page count.
+            # rank's page count. A pipeline stage owns them all.
             owned_pages = len(pool_spans[0].spans)
             if not owned_pages:
                 # Ranks owning no page publish a fully empty registration
@@ -3328,7 +3384,7 @@ class TPURaidenConnectorWorker:
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
             if _use_raiden_glm_admission():
-                transfer_tags = list(_STAGE3_GLM_TRANSFER_POOL_TAGS)
+                transfer_tags = self._stage3_glm_registration_tags()
             else:
                 transfer_tags = self._stage3_fa_registration_tags()
             fa_tag_count = len(transfer_tags)

@@ -829,3 +829,61 @@ def test_glm_manifest_rejects_bad_geometry(overrides, message):
         rpm.build_glm_mla_pool_manifest(named_kv_caches=named,
                                         raw_tensors=(),
                                         block_size_tokens=_GLM_BLOCK_SIZE)
+
+
+def test_glm_manifest_per_layer_tags_name_every_layer():
+    """A pipeline stage registers only the layers it holds, so the peer can
+    only pair pools by a tag that says which layer each one is."""
+    named = glm_named_kv_caches()
+
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named,
+        raw_tensors=(),
+        block_size_tokens=_GLM_BLOCK_SIZE,
+        per_layer_tags=True)
+
+    assert [pool.tag for pool in manifest.pools] == [
+        "dsa.idx.l0",
+        "mla.nope.l0",
+        "mla.rope.l0",
+        "mla.nope.l1",
+        "mla.rope.l1",
+    ]
+    # Classes still resolve, so geometry and layout checks are unchanged.
+    assert manifest.geometry_by_tag()[
+        rpm.TAG_MLA_ROPE]["live_bytes_per_block"] == 256 * 512
+    assert [p.tag for p in manifest.pools_of_class(rpm.TAG_DSA_IDX)
+            ] == ["dsa.idx.l0"]
+    for pool in manifest.pools:
+        (region, ) = pool.regions
+        assert region.name in ("mla_nope_rows", "mla_rope_rows", "dsa_rows")
+    rpm.verify_storage_binding(manifest, named, raw_tensors=())
+
+
+def test_glm_manifest_orders_layers_by_number_not_by_name():
+    """Both peers must build the same order, and layer 10 sorts before
+    layer 2 by name."""
+    named = glm_named_kv_caches()
+    named["model.layers.10.self_attn.mla_attn"] = named.pop(
+        "model.layers.1.self_attn.mla_attn")
+
+    manifest = rpm.build_glm_mla_pool_manifest(
+        named_kv_caches=named,
+        raw_tensors=(),
+        block_size_tokens=_GLM_BLOCK_SIZE,
+        per_layer_tags=True)
+
+    assert [pool.tag for pool in manifest.pools
+            ][-2:] == ["mla.nope.l10", "mla.rope.l10"]
+
+
+def test_glm_manifest_per_layer_tags_need_a_layer_index():
+    named = glm_named_kv_caches()
+    named["encoder.self_attn.mla_attn"] = named.pop(
+        "model.layers.1.self_attn.mla_attn")
+
+    with pytest.raises(rpm.ManifestError, match="layer index"):
+        rpm.build_glm_mla_pool_manifest(named_kv_caches=named,
+                                        raw_tensors=(),
+                                        block_size_tokens=_GLM_BLOCK_SIZE,
+                                        per_layer_tags=True)

@@ -17,7 +17,7 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, TAG_MLA_NOPE, PoolManifest
+from .pool_manifest import TAG_FA, TAG_MLA_NOPE, TAG_MLA_ROPE, PoolManifest
 from .tags import class_tag
 
 EXPECTED_FA_MINOR_TO_MAJOR = (4, 3, 2, 1, 0)
@@ -155,6 +155,9 @@ __all__ = [
     "measured_glm_layout_fingerprint",
 ]
 
+# The GLM cache classes every peer holds whatever layers it owns.
+GLM_UNIVERSAL_CLASS_TAGS = (TAG_MLA_NOPE, TAG_MLA_ROPE)
+
 
 def measured_glm_layout_fingerprint(
     manifest: PoolManifest,
@@ -232,11 +235,28 @@ def measured_glm_layout_fingerprint(
                 "element_size_in_bits": element_bits,
             })
 
+    # Hash only the classes every peer necessarily holds. Each layer keeps a
+    # latent (nope, rope) pair, but only the layers that choose the sparse
+    # indices keep an indexer cache, so a pipeline stage made of layers that
+    # reuse an earlier choice holds none -- and hashing a class it cannot
+    # have would make it disagree with a destination holding every layer.
+    # The omitted class is not unchecked: the loop above rejects any layout
+    # but the canonical one on whichever peer holds it, and the planner
+    # compares each tag's pool geometry between peers.
+    hashed = {
+        tag: layout
+        for tag, layout in per_tag.items() if tag in GLM_UNIVERSAL_CLASS_TAGS
+    }
+    missing = [tag for tag in GLM_UNIVERSAL_CLASS_TAGS if tag not in hashed]
+    if missing:
+        raise RuntimeError(
+            f"admitted GLM manifest holds no {missing} pools; every layer "
+            "keeps a latent cache")
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
         "page_tokens": int(page_tokens),
-        "layouts": per_tag,
+        "layouts": hashed,
     }
     return canonical_layout_fingerprint(payload), payload

@@ -35,7 +35,7 @@ import math
 from dataclasses import dataclass
 from statistics import median
 
-from vllm.logger import init_logger
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 

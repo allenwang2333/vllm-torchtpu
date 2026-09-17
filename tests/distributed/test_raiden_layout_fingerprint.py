@@ -6,6 +6,7 @@ import pytest
 from vllm_torchtpu.distributed.kv_transfer.raiden import \
     layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+from vllm_torchtpu.distributed.kv_transfer.raiden import tags as rtags
 
 from .raiden_test_utils import FakeTensor, glm_named_kv_caches
 
@@ -187,17 +188,51 @@ def test_measured_glm_layout_fingerprint_golden():
                 "tiles": [[4, 128], [4, 1]],
                 "element_size_in_bits": 8,
             },
-            "dsa.idx": {
-                "page_shape": [256, 4, 256],
-                "row_bytes": 1024,
-                "minor_to_major": [3, 2, 1, 0],
-                "tiles": [[4, 128], [4, 1]],
-                "element_size_in_bits": 8,
-            },
         },
     }
     assert fingerprint == (
-        "bfea2b664510bfb11f87b5092431492fddaf535f0f321f01d59a79e139c3bc2b")
+        "5276b0a32913b3a096aee4e1083d2cb4c391f029bb2239b1d2ba1d15a058d33f")
+
+
+def test_glm_fingerprint_ignores_the_indexer_cache_a_stage_may_not_hold():
+    """Only the layers that choose the sparse indices keep an indexer cache,
+    so a pipeline stage of layers that reuse an earlier choice holds none. It
+    still has to fingerprint identically to a peer holding every layer."""
+    full = _glm_manifest()
+    reusing = rpm.PoolManifest(
+        binding=full.binding,
+        storages=list(full.storages),
+        pools=[p for p in full.pools if rtags.class_tag(p.tag) != "dsa.idx"])
+
+    everything, _ = rlf.measured_glm_layout_fingerprint(
+        full,
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions)
+    subset, payload = rlf.measured_glm_layout_fingerprint(
+        reusing,
+        page_tokens=1024,
+        layout_getter=_glm_layout_getter,
+        package_version=_glm_versions)
+
+    assert subset == everything
+    assert sorted(payload["layouts"]) == ["mla.nope", "mla.rope"]
+
+
+def test_glm_fingerprint_still_needs_the_latent_caches():
+    """Every layer keeps a latent pair, so a manifest without one is broken
+    rather than merely partial."""
+    full = _glm_manifest()
+    latentless = rpm.PoolManifest(
+        binding=full.binding,
+        storages=list(full.storages),
+        pools=[p for p in full.pools if rtags.class_tag(p.tag) == "dsa.idx"])
+
+    with pytest.raises(RuntimeError, match="no.*mla.nope.*pools"):
+        rlf.measured_glm_layout_fingerprint(latentless,
+                                            page_tokens=1024,
+                                            layout_getter=_glm_layout_getter,
+                                            package_version=_glm_versions)
 
 
 def test_glm_fingerprint_rejects_shape_divergence_within_tag():

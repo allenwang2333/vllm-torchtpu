@@ -16,6 +16,15 @@ than in a single-stage model: a relative difference of at most 2^-8 per
 element for bfloat16. Sending the sum halves the bytes on the link; sending
 both tensors would reproduce the single-stage arithmetic exactly.
 
+A model may need side data to travel with the activations: a sparse-attention
+model whose later layers reuse the top-k indices an earlier layer chose has to
+carry that table across a stage boundary, because the layer that would
+recompute it lives on another chip. Such a tensor rides the same launch as a
+further lane -- one program, one permute per lane -- so a hand-off is still one
+launch and the numbering below is unchanged. A stage that does not recompute a
+lane passes on what it received, which is what makes a chain of stages without
+the producing layer work.
+
 A forward here is one runner forward over one token chunk; the runner splits
 a scheduler step into as many forwards as its token budget needs, and each
 forward is one hand-off. Launch numbers count from 0 within a burst.
@@ -68,11 +77,11 @@ never reads the result.
 from typing import Any
 
 import torch
-from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.distributed.pp_shift import (get_or_create_pp_mesh,
                                                 pp_permute_op)
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 logger = init_logger(__name__)
@@ -91,7 +100,8 @@ def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
     return bool(group.is_first_rank), bool(group.is_last_rank)
 
 
-def _launch_now(op, x: torch.Tensor) -> torch.Tensor:
+def _launch_now(op, lanes: tuple[torch.Tensor,
+                                 ...]) -> tuple[torch.Tensor, ...]:
     """Run one hand-off as its own device program, submitted immediately.
 
     vLLM runs torch_tpu in fused-eager mode, where ops are deferred, fused
@@ -100,8 +110,12 @@ def _launch_now(op, x: torch.Tensor) -> torch.Tensor:
     """
     from torch_tpu._internal.sync import sync
     sync.synchronize(None, wait=False)
-    out = op(x)
-    sync.synchronize([out], wait=False)
+    out = op(*lanes)
+    if isinstance(out, torch.Tensor):
+        out = (out, )
+    else:
+        out = tuple(out)
+    sync.synchronize(list(out), wait=False)
     return out
 
 
@@ -114,54 +128,71 @@ class PPWave:
         self.rank = int(group.rank_in_group)
         self.size = int(group.world_size)
         self.last = self.size - 1
-        if (set(template) != {HIDDEN_STATES, RESIDUAL}
-                or template[HIDDEN_STATES] != template[RESIDUAL]
-                or len(template[HIDDEN_STATES][0]) != 1):
+        extras = [
+            key for key in template if key not in (HIDDEN_STATES, RESIDUAL)
+        ]
+        if (set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
+                or template[HIDDEN_STATES] != template[RESIDUAL] or any(
+                    len(template[key][0]) != 1
+                    for key in (HIDDEN_STATES, *extras))):
             raise ValueError(
                 "the pipeline hand-off carries hidden_states and residual, "
-                "two [tokens, hidden] tensors of one dtype; the model's "
-                f"intermediate tensors are {template}")
-        (hidden, ), dtype = template[HIDDEN_STATES]
+                "two [tokens, hidden] tensors of one dtype, plus any number "
+                "of [tokens, width] side tensors; the model's intermediate "
+                f"tensors are {template}")
+        # Lane 0 is the activation sum; the rest are side data a stage passes
+        # on unchanged unless it recomputes it. Every stage builds the lanes
+        # from the same template, so the order matches across stages.
+        self.lanes = (HIDDEN_STATES, *extras)
         self.max_rows = int(max_rows)
-        self.op = pp_permute_op(get_or_create_pp_mesh())
-        self.zero = torch.zeros((self.max_rows, hidden),
-                                dtype=dtype,
-                                device=device)
+        self.op = pp_permute_op(get_or_create_pp_mesh(), arity=len(self.lanes))
+        self.zeros = tuple(
+            torch.zeros((self.max_rows, *template[key][0]),
+                        dtype=template[key][1],
+                        device=device) for key in self.lanes)
+        self.zero = self.zeros[0]
         self.launches = 0
         self.bursts = 0
         self.burst_open = False
         self.burst_launches = 0
         self.forwards = 0
-        self.pending: torch.Tensor | None = None
-        logger.info("PP wave: rank %d/%d, hand-off buffer [%d, %d] %s",
-                    self.rank, self.size, self.max_rows, hidden, dtype)
+        self.pending: tuple[torch.Tensor, ...] | None = None
+        logger.info(
+            "PP wave: rank %d/%d, hand-off lanes %s", self.rank, self.size,
+            ", ".join(f"{key}[{self.max_rows}, {template[key][0][0]}] "
+                      f"{template[key][1]}" for key in self.lanes))
 
-    def _launch(self, x: torch.Tensor) -> torch.Tensor:
+    def _launch(self, lanes: tuple[torch.Tensor,
+                                   ...]) -> tuple[torch.Tensor, ...]:
         with TraceAnnotation("PP:Handoff"):
-            out = _launch_now(self.op, x)
+            out = _launch_now(self.op, lanes)
         self.launches += 1
         self.burst_launches += 1
         return out
 
-    def _pad(self, t: torch.Tensor, rows: int) -> torch.Tensor:
+    def _pad(self, lanes: tuple[torch.Tensor, ...],
+             rows: int) -> tuple[torch.Tensor, ...]:
         if rows == self.max_rows:
-            return t
-        return torch.cat([t, self.zero[rows:]])
+            return lanes
+        return tuple(
+            torch.cat([t, z[rows:]]) for t, z in zip(lanes, self.zeros))
 
     def warmup(self) -> None:
         """One launch outside any burst on every stage, carrying a known
         value; checks that it arrived on the next stage."""
         assert not self.burst_open and self.launches == 0
-        x = self._launch(torch.full_like(self.zero, float(self.rank + 1)))
+        out = self._launch(
+            tuple(torch.full_like(z, self.rank + 1) for z in self.zeros))
         if self.rank > 0:
             want = float(self.rank)
-            got = (float(x[0, 0].item()), float(x[-1, -1].item()))
-            if any(g != want for g in got):
-                raise RuntimeError(
-                    f"PP wave rank {self.rank}: hand-off self-test received "
-                    f"{got}, expected {want}")
+            for key, x in zip(self.lanes, out):
+                got = (float(x[0, 0].item()), float(x[-1, -1].item()))
+                if any(g != want for g in got):
+                    raise RuntimeError(
+                        f"PP wave rank {self.rank}: hand-off self-test lane "
+                        f"{key!r} received {got}, expected {want}")
         else:
-            _ = x[0, 0].item()
+            _ = out[0][0, 0].item()
         self.burst_launches = 0
 
     def _open_burst(self) -> None:
@@ -176,7 +207,7 @@ class PPWave:
         self.forwards = 0
         with TraceAnnotation("PP:Prologue"):
             for _ in range(max(self.rank, 1)):
-                self._launch(self.zero)
+                self._launch(self.zeros)
 
     def _check_count(self, extra: int = 0) -> None:
         expected = self.forwards + max(self.rank, 1) + extra
@@ -191,15 +222,14 @@ class PPWave:
         self._open_burst()
         if self.rank == 0:
             return None
-        send = self.pending if self.pending is not None else self.zero
+        send = self.pending if self.pending is not None else self.zeros
         self.pending = None
-        x = self._launch(send)
-        # Copies: the next launch overwrites the received buffer. The
+        out = self._launch(send)
+        # Copies: the next launch overwrites the received buffers. The
         # residual is zero: the sum arrived as the hidden states.
-        return IntermediateTensors({
-            HIDDEN_STATES: x[:rows].clone(),
-            RESIDUAL: self.zero[:rows].clone()
-        })
+        tensors = {key: x[:rows].clone() for key, x in zip(self.lanes, out)}
+        tensors[RESIDUAL] = self.zero[:rows].clone()
+        return IntermediateTensors(tensors)
 
     def end_forward(self, tensors: dict[str, torch.Tensor] | None,
                     rows: int) -> None:
@@ -210,9 +240,15 @@ class PPWave:
             self._check_count()
             return
         assert tensors is not None
+        missing = [key for key in self.lanes if key not in tensors]
+        if missing:
+            raise RuntimeError(
+                f"PP wave rank {self.rank}: the forward produced no "
+                f"{missing} to hand on")
         # Summed in the model dtype; see the module docstring.
         total = tensors[HIDDEN_STATES] + tensors[RESIDUAL]
-        padded = self._pad(total, rows)
+        lanes = (total, *(tensors[key] for key in self.lanes[1:]))
+        padded = self._pad(lanes, rows)
         if self.rank == 0:
             self._launch(padded)
         else:
@@ -226,14 +262,14 @@ class PPWave:
         self._open_burst()
         with TraceAnnotation("PP:Push"):
             if self.rank == 0:
-                self._launch(self.zero)
+                self._launch(self.zeros)
             else:
-                send = self.pending if self.pending is not None else self.zero
+                send = self.pending if self.pending is not None else self.zeros
                 self.pending = None
                 self._launch(send)
         self.forwards += 1
         if 0 < self.rank < self.last:
-            self.pending = self.zero
+            self.pending = self.zeros
         self._check_count()
 
     def settle(self) -> None:
@@ -249,7 +285,7 @@ class PPWave:
             zero_launches = (self.size - 2 -
                              self.rank if self.rank < self.last else 0)
             for _ in range(zero_launches):
-                self._launch(self.zero)
+                self._launch(self.zeros)
         # Every stage now holds forwards + size - 1 launches.
         self._check_count(self.size - 1 - max(self.rank, 1))
         if self.bursts <= 5 or self.bursts % 100 == 0:
