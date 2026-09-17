@@ -747,10 +747,7 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
             bkv_idx=jnp.zeros((100000, ), dtype=jnp.int32),
         )
 
-    monkeypatch.setattr(
-        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk.metadata.compute_metadata",
-        _mock_compute_metadata,
-    )
+    monkeypatch.setattr(metadata, "compute_metadata", _mock_compute_metadata)
 
     num_seqs = 32
     seq_len = 128
