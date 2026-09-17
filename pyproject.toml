@@ -35,10 +35,10 @@ dependencies = [
     "torchvision==0.28.0",
     "torch-tpu==0.1.1.dev20260912075415",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
-    # raiden KV connector (disaggregated serving) and host KV offload
-    # (formerly tpu-raiden-torch; the import name is still `tpu_sync`). The
-    # wheel bundles one extension per supported torch ABI and dispatches to
-    # the variant matching the installed torch at import time.
+    # raiden KV connector (disaggregated serving) and host KV offload; the
+    # import name is `tpu_sync`. The wheel bundles one extension per
+    # supported torch ABI and dispatches to the variant matching the
+    # installed torch at import time.
     "tpu-sync-torch==0.0.1.dev20260914133043",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
