@@ -79,8 +79,9 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
-from vllm_torchtpu.runner.mm_encoder_manager import \
-    maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.mm_embed_bucket import mm_embed_bucket
+from vllm_torchtpu.runner.mm_encoder_manager import (
+    encoder_manager_enabled, maybe_create_mm_encoder_manager)
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata, SpeculativeDecodingManager)
 from vllm_torchtpu.runner.structured_decoding_manager import \
@@ -2512,6 +2513,26 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
+    def _mm_embed_bucket_fn(self):
+        """The ladder the cached encoder outputs are padded to, or None.
+
+        A model may declare its own ``mm_embed_bucket``; otherwise the
+        encoder manager's postprocess pads every item to the shared ladder.
+        Without that manager the cache holds exact-length tensors, and
+        gathering a bucket's worth of rows out of one would key the gather on
+        the image size -- the very thing the bucketing exists to avoid -- so
+        there is no bucketed path to offer.
+        """
+        if not envs.TPU_MM_BUCKET_SCATTER:
+            return None
+        model = self.get_model()
+        model_fn = getattr(model, "mm_embed_bucket", None)
+        if model_fn is not None:
+            return model_fn
+        if not encoder_manager_enabled(self.vllm_config, model):
+            return None
+        return mm_embed_bucket
+
     def _build_mm_scatter_plan(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2538,12 +2559,12 @@ class TPUModelRunner(GPUModelRunner):
         has a mask. ``extract_embeds_range`` hands back the contiguous embed
         runs, and one plan entry per run reproduces the mask exactly.
 
-        Returns None if the model does not expose the bucketing hook, in
-        which case the caller falls back to the concat + masked-scatter path.
+        Returns None when the cached encoder outputs are not bucket-padded,
+        in which case the caller falls back to the concat + masked-scatter
+        path.
         """
-        model = self.get_model()
-        if not envs.TPU_MM_BUCKET_SCATTER or not hasattr(
-                model, "mm_embed_bucket"):
+        bucket_fn = self._mm_embed_bucket_fn()
+        if bucket_fn is None:
             return None
 
         plan: list[tuple[torch.Tensor, int, int, int]] = []
@@ -3040,7 +3061,7 @@ class TPUModelRunner(GPUModelRunner):
                         tok_start,
                         tok_end,
                         input_ids.shape[0],
-                        self.get_model().mm_embed_bucket,
+                        self._mm_embed_bucket_fn(),
                         input_ids.device,
                     )
                     chunk_embeds = []
@@ -4115,7 +4136,7 @@ class TPUModelRunner(GPUModelRunner):
             0,
             num_tokens,
             num_tokens,
-            self.get_model().mm_embed_bucket,
+            self._mm_embed_bucket_fn(),
             self.device,
         )
         # _gather_mm_embeddings hands back a host-side mask covering only the
@@ -5027,7 +5048,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def _mm_embed_buckets(self) -> list[int]:
         """Every embedding bucket a vision item can round up to, ascending."""
-        bucket_fn = getattr(self.get_model(), "mm_embed_bucket", None)
+        bucket_fn = self._mm_embed_bucket_fn()
         if bucket_fn is None:
             return []
         buckets, bucket = [], bucket_fn(1)

@@ -101,6 +101,9 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
           _ENGINE,
           refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings"),
+    Patch(
+        "vllm_torchtpu.runner.mm_embed_bucket:"
+        "_patch_encoder_postprocess_to_buckets", _ACTIVE),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
 
     # Platform runtime configuration.

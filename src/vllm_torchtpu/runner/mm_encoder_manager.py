@@ -204,8 +204,19 @@ def maybe_create_mm_encoder_manager(
         the runner falls back to the eager multimodal path
         (``model.embed_multimodal(**mm_kwargs)``) without budget padding.
     """
-    if not vllm_config.compilation_config.cudagraph_mm_encoder:
-        return None
-    if not supports_encoder_cudagraph(vllm_model):
+    if not encoder_manager_enabled(vllm_config, vllm_model):
         return None
     return MMEncoderManager(vllm_config, device, vllm_model)
+
+
+def encoder_manager_enabled(
+    vllm_config: VllmConfig,
+    vllm_model: torch.nn.Module,
+) -> bool:
+    """Whether this model and config get an ``MMEncoderManager``.
+
+    Callers that run before ``maybe_create_mm_encoder_manager`` -- the boot
+    sweeps -- need the answer without the object.
+    """
+    return bool(vllm_config.compilation_config.cudagraph_mm_encoder
+                and supports_encoder_cudagraph(vllm_model))
