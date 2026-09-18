@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    USE_MOE_FUSED_RS_KERNEL: bool = False
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
@@ -556,6 +557,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL":
     env_bool("USE_MOE_FUSED_EP_KERNEL"),
+    # The tokamax fused reduce-scatter MoE kernel
+    # (`kernels/fused_moe_rs`, copied from openxla/tokamax) in place of the
+    # grouped-matmul path. Same fusion argument as the v2 switch above, and the
+    # same torch-side contract, but it reaches models v2 refuses: its GMM takes
+    # BLOCK-scaled fp8 weights, where v2 needs one scale per output channel.
+    # GLM-5.2-FP8 is block-scaled [128, 128], so this is the switch that arms
+    # it. Mutually exclusive with USE_MOE_FUSED_EP_KERNEL -- both claim the
+    # same layer, and the v2 arming runs first.
+    "USE_MOE_FUSED_RS_KERNEL":
+    env_bool("USE_MOE_FUSED_RS_KERNEL"),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8":

@@ -712,7 +712,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         - chunk pipelining stages the same two collectives itself so they
           overlap the compute;
-        - the fused EP kernel does the exchange inside its own program.
+        - the fused EP kernel does the exchange inside its own program;
+        - the fused RS kernel likewise, reaching the same contract by a
+          different route: its mesh has a unit `data` axis, so the kernel's
+          own sharding constraints express the all-gather on the way in and
+          its fused epilogue is the reduce-scatter on the way out.
 
         The fused half asks `fused_moe_ep_supported` about this method, not
         `envs.USE_MOE_FUSED_EP_KERNEL`: the env var only says the operator
@@ -724,8 +728,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         """
         from vllm_torchtpu.layers.adapter.fused_moe_ep import \
             fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.fused_moe_rs import \
+            fused_moe_rs_supported
         return (enable_pipelined_collective_and_compute()
-                or fused_moe_ep_supported(self))
+                or fused_moe_ep_supported(self)
+                or fused_moe_rs_supported(self))
 
     def maybe_roundup_sizes(
         self,
@@ -909,6 +916,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                                   topk=layer.moe_config.experts_per_token,
                                   renormalize=layer.renormalize,
                                   activation=activation_str))
+        # The fused reduce-scatter kernel, for block-scaled fp8 checkpoints the
+        # v2 path above refuses. It arms second and refuses outright if v2 is
+        # also switched on, so the two cannot both claim this layer.
+        from vllm_torchtpu.layers.adapter.fused_moe_rs import (
+            FUSED_MOE_RS_OP_ATTR, prebuild_fused_moe_rs)
+        setattr(
+            self, FUSED_MOE_RS_OP_ATTR,
+            prebuild_fused_moe_rs(layer,
+                                  topk=layer.moe_config.experts_per_token,
+                                  activation=activation_str))
 
     def apply_monolithic(
         self,
@@ -936,6 +953,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+
+        # The fused RS kernel takes the SAME routing the grouped-matmul path
+        # below computes -- that is the whole reason the router runs before the
+        # branch rather than inside the kernel -- and then owns the gather, both
+        # matmuls, the combine and the cross-chip exchange.
+        from vllm_torchtpu.layers.adapter.fused_moe_rs import (
+            fused_moe_rs, fused_moe_rs_supported)
+        if fused_moe_rs_supported(self):
+            return fused_moe_rs(self, layer, x, topk_weights, topk_ids)
 
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(

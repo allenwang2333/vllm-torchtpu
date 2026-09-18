@@ -170,3 +170,71 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
                 len(device_ids), list(device_ids))
     _MESH_CACHE[cache_key] = mesh
     return mesh
+
+
+# The axis names `fused_moe_rs` resolves against. They are not free to rename:
+# the kernel reads them off `ShardingAxisName` in its own module
+# (`kernels/fused_moe_rs/fused_moe_rs.py`), and `get_moe_expert_axis` searches
+# a fixed tuple -- ("attn_dp", "attn_dp_expert", "expert", "model") -- for the
+# expert axis, falling back to a literal "expert" that a differently-named mesh
+# then fails to resolve. "d", which `build_ep_mesh` defaults to for the v2
+# kernel, is in neither list.
+RS_DATA_AXIS_NAME = "data"
+RS_EXPERT_AXIS_NAME = "expert"
+
+
+def build_ep_rs_mesh() -> Any | None:
+    """A ``(data=1, expert=EP)`` mesh for the fused reduce-scatter MoE kernel.
+
+    Same devices and same ascending-device-id order as `build_ep_mesh` -- see
+    `ep_rank_order` for why that order and not EP-rank order -- reshaped to the
+    two axes `fused_moe_func_rs` partitions against.
+
+    The degenerate `data=1` is the point, not an accident. With sequence
+    parallelism on (the kernel's default) it partitions the hidden states
+    `P("data")` and its output `P(("data", "expert"))`, so a unit data axis
+    means: every chip receives all of the batch's tokens, and each leaves with
+    its own 1/EP shard. That is the all-gather-in / reduce-scatter-out contract
+    the EP MoE layer already has, with the reduce-scatter fused into the
+    kernel's epilogue instead of following it as an exposed collective -- and
+    it is the same torch-side contract as `fused_moe_ep`, which is what lets
+    the two share every upstream collective-ownership patch.
+
+    Turning sequence parallelism off instead (`TPU_MOE_ENABLE_SP=0`) would
+    replicate the output and all-gather it back inside the kernel, which is
+    strictly more transport for a result the caller then has to slice.
+    """
+    unordered = ep_device_ids()
+    if unordered is None:
+        return None
+    device_ids = tuple(sorted(unordered))
+
+    cache_key = ((RS_DATA_AXIS_NAME, RS_EXPERT_AXIS_NAME), device_ids)
+    cached = _MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    visible = {
+        int(getattr(device, "id", idx)): device
+        for idx, device in enumerate(jax.devices())
+    }
+    missing = [d for d in device_ids if d not in visible]
+    if missing:
+        raise RuntimeError(
+            "Cannot build the fused-RS EP mesh: JAX does not expose every EP "
+            f"device in this worker. missing={missing}, "
+            f"ep_device_ids={device_ids}, jax_visible_ids={sorted(visible)}.")
+
+    devices = np.asarray([visible[d] for d in device_ids]).reshape(
+        1, len(device_ids))
+    mesh = Mesh(devices,
+                axis_names=(RS_DATA_AXIS_NAME, RS_EXPERT_AXIS_NAME))
+    logger.info("Built fused-RS EP mesh | axes=(%s=1, %s=%d) | device_ids=%s",
+                RS_DATA_AXIS_NAME, RS_EXPERT_AXIS_NAME, len(device_ids),
+                list(device_ids))
+    _MESH_CACHE[cache_key] = mesh
+    return mesh

@@ -232,7 +232,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     # the unguarded `_fused_output_is_reduced` read below stops failing loudly
     # on an upstream rename in runs that do not use the kernel; if arming ever
     # grows a non-env path, this gate has to go with it.
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
+    if not (envs.USE_MOE_FUSED_EP_KERNEL or envs.USE_MOE_FUSED_RS_KERNEL):
         return
 
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
@@ -251,12 +251,16 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         try:
             from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_rs import \
+                fused_moe_rs_supported
         except ImportError:
             return original.fget(self)
         # Asked of the layer's own quant method, because arming is per layer:
         # a model whose layers do not all qualify must not have one armed layer
         # answer for the rest.
-        return (fused_moe_ep_supported(getattr(self, "_quant_method", None))
+        quant_method = getattr(self, "_quant_method", None)
+        return (fused_moe_ep_supported(quant_method)
+                or fused_moe_rs_supported(quant_method)
                 or original.fget(self))
 
     _mr.MoERunner._fused_output_is_reduced = patched
