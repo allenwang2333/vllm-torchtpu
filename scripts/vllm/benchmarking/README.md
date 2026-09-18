@@ -51,7 +51,12 @@ the same live server:
   `baselines/eval/<config>.<task>.baseline.json` (1.5pp default tolerance, or
   config `EVAL_TOLERANCE`). Only keys present in the baseline are gated. Where
   the baseline carries standard error (`exact_match_stderr`), the allowed drop
-  takes `max(tolerance, stderr)` to account for per-category sampling variance.
+  becomes `max(tolerance, 1.645 * hypot(stderr_baseline, stderr_run))` — a
+  one-sided 95% significance test. The gate compares two independent runs, so
+  the noisy quantity is their *difference*, whose standard error combines both
+  sides in quadrature; using one raw stderr would still fail ~24% of clean
+  reruns on small benchmarks like `humaneval_plus_tpu` (N=164). Baselines
+  without a recorded stderr fall back to the flat tolerance.
   `--run-lm-eval` walks `LM_EVAL_TASKS`
   (default `mmlu_llama mmlu_pro`; configs may narrow it). MMLU tasks
   (`mmlu_llama`, `mmlu_pro`) run against the chat-completions endpoint;
