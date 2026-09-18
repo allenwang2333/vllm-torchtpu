@@ -44,9 +44,16 @@ measurable change.
 
 **Weight layout.** The kernel's GMM is K-major: `w1` is [E, hidden, 2*inter]
 and `w2` is [E, inter, hidden], where vLLM stores [E, 2*inter, hidden] and
-[E, hidden, inter]. `relayout_weights_for_rs` transposes both, and their block
-scales with them, once at weight load. Doing it per forward would be a
-45 GB relayout per step on GLM-5.2.
+[E, hidden, inter]. `relayout_weights_for_rs` converts both in place, once at
+weight load. Doing it per forward would be a 45 GB relayout per step on
+GLM-5.2.
+
+The scales do **not** simply transpose with them. The kernel's scale DMA takes
+four indices with N in elements, so each [128, 128] block's scale has to be
+repeated across the 128 columns it covers -- `_block_scale_to_kmajor`. A plain
+transpose produces a three-dimensional scale whose last axis is N in blocks,
+and the Pallas ref rejects it on the first batch with `indices must not be
+longer than shape`.
 """
 
 from typing import Any
@@ -172,25 +179,68 @@ def _transpose_last_two(t: torch.Tensor) -> torch.Tensor:
     return t.transpose(-2, -1).contiguous()
 
 
+def _block_scale_to_kmajor(scale: torch.Tensor, size_n: int) -> torch.Tensor:
+    """[E, N_blocks, K_blocks] -> [E, K_blocks, 1, size_n], one scale per column.
+
+    The kernel's scale DMA is
+    ``w1_scale_ref.at[e, pl.ds(k_id * nqb1, nqb1), :, pl.ds(n_off, tile_n)]``
+    (`gmm_fused_rs_nodedup.py`), and its unquantized placeholder is
+    `jnp.zeros((1, 1, 1, 1))`. That is four indices: K in **blocks** on axis 1,
+    a free unit axis 2, and N in **elements** on axis 3. Transposing alone
+    leaves N in blocks and three dims, and the Pallas ref then raises
+    `indices must not be longer than shape` on the first batch -- so a
+    [128, 128]-block checkpoint reaches this kernel only by also repeating each
+    N block across the columns it covers.
+
+    Only N is expanded. K stays blocked, because axis 1 is exactly what
+    `_recover_quant_block_size(size_k, w1_scale.shape[1])` divides to learn the
+    block size; expanding it too would recover a block size of 1.
+
+    The repeat is not free -- on GLM-5.2 it is 1.42 GB per rank against the
+    6 MB the blocked form costs -- but it is what the kernel indexes, and it is
+    ~7% of the KV pool rather than a multiple of it.
+    """
+    s = scale.transpose(-2, -1)  # [E, K_blocks, N_blocks]
+    n_blocks = s.shape[-1]
+    # vLLM allocates ceil(size_n / block) blocks, so the last one can overhang
+    # a size_n that the block size does not divide; trim rather than assume.
+    block_n = -(-size_n // n_blocks)
+    s = s.repeat_interleave(block_n, dim=-1)[..., :size_n]
+    return s.unsqueeze(-2).contiguous()
+
+
 def relayout_weights_for_rs(layer) -> None:
-    """Stage K-major copies of this layer's expert weights and block scales.
+    """Put this layer's expert weights and block scales in the kernel's layout.
 
     vLLM stores `w13_weight` as [E, 2*inter, hidden] and `w2_weight` as
     [E, hidden, inter]; the kernel's GMM wants [E, hidden, 2*inter] and
-    [E, inter, hidden]. The block scales transpose with them, which is what
-    keeps `_recover_quant_block_size(w.shape[1], scale.shape[1])` -- how the
-    kernel learns its block size, from the scale's shape alone -- recovering
-    128 rather than a silently wrong stride.
+    [E, inter, hidden]. The scales come along, but not by a transpose alone --
+    see `_block_scale_to_kmajor`.
 
-    The originals are left in place. They are what the grouped-matmul fallback
-    reads, and a layer this path refuses still has to run.
+    **The originals are replaced, not kept beside the copies.** Holding both
+    layouts would double the MoE weights, which on GLM-5.2 is 45.3 GB per rank
+    against 90.6 GB -- the model stops fitting, at a memory utilization the
+    nightly already runs at 0.90. Overwriting `.data` releases the [E, N, K]
+    buffer as each layer is converted, so the peak is one layer's overhang
+    (~600 MB) rather than a second copy of the whole checkpoint.
+
+    Dropping them is safe precisely here and nowhere earlier: every refusal in
+    `prebuild_fused_moe_rs` has already returned by the time this is called, so
+    the layer is committed to the kernel and `apply_monolithic` returns through
+    `fused_moe_rs` before it can reach the grouped-matmul path that reads the
+    vLLM layout. A layer this path *refuses* never gets here and keeps its
+    weights untouched.
     """
-    w1 = _transpose_last_two(layer.w13_weight.data)
-    w2 = _transpose_last_two(layer.w2_weight.data)
-    w1_scale = _transpose_last_two(layer.w13_weight_scale_inv.data)
-    w2_scale = _transpose_last_two(layer.w2_weight_scale_inv.data)
-    setattr(layer, RS_W1_ATTR, w1)
-    setattr(layer, RS_W2_ATTR, w2)
+    # Read N off the vLLM layout before the transpose moves it.
+    size_n1 = layer.w13_weight.shape[-2]  # 2 * inter
+    size_n2 = layer.w2_weight.shape[-2]  # hidden
+    w1_scale = _block_scale_to_kmajor(layer.w13_weight_scale_inv.data, size_n1)
+    w2_scale = _block_scale_to_kmajor(layer.w2_weight_scale_inv.data, size_n2)
+
+    layer.w13_weight.data = _transpose_last_two(layer.w13_weight.data)
+    layer.w2_weight.data = _transpose_last_two(layer.w2_weight.data)
+    setattr(layer, RS_W1_ATTR, layer.w13_weight.data)
+    setattr(layer, RS_W2_ATTR, layer.w2_weight.data)
     setattr(layer, RS_W1_SCALE_ATTR, w1_scale)
     setattr(layer, RS_W2_SCALE_ATTR, w2_scale)
 
@@ -303,11 +353,14 @@ def prebuild_fused_moe_rs(layer, topk: int, activation: str) -> Any | None:
             _FUSED_RS_MAX_SAFE_SIZE_M)
         return None
 
+    # Read before the relayout: it transposes `w13_weight` in place, after
+    # which `shape[-1]` is 2*inter rather than hidden.
+    hidden = layer.w13_weight.shape[-1]
     relayout_weights_for_rs(layer)
     op = _build_op(mesh, topk, activation)
     logger.info_once(
         "Fused RS MoE armed | hidden=%d local_experts=%d ep=%d topk=%d "
-        "act=%s max_node_tokens=%d size_m=%d", layer.w13_weight.shape[-1],
+        "act=%s max_node_tokens=%d size_m=%d", hidden,
         local_experts, ep, topk, activation, max_node_tokens, size_m)
     return op
 
