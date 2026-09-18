@@ -500,6 +500,51 @@ def test_small_shape_tracks_a_dense_reference(quantized):
         f"per-token band; the batch norm was {error:.4f}")
 
 
+def test_the_kernel_accepts_the_scale_the_adapter_hands_it():
+    """The rank contract above, taken all the way through the kernel.
+
+    The test before this one pins what `relayout_weights_for_rs` produces:
+    vLLM's [E, N // block, K // block] block scale, transposed, so
+    [E, K // block, N // block] and three dims. This one builds a scale of
+    exactly that rank and those extents -- by subsampling the kernel-layout
+    scale on its N axis, which is value-identical block by block -- and calls
+    the kernel with it at the small shape.
+
+    Together the two are the whole chain: the adapter produces this, and this
+    is what the kernel does with it. Whatever comes out here is what a served
+    forward gets on its first batch, since nothing between the two reshapes.
+    """
+    mesh = _mesh()
+    hidden, inter, tokens = SMALL["hidden"], SMALL["inter"], SMALL["tokens"]
+    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
+                                               0,
+                                               hidden=hidden,
+                                               inter=inter,
+                                               quantized=True)
+    adapter_w1_scale = w1_scale[:, :, 0, ::BLOCK]
+    adapter_w2_scale = w2_scale[:, :, 0, ::BLOCK]
+    assert adapter_w1_scale.shape == (E_TOTAL, hidden // BLOCK,
+                                      (2 * inter) // BLOCK)
+    assert adapter_w2_scale.shape == (E_TOTAL, inter // BLOCK,
+                                      hidden // BLOCK)
+    x, tw, ti, tw32 = _make_inputs(mesh, 1, tokens=tokens, hidden=hidden)
+
+    try:
+        out = jax.block_until_ready(
+            _run(mesh, x, w1, w2, adapter_w1_scale, adapter_w2_scale, tw, ti))
+    except Exception as exc:  # noqa: BLE001 - the text is the evidence
+        print(f"RS_MOE_ADAPTER_SCALE raised {type(exc).__name__}: "
+              f"{str(exc)[:600]}")
+        raise
+
+    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, tw32, ti)
+    error = _relative_l2(out, want)
+    print(f"RS_MOE_ADAPTER_SCALE ran; relative_l2={error:.5f}")
+    assert error < FP8_RELATIVE_BOUND, (
+        f"the kernel accepted the adapter's scale layout but computed "
+        f"something {error:.4f} away from the reference")
+
+
 @pytest.mark.parametrize("tokens", [HALF_TOKENS, SERVED_TOKENS])
 def test_the_served_shape_compiles_and_runs(tokens):
     """GLM-5.2's MoE block at the served ``size_m``: does Mosaic take it.
