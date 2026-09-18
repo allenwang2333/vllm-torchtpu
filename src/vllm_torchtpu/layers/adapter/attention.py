@@ -423,15 +423,24 @@ def _pallas_rpa_kernel_batched(
     )
 
 
-def _tokamax_kv_layout(kv_layout: batched_rpa_configs.KVLayout):
-    """Maps this repo's `KVLayout` onto tokamax's identically-valued enum.
+def _tokamax_kv_cache_view(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Folds this repo's 5D KV pool onto the 4D cache tokamax's op declares.
 
-    Both are `StrEnum`s over the same member values, so the conversion is by
-    value; it raises if tokamax ever drops a layout this repo still uses.
+    vLLM allocates `[pages, page_size, kv_heads_x2 // packing, packing,
+    head_dim]` (see `PallasAttentionBackend.get_kv_cache_shape`), but
+    `tokamax._src.ops.experimental.batched_rpa.base.BatchedRpa.bind` annotates
+    the cache `"total_pages page_size num_kv_heads_x2 head_dim_aligned"` and
+    jaxtyping rejects the extra axis outright.
+
+    The fold is free and exactly invertible: tokamax's kernel wrapper splits
+    the packing axis back out itself with
+    `kv_cache.reshape(pages, page_size, kv_heads_x2 // kv_packing, kv_packing,
+    head_dim)` and folds it away again before returning, so the array the
+    Pallas kernel sees is bit-identical to the pool vLLM passes down the
+    in-tree path. The pool is contiguous, so this is a view, not a copy.
     """
-    from tokamax._src.ops.experimental.batched_rpa.kernel import \
-        configs as tokamax_configs
-    return tokamax_configs.KVLayout(kv_layout)
+    pages, page_size, packed_heads, packing, head_dim = kv_cache.shape
+    return kv_cache.view(pages, page_size, packed_heads * packing, head_dim)
 
 
 # =========================================================================================
@@ -780,6 +789,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         into traced placeholders and only feeds those to the compiled kernel.
         `get_batched_rpa` is the tokamax-side equivalent of the
         `_kernel_registry` lookup below, so equal configs share one op.
+
+        Only the subset of this repo's attention config that tokamax's
+        operator layer actually models is accepted; the rest raises. The
+        tokamax kernel under `tokamax/_src/ops/experimental/batched_rpa/kernel`
+        is a newer fork of this repo's `kernels/experimental/batched_rpa` and
+        its wrapper still takes `skip_kv_update`, `kv_layout` and
+        `decode_query_size` -- but `PallasTpuBatchedRpa._fwd`, the only way in
+        through the `TorchOp`, does not forward the first two and derives
+        `kv_layout` from its autotuning `Config` instead. Passing them would
+        raise from `Op.bind`; silently dropping them would change what the
+        kernel computes. Note also that `_fwd` always supplies explicit block
+        sizes from that `Config`, so the wrapper's VMEM-aware
+        `calculate_block_sizes` never runs on this path.
         """
         # Imported lazily: tokamax is an optional dependency, and building an
         # op registers a torch custom op as a side effect.
@@ -788,7 +810,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         config_key = ("tokamax", self.sliding_window, self.scale,
                       self.logits_soft_cap, q_scale, k_scale, v_scale,
-                      skip_kv_update, self.kv_layout, self.decode_query_size,
                       self.use_causal_mask)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -804,6 +825,43 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "USE_BATCHED_RPA_TOKAMAX=1: tokamax's batched RPA TorchOp is "
                 "registered without a mesh and shards nothing, but this run "
                 f"spreads attention over {model_axis} model-axis devices.")
+        if self.head_size == 64:
+            # `sharded_ragged_paged_attention` swaps in
+            # `ragged_paged_attention_hd64` for head_dim==64, and the pool is
+            # allocated for it (K/V packed along head_dim, so the head axis is
+            # num_kv_heads, not num_kv_heads * 2). tokamax has no hd64 variant.
+            raise NotImplementedError(
+                "USE_BATCHED_RPA_TOKAMAX=1: head_dim==64 uses the hd64 kernel "
+                "and its KV cache layout, which tokamax's batched RPA does "
+                "not implement.")
+        head_along_sublane = batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+        if self.kv_layout is not head_along_sublane:
+            # `PallasTpuBatchedRpa._fwd` reads the layout off its autotuning
+            # `Config`, whose heuristic default is HEAD_ALONG_SUBLANE, and the
+            # SEQ_ALONG_LANE branch of the kernel wrapper indexes
+            # `kv_cache.shape[4]` -- a rank the operator's jaxtyping signature
+            # rejects before the wrapper is reached.
+            raise NotImplementedError(
+                "USE_BATCHED_RPA_TOKAMAX=1: tokamax's batched RPA operator "
+                f"only models HEAD_ALONG_SUBLANE, but this run uses "
+                f"{self.kv_layout}. Unset VLLM_KV_CACHE_LAYOUT=HND.")
+        if skip_kv_update:
+            # tokamax's wrapper still declares `skip_kv_update`, but nothing
+            # reads it any more (its `generate_rpa_metadata` dropped the
+            # parameter), and `_fwd` does not pass it. A KV-sharing layer
+            # would write the slot owned by its target layer.
+            raise NotImplementedError(
+                "USE_BATCHED_RPA_TOKAMAX=1: cross-layer KV sharing needs "
+                "`skip_kv_update`, which tokamax's batched RPA operator does "
+                "not plumb through and its kernel no longer honours.")
+        if self.decode_query_size > 1:
+            # `_fwd` pins the decode blocks to bq_sz=1/bq_c_sz=1 and leaves
+            # `decode_query_size` at the wrapper default of 1, which is not
+            # the multi-token decode the draft model needs.
+            raise NotImplementedError(
+                "USE_BATCHED_RPA_TOKAMAX=1: speculative decoding needs "
+                f"decode_query_size={self.decode_query_size}, which tokamax's "
+                "batched RPA operator does not plumb through.")
 
         rpa_op = get_batched_rpa(
             use_causal_mask=self.use_causal_mask,
@@ -813,9 +871,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            skip_kv_update=skip_kv_update,
-            kv_layout=_tokamax_kv_layout(self.kv_layout),
-            decode_query_size=self.decode_query_size,
         )
 
         def tokamax_rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
@@ -833,21 +888,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 query,
                 key,
                 value,
-                kv_cache,
+                _tokamax_kv_cache_view(kv_cache),
                 seq_lens,
                 block_tables,
                 query_start_loc,
                 request_distribution,
             )
-            if new_kv_cache.shape != kv_cache.shape:
+            if new_kv_cache.numel() != kv_cache.numel():
                 raise RuntimeError(
-                    "Tokamax RPA op returned an incompatible KV cache shape: "
+                    "Tokamax RPA op returned an incompatible KV cache: "
                     f"expected {tuple(kv_cache.shape)}, got "
                     f"{tuple(new_kv_cache.shape)}.")
             # `TorchOp._register_ops` passes no `donate_argnums`, so unlike
             # `rpa_kernel_impl` this writeback is a real copy, not an aliased
-            # in-place pool update.
-            kv_cache.copy_(new_kv_cache)
+            # in-place pool update. The op hands back the folded 4D cache, so
+            # unfold it onto the pool's own shape first.
+            kv_cache.copy_(new_kv_cache.view(kv_cache.shape))
             return outputs
 
         self._kernel_config_cache[config_key] = tokamax_rpa_kernel_impl
