@@ -1882,6 +1882,7 @@ def test_sp_prefill_trace_accepts_dynamic_token_dimension():
     model.sp_group = SimpleNamespace(rank_in_group=0,
                                      world_size=32,
                                      all_gather=group.all_gather)
+    model.aux_hidden_state_layers = ()
     model.attn_res_block_size = 12
     model.output_attn_res = _attention_residual_stub(hidden=3584, eps=1e-5)
     model.layers = nn.ModuleList()
@@ -2311,10 +2312,13 @@ def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
 @pytest.mark.parametrize(
     "tokens", [0, 1, 8, 31, 32, 64, 96, 1024, 1056, 2048, 4096, 8192, 16384])
 @pytest.mark.parametrize("rank", [0, 7, 31])
-def test_sp_prefill_divisible_shapes_preserve_token_ownership(tokens, rank):
+@pytest.mark.parametrize("capture_aux", [False, True])
+def test_sp_prefill_divisible_shapes_preserve_token_ownership(
+        tokens, rank, capture_aux):
     model = KimiModel.__new__(KimiModel)
     nn.Module.__init__(model)
     model.sp_prefill = True
+    model.aux_hidden_state_layers = (1, ) if capture_aux else ()
     model.attn_res_block_size = None
     model.norm = nn.Identity()
     hidden = torch.arange(tokens * 4, dtype=torch.float32).reshape(tokens, 4)
@@ -2342,5 +2346,9 @@ def test_sp_prefill_divisible_shapes_preserve_token_ownership(tokens, rank):
                                      all_gather=gather)
     model.layers = nn.ModuleList([Layer()])
     actual = model.forward(None, positions, inputs_embeds=hidden)
+    if capture_aux:
+        actual, auxiliary = actual
+        assert len(auxiliary) == 1
+        torch.testing.assert_close(auxiliary[0], hidden + 1)
     torch.testing.assert_close(actual, hidden + 1)
-    assert calls == ([0] if expected_sp else [])
+    assert calls == ([0] * (2 if capture_aux else 1) if expected_sp else [])
