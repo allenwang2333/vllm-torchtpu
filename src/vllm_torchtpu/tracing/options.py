@@ -77,8 +77,8 @@ _DEFAULT_ADVANCED_OPTS = {
 def resolve_profile_dir_and_opts(
     base_dir: str,
     profile_prefix: str | None = None,
-    profiler_kwargs: Dict[str, Any] | None = None,
-) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    profiler_kwargs: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """
     Resolves the target profiling directory and parses dynamic tracing options.
 

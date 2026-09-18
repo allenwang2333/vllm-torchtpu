@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import Any, Dict, Tuple
+from typing import Any
 from urllib.parse import urlparse
 
 import torch
