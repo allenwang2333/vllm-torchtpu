@@ -24,6 +24,10 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, MambaSpec)
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.distributed.kv_transfer.connector_scheduler import \
+    _select_committed_mamba_blocks
+from vllm_torchtpu.distributed.kv_transfer.stage3_types import (
+    _Stage3LoadMeta, _Stage3RegisteredSend)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
@@ -31,7 +35,6 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3LoadMeta, _Stage3RegisteredSend, _select_committed_mamba_blocks,
     stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
@@ -40,6 +43,8 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
 
 _MOD = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
 _BASE = "vllm_torchtpu.distributed.kv_transfer.zmq_shm_base"
+_CFG = "vllm_torchtpu.distributed.kv_transfer.raiden_config"
+_SCHED = "vllm_torchtpu.distributed.kv_transfer.connector_scheduler"
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -574,7 +579,7 @@ class TestTPUConnectorScheduler:
         assert not delay
         assert params is None
 
-    @patch(f"{_MOD}.get_uuid", return_value=777)
+    @patch(f"{_SCHED}.get_uuid", return_value=777)
     @patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30)
     def test_producer_finished_all_full_blocks(self, _timeout, _uuid):
         req = MagicMock()
@@ -593,7 +598,7 @@ class TestTPUConnectorScheduler:
         assert params["remote_host"] == "127.0.0.1"
         assert params["remote_port"] == 9100
 
-    @patch(f"{_MOD}.get_uuid", return_value=888)
+    @patch(f"{_SCHED}.get_uuid", return_value=888)
     @patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30)
     def test_producer_finished_trailing_partial_block_is_dropped(
             self, _timeout, _uuid):
@@ -872,7 +877,7 @@ class TestTPURaidenConnectorScheduler:
                                    "TPU_RAIDEN_TRANSFER_PARALLELISM",
                                    1,
                                    create=True), patch(
-                                       f"{_MOD}.get_uuid",
+                                       f"{_SCHED}.get_uuid",
                                        return_value=777), patch(
                                            f"{_MOD}.dist_utils."
                                            "get_p2p_wait_pull_timeout",
@@ -922,7 +927,7 @@ class TestTPURaidenConnectorScheduler:
                                    "TPU_RAIDEN_TRANSFER_PARALLELISM",
                                    8,
                                    create=True), patch(
-                                       f"{_MOD}.get_uuid",
+                                       f"{_SCHED}.get_uuid",
                                        return_value=777), patch(
                                            f"{_MOD}.dist_utils."
                                            "get_p2p_wait_pull_timeout",
@@ -972,7 +977,7 @@ class TestTPURaidenConnectorScheduler:
                    create=True), patch(
                        f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
                        "prefill-controller.test:27000",
-                       create=True), patch(f"{_MOD}.get_uuid",
+                       create=True), patch(f"{_SCHED}.get_uuid",
                                            return_value=778), patch(
                                                f"{_MOD}.dist_utils."
                                                "get_p2p_wait_pull_timeout",
@@ -1069,7 +1074,7 @@ class TestTPURaidenConnectorScheduler:
                                f"{_MOD}.tpu_envs."
                                "TPU_RAIDEN_TRANSFER_PARALLELISM",
                                8,
-                               create=True), patch(f"{_MOD}.get_uuid",
+                               create=True), patch(f"{_SCHED}.get_uuid",
                                                    return_value=777):
             delay, params = producer.request_finished(req, block_ids)
         if transfers:
@@ -1107,7 +1112,7 @@ class TestTPURaidenConnectorScheduler:
                                    "TPU_RAIDEN_TRANSFER_PARALLELISM",
                                    8,
                                    create=True), patch(
-                                       f"{_MOD}.get_uuid",
+                                       f"{_SCHED}.get_uuid",
                                        side_effect=(11, 12, 13)), patch(
                                            f"{_MOD}.dist_utils."
                                            "get_p2p_wait_pull_timeout",
@@ -1146,7 +1151,7 @@ class TestTPURaidenConnectorScheduler:
                        create=True), patch(
                            f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
                            8,
-                           create=True), patch(f"{_MOD}.get_uuid",
+                           create=True), patch(f"{_SCHED}.get_uuid",
                                                return_value=778), patch(
                                                    f"{_MOD}.dist_utils."
                                                    "get_p2p_wait_pull_timeout",
@@ -1256,7 +1261,7 @@ class TestTPURaidenConnectorScheduler:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
                    True,
                    create=True), \
-             patch(f"{_MOD}._prefix_aware_load_supported",
+             patch(f"{_CFG}._prefix_aware_load_supported",
                    return_value=True), \
              patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
                    return_value=False):
@@ -1302,7 +1307,7 @@ class TestTPURaidenConnectorScheduler:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
                    requested,
                    create=True), \
-             patch(f"{_MOD}._prefix_aware_load_supported",
+             patch(f"{_CFG}._prefix_aware_load_supported",
                    return_value=supported), \
              patch(f"{_MOD}.dist_utils.get_raiden_inline_load",
                    return_value=False):
@@ -1349,7 +1354,7 @@ class TestTPURaidenConnectorScheduler:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
                    True,
                    create=True), \
-             patch(f"{_MOD}._prefix_aware_load_supported",
+             patch(f"{_CFG}._prefix_aware_load_supported",
                    return_value=True):
             consumer = _make_raiden_scheduler(is_producer=False,
                                               block_size=1024,
@@ -1379,7 +1384,7 @@ class TestTPURaidenConnectorScheduler:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
                    requested,
                    create=True), \
-             patch(f"{_MOD}._prefix_aware_load_supported",
+             patch(f"{_CFG}._prefix_aware_load_supported",
                    return_value=supported):
             consumer = _make_raiden_scheduler(is_producer=False,
                                               block_size=1024,
@@ -1413,7 +1418,7 @@ class TestTPURaidenConnectorScheduler:
              patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD",
                    True,
                    create=True), \
-             patch(f"{_MOD}._prefix_aware_load_supported",
+             patch(f"{_CFG}._prefix_aware_load_supported",
                    return_value=True):
             consumer = _make_raiden_scheduler(is_producer=False,
                                               block_size=1024,
