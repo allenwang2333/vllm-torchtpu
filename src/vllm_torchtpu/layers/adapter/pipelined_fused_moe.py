@@ -134,6 +134,11 @@ def pipelined_fused_moe_gmm(
     chunks and executed via a 3-stage pipelined schedule:
       ag0_start -> ag1_start || moe0(ag0_done) -> rs0_start || moe1(ag1_done) -> rs1_start || rs0_done -> rs1_done -> concat
 
+    Only ``hidden_states`` is chunked. ``topk_weights`` and ``topk_ids`` are
+    gathered once for the whole sequence and sliced locally per chunk, because
+    at 8-16 KB per rendezvous they are latency-bound and chunking them only
+    multiplies the rendezvous count.
+
     Args:
         hidden_states: Local input activations [S, H].
         w1: First expert projection weights [E, 2*I, H] or [E, H, 2*I]
@@ -206,21 +211,42 @@ def pipelined_fused_moe_gmm(
         hidden_states[i * chunk_size_local:(i + 1) * chunk_size_local]
         for i in range(num_chunks)
     ]
-    weights_slices = [
-        topk_weights[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_weights is not None else [None] * num_chunks
-    ids_slices = [
-        topk_ids[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_ids is not None else [None] * num_chunks
+
+    # The routing metadata is gathered ONCE for the whole sequence, not once
+    # per chunk. Its payload is 8 KB (`topk_weights`) and 16 KB (`topk_ids`)
+    # per rendezvous -- 8192 B / 197.9 us is ~41 MB/s against an 80 GB/s ICI
+    # link, so these are pure latency and there is no bandwidth to overlap.
+    # Chunking them only multiplied the rendezvous count: measured 292 per
+    # core-step costing 42.389 ms, against 73 costing 17.683 ms unchunked.
+    # `hidden_states` (6 MB/rendezvous) stays chunked -- that is where the
+    # collective/compute overlap actually lives.
+    #
+    # ORDERING HAZARD. `all_gather(x, dim=0)` concatenates rank-major, so
+    # gathering chunk i directly yields
+    #     [r0[chunk i], r1[chunk i], ..., r15[chunk i]]
+    # while gathering the full local tensor yields
+    #     [r0[all], r1[all], ..., r15[all]].
+    # Chunk i is therefore a STRIDED view of the full gather -- reshape to
+    # [world, seq_len, K] and slice the middle axis. A plain contiguous slice
+    # of the gathered buffer silently interleaves the wrong ranks' rows, and
+    # it matches on chunk 0, so a test that only checks the first chunk passes.
+    def _gather_full(t):
+        if t is None:
+            return None
+        ag = collective_group.all_gather(t, dim=0)
+        return ag.view(parallel_size, seq_len, *ag.shape[1:])
+
+    ag_tw_full = _gather_full(topk_weights)
+    ag_ti_full = _gather_full(topk_ids)
+
+    def _chunk_of(ag_full, i):
+        if ag_full is None:
+            return None
+        sl = ag_full[:, i * chunk_size_local:(i + 1) * chunk_size_local]
+        return sl.reshape(-1, *ag_full.shape[2:])
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
-                  if weights_slices[0] is not None else None)
-    ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
-                  if ids_slices[0] is not None else None)
 
     rs_outputs = []
 
@@ -228,11 +254,6 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
-                                                      dim=0)
-                          if weights_slices[i + 1] is not None else None)
-            ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
-                          if ids_slices[i + 1] is not None else None)
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
@@ -243,8 +264,8 @@ def pipelined_fused_moe_gmm(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            topk_weights=ag_tw_curr,
-            topk_ids=ag_ti_curr,
+            topk_weights=_chunk_of(ag_tw_full, i),
+            topk_ids=_chunk_of(ag_ti_full, i),
             experts_start=experts_start,
             topk=topk,
             activation=activation,
@@ -257,6 +278,6 @@ def pipelined_fused_moe_gmm(
         rs_outputs.append(rs_i)
 
         if i + 1 < num_chunks:
-            ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
+            ag_hs_curr = ag_hs_next
 
     return torch.cat(rs_outputs, dim=0)
