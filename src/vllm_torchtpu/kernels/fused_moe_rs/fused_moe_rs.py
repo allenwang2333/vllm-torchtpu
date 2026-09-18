@@ -374,16 +374,35 @@ def expert_parallel_gmm_rs(
     data_p_spec = P(MLP_DATA)
     # SP off: hidden replicated in/out with an explicit all-gather in the body.
     sp_enabled = enabled_tpu_sp()
-    hidden_in_spec = data_p_spec if sp_enabled else P()
-    moe_out_spec = (P(combine_partition_axes(MLP_DATA, expert_axis))
-                    if sp_enabled else P())
+    # ---- LOCAL DELTA vs tokamax 6303c14 (1 of 2) ------------------------
+    # Upstream declares `hidden_in_spec = P("data")` and
+    # `topk_i_spec = P("data", None)` here -- replicated over the expert axis
+    # -- and lets the shard_map BOUNDARY perform the all-gather. torch_tpu
+    # cannot compile that. `sharded_jax_op` exports this op with every operand
+    # `P("expert")`, and a `sdy.manual_computation` whose `in_shardings`
+    # disagree with the enclosing function's argument shardings is rejected
+    # when torch_tpu refines the registered module's global SPMD shapes down
+    # to this rank's local shard. It surfaces as the unhelpful
+    # "failed to compile MLIR module -- the XLA compiler failed with: failed
+    # to upgrade versioned StableHLO", because XLA swallows the underlying
+    # MLIR diagnostic. Measured: a 2.6 KB module with one shard_map and no
+    # Pallas call at all reproduces it, and only the reshard matters --
+    # `in=expert` passes, `in=data` fails.
+    #
+    # So the operands now ENTER expert-sharded, matching what the adapter
+    # declares, and the all-gather happens explicitly inside the body (delta
+    # 2 of 2, below). Same collective, same volume; only the boundary moves.
+    # `topk_weights` is deliberately NOT gathered -- it stays this chip's own
+    # rows, which is what `P(("data", "expert"))` gave upstream, since the
+    # `data` axis is 1.
+    hidden_in_spec = ep_p_spec if sp_enabled else P()
+    moe_out_spec = ep_p_spec if sp_enabled else P()
     fp8_post_gather = ((not sp_enabled) and w1_scale is not None
                        and w2_scale is not None and
                        (fp8_post_gather or _enable_fp8_output_comm_from_env()))
     # SP off: replicate routing tensors too; the body slices its local chunk.
-    topk_w_spec = (P(combine_partition_axes(MLP_DATA, expert_axis), None)
-                   if sp_enabled else P())
-    topk_i_spec = P(MLP_DATA, None) if sp_enabled else P()
+    topk_w_spec = P(expert_axis, None) if sp_enabled else P()
+    topk_i_spec = P(expert_axis, None) if sp_enabled else P()
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
@@ -398,17 +417,45 @@ def expert_parallel_gmm_rs(
     _has_pn_rs = post_expert_norm_weight is not None
     _pnw_rs = (post_expert_norm_weight if post_expert_norm_weight is not None
                else jnp.zeros((1, ), jnp.bfloat16))
+    _local_body = functools.partial(
+        moe_gmm_local_rs_nodedup,
+        activation=activation,
+        topk=topk,
+        ep_size=ep_size,
+        ep_axis_name=expert_axis,
+        has_post_norm=_has_pn_rs,
+        sp_enabled=sp_enabled,
+        fp8_post_gather=fp8_post_gather,
+    )
+
+    # ---- LOCAL DELTA vs tokamax 6303c14 (2 of 2) ------------------------
+    # The all-gather upstream got from the `P("data")` boundary, done here
+    # instead. The body is unchanged and still expects the FULL token set
+    # under SP -- it derives `chunk_size = num_tokens // ep_size` from it --
+    # so gathering here reproduces exactly what it used to receive.
+    # `tiled=True` concatenates the shards in axis-index order along axis 0,
+    # which is the same row order `P("expert")` split them in.
+    if sp_enabled:
+
+        def _gather_then_body(hidden_local, w1_, w1s, w1b, w2_, w2s, w2b,
+                              w1gs, w2gs, goff, tw_local, ti_local, pnw):
+            hidden_full = jax.lax.all_gather(hidden_local,
+                                             expert_axis,
+                                             axis=0,
+                                             tiled=True)
+            ti_full = jax.lax.all_gather(ti_local,
+                                         expert_axis,
+                                         axis=0,
+                                         tiled=True)
+            return _local_body(hidden_full, w1_, w1s, w1b, w2_, w2s, w2b,
+                               w1gs, w2gs, goff, tw_local, ti_full, pnw)
+
+        _shard_body = _gather_then_body
+    else:
+        _shard_body = _local_body
+
     result = jax.shard_map(
-        functools.partial(
-            moe_gmm_local_rs_nodedup,
-            activation=activation,
-            topk=topk,
-            ep_size=ep_size,
-            ep_axis_name=expert_axis,
-            has_post_norm=_has_pn_rs,
-            sp_enabled=sp_enabled,
-            fp8_post_gather=fp8_post_gather,
-        ),
+        _shard_body,
         mesh=mesh,
         in_specs=(
             hidden_in_spec,
@@ -489,10 +536,15 @@ def fused_moe_func_rs(
     assert (num_tokens * topk) % 16 == 0
     if topk_weights is not None and topk_indices is not None:
         # Honor pre-computed routing; do not recompute from gating_output.
-        topk_weights = jax.lax.with_sharding_constraint(
-            topk_weights, NamedSharding(mesh, P(MLP_DATA, None)))
-        topk_indices = jax.lax.with_sharding_constraint(
-            topk_indices, NamedSharding(mesh, P(MLP_DATA, None)))
+        #
+        # LOCAL DELTA vs tokamax 6303c14: upstream constrains both to
+        # `P("data", None)` here. That is the same expert-axis reshard the
+        # shard_map boundary used to carry, just hoisted one level up into the
+        # jit, and it fails torch_tpu's compile for the same reason -- see the
+        # two delta notes in `expert_parallel_gmm_rs`. The routing tensors now
+        # stay in the caller's `P("expert")` layout and the body gathers the
+        # indices itself.
+        pass
     else:
         assert gating_output is not None, (
             "fused_moe_func_rs: either pre-computed topk_weights+topk_indices "
