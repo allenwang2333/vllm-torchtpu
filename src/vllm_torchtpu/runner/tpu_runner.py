@@ -2255,30 +2255,36 @@ class TPUModelRunner(GPUModelRunner):
         local_padded_total_num_scheduled_tokens = (
             layout_plan.local_padded_num_tokens)
         local_token_slice = layout_plan.token_slice
+        _no_fence = bool(envs.TPU_DISABLE_STAGING_FENCE)
         if layout_plan.kind is SequenceLayoutKind.ALL:
             # Zero out to avoid spurious values from prev iteration.
             self.input_ids_cpu[total_num_scheduled_tokens:
                                padded_total_num_scheduled_tokens] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
+        _in_slice = self.input_ids_cpu[local_token_slice]
+        self.input_ids = (_in_slice.clone() if _no_fence else _in_slice).to(
             self.device, non_blocking=True)
         if self.uses_mrope:
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[:, total_num_scheduled_tokens:
                                          padded_total_num_scheduled_tokens] = 0
-            self.position_ids = self.mrope_positions.cpu[:,
-                                                         local_token_slice].to(
-                                                             self.device,
-                                                             non_blocking=True)
+            _pos_slice = self.mrope_positions.cpu[:, local_token_slice]
+            self.position_ids = (
+                _pos_slice.clone() if _no_fence else _pos_slice).to(
+                    self.device, non_blocking=True)
         else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
-                self.device, non_blocking=True)
+            _pos_slice = self.positions_cpu[local_token_slice]
+            self.position_ids = (
+                _pos_slice.clone() if _no_fence else _pos_slice).to(
+                    self.device, non_blocking=True)
         if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_max_model_len].to(
+            _sl_slice = self.seq_lens_cpu[:self.num_reqs_max_model_len]
+            seq_lens = (_sl_slice.clone() if _no_fence else _sl_slice).to(
                 self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[:self.num_reqs_most_model_len].to(
+            _sl_slice = self.seq_lens_cpu[:self.num_reqs_most_model_len]
+            seq_lens = (_sl_slice.clone() if _no_fence else _sl_slice).to(
                 self.device, non_blocking=True)
             target_num_reqs = self.num_reqs_most_model_len
 
@@ -2356,19 +2362,13 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # Compute and copy to device (first call or shape changed).
             if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[:self.
-                                                           num_reqs_max_model_len
-                                                           + 1].to(
-                                                               self.device,
-                                                               non_blocking=True
-                                                           )
+                _qsl = self.query_start_loc_cpu[:self.num_reqs_max_model_len + 1]
+                query_start_loc = (_qsl.clone() if _no_fence else _qsl).to(
+                    self.device, non_blocking=True)
             else:
-                query_start_loc = self.query_start_loc_cpu[:self.
-                                                           num_reqs_most_model_len
-                                                           + 1].to(
-                                                               self.device,
-                                                               non_blocking=True
-                                                           )
+                _qsl = self.query_start_loc_cpu[:self.num_reqs_most_model_len + 1]
+                query_start_loc = (_qsl.clone() if _no_fence else _qsl).to(
+                    self.device, non_blocking=True)
 
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
@@ -2390,7 +2390,8 @@ class TPUModelRunner(GPUModelRunner):
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
-            request_distribution = self._request_distribution_cpu.to(
+            _rd = self._request_distribution_cpu
+            request_distribution = (_rd.clone() if _no_fence else _rd).to(
                 self.device, non_blocking=True)
 
             if can_cache_decode_metadata:
@@ -2429,7 +2430,8 @@ class TPUModelRunner(GPUModelRunner):
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
             combined[5] = num_reqs
-            combined_device = combined.to(self.device, non_blocking=True)
+            combined_device = (combined.clone() if _no_fence else combined).to(
+                self.device, non_blocking=True)
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 
@@ -2494,19 +2496,16 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _record_input_staging_fence(self) -> None:
-        """Fence the uploads issued from the reusable host staging tensors.
-
-        Every `.to(self.device, non_blocking=True)` of a staging tensor keeps
-        reading its host memory until the transfer completes, and the same
-        tensors are rewritten by the next chunk's input preparation. The
-        event is recorded before the forward is dispatched, so waiting on it
-        never waits for the forward itself.
-        """
+        """Fence the uploads issued from the reusable host staging tensors."""
+        if envs.TPU_DISABLE_STAGING_FENCE:
+            return
         fence = torch.tpu.Event()
         fence.record()
         self._input_staging_fence = fence
 
     def _wait_input_staging_fence(self) -> None:
+        if envs.TPU_DISABLE_STAGING_FENCE:
+            return
         fence = self._input_staging_fence
         if fence is not None:
             fence.synchronize()
@@ -4281,6 +4280,8 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_structured_decoding(self) -> None:
+        if envs.TPU_COMPILE_SIZES:
+            return
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decoding_manager.structured_decode_arange
             for num_reqs in self.num_reqs_paddings:
@@ -4294,11 +4295,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
-            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
-            # we skip it here as well.
             if self.speculative_config is None or self._pcp_mtp_k1_enabled:
                 return
-            # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = self.structured_decoding_manager.target_grammar_bitmask_cpu.shape[
                 0]
             for num_tokens in self.num_tokens_paddings:
@@ -4317,6 +4315,7 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _precompile_sample_from_logits(self) -> None:
+        greedy_modes = [True] if envs.TPU_COMPILE_SIZES else [False, True]
         with self._precompile_timed("sample_from_logits"):
             for num_reqs in self.num_reqs_paddings:
                 dummy_logits = self._dummy_logits(num_reqs)
@@ -4324,14 +4323,16 @@ class TPUModelRunner(GPUModelRunner):
                     (num_reqs, 1),
                     dtype=self._hidden_states_dtype,
                     device=self.device)
-                dummy_u = torch.rand_like(dummy_logits)
+                dummy_u = (torch.empty_like(dummy_logits)
+                           if envs.TPU_COMPILE_SIZES else
+                           torch.rand_like(dummy_logits))
                 dummy_top_k = torch.zeros((num_reqs, 1),
                                           dtype=torch.int32,
                                           device=self.device)
                 dummy_top_p = torch.ones((num_reqs, 1),
                                          dtype=torch.float32,
                                          device=self.device)
-                for all_greedy in [False, True]:
+                for all_greedy in greedy_modes:
                     out = self.sample_from_logits_func(dummy_logits,
                                                        dummy_temperatures,
                                                        dummy_u,
@@ -4342,6 +4343,8 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_gather_logprobs(self) -> None:
+        if envs.TPU_COMPILE_SIZES:
+            return
         with self._precompile_timed("gather_logprobs"):
             for num_reqs in self.num_reqs_paddings:
                 out = self.gather_logprobs(
@@ -4659,14 +4662,9 @@ class TPUModelRunner(GPUModelRunner):
         return attempt_succeeded
 
     def _precompile_backbone(self) -> None:
-        """Compile the backbone for every token bucket.
-
-        One trace serves the whole ladder unless the model's structure depends
-        on the token count, in which case a bucket the current graph cannot
-        serve gets a trace of its own and hands its executable back, leaving
-        one executable per bucket either way (see
-        vllm_torchtpu.compilation.shape_variants).
-        """
+        if getattr(self, "_profile_slab", None) is not None:
+            self._profile_slab = None
+            synchronize_device()
         with shape_variants.warmup() as buckets:
             for num_tokens in self.num_tokens_paddings:
                 logger.info("  -- num_tokens: %d", num_tokens)
@@ -5151,24 +5149,49 @@ class TPUModelRunner(GPUModelRunner):
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
 
-            # Compile backbone here so XLA materializes the FP8 activation
-            # slab; vLLM's post-probe sees the real HBM. Cache writes are
-            # disabled so the kv=0-specialized graph never lands in the
-            # persistent serving cache. Compile only the max token bucket:
-            # every program loaded on the TPU holds a permanent bottom-of-HBM
-            # program-region reservation, and the kv=0-specialized graphs are
-            # dead after the dynamo reset below — one throwaway program keeps
-            # the region within budget for capture_model's full bucket ladder.
-            with self._profile_isolated_cache():
-                cc.compile_sizes = [num_tokens]
-                self._dummy_run(num_tokens, self.num_reqs_max_model_len,
-                                self.max_num_blocks_per_req)
-            reset_compile_wrapper(self.model)
-            # reset_compile_wrapper wipes cache_dir; restore so
-            # capture_model can read/write the persistent cache.
-            cc.cache_dir, cc.local_cache_dir = saved_cache
-            cc.compile_sizes = saved_sizes
-            torch._dynamo.reset()
+            if envs.TPU_COMPILE_SIZES and not getattr(
+                    self, "_tpu_vocab_fp8_quantized", False):
+                import gc
+                from vllm.model_executor.utils import replace_parameter
+                for mod_name, mod in self.model.named_modules():
+                    w_param = getattr(mod, "weight", None)
+                    if (isinstance(w_param, torch.nn.Parameter)
+                            and tuple(w_param.shape) == (163840, 7168)
+                            and w_param.dtype == torch.bfloat16):
+                        w = w_param.data
+                        is_lm_head = "lm_head" in mod_name
+                        if is_lm_head:
+                            w_fp8 = w.to(torch.float8_e5m2).transpose(
+                                0, 1).contiguous()
+                        else:
+                            w_fp8 = w.to(torch.float8_e5m2).contiguous()
+                        del w, w_param
+                        mod._parameters["weight"] = None
+                        replace_parameter(
+                            mod, "weight",
+                            torch.nn.Parameter(w_fp8, requires_grad=False))
+                        if is_lm_head:
+                            self._tpu_fp8_lm_head = mod
+                        else:
+
+                            def _make_fp8_embed_fwd(m):
+
+                                def _fwd(input_):
+                                    flat = input_.reshape(-1)
+                                    out = torch.index_select(
+                                        m.weight, 0, flat).to(torch.bfloat16)
+                                    return out.reshape(*input_.shape, -1)
+
+                                return _fwd
+
+                            mod.forward = _make_fp8_embed_fwd(mod)
+                        synchronize_tensors([mod.weight])
+                        logger.info("Quantized %s to E5M2: weight=%s",
+                                    mod_name, list(mod.weight.shape))
+                self._tpu_vocab_fp8_quantized = True
+                gc.collect()
+
+            self._profile_slab = None
             synchronize_device()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
@@ -5365,17 +5388,28 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _select_hidden_rows(
+            self, hidden_states: torch.Tensor,
+            indices_do_sample: torch.Tensor) -> torch.Tensor:
+        return torch.index_select(hidden_states, 0, indices_do_sample)
+
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
         if self.is_pooling_model:
             return torch.empty((0, ), device=hidden_states.device)
-        selected = torch.index_select(hidden_states, 0, indices_do_sample)
-        return self.model.compute_logits(selected)
+        selected = self._select_hidden_rows(hidden_states, indices_do_sample)
+        return self.compute_logits_from_hidden_states(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
             self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fp8_lm_head = getattr(self, "_tpu_fp8_lm_head", None)
+        if fp8_lm_head is not None:
+            return torch.matmul(
+                hidden_states,
+                fp8_lm_head.weight.to(hidden_states.dtype),
+            )
         return self.model.compute_logits(hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

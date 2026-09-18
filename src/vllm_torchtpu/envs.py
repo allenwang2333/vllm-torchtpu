@@ -69,7 +69,10 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
-    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 4096
+    TPU_MOE_PIPELINE_BARRIER: int = 0
+    TPU_DISABLE_STAGING_FENCE: int = 0
+    TPU_COMPILE_SIZES: str = "64,1024"
     TPU_MOE_FP8_DISPATCH: int = 0
     TPU_MOE_FP8_COMBINE: int = 0
     TPU_MOE_OVERLAP_SHARED_EXPERTS: int = 1
@@ -593,7 +596,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
-    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    env_int("TPU_MOE_COLLECTION_CHUNK_SIZE", 4096),
+    # Stage barriers inside pipelined_fused_moe_gmm to prevent HloAllGatherCombiner / HloReduceScatterCombiner from merging chunks.
+    "TPU_MOE_PIPELINE_BARRIER":
+    env_int("TPU_MOE_PIPELINE_BARRIER", 0),
+    "TPU_DISABLE_STAGING_FENCE":
+    env_int("TPU_DISABLE_STAGING_FENCE", 0),
+    "TPU_COMPILE_SIZES":
+    lambda: os.getenv("TPU_COMPILE_SIZES", "").strip(),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).

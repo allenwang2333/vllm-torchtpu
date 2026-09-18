@@ -117,7 +117,7 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         return [
             *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
-            f"moe_ici_{envs.TPU_MOE_FP8_DISPATCH}_{envs.TPU_MOE_FP8_COMBINE}_{envs.TPU_MOE_OVERLAP_SHARED_EXPERTS}_{envs.TPU_MOE_OVERLAP_MAX_TOKENS}",
+            f"moe_ici_{envs.TPU_MOE_FP8_DISPATCH}_{envs.TPU_MOE_FP8_COMBINE}_{envs.TPU_MOE_OVERLAP_SHARED_EXPERTS}_{envs.TPU_MOE_OVERLAP_MAX_TOKENS}_{envs.TPU_MOE_COLLECTION_CHUNK_SIZE}_{envs.TPU_MOE_PIPELINE_BARRIER}",
             *filter(None, [shape_variants.aot_cache_tag()]),
         ]
 
@@ -380,6 +380,48 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                         ag_tw = dp.all_gather(topk_weights, dim=0)
                         ag_ti = dp.all_gather(topk_ids, dim=0)
                     return ag_hs, (ag_tw, ag_ti)
+                if envs.TPU_MOE_FP8_DISPATCH == 6 and self.moe_config.dp_size > 1:
+                    from vllm.distributed import get_dp_group
+                    dp = get_dp_group()
+                    q_hs = hidden_states.to(torch.float8_e5m2).view(
+                        torch.bfloat16)
+                    ag_q_hs = dp.all_gather(q_hs, dim=0)
+                    topk_weights, topk_ids = moe_routing.route(
+                        self.routed_experts,
+                        hidden_states,
+                        router_logits,
+                    )
+                    tw_i32 = topk_weights.to(torch.bfloat16).view(
+                        torch.int16).to(torch.int32)
+                    meta_local = torch.cat([tw_i32, topk_ids.to(torch.int32)],
+                                           dim=-1)
+                    ag_meta = dp.all_gather(meta_local, dim=0)
+                    k = topk_weights.shape[-1]
+                    ag_tw = ag_meta[:, :k].to(torch.int16).view(
+                        torch.bfloat16).to(topk_weights.dtype)
+                    ag_ti = ag_meta[:, k:2 * k]
+                    ag_hs = ag_q_hs.view(torch.float8_e5m2).to(
+                        hidden_states.dtype)
+                    return ag_hs, (ag_tw, ag_ti)
+                if envs.TPU_MOE_FP8_DISPATCH == 0 and self.moe_config.dp_size > 1:
+                    from vllm.distributed import get_dp_group
+                    dp = get_dp_group()
+                    ag_hs = dp.all_gather(hidden_states, dim=0)
+                    topk_weights, topk_ids = moe_routing.route(
+                        self.routed_experts,
+                        hidden_states,
+                        router_logits,
+                    )
+                    tw_i32 = topk_weights.to(torch.bfloat16).view(
+                        torch.int16).to(torch.int32)
+                    meta_local = torch.cat([tw_i32, topk_ids.to(torch.int32)],
+                                           dim=-1)
+                    ag_meta = dp.all_gather(meta_local, dim=0)
+                    k = topk_weights.shape[-1]
+                    ag_tw = ag_meta[:, :k].to(torch.int16).view(
+                        torch.bfloat16).to(topk_weights.dtype)
+                    ag_ti = ag_meta[:, k:2 * k]
+                    return ag_hs, (ag_tw, ag_ti)
                 router_logits = moe_routing.route(
                     self.routed_experts,
                     hidden_states,
@@ -451,9 +493,103 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
             return upstream_combine(self, shared_output, hidden_states)
 
+        upstream_forward_impl = runner_cls._forward_impl
+
+        def forward_impl(self,
+                         hidden_states,
+                         router_logits,
+                         shared_experts_input,
+                         input_ids=None):
+            if (envs.TPU_MOE_OVERLAP_SHARED_EXPERTS == 5
+                    and self.routed_experts.quant_method.is_monolithic
+                    and not self.moe_config.is_sequence_parallel
+                    and self.moe_config.pcp_size <= 1
+                    and self.moe_config.dp_size > 1
+                    and self.gate is not None
+                    and self._shared_experts is not None
+                    and shared_experts_input is not None
+                    and hasattr(self._shared_experts._layer, "gate_up_proj")
+                    and hasattr(self._shared_experts._layer, "down_proj")):
+                from vllm.distributed import get_dp_group
+                from vllm_torchtpu.layers.adapter import moe_routing
+                from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+                    _gather_hs_and_meta, _gather_routing_meta,
+                    calculate_moe_chunks)
+                dp = get_dp_group()
+                layer = self._shared_experts._layer
+                self.routed_experts._ensure_moe_quant_config_init()
+                seq_len = hidden_states.shape[0]
+                num_chunks, _ = calculate_moe_chunks(
+                    seq_len, self.moe_config.dp_size,
+                    envs.TPU_MOE_COLLECTION_CHUNK_SIZE)
+
+                if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
+                    if num_chunks == 1:
+                        ag_hs0 = dp.all_gather(hidden_states, dim=0)
+                        self.routed_experts._tpu_pre_gate_ag = (None, ag_hs0)
+                    else:
+                        hs_slices = list(
+                            torch.chunk(hidden_states, num_chunks, dim=0))
+                        ag_hs0 = dp.all_gather(hs_slices[0], dim=0)
+                        self.routed_experts._tpu_pre_gate_ag = (hs_slices,
+                                                                ag_hs0)
+                    self.routed_experts._tpu_shared_experts = (
+                        layer, shared_experts_input)
+                    router_logits, _ = self.gate(hidden_states)
+                    routed_out = self.routed_experts.forward_monolithic(
+                        x=hidden_states,
+                        router_logits=router_logits,
+                        input_ids=input_ids,
+                    )
+                    shared_out = getattr(self.routed_experts,
+                                         "_tpu_shared_out", None)
+                    self.routed_experts._tpu_shared_out = None
+                    return shared_out, routed_out
+
+                # 1. Start SparseCore AllGather(hidden_states) BEFORE self.gate!
+                ag_hs = dp.all_gather(hidden_states, dim=0)
+
+                # 2. Compute self.gate + fused Pallas router while ag_hs is in flight
+                router_logits, _ = self.gate(hidden_states)
+                topk_weights, topk_ids = moe_routing.route(
+                    self.routed_experts,
+                    hidden_states,
+                    router_logits,
+                )
+
+                # 3. Start SparseCore AllGather(meta_local) (single int32[S, 16] tensor)
+                ag_tw, ag_ti = _gather_routing_meta(dp, topk_weights, topk_ids)
+
+                # 4. Overlap shared_experts.gate_up_proj + act_fn (2/3 of shared FLOPs)
+                #    with the in-flight ag_hs and ag_meta collectives!
+                gate_up, _ = layer.gate_up_proj(shared_experts_input)
+                shared_act = layer.act_fn(gate_up)
+
+                # 5. Unpack routing metadata and run fused_moe_gmm
+                routed_out = self.routed_experts.forward_monolithic(
+                    x=ag_hs,
+                    router_logits=(ag_tw, ag_ti),
+                    input_ids=input_ids,
+                )
+
+                # 6. Start ReduceScatter(routed_out) and overlap shared_experts.down_proj
+                _, combined_routed = upstream_combine(self, shared_act,
+                                                      routed_out)
+                real_shared_out, _ = layer.down_proj(shared_act)
+                return real_shared_out, combined_routed
+
+            return upstream_forward_impl(
+                self,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                shared_experts_input=shared_experts_input,
+                input_ids=input_ids,
+            )
+
         runner_cls._maybe_dispatch = maybe_dispatch
         runner_cls._apply_quant_method = apply_quant_method
         runner_cls._maybe_combine = maybe_combine
+        runner_cls._forward_impl = forward_impl
         runner_cls._tpu_fused_ep_pcp_collectives_patch = True
 
     logger.info("Applied TPU patch: use explicit PCP collectives unless MoE "

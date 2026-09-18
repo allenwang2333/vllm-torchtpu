@@ -21,7 +21,10 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import (
+    router_topk,
+    router_topk_fused_sigmoid_bias,
+)
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -33,10 +36,28 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
             torch.empty((rows, topk), dtype=torch.int32, device=scores.device))
 
 
+def _fake_router_topk_fused(router_logits: torch.Tensor,
+                            bias_2d: torch.Tensor,
+                            topk: int,
+                            renormalize: bool,
+                            routed_scaling_factor: float):
+    rows = router_logits.shape[0]
+    return (torch.empty((rows, topk),
+                        dtype=torch.float32,
+                        device=router_logits.device),
+            torch.empty((rows, topk),
+                        dtype=torch.int32,
+                        device=router_logits.device))
+
+
 # Registered at import, not lazily: this op is called from inside the MoE
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+
+_op_fused = pallas.jax_op("pallas::moe_router_topk_fused",
+                          router_topk_fused_sigmoid_bias)
+_op_fused.register_fake(_fake_router_topk_fused)
 
 
 def rowmax_select(scores: torch.Tensor,
@@ -48,3 +69,15 @@ def rowmax_select(scores: torch.Tensor,
         raise ValueError(
             f"router top-k kernel expects [rows, experts], got {scores.shape}")
     return _op(scores.float(), topk)
+
+
+def rowmax_select_fused_sigmoid_bias(
+    router_logits: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bias_2d = bias.float().view(1, -1)
+    return _op_fused(router_logits, bias_2d, topk, bool(renormalize),
+                     float(routed_scaling_factor))

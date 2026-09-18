@@ -68,7 +68,7 @@ def calculate_moe_chunks(seq_len: int, parallel_size: int,
         return 1, seq_len
 
     total_tokens = seq_len * parallel_size
-    num_chunks = (total_tokens + chunk_size - 1) // chunk_size
+    num_chunks = int((total_tokens + chunk_size - 1) // chunk_size)
     if seq_len % num_chunks != 0:
         raise ValueError(
             f"Local sequence length ({seq_len}) is not divisible by chunk count ({num_chunks})."
@@ -76,6 +76,76 @@ def calculate_moe_chunks(seq_len: int, parallel_size: int,
 
     chunk_size_local = seq_len // num_chunks
     return num_chunks, chunk_size_local
+
+
+def _tpu_opt_barrier(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if hasattr(torch.ops, "tpu") and hasattr(torch.ops.tpu, "optimization_barrier"):
+        res = torch.ops.tpu.optimization_barrier([a, b])
+        return res[0], res[1]
+    return a, b
+
+
+def _gather_routing_meta(
+    collective_group,
+    topk_weights: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if (topk_weights is not None and topk_ids is not None
+            and topk_weights.dtype == torch.bfloat16
+            and topk_ids.dtype == torch.int32):
+        meta_local = torch.cat(
+            [topk_weights.view(torch.int16).to(torch.int32), topk_ids],
+            dim=-1,
+        )
+        ag_meta = collective_group.all_gather(meta_local, dim=0)
+        k = topk_weights.shape[-1]
+        ag_tw = ag_meta[:, :k].to(torch.int16).view(torch.bfloat16)
+        ag_ti = ag_meta[:, k:]
+        return ag_tw, ag_ti
+    ag_tw = (collective_group.all_gather(topk_weights, dim=0)
+             if topk_weights is not None else None)
+    ag_ti = (collective_group.all_gather(topk_ids, dim=0)
+             if topk_ids is not None else None)
+    return ag_tw, ag_ti
+
+
+def _quantize_hs_fp8(hs_slice: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    amax = hs_slice.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    hs_scale = (amax / 448.0).to(torch.bfloat16)
+    hs_fp8_bf16 = (hs_slice / hs_scale).to(torch.float8_e4m3fn).view(torch.bfloat16)
+    return hs_fp8_bf16, hs_scale.view(hs_slice.shape[0], 1)
+
+
+def _gather_hs_and_meta(
+    collective_group,
+    hs_slice: torch.Tensor,
+    tw_slice: Optional[torch.Tensor],
+    ti_slice: Optional[torch.Tensor],
+    use_fp8: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if (use_fp8 and tw_slice is not None and ti_slice is not None
+            and hs_slice.dtype == torch.bfloat16
+            and hs_slice.shape[-1] == 7168 and tw_slice.shape[-1] == 8):
+        hs_fp8_bf16, hs_scale = _quantize_hs_fp8(hs_slice)
+        ag_hs_fp8 = collective_group.all_gather(hs_fp8_bf16, dim=0)
+        meta_local = torch.cat(
+            [
+                hs_scale,
+                tw_slice.to(torch.bfloat16),
+                ti_slice.to(torch.int32).view(torch.bfloat16),
+            ],
+            dim=-1,
+        )
+        ag_meta = collective_group.all_gather(meta_local, dim=0)
+        ag_scale = ag_meta[:, :1]
+        ag_tw = ag_meta[:, 1:9]
+        ag_ti = ag_meta[:, 9:25].contiguous().view(torch.int32)
+        ag_hs = ag_hs_fp8.view(torch.float8_e4m3fn).to(torch.bfloat16) * ag_scale
+        return ag_hs, ag_tw, ag_ti
+
+    ag_hs = collective_group.all_gather(hs_slice, dim=0)
+    ag_tw, ag_ti = _gather_routing_meta(collective_group, tw_slice, ti_slice)
+    return ag_hs, ag_tw, ag_ti
 
 
 def _get_moe_collective_group():
@@ -114,48 +184,18 @@ def pipelined_fused_moe_gmm(
     w2_scale: Optional[torch.Tensor],
     w1_bias: Optional[torch.Tensor],
     w2_bias: Optional[torch.Tensor],
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
     experts_start: Optional[torch.Tensor],
     topk: int,
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
-) -> torch.Tensor:
-    """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
-
-    This function wraps `fused_moe_gmm` by taking control of the active DP or
-    PCP collective communications (AllGather of activations/routing tensors
-    and ReduceScatter of outputs) and staging them in chunks to overlap network
-    communication with TPU matrix multiplication compute.
-
-    When `enable_pipelined_collective_and_compute()` is True and the collective
-    world size is greater than one, the sequence is partitioned into balanced
-    chunks and executed via a 3-stage pipelined schedule:
-      ag0_start -> ag1_start || moe0(ag0_done) -> rs0_start || moe1(ag1_done) -> rs1_start || rs0_done -> rs1_done -> concat
-
-    Args:
-        hidden_states: Local input activations [S, H].
-        w1: First expert projection weights [E, 2*I, H] or [E, H, 2*I]
-            (concatenated gate W1 and up W3 projections with intermediate dimension
-            2*I for gated activations like SwiGLU when activation="silu").
-        w2: Second expert projection weights [E, H, I] or [E, I, H]
-            (down projection W2 from intermediate dimension I back to hidden dimension H).
-        w1_scale: Optional first projection scale tensor.
-        w2_scale: Optional second projection scale tensor.
-        w1_bias: Optional first projection bias tensor.
-        w2_bias: Optional second projection bias tensor.
-        topk_weights: Routing top-k weights [S, topk].
-        topk_ids: Routing top-k expert IDs [S, topk].
-        experts_start: Optional 0-d tensor of starting expert ID for this shard.
-        topk: Number of experts selected per token.
-        activation: Gated activation function string (e.g., "silu" for SwiGLU).
-        rhs_quant_dtype: Optional RHS quantization data type.
-        skip_padded_tokens: Optional flag to skip padded tokens.
-
-    Returns:
-        torch.Tensor: Reduced local output activations [S, H].
-    """
+    route_fn=None,
+    pre_gate_ag=None,
+    shared_experts=None,
+):
+    """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute."""
     chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
     collective_group, _ = _get_moe_collective_group()
 
@@ -164,19 +204,31 @@ def pipelined_fused_moe_gmm(
                      if collective_group is not None else 1)
     num_chunks, chunk_size_local = calculate_moe_chunks(
         seq_len, parallel_size, chunk_size)
+    use_fp8 = (envs.TPU_MOE_FP8_DISPATCH == 5 and num_chunks > 1)
+    use_barrier = (envs.TPU_MOE_PIPELINE_BARRIER >= 1)
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
-            ag_hidden_states = collective_group.all_gather(hidden_states,
-                                                           dim=0)
-            ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
-                               if topk_weights is not None else None)
-            ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
-                           if topk_ids is not None else None)
+            if pre_gate_ag is not None and pre_gate_ag[1] is not None:
+                ag_hidden_states = pre_gate_ag[1]
+            else:
+                ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
+            if route_fn is not None and (topk_weights is None or topk_ids is None):
+                topk_weights, topk_ids = route_fn()
+            ag_topk_weights, ag_topk_ids = _gather_routing_meta(
+                collective_group, topk_weights, topk_ids)
         else:
+            if route_fn is not None and (topk_weights is None or topk_ids is None):
+                topk_weights, topk_ids = route_fn()
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
             ag_topk_ids = topk_ids
+
+        shared_act = None
+        if shared_experts is not None:
+            shared_layer, shared_in = shared_experts
+            gate_up, _ = shared_layer.gate_up_proj(shared_in)
+            shared_act = shared_layer.act_fn(gate_up)
 
         out = fused_moe_gmm(
             hidden_states=ag_hidden_states,
@@ -196,43 +248,82 @@ def pipelined_fused_moe_gmm(
         )
 
         if parallel_size > 1:
-            return collective_group.reduce_scatter(out, dim=0)
+            rs_out = collective_group.reduce_scatter(out, dim=0)
+            if shared_act is not None:
+                shared_out, _ = shared_experts[0].down_proj(shared_act)
+                return rs_out, shared_out
+            if shared_experts is not None:
+                return rs_out, None
+            return rs_out
+        if shared_act is not None:
+            shared_out, _ = shared_experts[0].down_proj(shared_act)
+            return out, shared_out
         return out
 
     _log_active_chunk_pipeline()
 
     # Slice local inputs into num_chunks chunks along dim 0
-    hs_slices = [
-        hidden_states[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ]
-    weights_slices = [
-        topk_weights[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_weights is not None else [None] * num_chunks
-    ids_slices = [
-        topk_ids[i * chunk_size_local:(i + 1) * chunk_size_local]
-        for i in range(num_chunks)
-    ] if topk_ids is not None else [None] * num_chunks
+    if pre_gate_ag is not None and pre_gate_ag[0] is not None:
+        hs_slices = pre_gate_ag[0]
+        pre_ag_hs0 = pre_gate_ag[1]
+    else:
+        hs_slices = list(torch.chunk(hidden_states, num_chunks, dim=0))
+        pre_ag_hs0 = None
 
-    # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
-                  if weights_slices[0] is not None else None)
-    ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
-                  if ids_slices[0] is not None else None)
+    # Stage 0: Issue AllGather for chunk 0 hidden_states BEFORE route_fn() so SparseCore overlaps with TensorCore router
+    if use_fp8 and hs_slices[0].dtype == torch.bfloat16 and hs_slices[0].shape[-1] == 7168:
+        hs0_fp8_bf16, hs0_scale = _quantize_hs_fp8(hs_slices[0])
+        ag_hs0_fp8 = collective_group.all_gather(hs0_fp8_bf16, dim=0)
+        if route_fn is not None and (topk_weights is None or topk_ids is None):
+            topk_weights, topk_ids = route_fn()
+        weights_slices = list(torch.chunk(topk_weights, num_chunks, dim=0))
+        ids_slices = list(torch.chunk(topk_ids, num_chunks, dim=0))
+        meta0_local = torch.cat(
+            [
+                hs0_scale,
+                weights_slices[0].to(torch.bfloat16),
+                ids_slices[0].to(torch.int32).view(torch.bfloat16),
+            ],
+            dim=-1,
+        )
+        ag_meta0 = collective_group.all_gather(meta0_local, dim=0)
+        ag_scale0 = ag_meta0[:, :1]
+        ag_tw_curr = ag_meta0[:, 1:9]
+        ag_ti_curr = ag_meta0[:, 9:25].contiguous().view(torch.int32)
+        ag_hs_curr = ag_hs0_fp8.view(torch.float8_e4m3fn).to(torch.bfloat16) * ag_scale0
+    else:
+        ag_hs_curr = (pre_ag_hs0 if pre_ag_hs0 is not None else
+                      collective_group.all_gather(hs_slices[0], dim=0))
+        if route_fn is not None and (topk_weights is None or topk_ids is None):
+            topk_weights, topk_ids = route_fn()
+        weights_slices = (list(torch.chunk(topk_weights, num_chunks, dim=0))
+                          if topk_weights is not None else [None] * num_chunks)
+        ids_slices = (list(torch.chunk(topk_ids, num_chunks, dim=0))
+                      if topk_ids is not None else [None] * num_chunks)
+        ag_tw_curr, ag_ti_curr = _gather_routing_meta(
+            collective_group, weights_slices[0], ids_slices[0])
+
+    shared_act = None
+    if shared_experts is not None:
+        shared_layer, shared_in = shared_experts
+        gate_up, _ = shared_layer.gate_up_proj(shared_in)
+        shared_act = shared_layer.act_fn(gate_up)
 
     rs_outputs = []
 
     for i in range(num_chunks):
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
-                                                      dim=0)
-                          if weights_slices[i + 1] is not None else None)
-            ag_ti_next = (collective_group.all_gather(ids_slices[i + 1], dim=0)
-                          if ids_slices[i + 1] is not None else None)
+            hs_next = hs_slices[i + 1]
+            if use_barrier:
+                ag_hs_curr, hs_next = _tpu_opt_barrier(ag_hs_curr, hs_next)
+            ag_hs_next, ag_tw_next, ag_ti_next = _gather_hs_and_meta(
+                collective_group,
+                hs_next,
+                weights_slices[i + 1],
+                ids_slices[i + 1],
+                use_fp8,
+            )
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
@@ -252,6 +343,11 @@ def pipelined_fused_moe_gmm(
             skip_padded_tokens=skip_padded_tokens,
         )
 
+        if use_barrier and i + 1 < num_chunks:
+            ag_hs_next, out_i = _tpu_opt_barrier(ag_hs_next, out_i)
+        if use_barrier and i > 0:
+            rs_outputs[-1], out_i = _tpu_opt_barrier(rs_outputs[-1], out_i)
+
         # Reduce-scatter partial output for current chunk
         rs_i = collective_group.reduce_scatter(out_i, dim=0)
         rs_outputs.append(rs_i)
@@ -259,4 +355,10 @@ def pipelined_fused_moe_gmm(
         if i + 1 < num_chunks:
             ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
 
-    return torch.cat(rs_outputs, dim=0)
+    combined_out = torch.cat(rs_outputs, dim=0)
+    if shared_act is not None:
+        shared_out, _ = shared_experts[0].down_proj(shared_act)
+        return combined_out, shared_out
+    if shared_experts is not None:
+        return combined_out, None
+    return combined_out

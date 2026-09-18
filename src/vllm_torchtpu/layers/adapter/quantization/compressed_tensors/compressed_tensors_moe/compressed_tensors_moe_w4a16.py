@@ -307,9 +307,35 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         activation_str = get_fused_moe_activation(layer.activation,
                                                   layer.moe_config)
 
-        # Quantization-independent routing decision (simulation override ->
-        # custom_routing_function -> select_experts); shared across all TPU MoE
-        # methods so the routing-simulation hook lives in exactly one place.
+        if enable_pipelined_collective_and_compute():
+            pre_gate_ag = getattr(layer, "_tpu_pre_gate_ag", None)
+            layer._tpu_pre_gate_ag = None
+            shared_exp = getattr(layer, "_tpu_shared_experts", None)
+            layer._tpu_shared_experts = None
+            res = pipelined_fused_moe_gmm(
+                hidden_states=x,
+                w1=layer.w13_weight_packed,
+                w2=layer.w2_weight_packed,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=None,
+                topk_ids=None,
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                rhs_quant_dtype=getattr(layer, "_rhs_quant_dtype", jnp.int4),
+                route_fn=lambda: moe_routing.route(layer, x, router_logits),
+                pre_gate_ag=pre_gate_ag,
+                shared_experts=shared_exp,
+            )
+            if shared_exp is not None:
+                out, shared_out = res
+                layer._tpu_shared_out = shared_out
+                return out
+            return res
+
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
         kwargs = {
@@ -327,7 +353,4 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": getattr(layer, "_rhs_quant_dtype", jnp.int4),
         }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
-
         return fused_moe_gmm(**kwargs)

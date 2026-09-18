@@ -271,9 +271,27 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = (layer.e_score_correction_bias
                                if layer is not None else None)
+    routed_scaling_factor = (layer.routed_scaling_factor
+                             if layer is not None else 1.0)
+
+    if (e_score_correction_bias is not None and scoring_fn == "sigmoid"
+            and _ROUTER_TOPK == "rowmax"
+            and router_logits.device.type == "tpu"
+            and router_logits.dim() == 2):
+        from vllm_torchtpu.layers.adapter.router_topk import (
+            rowmax_select_fused_sigmoid_bias)
+        topk_weights, topk_ids = rowmax_select_fused_sigmoid_bias(
+            router_logits,
+            e_score_correction_bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+        )
+        return topk_weights.to(hidden_states.dtype), topk_ids
+
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]
@@ -287,8 +305,6 @@ def select_experts(
     if renormalize:
         topk_weights = topk_weights / torch.clamp(
             topk_weights.sum(dim=-1, keepdim=True), min=1e-20)
-    routed_scaling_factor = (layer.routed_scaling_factor
-                             if layer is not None else 1.0)
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 

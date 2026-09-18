@@ -98,3 +98,70 @@ def select(scores: jax.Array,
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _select_fused_sigmoid_bias_kernel(logits_ref,
+                                      bias_ref,
+                                      w_ref,
+                                      i_ref,
+                                      *,
+                                      topk: int,
+                                      n: int,
+                                      renormalize: bool,
+                                      routed_scaling_factor: float):
+    """Fused sigmoid + e_score_correction_bias + top-k + unbiased gather + renorm in VMEM."""
+    scores = jax.nn.sigmoid(logits_ref[...].astype(jnp.float32))
+    bias = bias_ref[...].astype(jnp.float32)
+    x_raw = scores + bias
+    x = jnp.where(x_raw > NEG, x_raw, NEG)
+    masked = jnp.finfo(jnp.float32).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        mask_j = (iota == idx[:, None])
+        # Extract unbiased sigmoid score at selected column idx in VMEM (no 2D HBM gather)
+        w_j = jnp.max(jnp.where(mask_j, scores, -jnp.inf), axis=1)
+        w_ref[:, j] = w_j
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(mask_j, masked, x)
+    w_all = w_ref[...]
+    if renormalize:
+        w_sum = jnp.maximum(jnp.sum(w_all, axis=1, keepdims=True), 1e-20)
+        w_all = w_all / w_sum
+    if routed_scaling_factor != 1.0:
+        w_all = w_all * routed_scaling_factor
+    w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_all)
+
+
+def router_topk_fused_sigmoid_bias(
+    router_logits: jax.Array,
+    bias_2d: jax.Array,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> tuple[jax.Array, jax.Array]:
+    rows, n = router_logits.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(
+            _select_fused_sigmoid_bias_kernel,
+            topk=topk,
+            n=n,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+        ),
+        grid=(pl.cdiv(rows, block), ),
+        in_specs=[
+            pl.BlockSpec((block, n), lambda i: (i, 0)),
+            pl.BlockSpec((1, n), lambda i: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+    )(router_logits, bias_2d)
