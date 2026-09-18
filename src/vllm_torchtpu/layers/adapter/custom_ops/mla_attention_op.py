@@ -678,6 +678,10 @@ class VllmTPUMLAAttention(MLAAttention):
             self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
                 self, dcp_size, self.impl.dcp_interleave_size)
 
+        parent_wrapper = getattr(self, "_parent_wrapper", None)
+        if parent_wrapper is not None:
+            parent_wrapper.process_weights_after_loading(act_dtype)
+
     def forward(self,
                 q: tuple[torch.Tensor, torch.Tensor],
                 kv_c_normed: torch.Tensor,
@@ -789,17 +793,104 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             indexer=self.indexer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        object.__setattr__(self.mla_attn, "_parent_wrapper", self)
+        self._q_b_proj_grouped = False
 
         self.prefix = prefix
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
             super().process_weights_after_loading(act_dtype)
+        device = torch.device("tpu")
+        n_out = self.num_heads * self.qk_head_dim
+        if (
+            not getattr(self, "_q_b_proj_grouped", False)
+            and self.q_b_proj is not None
+            and hasattr(self.q_b_proj, "weight")
+            and self.q_b_proj.weight is not None
+            and self.q_b_proj.weight.shape[-1] == n_out
+        ):
+            w = self.q_b_proj.weight.data
+            w_3d = w.view(-1, self.num_heads, self.qk_head_dim)
+            w_grouped = torch.cat(
+                [
+                    w_3d[:, :, :self.qk_nope_head_dim].reshape(
+                        -1, self.num_heads * self.qk_nope_head_dim
+                    ),
+                    w_3d[:, :, self.qk_nope_head_dim:].reshape(
+                        -1, self.num_heads * self.qk_rope_head_dim
+                    ),
+                ],
+                dim=-1,
+            ).contiguous()
+            self.q_b_proj.weight = Parameter(w_grouped, requires_grad=False)
+            sync_list = [self.q_b_proj.weight]
+            if (
+                hasattr(self.q_b_proj, "weight_scale")
+                and self.q_b_proj.weight_scale is not None
+                and self.q_b_proj.weight_scale.shape[-1] == n_out
+            ):
+                ws = self.q_b_proj.weight_scale.data
+                ws_prefix = ws.shape[:-1]
+                ws_3d = ws.view(*ws_prefix, self.num_heads, self.qk_head_dim)
+                ws_grouped = torch.cat(
+                    [
+                        ws_3d[..., :self.qk_nope_head_dim].reshape(
+                            *ws_prefix, self.num_heads * self.qk_nope_head_dim
+                        ),
+                        ws_3d[..., self.qk_nope_head_dim:].reshape(
+                            *ws_prefix, self.num_heads * self.qk_rope_head_dim
+                        ),
+                    ],
+                    dim=-1,
+                ).contiguous()
+                self.q_b_proj.weight_scale = Parameter(
+                    ws_grouped, requires_grad=False
+                )
+                sync_list.append(self.q_b_proj.weight_scale)
+            synchronize_tensors(sync_list)
+            self._q_b_proj_grouped = True
+
         if self.rotary_emb is not None and hasattr(self.rotary_emb,
                                                    "cos_sin_cache"):
-            device = torch.device("tpu")
-            self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(
-                device)
+            if not hasattr(self.rotary_emb, "_cos_sin_128"):
+                cs = self.rotary_emb.cos_sin_cache[:16384].to(device)
+                c, s = cs.chunk(2, dim=-1)
+                if getattr(self.rotary_emb, "is_neox_style", False):
+                    c = torch.cat((c, c), dim=-1)
+                    s = torch.cat((s, s), dim=-1)
+                else:
+                    c = c.repeat_interleave(2, dim=-1)
+                    s = s.repeat_interleave(2, dim=-1)
+                self.rotary_emb._cos_sin_expanded = torch.cat(
+                    (c, s), dim=-1).to(act_dtype).contiguous()
+                self.rotary_emb._cos_sin_128 = torch.cat(
+                    (c, c, s, s), dim=-1).to(act_dtype).contiguous()
+                self.rotary_emb.cos_sin_cache = self.rotary_emb._cos_sin_expanded
+                r_dim = self.rotary_emb.rotary_dim
+                j64 = torch.zeros((r_dim, r_dim), dtype=act_dtype, device=device)
+                idx = torch.arange(r_dim // 2, device=device)
+                if getattr(self.rotary_emb, "is_neox_style", False):
+                    j64[idx + r_dim // 2, idx] = -1.0
+                    j64[idx, idx + r_dim // 2] = 1.0
+                else:
+                    j64[2 * idx + 1, 2 * idx] = -1.0
+                    j64[2 * idx, 2 * idx + 1] = 1.0
+                j128 = torch.zeros(
+                    (2 * r_dim, 2 * r_dim), dtype=act_dtype, device=device
+                )
+                j128[:r_dim, :r_dim] = j64
+                j128[r_dim:, r_dim:] = j64
+                self.rotary_emb._J_64 = j64.contiguous()
+                self.rotary_emb._J_128 = j128.contiguous()
+            synchronize_tensors(
+                [
+                    self.rotary_emb._cos_sin_expanded,
+                    self.rotary_emb._cos_sin_128,
+                    self.rotary_emb._J_64,
+                    self.rotary_emb._J_128,
+                ]
+            )
 
     def forward(
         self,
@@ -807,8 +898,13 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _, _, kv_cache, _ = get_attention_context(self.mla_attn.layer_name)
+        if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
+            return torch.zeros_like(hidden_states)
+
         q_c = None
-        kv_lora = None
+        kv_c = None
+        k_pe = None
         output_gate = None
 
         if self.q_lora_rank is not None:
@@ -821,19 +917,21 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             if self.gate_is_fused:
-                q_c, kv_lora, output_gate = qkv_lora.split(
+                q_c, kv_c, k_pe, output_gate = qkv_lora.split(
                     [
                         self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
+                        self.kv_lora_rank,
+                        self.qk_rope_head_dim,
                         self.num_heads * self.v_head_dim,
                     ],
                     dim=-1,
                 )
             else:
-                q_c, kv_lora = qkv_lora.split(
+                q_c, kv_c, k_pe = qkv_lora.split(
                     [
                         self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim
+                        self.kv_lora_rank,
+                        self.qk_rope_head_dim,
                     ],
                     dim=-1,
                 )
@@ -845,15 +943,27 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             assert self.q_proj is not None, (
                 "q_proj is required when q_lora_rank is None")
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
-                                   dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
-                               dim=-1)
+        if getattr(self, "_q_b_proj_grouped", False):
+            q_nope_flat, q_pe_flat = q.split(
+                [
+                    self.num_heads * self.qk_nope_head_dim,
+                    self.num_heads * self.qk_rope_head_dim,
+                ],
+                dim=-1,
+            )
+            q_nope = q_nope_flat.view(-1, self.num_heads, self.qk_nope_head_dim)
+            q_pe = q_pe_flat.view(-1, self.num_heads, self.qk_rope_head_dim)
+        else:
+            q = q.view(-1, self.num_heads, self.qk_head_dim)
+            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
+                                   dim=-1)
 
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
@@ -916,18 +1026,41 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
         pos = torch.add(positions,
                         offsets) if offsets is not None else positions
-        cos_sin = self.cos_sin_cache.index_select(0, pos)
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
-            sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+        if (
+            hasattr(self, "_cos_sin_128")
+            and query_rot.shape[-1] == 64
+            and (query_rot.shape[-2] % 2 == 0)
+        ):
+            cs_128 = self._cos_sin_128.index_select(0, pos)
+            cos_128, sin_128 = cs_128.unsqueeze(-2).chunk(2, dim=-1)
+            q_128 = query_rot.view(
+                query_rot.shape[0], query_rot.shape[1] // 2, 128
+            )
+            q_rot_128 = torch.matmul(q_128, self._J_128)
+            query_rot = (q_128 * cos_128 + q_rot_128 * sin_128).view_as(
+                query_rot
+            )
+            cos_64 = cos_128[..., :64]
+            sin_64 = sin_128[..., :64]
+            k_rot = torch.matmul(key_rot, self._J_64)
+            key_rot = key_rot * cos_64 + k_rot * sin_64
         else:
-            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+            if hasattr(self, "_cos_sin_expanded"):
+                cos_sin = self._cos_sin_expanded.index_select(0, pos)
+                cos, sin = cos_sin.unsqueeze(-2).chunk(2, dim=-1)
+            else:
+                cos_sin = self.cos_sin_cache.index_select(0, pos)
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                if self.is_neox_style:
+                    cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
+                    sin = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+                else:
+                    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+                    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
 
-        rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+            rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
+            query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+            key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
         if self.rotary_dim < self.head_size:
             query = torch.cat((query_rot, query_pass), dim=-1)

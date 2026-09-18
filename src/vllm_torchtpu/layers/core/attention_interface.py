@@ -698,15 +698,13 @@ def mla_attention(
         # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
         num_kv_pages_per_blocks = (
             decode_tuned.num_kv_pages_per_block,
-            1,
-            envs.MIXED_NUM_KV_PAGES_PER_BLOCK
-            or mixed_tuned.num_kv_pages_per_block,
+            mixed_tuned.num_kv_pages_per_block,
+            mixed_tuned.num_kv_pages_per_block,
         )
         num_queries_per_blocks = (
             decode_tuned.num_queries_per_block,
-            16,
-            envs.MIXED_NUM_QUERIES_PER_BLOCK
-            or mixed_tuned.num_queries_per_block,
+            mixed_tuned.num_queries_per_block,
+            mixed_tuned.num_queries_per_block,
         )
 
         out, new_cache = mla_ragged_paged_attention(
@@ -725,7 +723,7 @@ def mla_attention(
             vmem_limit_bytes=min(decode_tuned.vmem_limit_bytes,
                                  mixed_tuned.vmem_limit_bytes),
             decode_batch_size=decode_tuned.decode_batch_size,
-            mixed_q_split=envs.MIXED_Q_SPLIT or mixed_tuned.q_split,
+            mixed_q_split=mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -738,11 +736,10 @@ def mla_attention(
                             mesh=mesh,
                             in_specs=in_specs,
                             out_specs=out_specs,
-                            check_rep=False))(q_TNA, q_rope_TNH, k_SA,
-                                              k_rope_SH, kv_cache, md.seq_lens,
-                                              md.block_tables,
-                                              md.query_start_loc,
-                                              md.request_distribution)
+                            check_rep=False),
+        donate_argnums=(0, 4))(q_TNA, q_rope_TNH, k_SA, k_rope_SH, kv_cache,
+                               md.seq_lens, md.block_tables,
+                               md.query_start_loc, md.request_distribution)
     return kv_cache, output_TNA
 
 

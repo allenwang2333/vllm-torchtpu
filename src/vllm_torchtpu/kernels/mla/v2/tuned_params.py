@@ -1182,18 +1182,18 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
-    if tuning_key in tuned_params_mapping:
-        return tuned_params_mapping[tuning_key]
-
     # Optimal TPU v7x parameters for Kimi-K2.6 (actual_num_q_heads=64, actual_lkv_dim=512)
     if tuning_key.actual_num_q_heads == 64 and tuning_key.actual_lkv_dim == 512:
-        if tuning_key.case == "mixed":
+        if tuning_key.case in ("mixed", "prefill"):
+            bq_mix = 32 if tuning_key.max_num_tokens >= 32 else max(
+                1, tuning_key.max_num_tokens)
+            qs_mix = 8 if bq_mix >= 8 else bq_mix
             return TunableParams(
-                num_kv_pages_per_block=1,
-                num_queries_per_block=64,
-                vmem_limit_bytes=62914560,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=bq_mix,
+                vmem_limit_bytes=66000000,
                 decode_batch_size=1,
-                q_split=16,
+                q_split=qs_mix,
             )
         decode_bsz = 8 if tuning_key.max_num_tokens >= 8 else max(
             1, tuning_key.max_num_tokens)
@@ -1201,9 +1201,12 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
             decode_batch_size=decode_bsz,
             num_kv_pages_per_block=3,
             num_queries_per_block=1,
-            vmem_limit_bytes=62914560,
+            vmem_limit_bytes=66000000,
             q_split=1,
         )
+
+    if tuning_key in tuned_params_mapping:
+        return tuned_params_mapping[tuning_key]
 
     logger.warning(
         f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"

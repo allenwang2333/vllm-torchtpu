@@ -1654,7 +1654,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         op_name = f"pallas::mla_attention_{layer.layer_name.replace('.', '_')}"
         mla_jax_op = pallas.jax_op(op_name,
                                    mla_attention_core_tpu,
-                                   donate_argnums=(0, ))
+                                   donate_argnums=(0, 1))
 
         def _fake_mla(kv_cache, q_nope, q_pe, kv_c_normed, k_pe, *args,
                       **kwargs):
@@ -1912,14 +1912,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
         if layer.kv_cache_quantized_dtype is not None:
-            kv_c_normed, _ = quantize_kv(layer.kv_cache_quantized_dtype,
-                                         kv_c_normed,
-                                         value=None,
-                                         k_scale=k_scale)
-            k_pe, _ = quantize_kv(layer.kv_cache_quantized_dtype,
-                                  k_pe,
-                                  value=None,
-                                  k_scale=k_scale)
+            if k_scale is None or k_scale == 1.0:
+                kv_c_normed = kv_c_normed.to(layer.kv_cache_quantized_dtype)
+                k_pe = k_pe.to(layer.kv_cache_quantized_dtype)
+            else:
+                kv_c_normed, _ = quantize_kv(layer.kv_cache_quantized_dtype,
+                                             kv_c_normed,
+                                             value=None,
+                                             k_scale=k_scale)
+                k_pe, _ = quantize_kv(layer.kv_cache_quantized_dtype,
+                                      k_pe,
+                                      value=None,
+                                      k_scale=k_scale)
 
         ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
         q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
