@@ -396,37 +396,59 @@ def test_the_expert_axis_name_is_the_one_the_kernel_resolves():
 
 def test_the_adapter_relayout_produces_the_scale_rank_the_kernel_indexes():
     """What `relayout_weights_for_rs` hands the kernel, against what the
-    kernel's scale DMA indexes.
+    kernel's scale DMA indexes -- rank, extents, values, and storage.
 
     The kernel slices ``w1_scale_ref.at[e, pl.ds(...), :, pl.ds(...)]`` -- four
     indices, the last in N elements -- and its unquantized placeholder is
     `jnp.zeros((1, 1, 1, 1))`. So the scale it takes is
-    [E, size_k // block, 1, size_n]. This test asks the adapter for the same
-    thing, on one layer's worth of GLM-5.2-shaped weights.
+    [E, size_k // block, 1, size_n].
+
+    Shapes alone would not settle it. The scales here are given DISTINCT values
+    rather than zeros, because a repeat-along-N that landed on the wrong axis
+    produces the right shape from the wrong numbers, and a zero-filled scale
+    compares equal either way. The weights are checked the same way, and their
+    storage is checked too: the relayout replaces the vLLM-layout buffers
+    rather than staging copies beside them, so the RS attrs must alias the
+    parameters and the parameters must have moved.
     """
     import torch
 
     from vllm_torchtpu.layers.adapter.fused_moe_rs import (
-        RS_W1_SCALE_ATTR, RS_W2_SCALE_ATTR, relayout_weights_for_rs)
+        RS_W1_ATTR, RS_W1_SCALE_ATTR, RS_W2_ATTR, RS_W2_SCALE_ATTR,
+        relayout_weights_for_rs)
 
     class _Layer:
         pass
 
-    def _param(*shape, dtype=torch.float32):
-        return torch.nn.Parameter(torch.zeros(shape, dtype=dtype),
+    def _ramp(*shape, dtype=torch.float32):
+        """Distinct values, so a wrong axis cannot compare equal to a right
+        one. `arange` in f32 is exact to 2**24, well past these sizes."""
+        n = 1
+        for s in shape:
+            n *= s
+        return torch.nn.Parameter(torch.arange(n, dtype=torch.float32).reshape(
+            shape).to(dtype),
                                   requires_grad=False)
 
-    # Two experts rather than the layer's 16: the assertion is about rank and
-    # the last axis's units, and the served expert count would cost 1.2 GB of
-    # host copies to say the same thing.
+    # Two experts rather than the layer's 16: the assertions are about axis
+    # order and units, and the served expert count would cost 1.2 GB of host
+    # copies to say the same thing.
     e = 2
     layer = _Layer()
-    # vLLM's storage layout for a block-scaled fp8 MoE layer.
-    layer.w13_weight = _param(e, 2 * INTER, HIDDEN, dtype=torch.float8_e4m3fn)
-    layer.w2_weight = _param(e, HIDDEN, INTER, dtype=torch.float8_e4m3fn)
-    layer.w13_weight_scale_inv = _param(e, (2 * INTER) // BLOCK,
-                                        HIDDEN // BLOCK)
-    layer.w2_weight_scale_inv = _param(e, HIDDEN // BLOCK, INTER // BLOCK)
+    # vLLM's storage layout for a block-scaled fp8 MoE layer. The weights get
+    # a small ramp because fp8 e4m3 saturates at 448 and the check below is an
+    # exact equality.
+    w13_src = (torch.arange(e * 2 * INTER * HIDDEN, dtype=torch.float32) %
+               16).reshape(e, 2 * INTER, HIDDEN).to(torch.float8_e4m3fn)
+    w2_src = (torch.arange(e * HIDDEN * INTER, dtype=torch.float32) %
+              16).reshape(e, HIDDEN, INTER).to(torch.float8_e4m3fn)
+    layer.w13_weight = torch.nn.Parameter(w13_src, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2_src, requires_grad=False)
+    layer.w13_weight_scale_inv = _ramp(e, (2 * INTER) // BLOCK,
+                                       HIDDEN // BLOCK)
+    layer.w2_weight_scale_inv = _ramp(e, HIDDEN // BLOCK, INTER // BLOCK)
+    s13_src = layer.w13_weight_scale_inv.data.clone()
+    s2_src = layer.w2_weight_scale_inv.data.clone()
 
     relayout_weights_for_rs(layer)
     w1_scale = getattr(layer, RS_W1_SCALE_ATTR)
@@ -441,6 +463,36 @@ def test_the_adapter_relayout_produces_the_scale_rank_the_kernel_indexes():
     assert tuple(w2_scale.shape) == want2, (
         f"relayout_weights_for_rs gave w2_scale {tuple(w2_scale.shape)}; the "
         f"kernel's scale DMA indexes {want2}")
+
+    # Column n of K-block k must carry vLLM's scale for N-block n // BLOCK and
+    # K-block k. The shape check above cannot see this: a repeat that tiled
+    # the blocks instead of interleaving them, or that read the scale's axes
+    # in the other order before transposing, produces exactly the same
+    # extents from different numbers.
+    want_w1 = s13_src.transpose(-2, -1).repeat_interleave(BLOCK, dim=-1)
+    want_w2 = s2_src.transpose(-2, -1).repeat_interleave(BLOCK, dim=-1)
+    assert torch.equal(w1_scale.squeeze(-2), want_w1), (
+        "w1_scale has the right shape but the wrong values: the repeat did "
+        "not land on the N axis of the transposed scale")
+    assert torch.equal(w2_scale.squeeze(-2), want_w2), (
+        "w2_scale has the right shape but the wrong values")
+
+    # The weights are transposed in place, and the RS attrs alias them. Two
+    # copies of a GLM-5.2 layer's experts is 90.6 GB a rank against 45.3, so
+    # "the same storage" is the assertion, not "equal contents".
+    assert tuple(layer.w13_weight.shape) == (e, HIDDEN, 2 * INTER)
+    assert tuple(layer.w2_weight.shape) == (e, INTER, HIDDEN)
+    assert torch.equal(layer.w13_weight.data.float(),
+                       w13_src.float().transpose(-2, -1))
+    assert torch.equal(layer.w2_weight.data.float(),
+                       w2_src.float().transpose(-2, -1))
+    assert getattr(layer, RS_W1_ATTR).data_ptr() == \
+        layer.w13_weight.data.data_ptr(), (
+            "the RS w1 attr is a second buffer, not the parameter; that is a "
+            "second copy of the checkpoint's experts")
+    assert getattr(layer, RS_W2_ATTR).data_ptr() == \
+        layer.w2_weight.data.data_ptr(), (
+            "the RS w2 attr is a second buffer, not the parameter")
 
 
 @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "fp8"])
