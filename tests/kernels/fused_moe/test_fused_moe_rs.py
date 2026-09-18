@@ -19,7 +19,7 @@ The adapter (`layers/adapter/fused_moe_rs.py`) hands it vLLM's own
 ``topk_weights``/``topk_indices``, so routing is equal to the grouped-matmul
 path by construction and what is left to check is everything after routing.
 
-Two things are checked, and they are not the same question.
+Three things are checked, and they are not the same question.
 
 **Does it compile and fit VMEM at the served shape.** The sibling
 ``fused_ep_moe_v2`` kernel provably could not fit GLM-5.2 in VMEM (120.64 MiB
@@ -30,19 +30,49 @@ VMEM-exceeded shape fails at trace/compile time.
 
 **Is it numerically the grouped-matmul path.** That is
 ``test_small_shape_tracks_a_dense_reference``, held to a dense f32 reference
-over the same block-dequantized weights, with a rotated-expert control so a
-band wide enough to cover fp8 still means something.
+over the same dequantized weights, with a rotated-expert control so a band
+wide enough to cover fp8 still means something.
+
+**Does the adapter hand it a layout it accepts.** That is
+``test_bind_weights_passes_the_loaders_layout_through_unchanged``,
+``test_the_kernel_accepts_what_the_adapter_hands_it`` and
+``test_the_contract_check_refuses_a_scale_in_n_blocks``. This is where the
+first version of this file was wrong, so it is worth stating precisely what
+the layout is and where it is known from.
+
+**THE WEIGHT LAYOUT IS THE LOADER'S, NOT THE CHECKPOINT'S.** This is READ FROM
+A SERVER LOG -- job ``j-3c919167-e3fa-42ad-a8a6``, GLM-5.2-FP8 on DP16/EP16 --
+not derived here. `process_weights_after_loading` runs
+`_process_fp8_moe_weights` before either MoE adapter sees the layer: it
+dequantizes the checkpoint, **requantizes** it (per-channel by default, since
+`MOE_REQUANTIZE_BLOCK_SIZE` is unset) and transposes. That job logged
+
+    FP8 weights transposed for GMM kernel: w13=[16, 6144, 4096],
+    w2=[16, 2048, 6144], w13_scale=[16, 1, 1, 4096],
+    w2_scale=[16, 1, 1, 6144], requant_block_size=per-channel
+
+so what the adapter is handed is [E, hidden, 2*inter] / [E, inter, hidden] and
+four-dimensional scales [E, K_blocks, 1, N] with **K_blocks 1** and the last
+axis in N **elements**. The checkpoint's own [128, 128] block scaling is gone
+by then; it never reaches this kernel. Per-channel is the K_blocks == 1 case
+of the same contract -- `_recover_quant_block_size(size_k, 1)` short-circuits
+to `size_k`, one quant block spanning all of K.
+
+That is why the numeric and served-shape arms are parametrized over
+``per_channel`` and ``block128``: **per_channel is what production runs**, and
+block128 is only reachable by setting `MOE_REQUANTIZE_BLOCK_SIZE`. An earlier
+version of this file ran block128 alone and reported it as the served shape.
 
 **Shapes are GLM-5.2-FP8's**, from `knowledge/models/GLM-5.2-FP8/refs/model.md`
 (`config.json` @ GCS generation 1785565055944226): hidden 6144,
-``moe_intermediate_size`` 2048, top-8, fp8 e4m3 with ``weight_block_size``
-[128, 128]. Production shards those 256 routed experts over EP16 on a 2x2x2
-slice, i.e. **16 local experts a core**. This pod is 2x2x1 -- eight cores --
-so EP16 cannot be built here. The substitution is deliberate and is stated in
-``EP``/``E_TOTAL`` below: **128 global experts over EP8**, which reproduces
-production's 16 local experts a core (the number that sets the per-core weight
-footprint and the kernel's group loop) at half the mesh width. ``SERVED_TOKENS``
-is then chosen to hit production's ``size_m`` exactly rather than EP8's own.
+``moe_intermediate_size`` 2048, top-8. Production shards 256 routed experts
+over EP16 on a 2x2x2 slice, i.e. **16 local experts a core**. This pod is
+2x2x1 -- eight cores -- so EP16 cannot be built here. The substitution is
+deliberate and is stated in ``EP``/``E_TOTAL`` below: **128 global experts over
+EP8**, which reproduces production's 16 local experts a core (the number that
+sets the per-core weight footprint and the kernel's group loop) at half the
+mesh width. ``SERVED_TOKENS`` is then chosen to hit production's ``size_m``
+exactly rather than EP8's own.
 """
 
 import jax
@@ -87,7 +117,11 @@ EP = 8
 HIDDEN = 6144
 INTER = 2048
 TOPK = 8
-BLOCK = 128  # weight_block_size [128, 128]
+
+# The requantization block size `MOE_REQUANTIZE_BLOCK_SIZE` would select. Not
+# the checkpoint's [128, 128] -- that is dequantized away before the adapter
+# runs -- but the same number, and the only non-per-channel case reachable.
+BLOCK = 128
 
 # 256 routed experts over production's EP16 is 16 local a core. 128 over this
 # pod's EP8 is also 16 local a core -- the per-core count is what is held.
@@ -105,8 +139,8 @@ SERVED_SIZE_M = SERVED_TOKENS * TOPK  # 131072
 HALF_TOKENS = 8192
 
 # Structurally complete and cheap enough for a dense reference: same top-k,
-# same [128, 128] block scales, same 16-local-experts-a-core geometry, with
-# hidden and intermediate cut to one and two blocks.
+# same scale schemes, same 16-local-experts-a-core geometry, with hidden and
+# intermediate cut to one and two 128-blocks.
 SMALL = dict(hidden=512, inter=256, tokens=512)
 
 # How far the kernel may sit from a dense f32 reference over the same
@@ -123,11 +157,11 @@ BF16_TOKEN_BOUND = 0.01
 # one: the kernel online-quantizes each activation row to e4m3 in blocks of
 # `lhs_quant_block_size` (256 at this hidden size) on the way into both GMMs,
 # and e4m3's three mantissa bits are ~6% at full scale. Measured on this host
-# at the small shape: 0.0652 batch, 0.0793 worst token. That number is only
-# admissible as a band because two controls in the same test bound it from
-# both sides -- the bf16 arm above, an order of magnitude tighter over the
-# same code path, and the rotated-expert reference below, an order of
-# magnitude wider.
+# at the small shape: 0.0652 batch, 0.0793 worst token for block128. That
+# number is only admissible as a band because two controls in the same test
+# bound it from both sides -- the bf16 arm above, an order of magnitude
+# tighter over the same code path, and the rotated-expert reference below, an
+# order of magnitude wider.
 FP8_RELATIVE_BOUND = 0.09
 FP8_TOKEN_BOUND = 0.11
 
@@ -135,6 +169,11 @@ FP8_TOKEN_BOUND = 0.11
 # the reference itself, so a band this wide still discriminates. Same control
 # and same factor as the v2 suite.
 ROTATED_CONTROL_FACTOR = 10
+
+# The two scale schemes the kernel can be handed. `per_channel` is what
+# `_process_fp8_moe_weights` produces by default and therefore what production
+# runs; `block128` needs `MOE_REQUANTIZE_BLOCK_SIZE=128`.
+SCHEMES = ["per_channel", "block128"]
 
 
 def _mesh():
@@ -152,41 +191,31 @@ def _mesh():
     )
 
 
-def _kernel_scale_layout(block_scale):
-    """[E, K/BLOCK, N/BLOCK] -> the [E, K/BLOCK, 1, N] the kernel indexes.
+def _quantize(w_f32, scheme):
+    """[K, N] f32 -> (fp8 [K, N], f32 scale [K_blocks, N]).
 
-    `gmm_fused_rs_nodedup` DMAs a scale tile with
-    ``w1_scale_ref.at[expert, pl.ds(k_id * nqb, nqb), :, pl.ds(n_off, tile_n)]``
-    -- four indices, and the last slice is in N *elements*, width ``tile_n1``.
-    Its unquantized placeholder is `jnp.zeros((1, 1, 1, 1))`, which pins the
-    rank. So a [128, 128]-block checkpoint reaches this kernel by repeating
-    each N block across its 128 columns; that is value-identical to the block
-    scale and is what the reference dequantizes with.
-    """
-    return jnp.repeat(block_scale, BLOCK, axis=-1)[:, :, None, :]
-
-
-def _quantize_blockwise(w_f32):
-    """Block-quantize [K, N] f32 to (fp8 [K, N], f32 [K/BLOCK, N/BLOCK]).
-
-    One scale per [BLOCK, BLOCK] tile, which is the checkpoint's own scheme.
+    The scale comes back in the kernel's own units: K in **blocks**, N in
+    **elements**, which is what `w1_scale_ref.at[e, pl.ds(...), :, pl.ds(...)]`
+    indexes. `per_channel` is the K_blocks == 1 case, one scale per output
+    column -- exactly what `_process_fp8_moe_weights` emits by default.
     """
     size_k, size_n = w_f32.shape
-    tiles = w_f32.reshape(size_k // BLOCK, BLOCK, size_n // BLOCK, BLOCK)
-    amax = jnp.max(jnp.abs(tiles), axis=(1, 3), keepdims=True)
+    k_block = size_k if scheme == "per_channel" else BLOCK
+    tiles = w_f32.reshape(size_k // k_block, k_block, size_n)
+    amax = jnp.max(jnp.abs(tiles), axis=1, keepdims=True)
     scale = jnp.where(amax == 0, 1.0, amax / float(jnp.finfo(FP8).max))
     q = (tiles / scale).astype(FP8).reshape(size_k, size_n)
-    return q, scale.reshape(size_k // BLOCK, size_n // BLOCK).astype(
-        jnp.float32)
+    return q, scale.reshape(size_k // k_block, size_n).astype(jnp.float32)
 
 
-def _make_weights(mesh, seed, *, hidden, inter, quantized):
+def _make_weights(mesh, seed, *, hidden, inter, scheme):
     """(w1, w2, w1_scale, w2_scale) as global arrays sharded on the experts.
 
-    K-major, which is the layout the kernel's GMM reads and what the adapter's
-    `relayout_weights_for_rs` transposes vLLM's storage into: w1 is
-    [E, hidden, 2*inter] and w2 is [E, inter, hidden]. Scales come back in the
-    kernel's own 4D form, or as None for the unquantized arm.
+    K-major with four-dimensional scales, which is what the loader produces
+    and what `bind_weights_for_rs` passes straight through: w1 is
+    [E, hidden, 2*inter], w2 is [E, inter, hidden], scales
+    [E, K_blocks, 1, N]. `scheme="bf16"` quantizes nothing and returns no
+    scales.
 
     Built a shard at a time rather than on one device and handed out, so the
     served shape's f32 draw never has to exist whole.
@@ -200,19 +229,19 @@ def _make_weights(mesh, seed, *, hidden, inter, quantized):
         for key, shape in ((k1, (E_LOCAL, hidden, 2 * inter)),
                            (k2, (E_LOCAL, inter, hidden))):
             w = jax.random.normal(key, shape, jnp.float32) / 10
-            if not quantized:
+            if scheme == "bf16":
                 out.append((w.astype(jnp.bfloat16), ))
                 continue
-            q, s = jax.vmap(_quantize_blockwise)(w)
-            out.append((q, _kernel_scale_layout(s)))
+            q, s = jax.vmap(lambda a: _quantize(a, scheme))(w)
+            out.append((q, s[:, :, None, :]))
         return tuple(a for pair in out for a in pair)
 
-    n_out = 4 if quantized else 2
+    quantized = scheme != "bf16"
     built = jax.jit(
         jax.shard_map(local,
                       mesh=mesh,
                       in_specs=(P(axis), ),
-                      out_specs=(P(axis), ) * n_out,
+                      out_specs=(P(axis), ) * (4 if quantized else 2),
                       check_vma=False))(jnp.zeros((EP, ), jnp.float32))
     if quantized:
         w1, w1s, w2, w2s = built
@@ -221,7 +250,7 @@ def _make_weights(mesh, seed, *, hidden, inter, quantized):
     return w1, w2, None, None
 
 
-def _make_cheap_weights(mesh, *, hidden, inter):
+def _make_cheap_weights(mesh, *, hidden, inter, scheme):
     """The served shape's weights, without ever materializing an f32 draw.
 
     A [128, 6144, 4096] f32 draw is 12.9 GB; the fp8 form is 3.2 GB, and only
@@ -239,8 +268,10 @@ def _make_cheap_weights(mesh, *, hidden, inter):
             ramp = 0.25 + 0.125 * (
                 (jnp.arange(shape[-1], dtype=jnp.int32) + off + me) % 8)
             w = jnp.broadcast_to(ramp.astype(FP8), shape)
-            scale_shape = (shape[0], shape[1] // BLOCK, 1, shape[2])
-            out.append((w, jnp.full(scale_shape, 0.5, jnp.float32)))
+            k_blocks = 1 if scheme == "per_channel" else shape[1] // BLOCK
+            out.append(
+                (w, jnp.full((shape[0], k_blocks, 1, shape[2]), 0.5,
+                             jnp.float32)))
         (w1, w1s), (w2, w2s) = out
         return w1, w2, w1s, w2s
 
@@ -253,13 +284,11 @@ def _make_cheap_weights(mesh, *, hidden, inter):
 
 
 def _make_inputs(mesh, seed, *, tokens, hidden):
-    """(x, topk_weights, topk_indices, scores) the adapter's contract supplies.
+    """(x, topk_weights, topk_indices, weights_as_f32) the adapter supplies.
 
     The adapter runs vLLM's `moe_routing.route` and passes the result in, so
     the routing here is computed outside the kernel exactly as it is in
-    serving: a softmax over the router scores, top-k, renormalized. The scores
-    are returned as well because the dense reference has to weight by the same
-    numbers.
+    serving: a softmax over the router scores, top-k, renormalized.
     """
 
     @jax.jit
@@ -315,11 +344,12 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, topk_weights,
                      topk_indices):
     """Every expert applied to every token in f32, weighted by its routing.
 
-    The weights are dequantized from the same [128, 128] blocks the kernel
-    reads -- the 4D scale's N axis is already per column, so undoing it is a
-    plain multiply -- and the whole body runs in f32. What is left between
-    this and the kernel is the kernel's online activation quantization and its
-    transport, not a second implementation of the arithmetic.
+    The weights are dequantized from the same scales the kernel reads. The
+    repeat factor is derived from the scale's own K extent rather than from
+    `BLOCK`, so the same reference serves per-channel (K_blocks 1, repeat K)
+    and block128 (K_blocks K/128, repeat 128); hardcoding 128 would silently
+    compare against the wrong dequantization on the per-channel arm, which is
+    the one production runs.
 
     Spread over the same expert axis the kernel shards on: each shard applies
     its own experts to the whole batch and the shards are summed. That is a
@@ -344,8 +374,10 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, topk_weights,
                                                keepdims=False)[:, 0, :]
                 s2e = lax.dynamic_index_in_dim(s2, e, 0,
                                                keepdims=False)[:, 0, :]
-                w1e = w1e * jnp.repeat(s1e, BLOCK, axis=0)
-                w2e = w2e * jnp.repeat(s2e, BLOCK, axis=0)
+                w1e = w1e * jnp.repeat(
+                    s1e, w1e.shape[0] // s1e.shape[0], axis=0)
+                w2e = w2e * jnp.repeat(
+                    s2e, w2e.shape[0] // s2e.shape[0], axis=0)
             weight = jnp.sum(jnp.where(ti == first + e, tw, 0.0),
                              axis=-1)[:, None]
             acc1 = x32 @ w1e
@@ -383,6 +415,61 @@ def _worst_token_relative_l2(actual, want):
     return float(np.max(per_token / np.where(scale == 0, 1.0, scale)))
 
 
+def _check_against_reference(mesh, tag, x, w1, w2, w1_scale, w2_scale, tw32,
+                             ti, out, batch_bound, token_bound):
+    """Hold `out` to the dense reference, and rotate the experts as a control.
+
+    Every number is printed before anything is asserted, so a red arm still
+    reports what the others measured.
+    """
+    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, tw32, ti)
+    error = _relative_l2(out, want)
+    worst = _worst_token_relative_l2(out, want)
+
+    def roll(a):
+        return None if a is None else jnp.roll(a, 1, axis=0)
+
+    rotated = _dense_reference(mesh, x, roll(w1), roll(w2), roll(w1_scale),
+                               roll(w2_scale), tw32, ti)
+    control = _relative_l2(out, rotated)
+    print(f"{tag} relative_l2={error:.5f} worst_token={worst:.5f} "
+          f"rotated_control={control:.5f} "
+          f"control_ratio={control / max(error, 1e-12):.1f}x")
+    assert control > ROTATED_CONTROL_FACTOR * error, (
+        f"a reference over rotated experts sits {control:.4f} away against "
+        f"the real reference's {error:.4f}; the band does not discriminate")
+    assert error < batch_bound, (
+        f"relative L2 {error:.4f} past the {batch_bound} band")
+    assert worst < token_bound, (
+        f"worst token's relative error {worst:.4f} past the {token_bound} "
+        f"per-token band; the batch norm was {error:.4f}")
+
+
+def _served_layer(e=E_LOCAL):
+    """A stub layer in the layout job j-3c919167 logged, for the adapter.
+
+    Not a shape this file derived: `_process_fp8_moe_weights` logged
+    ``w13=[16, 6144, 4096], w2=[16, 2048, 6144], w13_scale=[16, 1, 1, 4096],
+    w2_scale=[16, 1, 1, 6144], requant_block_size=per-channel`` on
+    GLM-5.2-FP8 at DP16/EP16, and these are those tensors.
+    """
+    import torch
+
+    class _Layer:
+        pass
+
+    def _p(*shape, dtype=torch.float32):
+        return torch.nn.Parameter(torch.empty(shape, dtype=dtype),
+                                  requires_grad=False)
+
+    layer = _Layer()
+    layer.w13_weight = _p(e, HIDDEN, 2 * INTER, dtype=torch.float8_e4m3fn)
+    layer.w2_weight = _p(e, INTER, HIDDEN, dtype=torch.float8_e4m3fn)
+    layer.w13_weight_scale_inv = _p(e, 1, 1, 2 * INTER)
+    layer.w2_weight_scale_inv = _p(e, 1, 1, HIDDEN)
+    return layer
+
+
 def test_the_expert_axis_name_is_the_one_the_kernel_resolves():
     """`get_moe_expert_axis` searches a fixed tuple, so the mesh cannot be
     named freely -- `build_ep_rs_mesh`'s choice has to be in that tuple."""
@@ -394,185 +481,161 @@ def test_the_expert_axis_name_is_the_one_the_kernel_resolves():
     assert mesh.shape[RS_EXPERT_AXIS_NAME] == EP
 
 
-def test_the_adapter_relayout_produces_the_scale_rank_the_kernel_indexes():
-    """What `relayout_weights_for_rs` hands the kernel, against what the
-    kernel's scale DMA indexes -- rank, extents, values, and storage.
+def test_bind_weights_passes_the_loaders_layout_through_unchanged():
+    """`bind_weights_for_rs` must alias, not convert.
 
-    The kernel slices ``w1_scale_ref.at[e, pl.ds(...), :, pl.ds(...)]`` -- four
-    indices, the last in N elements -- and its unquantized placeholder is
-    `jnp.zeros((1, 1, 1, 1))`. So the scale it takes is
-    [E, size_k // block, 1, size_n].
+    The layer is built in the post-requantization layout job j-3c919167
+    logged -- see `_served_layer` -- at the served expert count, so the shapes
+    asserted here are literally the logged ones. Two claims:
 
-    Shapes alone would not settle it. The scales here are given DISTINCT values
-    rather than zeros, because a repeat-along-N that landed on the wrong axis
-    produces the right shape from the wrong numbers, and a zero-filled scale
-    compares equal either way. The weights are checked the same way, and their
-    storage is checked too: the relayout replaces the vLLM-layout buffers
-    rather than staging copies beside them, so the RS attrs must alias the
-    parameters and the parameters must have moved.
+    - the contract check accepts it, which is the claim the e2e run falsified
+      for the previous version of this adapter;
+    - all four RS attributes share storage with the parameters. Aliasing is
+      the assertion rather than equal contents, because a copy of a GLM-5.2
+      layer's experts is 45.3 GB a rank and would be invisible to any
+      value-based check.
+    """
+    from vllm_torchtpu.layers.adapter.fused_moe_rs import (
+        RS_W1_ATTR, RS_W1_SCALE_ATTR, RS_W2_ATTR, RS_W2_SCALE_ATTR,
+        _weights_unsupported_reason, bind_weights_for_rs)
+
+    layer = _served_layer()
+    assert tuple(layer.w13_weight.shape) == (E_LOCAL, 6144, 4096)
+    assert tuple(layer.w2_weight.shape) == (E_LOCAL, 2048, 6144)
+    assert tuple(layer.w13_weight_scale_inv.shape) == (E_LOCAL, 1, 1, 4096)
+    assert tuple(layer.w2_weight_scale_inv.shape) == (E_LOCAL, 1, 1, 6144)
+
+    reason = _weights_unsupported_reason(layer)
+    assert reason is None, (
+        f"the contract check refuses the layout the loader actually produces: "
+        f"{reason}")
+
+    before = {
+        name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype,
+               getattr(layer, name).data.data_ptr())
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale_inv",
+                     "w2_weight_scale_inv")
+    }
+    bind_weights_for_rs(layer)
+    after = {
+        name: (tuple(getattr(layer, name).shape), getattr(layer, name).dtype,
+               getattr(layer, name).data.data_ptr())
+        for name in before
+    }
+    assert after == before, (
+        "bind_weights_for_rs changed the parameters it was supposed to leave "
+        f"alone: {before} -> {after}")
+
+    for attr, param in ((RS_W1_ATTR, "w13_weight"), (RS_W2_ATTR, "w2_weight"),
+                        (RS_W1_SCALE_ATTR, "w13_weight_scale_inv"),
+                        (RS_W2_SCALE_ATTR, "w2_weight_scale_inv")):
+        bound = getattr(layer, attr)
+        want = getattr(layer, param)
+        assert bound.data_ptr() == want.data.data_ptr(), (
+            f"{attr} is a second buffer, not {param}; on GLM-5.2 that is a "
+            "duplicate of the layer's experts")
+        assert tuple(bound.shape) == tuple(want.shape)
+        assert bound.dtype == want.dtype
+
+
+def test_the_contract_check_refuses_a_scale_in_n_blocks():
+    """The red negative control for `_weights_unsupported_reason`.
+
+    It is now the only thing between a wrong layout and a Pallas error on the
+    first batch, so it has to refuse a scale that a rank-only check would wave
+    through: four dimensions, unit axis 2, and a last axis that is N in
+    **blocks** rather than N in elements. That shape is what a plain transpose
+    of vLLM's on-disk scale produces, which is exactly the mistake the
+    previous adapter made.
+
+    The positive control is `test_bind_weights_...` above, which asserts the
+    same function returns None on the loader's real output -- without it, a
+    checker that refused everything would pass this test.
     """
     import torch
 
     from vllm_torchtpu.layers.adapter.fused_moe_rs import (
-        RS_W1_ATTR, RS_W1_SCALE_ATTR, RS_W2_ATTR, RS_W2_SCALE_ATTR,
-        relayout_weights_for_rs)
+        _weights_unsupported_reason)
 
-    class _Layer:
-        pass
+    layer = _served_layer()
+    layer.w13_weight_scale_inv = torch.nn.Parameter(torch.empty(
+        E_LOCAL, 1, 1, (2 * INTER) // BLOCK),
+                                                    requires_grad=False)
+    reason = _weights_unsupported_reason(layer)
+    print(f"RS_MOE_REFUSAL n_blocks -> {reason!r}")
+    assert reason is not None, (
+        "a scale whose last axis is N in blocks was accepted; every scale "
+        "would land on the wrong columns and the kernel would not complain")
+    assert "N elements" in reason, (
+        f"the refusal does not say why: {reason!r}")
 
-    def _ramp(*shape, dtype=torch.float32):
-        """Distinct values, so a wrong axis cannot compare equal to a right
-        one. `arange` in f32 is exact to 2**24, well past these sizes."""
-        n = 1
-        for s in shape:
-            n *= s
-        return torch.nn.Parameter(torch.arange(n, dtype=torch.float32).reshape(
-            shape).to(dtype),
-                                  requires_grad=False)
-
-    # Two experts rather than the layer's 16: the assertions are about axis
-    # order and units, and the served expert count would cost 1.2 GB of host
-    # copies to say the same thing.
-    e = 2
-    layer = _Layer()
-    # vLLM's storage layout for a block-scaled fp8 MoE layer. The weights get
-    # a small ramp because fp8 e4m3 saturates at 448 and the check below is an
-    # exact equality.
-    w13_src = (torch.arange(e * 2 * INTER * HIDDEN, dtype=torch.float32) %
-               16).reshape(e, 2 * INTER, HIDDEN).to(torch.float8_e4m3fn)
-    w2_src = (torch.arange(e * HIDDEN * INTER, dtype=torch.float32) %
-              16).reshape(e, HIDDEN, INTER).to(torch.float8_e4m3fn)
-    layer.w13_weight = torch.nn.Parameter(w13_src, requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(w2_src, requires_grad=False)
-    layer.w13_weight_scale_inv = _ramp(e, (2 * INTER) // BLOCK,
-                                       HIDDEN // BLOCK)
-    layer.w2_weight_scale_inv = _ramp(e, HIDDEN // BLOCK, INTER // BLOCK)
-    s13_src = layer.w13_weight_scale_inv.data.clone()
-    s2_src = layer.w2_weight_scale_inv.data.clone()
-
-    relayout_weights_for_rs(layer)
-    w1_scale = getattr(layer, RS_W1_SCALE_ATTR)
-    w2_scale = getattr(layer, RS_W2_SCALE_ATTR)
-
-    want1 = (e, HIDDEN // BLOCK, 1, 2 * INTER)
-    want2 = (e, INTER // BLOCK, 1, HIDDEN)
-    assert tuple(w1_scale.shape) == want1, (
-        f"relayout_weights_for_rs gave w1_scale {tuple(w1_scale.shape)}; the "
-        f"kernel's scale DMA indexes {want1} -- four dims, the last in N "
-        "elements")
-    assert tuple(w2_scale.shape) == want2, (
-        f"relayout_weights_for_rs gave w2_scale {tuple(w2_scale.shape)}; the "
-        f"kernel's scale DMA indexes {want2}")
-
-    # Column n of K-block k must carry vLLM's scale for N-block n // BLOCK and
-    # K-block k. The shape check above cannot see this: a repeat that tiled
-    # the blocks instead of interleaving them, or that read the scale's axes
-    # in the other order before transposing, produces exactly the same
-    # extents from different numbers.
-    want_w1 = s13_src.transpose(-2, -1).repeat_interleave(BLOCK, dim=-1)
-    want_w2 = s2_src.transpose(-2, -1).repeat_interleave(BLOCK, dim=-1)
-    assert torch.equal(w1_scale.squeeze(-2), want_w1), (
-        "w1_scale has the right shape but the wrong values: the repeat did "
-        "not land on the N axis of the transposed scale")
-    assert torch.equal(w2_scale.squeeze(-2), want_w2), (
-        "w2_scale has the right shape but the wrong values")
-
-    # The weights are transposed in place, and the RS attrs alias them. Two
-    # copies of a GLM-5.2 layer's experts is 90.6 GB a rank against 45.3, so
-    # "the same storage" is the assertion, not "equal contents".
-    assert tuple(layer.w13_weight.shape) == (e, HIDDEN, 2 * INTER)
-    assert tuple(layer.w2_weight.shape) == (e, INTER, HIDDEN)
-    assert torch.equal(layer.w13_weight.data.float(),
-                       w13_src.float().transpose(-2, -1))
-    assert torch.equal(layer.w2_weight.data.float(),
-                       w2_src.float().transpose(-2, -1))
-    assert getattr(layer, RS_W1_ATTR).data_ptr() == \
-        layer.w13_weight.data.data_ptr(), (
-            "the RS w1 attr is a second buffer, not the parameter; that is a "
-            "second copy of the checkpoint's experts")
-    assert getattr(layer, RS_W2_ATTR).data_ptr() == \
-        layer.w2_weight.data.data_ptr(), (
-            "the RS w2 attr is a second buffer, not the parameter")
+    # The other half of the same mistake: three dimensions, which is what the
+    # Pallas ref rejects with `indices must not be longer than shape`.
+    layer = _served_layer()
+    layer.w13_weight_scale_inv = torch.nn.Parameter(torch.empty(
+        E_LOCAL, 1, 2 * INTER),
+                                                    requires_grad=False)
+    reason_3d = _weights_unsupported_reason(layer)
+    print(f"RS_MOE_REFUSAL 3d -> {reason_3d!r}")
+    assert reason_3d is not None and "K_blocks" in reason_3d
 
 
-@pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "fp8"])
-def test_small_shape_tracks_a_dense_reference(quantized):
+@pytest.mark.parametrize("scheme", ["bf16"] + SCHEMES)
+def test_small_shape_tracks_a_dense_reference(scheme):
     """The kernel end to end at a small but structurally complete shape.
 
-    Two arms, because the fp8 band on its own would not be evidence. The
-    ``bf16`` arm runs the same kernel with nothing quantized, so its band is
-    the arithmetic's; the ``fp8`` arm adds the block-scaled weights and the
-    kernel's online activation quantization, and its band is the transport's.
-    An order of magnitude between them is what says the wider one is the
-    wire rather than a mistake.
-
-    The rotated-expert control is the other half: both bands are wide enough
-    to cover something, so without it a kernel that gathered the wrong rows
-    could still clear one. Every number is printed before anything is
-    asserted, so a red arm still reports what the other arms measured.
+    Three arms, because a band on its own would not be evidence. The ``bf16``
+    arm runs the same kernel with nothing quantized, so its band is the
+    arithmetic's; the two fp8 arms add the scales and the kernel's online
+    activation quantization, and their band is the transport's. An order of
+    magnitude between them is what says the wider one is the wire rather than
+    a mistake. ``per_channel`` is the scheme production runs.
     """
     mesh = _mesh()
     hidden, inter, tokens = SMALL["hidden"], SMALL["inter"], SMALL["tokens"]
-    tag = "fp8" if quantized else "bf16"
     w1, w2, w1_scale, w2_scale = _make_weights(mesh,
                                                0,
                                                hidden=hidden,
                                                inter=inter,
-                                               quantized=quantized)
+                                               scheme=scheme)
+    if scheme != "bf16":
+        k_blocks = 1 if scheme == "per_channel" else hidden // BLOCK
+        assert w1_scale.shape == (E_TOTAL, k_blocks, 1, 2 * inter)
     x, tw, ti, tw32 = _make_inputs(mesh, 1, tokens=tokens, hidden=hidden)
 
     out = jax.block_until_ready(
         _run(mesh, x, w1, w2, w1_scale, w2_scale, tw, ti))
     assert out.shape == x.shape
     assert out.dtype == x.dtype
-
-    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, tw32, ti)
-    error = _relative_l2(out, want)
-    worst = _worst_token_relative_l2(out, want)
-
-    def roll(a):
-        return None if a is None else jnp.roll(a, 1, axis=0)
-
-    rotated = _dense_reference(mesh, x, roll(w1), roll(w2), roll(w1_scale),
-                               roll(w2_scale), tw32, ti)
-    control = _relative_l2(out, rotated)
-    print(f"RS_MOE_SMALL[{tag}] relative_l2={error:.5f} "
-          f"worst_token={worst:.5f} rotated_control={control:.5f} "
-          f"control_ratio={control / max(error, 1e-12):.1f}x")
-
-    batch_bound = FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND
-    token_bound = FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND
-    assert control > ROTATED_CONTROL_FACTOR * error, (
-        f"a reference over rotated experts sits {control:.4f} away against "
-        f"the real reference's {error:.4f}; the band does not discriminate")
-    assert error < batch_bound, (
-        f"relative L2 {error:.4f} past the {batch_bound} band")
-    assert worst < token_bound, (
-        f"worst token's relative error {worst:.4f} past the {token_bound} "
-        f"per-token band; the batch norm was {error:.4f}")
+    quantized = scheme != "bf16"
+    _check_against_reference(
+        mesh, f"RS_MOE_SMALL[{scheme}]", x, w1, w2, w1_scale, w2_scale, tw32,
+        ti, out, FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND,
+        FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND)
 
 
 def test_the_kernel_accepts_what_the_adapter_hands_it():
-    """The whole chain: vLLM's stored layout -> the adapter -> the kernel.
+    """The whole chain: the loader's layout -> `bind_weights_for_rs` -> kernel.
 
-    Everything else in this file hands the kernel tensors this file built in
-    the kernel's own layout, which cannot catch a conversion that is wrong on
-    both sides of itself. Here the weights start in vLLM's storage layout --
-    w13 [E, 2*inter, hidden], w2 [E, hidden, inter], block scales
-    [E, N // 128, K // 128] -- go through the real
-    `relayout_weights_for_rs`, and come back out into the kernel and into the
-    reference. Nothing in between reshapes, so what fails here is what a
-    served forward fails with on its first batch.
+    Every other arm hands the kernel tensors this file built in the kernel's
+    own layout, which cannot catch a binding that is wrong on both sides of
+    itself. Here the weights are per-channel fp8 in the layout j-3c919167
+    logged, they go through the real `bind_weights_for_rs` as a torch layer,
+    and what comes off the RS attributes is what the kernel and the reference
+    both get.
+
+    Per-channel is the arm that matters: `_recover_quant_block_size(size_k, 1)`
+    short-circuits to `size_k`, so this is the one quant block over all of K
+    that production takes, exercised rather than reasoned about.
 
     The round trip to torch and back is affordable only at the small shape:
-    128 experts of [512, 512] is 34 MB, where the served layer would be
-    3.2 GB.
+    128 experts of [512, 512] is 34 MB where the served layer would be 3.2 GB.
     """
     import torch
 
     from vllm_torchtpu.layers.adapter.fused_moe_rs import (
         RS_W1_ATTR, RS_W1_SCALE_ATTR, RS_W2_ATTR, RS_W2_SCALE_ATTR,
-        relayout_weights_for_rs)
+        _weights_unsupported_reason, bind_weights_for_rs)
 
     def to_torch_fp8(a):
         """jax fp8 -> torch fp8, through the uint8 neither library refuses."""
@@ -587,32 +650,34 @@ def test_the_kernel_accepts_what_the_adapter_hands_it():
     mesh = _mesh()
     hidden, inter, tokens = SMALL["hidden"], SMALL["inter"], SMALL["tokens"]
 
-    # vLLM's storage layout. `_quantize_blockwise` blocks both axes uniformly,
-    # so applied to a [2*inter, hidden] matrix it produces exactly the
-    # [N // 128, K // 128] scale vLLM stores.
     k1, k2 = jax.random.split(jax.random.key(3))
-    q13, s13 = jax.vmap(_quantize_blockwise)(
-        jax.random.normal(k1, (E_TOTAL, 2 * inter, hidden), jnp.float32) / 10)
-    q2, s2 = jax.vmap(_quantize_blockwise)(
-        jax.random.normal(k2, (E_TOTAL, hidden, inter), jnp.float32) / 10)
-    assert s13.shape == (E_TOTAL, (2 * inter) // BLOCK, hidden // BLOCK)
-    assert s2.shape == (E_TOTAL, hidden // BLOCK, inter // BLOCK)
+    q13, s13 = jax.vmap(lambda a: _quantize(a, "per_channel"))(
+        jax.random.normal(k1, (E_TOTAL, hidden, 2 * inter), jnp.float32) / 10)
+    q2, s2 = jax.vmap(lambda a: _quantize(a, "per_channel"))(
+        jax.random.normal(k2, (E_TOTAL, inter, hidden), jnp.float32) / 10)
+    s13, s2 = s13[:, :, None, :], s2[:, :, None, :]
+    assert s13.shape == (E_TOTAL, 1, 1, 2 * inter)
+    assert s2.shape == (E_TOTAL, 1, 1, hidden)
 
     class _Layer:
         pass
+
+    def _np_param(a):
+        return torch.nn.Parameter(torch.from_numpy(
+            np.asarray(jax.device_get(a)).copy()),
+                                  requires_grad=False)
 
     layer = _Layer()
     layer.w13_weight = torch.nn.Parameter(to_torch_fp8(q13),
                                           requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(to_torch_fp8(q2), requires_grad=False)
-    layer.w13_weight_scale_inv = torch.nn.Parameter(torch.from_numpy(
-        np.asarray(jax.device_get(s13)).copy()),
-                                                    requires_grad=False)
-    layer.w2_weight_scale_inv = torch.nn.Parameter(torch.from_numpy(
-        np.asarray(jax.device_get(s2)).copy()),
-                                                   requires_grad=False)
+    layer.w13_weight_scale_inv = _np_param(s13)
+    layer.w2_weight_scale_inv = _np_param(s2)
 
-    relayout_weights_for_rs(layer)
+    reason = _weights_unsupported_reason(layer)
+    assert reason is None, f"the contract check refuses this layout: {reason}"
+    bind_weights_for_rs(layer)
+
     w1 = to_jax_fp8(getattr(layer, RS_W1_ATTR))
     w2 = to_jax_fp8(getattr(layer, RS_W2_ATTR))
     w1_scale = jnp.asarray(getattr(layer, RS_W1_SCALE_ATTR).numpy())
@@ -623,29 +688,14 @@ def test_the_kernel_accepts_what_the_adapter_hands_it():
     x, tw, ti, tw32 = _make_inputs(mesh, 1, tokens=tokens, hidden=hidden)
     out = jax.block_until_ready(
         _run(mesh, x, w1, w2, w1_scale, w2_scale, tw, ti))
-    want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, tw32, ti)
-    error = _relative_l2(out, want)
-    worst = _worst_token_relative_l2(out, want)
-    rotated = _dense_reference(mesh, x, jnp.roll(w1, 1, axis=0),
-                               jnp.roll(w2, 1, axis=0),
-                               jnp.roll(w1_scale, 1, axis=0),
-                               jnp.roll(w2_scale, 1, axis=0), tw32, ti)
-    control = _relative_l2(out, rotated)
-    print(f"RS_MOE_ADAPTER relative_l2={error:.5f} worst_token={worst:.5f} "
-          f"rotated_control={control:.5f} "
-          f"control_ratio={control / max(error, 1e-12):.1f}x")
-    assert control > ROTATED_CONTROL_FACTOR * error, (
-        f"a reference over rotated experts sits {control:.4f} away against "
-        f"the real reference's {error:.4f}; the band does not discriminate")
-    assert error < FP8_RELATIVE_BOUND, (
-        f"relative L2 {error:.4f} past the {FP8_RELATIVE_BOUND} band")
-    assert worst < FP8_TOKEN_BOUND, (
-        f"worst token's relative error {worst:.4f} past the "
-        f"{FP8_TOKEN_BOUND} per-token band")
+    _check_against_reference(mesh, "RS_MOE_ADAPTER", x, w1, w2, w1_scale,
+                             w2_scale, tw32, ti, out, FP8_RELATIVE_BOUND,
+                             FP8_TOKEN_BOUND)
 
 
+@pytest.mark.parametrize("scheme", SCHEMES)
 @pytest.mark.parametrize("tokens", [HALF_TOKENS, SERVED_TOKENS])
-def test_the_served_shape_compiles_and_runs(tokens):
+def test_the_served_shape_compiles_and_runs(tokens, scheme):
     """GLM-5.2's MoE block at the served ``size_m``: does Mosaic take it.
 
     No reference and no band. The question is the one that killed
@@ -658,12 +708,19 @@ def test_the_served_shape_compiles_and_runs(tokens):
     so ``size_m`` is 131072, which is also the only one of the two that crosses
     the kernel's ``pack_indices`` threshold at 120k. ``tokens=8192`` is what an
     EP8 node would present at the same per-engine cap.
+
+    Parametrized over the scale scheme because the scheme changes the tiling,
+    not just the values: `_select_fused_rs_block_sizes` takes
+    `quant_block_size` and the scale VMEM buffers are sized
+    ``ceil(tile_k / quant_block_size)`` deep. **per_channel is production**;
+    an earlier version of this file ran block128 alone.
     """
     mesh = _mesh()
     size_m = tokens * TOPK
     w1, w2, w1_scale, w2_scale = _make_cheap_weights(mesh,
                                                      hidden=HIDDEN,
-                                                     inter=INTER)
+                                                     inter=INTER,
+                                                     scheme=scheme)
 
     @jax.jit
     def build_inputs():
@@ -679,12 +736,13 @@ def test_the_served_shape_compiles_and_runs(tokens):
                 lax.with_sharding_constraint(idx.astype(jnp.int32), rep))
 
     x, tw, ti = build_inputs()
-    print(f"RS_MOE_SERVED tokens={tokens} size_m={size_m} ep={EP} "
-          f"e_total={E_TOTAL} e_local={E_LOCAL} hidden={HIDDEN} "
-          f"inter={INTER} topk={TOPK} block={BLOCK}")
+    print(f"RS_MOE_SERVED scheme={scheme} tokens={tokens} size_m={size_m} "
+          f"ep={EP} e_total={E_TOTAL} e_local={E_LOCAL} hidden={HIDDEN} "
+          f"inter={INTER} topk={TOPK} w1_scale={w1_scale.shape}")
     out = jax.block_until_ready(
         _run(mesh, x, w1, w2, w1_scale, w2_scale, tw, ti))
     assert out.shape == (tokens, HIDDEN)
     assert out.dtype == jnp.bfloat16
     finite = bool(np.isfinite(np.asarray(out, np.float32)).all())
-    print(f"RS_MOE_SERVED tokens={tokens} ran; all_finite={finite}")
+    print(f"RS_MOE_SERVED scheme={scheme} tokens={tokens} ran; "
+          f"all_finite={finite}")
