@@ -23,12 +23,24 @@ tokens in, this rank's tokens out, no caller-side all-gather or reduce-scatter.
 Sharing that contract is deliberate -- it lets both reuse every upstream
 collective-ownership patch in `vllm_torchtpu/__init__.py` unchanged.
 
-**Why this exists next to `fused_moe_ep` rather than inside it.** The v2 kernel
-takes one fp8 scale per output channel; `_squeeze_channel_scale` is the
-conversion, and it refuses anything with more than one block along K. This
-kernel's GMM reads BLOCK-scaled weights natively, recovering the block size
-from the scale's own shape. GLM-5.2-FP8 is block-scaled [128, 128], so it is a
-model the v2 path structurally cannot serve and this one can.
+**Why this exists next to `fused_moe_ep` rather than inside it.** The two
+kernels are different programs with different tilings; this one fuses the
+reduce-scatter into its epilogue. It is a performance alternative, not a
+capability one.
+
+It is worth being explicit that the original justification for this path was
+**wrong**, because it is the kind of claim that gets repeated. The reasoning
+was: GLM-5.2-FP8's checkpoint is block-scaled [128, 128], the v2 kernel wants
+one scale per output channel, therefore v2 structurally cannot serve GLM-5.2
+and this kernel can. The premise does not survive contact with the loader.
+`_process_fp8_moe_weights` dequantizes the checkpoint and **requantizes** it
+before either adapter sees the layer -- per-channel by default, since
+`MOE_REQUANTIZE_BLOCK_SIZE` is unset -- so what arrives here is per-channel fp8
+in K-major layout, which is exactly what v2 accepts too. Measured on
+job j-3c919167, the server logs
+``w13_scale=[16, 1, 1, 4096] ... requant_block_size=per-channel``.
+Whether this kernel beats v2 or the grouped-matmul path on GLM-5.2 is a
+question for a benchmark, not for a weight layout.
 
 **Routing is not fused here, and that is the point.** The kernel will select
 its own top-k from a gating matrix, but its selector is a plain scoring
@@ -42,18 +54,16 @@ hands the result in through `fused_moe_func_rs`'s `topk_weights` /
 construction rather than by test. Fusing the router is a later, separately
 measurable change.
 
-**Weight layout.** The kernel's GMM is K-major: `w1` is [E, hidden, 2*inter]
-and `w2` is [E, inter, hidden], where vLLM stores [E, 2*inter, hidden] and
-[E, hidden, inter]. `relayout_weights_for_rs` converts both in place, once at
-weight load. Doing it per forward would be a 45 GB relayout per step on
-GLM-5.2.
+**Weight layout: there is nothing to do.** The kernel's GMM is K-major -- `w1`
+is [E, hidden, 2*inter], `w2` is [E, inter, hidden] -- and its scale DMA
+indexes four dimensions, [E, K_blocks, 1, N], with N in *elements*.
+`_process_fp8_moe_weights` has already produced precisely that by the time
+`prebuild_fused_moe_rs` runs, so `bind_weights_for_rs` only points the RS
+attributes at the existing tensors. No transpose, no copy, no second buffer.
 
-The scales do **not** simply transpose with them. The kernel's scale DMA takes
-four indices with N in elements, so each [128, 128] block's scale has to be
-repeated across the 128 columns it covers -- `_block_scale_to_kmajor`. A plain
-transpose produces a three-dimensional scale whose last axis is N in blocks,
-and the Pallas ref rejects it on the first batch with `indices must not be
-longer than shape`.
+This module previously transposed and repeated here, on the assumption that it
+was handed vLLM's on-disk [E, N, K] storage layout. It is not, and the
+conversion was corrupting weights that were already correct.
 """
 
 from typing import Any
@@ -81,7 +91,8 @@ FUSED_MOE_RS_OP_NAME = "pallas::fused_moe_rs"
 # `FUSED_MOE_EP_OP_ATTR` serves for the v2 path.
 FUSED_MOE_RS_OP_ATTR = "_fused_moe_rs_op"
 
-# Where `relayout_weights_for_rs` parks the K-major copies.
+# Where `bind_weights_for_rs` points at the layer's already-K-major tensors.
+# These are aliases, not copies.
 RS_W1_ATTR = "_rs_w13_weight"
 RS_W2_ATTR = "_rs_w2_weight"
 RS_W1_SCALE_ATTR = "_rs_w13_weight_scale"
@@ -169,105 +180,73 @@ def _build_op(mesh, topk: int, activation: str):
     return op
 
 
-def _transpose_last_two(t: torch.Tensor) -> torch.Tensor:
-    """A contiguous [.., A, B] -> [.., B, A] copy.
+def bind_weights_for_rs(layer) -> None:
+    """Point the RS attributes at this layer's weights. No copy, no transpose.
 
-    `.contiguous()` is not optional: the bridge hands the tensor's buffer to
-    JAX, so a transposed view would be read back in the original order and
-    every expert would compute against the wrong weight block.
+    `process_weights_after_loading` has already run `_process_fp8_moe_weights`
+    by the time this is called, and that does the whole conversion: it
+    dequantizes the checkpoint, **requantizes** (per-channel by default --
+    `MOE_REQUANTIZE_BLOCK_SIZE` is unset), and transposes into exactly the
+    K-major layout the kernel's GMM wants. On GLM-5.2 it logs
+
+        FP8 weights transposed for GMM kernel: w13=[16, 6144, 4096],
+        w2=[16, 2048, 6144], w13_scale=[16, 1, 1, 4096],
+        w2_scale=[16, 1, 1, 6144], requant_block_size=per-channel
+
+    which is [E, hidden, 2*inter] / [E, inter, hidden] for the weights and
+    [E, K_blocks, 1, N] for the scales -- the four-dimensional rank the
+    kernel's scale DMA indexes, with K_blocks 1. So there is nothing to
+    convert, and the previous transpose-and-repeat here was undoing work that
+    had already been done correctly.
+
+    Per-channel is the K_blocks == 1 case of the same contract, not a special
+    one: `_recover_quant_block_size(size_k, 1)` short-circuits to `size_k`, so
+    the kernel reads one quant block spanning all of K with a scale per N
+    column, which is what per-channel means.
     """
-    return t.transpose(-2, -1).contiguous()
-
-
-def _block_scale_to_kmajor(scale: torch.Tensor, size_n: int) -> torch.Tensor:
-    """[E, N_blocks, K_blocks] -> [E, K_blocks, 1, size_n], one scale per column.
-
-    The kernel's scale DMA is
-    ``w1_scale_ref.at[e, pl.ds(k_id * nqb1, nqb1), :, pl.ds(n_off, tile_n)]``
-    (`gmm_fused_rs_nodedup.py`), and its unquantized placeholder is
-    `jnp.zeros((1, 1, 1, 1))`. That is four indices: K in **blocks** on axis 1,
-    a free unit axis 2, and N in **elements** on axis 3. Transposing alone
-    leaves N in blocks and three dims, and the Pallas ref then raises
-    `indices must not be longer than shape` on the first batch -- so a
-    [128, 128]-block checkpoint reaches this kernel only by also repeating each
-    N block across the columns it covers.
-
-    Only N is expanded. K stays blocked, because axis 1 is exactly what
-    `_recover_quant_block_size(size_k, w1_scale.shape[1])` divides to learn the
-    block size; expanding it too would recover a block size of 1.
-
-    The repeat is not free -- on GLM-5.2 it is 1.42 GB per rank against the
-    6 MB the blocked form costs -- but it is what the kernel indexes, and it is
-    ~7% of the KV pool rather than a multiple of it.
-    """
-    s = scale.transpose(-2, -1)  # [E, K_blocks, N_blocks]
-    n_blocks = s.shape[-1]
-    # vLLM allocates ceil(size_n / block) blocks, so the last one can overhang
-    # a size_n that the block size does not divide; trim rather than assume.
-    block_n = -(-size_n // n_blocks)
-    s = s.repeat_interleave(block_n, dim=-1)[..., :size_n]
-    return s.unsqueeze(-2).contiguous()
-
-
-def relayout_weights_for_rs(layer) -> None:
-    """Put this layer's expert weights and block scales in the kernel's layout.
-
-    vLLM stores `w13_weight` as [E, 2*inter, hidden] and `w2_weight` as
-    [E, hidden, inter]; the kernel's GMM wants [E, hidden, 2*inter] and
-    [E, inter, hidden]. The scales come along, but not by a transpose alone --
-    see `_block_scale_to_kmajor`.
-
-    **The originals are replaced, not kept beside the copies.** Holding both
-    layouts would double the MoE weights, which on GLM-5.2 is 45.3 GB per rank
-    against 90.6 GB -- the model stops fitting, at a memory utilization the
-    nightly already runs at 0.90. Overwriting `.data` releases the [E, N, K]
-    buffer as each layer is converted, so the peak is one layer's overhang
-    (~600 MB) rather than a second copy of the whole checkpoint.
-
-    Dropping them is safe precisely here and nowhere earlier: every refusal in
-    `prebuild_fused_moe_rs` has already returned by the time this is called, so
-    the layer is committed to the kernel and `apply_monolithic` returns through
-    `fused_moe_rs` before it can reach the grouped-matmul path that reads the
-    vLLM layout. A layer this path *refuses* never gets here and keeps its
-    weights untouched.
-    """
-    # Read N off the vLLM layout before the transpose moves it.
-    size_n1 = layer.w13_weight.shape[-2]  # 2 * inter
-    size_n2 = layer.w2_weight.shape[-2]  # hidden
-    w1_scale = _block_scale_to_kmajor(layer.w13_weight_scale_inv.data, size_n1)
-    w2_scale = _block_scale_to_kmajor(layer.w2_weight_scale_inv.data, size_n2)
-
-    layer.w13_weight.data = _transpose_last_two(layer.w13_weight.data)
-    layer.w2_weight.data = _transpose_last_two(layer.w2_weight.data)
     setattr(layer, RS_W1_ATTR, layer.w13_weight.data)
     setattr(layer, RS_W2_ATTR, layer.w2_weight.data)
-    setattr(layer, RS_W1_SCALE_ATTR, w1_scale)
-    setattr(layer, RS_W2_SCALE_ATTR, w2_scale)
+    setattr(layer, RS_W1_SCALE_ATTR, layer.w13_weight_scale_inv.data)
+    setattr(layer, RS_W2_SCALE_ATTR, layer.w2_weight_scale_inv.data)
 
 
-def _relayout_unsupported_reason(layer) -> str | None:
-    """Why this layer's weights cannot be relaid out for the kernel, or None."""
+def _weights_unsupported_reason(layer) -> str | None:
+    """Why this layer's weights do not match the kernel's contract, or None.
+
+    Checked against what `_process_fp8_moe_weights` produces, not against
+    vLLM's on-disk storage layout -- nothing reaches this function without
+    going through that conversion first.
+    """
     for name in ("w13_weight", "w2_weight", "w13_weight_scale_inv",
                  "w2_weight_scale_inv"):
         if getattr(layer, name, None) is None:
-            return f"the layer has no {name}; this path is fp8-block-scaled only"
-    w1 = layer.w13_weight
-    scale = layer.w13_weight_scale_inv
-    if w1.ndim != 3 or scale.ndim != 3:
-        return (f"w13_weight {tuple(w1.shape)} / scale {tuple(scale.shape)} "
-                "are not the [E, N, K] and [E, N_blocks, K_blocks] this path "
-                "transposes")
-    # The kernel recovers its block size by dividing, so a K that the scale's
-    # block count does not evenly cover rounds to a power of two that is not
-    # the checkpoint's block size, and every scale lands on the wrong columns.
-    size_k, k_blocks = w1.shape[-1], scale.shape[-1]
-    if k_blocks == 0 or size_k % k_blocks != 0:
-        return (f"w13 K={size_k} is not divisible by its {k_blocks} scale "
-                "blocks, so the kernel cannot recover the block size")
-    recovered = 1 << ((-(-size_k // k_blocks) - 1).bit_length())
-    if recovered != size_k // k_blocks:
-        return (f"w13 block size {size_k // k_blocks} is not a power of two; "
-                f"the kernel would recover {recovered}")
+            return f"the layer has no {name}; this path is fp8 only"
+
+    for name, w, s in (("w13", layer.w13_weight, layer.w13_weight_scale_inv),
+                       ("w2", layer.w2_weight, layer.w2_weight_scale_inv)):
+        if w.ndim != 3:
+            return f"{name}_weight {tuple(w.shape)} is not [E, K, N]"
+        # Four dims with a unit axis 2 is what the kernel's scale DMA
+        # indexes; three would raise `indices must not be longer than shape`
+        # from inside Pallas on the first batch, which is a much worse place
+        # to find out.
+        if s.ndim != 4 or s.shape[2] != 1:
+            return (f"{name} scale {tuple(s.shape)} is not the "
+                    "[E, K_blocks, 1, N] this kernel's scale DMA indexes")
+        size_k, size_n = w.shape[1], w.shape[2]
+        if s.shape[0] != w.shape[0]:
+            return (f"{name} scale has {s.shape[0]} experts against the "
+                    f"weight's {w.shape[0]}")
+        # The last axis is N in ELEMENTS, not in blocks -- one scale per
+        # output column. A scale still expressed in N blocks has the right
+        # rank and the wrong extent, and lands every scale on wrong columns.
+        if s.shape[3] != size_n:
+            return (f"{name} scale last axis is {s.shape[3]}, not N={size_n}; "
+                    "the kernel indexes it in N elements, not N blocks")
+        k_blocks = s.shape[1]
+        if k_blocks == 0 or size_k % k_blocks != 0:
+            return (f"{name} K={size_k} is not divisible by its {k_blocks} "
+                    "scale blocks, so the kernel cannot recover the block size")
     return None
 
 
@@ -334,7 +313,7 @@ def prebuild_fused_moe_rs(layer, topk: int, activation: str) -> Any | None:
             local_experts)
         return None
 
-    reason = _relayout_unsupported_reason(layer)
+    reason = _weights_unsupported_reason(layer)
     if reason is not None:
         logger.warning_once("Fused RS MoE not engaged: %s", reason)
         return None
@@ -353,10 +332,10 @@ def prebuild_fused_moe_rs(layer, topk: int, activation: str) -> Any | None:
             _FUSED_RS_MAX_SAFE_SIZE_M)
         return None
 
-    # Read before the relayout: it transposes `w13_weight` in place, after
-    # which `shape[-1]` is 2*inter rather than hidden.
-    hidden = layer.w13_weight.shape[-1]
-    relayout_weights_for_rs(layer)
+    # `w13_weight` is [E, hidden, 2*inter] by this point -- see
+    # `bind_weights_for_rs` for who put it in that layout.
+    hidden = layer.w13_weight.shape[1]
+    bind_weights_for_rs(layer)
     op = _build_op(mesh, topk, activation)
     logger.info_once(
         "Fused RS MoE armed | hidden=%d local_experts=%d ep=%d topk=%d "
