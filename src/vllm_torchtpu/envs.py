@@ -70,6 +70,10 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_FP8_DISPATCH: int = 0
+    TPU_MOE_FP8_COMBINE: int = 0
+    TPU_MOE_OVERLAP_SHARED_EXPERTS: int = 1
+    TPU_MOE_OVERLAP_MAX_TOKENS: int = 128
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -768,6 +772,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # coordination port plus one.
     "TORCH_TPU_MP_RENDEZVOUS_PORT":
     env_optional_int("TORCH_TPU_MP_RENDEZVOUS_PORT"),
+    # Pre-dispatch FP8 activation + scale + routing packing into single 128B-aligned AllGather (0=off, 1=block512, 2=pertoken).
+    "TPU_MOE_FP8_DISPATCH":
+    env_int("TPU_MOE_FP8_DISPATCH", 0),
+    # Combine FP8 activation + scale packing into single 128B-aligned AllToAll + local VPU sum (0=off, 1=block512, 2=pertoken).
+    "TPU_MOE_FP8_COMBINE":
+    env_int("TPU_MOE_FP8_COMBINE", 0),
+    # Overlap shared experts compute (TensorCore MXU) with MoE Combine ReduceScatter collective (SparseCore) inside maybe_combine subgraph (0=off, 1=barrier-free full shared in maybe_combine, 2=split gate_up/down, 3=gate_up before/down in combine).
+    "TPU_MOE_OVERLAP_SHARED_EXPERTS":
+    env_int("TPU_MOE_OVERLAP_SHARED_EXPERTS", 1),
+    # Maximum local token count per step at which MoE shared experts overlap is enabled when dynamic threshold is used.
+    "TPU_MOE_OVERLAP_MAX_TOKENS":
+    env_int("TPU_MOE_OVERLAP_MAX_TOKENS", 128),
 }
 
 

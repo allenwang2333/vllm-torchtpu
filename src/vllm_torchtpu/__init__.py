@@ -117,6 +117,7 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         return [
             *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
+            f"moe_ici_{envs.TPU_MOE_FP8_DISPATCH}_{envs.TPU_MOE_FP8_COMBINE}_{envs.TPU_MOE_OVERLAP_SHARED_EXPERTS}_{envs.TPU_MOE_OVERLAP_MAX_TOKENS}",
             *filter(None, [shape_variants.aot_cache_tag()]),
         ]
 
@@ -303,8 +304,24 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
     runner_cls = _moe_runner.MoERunner
     if not getattr(runner_cls, "_tpu_fused_ep_pcp_collectives_patch", False):
+        import torch
         upstream_dispatch = runner_cls._maybe_dispatch
         upstream_combine = runner_cls._maybe_combine
+        upstream_apply_quant = runner_cls._apply_quant_method
+
+        try:
+            if hasattr(torch.ops, "tpu") and hasattr(torch.ops.tpu, "optimization_barrier"):
+                torch.library.register_fake("tpu::optimization_barrier")(
+                    lambda tensors: [torch.empty_like(t) for t in tensors]
+                )
+        except Exception:
+            pass
+
+        def _tpu_opt_barrier(a: torch.Tensor, b: torch.Tensor):
+            if hasattr(torch.ops, "tpu") and hasattr(torch.ops.tpu, "optimization_barrier"):
+                res = torch.ops.tpu.optimization_barrier([a, b])
+                return res[0], res[1]
+            return a, b
 
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
@@ -319,7 +336,87 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                 # upstream's generic DP/EP dispatch is a no-op.  The only work
                 # being bypassed here is its explicit PCP all-gather pair.
                 return hidden_states, router_logits
+            if (self.do_naive_dispatch_combine
+                    and self.routed_experts.quant_method.is_monolithic
+                    and not self.moe_config.is_sequence_parallel
+                    and self.moe_config.pcp_size <= 1
+                    and not isinstance(router_logits, tuple)):
+                from vllm_torchtpu.layers.adapter import moe_routing
+                overlap_mode = envs.TPU_MOE_OVERLAP_SHARED_EXPERTS
+                if (overlap_mode == 3
+                        and self._shared_experts is not None
+                        and hasattr(self._shared_experts._layer, "gate_up_proj")
+                        and hasattr(self._shared_experts._layer, "down_proj")):
+                    from vllm.distributed import get_dp_group
+                    dp = get_dp_group()
+                    layer = self._shared_experts._layer
+                    hidden_states, router_logits = _tpu_opt_barrier(
+                        hidden_states, router_logits)
+                    ag_hs = dp.all_gather(hidden_states, dim=0)
+                    topk_weights, topk_ids = moe_routing.route(
+                        self.routed_experts,
+                        hidden_states,
+                        router_logits,
+                    )
+                    gate_up, _ = layer.gate_up_proj(hidden_states)
+                    deferred_act = layer.act_fn(gate_up)
+                    ag_hs, deferred_act = _tpu_opt_barrier(ag_hs, deferred_act)
+                    self._tpu_deferred_shared_act = deferred_act
+                    if envs.TPU_MOE_FP8_DISPATCH in (3, 4):
+                        meta_local = torch.cat(
+                            [
+                                topk_weights.to(torch.float32),
+                                topk_ids.to(torch.float32),
+                            ],
+                            dim=-1,
+                        )
+                        if envs.TPU_MOE_FP8_DISPATCH == 4:
+                            meta_local = torch.nn.functional.pad(
+                                meta_local, (0, 112))
+                        ag_meta = dp.all_gather(meta_local, dim=0)
+                        ag_tw = ag_meta[:, :8].to(hidden_states.dtype)
+                        ag_ti = ag_meta[:, 8:16].to(torch.int32)
+                    else:
+                        ag_tw = dp.all_gather(topk_weights, dim=0)
+                        ag_ti = dp.all_gather(topk_ids, dim=0)
+                    return ag_hs, (ag_tw, ag_ti)
+                router_logits = moe_routing.route(
+                    self.routed_experts,
+                    hidden_states,
+                    router_logits,
+                )
             return upstream_dispatch(self, hidden_states, router_logits)
+
+        def apply_quant_method(self,
+                               hidden_states,
+                               router_logits,
+                               shared_experts_input,
+                               input_ids=None):
+            overlap_mode = envs.TPU_MOE_OVERLAP_SHARED_EXPERTS
+            if (overlap_mode in (1, 2, 3, 4)
+                    and self._shared_experts is not None
+                    and shared_experts_input is not None
+                    and self.routed_experts.quant_method.is_monolithic):
+                layer = self._shared_experts._layer
+                if overlap_mode == 3 and getattr(self, "_tpu_deferred_shared_act", None) is not None:
+                    deferred_tensor = self._tpu_deferred_shared_act
+                    self._tpu_deferred_shared_act = None
+                elif overlap_mode in (2, 3) and hasattr(layer, "gate_up_proj") and hasattr(layer, "down_proj"):
+                    gate_up, _ = layer.gate_up_proj(shared_experts_input)
+                    deferred_tensor = layer.act_fn(gate_up)
+                else:
+                    deferred_tensor = shared_experts_input
+                fused_out = self.routed_experts.forward_monolithic(
+                    x=hidden_states,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                )
+                return deferred_tensor, fused_out
+            return upstream_apply_quant(self,
+                                        hidden_states=hidden_states,
+                                        router_logits=router_logits,
+                                        shared_experts_input=shared_experts_input,
+                                        input_ids=input_ids)
 
         def maybe_combine(self, shared_output, hidden_states):
             if fused_ep_owns_pcp_collectives(self):
@@ -329,9 +426,33 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                 if self.shared_experts is not None:
                     return shared_output, hidden_states
                 return hidden_states
+
+            overlap_mode = envs.TPU_MOE_OVERLAP_SHARED_EXPERTS
+            if (overlap_mode in (1, 2, 3, 4)
+                    and self._shared_experts is not None
+                    and shared_output is not None
+                    and self.routed_experts.quant_method.is_monolithic):
+                layer = self._shared_experts._layer
+                if overlap_mode in (3, 4):
+                    hidden_states, deferred_tensor = _tpu_opt_barrier(
+                        hidden_states, shared_output)
+                else:
+                    deferred_tensor = shared_output
+                _, combined_routed = upstream_combine(
+                    self, deferred_tensor, hidden_states)
+                if overlap_mode in (2, 3) and hasattr(layer, "down_proj"):
+                    real_shared_out, _ = layer.down_proj(deferred_tensor)
+                else:
+                    real_shared_out = layer(deferred_tensor)
+                if overlap_mode in (3, 4):
+                    real_shared_out, combined_routed = _tpu_opt_barrier(
+                        real_shared_out, combined_routed)
+                return real_shared_out, combined_routed
+
             return upstream_combine(self, shared_output, hidden_states)
 
         runner_cls._maybe_dispatch = maybe_dispatch
+        runner_cls._apply_quant_method = apply_quant_method
         runner_cls._maybe_combine = maybe_combine
         runner_cls._tpu_fused_ep_pcp_collectives_patch = True
 
