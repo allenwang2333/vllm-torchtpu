@@ -186,6 +186,26 @@ if _sc_offload_bytes is not None:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
+# EXPERIMENT (annyan/rs-tc-offload): take the EP reduce-scatter off the
+# SparseCore and run it on the TensorCore, plus the four collective-scheduling
+# flags requested alongside it.
+#
+# Baked into the image rather than exported by the job, because the 2-node
+# recipe has no pod-level env passthrough (it templates nine named keys only)
+# and LIBTPU_INIT_ARGS is not in TpuPlatform.additional_env_vars -- so an
+# export inside VLLM_SERVER_CMD reaches the head node's shell and is a silent
+# no-op on the Ray workers. env_override runs at import on every host, which
+# is the same route the AR/AG threshold flags above already take.
+for _rs_flag in (
+        "--xla_tpu_use_minor_sharding_for_major_trivial_input=true",
+        "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
+        "--xla_tpu_ars_combiner_threshold_in_bytes=0",
+        "--xla_tpu_enable_async_collective_merger=false",
+        "--xla_tpu_check_legacy_constraints_in_reduce_scatter_legalizer=false",
+):
+    if not _user_has_flag(_rs_flag.split("=", 1)[0]):
+        _libtpu_extra_args.append(_rs_flag)
+
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:
