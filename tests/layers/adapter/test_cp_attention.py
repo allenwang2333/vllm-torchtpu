@@ -18,17 +18,33 @@ kernel builder and collectives are replaced so both adapter entry points and
 the registry can be checked together, including reuse across layers/layouts.
 """
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx.configs import (
     AttentionScope, KVLayout)
 from vllm_torchtpu.layers.adapter import attention, cp_attention
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
+
+
+@contextlib.contextmanager
+def _kv_cache_layout(layout):
+    """Resolve the current vLLM config's KV cache layout to `layout`.
+
+    Must wrap impl construction, not just the forward: the impl reads the
+    layout once, in __init__.
+    """
+    config = VllmConfig()
+    record_kv_cache_layout(config.cache_config, layout.name)
+    with set_current_vllm_config(config):
+        yield
 
 
 def _impl(cls=attention.PallasBatchedRPAAttentionBackendImpl, head_size=256):
@@ -77,12 +93,15 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
                         lambda *a, **k: None)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
     implementations = []
-    # The third layer must reuse NHD's ops after HND has populated the registry.
-    for layout in ("NHD", "HND", "NHD"):
-        set_kv_cache_layout(layout)
-        impl = _impl()
-        with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
-            impl.initialize_kernel(layer)
+    # The third layer must reuse LBNHC's ops after LBHNC has populated the
+    # registry.
+    for layout in (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC,
+                   KVCacheLayout.LBNHC):
+        with _kv_cache_layout(layout):
+            impl = _impl()
+            with set_vllm_model_wrapper_context(mesh=None,
+                                                vllm_config=_config()):
+                impl.initialize_kernel(layer)
         implementations.append(impl)
 
     assert len(
@@ -111,12 +130,15 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
             implementations,
         (KVLayout.HEAD_ALONG_SUBLANE, KVLayout.SEQ_ALONG_LANE,
          KVLayout.HEAD_ALONG_SUBLANE)):
-        # The per-layer layout must survive even if the global setting changes.
-        set_kv_cache_layout("HND")
-        forward = impl._run_dcp_forward
-        if compiled:
-            forward = torch.compile(forward, backend="eager", fullgraph=True)
-        output = forward(layer, query, key, key, torch.empty(1), metadata)
+        # The per-layer layout must survive a later change to the resolved
+        # layout on the current config.
+        with _kv_cache_layout(KVCacheLayout.LBHNC):
+            forward = impl._run_dcp_forward
+            if compiled:
+                forward = torch.compile(forward,
+                                        backend="eager",
+                                        fullgraph=True)
+            output = forward(layer, query, key, key, torch.empty(1), metadata)
         assert calls[-2:] == [
             (expected_layout, AttentionScope.CACHE_ONLY, (3, 16, 256)),
             (expected_layout, AttentionScope.NEW_TOKENS_ONLY, (3, 8, 256)),
@@ -152,9 +174,10 @@ def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
     (attention.PallasBatchedRPAAttentionBackendImpl, 64),
 ])
 def test_dcp_hnd_rejects_backends_that_allocate_nhd(cls, head_size):
-    set_kv_cache_layout("HND")
-    impl = _impl(cls, head_size)
-    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
-    with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
-        with pytest.raises(NotImplementedError, match="DCP with HND requires"):
-            impl.initialize_kernel(layer)
+    with _kv_cache_layout(KVCacheLayout.LBHNC):
+        impl = _impl(cls, head_size)
+        layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
+        with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
+            with pytest.raises(NotImplementedError,
+                               match="DCP with HND requires"):
+                impl.initialize_kernel(layer)

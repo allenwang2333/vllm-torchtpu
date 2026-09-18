@@ -40,7 +40,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from vllm.v1.attention.backends.utils import set_kv_cache_layout
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.utils import (get_flashinfer_layout_string,
+                                              record_kv_cache_layout)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.kernels.experimental.batched_rpa_longctx import (configs,
                                                                     wrapper)
@@ -233,8 +236,22 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
         for tensor in (output, lse, updated_cache))
 
 
+@pytest.fixture
+def resolved_layout(layout):
+    """Hold a vLLM config resolved to the parametrized `layout`.
+
+    Spans the test so the config is current when the impl is constructed,
+    which is when the impl reads the layout.
+    """
+    config = VllmConfig()
+    record_kv_cache_layout(config.cache_config, layout.name)
+    with set_current_vllm_config(config):
+        yield
+
+
 @pytest.mark.parametrize("entry", ["adapter", "longctx"])
-@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBNHC, KVCacheLayout.LBHNC],
+                         ids=get_flashinfer_layout_string)
 @pytest.mark.parametrize(
     "global_q_heads,global_kv_heads,dcp_size,rank",
     [
@@ -255,13 +272,14 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
                          ids=lambda scope: scope.name)
 def test_dcp_fp8_pass_matches_reference(entry, layout, global_q_heads,
                                         global_kv_heads, dcp_size, rank, scope,
-                                        monkeypatch):
+                                        monkeypatch, resolved_layout):
     assert global_q_heads % _TP_SIZE == 0
     assert global_kv_heads * dcp_size == _TP_SIZE
     own_q_heads = global_q_heads // _TP_SIZE
-    set_kv_cache_layout(layout)
+    # The helpers below speak this repo's NHD/HND spelling.
+    layout_name = get_flashinfer_layout_string(layout)
     args, expected_out, expected_lse, expected_cache = _make_case(
-        layout, rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
+        layout_name, rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
     if entry == "adapter":
         output, lse, cache = _run_adapter(args,
                                           rank,
@@ -271,7 +289,7 @@ def test_dcp_fp8_pass_matches_reference(entry, layout, global_q_heads,
                                           own_q_heads=own_q_heads)
     else:
         output, lse, cache = _run_longctx(args,
-                                          layout,
+                                          layout_name,
                                           rank,
                                           scope,
                                           dcp_size=dcp_size)
