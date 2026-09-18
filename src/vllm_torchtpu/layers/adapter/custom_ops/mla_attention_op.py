@@ -465,7 +465,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             return (
                 torch.empty_like(cache_kv),
                 q_bytes.new_empty((num_tokens, topk), dtype=torch.int32),
-                q_bytes.new_empty((num_tokens, topk), dtype=torch.float32),
+                # Scores come back as i32 bits, not floats.
+                q_bytes.new_empty((num_tokens, topk), dtype=torch.int32),
             )
 
         def _fake_merge(scores, **kwargs):
