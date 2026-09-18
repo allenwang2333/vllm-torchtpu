@@ -552,49 +552,96 @@ def test_small_shape_tracks_a_dense_reference(quantized):
         f"per-token band; the batch norm was {error:.4f}")
 
 
-def test_the_kernel_accepts_the_scale_the_adapter_hands_it():
-    """The rank contract above, taken all the way through the kernel.
+def test_the_kernel_accepts_what_the_adapter_hands_it():
+    """The whole chain: vLLM's stored layout -> the adapter -> the kernel.
 
-    The test before this one pins what `relayout_weights_for_rs` produces:
-    vLLM's [E, N // block, K // block] block scale, transposed, so
-    [E, K // block, N // block] and three dims. This one builds a scale of
-    exactly that rank and those extents -- by subsampling the kernel-layout
-    scale on its N axis, which is value-identical block by block -- and calls
-    the kernel with it at the small shape.
+    Everything else in this file hands the kernel tensors this file built in
+    the kernel's own layout, which cannot catch a conversion that is wrong on
+    both sides of itself. Here the weights start in vLLM's storage layout --
+    w13 [E, 2*inter, hidden], w2 [E, hidden, inter], block scales
+    [E, N // 128, K // 128] -- go through the real
+    `relayout_weights_for_rs`, and come back out into the kernel and into the
+    reference. Nothing in between reshapes, so what fails here is what a
+    served forward fails with on its first batch.
 
-    Together the two are the whole chain: the adapter produces this, and this
-    is what the kernel does with it. Whatever comes out here is what a served
-    forward gets on its first batch, since nothing between the two reshapes.
+    The round trip to torch and back is affordable only at the small shape:
+    128 experts of [512, 512] is 34 MB, where the served layer would be
+    3.2 GB.
     """
+    import torch
+
+    from vllm_torchtpu.layers.adapter.fused_moe_rs import (
+        RS_W1_ATTR, RS_W1_SCALE_ATTR, RS_W2_ATTR, RS_W2_SCALE_ATTR,
+        relayout_weights_for_rs)
+
+    def to_torch_fp8(a):
+        """jax fp8 -> torch fp8, through the uint8 neither library refuses."""
+        u8 = np.asarray(jax.device_get(lax.bitcast_convert_type(a,
+                                                                jnp.uint8)))
+        return torch.from_numpy(u8.copy()).view(torch.float8_e4m3fn)
+
+    def to_jax_fp8(t):
+        u8 = jnp.asarray(t.contiguous().view(torch.uint8).numpy())
+        return lax.bitcast_convert_type(u8, FP8)
+
     mesh = _mesh()
     hidden, inter, tokens = SMALL["hidden"], SMALL["inter"], SMALL["tokens"]
-    w1, w2, w1_scale, w2_scale = _make_weights(mesh,
-                                               0,
-                                               hidden=hidden,
-                                               inter=inter,
-                                               quantized=True)
-    adapter_w1_scale = w1_scale[:, :, 0, ::BLOCK]
-    adapter_w2_scale = w2_scale[:, :, 0, ::BLOCK]
-    assert adapter_w1_scale.shape == (E_TOTAL, hidden // BLOCK,
-                                      (2 * inter) // BLOCK)
-    assert adapter_w2_scale.shape == (E_TOTAL, inter // BLOCK,
-                                      hidden // BLOCK)
+
+    # vLLM's storage layout. `_quantize_blockwise` blocks both axes uniformly,
+    # so applied to a [2*inter, hidden] matrix it produces exactly the
+    # [N // 128, K // 128] scale vLLM stores.
+    k1, k2 = jax.random.split(jax.random.key(3))
+    q13, s13 = jax.vmap(_quantize_blockwise)(
+        jax.random.normal(k1, (E_TOTAL, 2 * inter, hidden), jnp.float32) / 10)
+    q2, s2 = jax.vmap(_quantize_blockwise)(
+        jax.random.normal(k2, (E_TOTAL, hidden, inter), jnp.float32) / 10)
+    assert s13.shape == (E_TOTAL, (2 * inter) // BLOCK, hidden // BLOCK)
+    assert s2.shape == (E_TOTAL, hidden // BLOCK, inter // BLOCK)
+
+    class _Layer:
+        pass
+
+    layer = _Layer()
+    layer.w13_weight = torch.nn.Parameter(to_torch_fp8(q13),
+                                          requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(to_torch_fp8(q2), requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(torch.from_numpy(
+        np.asarray(jax.device_get(s13)).copy()),
+                                                    requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(torch.from_numpy(
+        np.asarray(jax.device_get(s2)).copy()),
+                                                   requires_grad=False)
+
+    relayout_weights_for_rs(layer)
+    w1 = to_jax_fp8(getattr(layer, RS_W1_ATTR))
+    w2 = to_jax_fp8(getattr(layer, RS_W2_ATTR))
+    w1_scale = jnp.asarray(getattr(layer, RS_W1_SCALE_ATTR).numpy())
+    w2_scale = jnp.asarray(getattr(layer, RS_W2_SCALE_ATTR).numpy())
+    print(f"RS_MOE_ADAPTER w1={w1.shape} w1_scale={w1_scale.shape} "
+          f"w2={w2.shape} w2_scale={w2_scale.shape}")
+
     x, tw, ti, tw32 = _make_inputs(mesh, 1, tokens=tokens, hidden=hidden)
-
-    try:
-        out = jax.block_until_ready(
-            _run(mesh, x, w1, w2, adapter_w1_scale, adapter_w2_scale, tw, ti))
-    except Exception as exc:  # noqa: BLE001 - the text is the evidence
-        print(f"RS_MOE_ADAPTER_SCALE raised {type(exc).__name__}: "
-              f"{str(exc)[:600]}")
-        raise
-
+    out = jax.block_until_ready(
+        _run(mesh, x, w1, w2, w1_scale, w2_scale, tw, ti))
     want = _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, tw32, ti)
     error = _relative_l2(out, want)
-    print(f"RS_MOE_ADAPTER_SCALE ran; relative_l2={error:.5f}")
+    worst = _worst_token_relative_l2(out, want)
+    rotated = _dense_reference(mesh, x, jnp.roll(w1, 1, axis=0),
+                               jnp.roll(w2, 1, axis=0),
+                               jnp.roll(w1_scale, 1, axis=0),
+                               jnp.roll(w2_scale, 1, axis=0), tw32, ti)
+    control = _relative_l2(out, rotated)
+    print(f"RS_MOE_ADAPTER relative_l2={error:.5f} worst_token={worst:.5f} "
+          f"rotated_control={control:.5f} "
+          f"control_ratio={control / max(error, 1e-12):.1f}x")
+    assert control > ROTATED_CONTROL_FACTOR * error, (
+        f"a reference over rotated experts sits {control:.4f} away against "
+        f"the real reference's {error:.4f}; the band does not discriminate")
     assert error < FP8_RELATIVE_BOUND, (
-        f"the kernel accepted the adapter's scale layout but computed "
-        f"something {error:.4f} away from the reference")
+        f"relative L2 {error:.4f} past the {FP8_RELATIVE_BOUND} band")
+    assert worst < FP8_TOKEN_BOUND, (
+        f"worst token's relative error {worst:.4f} past the "
+        f"{FP8_TOKEN_BOUND} per-token band")
 
 
 @pytest.mark.parametrize("tokens", [HALF_TOKENS, SERVED_TOKENS])
