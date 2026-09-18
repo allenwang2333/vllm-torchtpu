@@ -186,6 +186,41 @@ if _sc_offload_bytes is not None:
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
 
+# EXPERIMENT (annyan/rs-async-tc): take the EP reduce-scatter off the SparseCore
+# AND keep it asynchronous, which the offload-off arm (j-463fa3a1) failed to do.
+#
+# Measured on that arm: removing SC offload converted the collective from an
+# async-start/async-done pair into a single synchronous `reduce-scatter` op on
+# the TensorCore. The transfer cost the same on either engine (110.632 ms on SC
+# vs 110.506 on TC, 0.1% apart) but overlap went 46.2% -> 0%, costing +12.350
+# ms/core-step of exposed time and regressing prefill 0.60%.
+#
+# The 491 us/call gap between the collective's span and its body is SparseCore
+# QUEUEING, not rank skew: 100% of it precedes the transfer, and the SparseCore
+# is busy for 99.5% of that window -- 92% of it running OTHER reduce-scatters,
+# serialized on the one engine. So the goal is both halves at once: off the
+# SparseCore queue, and still overlappable.
+#
+# async_collective_fusion is what decomposes a synchronous collective into a
+# start/done pair; the _fuse_reduce_scatter sub-flag is set explicitly because
+# the pass appears to be on by default (the kimik config overrides it to false)
+# yet did not fuse this op. latency_hiding_scheduler is almost certainly already
+# on -- the control hides 46.2% of this collective's span, which it could not do
+# otherwise -- and is set as insurance, not as a change.
+#
+# Deliberately NOT carried over from j-463fa3a1: async_collective_merger=false
+# and ars_combiner_threshold_in_bytes=0. Both act on this same pass family and
+# would work against the fusion being enabled here.
+for _rs_flag in (
+        "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
+        "--xla_tpu_enable_async_collective_fusion=true",
+        "--xla_tpu_enable_async_collective_fusion_fuse_reduce_scatter=true",
+        "--xla_tpu_enable_latency_hiding_scheduler=true",
+        "--xla_tpu_check_legacy_constraints_in_reduce_scatter_legalizer=false",
+):
+    if not _user_has_flag(_rs_flag.split("=", 1)[0]):
+        _libtpu_extra_args.append(_rs_flag)
+
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:
