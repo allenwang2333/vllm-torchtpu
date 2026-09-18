@@ -476,7 +476,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     f"TP size {self.tp_size} does not match mesh shape "
                     f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}.")
             derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
-                                         pcp_size)
+                                     pcp_size)
             op_name = ("pallas::gdn_attention_pcp_"
                        f"{self.prefix.replace('.', '_')}")
             wrapped_fn = functools.partial(
@@ -714,7 +714,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 f"TP size {self.tp_size} does not match mesh shape "
                 f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}.")
         derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads,
-                                     pcp_size)
+                                 pcp_size)
 
         vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim
@@ -764,6 +764,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,
+                gqa_interleaved_layout=self.gqa_interleaved_layout,
             )
 
         op_name = ("pallas::gdn_attention_pooled_pcp_fused_"
@@ -842,11 +843,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def _require_pcp_projection_parameters(
             self) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return BF16 or tensor/channel/block-scaled FP8 QKVZ parameters."""
-        if (hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz")
-                or self.gqa_interleaved_layout):
-            raise RuntimeError("GDN pooled PCP prefill requires the Qwen3.5 "
-                               "non-interleaved QKVZ layout.")
+        """Return BF16/FP8 QKVZ parameters in their native checkpoint layout."""
+        if hasattr(self, "in_proj_qkv") or not hasattr(self, "in_proj_qkvz"):
+            raise RuntimeError("GDN pooled PCP prefill requires a combined "
+                               "QKVZ projection.")
 
         projection = self.in_proj_qkvz
         weight = getattr(projection, "weight", None)
@@ -903,9 +903,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkvz_weight, qkvz_weight_scale = (
             self._require_pcp_projection_parameters())
         ba, _ = self.in_proj_ba(hidden_states)
+        if self.gqa_interleaved_layout:
+            # Qwen3Next stores [b_group, a_group] for each Q/K head.
+            ba = ba.reshape(hidden_states.shape[0],
+                            self.num_k_heads // self.tp_size, -1)
         b, a = ba.chunk(2, dim=-1)
-        b = b.contiguous()
-        a = a.contiguous()
+        b = b.reshape(hidden_states.shape[0], -1).contiguous()
+        a = a.reshape(hidden_states.shape[0], -1).contiguous()
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
