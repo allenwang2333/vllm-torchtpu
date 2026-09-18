@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
-    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 8192
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 4096
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -616,6 +616,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
+    # EXPERIMENT (annyan/rs-tc-offload): default 8192 -> 4096, which takes
+    # num_chunks from 2 to 4 at the 2x2x2/262144-1024/c16 cell
+    # (ceil(1024*16/4096) = 4, and 1024 % 4 == 0 so the divisibility check
+    # passes). Arm B of the reduce-scatter flag pair; arm A is the parent
+    # commit at 8192.
     # EXPERIMENT (annyan/sparsecore_layout_moe_chunk): default flipped 0 ->
     # 8192, stacked on the sparsecore MLA layout change. Changed here rather
     # than exported through VLLM_SERVER_CMD for the same reason as that one:
@@ -628,7 +633,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather / reduce-scatter pair is suppressed and the chunked path
     # stages those collectives itself.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
-    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "8192"),
+    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "4096"),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
