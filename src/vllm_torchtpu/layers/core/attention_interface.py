@@ -661,18 +661,25 @@ def mla_attention(
             x in str(cache.dtype).lower()
             for x in ("fp8", "e4m3")) else "bfloat16"
 
+        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
+        max_num_seqs = seq_lens.shape[0]
+        pages_per_seq = block_tables.shape[0] // max_num_seqs
+
         decode_key = TuningKey(
             case="batched_decode",
             max_num_tokens=max_num_tokens,
-            actual_num_q_heads=num_attention_heads,
-            actual_lkv_dim=qk_nope_head_dim,
+            actual_num_q_heads=q.shape[1],
+            actual_lkv_dim=q.shape[-1],
             actual_r_dim=actual_r_dim,
+            q_dtype=jnp.dtype(q.dtype).name,
             kv_dtype=kv_dtype_str,
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=kv_packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=pages_per_seq,
         )
         decode_tuned = get_tuned_params(decode_key)
 
-        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
-        max_num_seqs = seq_lens.shape[0]
         mixed_key = TuningKey(
             case="mixed",
             max_num_tokens=max_num_tokens,
@@ -684,7 +691,7 @@ def mla_attention(
             page_size_per_kv_packing=page_size_per_kv_packing,
             kv_packing=kv_packing,
             max_num_seqs=max_num_seqs,
-            pages_per_seq=block_tables.shape[0] // max_num_seqs,
+            pages_per_seq=pages_per_seq,
         )
         mixed_tuned = get_tuned_params(mixed_key)
 
@@ -701,9 +708,6 @@ def mla_attention(
             envs.MIXED_NUM_QUERIES_PER_BLOCK
             or mixed_tuned.num_queries_per_block,
         )
-
-        # tpu-inference MLA kernel expects ql_nope directly in head-major (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
-        q = q.transpose((1, 0, 2))
 
         out, new_cache = mla_ragged_paged_attention(
             q,
@@ -724,10 +728,8 @@ def mla_attention(
             mixed_q_split=envs.MIXED_Q_SPLIT or mixed_tuned.q_split,
             q_scale=q_scale,
             k_scale=k_scale,
-            v_scale=v_scale)
-
-        # tpu-inference kernel returns out in head-major (N, T, D) layout: [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
-        out = out.transpose((1, 0, 2))
+            v_scale=v_scale,
+            ql_nope_is_token_major=True)
 
         return out, new_cache
 

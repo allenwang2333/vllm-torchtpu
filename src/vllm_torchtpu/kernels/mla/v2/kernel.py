@@ -158,6 +158,7 @@ def static_validate_inputs(
     decode_batch_size: int = 1,
     mixed_q_split: int = 1,
     transpose_kv_cache: bool = False,
+    ql_nope_is_token_major: bool = False,
     # Debug params.
     debug_mode: bool = False,
 ):
@@ -171,17 +172,19 @@ def static_validate_inputs(
     if len(new_k_pe.shape) != 2:
         raise ValueError(f"Expected 2D array for {new_k_pe.shape=}")
 
-    if ql_nope.shape[0] != q_pe.shape[1]:
+    q_heads_dim = 1 if ql_nope_is_token_major else 0
+    q_tokens_dim = 0 if ql_nope_is_token_major else 1
+    if ql_nope.shape[q_heads_dim] != q_pe.shape[1]:
         raise ValueError(
-            f"Expected ql_nope num_heads {ql_nope.shape[0]=} to equal q_pe num_heads {q_pe.shape[1]=}"
+            f"Expected ql_nope num_heads {ql_nope.shape[q_heads_dim]=} to equal q_pe num_heads {q_pe.shape[1]=}"
         )
-    if ql_nope.shape[1] != q_pe.shape[0]:
+    if ql_nope.shape[q_tokens_dim] != q_pe.shape[0]:
         raise ValueError(
-            f"Expected ql_nope num_tokens {ql_nope.shape[1]=} to equal q_pe num_tokens {q_pe.shape[0]=}"
+            f"Expected ql_nope num_tokens {ql_nope.shape[q_tokens_dim]=} to equal q_pe num_tokens {q_pe.shape[0]=}"
         )
-    if ql_nope.shape[1] != new_kv_c.shape[0]:
+    if ql_nope.shape[q_tokens_dim] != new_kv_c.shape[0]:
         raise ValueError(
-            f"Expected {ql_nope.shape[1]=} to be equal to {new_kv_c.shape[0]=}"
+            f"Expected {ql_nope.shape[q_tokens_dim]=} to be equal to {new_kv_c.shape[0]=}"
         )
     if new_kv_c.shape[0] != new_k_pe.shape[0]:
         raise ValueError(
@@ -401,6 +404,16 @@ def _mla_ragged_paged_attention_kernel(
     debug_print("[RPA debug] bq_sz={}", bq_sz)
     debug_print("[RPA debug] batch_size={}", batch_size)
 
+    _LOG2_E = 1.4426950408889634
+    _LOG_256 = 5.545177444479562
+    total_qk_scale_exp = sm_scale * (k_scale if k_scale is not None else 1.0) * (
+        q_scale if q_scale is not None else 1.0)
+    total_qk_scale_exp2 = total_qk_scale_exp * _LOG2_E
+    p_shift_exp = _LOG_256 if (p_same_dtype_as_v
+                               and kv_dtype == jnp.float8_e4m3fn) else 0.0
+    p_shift_exp2 = 8.0 if (p_same_dtype_as_v
+                           and kv_dtype == jnp.float8_e4m3fn) else 0.0
+
     def batch_flash_attention(
         ql_nope,  # [batch_size, actual_bq_sz * num_q_heads, lkv_dim]
         q_pe,  # [batch_size, actual_bq_sz * num_q_heads, r_dim]
@@ -434,7 +447,9 @@ def _mla_ragged_paged_attention_kernel(
             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val),
                              ref[...])
 
-        # Follow FlashAttention-2 forward pass.
+        m_prev = load_with_init(head_m_ref, -jnp.inf)
+        l_prev = load_with_init(head_l_ref, 0.0)
+
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
         k = jnp.concatenate([kv_c, k_pe],
                             axis=-1 if not transpose_kv_cache else -2)
@@ -443,42 +458,47 @@ def _mla_ragged_paged_attention_kernel(
             q,
             k,
             preferred_element_type=jnp.float32)
-        s *= sm_scale
-        if k_scale is not None:
-            s *= k_scale
-        if q_scale is not None:
-            s *= q_scale
+
+        if soft_cap is not None:
+            s *= total_qk_scale_exp
+            s = soft_cap * jnp.tanh(s / soft_cap)
+            s *= _LOG2_E
+        else:
+            s *= total_qk_scale_exp2
 
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
             jnp.int32, s.shape[1:], 1)
+        q_offset = bq_idx * bq_sz + unsigned_floor_div(
+            lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads)
 
         mask_list = []
         for b in range(batch_size):
             seq_idx = batch_start_seq_idx + b
-            q_start = cu_q_lens_ref[seq_idx]
-            q_end = cu_q_lens_ref[seq_idx + 1]
-            q_len = q_end - q_start
+            q_len = cu_q_lens_ref[seq_idx + 1] - cu_q_lens_ref[seq_idx]
             kv_len = kv_lens_ref[seq_idx]
-            q_span = (kv_len - q_len + bq_idx * bq_sz + unsigned_floor_div(
-                lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads))
+            q_span = kv_len - q_len + q_offset
             mask = q_span < k_span
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
             mask_list.append(mask)
         mask = jnp.stack(mask_list, axis=0)
 
-        if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
         s = s.astype(s_dtype)
-
         s = jnp.where(mask, mask_value, s)
         s_rowmax = jnp.max(s, axis=2, keepdims=True)
-        m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+
+        exp_m_diff = jnp.exp2(m_prev - m_curr)
+        p = jnp.exp2(s - broadcast_minor(m_curr - p_shift_exp2, s.shape))
 
         p_rowsum = jnp.sum(p, axis=2, keepdims=True)
+        l_curr = exp_m_diff * l_prev + p_rowsum
+        head_l_ref[...] = l_curr
+
+        o_prev = load_with_init(head_acc_ref, 0.0)
+        o_scaled = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev
+
         if p_same_dtype_as_v:
             p = p.astype(kv_c.dtype)
         pv = jnp.einsum(
@@ -486,22 +506,13 @@ def _mla_ragged_paged_attention_kernel(
             p,
             kv_c,
             preferred_element_type=jnp.float32)
-        if v_scale is not None:
-            pv *= v_scale
+        head_acc_ref[...] = o_scaled + pv
 
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = load_with_init(head_l_ref, 0.0)
-        l_curr = exp_m_diff * l_prev + p_rowsum
-        head_l_ref[...] = l_curr
-        o_prev = load_with_init(head_acc_ref, 0.0)
-        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
-        head_acc_ref[...] = o_curr
-
-    def flash_attention_step1_qk_softmax(
-        ql_nope,  # [actual_bq_sz * num_q_heads // q_split, lkv_dim]
-        q_pe,  # [actual_bq_sz * num_q_heads // q_split, r_dim]
-        kv_c,  # [bkv_sz, lkv_dim] if not transpose_kv_cache else [lkv_dim, bkv_sz] <- Correspond to data from bkvc_x2_ref
-        k_pe,  # [bkv_sz, r_dim] if not transpose_kv_cache else [r_dim, bkv_sz] <- Correspond to data from bpe_x2_ref
+    def flash_attention_step1(
+        ql_nope,
+        q_pe,
+        kv_c,
+        k_pe,
         *,
         kv_len,
         q_len,
@@ -529,31 +540,38 @@ def _mla_ragged_paged_attention_kernel(
             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val),
                              ref[...])
 
-        # Follow FlashAttention-2 forward pass.
-        if bkv_sz % 256 == 0:
-            # Split QK into multiple chunks and compute them separately (256 is MXU
-            # size of TPU), then concatenate the results. To make next VALU operations
-            # overlap with the einsum, we have to compute the first element of output
-            # list first and then compute the einsum for the next chunk of output.
-            # It makes next VALU operations for first output are running parallel
-            # with the next chunk of QK einsums MXU computations.
+        m_prev = load_with_init(head_m_ref, -jnp.inf)
+
+        use_step1_exp2 = soft_cap is None
+        step1_qk_scale = total_qk_scale_exp2 if use_step1_exp2 else total_qk_scale_exp
+        step1_p_shift = p_shift_exp2 if use_step1_exp2 else p_shift_exp
+        step1_exp_fn = jnp.exp2 if use_step1_exp2 else jnp.exp
+
+        # Follow FlashAttention-2 forward pass with power-of-2 chunk_sz (1024 for >=1024)
+        # to overlap MXU QK^T with VPU scale/mask/rowmax while keeping XLU/VMEM tiles power-of-2 aligned.
+        chunk_sz = 1024 if bkv_sz >= 1024 and bkv_sz % 1024 == 0 else (512 if bkv_sz % 512 == 0 else 256)
+        if bkv_sz % chunk_sz == 0 and ql_nope.shape[0] % num_q_heads == 0:
+            base_threshold = (kv_len - q_len + (bq_idx * bq_sz + bq_offset) -
+                              bkv_idx * bkv_sz)
+            delta_iota = lax.broadcasted_iota(
+                jnp.int32, (ql_nope.shape[0], chunk_sz), 1) - unsigned_floor_div(
+                    lax.broadcasted_iota(jnp.int32, (ql_nope.shape[0], chunk_sz), 0),
+                    num_q_heads)
+
+            m_curr = m_prev
             s_list = []
-            for partial_idx in range(bkv_sz // 256):
-                partial_start = partial_idx * 256
+            num_chunks = bkv_sz // chunk_sz
+            for partial_idx in range(num_chunks):
+                partial_start = partial_idx * chunk_sz
                 if not transpose_kv_cache:
-                    kv_c_partial = kv_c[partial_start:partial_start + 256, :]
-                    k_pe_partial = k_pe[partial_start:partial_start + 256, :]
-                else:
-                    kv_c_partial = kv_c[:, partial_start:partial_start + 256]
-                    k_pe_partial = k_pe[:, partial_start:partial_start + 256]
-
-                if not transpose_kv_cache:
+                    kv_c_partial = kv_c if num_chunks == 1 else kv_c[partial_start:partial_start + chunk_sz, :]
+                    k_pe_partial = k_pe if num_chunks == 1 else k_pe[partial_start:partial_start + chunk_sz, :]
                     kv_c_partial = kv_c_partial.transpose((1, 0))
-
-                    # Bitcast trick to prevent transpose merge into vmatpush.xpose.
-                    # It enforce transpose using XLUs (vxpose.xlu).
                     kv_c_partial = pltpu.bitcast(kv_c_partial,
                                                  kv_c_partial.dtype)
+                else:
+                    kv_c_partial = kv_c if num_chunks == 1 else kv_c[:, partial_start:partial_start + chunk_sz]
+                    k_pe_partial = k_pe if num_chunks == 1 else k_pe[:, partial_start:partial_start + chunk_sz]
 
                 s_c_partial = jnp.einsum("nd,dm->nm",
                                          ql_nope,
@@ -565,9 +583,20 @@ def _mla_ragged_paged_attention_kernel(
                     k_pe_partial,
                     preferred_element_type=jnp.float32)
 
-                s_list.append(s_c_partial + s_pe_partial)
+                s_part = (s_c_partial + s_pe_partial) * step1_qk_scale
+                if soft_cap is not None:
+                    s_part = soft_cap * jnp.tanh(s_part / soft_cap)
+                s_part = s_part.astype(s_dtype)
 
-            s = jnp.concatenate(s_list, axis=1)
+                thresh_scalar = base_threshold - partial_start
+                mask_part = thresh_scalar < delta_iota
+                if sliding_window is not None:
+                    mask_part = jnp.logical_or(
+                        mask_part, thresh_scalar - sliding_window >= delta_iota)
+                s_part = jnp.where(mask_part, mask_value, s_part)
+
+                m_curr = jnp.maximum(m_curr, jnp.max(s_part, axis=1, keepdims=True))
+                s_list.append(s_part)
         else:
             q = jnp.concatenate([ql_nope, q_pe], axis=-1)
             k = jnp.concatenate([kv_c, k_pe],
@@ -577,41 +606,12 @@ def _mla_ragged_paged_attention_kernel(
                 q,
                 k,
                 preferred_element_type=jnp.float32)
-        s *= sm_scale
-        if k_scale is not None:
-            s *= k_scale
-        if q_scale is not None:
-            s *= q_scale
+            s *= step1_qk_scale
 
-        if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
-        s = s.astype(s_dtype)
+            if soft_cap is not None:
+                s = soft_cap * jnp.tanh(s / soft_cap)
+            s = s.astype(s_dtype)
 
-        if s.shape[0] % num_q_heads == 0 and s.shape[1] % 128 == 0:
-            # Optimized mask logic.
-            threshold = (kv_len - q_len + (bq_idx * bq_sz + bq_offset) -
-                         bkv_idx * bkv_sz)
-            iota1 = lax.broadcasted_iota(jnp.int32, (num_q_heads, 128), 1)
-            s_list = []
-            for s_idx in range(s.shape[1] // 128):
-                s_1d_list = []
-                threshold_per_s = threshold - (s_idx * 128)
-                for q_idx in range(s.shape[0] // num_q_heads):
-                    threshold_per_sq = threshold_per_s + q_idx
-                    mask_part = threshold_per_sq < iota1
-                    if sliding_window is not None:
-                        mask_part = jnp.logical_or(
-                            mask_part, threshold_per_sq - sliding_window
-                            >= iota1)
-                    s_1d_list.append(
-                        jnp.where(
-                            mask_part, mask_value,
-                            s[q_idx * num_q_heads:(q_idx + 1) * num_q_heads,
-                              s_idx * 128:(s_idx + 1) * 128]))
-                s_list.append(jnp.concatenate(s_1d_list, axis=0))
-            s = jnp.concatenate(s_list, axis=1)
-        else:
-            # Reference mask logic.
             q_span = (
                 kv_len - q_len +
                 (bq_idx * bq_sz + bq_offset) + unsigned_floor_div(
@@ -623,48 +623,73 @@ def _mla_ragged_paged_attention_kernel(
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
             s = jnp.where(mask, mask_value, s)
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
-        m_prev = load_with_init(head_m_ref, -jnp.inf)
-        m_curr = jnp.maximum(m_prev, s_rowmax)
+            s_rowmax = jnp.max(s, axis=1, keepdims=True)
+            m_curr = jnp.maximum(m_prev, s_rowmax)
+            s_list = [s]
+
+        p_list = []
+        p_rowsum = None
+        for s_part in s_list:
+            p_part = step1_exp_fn(
+                s_part - broadcast_minor(m_curr - step1_p_shift, s_part.shape))
+            part_sum = jnp.sum(p_part, axis=1, keepdims=True)
+            p_rowsum = part_sum if p_rowsum is None else (p_rowsum + part_sum)
+            if p_same_dtype_as_v and p_part.dtype != kv_c.dtype:
+                p_part = p_part.astype(kv_c.dtype)
+            p_list.append(p_part)
+
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        return p_list, m_prev, m_curr, p_rowsum
 
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = load_with_init(head_l_ref, 0.0)
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        l_curr = exp_m_diff * l_prev + p_rowsum
-        head_l_ref[...] = l_curr
-
-        return p, exp_m_diff
-
-    def flash_attention_step2_pv(
-        p,
+    def flash_attention_step2(
+        p_list,
+        m_prev,
+        m_curr,
+        p_rowsum,
         v,
-        exp_m_diff,
+        *,
         bkv_idx,
+        head_l_ref,
         head_acc_ref,
     ):
-
         def load_with_init(ref, init_val):
             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val),
                              ref[...])
 
-        if p_same_dtype_as_v:
-            p = p.astype(v.dtype)
-        if transpose_kv_cache:
-            v = v.transpose((1, 0))
-            # Bitcast trick to prevent transpose merge into vmatpush.xpose.
-            # It enforce transpose using XLUs (vxpose.xlu).
-            v = pltpu.bitcast(v, v.dtype)
-
-        pv = jnp.einsum("nm,md->nd", p, v, preferred_element_type=jnp.float32)
-
-        if v_scale is not None:
-            pv *= v_scale
-
+        l_prev = load_with_init(head_l_ref, 0.0)
         o_prev = load_with_init(head_acc_ref, 0.0)
-        o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
-        head_acc_ref[...] = o_curr
+
+        use_step1_exp2 = soft_cap is None
+        step1_exp_fn = jnp.exp2 if use_step1_exp2 else jnp.exp
+
+        exp_m_diff = step1_exp_fn(m_prev - m_curr)
+        head_l_ref[...] = exp_m_diff * l_prev + p_rowsum
+
+        if not isinstance(p_list, list):
+            p_list = [p_list]
+
+        num_parts = len(p_list)
+        part_sz = bkv_sz // num_parts
+
+        pv_acc = None
+        for idx, p_part in enumerate(p_list):
+            if not transpose_kv_cache:
+                v_part = v if num_parts == 1 else v[idx * part_sz:(idx + 1) * part_sz, :]
+            else:
+                v_part = v if num_parts == 1 else v[:, idx * part_sz:(idx + 1) * part_sz]
+                v_part = v_part.transpose((1, 0))
+                v_part = pltpu.bitcast(v_part, v_part.dtype)
+
+            pv_part = jnp.einsum("nm,md->nd",
+                                 p_part,
+                                 v_part,
+                                 preferred_element_type=jnp.float32)
+            if idx == 0:
+                pv_acc = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv_part
+            else:
+                pv_acc = pv_acc + pv_part
+
+        head_acc_ref[...] = pv_acc
 
     def _async_copy(src, dst, sem, wait):
         if debug_mode:
@@ -1653,6 +1678,9 @@ def _mla_ragged_paged_attention_kernel(
             q_dtype,
         )[:, :, :num_q_heads].reshape(batch_size, actual_bq_sz * num_q_heads,
                                       r_dim)
+        if p_same_dtype_as_v and kv_dtype == jnp.float8_e4m3fn:
+            q_nope_vec = q_nope_vec.astype(kv_dtype)
+            q_rope_vec = q_rope_vec.astype(kv_dtype)
         return q_nope_vec, q_rope_vec
 
     def load_bq(batch_item_idx, bq_sem_idx, *, actual_bq_sz=bq_sz):
@@ -1670,6 +1698,9 @@ def _mla_ragged_paged_attention_kernel(
             q_rope_ref[:actual_bq_sz],
             q_dtype,
         )[:, :num_q_heads].reshape(actual_bq_sz * num_q_heads, r_dim)
+        if p_same_dtype_as_v and kv_dtype == jnp.float8_e4m3fn:
+            q_nope_vec = q_nope_vec.astype(kv_dtype)
+            q_rope_vec = q_rope_vec.astype(kv_dtype)
         return q_nope_vec, q_rope_vec
 
     def load_bkv(batch_item_idx, bkv_sem_idx):
@@ -1829,9 +1860,12 @@ def _mla_ragged_paged_attention_kernel(
                 if two_step_flash_attention:
                     debug_print("[RPA debug] two step flash attention")
                     prev_p = None
+                    prev_m_prev = None
+                    prev_m_curr = None
+                    prev_p_rowsum = None
                     prev_v = None
+                    prev_l_ref = None
                     prev_acc = None
-                    prev_exp_m_diff = None
 
                     q_len = actual_bq_sz * num_q_heads
                     q_block_len = q_len // q_split
@@ -1866,7 +1900,7 @@ def _mla_ragged_paged_attention_kernel(
                             bq_end = bq_start + q_block_len
                             bq_offset = bq_sz_for_each_split * q_idx
 
-                            cur_p, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                            cur_p, cur_m_prev, cur_m_curr, cur_p_rowsum = flash_attention_step1(
                                 bq_nope_vec[bq_start:bq_end],
                                 bq_pe_vec[bq_start:bq_end],
                                 bkvc,
@@ -1882,30 +1916,39 @@ def _mla_ragged_paged_attention_kernel(
 
                             if prev_p is not None:
                                 assert prev_v is not None
-                                assert prev_exp_m_diff is not None
-                                flash_attention_step2_pv(
+                                assert prev_l_ref is not None
+                                flash_attention_step2(
                                     prev_p,
+                                    prev_m_prev,
+                                    prev_m_curr,
+                                    prev_p_rowsum,
                                     prev_v,
-                                    prev_exp_m_diff,
-                                    bkv_idx,
-                                    prev_acc,
+                                    bkv_idx=bkv_idx,
+                                    head_l_ref=prev_l_ref,
+                                    head_acc_ref=prev_acc,
                                 )
 
                             prev_p = cur_p
+                            prev_m_prev = cur_m_prev
+                            prev_m_curr = cur_m_curr
+                            prev_p_rowsum = cur_p_rowsum
                             prev_v = bkvc
-                            prev_exp_m_diff = cur_exp_m_diff
+                            prev_l_ref = l_ref.at[b, bq_start:bq_end]
                             prev_acc = acc_ref.at[b, bq_start:bq_end]
 
                     # last flash attention 2nd step
                     assert prev_p is not None
                     assert prev_v is not None
-                    assert prev_exp_m_diff is not None
-                    flash_attention_step2_pv(
+                    assert prev_l_ref is not None
+                    flash_attention_step2(
                         prev_p,
+                        prev_m_prev,
+                        prev_m_curr,
+                        prev_p_rowsum,
                         prev_v,
-                        prev_exp_m_diff,
-                        bkv_idx,
-                        prev_acc,
+                        bkv_idx=bkv_idx,
+                        head_l_ref=prev_l_ref,
+                        head_acc_ref=prev_acc,
                     )
                 else:  # One step flash attention
                     # Load bkv into vreg. There is no need to mask out invalid k/v entries,
@@ -1962,9 +2005,16 @@ def _mla_ragged_paged_attention_kernel(
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
-            out = (lax.div(acc, l) if q_dtype == jnp.float32 else
-                   (acc * pl.reciprocal(l, approx=True)).astype(q_dtype))
+            l_vec = l_ref[...]
+            if q_dtype == jnp.float32:
+                if v_scale is not None:
+                    acc = acc * v_scale
+                out = lax.div(acc, broadcast_minor(l_vec, acc.shape))
+            else:
+                inv_l = pl.reciprocal(l_vec, approx=True)
+                if v_scale is not None:
+                    inv_l = inv_l * v_scale
+                out = (acc * broadcast_minor(inv_l, acc.shape)).astype(q_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -2169,6 +2219,7 @@ def prepare_outputs(
         "transpose_kv_cache",
         "two_step_flash_attention",
         "p_same_dtype_as_v",
+        "ql_nope_is_token_major",
         "debug_mode",
     ),
     donate_argnames=("cache_kv", ),
@@ -2205,10 +2256,11 @@ def mla_ragged_paged_attention(
     transpose_kv_cache: bool = False,
     two_step_flash_attention: bool = True,
     p_same_dtype_as_v: bool = True,
+    ql_nope_is_token_major: bool = False,
     # Debug params.
     debug_mode: bool = False,
 ) -> tuple[
-        jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
+        jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim] if not ql_nope_is_token_major else [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
         jax.
         Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
 ]:
@@ -2249,6 +2301,7 @@ def mla_ragged_paged_attention(
       AV attention in two separate steps to make them be more parallelized
       with VALU ops instead of batched matmul in one step.
     p_same_dtype_as_v: if true, cast p to the same dtype as v before p @ v.
+    ql_nope_is_token_major: if true, ql_nope is expected in token-major (T, N, L) layout and output is returned in (T, N, L) layout without physical transpose.
     debug_mode: if true, RPA does not issue any DMAs or run flash attention but
       print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
 
@@ -2299,15 +2352,19 @@ def mla_ragged_paged_attention(
         decode_batch_size=decode_batch_size,
         mixed_q_split=mixed_q_split,
         transpose_kv_cache=transpose_kv_cache,
+        ql_nope_is_token_major=ql_nope_is_token_major,
         debug_mode=debug_mode,
     )
 
-    actual_num_q_heads, actual_max_num_tokens, actual_lkv_dim = ql_nope.shape
-
-    ql_nope = prepare_q_nope_inputs(
-        ql_nope,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )  # [max_num_tokens, num_q_heads, lkv_dim]
+    if ql_nope_is_token_major:
+        actual_max_num_tokens, actual_num_q_heads, actual_lkv_dim = ql_nope.shape
+        ql_nope = prepare_q_inputs(ql_nope)
+    else:
+        actual_num_q_heads, actual_max_num_tokens, actual_lkv_dim = ql_nope.shape
+        ql_nope = prepare_q_nope_inputs(
+            ql_nope,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )  # [max_num_tokens, num_q_heads, lkv_dim]
     q_pe = prepare_q_inputs(q_pe)  # [max_num_tokens, num_q_heads, r_dim]
     if not transpose_kv_cache:
         _, _, kv_packing, _ = cache_kv.shape
@@ -2619,12 +2676,17 @@ def mla_ragged_paged_attention(
         p_same_dtype_as_v=p_same_dtype_as_v,
         case=MlaCase.MIXED,
     )
-    output = prepare_outputs(
-        ql_nope,
-        actual_num_q_heads,
-        actual_max_num_tokens,
-        actual_lkv_dim,
-        vmem_limit_bytes=vmem_limit_bytes,
-    )  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
+    if ql_nope_is_token_major:
+        output = ql_nope[
+            :actual_max_num_tokens, :actual_num_q_heads, :actual_lkv_dim
+        ]
+    else:
+        output = prepare_outputs(
+            ql_nope,
+            actual_num_q_heads,
+            actual_max_num_tokens,
+            actual_lkv_dim,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
 
     return output, updated_kv

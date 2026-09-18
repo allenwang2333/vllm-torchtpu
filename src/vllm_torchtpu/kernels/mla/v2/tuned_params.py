@@ -667,7 +667,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -684,7 +684,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -701,7 +701,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -718,7 +718,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -735,7 +735,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -752,7 +752,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -769,7 +769,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -786,7 +786,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -803,7 +803,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -820,7 +820,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -837,7 +837,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -862,7 +862,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -886,7 +886,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -910,7 +910,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -934,7 +934,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -958,7 +958,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -982,7 +982,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -1006,7 +1006,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -1030,7 +1030,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -1054,7 +1054,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -1078,7 +1078,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -1102,7 +1102,7 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
     ):
     TunableParams(
         q_split=16,
-        num_kv_pages_per_block=1,
+        num_kv_pages_per_block=3,
         num_queries_per_block=64,
         vmem_limit_bytes=62914560,
     ),
@@ -1184,21 +1184,41 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
-    else:
-        logger.warning(
-            f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
-        )
+
+    # Optimal TPU v7x parameters for Kimi-K2.6 (actual_num_q_heads=64, actual_lkv_dim=512)
+    if tuning_key.actual_num_q_heads == 64 and tuning_key.actual_lkv_dim == 512:
         if tuning_key.case == "mixed":
             return TunableParams(
                 num_kv_pages_per_block=1,
-                num_queries_per_block=16,
+                num_queries_per_block=64,
                 vmem_limit_bytes=62914560,
+                decode_batch_size=1,
+                q_split=16,
             )
-
-        # decode, batched_decode
+        decode_bsz = 8 if tuning_key.max_num_tokens >= 8 else max(
+            1, tuning_key.max_num_tokens)
         return TunableParams(
-            decode_batch_size=4,
+            decode_batch_size=decode_bsz,
             num_kv_pages_per_block=3,
             num_queries_per_block=1,
             vmem_limit_bytes=62914560,
+            q_split=1,
         )
+
+    logger.warning(
+        f"No tuned parameters found for the given tuning key: {tuning_key}, using default parameters"
+    )
+    if tuning_key.case == "mixed":
+        return TunableParams(
+            num_kv_pages_per_block=1,
+            num_queries_per_block=16,
+            vmem_limit_bytes=62914560,
+        )
+
+    # decode, batched_decode
+    return TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=3,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    )
