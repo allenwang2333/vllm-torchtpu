@@ -4,6 +4,7 @@
 import functools
 from typing import TYPE_CHECKING, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
