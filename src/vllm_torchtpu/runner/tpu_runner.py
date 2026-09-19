@@ -2533,6 +2533,86 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
+    def _gather_mm_embeddings_static_tpu(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> tuple[list[torch.Tensor], np.ndarray, np.ndarray]:
+        from vllm.v1.worker.gpu_model_runner import get_mm_features_in_window
+
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        mm_embeds_full: list[torch.Tensor] = []
+        is_mm_embed_np = np.zeros(total_num_scheduled_tokens, dtype=bool)
+        mm_gather_idx_np = np.zeros(total_num_scheduled_tokens, dtype=np.int32)
+
+        req_start_idx = 0
+        base_row = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens
+            mm_features = req_state.mm_features
+            lo, hi = get_mm_features_in_window(
+                mm_features,
+                start=num_computed_tokens,
+                end=num_computed_tokens + num_scheduled_tokens,
+            )
+            for i in range(lo, hi):
+                mm_feature = mm_features[i]
+                pos_info = mm_feature.mm_position
+                start_pos = pos_info.offset
+                num_encoder_tokens = pos_info.length
+
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens,
+                )
+                assert start_idx < end_idx
+                curr_embeds_start, curr_embeds_end = (
+                    pos_info.get_embeds_indices_in_range(start_idx, end_idx)
+                )
+                if curr_embeds_start == curr_embeds_end:
+                    continue
+
+                mm_hash = mm_feature.identifier
+                encoder_output = self._get_encoder_output_from_cache(mm_hash)
+                if encoder_output is None:
+                    if (
+                        start_pos
+                        >= req_state.num_computed_tokens + num_scheduled_tokens
+                    ):
+                        continue
+                    raise RuntimeError(f"Encoder cache miss for {mm_hash}.")
+
+                mm_embeds_full.append(encoder_output)
+                full_len = int(encoder_output.shape[0])
+
+                req_start_pos = req_start_idx + start_pos - num_computed_tokens
+                span_slice = slice(req_start_pos + start_idx,
+                                   req_start_pos + end_idx)
+                if (is_embed := pos_info.is_embed) is not None:
+                    is_embed_np = (
+                        is_embed[start_idx:end_idx].cpu().numpy().astype(bool)
+                    )
+                    is_mm_embed_np[span_slice] |= is_embed_np
+                    mm_gather_idx_np[span_slice][is_embed_np] = np.arange(
+                        base_row + curr_embeds_start,
+                        base_row + curr_embeds_end,
+                        dtype=np.int32,
+                    )
+                else:
+                    is_mm_embed_np[span_slice] = True
+                    mm_gather_idx_np[span_slice] = np.arange(
+                        base_row + curr_embeds_start,
+                        base_row + curr_embeds_end,
+                        dtype=np.int32,
+                    )
+                base_row += full_len
+
+            req_start_idx += num_scheduled_tokens
+
+        return mm_embeds_full, is_mm_embed_np, mm_gather_idx_np
+
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -2547,6 +2627,7 @@ class TPUModelRunner(GPUModelRunner):
             # to the input device so the masked_scatter in embed_input_ids
             # aligns with the padded inputs_embeds.
             if is_mm_embed is not None:
+                gather_idx = getattr(is_mm_embed, "_tpu_mm_gather_idx", None)
                 n = input_ids.shape[0]
                 if is_mm_embed.shape[0] < n:
                     pad = torch.zeros(
@@ -2556,6 +2637,8 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     is_mm_embed = torch.cat([is_mm_embed, pad])
                 is_mm_embed = is_mm_embed.to(input_ids.device)
+                if gather_idx is not None:
+                    is_mm_embed._tpu_mm_gather_idx = gather_idx
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
@@ -2739,39 +2822,61 @@ class TPUModelRunner(GPUModelRunner):
         # all scheduled tokens (req order); mm_embeds_flat is the concatenated
         # image/audio embeddings.
         mm_embeds_flat = None
-        is_mm_embed_full = None
+        is_mm_embed_np = None
+        mm_gather_idx_np = None
         mm_tok_cumsum = None
-        mm_cumsum_np = None
         if self.supports_mm_inputs and self._pp_is_first:
-            mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
-                scheduler_output)
+            (
+                mm_embeds_list,
+                is_mm_embed_np,
+                mm_gather_idx_np,
+            ) = self._gather_mm_embeddings_static_tpu(scheduler_output)
             if mm_embeds_list:
-                num_mm_items = len(mm_embeds_list)
-                target_mm_items = 1
-                for b in (1, 2, 4, 8, 16, 32, 64):
-                    if num_mm_items <= b:
-                        target_mm_items = b
-                        break
+                first_shape = mm_embeds_list[0].shape
+                if all(t.shape == first_shape for t in mm_embeds_list):
+                    num_mm_items = len(mm_embeds_list)
+                    target_mm_items = 1
+                    for b in (1, 2, 4, 8, 16, 32, 64):
+                        if num_mm_items <= b:
+                            target_mm_items = b
+                            break
+                    else:
+                        target_mm_items = ((num_mm_items + 63) // 64) * 64
+                    if len(mm_embeds_list) < target_mm_items:
+                        mm_embeds_list = list(mm_embeds_list) + [
+                            mm_embeds_list[0]
+                        ] * (target_mm_items - len(mm_embeds_list))
+                    mm_embeds_flat = torch.cat(mm_embeds_list, dim=0)
                 else:
-                    target_mm_items = ((num_mm_items + 63) // 64) * 64
-                if len(mm_embeds_list) < target_mm_items:
-                    mm_embeds_list = list(mm_embeds_list) + [
-                        mm_embeds_list[-1]
-                    ] * (target_mm_items - len(mm_embeds_list))
-                mm_embeds_flat = torch.cat(mm_embeds_list, dim=0)
+                    total_mm_tokens = sum(
+                        int(t.shape[0]) for t in mm_embeds_list)
+                    target_mm_tokens = 256
+                    for b in (256, 512, 1024, 2048, 4096, 8192, 16384):
+                        if total_mm_tokens <= b:
+                            target_mm_tokens = b
+                            break
+                    else:
+                        target_mm_tokens = (
+                            (total_mm_tokens + 4095) // 4096) * 4096
+                    pad_tokens = target_mm_tokens - total_mm_tokens
+                    if pad_tokens > 0:
+                        last_t = mm_embeds_list[-1]
+                        pad_tensor = torch.zeros(
+                            (pad_tokens, *last_t.shape[1:]),
+                            dtype=last_t.dtype,
+                            device=last_t.device,
+                        )
+                        mm_embeds_list = list(mm_embeds_list) + [pad_tensor]
+                    mm_embeds_flat = torch.cat(mm_embeds_list, dim=0)
                 req_tok = np.array([
                     scheduler_output.num_scheduled_tokens[r]
                     for r in self.input_batch.req_ids
                 ],
                                    dtype=np.int64)
                 mm_tok_cumsum = np.concatenate([[0], np.cumsum(req_tok)])
-                is_mm_embed_cpu = (is_mm_embed_full.cpu()
-                                   if is_mm_embed_full.device.type != "cpu"
-                                   else is_mm_embed_full)
-                mm_cumsum_np = np.concatenate(
-                    [[0], np.cumsum(is_mm_embed_cpu.numpy())])
             else:
-                is_mm_embed_full = None
+                is_mm_embed_np = None
+                mm_gather_idx_np = None
 
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output)
@@ -2849,25 +2954,22 @@ class TPUModelRunner(GPUModelRunner):
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
             # covers requests [start_index, end_index) in req order). Offsets
-            # come from the host-side cumsum, so no per-chunk device sync.
+            # come from the host-side gather index array, so no device sync
+            # or TPU tensor slice is needed.
             chunk_mm_inputs = None
-            if is_mm_embed_full is not None and mm_cumsum_np is not None:
+            if (is_mm_embed_np is not None and mm_gather_idx_np is not None
+                    and mm_tok_cumsum is not None
+                    and mm_embeds_flat is not None):
                 tok_start = int(mm_tok_cumsum[start_index])
                 tok_end = int(mm_tok_cumsum[end_index])
-                mm_start = int(mm_cumsum_np[tok_start])
-                mm_cnt = int(mm_cumsum_np[tok_end]) - mm_start
-                if mm_cnt > 0 and mm_embeds_flat is not None:
+                is_mm_chunk_np = is_mm_embed_np[tok_start:tok_end]
+                if is_mm_chunk_np.any():
                     n_padded = input_ids.shape[0]
-                    is_mm_np = is_mm_embed_cpu[tok_start:tok_end].numpy()
                     pad_bool = np.zeros(n_padded, dtype=bool)
-                    pad_bool[:len(is_mm_np)] = is_mm_np
+                    pad_bool[:len(is_mm_chunk_np)] = is_mm_chunk_np
                     idx_np = np.zeros(n_padded, dtype=np.int32)
-                    max_mm_idx = max(0, int(mm_embeds_flat.shape[0]) - 1)
-                    idx_np[:len(is_mm_np)] = np.clip(
-                        np.cumsum(is_mm_np, dtype=np.int32) - 1 + mm_start,
-                        0,
-                        max_mm_idx,
-                    )
+                    idx_np[:len(is_mm_chunk_np)] = mm_gather_idx_np[
+                        tok_start:tok_end]
                     is_mm_tpu = torch.from_numpy(pad_bool).to(
                         input_ids.device, non_blocking=True)
                     idx_tpu = torch.from_numpy(idx_np).to(
