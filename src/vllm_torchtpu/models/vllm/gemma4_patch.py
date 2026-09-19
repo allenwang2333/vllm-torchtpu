@@ -435,30 +435,6 @@ def maybe_patch_gemma4(
             )
             self._tpu_compiled_audio_fn = compiled_fn
 
-        if not getattr(self, "_tpu_audio_buckets_prewarmed", False):
-            self._tpu_audio_buckets_prewarmed = True
-            try:
-                import torch_xla
-                dev = input_features.device
-                f_dtype = input_features.dtype
-                feat_dim = int(input_features.shape[-1])
-                logger.info(
-                    "Pre-warming Gemma4 Audio Conformer buckets %s at T=808...",
-                    _AUDIO_BATCH_BUCKETS,
-                )
-                for b_w in _AUDIO_BATCH_BUCKETS:
-                    d_f = torch.zeros((b_w, 808, feat_dim),
-                                      dtype=f_dtype,
-                                      device=dev)
-                    d_m = torch.ones((b_w, 808),
-                                     dtype=torch.bool,
-                                     device=dev)
-                    _ = compiled_fn(d_f, d_m)
-                    torch_xla.sync()
-                logger.info("Finished pre-warming Gemma4 Audio Conformer buckets.")
-            except Exception as exc:
-                logger.warning("Audio bucket pre-warm skipped: %s", exc)
-
         audio_features, parent_flat = compiled_fn(
             input_features, input_features_mask)
         t_out = int(audio_features.shape[1])
@@ -574,26 +550,6 @@ def maybe_patch_gemma4(
             )
         else:
             is_mm_dev = is_multimodal
-
-        if not getattr(self, "_tpu_mm_embed_buckets_prewarmed", False):
-            self._tpu_mm_embed_buckets_prewarmed = True
-            try:
-                import torch_xla
-                dev = input_ids.device
-                mm_dtype = mm_flat.dtype
-                h_dim = int(mm_flat.shape[-1])
-                for n_w in (256, 512, 1024, 2048, 4096, 8192, 16384):
-                    d_ids = torch.zeros((n_w,), dtype=input_ids.dtype, device=dev)
-                    d_mm = torch.zeros((n_w, h_dim), dtype=mm_dtype, device=dev)
-                    d_ismm = torch.zeros((n_w,), dtype=torch.bool, device=dev)
-                    d_idx = torch.zeros((n_w,), dtype=torch.int32, device=dev)
-                    _ = mm_embed_fn(d_ids, d_mm, d_ismm, d_idx)
-                    torch_xla.sync()
-                logger.info(
-                    "Finished pre-warming Gemma4 _mm_embed_and_ple buckets (256..16384)."
-                )
-            except Exception as exc:
-                logger.warning("_mm_embed_and_ple pre-warm skipped: %s", exc)
 
         inputs_embeds, per_layer_inputs = mm_embed_fn(
             input_ids,
