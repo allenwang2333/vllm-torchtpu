@@ -236,8 +236,10 @@ def _patch_fast_wav_audio_loader() -> None:
                         pcm = np.frombuffer(
                             data, dtype="<i2", count=n_samples, offset=pos)
                         wav_f32 = pcm.astype(np.float32) * (1.0 / 32768.0)
-                        if self.resample_sr is not None and int(
-                                self.resample_sr) != sample_rate:
+                        resample_sr = getattr(self, "resample_sr", None) or (
+                            getattr(self, "kwargs", {}) or {}).get("sr")
+                        if resample_sr is not None and int(
+                                resample_sr) != sample_rate:
                             return orig_load_bytes(self, data)
                         return wav_f32, float(sample_rate)
                     pos += chunk_size + (chunk_size & 1)
