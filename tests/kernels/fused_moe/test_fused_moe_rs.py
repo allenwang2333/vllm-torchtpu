@@ -314,12 +314,36 @@ def _make_inputs(mesh, seed, *, tokens, hidden):
     return build()
 
 
+def _rank(mesh):
+    """Each chip's mesh index as ``int32[EP, 1]`` sharded on the expert axis.
+
+    The kernel's `_shard_body` reads `rank_l[0, 0]` and derives both its
+    `group_offset` and the `shard_index` it hands the local body from it, so
+    this operand is what decides which global experts this chip owns. The
+    adapter builds the same thing per rank as a torch tensor --
+    `layers/adapter/fused_moe_rs.py:357`, `torch.tensor([[ep_mesh_index()]])`
+    sharded `P(RS_EXPERT_AXIS_NAME)` -- which is the global
+    `arange(EP).reshape(EP, 1)` below, one row a chip, in mesh order.
+
+    It is not optional: `_shard_body` passes `shard_index=rank_l[0, 0]`
+    unconditionally, so the `lax.axis_index` fallback kept in
+    `moe_gmm_local_rs_nodedup` for JAX-native callers is not reachable through
+    `expert_parallel_gmm_rs`, and leaving `rank` at its `None` default raises
+    `TypeError: 'NoneType' object is not subscriptable` during tracing.
+    """
+    return jax.device_put(
+        jnp.arange(EP, dtype=jnp.int32).reshape(EP, 1),
+        NamedSharding(mesh, P(RS_EXPERT_AXIS_NAME)),
+    )
+
+
 def _run(mesh, x, w1, w2, w1_scale, w2_scale, topk_weights, topk_indices):
     """Call the kernel the way `layers/adapter/fused_moe_rs.py` calls it.
 
     Same argument order, same dead `renormalize=False` / `"softmax"` pair --
     both are only read when the kernel computes its own top-k, which supplying
-    both routing tensors skips.
+    both routing tensors skips. `rank` is the adapter's `_RS_RANK_BUFFER`; see
+    `_rank`.
     """
     return fused_moe_func_rs(
         x,
@@ -337,6 +361,7 @@ def _run(mesh, x, w1, w2, w1_scale, w2_scale, topk_weights, topk_indices):
         "softmax",
         topk_weights=topk_weights,
         topk_indices=topk_indices,
+        rank=_rank(mesh),
     )
 
 
