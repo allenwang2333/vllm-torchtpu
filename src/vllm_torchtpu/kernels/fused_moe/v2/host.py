@@ -53,6 +53,25 @@ WEIGHT_PREFETCH_DISTANCE = 2
 # prefetch distance's worth of earlier experts are still live, so the slot
 # count has to exceed the distance for all of them to stay distinct.
 NBUF = WEIGHT_PREFETCH_DISTANCE + 1
+# The contraction heights a K-BLOCKED eight-bit weight residency buffers in.
+#
+# The default residency is a whole expert per slot: w1_vm is [NBUF, hidden,
+# 2 * inter] and w2_vm is [NBUF, inter, hidden]. At a wide enough expert that
+# does not fit -- GLM-5.2-FP8's 6144 x 2048 expert wants 72 + 36 MiB of a
+# 62.7 MiB budget -- and the kernel refuses to build. Buffering a CONTRACTION
+# BLOCK per slot instead of a whole expert cuts both slabs by the block count
+# and costs a re-read of every weight byte per row tile, which is free at one
+# tile and paid in full at four.
+#
+# The two heights are chosen as the largest pair that fits GLM-5.2's expert:
+# 3 x 8 MiB + 2 x 6 MiB of slab. Bigger blocks are strictly better up to the
+# budget, because the loop is expert-outer / row-tile-inner and so re-reads
+# every weight byte once per row tile WHATEVER the block height -- the height
+# changes VMEM and DMA size, never the re-read multiplier. Each has to divide
+# its contraction exactly (6144 / 2048 = 3, 2048 / 1024 = 2), and each is a
+# whole number of both the eight-bit sublane tiling (32) and HIDDEN_LANE_BLOCK.
+KBLOCK_HIDDEN = 2048
+KBLOCK_INTER = 1024
 # Every transport moves whole blocks of this many rows; dynamic DMA offsets
 # are block-aligned. It is also the padding each (expert, dest) run rounds up
 # to, so it sets how many rows the gather fetches, the FFN computes and the
@@ -74,8 +93,14 @@ TOKEN_GATHER_TILES_PER_WINDOW = 1
 # ROWBLK-aligned, so a window may start up to 120 rows before its logical base
 # and needs one extra HBM tile of overfetch.
 TOKEN_GATHER_DMA_ALIGNMENT = HIDDEN_LANE_BLOCK
-# The most of those blocks the kernel's row staging holds.
-HIDDEN_MAX_BLOCKS = 32
+# The most of those blocks the kernel's row staging holds. It bounds nothing
+# but the acceptance check that names it: every buffer whose width is `hidden`
+# is sized from `hidden` itself. It was 32 -- 4096 lanes -- which is wide
+# enough for every model the kernel had been built for and one block short of
+# GLM-5.2's 6144, so it is carried at 48 to cover that hidden size. Lifting it
+# is necessary for a 6144-wide model and nowhere near sufficient: the VMEM
+# budget below is what actually decides whether such a model builds.
+HIDDEN_MAX_BLOCKS = 48
 # The share of the chip's VMEM the kernel may claim.
 VMEM_FRACTION = 0.98
 # The routing tables pack an arrival position and an alignment slot into
@@ -1164,9 +1189,17 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
                            axis=0).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
-def vmem_limit():
-    """VMEM budget for the kernel, read from this generation's capacity."""
-    return int(pltpu.get_tpu_info().vmem_capacity_bytes * VMEM_FRACTION)
+def vmem_limit(info=None):
+    """VMEM budget for the kernel, read from this generation's capacity.
+
+    Takes the device record the caller already has where there is one, for
+    the same reason every other reader here does: one record answers a whole
+    acceptance check, and a caller holding a stand-in record gets a budget
+    that matches the sizes it just computed from it.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    return int(info.vmem_capacity_bytes * VMEM_FRACTION)
 
 
 # The oldest chip generation this kernel has been built and measured on.
@@ -1252,7 +1285,8 @@ def vmem_scratch_arrays(g_local,
                         weight_format=WeightFormat.FP8,
                         rhs_qb=QB4,
                         has_w1_bias=False,
-                        has_w2_bias=False):
+                        has_w2_bias=False,
+                        kblock=None):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
     _build_fused_ep_moe_kernel declares its scratch from this list, in this
@@ -1271,6 +1305,12 @@ def vmem_scratch_arrays(g_local,
     leaves the row axis untiled, which is what makes an 8-row transport
     offset legal. It does that for every element type, which is why a
     sixteen-bit wire takes the same geometry at twice the bytes.
+
+    `kblock` is the (KB1, KB2) contraction heights a K-blocked weight
+    residency buffers, or None for the default whole-expert residency. It is
+    a property of the BUFFERS and of nothing else here: every other array is
+    sized by the full hidden and inter, because every other array is indexed
+    by an output channel or a token row rather than by a contraction offset.
     """
     form = weight_form(weight_format)
     lane_blocks = row_lane_blocks(hidden)
@@ -1279,6 +1319,11 @@ def vmem_scratch_arrays(g_local,
     # Every local expert's scale table is resident. At four-bit block scales
     # that makes the two scale tables some of the largest buffers here.
     if weight_format == WeightFormat.FP4:
+        if kblock is not None:
+            raise ValueError(
+                "the four-bit weight stream already blocks its contraction "
+                "at the scale block size; a K-blocked residency on top of it "
+                "is not a layout this builder emits")
         # Four-bit weights stream as PACKED u32 words ([K/8, N]), so the
         # transfer moves half the bytes an eight-bit slab would.
         weights = [
@@ -1288,9 +1333,12 @@ def vmem_scratch_arrays(g_local,
             ("w2s_vm", (g_local, inter // rhs_qb, hidden), jnp.float32),
         ]
     else:
+        # A slot holds one contraction block where the residency is blocked
+        # and the whole expert where it is not.
+        w1_rows, w2_rows = (hidden, inter) if kblock is None else kblock
         weights = [
-            ("w1_vm", (nbuf, hidden, 2 * inter), form.weight_dtype),
-            ("w2_vm", (nbuf, inter, hidden), form.weight_dtype),
+            ("w1_vm", (nbuf, w1_rows, 2 * inter), form.weight_dtype),
+            ("w2_vm", (nbuf, w2_rows, hidden), form.weight_dtype),
         ]
         if form.has_scales:
             weights += [
@@ -1399,6 +1447,7 @@ def vmem_estimate_bytes(g_local,
                         rhs_qb=QB4,
                         has_w1_bias=False,
                         has_w2_bias=False,
+                        kblock=None,
                         info=None):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1422,7 +1471,8 @@ def vmem_estimate_bytes(g_local,
                                  weight_format=weight_format,
                                  rhs_qb=rhs_qb,
                                  has_w1_bias=has_w1_bias,
-                                 has_w2_bias=has_w2_bias)
+                                 has_w2_bias=has_w2_bias,
+                                 kblock=kblock)
     arrays += vmem_tile_body_arrays(capacity,
                                     hidden,
                                     inter,
@@ -1430,3 +1480,65 @@ def vmem_estimate_bytes(g_local,
                                     rhs_qb=rhs_qb)
     return sum(
         array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
+
+
+# The weight formats whose FFN body has a K-blocked spelling. Four-bit
+# weights already block their contraction at the scale block and integer
+# weights already chunk theirs at the widening chunk, so neither has a whole
+# slab to give up; bf16 has no blocked body written for it.
+KBLOCKABLE_FORMATS = (WeightFormat.FP8, )
+
+
+def resolve_weight_kblock(g_local,
+                          capacity,
+                          hidden,
+                          inter,
+                          *,
+                          nbuf=NBUF,
+                          weight_format=WeightFormat.FP8,
+                          rhs_qb=QB4,
+                          has_w1_bias=False,
+                          has_w2_bias=False,
+                          info=None):
+    """(KB1, KB2) if this build has to give up whole-expert weight residency
+    to fit VMEM, or None if it does not.
+
+    This is the whole policy, and it is deliberately a LAST RESORT rather
+    than a default. Whole-expert residency reads each weight byte once per
+    EXPERT; the blocked residency reads it once per ROW TILE, which is the
+    same at the decode bucket and four times as much at a prefill tile count
+    of four. So a shape that fits today keeps the buffers and the traffic it
+    has today, bit for bit, and only a shape that would otherwise refuse to
+    build pays for the room.
+
+    Returns None as well where blocking could not APPLY -- a format with no
+    blocked body, block heights that do not divide the contraction, or a
+    contraction too short to hold the prefetch distance's worth of blocks
+    (the weight ring names the position DISTANCE ahead as "this row tile or
+    the next", which needs at least DISTANCE blocks in a tile). In every one
+    of those the caller's budget check raises its own diagnostic rather than
+    this one inventing a second.
+    """
+    if weight_format not in KBLOCKABLE_FORMATS:
+        return None
+    if info is None:
+        info = pltpu.get_tpu_info()
+    whole = vmem_estimate_bytes(g_local,
+                                capacity,
+                                hidden,
+                                inter,
+                                nbuf=nbuf,
+                                weight_format=weight_format,
+                                rhs_qb=rhs_qb,
+                                has_w1_bias=has_w1_bias,
+                                has_w2_bias=has_w2_bias,
+                                kblock=None,
+                                info=info)
+    if whole <= vmem_limit(info):
+        return None
+    if hidden % KBLOCK_HIDDEN or inter % KBLOCK_INTER:
+        return None
+    if min(hidden // KBLOCK_HIDDEN,
+           inter // KBLOCK_INTER) < WEIGHT_PREFETCH_DISTANCE:
+        return None
+    return (KBLOCK_HIDDEN, KBLOCK_INTER)

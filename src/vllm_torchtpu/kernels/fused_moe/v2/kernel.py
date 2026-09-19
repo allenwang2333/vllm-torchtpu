@@ -327,6 +327,59 @@ def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
     return acc2, mid_scale
 
 
+def expert_ffn_fp8_blocked(act_q,
+                           act_scale,
+                           w1_block,
+                           w2_block,
+                           w1s,
+                           *,
+                           n_blocks1,
+                           n_blocks2,
+                           kb1,
+                           kb2,
+                           act_fn="silu",
+                           w1b=None):
+    """expert_ffn_fp8 with both contractions summed over K-blocks.
+
+    Same function, same scales, same epilogue; the only difference is that
+    each matmul is a sum of partial products over contraction blocks rather
+    than one dot_general, so the caller can hold one BLOCK of each weight
+    slab in vector memory instead of a whole expert. w1_block(b) and
+    w2_block(b) return contraction block b of the two weights.
+
+    Two things about this are load-bearing.
+
+    The scale placement. expert_ffn_blockscale looks like this function and
+    is not: its scales are PER CONTRACTION BLOCK, so it multiplies each
+    partial product by its own block's scale and its epilogue owes none.
+    Eight-bit float scales are per OUTPUT CHANNEL -- a constant with respect
+    to the contraction -- so they distribute over the block sum and land once,
+    in the epilogue, exactly where expert_ffn_fp8 puts them. Copying
+    blockscale's `w1s=None` here would be silently, uniformly wrong.
+
+    The partial type. `_chunked_dot` accumulates in fp32, and it has to: a
+    blocked contraction has a named intermediate that an unblocked one does
+    not, so letting the partials land in bf16 is a slip only this spelling
+    can make, and it measures about three thousand times over the tolerance
+    a float64 oracle allows for the reassociation itself.
+
+    Splitting a contraction is NOT bit-identical to not splitting it -- it
+    regroups the fp32 additions. Against a float64 oracle the blocked sum is
+    if anything the more accurate of the two, being a pairwise reduction
+    rather than one long chain.
+    """
+    inter = w1s.shape[-1] // 2
+    acc1 = _chunked_dot(act_q, w1_block, n_blocks1, kb1)
+    mid_q, mid_scale = _intermediate_rows(acc1,
+                                          act_scale,
+                                          inter,
+                                          w1s=w1s,
+                                          act_fn=act_fn,
+                                          w1b=w1b)
+    acc2 = _chunked_dot(mid_q, w2_block, n_blocks2, kb2)
+    return acc2, mid_scale
+
+
 def expert_ffn_blockscale(act_q,
                           act_scale,
                           w1_block,
@@ -599,6 +652,42 @@ def _build_fused_ep_moe_kernel(*,
     lane_blocks = host.row_lane_blocks(hidden)
     has_scales = form.has_scales
     has_act_scale = form.quantized_activations
+    # Weight residency policy, and it is a fallback rather than a choice: a
+    # shape whose whole-expert slabs fit keeps them, with the buffers, the
+    # pipeline and the weight traffic it has today unchanged, and only a
+    # shape that would otherwise refuse to build gives whole-expert
+    # residency up. host.resolve_weight_kblock is the one place that
+    # decides, and it answers None for every format and every shape that
+    # does not need it.
+    kblock = host.resolve_weight_kblock(g_local,
+                                        capacity,
+                                        hidden,
+                                        inter,
+                                        nbuf=NBUF,
+                                        weight_format=weight_format,
+                                        rhs_qb=rhs_qb,
+                                        has_w1_bias=has_w1_bias,
+                                        has_w2_bias=has_w2_bias)
+    kblocked = kblock is not None
+    if kblocked:
+        kb1, kb2 = kblock
+        n_wblocks1 = hidden // kb1
+        n_wblocks2 = inter // kb2
+        # The weight ring runs over (expert, row tile, block) and prefetches
+        # DISTANCE positions along it. With at least DISTANCE blocks per
+        # tile per slab, a refill target is either in this tile or in the
+        # next one, and the next one is a tile of an expert the visit list
+        # can name. Fewer blocks than that would put a target two tiles out,
+        # which it cannot name. host.resolve_weight_kblock only ever returns
+        # heights that divide, and both are strictly below their
+        # contraction, so this is arithmetic rather than a caller value.
+        assert min(n_wblocks1, n_wblocks2) >= WEIGHT_PREFETCH_DISTANCE, (
+            f"a K-blocked residency needs at least "
+            f"{WEIGHT_PREFETCH_DISTANCE} blocks per slab, got "
+            f"{n_wblocks1} and {n_wblocks2}")
+    else:
+        kb1 = kb2 = None
+        n_wblocks1 = n_wblocks2 = 1
     est = host.vmem_estimate_bytes(g_local,
                                    capacity,
                                    hidden,
@@ -607,7 +696,8 @@ def _build_fused_ep_moe_kernel(*,
                                    weight_format=weight_format,
                                    rhs_qb=rhs_qb,
                                    has_w1_bias=has_w1_bias,
-                                   has_w2_bias=has_w2_bias)
+                                   has_w2_bias=has_w2_bias,
+                                   kblock=kblock)
     limit = host.vmem_limit()
     if rhs_packed4:
         # Asked here, beside the other device reads, because the packed
@@ -622,7 +712,9 @@ def _build_fused_ep_moe_kernel(*,
         raise ValueError(
             f"the kernel's VMEM buffers need {est/2**20:.1f}MiB, over the "
             f"{limit/2**20:.1f}MiB budget, for {g_local} local experts of "
-            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity}")
+            f"{hidden}x{inter} at NBUF={NBUF} capacity={capacity} with "
+            f"{'K-blocked ' + str(kblock) if kblocked else 'whole-expert'} "
+            "weight residency")
     # ragged_rows_alloc must cover every tile READ as well as every commit
     # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
     # tail tile reads a full window.
@@ -798,13 +890,25 @@ def _build_fused_ep_moe_kernel(*,
             copy.start()
             copy.wait()
 
-        def w1_copy(expert, slot):
-            """The gate/up weight slab of `expert`, into weight slot `slot`."""
-            return _slot_copy(w1_hbm.at[expert], w1_vm, w1_sems, slot)
+        def w1_copy(expert, block, slot):
+            """The gate/up weight of `expert` into weight slot `slot`.
 
-        def w2_copy(expert, slot):
-            """The down weight slab of `expert`, into weight slot `slot`."""
-            return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
+            A whole slab where the residency is whole-expert, and
+            contraction block `block` of it where the residency is
+            K-blocked; `block` is ignored in the first case, where a slot is
+            the whole contraction and there is only ever one.
+            """
+            src = (w1_hbm.at[expert]
+                   if kb1 is None else w1_hbm.at[expert,
+                                                 pl.ds(block * kb1, kb1)])
+            return _slot_copy(src, w1_vm, w1_sems, slot)
+
+        def w2_copy(expert, block, slot):
+            """The down weight of `expert`, the same two ways."""
+            src = (w2_hbm.at[expert]
+                   if kb2 is None else w2_hbm.at[expert,
+                                                 pl.ds(block * kb2, kb2)])
+            return _slot_copy(src, w2_vm, w2_sems, slot)
 
         def prologue():
             """Land the resident tables and start the first weight refills."""
@@ -815,6 +919,24 @@ def _build_fused_ep_moe_kernel(*,
                 sync(w1b_hbm, w1b_vm)
             if has_w2_bias:
                 sync(w2b_hbm, w2b_vm)
+            if kblocked:
+                # The ring counts BLOCKS, not experts, and the first
+                # DISTANCE positions of both rings belong to the first
+                # visited expert's first row tile -- a tile consumes every
+                # w1 block then every w2 block, and each slab carries at
+                # least DISTANCE of them. So the head of each ring is a
+                # slot-for-counter identity and needs no visit list beyond
+                # its first entry.
+                @pl.when(jnp.int32(0) < n_visit)
+                def _():
+                    first = visit_sm[0]
+                    for c in range(WEIGHT_PREFETCH_DISTANCE):
+                        w1_copy(first, jnp.int32(c),
+                                c).start(priority=WEIGHT_DMA_PRIORITY)
+                        w2_copy(first, jnp.int32(c),
+                                c).start(priority=WEIGHT_DMA_PRIORITY)
+
+                return
             # Guarded on b < n_visit, matching the head waits. The range is
             # clamped to the visit-list length: at one local expert,
             # visit_sm[1] would be a statically out-of-bounds read before
@@ -823,8 +945,10 @@ def _build_fused_ep_moe_kernel(*,
 
                 @pl.when(jnp.int32(b) < n_visit)
                 def _(b=b):
-                    w1_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
-                    w2_copy(visit_sm[b], b).start(priority=WEIGHT_DMA_PRIORITY)
+                    w1_copy(visit_sm[b], jnp.int32(0),
+                            b).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2_copy(visit_sm[b], jnp.int32(0),
+                            b).start(priority=WEIGHT_DMA_PRIORITY)
 
         prologue()
         _all_pairs_barrier(ep)
@@ -874,6 +998,58 @@ def _build_fused_ep_moe_kernel(*,
                         host.BF16)
 
             return w1_chunk, w2_chunk
+
+        def _kblock_reader(copy, vm, n_blocks, counter_base, e, ahead_e,
+                           ahead_ok):
+            """A weight-block reader that advances one weight ring itself.
+
+            Where the residency is whole-expert the ring is over experts and
+            the waits sit at an expert's head, one per slab. Where it is
+            K-blocked there is nothing whole to wait for at a head: the unit
+            is one (expert, row tile, block) position, the ring runs over a
+            counter of those, and the wait for a position has to sit exactly
+            where that position is consumed. So it goes in the reader, and
+            the contraction loop that calls the reader is what drives the
+            pipeline.
+
+            block(b) waits for block b of this row tile, hands the DMA
+            engine the refill DISTANCE positions further along the ring, and
+            returns the block. Its slot is `rem(counter, NBUF)`; the slot the
+            refill targets is the one the position DISTANCE back released,
+            which is the whole reason NBUF exceeds DISTANCE. It must be
+            called once per b and in order.
+
+            `ahead_e` is the expert the position after this row tile's last
+            belongs to -- this expert while it has row tiles left, the next
+            visited one after that -- and `ahead_ok` is false only at the
+            very last row tile of the very last expert, where the ring ends
+            and nothing more is started. That is what makes every started
+            copy waited exactly once.
+            """
+
+            def block(b):
+                c = counter_base + b
+                slot = lax.rem(c, jnp.int32(NBUF))
+                copy(e, jnp.int32(b), slot).wait()
+                ahead_slot = lax.rem(c + WEIGHT_PREFETCH_DISTANCE,
+                                     jnp.int32(NBUF))
+                nxt = b + WEIGHT_PREFETCH_DISTANCE
+                if nxt < n_blocks:
+                    # Still inside this row tile: the expert is this one and
+                    # the position certainly exists.
+                    copy(e, jnp.int32(nxt),
+                         ahead_slot).start(priority=WEIGHT_DMA_PRIORITY)
+                else:
+                    # Into the next row tile. At least DISTANCE blocks per
+                    # slab is what keeps it from being the one after that.
+                    @pl.when(ahead_ok)
+                    def _():
+                        copy(ahead_e, jnp.int32(nxt - n_blocks),
+                             ahead_slot).start(priority=WEIGHT_DMA_PRIORITY)
+
+                return vm[slot]
+
+            return block
 
         # ---- ragged tile machinery ----
         # One-tile lookahead, double-buffered on the global tile parity:
@@ -1055,22 +1231,29 @@ def _build_fused_ep_moe_kernel(*,
             # this expert's first index window is in.
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
-            slot = lax.rem(visit_i, jnp.int32(NBUF))
-            w1_copy(e, slot).wait()
-            w2_copy(e, slot).wait()
+            # A K-blocked residency has no whole slab to wait for here: its
+            # ring is over (expert, row tile, block) and both its waits and
+            # its refills live in the per-tile readers below.
+            slot = None
+            if not kblocked:
+                slot = lax.rem(visit_i, jnp.int32(NBUF))
+                w1_copy(e, jnp.int32(0), slot).wait()
+                w2_copy(e, jnp.int32(0), slot).wait()
 
-            # Refill the slot for the expert DISTANCE ahead: the previous
-            # expert last read it, and DISTANCE < NBUF keeps it off both live
-            # readers, so no wait is needed.
-            @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
-            def _():
-                refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
-                                      jnp.int32(NBUF))
-                ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
-                # Weight refills take their own DMA priority to stay off the
-                # in-order token-gather queue.
-                w1_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
-                w2_copy(ahead, refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
+                # Refill the slot for the expert DISTANCE ahead: the previous
+                # expert last read it, and DISTANCE < NBUF keeps it off both
+                # live readers, so no wait is needed.
+                @pl.when(visit_i + WEIGHT_PREFETCH_DISTANCE < n_visit)
+                def _():
+                    refill_slot = lax.rem(visit_i + WEIGHT_PREFETCH_DISTANCE,
+                                          jnp.int32(NBUF))
+                    ahead = visit_sm[visit_i + WEIGHT_PREFETCH_DISTANCE]
+                    # Weight refills take their own DMA priority to stay off
+                    # the in-order token-gather queue.
+                    w1_copy(ahead, jnp.int32(0),
+                            refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2_copy(ahead, jnp.int32(0),
+                            refill_slot).start(priority=WEIGHT_DMA_PRIORITY)
 
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
@@ -1225,6 +1408,18 @@ def _build_fused_ep_moe_kernel(*,
                 live_blocks = live_rows // ROWBLK
                 tile_block_base = t * tile_blocks  # expert-local block base
                 parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
+                # Where the weight ring runs over row tiles, this is the
+                # position after this tile's last: the next row tile of this
+                # expert, else the first row tile of the next visited
+                # expert, else nothing -- and only the last tile of the last
+                # expert is "nothing", which is what stops the ring from
+                # starting a copy no one waits for. An empty expert is absent
+                # from the visit list, so a next visit always has a tile.
+                more_tiles = t + 1 < n_tiles
+                ahead_ok = jnp.logical_or(more_tiles, visit_i + 1 < n_visit)
+                ahead_e = jnp.where(
+                    more_tiles, e,
+                    visit_sm[jnp.minimum(visit_i + 1, n_visit - 1)])
 
                 # out_vm[parity] reuse guard. Predicated on the outstanding
                 # count rather than on the tile count, because the drain
@@ -1334,6 +1529,29 @@ def _build_fused_ep_moe_kernel(*,
                                                           w2_vm[slot],
                                                           act_fn=act_fn,
                                                           w1b=w1b_row)
+                    elif kblocked:
+                        # One block of each slab is resident, so the
+                        # contraction is summed over blocks and the readers
+                        # run the ring. The per-channel w1s still lands in
+                        # the epilogue, where a per-channel scale belongs.
+                        w1_block = _kblock_reader(w1_copy, w1_vm, n_wblocks1,
+                                                  tile_count * n_wblocks1, e,
+                                                  ahead_e, ahead_ok)
+                        w2_block = _kblock_reader(w2_copy, w2_vm, n_wblocks2,
+                                                  tile_count * n_wblocks2, e,
+                                                  ahead_e, ahead_ok)
+                        acc2, mid_scale = expert_ffn_fp8_blocked(
+                            act_rows,
+                            act_scales,
+                            w1_block,
+                            w2_block,
+                            w1s_vm[pl.ds(e, 1), :],
+                            n_blocks1=n_wblocks1,
+                            n_blocks2=n_wblocks2,
+                            kb1=kb1,
+                            kb2=kb2,
+                            act_fn=act_fn,
+                            w1b=w1b_row)
                     else:
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
@@ -1583,7 +1801,8 @@ def _build_fused_ep_moe_kernel(*,
                                  weight_format=weight_format,
                                  rhs_qb=rhs_qb,
                                  has_w1_bias=has_w1_bias,
-                                 has_w2_bias=has_w2_bias)
+                                 has_w2_bias=has_w2_bias,
+                                 kblock=kblock)
     ] + [
         pltpu.SemaphoreType.DMA,  # token_gather_sem0
         pltpu.SemaphoreType.DMA,  # token_gather_sem1
@@ -1651,10 +1870,16 @@ def _build_fused_ep_moe_kernel(*,
         }[weight_format]
         bias_tag = (("_w13bias" if has_w1_bias else "") +
                     ("_w2bias" if has_w2_bias else ""))
+        # Which weight residency a build got is not visible in any shape a
+        # profile reports, and it is the difference between reading each
+        # weight byte once per expert and once per row tile. Put it in the
+        # scope name, where a trace can be asked which one ran.
+        kblock_tag = f"_kb{kb1}x{kb2}" if kblocked else ""
         name = (f"fused_ep_moe_v2"
                 f"{format_tag}"
                 f"{'' if act_fn == 'silu' else '_' + act_fn}"
                 f"{bias_tag}"
+                f"{kblock_tag}"
                 f"_g{g_local}_c{capacity}_nb{NBUF}")
         return pl.pallas_call(
             kernel,
