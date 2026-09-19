@@ -35,7 +35,7 @@ from vllm_torchtpu.layers.core.gdn_attention import (
     _derive_pcp_ragged_exchange_descriptors,
     _derive_pcp_rank_major_reorder_indices,
     _exchange_pcp_token_shards_for_head_shards,
-    _select_replicated_shard_for_pcp_rank,
+    _select_replicated_shard_by_mesh_coordinate,
     _validate_pcp_ragged_exchange_layout_support,
     run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled_pcp_prefill,
@@ -174,7 +174,7 @@ def test_replicated_pcp_shard_selection_avoids_axis_index_partition_id(
                         fake_dynamic_slice_in_dim)
     monkeypatch.setattr(jax.lax, "all_to_all", fake_all_to_all)
 
-    shard = _select_replicated_shard_for_pcp_rank(
+    shard = _select_replicated_shard_by_mesh_coordinate(
         tensor,
         "pcp",
         3,

@@ -192,7 +192,7 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
     # position in this array: jax.export drops the mesh's device array and the
     # runtime rebuilds the assignment by walking the client's devices in order,
     # so the kernel sees that order instead. A kernel that indexes host-built
-    # per-rank tables with it needs partition_order_for_axis to translate.
+    # per-rank tables with it needs mesh_coordinates_for_axis to translate.
     # Logging the two side by side makes a divergence visible instead of
     # silent.
     # Cached per layout, so this logs once per worker rather than per step.
@@ -210,20 +210,20 @@ def get_or_create_cp_mesh(axis_name: str, group: Any | None) -> Any:
     return mesh
 
 
-def partition_order_for_axis(mesh: Any, axis_name: str) -> tuple[int, ...]:
+def mesh_coordinates_for_axis(mesh: Any, axis_name: str) -> tuple[int, ...]:
     """Map each position in ``mesh`` along ``axis_name`` to its mesh coordinate.
 
-    A kernel has two different numbers for the same peer. The host builds its
-    token plan from the group layout, so plan entry ``i`` belongs to the device
-    sitting at position ``i`` of ``mesh``. ``lax.axis_index`` and
+    A kernel has two different numbers for the same peer. The host indexes
+    everything by rank in the group, and the mesh is built in that order, so
+    rank ``i`` is the device sitting at position ``i`` of ``mesh``.
+    ``lax.axis_index`` and
     ``DeviceIdType.MESH`` instead speak the runtime device assignment, which
     ``jax.export`` rebuilds by walking the client's devices in order -- the
     mesh's own device array does not survive export. The two agree only when
     the group happens to be laid out in device order.
 
-    Returns a tuple whose ``i``-th entry is the mesh coordinate addressing the
-    device at position ``i``, so a caller can translate plan positions into
-    peer addresses. Raises if the runtime assignment cannot be expressed that
+    Returns a tuple whose ``i``-th entry is the mesh coordinate addressing
+    rank ``i``, so a caller can turn a rank into a peer address. Raises if the runtime assignment cannot be expressed that
     way, because silently addressing the wrong peer corrupts results instead
     of failing.
     """

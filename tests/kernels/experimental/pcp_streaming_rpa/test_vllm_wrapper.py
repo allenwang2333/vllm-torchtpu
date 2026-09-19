@@ -615,7 +615,8 @@ def test_sharded_wrapper_generates_slot_ids_when_metadata_omits_them(
         "pcp_streaming_attention_page_groups_packed_local_from_metadata",
         fake_streaming,
     )
-    monkeypatch.setattr(pcp_wrapper, "_select_replicated_shard_for_pcp_rank",
+    monkeypatch.setattr(pcp_wrapper,
+                        "_select_replicated_shard_by_mesh_coordinate",
                         fake_select_replicated_shard)
     monkeypatch.setattr(pcp_wrapper.jax, "shard_map", fake_shard_map)
 

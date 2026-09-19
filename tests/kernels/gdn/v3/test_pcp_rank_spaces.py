@@ -16,8 +16,9 @@
 Two numbering spaces meet in this kernel, and they coincide only when the PCP
 process group happens to be laid out in device order:
 
-  plan position    the host's index into the PCP group. Every ``rank_*`` and
-                   ``projection_*`` table the host builds is in this order.
+  pcp rank         the host's index into the PCP group, i.e. the group's
+                   rank_in_group. Every ``rank_*`` and ``projection_*`` table
+                   the host builds has one row per PCP rank.
   mesh coordinate  what ``lax.axis_index`` returns, what a
                    ``DeviceIdType.MESH`` peer address resolves against, and
                    the order a native collective stacks its participants in.
@@ -72,111 +73,113 @@ def _runtime_devices(monkeypatch, device_ids):
                         lambda *a, **k: [_FakeDevice(i) for i in device_ids])
 
 
-# --- partition_order_for_axis: plan position -> mesh coordinate -----------
+# --- mesh_coordinates_for_axis: PCP rank -> mesh coordinate ---------------
 
 
-def test_partition_order_is_the_identity_when_the_group_is_in_device_order(
+def test_mesh_coordinates_are_the_identity_when_the_group_is_in_device_order(
         monkeypatch):
     _runtime_devices(monkeypatch, range(8))
     mesh = _fake_mesh(range(8))
-    assert mesh_utils.partition_order_for_axis(mesh, "pcp") == tuple(range(8))
+    assert mesh_utils.mesh_coordinates_for_axis(mesh, "pcp") == tuple(range(8))
 
 
-def test_partition_order_translates_the_measured_tpu7x_layout(monkeypatch):
+def test_mesh_coordinates_translate_the_measured_tpu7x_layout(monkeypatch):
     # The runtime walks devices in id order, so device d sits at coordinate d.
-    # The mesh is in PCP rank order, so plan position i holds device
+    # The mesh is in PCP rank order, so PCP rank i holds device
     # _MEASURED_DEVICE_ORDER[i] and answers to that coordinate.
     _runtime_devices(monkeypatch, range(8))
     mesh = _fake_mesh(_MEASURED_DEVICE_ORDER)
-    assert (mesh_utils.partition_order_for_axis(
+    assert (mesh_utils.mesh_coordinates_for_axis(
         mesh, "pcp") == _MEASURED_DEVICE_ORDER)
 
 
-def test_partition_order_is_a_permutation_for_every_group_order(monkeypatch):
+def test_mesh_coordinates_are_a_permutation_for_every_group_order(monkeypatch):
     _runtime_devices(monkeypatch, range(8))
     rng = np.random.default_rng(0)
     for _ in range(16):
         order = rng.permutation(8)
-        got = mesh_utils.partition_order_for_axis(_fake_mesh(order), "pcp")
+        got = mesh_utils.mesh_coordinates_for_axis(_fake_mesh(order), "pcp")
         assert sorted(got) == list(range(8))
 
 
-def test_partition_order_rejects_a_device_the_runtime_does_not_expose(
+def test_mesh_coordinates_reject_a_device_the_runtime_does_not_expose(
         monkeypatch):
     # Addressing a peer that is not in the assignment cannot be expressed, and
     # guessing would deliver the rows to whoever is there instead.
     _runtime_devices(monkeypatch, range(8))
     mesh = _fake_mesh((0, 1, 2, 3, 4, 5, 6, 99))
     with pytest.raises(RuntimeError, match="absent from the runtime"):
-        mesh_utils.partition_order_for_axis(mesh, "pcp")
+        mesh_utils.mesh_coordinates_for_axis(mesh, "pcp")
 
 
-def test_partition_order_rejects_a_short_runtime_assignment(monkeypatch):
+def test_mesh_coordinates_reject_a_short_runtime_assignment(monkeypatch):
     _runtime_devices(monkeypatch, range(4))
     with pytest.raises(RuntimeError, match="JAX exposes only"):
-        mesh_utils.partition_order_for_axis(_fake_mesh(range(8)), "pcp")
+        mesh_utils.mesh_coordinates_for_axis(_fake_mesh(range(8)), "pcp")
 
 
-def test_partition_order_rejects_an_axis_that_is_not_unique():
+def test_mesh_coordinates_reject_an_axis_that_is_not_unique():
     mesh = _fake_mesh(range(8), axis_names=("pcp", "pcp"))
     with pytest.raises(ValueError, match="exactly once"):
-        mesh_utils.partition_order_for_axis(mesh, "pcp")
+        mesh_utils.mesh_coordinates_for_axis(mesh, "pcp")
 
 
-# --- _plan_position: mesh coordinate -> plan position ---------------------
+# --- _pcp_rank_for_mesh_coordinate: mesh coordinate -> PCP rank -----------
 
 
-def test_plan_position_inverts_partition_order():
-    for plan_index, coordinate in enumerate(_MEASURED_DEVICE_ORDER):
-        got = pcp_wrapper._plan_position(_MEASURED_DEVICE_ORDER,
-                                         jnp.int32(coordinate))
-        assert int(got) == plan_index, (
-            f"mesh coordinate {coordinate} must resolve to plan position "
-            f"{plan_index}")
+def test_pcp_rank_for_mesh_coordinate_inverts_the_map():
+    for pcp_rank, coordinate in enumerate(_MEASURED_DEVICE_ORDER):
+        got = pcp_wrapper._pcp_rank_for_mesh_coordinate(
+            _MEASURED_DEVICE_ORDER, jnp.int32(coordinate))
+        assert int(got) == pcp_rank, (
+            f"mesh coordinate {coordinate} must resolve to PCP rank "
+            f"{pcp_rank}")
 
 
-def test_plan_position_is_the_identity_under_an_identity_order():
+def test_pcp_rank_for_mesh_coordinate_is_the_identity_under_an_identity_map():
     order = tuple(range(8))
     for coordinate in range(8):
-        got = pcp_wrapper._plan_position(order, jnp.int32(coordinate))
+        got = pcp_wrapper._pcp_rank_for_mesh_coordinate(
+            order, jnp.int32(coordinate))
         assert int(got) == coordinate
 
 
-# --- _plan_major_from_mesh_major: collective output -> plan order ---------
+# --- _reorder_collective_output_to_pcp_rank: collective output -> rank ----
 
 
-def test_plan_major_reorders_collective_blocks_into_plan_order():
+def test_collective_blocks_are_reordered_to_pcp_rank():
     # Label every row with the mesh coordinate that contributed it: a
     # collective stacks its participants in that order, so block p is
     # coordinate p's. Stating the expectation as "which participant's data
-    # ends up at plan position i" keeps this a test of the contract rather
+    # ends up at PCP rank i" keeps this a test of the contract rather
     # than a restatement of the gather the implementation happens to use.
     rows_per_block = 3
     labels = jnp.repeat(jnp.arange(8, dtype=jnp.float32),
                         rows_per_block).reshape(8 * rows_per_block, 1)
     got = np.asarray(
-        gdn_attention._plan_major_from_mesh_major(labels,
-                                                  _MEASURED_DEVICE_ORDER))
-    for plan_index, coordinate in enumerate(_MEASURED_DEVICE_ORDER):
-        block = got[plan_index * rows_per_block:(plan_index + 1) *
-                    rows_per_block, 0]
+        gdn_attention._reorder_collective_output_to_pcp_rank(
+            labels, _MEASURED_DEVICE_ORDER))
+    for pcp_rank, coordinate in enumerate(_MEASURED_DEVICE_ORDER):
+        block = got[pcp_rank * rows_per_block:(pcp_rank + 1) * rows_per_block,
+                    0]
         assert set(block.tolist()) == {
             float(coordinate)
-        }, (f"plan position {plan_index} must be handed the block that "
+        }, (f"PCP rank {pcp_rank} must be handed the block that "
             f"collective participant {coordinate} contributed, got {block}")
 
 
-def test_plan_major_is_a_no_op_under_an_identity_order():
+def test_collective_reorder_is_a_no_op_under_an_identity_map():
     tensor = jnp.arange(16, dtype=jnp.float32).reshape(8, 2)
-    got = gdn_attention._plan_major_from_mesh_major(tensor, tuple(range(8)))
+    got = gdn_attention._reorder_collective_output_to_pcp_rank(
+        tensor, tuple(range(8)))
     assert got is tensor
 
 
-def test_plan_major_rejects_an_axis_it_cannot_split():
+def test_collective_reorder_rejects_an_axis_it_cannot_split():
     tensor = jnp.zeros((9, 2), dtype=jnp.float32)
     with pytest.raises(ValueError, match="Cannot split axis 0"):
-        gdn_attention._plan_major_from_mesh_major(tensor,
-                                                  _MEASURED_DEVICE_ORDER)
+        gdn_attention._reorder_collective_output_to_pcp_rank(
+            tensor, _MEASURED_DEVICE_ORDER)
 
 
 # --- the kernel's own indexing, pinned at the source ----------------------
@@ -186,7 +189,7 @@ def test_plan_major_rejects_an_axis_it_cannot_split():
 # keeps a locally reasonable sweep from undoing them.
 
 # Built by the host, one row per PCP group position.
-_PLAN_ORDERED_TABLES = (
+_RANK_ORDERED_TABLES = (
     "rank_active_row_end",
     "rank_row_start",
     "rank_valid_rows",
@@ -218,17 +221,17 @@ def _subscripts(source: str, expression: str):
                     break
 
 
-@pytest.mark.parametrize("table", _PLAN_ORDERED_TABLES)
+@pytest.mark.parametrize("table", _RANK_ORDERED_TABLES)
 def test_host_built_tables_are_never_indexed_by_the_mesh_coordinate(table):
     source = _wrapper_source()
     seen = 0
     for subscript in _subscripts(source, f"stage_metadata_ref.{table}"):
         seen += 1
-        assert not re.search(r"\brank\b", subscript), (
+        assert not re.search(r"\bmesh_coordinate\b", subscript), (
             f"stage_metadata_ref.{table}[{' '.join(subscript.split())}] "
-            "indexes a host-built, plan-ordered table with the mesh "
-            "coordinate `rank`. Use `plan_rank`: on a group that is not in "
-            "device order this silently reads another peer's row.")
+            "indexes a host-built, rank-ordered table with "
+            "`mesh_coordinate`. Use `pcp_rank`: on a group that is not laid "
+            "out in device order this silently reads another peer's row.")
     assert seen, (f"stage_metadata_ref.{table}[...] never appears; the table "
                   "was renamed or dropped, so update this list.")
 
@@ -236,41 +239,41 @@ def test_host_built_tables_are_never_indexed_by_the_mesh_coordinate(table):
 def test_the_head_shard_column_stays_a_mesh_coordinate():
     # The counter-rule. packed_out's second axis is a head shard, and head
     # shards are handed out by the all_to_all in
-    # _select_replicated_shard_for_pcp_rank, which assigns them by mesh
-    # coordinate. Rewriting this one to plan_rank would introduce the same
+    # _select_replicated_shard_by_mesh_coordinate, which assigns them by mesh
+    # coordinate. Rewriting this one to pcp_rank would introduce the same
     # class of bug in the opposite direction.
     subscripts = list(_subscripts(_wrapper_source(), "packed_out_ref.at"))
     assert subscripts, "packed_out_ref.at[...] not found; update this test"
-    assert any(re.search(r"\brank\b", s) for s in subscripts), (
-        "packed_out_ref's head-shard column must stay indexed by the mesh "
-        "coordinate `rank`, not by `plan_rank`.")
+    assert any(re.search(r"\bmesh_coordinate\b", s) for s in subscripts), (
+        "packed_out_ref's head-shard column must stay indexed by "
+        "`mesh_coordinate`, not by `pcp_rank`.")
 
 
 def test_peer_addressing_goes_through_the_partition_order():
     # A DeviceIdType.MESH coordinate is a mesh coordinate. `destination` in
-    # the q/k/v push loop is a plan position, so it has to be translated
-    # before it can name a chip.
-    assert "pcp_partition_order[destination]" in _wrapper_source(), (
+    # the q/k/v push loop is a PCP rank, so it has to be translated before
+    # it can name a chip.
+    assert "mesh_coordinate_by_pcp_rank[destination]" in _wrapper_source(), (
         "the q/k/v push must address its peer as "
-        "pcp_partition_order[destination]; `destination` alone is a plan "
-        "position and names the wrong chip.")
+        "mesh_coordinate_by_pcp_rank[destination]; `destination` alone is a "
+        "PCP rank and names the wrong chip.")
 
 
-def test_partition_order_is_a_static_kernel_argument():
-    # Closed over as a Python tuple rather than passed as data: _plan_position
+def test_the_coordinate_table_is_a_static_kernel_argument():
+    # Closed over as a Python tuple rather than passed as data: _pcp_rank_for_mesh_coordinate
     # unrolls it into selects because Pallas rejects a closed-over array and
     # SPMD forbids handing each device its own scalar.
-    assert re.search(
-        r'^\s*"pcp_partition_order",\s*$',
-        _wrapper_source(),
-        flags=re.MULTILINE), ("pcp_partition_order must stay in the static "
-                              "argument list, or the kernel would be asked to "
-                              "trace a traced value.")
+    assert re.search(r'^\s*"mesh_coordinate_by_pcp_rank",\s*$',
+                     _wrapper_source(),
+                     flags=re.MULTILINE), (
+                         "mesh_coordinate_by_pcp_rank must stay in the static "
+                         "argument list, or the kernel would be asked to "
+                         "trace a traced value.")
 
 
-def test_the_default_partition_order_is_the_identity():
+def test_the_default_coordinate_table_is_the_identity():
     # Callers that have not been taught the difference keep the old
     # behaviour rather than getting a silent reordering.
     source = _wrapper_source()
-    assert "pcp_partition_order = tuple(range(pcp_size))" in source, (
-        "an absent pcp_partition_order must default to the identity.")
+    assert "mesh_coordinate_by_pcp_rank = tuple(range(pcp_size))" in source, (
+        "an absent mesh_coordinate_by_pcp_rank must default to the identity.")

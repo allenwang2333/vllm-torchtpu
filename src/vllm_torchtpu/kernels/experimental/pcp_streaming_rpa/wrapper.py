@@ -140,14 +140,18 @@ def _reshape_packed_kv_cache_for_attention(
                      f"expected_packing={expected_packing}.")
 
 
-def _select_replicated_shard_for_pcp_rank(
+def _select_replicated_shard_by_mesh_coordinate(
     tensor: jax.Array,
     pcp_axis: str,
     pcp_size: int,
     *,
     axis: int,
 ) -> jax.Array:
-    """Select this PCP rank shard from replicated data without axis_index."""
+    """Select this device's shard from replicated data without axis_index.
+
+    Chosen by mesh coordinate, not by PCP rank: all_to_all hands participant
+    ``p`` the ``p``-th split, and ``p`` is a mesh coordinate.
+    """
     if axis < 0:
         axis += tensor.ndim
     if tensor.shape[axis] % pcp_size != 0:
@@ -596,7 +600,7 @@ def _select_replicated_query_row_mapping_for_pcp_rank(
         ),
         axis=1,
     )
-    local_mapping = _select_replicated_shard_for_pcp_rank(
+    local_mapping = _select_replicated_shard_by_mesh_coordinate(
         packed_mapping,
         pcp_axis,
         pcp_size,
