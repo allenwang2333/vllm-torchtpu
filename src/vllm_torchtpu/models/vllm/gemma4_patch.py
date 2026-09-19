@@ -2,6 +2,7 @@
 """Model-specific patches and TPU compilation optimizations for Gemma-4 multimodal/audio."""
 
 import functools
+import itertools
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -250,10 +251,91 @@ def _patch_fast_wav_audio_loader() -> None:
     logger.info("Applied TPU patch: AudioMediaIO zero-copy PCM_16 WAV loader.")
 
 
+def _patch_gemma4_cpu_audio_batching() -> None:
+    try:
+        from vllm.model_executor.models import gemma4_mm
+        import vllm.multimodal.utils as mm_utils
+        import vllm.v1.worker.gpu_model_runner as gpu_runner_mod
+    except Exception:
+        return
+
+    if getattr(mm_utils, "_tpu_audio_cpu_pad_patched", False):
+        return
+
+    orig_group_and_batch = mm_utils.group_and_batch_mm_kwargs
+    batch_audio_features_fn = gemma4_mm.batch_audio_features
+
+    @functools.wraps(orig_group_and_batch)
+    def _patched_group_and_batch_mm_kwargs(
+        mm_kwargs,
+        *,
+        device=None,
+        pin_memory: bool = False,
+    ):
+        for modality, group in itertools.groupby(mm_kwargs, key=lambda x: x[0]):
+            items_lst = [item for _, item in group]
+            if modality == "audio" and device is not None and str(device).startswith("tpu"):
+                for num_items, mm_kwargs_batch in mm_utils.group_and_batch_mm_items(
+                    items_lst,
+                    device="cpu",
+                    pin_memory=False,
+                ):
+                    raw_f = mm_kwargs_batch.get("input_features_padded")
+                    raw_m = mm_kwargs_batch.get("input_features_mask")
+                    if raw_f is not None and raw_m is not None:
+                        if isinstance(raw_m, list):
+                            valid_lens = [
+                                (int(m.shape[-1]) + 3) // 4 for m in raw_m
+                            ]
+                        else:
+                            b_sz = int(raw_m.shape[0]) if raw_m.ndim > 1 else 1
+                            valid_lens = [
+                                (int(raw_m.shape[-1]) + 3) // 4
+                            ] * b_sz
+                        feats_cpu, mask_cpu = batch_audio_features_fn(
+                            raw_f, raw_m)
+                        batch_size, seq_frames, _ = feats_cpu.shape
+                        target_b = _get_padded_bucket(
+                            batch_size, _AUDIO_BATCH_BUCKETS)
+                        target_t = _get_padded_bucket(
+                            seq_frames, _AUDIO_FRAME_BUCKETS)
+                        pad_b = target_b - batch_size
+                        pad_t = target_t - seq_frames
+                        if pad_b > 0 or pad_t > 0:
+                            feats_cpu = F.pad(
+                                feats_cpu, (0, 0, 0, pad_t, 0, pad_b),
+                                value=0.0)
+                            mask_cpu = F.pad(
+                                mask_cpu, (0, pad_t, 0, pad_b),
+                                value=False)
+                        mm_kwargs_batch["input_features_padded"] = feats_cpu.to(
+                            device=device, non_blocking=True)
+                        mm_kwargs_batch["input_features_mask"] = mask_cpu.to(
+                            device=device, non_blocking=True)
+                        mm_kwargs_batch["_tpu_valid_lens"] = valid_lens
+                        mm_kwargs_batch["_tpu_orig_batch_size"] = batch_size
+                    yield modality, num_items, mm_kwargs_batch
+            else:
+                for num_items, mm_kwargs_batch in mm_utils.group_and_batch_mm_items(
+                    items_lst,
+                    device=device,
+                    pin_memory=pin_memory,
+                ):
+                    yield modality, num_items, mm_kwargs_batch
+
+    mm_utils.group_and_batch_mm_kwargs = _patched_group_and_batch_mm_kwargs
+    gpu_runner_mod.group_and_batch_mm_kwargs = _patched_group_and_batch_mm_kwargs
+    mm_utils._tpu_audio_cpu_pad_patched = True
+    logger.info(
+        "Applied TPU patch: CPU-side static bucket padding for Gemma4 audio inputs."
+    )
+
+
 def maybe_patch_gemma4(
         model_config: Optional["ModelConfig"] = None) -> bool | None:
     _patch_fast_wav_audio_loader()
     _patch_gemma4_audio_feature_extractor()
+    _patch_gemma4_cpu_audio_batching()
     if not _is_gemma4_model(model_config):
         return False
 
@@ -294,54 +376,39 @@ def maybe_patch_gemma4(
         assert self.audio_tower is not None
         assert self.embed_audio is not None
 
-        raw_features = audio_input["input_features_padded"]
-        raw_masks = audio_input["input_features_mask"]
+        pre_valid_lens = audio_input.get("_tpu_valid_lens")
+        pre_batch_size = audio_input.get("_tpu_orig_batch_size")
 
-        # Compute valid output soft-token counts on CPU before moving to TPU.
-        # Gemma4AudioSubSampleConvProjection applies mask[:, ::2] twice (layer0, layer1),
-        # so the output mask is deterministically mask[:, ::4].
-        valid_lens: list[int] | None = None
-        if isinstance(raw_masks, list):
-            flat_valid_lens: list[int] = []
-            for m in raw_masks:
-                m_cpu = m.detach().cpu() if m.device.type != "cpu" else m
-                if m_cpu.ndim == 1:
-                    flat_valid_lens.append(int(m_cpu[::4].sum().item()))
-                else:
-                    for row in m_cpu.reshape(-1, m_cpu.shape[-1]):
-                        flat_valid_lens.append(int(row[::4].sum().item()))
-            valid_lens = flat_valid_lens
-        elif isinstance(raw_masks, torch.Tensor):
-            m_cpu = raw_masks.detach().cpu() if raw_masks.device.type != "cpu" else raw_masks
-            if m_cpu.ndim == 1:
-                valid_lens = [int(m_cpu[::4].sum().item())]
-            else:
+        if pre_valid_lens is not None and pre_batch_size is not None:
+            input_features = audio_input["input_features_padded"]
+            input_features_mask = audio_input["input_features_mask"]
+            valid_lens = pre_valid_lens
+            batch_size = int(pre_batch_size)
+        else:
+            raw_features = audio_input["input_features_padded"]
+            raw_masks = audio_input["input_features_mask"]
+            if isinstance(raw_masks, list):
                 valid_lens = [
-                    int(row[::4].sum().item())
-                    for row in m_cpu.reshape(-1, m_cpu.shape[-1])
+                    (int(m.shape[-1]) + 3) // 4 for m in raw_masks
                 ]
+            else:
+                b_sz = int(raw_masks.shape[0]) if raw_masks.ndim > 1 else 1
+                valid_lens = [(int(raw_masks.shape[-1]) + 3) // 4] * b_sz
 
-        input_features, input_features_mask = batch_audio_features_fn(
-            raw_features,
-            raw_masks,
-        )
-
-        batch_size, seq_frames, _ = input_features.shape
-        if valid_lens is None or len(valid_lens) != batch_size:
-            masks_cpu = input_features_mask.detach().cpu()
-            valid_lens = [int(row[::4].sum().item()) for row in masks_cpu]
-
-        target_b = _get_padded_bucket(batch_size, _AUDIO_BATCH_BUCKETS)
-        target_t = _get_padded_bucket(seq_frames, _AUDIO_FRAME_BUCKETS)
-
-        pad_b = target_b - batch_size
-        pad_t = target_t - seq_frames
-        if pad_b > 0 or pad_t > 0:
-            input_features = F.pad(input_features, (0, 0, 0, pad_t, 0, pad_b),
-                                   value=0.0)
-            input_features_mask = F.pad(input_features_mask,
-                                        (0, pad_t, 0, pad_b),
-                                        value=False)
+            input_features, input_features_mask = batch_audio_features_fn(
+                raw_features,
+                raw_masks,
+            )
+            batch_size, seq_frames, _ = input_features.shape
+            target_b = _get_padded_bucket(batch_size, _AUDIO_BATCH_BUCKETS)
+            target_t = _get_padded_bucket(seq_frames, _AUDIO_FRAME_BUCKETS)
+            pad_b = target_b - batch_size
+            pad_t = target_t - seq_frames
+            if pad_b > 0 or pad_t > 0:
+                input_features = F.pad(
+                    input_features, (0, 0, 0, pad_t, 0, pad_b), value=0.0)
+                input_features_mask = F.pad(
+                    input_features_mask, (0, pad_t, 0, pad_b), value=False)
 
         compiled_fn = getattr(self, "_tpu_compiled_audio_fn", None)
         if compiled_fn is None:
@@ -367,6 +434,30 @@ def maybe_patch_gemma4(
                 dynamic=False,
             )
             self._tpu_compiled_audio_fn = compiled_fn
+
+        if not getattr(self, "_tpu_audio_buckets_prewarmed", False):
+            self._tpu_audio_buckets_prewarmed = True
+            try:
+                import torch_xla
+                dev = input_features.device
+                f_dtype = input_features.dtype
+                feat_dim = int(input_features.shape[-1])
+                logger.info(
+                    "Pre-warming Gemma4 Audio Conformer buckets %s at T=808...",
+                    _AUDIO_BATCH_BUCKETS,
+                )
+                for b_w in _AUDIO_BATCH_BUCKETS:
+                    d_f = torch.zeros((b_w, 808, feat_dim),
+                                      dtype=f_dtype,
+                                      device=dev)
+                    d_m = torch.ones((b_w, 808),
+                                     dtype=torch.bool,
+                                     device=dev)
+                    _ = compiled_fn(d_f, d_m)
+                    torch_xla.sync()
+                logger.info("Finished pre-warming Gemma4 Audio Conformer buckets.")
+            except Exception as exc:
+                logger.warning("Audio bucket pre-warm skipped: %s", exc)
 
         audio_features, parent_flat = compiled_fn(
             input_features, input_features_mask)
@@ -483,6 +574,26 @@ def maybe_patch_gemma4(
             )
         else:
             is_mm_dev = is_multimodal
+
+        if not getattr(self, "_tpu_mm_embed_buckets_prewarmed", False):
+            self._tpu_mm_embed_buckets_prewarmed = True
+            try:
+                import torch_xla
+                dev = input_ids.device
+                mm_dtype = mm_flat.dtype
+                h_dim = int(mm_flat.shape[-1])
+                for n_w in (256, 512, 1024, 2048, 4096, 8192, 16384):
+                    d_ids = torch.zeros((n_w,), dtype=input_ids.dtype, device=dev)
+                    d_mm = torch.zeros((n_w, h_dim), dtype=mm_dtype, device=dev)
+                    d_ismm = torch.zeros((n_w,), dtype=torch.bool, device=dev)
+                    d_idx = torch.zeros((n_w,), dtype=torch.int32, device=dev)
+                    _ = mm_embed_fn(d_ids, d_mm, d_ismm, d_idx)
+                    torch_xla.sync()
+                logger.info(
+                    "Finished pre-warming Gemma4 _mm_embed_and_ple buckets (256..16384)."
+                )
+            except Exception as exc:
+                logger.warning("_mm_embed_and_ple pre-warm skipped: %s", exc)
 
         inputs_embeds, per_layer_inputs = mm_embed_fn(
             input_ids,
