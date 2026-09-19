@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _AUDIO_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
-_AUDIO_FRAME_BUCKETS = (544, 808, 1600, 3000)
+_AUDIO_FRAME_BUCKETS = (512, 1024, 2048, 3072)
 
 
 def _get_padded_bucket(val: int, buckets: tuple[int, ...]) -> int:
@@ -253,9 +253,11 @@ def _patch_fast_wav_audio_loader() -> None:
 
 def _patch_gemma4_cpu_audio_batching() -> None:
     try:
+        import gc
         from vllm.model_executor.models import gemma4_mm
         import vllm.multimodal.utils as mm_utils
         import vllm.v1.worker.gpu_model_runner as gpu_runner_mod
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
     except Exception:
         return
 
@@ -308,12 +310,14 @@ def _patch_gemma4_cpu_audio_batching() -> None:
                             mask_cpu = F.pad(
                                 mask_cpu, (0, pad_t, 0, pad_b),
                                 value=False)
-                        mm_kwargs_batch["input_features_padded"] = feats_cpu.to(
+                        feats_tpu = feats_cpu.to(
                             device=device, non_blocking=True)
-                        mm_kwargs_batch["input_features_mask"] = mask_cpu.to(
+                        mask_tpu = mask_cpu.to(
                             device=device, non_blocking=True)
-                        mm_kwargs_batch["_tpu_valid_lens"] = valid_lens
-                        mm_kwargs_batch["_tpu_orig_batch_size"] = batch_size
+                        feats_tpu._tpu_valid_lens = valid_lens
+                        feats_tpu._tpu_orig_batch_size = batch_size
+                        mm_kwargs_batch["input_features_padded"] = feats_tpu
+                        mm_kwargs_batch["input_features_mask"] = mask_tpu
                     yield modality, num_items, mm_kwargs_batch
             else:
                 for num_items, mm_kwargs_batch in mm_utils.group_and_batch_mm_items(
@@ -325,9 +329,35 @@ def _patch_gemma4_cpu_audio_batching() -> None:
 
     mm_utils.group_and_batch_mm_kwargs = _patched_group_and_batch_mm_kwargs
     gpu_runner_mod.group_and_batch_mm_kwargs = _patched_group_and_batch_mm_kwargs
+
+    if not getattr(TPUModelRunner, "_tpu_gemma4_capture_patched", False):
+        orig_capture_model = TPUModelRunner.capture_model
+
+        @functools.wraps(orig_capture_model)
+        def _patched_capture_model(self, *args, **kwargs):
+            model = getattr(self, "model", None)
+            if model is not None and hasattr(model, "_tpu_profile_headroom_tensor"):
+                model._tpu_profile_headroom_tensor = None
+                gc.collect()
+                try:
+                    import torch_xla
+                    torch_xla.sync()
+                except Exception:
+                    pass
+            res = orig_capture_model(self, *args, **kwargs)
+            if model is not None and hasattr(model, "_tpu_prewarm_all_buckets"):
+                try:
+                    model._tpu_prewarm_all_buckets(self.device)
+                except Exception as exc:
+                    logger.warning("Post-capture audio bucket prewarm warning: %s", exc)
+            return res
+
+        TPUModelRunner.capture_model = _patched_capture_model
+        TPUModelRunner._tpu_gemma4_capture_patched = True
+
     mm_utils._tpu_audio_cpu_pad_patched = True
     logger.info(
-        "Applied TPU patch: CPU-side static bucket padding for Gemma4 audio inputs."
+        "Applied TPU patch: CPU-side static bucket padding and post-KV-cache bucket pre-compilation for Gemma4."
     )
 
 
@@ -376,17 +406,23 @@ def maybe_patch_gemma4(
         assert self.audio_tower is not None
         assert self.embed_audio is not None
 
-        pre_valid_lens = audio_input.get("_tpu_valid_lens")
-        pre_batch_size = audio_input.get("_tpu_orig_batch_size")
+        raw_features = audio_input["input_features_padded"]
+        raw_masks = audio_input["input_features_mask"]
+        pre_valid_lens = (
+            audio_input.get("_tpu_valid_lens")
+            or getattr(raw_features, "_tpu_valid_lens", None)
+        )
+        pre_batch_size = (
+            audio_input.get("_tpu_orig_batch_size")
+            or getattr(raw_features, "_tpu_orig_batch_size", None)
+        )
 
         if pre_valid_lens is not None and pre_batch_size is not None:
-            input_features = audio_input["input_features_padded"]
-            input_features_mask = audio_input["input_features_mask"]
+            input_features = raw_features
+            input_features_mask = raw_masks
             valid_lens = pre_valid_lens
             batch_size = int(pre_batch_size)
         else:
-            raw_features = audio_input["input_features_padded"]
-            raw_masks = audio_input["input_features_mask"]
             if isinstance(raw_masks, list):
                 valid_lens = [
                     (int(m.shape[-1]) + 3) // 4 for m in raw_masks
@@ -410,6 +446,19 @@ def maybe_patch_gemma4(
                 input_features_mask = F.pad(
                     input_features_mask, (0, pad_t, 0, pad_b), value=False)
 
+        if not getattr(self, "_tpu_profile_headroom_reserved", False):
+            self._tpu_profile_headroom_reserved = True
+            try:
+                import torch_xla
+                self._tpu_profile_headroom_tensor = torch.zeros(
+                    (4400, 1024, 1024),
+                    dtype=torch.bfloat16,
+                    device=input_features.device,
+                )
+                torch_xla.sync()
+            except Exception:
+                pass
+
         compiled_fn = getattr(self, "_tpu_compiled_audio_fn", None)
         if compiled_fn is None:
             audio_tower = self.audio_tower
@@ -423,9 +472,8 @@ def maybe_patch_gemma4(
                 enc = out[0] if isinstance(out, tuple) else out.last_hidden_state
                 emb = embed_audio(inputs_embeds=enc)
                 flat = emb.reshape(-1, emb.shape[-1])
-                target_rows = feats.shape[0] * 256
-                if flat.shape[0] < target_rows:
-                    flat = F.pad(flat, (0, 0, 0, target_rows - flat.shape[0]))
+                if flat.shape[0] < 32768:
+                    flat = F.pad(flat, (0, 0, 0, 32768 - flat.shape[0]))
                 return emb, flat
 
             compiled_fn = torch.compile(
@@ -452,6 +500,7 @@ def maybe_patch_gemma4(
         return rows
 
     model_cls._process_audio_input = _patched_process_audio_input
+
 
     # 3. Compile fused PLE + token embedding + multimodal gather/merge into static XLA graphs
     orig_embed_input_ids = model_cls.embed_input_ids
@@ -517,8 +566,7 @@ def maybe_patch_gemma4(
                 ple = lm_model.get_per_layer_inputs(ple_ids).reshape(
                     -1, num_layers, ple_dim)
                 txt = lm.embed_input_ids(ids)
-                mm_cast = mm_flat.to(dtype=txt.dtype)
-                gathered = mm_cast.index_select(0, gather_idx)
+                gathered = mm_flat.index_select(0, gather_idx).to(dtype=txt.dtype)
                 merged = torch.where(is_mm.unsqueeze(-1), gathered, txt)
                 return merged, ple
 
@@ -535,19 +583,17 @@ def maybe_patch_gemma4(
             and len(multimodal_embeddings) == 1
             else torch.cat(list(multimodal_embeddings), dim=0)
         )
-        n_tok = int(input_ids.shape[0])
-        if mm_flat.shape[0] > n_tok:
-            mm_flat = mm_flat[:n_tok]
-        elif mm_flat.shape[0] < n_tok:
-            mm_flat = F.pad(mm_flat, (0, 0, 0, n_tok - mm_flat.shape[0]))
+        if mm_flat.shape[0] > 32768:
+            mm_flat = mm_flat[:32768]
+        elif mm_flat.shape[0] < 32768:
+            mm_flat = F.pad(mm_flat, (0, 0, 0, 32768 - mm_flat.shape[0]))
         gather_idx = getattr(is_multimodal, "_tpu_mm_gather_idx", None)
         if gather_idx is None:
-            is_mm_dev = is_multimodal.to(input_ids.device, non_blocking=True)
-            gather_idx = torch.clamp(
-                torch.cumsum(is_mm_dev, dim=0, dtype=torch.int32) - 1,
-                0,
-                max(0, mm_flat.shape[0] - 1),
+            n_tok = int(input_ids.shape[0])
+            gather_idx = (torch.cumsum(is_multimodal.to(torch.int32), dim=0) - 1).clamp_(
+                min=0, max=32767
             )
+            is_mm_dev = is_multimodal
         else:
             is_mm_dev = is_multimodal
 
@@ -595,11 +641,71 @@ def maybe_patch_gemma4(
         )
         return hidden_states
 
+    def _tpu_prewarm_all_buckets(self, device: torch.device) -> None:
+        if getattr(self, "_tpu_all_buckets_prewarmed", False):
+            return
+        self._tpu_all_buckets_prewarmed = True
+        import gc
+        import time
+        import torch_xla
+
+        t0 = time.perf_counter()
+        logger.info("Pre-compiling Gemma4 audio Conformer & MM-PLE buckets on %s...", device)
+        mel_bins = int(getattr(self.config.audio_config, "input_feat_size", 128))
+        hidden_size = int(self.config.text_config.hidden_size)
+
+        # Ensure compiled functions exist by running a tiny dummy pass if needed
+        compiled_audio_fn = getattr(self, "_tpu_compiled_audio_fn", None)
+        if compiled_audio_fn is not None:
+            for t_bkt in (512, 1024):
+                for b_bkt in _AUDIO_BATCH_BUCKETS:
+                    if b_bkt * (t_bkt // 4) > 16384:
+                        continue
+                    dummy_f = torch.zeros(
+                        (b_bkt, t_bkt, mel_bins),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    dummy_m = torch.ones(
+                        (b_bkt, t_bkt),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    out_emb, out_flat = compiled_audio_fn(dummy_f, dummy_m)
+                    torch_xla.sync()
+                    del dummy_f, dummy_m, out_emb, out_flat
+                    gc.collect()
+
+        # Pre-warm _mm_embed_and_ple across token buckets
+        dummy_mm_flat = torch.zeros(
+            (32768, hidden_size), dtype=torch.bfloat16, device=device)
+        for n_tok in (256, 512, 1024, 2048, 4096, 8192, 16384):
+            dummy_ids = torch.zeros((n_tok,), dtype=torch.int32, device=device)
+            dummy_is_mm = torch.zeros((n_tok,), dtype=torch.bool, device=device)
+            dummy_gather = torch.zeros((n_tok,), dtype=torch.int32, device=device)
+            dummy_is_mm._tpu_mm_gather_idx = dummy_gather
+            _ = self.embed_input_ids(
+                dummy_ids,
+                multimodal_embeddings=[dummy_mm_flat],
+                is_multimodal=dummy_is_mm,
+            )
+            self._latest_per_layer_inputs = None
+            torch_xla.sync()
+            del dummy_ids, dummy_is_mm, dummy_gather
+            gc.collect()
+        del dummy_mm_flat
+        gc.collect()
+        torch_xla.sync()
+        logger.info(
+            "Finished pre-compiling Gemma4 audio Conformer & MM-PLE buckets in %.2fs.",
+            time.perf_counter() - t0,
+        )
+
     model_cls.embed_input_ids = _patched_embed_input_ids
     model_cls.forward = _patched_forward
+    model_cls._tpu_prewarm_all_buckets = _tpu_prewarm_all_buckets
     model_cls._tpu_gemma4_patched = True
     logger.info(
-        "Applied TPU patch: Gemma4 BF16 audio attention, 808-frame audio buckets, and compiled fused PLE/MM embedder."
+        "Applied TPU patch: Gemma4 BF16 audio attention, power-of-2 audio buckets, and compiled fused PLE/MM embedder."
     )
     return None
-
