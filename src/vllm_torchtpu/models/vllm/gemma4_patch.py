@@ -129,6 +129,9 @@ def _patch_gemma4_audio_feature_extractor() -> None:
         pre = float(self.preemphasis)
         mel_floor = float(self.mel_floor)
 
+        if torch.get_num_threads() > 4:
+            torch.set_num_threads(4)
+
         batch_size = len(speeches)
         w = torch.zeros((batch_size, pad_left + max_len), dtype=torch.float32)
         valid_lens = []
@@ -201,12 +204,55 @@ def _patch_gemma4_audio_feature_extractor() -> None:
     )
 
 
+def _patch_fast_wav_audio_loader() -> None:
+    try:
+        from vllm.multimodal.media.audio import AudioMediaIO
+    except Exception:
+        return
+
+    if getattr(AudioMediaIO, "_tpu_fast_wav_patched", False):
+        return
+
+    orig_load_bytes = AudioMediaIO.load_bytes
+
+    @functools.wraps(orig_load_bytes)
+    def _fast_load_bytes(self, data: bytes) -> tuple[np.ndarray, float]:
+        # Fast zero-copy parser for standard uncompressed 16-bit PCM WAV (RIFF/WAVE)
+        if (len(data) > 44 and data[:4] == b"RIFF"
+                and data[8:16] == b"WAVEfmt "):
+            import struct
+            fmt_size, audio_fmt, num_channels, sample_rate, _, _, bits_per_sample = (
+                struct.unpack_from("<IHHIIHH", data, 16))
+            if audio_fmt == 1 and bits_per_sample == 16 and num_channels == 1:
+                pos = 20 + fmt_size
+                while pos + 8 <= len(data):
+                    chunk_id = data[pos:pos + 4]
+                    chunk_size = struct.unpack_from("<I", data, pos + 4)[0]
+                    pos += 8
+                    if chunk_id == b"data":
+                        end = min(len(data), pos + chunk_size)
+                        n_samples = (end - pos) // 2
+                        pcm = np.frombuffer(
+                            data, dtype="<i2", count=n_samples, offset=pos)
+                        wav_f32 = pcm.astype(np.float32) * (1.0 / 32768.0)
+                        if self.resample_sr is not None and int(
+                                self.resample_sr) != sample_rate:
+                            return orig_load_bytes(self, data)
+                        return wav_f32, float(sample_rate)
+                    pos += chunk_size + (chunk_size & 1)
+        return orig_load_bytes(self, data)
+
+    AudioMediaIO.load_bytes = _fast_load_bytes
+    AudioMediaIO._tpu_fast_wav_patched = True
+    logger.info("Applied TPU patch: AudioMediaIO zero-copy PCM_16 WAV loader.")
+
+
 def maybe_patch_gemma4(
         model_config: Optional["ModelConfig"] = None) -> bool | None:
+    _patch_fast_wav_audio_loader()
+    _patch_gemma4_audio_feature_extractor()
     if not _is_gemma4_model(model_config):
         return False
-
-    _patch_gemma4_audio_feature_extractor()
 
     try:
         from vllm.model_executor.models import gemma4_mm
@@ -315,17 +361,20 @@ def maybe_patch_gemma4(
             self._tpu_compiled_audio_fn = compiled_fn
 
         audio_features = compiled_fn(input_features, input_features_mask)
-        t_out = audio_features.shape[1]
+        t_out = int(audio_features.shape[1])
+        parent_flat = audio_features.reshape(-1, audio_features.shape[-1])
 
-        # When valid_lens matches t_out (e.g., 808 frames -> 202 soft tokens),
-        # unbind rows without creating variable-length sub-slices.
         if all(v == t_out for v in valid_lens):
-            return list(audio_features[:batch_size].unbind(0))
-
-        return [
-            audio_features[i, :valid_lens[i]]
-            for i in range(batch_size)
-        ]
+            rows = list(audio_features[:batch_size].unbind(0))
+        else:
+            rows = [
+                audio_features[i, :valid_lens[i]]
+                for i in range(batch_size)
+            ]
+        for i, r in enumerate(rows):
+            r._tpu_parent_flat = parent_flat
+            r._tpu_parent_offset = i * t_out
+        return rows
 
     model_cls._process_audio_input = _patched_process_audio_input
 

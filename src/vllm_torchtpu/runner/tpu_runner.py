@@ -2541,6 +2541,7 @@ class TPUModelRunner(GPUModelRunner):
 
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         mm_embeds_full: list[torch.Tensor] = []
+        gathered_spans: list = []
         is_mm_embed_np = np.zeros(total_num_scheduled_tokens, dtype=bool)
         mm_gather_idx_np = np.zeros(total_num_scheduled_tokens, dtype=np.int32)
 
@@ -2586,30 +2587,62 @@ class TPUModelRunner(GPUModelRunner):
 
                 mm_embeds_full.append(encoder_output)
                 full_len = int(encoder_output.shape[0])
+                parent_offset = getattr(encoder_output, "_tpu_parent_offset", None)
 
                 req_start_pos = req_start_idx + start_pos - num_computed_tokens
                 span_slice = slice(req_start_pos + start_idx,
                                    req_start_pos + end_idx)
+                is_embed_np = None
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed_np = (
                         is_embed[start_idx:end_idx].cpu().numpy().astype(bool)
                     )
-                    is_mm_embed_np[span_slice] |= is_embed_np
-                    mm_gather_idx_np[span_slice][is_embed_np] = np.arange(
-                        base_row + curr_embeds_start,
-                        base_row + curr_embeds_end,
-                        dtype=np.int32,
-                    )
+                    is_mm_embed_np[span_slice] = is_embed_np
                 else:
                     is_mm_embed_np[span_slice] = True
-                    mm_gather_idx_np[span_slice] = np.arange(
-                        base_row + curr_embeds_start,
-                        base_row + curr_embeds_end,
-                        dtype=np.int32,
-                    )
+
+                gathered_spans.append((
+                    span_slice,
+                    is_embed_np,
+                    curr_embeds_start,
+                    curr_embeds_end,
+                    base_row,
+                    parent_offset,
+                ))
                 base_row += full_len
 
             req_start_idx += num_scheduled_tokens
+
+        if mm_embeds_full:
+            first_parent = getattr(mm_embeds_full[0], "_tpu_parent_flat", None)
+            use_parent_flat = (
+                first_parent is not None
+                and all(
+                    getattr(t, "_tpu_parent_flat", None) is first_parent
+                    and getattr(t, "_tpu_parent_offset", None) is not None
+                    for t in mm_embeds_full
+                )
+            )
+            for (
+                span_slice,
+                is_embed_np,
+                curr_embeds_start,
+                curr_embeds_end,
+                seq_base_row,
+                parent_offset,
+            ) in gathered_spans:
+                eff_base = parent_offset if use_parent_flat else seq_base_row
+                indices = np.arange(
+                    eff_base + curr_embeds_start,
+                    eff_base + curr_embeds_end,
+                    dtype=np.int32,
+                )
+                if is_embed_np is not None:
+                    mm_gather_idx_np[span_slice][is_embed_np] = indices
+                else:
+                    mm_gather_idx_np[span_slice] = indices
+            if use_parent_flat:
+                return [first_parent], is_mm_embed_np, mm_gather_idx_np
 
         return mm_embeds_full, is_mm_embed_np, mm_gather_idx_np
 
@@ -2833,7 +2866,9 @@ class TPUModelRunner(GPUModelRunner):
             ) = self._gather_mm_embeddings_static_tpu(scheduler_output)
             if mm_embeds_list:
                 first_shape = mm_embeds_list[0].shape
-                if all(t.shape == first_shape for t in mm_embeds_list):
+                if len(mm_embeds_list) == 1:
+                    mm_embeds_flat = mm_embeds_list[0]
+                elif all(t.shape == first_shape for t in mm_embeds_list):
                     num_mm_items = len(mm_embeds_list)
                     target_mm_items = 1
                     for b in (1, 2, 4, 8, 16, 32, 64):
