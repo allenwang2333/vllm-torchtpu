@@ -184,9 +184,10 @@ def _patch_gemma4_audio_feature_extractor() -> None:
             if vf < num_mel_frames:
                 log_mel[i, vf:] = 0.0
 
+        log_mel_bf16 = log_mel.to(dtype=torch.bfloat16)
         if return_tensors == "pt":
             return BatchFeature({
-                "input_features": [log_mel[i] for i in range(batch_size)],
+                "input_features": [log_mel_bf16[i] for i in range(batch_size)],
                 "input_features_mask": [masks[i] for i in range(batch_size)],
             })
         return BatchFeature(
@@ -310,6 +311,8 @@ def _patch_gemma4_cpu_audio_batching() -> None:
                             mask_cpu = F.pad(
                                 mask_cpu, (0, pad_t, 0, pad_b),
                                 value=False)
+                        if feats_cpu.dtype != torch.bfloat16:
+                            feats_cpu = feats_cpu.to(dtype=torch.bfloat16)
                         feats_tpu = feats_cpu.to(
                             device=device, non_blocking=True)
                         mask_tpu = mask_cpu.to(
@@ -340,8 +343,7 @@ def _patch_gemma4_cpu_audio_batching() -> None:
                 model._tpu_profile_headroom_tensor = None
                 gc.collect()
                 try:
-                    import torch_xla
-                    torch_xla.sync()
+                    torch.tpu.synchronize()
                 except Exception:
                     pass
             res = orig_capture_model(self, *args, **kwargs)
@@ -449,13 +451,12 @@ def maybe_patch_gemma4(
         if not getattr(self, "_tpu_profile_headroom_reserved", False):
             self._tpu_profile_headroom_reserved = True
             try:
-                import torch_xla
                 self._tpu_profile_headroom_tensor = torch.zeros(
                     (4400, 1024, 1024),
                     dtype=torch.bfloat16,
                     device=input_features.device,
                 )
-                torch_xla.sync()
+                torch.tpu.synchronize()
             except Exception:
                 pass
 
@@ -647,7 +648,6 @@ def maybe_patch_gemma4(
         self._tpu_all_buckets_prewarmed = True
         import gc
         import time
-        import torch_xla
 
         t0 = time.perf_counter()
         logger.info("Pre-compiling Gemma4 audio Conformer & MM-PLE buckets on %s...", device)
@@ -672,14 +672,14 @@ def maybe_patch_gemma4(
                         device=device,
                     )
                     out_emb, out_flat = compiled_audio_fn(dummy_f, dummy_m)
-                    torch_xla.sync()
+                    torch.tpu.synchronize()
                     del dummy_f, dummy_m, out_emb, out_flat
                     gc.collect()
 
         # Pre-warm _mm_embed_and_ple across token buckets
         dummy_mm_flat = torch.zeros(
             (32768, hidden_size), dtype=torch.bfloat16, device=device)
-        for n_tok in (256, 512, 1024, 2048, 4096, 8192, 16384):
+        for n_tok in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384):
             dummy_ids = torch.zeros((n_tok,), dtype=torch.int32, device=device)
             dummy_is_mm = torch.zeros((n_tok,), dtype=torch.bool, device=device)
             dummy_gather = torch.zeros((n_tok,), dtype=torch.int32, device=device)
@@ -690,12 +690,12 @@ def maybe_patch_gemma4(
                 is_multimodal=dummy_is_mm,
             )
             self._latest_per_layer_inputs = None
-            torch_xla.sync()
+            torch.tpu.synchronize()
             del dummy_ids, dummy_is_mm, dummy_gather
             gc.collect()
         del dummy_mm_flat
         gc.collect()
-        torch_xla.sync()
+        torch.tpu.synchronize()
         logger.info(
             "Finished pre-compiling Gemma4 audio Conformer & MM-PLE buckets in %.2fs.",
             time.perf_counter() - t0,

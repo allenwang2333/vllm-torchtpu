@@ -3810,13 +3810,15 @@ class TPUModelRunner(GPUModelRunner):
                 # num_reqs), so the appended tail is never indexed -- real
                 # positions are unchanged. Spec only (stride 1+K); pure-non-spec
                 # async keeps its stride-1 source + existing precompile.
-                if spec_num_rejected is not None:
-                    bound = self.max_num_reqs * (
-                        1 + self.speculative_config.num_speculative_tokens)
-                    if next_tokens_tpu.shape[0] < bound:
-                        next_tokens_tpu = torch.nn.functional.pad(
-                            next_tokens_tpu,
-                            (0, bound - next_tokens_tpu.shape[0]))
+                bound = (
+                    self.max_num_reqs *
+                    (1 + self.speculative_config.num_speculative_tokens)
+                    if spec_num_rejected is not None else self.max_num_reqs
+                )
+                if next_tokens_tpu.shape[0] < bound:
+                    next_tokens_tpu = torch.nn.functional.pad(
+                        next_tokens_tpu,
+                        (0, bound - next_tokens_tpu.shape[0]))
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
@@ -4547,11 +4549,7 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source lengths the runtime produces: stride-1 num_reqs
-        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
-        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
-        # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        next_lens = [self.max_num_reqs]
         if (self._is_async_drafter):
             next_lens.append(
                 self.max_num_reqs *
@@ -4717,6 +4715,7 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
+        self._precompile_substitute_placeholder_token()
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
