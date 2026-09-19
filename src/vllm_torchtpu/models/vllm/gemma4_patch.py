@@ -40,78 +40,165 @@ def _is_gemma4_model(model_config: Optional["ModelConfig"]) -> bool:
     return "gemma-4" in model_name or "gemma4" in model_name
 
 
-def _patch_gemma4_audio_attention_bf16() -> None:
+def _patch_gemma4_audio_feature_extractor() -> None:
     try:
-        from transformers.models.gemma4 import modeling_gemma4
+        import numpy as np
+        from transformers.feature_extraction_utils import BatchFeature
+        from transformers.models.gemma4 import feature_extraction_gemma4
     except ImportError:
         return
 
-    attn_cls = getattr(modeling_gemma4, "Gemma4AudioAttention", None)
-    if attn_cls is None or getattr(attn_cls, "_tpu_bf16_attn_patched", False):
+    fe_cls = getattr(feature_extraction_gemma4, "Gemma4AudioFeatureExtractor",
+                     None)
+    if fe_cls is None or getattr(fe_cls, "_tpu_fast_stft_patched", False):
         return
 
-    def _bf16_audio_attn_forward(
+    orig_call = fe_cls.__call__
+
+    @functools.wraps(orig_call)
+    def _fast_fe_call(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        attention_mask: torch.BoolTensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_length, _ = hidden_states.shape
-        hidden_shape = (batch_size, seq_length, self.num_heads, self.head_dim)
-        compute_dtype = hidden_states.dtype
-
-        q_scale = (self.q_scale * F.softplus(self.per_dim_scale)).to(
-            dtype=compute_dtype)
-        k_scale = float(self.k_scale)
-
-        query_states = self.q_proj(hidden_states).view(hidden_shape) * q_scale
-        key_states = self.k_proj(hidden_states).view(hidden_shape) * k_scale
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
-
-        query_states = self._convert_to_block(query_states)
-        key_states = self._extract_block_context(key_states)
-        value_states = self._extract_block_context(value_states)
-        num_blocks = query_states.shape[1]
-
-        relative_key_states = self.relative_k_proj(position_embeddings)
-        relative_key_states = relative_key_states.view(
-            -1, self.num_heads, self.head_dim).to(dtype=compute_dtype)
-
-        queries = query_states.permute(0, 3, 1, 2, 4)
-        matrix_ac = queries @ key_states.permute(0, 3, 1, 4, 2)
-
-        queries_flat = queries.reshape(batch_size, self.num_heads, -1,
-                                       self.head_dim)
-        matrix_bd = queries_flat @ relative_key_states.permute(1, 2, 0)
-        matrix_bd = matrix_bd.reshape(batch_size, self.num_heads, num_blocks,
-                                      self.chunk_size, -1)
-        matrix_bd = self._rel_shift(matrix_bd)
-
-        attn_weights = matrix_ac.float() + matrix_bd.float()
-        attn_weights = attn_weights / self.softcap
-        attn_weights = torch.tanh(attn_weights)
-        attn_weights = attn_weights * self.softcap
-
-        if attention_mask is not None:
-            attn_weights = attn_weights.masked_fill(
-                attention_mask.logical_not(),
-                self.config.attention_invalid_logits_value,
+        raw_speech,
+        padding="longest",
+        max_length: int | None = 480_000,
+        truncation: bool = True,
+        pad_to_multiple_of: int | None = 128,
+        return_tensors=None,
+        return_attention_mask: bool | None = True,
+        **kwargs,
+    ):
+        # Fallback to original if dither is enabled
+        if getattr(self, "dither", 0.0) > 0.0:
+            return orig_call(
+                self,
+                raw_speech,
+                padding=padding,
+                max_length=max_length,
+                truncation=truncation,
+                pad_to_multiple_of=pad_to_multiple_of,
+                return_tensors=return_tensors,
+                return_attention_mask=return_attention_mask,
+                **kwargs,
             )
 
-        attn_weights = F.softmax(
-            attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
-        attn_output = attn_weights @ value_states.permute(0, 3, 1, 2, 4)
-        attn_output = attn_output.permute(0, 2, 3, 1, 4).reshape(
-            batch_size, num_blocks * self.chunk_size, -1)
-        attn_output = attn_output[:, :seq_length].contiguous()
-        attn_output = self.post(
-            attn_output.to(dtype=self.post.linear.weight.dtype))
+        window_t = getattr(self, "_tpu_window_f32", None)
+        if window_t is None:
+            window_t = torch.from_numpy(self.window.astype(np.float32))
+            self._tpu_window_f32 = window_t
+            self._tpu_win0_scale = float(window_t[0].item() *
+                                         (1.0 - self.preemphasis))
+            self._tpu_mel_filters_f32 = torch.from_numpy(
+                self.mel_filters.astype(np.float32))
+            self._tpu_per_bin_mean_f32 = (
+                torch.from_numpy(
+                    self.per_bin_mean.astype(np.float32)).squeeze(0)
+                if self.per_bin_mean is not None else None)
+            self._tpu_per_bin_stddev_f32 = (
+                torch.from_numpy(
+                    self.per_bin_stddev.astype(np.float32)).squeeze(0)
+                if self.per_bin_stddev is not None else None)
 
-        return attn_output, attn_weights
+        if isinstance(raw_speech, np.ndarray):
+            speeches = ([raw_speech] if raw_speech.ndim == 1 else
+                        [np.asarray(s, dtype=np.float32).reshape(-1)
+                         for s in raw_speech])
+        elif isinstance(raw_speech, (list, tuple)):
+            if len(raw_speech) > 0 and isinstance(
+                    raw_speech[0], (np.ndarray, list, tuple)):
+                speeches = [
+                    np.asarray(s, dtype=np.float32).reshape(-1)
+                    for s in raw_speech
+                ]
+            else:
+                speeches = [np.asarray(raw_speech, dtype=np.float32).reshape(-1)]
+        else:
+            speeches = [np.asarray(raw_speech, dtype=np.float32).reshape(-1)]
 
-    attn_cls.forward = _bf16_audio_attn_forward
-    attn_cls._tpu_bf16_attn_patched = True
-    logger.info("Applied TPU patch: Gemma4AudioAttention native BF16 MXU matmuls.")
+        if truncation and max_length is not None:
+            speeches = [s[:max_length] for s in speeches]
+
+        max_len = max(len(s) for s in speeches)
+        if pad_to_multiple_of:
+            rem = max_len % pad_to_multiple_of
+            if rem != 0:
+                max_len += pad_to_multiple_of - rem
+
+        pad_left = self.frame_length // 2
+        frame_size = self.frame_length + 1
+        hop = self.hop_length
+        pre = float(self.preemphasis)
+        mel_floor = float(self.mel_floor)
+
+        batch_size = len(speeches)
+        w = torch.zeros((batch_size, pad_left + max_len), dtype=torch.float32)
+        valid_lens = []
+        for i, s in enumerate(speeches):
+            n_s = len(s)
+            valid_lens.append(n_s)
+            w[i, pad_left:pad_left + n_s] = torch.from_numpy(
+                np.ascontiguousarray(s, dtype=np.float32))
+
+        if self.input_scale_factor != 1.0:
+            w.mul_(float(self.input_scale_factor))
+
+        num_mel_frames = (w.shape[1] - frame_size) // hop + 1
+        if pre > 0.0 and self.preemphasis_htk_flavor:
+            w_pre = torch.empty_like(w)
+            w_pre[:, 0] = w[:, 0]
+            torch.sub(w[:, 1:], w[:, :-1], alpha=pre, out=w_pre[:, 1:])
+            uf_pre = w_pre[:, :(num_mel_frames - 1) * hop +
+                           self.frame_length].unfold(-1, self.frame_length,
+                                                     hop)
+            frames = uf_pre * window_t
+            win0_scale = self._tpu_win0_scale
+            if win0_scale != 0.0:
+                uf_orig0 = w[:, :(num_mel_frames - 1) * hop + 1:hop]
+                frames[..., 0] = uf_orig0 * win0_scale
+            else:
+                frames[..., 0] = 0.0
+        elif pre > 0.0:
+            uf = w.unfold(-1, frame_size, hop)
+            frames = (uf[..., 1:] - pre * uf[..., :-1]) * window_t
+        else:
+            uf = w.unfold(-1, frame_size, hop)
+            frames = uf[..., :-1] * window_t
+
+        stft = torch.fft.rfft(frames, n=self.fft_length, dim=-1)
+        mag = torch.abs(stft)
+        mel = torch.matmul(mag, self._tpu_mel_filters_f32)
+        log_mel = torch.log(mel + mel_floor)
+        if self._tpu_per_bin_mean_f32 is not None:
+            log_mel.sub_(self._tpu_per_bin_mean_f32)
+        if self._tpu_per_bin_stddev_f32 is not None:
+            log_mel.div_(self._tpu_per_bin_stddev_f32)
+
+        masks = torch.zeros((batch_size, num_mel_frames), dtype=torch.bool)
+        for i, n_s in enumerate(valid_lens):
+            vf = max(0, (pad_left + n_s - frame_size) // hop + 1)
+            masks[i, :vf] = True
+            if vf < num_mel_frames:
+                log_mel[i, vf:] = 0.0
+
+        if return_tensors == "pt":
+            return BatchFeature({
+                "input_features": [log_mel[i] for i in range(batch_size)],
+                "input_features_mask": [masks[i] for i in range(batch_size)],
+            })
+        return BatchFeature(
+            {
+                "input_features":
+                [log_mel[i].numpy() for i in range(batch_size)],
+                "input_features_mask":
+                [masks[i].numpy() for i in range(batch_size)],
+            },
+            tensor_type=return_tensors,
+        )
+
+    fe_cls.__call__ = _fast_fe_call
+    fe_cls._tpu_fast_stft_patched = True
+    logger.info(
+        "Applied TPU patch: Gemma4AudioFeatureExtractor vectorized PyTorch float32 STFT."
+    )
 
 
 def maybe_patch_gemma4(
@@ -119,7 +206,7 @@ def maybe_patch_gemma4(
     if not _is_gemma4_model(model_config):
         return False
 
-    _patch_gemma4_audio_attention_bf16()
+    _patch_gemma4_audio_feature_extractor()
 
     try:
         from vllm.model_executor.models import gemma4_mm
