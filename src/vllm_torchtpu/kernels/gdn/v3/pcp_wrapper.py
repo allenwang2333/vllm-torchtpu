@@ -855,8 +855,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
 
     def _run_projection_catchup(stage) -> None:
         catchup_count = stage_metadata_ref.projection_catchup_count[stage,
-                                                                    rank]
-        work_start = stage_metadata_ref.projection_catchup_start[stage, rank]
+                                                                    plan_rank]
+        work_start = stage_metadata_ref.projection_catchup_start[stage,
+                                                                 plan_rank]
         previous_stage = jnp.maximum(stage - 1, 0)
         launch_tile = lax.select(
             stage == 0,
@@ -913,20 +914,21 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         is_stage_first_tile = p_id == stage_first_tile
 
         work_id = (p_id +
-                   stage_metadata_ref.projection_work_offset[stage, rank])
+                   stage_metadata_ref.projection_work_offset[stage, plan_rank])
         projection_is_active = work_id < num_projection_work_tiles
         projection_token_block, projection_out_block = (
             _projection_tile_for_work_id(work_id))
         safe_next_stage = jnp.minimum(stage + 1, active_stages - 1)
         next_stage_catchup = lax.select(
             stage + 1 < active_stages,
-            stage_metadata_ref.projection_catchup_count[safe_next_stage, rank],
+            stage_metadata_ref.projection_catchup_count[safe_next_stage,
+                                                        plan_rank],
             0,
         )
         projection_dma_was_drained = jnp.logical_or(
             jnp.logical_and(
                 stage == 0,
-                stage_metadata_ref.projection_catchup_count[0, rank] > 0,
+                stage_metadata_ref.projection_catchup_count[0, plan_rank] > 0,
             ),
             next_stage_catchup > 0,
         )
@@ -1108,7 +1110,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         # Z projection, finish only that real queue suffix here.  The loop bound
         # is runtime data and is independent of the compile bucket capacity.
         projection_work_end = (
-            num_tiles + stage_metadata_ref.projection_work_offset_end[rank])
+            num_tiles +
+            stage_metadata_ref.projection_work_offset_end[plan_rank])
         remaining_projection_tiles = jnp.maximum(
             num_projection_work_tiles - projection_work_end,
             0,
