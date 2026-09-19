@@ -45,8 +45,8 @@ from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, KVLayout, cp_rank_as_data, streamindex_topk,
     streamindex_topk_dcp)
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import \
-    indexer_kv_layout
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
+    PACKING8_KV_PACKING, indexer_kv_layout)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
@@ -68,13 +68,17 @@ STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
 def _indexer_cache_geometry(cache_kv: jax.Array, kv_layout: KVLayout):
-    """`(page_size, kv_packing, lkv_dim)` for either indexer K cache layout.
+    """`(page_size, kv_packing, lkv_dim)` for any indexer K cache layout.
 
-    `TOKEN_MAJOR_3D` stores the same bytes rank-3 with the packing axis folded
-    into the token axis, so `kv_packing` is 1 and a slot addresses a row
-    directly. Asserting the rank here is what stops the allocator and the
-    writer disagreeing silently: a cache shaped by one layout and scattered
-    through the other is a wrong-stride write, not a crash.
+    Everything below is derived from the shape, so `HEAD_ALONG_SUBLANE` and
+    `PACKING8` need no separate case: they differ only in the second-minor
+    extent, and the scatter spells the split as `slot // kv_packing`,
+    `slot % kv_packing` either way. `TOKEN_MAJOR_3D` folds the packing axis
+    into the token axis, so `kv_packing` is 1 and a slot addresses a row.
+
+    The rank and extent checks are what stop the allocator and the writer
+    disagreeing silently: a cache shaped for one layout and scattered through
+    another is a wrong-stride write, not a crash.
     """
     if kv_layout == KVLayout.TOKEN_MAJOR_3D:
         if cache_kv.ndim != 3:
@@ -85,9 +89,15 @@ def _indexer_cache_geometry(cache_kv: jax.Array, kv_layout: KVLayout):
         _, page_size, lkv_dim = cache_kv.shape
         return page_size, 1, lkv_dim
     if cache_kv.ndim != 4:
-        raise ValueError("HEAD_ALONG_SUBLANE expects a rank-4 indexer K "
+        raise ValueError(f"{kv_layout.name} expects a rank-4 indexer K "
                          f"cache, got {cache_kv.shape}.")
     _, page_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+    if (kv_layout == KVLayout.PACKING8
+            and kv_packing != PACKING8_KV_PACKING):
+        raise ValueError(
+            "TPU_DSA_INDEXER_KV_LAYOUT=packing8 expects a second-minor extent "
+            f"of {PACKING8_KV_PACKING}, got {cache_kv.shape}. The allocator in "
+            "runner/kv_cache_manager.py did not apply the layout.")
     return page_size_per_kv_packing * kv_packing, kv_packing, lkv_dim
 
 
@@ -427,9 +437,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
-        # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim], or
+        # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim]
+        # (kv_packing 4 for head_along_sublane, 8 for the default packing8), or
         # [num_blocks, block_size, lkv_dim] under
-        # TPU_DSA_INDEXER_KV_LAYOUT=token_major_3d. Same bytes either way;
+        # TPU_DSA_INDEXER_KV_LAYOUT=token_major_3d. Same bytes in every case;
         # lkv_dim = head_dim + 1 padded to a 128 multiple.
         kv_cache = self.k_cache.kv_cache
         if kv_cache.numel() == 0:

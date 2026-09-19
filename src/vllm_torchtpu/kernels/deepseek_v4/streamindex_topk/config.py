@@ -26,6 +26,14 @@ class MlaCase(enum.Enum):
         }[self]
 
 
+# Second-minor extent of the `PACKING8` indexer K cache. Not a free tuning
+# knob: 8 is the sublane count of the `T(8,128)(4,1)` tiling the SparseCore
+# scatter fusion requires, and the whole point of the layout is that the
+# buffer's *natural* tiling already equals it. Changing it reintroduces the
+# retiling copies.
+PACKING8_KV_PACKING = 8
+
+
 class KVLayout(enum.Enum):
     """Memory layout of the packed FP8 index KV cache.
 
@@ -48,23 +56,37 @@ class KVLayout(enum.Enum):
     yields the per-token scales directly as a `[1, bkv_sz]` row vector, so the
     lane broadcast of the dequantization scale becomes free.
 
-  - TOKEN_MAJOR_3D: `[pages, page_size, width]`. Byte-for-byte the same cache
-    as HEAD_ALONG_SUBLANE -- the `page_size // packing` and `packing` axes are
-    merged into one token axis -- but stored as a rank-3 array, which XLA
-    tiles `T(32,128)(4,1)` instead of `T(4,128)(4,1)`. The flatten to
-    `[pages * page_size, width]` that XLA's scatter canonicalises to then
-    preserves the tile and becomes a bitcast, so the write no longer pays a
-    `relayout -> scatter -> relayout` round trip over the whole cache.
+  - TOKEN_MAJOR_3D: **not shipping; kept only as the arm that documents why
+    PACKING8 exists.** `[pages, page_size, width]`. Byte-for-byte the same
+    cache as HEAD_ALONG_SUBLANE -- the `page_size // packing` and `packing`
+    axes are merged into one token axis -- but stored as a rank-3 array, which
+    XLA tiles `T(32,128)(4,1)` instead of `T(4,128)(4,1)`.
 
-    The kernel's read path is unchanged apart from addressing: one page is
-    `page_size` contiguous rows instead of `page_size // packing` contiguous
-    `(packing, width)` groups, and the VMEM block the pipeline stages is the
-    same bytes with the packing axis already folded in.
+    The intent was that the flatten to `[pages * page_size, width]` becomes a
+    bitcast. It does, but that was never the binding cost: the SparseCore
+    `scatter_fusion` wants the cache tiled `T(8,128)(4,1)`, so XLA wraps the
+    scatter in `copy T(32,128)->T(8,128)` / `copy back` over the whole buffer.
+    Measured (`j-5d800b55`, whole op, write + top-k): prefill 1024 tok 0.7504
+    vs the rank-4 incumbent's 1.2427 ms, but decode x8 0.2397 vs 0.0996 --
+    net **+0.365 s/request** on the bench mix, a regression. Do not ship.
+
+  - PACKING8: `[pages, page_size // 8, 8, width]`. The *same bytes again* --
+    token `t` is row-block `t // 8`, row `t % 8` -- but rank-4 with
+    second-minor extent 8, whose natural tiling **is** the `T(8,128)(4,1)` the
+    scatter wants. So the retiling copies are not made cheaper, they stop
+    being emitted: `cost_analysis()['bytes accessed']` at decode is 0.04 MB,
+    like the incumbent, against 889.26 MB for TOKEN_MAJOR_3D.
+
+    It needs no layout API and no new kernel branch: rank-4 takes the existing
+    HEAD_ALONG_SUBLANE read path, which derives `kv_packing` from the shape.
+    Measured net vs the incumbent: -13.28 ms/core-step prefill, -0.023 decode,
+    **-3.424 s/request** over 256 prefill + 1024 decode steps at 21 layers.
   """
 
     HEAD_ALONG_SUBLANE = 0
     SEQ_ALONG_LANE = 1
     TOKEN_MAJOR_3D = 2
+    PACKING8 = 3
 
     @classmethod
     def parse(cls, value: "str | KVLayout | None") -> "KVLayout":
@@ -80,6 +102,7 @@ class KVLayout(enum.Enum):
             # Tolerate the common typo seen in flags/configs.
             "seq_alone_lane": cls.SEQ_ALONG_LANE,
             "token_major_3d": cls.TOKEN_MAJOR_3D,
+            "packing8": cls.PACKING8,
         }
         if normalized not in aliases:
             raise ValueError(

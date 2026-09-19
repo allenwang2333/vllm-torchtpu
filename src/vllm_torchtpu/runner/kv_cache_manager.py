@@ -38,7 +38,8 @@ from vllm.v1.worker.utils import (AttentionGroup,
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
-    KVLayout, indexer_kv_layout)
+    PACKING8_KV_PACKING, KVLayout, indexer_kv_layout)
+from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
     materialize_kv_cache_tensors)
@@ -59,6 +60,68 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _reshape_indexer_kv_cache(
+        kv_cache_shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Respells the DSA indexer K cache shape for `TPU_DSA_INDEXER_KV_LAYOUT`.
+
+    `PallasMLAttentionBackend.get_kv_cache_shape` always hands back the
+    `uint8` default packing of 4, i.e.
+    `[pages, page_size // 4, 4, width]`. Every layout here holds the *same
+    bytes in the same order*; only the grouping of the token axis differs, and
+    with it the tiling XLA derives:
+
+      head_along_sublane  [pages, page_size // 4, 4, width]  T(4,128)(4,1)
+      token_major_3d      [pages, page_size,         width]  T(32,128)(4,1)
+      packing8            [pages, page_size // 8, 8, width]  T(8,128)(4,1)
+
+    `packing8` is the shipping one: `T(8,128)(4,1)` is what the SparseCore
+    scatter fusion that inserts each step's rows already wants, so the
+    `copy -> scatter -> copy back` over the whole 111 MB buffer is not emitted
+    at all. It is spelled through `mla_v2_kernel.get_kv_cache_shape` with an
+    explicit `kv_packing` rather than as a new shape path, so there is exactly
+    one place that knows how a packed uint8 cache is laid out.
+
+    Byte neutrality is asserted, not assumed: the region budget, the block
+    count and `page_size_bytes` are all computed from the *default* shape
+    elsewhere, so a layout that changed the element count would corrupt them
+    silently rather than fail.
+    """
+    layout = indexer_kv_layout()
+    if layout == KVLayout.HEAD_ALONG_SUBLANE:
+        return kv_cache_shape
+    pages, groups, packing, width = kv_cache_shape
+    page_size = groups * packing
+    if layout == KVLayout.TOKEN_MAJOR_3D:
+        # Non-shipping: measured slower overall than the default (decode
+        # regresses). Kept so the A/B that chose `packing8` stays runnable.
+        new_shape: tuple[int, ...] = (pages, page_size, width)
+    elif layout == KVLayout.PACKING8:
+        new_shape = tuple(
+            mla_v2_kernel.get_kv_cache_shape(
+                total_num_pages=pages,
+                page_size=page_size,
+                kv_dim=width,
+                kv_dtype=None,
+                kv_packing=PACKING8_KV_PACKING,
+            ))
+    else:
+        raise ValueError(
+            f"{layout} is not a DSA indexer K cache layout; "
+            "runner/kv_cache_manager.py and streamindex_topk/config.py "
+            "disagree.")
+    if math.prod(new_shape) != math.prod(kv_cache_shape):
+        raise ValueError(
+            f"TPU_DSA_INDEXER_KV_LAYOUT={layout.name} changed the indexer K "
+            f"cache size: {kv_cache_shape} is {math.prod(kv_cache_shape)} "
+            f"bytes, {new_shape} is {math.prod(new_shape)}. Every layout must "
+            "be byte-neutral or the region budget computed from the default "
+            "shape is wrong.")
+    logger.info(
+        "DSA indexer K cache layout %s: %s -> %s (%d bytes, unchanged)",
+        layout.name, tuple(kv_cache_shape), new_shape, math.prod(new_shape))
+    return new_shape
 
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
@@ -1313,17 +1376,9 @@ class KVCacheManager:
                         kv_cache_spec.head_size,
                         kv_cache_spec.dtype,
                     )
-                    if (isinstance(attn_module, DeepseekV32IndexerCache) and
-                            indexer_kv_layout() == KVLayout.TOKEN_MAJOR_3D):
-                        # Store the DSA indexer K cache rank-3, merging the
-                        # `(page_size // packing, packing)` pair back into one
-                        # token axis. Byte-identical, but XLA tiles a rank-3
-                        # parameter T(32,128)(4,1), which turns the scatter's
-                        # flatten into a bitcast instead of a relayout over the
-                        # whole cache. Derived from the rank-4 shape rather than
-                        # recomputed so the two can never differ in bytes.
-                        p, s, kp, w = kv_cache_shape
-                        kv_cache_shape = (p, s * kp, w)
+                    if isinstance(attn_module, DeepseekV32IndexerCache):
+                        kv_cache_shape = _reshape_indexer_kv_cache(
+                            kv_cache_shape)
                     dtype = kv_cache_spec.dtype
                     kv_caches[layer_name] = allocate_attention_region(
                         region, [(tuple(kv_cache_shape), dtype)])[0]

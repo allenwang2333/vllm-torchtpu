@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (bref_override,
 
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
+PACKING8_KV_PACKING = config.PACKING8_KV_PACKING
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
@@ -74,6 +75,7 @@ def kernel(
     cache_kv_hbm_ref,  # HEAD_ALONG_SUBLANE: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     # SEQ_ALONG_LANE: [total_num_pages, kv_sublane_groups, kv_packing, page_size]
     # TOKEN_MAJOR_3D: [total_num_pages, page_size, lkv_dim]
+    # PACKING8: HEAD_ALONG_SUBLANE with kv_packing == 8; same branch, no new code
     # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
     # (donated_in, out) after the first pass. Only the last is ever read.
     *score_refs,
@@ -561,10 +563,16 @@ def get_kv_cache_shape(
             KV_PACKING,
             page_size,
         )
-    if page_size % KV_PACKING != 0:
+    # Extent of the second-minor packed-group axis for this layout. `PACKING8`
+    # is the same bytes as `HEAD_ALONG_SUBLANE` regrouped 8 rows at a time, so
+    # that the buffer's natural tiling is the `T(8,128)(4,1)` the SparseCore
+    # scatter fusion requires and no retiling copy is emitted around it.
+    packing = (PACKING8_KV_PACKING
+               if kv_layout == KVLayout.PACKING8 else KV_PACKING)
+    if page_size % packing != 0:
         raise ValueError(
-            "HEAD_ALONG_SUBLANE requires page_size to be a multiple of"
-            f" {KV_PACKING}, got {page_size=}.")
+            f"{kv_layout.name} requires page_size to be a multiple of"
+            f" {packing}, got {page_size=}.")
     # `head_dim // 128` scale bytes are reserved to mirror the compressor's
     # record format, then the record is padded to the lane width.
     record_width = head_dim + head_dim // 128
@@ -573,8 +581,8 @@ def get_kv_cache_shape(
         return (total_num_pages, page_size, align_to(record_width, 128))
     return (
         total_num_pages,
-        page_size // KV_PACKING,
-        KV_PACKING,
+        page_size // packing,
+        packing,
         align_to(record_width, 128),
     )
 
@@ -840,8 +848,19 @@ def streamindex_topk(
             raise ValueError("TOKEN_MAJOR_3D expects cache_kv of shape"
                              f" {expected_shape}, got {cache_kv.shape}.")
     else:
+        # HEAD_ALONG_SUBLANE and PACKING8 share this path: both are rank-4 and
+        # everything below derives the packing from the shape, so the only
+        # difference between them is the second-minor extent. The check is not
+        # cosmetic -- a PACKING8-configured server whose allocator still handed
+        # back the 4-packed shape would score the right bytes at the wrong
+        # strides rather than crash.
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
         page_size = page_size_per_kv_packing * kv_packing
+        if kv_layout == KVLayout.PACKING8 and kv_packing != PACKING8_KV_PACKING:
+            raise ValueError(
+                f"PACKING8 expects a second-minor extent of"
+                f" {PACKING8_KV_PACKING}, got {cache_kv.shape}. The allocator"
+                " in runner/kv_cache_manager.py did not apply the layout.")
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
     for bkv_p in num_kv_pages_per_blocks:
@@ -949,6 +968,7 @@ def streamindex_topk(
             KVLayout.HEAD_ALONG_SUBLANE: "",
             KVLayout.SEQ_ALONG_LANE: "-sal",
             KVLayout.TOKEN_MAJOR_3D: "-tm3d",
+            KVLayout.PACKING8: "-p8",
         }[kv_layout]
         scope_name = (
             f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}")
