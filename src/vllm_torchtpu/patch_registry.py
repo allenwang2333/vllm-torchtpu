@@ -122,6 +122,9 @@ PATCHES = (
     Patch("vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl",
           ("platform_activation", "model_load"),
           model_config=True),
+    Patch("vllm_torchtpu.models.vllm.gemma4_patch:maybe_patch_gemma4",
+          ("platform_activation", "model_load"),
+          model_config=True),
 )
 
 _applied: set[str] = set()

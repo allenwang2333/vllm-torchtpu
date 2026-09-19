@@ -949,8 +949,14 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
             mm_embeds_flat = mm_embeds_flat.to(dtype=inputs_embeds.dtype,
                                                device=inputs_embeds.device)
 
-            idx = torch.cumsum(is_multimodal, dim=0, dtype=torch.int32) - 1
-            idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
+            precomputed_idx = getattr(is_multimodal, "_tpu_mm_gather_idx",
+                                      None)
+            if precomputed_idx is not None:
+                idx = precomputed_idx
+            else:
+                idx = torch.cumsum(is_multimodal, dim=0,
+                                   dtype=torch.int32) - 1
+                idx = torch.clamp(idx, 0, mm_embeds_flat.shape[0] - 1)
             gathered = mm_embeds_flat[idx]
             condition = is_multimodal.unsqueeze(-1)
             return torch.where(condition, gathered, inputs_embeds)
