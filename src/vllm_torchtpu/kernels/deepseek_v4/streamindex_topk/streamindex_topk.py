@@ -73,6 +73,7 @@ def kernel(
     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
     cache_kv_hbm_ref,  # HEAD_ALONG_SUBLANE: [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
     # SEQ_ALONG_LANE: [total_num_pages, kv_sublane_groups, kv_packing, page_size]
+    # TOKEN_MAJOR_3D: [total_num_pages, page_size, lkv_dim]
     # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
     # (donated_in, out) after the first pass. Only the last is ever read.
     *score_refs,
@@ -91,6 +92,7 @@ def kernel(
     scores_hbm_ref = score_refs[-1]
     buffer_cnt = buffer_count
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
+    token_major_3d = kv_layout == KVLayout.TOKEN_MAJOR_3D
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
 
@@ -101,6 +103,18 @@ def kernel(
         (_, kv_sublane_groups, kv_packing, page_size) = cache_kv_hbm_ref.shape
         kv_head_dim_groups = head_dim // kv_packing
         page_size_per_kv_packing = page_size // kv_packing
+    elif token_major_3d:
+        # [total_num_pages, page_size, lkv_dim]: HEAD_ALONG_SUBLANE with the
+        # packing axis already folded into the token axis. Setting the packed
+        # group size to one token makes every `*_per_kv_packing` count below a
+        # plain token count, and the rest of the HEAD_ALONG_SUBLANE path -- the
+        # DMA loop, the block slicing, the bitcasts -- is then correct verbatim
+        # on the rank-3 block.
+        (_, page_size, _) = cache_kv_hbm_ref.shape
+        kv_packing = 1
+        page_size_per_kv_packing = page_size
+        kv_sublane_groups = None
+        kv_head_dim_groups = None
     else:
         (
             _,
@@ -153,6 +167,21 @@ def kernel(
                 0,
                 0,
                 metadata_ref.bkv_idx[p_id],
+            ),
+            pipeline_mode=pl.Buffered(buffer_count=buffer_cnt,
+                                      use_lookahead=True),
+        )
+    elif token_major_3d:
+        kv_spec = pl.BlockSpec(
+            (
+                pl.BoundedSlice(seq_batch_size),
+                bkv_sz_per_kv_packing,
+                cache_kv_hbm_ref.shape[-1],
+            ),
+            lambda p_id: (
+                metadata_ref.batch_tile_idx[p_id],
+                metadata_ref.bkv_idx[p_id],
+                0,
             ),
             pipeline_mode=pl.Buffered(buffer_count=buffer_cnt,
                                       use_lookahead=True),
@@ -225,6 +254,7 @@ def kernel(
             kv_packing=kv_packing,
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
+            token_major_3d=token_major_3d,
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
@@ -538,6 +568,9 @@ def get_kv_cache_shape(
     # `head_dim // 128` scale bytes are reserved to mirror the compressor's
     # record format, then the record is padded to the lane width.
     record_width = head_dim + head_dim // 128
+    if kv_layout == KVLayout.TOKEN_MAJOR_3D:
+        # The same bytes as HEAD_ALONG_SUBLANE with dims 1 and 2 merged.
+        return (total_num_pages, page_size, align_to(record_width, 128))
     return (
         total_num_pages,
         page_size // KV_PACKING,
@@ -799,6 +832,13 @@ def streamindex_topk(
             raise ValueError(
                 f"Inconsistent SEQ_ALONG_LANE cache: {kv_sublane_groups=},"
                 f" {kv_packing=} does not match {head_dim=}.")
+    elif kv_layout == KVLayout.TOKEN_MAJOR_3D:
+        total_num_pages, page_size, _ = cache_kv.shape
+        expected_shape = get_kv_cache_shape(total_num_pages, page_size,
+                                            actual_head_dim, kv_layout)
+        if cache_kv.shape != expected_shape:
+            raise ValueError("TOKEN_MAJOR_3D expects cache_kv of shape"
+                             f" {expected_shape}, got {cache_kv.shape}.")
     else:
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
         page_size = page_size_per_kv_packing * kv_packing
@@ -905,7 +945,11 @@ def streamindex_topk(
         # The aliased `scores_init` is the 4th operand after the flat prefetches.
         input_output_aliases = {num_flat_prefetches + 3: 0} if aliased else {}
 
-        layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
+        layout_tag = {
+            KVLayout.HEAD_ALONG_SUBLANE: "",
+            KVLayout.SEQ_ALONG_LANE: "-sal",
+            KVLayout.TOKEN_MAJOR_3D: "-tm3d",
+        }[kv_layout]
         scope_name = (
             f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}")
         if chunked:
@@ -1216,6 +1260,7 @@ def _select_owned_winners(
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "dcp_axis_name",
+        "kv_layout",
     ),
 )
 def streamindex_topk_dcp(
@@ -1238,6 +1283,7 @@ def streamindex_topk_dcp(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1344,6 +1390,7 @@ def streamindex_topk_dcp(
             vmem_limit_bytes=vmem_limit_bytes,
             decode_req_batch_size=decode_req_batch_size,
             enable_early_exit=False,
+            kv_layout=kv_layout,
             cp_size=dcp_size,
             cp_rank=dcp_rank,
             interleave_size=interleave_size,

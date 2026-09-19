@@ -47,10 +47,24 @@ class KVLayout(enum.Enum):
     This also makes the QK product the MXU-native `[n, d] x [d, m]` form and
     yields the per-token scales directly as a `[1, bkv_sz]` row vector, so the
     lane broadcast of the dequantization scale becomes free.
+
+  - TOKEN_MAJOR_3D: `[pages, page_size, width]`. Byte-for-byte the same cache
+    as HEAD_ALONG_SUBLANE -- the `page_size // packing` and `packing` axes are
+    merged into one token axis -- but stored as a rank-3 array, which XLA
+    tiles `T(32,128)(4,1)` instead of `T(4,128)(4,1)`. The flatten to
+    `[pages * page_size, width]` that XLA's scatter canonicalises to then
+    preserves the tile and becomes a bitcast, so the write no longer pays a
+    `relayout -> scatter -> relayout` round trip over the whole cache.
+
+    The kernel's read path is unchanged apart from addressing: one page is
+    `page_size` contiguous rows instead of `page_size // packing` contiguous
+    `(packing, width)` groups, and the VMEM block the pipeline stages is the
+    same bytes with the packing axis already folded in.
   """
 
     HEAD_ALONG_SUBLANE = 0
     SEQ_ALONG_LANE = 1
+    TOKEN_MAJOR_3D = 2
 
     @classmethod
     def parse(cls, value: "str | KVLayout | None") -> "KVLayout":
@@ -65,12 +79,25 @@ class KVLayout(enum.Enum):
             "seq_along_lane": cls.SEQ_ALONG_LANE,
             # Tolerate the common typo seen in flags/configs.
             "seq_alone_lane": cls.SEQ_ALONG_LANE,
+            "token_major_3d": cls.TOKEN_MAJOR_3D,
         }
         if normalized not in aliases:
             raise ValueError(
                 f"Unknown kv_layout {value!r}; expected one of {sorted(aliases)}."
             )
         return aliases[normalized]
+
+
+def indexer_kv_layout() -> KVLayout:
+    """The DSA indexer K cache layout `TPU_DSA_INDEXER_KV_LAYOUT` selects.
+
+  One reader for the env var, because three places have to agree on it or the
+  cache is allocated in one layout and read in another: the allocator
+  (`runner/kv_cache_manager.py`), the scatter that inserts this step's rows
+  (`layers/adapter/custom_ops/mla_attention_op.py`) and the kernel itself.
+  """
+    from vllm_torchtpu import envs  # Local: envs imports torch.
+    return KVLayout.parse(envs.TPU_DSA_INDEXER_KV_LAYOUT)
 
 
 # Default buffer_count for (DECODE, PREFILL, MIXED) cases.

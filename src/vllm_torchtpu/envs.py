@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_DSA_INDEXER_KV_LAYOUT: str = "head_along_sublane"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -346,6 +347,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_ROPE_LAYOUT":
     env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
+    # Storage layout of the DSA (lightning indexer) K cache. Byte-neutral:
+    # "token_major_3d" is the same bytes as the default "head_along_sublane"
+    # with the packing axis folded into the token axis, but a rank-3 parameter
+    # gets T(32,128)(4,1), which makes XLA's scatter flatten a bitcast instead
+    # of a relayout over the whole cache. OFF by default so the incumbent stays
+    # the live baseline and an A/B needs no rebuild.
+    "TPU_DSA_INDEXER_KV_LAYOUT":
+    env_with_choices("TPU_DSA_INDEXER_KV_LAYOUT", "head_along_sublane",
+                     ["head_along_sublane", "token_major_3d"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
     lambda: os.getenv("JAX_PLATFORMS", "").lower(),

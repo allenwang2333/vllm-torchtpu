@@ -48,7 +48,15 @@ def _token_window(
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class StreamIndexKVBufferedRef(pltpu.BufferedRef):
-    """Handles fetching paged KV cache into VMEM buffers across sequence sublanes."""
+    """Handles fetching paged KV cache into VMEM buffers across sequence sublanes.
+
+  Serves both token-on-sublane layouts. `token_major_3d` says the HBM cache is
+  rank-3 `[pages, page_size, width]` rather than rank-4
+  `[pages, page_size // packing, packing, width]`; the caller then passes
+  `page_size_per_kv_packing = page_size` and `kv_packing = 1`, so the page
+  arithmetic and the DMA below are the same statements either way and only the
+  rank of the flattened source ref differs.
+  """
 
     bkv_p: int = dataclasses.field(default=1, metadata=dict(static=True))
     page_size_per_kv_packing: int = dataclasses.field(
@@ -58,6 +66,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
                                            metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1,
                                             metadata=dict(static=True))
+    token_major_3d: bool = dataclasses.field(default=False,
+                                             metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -73,6 +83,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         pages_per_seq: int,
         seq_batch_size: int,
         grid_rank: int = 1,
+        token_major_3d: bool = False,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -89,6 +100,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             kv_packing=kv_packing,
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
+            token_major_3d=token_major_3d,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -108,6 +120,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         pages_per_seq: int,
         seq_batch_size: int,
         grid_rank: int = 1,
+        token_major_3d: bool = False,
         **kwargs: Any,
     ):
         return cls.create(
@@ -122,6 +135,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
+            token_major_3d=token_major_3d,
         )
 
     def copy_in(  # pytype: disable=attribute-error
@@ -141,11 +155,19 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
-        reshaped_cache_hbm_ref: Any = cache_kv_hbm.reshape(  # pytype: disable=attribute-error
-            cache_kv_hbm.shape[0] * self.page_size_per_kv_packing,
-            self.kv_packing,
-            cache_kv_hbm.shape[-1],
-        )
+        if self.token_major_3d:
+            # [pages, page_size, width] -> [pages * page_size, width]. The tile
+            # is preserved, so this is a bitcast, not a relayout.
+            reshaped_cache_hbm_ref: Any = cache_kv_hbm.reshape(  # pytype: disable=attribute-error
+                cache_kv_hbm.shape[0] * self.page_size_per_kv_packing,
+                cache_kv_hbm.shape[-1],
+            )
+        else:
+            reshaped_cache_hbm_ref: Any = cache_kv_hbm.reshape(  # pytype: disable=attribute-error
+                cache_kv_hbm.shape[0] * self.page_size_per_kv_packing,
+                self.kv_packing,
+                cache_kv_hbm.shape[-1],
+            )
         max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
         num_page_indices = page_indices_ref.shape[0]
         effective_seq_idx = batch_tile_idx

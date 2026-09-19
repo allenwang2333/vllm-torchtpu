@@ -43,7 +43,10 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
-    DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
+    DCP_AXIS_NAME, KVLayout, cp_rank_as_data, streamindex_topk,
+    streamindex_topk_dcp)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import \
+    indexer_kv_layout
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
@@ -64,6 +67,38 @@ from vllm_torchtpu.utils import synchronize_tensors
 STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
+def _indexer_cache_geometry(cache_kv: jax.Array, kv_layout: KVLayout):
+    """`(page_size, kv_packing, lkv_dim)` for either indexer K cache layout.
+
+    `TOKEN_MAJOR_3D` stores the same bytes rank-3 with the packing axis folded
+    into the token axis, so `kv_packing` is 1 and a slot addresses a row
+    directly. Asserting the rank here is what stops the allocator and the
+    writer disagreeing silently: a cache shaped by one layout and scattered
+    through the other is a wrong-stride write, not a crash.
+    """
+    if kv_layout == KVLayout.TOKEN_MAJOR_3D:
+        if cache_kv.ndim != 3:
+            raise ValueError(
+                "TPU_DSA_INDEXER_KV_LAYOUT=token_major_3d expects a rank-3 "
+                f"indexer K cache, got {cache_kv.shape}. The allocator in "
+                "runner/kv_cache_manager.py did not apply the layout.")
+        _, page_size, lkv_dim = cache_kv.shape
+        return page_size, 1, lkv_dim
+    if cache_kv.ndim != 4:
+        raise ValueError("HEAD_ALONG_SUBLANE expects a rank-4 indexer K "
+                         f"cache, got {cache_kv.shape}.")
+    _, page_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+    return page_size_per_kv_packing * kv_packing, kv_packing, lkv_dim
+
+
+def _indexer_cache_set(cache_kv: jax.Array, page: jax.Array, slot: jax.Array,
+                       kv_packing: int, rows: jax.Array) -> jax.Array:
+    """Scatter `rows` at `(page, slot)`, whichever layout the cache is in."""
+    if cache_kv.ndim == 3:
+        return cache_kv.at[page, slot].set(rows)
+    return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(rows)
+
+
 def _cp_scatter_indexer_k(
     cache_kv: jax.Array,
     k_packed: jax.Array,
@@ -74,6 +109,7 @@ def _cp_scatter_indexer_k(
     mesh,
     cp_size: int,
     interleave_size: int,
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     axis_name: str = DCP_AXIS_NAME,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
@@ -94,8 +130,8 @@ def _cp_scatter_indexer_k(
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
         rank = cp_rank_as_data(axis_name, cp_size)
-        _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-        page_size = block_size_per_kv_packing * kv_packing
+        page_size, kv_packing, lkv_dim = _indexer_cache_geometry(
+            cache_kv, kv_layout)
         # The latent cache is guarded on its own page size in
         # `update_sparse_mla_kv_cache_dcp`; this cache is a separate
         # allocation, so it needs the check on its own number.
@@ -136,8 +172,7 @@ def _cp_scatter_indexer_k(
         valid = jnp.logical_and(in_batch, owner == rank)
         page = jnp.where(valid, local_page_indices[seq_id, virtual_page],
                          jnp.int32(OOB_PAGE))
-        return cache_kv.at[page, slot // kv_packing,
-                           slot % kv_packing].set(k_packed)
+        return _indexer_cache_set(cache_kv, page, slot, kv_packing, k_packed)
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
@@ -179,6 +214,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
+        kv_layout = indexer_kv_layout()
 
         def _streamidx_topk_jax(
                 q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -192,8 +228,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
                 distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
+            block_size, kv_packing, lkv_dim = _indexer_cache_geometry(
+                cache_kv, kv_layout)
             # Cache rows are padded to the 128-lane HBM width; pad the packed
             # fp8+scale rows to match before scattering.
             k_packed = jnp.pad(k_packed,
@@ -211,8 +247,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                                                             pos // block_size],
                 jnp.int32(2**30))
             slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing,
-                                   slot % kv_packing].set(k_packed)
+            cache_kv = _indexer_cache_set(cache_kv, page, slot, kv_packing,
+                                          k_packed)
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
@@ -230,6 +266,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                kv_layout=kv_layout,
             )
             return cache_kv, topk_indices
 
@@ -263,6 +300,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         replicated across the op boundary. Only the cache is split.
         """
         topk = self.topk_tokens
+        kv_layout = indexer_kv_layout()
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
 
         def _streamidx_topk_dcp_jax(
@@ -286,6 +324,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 mesh=mesh,
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
+                kv_layout=kv_layout,
                 axis_name=DCP_AXIS_NAME,
             )
 
@@ -305,6 +344,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                kv_layout=kv_layout,
             )
             return cache_kv, local_topk
 
@@ -387,7 +427,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if not isinstance(metadata, AttentionMetadata):
             return self.topk_indices_buffer
 
-        kv_cache = self.k_cache.kv_cache  # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim], lkv_dim = head_dim + 1 padded to a 128 multiple
+        # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim], or
+        # [num_blocks, block_size, lkv_dim] under
+        # TPU_DSA_INDEXER_KV_LAYOUT=token_major_3d. Same bytes either way;
+        # lkv_dim = head_dim + 1 padded to a 128 multiple.
+        kv_cache = self.k_cache.kv_cache
         if kv_cache.numel() == 0:
             return self.topk_indices_buffer
 

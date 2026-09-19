@@ -37,6 +37,8 @@ from vllm.v1.worker.utils import (AttentionGroup,
                                   prepare_kernel_block_sizes)
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
+    KVLayout, indexer_kv_layout)
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id, format_kv_cache_layout_summary,
     materialize_kv_cache_tensors)
@@ -1311,6 +1313,17 @@ class KVCacheManager:
                         kv_cache_spec.head_size,
                         kv_cache_spec.dtype,
                     )
+                    if (isinstance(attn_module, DeepseekV32IndexerCache) and
+                            indexer_kv_layout() == KVLayout.TOKEN_MAJOR_3D):
+                        # Store the DSA indexer K cache rank-3, merging the
+                        # `(page_size // packing, packing)` pair back into one
+                        # token axis. Byte-identical, but XLA tiles a rank-3
+                        # parameter T(32,128)(4,1), which turns the scatter's
+                        # flatten into a bitcast instead of a relayout over the
+                        # whole cache. Derived from the rank-4 shape rather than
+                        # recomputed so the two can never differ in bytes.
+                        p, s, kp, w = kv_cache_shape
+                        kv_cache_shape = (p, s * kp, w)
                     dtype = kv_cache_spec.dtype
                     kv_caches[layer_name] = allocate_attention_region(
                         region, [(tuple(kv_cache_shape), dtype)])[0]
