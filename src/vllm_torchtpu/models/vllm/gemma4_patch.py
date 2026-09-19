@@ -351,10 +351,15 @@ def maybe_patch_gemma4(
             def _audio_tower_and_embed(
                 feats: torch.Tensor,
                 mask: torch.Tensor,
-            ) -> torch.Tensor:
+            ) -> tuple[torch.Tensor, torch.Tensor]:
                 out = audio_tower(feats, mask)
                 enc = out[0] if isinstance(out, tuple) else out.last_hidden_state
-                return embed_audio(inputs_embeds=enc)
+                emb = embed_audio(inputs_embeds=enc)
+                flat = emb.reshape(-1, emb.shape[-1])
+                target_rows = feats.shape[0] * 256
+                if flat.shape[0] < target_rows:
+                    flat = F.pad(flat, (0, 0, 0, target_rows - flat.shape[0]))
+                return emb, flat
 
             compiled_fn = torch.compile(
                 _audio_tower_and_embed,
@@ -363,9 +368,9 @@ def maybe_patch_gemma4(
             )
             self._tpu_compiled_audio_fn = compiled_fn
 
-        audio_features = compiled_fn(input_features, input_features_mask)
+        audio_features, parent_flat = compiled_fn(
+            input_features, input_features_mask)
         t_out = int(audio_features.shape[1])
-        parent_flat = audio_features.reshape(-1, audio_features.shape[-1])
 
         if all(v == t_out for v in valid_lens):
             rows = list(audio_features[:batch_size].unbind(0))
@@ -463,6 +468,11 @@ def maybe_patch_gemma4(
             and len(multimodal_embeddings) == 1
             else torch.cat(list(multimodal_embeddings), dim=0)
         )
+        n_tok = int(input_ids.shape[0])
+        if mm_flat.shape[0] > n_tok:
+            mm_flat = mm_flat[:n_tok]
+        elif mm_flat.shape[0] < n_tok:
+            mm_flat = F.pad(mm_flat, (0, 0, 0, n_tok - mm_flat.shape[0]))
         gather_idx = getattr(is_multimodal, "_tpu_mm_gather_idx", None)
         if gather_idx is None:
             is_mm_dev = is_multimodal.to(input_ids.device, non_blocking=True)
