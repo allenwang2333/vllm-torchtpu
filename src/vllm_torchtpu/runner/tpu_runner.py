@@ -3405,7 +3405,9 @@ class TPUModelRunner(GPUModelRunner):
             req_ids = cast(
                 list[str],
                 self.input_batch.req_ids[:self.input_batch.num_reqs])
-            all_greedy = self.input_batch.all_greedy
+            all_greedy = self.input_batch.all_greedy or bool(
+                envs.TPU_COMPILE_SIZES and self.input_batch.no_top_k
+                and self.input_batch.no_top_p)
             for logits, num_reqs, mamba_indices in zip(state.logits_list,
                                                        state.num_reqs_list,
                                                        mamba_idx_list):
@@ -5153,11 +5155,57 @@ class TPUModelRunner(GPUModelRunner):
                     self, "_tpu_vocab_fp8_quantized", False):
                 import gc
                 from vllm.model_executor.utils import replace_parameter
+                def _make_fp8_embed_fwd(m):
+
+                    def _fwd(input_):
+                        flat = input_.reshape(-1)
+                        out = torch.index_select(
+                            m.weight, 0, flat).to(torch.bfloat16)
+                        return out.reshape(*input_.shape, -1)
+
+                    return _fwd
+
+                def _make_fp8_linear_fwd(m):
+
+                    def _fwd(x):
+                        return torch.matmul(x, m.weight.to(x.dtype)), None
+
+                    return _fwd
+
+                def _quantize_mlp_proj_e5m2(lin_mod):
+                    w_p = getattr(lin_mod, "weight", None)
+                    if not (isinstance(w_p, torch.nn.Parameter)
+                            and w_p.dtype == torch.bfloat16):
+                        return False
+                    w_data = w_p.data
+                    if getattr(lin_mod, "_tpu_weight_flipped", False):
+                        w_e5m2 = w_data.to(torch.float8_e5m2).contiguous()
+                    else:
+                        w_e5m2 = w_data.to(torch.float8_e5m2).transpose(
+                            0, 1).contiguous()
+                    del w_data, w_p
+                    lin_mod._parameters["weight"] = None
+                    replace_parameter(
+                        lin_mod, "weight",
+                        torch.nn.Parameter(w_e5m2, requires_grad=False))
+                    lin_mod.forward = _make_fp8_linear_fwd(lin_mod)
+                    synchronize_tensors([lin_mod.weight])
+                    return True
+
+                mlp_fp8_count = 0
                 for mod_name, mod in self.model.named_modules():
+                    se_wrapper = getattr(mod, "_shared_experts", None)
+                    se_layer = getattr(se_wrapper, "_layer", None) if se_wrapper is not None else None
+                    if se_layer is not None:
+                        for proj_attr in ("gate_up_proj", "down_proj"):
+                            proj_mod = getattr(se_layer, proj_attr, None)
+                            if proj_mod is not None and _quantize_mlp_proj_e5m2(proj_mod):
+                                mlp_fp8_count += 1
                     w_param = getattr(mod, "weight", None)
-                    if (isinstance(w_param, torch.nn.Parameter)
-                            and tuple(w_param.shape) == (163840, 7168)
+                    if not (isinstance(w_param, torch.nn.Parameter)
                             and w_param.dtype == torch.bfloat16):
+                        continue
+                    if tuple(w_param.shape) == (163840, 7168):
                         w = w_param.data
                         is_lm_head = "lm_head" in mod_name
                         if is_lm_head:
@@ -5173,22 +5221,24 @@ class TPUModelRunner(GPUModelRunner):
                         if is_lm_head:
                             self._tpu_fp8_lm_head = mod
                         else:
-
-                            def _make_fp8_embed_fwd(m):
-
-                                def _fwd(input_):
-                                    flat = input_.reshape(-1)
-                                    out = torch.index_select(
-                                        m.weight, 0, flat).to(torch.bfloat16)
-                                    return out.reshape(*input_.shape, -1)
-
-                                return _fwd
-
                             mod.forward = _make_fp8_embed_fwd(mod)
                         synchronize_tensors([mod.weight])
                         logger.info("Quantized %s to E5M2: weight=%s",
                                     mod_name, list(mod.weight.shape))
+                    elif (("shared_experts" in mod_name
+                           or "layers.0.mlp." in mod_name)
+                          and mod_name.endswith((".gate_up_proj", ".down_proj"))):
+                        if _quantize_mlp_proj_e5m2(mod):
+                            mlp_fp8_count += 1
+                if mlp_fp8_count > 0:
+                    logger.info(
+                        "Quantized %d dense/shared_experts MLP projections to E5M2",
+                        mlp_fp8_count)
                 self._tpu_vocab_fp8_quantized = True
+                if (envs.TPU_DISABLE_STAGING_FENCE == 2
+                        and getattr(self.model, "vision_tower", None) is None):
+                    self.supports_mm_inputs = False
+                    logger.info("Disabled supports_mm_inputs for language-model-only fast embed_tokens fusion")
                 gc.collect()
 
             self._profile_slab = None

@@ -116,6 +116,15 @@ def _quantize_hs_fp8(hs_slice: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return hs_fp8_bf16, hs_scale.view(hs_slice.shape[0], 1)
 
 
+def _all_gather_hs(collective_group, hs: torch.Tensor) -> torch.Tensor:
+    if (envs.TPU_MOE_FP8_DISPATCH == 6 and hs.dtype == torch.bfloat16
+            and hs.shape[-1] % 2 == 0):
+        q_hs = hs.to(torch.float8_e5m2).view(torch.bfloat16)
+        ag_q_hs = collective_group.all_gather(q_hs, dim=0)
+        return ag_q_hs.view(torch.float8_e5m2).to(hs.dtype)
+    return collective_group.all_gather(hs, dim=0)
+
+
 def _gather_hs_and_meta(
     collective_group,
     hs_slice: torch.Tensor,
@@ -143,7 +152,7 @@ def _gather_hs_and_meta(
         ag_hs = ag_hs_fp8.view(torch.float8_e4m3fn).to(torch.bfloat16) * ag_scale
         return ag_hs, ag_tw, ag_ti
 
-    ag_hs = collective_group.all_gather(hs_slice, dim=0)
+    ag_hs = _all_gather_hs(collective_group, hs_slice)
     ag_tw, ag_ti = _gather_routing_meta(collective_group, tw_slice, ti_slice)
     return ag_hs, ag_tw, ag_ti
 
@@ -212,7 +221,7 @@ def pipelined_fused_moe_gmm(
             if pre_gate_ag is not None and pre_gate_ag[1] is not None:
                 ag_hidden_states = pre_gate_ag[1]
             else:
-                ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
+                ag_hidden_states = _all_gather_hs(collective_group, hidden_states)
             if route_fn is not None and (topk_weights is None or topk_ids is None):
                 topk_weights, topk_ids = route_fn()
             ag_topk_weights, ag_topk_ids = _gather_routing_meta(
@@ -225,7 +234,7 @@ def pipelined_fused_moe_gmm(
             ag_topk_ids = topk_ids
 
         shared_act = None
-        if shared_experts is not None:
+        if shared_experts is not None and envs.TPU_MOE_OVERLAP_SHARED_EXPERTS != 6:
             shared_layer, shared_in = shared_experts
             gate_up, _ = shared_layer.gate_up_proj(shared_in)
             shared_act = shared_layer.act_fn(gate_up)
@@ -249,14 +258,20 @@ def pipelined_fused_moe_gmm(
 
         if parallel_size > 1:
             rs_out = collective_group.reduce_scatter(out, dim=0)
+            if shared_experts is not None:
+                if shared_act is not None:
+                    shared_out, _ = shared_experts[0].down_proj(shared_act)
+                else:
+                    shared_layer, shared_in = shared_experts
+                    shared_out = shared_layer(shared_in)
+                return rs_out, shared_out
+            return rs_out
+        if shared_experts is not None:
             if shared_act is not None:
                 shared_out, _ = shared_experts[0].down_proj(shared_act)
-                return rs_out, shared_out
-            if shared_experts is not None:
-                return rs_out, None
-            return rs_out
-        if shared_act is not None:
-            shared_out, _ = shared_experts[0].down_proj(shared_act)
+            else:
+                shared_layer, shared_in = shared_experts
+                shared_out = shared_layer(shared_in)
             return out, shared_out
         return out
 
@@ -293,18 +308,39 @@ def pipelined_fused_moe_gmm(
         ag_hs_curr = ag_hs0_fp8.view(torch.float8_e4m3fn).to(torch.bfloat16) * ag_scale0
     else:
         ag_hs_curr = (pre_ag_hs0 if pre_ag_hs0 is not None else
-                      collective_group.all_gather(hs_slices[0], dim=0))
+                      _all_gather_hs(collective_group, hs_slices[0]))
         if route_fn is not None and (topk_weights is None or topk_ids is None):
             topk_weights, topk_ids = route_fn()
         weights_slices = (list(torch.chunk(topk_weights, num_chunks, dim=0))
                           if topk_weights is not None else [None] * num_chunks)
         ids_slices = (list(torch.chunk(topk_ids, num_chunks, dim=0))
                       if topk_ids is not None else [None] * num_chunks)
-        ag_tw_curr, ag_ti_curr = _gather_routing_meta(
-            collective_group, weights_slices[0], ids_slices[0])
+        if (topk_weights is not None and topk_ids is not None
+                and topk_weights.dtype == torch.bfloat16
+                and topk_ids.dtype == torch.int32):
+            k = topk_weights.shape[-1]
+            meta_chunks = [
+                torch.cat([w.view(torch.int16).to(torch.int32), idx], dim=-1)
+                for w, idx in zip(weights_slices, ids_slices)
+            ]
+            ag_meta_all = collective_group.all_gather(
+                torch.cat(meta_chunks, dim=-1), dim=0)
+            ag_tw_list = [
+                ag_meta_all[:, c * 2 * k : c * 2 * k + k].to(torch.int16).view(torch.bfloat16)
+                for c in range(num_chunks)
+            ]
+            ag_ti_list = [
+                ag_meta_all[:, c * 2 * k + k : (c + 1) * 2 * k]
+                for c in range(num_chunks)
+            ]
+            ag_tw_curr, ag_ti_curr = ag_tw_list[0], ag_ti_list[0]
+        else:
+            ag_tw_list, ag_ti_list = None, None
+            ag_tw_curr, ag_ti_curr = _gather_routing_meta(
+                collective_group, weights_slices[0], ids_slices[0])
 
     shared_act = None
-    if shared_experts is not None:
+    if shared_experts is not None and envs.TPU_MOE_OVERLAP_SHARED_EXPERTS != 6:
         shared_layer, shared_in = shared_experts
         gate_up, _ = shared_layer.gate_up_proj(shared_in)
         shared_act = shared_layer.act_fn(gate_up)
@@ -317,13 +353,17 @@ def pipelined_fused_moe_gmm(
             hs_next = hs_slices[i + 1]
             if use_barrier:
                 ag_hs_curr, hs_next = _tpu_opt_barrier(ag_hs_curr, hs_next)
-            ag_hs_next, ag_tw_next, ag_ti_next = _gather_hs_and_meta(
-                collective_group,
-                hs_next,
-                weights_slices[i + 1],
-                ids_slices[i + 1],
-                use_fp8,
-            )
+            if not use_fp8 and ag_tw_list is not None:
+                ag_hs_next = _all_gather_hs(collective_group, hs_next)
+                ag_tw_next, ag_ti_next = ag_tw_list[i + 1], ag_ti_list[i + 1]
+            else:
+                ag_hs_next, ag_tw_next, ag_ti_next = _gather_hs_and_meta(
+                    collective_group,
+                    hs_next,
+                    weights_slices[i + 1],
+                    ids_slices[i + 1],
+                    use_fp8,
+                )
 
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
@@ -355,10 +395,15 @@ def pipelined_fused_moe_gmm(
         if i + 1 < num_chunks:
             ag_hs_curr, ag_tw_curr, ag_ti_curr = ag_hs_next, ag_tw_next, ag_ti_next
 
-    combined_out = torch.cat(rs_outputs, dim=0)
-    if shared_act is not None:
-        shared_out, _ = shared_experts[0].down_proj(shared_act)
-        return combined_out, shared_out
+    shared_out = None
     if shared_experts is not None:
-        return combined_out, None
+        if shared_act is not None:
+            shared_out, _ = shared_experts[0].down_proj(shared_act)
+        else:
+            shared_layer, shared_in = shared_experts
+            shared_out = shared_layer(shared_in)
+
+    combined_out = torch.cat(rs_outputs, dim=0)
+    if shared_experts is not None:
+        return combined_out, shared_out
     return combined_out

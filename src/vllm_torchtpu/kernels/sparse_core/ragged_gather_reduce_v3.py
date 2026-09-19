@@ -383,34 +383,36 @@ def ragged_gather_reduce(
     metadata_block_size = _TOKEN_BLOCK * reduce_group_size
     indices_blocks = indices_2d.reshape(num_blocks, metadata_block_size)
     valid_blocks = valid_2d.reshape(num_blocks, metadata_block_size)
-    destination_template = jnp.repeat(
-        jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), reduce_group_size)
-    destination_blocks = jnp.broadcast_to(destination_template,
-                                          indices_blocks.shape)
+    dest_shifted = jnp.left_shift(
+        jnp.repeat(jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32),
+                   reduce_group_size),
+        _ROUTE_INDEX_BITS,
+    )[None, :]
+    packed_meta_blocks = jnp.where(
+        valid_blocks,
+        jnp.bitwise_or(indices_blocks.astype(jnp.int32), dest_shifted),
+        0,
+    )
+    weights_blocks = jnp.where(
+        valid_blocks,
+        weights_2d.reshape(num_blocks, metadata_block_size).astype(
+            jnp.float32),
+        0.0,
+    )
 
     # A stable boolean partition keeps routes for each destination adjacent
     # while placing the exact valid prefix first in every destination block.
     route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks,
-                                             route_order,
-                                             axis=1)
-    weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
-    route_indices = jnp.where(compact_valid, route_indices,
-                              0).astype(jnp.int32)
-    route_destinations = jnp.where(compact_valid, route_destinations,
-                                   0).astype(jnp.int32)
-    route_metadata = jnp.bitwise_or(
-        route_indices,
-        jnp.left_shift(route_destinations, _ROUTE_INDEX_BITS),
-    ).reshape(-1)
-    route_weights = jnp.where(compact_valid, route_weights, 0).reshape(-1)
-    route_weights = route_weights.astype(jnp.float32)
+    route_metadata_2d = jnp.take_along_axis(packed_meta_blocks,
+                                            route_order,
+                                            axis=1)
+    route_metadata = route_metadata_2d.reshape(-1)
+    route_weights = jnp.take_along_axis(weights_blocks, route_order,
+                                        axis=1).reshape(-1)
     route_counts = jnp.sum(valid_blocks, axis=1, dtype=jnp.int32)
-    paired_destinations = route_destinations[:, :2 * _TOKEN_BLOCK].reshape(
-        num_blocks, _TOKEN_BLOCK, 2)
+    paired_destinations = jnp.right_shift(
+        route_metadata_2d[:, :2 * _TOKEN_BLOCK],
+        _ROUTE_INDEX_BITS).reshape(num_blocks, _TOKEN_BLOCK, 2)
     fixed_two_route_blocks = jnp.logical_and(
         route_counts == 2 * _TOKEN_BLOCK,
         jnp.all(paired_destinations[:, :, 0] == paired_destinations[:, :, 1],

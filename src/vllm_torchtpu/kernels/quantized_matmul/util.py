@@ -305,11 +305,12 @@ def quantize_block(data, axis, target_dtype):
         keepdims=True,
     )
     dtype_max, dtype_min = get_max_min(target_dtype)
-    scale = abs_max / dtype_max
-    scale = jnp.where(scale == 0, 1.0, scale)
+    safe_max = jnp.where(abs_max == 0, 1.0, abs_max)
+    scale = safe_max / dtype_max
 
     if jnp.issubdtype(target_dtype, jnp.floating):
-        data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
+        scale_inv = dtype_max / safe_max
+        data_q = (data * scale_inv).astype(target_dtype)
     else:
         data_q = jnp.round(data / scale).astype(target_dtype)
     return data_q, scale

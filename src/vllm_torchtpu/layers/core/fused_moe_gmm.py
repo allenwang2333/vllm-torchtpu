@@ -270,42 +270,65 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    # The keys take only `local_num_experts + 1` values, so a counting sort
-    # gives the positions and `group_sizes` without a second comparison sort.
-    # Ragged permute only: under the one-hot permute these positions break MTP.
+    owner_mode = envs.TPU_MOE_OWNER_OUTPUT_MODE.lower()
+    token_bits = max(1, (num_tokens_local - 1).bit_length())
+    pack_weights_in_sort = (
+        use_ep and use_sparse_core
+        and token_indices_flat.shape[0] <= onehot_moe_permute_threshold
+        and owner_mode in ("on", "ragged_perm")
+        and ((local_num_experts + 1).bit_length() + token_bits <= 15))
     ragged_permute = (use_ep and use_sparse_core
                       and token_indices_flat.shape[0]
                       > onehot_moe_permute_threshold)
     argsort_revert_indices, bucket_counts = (_counting_sort_positions(
         sort_keys, local_num_experts + 1) if ragged_permute else (None, None))
-    token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = ((local_num_experts + 1).bit_length() + token_bits < 31)
-    sorted_indices = (jnp.argsort(sort_keys) if argsort_revert_indices is None
-                      or not packable else None)
 
-    if argsort_revert_indices is not None:
-        group_sizes_local = bucket_counts[:local_num_experts]
+    if pack_weights_in_sort:
+        group_sizes_local = jax.nn.one_hot(
+            sort_keys, local_num_experts, dtype=jnp.int32).sum(axis=0)
+        weight_u16 = jax.lax.bitcast_convert_type(
+            topk_weights_flat.astype(jnp.bfloat16), jnp.uint16).astype(
+                jnp.int32)
+        packed = jax.lax.sort(
+            jnp.left_shift(sort_keys, token_bits + 16)
+            | jnp.left_shift(token_indices_flat, 16)
+            | weight_u16,
+            is_stable=False,
+        )
+        token_indices_sorted = jnp.bitwise_and(
+            jnp.right_shift(packed, 16), (1 << token_bits) - 1)
+        topk_weights_flat = jax.lax.bitcast_convert_type(
+            jnp.bitwise_and(packed, 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
     else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
-        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-        group_sizes_local = (jax.nn.one_hot(
-            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                             valid_mask[:, None].astype(jnp.int32))
-        group_sizes_local = group_sizes_local.sum(axis=0)
+        sorted_indices = (jnp.argsort(sort_keys)
+                          if argsort_revert_indices is None
+                          or not packable else None)
+        if argsort_revert_indices is not None:
+            group_sizes_local = bucket_counts[:local_num_experts]
+        else:
+            argsort_revert_indices = jnp.argsort(sorted_indices)
+            topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+            group_sizes_local = (jax.nn.one_hot(
+                topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
+                                 valid_mask[:, None].astype(jnp.int32))
+            group_sizes_local = group_sizes_local.sum(axis=0)
 
-    if packable:
-        # Packing (key, token) into one int32 keeps the payload out of the sort
-        # and drops the follow-up gather. Equal packed values carry the same
-        # token id, so their order cannot matter.
-        packed = jax.lax.sort(jnp.left_shift(sort_keys, token_bits)
-                              | token_indices_flat,
-                              is_stable=False)
-        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
-    else:
-        token_indices_sorted = token_indices_flat[sorted_indices]
+        if packable:
+            # Packing (key, token) into one int32 keeps the payload out of the sort
+            # and drops the follow-up gather. Equal packed values carry the same
+            # token id, so their order cannot matter.
+            packed = jax.lax.sort(jnp.left_shift(sort_keys, token_bits)
+                                  | token_indices_flat,
+                                  is_stable=False)
+            token_indices_sorted = jnp.bitwise_and(
+                packed, (1 << token_bits) - 1)
+        else:
+            token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+        if (token_indices_sorted.shape[0] <= onehot_moe_permute_threshold
+                and owner_mode != "ragged_perm"):
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
             onehot = jax.nn.one_hot(token_indices_sorted,
@@ -426,20 +449,22 @@ def moe_gmm(
                     reduce_group_size=topk,
                 ).astype(x.dtype)
     if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+        if token_indices_sorted.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
-            # `argsort_revert_indices` is the inverse of the sort, so scattering
-            # through it is the gather by the (unmaterialised) forward one.
-            topk_weights_sorted = jnp.zeros_like(topk_weights_flat).at[
-                argsort_revert_indices].set(topk_weights_flat)
+            if argsort_revert_indices is None:
+                topk_weights_sorted = topk_weights_flat
+            else:
+                topk_weights_sorted = jnp.zeros_like(topk_weights_flat).at[
+                    argsort_revert_indices].set(topk_weights_flat)
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if (envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on" and
-                    can_use_blockwise_onehot_unpermute(gmm2_res,
-                                                       token_indices_sorted,
-                                                       topk_weights_sorted,
-                                                       valid_count,
-                                                       num_tokens=num_tokens)):
+            if (envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() in ("on", "ragged_perm")
+                    and can_use_blockwise_onehot_unpermute(
+                        gmm2_res,
+                        token_indices_sorted,
+                        topk_weights_sorted,
+                        valid_count,
+                        num_tokens=num_tokens)):
                 logger.info_once(
                     "Selected owner_output blockwise one-hot unpermute: "
                     "routes=%d hidden=%d tokens=%d", gmm2_res.shape[0],
