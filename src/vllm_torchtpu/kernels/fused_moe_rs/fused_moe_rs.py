@@ -225,6 +225,7 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_post_gather: bool = False,
+    shard_index: jax.Array | None = None,
 ) -> jax.Array:
     """Per-chip MoE body: ICI direct-write per row, then weighted top_k reduce."""
     num_tokens = hidden_states_local.shape[0]
@@ -232,7 +233,23 @@ def moe_gmm_local_rs_nodedup(
     chunk_size = num_tokens // ep_size
     num_experts = w1.shape[0] * ep_size  # global num_experts
     num_local_experts = w1.shape[0]
-    my_id = jax.lax.axis_index(ep_axis_name)
+    # LOCAL DELTA vs tokamax 6303c14: this shard's index arrives as DATA when
+    # the caller supplies it. `lax.axis_index` lowers to `partition-id`, and
+    # torch_tpu's `jax.export` bridge recompiles the serialized module with an
+    # SPMD partitioner that rejects it:
+    #
+    #   partitionId instruction is not supported for SPMD partitioning
+    #
+    # `kernels/fused_moe/v2/kernel.py:80-86` names the same error for the same
+    # reason, and v2 passes this probe precisely because it reads its index
+    # out of a tensor (`layer.py:371-374`). The `axis_index` default is kept so
+    # plain-`jax.jit` callers -- the in-tree device tests -- still work; under
+    # a mesh without the export bridge the constant form is legal.
+    #
+    # Note `kernel_main_fused_rs`'s own `axis_index` is deliberately untouched:
+    # Mosaic lowers that one, not XLA.
+    my_id = (jax.lax.axis_index(ep_axis_name)
+             if shard_index is None else shard_index)
 
     # Routing inlined here so it fuses with the kernel pipeline.
     lhs_indices, group_sizes, output_indices, topk_slot_indices = _compute_rs_routing(
@@ -366,8 +383,16 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_post_gather: bool = False,
+    rank: jax.Array | None = None,
 ) -> jax.Array:
-    """shard_map driver: routing runs per-chip so it fuses with the kernel."""
+    """shard_map driver: routing runs per-chip so it fuses with the kernel.
+
+    LOCAL DELTA vs tokamax 6303c14: `rank` is this shard's mesh index as an
+    ``int32[ep, 1]`` operand, sharded `P(expert)` so each chip sees ``[[i]]``.
+    It replaces both `lax.axis_index` sites that XLA's SPMD partitioner
+    rejects through torch_tpu's export bridge. `None` keeps the JAX-native
+    path working.
+    """
     expert_axis = get_moe_expert_axis(mesh, EXPERT)
     ep_size = get_mesh_shape_product(mesh, expert_axis)
     ep_p_spec = P(expert_axis)
@@ -454,14 +479,14 @@ def expert_parallel_gmm_rs(
     # the module per device and trips it.
     #
     # The body only ever reads `group_offset[0]`, and that value is exactly
-    # this shard's first global expert id. `jax.lax.axis_index` inside the
-    # manual computation gives it directly, with no constant to slice and no
-    # partition-id in the exported module. The body already uses the same call
-    # for `my_id`, so this adds no new construct.
+    # this shard's first global expert id -- so it follows from the shard
+    # index, which now arrives as the `rank` operand rather than from
+    # `lax.axis_index` (that lowers to `partition-id` too; see the note in
+    # `moe_gmm_local_rs_nodedup`). One operand retires both sites.
     def _shard_body(hidden_local, w1_, w1s, w1b, w2_, w2s, w2b, w1gs, w2gs,
-                    tw_local, ti_local, pnw):
-        goff = (jax.lax.axis_index(expert_axis).astype(jnp.int32).reshape(1) *
-                num_experts_per_shard)
+                    rank_l, tw_local, ti_local, pnw):
+        my_id = rank_l[0, 0]
+        goff = (my_id * num_experts_per_shard).astype(jnp.int32).reshape(1)
         if sp_enabled:
             # Delta 2 of 2: the all-gather upstream got from the `P("data")`
             # boundary. `tiled=True` concatenates shards in axis-index order
@@ -474,8 +499,20 @@ def expert_parallel_gmm_rs(
                                           expert_axis,
                                           axis=0,
                                           tiled=True)
-        return _local_body(hidden_local, w1_, w1s, w1b, w2_, w2s, w2b, w1gs,
-                           w2gs, goff, tw_local, ti_local, pnw)
+        return _local_body(hidden_local,
+                           w1_,
+                           w1s,
+                           w1b,
+                           w2_,
+                           w2s,
+                           w2b,
+                           w1gs,
+                           w2gs,
+                           goff,
+                           tw_local,
+                           ti_local,
+                           pnw,
+                           shard_index=my_id)
 
     result = jax.shard_map(
         _shard_body,
@@ -490,7 +527,8 @@ def expert_parallel_gmm_rs(
             w2_bias_spec,
             w1_gs_spec,
             w2_gs_spec,
-            # group_offset removed -- see delta 3 of 3 above.
+            # group_offset removed; `rank` replaces it -- delta 3 of 3 above.
+            ep_p_spec,  # rank: [ep, 1] i32, this shard's mesh index
             topk_w_spec,
             topk_i_spec,
             P(),  # post_expert_norm_weight
@@ -507,6 +545,7 @@ def expert_parallel_gmm_rs(
         w2_bias,
         w1_global_scale,
         w2_global_scale,
+        rank,
         topk_weights,
         topk_indices,
         _pnw_rs,
@@ -544,6 +583,7 @@ def fused_moe_func_rs(
     topk_weights: jax.Array | None = None,
     topk_indices: jax.Array | None = None,
     fp8_post_gather: bool = False,
+    rank: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -598,6 +638,7 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_post_gather=fp8_post_gather,
+        rank=rank,
     )
 
     return result[:num_tokens, :hidden_size]

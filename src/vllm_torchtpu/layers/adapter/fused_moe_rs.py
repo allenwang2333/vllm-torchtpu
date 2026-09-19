@@ -13,8 +13,16 @@
 # limitations under the License.
 """Torch bridge for the tokamax fused reduce-scatter MoE kernel.
 
-`kernels/fused_moe_rs` is a verbatim copy of
-`tokamax/_src/ops/experimental/fused_moe_rs`. It runs the whole EP MoE --
+`kernels/fused_moe_rs` is a copy of
+`tokamax/_src/ops/experimental/fused_moe_rs` at openxla/tokamax `6303c14`,
+carrying **three local deltas**, each marked `LOCAL DELTA vs tokamax 6303c14`
+at its site in `kernels/fused_moe_rs/fused_moe_rs.py`. All three exist because
+this tree reaches the kernel through torch_tpu's `jax.export` bridge, which
+re-partitions the serialized module and rejects two constructs upstream is free
+to use under plain `jax.jit`: (1) a `shard_map` boundary reshard, and (2)
+`lax.axis_index` / a sharded jit-internal constant, both of which become
+`partition-id`. `gmm_fused_rs_nodedup.py` and `gmm_v2_gather_scatter.py` are
+untouched. It runs the whole EP MoE --
 gather, GMM1, activation, GMM2, and the cross-chip exchange -- as one Pallas
 program, so the reduce-scatter is the kernel's epilogue rather than an exposed
 collective after it. That is the same argument `fused_moe_ep` makes for the v2
@@ -77,7 +85,8 @@ from jax.sharding import PartitionSpec
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (RS_DATA_AXIS_NAME,
                                                RS_EXPERT_AXIS_NAME,
-                                               build_ep_rs_mesh)
+                                               build_ep_rs_mesh,
+                                               ep_mesh_index)
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
@@ -103,6 +112,14 @@ RS_W2_SCALE_ATTR = "_rs_w2_weight_scale"
 # stop fitting SMEM. Mirrored here so the refusal is a log line at weight load
 # rather than an assert inside a traced forward on the first real batch.
 _FUSED_RS_MAX_SAFE_SIZE_M = 262144
+
+# This rank's mesh index, as a device tensor. The kernel needs it as DATA:
+# `lax.axis_index` lowers to `partition-id`, which the SPMD partitioner rejects
+# when torch_tpu recompiles the exported module ("partitionId instruction is
+# not supported for SPMD partitioning"). `fused_moe_ep._RANK_BUFFER` exists for
+# exactly the same reason. It is the MESH index, not the EP rank -- the mesh is
+# built in ascending device-id order; see `ep_mesh.ep_rank_order`.
+_RS_RANK_BUFFER: Any = None
 
 # Ops are built once per distinct closure and reused; a fresh `CustomOpDef`
 # per layer would re-export the same program 75 times on GLM-5.2. Keyed on
@@ -131,7 +148,7 @@ def _build_op(mesh, topk: int, activation: str):
 
     def moe(x: jax.Array, w1: jax.Array, w2: jax.Array, w1_scale: jax.Array,
             w2_scale: jax.Array, topk_weights: jax.Array,
-            topk_indices: jax.Array) -> jax.Array:
+            topk_indices: jax.Array, rank: jax.Array) -> jax.Array:
         # `renormalize` and `scoring_fn` are dead arguments on this path: both
         # are only read when the kernel computes its own top-k, and supplying
         # both `topk_weights` and `topk_indices` takes the branch that does
@@ -153,6 +170,7 @@ def _build_op(mesh, topk: int, activation: str):
             "softmax",
             topk_weights=topk_weights.astype(x.dtype),
             topk_indices=topk_indices.astype(jnp.int32),
+            rank=rank.astype(jnp.int32),
         )
 
     # x and the routing tensors carry this rank's own tokens, so they are
@@ -165,7 +183,7 @@ def _build_op(mesh, topk: int, activation: str):
         _op_name(),
         moe,
         mesh=mesh,
-        input_partition_specs=(spec, ) * 7,
+        input_partition_specs=(spec, ) * 8,
         output_partition_specs=spec,
     )
 
@@ -335,6 +353,10 @@ def prebuild_fused_moe_rs(layer, topk: int, activation: str) -> Any | None:
     # `w13_weight` is [E, hidden, 2*inter] by this point -- see
     # `bind_weights_for_rs` for who put it in that layout.
     hidden = layer.w13_weight.shape[1]
+    global _RS_RANK_BUFFER
+    _RS_RANK_BUFFER = torch.tensor([[ep_mesh_index()]],
+                                   dtype=torch.int32,
+                                   device=layer.w13_weight.device)
     bind_weights_for_rs(layer)
     op = _build_op(mesh, topk, activation)
     logger.info_once(
@@ -388,4 +410,5 @@ def fused_moe_rs(
         getattr(layer, RS_W2_SCALE_ATTR),
         topk_weights,
         topk_ids,
+        _RS_RANK_BUFFER,
     )
