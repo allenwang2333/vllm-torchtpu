@@ -942,12 +942,24 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
+        #
+        # `score_bias_operand` is not optional, and omitting it is silent on
+        # every model that does not have one. `prebuild_fused_moe_ep` builds
+        # the op with an eighth operand exactly when the layer carries an
+        # `e_score_correction_bias`, so a layer that has one and a call site
+        # that does not pass it disagree on the op's arity and Dynamo refuses
+        # the trace with `pallas::fused_moe_ep() is missing value for argument
+        # 'score_bias'`. Qwen3.5 has no such bias, so the seven-argument call
+        # matched for as long as this path had only been run on models without
+        # one; GLM-5.2 routes with `noaux_tc` and is the first that does.
+        # `nvfp4.py:445` and `mxfp4.py:642` already pass it.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep, fused_moe_ep_supported)
+            fused_moe_ep, fused_moe_ep_supported, score_bias_operand)
         if fused_moe_ep_supported(self):
             return fused_moe_ep(self, x, layer.w13_weight, layer.w2_weight,
                                 layer.w13_weight_scale_inv,
-                                layer.w2_weight_scale_inv, router_logits)
+                                layer.w2_weight_scale_inv, router_logits,
+                                score_bias_operand(layer))
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
