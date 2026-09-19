@@ -405,7 +405,9 @@ def expert_parallel_gmm_rs(
     topk_i_spec = P(expert_axis, None) if sp_enabled else P()
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
-    group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
+    # LOCAL DELTA vs tokamax 6303c14: the `group_offset` arange that stood here
+    # is gone. It was a jit-internal constant fed to shard_map sharded, which
+    # XLA rejects under torch_tpu. Delta 3 of 3 derives it per shard instead.
 
     w1_scale_spec = None if w1_scale is None else ep_p_spec
     w1_bias_spec = None if w1_bias is None else ep_p_spec
@@ -435,24 +437,45 @@ def expert_parallel_gmm_rs(
     # so gathering here reproduces exactly what it used to receive.
     # `tiled=True` concatenates the shards in axis-index order along axis 0,
     # which is the same row order `P("expert")` split them in.
-    if sp_enabled:
-
-        def _gather_then_body(hidden_local, w1_, w1s, w1b, w2_, w2s, w2b,
-                              w1gs, w2gs, goff, tw_local, ti_local, pnw):
-            hidden_full = jax.lax.all_gather(hidden_local,
-                                             expert_axis,
-                                             axis=0,
-                                             tiled=True)
-            ti_full = jax.lax.all_gather(ti_local,
-                                         expert_axis,
-                                         axis=0,
-                                         tiled=True)
-            return _local_body(hidden_full, w1_, w1s, w1b, w2_, w2s, w2b,
-                               w1gs, w2gs, goff, tw_local, ti_full, pnw)
-
-        _shard_body = _gather_then_body
-    else:
-        _shard_body = _local_body
+    # ---- LOCAL DELTA vs tokamax 6303c14 (3 of 3) ------------------------
+    # `group_offset` is gone from the shard_map. Upstream builds it as
+    # `jnp.arange(0, num_experts, num_experts_per_shard)` -- a constant of the
+    # traced function -- and hands it in with `ep_p_spec`. Sharding a
+    # jit-internal constant compiles to `dynamic-slice(constant, partition-id)`
+    # and XLA refuses it:
+    #
+    #   partitionId instruction is not supported for SPMD partitioning since
+    #   the meaning is ambiguous
+    #
+    # This is the same trap `kernels/fused_moe/v2/layer.py:589-597` documents,
+    # and the reason v2 passes `rank` as a real operand. It is invisible under
+    # plain `jax.jit` with a mesh, which is why the in-tree kernel tests and
+    # the device preflight never saw it -- only the torch_tpu path recompiles
+    # the module per device and trips it.
+    #
+    # The body only ever reads `group_offset[0]`, and that value is exactly
+    # this shard's first global expert id. `jax.lax.axis_index` inside the
+    # manual computation gives it directly, with no constant to slice and no
+    # partition-id in the exported module. The body already uses the same call
+    # for `my_id`, so this adds no new construct.
+    def _shard_body(hidden_local, w1_, w1s, w1b, w2_, w2s, w2b, w1gs, w2gs,
+                    tw_local, ti_local, pnw):
+        goff = (jax.lax.axis_index(expert_axis).astype(jnp.int32).reshape(1) *
+                num_experts_per_shard)
+        if sp_enabled:
+            # Delta 2 of 2: the all-gather upstream got from the `P("data")`
+            # boundary. `tiled=True` concatenates shards in axis-index order
+            # along axis 0, the order `P("expert")` split them in.
+            hidden_local = jax.lax.all_gather(hidden_local,
+                                              expert_axis,
+                                              axis=0,
+                                              tiled=True)
+            ti_local = jax.lax.all_gather(ti_local,
+                                          expert_axis,
+                                          axis=0,
+                                          tiled=True)
+        return _local_body(hidden_local, w1_, w1s, w1b, w2_, w2s, w2b, w1gs,
+                           w2gs, goff, tw_local, ti_local, pnw)
 
     result = jax.shard_map(
         _shard_body,
@@ -467,7 +490,7 @@ def expert_parallel_gmm_rs(
             w2_bias_spec,
             w1_gs_spec,
             w2_gs_spec,
-            ep_p_spec,  # group_offset
+            # group_offset removed -- see delta 3 of 3 above.
             topk_w_spec,
             topk_i_spec,
             P(),  # post_expert_norm_weight
@@ -484,7 +507,6 @@ def expert_parallel_gmm_rs(
         w2_bias,
         w1_global_scale,
         w2_global_scale,
-        group_offset,
         topk_weights,
         topk_indices,
         _pnw_rs,
