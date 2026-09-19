@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
-    TPU_DSA_INDEXER_KV_LAYOUT: str = "head_along_sublane"
+    TPU_DSA_INDEXER_KV_LAYOUT: str = "token_major_3d"
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -348,13 +348,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_with_choices("TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore",
                      ["sparsecore", "tensorcore"]),
     # Storage layout of the DSA (lightning indexer) K cache. Byte-neutral:
-    # "token_major_3d" is the same bytes as the default "head_along_sublane"
-    # with the packing axis folded into the token axis, but a rank-3 parameter
-    # gets T(32,128)(4,1), which makes XLA's scatter flatten a bitcast instead
-    # of a relayout over the whole cache. OFF by default so the incumbent stays
-    # the live baseline and an A/B needs no rebuild.
+    # "token_major_3d" is the same bytes as "head_along_sublane" with the
+    # packing axis folded into the token axis, but a rank-3 parameter gets
+    # T(32,128)(4,1), which makes XLA's scatter flatten a bitcast instead of a
+    # relayout over the whole cache.
+    #
+    # EXPERIMENT (annyan/c08-indexer-3d-cache): default deliberately flipped
+    # from "head_along_sublane" to "token_major_3d". THIS BUILD IS THE ON ARM
+    # of the c08 A/B; the OFF arm is the control image built at 01a7a3a3d, not
+    # this image with the env var unset. Flipped here rather than exported
+    # through VLLM_SERVER_CMD because on the 2-node bench recipe that string is
+    # eval'd on the head only, and this name is carried to no Ray worker:
+    # vllm_torchtpu's Ray executor copies only get_env_vars_to_copy(), whose
+    # allowlist is vllm.envs + the VLLM_/HF_/NCCL_/... prefixes +
+    # tpu_platform.additional_env_vars, and this name is in none of the three.
+    # An env-var arm would therefore be a silent no-op; a changed default
+    # reaches every worker process.
     "TPU_DSA_INDEXER_KV_LAYOUT":
-    env_with_choices("TPU_DSA_INDEXER_KV_LAYOUT", "head_along_sublane",
+    env_with_choices("TPU_DSA_INDEXER_KV_LAYOUT", "token_major_3d",
                      ["head_along_sublane", "token_major_3d"]),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS":
