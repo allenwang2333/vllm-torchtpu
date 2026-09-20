@@ -204,14 +204,21 @@ def _pallas_rpa_kernel_impl(
     mesh: jax.sharding.Mesh,
     sliding_window: int | None,
     skip_kv_update: bool,
-    rpa_func,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     shard: bool = True,
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
-    kv_layout: batched_rpa_configs.KVLayout | None = None,
 ) -> tuple[jax.Array, jax.Array]:
+    """Shared body of the two Pallas RPA entries below.
+
+    There used to be a `rpa_func` knob here, because the batched entry passed
+    `ragged_paged_attention_batched` through it; the batched path is tokamax's
+    now, so the only kernel left on this side is `ragged_paged_attention` and
+    it is named directly. The `kv_layout` knob went the same way -- only the
+    batched entry ever set it, and tokamax is given HEAD_ALONG_SUBLANE pools
+    exclusively.
+    """
     metadata = AttentionMetadata(
         input_positions=
         None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
@@ -233,13 +240,12 @@ def _pallas_rpa_kernel_impl(
         sinks=sinks,
         attention_chunk_size=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=rpa_func,
+        rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
-        kv_layout=kv_layout,
     )
     return new_kv_cache, outputs
 
@@ -286,7 +292,6 @@ def _pallas_rpa_kernel_default(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
@@ -344,7 +349,6 @@ def _pallas_rpa_kernel_local(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=ragged_paged_attention,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         shard=False,
