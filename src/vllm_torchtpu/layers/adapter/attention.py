@@ -5,25 +5,28 @@
 Two backends live here and they do not share a kernel:
 
 * `PallasAttentionBackend` (FLASH_ATTN, the default) runs the in-tree Pallas
-  flash kernel, `ragged_paged_attention`, through `_pallas_rpa_kernel_default`
-  -- plus `_pallas_rpa_kernel_local` for the tp=1 eagle3 draft and
-  `_pallas_rpa_kernel_default_bundled` for block-major KV. It is the only path
-  that supports in-process TP > 1, head_dim 64, HND pools, speculative verify
-  windows, non-causal masks, cross-layer KV sharing and attention sinks.
-* `PallasBatchedRPAAttentionBackend` (CUSTOM) has no kernel of its own: it
-  routes onto tokamax's `PallasMosaicTpuBatchedRpa` singleton, and
-  `_tokamax_rpa_closure` refuses at build time every configuration in the list
-  above.
+  flash kernel. Its four JAX entry points live in `rpa_kernels.py`; this module
+  only names two of them as class defaults and wraps them with `pallas.jax_op`.
+  It is the only path that supports in-process TP > 1, head_dim 64, HND pools,
+  speculative verify windows, non-causal masks, cross-layer KV sharing and
+  attention sinks.
+* `PallasBatchedRPAAttentionBackend` (CUSTOM) has no kernel entry at all: it
+  routes onto tokamax's `PallasMosaicTpuBatchedRpa` singleton, built inline by
+  `_tokamax_rpa_closure`, which refuses at build time every configuration in
+  the list above.
 
-MLA is not here -- see `mla_attention.py`, which imports the three KV-cache
-dtype/page-size helpers below and nothing else from this module.
+What is left here is the backend and impl classes plus the KV-cache geometry
+helpers. The two other halves that used to be in this file are
+
+* `rpa_kernels.py`   -- the flash kernel entries, which import nothing back.
+* `mla_attention.py` -- MLA, which takes only the three KV-cache dtype and
+                        page-size helpers below.
 """
 
 import dataclasses
 import functools
 from typing import Any, ClassVar
 
-import jax
 import torch
 from torch_tpu._internal import pallas
 from vllm import envs as vllm_envs
@@ -44,8 +47,8 @@ from vllm_torchtpu.layers.adapter.cp_attention import \
     build_dcp_kernels as _build_dcp_kernels
 from vllm_torchtpu.layers.adapter.cp_attention import \
     forward_with_dcp as _forward_with_dcp
-from vllm_torchtpu.layers.core.attention_interface import (
-    attention, attention_bundled, ragged_paged_attention)
+from vllm_torchtpu.layers.adapter.rpa_kernels import (
+    _pallas_rpa_kernel_default, _pallas_rpa_kernel_default_bundled)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.logger import init_logger
@@ -166,234 +169,6 @@ def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
                          max_num_page_per_req)
     min_page_size = 1 << (min_page_size - 1).bit_length()
     return min_page_size
-
-
-def _pallas_rpa_kernel_impl(
-    kv_cache: jax.Array,
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
-    *,
-    mesh: jax.sharding.Mesh,
-    sliding_window: int | None,
-    skip_kv_update: bool,
-    sm_scale: float | None = None,
-    soft_cap: float | None = None,
-    shard: bool = True,
-    kv_block_cap: int | None = None,
-    use_causal_mask: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-    """Shared body of the two Pallas RPA entries below.
-
-    There used to be a `rpa_func` knob here, because the batched entry passed
-    `ragged_paged_attention_batched` through it; the batched path is tokamax's
-    now, so the only kernel left on this side is `ragged_paged_attention` and
-    it is named directly. The `kv_layout` knob went the same way -- only the
-    batched entry ever set it, and tokamax is given HEAD_ALONG_SUBLANE pools
-    exclusively.
-    """
-    metadata = AttentionMetadata(
-        input_positions=
-        None,  # NOTE: vLLM applies RoPE before attention, so input_positions is not consumed here.
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        request_distribution=request_distribution,
-    )
-    new_kv_cache, outputs = attention(
-        kv_cache,
-        query,
-        key,
-        value,
-        metadata,
-        mesh,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        sinks=sinks,
-        attention_chunk_size=sliding_window,
-        skip_kv_update=skip_kv_update,
-        rpa_func=ragged_paged_attention,
-        sm_scale=sm_scale,
-        soft_cap=soft_cap,
-        shard=shard,
-        kv_block_cap=kv_block_cap,
-        use_causal_mask=use_causal_mask,
-    )
-    return new_kv_cache, outputs
-
-
-def _pallas_rpa_kernel_default(
-    kv_cache: jax.Array,
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
-    *,
-    mesh: jax.sharding.Mesh,
-    sliding_window: int | None,
-    sm_scale: float | None = None,
-    soft_cap: float | None = None,
-    skip_kv_update: bool,
-    use_causal_mask: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-    """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
-
-    Full signature (not `*args, **kwargs`) is required so `pallas.jax_op` can
-    introspect argument types via `_verify_signature`.
-    """
-    return _pallas_rpa_kernel_impl(
-        kv_cache,
-        query,
-        key,
-        value,
-        seq_lens,
-        block_tables,
-        query_start_loc,
-        request_distribution,
-        sinks,
-        q_scale,
-        k_scale,
-        v_scale,
-        mesh=mesh,
-        sliding_window=sliding_window,
-        skip_kv_update=skip_kv_update,
-        sm_scale=sm_scale,
-        soft_cap=soft_cap,
-        use_causal_mask=use_causal_mask,
-    )
-
-
-# KV-fetch block cap (tokens) for the tp=1 eagle3 draft's local RPA kernel.
-# Capping bkv shrinks the dominant KV scratch tile; the flash kernel loops over more KV chunks.
-# 1024 was validated on Llama-3.1-8B (TP=2) and Qwen3-Coder-480b(TP=8). Models with
-# many KV heads or longer sequences may need a smaller value to avoid VMEM OOM.
-_DRAFT_KV_BLOCK_CAP = 1024
-
-
-def _pallas_rpa_kernel_local(
-    kv_cache: jax.Array,
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
-    *,
-    mesh: jax.sharding.Mesh,
-    sliding_window: int | None,
-    sm_scale: float | None = None,
-    soft_cap: float | None = None,
-    skip_kv_update: bool,
-    use_causal_mask: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-    """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
-
-    Identical to `_pallas_rpa_kernel_default` but invokes the kernel WITHOUT
-    shard_map (`shard=False`), so the output lands on the worker's own device
-    instead of a global chip-0 partition. Also caps the KV-fetch block via
-    `kv_block_cap` for speculative decoding draft model.
-    """
-    return _pallas_rpa_kernel_impl(
-        kv_cache,
-        query,
-        key,
-        value,
-        seq_lens,
-        block_tables,
-        query_start_loc,
-        request_distribution,
-        sinks,
-        q_scale,
-        k_scale,
-        v_scale,
-        mesh=mesh,
-        sliding_window=sliding_window,
-        skip_kv_update=skip_kv_update,
-        sm_scale=sm_scale,
-        soft_cap=soft_cap,
-        shard=False,
-        kv_block_cap=_DRAFT_KV_BLOCK_CAP,
-        use_causal_mask=use_causal_mask,
-    )
-
-
-def _pallas_rpa_kernel_default_bundled(
-    kv_cache_bundle: jax.Array,
-    layer_idx: jax.Array,
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
-    *,
-    mesh: jax.sharding.Mesh,
-    sliding_window: int | None,
-    sm_scale: float | None = None,
-    soft_cap: float | None = None,
-    use_causal_mask: bool = True,
-) -> tuple[jax.Array, jax.Array]:
-    """Default bundled Pallas RPA kernel entry for block-major execution.
-
-    Invoked when `VllmModelWrapperContext.kv_cache_bundle` is set. Matches the
-    standard kernel entry point interface, taking the full KV cache bundle as the
-    first argument and a dynamic int32 scalar layer_idx as the second argument.
-    """
-    if sinks is not None:
-        # Attention sinks are unsupported in the bundled block-major kernel path.
-        raise NotImplementedError(
-            "VLLM_TPU_BLOCK_MAJOR_KV=1: attention sinks are not supported "
-            "by the bundled RPA path")
-    metadata = AttentionMetadata(
-        input_positions=None,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        request_distribution=request_distribution,
-    )
-    new_bundle, outputs = attention_bundled(
-        kv_cache_bundle,
-        layer_idx,
-        query,
-        key,
-        value,
-        metadata,
-        mesh,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        attention_chunk_size=sliding_window,
-        sm_scale=sm_scale,
-        soft_cap=soft_cap,
-        use_causal_mask=use_causal_mask,
-    )
-    return new_bundle, outputs
 
 
 # =========================================================================================

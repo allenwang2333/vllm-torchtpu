@@ -34,9 +34,11 @@ from vllm import envs as vllm_envs
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter import attention as attn
 from vllm_torchtpu.layers.adapter import mla_attention as mla_attn
+from vllm_torchtpu.layers.adapter import rpa_kernels
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend, PallasAttentionBackendImpl,
-    PallasBatchedRPAAttentionBackend, PallasBatchedRPAAttentionBackendImpl,
+    PallasBatchedRPAAttentionBackend, PallasBatchedRPAAttentionBackendImpl)
+from vllm_torchtpu.layers.adapter.rpa_kernels import (
     _pallas_rpa_kernel_default, _pallas_rpa_kernel_local)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
@@ -867,6 +869,34 @@ def test_mla_lives_in_its_own_module():
     assert not any(
         m.startswith("vllm_torchtpu.layers.adapter.mla_attention")
         for m in _imported_modules(module))
+
+
+def test_flash_kernel_entries_live_in_rpa_kernels():
+    """`attention` names the flash entries but no longer defines them.
+
+    The four `_pallas_rpa_kernel_*` functions are the last callers of the
+    in-tree flash kernel, so keeping them here is what stopped `attention`
+    from being the tokamax-routing half alone.
+    """
+    module = sys.modules[attn.__name__]
+    for name in ("_pallas_rpa_kernel_impl", "_pallas_rpa_kernel_local",
+                 "_DRAFT_KV_BLOCK_CAP", "attention", "attention_bundled",
+                 "ragged_paged_attention"):
+        assert not hasattr(module, name)
+
+    # The two the impl classes name as defaults are imported, not defined.
+    assert (PallasAttentionBackendImpl._kernel_entry
+            is rpa_kernels._pallas_rpa_kernel_default)
+    assert (PallasAttentionBackendImpl._kernel_entry_bundled
+            is rpa_kernels._pallas_rpa_kernel_default_bundled)
+    assert (attn._pallas_rpa_kernel_default.__module__ ==
+            "vllm_torchtpu.layers.adapter.rpa_kernels")
+
+    # One way again: the entries reach the kernel directly and know nothing
+    # about the backend classes that wrap them.
+    assert not any(
+        m.startswith("vllm_torchtpu.layers.adapter.attention")
+        for m in _imported_modules(sys.modules[rpa_kernels.__name__]))
 
 
 def test_both_backends_register_under_their_own_module():

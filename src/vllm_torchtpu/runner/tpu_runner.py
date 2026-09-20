@@ -3811,9 +3811,10 @@ class TPUModelRunner(GPUModelRunner):
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
         if self._attention_kernels_initialized and not force:
             return
-        from vllm_torchtpu.layers.adapter.attention import (
-            _DRAFT_KV_BLOCK_CAP, PallasAttentionBackendImpl,
-            _pallas_rpa_kernel_local)
+        from vllm_torchtpu.layers.adapter.attention import \
+            PallasAttentionBackendImpl
+        from vllm_torchtpu.layers.adapter.rpa_kernels import (
+            _DRAFT_KV_BLOCK_CAP, _pallas_rpa_kernel_local)
 
         # Only draft proposers expose _draft_attn_layer_names; NgramProposer
         # operates purely on token IDs. no draft attention layers to relocate.
