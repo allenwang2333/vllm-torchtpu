@@ -3,7 +3,10 @@
 
 import functools
 import itertools
+import os
 from typing import TYPE_CHECKING, Optional
+
+os.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
 
 import numpy as np
 import torch
@@ -17,7 +20,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _AUDIO_BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
-_AUDIO_FRAME_BUCKETS = (512, 1024, 2048, 3072)
+_AUDIO_FRAME_BUCKETS = (512, 832, 1024, 2048, 3072)
 
 
 def _get_padded_bucket(val: int, buckets: tuple[int, ...]) -> int:
@@ -342,24 +345,82 @@ def _patch_gemma4_cpu_audio_batching() -> None:
         @functools.wraps(orig_determine_mem)
         def _patched_determine_available_memory(self, *args, **kwargs) -> int:
             avail = orig_determine_mem(self, *args, **kwargs)
-            # Reserve >=8.5 GiB of HBM headroom below the PJRT cap for
-            # 16384-token lm_head logits (8.13 GiB) and Conformer activations.
-            return min(int(avail), 8 * 1024 * 1024 * 1024)
+            # Cap KV cache at 4.5 GiB (~100,000 tokens = 48x concurrency at 2048 context)
+            # so >14 GiB of HBM remains free for pre-compiled Conformer (512..3072) and LM executables.
+            return min(int(avail), int(4.5 * 1024 * 1024 * 1024))
 
         @functools.wraps(orig_capture_model)
         def _patched_capture_model(self, *args, **kwargs):
-            res = orig_capture_model(self, *args, **kwargs)
-            model = getattr(self, "model", None)
-            if model is not None and hasattr(model, "_tpu_prewarm_all_buckets"):
-                try:
-                    model._tpu_prewarm_all_buckets(self.device)
-                except Exception as exc:
-                    logger.warning("Post-capture audio bucket prewarm warning: %s", exc)
+            try:
+                from vllm.utils.torch_utils import reduce_torch_threads
+                reduce_torch_threads()
+            except Exception:
+                if torch.get_num_threads() != 1:
+                    torch.set_num_threads(1)
+            with torch.no_grad():
+                res = orig_capture_model(self, *args, **kwargs)
+                model = getattr(self, "model", None)
+                if model is not None and hasattr(model, "_tpu_prewarm_all_buckets"):
+                    try:
+                        model._tpu_prewarm_all_buckets(self.device, getattr(self, "num_tokens_paddings", None))
+                    except Exception as exc:
+                        logger.warning("Post-capture audio bucket prewarm warning: %s", exc)
             return res
 
         TPUWorker.determine_available_memory = _patched_determine_available_memory
         TPUModelRunner.capture_model = _patched_capture_model
         TPUModelRunner._tpu_gemma4_capture_patched = True
+
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        if not getattr(Scheduler, "_tpu_gemma4_sched_patched", False):
+            orig_schedule = Scheduler.schedule
+            orig_try_sched_enc = Scheduler._try_schedule_encoder_inputs
+
+            @functools.wraps(orig_schedule)
+            def _patched_schedule(self, *args, **kwargs):
+                self._tpu_step_encoder_count = 0
+                return orig_schedule(self, *args, **kwargs)
+
+            @functools.wraps(orig_try_sched_enc)
+            def _patched_try_schedule_encoder_inputs(
+                self,
+                request,
+                num_computed_tokens: int,
+                num_new_tokens: int,
+                encoder_compute_budget: int,
+                shift_computed_tokens: int = 0,
+            ):
+                if num_new_tokens > 0 and getattr(request, "has_encoder_inputs", False):
+                    max_batched = int(getattr(self.scheduler_config, "max_num_batched_tokens", 2048))
+                    prompt_len = int(getattr(request, "num_prompt_tokens", 0))
+                    # 1. Atomic multimodal prompt scheduling: never split a multimodal prompt
+                    #    across two prefill steps when prompt_len <= max_num_batched_tokens.
+                    if num_computed_tokens == 0 and prompt_len <= max_batched and (num_computed_tokens + num_new_tokens) < prompt_len:
+                        return [], 0, encoder_compute_budget, []
+                    # 2. Power-of-2 batch cap for 1024+ frame buckets (prompt_len >= 230):
+                    #    cap encoder items per step at 8 while allowing 832/512 buckets
+                    #    to pack up to 16 items per 2048-token prefill step.
+                    if num_computed_tokens == 0 and prompt_len >= 230 and getattr(self, "_tpu_step_encoder_count", 0) >= 8:
+                        return [], 0, encoder_compute_budget, []
+
+                enc_inputs, new_toks, new_budget, ext_load = orig_try_sched_enc(
+                    self,
+                    request,
+                    num_computed_tokens,
+                    num_new_tokens,
+                    encoder_compute_budget,
+                    shift_computed_tokens=shift_computed_tokens,
+                )
+                if enc_inputs:
+                    self._tpu_step_encoder_count = getattr(self, "_tpu_step_encoder_count", 0) + len(enc_inputs)
+                return enc_inputs, new_toks, new_budget, ext_load
+
+            Scheduler.schedule = _patched_schedule
+            Scheduler._try_schedule_encoder_inputs = _patched_try_schedule_encoder_inputs
+            Scheduler._tpu_gemma4_sched_patched = True
+    except Exception as exc:
+        logger.warning("Failed to patch Scheduler encoder batching: %s", exc)
 
     mm_utils._tpu_audio_cpu_pad_patched = True
     logger.info(
@@ -422,6 +483,9 @@ def maybe_patch_gemma4(
             audio_input.get("_tpu_orig_batch_size")
             or getattr(raw_features, "_tpu_orig_batch_size", None)
         )
+        if hasattr(raw_features, "__dict__"):
+            raw_features.__dict__.pop("_tpu_valid_lens", None)
+            raw_features.__dict__.pop("_tpu_orig_batch_size", None)
 
         if pre_valid_lens is not None and pre_batch_size is not None:
             input_features = raw_features
@@ -459,6 +523,7 @@ def maybe_patch_gemma4(
             audio_tower = self.audio_tower
             embed_audio = self.embed_audio
 
+
             def _audio_tower_and_embed(
                 feats: torch.Tensor,
                 mask: torch.Tensor,
@@ -467,8 +532,8 @@ def maybe_patch_gemma4(
                 enc = out[0] if isinstance(out, tuple) else out.last_hidden_state
                 emb = embed_audio(inputs_embeds=enc)
                 flat = emb.reshape(-1, emb.shape[-1])
-                if flat.shape[0] < 32768:
-                    flat = F.pad(flat, (0, 0, 0, 32768 - flat.shape[0]))
+                if flat.shape[0] < 16384:
+                    flat = F.pad(flat, (0, 0, 0, 16384 - flat.shape[0]))
                 return emb, flat
 
             compiled_fn = torch.compile(
@@ -578,15 +643,14 @@ def maybe_patch_gemma4(
             and len(multimodal_embeddings) == 1
             else torch.cat(list(multimodal_embeddings), dim=0)
         )
-        if mm_flat.shape[0] > 32768:
-            mm_flat = mm_flat[:32768]
-        elif mm_flat.shape[0] < 32768:
-            mm_flat = F.pad(mm_flat, (0, 0, 0, 32768 - mm_flat.shape[0]))
+        if mm_flat.shape[0] > 16384:
+            mm_flat = mm_flat[:16384]
+        elif mm_flat.shape[0] < 16384:
+            mm_flat = F.pad(mm_flat, (0, 0, 0, 16384 - mm_flat.shape[0]))
         gather_idx = getattr(is_multimodal, "_tpu_mm_gather_idx", None)
         if gather_idx is None:
-            n_tok = int(input_ids.shape[0])
             gather_idx = (torch.cumsum(is_multimodal.to(torch.int32), dim=0) - 1).clamp_(
-                min=0, max=32767
+                min=0, max=16383
             )
             is_mm_dev = is_multimodal
         else:
@@ -636,7 +700,11 @@ def maybe_patch_gemma4(
         )
         return hidden_states
 
-    def _tpu_prewarm_all_buckets(self, device: torch.device) -> None:
+    def _tpu_prewarm_all_buckets(
+        self,
+        device: torch.device,
+        token_paddings: list[int] | None = None,
+    ) -> None:
         if getattr(self, "_tpu_all_buckets_prewarmed", False):
             return
         self._tpu_all_buckets_prewarmed = True
@@ -648,50 +716,62 @@ def maybe_patch_gemma4(
         mel_bins = int(getattr(self.config.audio_config, "input_feat_size", 128))
         hidden_size = int(self.config.text_config.hidden_size)
 
-        # Pre-warm _audio_tower_and_embed across (B_pad, T_bucket) buckets
-        for t_bkt, b_buckets in ((1024, _AUDIO_BATCH_BUCKETS), (3072, (1, 2, 4, 8))):
-            for b_bkt in b_buckets:
-                dummy_f = torch.zeros(
-                    (b_bkt, t_bkt, mel_bins),
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
-                dummy_m = torch.ones(
-                    (b_bkt, t_bkt),
-                    dtype=torch.bool,
-                    device=device,
-                )
-                dummy_f._tpu_valid_lens = [t_bkt // 4] * b_bkt
-                dummy_f._tpu_orig_batch_size = b_bkt
-                rows = self._process_audio_input({
-                    "input_features_padded": dummy_f,
-                    "input_features_mask": dummy_m,
-                    "_tpu_valid_lens": [t_bkt // 4] * b_bkt,
-                    "_tpu_orig_batch_size": b_bkt,
-                })
-                torch.tpu.synchronize()
-                del dummy_f, dummy_m, rows
-                gc.collect()
-
-        # Pre-warm _mm_embed_and_ple across token buckets
-        dummy_mm_flat = torch.zeros(
-            (32768, hidden_size), dtype=torch.bfloat16, device=device)
-        for n_tok in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384):
-            dummy_ids = torch.zeros((n_tok,), dtype=torch.int32, device=device)
-            dummy_is_mm = torch.zeros((n_tok,), dtype=torch.bool, device=device)
-            dummy_gather = torch.zeros((n_tok,), dtype=torch.int32, device=device)
-            dummy_is_mm._tpu_mm_gather_idx = dummy_gather
-            _ = self.embed_input_ids(
-                dummy_ids,
-                multimodal_embeddings=[dummy_mm_flat],
-                is_multimodal=dummy_is_mm,
+        with torch.no_grad():
+            # 1. Pre-warm _audio_tower_and_embed across all 5 frame buckets (512, 832, 1024, 2048, 3072)
+            bucket_plan = (
+                (512, (1, 2, 4, 8, 16)),
+                (832, (1, 2, 4, 8, 16)),
+                (1024, (1, 2, 4, 8)),
+                (2048, (1, 2, 4, 8)),
+                (3072, (1, 2, 4)),
             )
-            self._latest_per_layer_inputs = None
-            torch.tpu.synchronize()
-            del dummy_ids, dummy_is_mm, dummy_gather
+            sample_parent_flat = None
+            for t_bkt, b_buckets in bucket_plan:
+                for b_bkt in b_buckets:
+                    dummy_f = torch.zeros(
+                        (b_bkt, t_bkt, mel_bins),
+                        dtype=torch.bfloat16,
+                    ).to(device, non_blocking=True)
+                    dummy_m = torch.ones(
+                        (b_bkt, t_bkt),
+                        dtype=torch.bool,
+                    ).to(device, non_blocking=True)
+                    rows = self._process_audio_input({
+                        "input_features_padded": dummy_f,
+                        "input_features_mask": dummy_m,
+                        "_tpu_valid_lens": [t_bkt // 4] * b_bkt,
+                        "_tpu_orig_batch_size": b_bkt,
+                    })
+                    if sample_parent_flat is None and rows:
+                        sample_parent_flat = getattr(rows[0], "_tpu_parent_flat", None)
+                    torch.tpu.synchronize()
+                    del dummy_f, dummy_m, rows
+                    gc.collect()
+
+            # 2. Pre-warm _mm_embed_and_ple across active token buckets using XLA output parent_flat
+            tok_buckets = token_paddings or [16, 32, 64, 128, 256, 512, 1024, 2048]
+            if sample_parent_flat is None:
+                sample_parent_flat = torch.zeros(
+                    (16384, hidden_size), dtype=torch.bfloat16).to(device, non_blocking=True)
+            for n_tok in tok_buckets:
+                dummy_ids = torch.zeros((n_tok,), dtype=torch.int32).to(device, non_blocking=True)
+                pad_bool = np.zeros(n_tok, dtype=bool)
+                pad_bool[:min(8, n_tok)] = True
+                idx_np = np.zeros(n_tok, dtype=np.int32)
+                dummy_is_mm = torch.from_numpy(pad_bool).to(device, non_blocking=True)
+                dummy_gather = torch.from_numpy(idx_np).to(device, non_blocking=True)
+                dummy_is_mm._tpu_mm_gather_idx = dummy_gather
+                _ = self.embed_input_ids(
+                    dummy_ids,
+                    multimodal_embeddings=[sample_parent_flat],
+                    is_multimodal=dummy_is_mm,
+                )
+                self._latest_per_layer_inputs = None
+                torch.tpu.synchronize()
+                del dummy_ids, dummy_is_mm, dummy_gather
+            del sample_parent_flat
             gc.collect()
-        del dummy_mm_flat
-        gc.collect()
+
         torch.tpu.synchronize()
         logger.info(
             "Finished pre-compiling Gemma4 audio Conformer & MM-PLE buckets in %.2fs.",
