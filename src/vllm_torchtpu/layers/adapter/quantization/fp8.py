@@ -909,13 +909,26 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # method, which vLLM builds one of per MoE layer, so a layer the kernel
         # cannot serve is refused on its own rather than for the process.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep)
-        setattr(
-            self, FUSED_MOE_EP_OP_ATTR,
-            prebuild_fused_moe_ep(layer,
-                                  topk=layer.moe_config.experts_per_token,
-                                  renormalize=layer.renormalize,
-                                  activation=activation_str))
+            FUSED_MOE_EP_OP_ATTR, prebuild_fused_moe_ep,
+            register_score_bias_buffer)
+        _ep_op = prebuild_fused_moe_ep(
+            layer,
+            topk=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            activation=activation_str)
+        setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
+        if _ep_op is not None:
+            # Stage the bias, exactly as `nvfp4.py:413` and `mxfp4.py:610` do.
+            # This is the other half of the arity contract: `_routing_config`
+            # decides the op's operand count from
+            # `layer.e_score_correction_bias`, while the call site reads the
+            # STAGED buffer via `score_bias_operand`. Register nothing and the
+            # two disagree -- the op is built with eight operands and
+            # `fused_moe_ep` takes its `score_bias is None` branch and passes
+            # seven, which Dynamo rejects with `missing value for argument
+            # 'score_bias'`. Passing the operand at the call site is not
+            # sufficient on its own; it has to exist.
+            register_score_bias_buffer(layer)
         # The fused reduce-scatter kernel, for block-scaled fp8 checkpoints the
         # v2 path above refuses. It arms second and refuses outright if v2 is
         # also switched on, so the two cannot both claim this layer.
