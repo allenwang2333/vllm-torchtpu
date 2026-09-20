@@ -14,7 +14,10 @@
 """DCP (Decode Context Parallelism) attention for MLA: the head gather and
 the log-sum-exp merge that bracket the sharded attention call.
 
-The MLA counterpart of `cp_attention.py`.
+MLA is the only backend with a DCP path left. Its ragged-paged-attention
+counterpart, `cp_attention.py`, went away with the in-tree RPA kernels:
+tokamax's operator returns the attention output alone, with no per-rank
+log-sum-exp for step 3 below to merge.
 
 Every collective runs on tensors already in torch's hands, outside
 the exported op.

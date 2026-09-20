@@ -1039,7 +1039,7 @@ class TestInitializeAttentionKernelsThreshold:
     """`reorder_batch_threshold` is the smallest DECODE query width across the
     kernels `_initialize_attention_kernels` builds, draft layers included."""
 
-    def _make_runner(self, widths, draft_names=(), draft_tp=2):
+    def _make_runner(self, widths, draft_names=()):
         from vllm_torchtpu.layers.adapter.attention import \
             PallasAttentionBackendImpl
         runner = MagicMock(spec=TPUModelRunner)
@@ -1051,7 +1051,7 @@ class TestInitializeAttentionKernelsThreshold:
         runner.drafter = SimpleNamespace(
             _draft_attn_layer_names=set(draft_names))
         runner.speculative_config = SimpleNamespace(
-            draft_tensor_parallel_size=draft_tp)
+            draft_tensor_parallel_size=1)
         runner._initialize_attention_kernels = (
             TPUModelRunner._initialize_attention_kernels.__get__(runner))
         layers = {}
@@ -1079,26 +1079,21 @@ class TestInitializeAttentionKernelsThreshold:
         self._run(runner, layers)
         assert runner.reorder_batch_threshold == 1
 
-    def test_relocated_draft_forces_one_token_decode(self):
+    def test_a_draft_layer_is_no_longer_relocated(self):
+        """A tp=1 draft used to be moved off the sharded kernel onto the LOCAL
+        one, which narrowed that layer to a 1-token decode and dragged the
+        threshold down with it. The local kernel went with the rest of the
+        in-tree RPA implementations -- tokamax's op is unsharded to begin with
+        -- so the draft now keeps the width it was built with, whatever the
+        draft's tensor-parallel size."""
         runner, layers = self._make_runner({
             "target": 4,
             "draft": 4
         },
-                                           draft_names=("draft", ),
-                                           draft_tp=1)
+                                           draft_names=("draft", ))
         self._run(runner, layers)
-        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["draft"].impl.decode_query_size == 4
         assert layers["target"].impl.decode_query_size == 4
-        assert runner.reorder_batch_threshold == 1
-
-    def test_sharded_draft_keeps_width(self):
-        runner, layers = self._make_runner({
-            "target": 4,
-            "draft": 4
-        },
-                                           draft_names=("draft", ),
-                                           draft_tp=2)
-        self._run(runner, layers)
         assert runner.reorder_batch_threshold == 4
 
     def test_no_pallas_layers(self):

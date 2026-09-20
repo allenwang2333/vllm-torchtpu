@@ -6,10 +6,11 @@
                         \\_____ packing dimension ____/     \\______ lanes ______/
 
 `packing` is `32 / bitwidth` (2 for bf16, 4 for fp8), so a narrower dtype makes
-the first round-up bite sooner. `Kx2` is `num_kv_heads * 2`, except under the
-hd64 kernel (`head_size == 64`), which folds K and V along head_dim — which is
-why bf16 can be padded too. The second round-up is dtype-independent: any
-head_size neither 64 nor a multiple of 128 leaves lanes empty.
+the first round-up bite sooner. `Kx2` is `num_kv_heads * 2` everywhere: the hd64
+kernel, which folded K and V along head_dim and let `head_size == 64` fill its
+lanes, went away with the rest of the in-tree RPA implementations. The second
+round-up is dtype-independent, and now bites at 64 as well: any head_size that
+is not a multiple of 128 leaves lanes empty.
 """
 import contextlib
 import logging
@@ -26,12 +27,13 @@ BLOCK_SIZE = 256
 
 # (num_kv_heads, head_size, dtype) -> is the page padded today?
 PADDING_CASES = [
-    # Packing-dimension padding. hd64 folds K and V, so Kx2 == num_kv_heads
-    # and an odd count pads even bf16.
+    # head_size 64 is padded up to a full 128-lane tile at every head count and
+    # dtype, so every row here wastes half its lanes. It used to be exact under
+    # the hd64 kernel, which is gone.
     (1, 64, BF16, True),
     (3, 64, BF16, True),
-    (2, 64, BF16, False),
-    (4, 64, BF16, False),
+    (2, 64, BF16, True),
+    (4, 64, BF16, True),
     # head_size 128/256 gives an even Kx2, which always fills a bf16 word.
     (1, 128, BF16, False),
     (8, 128, BF16, False),
@@ -44,7 +46,7 @@ PADDING_CASES = [
     (2, 64, FP8, True),
     (2, 128, FP8, False),
     (8, 128, FP8, False),
-    (4, 64, FP8, False),
+    (4, 64, FP8, True),
     # Lane padding, independent of the packing dimension. Every row here fills
     # its 32-bit word exactly, so packing is not what pads them.
     (1, 80, BF16, True),
@@ -55,9 +57,9 @@ PADDING_CASES = [
 ]
 
 # fp8 must halve the page against bf16 wherever the head count fills a word.
-FP8_HALVES = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (4, 64),
-              (8, 64)]
-FP8_SHOULD_HALVE = [(1, 128), (1, 256), (1, 64), (2, 64)]
+FP8_HALVES = [(2, 128), (4, 128), (8, 128), (2, 256), (8, 256), (2, 64),
+              (4, 64), (8, 64)]
+FP8_SHOULD_HALVE = [(1, 128), (1, 256), (1, 64)]
 
 
 def page_bytes(num_kv_heads, head_size, dtype):
@@ -66,10 +68,7 @@ def page_bytes(num_kv_heads, head_size, dtype):
 
 
 def unpadded_bytes(num_kv_heads, head_size, dtype):
-    """What the model needs: a key and a value vector per head, per token.
-
-    No hd64 special case — folding changes where values sit, not how many.
-    """
+    """What the model needs: a key and a value vector per head, per token."""
     return BLOCK_SIZE * 2 * num_kv_heads * head_size * dtype.itemsize
 
 

@@ -39,7 +39,6 @@ logger = init_logger(__name__)
 # request.
 _DEFAULT_RELOAD_MODULES = (
     "vllm_torchtpu.kernels.experimental.batched_rpa.utils",
-    "vllm_torchtpu.kernels.experimental.batched_rpa.kernel",
     "vllm_torchtpu.kernels.experimental.batched_rpa.wrapper",
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout",
     "vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule",

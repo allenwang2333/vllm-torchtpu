@@ -212,39 +212,6 @@ class PagedAttentionGuardedSmemTest(parameterized.TestCase):
         np.testing.assert_array_equal(out, jnp.ones_like(q))
 
 
-class ShardedRaggedPagedAttentionValidationTest(parameterized.TestCase):
-    """Argument checks in `sharded_ragged_paged_attention` that fail fast,
-    before the function builds the sharded kernel call."""
-
-    def test_attention_sink_requires_hd64(self):
-        """Attention sinks are only implemented in the head_dim=64 kernel
-        variant. Passing one with any other head size must raise a clear
-        `NotImplementedError` rather than a confusing kernel failure. The
-        check happens before `mesh` or `kv_cache` are read, so both can be
-        placeholders here."""
-        head_dim = 32  # != 64, so use_hd64 is False
-        q = jnp.zeros((4, 2, head_dim))
-        kv_lens = jnp.zeros((1, ), jnp.int32)
-        page_indices = jnp.zeros((1, ), jnp.int32)
-        cu_q_lens = jnp.zeros((1, ), jnp.int32)
-        distribution = jnp.zeros((3, ), jnp.int32)
-        attention_sink = jnp.zeros((2, ))
-
-        with self.assertRaisesRegex(NotImplementedError, "head_dim==64"):
-            attention_interface.sharded_ragged_paged_attention(
-                None,  # mesh: unused before the raise
-                q,
-                q,
-                q,
-                jnp.zeros((1, )),  # kv_cache: unused before the raise
-                kv_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
-                attention_sink,
-                sm_scale=1.0)
-
-
 class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
     """Argument checks in `sparse_mla_attention` that fail fast, before the
     function builds the sharded kernel call."""

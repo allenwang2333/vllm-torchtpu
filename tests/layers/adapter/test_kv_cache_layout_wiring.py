@@ -106,8 +106,8 @@ def test_resolve_reads_the_negotiated_config_layout(monkeypatch, value,
     with _layout_env(monkeypatch, value):
         assert _resolve_kv_layout() is expected
         assert _resolve_kv_layout() is KV_LAYOUT_BY_VLLM_LAYOUT[
-            get_current_vllm_config().cache_config
-            .get_resolved_kv_cache_layout()]
+            get_current_vllm_config(
+            ).cache_config.get_resolved_kv_cache_layout()]
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -179,9 +179,10 @@ def test_supported_layouts_no_longer_offer_hnd():
     }
 
 
-# DCP's own HND refusal lives with the rest of the DCP wiring, in
-# test_cp_attention.py::test_dcp_rejects_hnd_on_every_backend.
-
+# HND's own refusal lives with the rest of the tokamax guards, in
+# test_attention_tokamax_rpa.py::test_build_rpa_kernel_rejects_hnd_layout.
+# (There is no DCP counterpart any more: RPA has no context-parallel path left,
+# so `cp_attention.py` and its tests went with the in-tree kernels.)
 
 # Shape contracts the rest of the stack depends on
 

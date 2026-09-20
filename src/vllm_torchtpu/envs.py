@@ -72,9 +72,6 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
-    USE_BATCHED_RPA_LONGCTX: bool = False
-    USE_RPA_PIPELINED_DMA_STAGING: bool = False
-    USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
@@ -617,17 +614,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_TOPOLOGY_AWARE_MESH":
     lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower(
     ) not in ("0", "false", "off", "no"),
-    # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
-    "USE_BATCHED_RPA_LONGCTX":
-    env_bool("USE_BATCHED_RPA_LONGCTX"),
-    # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
-    # query DMA layout in RPA v3.
-    "USE_RPA_PIPELINED_DMA_STAGING":
-    lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")
-    () or env_bool("USE_PIPELINED_DMA_STAGING")(),
-    "USE_PIPELINED_DMA_STAGING":
-    lambda: env_bool("USE_PIPELINED_DMA_STAGING")
-    () or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.

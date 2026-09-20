@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone tests for the tokamax-only batched-RPA path in `attention.py`.
+"""Standalone tests for the tokamax-only `attention.py`.
 
-Batched RPA has exactly one implementation now: tokamax's
+Ragged paged attention has exactly one implementation now: tokamax's
 `PallasMosaicTpuBatchedRpa` singleton, called at the torch level by
-`PallasAttentionBackendImpl._build_rpa_kernel`. The in-tree batched kernel, the
-`USE_BATCHED_RPA_LONGCTX` fork and the PCP streaming kernels are gone. What is
-left to protect is (a) the adapter seam between this repo's calling convention
-and tokamax's, and (b) the guards that make every configuration tokamax cannot
-serve fail loudly instead of silently attending over the wrong thing.
+`PallasAttentionBackendImpl._build_rpa_kernel`. The in-tree flash kernel
+entries, the batched kernel, the `USE_BATCHED_RPA_LONGCTX` fork, the bundled
+(block-major) variant and the PCP streaming path are all gone, and with them the
+`_kernel_entry` indirection that used to choose between them. What is left to
+protect is (a) the adapter seam between this repo's calling convention and
+tokamax's, and (b) the guards that make every configuration tokamax cannot serve
+fail loudly instead of silently attending over the wrong thing.
 
 Standalone by construction: every fixture this module needs is defined here, so
 it runs on its own (`pytest tests/layers/adapter/test_attention_tokamax_rpa.py`)
@@ -20,6 +22,7 @@ is the one that needs a TPU and skips without one.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import inspect
 import sys
 from dataclasses import dataclass
@@ -34,12 +37,9 @@ from vllm import envs as vllm_envs
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter import attention as attn
 from vllm_torchtpu.layers.adapter import mla_attention as mla_attn
-from vllm_torchtpu.layers.adapter import rpa_kernels
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend, PallasAttentionBackendImpl,
-    PallasBatchedRPAAttentionBackend, PallasBatchedRPAAttentionBackendImpl)
-from vllm_torchtpu.layers.adapter.rpa_kernels import (
-    _pallas_rpa_kernel_default, _pallas_rpa_kernel_local)
+    PallasBatchedRPAAttentionBackend)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     set_vllm_model_wrapper_context
@@ -56,7 +56,7 @@ _TOKAMAX_OP_ATTR = "PallasMosaicTpuBatchedRpa"
 # actually sees in production: a handful of 1-token decodes at the front of the
 # persistent batch, then a chunked prefill resuming mid-sequence, then a fresh
 # prefill. Shapes follow Llama-3-8B's attention config (32 query heads over 8 KV
-# heads, head_dim 128) at the only page size the CUSTOM backend still offers.
+# heads, head_dim 128) at the only page size the backend still offers.
 #
 # The pool is deliberately small (24 pages, ~25 MiB in bf16) so the suite stays
 # fast; the *structure* -- 5D packed layout, page count covering every active
@@ -70,7 +70,7 @@ class Workload:
     num_heads: int = 32
     num_kv_heads: int = 8
     head_size: int = 128
-    # `PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes()`.
+    # `PallasAttentionBackend.get_supported_kernel_block_sizes()`.
     page_size: int = 256
     max_model_len: int = 1024
     # Persistent batch is padded to a fixed width; only `num_reqs` rows are live.
@@ -154,13 +154,12 @@ class Workload:
 WORKLOAD = Workload()
 
 
-def _impl(cls=PallasBatchedRPAAttentionBackendImpl,
-          workload: Workload = WORKLOAD,
+def _impl(workload: Workload = WORKLOAD,
           **kwargs) -> PallasAttentionBackendImpl:
     head_size = kwargs.pop("head_size", workload.head_size)
     kwargs.setdefault("kv_cache_dtype", "bfloat16")
     kwargs.setdefault("sliding_window", None)
-    return cls(
+    return PallasAttentionBackendImpl(
         num_heads=kwargs.pop("num_heads", workload.num_heads),
         head_size=head_size,
         scale=kwargs.pop("scale", head_size**-0.5),
@@ -214,12 +213,12 @@ def kv_cache_layout(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clean_kernel_registry():
-    """Drop registered ops between tests.
+    """Drop built closures between tests.
 
     `_kernel_registry` is class-level: it is how two layers with the same
-    config share one torch custom op. That sharing is the production behaviour
-    and is asserted below, but across tests it would hand a later test a
-    closure holding an earlier test's stubbed operator.
+    config share one closure over tokamax's operator. That sharing is the
+    production behaviour and is asserted below, but across tests it would hand
+    a later test a closure holding an earlier test's stubbed operator.
     """
     PallasAttentionBackendImpl._kernel_registry.clear()
     yield
@@ -330,20 +329,18 @@ def tpu():
 # =========================================================================
 
 
-def test_batched_backend_offers_only_the_page_size_tokamax_tiles():
+def test_backend_offers_only_the_page_size_tokamax_tiles():
     """HEAD_ALONG_SUBLANE puts one page per 128-lane tile. The other multiples
     of 128 belonged to the HND and PCP-streaming kernels, which are gone."""
-    assert PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes(
-    ) == [256]
+    assert PallasAttentionBackend.get_supported_kernel_block_sizes() == [256]
 
 
-def test_batched_backend_allocates_the_same_pool_as_the_default_one():
-    """The SEQ_ALONG_LANE override is deliberately not there any more: tokamax
-    models only HEAD_ALONG_SUBLANE, for which the inherited shape is correct."""
-    args = (WORKLOAD.num_blocks, WORKLOAD.page_size, WORKLOAD.num_kv_heads,
-            WORKLOAD.head_size, WORKLOAD.dtype)
-    assert (PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
-        *args) == PallasAttentionBackend.get_kv_cache_shape(*args))
+def test_backend_offers_only_the_layout_tokamax_models():
+    """The pool is physically NHD. Advertising BLNHC as well used to let vLLM
+    negotiate the block-major layout the bundled kernel wanted."""
+    from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
+    assert PallasAttentionBackend.supported_kv_cache_layouts() == (
+        VllmKVCacheLayout.LBNHC, )
 
 
 def test_workload_pool_shape_is_the_packed_5d_layout():
@@ -359,10 +356,34 @@ def test_workload_pool_shape_is_the_packed_5d_layout():
     )
 
 
-def test_batched_backend_resolves_to_the_tokamax_impl():
-    assert (PallasBatchedRPAAttentionBackend.get_impl_cls()
-            is PallasBatchedRPAAttentionBackendImpl)
+def test_pool_shape_has_no_head_dim_64_branch():
+    """The hd64 kernel packed K and V differently. It is gone, so head_dim 64
+    gets the same `num_kv_heads * 2` head axis as every other width -- and
+    `_tokamax_rpa_closure` refuses it outright rather than attend over it."""
+    shape = PallasAttentionBackend.get_kv_cache_shape(WORKLOAD.num_blocks, 256,
+                                                      WORKLOAD.num_kv_heads,
+                                                      64, WORKLOAD.dtype)
+    assert shape[2:4] == (WORKLOAD.num_kv_heads * 2 // 2, 2)
+    # Padded up to the TPU's 128-lane minimum, as every head width is.
+    assert shape[-1] == 128
+
+
+def test_custom_backend_is_the_same_backend_under_another_name():
+    """vLLM's registry is keyed by `AttentionBackendEnum`, so
+    `--attention-backend CUSTOM` has to resolve to a class of its own. It
+    overrides nothing but the name it reports."""
+    # `_abc_impl` is ABCMeta's, stamped onto every AttentionBackend subclass.
+    own = {
+        k
+        for k in vars(PallasBatchedRPAAttentionBackend)
+        if not k.startswith("__") and k != "_abc_impl"
+    }
+    assert own == {"get_name"}
     assert PallasBatchedRPAAttentionBackend.get_name() == "CUSTOM"
+    assert PallasAttentionBackend.get_name() == "FLASH_ATTN"
+    assert (PallasBatchedRPAAttentionBackend.get_impl_cls() is
+            PallasAttentionBackend.get_impl_cls() is
+            PallasAttentionBackendImpl)
 
 
 # =========================================================================
@@ -437,8 +458,8 @@ def test_build_rpa_kernel_is_shared_across_layers(fake_tokamax_op):
     Sharing is really tokamax's -- its singleton keys compilations on the
     shapes and the keyword config by value, so identical layers land on one
     kernel either way. The class-level `_kernel_registry` makes that explicit
-    and saves rebuilding the closure per layer, exactly as on the in-tree
-    path; the per-instance `_kernel_config_cache` only saves the lookup."""
+    and saves rebuilding the closure per layer; the per-instance
+    `_kernel_config_cache` only saves the lookup."""
     with set_vllm_model_wrapper_context(mesh=_mesh(),
                                         vllm_config=_vllm_config()):
         a = _impl()._build_rpa_kernel(None, None, None)
@@ -459,7 +480,7 @@ def test_build_rpa_kernel_rejects_in_process_tensor_parallelism(
 
 
 def test_build_rpa_kernel_rejects_head_dim_64(fake_tokamax_op):
-    """head_dim 64 selects the hd64 kernel and its differently-packed pool."""
+    """head_dim 64 selected the hd64 kernel and its differently-packed pool."""
     impl = _impl(head_size=64)
     with set_vllm_model_wrapper_context(mesh=_mesh(),
                                         vllm_config=_vllm_config()):
@@ -477,6 +498,28 @@ def test_build_rpa_kernel_rejects_hnd_layout(fake_tokamax_op, monkeypatch):
                                         vllm_config=_vllm_config()):
         with pytest.raises(NotImplementedError, match="VLLM_KV_CACHE_LAYOUT"):
             impl._build_rpa_kernel(None, None, None)
+
+
+def test_build_rpa_kernel_rejects_block_major_kv(fake_tokamax_op, monkeypatch):
+    """Block-major KV was served by the bundled kernel, which took the whole
+    pool plus a dynamic layer index. tokamax's operator takes one layer's."""
+    monkeypatch.setenv("VLLM_TPU_BLOCK_MAJOR_KV", "1")
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        with pytest.raises(NotImplementedError,
+                           match="VLLM_TPU_BLOCK_MAJOR_KV"):
+            _impl()._build_rpa_kernel(None, None, None)
+
+
+def test_build_rpa_kernel_rejects_kernel_iter_mode(fake_tokamax_op,
+                                                   monkeypatch):
+    """The timing loop re-runs one kernel in place; tokamax donates the pool,
+    so the second iteration would read a donated buffer."""
+    monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "1")
+    with set_vllm_model_wrapper_context(mesh=_mesh(),
+                                        vllm_config=_vllm_config()):
+        with pytest.raises(NotImplementedError, match="TPU_KERNEL_ITER_MODE"):
+            _impl()._build_rpa_kernel(None, None, None)
 
 
 def test_build_rpa_kernel_rejects_kv_sharing(fake_tokamax_op):
@@ -501,25 +544,28 @@ def test_build_rpa_kernel_rejects_multi_token_decode(fake_tokamax_op):
             impl._build_rpa_kernel(None, None, None)
 
 
-def test_batched_impl_keeps_decode_query_size_at_one():
+def test_decode_query_size_stays_at_one():
     """The longctx fork used to raise this to num_speculative_tokens + 1."""
-    assert PallasBatchedRPAAttentionBackendImpl.decode_query_size == 1
+    assert PallasAttentionBackendImpl.decode_query_size == 1
     assert _impl().decode_query_size == 1
 
 
-def test_build_rpa_kernel_rejects_sinks(fake_tokamax_op):
-    """Sinks are not in tokamax's signature; the closure refuses rather than
-    dropping them."""
-    impl = _impl(sinks=torch.zeros(WORKLOAD.num_heads))
-    kv_cache = WORKLOAD.kv_cache()
-    query, key, value = WORKLOAD.qkv()
-    md = WORKLOAD.metadata()
+def test_build_rpa_kernel_rejects_a_non_causal_mask(fake_tokamax_op):
+    """DFlash asks for this; tokamax's wrapper raises for it mid-compile, so
+    it is hoisted to a build-time guard with a message that names the knob."""
+    impl = _impl(use_causal_mask=False)
     with set_vllm_model_wrapper_context(mesh=_mesh(),
                                         vllm_config=_vllm_config()):
-        kernel = impl._build_rpa_kernel(None, None, None)
-        with pytest.raises(NotImplementedError, match="Attention sinks"):
-            kernel(kv_cache, query, key, value, md.seq_lens, md.block_tables,
-                   md.query_start_loc, md.request_distribution, impl.sinks)
+        with pytest.raises(NotImplementedError, match="use_causal_mask=False"):
+            impl._build_rpa_kernel(None, None, None)
+
+
+def test_sinks_are_refused_at_construction():
+    """Sinks are not in tokamax's signature at all, so there is nowhere to
+    forward them -- and nothing downstream that could notice they were
+    dropped. Refuse while the layer is still being built."""
+    with pytest.raises(NotImplementedError, match="Attention sinks"):
+        _impl(sinks=torch.zeros(WORKLOAD.num_heads))
 
 
 def test_build_rpa_kernel_forwards_attention_config(fake_tokamax_op):
@@ -533,7 +579,7 @@ def test_build_rpa_kernel_forwards_attention_config(fake_tokamax_op):
                                         vllm_config=_vllm_config()):
         kernel = impl._build_rpa_kernel(None, 0.5, 0.25)
         kernel(kv_cache, query, key, value, md.seq_lens, md.block_tables,
-               md.query_start_loc, md.request_distribution, None)
+               md.query_start_loc, md.request_distribution)
 
     assert len(fake_tokamax_op) == 1
     assert fake_tokamax_op[0].config == {
@@ -565,7 +611,7 @@ def test_build_rpa_kernel_rejects_a_resized_cache(monkeypatch):
         kernel = impl._build_rpa_kernel(None, None, None)
         with pytest.raises(RuntimeError, match="incompatible KV cache"):
             kernel(kv_cache, query, key, value, md.seq_lens, md.block_tables,
-                   md.query_start_loc, md.request_distribution, None)
+                   md.query_start_loc, md.request_distribution)
 
 
 # =========================================================================
@@ -592,36 +638,26 @@ def test_initialize_kernel_passes_fp8_scales_through(fake_tokamax_op):
         assert impl.rpa_kernel is impl._build_rpa_kernel(None, 0.5, 0.25)
 
 
-def test_initialize_kernel_refuses_prefill_context_parallelism(
-        fake_tokamax_op):
-    """PCP needed the streaming RPA kernel. tokamax has no streaming variant,
-    so this raises instead of quietly attending over the wrong layout."""
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({
+        "pcp": 2
+    }, "Prefill context parallelism"),
+    ({
+        "dcp": 2
+    }, "Decode context parallelism"),
+])
+def test_initialize_kernel_refuses_context_parallelism(fake_tokamax_op, kwargs,
+                                                       match):
+    """Both modes split the KV axis across ranks and recombine the partial
+    softmaxes, which needs a kernel that hands back its log-sum-exp. tokamax's
+    operator returns the attention output only, so neither can be faked by
+    running it per rank -- hence a raise rather than a silent wrong answer."""
     impl = _impl()
     with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                        vllm_config=_vllm_config(pcp=2)):
-        with pytest.raises(NotImplementedError,
-                           match="Prefill context parallelism"):
+                                        vllm_config=_vllm_config(**kwargs)):
+        with pytest.raises(NotImplementedError, match=match):
             impl.initialize_kernel(_layer())
-
-
-def test_initialize_kernel_still_short_circuits_for_dcp(fake_tokamax_op):
-    """Decode context parallelism was kept. It returns before the tokamax
-    builder, and with no DCP group initialized it builds nothing at all."""
-    impl = _impl()
-    with set_vllm_model_wrapper_context(mesh=_mesh(),
-                                        vllm_config=_vllm_config(dcp=2)):
-        impl.initialize_kernel(_layer())
-    assert impl.rpa_kernel is None
-    assert impl.dcp_world_size == 1
     assert not fake_tokamax_op
-
-
-def test_runs_batched_rpa_schedule_is_false_everywhere():
-    """tokamax spills its (query block, KV block) schedule to HBM, so the
-    runner's SMEM bound no longer applies to any remaining path."""
-    assert _impl().runs_batched_rpa_schedule() is False
-    assert _impl(
-        cls=PallasAttentionBackendImpl).runs_batched_rpa_schedule() is False
 
 
 # =========================================================================
@@ -641,9 +677,9 @@ def test_forward_drives_the_tokamax_op_over_a_mixed_batch(
 
     assert len(fake_tokamax_op) == 1
     call = fake_tokamax_op[0]
-    # Argument order is tokamax's, not `_kernel_entry`'s: q/k/v first, cache
-    # fourth, no `sinks`. q/k/v are distinct random tensors, so this also
-    # catches a k/v transposition, which the shapes alone would not.
+    # Argument order is tokamax's: q/k/v first, cache fourth, no `sinks`. q/k/v
+    # are distinct random tensors, so this also catches a k/v transposition,
+    # which the shapes alone would not.
     assert torch.equal(call.query, q)
     assert torch.equal(call.key, k)
     assert torch.equal(call.value, v)
@@ -760,69 +796,66 @@ def test_forward_rejects_fused_output_quantization(fake_tokamax_op):
 
 
 # =========================================================================
-# Fail-closed: block-major KV has no tokamax variant
-# =========================================================================
-
-
-def test_bundled_kernel_refuses_the_batched_impl():
-    """With no `_kernel_entry` override left on the batched impl, the identity
-    check below it would let block-major KV silently run the *default* bundled
-    kernel. The isinstance guard is what stops that."""
-    with pytest.raises(NotImplementedError, match="no bundled variant"):
-        _impl()._build_bundled_kernel(None, None, None)
-
-
-def test_bundled_kernel_still_refuses_a_rebound_layer_major_kernel():
-    """The runner rebinds `_kernel_entry` per instance for the eagle3 draft."""
-    impl = _impl(cls=PallasAttentionBackendImpl)
-    impl._kernel_entry = _pallas_rpa_kernel_local
-    with pytest.raises(NotImplementedError, match="overrides the layer-major"):
-        impl._build_bundled_kernel(None, None, None)
-
-
-# =========================================================================
 # Regression: the other implementations stay deleted
 # =========================================================================
 
 
-@pytest.mark.parametrize("name", [
-    "_pallas_rpa_kernel_batched",
-    "_build_tokamax_rpa_kernel",
-    "_validate_pcp_streaming_support",
-    "_select_kernel_mesh",
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        # The in-tree kernel entries and the indirection that chose between them.
+        "_kernel_entry",
+        "_kernel_entry_bundled",
+        "_kernel_op_prefix",
+        "_pallas_rpa_kernel_impl",
+        "_pallas_rpa_kernel_default",
+        "_pallas_rpa_kernel_local",
+        "_pallas_rpa_kernel_batched",
+        "_DRAFT_KV_BLOCK_CAP",
+        # The bundled (block-major) variant.
+        "_build_bundled_kernel",
+        "setup_bundled",
+        "_bundled_kernel_registry",
+        # The batched schedule the runner used to have to respect.
+        "runs_batched_rpa_schedule",
+        # Context parallelism.
+        "_validate_pcp_streaming_support",
+        "_select_kernel_mesh",
+        "_run_dcp_forward",
+        # A second builder: `_build_rpa_kernel` is the only entry point.
+        "_build_tokamax_rpa_kernel",
+        # The second impl class. One kernel, one impl.
+        "PallasBatchedRPAAttentionBackendImpl",
+    ])
 def test_removed_symbols_stay_removed(name):
-    """`_build_rpa_kernel` is the single builder; re-adding a second one should
-    be a deliberate act, not a quiet re-import."""
     assert not hasattr(attn, name)
     assert not hasattr(PallasAttentionBackendImpl, name)
 
 
-def test_batched_impl_adds_nothing_but_a_marker():
-    """It exists so the CUSTOM backend and `_build_bundled_kernel` have
-    something to dispatch on; tokamax's op is not an in-tree kernel function."""
-    # `_abc_impl` is ABCMeta's, stamped onto every AttentionImpl subclass.
-    # `_kernel_instance_counter` is the base class's op-name counter. The
-    # tokamax path never allocates one -- tokamax owns the op name -- but the
-    # in-tree path rebinds it onto whichever class builds a kernel, so leaving
-    # it out keeps this test independent of test order.
-    inherited_machinery = {"_abc_impl", "_kernel_instance_counter"}
-    own = {
-        k
-        for k in vars(PallasBatchedRPAAttentionBackendImpl)
-        if not k.startswith("__") and k not in inherited_machinery
-    }
-    assert own == {"_kernel_op_prefix"}
-    assert (PallasBatchedRPAAttentionBackendImpl._kernel_op_prefix ==
-            "pallas::rpa_kernel_batched")
+@pytest.mark.parametrize("module_name", [
+    "vllm_torchtpu.layers.adapter.rpa_kernels",
+    "vllm_torchtpu.layers.adapter.cp_attention",
+    "vllm_torchtpu.kernels.experimental.batched_rpa.kernel",
+    "vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention",
+    "vllm_torchtpu.kernels.experimental.batched_rpa.schedule",
+    "vllm_torchtpu.kernels.experimental.batched_rpa_longctx",
+])
+def test_removed_modules_stay_removed(module_name):
+    """`find_spec` rather than an import, so a module left on disk but broken
+    still fails this."""
+    assert importlib.util.find_spec(module_name) is None
 
 
-def test_default_backend_still_uses_the_in_tree_kernel():
-    """The FLASH_ATTN path was explicitly out of scope of the tokamax-only
-    change; only batched RPA collapsed onto tokamax."""
-    assert (PallasAttentionBackendImpl._kernel_entry
-            is _pallas_rpa_kernel_default)
-    assert PallasAttentionBackend.get_name() == "FLASH_ATTN"
+def test_batched_rpa_package_is_down_to_what_pcp_streaming_needs():
+    """`kernels/experimental/batched_rpa` outlives its kernel: the PCP
+    streaming RPA kernel -- the substrate for GDN attention and MLA -- still
+    reaches for its `KVLayout` enum, its utils and `wrapper.prepare_inputs`."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
+    assert hasattr(wrapper, "prepare_inputs")
+    for name in ("ragged_paged_attention", "prepare_outputs",
+                 "get_kv_cache_shape", "calculate_block_sizes",
+                 "schedule_capacity", "schedule_pairs"):
+        assert not hasattr(wrapper, name)
 
 
 def test_attention_module_no_longer_imports_streaming_rpa_entry_points():
@@ -871,32 +904,18 @@ def test_mla_lives_in_its_own_module():
         for m in _imported_modules(module))
 
 
-def test_flash_kernel_entries_live_in_rpa_kernels():
-    """`attention` names the flash entries but no longer defines them.
-
-    The four `_pallas_rpa_kernel_*` functions are the last callers of the
-    in-tree flash kernel, so keeping them here is what stopped `attention`
-    from being the tokamax-routing half alone.
-    """
-    module = sys.modules[attn.__name__]
-    for name in ("_pallas_rpa_kernel_impl", "_pallas_rpa_kernel_local",
-                 "_DRAFT_KV_BLOCK_CAP", "attention", "attention_bundled",
-                 "ragged_paged_attention"):
-        assert not hasattr(module, name)
-
-    # The two the impl classes name as defaults are imported, not defined.
-    assert (PallasAttentionBackendImpl._kernel_entry
-            is rpa_kernels._pallas_rpa_kernel_default)
-    assert (PallasAttentionBackendImpl._kernel_entry_bundled
-            is rpa_kernels._pallas_rpa_kernel_default_bundled)
-    assert (attn._pallas_rpa_kernel_default.__module__ ==
-            "vllm_torchtpu.layers.adapter.rpa_kernels")
-
-    # One way again: the entries reach the kernel directly and know nothing
-    # about the backend classes that wrap them.
-    assert not any(
-        m.startswith("vllm_torchtpu.layers.adapter.attention")
-        for m in _imported_modules(sys.modules[rpa_kernels.__name__]))
+def test_attention_reaches_no_in_tree_attention_kernel():
+    """The whole point of the collapse: `attention` imports the metadata, the
+    quantization helper and the layout enum, and gets its kernel from tokamax.
+    Nothing under `kernels/` that computes attention is left in its imports."""
+    imported = _imported_modules(sys.modules[attn.__name__])
+    kernels = {
+        m
+        for m in imported if ".kernels." in m or m.endswith(".kernels")
+    }
+    # Only the layout enum, which is a plain `enum.Enum` of pool layouts.
+    assert kernels == {"vllm_torchtpu.kernels.experimental.batched_rpa"}
+    assert not any("attention_interface" in m for m in imported)
 
 
 def test_both_backends_register_under_their_own_module():
@@ -904,10 +923,11 @@ def test_both_backends_register_under_their_own_module():
     so moving a class rewrites a string the platform hands back."""
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    assert AttentionBackendEnum.FLASH_ATTN.get_path().startswith(
-        "vllm_torchtpu.layers.adapter.attention.")
-    assert AttentionBackendEnum.CUSTOM.get_path().startswith(
-        "vllm_torchtpu.layers.adapter.attention.")
+    assert (AttentionBackendEnum.FLASH_ATTN.get_path() ==
+            "vllm_torchtpu.layers.adapter.attention.PallasAttentionBackend")
+    assert (AttentionBackendEnum.CUSTOM.get_path() ==
+            "vllm_torchtpu.layers.adapter.attention."
+            "PallasBatchedRPAAttentionBackend")
     assert (AttentionBackendEnum.FLASH_ATTN_MLA.get_path() ==
             "vllm_torchtpu.layers.adapter.mla_attention."
             "PallasMLAttentionBackend")

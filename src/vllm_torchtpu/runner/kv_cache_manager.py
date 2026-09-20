@@ -47,8 +47,6 @@ from vllm_torchtpu.layers.adapter.mla_attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import \
     AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
-    set_vllm_model_wrapper_context
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
@@ -911,14 +909,6 @@ class KVCacheManager:
                         and kernel_block_size is not None):
                     kv_cache_spec = kv_cache_spec.copy_with_new_block_size(
                         kernel_block_size)
-                    if isinstance(kv_cache_spec, FullAttentionSpec):
-                        # The schedule check sizes the batched kernel's
-                        # table from this group's page size and block
-                        # table width.
-                        self.runner._attention_kernel_block_size = (
-                            kernel_block_size)
-                        self.runner._attention_kv_cache_group_id = (
-                            group.kv_cache_group_id)
                 builder = AttentionMetadataBuilder(
                     kv_cache_spec,
                     group.layer_names,
@@ -1358,30 +1348,6 @@ class KVCacheManager:
             self.runner.vllm_config.compilation_config.static_forward_context,
             self.runner.kv_caches,
         )
-
-        # Pre-build and cache bundled RPA kernels across all attention layers before torch.compile tracing.
-        if self.runner._kv_cache_bundle is not None:
-            from vllm_torchtpu.layers.adapter.attention import \
-                PallasAttentionBackendImpl
-            layers = get_layers_from_vllm_config(self.runner.vllm_config,
-                                                 Attention)
-            # Only enter wrapper context when eligible attention layers are present.
-            eligible = [
-                (name, attn_layer) for name, attn_layer in layers.items()
-                if name in self.runner._kv_cache_bundle_layer_index
-                and isinstance(attn_layer.impl, PallasAttentionBackendImpl)
-            ]
-            if eligible:
-                with set_vllm_model_wrapper_context(
-                        mesh=self.runner.mesh,
-                        kv_cache_bundle=self.runner._kv_cache_bundle,
-                ):
-                    for name, attn_layer in eligible:
-                        attn_layer.impl.setup_bundled(
-                            self.runner._kv_cache_bundle_layer_index[name],
-                            self.runner._kv_cache_bundle.device,
-                            attn_layer,
-                        )
 
         if self.runner.use_spmd:
             # Shard KV Cache
