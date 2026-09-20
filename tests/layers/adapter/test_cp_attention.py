@@ -13,7 +13,7 @@
 # limitations under the License.
 """CPU tests for DCP layout propagation and kernel registry isolation.
 
-Real TPU pass correctness is covered by test_attention_dcp_hnd.py. Here the
+Real TPU pass correctness is covered by test_attention_dcp.py. Here the
 kernel builder and collectives are replaced so both adapter entry points and
 the registry can be checked together, including reuse across layers/layouts.
 """
@@ -91,24 +91,22 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
                         lambda *a, **k: None)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
     implementations = []
-    # The third layer must reuse NHD's ops after HND has populated the registry.
-    for layout in ("LBNHC", "LBHNC", "LBNHC"):
-        get_current_vllm_config().cache_config.kv_cache_layout = layout
+    # Every layer resolves NHD: it is the only layout any backend allocates
+    # now, and `initialize_kernel` refuses HND outright (see below). Three
+    # layers, so a later one has to reuse the registry rather than rebuild.
+    get_current_vllm_config().cache_config.kv_cache_layout = "LBNHC"
+    for _ in range(3):
         impl = _impl()
         with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
             impl.initialize_kernel(layer)
         implementations.append(impl)
 
-    assert len(
-        built) == 4  # Two layouts, two scopes; shared by matching layers.
-    assert implementations[0].rpa_dcp_cache_kernel is implementations[
-        2].rpa_dcp_cache_kernel
-    assert implementations[0].rpa_dcp_new_kernel is implementations[
-        2].rpa_dcp_new_kernel
-    assert implementations[0].rpa_dcp_cache_kernel is not implementations[
-        1].rpa_dcp_cache_kernel
-    assert implementations[0].rpa_dcp_new_kernel is not implementations[
-        1].rpa_dcp_new_kernel
+    assert len(built) == 2  # One layout, two scopes; shared by every layer.
+    for other in implementations[1:]:
+        assert implementations[0].rpa_dcp_cache_kernel is (
+            other.rpa_dcp_cache_kernel)
+        assert implementations[0].rpa_dcp_new_kernel is (
+            other.rpa_dcp_new_kernel)
 
     metadata = SimpleNamespace(seq_lens=torch.tensor([2, 3, 4],
                                                      dtype=torch.int32),
@@ -121,29 +119,32 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
                                    [3, 3, 3], dtype=torch.int32))
     query = torch.ones(3, 8, 256)
     key = torch.ones(3, 1, 256)
-    for impl, expected_layout in zip(
-            implementations,
-        (KVLayout.HEAD_ALONG_SUBLANE, KVLayout.SEQ_ALONG_LANE,
-         KVLayout.HEAD_ALONG_SUBLANE)):
-        # The per-layer layout must survive even if the current config changes.
+    for impl in implementations:
+        # The layout baked in at prebuild must survive a config that changes
+        # underneath the layer -- forward must not re-resolve it.
         get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
         forward = impl._run_dcp_forward
         if compiled:
             forward = torch.compile(forward, backend="eager", fullgraph=True)
         output = forward(layer, query, key, key, torch.empty(1), metadata)
         assert calls[-2:] == [
-            (expected_layout, AttentionScope.CACHE_ONLY, (3, 16, 256)),
-            (expected_layout, AttentionScope.NEW_TOKENS_ONLY, (3, 8, 256)),
+            (KVLayout.HEAD_ALONG_SUBLANE, AttentionScope.CACHE_ONLY,
+             (3, 16, 256)),
+            (KVLayout.HEAD_ALONG_SUBLANE, AttentionScope.NEW_TOKENS_ONLY,
+             (3, 8, 256)),
         ]
         # Two cached partials (value=1, weight=1 each) and one new partial
         # (value=3, weight=1), including both production LSE merges.
         torch.testing.assert_close(output, torch.full_like(query, 5 / 3))
-    assert len(
-        built) == 4  # Forward must reuse the prebuilt ops for each layout.
+    assert len(built) == 2  # Forward must reuse the prebuilt ops.
     assert all(type(fn.keywords["kv_layout"]) is KVLayout for fn in built)
 
 
-def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
+def test_dcp_kernel_registry_is_keyed_by_layout(monkeypatch):
+    """The adapter only ever asks for NHD now, but the registry key still has
+    to carry the layout: `build_dcp_kernels` is public and the DCP kernels
+    reinterpret the pool from this argument alone. Also pins the default --
+    omitting `kv_layout` must land on the same entry as passing NHD."""
     monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
     monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op",
                         lambda name, fn: fn)
@@ -160,16 +161,25 @@ def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
         **kwargs, kv_layout=KVLayout.HEAD_ALONG_SUBLANE)
     assert all(a is b for a, b in zip(implicit, explicit))
 
+    hnd = cp_attention.build_dcp_kernels(**kwargs,
+                                         kv_layout=KVLayout.SEQ_ALONG_LANE)
+    assert all(a is not b for a, b in zip(implicit, hnd))
+
 
 @pytest.mark.parametrize("cls,head_size", [
     (attention.PallasAttentionBackendImpl, 256),
+    (attention.PallasBatchedRPAAttentionBackendImpl, 256),
     (attention.PallasBatchedRPAAttentionBackendImpl, 64),
 ])
-def test_dcp_hnd_rejects_backends_that_allocate_nhd(cls, head_size,
-                                                    cpu_vllm_config_context):
+def test_dcp_rejects_hnd_on_every_backend(cls, head_size,
+                                          cpu_vllm_config_context):
+    """Every backend allocates the NHD pool now -- the CUSTOM backend's HND
+    shape override went away with the in-tree batched kernel -- so the guard
+    is no longer conditional on the class or the head width."""
     get_current_vllm_config().cache_config.kv_cache_layout = "LBHNC"
     impl = _impl(cls, head_size)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=_config()):
-        with pytest.raises(NotImplementedError, match="DCP with HND requires"):
+        with pytest.raises(NotImplementedError,
+                           match="VLLM_KV_CACHE_LAYOUT=HND"):
             impl.initialize_kernel(layer)

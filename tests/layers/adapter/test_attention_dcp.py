@@ -11,16 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify DCP + HND behavior with real TPU kernels and a NumPy reference.
+"""Verify DCP behavior with real TPU kernels and a NumPy reference.
 
 Run from the repository root with its dependencies active::
 
-    PYTHONPATH=src python -m pytest -v tests/layers/adapter/test_attention_dcp_hnd.py
+    PYTHONPATH=src python -m pytest -v tests/layers/adapter/test_attention_dcp.py
 
 The adapter cases use the backend's cache allocation and initialize_kernel(),
-including the real Pallas custom ops. The longctx cases pass the layout
-explicitly to the underlying wrapper, to distinguish adapter wiring failures
-from kernel failures. Neither path replaces or patches a kernel.
+including the real Pallas custom ops. The longctx cases call the underlying
+wrapper directly, to distinguish adapter wiring failures from kernel failures.
+Neither path replaces or patches a kernel.
+
+Only NHD is exercised. The batched backend allocates its pool NHD and no
+longer offers HND, so DCP + HND is a refusal rather than a geometry -- see
+`test_dcp_rejects_hnd_on_every_backend` in test_cp_attention.py, which needs
+no TPU. The longctx kernel still accepts
+SEQ_ALONG_LANE; that is the kernel package's business, not the adapter's.
 
 The TP8 matrix uses 16 global Q heads and (global KV heads, DCP size) of
 (4, 2), (2, 4), and (1, 8). Every rank has two Q heads and one KV head.
@@ -75,14 +81,10 @@ def _require_tpu():
         pytest.skip("DCP Pallas kernels require a TPU")
 
 
-def _write_slot(cache, layout, page, offset, key, value):
+def _write_slot(cache, page, offset, key, value):
     """Pack one KV head without using the kernel's packing/writeback helpers."""
-    if layout == "HND":
-        cache[page, 0, :, :, offset] = key.reshape(_HEAD_DIM // 4, 4)
-        cache[page, 1, :, :, offset] = value.reshape(_HEAD_DIM // 4, 4)
-    else:
-        cache[page, offset, 0, 0, :] = key
-        cache[page, offset, 0, 1, :] = value
+    cache[page, offset, 0, 0, :] = key
+    cache[page, offset, 0, 1, :] = value
 
 
 def _reference(query, keys, values):
@@ -97,8 +99,8 @@ def _reference(query, keys, values):
             (maximum + np.log(denominator))[:, 0])
 
 
-def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
-    # Identical logical data across layouts, ranks, and entry points. Quantize
+def _make_case(rank, scope, *, dcp_size, own_q_heads):
+    # Identical logical data across ranks and entry points. Quantize
     # before computing the reference so FP8 rounding is not a reference error.
     rng = np.random.default_rng(20260915)
     # Exercise both sides of every ownership boundary, including wraparound
@@ -127,9 +129,9 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
     shape = attention.PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
         num_pages, _PAGE_SIZE, 1, _HEAD_DIM, _FP8)
     cache = np.zeros(shape, dtype=np.float32)
-    # A physical HND page uses exactly half the bytes for a single FP8 KV head.
-    assert np.prod(shape[1:]) // _PAGE_SIZE == (512
-                                                if layout == "HND" else 1024)
+    # One NHD slot holds a K and a V head of _HEAD_DIM FP8 elements each,
+    # laid out along the packing lane -- 2 * 256 * 2 bytes per token.
+    assert np.prod(shape[1:]) // _PAGE_SIZE == 1024
     expected_out, expected_lse = [], []
     new_keys, new_values = [], []
     for seq, kv_len in enumerate(kv_lens):
@@ -137,7 +139,7 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
         owned = history[(history // _PAGE_SIZE) % dcp_size == rank]
         for pos in owned:
             page = page_table[seq, pos // (_PAGE_SIZE * dcp_size)]
-            _write_slot(cache, layout, page, pos % _PAGE_SIZE, keys[seq, pos],
+            _write_slot(cache, page, pos % _PAGE_SIZE, keys[seq, pos],
                         values[seq, pos])
         positions = (owned if scope == configs.AttentionScope.CACHE_ONLY else
                      np.array([kv_len - 1]))
@@ -154,7 +156,7 @@ def _make_case(layout, rank, scope, *, dcp_size, own_q_heads):
             pos = kv_len - 1
             if (pos // _PAGE_SIZE) % dcp_size == rank:
                 page = page_table[seq, pos // (_PAGE_SIZE * dcp_size)]
-                _write_slot(expected_cache, layout, page, pos % _PAGE_SIZE,
+                _write_slot(expected_cache, page, pos % _PAGE_SIZE,
                             new_keys[seq], new_values[seq])
 
     args = (
@@ -202,8 +204,8 @@ def _run_adapter(args, rank, scope, monkeypatch, *, dcp_size, own_q_heads):
             device_args[0].cpu().float().numpy())
 
 
-def _run_longctx(args, layout, rank, scope, *, dcp_size):
-    """Control: call the unmodified lower wrapper with an explicit layout."""
+def _run_longctx(args, rank, scope, *, dcp_size):
+    """Control: call the unmodified lower wrapper directly."""
     dtype_map = {
         _FP8: jnp.float8_e4m3fn,
         torch.bfloat16: jnp.bfloat16,
@@ -225,8 +227,7 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
         cp_rank=jnp.array([rank], jnp.int32),
         attention_scope=scope,
         return_lse=True,
-        kv_layout=(configs.KVLayout.SEQ_ALONG_LANE if layout == "HND" else
-                   configs.KVLayout.HEAD_ALONG_SUBLANE),
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
     )
     return tuple(
         np.asarray(tensor.astype(jnp.float32))
@@ -234,7 +235,6 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
 
 
 @pytest.mark.parametrize("entry", ["adapter", "longctx"])
-@pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize(
     "global_q_heads,global_kv_heads,dcp_size,rank",
     [
@@ -253,16 +253,15 @@ def _run_longctx(args, layout, rank, scope, *, dcp_size):
     configs.AttentionScope.NEW_TOKENS_ONLY,
 ],
                          ids=lambda scope: scope.name)
-def test_dcp_fp8_pass_matches_reference(entry, layout, global_q_heads,
-                                        global_kv_heads, dcp_size, rank, scope,
-                                        monkeypatch, vllm_config_context):
+def test_dcp_fp8_pass_matches_reference(entry, global_q_heads, global_kv_heads,
+                                        dcp_size, rank, scope, monkeypatch,
+                                        vllm_config_context):
     assert global_q_heads % _TP_SIZE == 0
     assert global_kv_heads * dcp_size == _TP_SIZE
     own_q_heads = global_q_heads // _TP_SIZE
-    get_current_vllm_config().cache_config.kv_cache_layout = (
-        "LBHNC" if layout == "HND" else "LBNHC")
+    get_current_vllm_config().cache_config.kv_cache_layout = "LBNHC"
     args, expected_out, expected_lse, expected_cache = _make_case(
-        layout, rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
+        rank, scope, dcp_size=dcp_size, own_q_heads=own_q_heads)
     if entry == "adapter":
         output, lse, cache = _run_adapter(args,
                                           rank,
@@ -271,11 +270,7 @@ def test_dcp_fp8_pass_matches_reference(entry, layout, global_q_heads,
                                           dcp_size=dcp_size,
                                           own_q_heads=own_q_heads)
     else:
-        output, lse, cache = _run_longctx(args,
-                                          layout,
-                                          rank,
-                                          scope,
-                                          dcp_size=dcp_size)
+        output, lse, cache = _run_longctx(args, rank, scope, dcp_size=dcp_size)
 
     # BF16 output and LSE; the FP8 input rounding is already in the reference.
     # An empty shard has LSE=-inf and zero merge weight. Its output buffer is

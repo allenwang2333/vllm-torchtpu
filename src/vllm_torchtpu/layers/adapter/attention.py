@@ -3,15 +3,14 @@
 
 import dataclasses
 import functools
-import inspect
 from typing import Any, ClassVar
 
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
-from vllm.config import (VllmConfig, get_current_vllm_config,
-                         get_current_vllm_config_or_none)
+from vllm import envs as vllm_envs
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
                                        AttentionLayer, AttentionType,
@@ -28,10 +27,8 @@ from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-    PCP_STREAMING_RPA_INPUT_PARTITION_SPECS, get_pcp_streaming_mesh,
-    invoke_pcp_streaming_op, make_pcp_streaming_rpa_kernel,
-    pcp_streaming_jax_op)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
+    pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (KVCacheLayout,
                                                       KVCacheType,
@@ -44,25 +41,21 @@ from vllm_torchtpu.layers.adapter.cp_attention import \
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads, merge_lse_partials_scatter_heads)
 from vllm_torchtpu.layers.core.attention_interface import (
-    attention, attention_bundled, mla_attention, ragged_paged_attention,
-    ragged_paged_attention_batched)
+    attention, attention_bundled, mla_attention, ragged_paged_attention)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_kv
-from vllm_torchtpu.layers.core.sequence_layout import \
-    is_pcp_streaming_attention_metadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
-from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
-# Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
-if envs.USE_BATCHED_RPA_LONGCTX:
-    import vllm_torchtpu.kernels.experimental.batched_rpa_longctx.wrapper as rpa_batched_wrapper
-else:
-    import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
+# The op prefix that routes a layer onto tokamax's batched RPA operator.
+# Matched by value rather than by `isinstance`, because the runner rebinds
+# both the entry and the prefix per instance (see `tpu_runner`'s eagle3 draft
+# path) and a rebound layer must follow its new prefix, not its class.
+_TOKAMAX_RPA_OP_PREFIX = "pallas::rpa_kernel_batched"
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -145,6 +138,44 @@ KV_LAYOUT_BY_VLLM_LAYOUT: dict[
         VllmKVCacheLayout.LBHNC: batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
         VllmKVCacheLayout.BLHNC: batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
     }
+
+# vLLM still accepts the pre-refactor layout names on
+# `VLLM_KV_CACHE_LAYOUT`; `vllm.config.cache` aliases them privately, so the
+# two entries are repeated here rather than reached through a `_`-name.
+_VLLM_LAYOUT_NAME_ALIASES = {"NHD": "LBNHC", "HND": "LBHNC"}
+
+
+def _resolve_kv_layout() -> batched_rpa_configs.KVLayout:
+    """Resolve the layout the KV pool is physically laid out in.
+
+    Prefers the layout the current vLLM config negotiated against the backend's
+    `supported_kv_cache_layouts()` -- the engine core resolves it once and
+    pushes it to every worker before any layer is built, so in a live server
+    this is always the branch taken.
+
+    The fallback covers a bare impl constructed outside a
+    `set_current_vllm_config()` scope, or before resolution has run: read the
+    same `VLLM_KV_CACHE_LAYOUT` override the resolver reads, and otherwise take
+    the NHD default the pool is allocated in. (There is no process-wide getter
+    to fall back on any more -- `get_kv_cache_layout` went away with the layout
+    refactor that introduced `vllm.v1.kv_cache_layout`.)
+    """
+    vllm_config = get_current_vllm_config_or_none()
+    if (vllm_config is not None
+            and vllm_config.cache_config.kv_cache_layout is not None):
+        resolved = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    elif (requested := vllm_envs.VLLM_KV_CACHE_LAYOUT) is not None:
+        name = _VLLM_LAYOUT_NAME_ALIASES.get(requested, requested)
+        resolved = VllmKVCacheLayout[name]
+    else:
+        return batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+
+    layout = KV_LAYOUT_BY_VLLM_LAYOUT.get(resolved)
+    if layout is None:
+        raise NotImplementedError(
+            f"KV cache layout {resolved.name} has no batched-RPA equivalent; "
+            f"supported: {sorted(l.name for l in KV_LAYOUT_BY_VLLM_LAYOUT)}.")
+    return layout
 
 
 def get_tpu_min_page_size(vllm_config: VllmConfig) -> int:
@@ -380,56 +411,6 @@ def _pallas_rpa_kernel_default_bundled(
     return new_bundle, outputs
 
 
-def _pallas_rpa_kernel_batched(
-    kv_cache: jax.Array,
-    query: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
-    *,
-    mesh: jax.sharding.Mesh,
-    sliding_window: int | None,
-    sm_scale: float | None = None,
-    soft_cap: float | None = None,
-    skip_kv_update: bool,
-    use_causal_mask: bool = True,
-    kv_layout: batched_rpa_configs.KVLayout,
-    decode_query_size: int = 1,
-) -> tuple[jax.Array, jax.Array]:
-    """Batched-RPA Pallas kernel entry — used by `PallasBatchedRPAAttentionBackendImpl`."""
-    return _pallas_rpa_kernel_impl(
-        kv_cache,
-        query,
-        key,
-        value,
-        seq_lens,
-        block_tables,
-        query_start_loc,
-        request_distribution,
-        sinks,
-        q_scale,
-        k_scale,
-        v_scale,
-        mesh=mesh,
-        sliding_window=sliding_window,
-        skip_kv_update=skip_kv_update,
-        rpa_func=(functools.partial(ragged_paged_attention_batched,
-                                    decode_query_size=decode_query_size) if
-                  decode_query_size > 1 else ragged_paged_attention_batched),
-        sm_scale=sm_scale,
-        soft_cap=soft_cap,
-        use_causal_mask=use_causal_mask,
-        kv_layout=kv_layout,
-    )
-
-
 # =========================================================================================
 # VLLM Attention Backend
 # =========================================================================================
@@ -588,18 +569,17 @@ class PallasAttentionBackend(AttentionBackend):
 
 @register_backend(AttentionBackendEnum.CUSTOM)
 class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
-    """Pallas attention backend wired to the batched-RPA kernel.
+    """Pallas attention backend wired to tokamax's batched-RPA operator.
 
     Registered under `AttentionBackendEnum.CUSTOM` by
     `TpuPlatform.pre_register_and_update`; user opts in via
-    `--attention-backend CUSTOM`. The Impl subclass sets `use_batched_rpa=True`,
-    which plumbs through `_pallas_rpa_kernel` → `attention()` →
-    `sharded_ragged_paged_attention()` to pick the batched kernel function.
-    Any multiple of 128 is a valid page size for this kernel;
-    `get_preferred_block_size` is overridden so the auto-selected default (no
-    `--block-size` given) stays at 256. Under `VLLM_KV_CACHE_LAYOUT=HND`, the
-    non-PCP kernel accepts only page size 128; PCP streaming retains support
-    for every multiple of 128 listed below.
+    `--attention-backend CUSTOM`. The Impl subclass is a marker: it carries no
+    in-tree kernel of its own, and `PallasAttentionBackendImpl`'s builder
+    routes its `_kernel_op_prefix` to tokamax's `PallasMosaicTpuBatchedRpa`.
+
+    The KV pool is the inherited 5D packed HEAD_ALONG_SUBLANE one; the
+    SEQ_ALONG_LANE (HND) shape and the PCP-streaming page sizes belonged to the
+    in-tree kernels and are gone with them.
     """
 
     @staticmethod
@@ -612,57 +592,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[VllmKVCacheLayout, ...]:
-        return (VllmKVCacheLayout.LBNHC, VllmKVCacheLayout.LBHNC)
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str | torch.dtype = "auto",
-    ) -> tuple[int, ...]:
-        is_auto = (isinstance(cache_dtype_str, str)
-                   and cache_dtype_str.lower().strip() == "auto")
-        # Resolve the layout last: the dtype-less probe and hd64 callers
-        # do not need a current vLLM config.
-        if (head_size == 64
-                or is_auto or KV_LAYOUT_BY_VLLM_LAYOUT[get_current_vllm_config(
-                ).cache_config.get_resolved_kv_cache_layout()]
-                is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE):
-            return PallasAttentionBackend.get_kv_cache_shape(
-                num_blocks, block_size, num_kv_heads, head_size,
-                cache_dtype_str)
-        torch_dtype = _resolve_kv_cache_dtype(cache_dtype_str)
-        # Resolve the chip here rather than in the kernel: the scheduler
-        # process calls this and owns no chip, so the wrapper must not query a
-        # live device.
-        return rpa_batched_wrapper.get_kv_cache_shape(
-            total_num_pages=num_blocks,
-            page_size=block_size,
-            actual_num_kv_heads=num_kv_heads,
-            actual_head_dim=head_size,
-            kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
-            kv_layout=KV_LAYOUT_BY_VLLM_LAYOUT[get_current_vllm_config(
-            ).cache_config.get_resolved_kv_cache_layout()],
-            chip_version=get_chip_version(),
-        )
+        # tokamax's autotuning config pins the layout to HEAD_ALONG_SUBLANE, so
+        # HND is no longer negotiable for this backend.
+        return (VllmKVCacheLayout.LBNHC, )
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        # Needs a current vLLM config: the layout falls through to the KV
-        # connector when `VLLM_KV_CACHE_LAYOUT` is unset.
-        if envs.USE_BATCHED_RPA_LONGCTX:
-            return [128, 256, 512, 1024, 2048, 4096]
-        # SEQ_ALONG_LANE maps a page onto one 128-lane tile; `RpaConfigs`
-        # rejects any other page size in non-PCP mode. PCP streaming supports
-        # each 128-aligned page size listed below.
-        if get_current_vllm_config().cache_config.get_resolved_kv_cache_layout(
-        ) is VllmKVCacheLayout.LBHNC:
-            parallel_config = get_current_vllm_config().parallel_config
-            if parallel_config.prefill_context_parallel_size > 1:
-                return [128, 256, 512, 1024, 2048, 4096]
-            return [128]
+        # HEAD_ALONG_SUBLANE puts one page on one 128-lane tile. The other
+        # multiples of 128 belonged to the HND and PCP-streaming kernels.
         return [256]
 
 
@@ -739,19 +676,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "heads in the layer")
         # Cache the resolved config value during construction: compiled
         # forwards have no active vLLM config and must not look it up.
-        self.kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[get_current_vllm_config(
-        ).cache_config.get_resolved_kv_cache_layout()]
-        self._pool_is_seq_along_lane = (
-            isinstance(self, PallasBatchedRPAAttentionBackendImpl)
-            and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE)
+        self.kv_layout = _resolve_kv_layout()
         self.rpa_kernel = None
         # Populated by initialize_kernel() before torch.compile traces the
-        # model. Forward can then reuse the custom op without resolving a PCP
-        # mesh from inside Dynamo's fullgraph capture.
+        # model, so forward can reuse the custom op without rebuilding it from
+        # inside Dynamo's fullgraph capture.
         self._kernel_config_cache: dict = {}
-        # Set by initialize_kernel() when PCP routes this layer to the
-        # streaming kernel.
-        self._pcp_streaming = False
         # DCP (Decode Context Parallelism) state. Populated by initialize_kernel()
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
@@ -777,37 +707,33 @@ class PallasAttentionBackendImpl(AttentionImpl):
         k_scale: float | None,
         v_scale: float | None,
         skip_kv_update: bool = False,
-        use_pcp_streaming: bool = False,
-        cp_kv_cache_interleave_size: int = 0,
     ):
-        ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
-        max_model_len = (vllm_config.model_config.max_model_len
-                         if use_pcp_streaming and vllm_config is not None else
-                         None)
-        pcp_kv_layout = (self.kv_layout if use_pcp_streaming else
-                         batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE)
         config_key = (self._kernel_op_prefix, self.sliding_window, q_scale,
-                      k_scale, v_scale, use_pcp_streaming,
-                      cp_kv_cache_interleave_size, max_model_len,
-                      pcp_kv_layout, self.decode_query_size)
+                      k_scale, v_scale, skip_kv_update, self.decode_query_size)
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
             return existing
 
+        ctx = get_vllm_model_wrapper_context()
+        if self._kernel_op_prefix == _TOKAMAX_RPA_OP_PREFIX:
+            kernel = self._tokamax_rpa_closure(ctx, q_scale, k_scale, v_scale,
+                                               skip_kv_update)
+            # Cached per instance only. Sharing happens a level down: tokamax's
+            # operator is a process singleton that keys its compilations on the
+            # keyword arguments by value.
+            self._kernel_config_cache[config_key] = kernel
+            return kernel
+
         # Reuse an existing custom op if one with the same config already exists.
-        # `_kernel_op_prefix` is included so subclasses (e.g. the batched RPA
-        # variant) don't collide with the base impl in the shared registry.
-        # `skip_kv_update` is part of the key so KV-sharing (read-only) layers
-        # get their own kernel variant and never share an op with KV-owning
-        # layers of an otherwise-identical config.
-        mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(
-            ctx.mesh, use_pcp_streaming)
-        registry_key = (self._kernel_op_prefix,
-                        self.sliding_window, self.scale, self.logits_soft_cap,
-                        id(mesh), q_scale, k_scale, v_scale, skip_kv_update,
-                        use_pcp_streaming, cp_kv_cache_interleave_size,
-                        max_model_len, self.use_causal_mask, pcp_kv_layout,
+        # `_kernel_op_prefix` is included so variants (e.g. the runner's
+        # single-device local kernel) don't collide with the base impl in the
+        # shared registry. `skip_kv_update` is part of the key so KV-sharing
+        # (read-only) layers get their own kernel variant and never share an op
+        # with KV-owning layers of an otherwise-identical config.
+        mesh = ctx.mesh
+        registry_key = (self._kernel_op_prefix, self.sliding_window,
+                        self.scale, self.logits_soft_cap, id(mesh), q_scale,
+                        k_scale, v_scale, skip_kv_update, self.use_causal_mask,
                         self.decode_query_size)
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -817,40 +743,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
-        if use_pcp_streaming:
-            pcp_make_kwargs = dict(
-                mesh=mesh,
-                sliding_window=self.sliding_window,
-                sm_scale=self.scale,
-                soft_cap=self.logits_soft_cap,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                skip_kv_update=skip_kv_update,
-                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-                kv_layout=pcp_kv_layout,
-            )
-            wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
-        else:
-            entry_params = inspect.signature(self._kernel_entry).parameters
-            entry_kwargs = {}
-            if "kv_layout" in entry_params:
-                entry_kwargs["kv_layout"] = self.kv_layout
-            if "decode_query_size" in entry_params:
-                entry_kwargs["decode_query_size"] = self.decode_query_size
-            wrapped_fn = functools.partial(
-                self._kernel_entry,
-                mesh=mesh,
-                sliding_window=self.sliding_window,
-                sm_scale=self.scale,
-                soft_cap=self.logits_soft_cap,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                skip_kv_update=skip_kv_update,
-                use_causal_mask=self.use_causal_mask,
-                **entry_kwargs,
-            )
+        wrapped_fn = functools.partial(
+            self._kernel_entry,
+            mesh=mesh,
+            sliding_window=self.sliding_window,
+            sm_scale=self.scale,
+            soft_cap=self.logits_soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            skip_kv_update=skip_kv_update,
+            use_causal_mask=self.use_causal_mask,
+        )
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
@@ -861,41 +765,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # graph XLA rewires the alias, so donation is only safe when the op
         # is compiled.
         rpa_donate_argnums = (None if envs.TPU_KERNEL_ITER_MODE else (0, ))
-        if use_pcp_streaming:
-            rpa_kernel_op = pcp_streaming_jax_op(
-                op_name,
-                wrapped_fn,
-                donate_argnums=rpa_donate_argnums,
-                mesh=op_mesh,
-                input_partition_specs=input_partition_specs)
-            if envs.TPU_KERNEL_ITER_MODE:
-                from vllm_torchtpu.compilation import kernel_reload
-
-                def _rebuild_pcp_callable(name=op_name,
-                                          make_kwargs=pcp_make_kwargs,
-                                          op_mesh=op_mesh,
-                                          specs=input_partition_specs,
-                                          donate=rpa_donate_argnums):
-                    import importlib
-                    adapter = importlib.import_module(
-                        "vllm_torchtpu.kernels.experimental."
-                        "pcp_streaming_rpa.vllm_adapter")
-                    fn = adapter.make_pcp_streaming_rpa_kernel(**make_kwargs)
-                    return adapter.build_pcp_streaming_callable(
-                        name,
-                        fn,
-                        donate_argnums=donate,
-                        mesh=op_mesh,
-                        input_partition_specs=specs)
-
-                kernel_reload.register_builder(op_name, _rebuild_pcp_callable)
-        else:
-            rpa_kernel_op = pallas.jax_op(
-                op_name,
-                wrapped_fn,
-                donate_argnums=rpa_donate_argnums,
-                mesh=op_mesh,
-                input_partition_specs=(input_partition_specs))
+        rpa_kernel_op = pallas.jax_op(
+            op_name,
+            wrapped_fn,
+            donate_argnums=rpa_donate_argnums,
+        )
 
         # We must overwrite the default fake implementation as vLLM uses dynamic
         # dimensions for the query.
@@ -906,11 +780,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         rpa_kernel_op.register_fake(_fake_rpa_op)
 
         def rpa_kernel_impl(kv_cache, *args, **kwargs):
-            if use_pcp_streaming:
-                new_kv_cache, output = invoke_pcp_streaming_op(
-                    rpa_kernel_op, kv_cache, args, kwargs)
-            else:
-                new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
+            new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
             if new_kv_cache.shape != kv_cache.shape:
                 raise RuntimeError(
                     "RPA kernel returned an incompatible KV cache shape: "
@@ -925,6 +795,150 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_registry[registry_key] = rpa_kernel_impl
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
+
+    def _tokamax_rpa_closure(
+        self,
+        ctx,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool,
+    ):
+        """Validate this layer against tokamax's batched RPA and configure it.
+
+        Not a second builder: `_build_rpa_kernel` stays the only entry point
+        and owns the cache. This half holds the guards for everything
+        tokamax's operator cannot express and the keyword config derived from
+        the layer; `_tokamax_rpa_kernel` holds the call.
+        """
+        unsupported = []
+        if ctx.mesh.shape.get("model", 1) > 1:
+            # tokamax's torch operator registers itself once, at import, with
+            # no mesh and no `input_partition_specs`, so there is nothing to
+            # shard over and every rank would attend over every rank's heads.
+            # Multi-process TP, where each worker drives one chip and sees
+            # `model=1`, is unaffected.
+            unsupported.append(
+                f"{ctx.mesh.shape['model']} model-axis devices in one process")
+        if envs.TPU_KERNEL_ITER_MODE:
+            # tokamax donates the KV pool, so the second iteration of a timing
+            # loop would read a donated buffer.
+            unsupported.append("TPU_KERNEL_ITER_MODE (the pool is donated)")
+        if self.head_size == 64:
+            unsupported.append("head_dim 64 (the hd64 kernel and its pool)")
+        nhd = batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
+        if self.kv_layout is not nhd:
+            unsupported.append("VLLM_KV_CACHE_LAYOUT=HND")
+        if skip_kv_update:
+            # tokamax still lists `skip_kv_update` in `static_argnames` but
+            # never reads it, so a read-only layer would clobber its target's
+            # slots rather than attend without writing.
+            unsupported.append("Cross-layer KV sharing")
+        if self.decode_query_size != 1:
+            # `_fwd` pins the decode blocks to bq_sz=1.
+            unsupported.append(
+                f"decode_query_size={self.decode_query_size} "
+                "(speculative verify windows)")
+        if not self.use_causal_mask:
+            # `kernel/wrapper.py` raises for a non-causal mask mid-compile.
+            unsupported.append("use_causal_mask=False")
+        if unsupported:
+            raise NotImplementedError(
+                "tokamax's batched RPA operator does not support: "
+                f"{', '.join(unsupported)}.")
+
+        # Passed by value, because this tuple is tokamax's compilation cache
+        # key. `kv_layout` and `decode_query_size` are deliberately left at
+        # tokamax's defaults -- HEAD_ALONG_SUBLANE and 1 are exactly the only
+        # values the guards above let through.
+        config = dict(
+            use_causal_mask=self.use_causal_mask,
+            sm_scale=self.scale,
+            sliding_window=self.sliding_window,
+            soft_cap=self.logits_soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+        return self._tokamax_rpa_kernel(config, q_scale, k_scale, v_scale,
+                                        skip_kv_update)
+
+    def _tokamax_rpa_kernel(
+        self,
+        config: dict[str, Any],
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool,
+    ):
+        """Close over tokamax's batched RPA operator for this layer.
+
+        `PallasMosaicTpuBatchedRpa` is a process-wide singleton: it registers
+        itself with `pallas.jax_op` once, on import, and keys its compilations
+        on the argument shapes and the keyword config by value, so layers that
+        agree on both already share one kernel a level below this one. What is
+        left here is the writeback and a registry entry so the layers also
+        share this closure.
+
+        The pool crosses into the operator in the packed 5-D shape the runner
+        allocated, not folded onto tokamax's 4-D cache first: tokamax folds it
+        on the far side, inside the JAX trace, where the reshape is free. A
+        fold on this side would be a tensor of its own, and since the pool is
+        donated the operator would then reuse *that* buffer -- 40 GiB of extra
+        HBM temporaries per worker on a 397B-class model, which is enough to
+        fail the backbone compile outright.
+
+        Donation is also why the writeback below is a `copy_` into the tensor
+        the runner owns rather than a rebind: the buffer tokamax hands back is
+        the same one it was given.
+        """
+        # Imported lazily so a missing or moved tokamax surfaces here, against
+        # a concrete layer, rather than at module import.
+        from tokamax.experimental.torch_tpu.ops.batched_rpa import \
+            torch_pallas_mosaic_tpu as tokamax_rpa
+
+        registry_key = ("tokamax", self.sliding_window, self.scale,
+                        self.logits_soft_cap, q_scale, k_scale, v_scale,
+                        skip_kv_update, self.use_causal_mask,
+                        self.decode_query_size)
+        existing = self._kernel_registry.get(registry_key)
+        if existing is not None:
+            return existing
+
+        tokamax_batched_rpa = tokamax_rpa.PallasMosaicTpuBatchedRpa
+
+        def tokamax_rpa_kernel_impl(kv_cache, query, key, value, seq_lens,
+                                    block_tables, query_start_loc,
+                                    request_distribution, sinks):
+            if sinks is not None:
+                raise NotImplementedError(
+                    "Attention sinks are not in tokamax's batched RPA "
+                    "signature.")
+            outputs, new_kv_cache = tokamax_batched_rpa(
+                query,
+                key,
+                value,
+                kv_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                **config,
+            )
+            # Checked before the copy, which would otherwise fail with a shape
+            # error that says nothing about where the cache came from. Shapes
+            # are static here, so this costs nothing at run time.
+            if new_kv_cache.shape != kv_cache.shape:
+                raise RuntimeError(
+                    "tokamax returned an incompatible KV cache: expected "
+                    f"{tuple(kv_cache.shape)}, got "
+                    f"{tuple(new_kv_cache.shape)}.")
+            kv_cache.copy_(new_kv_cache)
+            return outputs
+
+        self._kernel_registry[registry_key] = tokamax_rpa_kernel_impl
+        return tokamax_rpa_kernel_impl
 
     def _run_dcp_forward(
         self,
@@ -951,34 +965,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             kv_layout=self.kv_layout,
         )
 
-    def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
-        unsupported_features = []
-        if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
-            if not isinstance(self, PallasBatchedRPAAttentionBackendImpl):
-                unsupported_features.append(
-                    "VLLM_KV_CACHE_LAYOUT=HND with a non-CUSTOM backend")
-            if self.kv_cache_quantized_dtype is None:
-                unsupported_features.append(
-                    "VLLM_KV_CACHE_LAYOUT=HND without an FP8 KV cache")
-        if self.sinks is not None:
-            unsupported_features.append("attention sinks")
-        if self.logits_soft_cap is not None:
-            unsupported_features.append("logits soft cap")
-        if skip_kv_update:
-            unsupported_features.append("skip_kv_update")
-        if unsupported_features:
-            raise NotImplementedError(
-                "PCP streaming attention does not support: "
-                f"{', '.join(unsupported_features)}.")
-
-    @staticmethod
-    def _select_kernel_mesh(default_mesh, use_pcp_streaming: bool):
-        if not use_pcp_streaming:
-            return default_mesh, None, None
-
-        pcp_mesh = get_pcp_streaming_mesh()
-        return pcp_mesh, pcp_mesh, PCP_STREAMING_RPA_INPUT_PARTITION_SPECS
-
     def _build_bundled_kernel(
         self,
         q_scale: float | None,
@@ -991,10 +977,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         `layer_idx` scalar. Layers sharing identical kernel configurations reuse
         the cached op via `_bundled_kernel_registry`.
         """
-        # Fail closed when the layer-major kernel is overridden (e.g. subclass
-        # ClassVar like batched RPA, or per-instance rebinds like single-device
-        # local kernels) without a corresponding bundled counterpart, preventing
-        # silent fallback to default kernels. Read via `self` to detect instance overrides.
+        # The batched impl carries no `_kernel_entry` of its own -- its layer-
+        # major kernel is tokamax's, reached by op prefix -- so the identity
+        # check below would not notice it and block-major KV would silently run
+        # the *default* bundled kernel. Refuse by type first.
+        if isinstance(self, PallasBatchedRPAAttentionBackendImpl):
+            raise NotImplementedError(
+                "VLLM_TPU_BLOCK_MAJOR_KV=1: tokamax's batched RPA operator "
+                "has no bundled variant; refusing to fall back to the "
+                "default bundled kernel.")
+        # Fail closed when the layer-major kernel is overridden (per-instance
+        # rebinds like single-device local kernels) without a corresponding
+        # bundled counterpart, preventing silent fallback to default kernels.
+        # Read via `self` to detect instance overrides.
         if (self._kernel_entry is not PallasAttentionBackendImpl._kernel_entry
                 and self._kernel_entry_bundled
                 is PallasAttentionBackendImpl._kernel_entry_bundled):
@@ -1106,34 +1101,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
         pcp_configured = (parallel_config is not None and
                           parallel_config.prefill_context_parallel_size > 1)
         if pcp_configured:
-            self._validate_pcp_streaming_support(skip_kv_update)
-            self.decode_query_size = 1
-            self._pcp_streaming = True
-            self.rpa_kernel = self._build_rpa_kernel(
-                q_scale,
-                k_scale,
-                v_scale,
-                skip_kv_update=skip_kv_update,
-                use_pcp_streaming=True,
-                cp_kv_cache_interleave_size=parallel_config.
-                cp_kv_cache_interleave_size,
-            )
-            return
+            raise NotImplementedError(
+                "Prefill context parallelism needs the streaming RPA kernel, "
+                "which was removed along with the in-tree batched RPA "
+                "kernels; tokamax has no streaming variant.")
 
         dcp_configured = (parallel_config is not None and getattr(
             parallel_config, 'decode_context_parallel_size', 1) > 1)
         if dcp_configured:
             # TODO(kwang3939): forward decode_query_size to the DCP ops
             self.decode_query_size = 1
-            # These backends allocate NHD even when the global layout is HND.
-            # Passing HND to LONGCTX would reinterpret the physical KV pool.
-            if (self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-                    and
-                (not isinstance(self, PallasBatchedRPAAttentionBackendImpl)
-                 or self.head_size == 64)):
+            # Every backend now allocates the NHD pool, so passing HND to the
+            # DCP kernels would reinterpret the physical KV pool. This used to
+            # be reachable on the CUSTOM backend, which allocated its own HND
+            # pool; that shape override is gone with the in-tree kernel.
+            if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
                 raise NotImplementedError(
-                    "DCP with HND requires the CUSTOM attention backend "
-                    "and head_size != 64.")
+                    "DCP with VLLM_KV_CACHE_LAYOUT=HND is not supported: the "
+                    "KV pool is allocated NHD.")
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
@@ -1156,21 +1141,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                                  skip_kv_update=skip_kv_update)
 
     def runs_batched_rpa_schedule(self) -> bool:
-        """Whether forward runs the batched RPA kernel, which keeps a whole
-        step's (query block, KV block) schedule in SMEM. The PCP streaming
-        kernel, the DCP kernels, the long-context fork, the head-dim-64
-        kernel and the bundled kernel keep no such table."""
-        # TODO(#1015): remove, with the runner's schedule check, once the
-        # batched RPA kernel enforces its own schedule bound.
-        other_kernel = (
-            self._pcp_streaming  # PCP: the streaming kernel
-            or self.dcp_world_size > 1  # DCP: the long-context kernels
-            or self.rpa_kernel_bundled is not None  # block-major KV: bundled
-            or envs.USE_BATCHED_RPA_LONGCTX  # the long-context fork
-            or self.head_size == 64  # the head-dim-64 kernel (see use_hd64)
-        )
-        return (self._kernel_entry is _pallas_rpa_kernel_batched
-                and not other_kernel)
+        """Whether forward runs a kernel that keeps a whole step's (query
+        block, KV block) schedule in SMEM, which the runner bounds.
+
+        Always False now: the only remaining batched RPA implementation is
+        tokamax's, which spills its schedule to HBM. Kept because the runner
+        calls it.
+        """
+        return False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         """Process sinks after model loading - convert to float32 as required by RPA kernel."""
@@ -1202,9 +1180,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
                  kv_packing, padded_head_size] (preferred)
                 or legacy 4D
                 [num_blocks, block_size, num_kv_heads_x2, padded_head_size]
-                or, under SEQ_ALONG_LANE,
-                [num_blocks, num_kv_heads_x2, padded_head_size // kv_packing,
-                 kv_packing, block_size]
             attn_metadata: Metadata for attention.
             output: buffer written in place, shape
                 = [num_tokens, num_heads, head_size_v]
@@ -1255,11 +1230,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Only the head dim is reconciled. A layer whose `num_kv_heads`
         # disagrees with the pool's would write the wrong slots and padding
         # cannot fix that, so the two must already agree.
-        # SEQ_ALONG_LANE ends in page_size; its head_dim words are dims 2-3.
-        if self._pool_is_seq_along_lane:
-            pool_head_dim = kv_cache.shape[2] * kv_cache.shape[3]
-        else:
-            pool_head_dim = kv_cache.shape[-1]
+        pool_head_dim = kv_cache.shape[-1]
         if pool_head_dim > self.head_size:
             pad_size = pool_head_dim - self.head_size
             query = torch.nn.functional.pad(query, (0, pad_size))
@@ -1276,9 +1247,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
-        parallel_config = (None if vllm_config is None else
-                           vllm_config.parallel_config)
 
         if self.dcp_world_size > 1:
             if sink is not None or ctx.kv_cache_bundle is not None:
@@ -1296,26 +1264,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 output.copy_(outputs)
             return outputs
 
-        use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
-        pcp_configured = (parallel_config is not None and
-                          parallel_config.prefill_context_parallel_size > 1)
-        if pcp_configured and not use_pcp_streaming:
-            raise RuntimeError(
-                "PCP is configured, but attention metadata does not use "
-                "the PCP streaming sequence layout.")
         skip_kv_update = self.kv_sharing_target_layer_name is not None
-        if use_pcp_streaming:
-            self._validate_pcp_streaming_support(skip_kv_update)
-        cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size
-            if use_pcp_streaming else 0)
         rpa_kernel = self._build_rpa_kernel(
             None,
             layer._k_scale_float if self.kv_cache_quantized_dtype else None,
             layer._v_scale_float if self.kv_cache_quantized_dtype else None,
             skip_kv_update=skip_kv_update,
-            use_pcp_streaming=use_pcp_streaming,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
         # TODO (geyuhao) the support of this API is pending discussion.
@@ -1329,10 +1283,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # updates to the full bundle. During profile_run, `ctx.kv_cache_bundle` is None;
         # Dynamo guards on this check trigger retracing once the bundle is initialized.
         if ctx.kv_cache_bundle is not None:
-            if use_pcp_streaming or skip_kv_update:
+            if skip_kv_update:
                 raise NotImplementedError(
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA path does "
-                    "not support PCP streaming or KV sharing")
+                    "not support KV sharing")
             outputs = self.rpa_kernel_bundled(
                 ctx.kv_cache_bundle,
                 self._bundle_layer_idx_tensor,
@@ -1377,19 +1331,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
 
 class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
-    """Impl variant that dispatches to the batched RPA Pallas kernel."""
-    _kernel_entry = staticmethod(_pallas_rpa_kernel_batched)
-    _kernel_op_prefix = "pallas::rpa_kernel_batched"
+    """Marker impl for the CUSTOM backend; the kernel itself is tokamax's.
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        vllm_config = get_current_vllm_config_or_none()
-        spec = vllm_config.speculative_config if vllm_config else None
-        # Run K + 1 verify tokens in the DECODE stage.
-        # head_dim 64 is rerouted to the hd64 kernel.
-        if (spec is not None and envs.USE_BATCHED_RPA_LONGCTX
-                and self.head_size != 64):
-            self.decode_query_size = spec.num_speculative_tokens + 1
+    It exists so the backend and `_build_bundled_kernel` have something to
+    dispatch on. `_build_rpa_kernel` routes on `_kernel_op_prefix` rather than
+    on this type, because the runner rebinds the prefix per instance.
+    """
+    _kernel_op_prefix = _TOKAMAX_RPA_OP_PREFIX
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)
