@@ -233,23 +233,64 @@ def _reorder_collective_output_to_pcp_rank(
     return blocks.reshape(tensor.shape)
 
 
-def _select_replicated_shard_by_mesh_coordinate(
+def _place_head_shards_in_collective_order(
     tensor: jnp.ndarray,
+    mesh_coordinate_by_pcp_rank: tuple[int, ...],
+    *,
+    axis: int,
+) -> jnp.ndarray:
+    """Reorder head-shard blocks so a collective delivers them by PCP rank.
+
+    Every collective here splits ``axis`` into one block per participant and
+    routes block ``p`` to mesh coordinate ``p``. PCP rank ``r`` answers to mesh
+    coordinate ``mesh_coordinate_by_pcp_rank[r]``, so to hand head shard ``h``
+    to PCP rank ``h`` the block has to sit at slot
+    ``mesh_coordinate_by_pcp_rank[h]``. That is a gather by the inverse map.
+
+    Without this the shard a rank ends up owning is its mesh coordinate, which
+    is what the GDN state cache slot -- indexed by PCP rank -- disagrees with.
+    """
+    pcp_size = len(mesh_coordinate_by_pcp_rank)
+    if tuple(mesh_coordinate_by_pcp_rank) == tuple(range(pcp_size)):
+        return tensor
+    if axis < 0:
+        axis += tensor.ndim
+    if tensor.shape[axis] % pcp_size != 0:
+        raise ValueError(
+            f"Cannot split axis {axis} of {tensor.shape} into {pcp_size}.")
+    pcp_rank_by_mesh_coordinate = [0] * pcp_size
+    for pcp_rank, mesh_coordinate in enumerate(mesh_coordinate_by_pcp_rank):
+        pcp_rank_by_mesh_coordinate[mesh_coordinate] = pcp_rank
+    shard_size = tensor.shape[axis] // pcp_size
+    blocks = tensor.reshape(*tensor.shape[:axis], pcp_size, shard_size,
+                            *tensor.shape[axis + 1:])
+    blocks = jnp.take(blocks,
+                      jnp.asarray(pcp_rank_by_mesh_coordinate,
+                                  dtype=jnp.int32),
+                      axis=axis)
+    return blocks.reshape(tensor.shape)
+
+
+def _select_replicated_shard_for_pcp_rank(
+    tensor: jnp.ndarray,
+    mesh_coordinate_by_pcp_rank: tuple[int, ...],
     pcp_axis: str,
     pcp_size: int,
     *,
     axis: int,
 ) -> jnp.ndarray:
-    """Select this device's shard without emitting axis_index/partitionId.
+    """Select this PCP rank's shard without emitting axis_index/partitionId.
 
-    The shard is chosen by mesh coordinate, not by PCP rank: all_to_all hands
-    participant ``p`` the ``p``-th split, and ``p`` is a mesh coordinate. Any
-    consumer of the result is therefore in mesh-coordinate space too.
+    all_to_all hands participant ``p`` the ``p``-th split and ``p`` is a mesh
+    coordinate, so the blocks are pre-placed in collective order first; the
+    shard that comes back is then this device's PCP rank shard.
     """
     if axis < 0:
         axis += tensor.ndim
     assert tensor.shape[axis] % pcp_size == 0
     shard_size = tensor.shape[axis] // pcp_size
+    tensor = _place_head_shards_in_collective_order(
+        tensor, mesh_coordinate_by_pcp_rank, axis=axis)
     # Every device starts with the same replicated full tensor. all_to_all
     # routes split ``p`` to mesh coordinate ``p``; because all inputs are
     # equal, each device receives pcp_size copies of its own shard. Taking the
@@ -260,6 +301,25 @@ def _select_replicated_shard_by_mesh_coordinate(
                                    concat_axis=axis,
                                    tiled=True)
     return jax.lax.dynamic_slice_in_dim(exchanged, 0, shard_size, axis=axis)
+
+
+def _select_replicated_shard_by_mesh_coordinate(
+    tensor: jnp.ndarray,
+    pcp_axis: str,
+    pcp_size: int,
+    *,
+    axis: int,
+) -> jnp.ndarray:
+    """Select this device's shard, named by mesh coordinate.
+
+    Kept for the PCP paths that have not been moved to PCP-rank head shards
+    yet; their kernels still address head shards by mesh coordinate.
+    """
+    return _select_replicated_shard_for_pcp_rank(tensor,
+                                                 tuple(range(pcp_size)),
+                                                 pcp_axis,
+                                                 pcp_size,
+                                                 axis=axis)
 
 
 def _reorder_gdn_qkv_for_pcp(
@@ -1144,8 +1204,13 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         # to request-major order before the GDN schedule consumes it.
         local_ba = jnp.stack((local_b, local_a),
                              axis=-1).reshape(local_b.shape[0], -1)
+        # The exchange routes head-shard block p to mesh coordinate p; place
+        # the blocks so head shard h reaches PCP rank h instead.
         packed_ba_shard = _exchange_pcp_token_shards_for_head_shards(
-            local_ba, pcp_axis, pcp_size)
+            _place_head_shards_in_collective_order(local_ba,
+                                                   mesh_coordinate_by_pcp_rank,
+                                                   axis=-1), pcp_axis,
+            pcp_size)
         # The exchange above is a collective, so it stacked the senders in
         # mesh-coordinate order; the reorder below is expressed by PCP rank.
         packed_ba_shard = _reorder_collective_output_to_pcp_rank(
@@ -1176,8 +1241,12 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             d_v=d_v,
             axis=0,
         )
-        weight_shard = _select_replicated_shard_by_mesh_coordinate(
-            conv_weight_interleaved, pcp_axis, pcp_size, axis=0)
+        weight_shard = _select_replicated_shard_for_pcp_rank(
+            conv_weight_interleaved,
+            mesh_coordinate_by_pcp_rank,
+            pcp_axis,
+            pcp_size,
+            axis=0)
         if conv_bias_ is None:
             bias_shard = None
         else:
@@ -1188,16 +1257,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
                 d_v=d_v,
                 axis=0,
             )
-            bias_shard = _select_replicated_shard_by_mesh_coordinate(
-                conv_bias_interleaved, pcp_axis, pcp_size, axis=0)
-        A_shard = _select_replicated_shard_by_mesh_coordinate(A_log_,
-                                                              pcp_axis,
-                                                              pcp_size,
-                                                              axis=0)
-        dt_shard = _select_replicated_shard_by_mesh_coordinate(dt_bias_,
-                                                               pcp_axis,
-                                                               pcp_size,
-                                                               axis=0)
+            bias_shard = _select_replicated_shard_for_pcp_rank(
+                conv_bias_interleaved,
+                mesh_coordinate_by_pcp_rank,
+                pcp_axis,
+                pcp_size,
+                axis=0)
+        A_shard = _select_replicated_shard_for_pcp_rank(
+            A_log_, mesh_coordinate_by_pcp_rank, pcp_axis, pcp_size, axis=0)
+        dt_shard = _select_replicated_shard_for_pcp_rank(
+            dt_bias_, mesh_coordinate_by_pcp_rank, pcp_axis, pcp_size, axis=0)
 
         if weight_shard.shape[0] != local_conv_dim:
             raise ValueError("GDN PCP conv weights must be PCP-local after "

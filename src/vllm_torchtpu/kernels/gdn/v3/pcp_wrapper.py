@@ -332,7 +332,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 ],
                 dst_ref=packed_out_ref.at[
                     pl.ds(dst_row, local_rows),
-                    mesh_coordinate,
+                    pcp_rank,
                     :,
                     :,
                 ],
@@ -347,7 +347,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
                 ],
                 dst_ref=packed_out_ref.at[
                     pl.ds(dst_row, remote_rows),
-                    mesh_coordinate,
+                    pcp_rank,
                     :,
                     :,
                 ],
@@ -430,10 +430,10 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         slot,
         destination: int,
     ) -> None:
-        # `destination` selects a head shard, so it is already the mesh
-        # coordinate of the device that owns it; only the rows being sent are
-        # indexed by PCP rank.
-        is_local = mesh_coordinate == destination
+        # `destination` selects a head shard, and head shard h is owned by PCP
+        # rank h, which answers to mesh_coordinate_by_pcp_rank[h].
+        destination_coordinate = mesh_coordinate_by_pcp_rank[destination]
+        is_local = mesh_coordinate == destination_coordinate
         valid_rows = stage_metadata_ref.rank_valid_rows[stage, pcp_rank]
         src_row = stage_metadata_ref.rank_row_start[stage, pcp_rank]
         src_prefix = lax.rem(src_row, _TPU_TILE_ROWS)
@@ -484,7 +484,7 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             device_id=_mesh_device_id(
                 mesh_axis_names,
                 pcp_axis_name,
-                destination,
+                destination_coordinate,
             ),
             device_id_type=pl.DeviceIdType.MESH,
         ).start()

@@ -236,17 +236,49 @@ def test_host_built_tables_are_never_indexed_by_the_mesh_coordinate(table):
                   "was renamed or dropped, so update this list.")
 
 
-def test_the_head_shard_column_stays_a_mesh_coordinate():
-    # The counter-rule. packed_out's second axis is a head shard, and head
-    # shards are handed out by the all_to_all in
-    # _select_replicated_shard_by_mesh_coordinate, which assigns them by mesh
-    # coordinate. Rewriting this one to pcp_rank would introduce the same
-    # class of bug in the opposite direction.
+def test_the_head_shard_column_is_a_pcp_rank():
+    # packed_out's second axis is a head shard, and head shard h is owned by
+    # PCP rank h: the replicated per-head inputs are pre-placed in collective
+    # order so the all_to_all hands each device its own PCP rank's shard. The
+    # GDN state cache slot is indexed by PCP rank too, so if this column ever
+    # goes back to `mesh_coordinate` the two disagree and every rank whose
+    # mesh coordinate differs from its PCP rank silently keeps the wrong
+    # head shard's conv and recurrent state.
     subscripts = list(_subscripts(_wrapper_source(), "packed_out_ref.at"))
     assert subscripts, "packed_out_ref.at[...] not found; update this test"
-    assert any(re.search(r"\bmesh_coordinate\b", s) for s in subscripts), (
-        "packed_out_ref's head-shard column must stay indexed by "
-        "`mesh_coordinate`, not by `pcp_rank`.")
+    indexed = [s for s in subscripts if re.search(r"\bpcp_rank\b", s)]
+    assert indexed, ("packed_out_ref's head-shard column must be indexed by "
+                     "`pcp_rank`, not by `mesh_coordinate`.")
+    for subscript in subscripts:
+        assert not re.search(r"\bmesh_coordinate\b", subscript), (
+            f"packed_out_ref.at[{subscript}] indexes its head-shard column "
+            "by `mesh_coordinate`; head shards are owned by PCP rank.")
+
+
+def test_head_shards_are_placed_so_the_collective_delivers_by_pcp_rank():
+    # The whole point of the placement: a collective routes split p to mesh
+    # coordinate p, so head shard h has to sit at slot
+    # mesh_coordinate_by_pcp_rank[h] for PCP rank h to receive it.
+    order = _MEASURED_DEVICE_ORDER
+    pcp_size = len(order)
+    # One row per head shard, labelled by the head shard it belongs to.
+    tensor = jnp.repeat(jnp.arange(pcp_size, dtype=jnp.int32), 3)[None, :]
+    placed = gdn_attention._place_head_shards_in_collective_order(
+        tensor, order, axis=-1)
+    blocks = placed.reshape(1, pcp_size, 3)
+    for pcp_rank, mesh_coordinate in enumerate(order):
+        got = set(blocks[0, mesh_coordinate].tolist())
+        assert got == {pcp_rank}, (
+            f"slot {mesh_coordinate} is routed to PCP rank {pcp_rank}, so it "
+            f"must carry head shard {pcp_rank}; it carries {sorted(got)}.")
+
+
+def test_head_shard_placement_is_a_no_op_under_an_identity_map():
+    tensor = jnp.arange(16, dtype=jnp.int32)[None, :]
+    got = gdn_attention._place_head_shards_in_collective_order(tensor,
+                                                               tuple(range(8)),
+                                                               axis=-1)
+    assert got is tensor
 
 
 def test_peer_addressing_goes_through_the_partition_order():
