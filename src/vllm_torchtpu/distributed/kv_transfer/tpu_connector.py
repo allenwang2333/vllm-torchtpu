@@ -2035,6 +2035,20 @@ class TPURaidenConnectorWorker:
 
         return int(get_pcp_cache_rank())
 
+    def _local_state_shard_rank(self) -> int:
+        """Which GDN head shard this worker computed.
+
+        The pooled PCP kernel selects its conv/A_log/dt_bias shard so that PCP
+        rank ``r`` owns head shard ``r``, so the destination offset for this
+        worker's state is its PCP rank -- not the device-order index the
+        attention pages are laid out by.
+        """
+        if not self.is_producer:
+            return 0
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
+        return int(get_pcp_rank())
+
     def _raiden_engine_id(self) -> str:
         env_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
         if env_id:
@@ -2448,6 +2462,13 @@ class TPURaidenConnectorWorker:
         pipeline = _engine_is_pipeline(self.vllm_config)
         lowering_parallelism = 1 if pipeline else parallelism
         lowering_rank = 0 if pipeline else transfer_rank
+        # The two payloads are laid out by different numberings. Attention
+        # pages are written by the PCP streaming kernel, which names peers by
+        # the device order lax.axis_index reports; the GDN head shard is
+        # selected by PCP rank. One transfer rank cannot describe both, and
+        # using either one alone scatters the other payload into a peer's
+        # span.
+        state_lowering_rank = 0 if pipeline else self._local_state_shard_rank()
 
         now = time.perf_counter()
         expired_terminal_req_ids = [
@@ -2552,7 +2573,7 @@ class TPURaidenConnectorWorker:
                 pool_spans.extend(
                     self._stage3_state_pool_spans(
                         getattr(req_meta, "mamba_state_block_ids", None),
-                        lowering_rank, lowering_parallelism))
+                        state_lowering_rank, lowering_parallelism))
                 facade.register_request_blocks(
                     req_id=req_id,
                     uuid=uuid,

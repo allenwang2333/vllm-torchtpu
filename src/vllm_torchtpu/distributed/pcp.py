@@ -6,11 +6,19 @@ from typing import Any
 
 import torch
 
+from vllm.logger import init_logger
+
 from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,
                                                   get_cp_group_layout,
                                                   get_or_create_cp_mesh)
 
+logger = init_logger(__name__)
+
 PcpGroupLayout = CpGroupLayout
+
+# The cache rank is asked for on every transfer; log the two candidate
+# numberings once per worker so a divergence is visible instead of silent.
+_CACHE_RANK_LOGGED = False
 
 
 def get_pcp_group() -> Any | None:
@@ -60,6 +68,13 @@ def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
 def get_pcp_cache_rank() -> int:
     """
     Index of the PCP chunk whose KV this worker's device physically holds.
+
+    This is the device-order index, which is what ``lax.axis_index`` reports
+    inside an exported kernel -- measured on a tpu7x-8 pod, PCP ranks 0..7 see
+    0, 1, 2, 3, 6, 7, 4, 5. The attention pages are laid out by that numbering,
+    so their byte spans use it. The GDN head shard is numbered by PCP rank
+    instead; that one goes through
+    ``TPUConnectorWorker._local_state_shard_rank``.
     """
     from torch_tpu._internal.distributed import tpu_distributed
     group = get_pcp_group()
@@ -83,7 +98,16 @@ def get_pcp_cache_rank() -> int:
         raise RuntimeError(
             f"This worker's TPU device id {device_id} is not in torch_tpu's "
             f"device list {device_ids}.")
-    return device_ids.index(device_id)
+    cache_rank = device_ids.index(device_id)
+    global _CACHE_RANK_LOGGED
+    if not _CACHE_RANK_LOGGED:
+        _CACHE_RANK_LOGGED = True
+        logger.info(
+            "PCP cache rank | device_order=%d rank_in_group=%d device_id=%d "
+            "device_ids=%s%s", cache_rank, int(group.rank_in_group), device_id,
+            device_ids, "" if cache_rank == int(group.rank_in_group) else
+            "  <- the two numberings differ on this layout")
+    return cache_rank
 
 
 def get_pcp_group_layout() -> PcpGroupLayout:
