@@ -34,8 +34,8 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu.layers.adapter.attention import (
-    PallasAttentionBackend, PallasBatchedRPAAttentionBackend,
-    PallasMLAttentionBackend)
+    PallasAttentionBackend, PallasBatchedRPAAttentionBackend)
+from vllm_torchtpu.layers.adapter.mla_attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import \
     AttentionMetadataBuilder
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform

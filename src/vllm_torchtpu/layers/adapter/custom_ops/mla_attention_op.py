@@ -47,9 +47,10 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
-from vllm_torchtpu.layers.adapter.attention import (
-    TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
+from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.mla_attention import \
+    VllmTPUDeepseekV32IndexerBackend
 from vllm_torchtpu.layers.adapter.quantization.configs import \
     should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata

@@ -3,6 +3,7 @@
 # this module must be imported before any model is constructed.
 from vllm_torchtpu.layers.adapter import attention as attention
 from vllm_torchtpu.layers.adapter import linear as linear
+from vllm_torchtpu.layers.adapter import mla_attention as mla_attention
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.tokenizers import register_tokenizers
 

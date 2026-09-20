@@ -42,8 +42,8 @@ from vllm_torchtpu.kv_cache_materializer import (
     materialize_kv_cache_tensors)
 from vllm_torchtpu.kv_cache_spec_normalizer import \
     normalize_kv_cache_specs_for_tpu
-from vllm_torchtpu.layers.adapter.attention import (PallasAttentionBackend,
-                                                    PallasMLAttentionBackend)
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.mla_attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import \
     AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger

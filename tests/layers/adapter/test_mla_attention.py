@@ -20,11 +20,11 @@ import torch
 from vllm.model_executor.layers.mla import MLAModules
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.attention import (
-    PallasMLAttentionBackend, PallasMLAttentionBackendImpl)
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMLAAttention, VllmMultiHeadLatentAttentionWrapper)
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.mla_attention import (
+    PallasMLAttentionBackend, PallasMLAttentionBackendImpl)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import \
     VllmFp8LinearMethodTPU
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
@@ -199,7 +199,8 @@ def test_tpu_platform_mla_backend():
     cls_name = TpuPlatform.get_attn_backend_cls(
         selected_backend=MagicMock(),
         attn_selector_config=attn_selector_config)
-    assert cls_name == "vllm_torchtpu.layers.adapter.attention.PallasMLAttentionBackend"
+    assert cls_name == (
+        "vllm_torchtpu.layers.adapter.mla_attention.PallasMLAttentionBackend")
 
 
 def test_vllm_fp8_linear_method_tpu():

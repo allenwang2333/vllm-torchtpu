@@ -2078,9 +2078,9 @@ def test_packed_kda_keeps_parameter_abi_across_token_buckets(monkeypatch):
 
 
 def test_mla_keeps_weight_cache_abi_across_token_buckets(monkeypatch):
-    from vllm_torchtpu.layers.adapter.attention import \
-        PallasMLAttentionBackendImpl
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla
+    from vllm_torchtpu.layers.adapter.mla_attention import \
+        PallasMLAttentionBackendImpl
 
     @torch.library.custom_op('kimi_abi_test::latent_attention',
                              mutates_args=())

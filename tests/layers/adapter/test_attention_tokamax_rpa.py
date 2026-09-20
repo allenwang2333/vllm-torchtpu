@@ -19,6 +19,8 @@ is the one that needs a TPU and skips without one.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -31,6 +33,7 @@ from vllm import envs as vllm_envs
 
 from vllm_torchtpu.kernels.experimental.batched_rpa.configs import KVLayout
 from vllm_torchtpu.layers.adapter import attention as attn
+from vllm_torchtpu.layers.adapter import mla_attention as mla_attn
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend, PallasAttentionBackendImpl,
     PallasBatchedRPAAttentionBackend, PallasBatchedRPAAttentionBackendImpl,
@@ -821,13 +824,63 @@ def test_default_backend_still_uses_the_in_tree_kernel():
 
 
 def test_attention_module_no_longer_imports_streaming_rpa_entry_points():
-    """Only the generic `jax_op` helper survives, for sparse-MLA DCP."""
+    """Nothing from the PCP streaming package is left in `attention`.
+
+    The generic `jax_op` helper does survive, but in `mla_attention`: its one
+    remaining caller is the sparse-MLA DCP op, which moved there with the rest
+    of MLA.
+    """
     module = sys.modules[attn.__name__]
-    assert hasattr(module, "pcp_streaming_jax_op")
-    for name in ("pcp_streaming_ragged_paged_attention",
+    for name in ("pcp_streaming_jax_op",
+                 "pcp_streaming_ragged_paged_attention",
                  "is_pcp_streaming_attention_metadata",
                  "ragged_paged_attention_batched"):
         assert not hasattr(module, name)
+    assert hasattr(mla_attn, "pcp_streaming_jax_op")
+
+
+def _imported_modules(module) -> set[str]:
+    """Every module name `module` imports, from its source rather than its
+    globals -- a `from x import y` binds `y`, not `x`."""
+    names = set()
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def test_mla_lives_in_its_own_module():
+    """`attention` is the RPA half only -- MLA shares no kernel with it."""
+    module = sys.modules[attn.__name__]
+    for name in ("PallasMLAttentionBackend", "PallasMLAttentionBackendImpl",
+                 "VllmTPUDeepseekV32IndexerBackend", "mla_attention",
+                 "mla_v2_kernel", "SparseMLAKVCacheSpec"):
+        assert not hasattr(module, name)
+
+    # The dependency runs one way only: MLA reuses the KV dtype/page helpers,
+    # `attention` reaches for nothing in return. A cycle here would break the
+    # import that `layers/__init__` does for the registration side effects.
+    assert mla_attn.get_dtype_packing is attn.get_dtype_packing
+    assert mla_attn.get_tpu_min_page_size is attn.get_tpu_min_page_size
+    assert not any(
+        m.startswith("vllm_torchtpu.layers.adapter.mla_attention")
+        for m in _imported_modules(module))
+
+
+def test_both_backends_register_under_their_own_module():
+    """vLLM instantiates a backend from the path `register_backend` recorded,
+    so moving a class rewrites a string the platform hands back."""
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    assert AttentionBackendEnum.FLASH_ATTN.get_path().startswith(
+        "vllm_torchtpu.layers.adapter.attention.")
+    assert AttentionBackendEnum.CUSTOM.get_path().startswith(
+        "vllm_torchtpu.layers.adapter.attention.")
+    assert (AttentionBackendEnum.FLASH_ATTN_MLA.get_path() ==
+            "vllm_torchtpu.layers.adapter.mla_attention."
+            "PallasMLAttentionBackend")
 
 
 # =========================================================================
