@@ -27,7 +27,7 @@ def _get_padded_bucket(val: int, buckets: tuple[int, ...]) -> int:
     for b in buckets:
         if val <= b:
             return b
-    return ((val + 63) // 64) * 64
+    return 1 << (val - 1).bit_length()  # power-of-2 growth past the declared buckets
 
 
 def _is_gemma4_model(model_config: Optional["ModelConfig"]) -> bool:
@@ -717,13 +717,12 @@ def maybe_patch_gemma4(
         hidden_size = int(self.config.text_config.hidden_size)
 
         with torch.no_grad():
-            # 1. Pre-warm _audio_tower_and_embed across all 5 frame buckets (512, 832, 1024, 2048, 3072)
-            bucket_plan = (
-                (512, (1, 2, 4, 8, 16)),
-                (832, (1, 2, 4, 8, 16)),
-                (1024, (1, 2, 4, 8)),
-                (2048, (1, 2, 4, 8)),
-                (3072, (1, 2, 4)),
+            # 1. Pre-warm _audio_tower_and_embed over the full (batch, frame) cross
+            #    product. Pad-to-max lets one long clip set T while short clips set B,
+            #    so any (B, T) pair is reachable; a partial plan leaves holes that
+            #    compile synchronously inside execute_model and stall the engine.
+            bucket_plan = tuple(
+                (t_bkt, _AUDIO_BATCH_BUCKETS) for t_bkt in _AUDIO_FRAME_BUCKETS
             )
             sample_parent_flat = None
             for t_bkt, b_buckets in bucket_plan:
