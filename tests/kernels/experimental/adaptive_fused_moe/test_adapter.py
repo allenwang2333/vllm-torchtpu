@@ -187,10 +187,15 @@ def test_built_bridge_calls_experimental_kernel_and_separates_formats(
 
     def create(name, fn, **kwargs):
         op = Mock()
+        from jax.sharding import PartitionSpec
+        assert kwargs["input_partition_specs"] == (PartitionSpec(
+            bridge.EP_AXIS_NAME), ) * 7
+        assert kwargs["output_partition_specs"] == PartitionSpec(
+            bridge.EP_AXIS_NAME)
         built.append((name, fn, op))
         return op
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", create)
+    monkeypatch.setattr(bridge, "jax_op", create)
     mesh = object()
     first = bridge._build_op(mesh, 2, True, "silu", None, "fp4", 64)
     second = bridge._build_op(mesh, 2, True, "silu", None, "fp8", None)
@@ -231,7 +236,7 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(
         functions.append(fn)
         return Mock()
 
-    monkeypatch.setattr(bridge, "sharded_jax_op", create)
+    monkeypatch.setattr(bridge, "jax_op", create)
     mesh = object()
     groups = ((1, 0), )
     original = bridge._build_op(mesh, 2, True, "silu", None)

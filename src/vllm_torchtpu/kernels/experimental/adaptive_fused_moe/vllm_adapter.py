@@ -28,13 +28,13 @@ import jax.numpy as jnp
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 from vllm.config import get_current_vllm_config
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (EP_AXIS_NAME, build_ep_mesh,
                                                ep_mesh_index, ep_rank_order,
                                                ep_token_replica_groups)
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental import \
     adaptive_fused_moe as adaptive_kernel
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
@@ -459,11 +459,8 @@ def _build_op(
         )
 
     spec = PartitionSpec(EP_AXIS_NAME)
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
-    op = sharded_jax_op(
+    # Native TorchTPU sizes each rank's output from output_partition_specs.
+    op = jax_op(
         name,
         moe,
         mesh=mesh,
@@ -473,10 +470,8 @@ def _build_op(
         output_partition_specs=spec,
     )
 
-    # Deliberately replaces the shard-aware fake `sharded_jax_op` installed,
-    # which resolves the output aval by running a real `jax.export` every time
-    # Dynamo traces the op. This kernel returns the rows it was given, so the
-    # answer is known without exporting for it.
+    # The output shape is known without exporting the kernel during Dynamo
+    # tracing; native runtime allocation still uses the explicit output spec.
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 
