@@ -646,14 +646,21 @@ def _mla_ragged_paged_attention_kernel(
                 m_curr = jnp.maximum(m_curr, jnp.max(s_part, axis=1, keepdims=True))
                 s_list.append(s_part)
         else:
-            q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-            k = jnp.concatenate([kv_c, k_pe],
-                                axis=-1 if not transpose_kv_cache else -2)
-            s = jnp.einsum(
-                "nd,md->nm" if not transpose_kv_cache else "nd,dm->nm",
-                q,
-                k,
-                preferred_element_type=jnp.float32)
+            if ql_nope.dtype == q_pe.dtype:
+                q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+                k = jnp.concatenate([kv_c, k_pe],
+                                    axis=-1 if not transpose_kv_cache else -2)
+                s = jnp.einsum(
+                    "nd,md->nm" if not transpose_kv_cache else "nd,dm->nm",
+                    q,
+                    k,
+                    preferred_element_type=jnp.float32)
+            else:
+                einsum_pat = "nd,md->nm" if not transpose_kv_cache else "nd,dm->nm"
+                s = (
+                    jnp.einsum(einsum_pat, ql_nope, kv_c, preferred_element_type=jnp.float32) +
+                    jnp.einsum(einsum_pat, q_pe, k_pe, preferred_element_type=jnp.float32)
+                )
             s *= step1_qk_scale
 
             if soft_cap is not None:
@@ -1757,7 +1764,6 @@ def _mla_ragged_paged_attention_kernel(
                                       r_dim)
         if p_same_dtype_as_v and kv_dtype == jnp.float8_e4m3fn:
             q_nope_vec = q_nope_vec.astype(kv_dtype)
-            q_rope_vec = q_rope_vec.astype(kv_dtype)
         return q_nope_vec, q_rope_vec
 
     def load_bq(batch_item_idx, bq_sem_idx, *, actual_bq_sz=bq_sz):
@@ -1777,7 +1783,6 @@ def _mla_ragged_paged_attention_kernel(
         )[:, :num_q_heads].reshape(actual_bq_sz * num_q_heads, r_dim)
         if p_same_dtype_as_v and kv_dtype == jnp.float8_e4m3fn:
             q_nope_vec = q_nope_vec.astype(kv_dtype)
-            q_rope_vec = q_rope_vec.astype(kv_dtype)
         return q_nope_vec, q_rope_vec
 
     def load_bq_slice(batch_item_idx, bq_sem_idx, q_idx, bq_sz_split):
@@ -1798,7 +1803,6 @@ def _mla_ragged_paged_attention_kernel(
         )[:, :num_q_heads].reshape(bq_sz_split * num_q_heads, r_dim)
         if p_same_dtype_as_v and kv_dtype == jnp.float8_e4m3fn:
             q_nope_vec = q_nope_vec.astype(kv_dtype)
-            q_rope_vec = q_rope_vec.astype(kv_dtype)
         return q_nope_vec, q_rope_vec
 
     def load_bkv(batch_item_idx, bkv_sem_idx, *, active_bkv_sz=bkv_sz):
@@ -2350,7 +2354,7 @@ def prepare_outputs(
         "ql_nope_is_token_major",
         "debug_mode",
     ),
-    donate_argnames=("ql_nope", "cache_kv"),
+    donate_argnames=("cache_kv",),
 )
 def mla_ragged_paged_attention(
     ql_nope: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]

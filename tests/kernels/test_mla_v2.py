@@ -309,3 +309,89 @@ def test_mixed_q_split_matches_unsplit_mixed_mode() -> None:
         np.asarray(split_cache),
         np.asarray(unsplit_cache),
     )
+
+
+def test_fp8_pv_and_q_nope_keeps_q_pe_in_bfloat16() -> None:
+    """Under FP8 KV cache + p_same_dtype_as_v=True (Candidate 3), q_pe stays in BF16 and matches BF16 reference."""
+    num_q_heads = 16
+    num_decode = 4
+    num_prefill = 2
+    prefill_len = 64
+    num_seqs = num_decode + num_prefill
+    total_tokens = num_decode + num_prefill * prefill_len
+    lkv_dim = 512
+    r_dim = 64
+    padded_r_dim = 128
+    page_size = 64
+    packing = 4
+    pages_per_seq = (prefill_len + page_size - 1) // page_size
+
+    ql_nope = ((jnp.arange(total_tokens * num_q_heads * lkv_dim, dtype=jnp.int32) % 29) - 14).astype(
+        jnp.bfloat16
+    ).reshape(total_tokens, num_q_heads, lkv_dim) * jnp.bfloat16(0.05)
+    # Use fine-grained RoPE values that would collapse to identical FP8 buckets if q_pe were cast to float8_e4m3fn
+    q_pe = (
+        jnp.ones((total_tokens, num_q_heads, r_dim), dtype=jnp.bfloat16) * jnp.bfloat16(1.0)
+        + ((jnp.arange(total_tokens * num_q_heads * r_dim, dtype=jnp.int32) % 16) * 0.0078125).astype(
+            jnp.bfloat16
+        ).reshape(total_tokens, num_q_heads, r_dim)
+    )
+    new_kv_c = (((jnp.arange(total_tokens * lkv_dim, dtype=jnp.int32) % 23) - 11).astype(jnp.bfloat16) * 0.1).astype(
+        jnp.float8_e4m3fn
+    ).reshape(total_tokens, lkv_dim)
+    new_k_pe = (((jnp.arange(total_tokens * r_dim, dtype=jnp.int32) % 19) - 9).astype(jnp.bfloat16) * 0.2).astype(
+        jnp.float8_e4m3fn
+    ).reshape(total_tokens, r_dim)
+    cache_kv = jnp.zeros(
+        (num_seqs * pages_per_seq, page_size // packing, packing, lkv_dim + padded_r_dim),
+        jnp.float8_e4m3fn,
+    )
+
+    seq_lens = jnp.array([1, 1, 1, 1, prefill_len, prefill_len], dtype=jnp.int32)
+    block_tables = jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32)
+    query_start_loc = jnp.array([0, 1, 2, 3, 4, 4 + prefill_len, total_tokens], dtype=jnp.int32)
+    request_distribution = jnp.array([num_decode, num_decode, num_seqs], dtype=jnp.int32)
+
+    ref_out, _ = mla_ragged_paged_attention(
+        ql_nope.copy(),
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv.copy(),
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sm_scale=0.13523377,
+        num_kv_pages_per_block=(1, 1, 1),
+        num_queries_per_block=(1, 16, 16),
+        mixed_q_split=2,
+        p_same_dtype_as_v=False,
+        ql_nope_is_token_major=True,
+    )
+    cand3_out, _ = mla_ragged_paged_attention(
+        ql_nope.copy(),
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_kv.copy(),
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sm_scale=0.13523377,
+        num_kv_pages_per_block=(1, 1, 1),
+        num_queries_per_block=(1, 16, 16),
+        mixed_q_split=2,
+        p_same_dtype_as_v=True,
+        ql_nope_is_token_major=True,
+    )
+    ref_out.block_until_ready()
+    cand3_out.block_until_ready()
+
+    rel_l2 = float(
+        jnp.linalg.norm(cand3_out.astype(jnp.float32) - ref_out.astype(jnp.float32))
+        / jnp.linalg.norm(ref_out.astype(jnp.float32))
+    )
+    assert rel_l2 < 0.03, f"Expected Candidate 3 relative L2 error < 0.03, got {rel_l2}"
+
