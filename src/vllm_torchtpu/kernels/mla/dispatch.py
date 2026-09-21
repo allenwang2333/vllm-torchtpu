@@ -182,6 +182,15 @@ def ragged_paged_attention(
                                         topk_indices))
 
     def _sparse():
+        # These native bucket choices are measured BF16 tuning domains, not
+        # decode/prefill classifications or hardware requirements.
+        native_glm_geometry = (
+            cache_layout == "sparsecore" and q.dtype == jnp.bfloat16
+            and q.shape[1:] in ((8, 576), (32, 576), (64, 576))
+            and topk_indices.shape == (q.shape[0], GLM52_INDEX_TOPK)
+            and kv_cache_nope.shape[1:] == (GLM52_PAGE_SIZE, 128)
+            and kv_cache_rope.shape[1:] == (GLM52_PAGE_SIZE // 4, 128))
+        small_native_bucket = native_glm_geometry and q.shape[0] == 16
         return sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -193,6 +202,10 @@ def ragged_paged_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=k_scale or 1.0,
             cache_layout=cache_layout,
+            attention_kernel_batch_size=1 if small_native_bucket else 16,
+            gather_and_attention_chunk_size=128 if native_glm_geometry
+            and q.shape == (1024, GLM52_NUM_HEADS,
+                            GLM52_NOPE_DIM + GLM52_ROPE_DIM) else 64,
         )
 
     if not enable_masked_dense:

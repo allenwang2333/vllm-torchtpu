@@ -46,6 +46,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME, cp_rank_as_data, streamindex_topk, streamindex_topk_dcp)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import \
     pcp_streaming_jax_op
+from vllm_torchtpu.kernels.mla.indexer_cache_update import update_indexer_cache
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE, VllmTPUDeepseekV32IndexerBackend)
@@ -211,8 +212,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                                                             pos // block_size],
                 jnp.int32(2**30))
             slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing,
-                                   slot % kv_packing].set(k_packed)
+            cache_kv = update_indexer_cache(cache_kv, k_packed, page, slot)
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
@@ -865,6 +865,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         k_pe = k_pe.unsqueeze(1)
 
         if self.rotary_emb is not None:
+            q_pe = q_pe.contiguous()
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         topk_indices = None

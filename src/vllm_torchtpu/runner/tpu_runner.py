@@ -46,7 +46,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds,
-                             LogprobsLists, LogprobsTensors, ModelRunnerOutput)
+                             LogprobsTensors, ModelRunnerOutput)
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
@@ -3344,7 +3344,7 @@ class TPUModelRunner(GPUModelRunner):
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
-        combined_logprobs: list[Any] = []
+        combined_logprobs: list[LogprobsTensors] = []
 
         # True if the step has drafts to verify (a request carried drafts in
         # from the previous step). Not the same as self.speculative_config, the
@@ -3470,13 +3470,8 @@ class TPUModelRunner(GPUModelRunner):
                         next_token_indices[req_idx] = (next_tokens_tpu_offset +
                                                        req_idx - cur_start_idx)
                     next_tokens_tpu_offset += selected_token_ids.shape[0]
-                if needs_logprobs:
-                    sliced_logprobs = LogprobsTensors(
-                        logprobs.logprob_token_ids[:num_reqs],
-                        logprobs.logprobs[:num_reqs],
-                        logprobs.selected_token_ranks[:num_reqs],
-                        logprobs.cu_num_generated_tokens)
-                    combined_logprobs.append(sliced_logprobs)
+                if logprobs is not None:
+                    combined_logprobs.append(logprobs)
 
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
@@ -3485,27 +3480,6 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        logprobs = []
-        if needs_logprobs and len(combined_logprobs):
-            # TODO: concatenate the LogprobsTensors (torch) first, then
-            # call .tolists() once to match the GPU path and avoid the
-            # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
-
-            logprobs_lists = LogprobsLists(
-                logprob_token_ids=np.concatenate(
-                    [lp.logprob_token_ids for lp in combined_logprobs_lists]),
-                logprobs=np.concatenate(
-                    [lp.logprobs for lp in combined_logprobs_lists]),
-                sampled_token_ranks=np.concatenate([
-                    lp.sampled_token_ranks for lp in combined_logprobs_lists
-                ]),
-            )
-            logprobs = logprobs_lists
-
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
@@ -3533,7 +3507,8 @@ class TPUModelRunner(GPUModelRunner):
         copy_state = None
         if combined_selected_tokens:
             copy_state = AsyncTPUCopyState.from_device_chunks(
-                combined_selected_tokens, combined_selected_tokens_real_lens)
+                combined_selected_tokens, combined_selected_tokens_real_lens,
+                combined_logprobs or None)
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
@@ -3692,7 +3667,7 @@ class TPUModelRunner(GPUModelRunner):
             req_id_to_index=dict(self.input_batch.req_id_to_index),
             sampled_token_ids=
             [],  # Filled in AsyncTPUModelRunnerOutput get_output
-            logprobs=logprobs,
+            logprobs=[],  # Filled after D2H in get_output, when requested.
             prompt_logprobs_dict={req_id: None
                                   for req_id in req_ids},
             pooler_output=pooler_output,

@@ -3,32 +3,47 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import (AsyncModelRunnerOutput, LogprobsLists,
+                             LogprobsTensors, ModelRunnerOutput)
 
 INVALID_TOKEN_ID = -1
 
 
 @dataclass
 class AsyncTPUCopyState:
-    """Async D2H copy state for sampled tokens.
+    """Async D2H copy state for sampled tokens and their logprobs.
 
     Per-chunk device tensors are kept at their bucketed (padded) shapes so
-    each D2H copy hits a precompiled program. Host-side trim and concat
-    happen lazily on `wait()` and produce a single contiguous CPU tensor
-    matching the real (unpadded) request count.
+    each D2H copy hits a precompiled program. After `wait()`, output access
+    trims and concatenates on the host using the real request counts.
+    Each real count is in [0, chunk rows]; logprob chunks, when present,
+    have the same row layout and one generated-token row per request.
     """
     chunks_cpu: list[torch.Tensor]
     chunk_real_lens: list[int]
     copy_ready_event: Any
     chunks_tpu: list[torch.Tensor] | None = None
+    logprob_chunks_cpu: list[LogprobsTensors] | None = None
+    logprob_chunks_tpu: list[LogprobsTensors] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
 
     @classmethod
-    def from_device_chunks(cls, chunks_tpu: list[torch.Tensor],
-                           chunk_real_lens: list[int]) -> "AsyncTPUCopyState":
+    def from_device_chunks(
+        cls,
+        chunks_tpu: list[torch.Tensor],
+        chunk_real_lens: list[int],
+        logprob_chunks_tpu: list[LogprobsTensors] | None = None,
+    ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
+        assert (logprob_chunks_tpu is None
+                or len(logprob_chunks_tpu) == len(chunks_tpu)), (
+                    "Logprob chunks must align with sampled-token chunks")
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        logprob_chunks_cpu = ([
+            lp.to_cpu_nonblocking() for lp in logprob_chunks_tpu
+        ] if logprob_chunks_tpu is not None else None)
+        # The event must include every D2H copy, including logprob tensors.
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
         return cls(
@@ -36,6 +51,8 @@ class AsyncTPUCopyState:
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
             chunks_tpu=chunks_tpu,
+            logprob_chunks_cpu=logprob_chunks_cpu,
+            logprob_chunks_tpu=logprob_chunks_tpu,
         )
 
     def wait(self) -> None:
@@ -43,7 +60,23 @@ class AsyncTPUCopyState:
             return
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
+        self.logprob_chunks_tpu = None
         self.completed = True
+
+    @property
+    def logprobs(self) -> LogprobsLists | None:
+        if self.logprob_chunks_cpu is None:
+            return None
+        assert self.completed, "Logprob CPU data requires completed D2H copies"
+        # gather_logprobs produces one row per sampled request, with no
+        # speculative-token boundaries. Keep its padded shape on device and
+        # trim each chunk using the same real request counts as sampled tokens.
+        trimmed = [
+            LogprobsTensors(lp.logprob_token_ids[:n], lp.logprobs[:n],
+                            lp.selected_token_ranks[:n])
+            for lp, n in zip(self.logprob_chunks_cpu, self.chunk_real_lens)
+        ]
+        return LogprobsTensors.cat(trimmed).tolists()
 
     @property
     def sampled_token_ids_cpu(self) -> torch.Tensor:
@@ -106,6 +139,9 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             return self._model_runner_output
 
         self.copy_state.wait()
+        logprobs = self.copy_state.logprobs
+        if logprobs is not None:
+            self._model_runner_output.logprobs = logprobs
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []
