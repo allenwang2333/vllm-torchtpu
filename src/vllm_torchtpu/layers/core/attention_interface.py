@@ -1030,6 +1030,8 @@ def sparse_mla_attention_dcp(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             return_lse=True,
+            # The kernel defaults to tensorcore; the caches follow the spec.
+            cache_layout=nope_spec.layout.value,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
