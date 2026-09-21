@@ -2031,9 +2031,11 @@ class TPURaidenConnectorWorker:
             return 0
         if _use_raiden_glm_admission():
             return int(self.tp_rank)
-        from vllm_torchtpu.distributed.pcp import get_pcp_cache_rank
+        # Attention pages and the GDN head shard are both numbered by the
+        # interleave slot the host dealt this worker, which is its PCP rank.
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank
 
-        return int(get_pcp_cache_rank())
+        return int(get_pcp_rank())
 
     def _local_state_shard_rank(self) -> int:
         """Which GDN head shard this worker computed.

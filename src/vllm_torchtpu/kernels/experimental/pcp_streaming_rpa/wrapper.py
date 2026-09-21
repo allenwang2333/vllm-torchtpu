@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.distributed import mesh_utils
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
     configs as batched_rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
@@ -140,20 +141,36 @@ def _reshape_packed_kv_cache_for_attention(
                      f"expected_packing={expected_packing}.")
 
 
-def _select_replicated_shard_by_mesh_coordinate(
+def _select_replicated_shard_for_pcp_rank(
     tensor: jax.Array,
+    mesh_coordinate_by_pcp_rank: tuple[int, ...],
     pcp_axis: str,
     pcp_size: int,
     *,
     axis: int,
 ) -> jax.Array:
-    """Select this device's shard from replicated data without axis_index.
+    """Select this PCP rank's shard from replicated data without axis_index.
 
-    Chosen by mesh coordinate, not by PCP rank: all_to_all hands participant
-    ``p`` the ``p``-th split, and ``p`` is a mesh coordinate.
+    all_to_all hands participant ``p`` the ``p``-th split and ``p`` is a device
+    order index, so the blocks are pre-placed in that order first; the shard
+    that comes back is then this device's PCP rank shard, which is the
+    interleave slot the host dealt it.
     """
     if axis < 0:
         axis += tensor.ndim
+    pcp_size_int = len(mesh_coordinate_by_pcp_rank) or pcp_size
+    if tuple(mesh_coordinate_by_pcp_rank) != tuple(range(pcp_size_int)):
+        pcp_rank_by_mesh_coordinate = [0] * pcp_size_int
+        for pcp_rank, coordinate in enumerate(mesh_coordinate_by_pcp_rank):
+            pcp_rank_by_mesh_coordinate[coordinate] = pcp_rank
+        shard = tensor.shape[axis] // pcp_size_int
+        blocks = tensor.reshape(*tensor.shape[:axis], pcp_size_int, shard,
+                                *tensor.shape[axis + 1:])
+        blocks = jnp.take(blocks,
+                          jnp.asarray(pcp_rank_by_mesh_coordinate,
+                                      dtype=jnp.int32),
+                          axis=axis)
+        tensor = blocks.reshape(tensor.shape)
     if tensor.shape[axis] % pcp_size != 0:
         raise ValueError("Replicated PCP tensor axis must be divisible by "
                          f"pcp_size: shape={tensor.shape}, axis={axis}, "
@@ -587,6 +604,7 @@ def _build_writeback_segment_descriptors(
 
 def _select_replicated_query_row_mapping_for_pcp_rank(
     mapping: _PCPQueryRowMapping,
+    mesh_coordinate_by_pcp_rank: tuple[int, ...],
     pcp_axis: str,
     pcp_size: int,
 ) -> _PCPQueryRowMapping:
@@ -600,8 +618,9 @@ def _select_replicated_query_row_mapping_for_pcp_rank(
         ),
         axis=1,
     )
-    local_mapping = _select_replicated_shard_by_mesh_coordinate(
+    local_mapping = _select_replicated_shard_for_pcp_rank(
         packed_mapping,
+        mesh_coordinate_by_pcp_rank,
         pcp_axis,
         pcp_size,
         axis=0,
@@ -681,6 +700,8 @@ def sharded_pcp_ragged_paged_attention(
         raise ValueError("PCP streaming RPA requires KV cache blocks to be "
                          f"evenly sharded across PCP ranks: "
                          f"{kv_cache.shape[0]=} {pcp_size=}.")
+    mesh_coordinate_by_pcp_rank = mesh_utils.mesh_coordinates_for_axis(
+        mesh, PCP_AXIS_NAME)
     qkv_spec = P(PCP_AXIS_NAME)
     metadata_spec = P()
     in_specs = (
@@ -719,6 +740,7 @@ def sharded_pcp_ragged_paged_attention(
         )
         local_query_rows = _select_replicated_query_row_mapping_for_pcp_rank(
             rank_major_query_rows,
+            mesh_coordinate_by_pcp_rank,
             PCP_AXIS_NAME,
             pcp_size,
         )
@@ -789,6 +811,7 @@ def sharded_pcp_ragged_paged_attention(
             kv_layout=kv_layout,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=PCP_AXIS_NAME,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
         )
         output = output[:, :, :q_per_kv, :]
         valid_output_rows = query_row_valid.reshape(

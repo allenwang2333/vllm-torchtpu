@@ -1167,6 +1167,23 @@ def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
         for axis_name in mesh_axis_names)
 
 
+def _slot_for_mesh_coordinate(mesh_coordinate_by_pcp_rank, coordinate):
+    """Which PCP rank's schedule row this device owns.
+
+    The host deals the sequence into one interleave slot per PCP rank and
+    builds the tile plan and the runtime schedule with one row per slot, but
+    ``lax.axis_index`` numbers devices the way the runtime walks them, which is
+    not the PCP rank order unless the group happens to be laid out in device
+    order. Selecting a row with the raw axis index reads another slot's tile
+    geometry.
+    """
+    slot = jnp.int32(0)
+    for pcp_rank, mesh_coordinate in enumerate(mesh_coordinate_by_pcp_rank):
+        slot = jnp.where(coordinate == mesh_coordinate, jnp.int32(pcp_rank),
+                         slot)
+    return slot
+
+
 def _run_pcp_page_groups_multi_head(
     active_tiles,
     active_page_groups,
@@ -1212,14 +1229,20 @@ def _run_pcp_page_groups_multi_head(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    mesh_coordinate_by_pcp_rank,
     state_mode,
 ):
     if state_mode not in ("current", "history"):
         raise ValueError(f"Unsupported PCP state mode: {state_mode}")
     causal = state_mode == "current"
-    my_id = lax.axis_index(pcp_axis_name)
-    next_rank = lax.rem(my_id + 1, pcp_size)
-    prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
+    # Two numbers, two jobs. The ring is addressed with DeviceIdType.MESH, so
+    # its hops stay in the space lax.axis_index reports. The tile plan and the
+    # runtime schedule have one row per interleave slot, and the host deals
+    # slot r to PCP rank r, so row selection uses the translated slot.
+    my_axis = lax.axis_index(pcp_axis_name)
+    my_id = _slot_for_mesh_coordinate(mesh_coordinate_by_pcp_rank, my_axis)
+    next_rank = lax.rem(my_axis + 1, pcp_size)
+    prev_rank = lax.rem(my_axis + pcp_size - 1, pcp_size)
     next_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, next_rank)
     prev_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, prev_rank)
 
@@ -1353,7 +1376,9 @@ def _run_pcp_page_groups_multi_head(
         def _round_loop(round_idx, carry):
             del carry
             curr_slot = lax.rem(round_idx, 2)
-            src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
+            src_axis = lax.rem(my_axis + pcp_size - round_idx, pcp_size)
+            src_rank = _slot_for_mesh_coordinate(mesh_coordinate_by_pcp_rank,
+                                                 src_axis)
 
             @pl.when(round_idx > 0)
             def _load_round_schedule():
@@ -1618,6 +1643,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    mesh_coordinate_by_pcp_rank,
 ):
     """Current-chunk causal PCP body that only materializes online state."""
     for lane in range(num_lanes):
@@ -1667,6 +1693,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_kernel(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
             state_mode="current",
         )
 
@@ -1714,6 +1741,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
     v_scale,
     mesh_axis_names,
     pcp_axis_name,
+    mesh_coordinate_by_pcp_rank,
 ):
     """History no-causal PCP body initialized from current state.
 
@@ -1769,6 +1797,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_kernel(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
             state_mode="history",
         )
 
@@ -1795,10 +1824,13 @@ def _pcp_streaming_attention_zero_history_output_multi_head_kernel(
     *,
     num_tiles,
     pcp_axis_name,
+    mesh_coordinate_by_pcp_rank,
 ):
     """Write outputs for tiles whose current pass already covered all KV."""
     del o_in_ref
-    my_id = lax.axis_index(pcp_axis_name)
+    # One row per interleave slot; translate before selecting one.
+    my_id = _slot_for_mesh_coordinate(mesh_coordinate_by_pcp_rank,
+                                      lax.axis_index(pcp_axis_name))
     active_tiles = jnp.minimum(pass_meta_ref[0], num_tiles)
     active_page_groups = pass_meta_ref[1]
     ids_load = pltpu.make_async_copy(
@@ -1901,6 +1933,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
         v_scale: float | None = None,
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
+        mesh_coordinate_by_pcp_rank: tuple[int, ...] = (),
 ):
     local_tokens = q_multi_head.shape[0]
     kv_heads = q_multi_head.shape[1]
@@ -1964,6 +1997,7 @@ def _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
         ),
         out_shape=(
             jax.ShapeDtypeStruct(state_lm_hbm_shape, jnp.float32),
@@ -2042,6 +2076,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
         v_scale: float | None = None,
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
+        mesh_coordinate_by_pcp_rank: tuple[int, ...] = (),
 ):
     kv_heads = q_multi_head.shape[1]
     q_per_kv = q_multi_head.shape[2]
@@ -2086,6 +2121,7 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
         ),
         out_shape=jax.ShapeDtypeStruct(q_multi_head.shape, q_multi_head.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2134,17 +2170,18 @@ def _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
 
 
 def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
-    o_multi_head,
-    tile_plan,
-    tile_ids,
-    group_starts,
-    m_state,
-    l_state,
-    acc_state,
-    pass_meta,
-    *,
-    q_block_size: int,
-    pcp_axis_name: str = AXIS,
+        o_multi_head,
+        tile_plan,
+        tile_ids,
+        group_starts,
+        m_state,
+        l_state,
+        acc_state,
+        pass_meta,
+        *,
+        q_block_size: int,
+        pcp_axis_name: str = AXIS,
+        mesh_coordinate_by_pcp_rank: tuple[int, ...] = (),
 ):
     kv_heads = o_multi_head.shape[1]
     q_per_kv = o_multi_head.shape[2]
@@ -2164,6 +2201,7 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
             _pcp_streaming_attention_zero_history_output_multi_head_kernel,
             num_tiles=num_tiles,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
         ),
         out_shape=jax.ShapeDtypeStruct(o_multi_head.shape, o_multi_head.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2222,6 +2260,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
         mesh_axis_names: tuple[str, ...] = (AXIS, ),
         pcp_axis_name: str = AXIS,
+        mesh_coordinate_by_pcp_rank: tuple[int, ...] = (),
 ):
     """Generate the narrow metadata schedule and run split PCP RPA.
 
@@ -2331,6 +2370,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
         ))
     kv_cache_local = write_captured_kv_to_local_cache(
         kv_cache_local,
@@ -2361,6 +2401,7 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
             v_scale=v_scale,
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
+            mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
         ))
     output = _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
         history_output,
@@ -2373,5 +2414,6 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         current_meta,
         q_block_size=q_block_size,
         pcp_axis_name=pcp_axis_name,
+        mesh_coordinate_by_pcp_rank=mesh_coordinate_by_pcp_rank,
     )
     return output, kv_cache_local
