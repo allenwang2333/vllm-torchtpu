@@ -69,9 +69,36 @@ def _kernel_quantize(x: torch.Tensor):
     return codes, scale
 
 
-def _knob(on: bool):
-    return patch.dict(os.environ,
-                      {"TPU_MOE_FP8_WIRE_ALLGATHER": "1" if on else "0"})
+def _knob(on: bool, min_bytes: int = 0):
+    """Enable the knob and, by default, drop the byte gate out of the way.
+
+    The production gate is 64 MiB of gathered payload; every tensor in this
+    file is kilobytes. Tests that are about the arithmetic pin the gate to 0 so
+    the arithmetic is what they test; `test_size_gate_*` pins it back and is
+    the only place the gate itself is under test.
+    """
+    return _Both(
+        patch.dict(os.environ,
+                   {"TPU_MOE_FP8_WIRE_ALLGATHER": "1" if on else "0"}),
+        patch.object(mod._env_override, "SC_OFFLOAD_THRESHOLD_BYTES",
+                     min_bytes))
+
+
+class _Both:
+    """Two context managers as one, so call sites stay a single `with`."""
+
+    def __init__(self, *ctxs):
+        self._ctxs = ctxs
+
+    def __enter__(self):
+        for c in self._ctxs:
+            c.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for c in reversed(self._ctxs):
+            c.__exit__(*exc)
+        return False
 
 
 def test_knob_defaults_off_and_the_env_overrides_it():
@@ -161,10 +188,45 @@ def test_shapes_the_knob_must_decline():
     """A hidden dim that is not a multiple of the kernel's block is left alone."""
     x = torch.randn(4, _BLOCK + 128, dtype=torch.bfloat16)
     with _knob(True):
-        assert not fp8_wire_allgather_applies(x)
+        assert not fp8_wire_allgather_applies(x, 16)
     ints = torch.zeros(4, _BLOCK, dtype=torch.int32)
     with _knob(True):
-        assert not fp8_wire_allgather_applies(ints)
+        assert not fp8_wire_allgather_applies(ints, 16)
+
+
+def test_size_gate_takes_prefill_and_refuses_decode():
+    """The gate is the fix for the measured decode regression, so pin it.
+
+    Both shapes are the real ones from j-0fff50f8 / j-86cfd828 at DP=16:
+    prefill gathers 512x16 rows of 6144 bf16 = 96 MiB and must be quantized;
+    decode gathers 16x16 rows = 3 MiB, is fixed-cost bound on the TensorCore,
+    and must not be.
+    """
+    threshold = 64 << 20
+    prefill = torch.zeros(512, 6144, dtype=torch.bfloat16)
+    decode = torch.zeros(16, 6144, dtype=torch.bfloat16)
+    with _knob(True, min_bytes=threshold):
+        assert 512 * 16 * 6144 * 2 == 96 << 20
+        assert 16 * 16 * 6144 * 2 == 3 << 20
+        assert fp8_wire_allgather_applies(prefill, 16)
+        assert not fp8_wire_allgather_applies(decode, 16)
+
+
+def test_size_gate_counts_the_gathered_size_not_the_local_one():
+    """A shard that is small only because the world is large still qualifies."""
+    threshold = 64 << 20
+    x = torch.zeros(512, 6144, dtype=torch.bfloat16)  # 6 MiB locally
+    with _knob(True, min_bytes=threshold):
+        assert not fp8_wire_allgather_applies(x, 1)
+        assert fp8_wire_allgather_applies(x, 16)
+
+
+def test_size_gate_uses_the_unhalved_threshold_from_env_override():
+    """The gate and the libtpu flag must not be able to drift apart."""
+    from vllm_torchtpu.env_override import (
+        _compute_sc_offload_threshold_bytes)
+    with patch.dict(os.environ, {"TPU_ACCELERATOR_TYPE": "tpu7x-16"}):
+        assert _compute_sc_offload_threshold_bytes() == 67108864
 
 
 _TOPK = 2
