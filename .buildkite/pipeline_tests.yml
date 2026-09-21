@@ -68,6 +68,7 @@ steps:
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
+        timeout_in_minutes: 90
         if: 'build.env("NIGHTLY") != "1"'
         agents:
           queue: "tpu_v7x_2_queue"
