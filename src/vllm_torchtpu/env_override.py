@@ -152,6 +152,59 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     return None
 
 
+# TPU_MOE_FP8_WIRE_ALLGATHER: quantize MoE dispatch activations to fp8 before
+# the DP all-gather instead of leaving that to the GMM kernel after it, so the
+# wire carries one byte per element rather than two.
+#
+# The default lives here, as a module constant, rather than only in the
+# environment, because this file is imported by every worker process
+# (tpu_worker.py) while an env var set in the head's VLLM_SERVER_CMD is not
+# guaranteed to reach a Ray worker on a multi-node recipe. A benchmark arm
+# flips this constant and rebuilds the image; the env var is for local runs
+# and tests.
+FP8_WIRE_ALLGATHER_DEFAULT = True
+
+
+def fp8_wire_allgather_enabled() -> bool:
+    """Whether the MoE dispatch all-gather carries fp8 instead of bf16."""
+    raw = os.getenv("TPU_MOE_FP8_WIRE_ALLGATHER")
+    if raw is None or raw.strip() == "":
+        return FP8_WIRE_ALLGATHER_DEFAULT
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
+# Fallback when the chip family is unknown. tpu7x and v5p both sit here, and a
+# defined boundary beats a knob that silently does nothing on an unrecognised
+# accelerator string.
+_DEFAULT_SC_OFFLOAD_THRESHOLD_BYTES = 64 << 20
+
+
+def _compute_sc_offload_threshold_bytes() -> int:
+    """The unhalved SparseCore-offload threshold, as a size decision boundary.
+
+    Public because the fp8-wire path needs the same number for a different
+    purpose: a collective below this threshold runs on the TensorCore, where
+    it is dominated by its fixed cost rather than by its bytes, so quantizing
+    its payload buys nothing and costs a second collective. Reusing this one
+    constant keeps "which collective is byte-limited" and "which collective is
+    offloaded" the same question, which is what makes the halving below
+    self-consistent: 96 MiB >= 64 MiB before, 48 MiB >= 32 MiB after, the same
+    inequality either side of the change.
+    """
+    return (_resolve_sc_offload_threshold_bytes()
+            or _DEFAULT_SC_OFFLOAD_THRESHOLD_BYTES)
+
+
+# Resolved once, at import, and read as a plain int by the MoE hot path.
+# Not a function call there: resolving can fall through to a GCE metadata probe,
+# and Dynamo traces whatever it is given -- calling the resolver inside the
+# compiled region raises "Dynamo does not know how to trace method `__new__` of
+# class `type`" and takes the whole graph down. Import time is also the only
+# moment the answer can still change anything, since the libtpu flag below is
+# assembled from the same number.
+SC_OFFLOAD_THRESHOLD_BYTES = _compute_sc_offload_threshold_bytes()
+
+
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
 
 
@@ -178,6 +231,14 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
 # each flag is added only if the user hasn't supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
+if _sc_offload_bytes is not None and fp8_wire_allgather_enabled():
+    # TPU_MOE_FP8_WIRE_ALLGATHER halves the MoE dispatch all-gather's payload
+    # (bf16 -> fp8), which would drop a gathered tensor that sat just above
+    # this VMEM-sized threshold to just below it -- silently moving the
+    # collective back onto the TensorCore, which measured slower for exactly
+    # this collective. Halve the threshold with the payload so the same
+    # collectives keep the same engine and the arm tests one variable.
+    _sc_offload_bytes //= 2
 if _sc_offload_bytes is not None:
     for _flag_name in (
             "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
