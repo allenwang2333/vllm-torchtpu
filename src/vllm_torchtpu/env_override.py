@@ -162,7 +162,7 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
 # guaranteed to reach a Ray worker on a multi-node recipe. A benchmark arm
 # flips this constant and rebuilds the image; the env var is for local runs
 # and tests.
-FP8_WIRE_ALLGATHER_DEFAULT = True
+FP8_WIRE_ALLGATHER_DEFAULT = False
 
 
 def fp8_wire_allgather_enabled() -> bool:
