@@ -6,6 +6,8 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from vllm_torchtpu import env_override as _env_override
+
 if TYPE_CHECKING:
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -64,6 +66,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_FP8_WIRE_ALLGATHER: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_BATCHED_RPA_LONGCTX: bool = False
@@ -442,6 +445,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
     lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    # Carry the MoE dispatch all-gather's activations as fp8 e4m3 plus their
+    # per-row block scales instead of bf16. The GMM kernel quantizes its lhs
+    # to exactly this format straight after the gather, so the wire format is
+    # the only thing that changes. The default lives in env_override -- the one
+    # module every worker process imports before libtpu loads -- because the
+    # same switch also has to move the SparseCore offload threshold.
+    "TPU_MOE_FP8_WIRE_ALLGATHER":
+    lambda: _env_override.fp8_wire_allgather_enabled(),
     "USE_BATCHED_RPA_SEQ_ON_LANE":
     env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
     # 0 = the arithmetic device-order layout (the one every disaggregated

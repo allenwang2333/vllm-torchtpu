@@ -164,6 +164,27 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
     return None
 
 
+# TPU_MOE_FP8_WIRE_ALLGATHER: quantize MoE dispatch activations to fp8 before
+# the DP all-gather instead of leaving that to the GMM kernel after it, so the
+# wire carries one byte per element rather than two.
+#
+# The default lives here, as a module constant, rather than only in the
+# environment, because this file is imported by every worker process
+# (tpu_worker.py) while an env var set in the head's VLLM_SERVER_CMD is not
+# guaranteed to reach a Ray worker on a multi-node recipe. A benchmark arm
+# flips this constant and rebuilds the image; the env var is for local runs
+# and tests.
+FP8_WIRE_ALLGATHER_DEFAULT = False
+
+
+def fp8_wire_allgather_enabled() -> bool:
+    """Whether the MoE dispatch all-gather carries fp8 instead of bf16."""
+    raw = os.getenv("TPU_MOE_FP8_WIRE_ALLGATHER")
+    if raw is None or raw.strip() == "":
+        return FP8_WIRE_ALLGATHER_DEFAULT
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
 
 
@@ -190,6 +211,14 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
 # each flag is added only if the user hasn't supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
+if _sc_offload_bytes is not None and fp8_wire_allgather_enabled():
+    # TPU_MOE_FP8_WIRE_ALLGATHER halves the MoE dispatch all-gather's payload
+    # (bf16 -> fp8), which would drop a gathered tensor that sat just above
+    # this VMEM-sized threshold to just below it -- silently moving the
+    # collective back onto the TensorCore, which measured slower for exactly
+    # this collective. Halve the threshold with the payload so the same
+    # collectives keep the same engine and the arm tests one variable.
+    _sc_offload_bytes //= 2
 if _sc_offload_bytes is not None:
     for _flag_name in (
             "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",

@@ -44,6 +44,80 @@ def enable_pipelined_collective_and_compute() -> bool:
 # Alias for alternative naming convention
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
 
+# The GMM kernel quantizes its own lhs to fp8 e4m3, per row, over contiguous
+# 512-element blocks of the contracting dimension:
+# `kernels/megablox/gmm_v2.py` sets the lhs `quant_block_size` to 512 in
+# `make_gmm_configs` and the kernel body takes `jnp.max(jnp.abs(block_lhs),
+# axis=1)` over `tiled_lhs[:, start_k:end_k]`. That reduction runs along the
+# hidden dimension and never crosses a row, so the scale a token gets is a
+# function of that token alone -- not of which rank the token came from, and
+# not of how many tokens were gathered next to it. Quantizing here, before the
+# all-gather, therefore reproduces those scales rather than changing their
+# granularity, and the wire carries one byte per element instead of two.
+#
+# Blocks line up with the kernel's only when its `tile_k` equals the full
+# contracting dimension, which is the case for the shapes this path runs
+# (the emitted kernel is `...-k_6144-...-tk_6144-...`). `_FP8_WIRE_QUANT_BLOCK`
+# must stay equal to `gmm_v2`'s lhs `quant_block_size`.
+_FP8_WIRE_QUANT_BLOCK = 512
+_FP8_WIRE_E4M3_MAX = 448.0
+_FP8_WIRE_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def fp8_wire_allgather_applies(x: torch.Tensor) -> bool:
+    """Whether `x` can ride the dispatch all-gather as fp8 rather than bf16."""
+    return (envs.TPU_MOE_FP8_WIRE_ALLGATHER and x.dim() == 2
+            and x.dtype in _FP8_WIRE_DTYPES
+            and x.shape[1] % _FP8_WIRE_QUANT_BLOCK == 0)
+
+
+def _all_gather_activations(collective_group, x: torch.Tensor) -> torch.Tensor:
+    """All-gather activations along dim 0, optionally quantized on the wire.
+
+    Returns a tensor of `x`'s own dtype either way, so everything downstream --
+    routing, the SparseCore ragged gather, the GMM kernel -- sees what it saw
+    before. Only the bytes the collective moves change.
+
+    The round trip is value-preserving rather than merely close: the element
+    that set a block's abs-max maps to exactly +/-448, so dequantizing and
+    letting the kernel re-derive its own scale recovers the same scale and the
+    same fp8 codes it would have computed from the unquantized input.
+
+    The scale ride-along is a second, tiny all-gather (4 bytes per 512
+    elements). It stays far below the SparseCore offload threshold, so it
+    lands on the TensorCore next to the existing topk_weights/topk_ids
+    gathers rather than competing for the SparseCore this change is trying
+    to free.
+    """
+    if not fp8_wire_allgather_applies(x):
+        return collective_group.all_gather(x, dim=0)
+
+    # Everything below stays in `x`'s own dtype, never promoted to float32.
+    # The kernel derives its scale from a bf16 tile in bf16 arithmetic, and a
+    # float32 scale here is a *different* scale: it differs from the kernel's
+    # in the last bits, which moves fp8 codes on elements sitting near a
+    # rounding boundary. Matching the dtype makes the round trip bit-exact --
+    # 0 differing codes in 7.86M, scales identical -- rather than merely close.
+    rows, hidden = x.shape
+    blocks = hidden // _FP8_WIRE_QUANT_BLOCK
+    blocked = x.reshape(rows, blocks, _FP8_WIRE_QUANT_BLOCK)
+    scale = blocked.abs().amax(dim=-1, keepdim=True) / _FP8_WIRE_E4M3_MAX
+    # An all-zero block gives scale 0; mirror the kernel's own `where` and send
+    # zeros rather than the inf/NaN a bare reciprocal would produce.
+    scale_inv = torch.where(scale == 0, torch.zeros_like(scale),
+                            scale.reciprocal())
+    quantized = (blocked * scale_inv).to(torch.float8_e4m3fn).reshape(
+        rows, hidden)
+
+    ag_quantized = collective_group.all_gather(quantized, dim=0)
+    ag_scale = collective_group.all_gather(scale.reshape(rows, blocks), dim=0)
+
+    ag_rows = ag_quantized.shape[0]
+    ag_blocked = ag_quantized.reshape(ag_rows, blocks,
+                                      _FP8_WIRE_QUANT_BLOCK).to(x.dtype)
+    return (ag_blocked * ag_scale.reshape(ag_rows, blocks, 1)).reshape(
+        ag_rows, hidden)
+
 
 def calculate_moe_chunks(seq_len: int, parallel_size: int,
                          chunk_size: int) -> tuple[int, int]:
@@ -167,8 +241,8 @@ def pipelined_fused_moe_gmm(
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
-            ag_hidden_states = collective_group.all_gather(hidden_states,
-                                                           dim=0)
+            ag_hidden_states = _all_gather_activations(
+                collective_group, hidden_states)
             ag_topk_weights = (collective_group.all_gather(topk_weights, dim=0)
                                if topk_weights is not None else None)
             ag_topk_ids = (collective_group.all_gather(topk_ids, dim=0)
@@ -216,7 +290,7 @@ def pipelined_fused_moe_gmm(
     ] if topk_ids is not None else [None] * num_chunks
 
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_hs_curr = _all_gather_activations(collective_group, hs_slices[0])
     ag_tw_curr = (collective_group.all_gather(weights_slices[0], dim=0)
                   if weights_slices[0] is not None else None)
     ag_ti_curr = (collective_group.all_gather(ids_slices[0], dim=0)
@@ -227,7 +301,8 @@ def pipelined_fused_moe_gmm(
     for i in range(num_chunks):
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_hs_next = _all_gather_activations(collective_group,
+                                                 hs_slices[i + 1])
             ag_tw_next = (collective_group.all_gather(weights_slices[i + 1],
                                                       dim=0)
                           if weights_slices[i + 1] is not None else None)
