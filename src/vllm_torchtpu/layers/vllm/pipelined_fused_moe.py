@@ -78,10 +78,16 @@ def _all_gather_activations(collective_group, x: torch.Tensor) -> torch.Tensor:
     routing, the SparseCore ragged gather, the GMM kernel -- sees what it saw
     before. Only the bytes the collective moves change.
 
-    The round trip is value-preserving rather than merely close: the element
-    that set a block's abs-max maps to exactly +/-448, so dequantizing and
-    letting the kernel re-derive its own scale recovers the same scale and the
-    same fp8 codes it would have computed from the unquantized input.
+    The round trip nearly, but not exactly, preserves what the kernel derives.
+    The element that set a block's abs-max maps to exactly +/-448, so the
+    kernel re-derives the same fp8 codes -- measured on device, 0 differing
+    codes in 50.3M. Its re-derived *scale* moves by exactly one bf16 ULP on
+    30.6% of blocks (max relative error 0.75%, never more than 1 ULP), because
+    `fl(fl(x_max/448) * 448) / 448` does not land back on `x_max` in XLA's
+    rounding the way it does in CPU torch. Reconstructing in float32 does not
+    help; it gives the identical count. So this is a small, bounded, real
+    numerical change, not a no-op, and it needs an accuracy check rather than
+    an argument. Measured in j-3c06b709-ed10-468c-9646.
 
     The scale ride-along is a second, tiny all-gather (4 bytes per 512
     elements). It stays far below the SparseCore offload threshold, so it
@@ -96,8 +102,8 @@ def _all_gather_activations(collective_group, x: torch.Tensor) -> torch.Tensor:
     # The kernel derives its scale from a bf16 tile in bf16 arithmetic, and a
     # float32 scale here is a *different* scale: it differs from the kernel's
     # in the last bits, which moves fp8 codes on elements sitting near a
-    # rounding boundary. Matching the dtype makes the round trip bit-exact --
-    # 0 differing codes in 7.86M, scales identical -- rather than merely close.
+    # rounding boundary. Matching the dtype holds the codes exactly; promoting
+    # moves 3.85% of them, by up to 32 code steps. Both measured on device.
     rows, hidden = x.shape
     blocks = hidden // _FP8_WIRE_QUANT_BLOCK
     blocked = x.reshape(rows, blocks, _FP8_WIRE_QUANT_BLOCK)
