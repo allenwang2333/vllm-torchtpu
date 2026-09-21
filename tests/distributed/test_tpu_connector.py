@@ -21,15 +21,14 @@ import torch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheGroupSpec, MambaSpec,
-                                        MLAAttentionSpec, SlidingWindowMLASpec)
+                                        KVCacheGroupSpec, MambaSpec)
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
-from .raiden_test_utils import dsv4_materialization
+from .raiden_test_utils import dsv4_kv_cache_groups, dsv4_materialization
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
@@ -98,97 +97,58 @@ def _make_stage3_hybrid_kv_cache_config(
 
 
 def _make_stage3_dsv4_kv_cache_config() -> KVCacheConfig:
-    """A DeepSeek-V4-shaped config: several attention groups, no Mamba.
-
-    Page sizes differ per group by design. The SWA group's block covers an
-    eighth of the CSA group's tokens at the same byte size, so no single
-    connector-wide page size can validate both.
-    """
-    return KVCacheConfig(
-        num_blocks=0,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=["model.layers.0.self_attn"],
-                kv_cache_spec=MLAAttentionSpec(
-                    block_size=1024,
-                    num_kv_heads=1,
-                    head_size=1024,
-                    dtype=torch.uint8,
-                    compress_ratio=4,
-                    model_version="deepseek_v4",
-                ),
-            ),
-            KVCacheGroupSpec(
-                layer_names=["model.layers.0.self_attn.indexer"],
-                kv_cache_spec=MLAAttentionSpec(
-                    block_size=1024,
-                    num_kv_heads=1,
-                    head_size=256,
-                    dtype=torch.uint8,
-                    compress_ratio=4,
-                    model_version="deepseek_v4",
-                ),
-            ),
-            KVCacheGroupSpec(
-                layer_names=["model.layers.1.self_attn"],
-                kv_cache_spec=SlidingWindowMLASpec(
-                    block_size=128,
-                    num_kv_heads=1,
-                    head_size=1024,
-                    dtype=torch.uint8,
-                    sliding_window=512,
-                    model_version="deepseek_v4",
-                ),
-            ),
-        ],
-    )
+    """A DeepSeek-V4-shaped config: several attention groups, no Mamba."""
+    return KVCacheConfig(num_blocks=0,
+                         kv_cache_tensors=[],
+                         kv_cache_groups=dsv4_kv_cache_groups())
 
 
-def test_stage3_transfer_groups_skips_mamba_state_groups():
-    """Mamba state rides the state-class tags, not the page transfer."""
-    config = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
-    groups = _stage3_transfer_groups(config.kv_cache_groups, multi_group=False)
-    assert [(group.cache_group_index, group.page_tokens)
-            for group in groups] == [(2, 16)]
-
-
-def test_stage3_transfer_groups_rejects_several_groups_by_default():
-    with pytest.raises(ValueError, match="exactly one"):
-        _stage3_transfer_groups(
-            _make_stage3_dsv4_kv_cache_config().kv_cache_groups,
-            multi_group=False)
-
-
-def test_stage3_transfer_groups_rejects_a_single_group_dsv4_plan():
-    """DSv4 admission on a one-group model is rejected at startup.
-
-    The scheduler builds per-group block tables only when the plan has more
-    than one group, while the worker's DSv4 path needs them for every request.
-    Without this check the disagreement surfaces as a mid-transfer
-    RuntimeError that takes the engine down.
-    """
-    single = _make_stage3_hybrid_kv_cache_config(fa_group_index=2)
-    with pytest.raises(ValueError, match="TPU_RAIDEN_DSV4_ADMISSION"):
-        _stage3_transfer_groups(single.kv_cache_groups, multi_group=True)
-
-
-def test_stage3_transfer_groups_rejects_a_config_with_no_paged_group():
+def _mamba_only_groups():
     hybrid = _make_stage3_hybrid_kv_cache_config(fa_group_index=0)
-    mamba_only = [
+    return [
         group for group in hybrid.kv_cache_groups
         if isinstance(group.kv_cache_spec, MambaSpec)
     ]
-    with pytest.raises(ValueError, match="at least one non-Mamba"):
-        _stage3_transfer_groups(mamba_only, multi_group=True)
 
 
-def test_stage3_transfer_groups_keeps_each_dsv4_group_page_size():
-    """Group order is preserved and each group carries its own page size."""
-    groups = _stage3_transfer_groups(
-        _make_stage3_dsv4_kv_cache_config().kv_cache_groups, multi_group=True)
+@pytest.mark.parametrize(
+    "groups,multi_group,expected",
+    [
+        # Mamba state rides the state-class tags, not the page transfer.
+        (lambda: _make_stage3_hybrid_kv_cache_config(fa_group_index=2).
+         kv_cache_groups, False, [(2, 16)]),
+        # Group order is preserved and each group keeps its own page size.
+        (lambda: _make_stage3_dsv4_kv_cache_config().kv_cache_groups, True, [
+            (0, 1024), (1, 1024), (2, 128)
+        ]),
+    ],
+)
+def test_stage3_transfer_groups_keeps_each_groups_page_size(
+        groups, multi_group, expected):
+    plan = _stage3_transfer_groups(groups(), multi_group=multi_group)
     assert [(group.cache_group_index, group.page_tokens)
-            for group in groups] == [(0, 1024), (1, 1024), (2, 128)]
+            for group in plan] == expected
+
+
+@pytest.mark.parametrize(
+    "groups,multi_group,match",
+    [
+        (lambda: _make_stage3_dsv4_kv_cache_config().kv_cache_groups, False,
+         "exactly one"),
+        # DSv4 admission on a one-group model is rejected at startup: the
+        # scheduler builds per-group block tables only when the plan has more
+        # than one group, while the worker's DSv4 path needs them for every
+        # request. Unchecked, that disagreement surfaces as a mid-transfer
+        # RuntimeError that takes the engine down.
+        (lambda: _make_stage3_hybrid_kv_cache_config(fa_group_index=2).
+         kv_cache_groups, True, "TPU_RAIDEN_DSV4_ADMISSION"),
+        (_mamba_only_groups, True, "at least one non-Mamba"),
+    ],
+)
+def test_stage3_transfer_groups_rejects_a_plan_it_cannot_serve(
+        groups, multi_group, match):
+    with pytest.raises(ValueError, match=match):
+        _stage3_transfer_groups(groups(), multi_group=multi_group)
 
 
 @pytest.mark.parametrize(("num_speculative_blocks", "expected"),
@@ -4022,78 +3982,54 @@ def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
                                  dp_size=8)
     plan, _ = _dsv4_worker_plan(worker)
 
+    # Page geometry, plan position and sliding window, per tag. Only the SWA
+    # group has a window; everything else is full attention.
     assert [(pool.tag, pool.plan_position, pool.page_tokens,
-             pool.live_bytes_per_block, pool.row_bytes) for pool in plan] == [
-                 ("dsv4.csa.nope.g0", 0, 1024, 131072, 512),
-                 ("dsv4.csa.rope.g0", 0, 1024, 32768, 512),
-                 ("dsv4.idx.g1", 1, 1024, 65536, 1024),
-                 ("dsv4.hca.g2", 2, 256, 262144, 512),
-                 ("dsv4.swa.g3", 3, 128, 131072, 512),
-                 ("dsv4.state.csa.g4", 4, 1024, 131072, 512),
-                 ("dsv4.state.idx.g5", 5, 1024, 65536, 1024),
-                 ("dsv4.state.hca.g6", 6, 256, 131072, 512),
-             ]
+             pool.live_bytes_per_block, pool.row_bytes, pool.window_tokens)
+            for pool in plan] == [
+                ("dsv4.csa.nope.g0", 0, 1024, 131072, 512, None),
+                ("dsv4.csa.rope.g0", 0, 1024, 32768, 512, None),
+                ("dsv4.idx.g1", 1, 1024, 65536, 1024, None),
+                ("dsv4.hca.g2", 2, 256, 262144, 512, None),
+                ("dsv4.swa.g3", 3, 128, 131072, 512, 128),
+                ("dsv4.state.csa.g4", 4, 1024, 131072, 512, None),
+                ("dsv4.state.idx.g5", 5, 1024, 65536, 1024, None),
+                ("dsv4.state.hca.g6", 6, 256, 131072, 512, None),
+            ]
     assert worker._stage3_dsv4_group_count == 7
 
 
-def test_dsv4_pool_plan_carries_the_sliding_window_of_its_group():
-    worker = _make_raiden_worker(tp_rank=0,
-                                 tp_size=1,
-                                 is_producer=True,
-                                 dp_size=8)
-    plan, _ = _dsv4_worker_plan(worker)
-
-    windows = {pool.tag: pool.window_tokens for pool in plan}
-    assert windows["dsv4.swa.g3"] == 128
-    assert all(window is None for tag, window in windows.items()
-               if tag != "dsv4.swa.g3")
-
-
-def test_dsv4_window_trim_drops_the_null_prefix_and_its_tokens():
-    """A windowed group transfers only the pages still inside its window.
-
-    The out-of-window entries are all the same null block, and Raiden rejects
-    a destination page list that repeats an ID, so leaving them in fails the
-    whole transfer.
-    """
-    pool = _Stage3Dsv4Pool(tag="dsv4.swa.g1",
+def _dsv4_pool(tag, page_tokens, window_tokens=None):
+    return _Stage3Dsv4Pool(tag=tag,
                            plan_position=1,
-                           page_tokens=128,
+                           page_tokens=page_tokens,
                            live_bytes_per_block=131072,
                            row_bytes=512,
-                           window_tokens=128)
-    # 1534 tokens over 128-token pages is 12 pages; the window keeps the last
-    # two, matching SlidingWindowManager's (1534 - 128 + 1) // 128 == 10 skip.
-    table = [0] * 10 + [41, 42]
-
-    pages, tokens = _stage3_dsv4_pool_pages(pool, table, 1534)
-
-    assert pages == [41, 42]
-    assert tokens == 1534 - 10 * 128
+                           window_tokens=window_tokens)
 
 
-def test_dsv4_window_trim_leaves_a_full_attention_group_alone():
-    pool = _Stage3Dsv4Pool(tag="dsv4.csa.nope.g0",
-                           plan_position=0,
-                           page_tokens=1024,
-                           live_bytes_per_block=131072,
-                           row_bytes=512)
-
-    pages, tokens = _stage3_dsv4_pool_pages(pool, [7, 8], 1534)
-
-    assert (pages, tokens) == ([7, 8], 1534)
+@pytest.mark.parametrize(
+    "pool,table,expected",
+    [
+        # A windowed group transfers only the pages still inside its window.
+        # 1534 tokens over 128-token pages is 12 pages; the window keeps the
+        # last two, matching SlidingWindowManager's (1534 - 128 + 1) // 128
+        # == 10 skip. The dropped entries are all the same null block, and
+        # Raiden rejects a destination list that repeats an ID.
+        (_dsv4_pool("dsv4.swa.g1", 128, 128), [0] * 10 + [41, 42],
+         ([41, 42], 1534 - 10 * 128)),
+        # A full-attention group keeps every page and every token.
+        (_dsv4_pool("dsv4.csa.nope.g0", 1024), [7, 8], ([7, 8], 1534)),
+    ],
+)
+def test_dsv4_window_trim_keeps_only_the_live_pages(pool, table, expected):
+    assert _stage3_dsv4_pool_pages(pool, table, 1534) == expected
 
 
 def test_dsv4_window_trim_rejects_a_table_that_still_repeats_a_page():
-    pool = _Stage3Dsv4Pool(tag="dsv4.swa.g1",
-                           plan_position=1,
-                           page_tokens=128,
-                           live_bytes_per_block=131072,
-                           row_bytes=512,
-                           window_tokens=128)
-
     with pytest.raises(ValueError, match="still repeats a page"):
-        _stage3_dsv4_pool_pages(pool, [0] * 10 + [41, 41], 1534)
+        _stage3_dsv4_pool_pages(_dsv4_pool("dsv4.swa.g1", 128, 128),
+                                [0] * 10 + [41, 41], 1534)
 
 
 def test_dsv4_pool_plan_rejects_a_tag_outside_the_transfer_plan():

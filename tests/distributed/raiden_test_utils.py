@@ -80,6 +80,54 @@ def glm_named_kv_caches(*,
     return named
 
 
+# DSv4 page geometry, mirroring _allocate_ds_v4_kv_caches: a CSA layer pages
+# 1024 tokens at compress_ratio 4, and VllmDeepseekV4SWACache._swa_block_size
+# gives 1024 // 4 // 2 = 128 so the SWA page lands on the same byte size as the
+# CSA NoPE page it overlays.
+DSV4_CSA_BLOCK_TOKENS = 1024
+DSV4_CSA_COMPRESS_RATIO = 4
+DSV4_SWA_BLOCK_TOKENS = (DSV4_CSA_BLOCK_TOKENS // DSV4_CSA_COMPRESS_RATIO // 2)
+
+
+def dsv4_kv_cache_groups():
+    """The three real DSv4 attention groups: CSA, indexer, then SWA.
+
+    Page sizes differ per group by design, so no single connector-wide page
+    size can validate all three. torch and vLLM are imported here rather than
+    at module scope so the fake-tensor helpers above stay importable without
+    them.
+    """
+    import torch
+    from vllm.v1.kv_cache_interface import (KVCacheGroupSpec, MLAAttentionSpec,
+                                            SlidingWindowMLASpec)
+
+    def mla(head_size):
+        return MLAAttentionSpec(
+            block_size=DSV4_CSA_BLOCK_TOKENS,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.uint8,
+            compress_ratio=DSV4_CSA_COMPRESS_RATIO,
+            model_version="deepseek_v4",
+        )
+
+    return [
+        KVCacheGroupSpec(layer_names=["model.layers.0.self_attn"],
+                         kv_cache_spec=mla(1024)),
+        KVCacheGroupSpec(layer_names=["model.layers.0.self_attn.indexer"],
+                         kv_cache_spec=mla(256)),
+        KVCacheGroupSpec(layer_names=["model.layers.1.self_attn"],
+                         kv_cache_spec=SlidingWindowMLASpec(
+                             block_size=DSV4_SWA_BLOCK_TOKENS,
+                             num_kv_heads=1,
+                             head_size=1024,
+                             dtype=torch.uint8,
+                             sliding_window=512,
+                             model_version="deepseek_v4",
+                         )),
+    ]
+
+
 class FakeKVCacheGroup:
     """Duck-typed KVCacheGroupSpec (layer names plus one shared spec)."""
 
@@ -130,9 +178,9 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     """A DSv4 materialization with the runner's overlay plan applied.
 
     Two CSA layers, two indexer layers, one HCA layer, two SWA layers and the
-    four compressor state caches. Every SWA cache and every state cache
-    aliases an already-allocated array, so the returned caches exercise the
-    block-ID-disjoint aliasing that DSv4 admission has to describe.
+    four compressor state caches. Every SWA and state cache aliases an
+    already-allocated array, so the returned caches exercise the
+    block-ID-disjoint aliasing DSv4 admission has to describe.
 
     Returns `(named_kv_caches, kv_cache_groups)`.
     """
