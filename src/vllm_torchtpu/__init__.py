@@ -500,7 +500,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                          router_logits,
                          shared_experts_input,
                          input_ids=None):
-            if (envs.TPU_MOE_OVERLAP_SHARED_EXPERTS == 5
+            if (envs.TPU_MOE_OVERLAP_SHARED_EXPERTS in (5, 6)
                     and self.routed_experts.quant_method.is_monolithic
                     and not self.moe_config.is_sequence_parallel
                     and self.moe_config.pcp_size <= 1
@@ -513,7 +513,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                 from vllm.distributed import get_dp_group
                 from vllm_torchtpu.layers.adapter import moe_routing
                 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-                    _gather_hs_and_meta, _gather_routing_meta,
+                    _all_gather_hs, _gather_hs_and_meta, _gather_routing_meta,
                     calculate_moe_chunks)
                 dp = get_dp_group()
                 layer = self._shared_experts._layer
@@ -525,12 +525,12 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
                 if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
                     if num_chunks == 1:
-                        ag_hs0 = dp.all_gather(hidden_states, dim=0)
+                        ag_hs0 = _all_gather_hs(dp, hidden_states)
                         self.routed_experts._tpu_pre_gate_ag = (None, ag_hs0)
                     else:
                         hs_slices = list(
                             torch.chunk(hidden_states, num_chunks, dim=0))
-                        ag_hs0 = dp.all_gather(hs_slices[0], dim=0)
+                        ag_hs0 = _all_gather_hs(dp, hs_slices[0])
                         self.routed_experts._tpu_pre_gate_ag = (hs_slices,
                                                                 ag_hs0)
                     self.routed_experts._tpu_shared_experts = (
