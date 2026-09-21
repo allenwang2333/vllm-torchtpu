@@ -46,9 +46,17 @@ def _make_mock_moe_config():
 
 
 def test_env_var_default_and_override():
-    """Verify TPU_MOE_COLLECTION_CHUNK_SIZE default is 0 and parses positive ints."""
+    """Verify TPU_MOE_COLLECTION_CHUNK_SIZE's default and that it parses ints.
+
+    BENCHMARK-ARM BRANCH: the default is 8192 here, not upstream's 0, because
+    the GLM-5.2-FP8 baseline this arm is compared against was profiled with
+    chunking on -- 2 chunks of 512 local tokens, 146 all-gathers per step. The
+    value cannot come from the environment: only host index 0 evaluates
+    VLLM_SERVER_CMD, and the vLLM workers on index 1 are Ray actors that
+    inherit from `ray start`, not from the head.
+    """
     with patch.dict(os.environ, {}, clear=True):
-        assert envs.TPU_MOE_COLLECTION_CHUNK_SIZE == 0
+        assert envs.TPU_MOE_COLLECTION_CHUNK_SIZE == 8192
 
     with patch.dict(os.environ, {"TPU_MOE_COLLECTION_CHUNK_SIZE": "16384"}):
         assert envs.TPU_MOE_COLLECTION_CHUNK_SIZE == 16384

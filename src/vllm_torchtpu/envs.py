@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
-    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_COLLECTION_CHUNK_SIZE: int = 8192
     TPU_MOE_FP8_WIRE_ALLGATHER: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -444,7 +444,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE":
-    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"),
+    lambda: int(os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "8192"),
     # Carry the MoE dispatch all-gather's activations as fp8 e4m3 plus their
     # per-row block scales instead of bf16. The GMM kernel quantizes its lhs
     # to exactly this format straight after the gather, so the wire format is
