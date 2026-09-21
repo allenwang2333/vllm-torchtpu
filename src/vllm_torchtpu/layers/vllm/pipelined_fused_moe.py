@@ -286,6 +286,13 @@ def pipelined_fused_moe_gmm(
     hoist_routing = have_routing and envs.TPU_MOE_UNCHUNKED_ROUTING_GATHER
     num_weights = topk_weights.shape[-1] if have_routing else 0
 
+    # Bind all three unconditionally. `_gather_routing` closes over them, and Dynamo
+    # resolves a closure's freevars when it traces the function, not when the guarded
+    # branch that reads one runs -- so leaving a name unassigned on the knobs-off path
+    # fails the trace with "Read uninitialized cell", even though plain Python never
+    # reaches the read. This is the default path, so it is the one that must not break.
+    ag_routing_all = ag_tw_all = ag_ti_all = None
+
     if hoist_routing and fuse_routing:
         ag_routing_all = collective_group.all_gather(_pack_routing(
             topk_weights, topk_ids),

@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.envs as envs
+import vllm_torchtpu.layers.vllm.pipelined_fused_moe as pipelined_moe_module
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.vllm.pipelined_fused_moe import (
     _pack_routing, _slice_gathered, _unpack_routing, calculate_moe_chunks,
@@ -1043,4 +1044,58 @@ def test_routing_knobs_are_inert_without_both_tensors():
             hidden_states=hs, w1=None, w2=None, w1_scale=None, w2_scale=None,
             w1_bias=None, w2_bias=None, topk_weights=None, topk_ids=None,
             experts_start=None, topk=_TOPK, activation="silu")
+    assert out.shape == (seq_len, hidden)
+
+
+@pytest.mark.parametrize("unchunked,fused", [("0", "0"), ("1", "0"),
+                                             ("0", "1"), ("1", "1")])
+def test_every_knob_arm_survives_dynamo(unchunked, fused):
+    """Every arm must TRACE, not merely run eagerly.
+
+    `_gather_routing` closes over ag_routing_all/ag_tw_all/ag_ti_all, and Dynamo
+    resolves a closure's freevars when it traces the function -- not when the
+    guarded branch that reads one runs. Eager Python never reaches those reads on
+    the arms that do not hoist, so every other test in this file passes while three
+    of these four arms fail to compile with "Read uninitialized cell". That is not
+    a theoretical gap: it took down all 16 engine cores in `profile_run` during
+    `determine_available_memory`, on the knobs-off default path.
+
+    Patch with plain functions, never MagicMock: Dynamo refuses to inline a mock
+    ("Attempted to inline function marked as skipped"), which fails all four arms
+    identically and makes this test prove nothing.
+    """
+    parallel_size, seq_len, hidden = _P, _S, 5
+    assert hidden not in (_TOPK, 2 * _TOPK), "hidden collides with the classifier"
+
+    hs = torch.randn(seq_len, hidden)
+    weights = torch.randn(seq_len, _TOPK)
+    ids = torch.randint(0, 32, (seq_len, _TOPK), dtype=torch.int32)
+
+    group = _MockCollectiveGroup(world_size=parallel_size)
+
+    def call(h, w, i):
+        return pipelined_fused_moe_gmm(
+            hidden_states=h, w1=None, w2=None, w1_scale=None, w2_scale=None,
+            w1_bias=None, w2_bias=None, topk_weights=w, topk_ids=i,
+            experts_start=None, topk=_TOPK, activation="silu")
+
+    env = {
+        # num_chunks = 2, so the multi-chunk path -- the one with the closure --
+        # is the path under test.
+        "TPU_MOE_COLLECTION_CHUNK_SIZE": str(parallel_size * seq_len // 2),
+        "TPU_MOE_UNCHUNKED_ROUTING_GATHER": unchunked,
+        "TPU_MOE_FUSED_ROUTING_GATHER": fused,
+    }
+
+    torch._dynamo.reset()
+    compiled = torch.compile(call, backend="eager", fullgraph=True)
+
+    with patch.dict(os.environ, env), \
+         patch.object(pipelined_moe_module, "_get_moe_collective_group",
+                      lambda: (group, "dp")), \
+         patch.object(pipelined_moe_module, "fused_moe_gmm",
+                      lambda **kw: torch.zeros(kw["hidden_states"].shape[0],
+                                               hidden)):
+        out = compiled(hs, weights, ids)
+
     assert out.shape == (seq_len, hidden)
