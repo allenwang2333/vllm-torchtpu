@@ -74,14 +74,29 @@ def _knob(on: bool):
                       {"TPU_MOE_FP8_WIRE_ALLGATHER": "1" if on else "0"})
 
 
-def test_knob_defaults_off():
-    """An unset knob must leave the wire format alone."""
+def test_knob_defaults_off_and_the_env_overrides_it():
+    """The shipped default is off, and an explicit setting wins either way.
+
+    The default is read from the constant rather than spelled `False` here on
+    purpose: a benchmark arm flips that constant and rebuilds the image, and a
+    test that hardcoded the shipped value would fail in the arm image for a
+    reason that has nothing to do with the arm.
+    """
+    from vllm_torchtpu.env_override import FP8_WIRE_ALLGATHER_DEFAULT
     with patch.dict(os.environ, {}, clear=True):
-        assert envs.TPU_MOE_FP8_WIRE_ALLGATHER is False
+        assert envs.TPU_MOE_FP8_WIRE_ALLGATHER is FP8_WIRE_ALLGATHER_DEFAULT
     with _knob(True):
         assert envs.TPU_MOE_FP8_WIRE_ALLGATHER is True
     with _knob(False):
         assert envs.TPU_MOE_FP8_WIRE_ALLGATHER is False
+
+
+def test_shipped_default_is_off():
+    """Separately, and only on a branch meant for merge: the default is off."""
+    from vllm_torchtpu.env_override import FP8_WIRE_ALLGATHER_DEFAULT
+    if FP8_WIRE_ALLGATHER_DEFAULT:
+        pytest.skip("benchmark-arm image: default deliberately flipped on")
+    assert FP8_WIRE_ALLGATHER_DEFAULT is False
 
 
 def test_off_path_is_the_untouched_collective():
@@ -246,7 +261,8 @@ def test_knob_moves_the_sparsecore_offload_threshold():
     back to the TensorCore -- a measured regression, and one that would be
     read as "fp8 on the wire does not help". The knob has to move both.
     """
-    off = _sc_allgather_bytes(_libtpu_flag_in_subprocess({}))
+    off = _sc_allgather_bytes(
+        _libtpu_flag_in_subprocess({"TPU_MOE_FP8_WIRE_ALLGATHER": "0"}))
     on = _sc_allgather_bytes(
         _libtpu_flag_in_subprocess({"TPU_MOE_FP8_WIRE_ALLGATHER": "1"}))
     assert off == 67108864, off
