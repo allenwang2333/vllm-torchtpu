@@ -400,16 +400,6 @@ def lower_dsv4_row_spans(
     block_ids: Sequence[int],
 ) -> PoolSpanRegistration:
     """Lower one DeepSeek-V4 cache class to round-robin per-page byte spans.
-
-    Same striping and page-prefix trimming as ``lower_glm_row_spans``. DSv4
-    differs in that each role packs a different number of tokens into a row
-    (CSA NoPE four, RoPE and the indexer sixteen, HCA two rows per token), so
-    the tail is rounded up in rows rather than in whole tokens.
-
-    ``block_ids`` are the request's pages in this cache group's block table.
-    Groups never share a block ID, which is what keeps the aliased arrays
-    apart. Striping is inherited from GLM and unused here: DSv4 pins
-    parallelism to 1 because both replicas run DP attention.
     """
     if not tag:
         raise ValueError("pool tag must not be empty")

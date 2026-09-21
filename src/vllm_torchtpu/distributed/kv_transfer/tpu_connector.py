@@ -205,16 +205,11 @@ def _stage3_recycled_transfer_pages(
     page_tokens: int,
     window_tokens: Optional[int],
 ) -> int:
-    """Pages this group would send that the allocator has already freed.
+    """Counts the pages this send would carry that the allocator already freed.
 
-    Skipping counts from `num_tokens`, the transfer prefix, while the allocator
-    freed against however far the producer actually ran. Those agree only when
-    the producer stops at the handoff token, which is what
-    `_maybe_truncate_prompt_for_handoff` arranges. This guard covers what
-    truncation cannot reach: a client that hits the prefill port directly keeps
-    generating past the handoff, and the allocator frees pages the prefix still
-    lists. Two of them collide into a duplicate destination and Raiden raises
-    out of `execute_model`.
+    vLLM points a freed sliding-window page at block 0. We predict how many
+    leading pages are freed and skip that many, so this counts only the block 0
+    entries left after the skip, not every one in the table.
     """
     skipped = _stage3_skipped_window_pages(num_tokens=num_tokens,
                                            page_tokens=page_tokens,
@@ -1377,9 +1372,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             raise ValueError(
                 "External token count exceeds the published reshard payload: "
                 f"external={external_tokens}, num_tokens={num_tokens}")
-        # The suffix clip is one dst_skip_bytes offset into a flat byte space,
-        # so it cannot skip a different prefix per group. A multi-group model
-        # pulls its whole prefix and pays the redundant bytes.
+        # TODO: turn on prefix-aware loads for DSv4. The current path assumes
+        # an `fa` pool tag, one page size, and one block table, and DSv4 has
+        # none of those.
         skip_tokens = (num_tokens - external_tokens if
                        (self._stage3_prefix_aware_load_enabled
                         and not multi_group) else 0)
@@ -1600,8 +1595,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                             self._stage3_transfer_groups, group_block_ids)
             ]
 
-        # Count the pages this send would carry that the allocator has already
-        # taken back. See `_stage3_recycled_transfer_pages` for why they drift.
         if normalized_group_block_ids is not None:
             recycled: list[tuple[int, int]] = []
             for group, ids in zip(self._stage3_transfer_groups,
@@ -1613,12 +1606,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     window_tokens=group.window_tokens)
                 if dead:
                     recycled.append((group.cache_group_index, dead))
-            # Two dead pages in one group are two copies of the null block.
-            # Raiden rejects that duplicate destination by raising out of
-            # `execute_model`, which kills the engine and every other request
-            # on it, so drop the send instead.
-            if any(dead > 1 for _, dead in recycled):
-                logger.warning(
+            if recycled:
+                logger.error(
                     "Stage-3 skipping the send for req=%s: the producer ran to "
                     "%d computed tokens and recycled sliding-window pages the "
                     "%d-token transfer prefix still lists, as (cache group, "
@@ -1626,20 +1615,6 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     "request itself.", request.request_id, computed_tokens,
                     num_tokens, recycled)
                 return False, {}
-            if recycled:
-                # One dead page is a hole in that group's window, not something
-                # Raiden refuses, and it predates this check. Skipping the send
-                # would be worse: the decode replica is provisioned to decode
-                # and falls over prefilling a long prompt. The real fix is for
-                # the producer to publish the page count it dropped instead of
-                # having the consumer re-derive it.
-                logger.warning(
-                    "Stage-3 send for req=%s carries sliding-window pages the "
-                    "allocator already recycled, as (cache group, dead pages) "
-                    "%s. The producer ran to %d computed tokens against a "
-                    "%d-token transfer prefix; the decode replica will attend "
-                    "over a hole in those groups' windows.",
-                    request.request_id, recycled, computed_tokens, num_tokens)
 
         producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
                             if self.vllm_config.parallel_config else 0)
