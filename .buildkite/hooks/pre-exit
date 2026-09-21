@@ -3,25 +3,16 @@ set -uo pipefail
 
 echo "~~~ :broom: Cleaning up containers and host resources"
 
-# 1. Force-kill all running/hung containers on the host
+# Force-kill all running/hung containers so TPU hardware locks are freed
 RUNNING_CONTAINERS=$(docker ps -q)
 if [ -n "${RUNNING_CONTAINERS}" ]; then
   echo "Terminating running/hung containers..."
   echo "${RUNNING_CONTAINERS}" | xargs -r docker rm -f || true
 fi
 
-# 2. Prune only dangling images and stopped containers (PRESERVES BuildKit layer cache)
+# Prune stopped containers and dangling images (preserves BuildKit layer cache)
 docker container prune -f || true
 docker image prune -f || true
 
-# 3. High-watermark disk mitigation (Avoid blowing away cache unless disk is >80% full)
-DISK_USAGE_PCT=$(df /mnt/disks/persist 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%' || echo "0")
-if [ "${DISK_USAGE_PCT}" -gt 80 ]; then
-  echo "WARNING: /mnt/disks/persist is at ${DISK_USAGE_PCT}% usage. Purging old model weights..."
-  docker run --rm -v /mnt/disks/persist:/persist alpine sh -c 'rm -rf /persist/models/* /persist/perf_eval_results/*' || true
-else
-  echo "Disk usage on /mnt/disks/persist is healthy (${DISK_USAGE_PCT}%). Retaining model cache."
-fi
-
-# 4. Clean workspace results staging
+# Clean temporary evaluation logs and results from workspace
 rm -rf perf_eval_results/* 2>/dev/null || true
