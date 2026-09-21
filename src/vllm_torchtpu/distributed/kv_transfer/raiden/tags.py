@@ -32,3 +32,30 @@ TAG_DSV4_STATE_HCA = "dsv4.state.hca"
 def dsv4_group_tag(base_tag: str, group_index: int) -> str:
     """``dsv4.swa`` + group 3 -> ``dsv4.swa.g3``."""
     return f"{base_tag}.g{int(group_index)}"
+
+
+# Per-layer tags: ``<class tag>.l<layer index>``. A pipeline-parallel
+# producer stage registers only its own layers, so pools pair up by layer
+# rather than by manifest position; both transfer peers must build their
+# manifests with the same policy.
+_LAYER_SUFFIX = ".l"
+
+
+def layer_tag(tag: str, layer_index: int) -> str:
+    """Tag of one layer's pool under the per-layer tagging policy."""
+    if layer_index < 0:
+        raise ValueError(f"layer index must be non-negative: {layer_index}")
+    return f"{tag}{_LAYER_SUFFIX}{layer_index}"
+
+
+def split_layer_tag(tag: str) -> tuple[str, int | None]:
+    """(class tag, layer index) of a tag; the index is None when absent."""
+    head, sep, tail = tag.rpartition(_LAYER_SUFFIX)
+    if sep and tail.isdigit():
+        return head, int(tail)
+    return tag, None
+
+
+def class_tag(tag: str) -> str:
+    """The tag with any per-layer suffix removed."""
+    return split_layer_tag(tag)[0]

@@ -8,79 +8,41 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _patch_vllm_pcp_v2_validation() -> None:
-    """Allow TPU PCP through GPU-specific Model Runner V2 checks."""
-    from vllm.config import vllm as vllm_config
-
-    cls = vllm_config.VllmConfig
-    original_validate = cls._validate_v2_model_runner
-    if getattr(original_validate, "_tpu_pcp_v2_validation_patch", False):
-        return
-    original_unsupported = cls._get_v2_model_runner_unsupported_features
-
-    def get_unsupported(self):
-        unsupported = original_unsupported(self)
-        if self.parallel_config.prefill_context_parallel_size > 1:
-            unsupported = [
-                feature for feature in unsupported
-                if feature != "prefill context parallelism"
-            ]
-        return unsupported
-
-    def validate(self):
-        if self.parallel_config.prefill_context_parallel_size <= 1:
-            return original_validate(self)
-        has_triton = vllm_config.HAS_TRITON
-        vllm_config.HAS_TRITON = True
-        try:
-            return original_validate(self)
-        finally:
-            vllm_config.HAS_TRITON = has_triton
-
-    validate._tpu_pcp_v2_validation_patch = True
-    cls._get_v2_model_runner_unsupported_features = get_unsupported
-    cls._validate_v2_model_runner = validate
-    logger.info("Applied TPU patch: allow PCP through GPU-specific V2 checks.")
-
-
 def _reconcile_hybrid_producer_prefix_hits(scheduler) -> None:
-    """Require a common local prefix hit on a hybrid KV producer.
+    """Use a common local prefix boundary for hybrid TPU producers.
 
-    vLLM 0.26.1rc0 lets a hybrid model with any KV connector resume from the
-    deepest per-group local hit. That is valid on a consumer when the connector
-    transfers the missing groups, but a producer has no external state to fill
-    the gap. In particular, FA can have a cached page where Mamba has no state
-    checkpoint, and resuming from the FA-only boundary corrupts generation.
-
-    This is the producer-only subset of the reconciliation merged upstream in
-    vllm-project/vllm#48425. Keep it local to the coordinator instance so
-    consumer-side divergent lookup and remote suffix transfer are unchanged.
+    vLLM 0.27.0 assumes every KV connector can complete a divergent local
+    hybrid hit by restoring the recurrent state missing at the deeper
+    full-attention boundary. The Raiden offloading path used by GPC does not
+    provide that contract. Backport the conservative behavior from vLLM
+    #50344 at the producer manager instance boundary, while preserving
+    ``shared_prefix_boundary`` for adaptive Mamba checkpoint retention.
+    Stage-3 Raiden consumers support divergent hits and are unaffected.
     """
     from types import MethodType
 
     from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 
     kv_transfer_config = scheduler.vllm_config.kv_transfer_config
-    coordinator = scheduler.kv_cache_manager.coordinator
+    manager = scheduler.kv_cache_manager
     if (kv_transfer_config is None or not kv_transfer_config.is_kv_producer
             or not scheduler.has_mamba_layers
-            or not isinstance(coordinator, HybridKVCacheCoordinator)):
+            or not isinstance(manager.coordinator, HybridKVCacheCoordinator)):
         return
 
-    def find_common_prefix_hit(self, block_hashes, max_cache_hit_length):
-        blocks, hit_length, _ = self.find_longest_cache_hit(
-            block_hashes, max_cache_hit_length)
-        per_group_hits = (hit_length, ) * len(
-            self.kv_cache_config.kv_cache_groups)
-        return blocks, per_group_hits
+    def get_common_prefix_hit_for_connector(self, request):
+        blocks, hit_length, shared_prefix_boundary = self.get_computed_blocks(
+            request)
+        return blocks, hit_length, shared_prefix_boundary, False
 
-    coordinator.find_longest_cache_hit_per_group = MethodType(
-        find_common_prefix_hit, coordinator)
-    logger.info("Reconciled hybrid producer prefix hits to a common boundary.")
+    manager.get_computed_blocks_for_connector = MethodType(
+        get_common_prefix_hit_for_connector, manager)
+    logger.info(
+        "Reconciled hybrid TPU producer prefix hits to a common boundary.")
 
 
 def _patch_vllm_hybrid_producer_prefix_hits() -> None:
-    """Backport vLLM's hybrid connector hit reconciliation to 0.26.0."""
+    """Backport connector-scoped hybrid hit handling from vLLM #50344."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
     if Scheduler.__dict__.get("_tpu_hybrid_producer_prefix_hit_patch", False):
@@ -95,6 +57,81 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
     Scheduler.__init__ = patched_init
     Scheduler._tpu_hybrid_producer_prefix_hit_patch = True
     logger.info("Applied TPU patch: reconcile hybrid producer prefix hits.")
+
+
+def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
+    """Backport hybrid KV cache load failure recovery from vLLM #50388.
+
+    In vLLM <= 0.29.0 (prior to vLLM #50388),
+    ``Scheduler._update_requests_with_invalid_blocks`` unpacks
+    ``(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)``, which
+    raises ``ValueError: too many values to unpack (expected 1)`` whenever a
+    hybrid model (multiple KV cache groups) encounters a failed KV load.
+    """
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if Scheduler.__dict__.get("_tpu_hybrid_kv_load_failure_patch", False):
+        return
+
+    original_update = getattr(Scheduler,
+                              "_update_requests_with_invalid_blocks", None)
+    if original_update is None:
+        return
+
+    @wraps(original_update)
+    def _hybrid_update_requests_with_invalid_blocks(
+        self,
+        requests,
+        invalid_block_ids: set[int],
+        num_scheduled_tokens: dict[str, int],
+        evict_blocks: bool = True,
+    ) -> tuple[set[str], int, set[int]]:
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            return original_update(
+                self,
+                requests,
+                invalid_block_ids,
+                num_scheduled_tokens,
+                evict_blocks=evict_blocks,
+            )
+
+        affected_req_ids: set[str] = set()
+        total_affected_tokens = 0
+        blocks_to_evict: set[int] = set()
+        marked_invalid_block_ids: set[int] = set()
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
+        for request in requests:
+            req_id = request.request_id
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(
+                req_id)
+            req_num_computed_tokens = (request.num_computed_tokens -
+                                       num_scheduled_tokens.get(req_id, 0))
+            request_invalid_block_ids = {
+                block_id
+                for req_block_ids in req_block_ids_per_group
+                for block_id in req_block_ids
+                if block_id != null_block_id and block_id in invalid_block_ids
+            }
+            if request_invalid_block_ids:
+                marked_invalid_block_ids |= request_invalid_block_ids
+                total_affected_tokens += req_num_computed_tokens
+                request.num_computed_tokens = 0
+                if evict_blocks:
+                    for req_block_ids in req_block_ids_per_group:
+                        blocks_to_evict.update(block_id
+                                               for block_id in req_block_ids
+                                               if block_id != null_block_id)
+                affected_req_ids.add(req_id)
+        return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    Scheduler._update_requests_with_invalid_blocks = (
+        _hybrid_update_requests_with_invalid_blocks)
+    Scheduler._tpu_hybrid_kv_load_failure_patch = True
+    logger.info(
+        "Applied TPU patch: hybrid KV cache load failure recovery (vLLM #50388)."
+    )
 
 
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
@@ -216,33 +253,6 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         sorted(HASH_IGNORED_ADDITIONAL_CONFIG_KEYS))
 
 
-def _patch_vllm_tpu_group_custom_ops() -> None:
-    """Disable vLLM custom collective ops for TPU in this TorchTPU integration.
-
-    vLLM's `torch.ops.vllm.all_reduce/all_gather` custom ops are not available
-    on the TorchTPU backend in this repo. Force GroupCoordinator to use
-    communicator-backed collectives instead.
-
-    TODO (geyuhao): Do we actually need to support torch.ops.vllm.* on TPU? Currently
-    this patch will use torch.distributed.all_reduce/all_gather.
-    """
-
-    from vllm.distributed.parallel_state import GroupCoordinator
-
-    if getattr(GroupCoordinator, "_tpu_no_custom_collective_patch", False):
-        return
-
-    original_init = GroupCoordinator.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self.use_custom_op_call = False
-
-    GroupCoordinator.__init__ = patched_init
-    GroupCoordinator._tpu_no_custom_collective_patch = True
-    logger.info("Applied TPU patch: disable vLLM custom collective ops.")
-
-
 def _patch_default_moe_runner_select_forward() -> None:
     """Keep DefaultMoERunner on the direct ``_moe_forward`` path under OOT.
 
@@ -314,7 +324,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
         try:
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
         except ImportError:
             return original.fget(self)
@@ -374,7 +384,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         def fused_ep_owns_pcp_collectives(self) -> bool:
             if self.moe_config.pcp_size <= 1:
                 return False
-            from vllm_torchtpu.layers.vllm.fused_moe_ep import \
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import \
                 fused_moe_ep_supported
             return fused_moe_ep_supported(getattr(self, "_quant_method", None))
 
@@ -532,63 +542,6 @@ def _patch_vllm_compile_all_ranges() -> None:
         logger.info("Applied TPU patch: compile_all_ranges.")
 
 
-def _patch_rowparallel_defer_bias() -> None:
-    """Defer RowParallelLinear bias past the TP all-reduce on TPU.
-
-    Upstream ``RowParallelLinear.forward`` fuses bias into the GEMM **only on
-    rank 0** (``bias_ = None if tp_rank > 0 ... else self.bias``). Under TP>1
-    this makes the per-rank FX graphs structurally different, so the torch_tpu
-    XLA backend assigns mismatched all_reduce channel IDs and the collective is
-    broken.
-    """
-    from vllm.distributed import (split_tensor_along_last_dim,
-                                  tensor_model_parallel_all_reduce)
-    from vllm.model_executor.layers.linear import RowParallelLinear
-
-    # Preserve the genuine upstream forward once so re-application (e.g. a
-    # test that re-applies after mocking the all-reduce) never captures an
-    # already-patched forward as the trunk reference.
-    if not hasattr(RowParallelLinear, "_tpu_upstream_forward"):
-        RowParallelLinear._tpu_upstream_forward = RowParallelLinear.forward
-
-    def forward(self, input_):
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size)
-            input_parallel = splitted_input[self.tp_rank].contiguous()
-
-        do_all_reduce = self.reduce_results and self.tp_size > 1
-        # Defer the (replicated) bias past the all-reduce so every rank runs an
-        # identical GEMM graph -> matching XLA all_reduce channel IDs.
-        defer_tpu_bias = (do_all_reduce and not self.skip_bias_add
-                          and self.bias is not None)
-        if defer_tpu_bias:
-            bias_ = None
-        else:
-            bias_ = (None if
-                     (self.tp_rank > 0 or self.skip_bias_add) else self.bias)
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-
-        if do_all_reduce:
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
-
-        if defer_tpu_bias:
-            output = output + self.bias
-
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
-    RowParallelLinear.forward = forward
-    logger.info(
-        "Applied TPU patch: defer RowParallelLinear bias past TP all_reduce.")
-
-
 def _patch_disable_sequence_parallel_moe() -> None:
     """Disable vLLM's sequence-parallel MoE on TPU.
 
@@ -603,76 +556,6 @@ def _patch_disable_sequence_parallel_moe() -> None:
     ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
     logger.info("Applied TPU patch: disable sequence-parallel MoE.")
-
-
-def _patch_disable_dp_ubatch() -> None:
-    """Disable DP microbatching (DBO) on TPU.
-
-    TPU does not support vLLM DP microbatching yet. Force the post-sync ubatch
-    decision off so DP uses one forward per engine step.
-    """
-    from vllm.v1.worker import dp_utils
-
-    if getattr(dp_utils, "_tpu_no_ubatch_patch", False):
-        return
-
-    dp_utils._post_process_ubatch = lambda tensor, num_ubatches: False
-    dp_utils._tpu_no_ubatch_patch = True
-    logger.info("Applied TPU patch: disable DP microbatching.")
-
-
-def _patch_moe_no_ep_tp_scope() -> None:
-    """Keep non-EP MoE tensor parallelism scoped to each DP engine.
-
-    Upstream vLLM flattens TP across DP for MoE when expert parallelism is
-    disabled. This temporary TPU patch avoids that path until the TPU dummy
-    batch path can keep no-EP MoE ranks in the same lockstep as upstream
-    model-internal DP.
-    """
-    from vllm.distributed import parallel_state
-    from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
-
-    if getattr(FusedMoEParallelConfig, "_tpu_no_ep_tp_scope_patch", False):
-        return
-
-    original_make = FusedMoEParallelConfig.make
-
-    # TODO: Remove this patch in a follow-up PR. TorchTPU should match vLLM's
-    # no-EP MoE convention by flattening DP*TP and extending the coordinated
-    # dummy/lockstep execution used for EP to no-EP MoE as well.
-    def patched_make(tp_size_, pcp_size_, dp_size_, sp_size_,
-                     vllm_parallel_config):
-        use_ep = (dp_size_ * pcp_size_ * tp_size_ > 1
-                  and vllm_parallel_config.enable_expert_parallel)
-        if use_ep:
-            return original_make(tp_size_, pcp_size_, dp_size_, sp_size_,
-                                 vllm_parallel_config)
-
-        dp_rank = (parallel_state.get_dp_group().rank_in_group
-                   if dp_size_ > 1 else 0)
-        pcp_rank = (parallel_state.get_pcp_group().rank_in_group
-                    if pcp_size_ > 1 else 0)
-        tp_rank = (0 if tp_size_ == 1 else
-                   parallel_state.get_tensor_model_parallel_rank())
-        return FusedMoEParallelConfig(
-            tp_size=tp_size_,
-            tp_rank=tp_rank,
-            pcp_size=pcp_size_,
-            pcp_rank=pcp_rank,
-            dp_size=dp_size_,
-            dp_rank=dp_rank,
-            ep_size=1,
-            ep_rank=0,
-            sp_size=sp_size_,
-            use_ep=False,
-            all2all_backend=vllm_parallel_config.all2all_backend,
-            enable_eplb=vllm_parallel_config.enable_eplb,
-        )
-
-    FusedMoEParallelConfig.make = staticmethod(patched_make)
-    FusedMoEParallelConfig._tpu_no_ep_tp_scope_patch = True
-    logger.info(
-        "Applied TPU patch: scope non-EP MoE TP inside each DP engine.")
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:
@@ -714,14 +597,14 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
-    _patch_vllm_hybrid_pcp_block_sizes()
-    _patch_vllm_mamba_split_scheduler_block_size()
-    _patch_vllm_offloading_config_build()
-    # Platform activation can happen from inside the first Scheduler.__init__.
-    # Install this constructor patch at the engine-core boundary instead, before
-    # the first scheduler is created.
-    _patch_vllm_hybrid_producer_prefix_hits()
-    _patch_vllm_merge_multimodal_embeddings()
+    from vllm_torchtpu import patch_registry
+
+    patch_registry.apply("engine_core")
+    from vllm_torchtpu.core.pp_chunk_scheduler import \
+        patch_engine_core_for_pp_chunks
+    from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
+    patch_executor_for_pp_wave(kwargs.get("vllm_config"))
+    patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -890,11 +773,16 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 _has_spec_type(group.kv_cache_spec, AttentionSpec)
                 for group in groups)
 
-    def _with_effective_block_size(spec: KVCacheSpec, pcp: int) -> KVCacheSpec:
+    def _with_effective_block_size(spec: KVCacheSpec,
+                                   pcp: int,
+                                   dcp: int = 1) -> KVCacheSpec:
         """Restate a rank-local spec in the logical (all-ranks) page size."""
+        assert not (pcp > 1 and dcp > 1), (
+            f"Concurrent PCP and DCP are not supported: got pcp={pcp}, dcp={dcp}."
+        )
         if isinstance(spec, UniformTypeKVCacheSpecs):
             effective_specs = {
-                name: _with_effective_block_size(leaf, pcp)
+                name: _with_effective_block_size(leaf, pcp, dcp)
                 for name, leaf in spec.kv_cache_specs.items()
             }
             effective_block_size = math.lcm(
@@ -902,12 +790,24 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             return replace(spec,
                            block_size=effective_block_size,
                            kv_cache_specs=effective_specs)
-        if isinstance(spec, (AttentionSpec, MambaSpec)):
+        if isinstance(spec, AttentionSpec):
+            # Attention KV cache is partitioned along the 1D Context Parallel (CP)
+            # axis during prefill (PCP) or decode (DCP). Because PCP and DCP share
+            # the same physical axis (rather than forming a 2D grid), the effective
+            # sharding factor is max(pcp, dcp).
+            cp_world_size = max(pcp, dcp)
+            return replace(spec, block_size=spec.block_size * cp_world_size)
+        if isinstance(spec, MambaSpec):
+            # Mamba/GDN recurrent state has a fixed per-sequence footprint that
+            # is partitioned across ranks during prefill (PCP), but maintains
+            # full per-rank state during decode and is not sharded by DCP.
             return replace(spec, block_size=spec.block_size * pcp)
         return spec
 
-    def _effective_block_size(spec: KVCacheSpec, pcp: int) -> int:
-        return _with_effective_block_size(spec, pcp).block_size
+    def _effective_block_size(spec: KVCacheSpec,
+                              pcp: int,
+                              dcp: int = 1) -> int:
+        return _with_effective_block_size(spec, pcp, dcp).block_size
 
     def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         cache_config = vllm_config.cache_config
@@ -972,7 +872,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                                                  pcp_world_size,
                                                  scheduler_block_size,
                                                  hash_block_size,
-                                                 metrics_collector=None):
+                                                 metrics_collector=None,
+                                                 num_prefill_lookahead=0):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
             if (pcp_world_size == 1 and _is_attention_mamba_hybrid(groups)):
@@ -981,7 +882,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 # constructing KVCacheManager. Recover the folded PCP factor
                 # from the logical scheduler block and the rank-local specs.
                 physical_scheduler_block_size = math.lcm(
-                    *(_effective_block_size(group.kv_cache_spec, 1)
+                    *(_effective_block_size(group.kv_cache_spec, 1,
+                                            dcp_world_size)
                       for group in groups))
                 if scheduler_block_size % physical_scheduler_block_size != 0:
                     raise ValueError(
@@ -1033,6 +935,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 scheduler_block_size,
                 hash_block_size,
                 metrics_collector,
+                num_prefill_lookahead=num_prefill_lookahead,
             )
 
         hybrid_coordinator.__init__ = _hybrid_init_with_logical_pcp_blocks
@@ -1045,7 +948,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
         module = sys.modules.get(module_name)
         if module is not None:
-            setattr(module, "resolve_kv_cache_block_sizes", patched_resolve)
+            module.resolve_kv_cache_block_sizes = patched_resolve
 
     # Upstream _promote_local_kv_cache_specs asserts that all workers share a
     # uniform KV cache spec across groups, raising ValueError when encountering
@@ -1072,7 +975,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             mod = sys.modules.get(module_name)
             if mod is not None and hasattr(mod,
                                            "_promote_local_kv_cache_specs"):
-                setattr(mod, "_promote_local_kv_cache_specs", patched_promote)
+                mod._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = (
@@ -1138,8 +1041,8 @@ def _patch_vllm_merge_multimodal_embeddings() -> None:
     for mod_name, mod in list(sys.modules.items()):
         if mod_name.startswith("vllm.model_executor.models") and hasattr(
                 mod, "_merge_multimodal_embeddings"):
-            if getattr(mod, "_merge_multimodal_embeddings") is not patched_fn:
-                setattr(mod, "_merge_multimodal_embeddings", patched_fn)
+            if mod._merge_multimodal_embeddings is not patched_fn:
+                mod._merge_multimodal_embeddings = patched_fn
 
 
 def _patch_vllm_reset_compile_wrapper() -> None:
@@ -1367,17 +1270,15 @@ def _patch_vllm_config_triton_tpu() -> None:
 
 
 def _patch_vllm_force_v1_runner_tpu() -> None:
-    """Keep ``use_v2_model_runner`` False for DSpark on TPU.
+    """Keep TPU's V1 scheduler contract and validate its own capabilities.
 
-    Upstream forces the flag True for dspark (and for hybrid DFlash drafts
-    via ``_dflash_needs_multi_kv_group``), because those methods are only
-    implemented by the V2 *GPU* model runner. The flag is not just a runner
-    selector: the scheduler, async scheduler, and input processor all branch
-    on it and emit V2-shaped request data (resumed requests folded into
-    scheduled_new_reqs, no prev_step_scheduled_req_ids, ...). TPUModelRunner
-    subclasses the V1 GPUModelRunner and expects V1-shaped output, so the
-    flag must stay False for DSpark. An explicit VLLM_USE_V2_MODEL_RUNNER env
-    setting still wins, matching upstream's own precedence.
+    vLLM 0.29 defaults to GPU Model Runner V2 when Triton is available and
+    rejects GPU V2-only features when V1 is selected. TPUModelRunner owns
+    PCP, DSpark, and mixed-attention DFlash implementations, but consumes
+    V1-shaped scheduler output. Keep that default regardless of Triton and
+    remove only those implemented features from the native V1 rejection
+    list. The other native checks and TPU's combination checks still apply.
+    An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
     from vllm.config.vllm import VllmConfig
 
@@ -1388,7 +1289,7 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
     if not isinstance(original_prop, property):
         logger.warning(
             "VllmConfig.use_v2_model_runner is no longer a property; skipping "
-            "the TPU V1-runner patch. DSpark on TPU may misbehave until this "
+            "the TPU V1-runner patch. TPU execution may misbehave until this "
             "is updated for the current vLLM version.")
         return
 
@@ -1397,13 +1298,30 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
             return original_prop.fget(self)
         device_config = getattr(self, "device_config", None)
-        spec_config = getattr(self, "speculative_config", None)
-        if (device_config is not None and device_config.device_type == "tpu"
-                and spec_config is not None
-                and getattr(spec_config, "method", None) == "dspark"):
+        if device_config is not None and device_config.device_type == "tpu":
             return False
         return original_prop.fget(self)
 
+    original_unsupported = VllmConfig._get_v1_model_runner_unsupported_features
+
+    def patched_unsupported(self):
+        unsupported = original_unsupported(self)
+        device_config = getattr(self, "device_config", None)
+        if device_config is None or device_config.device_type != "tpu":
+            return unsupported
+        # These are limitations of the upstream GPU V1 runner. Do not bypass
+        # the validator: adaptive verification, DFlash2, and future features
+        # must remain rejected until TPU implements them.
+        implemented = {
+            "prefill context parallel",
+            "dspark speculative decoding",
+            "mixed sliding/full dflash drafts",
+        }
+        return [
+            feature for feature in unsupported if feature not in implemented
+        ]
+
+    VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
     VllmConfig.use_v2_model_runner = property(patched_use_v2)
     VllmConfig._tpu_force_v1_runner_patch = True
     logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")

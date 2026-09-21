@@ -13,9 +13,10 @@ import importlib.util
 import json
 import os
 import pickle
+from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch._guards
@@ -94,6 +95,60 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
+    # timeouts. Same reasoning as the Raiden group above. Every registry
+    # entry not named here joins the cache key, so omitting these would
+    # recompile the world whenever an operator retuned a port.
+    "TPU_IPC_SOCKET_DIR",
+    "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
+    "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
+    "TPU_KV_LATENCY_LOG_INTERVAL",
+    "TPU_KV_PIN_SHM",
+    "TPU_KV_SHM_POOL_GB",
+    "TPU_KV_STAGE_WAITER_POOL_SIZE",
+    "TPU_KV_STAGE_WAIT_TIMEOUT_SECS",
+    "TPU_KV_TRANSFER_CHANNEL_NUMBER",
+    "TPU_KV_TRANSFER_NAMESPACE",
+    "TPU_KV_TRANSFER_PORT",
+    # Compiles the same artifacts, just eagerly at startup.
+    "TPU_KV_WARMUP_ENABLED",
+    "TPU_NODE_ID",
+    "TPU_P2P_WAIT_PULL_TIMEOUT",
+    "TPU_RAIDEN_INLINE_LOAD",
+    "TPU_RAIDEN_POOL_STAGING_LEASES",
+    "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+    "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
+    "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
+    "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
+    "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+    "TPU_SIDE_CHANNEL_PORT",
+    # The HBM reserve that feeds block-count sizing comes from
+    # kv_transfer_config, not from this variable.
+    "TPU_USE_RAIDEN_CONNECTOR",
+    # Pipeline chunk sizing: scheduling and the extra token buckets, which
+    # are keyed by shape inside the same cache.
+    "TPU_PP_DYNAMIC_CHUNKS",
+    "TPU_PP_CHUNK_SLACK",
+    # Startup and host-side knobs: ports, an IPC secret, two raiden startup
+    # checks, offload retry and drain limits, a weight-load sync cadence, a
+    # debug log switch, and the local-rank offsets, which move a worker to a
+    # different chip without changing the executable it runs.
+    "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "RAIDEN_DISABLE_SINGLETON_WORKER",
+    "RAIDEN_SHM_KEY",
+    # Compiles the same spec-decode artifacts, just eagerly at startup.
+    "SPEC_WARMUP",
+    "TORCH_TPU_BASE_PORT",
+    "TORCH_TPU_MP_RENDEZVOUS_PORT",
+    "TPU_LOCAL_RANK_OFFSET",
+    "TPU_SHARDED_LOAD_SYNC_EVERY",
+    "VLLM_TORCHTPU_IPC_KEY",
+    "VLLM_TPU_DEBUG_PCP_LAYOUT",
+    "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
+    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+    # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
+    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -107,26 +162,30 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
-    "vllm_torchtpu/layers/common",
-    "vllm_torchtpu/layers/vllm/attention.py",
-    "vllm_torchtpu/layers/vllm/custom_ops",
-    "vllm_torchtpu/layers/vllm/fused_moe.py",
+    "vllm_torchtpu/layers/core",
+    "vllm_torchtpu/layers/adapter/attention.py",
+    "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/custom_ops",
+    "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
-    "vllm_torchtpu/layers/vllm/fused_moe_ep.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` fixes the device ORDER
     # the kernel's remote DMAs resolve their peer coordinates against, so an
     # edit to the ordering changes where every routed row goes without
     # changing a byte of the kernel.
     "vllm_torchtpu/distributed/ep_mesh.py",
-    "vllm_torchtpu/layers/vllm/linear_common.py",
-    "vllm_torchtpu/layers/vllm/router_topk.py",
-    "vllm_torchtpu/layers/vllm/quantization",
-    "vllm_torchtpu/layers/vllm/vision_attention.py",
+    "vllm_torchtpu/layers/adapter/linear_common.py",
+    "vllm_torchtpu/layers/adapter/router_topk.py",
+    "vllm_torchtpu/layers/adapter/quantization",
+    "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # K3 custom-op registration, sharding, and Attention Residual bridges.
+    "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+    "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
 )
 
 

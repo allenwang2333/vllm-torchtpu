@@ -464,9 +464,8 @@ def test_a_refused_bucket_nobody_retraced_raises(tmp_path):
 
 def test_warmup_scope_survives_a_failure():
     """A failed warmup must not leave the session pinned for the next one."""
-    with pytest.raises(RuntimeError):
-        with shape_variants.warmup():
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), shape_variants.warmup():
+        raise RuntimeError("boom")
     assert shape_variants._session is None
 
 
@@ -495,3 +494,14 @@ def test_env_override_keeps_the_mega_artifact_off():
         # The write only means something while vLLM still reads this name.
         assert "VLLM_USE_MEGA_AOT_ARTIFACT" in vllm.envs.environment_variables
         assert vllm.envs.VLLM_USE_MEGA_AOT_ARTIFACT is False
+
+
+@pytest.mark.parametrize("field", ["guards", "expr"])
+def test_missing_guard_field_cannot_accept_a_bucket(field):
+    symbol = sympy.Symbol("s0", integer=True)
+    guard = SimpleNamespace(expr=sympy.Eq(sympy.Mod(symbol, 3), 0))
+    env = SimpleNamespace(var_to_range={symbol: ValueRanges(2, 8192)},
+                          guards=[guard])
+    delattr(env if field == "guards" else guard, field)
+    with pytest.raises(AttributeError, match=field):
+        unsupported_reason(env, 2048)

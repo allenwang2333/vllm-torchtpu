@@ -3,11 +3,12 @@
 
 Phase 1.1 of KIMI_LINEAR_POOLED_APC_PLAN.md: the pooled op gathers each
 request's conv/SSM regions out of its pool block into dense batch-local
-buffers, runs the unmodified dispatched KDA core, and scatters the updated
-states back. The dense core with identity indices over null-slot-prepended
-buffers is the reference: identical values in, so the paths agree up to
-fusion reassociation of the non-Pallas f32 sums (the conv state update is
-pure data movement and stays bitwise exact).
+buffers, runs the fused conv1d + GDN v3 kernel, and scatters the updated
+states back. The dense reference is the same fused core with identity
+indices over null-slot-prepended buffers: identical values into the same
+kernel, so the paths agree up to any reassociation XLA applies around the
+gather-fed buffers (the conv state update is pure data movement and stays
+bitwise exact).
 """
 
 import jax.numpy as jnp
@@ -16,8 +17,8 @@ import pytest
 
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
-from vllm_torchtpu.layers.vllm.custom_ops.kda_attention_op import (
-    _dispatched_kda_core, _pooled_kda_core)
+from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
+    _build_fused_core, _pooled_kda_core)
 
 # Kimi-Linear TP8 shard geometry on an MLA pool.
 NUM_HEADS, HEAD_DIM, KERNEL_SIZE = 4, 128, 4
@@ -73,7 +74,7 @@ def _initial_states(rng, num_seqs):
     return conv, ssm
 
 
-def _pack_pool(conv_init, ssm_init, block_ids):
+def _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads=None):
     """Write the given states into the pool's state regions; the rest of the
     pool (including block 0 and the attention rows of every block) keeps its
     sentinel bytes."""
@@ -83,11 +84,16 @@ def _pack_pool(conv_init, ssm_init, block_ids):
                        dtype=jnp.bfloat16)
     idx = jnp.asarray(block_ids, dtype=jnp.int32)
 
-    conv_vals = conv_init.reshape(len(block_ids), CONV_ELEMS)
-    conv_vals = jnp.pad(conv_vals,
-                        ((0, 0),
-                         (0, CONV_REGION_ROWS * LANES - CONV_ELEMS))).reshape(
-                             len(block_ids), CONV_REGION_ROWS, LANES)
+    shard_heads = NUM_HEADS if conv_shard_heads is None else conv_shard_heads
+    capacity = CONV_REGION_ROWS * LANES // (NUM_HEADS // shard_heads)
+    chunks = []
+    for start in range(0, NUM_HEADS, shard_heads):
+        chunk = conv_init[:, :, :, start:start + shard_heads].reshape(
+            len(block_ids), -1)
+        chunks.append(jnp.pad(chunk, ((0, 0), (0, capacity - chunk.shape[1]))))
+    conv_vals = jnp.concatenate(chunks,
+                                axis=1).reshape(len(block_ids),
+                                                CONV_REGION_ROWS, LANES)
     pool = pool_adapters.scatter_region(pool,
                                         conv_vals,
                                         idx,
@@ -106,7 +112,7 @@ def _pack_pool(conv_init, ssm_init, block_ids):
     return pool
 
 
-def _unpack_pool(pool, block_ids, split=1):
+def _unpack_pool(pool, block_ids, split=1, conv_shard_heads=None):
     idx = jnp.asarray(block_ids, dtype=jnp.int32)
     conv = pool_adapters.gather_region(pool,
                                        idx,
@@ -114,10 +120,16 @@ def _unpack_pool(pool, block_ids, split=1):
                                        ntok=LAYOUT.conv_tokens,
                                        out_dtype=jnp.bfloat16,
                                        split=split)
-    conv = conv.reshape(len(block_ids),
-                        -1)[:, :CONV_ELEMS].reshape(len(block_ids),
-                                                    KERNEL_SIZE - 1, 3,
-                                                    NUM_HEADS, HEAD_DIM)
+    shard_heads = NUM_HEADS if conv_shard_heads is None else conv_shard_heads
+    fragments = NUM_HEADS // shard_heads
+    conv = conv.reshape(len(block_ids), fragments, -1)
+    live = (KERNEL_SIZE - 1) * 3 * shard_heads * HEAD_DIM
+    conv = jnp.concatenate([
+        conv[:, i, :live].reshape(len(block_ids), KERNEL_SIZE - 1, 3,
+                                  shard_heads, HEAD_DIM)
+        for i in range(fragments)
+    ],
+                           axis=3)
     ssm = pool_adapters.gather_region(pool,
                                       idx,
                                       tok0=0,
@@ -130,18 +142,22 @@ def _unpack_pool(pool, block_ids, split=1):
     return conv, ssm
 
 
-def _dispatched_kda_core_dense(inputs, conv_init, ssm_init, distribution):
+def _fused_kda_core_dense(inputs, conv_init, ssm_init, distribution):
+    """The dense reference: the fused conv1d + GDN v3 core over
+    null-slot-prepended dense buffers, exactly what the pooled op runs after
+    gathering its regions (including the flat conv-state layout the kernel
+    expects)."""
     num_seqs = inputs["seq_lens"].shape[0]
     conv_buf = jnp.concatenate([jnp.zeros_like(conv_init[:1]), conv_init],
                                axis=0)
     ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_init[:1]), ssm_init], axis=0)
     identity = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
-    return _dispatched_kda_core(
+    output, new_conv, new_ssm = _build_fused_core(LOWER_BOUND, EPS)(
         inputs["mixed_qkv"],
         inputs["raw_gate"],
         inputs["beta"],
         inputs["output_gate"],
-        conv_buf,
+        conv_buf.reshape(num_seqs + 1, KERNEL_SIZE - 1, -1),
         ssm_buf,
         inputs["conv_weight"],
         inputs["a_log"],
@@ -151,12 +167,17 @@ def _dispatched_kda_core_dense(inputs, conv_init, ssm_init, distribution):
         identity,
         inputs["seq_lens"],
         distribution,
-        lower_bound=LOWER_BOUND,
-        eps=EPS,
     )
+    return output, new_conv.reshape(num_seqs + 1, KERNEL_SIZE - 1, 3,
+                                    NUM_HEADS, HEAD_DIM), new_ssm
 
 
-def _run_pooled(inputs, pool, block_ids, distribution, pool_block_tokens):
+def _run_pooled(inputs,
+                pool,
+                block_ids,
+                distribution,
+                pool_block_tokens,
+                conv_shard_heads=None):
     return _pooled_kda_core(
         inputs["mixed_qkv"],
         inputs["raw_gate"],
@@ -174,22 +195,26 @@ def _run_pooled(inputs, pool, block_ids, distribution, pool_block_tokens):
         lower_bound=LOWER_BOUND,
         eps=EPS,
         pool_block_tokens=pool_block_tokens,
+        conv_shard_heads=conv_shard_heads,
     )
 
 
 @pytest.mark.parametrize(
-    ("query_lens", "seq_lens", "decode_end"),
+    ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
         # One decode with history, one fresh prefill, one continuation.
-        ([1, 5, 3], [9, 5, 11], 1),
+        ([1, 5, 3], [9, 5, 11], 1, None),
         # Decode-only batch: the prefill segment is skipped entirely.
-        ([1, 1], [4, 7], 2),
+        ([1, 1], [4, 7], 2, None),
         # Prefill-only, all fresh: no initial state is ever read.
-        ([6, 2], [6, 2], 0),
+        ([6, 2], [6, 2], 0, None),
+        # Stage-3 rank-blocked convolution fragments.
+        ([1, 5, 3], [9, 5, 11], 1, 1),
     ],
-    ids=["mixed", "decode-only", "prefill-fresh"],
+    ids=["mixed", "decode-only", "prefill-fresh", "rank-blocked"],
 )
-def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
+def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end,
+                                          conv_shard_heads):
     num_seqs = len(query_lens)
     rng = np.random.default_rng(0)
     inputs = _inputs(rng, query_lens, seq_lens)
@@ -198,16 +223,17 @@ def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
                                dtype=jnp.int32)
     block_ids = [1, 2, 3][:num_seqs]
 
-    out_dense, conv_dense, ssm_dense = _dispatched_kda_core_dense(
+    out_dense, conv_dense, ssm_dense = _fused_kda_core_dense(
         inputs, conv_init, ssm_init, distribution)
 
-    pool = _pack_pool(conv_init, ssm_init, block_ids)
+    pool = _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads)
     before = np.asarray(pool.view(jnp.uint16))
     out_pool, pool_after = _run_pooled(inputs,
                                        pool,
                                        block_ids,
                                        distribution,
-                                       pool_block_tokens=BLOCK_SIZE * PACK)
+                                       pool_block_tokens=BLOCK_SIZE * PACK,
+                                       conv_shard_heads=conv_shard_heads)
 
     # Same arithmetic on identical values, but compiled in a different graph
     # (gather-fed buffers instead of plain ones), so fusion can reassociate
@@ -217,7 +243,9 @@ def test_pooled_kda_matches_dense_bitwise(query_lens, seq_lens, decode_end):
                                rtol=5e-2,
                                atol=4e-3)
 
-    conv_back, ssm_back = _unpack_pool(pool_after, block_ids)
+    conv_back, ssm_back = _unpack_pool(pool_after,
+                                       block_ids,
+                                       conv_shard_heads=conv_shard_heads)
     # The conv state update is pure data movement: bitwise equal.
     np.testing.assert_array_equal(np.asarray(conv_back.view(jnp.uint16)),
                                   np.asarray(conv_dense[1:].view(jnp.uint16)))
@@ -317,3 +345,51 @@ def test_pooled_kda_manager_block_split():
     for block in range(NUM_BLOCKS):
         if block not in block_ids:
             np.testing.assert_array_equal(after[block], seed[block])
+
+
+def test_pooled_kda_multistep_state_evolution():
+    """State must round-trip the pool across a chunked prefill and decodes.
+
+    One request: two prefill chunks followed by three decode steps. The dense
+    path threads its buffers; the pooled path threads only the pool, so every
+    step's state goes through the gather/scatter seam. Outputs are compared
+    per step and the final states at the end.
+    """
+    rng = np.random.default_rng(0)
+    steps = [(128, 128, 0), (96, 224, 0), (1, 225, 1), (1, 226, 1),
+             (1, 227, 1)]  # (query_len, seq_len_after, decode_end)
+
+    conv_init, ssm_init = _initial_states(rng, 1)
+    # Dense: null slot 0 + the request's slot 1, threaded across steps.
+    conv_buf = jnp.concatenate([jnp.zeros_like(conv_init[:1]), conv_init],
+                               axis=0)
+    ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_init[:1]), ssm_init], axis=0)
+    # Pooled: the request's state lives in pool block 1.
+    pool = _pack_pool(conv_init, ssm_init, [1])
+
+    for step_idx, (query_len, seq_len, decode_end) in enumerate(steps):
+        inputs = _inputs(rng, [query_len], [seq_len])
+        distribution = jnp.asarray([decode_end, 1, 1], dtype=jnp.int32)
+
+        out_dense, conv_buf, ssm_buf = _fused_kda_core_dense(
+            inputs, conv_buf[1:], ssm_buf[1:], distribution)
+        out_pool, pool = _run_pooled(inputs,
+                                     pool, [1],
+                                     distribution,
+                                     pool_block_tokens=BLOCK_SIZE * PACK)
+
+        np.testing.assert_allclose(np.asarray(out_pool, np.float32),
+                                   np.asarray(out_dense, np.float32),
+                                   rtol=5e-2,
+                                   atol=4e-3,
+                                   err_msg=f"output diverged at step "
+                                   f"{step_idx} {steps[step_idx]}")
+
+    conv_back, ssm_back = _unpack_pool(pool, [1])
+    # Conv state is pure data movement through the seam: bitwise equal.
+    np.testing.assert_array_equal(np.asarray(conv_back.view(jnp.uint16)),
+                                  np.asarray(conv_buf[1:].view(jnp.uint16)))
+    np.testing.assert_allclose(np.asarray(ssm_back, np.float32),
+                               np.asarray(ssm_buf[1:], np.float32),
+                               rtol=1e-2,
+                               atol=5e-4)
