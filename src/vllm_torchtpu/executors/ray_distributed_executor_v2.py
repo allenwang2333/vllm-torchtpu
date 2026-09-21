@@ -17,15 +17,14 @@ import threading
 import time
 import weakref
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import ray
 import vllm.envs as envs
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.platforms import current_platform
-from vllm.utils.network_utils import (get_distributed_init_method, get_ip,
-                                      get_open_port)
+from vllm.utils.network_utils import get_ip, get_open_port
 from vllm.v1.executor.multiproc_executor import FutureWrapper
 from vllm.v1.executor.ray_env_utils import get_driver_env_vars
 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerHandle
@@ -34,6 +33,7 @@ from vllm.v1.executor.ray_utils import (WORKER_SPECIFIC_ENV_VARS,
                                         get_bundles_sorted_by_node)
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.executors.kv_block_override import \
     reconcile_num_gpu_blocks_override
@@ -46,7 +46,7 @@ from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 def get_tpu_bundles_for_indices(
     placement_group,
     bundle_indices: list[int],
-    bundle_to_node_id: Optional[list[tuple[int, str, str]]] = None,
+    bundle_to_node_id: list[tuple[int, str, str]] | None = None,
 ) -> list[tuple[int, str, str]]:
     """Return bundle metadata for the specified bundle indices."""
     if bundle_to_node_id is None:
@@ -98,7 +98,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
         return dp_size, int(dp_rank), world_size * dp_size
 
     def _slice_host_layout(
-            self, device_str: str) -> tuple[list[str], Dict[str, int]]:
+            self, device_str: str) -> tuple[list[str], dict[str, int]]:
         """Return the slice's hosts in rank order and their device counts.
 
         Each DP engine owns a placement group covering only its own chips, so
@@ -106,8 +106,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
         from `ray.nodes()` and ordering by address gives every engine the same
         answer without any of them having to agree on anything.
         """
-        hosts: list[tuple[str, int]] = []
+        hosts: list[tuple[int, str, int]] = []
+        has_worker_id = True
         for node in ray.nodes():
+            if not node.get("Alive", True):
+                continue
             resources = node.get("Resources", {})
             if device_str not in resources:
                 continue
@@ -118,10 +121,52 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 raise RuntimeError(
                     f"Ray node {node.get('NodeID')} reports {device_str} but "
                     "no address to reach it by.")
-            hosts.append((node_ip, int(resources[device_str])))
 
-        hosts.sort()
-        return [ip for ip, _ in hosts], {ip: count for ip, count in hosts}
+            labels = node.get("labels") or node.get("Labels") or {}
+            raw_worker_id = labels.get("ray.io/tpu-worker-id")
+            if raw_worker_id is not None:
+                try:
+                    w_id = int(raw_worker_id)
+                except (ValueError, TypeError):
+                    w_id = 0
+                    has_worker_id = False
+            else:
+                w_id = 0
+                has_worker_id = False
+
+            hosts.append((w_id, node_ip, int(resources[device_str])))
+
+        ordered_by = "IP"
+        if has_worker_id and len(hosts) > 0:
+            hosts.sort(key=lambda x: (x[0], x[1]))
+            actual_w_ids = [w_id for w_id, _, _ in hosts]
+            expected_w_ids = list(range(len(hosts)))
+            if actual_w_ids != expected_w_ids:
+                logger.warning(
+                    "RayDistributedExecutorV2 | TPU worker IDs are not "
+                    "contiguous 0-indexed: got %s, expected %s. Falling back "
+                    "to IP sorting.", actual_w_ids, expected_w_ids)
+                hosts.sort(key=lambda x: x[1])
+            else:
+                ordered_by = "ray.io/tpu-worker-id"
+        else:
+            if len(hosts) > 1:
+                logger.warning(
+                    "RayDistributedExecutorV2 | Multi-host TPU detected (%d "
+                    "hosts) but 'ray.io/tpu-worker-id' label is missing on "
+                    "one or more nodes. Falling back to IP sorting, which may "
+                    "mismatch ICI hardware topology.", len(hosts))
+            hosts.sort(key=lambda x: x[1])
+
+        logger.info(
+            "RayDistributedExecutorV2 | Resolved %d TPU slice hosts "
+            "(ordered by %s): %s", len(hosts), ordered_by,
+            [(w_id, ip) for w_id, ip, _ in hosts])
+
+        return [ip for _, ip, _ in hosts], {
+            ip: count
+            for _, ip, count in hosts
+        }
 
     def _get_actor_resource_kwargs(self) -> dict[str, Any]:
         """Return Ray actor resource kwargs for the TPU platform.
@@ -195,16 +240,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
             placement_group, bundle_to_node_id)
         driver_node = ray.get_runtime_context().get_node_id()
 
-        # Step 3: Resolve the IP for torch.distributed TCPStore.
-        # The TCPStore server runs on rank 0's node, so all workers
-        # must be able to reach this address.
-        dist_ip = bundle_assignments[0]["node_ip"]
-        port = self._select_tcpstore_port(
-            self.parallel_config.data_parallel_rank_local,
-            self.parallel_config.data_parallel_master_port,
-        )
-        distributed_init_method = get_distributed_init_method(dist_ip, port)
-
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
@@ -258,7 +293,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
             ).remote(
                 vllm_config=self.vllm_config,
                 rank=bundle["rank"],
-                distributed_init_method=distributed_init_method,
                 input_shm_handle=scheduler_output_handle,
                 is_driver_worker=is_driver_worker,
                 is_driver_node=is_driver_node,
@@ -317,7 +351,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             host_rank_offset[ip] = offset
             offset += chips_per_host[ip]
 
-        base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+        base_port = tpu_envs.TORCH_TPU_BASE_PORT
         sb_addresses = [
             f"{ip}:{base_port + chip}" for ip in host_order
             for chip in range(chips_per_host[ip])
@@ -411,6 +445,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     "groups. Free the slice and retry so Ray can hand each "
                     "engine a contiguous, aligned set of chips.")
 
+        # Let rank 0 reserve its TCPStore on its own host, matching vLLM's
+        # two-phase RayWorkerProc startup and avoiding a free-port race.
+        distributed_init_method = ray.get(
+            self.ray_worker_handles[0].actor.create_dist_init_method.remote())
+
         # Initialize workers with correct environment variables and local_rank.
         init_worker_refs = []
         for i, (node_id,
@@ -466,6 +505,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
                     engine_local_rank,
                     worker_env_vars,
+                    distributed_init_method,
                     self.driver_env_vars,
                     assigned_physical_gpu_ids=assigned_physical_tpu_ids,
                 ))
@@ -537,7 +577,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 "support ray.")
 
         pp_size = self.parallel_config.pipeline_parallel_size
-        placement_group_specs: List[Dict[str, float]] = []
+        placement_group_specs: list[dict[str, float]] = []
 
         ray_nodes = ray.nodes()
         logger.info(f"RayDistributedExecutorV2 | ray_nodes={ray_nodes}")
@@ -560,9 +600,9 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 device_str: 1.0
             } for _ in range(self.parallel_config.world_size)]
         else:
-            assert pp_size == len(
-                nodes_with_device
-            ), f"Cannot use PP across hosts, please set --pipeline-parallel-size to 1 or {len(nodes_with_device)}"
+            # One bundle per pipeline stage, sized to the stage's devices.
+            # PACK fills a host before moving to the next, so consecutive
+            # stages share a host whenever the stage size allows it.
             num_devices_per_pp_rank = self.parallel_config.world_size // pp_size
             placement_group_specs = [{
                 device_str: num_devices_per_pp_rank
@@ -615,8 +655,10 @@ class RayDistributedExecutorV2(RayExecutorV2):
             # measurement jitter exactly like TpuMultiprocExecutor: build 155
             # died here on a 3-block spread (6456..6459 at TP=32) because this
             # path still demanded exact agreement.
+            pc = self.vllm_config.parallel_config
             agreed = reconcile_num_gpu_blocks_override(
-                self.collective_rpc("get_num_gpu_blocks_override"))
+                self.collective_rpc("get_num_gpu_blocks_override"),
+                workers_per_stage=pc.world_size // pc.pipeline_parallel_size)
             if agreed is not None:
                 self.vllm_config.cache_config.num_gpu_blocks_override = agreed
 

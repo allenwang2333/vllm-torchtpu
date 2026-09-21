@@ -7,6 +7,8 @@ from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size
 
+pytestmark = pytest.mark.cpu_test
+
 
 @pytest.fixture(autouse=True)
 def _restore_scheduler_split_method():
@@ -35,6 +37,7 @@ def _scheduler():
         max_num_scheduled_tokens=16384,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         mamba_partial_cache_hit=False,
+        mamba_has_prefill_checkpoint_blocks=False,
         hash_block_size=3072,
     )
     return scheduler, physical_cache_config

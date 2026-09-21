@@ -32,11 +32,29 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
-COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
+# Point Test Steps to the Metadata-Driven Image Tag
+IMAGE_TAG=""
+if command -v buildkite-agent &> /dev/null; then
+  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+fi
+
+# Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
+if [ -z "${IMAGE_TAG:-}" ]; then
+  if [ "${BUILDKITE:-false}" == "true" ]; then
+    echo "ERROR: CI_IMAGE_TAG metadata is missing in Buildkite CI environment." >&2
+    exit 1
+  fi
+  VLLM_REF="$(sed -nE 's/.*vllm @ git\+https:\/\/github\.com\/vllm-project\/vllm\.git@([a-zA-Z0-9.-]+).*/\1/p' "${REPO_ROOT}/pyproject.toml" | head -n 1)"
+  if [ -z "${VLLM_REF}" ]; then
+    echo "ERROR: Could not parse the vLLM pin from ${REPO_ROOT}/pyproject.toml" >&2
+    exit 1
+  fi
+  IMAGE_TAG="${IMAGE_REPO}:${BUILDKITE_COMMIT:-latest}-${VLLM_REF}"
+fi
 
 # Buildkite expands the last `---` group whenever a log contains no `+++` group
 # at all. Every group below that is pure housekeeping is therefore `~~~`
@@ -50,13 +68,18 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh"
 echo "~~~ Pulling Docker Image: ${IMAGE_TAG}"
 docker pull -q "${IMAGE_TAG}"
 
-# Ensure cache directory exists on the host
-mkdir -p /mnt/disks/persist/models
+HOST_CACHE_ROOT="/mnt/disks/persist"
+if [[ "${CPU_ONLY:-0}" == "1" ]]; then
+  # CPU agents have no persistent disk mounted under /mnt/disks.
+  HOST_CACHE_ROOT="${HOME}/.cache/vllm-torchtpu-ci"
+fi
 
-# Ensure results directory exists on the persistent disk (always mountable).
-# The container below runs as root, so never assume the agent can rm the
-# leftovers of whatever ran last -- see reset_results_dir.sh.
-bash "${SCRIPT_DIR}/reset_results_dir.sh" /mnt/disks/persist/perf_eval_results "${IMAGE_TAG}"
+# Ensure cache directory exists on the host
+mkdir -p "${HOST_CACHE_ROOT}/models"
+
+# The container runs as root, so reset_results_dir.sh handles results the
+# agent cannot remove.
+bash "${SCRIPT_DIR}/reset_results_dir.sh" "${HOST_CACHE_ROOT}/perf_eval_results" "${IMAGE_TAG}"
 
 # Ensure a clean results directory exists in the workspace
 rm -rf perf_eval_results
@@ -108,11 +131,16 @@ BQ_EVAL_VARS=(
   -e TPU_NAME="${TPU_NAME:-}"
 )
 
+DEVICE_ARGS=(--privileged --device /dev/fuse)
+if [[ "${CPU_ONLY:-0}" == "1" ]]; then
+  DEVICE_ARGS=(-e JAX_PLATFORMS=cpu)
+fi
+
 echo "--- Running command in Docker container"
-docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64g --device /dev/fuse \
+docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size=64g \
   -w /root/torchtpu-vllm \
-  -v /mnt/disks/persist/models:/local_hf_cache \
-  -v /mnt/disks/persist/perf_eval_results:/perf_eval_results \
+  -v "${HOST_CACHE_ROOT}/models:/local_hf_cache" \
+  -v "${HOST_CACHE_ROOT}/perf_eval_results:/perf_eval_results" \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
   -e FORCE_COLOR="1" \
   -e HF_HOME=/local_hf_cache \
@@ -122,6 +150,7 @@ docker run --rm --name "${CONTAINER_NAME}" --privileged --net=host --shm-size=64
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
+  ${EVAL_SOFT_FAIL:+-e EVAL_SOFT_FAIL="${EVAL_SOFT_FAIL}"} \
   ${MODEL_PATH:+-e MODEL_PATH="${MODEL_PATH}"} \
   ${P4D2_BIND_HOST:+-e P4D2_BIND_HOST="${P4D2_BIND_HOST}"} \
   ${PROXY_PORT:+-e PROXY_PORT="${PROXY_PORT}"} \
@@ -143,7 +172,7 @@ DOCKER_EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
 echo "~~~ Copying test results back to workspace for artifact upload"
-cp -r /mnt/disks/persist/perf_eval_results/* perf_eval_results/ 2>/dev/null || true
+cp -r "${HOST_CACHE_ROOT}/perf_eval_results/"* perf_eval_results/ 2>/dev/null || true
 # Clean up any broken symlinks on the host to prevent buildkite-agent upload failures
 find perf_eval_results/ -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 

@@ -21,14 +21,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-TILE_SUBROWS = 4
-TILE_LANE_BYTES = 128
+from vllm_torchtpu.kernels.mla import kv_cache_utils
 
 
 def main_kernel(
     nope_in_hbm_ref: Any,
     rope_in_hbm_ref: Any,
     indices_hbm_ref: Any,
+    valid_indices_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
     nope_sem: Any,
@@ -49,7 +49,7 @@ def main_kernel(
     num_blocks = pl.cdiv(indices_hbm_ref.shape[0], block_size)
 
     # Inputs are 8-bit;
-    # nope output stays uint8 (4/int32), rope is unpacked to bf16 (2/int32).
+    # nope and rope output stays uint8 (4/int32).
     in_bits = jax.dtypes.itemsize_bits(nope_in_hbm_ref.dtype)
     in_packing = 32 // in_bits
     in_mask = (1 << in_bits) - 1  # 0xFF for 8-bit.
@@ -83,7 +83,8 @@ def main_kernel(
                 packed = jnp.bitwise_or(packed, jnp.left_shift(val, 8 * sub))
             out_ref[pl.ds(out_row_base + rg, 1), :] = packed
 
-    def outer_pipeline(idx_ref):
+    def outer_pipeline(idx_ref, valid_ref):
+        valid_indices = valid_ref[pl.ds(0, row_subchunk_size)][0]
         b = pl.program_id(0)
         out_row_base = (b * num_cores + core_index) * num_row_subchunks
 
@@ -157,25 +158,35 @@ def main_kernel(
             (num_streams * rope_rows_per_stream, rope_out_i32.shape[1]),
             lambda r: (out_row_base // num_streams + r, 0),
         )
-        pltpu.emit_pipeline(
-            functools.partial(_body, nope_sem, nope_out_i32),
-            grid=(num_row_subchunks // num_streams, ),
-            in_specs=nope_in_specs + rope_in_specs,
-            out_specs=(rope_out_spec, ),
-        )(
-            *([nope_in_i32] * num_streams),
-            *([rope_in_i32] * num_streams),
-            rope_out_i32,
-        )
+        core_start_idx = out_row_base * row_subchunk_size
+
+        @pl.when(core_start_idx < valid_indices)
+        def _run_gather():
+            pltpu.emit_pipeline(
+                functools.partial(_body, nope_sem, nope_out_i32),
+                grid=(num_row_subchunks // num_streams, ),
+                in_specs=nope_in_specs + rope_in_specs,
+                out_specs=(rope_out_spec, ),
+            )(
+                *([nope_in_i32] * num_streams),
+                *([rope_in_i32] * num_streams),
+                rope_out_i32,
+            )
 
     pltpu.emit_pipeline(
         outer_pipeline,
         grid=(num_blocks, ),
-        in_specs=pl.BlockSpec(
-            (row_chunk_size, ),
-            lambda b: (b * num_cores + core_index, ),
+        in_specs=(
+            pl.BlockSpec(
+                (row_chunk_size, ),
+                lambda b: (b * num_cores + core_index, ),
+            ),
+            pl.BlockSpec(
+                (row_subchunk_size, ),
+                lambda b: (0, ),
+            ),
         ),
-    )(indices_hbm_ref)
+    )(indices_hbm_ref, valid_indices_ref)
 
 
 @functools.partial(jax.jit)
@@ -183,33 +194,38 @@ def dsa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
+    num_valid_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
   Args:
-    nope_cache: (total_pages, page_size, TILE_SUBROWS, TILE_LANE_BYTES) uint8.
-      Each (TILE_SUBROWS, TILE_LANE_BYTES) uint8 is token's nope. It encodes 512
+    nope_cache: (total_pages, page_size, WORD_BYTES, TILE_LANE_BYTES) uint8.
+      Each (WORD_BYTES, TILE_LANE_BYTES) uint8 is token's nope. It encodes 512
       fp8 values (per-tensor k_scale applied by the attention kernel; no inline
       scales).
-    rope_cache: (total_pages, page_size // TILE_SUBROWS, TILE_SUBROWS,
+    rope_cache: (total_pages, page_size // WORD_BYTES, WORD_BYTES,
       TILE_LANE_BYTES) uint8. Each (1, TILE_LANE_BYTES) uint8 is token's rope.
-      It encodes 64 bf16.
+      It encodes 128 (rope_out_cols) fp8 values.
     indices: (N,) int32. Token indices into the caches.
+    num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
+      to gather. Subcores assigned to indices beyond this count skip gathering.
 
   Returns:
-    nope_out: (N, TILE_SUBROWS, TILE_LANE_BYTES) uint8. Each token's nope tile
+    nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
       is copied out in the cache's raw layout.
-    rope_out: (N, 64) bf16.
-      Each (64) bf16 is token's rope.
+    rope_out: (N, 128) fp8.
+      (64) fp8 is token's rope, the rest 64 are padding.
   """
+    word_bytes = kv_cache_utils.WORD_BYTES
+    tile_lane_bytes = kv_cache_utils.TILE_LANE_BYTES
     assert indices.ndim == 1, "Indices must be 1D."
     assert nope_cache.dtype == rope_cache.dtype, "Caches must share a dtype."
     assert nope_cache.dtype == jnp.uint8, "Caches must be uint8."
-    assert nope_cache.shape[2:] == (TILE_SUBROWS, TILE_LANE_BYTES), (
-        f"nope_cache must be tiled (..., {TILE_SUBROWS}, {TILE_LANE_BYTES}), "
+    assert nope_cache.shape[2:] == (word_bytes, tile_lane_bytes), (
+        f"nope_cache must be tiled (..., {word_bytes}, {tile_lane_bytes}), "
         f"got {nope_cache.shape}")
-    assert rope_cache.shape[2:] == (TILE_SUBROWS, TILE_LANE_BYTES), (
-        f"rope_cache must be tiled (..., {TILE_SUBROWS}, {TILE_LANE_BYTES}), "
+    assert rope_cache.shape[2:] == (word_bytes, tile_lane_bytes), (
+        f"rope_cache must be tiled (..., {word_bytes}, {tile_lane_bytes}), "
         f"got {rope_cache.shape}")
     rope_out_cols = rope_cache.shape[3]
 
@@ -221,6 +237,16 @@ def dsa_gather(
     out_size = indices.size
     num_simd_lanes = sc_info.num_lanes
     num_cores = sc_info.num_cores * sc_info.num_subcores
+    row_subchunk_size = num_simd_lanes
+
+    if num_valid_indices is None:
+        valid_indices = jnp.full((row_subchunk_size, ),
+                                 out_size,
+                                 dtype=jnp.int32)
+    else:
+        valid_indices = jnp.full((row_subchunk_size, ),
+                                 num_valid_indices,
+                                 dtype=jnp.int32)
 
     # `num_streams` independent `pl.Indirect` gathers are issued per
     # pipeline step to keep multiple gather DMAs in flight.
@@ -230,7 +256,6 @@ def dsa_gather(
     assert (
         num_row_subchunks %
         num_streams == 0), f"{num_streams=} must divide {num_row_subchunks=}."
-    row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = (
@@ -252,7 +277,7 @@ def dsa_gather(
         ),
         out_type=(
             jax.ShapeDtypeStruct(
-                ((out_size + out_pad_size) * TILE_SUBROWS, TILE_LANE_BYTES),
+                ((out_size + out_pad_size) * word_bytes, tile_lane_bytes),
                 jnp.uint8,
             ),
             jax.ShapeDtypeStruct((out_size + out_pad_size, rope_out_cols),
@@ -268,8 +293,8 @@ def dsa_gather(
         ),
         mesh=vector_mesh,
         name="sc_dsa_gather",
-    )(nope_cache, rope_cache, indices)
+    )(nope_cache, rope_cache, indices, valid_indices)
     return (
-        nope_out.reshape(-1, TILE_SUBROWS, TILE_LANE_BYTES)[:out_size],
+        nope_out.reshape(-1, word_bytes, tile_lane_bytes)[:out_size],
         rope_out[:out_size],
     )

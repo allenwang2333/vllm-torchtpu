@@ -26,6 +26,8 @@ PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
+TPU_RAIDEN_PREFIX_AWARE_LOAD="${TPU_RAIDEN_PREFIX_AWARE_LOAD:-1}"
 # P4D4 uses a smaller per-worker premapped pool than the plugin-wide Raiden
 # default to reduce libtpu startup reservation time for this bounded case.
 TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
@@ -42,6 +44,7 @@ default_prefill_speculative_config='{"method":"mtp","num_speculative_tokens":1}'
 default_decode_speculative_config='{"method":"mtp","num_speculative_tokens":3}'
 PREFILL_SPECULATIVE_CONFIG="${PREFILL_SPECULATIVE_CONFIG-${default_prefill_speculative_config}}"
 DECODE_SPECULATIVE_CONFIG="${DECODE_SPECULATIVE_CONFIG-${default_decode_speculative_config}}"
+MIN_MTP_ACCEPTANCE_RATE="${MIN_MTP_ACCEPTANCE_RATE:-0.45}"
 
 cleanup() {
   local pid_file pid
@@ -82,6 +85,10 @@ fi
 
 mkdir -p "${RUN_ROOT}" "${RUN_DIR}/logs"
 
+# Dynamically extract the exact vLLM version installed in the container
+EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-$(python3 -c 'import importlib.metadata as m; print(m.version("vllm"))')}"
+export EXPECTED_VLLM_VERSION
+
 export MODEL_PATH
 export SERVED_MODEL_NAME
 export RUN_ROOT
@@ -104,6 +111,8 @@ export PREFILL_BLOCK_SIZE
 export DECODE_BLOCK_SIZE
 export ENABLE_PREFIX_CACHING
 export MAMBA_CACHE_MODE
+export VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+export TPU_RAIDEN_PREFIX_AWARE_LOAD
 export TPU_PREMAPPED_BUFFER_SIZE
 export TPU_PARALLEL_PRECOMPILE
 export NUM_GPU_BLOCKS_OVERRIDE
@@ -137,6 +146,22 @@ cd "${repo_root}"
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh \
   2>&1 | tee "${RUN_DIR}/logs/launch.log"
 
+if ! grep -Fqx \
+    "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL} in launch_params.txt" >&2
+  exit 1
+fi
+echo "PREFIX_CACHE_RETENTION_INTERVAL_OK ${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}"
+
+if ! grep -Fqx \
+    "TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD}" \
+    "${RUN_DIR}/launch_params.txt"; then
+  echo "Expected TPU_RAIDEN_PREFIX_AWARE_LOAD=${TPU_RAIDEN_PREFIX_AWARE_LOAD} in launch_params.txt" >&2
+  exit 1
+fi
+echo "RAIDEN_PREFIX_AWARE_LOAD_OK ${TPU_RAIDEN_PREFIX_AWARE_LOAD}"
+
 expected_prefill_scheduler_block_size=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
 expected_decode_scheduler_block_size="${DECODE_BLOCK_SIZE}"
 prefill_resolution="scheduler_block_size=${expected_prefill_scheduler_block_size} hash_block_size=${expected_prefill_scheduler_block_size}"
@@ -161,11 +186,30 @@ if ((P4D2_PREFIX_HIT_PROBE_COUNT < 2)); then
   echo "P4D2_PREFIX_HIT_PROBE_COUNT must be at least 2" >&2
   exit 2
 fi
+prefix_hit_probe_namespace="pc-retention-${BUILDKITE_JOB_ID:-local}-$$"
+if [[ "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL}" == "0" ]]; then
+  # Zero retention starts with no periodic Mamba checkpoints. Prime the full
+  # attention cache once so the next request discovers the shared-prefix
+  # junction and materializes the adaptive Mamba checkpoint. Keep this setup
+  # request outside the measured interval: the existing assertion then still
+  # requires every repeat after the adaptive request to hit one scheduler block.
+  python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
+    --host "${P4D2_BIND_HOST}" \
+    --port "${PROXY_PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    --namespace "${prefix_hit_probe_namespace}" \
+    --prefix-hit-probe-only \
+    --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
+    --long-repeat-count 1 \
+    2>&1 | tee "${RUN_DIR}/logs/prefix_cache_retention_warmup.log"
+  echo "PREFIX_CACHE_RETENTION_WARMUP_OK 1"
+fi
 prefill_prefix_cache_hits_before="$(read_prefill_prefix_cache_hits)"
 python scripts/vllm/integration/smoke_prefix_cache_correctness.py \
   --host "${P4D2_BIND_HOST}" \
   --port "${PROXY_PORT}" \
   --model "${SERVED_MODEL_NAME}" \
+  --namespace "${prefix_hit_probe_namespace}" \
   --prefix-hit-probe-only \
   --long-repeat-lines "${P4D2_PREFIX_HIT_PROBE_LINES}" \
   --long-repeat-count "${P4D2_PREFIX_HIT_PROBE_COUNT}" \
@@ -200,4 +244,43 @@ if [[ "${RUN_PREFIX_CACHE_E2E_DIVERGENCE}" == "1" ]]; then
     2>&1 | tee "${RUN_DIR}/logs/prefix_cache_e2e_divergence.log"
 else
   echo "RUN_PREFIX_CACHE_E2E_DIVERGENCE=${RUN_PREFIX_CACHE_E2E_DIVERGENCE}; skip prefix-cache E2E divergence smoke"
+fi
+
+# --- MTP (speculative decoding) health -------------------------------------
+if [[ -z "${DECODE_SPECULATIVE_CONFIG}" ]]; then
+  echo "DECODE_SPECULATIVE_CONFIG is empty; skip MTP acceptance assertions"
+else
+  read_spec_counter() {
+    # $1 = port, $2 = counter name without the Prometheus _total suffix.
+    # Missing counters read as 0, which the draft-token check below rejects.
+    curl -fsS "http://${P4D2_BIND_HOST}:$1/metrics" |
+      awk -v want="^$2_total" '$0 ~ want { sum += $2 } END { printf "%.0f", sum + 0 }'
+  }
+
+  decode_draft_tokens="$(read_spec_counter "${DECODE_PORT}" vllm:spec_decode_num_draft_tokens)"
+  decode_accepted_tokens="$(read_spec_counter "${DECODE_PORT}" vllm:spec_decode_num_accepted_tokens)"
+  echo "MTP_DECODE_DRAFT_TOKENS ${decode_draft_tokens}"
+  echo "MTP_DECODE_ACCEPTED_TOKENS ${decode_accepted_tokens}"
+
+  # Observability only: the prefill engine drafts to warm its own draft-layer
+  # KV but never verifies (the proxy caps it at max_tokens=1), so this is
+  # expected to stay at 0. Printed, not asserted.
+  echo "MTP_PREFILL_DRAFT_TOKENS $(read_spec_counter "${PREFILL_PORT}" vllm:spec_decode_num_draft_tokens)"
+
+  if ((decode_draft_tokens <= 0)); then
+    echo "Decode engine proposed no draft tokens; MTP never ran" >&2
+    exit 1
+  fi
+
+  decode_acceptance_rate="$(awk -v a="${decode_accepted_tokens}" \
+    -v d="${decode_draft_tokens}" 'BEGIN { printf "%.4f", a / d }')"
+  echo "MTP_DECODE_ACCEPTANCE_RATE ${decode_acceptance_rate}"
+
+  if awk -v r="${decode_acceptance_rate}" -v m="${MIN_MTP_ACCEPTANCE_RATE}" \
+      'BEGIN { exit !(r < m) }'; then
+    echo "Expected MTP acceptance rate >= ${MIN_MTP_ACCEPTANCE_RATE} on the" \
+      "decode engine, got ${decode_acceptance_rate}" >&2
+    exit 1
+  fi
+  echo "MTP_ACCEPTANCE_OK 1"
 fi

@@ -196,6 +196,13 @@ After the PR is merged into `main`:
 
 ## 4. CI Policy
 
+### Pure CPU unit tests
+
+Explicitly mark newly authored pure CPU unit tests with `pytestmark = pytest.mark.cpu_test`
+at module scope, or `@pytest.mark.cpu_test` on individual tests in mixed modules.
+CI uses this marker to run these tests on CPU queues and exclude them from TPU queues.
+Unmarked tests remain eligible for TPU queues.
+
 ### Presubmit Requires the `ready` Label
 
 - **Policy:** Presubmit pipelines only run on a PR that carries the `ready` label. Without it, the bootstrap job stops in about ten seconds and no test, build, or benchmark steps are uploaded.
@@ -214,8 +221,10 @@ After the PR is merged into `main`:
 
 - **Policy:** The `CODEOWNERS Approval` check reports whether every area a PR touches has at least one approval from an owner of that area in [.github/CODEOWNERS](../.github/CODEOWNERS). It resolves ownership with the same matcher as `scripts/find_owners.py`, so its verdict always agrees with what that command tells you to do. (The `Run Approval Gate` check next to it is the job that produces the verdict; it is green whenever the gate managed to run.)
 - **Rationale:** GitHub applies CODEOWNERS automatically only on plans this repository is not on (see Section 1), so an approval from someone who happens to be available today does not mean the people who own the code have seen it. The gate makes that gap visible instead of leaving it to the reviewer's memory.
-- **It is advisory, not enforcing.** Like every other check here, a red gate does not disable the merge button. Treat it as a line item on the Pre-Merge Verification Checklist. Marking it required is a one-click change once branch rulesets become available.
-- **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. A failure names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
+- **It is advisory, not enforcing.** An unmet gate is reported **grey, not red**, so it stays out of the "some checks were not successful" banner and is never confused with a real test failure. Every PR is unmet for the whole window between opening it and being reviewed, and a red X across that window would just train everyone to ignore the check. Treat it as a line item on the Pre-Merge Verification Checklist. Making it block, once branch rulesets become available, takes two changes: set `MISSING_APPROVAL_CONCLUSION: failure` in the workflow, and mark the check required.
+- **Reading the result:** The check's details have a table of one row per owned area, who approved it, and who could. An unmet gate names the specific areas that are missing an approval and the handles that would satisfy each one — `scripts/find_owners.py --request` asks exactly those people. The check re-runs on every push and on every review, so approving a PR turns it green without anyone re-triggering CI.
+- **Reviewers are requested for you.** When a PR is opened (or marked ready for review), the gate requests review from the smallest set of owners that covers everything the PR touches — the same set `scripts/find_owners.py --request` would pick, and never the author. It does this only on those two events: re-requesting someone whose review is still pending is a no-op, but re-requesting someone who has already reviewed re-adds them and notifies them again, so doing it on every push would nag the whole reviewer list. Add anyone else yourself; the gate never removes a reviewer. Set `AUTO_REQUEST_REVIEWERS: 'false'` in the workflow to turn it off.
+- **A broken CODEOWNERS disables assignment.** Before resolving owners the gate asks GitHub to validate the base branch's CODEOWNERS via `/codeowners/errors`. A handle that does not exist, or a user without write access, can neither approve nor receive a review request, and GitHub rejects an entire `requestReviewers` batch if any single entry is bad. When there are errors the gate reports them on the check and skips assignment, rather than silently failing to assign on every PR until someone notices.
 - **What counts:**
   - Ownership is read from the **base branch's** CODEOWNERS, matching how GitHub evaluates it: a PR does not get to grant itself ownership of a directory until it merges. The resolver itself runs from the PR, so a change to `scripts/find_owners.py` is exercised by the gate before it lands.
   - Self-approvals are ignored. If you are an area's **only** owner, any other reviewer's approval clears it, so the PR does not deadlock.

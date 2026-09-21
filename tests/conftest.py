@@ -60,6 +60,32 @@ def pytest_addoption(parser):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_warning_once():
+    """`warning_once` dedups by message for the life of the process, so without
+    this a test passes or fails depending on what ran before it."""
+    try:
+        import vllm.logger
+    except ImportError:
+        yield
+        return
+
+    vllm.logger._print_warning_once.cache_clear()
+    yield
+    vllm.logger._print_warning_once.cache_clear()
+
+
+@pytest.fixture
+def vllm_config_context():
+    """Run backend helpers with the same resolved layout as worker startup."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+    config = VllmConfig()
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
 @pytest.fixture
 def device(request):
     """Get the device to run tests on (CPU or TPU).

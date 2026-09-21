@@ -18,6 +18,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
 
 class TestTpuCompilerCache:
 
@@ -164,7 +168,76 @@ class TestTpuCompilerCache:
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
+            "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
+            "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
+
+    def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
+        """Serving-time knobs must stay out of the compile-cache key.
+
+        Every `envs.py` entry not in `_TPU_COMPILE_ENV_IGNORED` is hashed, so
+        a knob added there recompiles the world once on upgrade and again
+        every time an operator retunes it.
+        """
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _TPU_COMPILE_ENV_IGNORED, _tpu_compile_env_factors)
+
+        serving_only = {
+            "TPU_IPC_SOCKET_DIR",
+            "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
+            "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
+            "TPU_KV_LATENCY_LOG_INTERVAL",
+            "TPU_KV_PIN_SHM",
+            "TPU_KV_SHM_POOL_GB",
+            "TPU_KV_STAGE_WAITER_POOL_SIZE",
+            "TPU_KV_STAGE_WAIT_TIMEOUT_SECS",
+            "TPU_KV_TRANSFER_CHANNEL_NUMBER",
+            "TPU_KV_TRANSFER_NAMESPACE",
+            "TPU_KV_TRANSFER_PORT",
+            "TPU_KV_WARMUP_ENABLED",
+            "TPU_NODE_ID",
+            "TPU_P2P_WAIT_PULL_TIMEOUT",
+            "TPU_RAIDEN_INLINE_LOAD",
+            "TPU_RAIDEN_POOL_STAGING_LEASES",
+            "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+            "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
+            "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
+            "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
+            "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+            "TPU_SIDE_CHANNEL_PORT",
+            "TPU_USE_RAIDEN_CONNECTOR",
+            "DEBUG_TPU_LOCAL_RANK_OFFSET",
+            "RAIDEN_DISABLE_SINGLETON_WORKER",
+            "RAIDEN_SHM_KEY",
+            "SPEC_WARMUP",
+            "TORCH_TPU_BASE_PORT",
+            "TORCH_TPU_MP_RENDEZVOUS_PORT",
+            "TPU_LOCAL_RANK_OFFSET",
+            "TPU_SHARDED_LOAD_SYNC_EVERY",
+            "VLLM_TORCHTPU_IPC_KEY",
+            "VLLM_TPU_DEBUG_PCP_LAYOUT",
+            "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
+            "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+            "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+        }
+
+        assert serving_only <= _TPU_COMPILE_ENV_IGNORED
+        assert not serving_only & set(_tpu_compile_env_factors())
+
+    def test_every_registry_entry_is_hashed_or_deliberately_ignored(self):
+        """The two sets must partition the registry, so a new entry forces a
+        deliberate hash-or-ignore choice, and a stale exemption cannot sit
+        waiting for a later knob to reuse its name."""
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _TPU_COMPILE_ENV_IGNORED, _tpu_compile_env_factors)
+
+        registry = set(envs.environment_variables)
+        stale = _TPU_COMPILE_ENV_IGNORED - registry
+        assert not stale, f"ignored but no longer in envs.py: {sorted(stale)}"
+        assert set(_tpu_compile_env_factors()) | _TPU_COMPILE_ENV_IGNORED \
+            == registry
 
     def test_aot_hash_includes_tpu_compiler_hash(self):
         from vllm.compilation import caching
@@ -198,6 +271,76 @@ class TestTpuCompilerCache:
 
             assert os.environ.get(
                 "TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
+
+    @staticmethod
+    def _sc_offload_flags() -> list[str]:
+        return [
+            token for token in os.environ.get("LIBTPU_INIT_ARGS", "").split()
+            if "offload_min_size_in_bytes" in token
+        ]
+
+    @pytest.mark.parametrize(
+        "value,expected_threshold",
+        [
+            ("12345", 12345),
+            ("auto", _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"]),
+            ("", _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"]),
+            ("0", None),
+        ],
+    )
+    def test_env_override_sc_offload_threshold(self, value,
+                                               expected_threshold):
+        """An explicit value is used as given, unset/empty/auto resolves
+        from the chip family, and 0 sets no flag at all."""
+        env_mock = {
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
+            "TPU_ACCELERATOR_TYPE": "v6e-8",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+            importlib.reload(vllm_torchtpu.env_override)
+
+            expected = [] if expected_threshold is None else [
+                f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes="
+                f"{expected_threshold}" for op in ("all_reduce", "all_gather")
+            ]
+            assert self._sc_offload_flags() == expected
+
+    @pytest.mark.parametrize("value", ["banana", "-1"])
+    def test_env_override_sc_offload_bad_value_raises(self, value):
+        """A value that is not "auto" or a non-negative integer stops the
+        package import with an error that names the variable, rather than
+        silently running without the SC-offload flag."""
+        env_mock = {
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
+            "TPU_ACCELERATOR_TYPE": "v6e-8",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+            with pytest.raises(
+                    ValueError,
+                    match="SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES"):
+                importlib.reload(vllm_torchtpu.env_override)
+
+    def test_envs_module_imports_only_the_standard_library(self):
+        """env_override.py imports envs while the package's own __init__ is
+        still running, which is only safe while envs.py depends on nothing
+        in this package."""
+        import ast
+        import sys
+
+        import vllm_torchtpu.envs
+        tree = ast.parse(Path(vllm_torchtpu.envs.__file__).read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(
+                    alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        assert imported <= sys.stdlib_module_names, (
+            f"envs.py imports non-stdlib modules: "
+            f"{sorted(imported - sys.stdlib_module_names)}")
 
     def test_env_override_disables_breakable_cudagraph(self):
         """Verify that the TPU plugin always disables breakable cudagraph."""

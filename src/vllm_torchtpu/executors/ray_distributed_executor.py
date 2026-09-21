@@ -17,7 +17,7 @@ import copy
 import os
 from collections import defaultdict
 from concurrent.futures import Future
-from typing import Dict, List, Optional, Union
+from typing import Union
 
 import ray
 import vllm.envs as envs
@@ -37,6 +37,7 @@ from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
 from vllm.v1.executor.ray_utils import _wait_until_pg_ready
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
@@ -92,7 +93,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         return True
 
     def _init_executor(self) -> None:
-        self.forward_dag: Optional[ray.dag.CompiledDAG] = None
+        self.forward_dag: ray.dag.CompiledDAG | None = None
 
         os.environ["VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE"] = "shm"
 
@@ -108,15 +109,16 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         self._initialize_ray_cluster()
         placement_group = self.parallel_config.placement_group
 
-        # Disable Ray usage stats collection.
-        ray_usage = os.environ.get("RAY_USAGE_STATS_ENABLED", "0")
-        if ray_usage != "1":
+        # Disable Ray usage stats collection. Ray accepts exactly "0" or "1"
+        # here and raises on anything else (ray/_common/usage/usage_lib.py),
+        # so pass an explicit "1" through and force every other value to "0".
+        if tpu_envs.RAY_USAGE_STATS_ENABLED != "1":
             os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
         # Create the parallel GPU workers.
         self._init_workers_ray(placement_group)
 
-        self.pp_locks: Optional[List[asyncio.Lock]] = None
+        self.pp_locks: list[asyncio.Lock] | None = None
 
         self.scheduler_output: SchedulerOutput | None = None
 
@@ -165,7 +167,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 "support ray.")
 
         pp_size = self.parallel_config.pipeline_parallel_size
-        placement_group_specs: List[Dict[str, float]] = []
+        placement_group_specs: list[dict[str, float]] = []
 
         ray_nodes = ray.nodes()
         logger.info(f"RayDistributedExecutor | ray_nodes={ray_nodes}")
@@ -187,9 +189,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 for _ in range(num_devices):
                     placement_group_specs.append({device_str: 1.0})
         else:
-            assert pp_size == len(
-                nodes_with_device
-            ), f"Cannot use PP across hosts, please set --pipeline-parallel-size to 1 or {len(nodes_with_device)}"
+            # One bundle per pipeline stage, sized to the stage's devices.
+            # PACK fills a host before moving to the next, so consecutive
+            # stages share a host whenever the stage size allows it.
             num_devices_per_pp_rank = self.parallel_config.world_size // pp_size
             placement_group_specs = [{
                 device_str: num_devices_per_pp_rank
@@ -231,19 +233,19 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
     def _init_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
         # The workers are the actual ray actors.
-        self.workers: List[RayWorkerWrapper] = []
+        self.workers: list[RayWorkerWrapper] = []
 
         # Used in ray compiled DAG: indexed first by PP rank,
         # and then TP rank. In other words, the inner list is
         # the TP group of workers for a PP rank.
-        self.pp_tp_workers: List[List[RayWorkerWrapper]] = []
+        self.pp_tp_workers: list[list[RayWorkerWrapper]] = []
 
         if self.parallel_config.ray_workers_use_nsight:
             ray_remote_kwargs = self._configure_ray_workers_use_nsight(
                 ray_remote_kwargs)
 
         # Create the workers.
-        bundle_indices: List[int]
+        bundle_indices: list[int]
         if envs.VLLM_RAY_BUNDLE_INDICES:
             # Use the bundle indices specified by the user.
             bundle_indices = list(
@@ -273,7 +275,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 f"Number of bundle indices ({len(bundle_indices)}) must be less than or equal to "
                 f"world_size ({self.parallel_config.world_size}).")
 
-        worker_metadata: List[RayWorkerMetaData] = []
+        worker_metadata: list[RayWorkerMetaData] = []
         driver_ip = get_ip()
         # For vllm-torchtpu, we always use 1 TPU per worker similar to Multiprocexecutor
         num_tpu_per_worker = 1.0
@@ -305,7 +307,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         logger.debug(f"Initialized worker_metadata: {worker_metadata}")
 
-        ip_counts: Dict[str, int] = {}
+        ip_counts: dict[str, int] = {}
         for ip in worker_ips:
             ip_counts[ip] = ip_counts.get(ip, 0) + 1
 
@@ -381,7 +383,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             host_workers[each.ip].append(each)
 
         sb_addresses = []
-        base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
+        base_port = tpu_envs.TORCH_TPU_BASE_PORT
         for ip in sorted(host_workers.keys()):
             for i in range(len(host_workers[ip])):
                 sb_addresses.append(f"{ip}:{base_port + i}")
@@ -459,7 +461,6 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         for rank, (node_id, _) in enumerate(worker_node_and_physical_tpu_ids):
             local_rank = node_workers[node_id].index(rank)
             ip = sorted_worker_metadata[rank].ip
-            prev_ip = sorted_worker_metadata[rank - 1].ip if rank > 0 else ""
 
             worker_vllm_config = self.vllm_config
 
@@ -491,13 +492,10 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 is_driver_worker=(not self.parallel_config)
                 or (rank % self.parallel_config.tensor_parallel_size == 0),
                 ip=ip,
-                prev_worker_ip=prev_ip,
             )
             all_kwargs.append(kwargs)
         self.collective_rpc("init_worker", args=(all_kwargs, ))
         self.collective_rpc("init_device")
-        if self.parallel_config.pipeline_parallel_size > 1:
-            self.collective_rpc("initialize_pp_transfer_connect")
         self.collective_rpc("load_model")
         if self.use_ray_spmd_worker:
             for pp_rank in range(self.parallel_config.pipeline_parallel_size):
@@ -553,7 +551,7 @@ class RayWorkerWrapper(RayWorkerWrapperV1):
         #  `_execute_model_outputs` is used to store the actual outputs
         #  for async scheduling, with result_id as the key.
         self._execute_model_outputs = dict()  # type: ignore
-        self.result_id = int(0)
+        self.result_id = 0
 
     def setup_device_if_necessary(self):
         # TODO(swang): This is needed right now because Ray CG executes

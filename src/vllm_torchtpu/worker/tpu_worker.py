@@ -6,7 +6,6 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import Dict, Tuple
 from urllib.parse import urlparse
 
 import torch
@@ -21,23 +20,22 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              get_pp_group,
                                              get_tensor_model_parallel_rank,
                                              init_distributed_environment)
+from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
-from vllm_torchtpu.distributed import jax_parallel_state
 from vllm_torchtpu.distributed.pcp_rank_order import (
     pcp_topology_order, resolve_pcp_topology_order, verify_pcp_topology_order)
-from vllm_torchtpu.layers.vllm.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
+from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
-DEBUG_TPU_LOCAL_RANK_OFFSET_ENV = "DEBUG_TPU_LOCAL_RANK_OFFSET"
 
 
 def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
@@ -45,15 +43,6 @@ def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
     rank = (int(transfer_rank) if transfer_rank is not None else int(
         get_tensor_model_parallel_rank()))
     return get_pp_group().rank_in_group, rank
-
-
-def _debug_tpu_local_rank_offset() -> int:
-    value = os.environ.get(DEBUG_TPU_LOCAL_RANK_OFFSET_ENV, "0") or "0"
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise ValueError(f"{DEBUG_TPU_LOCAL_RANK_OFFSET_ENV} must be an int, "
-                         f"got {value!r}") from exc
 
 
 def _configure_tpu_process_env(rank: int, local_rank: int, world_size: int,
@@ -78,13 +67,13 @@ class TPUWorker(WorkerBase):
         is_driver_worker: bool = False,
         devices=None,
         ip: str = "localhost",
-        prev_worker_ip: str = "localhost",
     ):
-        # Re-apply patches that were done in check_and_update_config.
-        # Workers may be spawned (not forked) so module-level patches
-        # from the parent process are lost.
-        from vllm_torchtpu.platforms.tpu_platform import apply_tpu_patches
-        apply_tpu_patches()
+        from vllm_torchtpu import patch_registry
+
+        patch_registry.apply("worker_init")
+        # This process creates the worker's reply ring to the engine.
+        from vllm_torchtpu.distributed.pp_push import widen_message_rings
+        widen_message_rings(vllm_config)
 
         super().__init__(vllm_config=vllm_config,
                          local_rank=local_rank,
@@ -112,7 +101,6 @@ class TPUWorker(WorkerBase):
         # TPU-specific extras not in WorkerBase.
         self.devices = devices if devices is not None else []
         self.device_ranks = set(device.id for device in self.devices)
-        self.prev_worker_ip = prev_worker_ip
 
         if self.cache_config.cache_dtype == "auto":
             model_dtype = self.model_config.dtype
@@ -145,8 +133,17 @@ class TPUWorker(WorkerBase):
             logger.info("Profiling enabled. Traces will be saved to: %s",
                         self.profile_dir)
 
-        # step_counter is used to calc uuid for intermediate tensor transfer.
-        self.step_counter = 0
+    def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
+        # TPU resolves before model load because layout determines its page
+        # geometry. Check the actual loaded backends when engine core publishes
+        # that choice; its pre-resolved-config path does not validate them.
+        supported = self.get_supported_kv_cache_layouts()
+        if kv_cache_layout not in supported:
+            raise ValueError(
+                f"TPU KV cache layout {kv_cache_layout} is incompatible with "
+                f"the loaded attention backends; supported layouts: {supported}"
+            )
+        super().set_kv_cache_layout(kv_cache_layout)
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
@@ -311,10 +308,19 @@ class TPUWorker(WorkerBase):
         else:
             dist_init_method = self.distributed_init_method
             parsed = urlparse(dist_init_method)
-            if parsed.scheme != "tcp" or not parsed.hostname or not parsed.port:
+            if parsed.scheme == "tcp" and parsed.hostname and parsed.port:
+                os.environ.setdefault("MASTER_ADDR", parsed.hostname)
+                os.environ.setdefault("MASTER_PORT", str(parsed.port))
+            elif parsed.scheme == "file" and parsed.path:
+                # vLLM 0.29's local executors rendezvous through FileStore.
+                # Keep that store for torch.distributed. Multi-rank PjRt also
+                # requires MASTER_PORT, chosen once by the parent's shared
+                # slice preparation and inherited by all local workers.
+                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            else:
                 raise ValueError(
-                    "Expected tcp://<host>:<port> distributed_init_method, "
-                    f"got: {dist_init_method!r}")
+                    "Expected tcp://<host>:<port> or file://<path> "
+                    f"distributed_init_method, got: {dist_init_method!r}")
             if pcp_size > 1:
                 logger.info(
                     "PCP native-rank TPU binding | rank=%d "
@@ -337,7 +343,7 @@ class TPUWorker(WorkerBase):
                 local_world = os.environ.get(
                     "LOCAL_WORLD_SIZE") or pc.world_size
                 local_rank_for_init = int(self.local_rank)
-                debug_local_rank_offset = _debug_tpu_local_rank_offset()
+                debug_local_rank_offset = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
                 tpu_local_rank_env = (local_rank_for_init +
                                       debug_local_rank_offset)
                 tpu_local_world = int(local_world)
@@ -347,28 +353,25 @@ class TPUWorker(WorkerBase):
                         debug_local_rank_offset + pc.world_size)
                     logger.info(
                         "DEBUG TPU local rank offset applied: rank=%d "
-                        "local_rank=%d %s=%d -> tpu_local_rank=%d "
-                        "tpu_local_world=%d", self.rank, self.local_rank,
-                        DEBUG_TPU_LOCAL_RANK_OFFSET_ENV,
-                        debug_local_rank_offset, tpu_local_rank_env,
-                        tpu_local_world)
+                        "local_rank=%d DEBUG_TPU_LOCAL_RANK_OFFSET=%d -> "
+                        "tpu_local_rank=%d tpu_local_world=%d", self.rank,
+                        self.local_rank, debug_local_rank_offset,
+                        tpu_local_rank_env, tpu_local_world)
                 init_rank = self.rank
                 init_world = pc.world_size
                 dist_world_size = pc.world_size
                 _configure_tpu_process_env(self.rank, tpu_local_rank_env,
                                            pc.world_size, tpu_local_world)
-            if int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"):
+            if envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
                     "offset=%d -> tpu_local_rank=%d tpu_local_world=%d",
                     self.rank,
                     self.local_rank,
-                    int(os.environ.get("TPU_LOCAL_RANK_OFFSET", "0") or "0"),
+                    envs.TPU_LOCAL_RANK_OFFSET,
                     binding.local_rank,
                     binding.local_world_size,
                 )
-            os.environ.setdefault("MASTER_ADDR", parsed.hostname)
-            os.environ.setdefault("MASTER_PORT", str(parsed.port))
 
         if not self.devices:
             self.devices = [torch.device("tpu")]
@@ -398,22 +401,17 @@ class TPUWorker(WorkerBase):
                 pipeline_model_parallel_size=self.parallel_config.
                 pipeline_parallel_size,
                 prefill_context_model_parallel_size=pcp_size,
+                decode_context_model_parallel_size=self.parallel_config.
+                decode_context_parallel_size,
             )
         # The patch above substitutes rank lists on the way in; this reads the
         # built groups back, so a patch that silently stopped applying fails
         # here rather than costing a few percent unnoticed.
         verify_pcp_topology_order(group_ranks_by_name)
 
-        # TODO: Enable PP support. The old JAX-based PP init
-        # (jax_parallel_state.init_pp_distributed_environment) was removed
-        # during the torch_tpu migration. PP will need KV transfer init
-        # and proper rank assignment via torch.distributed.
-        is_first_rank = True
-        is_last_rank = True
-        if self.parallel_config.pipeline_parallel_size > 1:
-            is_first_rank = self.rank == 0
-            is_last_rank = (
-                self.rank == self.parallel_config.pipeline_parallel_size - 1)
+        pp_group = get_pp_group()
+        is_first_rank = pp_group.is_first_rank
+        is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
         self.model_runner = TPUModelRunner(
@@ -429,11 +427,6 @@ class TPUWorker(WorkerBase):
                     f"is_driver_worker={self.is_driver_worker} | ")
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
-
-    def initialize_pp_transfer_connect(self):
-        if self.rank == 0:
-            return
-        jax_parallel_state.connect(self.prev_worker_ip, self.rank - 1)
 
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm
@@ -493,6 +486,15 @@ class TPUWorker(WorkerBase):
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
+
+    def pp_push(self):
+        return self.model_runner.pp_push()
+
+    def pp_settle(self):
+        return self.model_runner.pp_settle()
+
+    def profile_pipeline_chunks(self) -> dict:
+        return self.model_runner.profile_pipeline_chunks()
 
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
@@ -624,9 +626,9 @@ class TPUWorker(WorkerBase):
         return key
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        from vllm_torchtpu.platforms.tpu_platform import \
-            _apply_model_specific_patches
-        _apply_model_specific_patches(self.model_config)
+        from vllm_torchtpu import patch_registry
+
+        patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -634,6 +636,7 @@ class TPUWorker(WorkerBase):
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+        set_torch_threads_for_runtime()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
@@ -697,8 +700,8 @@ class TPUWorker(WorkerBase):
 
     def sync_weights(self,
                      updated_weights,
-                     mappings: Dict[str, Tuple[str, Tuple[str]]],
-                     transpose_keys: Dict[str, Tuple[int]],
+                     mappings: dict[str, tuple[str, tuple[str]]],
+                     transpose_keys: dict[str, tuple[int]],
                      reshard_fn=None) -> None:
         return self.model_runner._sync_weights(
             updated_weights=updated_weights,
