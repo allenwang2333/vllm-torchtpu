@@ -24,6 +24,7 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import env_override as _env_override
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.vllm.fused_moe import fused_moe_gmm
 from vllm_torchtpu.logger import init_logger
@@ -64,11 +65,28 @@ _FP8_WIRE_E4M3_MAX = 448.0
 _FP8_WIRE_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
-def fp8_wire_allgather_applies(x: torch.Tensor) -> bool:
-    """Whether `x` can ride the dispatch all-gather as fp8 rather than bf16."""
-    return (envs.TPU_MOE_FP8_WIRE_ALLGATHER and x.dim() == 2
+def fp8_wire_allgather_applies(x: torch.Tensor, parallel_size: int) -> bool:
+    """Whether `x` should ride the dispatch all-gather as fp8 rather than bf16.
+
+    The size test is not a safety margin, it is the whole point. Halving a
+    payload only helps a collective whose cost is its payload. Below the
+    SparseCore offload threshold the gather runs on the TensorCore as one
+    synchronous `distributed_all_gather_into_tensor` and is dominated by its
+    fixed cost -- measured on GLM-5.2-FP8 decode, 30.31 us for a 3 MiB gather,
+    against a ~36 us/call fixed term at world=16, so the bytes were never the
+    constraint. Quantizing there returns nothing and still pays for the second
+    collective the scales ride in: 75 extra small all-gathers per core-step at
+    ~14.84 us measured = +1.11 ms, which is 62% of the +1.79 ms median TPOT
+    regression the ungated version cost in j-86cfd828-8634-40fe-beca. Prefill
+    gathers 96 MiB and clears the threshold; decode gathers 3 MiB and does not.
+    """
+    if not (envs.TPU_MOE_FP8_WIRE_ALLGATHER and x.dim() == 2
             and x.dtype in _FP8_WIRE_DTYPES
-            and x.shape[1] % _FP8_WIRE_QUANT_BLOCK == 0)
+            and x.shape[1] % _FP8_WIRE_QUANT_BLOCK == 0):
+        return False
+    gathered_bytes = (x.shape[0] * parallel_size * x.shape[1] *
+                      x.element_size())
+    return gathered_bytes >= _env_override.SC_OFFLOAD_THRESHOLD_BYTES
 
 
 def _all_gather_activations(collective_group, x: torch.Tensor) -> torch.Tensor:
@@ -89,13 +107,16 @@ def _all_gather_activations(collective_group, x: torch.Tensor) -> torch.Tensor:
     numerical change, not a no-op, and it needs an accuracy check rather than
     an argument. Measured in j-3c06b709-ed10-468c-9646.
 
-    The scale ride-along is a second, tiny all-gather (4 bytes per 512
+    The scale ride-along is a second, tiny all-gather (2 bytes per 512
     elements). It stays far below the SparseCore offload threshold, so it
     lands on the TensorCore next to the existing topk_weights/topk_ids
-    gathers rather than competing for the SparseCore this change is trying
-    to free.
+    gathers rather than competing for the SparseCore this change is trying to
+    free -- but it is not free itself, which is why the payload size gate in
+    `fp8_wire_allgather_applies` exists.
     """
-    if not fp8_wire_allgather_applies(x):
+    parallel_size = (int(collective_group.world_size)
+                     if collective_group is not None else 1)
+    if not fp8_wire_allgather_applies(x, parallel_size):
         return collective_group.all_gather(x, dim=0)
 
     # Everything below stays in `x`'s own dtype, never promoted to float32.
