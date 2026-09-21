@@ -12,7 +12,6 @@ from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-from . import mock_omni  # noqa: F401
 from .mock_omni import vllm_omni_mock
 
 pytestmark = pytest.mark.cpu_test
