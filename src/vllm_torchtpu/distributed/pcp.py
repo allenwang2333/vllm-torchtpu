@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-
 from vllm.logger import init_logger
 
 from vllm_torchtpu.distributed.mesh_utils import (CpGroupLayout,

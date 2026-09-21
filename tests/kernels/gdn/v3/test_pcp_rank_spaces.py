@@ -263,12 +263,14 @@ def test_head_shards_are_placed_so_the_collective_delivers_by_pcp_rank():
     pcp_size = len(order)
     # One row per head shard, labelled by the head shard it belongs to.
     tensor = jnp.repeat(jnp.arange(pcp_size, dtype=jnp.int32), 3)[None, :]
-    placed = gdn_attention._place_head_shards_in_collective_order(
-        tensor, order, axis=-1)
+    placed = gdn_attention._place_head_shards_in_collective_order(tensor,
+                                                                  order,
+                                                                  axis=-1)
     blocks = placed.reshape(1, pcp_size, 3)
     for pcp_rank, mesh_coordinate in enumerate(order):
         got = set(blocks[0, mesh_coordinate].tolist())
-        assert got == {pcp_rank}, (
+        want = {pcp_rank}
+        assert got == want, (
             f"slot {mesh_coordinate} is routed to PCP rank {pcp_rank}, so it "
             f"must carry head shard {pcp_rank}; it carries {sorted(got)}.")
 
