@@ -10,12 +10,12 @@ import copy
 import math
 import os
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -289,11 +289,6 @@ def _build_kv_connector_output(
     }
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
-    elif invalid_block_group_index is not None:
-        raise RuntimeError(
-            "Installed vLLM does not support cache-group-scoped KV load "
-            "failure recovery; upgrade vLLM before recovering a failed "
-            f"hybrid KV load (group={invalid_block_group_index})")
     return KVConnectorOutput(**kwargs)
 
 
@@ -360,6 +355,32 @@ def _torch_tpu_wrapper():
                     delattr(torch.cuda, k)
             else:
                 setattr(torch.cuda, k, v)
+
+
+_TOPK_INDICES = "topk_indices"
+_TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
+
+# Hand-off tensors that carry indices.
+# -1 is "no token", so such a row attends to nothing.
+_PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
+
+
+def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
+    """The one top-k table this process's layers share, or None.
+    """
+    found: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        buffer = getattr(module, _TOPK_BUFFER_ATTRIBUTE, None)
+        if isinstance(buffer, torch.Tensor):
+            found.setdefault(id(buffer), buffer)
+    if not found:
+        return None
+    if len(found) > 1:
+        shapes = sorted(tuple(b.shape) for b in found.values())
+        raise RuntimeError(
+            "the model's layers hold several distinct top-k index tables "
+            f"{shapes}; the pipeline hand-off carries one per stage")
+    return next(iter(found.values()))
 
 
 # Recompilation-avoidance contract:
@@ -737,6 +758,9 @@ class TPUModelRunner(GPUModelRunner):
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
         self._pp_wave: PPWave | None = None
+        # A sparse model's shared top-k index table, when this stage's layers
+        # cannot all recompute it; set at load time under a pipeline.
+        self._pp_topk_buffer: torch.Tensor | None = None
         # Token granule the pipeline chunk scheduler cuts at; set with the
         # extra buckets once the KV block size is final.
         self._pp_chunk_granularity: int | None = None
@@ -2878,6 +2902,8 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_wave is not None:
                 intermediate_tensors = self._pp_wave.start_forward(
                     num_tokens_padded)
+                self._pp_take_topk_indices(intermediate_tensors,
+                                           num_tokens_padded)
 
             trace_kwargs = {}
             if TraceAnnotation.is_enabled():
@@ -2935,8 +2961,10 @@ class TPUModelRunner(GPUModelRunner):
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
-                self._pp_wave.end_forward(hidden_states.tensors,
-                                          num_tokens_padded)
+                self._pp_wave.end_forward(
+                    self._pp_outgoing_tensors(hidden_states.tensors,
+                                              num_tokens_padded),
+                    num_tokens_padded)
                 start_index = end_index
                 chunk_index += 1
                 continue
@@ -3767,6 +3795,15 @@ class TPUModelRunner(GPUModelRunner):
                                             model_config=self.model_config)
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.parallel_config.pipeline_parallel_size > 1:
+            # A sparse model's layers share one top-k index table, and under a
+            # pipeline the layer that writes it and the layers that reuse it
+            # can sit on different chips. Hand the table between stages
+            # instead.
+            self._pp_topk_buffer = _find_topk_indices_buffer(self.model)
+            if self._pp_topk_buffer is not None:
+                # -1 is "no token": a row of it attends to nothing.
+                self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -4034,6 +4071,7 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_first:
             intermediate_tensors = self._pp_intermediate_tensors(
                 num_tokens, zeros=not profiling, random=profiling)
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
         with (
                 self.maybe_select_dummy_loras(
                     self.lora_config, np.array([num_tokens], dtype=np.int32)),
@@ -4059,6 +4097,8 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 if intermediate_tensors is not None:
                     inputs += list(intermediate_tensors.tensors.values())
+                if self._pp_topk_buffer is not None:
+                    inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
             out, _ = self.forward_model(
@@ -4571,6 +4611,12 @@ class TPUModelRunner(GPUModelRunner):
                 and self._pp_wave is None):
             self._pp_intermediate_tensors(1, zeros=True)
             assert self._pp_intermediate_template is not None
+            if (self._pp_topk_buffer is not None
+                    and self._pp_topk_buffer.shape[0] < self.max_num_tokens):
+                raise RuntimeError(
+                    "the shared top-k table holds "
+                    f"{self._pp_topk_buffer.shape[0]} rows, fewer than the "
+                    f"{self.max_num_tokens} tokens a hand-off carries")
             self._pp_wave = PPWave(self.device, self.max_num_tokens,
                                    self._pp_intermediate_template)
             self._pp_wave.warmup()
@@ -4897,11 +4943,17 @@ class TPUModelRunner(GPUModelRunner):
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P,
+                    greedy)
         try:
-            # ---- batched prefill of R requests (disjoint top-of-pool blocks) --
+            # Match the low-block working set used by the LIFO BlockPool
+            # workaround. High physical block ids can trigger the v7x SC2
+            # indexed-KV halt even though they are inside the allocated pool.
+            # Warmup runs before serving, with no live scheduler requests;
+            # reserve block 0 and keep each synthetic request's range disjoint.
             new_reqs = []
             for j, rid in enumerate(rids):
-                lo = top - (j + 1) * nblk
+                lo = 1 + j * nblk
                 new_reqs.append(
                     NewRequestData(req_id=rid,
                                    prompt_token_ids=[0] * P,
@@ -4979,10 +5031,11 @@ class TPUModelRunner(GPUModelRunner):
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
         decode_ncts = [P + t for t in range(n_dec)]
-        # Blocks from the TOP of the pool so the first real allocations (low ids)
-        # don't collide. Page CONTENTS are value-insensitive and KV writes use
-        # empty_slot_mappings, so stale pages are safe; each request is fully torn
-        # down before the next. Cover the highest context this request reaches.
+        # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
+        # BlockPool workaround, rather than exercising the SC2-sensitive end
+        # of the pool. Warmup runs before serving and tears down each request;
+        # real requests overwrite their valid KV positions on first prefill.
+        # Cover the highest context this request reaches, reserving block 0.
         # Count blocks per kv-cache group at that group's own block size:
         # groups differ on hybrid models (mamba vs attention), and the
         # runner-level self.block_size predates the executor's post-load
@@ -4994,7 +5047,7 @@ class TPUModelRunner(GPUModelRunner):
         for group in self.kv_cache_config.kv_cache_groups:
             gbs = int(group.kv_cache_spec.block_size)
             g_nblk = min(cdiv(max_pos, gbs), cdiv(self.max_model_len, gbs))
-            block_ids_per_group.append(list(range(top - g_nblk, top)))
+            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
             logger.warning(
@@ -5314,24 +5367,57 @@ class TPUModelRunner(GPUModelRunner):
                 batch_size=1,
                 dtype=self.model_config.dtype,
                 device=self.device)
-            self._pp_intermediate_template = {
+            template = {
                 key: (tuple(tensor.shape[1:]), tensor.dtype)
                 for key, tensor in probe.items()
             }
-        if random:
-            return IntermediateTensors({
-                key:
-                self._profile_input(key, (self.max_num_tokens, *shape),
-                                    dtype)[:num_tokens].to(self.device)
-                for key, (shape,
-                          dtype) in self._pp_intermediate_template.items()
-            })
-        alloc = torch.zeros if zeros else torch.empty
-        return IntermediateTensors({
-            key:
-            alloc((num_tokens, *shape), dtype=dtype, device=self.device)
-            for key, (shape, dtype) in self._pp_intermediate_template.items()
-        })
+            if self._pp_topk_buffer is not None:
+                template[_TOPK_INDICES] = (tuple(
+                    self._pp_topk_buffer.shape[1:]),
+                                           self._pp_topk_buffer.dtype)
+            self._pp_intermediate_template = template
+        tensors: dict[str, torch.Tensor] = {}
+        for key, (shape, dtype) in self._pp_intermediate_template.items():
+            fill = _PP_CARRIED_FILL.get(key)
+            if fill is not None:
+                tensors[key] = torch.full((num_tokens, *shape),
+                                          fill,
+                                          dtype=dtype,
+                                          device=self.device)
+            elif random:
+                tensors[key] = self._profile_input(
+                    key, (self.max_num_tokens, *shape),
+                    dtype)[:num_tokens].to(self.device)
+            else:
+                alloc = torch.zeros if zeros else torch.empty
+                tensors[key] = alloc((num_tokens, *shape),
+                                     dtype=dtype,
+                                     device=self.device)
+        return IntermediateTensors(tensors)
+
+    def _pp_take_topk_indices(self,
+                              intermediate_tensors: IntermediateTensors | None,
+                              rows: int) -> None:
+        """Take the incoming top-k table into the buffer this stage's sparse
+        layers read from.
+        """
+        if self._pp_topk_buffer is None or intermediate_tensors is None:
+            return
+        received = intermediate_tensors.tensors.pop(_TOPK_INDICES, None)
+        if received is None:
+            raise RuntimeError(
+                "a pipeline stage of a sparse model was handed no top-k "
+                "indices; every stage passes them on")
+        self._pp_topk_buffer[:rows].copy_(received)
+
+    def _pp_outgoing_tensors(self, tensors: dict[str, torch.Tensor],
+                             rows: int) -> dict[str, torch.Tensor]:
+        """What this stage hands the next one: the model's activations, plus
+        the top-k table whether this stage chose it or passed it through.
+        """
+        if self._pp_topk_buffer is None:
+            return tensors
+        return {**tensors, _TOPK_INDICES: self._pp_topk_buffer[:rows].clone()}
 
     def pp_push(self) -> None:
         """A pipeline hand-off that carries nothing, so the forwards in
