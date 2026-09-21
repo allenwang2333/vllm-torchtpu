@@ -826,27 +826,25 @@ def test_dsv4_csa_state_pool_covers_nope_only():
     assert not {p.storage_index for p in state_pools} & rope_storages
 
 
-def test_dsv4_manifest_rejects_two_layers_of_one_group_on_one_array():
+@pytest.mark.parametrize(
+    "layer_name,replacement,match",
+    [
+        # Both SWA layers of group 3 land on one CSA NoPE array. They share a
+        # block table, so this is real corruption rather than benign aliasing.
+        ("model.layers.1.self_attn.swa_cache",
+         "model.layers.0.self_attn.swa_cache", "share an array inside"),
+        # HCA keeps raw bf16 latents: two rows per token, not one.
+        ("model.layers.2.self_attn.attn",
+         (16, 256, 4, 128), "256 rows; the 256-token"),
+    ],
+)
+def test_dsv4_manifest_rejects_a_materialization_it_cannot_describe(
+        layer_name, replacement, match):
     named, groups = dsv4_materialization()
-    # Both SWA layers of group 3 land on one CSA NoPE array. They share a
-    # block table, so this is real corruption rather than benign aliasing.
-    named["model.layers.1.self_attn.swa_cache"] = (
-        named["model.layers.0.self_attn.swa_cache"])
+    named[layer_name] = (named[replacement] if isinstance(replacement, str)
+                         else FakeTensor(replacement, 1, dtype="torch.uint8"))
 
-    with pytest.raises(rpm.ManifestError, match="share an array inside"):
-        rpm.build_dsv4_pool_manifest(named_kv_caches=named,
-                                     kv_cache_groups=groups,
-                                     raw_tensors=())
-
-
-def test_dsv4_manifest_rejects_a_page_that_mismatches_its_role():
-    named, groups = dsv4_materialization()
-    # HCA keeps raw bf16 latents: two rows per token, not one.
-    named["model.layers.2.self_attn.attn"] = FakeTensor((16, 256, 4, 128),
-                                                        1,
-                                                        dtype="torch.uint8")
-
-    with pytest.raises(rpm.ManifestError, match="256 rows; the 256-token"):
+    with pytest.raises(rpm.ManifestError, match=match):
         rpm.build_dsv4_pool_manifest(named_kv_caches=named,
                                      kv_cache_groups=groups,
                                      raw_tensors=())
