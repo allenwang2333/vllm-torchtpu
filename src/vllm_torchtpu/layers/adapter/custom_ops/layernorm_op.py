@@ -18,12 +18,13 @@ import torch.nn as nn
 from vllm import ir
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
-from vllm_torchtpu.layers.adapter.quantization.unquantized import \
-    VllmUnquantizedGemmaNormWeightFold
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedGemmaNormWeightFold,
+)
 
 
 @GemmaRMSNorm.register_oot
-class WeightPreprocessedGemmaRMSNorm(GemmaRMSNorm):
+class VllmTPUGemmaRMSNorm(GemmaRMSNorm):
     """Holds ``1 + w`` in fp32 so forward skips the per-step upcast-and-add.
 
     Gemma normalizes with ``x * (1 + w)``, and upstream's ``forward_native``
@@ -48,9 +49,9 @@ class WeightPreprocessedGemmaRMSNorm(GemmaRMSNorm):
         # `set_default_torch_dtype(model_config.dtype)`, so the upstream
         # parameter would be bf16, which cannot hold `1 + w` at the precision
         # the per-step `.float()` upcast was providing.
-        self.weight = nn.Parameter(torch.zeros(hidden_size,
-                                               dtype=torch.float32),
-                                   requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.zeros(hidden_size, dtype=torch.float32), requires_grad=False
+        )
         # The sole reason a norm carries a quantization method: it is the only
         # hook in vLLM's post-load sweep that a plain norm layer can reach.
         self.quant_method = VllmUnquantizedGemmaNormWeightFold()
@@ -63,5 +64,6 @@ class WeightPreprocessedGemmaRMSNorm(GemmaRMSNorm):
         """PyTorch-native implementation equivalent to forward()."""
         if residual is None:
             return ir.ops.rms_norm(x, self.weight, self.variance_epsilon)
-        return ir.ops.fused_add_rms_norm(x, residual, self.weight,
-                                         self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm(
+            x, residual, self.weight, self.variance_epsilon
+        )
