@@ -224,6 +224,7 @@ def _substitute_placeholder_token(
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
     new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
+    new_token_values = torch.clamp_min(new_token_values, 0)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
@@ -5139,7 +5140,10 @@ class TPUModelRunner(GPUModelRunner):
             assert self.execute_model(so) is None
             self.sample_tokens(None)
             d = self.take_draft_token_ids()
-            cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
+            cur = [
+                max(0, min(int(x), self.vocab_size - 1))
+                for x in d.draft_token_ids[0]
+            ] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
                 all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
@@ -5161,7 +5165,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.sample_tokens(None)
                 d = self.take_draft_token_ids()
                 if d and d.draft_token_ids:
-                    cur = d.draft_token_ids[0]
+                    cur = [
+                        max(0, min(int(x), self.vocab_size - 1))
+                        for x in d.draft_token_ids[0]
+                    ]
         except Exception:
             if quiet:
                 # First attempt: a SymInt from the draft forward's cold compile
