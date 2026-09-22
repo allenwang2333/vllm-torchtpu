@@ -214,19 +214,13 @@ def _stage3_trim_window_pages(
     if not skipped:
         return ids
     dropped, kept = ids[:skipped], ids[skipped:]
-    # The dropped prefix should be all null block. Anything else means this
-    # skip count and vLLM's have drifted apart. Warn rather than raise, since
-    # dropping out-of-window pages is still the right move.
-    if len(set(dropped)) != 1:
-        logger.warning(
-            "Stage-3 sliding-window trim dropped pages that are not all the "
-            "null block: group=%s, dropped=%s, num_tokens=%d, page_tokens=%d, "
-            "window=%s",
-            group_label,
-            dropped,
-            num_tokens,
-            page_tokens,
-            window_tokens,
+    if any(block_id != _STAGE3_NULL_BLOCK_ID for block_id in dropped):
+        raise ValueError(
+            "Stage-3 sliding-window trim dropped pages that are not the null "
+            f"block: group={group_label}, dropped={dropped}, ids={ids}, "
+            f"skipped={skipped}, "
+            f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
+            f"window={window_tokens}"
         )
     if len(set(kept)) != len(kept):
         raise ValueError(
