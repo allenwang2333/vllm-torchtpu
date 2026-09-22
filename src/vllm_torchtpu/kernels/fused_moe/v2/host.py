@@ -1350,7 +1350,7 @@ def vmem_scratch_arrays(
     hidden,
     inter,
     *,
-    nbuf=MAX_NBUF,
+    nbuf,
     weight_format=WeightFormat.FP8,
     rhs_qb=QB4,
     has_w1_bias=False,
