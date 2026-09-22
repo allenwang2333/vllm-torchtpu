@@ -1111,8 +1111,8 @@ def _dsv4_layer_spec(group_spec: Any, layer_name: str) -> Any:
     """The per-layer spec behind a DSv4 cache group.
 
     The group's spec is a `UniformTypeKVCacheSpecs` wrapper whose `block_size`
-    is the uncompressed page and which has no `compress_ratio`, so reading role
-    geometry off it reports every layer as an uncompressed HCA page.
+    is the uncompressed page and which has no `tokens_per_state`, so reading
+    role geometry off it reports every layer as an uncompressed HCA page.
     `TPUModelRunner._per_layer_spec` unwraps the same way before allocating.
     """
     specs = getattr(group_spec, "kv_cache_specs", None)
@@ -1126,25 +1126,34 @@ def _dsv4_layer_spec(group_spec: Any, layer_name: str) -> Any:
             f"spec map (has {sorted(specs)})") from None
 
 
-def _dsv4_storage_block_size(spec: Any, layer_name: str) -> int:
-    """Compressed tokens per page (`T` in the runner's allocation table)."""
-    tokens = getattr(spec, "storage_block_size", None)
-    if tokens is None:
-        block_size = getattr(spec, "block_size", None)
-        ratio = getattr(spec, "compress_ratio", 1) or 1
-        if block_size is None:
-            raise ManifestError(
-                f"DSv4 layer {layer_name} has a spec with neither "
-                "storage_block_size nor block_size")
-        tokens = int(block_size) // int(ratio)
-    return int(tokens)
+def _dsv4_spec_field(spec: Any, field: str, layer_name: str) -> int:
+    """One geometry field off a per-layer spec, or a hard failure.
+
+    Never default these. vLLM renames KV cache spec fields, and a default
+    turns a rename into a plausible wrong number instead of an error.
+    """
+    value = getattr(spec, field, None)
+    if value is None:
+        raise ManifestError(
+            f"DSv4 layer {layer_name} spec {type(spec).__name__} has no "
+            f"`{field}`; vLLM renamed it and pool_manifest needs updating")
+    return int(value)
+
+
+def _dsv4_num_states(spec: Any, layer_name: str) -> int:
+    """Compressed states per page (`T` in the runner's allocation table).
+
+    The same field `_initialize_ds_v4_kv_cache` sizes the arrays from.
+    """
+    return _dsv4_spec_field(spec, "num_states", layer_name)
 
 
 def _dsv4_kv_tag(layer_name: str, spec: Any) -> str:
     """The compressed-KV role of an MLA layer (CSA reports its NoPE tag)."""
     if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
         return TAG_DSV4_IDX
-    if int(getattr(spec, "compress_ratio", 1)) == DSV4_CSA_COMPRESS_RATIO:
+    if _dsv4_spec_field(spec, "tokens_per_state",
+                        layer_name) == DSV4_CSA_COMPRESS_RATIO:
         return TAG_DSV4_CSA_NOPE
     return TAG_DSV4_HCA
 
@@ -1241,7 +1250,7 @@ def _dsv4_classify(
 def _dsv4_check_role_rows(kv_tag: str, layer_name: str, spec: Any,
                           arrays: Sequence[Any]) -> None:
     """Row counts must match the runner's per-role allocation table."""
-    tokens = _dsv4_storage_block_size(spec, layer_name)
+    tokens = _dsv4_num_states(spec, layer_name)
     if kv_tag == TAG_DSV4_CSA_NOPE:
         expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
     elif kv_tag == TAG_DSV4_IDX:
