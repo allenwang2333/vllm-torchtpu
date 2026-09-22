@@ -318,15 +318,14 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
 def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     """Optional size knob that must be greater than zero when it is set.
 
-    Unset or empty reads as ``None``, meaning the feature is off.
+    Unset, empty, or <= 0 reads as ``None``, meaning the feature is off.
     """
     parse_int = env_optional_int(env_name)
 
     def _get_positive_int_or_none_env() -> int | None:
         value = parse_int()
         if value is not None and value <= 0:
-            raise ValueError(
-                f"Invalid value '{value}' for {env_name}: must be > 0.")
+            return None
         return value
 
     return _get_positive_int_or_none_env

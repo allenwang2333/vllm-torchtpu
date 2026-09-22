@@ -488,17 +488,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     return p
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "k",
-        "write_empty_rows",
-        "scheduling_group_id",
-        "stage2_scheduling_group_id",
-        "return_scores",
-    ),
-)
-def sparsecore_topk(
+def _sparsecore_topk_impl(
     scores: jax.Array,  # f32[b, n] or i32[b, n] of f32 bits
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
@@ -508,21 +498,7 @@ def sparsecore_topk(
     stage2_scheduling_group_id: int | None = None,
     return_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
-    """Exact top-k indices per row, unsorted, -1 suffix-padded.
-
-    Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
-    all 32 subcores in parallel without inter-core barrier overhead.
-
-    On the two-stage path, stage 1 emits each winner's score alongside its index,
-    feeding directly into stage 2 without an intermediate HBM score gather.
-
-    ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
-    raw bits either way.
-
-    ``scheduling_group_id`` and ``stage2_scheduling_group_id`` place each stage
-    in an XLA scheduling group, so each can overlap a different caller's
-    TensorCore work. Stage 2 only exists on the two-stage path.
-    """
+    """Implementation of sparsecore_topk that can recurse without JIT re-entry."""
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     if scores.dtype not in (jnp.float32, jnp.int32):
@@ -584,7 +560,7 @@ def sparsecore_topk(
     if p * k_p > MAX_SLICE_WORDS:
         # Too wide for one slice; recurse so stage 2 partitions in turn. `k_p`
         # is `k` whenever `p > 1`, so `p * k_p < n` and this terminates.
-        final_cand_slots, final_cand_scores = sparsecore_topk(
+        final_cand_slots, final_cand_scores = _sparsecore_topk_impl(
             cand_scores,
             k,
             row_lengths=cand_lengths,
@@ -609,3 +585,49 @@ def sparsecore_topk(
     if return_scores:
         return final_indices, final_cand_scores
     return final_indices
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "k",
+        "write_empty_rows",
+        "scheduling_group_id",
+        "stage2_scheduling_group_id",
+        "return_scores",
+    ),
+)
+def sparsecore_topk(
+    scores: jax.Array,  # f32[b, n] or i32[b, n] of f32 bits
+    k: int,
+    row_lengths: jax.Array | None = None,  # i32[b], defaults to n
+    *,
+    write_empty_rows: bool = True,
+    scheduling_group_id: int | None = None,
+    stage2_scheduling_group_id: int | None = None,
+    return_scores: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
+    """Exact top-k indices per row, unsorted, -1 suffix-padded.
+
+    Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
+    all 32 subcores in parallel without inter-core barrier overhead.
+
+    On the two-stage path, stage 1 emits each winner's score alongside its index,
+    feeding directly into stage 2 without an intermediate HBM score gather.
+
+    ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
+    raw bits either way.
+
+    ``scheduling_group_id`` and ``stage2_scheduling_group_id`` place each stage
+    in an XLA scheduling group, so each can overlap a different caller's
+    TensorCore work. Stage 2 only exists on the two-stage path.
+    """
+    return _sparsecore_topk_impl(
+        scores,
+        k,
+        row_lengths=row_lengths,
+        write_empty_rows=write_empty_rows,
+        scheduling_group_id=scheduling_group_id,
+        stage2_scheduling_group_id=stage2_scheduling_group_id,
+        return_scores=return_scores,
+    )

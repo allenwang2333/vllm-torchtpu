@@ -1083,26 +1083,31 @@ def streamindex_topk(
             if num_chunks == 1
             else tuple(m * chunk_len for m in range(num_chunks))
         )
-        passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
+        # Precompute per-chunk metadata so each chunk kernel invocation only
+        # prefetches its own schedule into TPU SMEM (Scalar Memory), avoiding
+        # multiplying max_steps by num_chunks which overflows the 1MB SMEM hardware
+        # limit on long contexts (e.g. 1M context with pure TP).
+        chunk_passes = tuple(
+            tuple((spec, _pass_metadata(spec, start, chunk_len))
+                  for spec in _pass_specs(decode_batch_end))
+            for start in chunk_starts
         )
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
-            # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
-            # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
-            # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
-            # Stage 2 lands one group later than its own stage 1, so it overlaps
-            # chunk m + 2's scoring. The last two chunks have no later group.
-            sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
+            # Disable cross-chunk _scheduling_group_id annotations: on long
+            # contexts (e.g. 1M tokens), 2-stage hierarchical sparsecore_topk
+            # is active and placing chunk m's stage 2 and chunk m+1's stage 1
+            # into the same scheduling group co-schedules two SparseCore kernels
+            # simultaneously, causing SparseCoreSequencer to halt at 0x3fff.
+            tc_group = None
+            sc_group = None
+            sc2_group = None
 
             start = m * chunk_len
             scores = _scores_for_chunk(
-                passes,
-                m,
+                chunk_passes[m],
+                0,
                 chunk_starts[m],
                 chunk_len,
                 out_dtype,
@@ -1333,10 +1338,6 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"dcp_size={dcp_size} does not match mesh axis"
             f" {dcp_axis_name!r}={mesh.shape[dcp_axis_name]}."
-        )
-    if q.shape[0] % dcp_size != 0:
-        raise ValueError(
-            f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
     interleave_c = interleave_size // compression_ratio
 
