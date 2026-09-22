@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for batch_tile_idx, bq_idx, and bkv_idx metadata (GDN v3 style)."""
 
+from unittest.mock import MagicMock, patch
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -67,10 +69,16 @@ class MetadataTest(parameterized.TestCase):
         max_pages_per_seq: int,
         expected_max_steps: int,
     ):
-        max_steps = metadata.generate_max_steps(
-            num_seqs=num_seqs,
-            max_pages_per_seq=max_pages_per_seq,
-        )
+        mock_tpu_info = MagicMock()
+        mock_tpu_info.smem_capacity_bytes = 1024 * 1024
+        mock_tpu_info.num_lanes = 128
+        with patch.object(metadata.pltpu,
+                          "get_tpu_info",
+                          return_value=mock_tpu_info):
+            max_steps = metadata.generate_max_steps(
+                num_seqs=num_seqs,
+                max_pages_per_seq=max_pages_per_seq,
+            )
         self.assertEqual(max_steps, expected_max_steps)
         self.assertGreater(max_steps, 0)
         self.assertEqual(max_steps % 128, 0)

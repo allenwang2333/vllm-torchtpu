@@ -1070,12 +1070,6 @@ def streamindex_topk(
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
 
-        # Ids count from 1, so the 0 is never a real group: a single chunk has no
-        # pair to annotate and takes the `None` branch below both times.
-        group_base = 0
-        if num_chunks > 1:
-            group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
-
         need_scores = cp_size > 1 or return_scores
 
         chunk_starts = ((None, ) if num_chunks == 1 else tuple(
@@ -1091,14 +1085,14 @@ def streamindex_topk(
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
-            # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
-            # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
-            # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
-            # Stage 2 lands one group later than its own stage 1, so it overlaps
-            # chunk m + 2's scoring. The last two chunks have no later group.
-            sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
+            # Disable cross-chunk _scheduling_group_id annotations: on long
+            # contexts (e.g. 1M tokens), 2-stage hierarchical sparsecore_topk
+            # is active and placing chunk m's stage 2 and chunk m+1's stage 1
+            # into the same scheduling group co-schedules two SparseCore kernels
+            # simultaneously, causing SparseCoreSequencer to halt at 0x3fff.
+            tc_group = None
+            sc_group = None
+            sc2_group = None
 
             start = m * chunk_len
             scores = _scores_for_chunk(

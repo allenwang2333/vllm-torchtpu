@@ -1172,10 +1172,8 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
                                 bkv_p, _HAS, chunk_tokens)
 
     hlo = streamindex_topk.lower(**kwargs).as_text()
-    assert "_scheduling_group_id" in hlo, (
-        f"chunk_tokens={chunk_tokens} did not chunk: no scheduling group id "
-        "reached the HLO, so the kernel took the single-pass fallback and "
-        "this test would prove nothing")
+    assert hlo.count("tpu_custom_call") >= 2 * (sum(T_list) // chunk_tokens), (
+        f"chunk_tokens={chunk_tokens} did not chunk: single-pass fallback taken")
 
     actual = np.array(streamindex_topk(**kwargs))
     expected = streamindex_topk_ref(
@@ -1356,8 +1354,8 @@ class TestChunkedPipelining:
         # proof that more than one chunk was emitted. Without it this would be
         # comparing the unchunked kernel against itself.
         hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
-        assert "_scheduling_group_id" in hlo, (
-            "no scheduling group annotation: the kernel ran a single unchunked"
+        assert hlo.count("tpu_custom_call") >= 2 * (sum(T_list) // chunk_tokens), (
+            "insufficient tpu_custom_call count: the kernel ran a single unchunked"
             " pass and this comparison would pass trivially")
 
         chunked = np.array(streamindex_topk(**chunked_kwargs))
@@ -1393,8 +1391,8 @@ class TestChunkedPipelining:
                                             chunk_tokens,
                                             return_scores=True)
         hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
-        assert "_scheduling_group_id" in hlo, (
-            "no scheduling group annotation: the kernel ran a single unchunked"
+        assert hlo.count("tpu_custom_call") >= 2 * (sum(T_list) // chunk_tokens), (
+            "insufficient tpu_custom_call count: the kernel ran a single unchunked"
             " pass and this comparison would pass trivially")
 
         chunked_idx, chunked_scores = streamindex_topk(**chunked_kwargs)
@@ -1437,7 +1435,7 @@ class TestChunkedPipelining:
         hlo = streamindex_topk.lower(
             **_chunk_call_kwargs(inputs, T_list, S_list, 128, 1, 8, 2, _HAS,
                                  chunk_tokens)).as_text()
-        assert "_scheduling_group_id" not in hlo, (
+        assert hlo.count("tpu_custom_call") == 2, (
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
 
