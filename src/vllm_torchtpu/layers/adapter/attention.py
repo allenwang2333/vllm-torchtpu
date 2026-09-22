@@ -56,6 +56,9 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import \
 from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
+from tokamax.experimental.torch_tpu.ops.batched_rpa import \
+    torch_pallas_mosaic_tpu as tokamax_rpa
+
 logger = init_logger(__name__)
 
 # Temporary: selects the batched_rpa_longctx fork over mainline batched_rpa
@@ -890,20 +893,61 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
                 kernel_reload.register_builder(op_name, _rebuild_pcp_callable)
         else:
-            rpa_kernel_op = pallas.jax_op(
-                op_name,
-                wrapped_fn,
-                donate_argnums=rpa_donate_argnums,
-                mesh=op_mesh,
-                input_partition_specs=(input_partition_specs))
+            # Every non-PCP RPA config is served by tokamax's operator instead
+            # of an in-tree kernel. The operator registers itself once at
+            # import, so this branch builds no op -- only the adaptation
+            # around it.
+
+            tokamax_sm_scale = (self.scale if self.scale is not None else
+                                self.head_size**-0.5)
+
+            # Same calling convention as the op `pallas.jax_op` would have
+            # returned, so `rpa_kernel_impl` below is unchanged: this call site
+            # leads with `kv_cache` and wants `(new_kv_cache, output)`, while
+            # tokamax leads with the projections and returns the pair the other
+            # way round. The pool crosses in the packed 5-D shape the runner
+            # allocated; tokamax folds it on the far side, inside the JAX
+            # trace, where the reshape is free and does not become a second
+            # tensor competing for the donation.
+            def rpa_kernel_op(kv_cache, query, key, value, seq_lens,
+                              block_tables, query_start_loc,
+                              request_distribution, sinks, **kwargs):
+                if sinks is not None:
+                    raise NotImplementedError(
+                        "Attention sinks are not supported by tokamax's "
+                        "batched RPA operator.")
+                outputs, new_kv_cache = tokamax_rpa.PallasMosaicTpuBatchedRpa(
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    use_causal_mask=self.use_causal_mask,
+                    sm_scale=tokamax_sm_scale,
+                    sliding_window=self.sliding_window,
+                    soft_cap=self.logits_soft_cap,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    skip_kv_update=skip_kv_update,
+                    kv_layout=self.kv_layout,
+                    decode_query_size=self.decode_query_size,
+                )
+                return new_kv_cache, outputs
 
         # We must overwrite the default fake implementation as vLLM uses dynamic
-        # dimensions for the query.
+        # dimensions for the query. Only the PCP op needs this: tokamax's
+        # operator registers its own, which already carries the symbolic token
+        # count through.
         def _fake_rpa_op(kv_cache: torch.Tensor, query: torch.Tensor, *args,
                          **kwargs):
             return torch.empty_like(kv_cache), torch.empty_like(query)
 
-        rpa_kernel_op.register_fake(_fake_rpa_op)
+        if use_pcp_streaming:
+            rpa_kernel_op.register_fake(_fake_rpa_op)
 
         def rpa_kernel_impl(kv_cache, *args, **kwargs):
             if use_pcp_streaming:
