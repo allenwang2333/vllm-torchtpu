@@ -28,12 +28,14 @@ class FakeStorage:
 class FakeTensor:
     """Duck-typed tensor for pool-manifest tests (no torch required)."""
 
-    def __init__(self,
-                 shape,
-                 element_size,
-                 dtype="torch.fake",
-                 storage=None,
-                 storage_offset_elems=0):
+    def __init__(
+        self,
+        shape,
+        element_size,
+        dtype="torch.fake",
+        storage=None,
+        storage_offset_elems=0,
+    ):
         self.shape = tuple(shape)
         self._element_size = int(element_size)
         self.dtype = dtype
@@ -56,45 +58,51 @@ class FakeTensor:
 
 def kimi_pool_manifest(heads, pool=None):
     """The stock full K3 unified pool for a local KDA head count."""
-    from vllm_torchtpu.distributed.kv_transfer.raiden import \
-        pool_manifest as rpm
+    from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
     from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
     state_shape = ((3, 3, heads, 128), (heads, 128, 128))
-    layout = derive_pooled_gdn_state_layout(ssm_bytes=heads * 128 * 128 * 4,
-                                            conv_bytes=3 * 3 * heads * 128 * 2,
-                                            token_bytes=2560)
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=heads * 128 * 128 * 4,
+        conv_bytes=3 * 3 * heads * 128 * 2,
+        token_bytes=2560,
+    )
     rows = layout.required_tokens
     if pool is None:
         pool = FakeTensor((4, rows, 2, 640), 2, dtype="torch.bfloat16")
     state_layer, fa_layer = "model.layers.1.kda", "model.layers.4.attn"
     groups = [
-        types.SimpleNamespace(layer_names=[state_layer],
-                              kv_cache_spec=types.SimpleNamespace(
-                                  shapes=state_shape,
-                                  dtypes=("torch.float32", "torch.float32"),
-                                  page_size_bytes=rows * 2560)),
-        types.SimpleNamespace(layer_names=[fa_layer],
-                              kv_cache_spec=types.SimpleNamespace(
-                                  block_size=rows * 2,
-                                  page_size_bytes=rows * 2560)),
+        types.SimpleNamespace(
+            layer_names=[state_layer],
+            kv_cache_spec=types.SimpleNamespace(
+                shapes=state_shape,
+                dtypes=("torch.float32", "torch.float32"),
+                page_size_bytes=rows * 2560,
+            ),
+        ),
+        types.SimpleNamespace(
+            layer_names=[fa_layer],
+            kv_cache_spec=types.SimpleNamespace(
+                block_size=rows * 2, page_size_bytes=rows * 2560
+            ),
+        ),
     ]
     return rpm.build_kimi_k3_pool_manifest(
-        named_kv_caches={
-            state_layer: [pool],
-            fa_layer: pool
-        },
+        named_kv_caches={state_layer: [pool], fa_layer: pool},
         kv_cache_groups=groups,
         raw_tensors=[pool],
-        mamba_group_ordinal_by_layer={state_layer: 0})
+        mamba_group_ordinal_by_layer={state_layer: 0},
+    )
 
 
-def glm_named_kv_caches(*,
-                        num_blocks=16,
-                        block_size_tokens=1024,
-                        nope_shape=None,
-                        rope_shape=None,
-                        idx_shape=None):
+def glm_named_kv_caches(
+    *,
+    num_blocks=16,
+    block_size_tokens=1024,
+    nope_shape=None,
+    rope_shape=None,
+    idx_shape=None,
+):
     """Named per-layer caches shaped like a GLM-5.2 materialization.
 
     Each MLA layer holds a (nope, rope) uint8 tensor pair and
@@ -111,9 +119,9 @@ def glm_named_kv_caches(*,
         )
         for idx in range(2)
     }
-    named["model.layers.0.self_attn.indexer"] = FakeTensor(idx_shape,
-                                                           1,
-                                                           dtype="torch.uint8")
+    named["model.layers.0.self_attn.indexer"] = FakeTensor(
+        idx_shape, 1, dtype="torch.uint8"
+    )
     return named
 
 
@@ -123,7 +131,7 @@ def glm_named_kv_caches(*,
 # CSA NoPE page it overlays.
 DSV4_CSA_BLOCK_TOKENS = 1024
 DSV4_CSA_COMPRESS_RATIO = 4
-DSV4_SWA_BLOCK_TOKENS = (DSV4_CSA_BLOCK_TOKENS // DSV4_CSA_COMPRESS_RATIO // 2)
+DSV4_SWA_BLOCK_TOKENS = DSV4_CSA_BLOCK_TOKENS // DSV4_CSA_COMPRESS_RATIO // 2
 
 
 def dsv4_kv_cache_groups():
@@ -135,8 +143,11 @@ def dsv4_kv_cache_groups():
     them.
     """
     import torch
-    from vllm.v1.kv_cache_interface import (KVCacheGroupSpec, MLAAttentionSpec,
-                                            SlidingWindowMLASpec)
+    from vllm.v1.kv_cache_interface import (
+        KVCacheGroupSpec,
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+    )
 
     def mla(head_size):
         return MLAAttentionSpec(
@@ -149,19 +160,23 @@ def dsv4_kv_cache_groups():
         )
 
     return [
-        KVCacheGroupSpec(layer_names=["model.layers.0.self_attn"],
-                         kv_cache_spec=mla(1024)),
-        KVCacheGroupSpec(layer_names=["model.layers.0.self_attn.indexer"],
-                         kv_cache_spec=mla(256)),
-        KVCacheGroupSpec(layer_names=["model.layers.1.self_attn"],
-                         kv_cache_spec=SlidingWindowMLASpec(
-                             block_size=DSV4_SWA_BLOCK_TOKENS,
-                             num_kv_heads=1,
-                             head_size=1024,
-                             dtype=torch.uint8,
-                             sliding_window=512,
-                             model_version="deepseek_v4",
-                         )),
+        KVCacheGroupSpec(
+            layer_names=["model.layers.0.self_attn"], kv_cache_spec=mla(1024)
+        ),
+        KVCacheGroupSpec(
+            layer_names=["model.layers.0.self_attn.indexer"], kv_cache_spec=mla(256)
+        ),
+        KVCacheGroupSpec(
+            layer_names=["model.layers.1.self_attn"],
+            kv_cache_spec=SlidingWindowMLASpec(
+                block_size=DSV4_SWA_BLOCK_TOKENS,
+                num_kv_heads=1,
+                head_size=1024,
+                dtype=torch.uint8,
+                sliding_window=512,
+                model_version="deepseek_v4",
+            ),
+        ),
     ]
 
 
@@ -199,15 +214,14 @@ class FakeUniformTypeSpecs:
 
     def __init__(self, specs):
         self.kv_cache_specs = dict(specs)
-        self.block_size = max(spec.block_size
-                              for spec in self.kv_cache_specs.values())
+        self.block_size = max(spec.block_size for spec in self.kv_cache_specs.values())
 
 
 def _dsv4_group(layer_names, spec):
     """A DSv4 cache group: per-layer specs under a uniform-type wrapper."""
     return FakeKVCacheGroup(
-        layer_names, FakeUniformTypeSpecs({name: spec
-                                           for name in layer_names}))
+        layer_names, FakeUniformTypeSpecs({name: spec for name in layer_names})
+    )
 
 
 def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
@@ -231,9 +245,7 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     hca = cache(tokens * 2, 128)
 
     csa_names = [f"model.layers.{i}.self_attn.attn" for i in range(2)]
-    idx_names = [
-        f"model.layers.{i}.self_attn.attn.indexer.k_cache" for i in range(2)
-    ]
+    idx_names = [f"model.layers.{i}.self_attn.attn.indexer.k_cache" for i in range(2)]
     hca_name = "model.layers.2.self_attn.attn"
     swa_names = [f"model.layers.{i}.self_attn.swa_cache" for i in range(2)]
 
@@ -266,9 +278,9 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     hca_spec = FakeDsv4Spec(num_states=tokens, tokens_per_state=1)
     # SWA keeps raw latents, so its page holds an eighth of the CSA group's
     # tokens at the same byte size, and it pages at that smaller size.
-    swa_spec = FakeDsv4Spec(num_states=tokens // 2,
-                            tokens_per_state=1,
-                            sliding_window=tokens // 2)
+    swa_spec = FakeDsv4Spec(
+        num_states=tokens // 2, tokens_per_state=1, sliding_window=tokens // 2
+    )
     # Each state role has its own window, so vLLM puts it in its own group.
     groups = [
         _dsv4_group(csa_names, csa_spec),
