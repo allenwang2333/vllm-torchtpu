@@ -37,9 +37,9 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta, TPUConnector, TPUConnectorMetadata, TPUConnectorScheduler,
     TPUConnectorWorker, TPURaidenConnector, TPURaidenConnectorScheduler,
     TPURaidenConnectorWorker, _CoordRecvEntry, _CoordSendEntry,
-    _Stage3Dsv4Pool, _Stage3LoadMeta, _Stage3RegisteredSend,
-    _select_committed_mamba_blocks, _stage3_dsv4_pool_pages,
-    _stage3_transfer_groups, stage3_fa_raiden_id_fields)
+    _Stage3LoadMeta, _Stage3RegisteredSend, _Stage3TransferGroup,
+    _select_committed_mamba_blocks, _stage3_transfer_groups,
+    stage3_fa_raiden_id_fields)
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -4795,54 +4795,67 @@ def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
                                  dp_size=8)
     plan, _ = _dsv4_worker_plan(worker)
 
-    # Page geometry, plan position and sliding window, per tag. Only the SWA
-    # group has a window; everything else is full attention.
+    # Byte geometry, per tag. Two tags of one group share a plan position and
+    # differ only in how many bytes a row carries.
     assert [(pool.tag, pool.plan_position, pool.page_tokens,
-             pool.live_bytes_per_block, pool.row_bytes, pool.window_tokens)
-            for pool in plan] == [
-                ("dsv4.csa.nope.g0", 0, 1024, 131072, 512, None),
-                ("dsv4.csa.rope.g0", 0, 1024, 32768, 512, None),
-                ("dsv4.idx.g1", 1, 1024, 65536, 1024, None),
-                ("dsv4.hca.g2", 2, 256, 262144, 512, None),
-                ("dsv4.swa.g3", 3, 128, 131072, 512, 128),
-                ("dsv4.state.csa.g4", 4, 1024, 131072, 512, None),
-                ("dsv4.state.idx.g5", 5, 1024, 65536, 1024, None),
-                ("dsv4.state.hca.g6", 6, 256, 131072, 512, None),
+             pool.live_bytes_per_block, pool.row_bytes) for pool in plan] == [
+                 ("dsv4.csa.nope.g0", 0, 1024, 131072, 512),
+                 ("dsv4.csa.rope.g0", 0, 1024, 32768, 512),
+                 ("dsv4.idx.g1", 1, 1024, 65536, 1024),
+                 ("dsv4.hca.g2", 2, 256, 262144, 512),
+                 ("dsv4.swa.g3", 3, 128, 131072, 512),
+                 ("dsv4.state.csa.g4", 4, 1024, 131072, 512),
+                 ("dsv4.state.idx.g5", 5, 1024, 65536, 1024),
+                 ("dsv4.state.hca.g6", 6, 256, 131072, 512),
+             ]
+    # Trim geometry lives on the groups instead, one entry per block table the
+    # scheduler sends. Only the SWA group has a window.
+    assert [(group.cache_group_index, group.page_tokens, group.window_tokens)
+            for group in worker._stage3_dsv4_transfer_groups] == [
+                (0, 1024, None),
+                (1, 1024, None),
+                (2, 256, None),
+                (3, 128, 128),
+                (4, 1024, None),
+                (5, 1024, None),
+                (6, 256, None),
             ]
-    assert worker._stage3_dsv4_group_count == 7
 
 
-def _dsv4_pool(tag, page_tokens, window_tokens=None):
-    return _Stage3Dsv4Pool(tag=tag,
-                           plan_position=1,
-                           page_tokens=page_tokens,
-                           live_bytes_per_block=131072,
-                           row_bytes=512,
-                           window_tokens=window_tokens)
+def _dsv4_trim_worker(*groups):
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
+    worker._stage3_dsv4_transfer_groups = tuple(
+        _Stage3TransferGroup(cache_group_index=index,
+                             page_tokens=page_tokens,
+                             window_tokens=window_tokens)
+        for index, (page_tokens, window_tokens) in enumerate(groups))
+    return worker
 
 
-@pytest.mark.parametrize(
-    "pool,table,expected",
-    [
-        # A windowed group transfers only the pages still inside its window.
-        # 1534 tokens over 128-token pages is 12 pages; the window keeps the
-        # last two, matching SlidingWindowManager's (1534 - 128 + 1) // 128
-        # == 10 skip. The dropped entries are all the same null block, and
-        # Raiden rejects a destination list that repeats an ID.
-        (_dsv4_pool("dsv4.swa.g1", 128, 128), [0] * 10 + [41, 42],
-         ([41, 42], 1534 - 10 * 128)),
-        # A full-attention group keeps every page and every token.
-        (_dsv4_pool("dsv4.csa.nope.g0", 1024), [7, 8], ([7, 8], 1534)),
-    ],
-)
-def test_dsv4_window_trim_keeps_only_the_live_pages(pool, table, expected):
-    assert _stage3_dsv4_pool_pages(pool, table, 1534) == expected
+def test_dsv4_window_trim_keeps_only_the_live_pages():
+    """Each group is trimmed against its own page size and window.
+
+    1534 tokens over 128-token pages is 12 pages, and the window keeps the
+    last two, matching SlidingWindowManager's (1534 - 128 + 1) // 128 == 10
+    skip. The dropped entries are all the same null block, and Raiden rejects
+    a destination list that repeats an ID. The full-attention group beside it
+    keeps every page and every token.
+    """
+    worker = _dsv4_trim_worker((128, 128), (1024, None))
+    trimmed = worker._stage3_dsv4_group_blocks(
+        SimpleNamespace(group_block_ids=[[0] * 10 + [41, 42], [7, 8]]), 1534)
+
+    assert [(group.pages, group.num_tokens) for group in trimmed] == [
+        ([41, 42], 1534 - 10 * 128),
+        ([7, 8], 1534),
+    ]
 
 
 def test_dsv4_window_trim_rejects_a_table_that_still_repeats_a_page():
+    worker = _dsv4_trim_worker((128, 128))
     with pytest.raises(ValueError, match="still repeats a page"):
-        _stage3_dsv4_pool_pages(_dsv4_pool("dsv4.swa.g1", 128, 128),
-                                [0] * 10 + [41, 41], 1534)
+        worker._stage3_dsv4_group_blocks(
+            SimpleNamespace(group_block_ids=[[0] * 10 + [41, 41]]), 1534)
 
 
 def test_dsv4_pool_plan_rejects_a_tag_outside_the_transfer_plan():
@@ -4860,10 +4873,11 @@ def test_dsv4_group_blocks_must_match_the_admitted_plan():
     _dsv4_worker_plan(worker)
 
     with pytest.raises(RuntimeError, match="the scheduler supplied none"):
-        worker._stage3_dsv4_group_blocks(SimpleNamespace(group_block_ids=None))
+        worker._stage3_dsv4_group_blocks(SimpleNamespace(group_block_ids=None),
+                                         1024)
     with pytest.raises(RuntimeError, match="do not match the admitted"):
         worker._stage3_dsv4_group_blocks(
-            SimpleNamespace(group_block_ids=[[1], [2]]))
+            SimpleNamespace(group_block_ids=[[1], [2]]), 1024)
 
 
 def test_dsv4_producer_registers_one_span_set_per_cache_group():
@@ -4941,6 +4955,83 @@ def test_dsv4_producer_registers_one_span_set_per_cache_group():
     assert declared["dsv4.csa.nope.g0"] == 131072
     assert declared["dsv4.hca.g2"] == 4 * 262144
     assert declared["dsv4.swa.g3"] == 131072
+
+
+def test_dsv4_producer_trims_the_block_list_it_registers():
+    """The registered list is trimmed the same way the spans are.
+
+    On hardware the first plan position is windowed, so its table arrives with
+    a null-block prefix. Registering that table raw made the controller reject
+    the request with "block_ids must not contain duplicates" as soon as a
+    prompt ran long enough to push a page out of the window.
+    """
+    worker = _make_raiden_worker(tp_rank=0,
+                                 tp_size=1,
+                                 is_producer=True,
+                                 dp_size=8,
+                                 block_size=1024)
+    plan, _ = _dsv4_worker_plan(worker)
+    worker._stage3_dsv4_plan = plan
+    # Give the first position a window one page wide, as the served config
+    # does. Everything else keeps the geometry admission measured.
+    groups = list(worker._stage3_dsv4_transfer_groups)
+    groups[0] = _Stage3TransferGroup(cache_group_index=0,
+                                     page_tokens=1024,
+                                     window_tokens=1024)
+    worker._stage3_dsv4_transfer_groups = tuple(groups)
+
+    facade = _FakeRaidenControllerFacade()
+    unit = SimpleNamespace(job_name="dsv4-prefill",
+                           job_replica_id="producer-engine-rank0",
+                           data_name="kv.dsv4",
+                           data_replica_idx=0)
+    worker._raiden_transfer_engine = _FakeRaidenEngine()
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "prefill-controller.test:27000"
+    worker._raiden_work_unit = unit
+
+    # 2048 tokens. Both windowed groups have already had their out-of-window
+    # entries replaced with the null block: one of group 0's two pages, and
+    # fifteen of group 3's sixteen.
+    group_block_ids = [
+        [0, 11],
+        [20, 21],
+        list(range(30, 38)),
+        [0] * 15 + [47],
+        [50, 51],
+        [60, 61],
+        list(range(70, 78)),
+    ]
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send["dsv4-req"] = MagicMock(uuid=99,
+                                              local_block_ids=[11],
+                                              group_block_ids=group_block_ids,
+                                              num_tokens=2048,
+                                              expiration_time=1e20)
+
+    with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+               "raiden",
+               create=True), patch(
+                   f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+                   True,
+                   create=True), patch(
+                       f"{_MOD}.tpu_envs.TPU_RAIDEN_DSV4_ADMISSION",
+                       True,
+                       create=True), patch(
+                           f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                           1,
+                           create=True):
+        worker.process_send_load(meta)
+
+    call = facade.register_request_blocks_calls[0]
+    assert call["block_ids"] == [11]
+    spans = {reg.tag: list(reg.block_ids) for reg in call["pool_spans"]}
+    assert spans["dsv4.csa.nope.g0"] == [11]
+    assert spans["dsv4.csa.rope.g0"] == [11]
+    assert spans["dsv4.swa.g3"] == [47]
+    # One live page, so one page of bytes, not the two the raw table spans.
+    declared = {reg.tag: reg.declared_bytes for reg in call["pool_spans"]}
+    assert declared["dsv4.csa.nope.g0"] == 131072
 
 
 class TestPipelineParallelProducer:

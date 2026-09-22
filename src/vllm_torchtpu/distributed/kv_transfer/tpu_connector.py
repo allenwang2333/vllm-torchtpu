@@ -302,29 +302,18 @@ class _Stage3Dsv4Pool:
     # Rows per page is `live_bytes_per_block // row_bytes`, not `page_tokens`:
     # CSA NoPE packs four tokens into a row and RoPE sixteen.
     row_bytes: int
-    # None for full attention.
-    window_tokens: int | None = None
 
 
-def _stage3_dsv4_pool_pages(
-    pool: _Stage3Dsv4Pool,
-    block_ids: Sequence[int],
-    num_tokens: int,
-) -> tuple[list[int], int]:
-    """The pages one DSv4 pool actually transfers, and the tokens they hold.
+@dataclass(frozen=True)
+class _Stage3Dsv4GroupPages:
+    """One cache group's transferable pages, and the tokens they hold.
 
     A windowed group's table opens with null blocks, so the dead pages and the
-    tokens they would have covered come off the front together. Producer and
-    consumer call this with the same geometry and request length, so their page
-    lists line up.
+    tokens they would have covered come off the front together.
     """
-    trimmed = _stage3_trim_window_pages(block_ids,
-                                        num_tokens=num_tokens,
-                                        page_tokens=pool.page_tokens,
-                                        window_tokens=pool.window_tokens,
-                                        group_label=pool.tag)
-    dropped_pages = len(block_ids) - len(trimmed)
-    return trimmed, int(num_tokens) - dropped_pages * int(pool.page_tokens)
+
+    pages: list[int]
+    num_tokens: int
 
 
 @dataclass
@@ -1915,7 +1904,9 @@ class TPURaidenConnectorWorker:
         # DSv4: the admitted pool tags in wire order, each with the kv-cache
         # group whose block table addresses it and its page geometry.
         self._stage3_dsv4_plan: tuple[_Stage3Dsv4Pool, ...] = ()
-        self._stage3_dsv4_group_count = 0
+        # One entry per block table the scheduler sends, in plan order.
+        self._stage3_dsv4_transfer_groups: tuple[_Stage3TransferGroup,
+                                                 ...] = ()
         # GDN state-class sibling transfers: derived source req_id -> base
         # destination req_id; destination -> derived ids still pending; FA
         # completions parked until every state class lands.
@@ -2485,12 +2476,10 @@ class TPURaidenConnectorWorker:
                     live_bytes_per_block=int(
                         geometry[tag]["live_bytes_per_block"]),
                     row_bytes=int(region.unit_bytes),
-                    window_tokens=_stage3_group_window_tokens(
-                        kv_cache_groups[group_index].kv_cache_spec),
                 ))
         if not pools:
             raise RuntimeError("DSv4 admission produced no transfer pools")
-        self._stage3_dsv4_group_count = len(transfer_groups)
+        self._stage3_dsv4_transfer_groups = transfer_groups
         return tuple(pools)
 
     def _raiden_dsv4_admission_topology(self) -> str:
@@ -3463,19 +3452,43 @@ class TPURaidenConnectorWorker:
             }
             logger.info("%s", json.dumps(event, sort_keys=True))
 
-    def _stage3_dsv4_group_blocks(self, req_meta: Any) -> list[list[int]]:
-        """The request's per-cache-group block tables, in plan order."""
+    def _stage3_dsv4_group_blocks(
+            self, req_meta: Any,
+            num_tokens: int) -> list[_Stage3Dsv4GroupPages]:
+        """Each cache group's still-live pages, in plan order.
+
+        The producer's byte spans, the block list the producer registers,
+        and the consumer's destination pages must all name the same pages,
+        and each reads this table separately. Trimming once here keeps them
+        agreeing; trimming per pool is how a duplicate null block reached
+        the controller. The trim does not have to be per-tag, since tags at
+        one plan position share a block table and drop the same pages.
+        """
+        groups = self._stage3_dsv4_transfer_groups
         group_block_ids = getattr(req_meta, "group_block_ids", None)
         if not group_block_ids:
             raise RuntimeError(
                 "DSv4 Stage-3 transfers require one block table per KV cache "
                 "group; the scheduler supplied none")
-        if len(group_block_ids) != self._stage3_dsv4_group_count:
+        if len(group_block_ids) != len(groups):
             raise RuntimeError(
                 "DSv4 Stage-3 block tables do not match the admitted transfer "
                 f"plan: tables={len(group_block_ids)}, "
-                f"groups={self._stage3_dsv4_group_count}")
-        return [[int(block_id) for block_id in ids] for ids in group_block_ids]
+                f"groups={len(groups)}")
+        trimmed: list[_Stage3Dsv4GroupPages] = []
+        for group, ids in zip(groups, group_block_ids):
+            pages = _stage3_trim_window_pages(
+                ids,
+                num_tokens=num_tokens,
+                page_tokens=group.page_tokens,
+                window_tokens=group.window_tokens,
+                group_label=f"g{group.cache_group_index}")
+            dropped = len(ids) - len(pages)
+            trimmed.append(
+                _Stage3Dsv4GroupPages(pages=pages,
+                                      num_tokens=int(num_tokens) -
+                                      dropped * int(group.page_tokens)))
+        return trimmed
 
     def _register_stage3_request_blocks_dsv4(
             self, metadata: TPUConnectorMetadata) -> None:
@@ -3518,27 +3531,27 @@ class TPURaidenConnectorWorker:
                 raise ValueError(
                     "Stage-3 producer send metadata requires a positive "
                     "expiration_time")
-            group_blocks = self._stage3_dsv4_group_blocks(req_meta)
+            group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
             pool_spans = []
             for pool in self._stage3_dsv4_plan:
-                pool_blocks, pool_tokens = _stage3_dsv4_pool_pages(
-                    pool, group_blocks[pool.plan_position], num_tokens)
+                group = group_blocks[pool.plan_position]
                 pool_spans.append(
                     lower_dsv4_row_spans(
                         tag=pool.tag,
-                        num_tokens=pool_tokens,
+                        num_tokens=group.num_tokens,
                         transfer_rank=transfer_rank,
                         parallelism=parallelism,
                         page_tokens=pool.page_tokens,
                         live_bytes_per_block=pool.live_bytes_per_block,
                         row_bytes=pool.row_bytes,
-                        block_ids=pool_blocks,
+                        block_ids=group.pages,
                     ))
             owned_spans = sum(len(reg.spans) for reg in pool_spans)
             # The controller keys D5 on one block list per request, so the
             # per-tag pages ride in the span registrations and this list is
             # the primary group's.
-            registered_ids = tuple(group_blocks[0]) if owned_spans else ()
+            registered_ids = tuple(
+                group_blocks[0].pages) if owned_spans else ()
             if not owned_spans:
                 pool_spans = []
             terminal = self._stage3_terminal_sends.get(req_id)
@@ -3604,7 +3617,8 @@ class TPURaidenConnectorWorker:
                         "num_tokens": num_tokens,
                         "transfer_rank": transfer_rank,
                         "parallelism": parallelism,
-                        "group_pages": [len(ids) for ids in group_blocks],
+                        "group_pages":
+                        [len(group.pages) for group in group_blocks],
                         "declared_bytes": {
                             reg.tag: reg.declared_bytes
                             for reg in pool_spans
@@ -4212,14 +4226,13 @@ class TPURaidenConnectorWorker:
                 # Each DSv4 tag replays over its own group's pages rather than
                 # one shared list. Disjoint block IDs are the only thing
                 # separating the caches that alias one array.
-                group_blocks = self._stage3_dsv4_group_blocks(req_meta)
+                group_blocks = self._stage3_dsv4_group_blocks(
+                    req_meta, pending.num_tokens)
                 transfer_tags = []
                 dst_blocks = []
                 dst_counts = []
                 for pool in self._stage3_dsv4_plan:
-                    pages, _ = _stage3_dsv4_pool_pages(
-                        pool, group_blocks[pool.plan_position],
-                        pending.num_tokens)
+                    pages = group_blocks[pool.plan_position].pages
                     transfer_tags.append(pool.tag)
                     dst_blocks.extend(pages)
                     dst_counts.append(len(pages))
