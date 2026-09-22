@@ -144,7 +144,7 @@ def dsv4_kv_cache_groups():
             num_kv_heads=1,
             head_size=head_size,
             dtype=torch.uint8,
-            compress_ratio=DSV4_CSA_COMPRESS_RATIO,
+            tokens_per_state=DSV4_CSA_COMPRESS_RATIO,
             model_version="deepseek_v4",
         )
 
@@ -174,27 +174,26 @@ class FakeKVCacheGroup:
 
 
 class FakeDsv4Spec:
-    """Duck-typed DSv4 KV cache spec: only the fields the manifest reads."""
+    """Duck-typed DSv4 KV cache spec: only the fields the manifest reads.
 
-    def __init__(self,
-                 *,
-                 storage_block_size,
-                 compress_ratio=1,
-                 sliding_window=None):
-        self.storage_block_size = int(storage_block_size)
-        self.compress_ratio = int(compress_ratio)
+    Field names track vLLM's. A fake left on a renamed field keeps the suite
+    green while production reads an attribute that no longer exists.
+    """
+
+    def __init__(self, *, num_states, tokens_per_state=1, sliding_window=None):
+        self.num_states = int(num_states)
+        self.tokens_per_state = int(tokens_per_state)
         self.sliding_window = sliding_window
-        # Logical page size, what the scheduler pages this group at. The
-        # compressed roles store one row per `compress_ratio` tokens, so their
-        # storage block is that much smaller than their block_size.
-        self.block_size = self.storage_block_size * self.compress_ratio
+        # What the scheduler pages this group at, one row per
+        # `tokens_per_state` tokens.
+        self.block_size = self.num_states * self.tokens_per_state
 
 
 class FakeUniformTypeSpecs:
     """Duck-typed `UniformTypeKVCacheSpecs`, how vLLM hands DSv4 its groups.
 
     The wrapper reports the uncompressed `block_size` and carries no
-    `compress_ratio`, so anything reading role geometry off it sees every
+    `tokens_per_state`, so anything reading role geometry off it sees every
     layer as an uncompressed page. Callers have to unwrap per layer.
     """
 
@@ -262,13 +261,13 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
         named[name] = host
     named[hca_state] = csa_nope[0]
 
-    csa_spec = FakeDsv4Spec(storage_block_size=tokens, compress_ratio=4)
-    idx_spec = FakeDsv4Spec(storage_block_size=tokens, compress_ratio=4)
-    hca_spec = FakeDsv4Spec(storage_block_size=tokens, compress_ratio=1)
+    csa_spec = FakeDsv4Spec(num_states=tokens, tokens_per_state=4)
+    idx_spec = FakeDsv4Spec(num_states=tokens, tokens_per_state=4)
+    hca_spec = FakeDsv4Spec(num_states=tokens, tokens_per_state=1)
     # SWA keeps raw latents, so its page holds an eighth of the CSA group's
     # tokens at the same byte size, and it pages at that smaller size.
-    swa_spec = FakeDsv4Spec(storage_block_size=tokens // 2,
-                            compress_ratio=1,
+    swa_spec = FakeDsv4Spec(num_states=tokens // 2,
+                            tokens_per_state=1,
                             sliding_window=tokens // 2)
     # Each state role has its own window, so vLLM puts it in its own group.
     groups = [
