@@ -121,13 +121,8 @@ def generate_max_steps(
         + 11  # num_steps and other scalar inputs
     ) * 4  # 4 bytes per int32 element
 
-    try:
-        tpu_info = pltpu.get_tpu_info()
-        smem_limit_bytes = tpu_info.smem_capacity_bytes - (32 * 1024)
-        num_lanes = tpu_info.num_lanes
-    except Exception:
-        smem_limit_bytes = 1024 * 1024 - (32 * 1024)
-        num_lanes = 128
+    tpu_info = pltpu.get_tpu_info()
+    smem_limit_bytes = tpu_info.smem_capacity_bytes - (32 * 1024)
     smem_limit_bytes //= 2  # Use half of the SMEM for metadata.
     available_bytes = max(0, smem_limit_bytes - fixed_bytes)
 
@@ -136,6 +131,7 @@ def generate_max_steps(
     bytes_per_step = 12
     max_steps_ub = available_bytes // bytes_per_step
 
+    num_lanes = tpu_info.num_lanes
     max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
     return max_steps_ub
 
