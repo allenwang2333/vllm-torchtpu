@@ -2765,27 +2765,33 @@ def mla_ragged_paged_attention(
             case=MlaCase.PREFILL,
         )
 
-    # Handle mixed case where the query length per sequence is variable.
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-        num_queries_per_block=num_queries_per_blocks[2],
-        start_seq_idx=distribution[1],
-        end_seq_idx=distribution[2],
-        static_q_len=None,
-        batch_size=1,
-        q_split=mixed_q_split,
-        s_dtype=s_dtype,
-        p_same_dtype_as_v=p_same_dtype_as_v,
-        case=MlaCase.MIXED,
+    import os
+    skip_mixed_decode_bucket = (
+        os.environ.get("MLA_SKIP_MIXED_AT_DECODE_BUCKET", "0") == "1"
+        and actual_max_num_tokens == 64
     )
+    if not skip_mixed_decode_bucket:
+        # Handle mixed case where the query length per sequence is variable.
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=None,
+            batch_size=1,
+            q_split=mixed_q_split,
+            s_dtype=s_dtype,
+            p_same_dtype_as_v=p_same_dtype_as_v,
+            case=MlaCase.MIXED,
+        )
     if ql_nope_is_token_major:
         output = ql_nope[
             :actual_max_num_tokens, :actual_num_q_heads, :actual_lkv_dim

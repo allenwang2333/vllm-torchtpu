@@ -1182,24 +1182,30 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 
 
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
+    import os
     # Optimal TPU v7x parameters for Kimi-K2.6 (actual_num_q_heads=64, actual_lkv_dim=512)
     if tuning_key.actual_num_q_heads == 64 and tuning_key.actual_lkv_dim == 512:
         if tuning_key.case in ("mixed", "prefill"):
-            bq_mix = 32 if tuning_key.max_num_tokens >= 32 else max(
+            env_bq = int(os.environ.get("MLA_MIXED_BQ", "32"))
+            env_qs = int(os.environ.get("MLA_MIXED_QSPLIT", "8"))
+            env_bkvp = int(os.environ.get("MLA_MIXED_BKVP", "2"))
+            bq_mix = env_bq if tuning_key.max_num_tokens >= env_bq else max(
                 1, tuning_key.max_num_tokens)
-            qs_mix = 8 if bq_mix >= 8 else bq_mix
+            qs_mix = env_qs if bq_mix >= env_qs else bq_mix
             return TunableParams(
-                num_kv_pages_per_block=2,
+                num_kv_pages_per_block=env_bkvp,
                 num_queries_per_block=bq_mix,
                 vmem_limit_bytes=66000000,
                 decode_batch_size=1,
                 q_split=qs_mix,
             )
-        decode_bsz = 8 if tuning_key.max_num_tokens >= 8 else max(
+        env_dec_bsz = int(os.environ.get("MLA_DECODE_BSZ", "8"))
+        env_dec_bkvp = int(os.environ.get("MLA_DECODE_BKVP", "3"))
+        decode_bsz = env_dec_bsz if tuning_key.max_num_tokens >= env_dec_bsz else max(
             1, tuning_key.max_num_tokens)
         return TunableParams(
             decode_batch_size=decode_bsz,
-            num_kv_pages_per_block=3,
+            num_kv_pages_per_block=env_dec_bkvp,
             num_queries_per_block=1,
             vmem_limit_bytes=66000000,
             q_split=1,

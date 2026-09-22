@@ -51,8 +51,38 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
     original_init = Scheduler.__init__
 
     def patched_init(self, *args, **kwargs):
+        import os
         original_init(self, *args, **kwargs)
         _reconcile_hybrid_producer_prefix_hits(self)
+        if os.environ.get("TPU_TAIL_PREFILL_OVERLAP", "0") == "1":
+            orig_schedule = self.schedule
+            base_max_reqs = self.max_num_running_reqs
+
+            def schedule_with_tail_overlap(*s_args, **s_kwargs):
+                # Count requests already in decode (num_computed_tokens >= num_prompt_tokens)
+                # vs requests still prefilling (num_computed_tokens < num_prompt_tokens).
+                num_decoding = sum(
+                    1 for r in self.running
+                    if r.num_computed_tokens >= r.num_prompt_tokens
+                )
+                # If 60 requests are already decoding (540 blocks), only allow the
+                # 62nd slot (base_max_reqs) when an active prefill request is on its
+                # final chunk (< 2560 tokens remaining), so Request B fills the tail
+                # tokens of the batch without ever exceeding 550 KV blocks!
+                has_tail_prefill = any(
+                    0 < (r.num_prompt_tokens - r.num_computed_tokens) <= 2500
+                    for r in self.running
+                )
+                if num_decoding >= base_max_reqs - 2 and not has_tail_prefill:
+                    self.max_num_running_reqs = base_max_reqs - 1
+                else:
+                    self.max_num_running_reqs = base_max_reqs
+                try:
+                    return orig_schedule(*s_args, **s_kwargs)
+                finally:
+                    self.max_num_running_reqs = base_max_reqs
+
+            self.schedule = schedule_with_tail_overlap
 
     Scheduler.__init__ = patched_init
     Scheduler._tpu_hybrid_producer_prefix_hit_patch = True
@@ -111,13 +141,26 @@ def _patch_vllm_aot_compile_cache_key() -> None:
         return
 
     def tpu_aot_compile_hash_factors(vllm_config):
+        import os
         from vllm_torchtpu.compilation import shape_variants
         from vllm_torchtpu.compilation.tpu_compiler import \
             compute_tpu_compilation_hash
+        v62_tag = (
+            f"v62_{os.environ.get('MLA_MIXED_BQ', '32')}_"
+            f"{os.environ.get('MLA_MIXED_QSPLIT', '8')}_"
+            f"{os.environ.get('MLA_MIXED_BKVP', '2')}_"
+            f"{os.environ.get('MLA_DECODE_BSZ', '8')}_"
+            f"{os.environ.get('MLA_DECODE_BKVP', '3')}_"
+            f"{os.environ.get('MLA_SKIP_MIXED_AT_DECODE_BUCKET', '0')}_"
+            f"{os.environ.get('TPU_GMM_DECODE_BUCKET_BASE', '0')}_"
+            f"{os.environ.get('TPU_FP8_EMBED_TOKENS', '0')}_"
+            f"{os.environ.get('TPU_SC_OFFLOAD_ALL_GATHER', 'true')}_"
+            f"{os.environ.get('TPU_SC_OFFLOAD_REDUCE_SCATTER', 'true')}"
+        )
         return [
             *original(vllm_config),
             compute_tpu_compilation_hash(vllm_config),
-            f"moe_ici_{envs.TPU_MOE_FP8_DISPATCH}_{envs.TPU_MOE_FP8_COMBINE}_{envs.TPU_MOE_OVERLAP_SHARED_EXPERTS}_{envs.TPU_MOE_OVERLAP_MAX_TOKENS}_{envs.TPU_MOE_COLLECTION_CHUNK_SIZE}_{envs.TPU_MOE_PIPELINE_BARRIER}",
+            f"moe_ici_{envs.TPU_MOE_FP8_DISPATCH}_{envs.TPU_MOE_FP8_COMBINE}_{envs.TPU_MOE_OVERLAP_SHARED_EXPERTS}_{envs.TPU_MOE_OVERLAP_MAX_TOKENS}_{envs.TPU_MOE_COLLECTION_CHUNK_SIZE}_{envs.TPU_MOE_PIPELINE_BARRIER}_{v62_tag}",
             *filter(None, [shape_variants.aot_cache_tag()]),
         ]
 
@@ -500,7 +543,7 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                          router_logits,
                          shared_experts_input,
                          input_ids=None):
-            if (envs.TPU_MOE_OVERLAP_SHARED_EXPERTS in (5, 6)
+            if (envs.TPU_MOE_OVERLAP_SHARED_EXPERTS in (5, 6, 7)
                     and self.routed_experts.quant_method.is_monolithic
                     and not self.moe_config.is_sequence_parallel
                     and self.moe_config.pcp_size <= 1
@@ -1560,6 +1603,46 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         return
 
     original_init = vpe.VocabParallelEmbedding.__init__
+    original_weight_loader = vpe.VocabParallelEmbedding.weight_loader
+    orig_create_weights = vpe.UnquantizedEmbeddingMethod.create_weights
+
+    def patched_create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        import os
+        fp8_emb = (
+            os.environ.get("TPU_FP8_EMBED_TOKENS", "0") == "1"
+            and not isinstance(layer, vpe.ParallelLMHead)
+        )
+        if fp8_emb:
+            params_dtype = torch.int8
+        orig_create_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        if fp8_emb and hasattr(layer, "weight") and layer.weight is not None:
+            dev = layer.weight.device
+            shape = layer.weight.shape
+            layer.register_buffer(
+                "_fp8_embed_scale",
+                torch.ones((shape[0], 1), dtype=torch.bfloat16, device=dev),
+                persistent=False,
+            )
+
+    vpe.UnquantizedEmbeddingMethod.create_weights = patched_create_weights
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
@@ -1595,6 +1678,31 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
                 persistent=False,
             )
 
+    def patched_weight_loader(self, param, loaded_weight):
+        if (
+            hasattr(self, "_fp8_embed_scale")
+            and self._fp8_embed_scale is not None
+            and param is self.weight
+            and param.dtype == torch.int8
+        ):
+            start_idx = self.shard_indices.org_vocab_start_index
+            shard_size = self.shard_indices.org_vocab_end_index - start_idx
+            lw = loaded_weight.narrow(0, start_idx, shard_size).to(torch.float32)
+            amax = lw.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            scale = (amax / 448.0).to(torch.bfloat16)
+            w_fp8 = (
+                (lw / scale.to(torch.float32))
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .view(torch.int8)
+            )
+            param[: lw.shape[0]].data.copy_(w_fp8)
+            if lw.shape[0] < param.shape[0]:
+                param[lw.shape[0] :].data.fill_(0)
+            self._fp8_embed_scale[: lw.shape[0]].data.copy_(scale)
+            return
+        return original_weight_loader(self, param, loaded_weight)
+
     def patched_forward(self, input_):
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
@@ -1612,13 +1720,23 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
         else:
             masked_input = input_
-        output_parallel = self.quant_method.embedding(self,
-                                                      masked_input.long())
+        if hasattr(self, "_fp8_embed_scale") and self._fp8_embed_scale is not None:
+            idx = masked_input.long()
+            q_emb = torch.nn.functional.embedding(
+                idx, self.weight
+            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
+            s_emb = torch.nn.functional.embedding(idx, self._fp8_embed_scale)
+            output_parallel = q_emb * s_emb
+        else:
+            output_parallel = self.quant_method.embedding(self,
+                                                          masked_input.long())
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
             return tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
+
+    vpe.VocabParallelEmbedding.weight_loader = patched_weight_loader
 
     def patched_get_masked_input_and_mask(
         input_: torch.Tensor,

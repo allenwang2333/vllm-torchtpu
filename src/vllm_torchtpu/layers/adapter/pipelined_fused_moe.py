@@ -340,7 +340,10 @@ def pipelined_fused_moe_gmm(
                 collective_group, weights_slices[0], ids_slices[0])
 
     shared_act = None
-    if shared_experts is not None and envs.TPU_MOE_OVERLAP_SHARED_EXPERTS != 6:
+    pre_launched_ag_hs1 = None
+    if shared_experts is not None and envs.TPU_MOE_OVERLAP_SHARED_EXPERTS in (5, 7):
+        if envs.TPU_MOE_OVERLAP_SHARED_EXPERTS == 7 and num_chunks > 1 and not use_fp8 and ag_tw_list is not None:
+            pre_launched_ag_hs1 = _all_gather_hs(collective_group, hs_slices[1])
         shared_layer, shared_in = shared_experts
         gate_up, _ = shared_layer.gate_up_proj(shared_in)
         shared_act = shared_layer.act_fn(gate_up)
@@ -353,7 +356,10 @@ def pipelined_fused_moe_gmm(
             hs_next = hs_slices[i + 1]
             if use_barrier:
                 ag_hs_curr, hs_next = _tpu_opt_barrier(ag_hs_curr, hs_next)
-            if not use_fp8 and ag_tw_list is not None:
+            if i == 0 and pre_launched_ag_hs1 is not None:
+                ag_hs_next = pre_launched_ag_hs1
+                ag_tw_next, ag_ti_next = ag_tw_list[1], ag_ti_list[1]
+            elif not use_fp8 and ag_tw_list is not None:
                 ag_hs_next = _all_gather_hs(collective_group, hs_next)
                 ag_tw_next, ag_ti_next = ag_tw_list[i + 1], ag_ti_list[i + 1]
             else:

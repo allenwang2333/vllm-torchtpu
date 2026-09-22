@@ -965,10 +965,12 @@ def calculate_tiling(
     # safe to use for most scenarios. But if lower bitwidth is used, we need
     # to tweak tile_m to account for using faster hardware unit.
     # TODO(kyuyeunk): Account for different TPU hardware specs.
+    import os
     bf16_bf16_tile_m = 128
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
-    if lhs_cfgs.should_quantize:
+    decode_bb = int(os.environ.get("TPU_GMM_DECODE_BUCKET_BASE", "0"))
+    if lhs_cfgs.should_quantize and not (decode_bb == 64 and dims.size_m <= 4096):
         tile_m *= 2
     tile_m = min(tile_m, dims.size_m)
 
