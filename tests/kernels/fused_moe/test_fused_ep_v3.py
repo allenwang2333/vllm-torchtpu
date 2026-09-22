@@ -448,3 +448,70 @@ def test_served_bucket_with_a_partially_padded_rank(production_weights):
     assert not np.count_nonzero(actual[~valid])
     error = _relative_l2(actual[valid], reference[valid])
     assert error < FP8_RELATIVE_BOUND, error
+
+
+def test_wide_weights_with_an_explicit_per_shard_count_match_the_primaries_alone(
+):
+    """An expert placement's copy slots ride after each shard's primaries in the weight arrays; with
+    experts_per_shard given, the kernel routes over the primaries and never reads the slots after them, so the
+    output equals the call on the primaries alone, bitwise."""
+    mesh = _mesh()
+    wf = WeightFormat.FP8
+    e_total = SMALL["e_total"]
+    per = e_total // EP
+    w1, w2, s1, s2 = _make_weights(mesh,
+                                   0,
+                                   hidden=1024,
+                                   inter=SMALL["inter"],
+                                   e_total=e_total,
+                                   weight_format=wf)
+    x, gating = _make_inputs(mesh,
+                             1,
+                             tokens=SMALL["tokens"],
+                             hidden=1024,
+                             e_total=e_total)
+    # the wide arrays: each shard's block gets one extra expert after its primaries (random weights of the same form)
+    extra1, extra2, es1, es2 = _make_weights(mesh,
+                                             7,
+                                             hidden=1024,
+                                             inter=SMALL["inter"],
+                                             e_total=EP,
+                                             weight_format=wf)
+
+    def widen(base, extra):
+        b = np.asarray(base)
+        e = np.asarray(extra)
+        wide = np.concatenate([
+            b.reshape((EP, per) + b.shape[1:]),
+            e.reshape((EP, 1) + e.shape[1:])
+        ],
+                              axis=1)
+        wide = wide.reshape((EP * (per + 1), ) + b.shape[1:])
+        return jax.device_put(jnp.asarray(wide, base.dtype), base.sharding)
+
+    w1w, w2w, s1w, s2w = widen(w1, extra1), widen(w2, extra2), widen(
+        s1, es1), widen(s2, es2)
+
+    def run(x, gating, w1, w2, s1, s2, per_shard):
+
+        @jax.jit
+        def f(x, gating, w1, w2, s1, s2):
+            return fused_ep_moe(x,
+                                w1,
+                                w2,
+                                s1,
+                                s2,
+                                gating.astype(jnp.float32),
+                                top_k=SMALL["topk"],
+                                renormalize=True,
+                                mesh=mesh,
+                                tile_rows=TILE_ROWS,
+                                weight_format=wf,
+                                activation="silu",
+                                experts_per_shard=per_shard)
+
+        return np.asarray(jax.block_until_ready(f(x, gating, w1, w2, s1, s2)))
+
+    want = run(x, gating, w1, w2, s1, s2, None)
+    got = run(x, gating, w1w, w2w, s1w, s2w, per)
+    np.testing.assert_array_equal(got, want)

@@ -173,6 +173,7 @@ def calculate_block_sizes(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
     vmem_limit_bytes: int,
+    decode_batch_size: int = 8,
 ) -> tuple[configs.BlockSizes, configs.BlockSizes]:
     """Calculate optimal block size for decode and prefill."""
 
@@ -362,8 +363,7 @@ def calculate_block_sizes(
 
     # Default to triple buffer as its almost always beneficial.
     n_buffer = 3
-    # Fixed value based on experimental results.
-    decode_batch_size = 8
+    # Fixed value based on experimental results (the decode batch is the caller's: 8 unless it asks for fewer lanes).
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
@@ -385,6 +385,7 @@ def calculate_block_sizes(
         "decode_block_sizes",
         "prefill_block_sizes",
         "vmem_limit_bytes",
+        "decode_batch_size",
         "debug_mode",
         "out_dtype",
         "use_causal_mask",
@@ -414,6 +415,7 @@ def ragged_paged_attention(
     decode_block_sizes: configs.BlockSizes | None = None,
     prefill_block_sizes: configs.BlockSizes | None = None,
     vmem_limit_bytes: int | None = None,
+    decode_batch_size: int | None = None,
     debug_mode: bool = False,
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
@@ -450,6 +452,8 @@ def ragged_paged_attention(
         chunk_prefill_size: Not used.
         decode_block_sizes: Kernel block size to use during decode.
         prefill_block_sizes: Kernel block size to use during prefill.
+        decode_batch_size: Sequences the decode kernel works on concurrently (8
+            unless given; fewer lanes need less VMEM for the same KV tile).
         vmem_limit_bytes: VMEM size limit of the kernel. Defaults to maximum VMEM
             size of the hardware.
         debug_mode: Not used.
@@ -529,7 +533,7 @@ def ragged_paged_attention(
     )
 
     default_decode, default_prefill = calculate_block_sizes(
-        model_cfgs, serve_cfgs, vmem_limit_bytes)
+        model_cfgs, serve_cfgs, vmem_limit_bytes, decode_batch_size or 8)
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
@@ -607,6 +611,7 @@ def schedule_capacity(
     dtype_kv: jnp.dtype,
     kv_layout: configs.KVLayout | None = None,
     vmem_limit_bytes: int | None = None,
+    decode_batch_size: int | None = None,
 ) -> tuple[int, int, int]:
     """How many (query block, KV block) pairs one step's kernel of ``mode``
     can schedule, with the query and KV tile sizes it plans with:
@@ -638,7 +643,8 @@ def schedule_capacity(
         kv_layout=kv_layout,
     )
     decode, prefill = calculate_block_sizes(model_cfgs, serve_cfgs,
-                                            vmem_limit_bytes)
+                                            vmem_limit_bytes, decode_batch_size
+                                            or 8)
     block = decode if mode == configs.RpaCase.DECODE else prefill
     cfgs = configs.RpaConfigs(block=block,
                               model=model_cfgs,

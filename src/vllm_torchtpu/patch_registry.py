@@ -64,7 +64,10 @@ PATCHES = (
     # MoE routing and collectives.
     Patch("vllm_torchtpu:_patch_default_moe_runner_select_forward", _ACTIVE),
     Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_qwen3_next_sequence_parallel_by_rows",
+          _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_qwen3_next_fused_qk_norm_rope_gate", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_fused_ep_threshold_contract", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_runner_fused_output_is_reduced", _ACTIVE),

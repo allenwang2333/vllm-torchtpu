@@ -194,7 +194,8 @@ def run_moe_v3(mesh, topk: int, renormalize: bool, activation: str, *,
                             activation=activation,
                             drop_nan_rows=drop_nan_rows,
                             config=config,
-                            shard_index=rank)
+                            shard_index=rank,
+                            experts_per_shard=experts_per_shard)
 
     return run_moe
 
@@ -426,13 +427,21 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return
 
     tp = _tensor_parallel_size()
-    if tp > 1:
+    from vllm_torchtpu.layers.vllm import sequence_parallel as _sp
+    if tp > 1 and not _sp.enabled():
         logger.warning_once(
             "Fused EP MoE not engaged: under tensor parallelism (tp_size=%d) "
-            "it arms and compiles but then deadlocks during warmup, and with "
-            "the batch replicated it would do %dx the expert work per batch "
-            "anyway. The grouped-matmul path serves every step.", tp, tp)
+            "without sequence parallelism the batch is replicated on every "
+            "rank, so the kernel would do %dx the expert work per batch. "
+            "Replicated-input MoE paths serve these steps.", tp, tp)
         return
+    if tp > 1:
+        # with sequence parallelism each rank hands the kernel its own rows:
+        # the shape the DP8 line runs it at
+        logger.info_once(
+            "Fused EP MoE under tensor parallelism (tp_size=%d) with sequence "
+            "parallelism: each rank's own rows, prompt steps of at least "
+            "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows.", tp)
 
     mesh = build_ep_mesh()
     if mesh is None:
@@ -445,6 +454,16 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
     w2_scale = layer.w2_weight_scale_inv
+    # under a copies placement the rank's tensors carry copy slots after its primaries; the prompt path routes
+    # to primaries only and streams them alone (the forward passes the same views)
+    from vllm_torchtpu import expert_placement as _placement
+    if _placement.has_copies() and int(_placement.owned()) < int(w1.shape[0]):
+        n_prim = int(_placement.owned())
+        w1, w2, w1_scale, w2_scale = w1[:
+                                        n_prim], w2[:
+                                                    n_prim], w1_scale[:
+                                                                      n_prim], w2_scale[:
+                                                                                        n_prim]
     local_experts, hidden = w1.shape[0], w1.shape[1]
     inter = w1.shape[2] // 2
 
@@ -516,7 +535,8 @@ def _unsupported_layer_reason(layer, local_experts: int,
 def _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts, hidden,
                         inter, activation) -> str | None:
     """Why this layer cannot use the fused kernel, or None if it can."""
-    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != local_experts:
+    if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] < local_experts or w1.shape[
+            0] != w2.shape[0]:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
     if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
         return (f"the kernel's fp8 form takes float8_e4m3fn expert weights, "

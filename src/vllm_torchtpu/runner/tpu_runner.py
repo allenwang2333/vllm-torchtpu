@@ -4993,6 +4993,20 @@ class TPUModelRunner(GPUModelRunner):
                 rpa_batched.schedule_capacity(mode=rpa_configs.RpaCase.MIXED,
                                               **shared),
             }
+            # the decode programs may run the kernel with a smaller VMEM limit and fewer lanes: the check
+            # keeps the tighter of the two schedules (fewer pairs, and the smaller KV tile, which needs more)
+            from vllm_torchtpu.layers.common.attention_interface import \
+                batched_rpa_decode_overrides
+            small = batched_rpa_decode_overrides(1, self.max_num_reqs)
+            if small:
+                for mode, case in (("decode", rpa_configs.RpaCase.DECODE),
+                                   ("mixed", rpa_configs.RpaCase.MIXED)):
+                    alt = rpa_batched.schedule_capacity(mode=case,
+                                                        **shared,
+                                                        **small)
+                    pairs, bq, bkv = capacity[mode]
+                    capacity[mode] = (min(pairs, alt[0]), min(bq, alt[1]),
+                                      min(bkv, alt[2]))
             logger.info(
                 "Batched attention schedule capacity per step: decode %s, "
                 "mixed %s (pairs, query tile, KV tile) for %d seqs x %d "
@@ -6889,6 +6903,13 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        # The step's form under the row-gated sequence parallelism, set here
+        # outside the compiled region: inside a traced forward the write would
+        # become a graph output. The row count is static per compiled shape,
+        # so the decoder layers and the communicator read a constant.
+        from vllm_torchtpu.layers.vllm import sequence_parallel
+        sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(positions.shape[-1]))
         out = self.model(input_ids=input_ids,
                          positions=positions,
                          inputs_embeds=inputs_embeds,

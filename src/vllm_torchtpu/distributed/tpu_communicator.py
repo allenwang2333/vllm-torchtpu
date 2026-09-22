@@ -17,7 +17,9 @@ rank.
 import torch
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase, DeviceCommunicatorBase)
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+from vllm_torchtpu.layers.vllm import sequence_parallel as _sp
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -38,6 +40,27 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def _dp_gather(self, x: torch.Tensor) -> torch.Tensor:
         return get_dp_group().all_gather(x, dim=0)
 
+    @staticmethod
+    def _sequence_parallel_step(is_sequence_parallel: bool) -> bool:
+        """Whether this call's rows are one rank's slice of the step.
+
+        Under the row-gated sequence parallelism (layers/vllm/sequence_parallel)
+        the MoE config is sequence-parallel for every compiled shape, but only
+        the steps above the row threshold carry sliced rows; the smaller steps
+        carry replicated rows and are combined with an all-reduce.
+        """
+        return bool(is_sequence_parallel and _sp.enabled() and _sp.is_active())
+
+    @staticmethod
+    def _replicated_sequence_parallel_step(is_sequence_parallel: bool) -> bool:
+        return bool(is_sequence_parallel and _sp.enabled()
+                    and not _sp.is_active())
+
+    @staticmethod
+    def _sp_gather(x: torch.Tensor) -> torch.Tensor:
+        # every rank's owned rows in rank order, over the expert-parallel group
+        return get_ep_group().all_gather(x, dim=0)
+
     def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
@@ -48,6 +71,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if extra_tensors is not None:
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator")
+        if self._replicated_sequence_parallel_step(is_sequence_parallel):
+            return hidden_states, router_logits
+        if self._sequence_parallel_step(is_sequence_parallel):
+            return self._sp_gather(hidden_states), self._sp_gather(
+                router_logits)
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, router_logits
@@ -66,6 +94,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if extra_tensors is not None:
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator")
+        if self._replicated_sequence_parallel_step(is_sequence_parallel):
+            return hidden_states, topk_weights, topk_ids
+        if self._sequence_parallel_step(is_sequence_parallel):
+            return (self._sp_gather(hidden_states),
+                    self._sp_gather(topk_weights), self._sp_gather(topk_ids))
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states, topk_weights, topk_ids
@@ -77,6 +110,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
     def combine(self,
                 hidden_states: torch.Tensor,
                 is_sequence_parallel: bool = False) -> torch.Tensor:
+        if self._replicated_sequence_parallel_step(is_sequence_parallel):
+            # replicated rows, partial sums over the ranks' experts: the
+            # runner skips its final all-reduce under sequence parallelism
+            return get_ep_group().all_reduce(hidden_states)
+        if self._sequence_parallel_step(is_sequence_parallel):
+            return get_ep_group().reduce_scatter(hidden_states, dim=0)
         dp = get_dp_group()
         if dp.world_size == 1:
             return hidden_states

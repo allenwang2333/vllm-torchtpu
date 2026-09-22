@@ -61,3 +61,50 @@ def test_unset_is_the_identity(monkeypatch):
     assert not ep.enabled()
     w = torch.zeros(4, 1)
     assert ep.permute_router_rows("model.layers.0.mlp.gate.weight", w) is w
+
+
+def _copy_table(tmp_path):
+    table = {
+        "shards": 2,
+        "experts": 4,
+        "owned_per_core": 2,
+        "slots_per_core": 3,
+        "copies": True,
+        "layers": {
+            "0": {
+                "cores": [[0, 1, 2], [2, 3, 0]],
+                "copies": {
+                    "2": 0,
+                    "0": 1
+                }
+            }
+        }
+    }
+    path = tmp_path / "copies.json"
+    path.write_text(json.dumps(table))
+    return path, table
+
+
+def test_copy_tables_preserve_primary_order(tmp_path, monkeypatch):
+    path, _ = _copy_table(tmp_path)
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    assert ep.virtual_order(0) == [0, 1, 2, 3]
+    assert ep.hot_order(0) == [2, 0]
+    assert ep.holder_tables(0, 0) == ([0, 1, 2], [0, 0, 1, 1], [1, -1, 0, -1])
+
+
+@pytest.mark.parametrize("case",
+                         ["invalid_id", "duplicate_copy", "wrong_order"])
+def test_invalid_copy_tables_are_rejected(tmp_path, monkeypatch, case):
+    path, table = _copy_table(tmp_path)
+    if case == "invalid_id":
+        table["layers"]["0"]["cores"][0][-1] = 4
+    elif case == "duplicate_copy":
+        table["slots_per_core"] = 4
+        table["layers"]["0"]["cores"] = [[0, 1, 2, 2], [2, 3, 0, 1]]
+    else:
+        table["layers"]["0"]["copies"] = {"2": 1, "0": 0}
+    path.write_text(json.dumps(table))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    with pytest.raises(ValueError):
+        ep.data()

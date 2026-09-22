@@ -64,6 +64,15 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
+    TPU_FUSED_QK_NORM_ROPE: int = 0
+    TPU_RPA_DECODE_VMEM_MIB: int = 0
+    TPU_RPA_DECODE_BATCH: int = 0
+    TPU_MOE_LOWTOK_FROM_SCORES: int = 0
+    TPU_MOE_LOWTOK_SCORES_STRICT: int = 0
+    TPU_SP_MIN_ROWS: int = 0
+    TPU_SP_FP8_GATHER: int = 0
+    TPU_EXPERT_PLACEMENT_COPIES_OFF: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -474,6 +483,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # loading instead of recomputing it in every forward.
     "TPU_NORM_WEIGHT_HOIST":
     env_bool("TPU_NORM_WEIGHT_HOIST"),
+    # Under a copies placement, load the copy slots but never route to them:
+    # the few-token kernel sees no copied expert (the primaries' routing of
+    # the placement's base), the tensors and tables stay as the copies build
+    # them. A measurement switch: what the copies cost with no expert moved.
+    "TPU_EXPERT_PLACEMENT_COPIES_OFF":
+    env_bool("TPU_EXPERT_PLACEMENT_COPIES_OFF"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
@@ -570,6 +585,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and combine path. 0 sends every shape to the kernel.
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS":
     lambda: int(os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")),
+
+    # Expert-parallel MoE calls of at most this many tokens run the few-token
+    # kernel (kernels/moe_lowtok): the shard's hit experts walked with the
+    # routing weights as the row mask, no sort, permute, pad or unpermute.
+    # 0 keeps the grouped-matmul path for every count.
+    "TPU_MOE_LOWTOK_MAX_TOKENS":
+    lambda: int(os.getenv("TPU_MOE_LOWTOK_MAX_TOKENS", "0")),
+    "TPU_FUSED_QK_NORM_ROPE":
+    lambda: int(os.getenv("TPU_FUSED_QK_NORM_ROPE", "0")),
+    # batched attention in programs of up to RPA_DECODE_PROGRAM_ROWS query rows: this VMEM limit (MiB) and a
+    # decode batch of min(8, slots), so the attention layers' weights can be prefetched across the kernel
+    "TPU_RPA_DECODE_VMEM_MIB":
+    lambda: int(os.getenv("TPU_RPA_DECODE_VMEM_MIB", "0")),
+    # the decode batch (sequences the batched attention kernel works on concurrently) for the decode programs;
+    # 0 = min(8, the slot count the wrapper sees, which is the padded count)
+    "TPU_RPA_DECODE_BATCH":
+    lambda: int(os.getenv("TPU_RPA_DECODE_BATCH", "0")),
+    "TPU_MOE_LOWTOK_FROM_SCORES":
+    lambda: int(os.getenv("TPU_MOE_LOWTOK_FROM_SCORES", "0")),
+    # refuse to boot when the scores entry's static terms fail on the loaded layer (the term is in the error)
+    "TPU_MOE_LOWTOK_SCORES_STRICT":
+    lambda: int(os.getenv("TPU_MOE_LOWTOK_SCORES_STRICT", "0")),
+    # Sequence parallelism for the tensor-parallel prefill: steps with at
+    # least this many rows reduce-scatter the attention output and run the
+    # residual, norms, router and shared expert on each rank's own rows;
+    # smaller steps keep the all-reduce form. 0 = off.
+    "TPU_SP_MIN_ROWS":
+    lambda: int(os.getenv("TPU_SP_MIN_ROWS", "0")),
+    # With sequence parallelism: the all-gather before the attention and GDN
+    # in-projections carries fp8 rows and per-row scales (each rank
+    # quantises its own rows once) instead of bf16 rows. 0 = bf16 rows.
+    "TPU_SP_FP8_GATHER":
+    lambda: int(os.getenv("TPU_SP_FP8_GATHER", "0")),
 
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.

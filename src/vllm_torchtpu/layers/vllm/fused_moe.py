@@ -26,7 +26,8 @@ from vllm_torchtpu.layers.common.fused_moe_gmm import (
     resolve_onehot_permute_threshold, unpack_fp4_to_e2m1)
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, int | None],
+                              Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[int, Callable] = {}
@@ -139,6 +140,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    num_primary_experts: int | None = None,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -161,7 +163,8 @@ def _build_fused_moe_custom_op(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens)
+        skip_padded_tokens=skip_padded_tokens,
+        num_primary_experts=num_primary_experts)
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
@@ -172,7 +175,8 @@ def _build_fused_moe_custom_op(
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
+                 num_primary_experts)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -184,10 +188,23 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    num_primary_experts: int | None = None,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    if use_ep and num_primary_experts is None:
+        # A placement with copy slots gives a rank more weight slots than it
+        # has primary experts, and the interval below would accept the next
+        # rank's first ids as local and add their contribution a second time.
+        # A caller that has not supplied the primary count cannot be served.
+        from vllm_torchtpu import expert_placement
+        if expert_placement.has_copies():
+            raise ValueError(
+                "this expert placement holds copies: the grouped path needs "
+                "num_primary_experts, which this quantisation method does not "
+                "supply")
+    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
+                 num_primary_experts)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -197,6 +214,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        num_primary_experts=num_primary_experts,
     )
 
 
@@ -207,6 +225,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    num_primary_experts: int | None = None,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -215,6 +234,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        num_primary_experts=num_primary_experts,
     )
 
 
@@ -233,6 +253,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: Optional[bool] = None,
+    num_primary_experts: int | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -243,7 +264,9 @@ def fused_moe_gmm(
     EP rank owns a different value, and passing it as real tensor data (vs.
     binding it as a Python int into the compiled closure) keeps the compiled
     program identical across ranks. The kernel remaps global ids to local ids
-    with an elementwise subtract and masks non-local experts. When present,
+    with an elementwise subtract and masks non-local experts. With replica
+    slots, ``num_primary_experts`` bounds that interval without slicing the
+    weight tensors. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
     use_ep = experts_start is not None
@@ -253,6 +276,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        num_primary_experts=num_primary_experts,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand

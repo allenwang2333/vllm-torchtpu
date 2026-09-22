@@ -16,8 +16,9 @@ parallelism, applied as a permutation of the checkpoint at load time.
 
 The file says, per MoE layer, which global experts each expert-parallel rank
 holds and in what slot order: `layers[<n>].cores[r]` is a list of
-`slots_per_core` global expert ids, and every expert is held exactly once
-across the ranks (a permutation, no copies). vLLM's EPLB policy run on a
+`slots_per_core` global expert ids, and the primary slots hold every expert exactly once. Optional copy slots
+follow the primaries; the small-batch MoE kernel assigns each active expert
+to exactly one holder. vLLM's EPLB policy run on a
 routing recording produces such a file. Off by default (no file): the
 checkpoint's own contiguous placement, nothing touched.
 
@@ -25,7 +26,7 @@ What it changes, and where:
   * the layer's `expert_map` (vLLM's global-to-local slot map) is this rank's
     slot index of each global expert, so expert `cores[r][j]` lands in slot
     j. The kernels' contiguous-block assumption (rank r holds virtual ids
-    r * slots .. (r + 1) * slots - 1; virtual id v = r * slots + j for slot j
+    r * owned .. (r + 1) * owned - 1; virtual id v = r * owned + j for primary slot j
     of rank r) then holds by construction;
   * the loader's expert filter keeps the experts the placement gives this
     rank (model_loader_patches);
@@ -74,7 +75,7 @@ def _log_once(key: str, message: str) -> None:
 
 def data() -> dict:
     """The placement table, loaded once per path and checked to be a
-    permutation."""
+    primary permutation and optional copies."""
     global _DATA, _DATA_PATH
     path = _path()
     if _DATA is None or _DATA_PATH != path:
@@ -83,20 +84,51 @@ def data() -> dict:
         experts = int(table["experts"])
         ranks = int(table["shards"])
         per_rank = int(table["slots_per_core"])
-        if ranks * per_rank != experts:
+        # a copies table: the first owned_per_core slots of every rank are a
+        # permutation of the experts, the slots after them hold copies
+        copies = bool(table.get("copies", False))
+        owned_n = int(table.get("owned_per_core",
+                                per_rank)) if copies else per_rank
+        if ranks * owned_n != experts or owned_n > per_rank:
             raise ValueError(
-                f"expert placement {path}: {ranks} ranks x {per_rank} slots "
-                f"must equal {experts} experts")
+                f"expert placement {path}: {ranks} ranks x {owned_n} owned slots "
+                f"must equal {experts} experts (slots per rank {per_rank})")
         for n, layer in table["layers"].items():
             cores = layer["cores"]
             if len(cores) != ranks or any(len(c) != per_rank for c in cores):
                 raise ValueError(
                     f"expert placement {path}: layer {n} must list {ranks} "
                     f"ranks x {per_rank} slots")
-            if sorted(e for c in cores for e in c) != list(range(experts)):
+            if sorted(e for c in cores
+                      for e in c[:owned_n]) != list(range(experts)):
                 raise ValueError(
                     f"expert placement {path}: layer {n} must hold every "
-                    "expert exactly once")
+                    "expert exactly once among the owned slots")
+            if copies and any(e in c[:owned_n] for c in cores
+                              for e in c[owned_n:]):
+                raise ValueError(
+                    f"expert placement {path}: layer {n} holds an expert as a "
+                    "copy on the rank that owns it")
+            if copies:
+                copy_slots = [e for c in cores for e in c[owned_n:]]
+                if any(e < 0 or e >= experts for e in copy_slots):
+                    raise ValueError(
+                        f"expert placement: layer {n} has an invalid copy id")
+                if len(copy_slots) != len(set(copy_slots)):
+                    raise ValueError(
+                        f"expert placement: layer {n} allows at most one extra copy per expert"
+                    )
+                declared = layer.get("copies")
+                if isinstance(declared, dict):
+                    actual = {
+                        str(e): r
+                        for r, c in enumerate(cores)
+                        for e in c[owned_n:]
+                    }
+                    if declared != actual:
+                        raise ValueError(
+                            f"expert placement: layer {n} copy order must match the copy slots"
+                        )
         _DATA, _DATA_PATH = table, path
     return _DATA
 
@@ -148,9 +180,60 @@ def expert_map(layer: int, rank: int) -> list[int]:
 
 
 def virtual_order(layer: int) -> list[int]:
-    """The global expert of each virtual id v = r * slots + j (the router's
-    row order after the permutation)."""
-    return [e for c in cores(layer) for e in c]
+    """The global expert of each virtual id v = r * owned + j (the router's
+    row order after the permutation): every rank's primaries, copy slots
+    left out."""
+    o = owned()
+    return [e for c in cores(layer) for e in c[:o]]
+
+
+def has_copies() -> bool:
+    """Whether the placement holds experts on more than one rank (copy slots
+    after each rank's owned primaries)."""
+    return enabled() and bool(data().get("copies", False))
+
+
+def owned() -> int:
+    """The primaries per rank: the slots the grouped path and the router
+    permutation know; copy slots follow them."""
+    return int(data().get("owned_per_core", slots()))
+
+
+def holder_tables(layer: int, rank: int):
+    """For the few-token kernel's scores entry, in VIRTUAL ids (the router's
+    row order after the permutation: rank r's primaries are v = r*owned ..
+    (r+1)*owned - 1): this rank's slot -> virtual id table (primaries first,
+    then its copy slots), and per virtual id the rank of the primary (v //
+    owned, by construction) and of the copy (-1 without one)."""
+    cs = cores(layer)
+    o = owned()
+    vid = {}  # global expert -> virtual id
+    for r, lst in enumerate(cs):
+        for j, e in enumerate(lst[:o]):
+            vid[e] = r * o + j
+    n = len(vid)
+    prim = [v // o for v in range(n)]
+    copy = [-1] * n
+    for r, lst in enumerate(cs):
+        for e in lst[o:]:
+            copy[vid[e]] = r
+    gid = [vid[e] for e in cs[rank]]
+    return gid, prim, copy
+
+
+def hot_order(layer: int) -> list[int]:
+    """The copied experts of a layer as VIRTUAL ids, hottest first: the placement file's per-layer `copies`
+    (an insertion-ordered mapping, written hottest first), else the copy slots in core order."""
+    cs = cores(layer)
+    o = owned()
+    vid = {}
+    for r, lst in enumerate(cs):
+        for j, e in enumerate(lst[:o]):
+            vid[e] = r * o + j
+    entry = data()["layers"][str(layer)]
+    if isinstance(entry.get("copies"), dict):
+        return [vid[int(e)] for e in entry["copies"]]
+    return [vid[e] for lst in cs for e in lst[o:]]
 
 
 def permute_router_rows(name: str, tensor):

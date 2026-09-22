@@ -272,16 +272,23 @@ def prepare_routed_gmm_inputs(
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort
     # (USE_MOE_COUNTING_SORT; it declines shapes whose bucket count exceeds
-    # its block). It runs on the one-hot permute path too, where its gain
-    # was measured, which main avoids because of a draft-token acceptance
-    # regression seen with these positions there; not validated with MTP.
+    # its block). It also runs on the one-hot permute path. Speculative
+    # decoding is out of its measured scope: the positions it produces have
+    # not been checked against draft-token acceptance, so leave the flag off
+    # with multi-token prediction.
     argsort_revert_indices, bucket_counts = (_counting_sort_positions(
         sort_keys, local_num_experts + 1) if envs.USE_MOE_COUNTING_SORT else
                                              (None, None))
+    # The packed (key, token) sort below needs both fields inside an int32; at
+    # the served shapes it takes about 21 of the 31 bits, but a shape that does
+    # not fit takes the gather instead of silently wrapping.
+    if argsort_revert_indices is not None and (
+        (local_num_experts + 1).bit_length() +
+            max(1, (num_tokens_local - 1).bit_length()) >= 31):
+        argsort_revert_indices, bucket_counts = None, None
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
 
-        # int32 overflows only past num_tokens * local_num_experts >= 2**30.
         token_bits = (num_tokens_local - 1).bit_length()
         # (key, token) packed: no payload, no gather, and token_indices_flat is
         # non-decreasing so this IS the stable order by row.
@@ -361,7 +368,16 @@ def moe_gmm(
     # no kernel trace: a shape it would refuse (whole-expert weight slabs over
     # VMEM, scales it does not take, rows it cannot tile) keeps the two-call
     # path below.
-    use_fused = envs.USE_FUSED_MOE_GMM and can_fuse(x,
+    # The fused kernel tiles rows by the 16-row sublane tile and refuses a
+    # count that is not a multiple of it (4 users x top-10 = 40 rows); the
+    # two-call path's gmm_v2 pads the same count to 48 internally. Pad the
+    # sorted rows the same way here: the padded rows sit after every group,
+    # so the zero-initialised kernel leaves them zero, and the result is
+    # sliced back to the routed rows.
+    num_rows = x.shape[0]
+    fused_pad = (-num_rows) % 16
+    x_fused = jnp.pad(x, ((0, fused_pad), (0, 0))) if fused_pad else x
+    use_fused = envs.USE_FUSED_MOE_GMM and can_fuse(x_fused,
                                                     w1,
                                                     w2,
                                                     group_sizes,
@@ -377,7 +393,7 @@ def moe_gmm(
         # outside the shard's expert window, the merged-body pipeline off.
         from vllm_torchtpu.kernels.megablox.gmm_fused import (
             GMM_FUSED_BUCKET_BASE, gmm_fused)
-        gmm2_res = gmm_fused(lhs=x,
+        gmm2_res = gmm_fused(lhs=x_fused,
                              w1=w1,
                              w2=w2,
                              group_sizes=group_sizes,
@@ -390,6 +406,8 @@ def moe_gmm(
                              zero_initialize=True,
                              unconditional_pipeline=False,
                              bucket_base=GMM_FUSED_BUCKET_BASE)
+        if fused_pad:
+            gmm2_res = gmm2_res[:num_rows]
     else:
         gmm1_res = gmm_wrapper(
             x,
@@ -478,6 +496,15 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def _local_expert_routing(topk_ids, topk_weights, experts_start,
+                          num_primary_experts):
+    """Route only to this shard's primary interval; trailing slots may be copies."""
+    local_ids = topk_ids - experts_start
+    valid = (local_ids >= 0) & (local_ids < num_primary_experts)
+    return (jnp.where(valid, local_ids, jnp.full_like(local_ids, -1)),
+            jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights)))
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -488,6 +515,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -508,6 +536,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -552,11 +581,36 @@ def fused_moe_func(
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
     if use_ep and experts_start is not None:
-        local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights,
-                                 jnp.zeros_like(topk_weights))
-        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+        owned = w1.shape[
+            0] if num_primary_experts is None else num_primary_experts
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError(
+                "num_primary_experts must fit the local weight slots")
+        topk_ids, topk_weights = _local_expert_routing(topk_ids, topk_weights,
+                                                       experts_start, owned)
+
+    # A few tokens under expert parallelism: one Pallas call that walks the
+    # shard's hit experts with the routing weights as the row mask
+    # (kernels/moe_lowtok), instead of the sort, permute, grouped matmuls,
+    # pad and unpermute below. Per-channel fp8 scales, no bias, the hidden
+    # width unpadded; the caller's all-reduce combines the shards as before.
+    lowtok_max = envs.TPU_MOE_LOWTOK_MAX_TOKENS
+    if (use_ep and experts_start is not None and lowtok_max
+            and num_tokens <= lowtok_max and activation == "silu"
+            and rhs_quant_dtype is None and w1_bias is None and w2_bias is None
+            and w1_scale is not None and w2_scale is not None
+            and w1.dtype == jnp.float8_e4m3fn and w2.dtype == jnp.float8_e4m3fn
+            and hidden_states.dtype == jnp.bfloat16 and w1_scale.ndim == 4
+            and w1_scale.shape[1] == 1 and w1_scale.shape[2] == 1
+            and w2_scale.ndim == 4 and w2_scale.shape[1] == 1
+            and w2_scale.shape[2] == 1 and w1.shape[1] == hidden_size
+            # the kernel's own limits: a routing table of one lane tile of
+            # experts, and an intermediate width that splits into two
+            # lane-aligned halves; anything else takes the grouped path
+            and w1.shape[0] <= 128 and w1.shape[2] % 512 == 0):
+        from vllm_torchtpu.kernels.moe_lowtok.kernel import moe_lowtok
+        return moe_lowtok(hidden_states, topk_ids, topk_weights, w1, w1_scale,
+                          w2, w2_scale)
 
     (x, group_sizes, argsort_revert_indices, topk_weights_flat, valid_mask,
      token_indices_sorted) = prepare_routed_gmm_inputs(
