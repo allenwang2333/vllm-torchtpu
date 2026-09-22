@@ -19,6 +19,10 @@ import math
 import pathlib
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.cpu_test
+
 _SCRIPT = (pathlib.Path(__file__).resolve().parents[2] / "scripts" / "vllm" /
            "benchmarking" / "check_regression.py")
 _spec = importlib.util.spec_from_file_location("check_regression", _SCRIPT)
@@ -126,6 +130,22 @@ def test_delta_stderr_assumes_symmetry_when_run_stderr_missing():
     # A missing task entry behaves the same way.
     got_none = check_regression.delta_stderr(baseline, None, metric)
     assert math.isclose(got_none, 0.03 * math.sqrt(2))
+
+
+def test_delta_stderr_uses_run_stderr_when_baseline_missing():
+    """A stderr-less baseline still widens the gate, off the run's stderr.
+
+    The baseline accuracy is itself a sampled estimate, so a baseline that
+    predates stderr recording is unmeasured, not noiseless. This is the
+    direction that moves `kimi-k3-tp32-ep.mmlu_pro`, whose shipped baseline
+    carries no stderr.
+    """
+    metric = "exact_match,custom-extract"
+    baseline = {metric: 0.88}
+    results = {metric: 0.86, "exact_match_stderr,custom-extract": 0.02}
+    # hypot(0.0, 0.02) == 0.02: the run's own stderr sets the scale.
+    assert math.isclose(
+        check_regression.delta_stderr(baseline, results, metric), 0.02)
 
 
 def test_delta_stderr_zero_when_neither_side_reports():
