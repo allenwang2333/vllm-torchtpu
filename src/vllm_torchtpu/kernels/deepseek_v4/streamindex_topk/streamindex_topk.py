@@ -1100,6 +1100,7 @@ def streamindex_topk(
             # chunk m + 2's scoring. The last two chunks have no later group.
             sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
+            start = m * chunk_len
             scores = _scores_for_chunk(
                 chunk_passes[m],
                 0,
