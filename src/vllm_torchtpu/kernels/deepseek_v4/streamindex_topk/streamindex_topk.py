@@ -1080,8 +1080,14 @@ def streamindex_topk(
 
         chunk_starts = ((None, ) if num_chunks == 1 else tuple(
             m * chunk_len for m in range(num_chunks)))
-        passes = tuple((spec, _pass_metadata(spec, chunk_starts, chunk_len))
-                       for spec in _pass_specs(decode_batch_end))
+        # Precompute per-chunk metadata so each chunk kernel invocation only
+        # prefetches its own schedule into TPU SMEM (Scalar Memory), avoiding
+        # multiplying max_steps by num_chunks which overflows the 1MB SMEM hardware
+        # limit on long contexts (e.g. 1M context with pure TP).
+        chunk_passes = tuple(
+            tuple((spec, _pass_metadata(spec, start, chunk_len))
+                  for spec in _pass_specs(decode_batch_end))
+            for start in chunk_starts)
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
@@ -1094,10 +1100,9 @@ def streamindex_topk(
             # chunk m + 2's scoring. The last two chunks have no later group.
             sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
-            start = m * chunk_len
             scores = _scores_for_chunk(
-                passes,
-                m,
+                chunk_passes[m],
+                0,
                 chunk_starts[m],
                 chunk_len,
                 out_dtype,
