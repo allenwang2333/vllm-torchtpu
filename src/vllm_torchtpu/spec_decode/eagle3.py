@@ -589,7 +589,6 @@ class Eagle3Proposer:
                                                      hidden).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
         self,
         hidden: torch.Tensor,
