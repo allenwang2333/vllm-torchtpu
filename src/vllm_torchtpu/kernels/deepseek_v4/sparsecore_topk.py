@@ -324,7 +324,8 @@ def _topk_body(
         plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
 
     cores_per_chip = num_sc_cores * num_subcores
-    buf_count = 1 if num_waves == 1 else 2
+    # Single-buffering avoids exceeding SparseCore 64KB DMEM when slice_len or k is large
+    buf_count = 1
     in_specs = (
         pl.BlockSpec(
             (slice_len, ),
