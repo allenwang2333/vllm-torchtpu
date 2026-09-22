@@ -17,7 +17,8 @@ _SPEC.loader.exec_module(kernel)
 
 
 @pytest.mark.parametrize("length", [1, 4, 5, 8, 9, 17])
-def test_decode_page_ownership_and_empty_rank(length):
+@pytest.mark.parametrize("tile_size", [2, 4, 8])
+def test_decode_page_ownership_and_empty_rank(length, tile_size):
     # Deliberately non-contiguous physical pages, with NaNs in unused rows.
     page_size, latent, rope = 4, 8, 4
     q = jnp.ones((2, 2, latent), dtype=jnp.float32)
@@ -52,7 +53,7 @@ def test_decode_page_ownership_and_empty_rank(length):
                                                          rank=rank,
                                                          size=2,
                                                          scale=0.25,
-                                                         tile_size=4))
+                                                         tile_size=tile_size))
         updated, out, lse = run(cache)
         if local:
             np.testing.assert_allclose(out[0], 1, atol=1e-5)

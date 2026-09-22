@@ -32,7 +32,7 @@ def decode_attention(
     scale: float,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
-    tile_size: int = 512,
+    tile_size: int = 2048,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Insert owned decode tokens; return cache, local output, natural-log LSE.
 
@@ -82,10 +82,18 @@ def decode_attention(
         def step(i, state):
             m, denominator, acc = state
             pos = i * tile_size + jnp.arange(tile_size)
-            col = jnp.minimum(pos // page_size, tables.shape[1] - 1)
-            pages = tables[req, col]
-            rows = cache[pages, pos % page_size // cache.shape[2],
-                         pos % cache.shape[2], :]
+            if tile_size % page_size == 0:
+                # Read each physical page once instead of repeating its index
+                # for every token. This preserves contiguous packed KV reads.
+                cols = i * (tile_size // page_size) + jnp.arange(
+                    tile_size // page_size)
+                pages = tables[req, jnp.minimum(cols, tables.shape[1] - 1)]
+                rows = cache[pages].reshape(tile_size, cache.shape[-1])
+            else:
+                col = jnp.minimum(pos // page_size, tables.shape[1] - 1)
+                pages = tables[req, col]
+                rows = cache[pages, pos % page_size // cache.shape[2],
+                             pos % cache.shape[2], :]
             valid = pos < length
             rows = jnp.where(valid[:, None], rows, 0)
             keys = rows[:, :latent_dim + rope_dim].astype(q.dtype)
