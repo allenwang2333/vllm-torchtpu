@@ -119,7 +119,7 @@ MODELS = {
          bias=False,
          activation_block=128),
 }
-# Shapes the package refuses today, and the operand the refusal names.
+# Unsupported shapes and the operands identified by their errors.
 # Every refusal below is the VMEM budget of whole-expert weight buffers.
 REFUSED_MODELS = {
     # 3072 x 3072 four-bit experts: the whole-expert buffers are over the

@@ -107,3 +107,11 @@ def weight_form(weight_format):
         raise ValueError(
             f"the fused EP MoE kernel takes weight formats "
             f"{WEIGHT_FORMAT_NAMES}. Got {weight_format!r}") from None
+
+
+def weight_format_of_dtype(dtype):
+    """The format carrying this weight element type, or None."""
+    for weight_format, form in WEIGHT_FORMS.items():
+        if jnp.dtype(form.weight_dtype) == jnp.dtype(dtype):
+            return weight_format
+    return None

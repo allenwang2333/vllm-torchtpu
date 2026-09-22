@@ -634,7 +634,8 @@ def fused_ep_moe(x,
                  no_gate=False,
                  routing=None,
                  config=None,
-                 shard_index=None):
+                 shard_index=None,
+                 experts_per_shard=None):
     """One MoE layer under expert parallelism, through the fused kernel.
 
     Args:
@@ -750,7 +751,17 @@ def fused_ep_moe(x,
     if tokens % (num_shards * replicas):
         raise ValueError(f"{tokens} tokens do not split over the mesh's "
                          f"{num_shards * replicas} cores")
-    experts_per_shard = num_experts // num_shards
+    if experts_per_shard is None:
+        experts_per_shard = num_experts // num_shards
+    elif num_experts < num_shards * experts_per_shard:
+        raise ValueError(
+            f"experts_per_shard {experts_per_shard} over {num_shards} shards needs {num_shards * experts_per_shard} "
+            f"experts, the weights carry {num_experts}")
+    else:
+        # the weight arrays carry more experts per shard than the kernel routes over (an expert placement's copy
+        # slots after the primaries): the routing tables and the FFN visit the first experts_per_shard of every
+        # shard's block, the rest of the block is never read
+        num_experts = num_shards * experts_per_shard
     tokens_per_shard = tokens // (num_shards * replicas)
     # shard_index: int32 [num_shards, 1], the shard's own index handed to the
     # transport and shard-tables programs as data (layout.SHARD_INDEX_OPERAND,

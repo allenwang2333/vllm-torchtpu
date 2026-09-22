@@ -44,7 +44,7 @@ WEIGHT_PREFETCH_DEFAULT = 2
 # Routing blocks of 128 pairs the two tables kernels handle per grid step:
 # up to 8 blocks, 1024 pairs, a tuning choice (fewer, larger steps against
 # the step's VMEM). A step reads whole tiles of the routing message (1024
-# pairs), so smaller counts do not lower the token padding today; the layer
+# pairs), so smaller counts do not lower the token padding; the layer
 # takes the largest count that pads no further than the smallest does.
 TABLES_BLOCKS_PER_STEP_MAX = 8
 TABLES_BLOCKS_PER_STEP_AUTOMATIC = 0

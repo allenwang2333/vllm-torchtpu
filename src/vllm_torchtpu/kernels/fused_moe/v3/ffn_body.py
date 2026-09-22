@@ -150,7 +150,10 @@ def count(ctx, row):
 
 
 def resident_copy(ctx, src, dst):
-    """Copy src to dst on the resident semaphore and wait for it."""
+    """Copy src to dst on the resident semaphore and wait for it. A source with more leading entries than the
+    destination (a placement's copy slots after the shard's primaries) contributes its head only."""
+    if src.shape[0] != dst.shape[0]:
+        src = src.at[pl.ds(0, dst.shape[0])]
     copy = pltpu.make_async_copy(src, dst, ctx.sems.copy)
     copy.start()
     copy.wait()

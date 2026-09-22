@@ -1,8 +1,9 @@
-"""The fused grouped matmul (kernels/megablox/gmm_fused.py, the decode step's MoE FFN) against the dense reference
-and against the two-call path it replaces, at a small but structurally faithful shape; and the fusion planner's
-shape gate (gmm_fused.can_fuse) without a device. The reference-based cases came with the
-tpu-inference PR 3346 port's test file and are retargeted at this kernel; the port's kernel and its bit-exactness
-against the two-call path left with it (this kernel tiles differently, so the comparisons are tolerance-based)."""
+"""Tests for fused grouped matmul and its shape gate.
+
+Compare with a dense reference and the two-call grouped-matmul path.
+Comparisons use tolerances because the fused kernel uses different tiling.
+Reference cases are adapted from TPU Inference.
+"""
 
 from types import SimpleNamespace
 
@@ -102,7 +103,7 @@ def _make_weights(weight_mode: str, key: jax.Array, num_groups: int):
 
 def _run_split(lhs, w1, w1_scale, w2, w2_scale, group_sizes, group_offset,
                fuse_act, rhs_quant_dtype):
-    """Today's two-call path, pinned to the fused kernel's tiling."""
+    """Two-call grouped matmul with the fused kernel's tiling."""
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     size_k2 = w2.shape[1] * packing_factor
 

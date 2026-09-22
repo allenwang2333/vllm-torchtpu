@@ -41,6 +41,7 @@ The program (kernel_body):
   Drain       every push and commit still in flight. An all-shard barrier.
 """
 import dataclasses
+import logging
 import threading
 
 import jax
@@ -48,8 +49,6 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-
-from vllm_torchtpu.logger import init_logger
 
 from . import device, ffn
 from . import ffn_body as body
@@ -63,7 +62,7 @@ from .formats import (PACKED_ROW_TILE, WEIGHT_BLOCK_DEFAULT, WeightFormat,
                       weight_form)
 from .layout import LANES, ROW_BLOCK, SUBLANES
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)

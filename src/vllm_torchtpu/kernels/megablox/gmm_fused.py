@@ -506,6 +506,11 @@ def can_fuse(lhs,
     `gmm_v2` calls."""
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
+    # The kernel tiles its rows in sublane tiles of 16: a row count that is
+    # not a multiple of 16 (4 tokens of top-k 10 are 40 routed rows) is a
+    # shape it refuses at trace time, so the layer keeps the two-call path.
+    if lhs.shape[0] % 16:
+        return False
     try:
         check_fused_operands(lhs, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias,
                              fuse_act)
