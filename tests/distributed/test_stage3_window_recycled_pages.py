@@ -17,8 +17,10 @@ from __future__ import annotations
 import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
-    TPURaidenConnectorScheduler, _stage3_recycled_transfer_pages,
-    _Stage3TransferGroup)
+    TPURaidenConnectorScheduler,
+    _stage3_recycled_transfer_pages,
+    _Stage3TransferGroup,
+)
 
 # DeepSeek-V4-Flash compressor-state geometry: a 16-token page under an
 # 8-token window, the tightest ratio the model has and so the first to drift.
@@ -56,13 +58,16 @@ _CSA_WINDOW = 8
         ([84, 85, 242, 279, 109], 4371, 1024, None, 0),
     ],
 )
-def test_captured_group_tables(ids, num_tokens, page_tokens, window_tokens,
-                               expected):
-    assert _stage3_recycled_transfer_pages(
-        ids,
-        num_tokens=num_tokens,
-        page_tokens=page_tokens,
-        window_tokens=window_tokens) == expected
+def test_captured_group_tables(ids, num_tokens, page_tokens, window_tokens, expected):
+    assert (
+        _stage3_recycled_transfer_pages(
+            ids,
+            num_tokens=num_tokens,
+            page_tokens=page_tokens,
+            window_tokens=window_tokens,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -80,11 +85,12 @@ def test_captured_group_tables(ids, num_tokens, page_tokens, window_tokens,
     ],
 )
 def test_which_models_truncate_the_prompt(mamba_indices, windows, expected):
-    scheduler = TPURaidenConnectorScheduler.__new__(
-        TPURaidenConnectorScheduler)
+    scheduler = TPURaidenConnectorScheduler.__new__(TPURaidenConnectorScheduler)
     scheduler._stage3_mamba_group_indices = list(mamba_indices)
     scheduler._stage3_transfer_groups = tuple(
         _Stage3TransferGroup(
-            cache_group_index=index, page_tokens=16, window_tokens=window)
-        for index, window in enumerate(windows))
+            cache_group_index=index, page_tokens=16, window_tokens=window
+        )
+        for index, window in enumerate(windows)
+    )
     assert scheduler._stage3_truncates_prompt() is expected
