@@ -33,10 +33,10 @@ determine_job_priority() {
     # Pre-merge PR tests
     priority="$PRIORITY_PRE_MERGE"
     echo "Build type: Pre-merge (PR #${BUILDKITE_PULL_REQUEST}) - Priority: $priority" >&2
-  elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
-    # Post-merge tests on main (Highest priority)
+  elif [[ ( "${BUILDKITE_BRANCH:-}" == "main" || "${BUILDKITE_BRANCH:-}" =~ ^releases?/ ) && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+    # Post-merge tests on main or release branches (Highest priority)
     priority="$PRIORITY_POST_MERGE"
-    echo "Build type: Post-merge (Main branch) - Priority: $priority" >&2
+    echo "Build type: Post-merge (${BUILDKITE_BRANCH} branch) - Priority: $priority" >&2
   else
     # Default priority for other branches or manual builds
     priority="$PRIORITY_DEFAULT"
