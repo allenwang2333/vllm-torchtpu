@@ -1707,7 +1707,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.dcp_interleave_size = getattr(parallel_config,
                                            "cp_kv_cache_interleave_size", 1)
         self._dcp_mesh = None
-        if self.dcp_size > 1:
+        from vllm_torchtpu.distributed.k3_decode_dcp import native_size
+        self.native_dense_decode_dcp = native_size(
+            get_current_vllm_config_or_none()) > 1
+        if self.dcp_size > 1 and not self.native_dense_decode_dcp:
             # The indexer refuses pcp>1 and dcp>1 together (see
             # `VllmTPUSparseAttnIndexer.__init__`)
             pcp_size = getattr(parallel_config,
@@ -2021,6 +2024,54 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
+    def _build_dense_decode_dcp_op(self, layer: Any):
+        from vllm_torchtpu.distributed.dcp import get_dcp_rank
+        from vllm_torchtpu.kernels.mla.decode_dcp import decode_attention
+
+        rank = get_dcp_rank()
+        if layer.kv_cache_quantized_dtype is not None:
+            raise NotImplementedError(
+                "K3 decode DCP currently requires BF16 KV")
+
+        def core(cache: jax.Array, q: jax.Array, q_pe: jax.Array,
+                 kv: jax.Array, pe: jax.Array, lengths: jax.Array,
+                 tables: jax.Array,
+                 starts: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+            if (getattr(self, "native_dense_decode_dcp", False)
+                    and cache.shape[1] * cache.shape[2]
+                    != self.dcp_interleave_size):
+                raise ValueError(
+                    "Native K3 DCP requires page-sized KV interleave")
+            return decode_attention(cache,
+                                    q,
+                                    q_pe,
+                                    kv,
+                                    pe,
+                                    lengths,
+                                    tables,
+                                    starts,
+                                    rank=rank,
+                                    size=self.dcp_size,
+                                    scale=layer.scale)
+
+        op = pallas.jax_op(
+            f"pallas::k3_decode_dcp_{layer.layer_name.replace('.', '_')}",
+            core,
+            donate_argnums=(0, ))
+
+        def fake(cache, q, *args):
+            return (torch.empty_like(cache), torch.empty_like(q),
+                    q.new_empty(q.shape[:2], dtype=torch.float32))
+
+        op.register_fake(fake)
+
+        def run(cache, *args):
+            new_cache, output, lse = op(cache, *args)
+            cache.copy_(new_cache)
+            return output, lse
+
+        return run
+
     def forward(
         self,
         layer: Any,
@@ -2131,6 +2182,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
+        elif getattr(self, "native_dense_decode_dcp", False):
+            partial, lse = layer.dense_decode_dcp_op(
+                kv_cache, all_gather_heads(ql_nope_flat),
+                all_gather_heads(q_pe_flat), kv_c_normed_flat, k_pe_flat,
+                attn_metadata.seq_lens, attn_metadata.block_tables,
+                attn_metadata.query_start_loc)
+            outputs = merge_lse_partials_scatter_heads(partial, lse)
         else:
             if not hasattr(layer, "mla_op") or layer.mla_op is None:
                 layer.mla_op = self._build_mla_op(layer,

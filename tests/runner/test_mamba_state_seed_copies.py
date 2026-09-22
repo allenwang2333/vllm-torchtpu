@@ -143,11 +143,22 @@ def test_chunk_advance_copies_state():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(6, 7)]
 
 
-def test_pcp_uses_rank_local_state_block_size(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
+def test_dcp_does_not_change_mamba_state_stride(monkeypatch):
+    monkeypatch.setattr(runner_mod,
+                        "get_dcp_group",
+                        lambda: SimpleNamespace(world_size=2),
+                        raising=False)
     monkeypatch.setattr(runner_mod, "get_pcp_group",
                         lambda: SimpleNamespace(world_size=1))
+    fake, _ = _make_self(["a"], [BLOCK_SIZE], [[[5, 6]]], state_pos={"a": 0})
+    _collect(fake, _sched({"a": 1}))
+    assert fake._mamba_state_pos["a"] == 1
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(5, 6)]
+
+
+def test_pcp_uses_rank_local_state_block_size(monkeypatch):
+    monkeypatch.setattr(runner_mod, "get_pcp_group",
+                        lambda: SimpleNamespace(world_size=8))
     # A PCP rank's two table columns cover 16 logical manager blocks. The
     # third global chunk is still in local column 0 and must not index column 2.
     fake, _ = _make_self(["a"], [2 * BLOCK_SIZE], [[[5, 6]]])
@@ -157,10 +168,8 @@ def test_pcp_uses_rank_local_state_block_size(monkeypatch):
 
 
 def test_pcp_local_state_block_crossing_copies(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
     monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+                        lambda: SimpleNamespace(world_size=8))
     fake, _ = _make_self(["a"], [8 * BLOCK_SIZE], [[[5, 6]]],
                          state_pos={"a": 0})
     _collect(fake, _sched({"a": BLOCK_SIZE}))
@@ -169,10 +178,8 @@ def test_pcp_local_state_block_crossing_copies(monkeypatch):
 
 
 def test_pcp_disagg_mamba_block_table_dimensions(monkeypatch):
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
     monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+                        lambda: SimpleNamespace(world_size=8))
     # Simulate disaggregated serving where Mamba physical block size is 2048
     # (rounded up power-of-two fit size for TP=2 decode).
     # With max_model_len = 4096 and mamba_block_size = 2048, the block table
@@ -199,10 +206,8 @@ def test_pcp_disagg_mamba_block_stride_comparison(monkeypatch):
     attention-derived size instead. Each wrong stride is simulated here by
     installing it as ``_mamba_state_block_size``.
     """
-    monkeypatch.setattr(runner_mod, "get_dcp_group",
-                        lambda: SimpleNamespace(world_size=8))
     monkeypatch.setattr(runner_mod, "get_pcp_group",
-                        lambda: SimpleNamespace(world_size=1))
+                        lambda: SimpleNamespace(world_size=8))
 
     # Wrong stride 1 (pre-PR172): attention block_size=16 with no cp factor,
     # i.e. an effective stride of 16 logical tokens per column.

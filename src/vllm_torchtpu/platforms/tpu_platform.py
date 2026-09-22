@@ -579,6 +579,9 @@ class TpuPlatform(Platform):
                 "Unset VLLM_TPU_USING_PATHWAYS.")
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+        from vllm_torchtpu.distributed.k3_decode_dcp import \
+            validate_native_config
+        validate_native_config(vllm_config)
         # TPU's page geometry and block-size selection depend on layout while
         # loading the model, before engine-core's post-load resolution. Resolve
         # explicitly here through vLLM's API and publish the same CacheConfig
@@ -928,6 +931,9 @@ class TpuPlatform(Platform):
                 cache_config.block_size = min_page_size  # type: ignore[assignment]
             logger.info("Using KV cache block size: %s",
                         cache_config.block_size)
+            from vllm_torchtpu.distributed.k3_decode_dcp import \
+                configure_native_interleave
+            configure_native_interleave(vllm_config)
 
     @classmethod
     def is_pin_memory_available(cls):

@@ -29,7 +29,7 @@ from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           kv_transfer_state)
@@ -1492,7 +1492,7 @@ class TPUModelRunner(GPUModelRunner):
         #     per-rank, and cannot be stale: specs are created only after the
         #     platform finalizes block sizes;
         #   * the scheduler appends a block id to a mamba row only once per
-        #     mamba_block_size * total_cp_world logical tokens, because the
+        #     mamba_block_size * pcp_world logical tokens, because the
         #     PCP coordinator patch presents specs to the hybrid coordinator
         #     at that granularity (_patch_vllm_hybrid_pcp_block_sizes). Mamba
         #     state is never token-sharded across CP ranks; the cp factor
@@ -1500,13 +1500,12 @@ class TPUModelRunner(GPUModelRunner):
         # Every reader of these tables must divide logical token counts by
         # the allocator's stride. This is the same derivation
         # AttentionMetadataBuilder.target_block_size uses for its state-slot
-        # lookup -- spec block size times cp world -- so the two readers
+        # lookup -- spec block size times PCP world -- so the two readers
         # cannot diverge. A smaller divisor visits columns the scheduler
         # never filled: beyond the row width it raises IndexError, within it
         # the null block silently swallows the recurrent state.
         try:
-            cp_world_size = (get_dcp_group().world_size *
-                             get_pcp_group().world_size)
+            cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
         col_stride = self._mamba_state_block_size * cp_world_size
@@ -2765,6 +2764,9 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | None:
+        from vllm_torchtpu.distributed.k3_decode_dcp import \
+            validate_decode_step
+        validate_decode_step(self.vllm_config, scheduler_output)
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
