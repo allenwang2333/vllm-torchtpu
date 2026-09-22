@@ -3,12 +3,10 @@
 
 import pytest
 
-from vllm_torchtpu.distributed.kv_transfer.raiden import \
-    layout_fingerprint as rlf
+from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import (FakeTensor, dsv4_materialization,
-                                glm_named_kv_caches)
+from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
 
 
 def _manifest(*, page_tokens=4096):
@@ -24,14 +22,16 @@ def _manifest(*, page_tokens=4096):
                 base_offset_bytes=0,
                 block_stride_bytes=page_tokens * 1024,
                 num_blocks=16,
-                regions=(rpm.RegionSpec(
-                    name="fa_payload",
-                    offset_bytes=0,
-                    stride_bytes=1024,
-                    unit_bytes=512,
-                    num_units=page_tokens,
-                    units_per_stride=2,
-                ), ),
+                regions=(
+                    rpm.RegionSpec(
+                        name="fa_payload",
+                        offset_bytes=0,
+                        stride_bytes=1024,
+                        unit_bytes=512,
+                        num_units=page_tokens,
+                        units_per_stride=2,
+                    ),
+                ),
                 dtype_tag="float8_e4m3fn",
             )
         ],
@@ -60,9 +60,12 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
         "gdn_conv_layout": "legacy-split-qk",
     }
     assert fingerprint == (
-        "0ddf18228f657fb11c8b6a5ddf0826b1f3020cf88fde96833832eedbd3cf9811")
-    assert rlf.canonical_layout_fingerprint(
-        dict(reversed(list(payload.items())))) == fingerprint
+        "0ddf18228f657fb11c8b6a5ddf0826b1f3020cf88fde96833832eedbd3cf9811"
+    )
+    assert (
+        rlf.canonical_layout_fingerprint(dict(reversed(list(payload.items()))))
+        == fingerprint
+    )
     assert rlf.fa_page_tokens(manifest) == 4096
 
 
@@ -74,8 +77,7 @@ def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
     def measure():
         return rlf.measured_fa_layout_fingerprint(
             _manifest(),
-            layout_getter=lambda tensor:
-            ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
+            layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
             package_version=lambda package: "unused",
         )
 
@@ -140,8 +142,7 @@ def _glm_versions(package):
         (([3, 2, 1, 0], [[4, 128], [4, 1]], 0), 512, "page geometry"),
     ],
 )
-def test_measured_glm_layout_fingerprint_fails_closed(layout, page_tokens,
-                                                      message):
+def test_measured_glm_layout_fingerprint_fails_closed(layout, page_tokens, message):
     with pytest.raises(RuntimeError, match=message):
         rlf.measured_glm_layout_fingerprint(
             _glm_manifest(),
@@ -155,7 +156,8 @@ def _glm_manifest(**kwargs):
     return rpm.build_glm_mla_pool_manifest(
         named_kv_caches=glm_named_kv_caches(**kwargs),
         raw_tensors=(),
-        block_size_tokens=1024)
+        block_size_tokens=1024,
+    )
 
 
 def test_measured_glm_layout_fingerprint_golden():
@@ -198,7 +200,8 @@ def test_measured_glm_layout_fingerprint_golden():
         },
     }
     assert fingerprint == (
-        "bfea2b664510bfb11f87b5092431492fddaf535f0f321f01d59a79e139c3bc2b")
+        "bfea2b664510bfb11f87b5092431492fddaf535f0f321f01d59a79e139c3bc2b"
+    )
 
 
 def test_glm_fingerprint_rejects_shape_divergence_within_tag():
@@ -206,8 +209,7 @@ def test_glm_fingerprint_rejects_shape_divergence_within_tag():
     divergent = _glm_manifest(rope_shape=(16, 256, 4, 256))
     rope_pool = next(p for p in divergent.pools if p.tag == rpm.TAG_MLA_ROPE)
     manifest.pools.append(rope_pool)
-    manifest.storages.append(
-        FakeTensor((16, 256, 4, 256), 1, dtype="torch.uint8"))
+    manifest.storages.append(FakeTensor((16, 256, 4, 256), 1, dtype="torch.uint8"))
     manifest.pools[-1].storage_index = len(manifest.storages) - 1
     with pytest.raises(RuntimeError, match="disagree on shape"):
         rlf.measured_glm_layout_fingerprint(
@@ -225,9 +227,9 @@ def test_glm_fingerprint_rejects_shape_divergence_within_tag():
 
 def _dsv4_manifest(**kwargs):
     named_kv_caches, kv_cache_groups = dsv4_materialization(**kwargs)
-    return rpm.build_dsv4_pool_manifest(named_kv_caches=named_kv_caches,
-                                        kv_cache_groups=kv_cache_groups,
-                                        raw_tensors=())
+    return rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named_kv_caches, kv_cache_groups=kv_cache_groups, raw_tensors=()
+    )
 
 
 def test_measured_dsv4_layout_fingerprint_records_every_role():
@@ -242,9 +244,14 @@ def test_measured_dsv4_layout_fingerprint_records_every_role():
     # a page, so the identity is per-tag page geometry instead.
     assert "page_tokens" not in payload
     assert set(payload["layouts"]) == {
-        "dsv4.csa.nope.g0", "dsv4.csa.rope.g0", "dsv4.idx.g1", "dsv4.hca.g2",
-        "dsv4.swa.g3", "dsv4.state.csa.g4", "dsv4.state.idx.g5",
-        "dsv4.state.hca.g6"
+        "dsv4.csa.nope.g0",
+        "dsv4.csa.rope.g0",
+        "dsv4.idx.g1",
+        "dsv4.hca.g2",
+        "dsv4.swa.g3",
+        "dsv4.state.csa.g4",
+        "dsv4.state.idx.g5",
+        "dsv4.state.hca.g6",
     }
     assert payload["layouts"]["dsv4.csa.nope.g0"] == {
         "page_shape": [256, 4, 128],
