@@ -58,22 +58,35 @@ def _kernel(
     batches_per_owner: int,
     wait_mode: str,
     serve_pipelined: bool,
+    live_bound: bool,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
 
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
-        occurrence_base = (logical_batch * atoms_per_batch *
-                           OCCURRENCES_PER_ATOM)
 
-        def values(atom, stream):
-            return indices_ref[0, atom, stream, :]
+        if live_bound:
+            # Interleaved: owner ``o`` serves every ``num_owners``-th atom, so
+            # a prefix-live bound splits evenly across owners instead of
+            # leaving all the work on the first few.
+            def dst_atom(atom):
+                return ((owner_batch * atoms_per_batch + atom) * num_owners +
+                        owner)
+
+            def values(atom, stream):
+                return indices_ref[atom, 0, stream, :]
+        else:
+
+            def dst_atom(atom):
+                return logical_batch * atoms_per_batch + atom
+
+            def values(atom, stream):
+                return indices_ref[0, atom, stream, :]
 
         def destinations(atom, stream):
             return pl.ds(
-                occurrence_base + atom * OCCURRENCES_PER_ATOM +
-                stream * NUM_LANES,
+                dst_atom(atom) * OCCURRENCES_PER_ATOM + stream * NUM_LANES,
                 NUM_LANES,
             )
 
@@ -133,29 +146,77 @@ def _kernel(
             ) for stream in range(ROPE_PACKING))
         rope_out_spec = pl.BlockSpec(
             (QUADS_PER_ATOM, 128),
-            lambda atom: (logical_batch * atoms_per_batch + atom, 0),
-        )
-        pltpu.emit_pipeline(
-            body,
-            grid=(atoms_per_batch, ),
-            in_specs=nope_specs + rope_specs,
-            out_specs=(rope_out_spec, ),
-            no_pipelining=not serve_pipelined,
-        )(
-            *([nope_hbm_ref] * ROPE_PACKING),
-            *([rope_hbm_ref] * ROPE_PACKING),
-            rope_out_hbm_ref,
+            lambda atom: (dst_atom(atom), 0),
         )
 
-    indices_spec = pl.BlockSpec(
-        (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-        lambda batch: (owner + batch * num_owners, 0, 0, 0),
-    )
+        def serve(steps):
+            pltpu.emit_pipeline(
+                body,
+                grid=(steps, ),
+                in_specs=nope_specs + rope_specs,
+                out_specs=(rope_out_spec, ),
+                no_pipelining=not serve_pipelined,
+            )(
+                *([nope_hbm_ref] * ROPE_PACKING),
+                *([rope_hbm_ref] * ROPE_PACKING),
+                rope_out_hbm_ref,
+            )
+
+        if not live_bound:
+            serve(atoms_per_batch)
+            return
+
+        # The runtime bound RIDES the index operand: one extra stream row on a
+        # fetch that already happens, so there is no second DMA.  It arrives as
+        # a vector and is lane-extracted -- a SparseCore kernel cannot load a
+        # scalar at rank 0.
+        num_valid = indices_ref[0, 0, ROPE_PACKING, :][0]
+        live_atoms = lax.div(num_valid + OCCURRENCES_PER_ATOM - 1,
+                             jnp.int32(OCCURRENCES_PER_ATOM))
+        owner_atoms = lax.div(
+            jnp.maximum(live_atoms - owner, 0) + num_owners - 1,
+            jnp.int32(num_owners))
+        steps = jnp.clip(owner_atoms - owner_batch * atoms_per_batch, 0,
+                         atoms_per_batch)
+
+        @pl.when(steps > 0)
+        def _():
+            serve(steps)
+
+    if live_bound:
+        indices_spec = pl.BlockSpec(
+            (atoms_per_batch, 1, ROPE_PACKING + 1, NUM_LANES),
+            lambda batch: (batch, owner, 0, 0),
+        )
+    else:
+        indices_spec = pl.BlockSpec(
+            (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+            lambda batch: (owner + batch * num_owners, 0, 0, 0),
+        )
     pltpu.emit_pipeline(
         serve_batch,
         grid=(batches_per_owner, ),
         in_specs=(indices_spec, ),
     )(indices_hbm_ref)
+
+
+def _index_operand(indices, num_valid_occurrences, num_owners,
+                   atoms_per_batch, batches_per_owner, num_batches):
+    """Shape the index array for the map the grid will use.
+
+    Without a bound this is the incumbent's free reshape.  With one the array
+    is interleaved owner-major and carries the bound in one extra stream row
+    (the "rider"), which costs a materialisation the reshape does not.
+    """
+    if num_valid_occurrences is None:
+        return indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING,
+                               NUM_LANES)
+    atoms_total = atoms_per_batch * batches_per_owner
+    core = indices.reshape(atoms_total, num_owners, ROPE_PACKING, NUM_LANES)
+    rider = jnp.broadcast_to(
+        jnp.asarray(num_valid_occurrences, jnp.int32).reshape(1, 1, 1, 1),
+        (atoms_total, num_owners, 1, NUM_LANES))
+    return jnp.concatenate([core, rider], axis=2)
 
 
 @functools.partial(
@@ -176,6 +237,7 @@ def dsa_gather_native_sc(
     atoms_per_batch: int = 16,
     wait_mode: str = "overlap_rope",
     serve_pipelined: bool = True,
+    num_valid_occurrences: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -219,6 +281,34 @@ def dsa_gather_native_sc(
             f"occurrences_per_batch ({owner_batch_size})")
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
+
+    # THE GATE.  The interleaved occurrence->owner map plus the traced grid
+    # bound are taken ONLY at `batches_per_owner == 1`, which on GLM-5.2-FP8 at
+    # csa_topk 2048 / atoms_per_batch 16 / 32 owners is exactly the decode
+    # geometry (out_size = 16*2048 = 32768 -> num_batches 32 -> bpo 1).  The
+    # prefill geometry (chunk 64 -> out_size 131072 -> num_batches 128 -> bpo
+    # 4) keeps the shipped blocked map.
+    #
+    # WHY: measured against the shipped file at 100% live, the arm is 0.954x at
+    # bpo 1 (bucket 16) and 0.911x at bpo 4 (bucket 64, the nightly cell) --
+    # applying it unconditionally takes a ~9-10% regression on every prefill
+    # chunk.  At bpo 1 and a low live fraction it is 2.20x (bucket 16, R=1,
+    # j-f825a03b).
+    #
+    # WHY THIS KEY AND NOT ANOTHER: the ~6 us geometry term was never
+    # decomposed -- three mechanisms move together between the two measured
+    # cells (the `_index_operand` concat, which is O(out_size); the strided
+    # index BlockSpec, which is O(batches_per_owner) descriptors per owner; and
+    # the interleaved destination scatter, which is O(atoms per owner)).  All
+    # three are monotone increasing in `batches_per_owner` at fixed
+    # `atoms_per_batch` and `num_owners`, so `bpo == 1` selects the minimum of
+    # every candidate mechanism and the gate is robust to which one it is.
+    #
+    # This is a TRACE-TIME decision: no runtime branch, and the two map
+    # variants never coexist in one kernel body, because each (out_size,
+    # atoms_per_batch) pair already traces its own body (STRAT-SC-16).
+    live_bound = num_valid_occurrences is not None and batches_per_owner == 1
+
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
@@ -235,6 +325,7 @@ def dsa_gather_native_sc(
             batches_per_owner=batches_per_owner,
             wait_mode=wait_mode,
             serve_pipelined=serve_pipelined,
+            live_bound=live_bound,
         ),
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
@@ -248,9 +339,12 @@ def dsa_gather_native_sc(
         scratch_types={"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING, ))},
         mesh=mesh,
         name=(f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
-              f"{'pipe' if serve_pipelined else 'nopipe'}"),
+              f"{'pipe' if serve_pipelined else 'nopipe'}"
+              f"{'_live' if live_bound else ''}"),
     )(
         nope_cache.reshape(-1, 128),
         rope_cache.reshape(-1, 32),
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+        _index_operand(indices, num_valid_occurrences if live_bound else None,
+                       num_owners, atoms_per_batch, batches_per_owner,
+                       num_batches),
     )

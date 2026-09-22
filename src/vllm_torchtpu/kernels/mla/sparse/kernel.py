@@ -755,6 +755,22 @@ def sparse_ragged_paged_attention(
 
     # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+    # Query rows past the last valid token are padding. Force their kv_len to
+    # zero so `load_bkv`'s `jnp.where(k_span < kv_len, bkv, 0)` masks their
+    # gathered buffer to zeros before any arithmetic touches it.
+    #
+    # This is a PRECONDITION of the live gather bound below, not a tidy-up.
+    # With a bound the gather stops at the last live occurrence, while the
+    # attention grid still walks to `batch_end`, which rounds up to
+    # `kernel_batch_size` -- at one live decode row in a 16-row batch the
+    # other 15 rows are read from a destination the gather never wrote. That
+    # is arbitrary HBM, and as fp8 it can decode to NaN. The mask below makes
+    # those rows read as zeros by construction instead of relying on the
+    # indexer to have emitted -1 for every padding row, which nothing in this
+    # kernel's contract promises (see the docstring for `topk_indices`).
+    kv_lens = jnp.where(
+        jnp.arange(q.shape[0], dtype=jnp.int32) < cu_q_lens[distribution[2]],
+        kv_lens, 0)
     is_padding = topk_indices == -1
     flat_element_index = jnp.arange(q.shape[0] * topk,
                                     dtype=jnp.int32).reshape(q.shape[0], topk)
@@ -832,6 +848,14 @@ def sparse_ragged_paged_attention(
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
         if sparsecore_layout:
+            # UNROUNDED live occurrence count.  `num_valid_indices` above is
+            # `batch_end`-derived and rounds up to `kernel_batch_size`, which
+            # at one live decode row in a 16-row batch restores the full
+            # gather.  Rows in [live_end, batch_end) are query padding.
+            num_valid_occurrences = topk * jnp.maximum(
+                0,
+                jnp.minimum(cu_q_lens[distribution[2]], end_pos) - start_pos,
+            )
             gathered_nope_buffer, gathered_rope_buffer = (
                 native_sc_gather.dsa_gather_native_sc(
                     cache_kv_nope,
@@ -841,6 +865,7 @@ def sparse_ragged_paged_attention(
                     atoms_per_batch=sparsecore_atoms_per_batch,
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
+                    num_valid_occurrences=num_valid_occurrences,
                 ))
             gathered_nope_buffer = gathered_nope_buffer.reshape(
                 chunk_size, topk, 128)
