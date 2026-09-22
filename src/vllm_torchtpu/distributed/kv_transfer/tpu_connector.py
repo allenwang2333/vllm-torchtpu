@@ -23,6 +23,7 @@ import json
 import queue
 import threading
 import time
+import types
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -2136,13 +2137,14 @@ class TPURaidenConnectorWorker:
 
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job
+        raw_raiden_id = _reshard_store_mod.RaidenId(
+            job_name=job_name,
+            job_replica_id=self._raiden_engine_id(),
+            data_name="reshard_store",
+            data_replica_idx=self.dp_rank,
+        )
         store_kwargs: dict[str, Any] = dict(
-            raiden_id=_reshard_store_mod.RaidenId(
-                job_name=job_name,
-                job_replica_id=self._raiden_engine_id(),
-                data_name="reshard_store",
-                data_replica_idx=self.dp_rank,
-            ),
+            raiden_id=raw_raiden_id,
             store_server_ip=_reshard_advertise_host(),
             raiden_controller_port=(
                 int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) +
@@ -2598,9 +2600,22 @@ class TPURaidenConnectorWorker:
             # registration/planning validation.
             from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (  # noqa: E501
                 lower_fa_spans, owned_token_ranges)
+            dst_shards = _raiden_dst_shards()
+            dst_dcp_size = (
+                _raiden_dst_dcp_size(self.vllm_config)
+                if _raiden_seq_on_lane_layout() else 1
+            )
+            fa_num_tokens = num_tokens
+            if dst_dcp_size > 1:
+                dcp_cycle_tokens = dst_dcp_size * interleave_tokens
+                padded_fa_tokens = (
+                    (num_tokens + dcp_cycle_tokens - 1) // dcp_cycle_tokens
+                ) * dcp_cycle_tokens
+                if padded_fa_tokens <= len(scheduler_ids) * scheduler_block_tokens:
+                    fa_num_tokens = padded_fa_tokens
             owned_tokens = sum(end - start
                                for start, end in owned_token_ranges(
-                                   num_tokens=num_tokens,
+                                   num_tokens=fa_num_tokens,
                                    transfer_rank=lowering_rank,
                                    parallelism=lowering_parallelism,
                                    interleave_tokens=interleave_tokens,
@@ -2608,12 +2623,11 @@ class TPURaidenConnectorWorker:
             owned_blocks = (owned_tokens + page_tokens - 1) // page_tokens
             local_ids = scheduler_ids[:owned_blocks]
             fa_pool_spans = []
-            dst_shards = _raiden_dst_shards()
             if _raiden_seq_on_lane_layout():
                 from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
                     lower_fa_spans_sol, sol_fa_geometry_from_manifest)
                 fa_registration = lower_fa_spans_sol(
-                    num_tokens=num_tokens,
+                    num_tokens=fa_num_tokens,
                     transfer_rank=lowering_rank,
                     parallelism=lowering_parallelism,
                     interleave_tokens=interleave_tokens,
@@ -2626,7 +2640,7 @@ class TPURaidenConnectorWorker:
                     producer_tp_rank=self.tp_rank,
                     total_kv_heads=self._model_config_int(
                         "num_key_value_heads", 0),
-                    dst_dcp_size=_raiden_dst_dcp_size(self.vllm_config),
+                    dst_dcp_size=dst_dcp_size,
                 )
             else:
                 if dst_shards != 1 or self.tp_size != 1:
