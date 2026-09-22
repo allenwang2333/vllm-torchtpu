@@ -42,6 +42,10 @@
 # 3. Trigger the pipeline — only your branch's copy of this file is used, so
 #    you can leave it modified indefinitely without affecting anyone else.
 #
+# The `[demo]` steps are gated behind `RUN_DEMOS` so they cost nothing by
+# default while staying readable as templates. Set RUN_DEMOS=1 on the build
+# to actually run them, or drop the `if:` line from the one you adapt.
+#
 # NOTES
 # ─────
 # * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
@@ -68,6 +72,42 @@ steps:
       - bash .buildkite/scripts/setup_docker_env.sh
 
   # -----------------------------------------------------------------
+  # Structured decoding benchmark (mirror of the nightly perf step)
+  # Same command, queue and date-stamped archive as
+  # "Perf: Nightly structured decoding (TPU v7x-2)" in pipeline_perf.yml,
+  # so a green run here means that step is green too. Kept in sync by hand:
+  # if you change one, change the other.
+  #
+  # This is the only step that runs by default -- the demos below are gated
+  # behind RUN_DEMOS so triggering this pipeline costs exactly one TPU slot
+  # and tests exactly this benchmark.
+  # -----------------------------------------------------------------
+  - label: "Structured decoding benchmark (TPU v7x-2)"
+    key: structured_decoding_benchmark
+    depends_on: build_docker
+    timeout_in_minutes: 120
+    agents:
+      queue: tpu_v7x_2_queue
+    commands:
+      - |
+        rc=0
+        bash .buildkite/scripts/run_in_docker.sh \
+          pytest -sv --timeout=3600 -m 'benchmark' \
+            --junit-xml=/perf_eval_results/structured_decoding_junit.xml \
+            tests/benchmarks/test_structured_decoding_nightly.py || rc=$$?
+        src=perf_eval_results/structured_decoding_benchmark.json
+        if [ -f "$$src" ]; then
+          stamp="$$(LC_ALL=C TZ=America/Los_Angeles date +%Y-%m-%d)"
+          cp "$$src" "perf_eval_results/structured_decoding_benchmark_$$stamp.json"
+          echo "Archived $$src as structured_decoding_benchmark_$$stamp.json"
+        else
+          echo "::warning::$$src missing; the sweep wrote no results to archive."
+        fi
+        exit $$rc
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  # -----------------------------------------------------------------
   # Demo 1: offline_inference.py
   # The simplest pattern — run a Python script inside the image.
   # Starting point for any offline batch-inference experiment.
@@ -75,6 +115,7 @@ steps:
   - label: "[demo] offline_inference.py (Qwen3-0.6B)"
     key: demo_offline_inference
     depends_on: build_docker
+    if: 'build.env("RUN_DEMOS") == "1"'
     agents:
       queue: tpu_v7x_2_queue
     commands:
@@ -97,6 +138,7 @@ steps:
   - label: "[demo] pytest one file"
     key: demo_pytest
     depends_on: build_docker
+    if: 'build.env("RUN_DEMOS") == "1"'
     agents:
       queue: tpu_v7x_2_queue
     commands:
@@ -117,6 +159,7 @@ steps:
   - label: "[demo] stress: pytest one file (run {{matrix}})"
     key: demo_stress
     depends_on: build_docker
+    if: 'build.env("RUN_DEMOS") == "1"'
     agents:
       queue: tpu_v7x_2_queue
     matrix: ["1", "2", "3", "4", "5"]
