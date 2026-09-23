@@ -28,42 +28,13 @@ repos:
       # (?!) never matches, so every path below can carry a leading `|` and a
       # migration deletes whole lines only.
       (?!)
-      # kernels/experimental
-      |src/vllm_torchtpu/kernels/experimental/
-
-      # kernels/deepseek_v4
-      |src/vllm_torchtpu/kernels/deepseek_v4/
-
-      # kernels: fused_moe, gdn, kimi_k3
-      |src/vllm_torchtpu/kernels/fused_moe/
-      |src/vllm_torchtpu/kernels/gdn/
-      |src/vllm_torchtpu/kernels/kimi_k3/
-
-      # kernels: attention and the rest
-      |src/vllm_torchtpu/kernels/causal_conv1d/
-      |src/vllm_torchtpu/kernels/collectives/
-      |src/vllm_torchtpu/kernels/flash_attention/
-      |src/vllm_torchtpu/kernels/megablox/
-      |src/vllm_torchtpu/kernels/mla/
-      |src/vllm_torchtpu/kernels/quantized_matmul/
-      |src/vllm_torchtpu/kernels/ragged_paged_attention/
-      |src/vllm_torchtpu/kernels/sparse_core/
-      |src/vllm_torchtpu/kernels/__init__\.py$
-      |src/vllm_torchtpu/kernels/partial_kv_update\.py$
-      |src/vllm_torchtpu/kernels/pool_adapters\.py$
-      |src/vllm_torchtpu/kernels/router_topk\.py$
-      |src/vllm_torchtpu/kernels/typed_ldst\.py$
 
 
-      # layers/adapter (src)
-      |src/vllm_torchtpu/layers/adapter/
 
-      # tests/layers
-      |tests/layers/
 
-      # layers/core
-      |src/vllm_torchtpu/layers/core/
-      |src/vllm_torchtpu/layers/__init__\.py$
+
+
+
 
 
       # runner
