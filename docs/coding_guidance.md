@@ -90,13 +90,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
                    functools.partial(quantized_matmul_kernel, ...))
 ```
 
-- **R-2.1** **There is no model zoo in this repo.** Models come from vLLM
-  upstream. Never add a model definition here; add TPU behavior by swapping
-  layers/ops (`@register_oot`-style registration, `register_layers()` →
-  op registration) and registering attention backends. Monkey-patching vLLM
-  internals is a last resort and each patch needs a comment stating the
-  upstream issue and the removal condition.
-- **R-2.2** Directory responsibilities (all under `src/vllm_torchtpu/`):
+- **R-2.1** Directory responsibilities (all under `src/vllm_torchtpu/`):
 
   | Directory | Role | Allowed dependencies |
   |---|---|---|
@@ -105,44 +99,44 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   | `layers/vllm/` | The vLLM/torch-facing layer: quant methods, fused-MoE wiring, attention backends, `custom_ops/` jax_op bridges | torch, vLLM, layers/common, kernels |
   | `platforms/`, `runner/`, `worker/`, `executors/` | vLLM integration surface | thin translation only |
 
-- **R-2.3** **Interface files stay thin.** `platforms/`, `runner/`, and the
+- **R-2.2** **Interface files stay thin.** `platforms/`, `runner/`, and the
   `layers/vllm/custom_ops/*_op.py` bridges only translate between vLLM/torch
   and the JAX side. Hardware-specific implementation belongs in
   `layers/common/` or inside the kernel. No model-specific logic in
   model-agnostic files.
-- **R-2.4** **Kernels are self-contained modules.** Everything a kernel needs
+- **R-2.3** **Kernels are self-contained modules.** Everything a kernel needs
   arrives via arguments: no `envs`/`os.environ` reads inside a kernel (the
   jitted-code rule R-4.3 applies doubly here), no vLLM config objects in
   kernel signatures. Tile-tuning logic and
   supported-envelope predicates (`is_supported_by_*`) live inside the kernel
   directory, next to the kernel, not at layer or runner level.
-- **R-2.5** Name kernels and modules by **functionality, not by model**
+- **R-2.4** Name kernels and modules by **functionality, not by model**
   (`ragged_paged_attention/`, `quantized_matmul/`, `kernel_hd64.py`). A
   functional name states what it does, when it is useful, and what can be
   deleted without collateral damage. A model-named kernel directory is only
   acceptable for a genuinely model-specific architecture component, and it
   must not become the home for reusable pieces — factor those out.
-- **R-2.6** **Write against the pinned versions.** The JAX / libtpu /
+- **R-2.5** **Write against the pinned versions.** The JAX / libtpu /
   torch-tpu / vLLM pins in `pyproject.toml` are load-bearing (startup patches
   in `env_override.py` and `__init__.py` depend on them). No `hasattr`/
   `try-import` compat shims for APIs newer than the pin — call the pinned API
   directly. Existing back-compat branches are removed only when the pin
   advances, in a dedicated PR, with before/after perf evidence.
-- **R-2.7** Environment/startup mutation belongs in one place:
+- **R-2.6** Environment/startup mutation belongs in one place:
   `env_override.py` (which runs before libtpu loads). Never scatter
   `os.environ[...] =` or `LIBTPU_INIT_ARGS` edits through layer or runner
   code.
-- **R-2.8** **Read the governing section before touching a gated area.** Do
+- **R-2.7** **Read the governing section before touching a gated area.** Do
   not modify code in these areas without first reading and following the
   listed rules; if they conflict with the requested change, stop and explain
   rather than proceeding:
 
   | Area | Read first |
   |---|---|
-  | `kernels/` | R-2.4, R-2.5, and §1 (Performance) of [optimization_best_practices.md](optimization_best_practices.md) (perf evidence, tuned tables, envelopes) |
+  | `kernels/` | R-2.3, R-2.4, and §1 (Performance) of [optimization_best_practices.md](optimization_best_practices.md) (perf evidence, tuned tables, envelopes) |
   | `layers/vllm/quantization/`, `layers/common/quantization.py` | §2 (Quantization) of [optimization_best_practices.md](optimization_best_practices.md) (numeric verification, memory validation) |
-  | `env_override.py`, `__init__.py` startup patches, version pins in `pyproject.toml` | R-2.6, R-2.7 (pins are load-bearing) |
-  | `platforms/`, `runner/`, `custom_ops/*_op.py` bridges | R-2.3 (interface files stay thin) |
+  | `env_override.py`, `__init__.py` startup patches, version pins in `pyproject.toml` | R-2.5, R-2.6 (pins are load-bearing) |
+  | `platforms/`, `runner/`, `custom_ops/*_op.py` bridges | R-2.2 (interface files stay thin) |
 
 ## 3. Reuse upstream first
 
@@ -382,7 +376,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   or a cleanup PR that meaningfully reduces duplication or dead code, is
   substantive work, not busywork.
 - **R-7.10** **Fail closed.** If the work turns out to be a duplicate,
-  trivial busywork, or blocked by a gated-area conflict (R-2.8), stop and
+  trivial busywork, or blocked by a gated-area conflict (R-2.7), stop and
   report what is missing instead of opening the PR anyway. This applies
   doubly to coding agents: returning a short explanation is the correct
   outcome, not a failure.
@@ -462,7 +456,7 @@ Background material for the rules above.
    single purpose; kernel changes separated; refactor pre-landed; stacked
    base cited; no drive-by reformatting. (R-7.x)
 2. **Reuse & placement** — nothing reimplements a vLLM / vllm-torchtpu /
-   Pallas utility; code sits in the right directory per R-2.2; interface
+   Pallas utility; code sits in the right directory per R-2.1; interface
    files thin; kernels dependency-free; no model-specific logic in shared
    files; dead and superseded code deleted. (R-2.x, R-3.x)
 3. **Description** — title names the general capability, not the triggering
