@@ -1271,17 +1271,26 @@ def streamindex_topk_dcp(
          `k - 1` positions globally, and therefore by at most `k - 1` positions
          on its owner rank. Thus, every true global winner is guaranteed to
          survive into its owner's local candidate list.
-      2. Candidate All-Gather: An `all_gather` along the candidate axis (axis 1)
-         exchanges candidate indices and scores across all `dcp_size` ranks:
-         `[T, k] -> [T, dcp_size * k]`.
+      2. Candidate All-Gather: A single `all_gather` along the candidate axis
+         (axis 1) exchanges two lanes per candidate -- its *score* and the rank
+         that produced it -- as one `[T, 2k] -> [T, dcp_size * 2k]` payload that
+         reshapes to `[T, dcp_size, 2, k]`. The indices are not exchanged: rank
+         `r` scores only its own `P(dcp_axis_name)` shard, so `cp_owner_rank` of
+         every candidate it emits is `r` -- source rank and owner rank coincide,
+         and a rank can resolve its own winners against its local indices. The
+         source-rank lane costs exactly what the index lane used to, so the win
+         here is one collective instead of two, not fewer bytes; carrying the
+         rank explicitly is what keeps step 4 independent of the gather order.
       3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
          `[T, dcp_size * k]` scores to select the exact top-k global winners:
          `[T, dcp_size * k] -> [T, k]`.
-      4. Rank-Local Filtering: Each rank filters the merged winners with
-         `_select_owned_winners`, keeping only the positions it holds
-         (`cp_owner_rank(g) == dcp_rank`), mapping them to local shard
-         coordinates (`cp_global_to_local`), and packing them into a `-1` padded
-         prefix.
+      4. Rank-Local Filtering: Each rank keeps the slots whose gathered source
+         rank equals `dcp_rank`, resolves them against its own pre-gather
+         indices at `slot % k` -- a function of the chunk width alone, not of
+         the order the chunks arrived in -- and marks the rest `-1`,
+         then `_select_owned_winners` maps them to local shard coordinates
+         (`cp_global_to_local`) and packs them into a `-1` padded prefix. The
+         ranks' outputs still form an exact partition of the global top-k.
 
     By gathering candidates along axis 1 upfront rather than partitioning tokens
     over an `all_to_all`, all communication is consolidated into a single upfront
@@ -1374,10 +1383,18 @@ def streamindex_topk_dcp(
             return_scores=True,
         )
 
-        # Stage 1. All-gather candidate indices and scores along axis 1.
-        # [T, k] -> [T, dcp * k]; candidates concatenated over source ranks.
-        idxs = lax.all_gather(idxs, dcp_axis_name, axis=1, tiled=True)
-        scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
+        # Stage 1. One all-gather carries two lanes: the candidate scores and the
+        # rank that produced them. The indices stay home -- a rank only ever
+        # scores its own shard, so every candidate it emits is also owned by it,
+        # and it can resolve its own winners against its local `idxs`.
+        src = jnp.broadcast_to(dcp_rank.astype(scores.dtype), scores.shape)
+        payload = lax.all_gather(
+            jnp.concatenate([scores, src], axis=1), dcp_axis_name, axis=1, tiled=True
+        )
+        # [T, dcp * 2k] -> [T, dcp, 2, k]: lane 0 scores, lane 1 source rank.
+        payload = payload.reshape(payload.shape[0], dcp_size, 2, k)
+        scores = payload[:, :, 0, :].reshape(payload.shape[0], dcp_size * k)
+        src = payload[:, :, 1, :].reshape(payload.shape[0], dcp_size * k)
 
         # Stage 2. Full width as the row length: -inf entries (unfilled local
         # slots, padding tokens) are never selected, so they need no masking.
@@ -1387,8 +1404,14 @@ def streamindex_topk_dcp(
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
             write_empty_rows=True,
         )
-        merged = jnp.take_along_axis(idxs, jnp.maximum(slots, 0), axis=1)
-        merged = jnp.where(slots >= 0, merged, -1)
+        # Keep only winners this rank produced; `slot % k` is their position in
+        # its own list, which follows from the chunk width alone, not the order.
+        safe = jnp.maximum(slots, 0)
+        ours = (slots >= 0) & (
+            jnp.take_along_axis(src, safe, axis=1).astype(jnp.int32) == dcp_rank
+        )
+        merged = jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1)
+        merged = jnp.where(ours, merged, -1)
 
         return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
 
