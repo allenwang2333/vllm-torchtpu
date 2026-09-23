@@ -24,3 +24,13 @@
 # somewhere its own service account can write without editing the tree.
 # shellcheck disable=SC2034  # read by the scripts that source this file
 IMAGE_REPO="${CI_IMAGE_REPO:-us-central1-docker.pkg.dev/inferact-vllm-tpu/vllm-tpu-ci/vllm-torchtpu}"
+
+# Repos that get the same tag pushed to them, space separated. Only the builder
+# reads this; nothing pulls from a mirror, because CI_IMAGE_TAG names IMAGE_REPO
+# and that is what every consumer asks for.
+#
+# The old repo is a mirror rather than gone so that a pull someone has written
+# down - a reproduction on a workstation, a manifest outside this tree - keeps
+# resolving through the move. Unset it (CI_IMAGE_MIRROR_REPOS=) to push once.
+# shellcheck disable=SC2034  # read by setup_docker_env.sh
+CI_IMAGE_MIRROR_REPOS="${CI_IMAGE_MIRROR_REPOS-us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu}"

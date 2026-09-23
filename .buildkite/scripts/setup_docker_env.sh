@@ -42,7 +42,21 @@ buildkite-agent meta-data set "CI_IMAGE_TAG" "${IMAGE_TAG}"
 echo "--- Pushing Docker Image to Registry"
 docker push "${IMAGE_TAG}"
 
+# A mirror push that fails is fatal, not a warning: the mirror exists for pulls
+# written down outside this tree, and those have no way to notice that what
+# they resolve is a week old. The tag is already pushed to IMAGE_REPO by here,
+# so a failure leaves the lane's own image intact and only this step red.
+MIRROR_TAGS=()
+# shellcheck disable=SC2086  # the list is space separated on purpose
+for MIRROR_REPO in ${CI_IMAGE_MIRROR_REPOS}; do
+  MIRROR_TAG="${MIRROR_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}"
+  MIRROR_TAGS+=("${MIRROR_TAG}")
+  echo "--- Mirroring Docker Image: ${MIRROR_TAG}"
+  docker tag "${IMAGE_TAG}" "${MIRROR_TAG}"
+  docker push "${MIRROR_TAG}"
+done
+
 echo "--- Cleaning up local built image"
-docker rmi "${IMAGE_TAG}" || true
+docker rmi "${IMAGE_TAG}" ${MIRROR_TAGS[@]+"${MIRROR_TAGS[@]}"} || true
 
 echo "--- Done setup_docker_env.sh"
