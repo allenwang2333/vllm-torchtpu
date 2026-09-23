@@ -454,17 +454,85 @@ def stage_block_table_uploads(
     if not entries:
         return
 
-    ctx.staged_block_tables = {}
-    for gid, block_table_obj, target_num_blocks in entries:
-        rows = torch.zeros((num_reqs_padded, target_num_blocks),
-                           dtype=torch.int32,
-                           device="cpu",
-                           pin_memory=PIN_MEMORY)
-        if ctx.position_ids_override is None:
+    total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
+    scratch = runner._block_table_stage_cpu
+    if scratch is None or scratch.numel() < total:
+        scratch = torch.zeros((total, ),
+                              dtype=torch.int32,
+                              device="cpu",
+                              pin_memory=PIN_MEMORY)
+        runner._block_table_stage_cpu = scratch
+    flat = scratch[:total]
+    flat.zero_()
+
+    if ctx.position_ids_override is None:
+        offset = 0
+        for _, block_table_obj, target_num_blocks in entries:
+            rows = flat[offset:offset +
+                        num_reqs_padded * target_num_blocks].view(
+                            num_reqs_padded, target_num_blocks)
             source = block_table_obj.get_cpu_tensor()
             rows[:ctx.num_reqs] = source[ctx.start_index:ctx.start_index +
                                          ctx.num_reqs, :target_num_blocks]
-        ctx.staged_block_tables[gid] = rows.reshape(-1).to(
-            runner.device, non_blocking=True)
-    ctx.staged_mamba_products = None
+            offset += num_reqs_padded * target_num_blocks
+    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
+    staged_dev = flat.to(runner.device, non_blocking=True)
+
+    # One compiled program splits the staged tensor into per-group tables
+    # and derives every unified-pool mamba group's state/checkpoint indices
+    # (replaces one micro-program per group per step).
+    table_geom: list[tuple[int, int, int]] = []
+    offset = 0
+    for _, _, target_num_blocks in entries:
+        table_geom.append((offset, num_reqs_padded, target_num_blocks))
+        offset += num_reqs_padded * target_num_blocks
+
+    # Mirror of build()'s branch order: the compact path
+    # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
+    # per-group indices — which is what this precompute batches.
+    unified_mamba = (ctx.mamba_state_indices is None
+                     and runner._unified_kv_layout)
+    mamba_geom: list[tuple[int, int, int]] = []
+    mamba_entry_indices: list[int] = []
+    if unified_mamba:
+        for i, builder in enumerate(entry_builders):
+            if builder.is_mamba_group:
+                mamba_geom.append(
+                    (i, table_geom[i][2], builder.target_block_size))
+                mamba_entry_indices.append(i)
+
+    if len(entries) == 1 and not mamba_geom:
+        # Exactly one group with no mamba derivation: the flat upload is
+        # already the complete table view; avoid launching an unnecessary
+        # device clone program.
+        gid, _, target_num_blocks = entries[0]
+        length = num_reqs_padded * target_num_blocks
+        ctx.staged_block_tables = {gid: staged_dev[:length]}
+        return
+
+    if staged_dev.device.type == "tpu":
+        products = _staged_walk_products_compiled(staged_dev, ctx.seq_lens,
+                                                  tuple(table_geom),
+                                                  tuple(mamba_geom),
+                                                  ctx.mamba_ckpt_window)
+    else:
+        products = _staged_walk_products(staged_dev, ctx.seq_lens,
+                                         tuple(table_geom), tuple(mamba_geom),
+                                         ctx.mamba_ckpt_window)
+
+    n_tables = len(entries)
+    n_mamba = len(mamba_geom)
+    ctx.staged_block_tables = {
+        gid: products[i]
+        for i, (gid, _, _) in enumerate(entries)
+    }
+    if n_mamba:
+        states = products[n_tables:n_tables + n_mamba]
+        has_ckpt = ctx.mamba_ckpt_window > 1
+        ckpts = products[n_tables +
+                         n_mamba:] if has_ckpt else (None, ) * n_mamba
+        ctx.staged_mamba_products = {
+            entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
+            for j, ei in enumerate(mamba_entry_indices)
+        }
