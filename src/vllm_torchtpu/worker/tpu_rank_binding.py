@@ -256,7 +256,7 @@ def get_tpu_worker_binding(
         native_local_rank = dp_rank_local * world_size + local_rank
         global_rank = dp_rank * world_size + rank
         global_world = world_size * dp_size
-        if pcp_size > 1 and use_spawned_pcp_local_rank:
+        if pcp_size > 1 and use_spawned_pcp_local_rank and bool(env.get("LOCAL_RANK")):
             tpu_local_rank = _get_spawned_pcp_local_rank(
                 env=env,
                 local_rank_offset=local_rank_offset,
@@ -280,7 +280,7 @@ def get_tpu_worker_binding(
 
     dp_rank = parallel_config.data_parallel_index or 0
     native_local_rank = dp_rank * world_size + local_rank
-    if pcp_size > 1 and use_spawned_pcp_local_rank:
+    if pcp_size > 1 and use_spawned_pcp_local_rank and bool(env.get("LOCAL_RANK")):
         tpu_local_rank = _get_spawned_pcp_local_rank(
             env=env,
             local_rank_offset=local_rank_offset,
@@ -291,12 +291,11 @@ def get_tpu_worker_binding(
         # dp offset because it is the physical chip ordinal, and two dense
         # DP replicas must not resolve to the same chip.
         tpu_local_rank = local_rank
-    # LOCAL_WORLD_SIZE must be the per-host chip count, not the global TP*PP
-    # world size: on a single host they're equal, but across --nnodes hosts
-    # each host only has world_size // nnodes chips, and PjRt bootstrap fails
-    # ("PjRtClient is not initialized") if told to expect more local devices
-    # than physically exist on this host.
-    local_chip_count = parallel_config.local_world_size
+    # Prefer LOCAL_WORLD_SIZE from env (set per-host by Ray) over
+    # parallel_config.local_world_size, which is global without --nnodes.
+    local_chip_count = _get_int_env(
+        env, "LOCAL_WORLD_SIZE", parallel_config.local_world_size
+    )
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,
