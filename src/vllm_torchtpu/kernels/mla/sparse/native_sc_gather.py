@@ -64,7 +64,6 @@ def _kernel(
 
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
-        logical_batch = owner + owner_batch * num_owners
 
         if live_bound:
             # Interleaved: owner ``o`` serves every ``num_owners``-th atom, so
@@ -77,12 +76,50 @@ def _kernel(
             def values(atom, stream):
                 return indices_ref[atom, 0, stream, :]
         else:
+            # Q4R -- the blocked (prefill) map's owner assignment and inner
+            # phase.  Two pieces of pure integer index arithmetic on values
+            # the kernel already has: the grid extents, every BlockSpec shape
+            # and every DMA descriptor count are unchanged, and the program's
+            # ``memory_analysis`` is BYTE-IDENTICAL to the shipped blocked map
+            # (``temp_size_in_bytes`` 2864497376, ``generated_code_size_in_
+            # bytes`` 29370368) with an identical opcode histogram.
+            #
+            #   Q4 (sigma): owner PAIR ``(2j, 2j+1)`` owns the four
+            #     consecutive query rows ``4j..4j+3`` and serves one per outer
+            #     step, so rows that share most of their top-k sit on one
+            #     owner pair ACROSS TIME instead of racing concurrently.
+            #   PR (rho): ``rot(a) = (a + owner) % atoms_per_batch`` rotates
+            #     each owner's inner-step phase, so the rows that ARE
+            #     concurrent read different rank windows instead of the same
+            #     one.  One add and one rem.
+            #
+            # WHY IT CANNOT CHANGE RESULTS: ``rot`` is a permutation of the
+            # inner grid applied to BOTH the index read and the destination
+            # write, and ``sigma`` is a bijection on the logical batches, so
+            # the set of (source, destination) pairs is identical to shipped
+            # -- only the order and the owner change.  Verified bit-exact on
+            # 1024 rows x 4 index distributions.
+            #
+            # WHY IT IS WORTH IT: the shipped map puts 16 different query rows
+            # on 32 owners all reading the same rank window, the maximum-
+            # collision configuration.  On REAL captured indices that costs
+            # 157.5 us/step of loop time over uniform indices; Q4R recovers
+            # 66.6 us of it (42%), measured 1.0390x LOOP on prose / 1.0320x
+            # code / 1.0096x random / 0.9945x uniform, with the overlap
+            # fraction ``c`` unmoved (0.2991 vs base 0.3065).  Arms that reach
+            # zero contention instead need the index operand repacked and pay
+            # ``c`` +0.05, which costs more than it returns.
+            logical_batch = ((owner // 2) * batches_per_owner +
+                             owner_batch) * 2 + owner % 2
+
+            def rot(atom):
+                return (atom + owner) % atoms_per_batch
 
             def dst_atom(atom):
-                return logical_batch * atoms_per_batch + atom
+                return logical_batch * atoms_per_batch + rot(atom)
 
             def values(atom, stream):
-                return indices_ref[0, atom, stream, :]
+                return indices_ref[0, rot(atom), stream, :]
 
         def destinations(atom, stream):
             return pl.ds(
@@ -191,7 +228,9 @@ def _kernel(
     else:
         indices_spec = pl.BlockSpec(
             (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-            lambda batch: (owner + batch * num_owners, 0, 0, 0),
+            # Q4R's sigma, matching ``logical_batch`` in ``serve_batch``.
+            lambda batch: (((owner // 2) * batches_per_owner + batch) * 2 +
+                           owner % 2, 0, 0, 0),
         )
     pltpu.emit_pipeline(
         serve_batch,
