@@ -1885,9 +1885,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kwargs.get("non_causal_multi_token_decode", False)
         )
 
-        parallel_config = getattr(
-            get_current_vllm_config_or_none(), "parallel_config", None
-        )
+        parallel_config = getattr(get_current_vllm_config_or_none(),
+                                  "parallel_config", None)
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        self.pcp_size = pcp_size if isinstance(pcp_size,
+                                               int) and pcp_size > 1 else 1
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         self.dcp_size = dcp_size if isinstance(dcp_size, int) and dcp_size > 1 else 1
         self.dcp_interleave_size = getattr(
