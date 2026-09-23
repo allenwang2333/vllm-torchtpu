@@ -42,10 +42,12 @@ MIB = 1024 * 1024
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--candidate",
-                        action="append",
-                        default=[],
-                        help="BQ,BKVP,Q_SPLIT,VMEM_MIB; repeat as needed")
+    parser.add_argument(
+        "--candidate",
+        action="append",
+        default=[],
+        help="BQ,BKVP,Q_SPLIT,VMEM_MIB; repeat as needed",
+    )
     parser.add_argument("--bq", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--bkvp", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--q-split", type=int, help=argparse.SUPPRESS)
@@ -61,22 +63,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pages-per-seq", type=int, default=520)
     parser.add_argument("--total-pages", type=int, default=2112)
     parser.add_argument("--warmups", type=int, default=2)
-    # Was 5, far below convergence (see kernel_timing). Literals, not
-    # kernel_timing.DEFAULT_*: that imports jax, and the parent wants no TPU.
+    # Spelled out rather than read from kernel_timing, which imports jax: the
+    # parent must stay TPU-free so a child's crash cannot take the sweep down.
     parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--bursts", type=int, default=3,
-                        help="bursts to median over, to reject a hiccup")
-    parser.add_argument("--output",
-                        type=Path,
-                        help="Write aggregate JSON results here")
+    parser.add_argument(
+        "--bursts",
+        type=int,
+        default=3,
+        help="bursts to median over, to reject a hiccup",
+    )
+    parser.add_argument("--output", type=Path, help="Write aggregate JSON results here")
     return parser
 
 
 def _parse_candidate(value: str) -> tuple[int, int, int, int]:
     fields = tuple(int(field) for field in value.split(","))
     if len(fields) != 4:
-        raise ValueError(
-            f"candidate must be BQ,BKVP,Q_SPLIT,VMEM_MIB: {value}")
+        raise ValueError(f"candidate must be BQ,BKVP,Q_SPLIT,VMEM_MIB: {value}")
     bq, bkvp, q_split, vmem_mib = fields
     if min(fields) <= 0 or bq % q_split:
         raise ValueError(f"invalid candidate: {value}")
@@ -89,9 +92,13 @@ def _default_candidates() -> list[tuple[int, int, int, int]]:
     # viable KV-page tile fit even when q_split=1 does not.
     tiles = itertools.product((16, 32, 64, 128, 256, 512), (1, 2, 4, 8, 16))
     base = [(bq, bkvp, 1, 60) for bq, bkvp in tiles]
-    split = [(bq, bkvp, q_split, 60) for bq in (256, 512)
-             for bkvp in (16, 32, 64, 128, 256, 512) for q_split in (2, 4, 8)
-             if bq % q_split == 0]
+    split = [
+        (bq, bkvp, q_split, 60)
+        for bq in (256, 512)
+        for bkvp in (16, 32, 64, 128, 256, 512)
+        for q_split in (2, 4, 8)
+        if bq % q_split == 0
+    ]
     vmem_boundary = [(512, 256, 4, vmem_mib) for vmem_mib in (48, 56, 64)]
     return base + split + vmem_boundary
 
@@ -101,10 +108,10 @@ def _run_child(args: argparse.Namespace) -> None:
     # therefore isolated to this one candidate.
     import jax
     import jax.numpy as jnp
+    import kernel_timing
     import numpy as np
 
     from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
-    import kernel_timing
 
     if args.result_path is None:
         raise ValueError("--result-path is required in child mode")
@@ -114,24 +121,30 @@ def _run_child(args: argparse.Namespace) -> None:
     if needed_pages > args.pages_per_seq or needed_pages > args.total_pages:
         raise ValueError("page-table/cache capacity is too small")
 
-    ql_nope = jnp.ones((args.num_heads, args.tokens, args.lkv_dim),
-                       jnp.bfloat16)
+    ql_nope = jnp.ones((args.num_heads, args.tokens, args.lkv_dim), jnp.bfloat16)
     q_pe = jnp.ones((args.tokens, args.num_heads, args.rope_dim), jnp.bfloat16)
     new_kv_c = jnp.ones((args.tokens, args.lkv_dim), jnp.float8_e4m3fn)
     new_k_pe = jnp.ones((args.tokens, args.rope_dim), jnp.float8_e4m3fn)
-    padded_kv_dim = ((args.lkv_dim + 127) // 128 * 128 +
-                     (args.rope_dim + 127) // 128 * 128)
-    cache_kv = jnp.zeros((args.total_pages, args.page_size // args.kv_packing,
-                          args.kv_packing, padded_kv_dim), jnp.float8_e4m3fn)
-    kv_lens = jnp.asarray([args.tokens] + [0] * (args.max_num_seqs - 1),
-                          jnp.int32)
-    page_row = list(
-        range(needed_pages)) + [-1] * (args.pages_per_seq - needed_pages)
+    padded_kv_dim = (args.lkv_dim + 127) // 128 * 128 + (
+        args.rope_dim + 127
+    ) // 128 * 128
+    cache_kv = jnp.zeros(
+        (
+            args.total_pages,
+            args.page_size // args.kv_packing,
+            args.kv_packing,
+            padded_kv_dim,
+        ),
+        jnp.float8_e4m3fn,
+    )
+    kv_lens = jnp.asarray([args.tokens] + [0] * (args.max_num_seqs - 1), jnp.int32)
+    page_row = list(range(needed_pages)) + [-1] * (args.pages_per_seq - needed_pages)
     page_indices = jnp.asarray(
-        page_row + [-1] * (args.pages_per_seq * (args.max_num_seqs - 1)),
-        jnp.int32)
-    cu_q_lens = jnp.asarray([0, args.tokens] + [args.tokens] *
-                            (args.max_num_seqs - 1), jnp.int32)
+        page_row + [-1] * (args.pages_per_seq * (args.max_num_seqs - 1)), jnp.int32
+    )
+    cu_q_lens = jnp.asarray(
+        [0, args.tokens] + [args.tokens] * (args.max_num_seqs - 1), jnp.int32
+    )
     distribution = jnp.asarray([0, 0, 1], jnp.int32)
 
     def invoke(cache):
@@ -168,13 +181,12 @@ def _run_child(args: argparse.Namespace) -> None:
         jax.block_until_ready((output, cache_kv))
         result["compile_and_first_s"] = time.perf_counter() - compile_start
 
-        # The carried cache chains the burst on device. Blocking per step adds
-        # ~150 us to every sample, compressing the spread between candidates.
-        state = {"cache": cache_kv, "out": output}
-
+        # Each call consumes the previous call's cache, so the burst chains on
+        # device and needs no host sync between steps.
         def step():
-            state["out"], state["cache"] = invoke(state["cache"])
-            return state["out"], state["cache"]
+            nonlocal output, cache_kv
+            output, cache_kv = invoke(cache_kv)
+            return output, cache_kv
 
         for _ in range(args.warmups):
             jax.block_until_ready(step())
@@ -182,39 +194,35 @@ def _run_child(args: argparse.Namespace) -> None:
             kernel_timing.burst_ms(step, (), args.iterations)
             for _ in range(args.bursts)
         ]
-        output = state["out"]
 
         # All values use V=1, so causal attention must produce one everywhere.
         # This cheaply rejects candidates with silent numerical corruption.
         host_output = np.asarray(output, dtype=np.float32)
-        result.update({
-            "status":
-            "success",
-            "samples_ms":
-            samples_ms,
-            "median_ms":
-            statistics.median(samples_ms),
-            "mean_ms":
-            statistics.fmean(samples_ms),
-            "min_ms":
-            min(samples_ms),
-            "max_abs_error_from_one":
-            float(np.max(np.abs(host_output - 1.0))),
-            "finite":
-            bool(np.isfinite(host_output).all()),
-        })
+        result.update(
+            {
+                "status": "success",
+                "samples_ms": samples_ms,
+                "median_ms": statistics.median(samples_ms),
+                "mean_ms": statistics.fmean(samples_ms),
+                "min_ms": min(samples_ms),
+                "max_abs_error_from_one": float(np.max(np.abs(host_output - 1.0))),
+                "finite": bool(np.isfinite(host_output).all()),
+            }
+        )
         if not result["finite"] or result["max_abs_error_from_one"] > 0.02:
             result["status"] = "incorrect"
     except Exception as error:  # A structured result is more useful in a sweep.
-        result["status"] = "oom" if "RESOURCE_EXHAUSTED" in str(
-            error) else "error"
+        result["status"] = "oom" if "RESOURCE_EXHAUSTED" in str(error) else "error"
         result["error"] = repr(error)
     args.result_path.write_text(json.dumps(result, indent=2) + "\n")
 
 
 def _run_parent(args: argparse.Namespace) -> int:
-    candidates = ([_parse_candidate(value) for value in args.candidate]
-                  if args.candidate else _default_candidates())
+    candidates = (
+        [_parse_candidate(value) for value in args.candidate]
+        if args.candidate
+        else _default_candidates()
+    )
     common = [
         f"--tokens={args.tokens}",
         f"--num-heads={args.num_heads}",
@@ -247,10 +255,9 @@ def _run_parent(args: argparse.Namespace) -> int:
             print(
                 f"[{index + 1}/{len(candidates)}] bq={bq} bkvp={bkvp} "
                 f"q_split={q_split} vmem={vmem_mib}MiB",
-                flush=True)
-            completed = subprocess.run(command,
-                                       env=os.environ.copy(),
-                                       check=False)
+                flush=True,
+            )
+            completed = subprocess.run(command, env=os.environ.copy(), check=False)
             if result_path.exists():
                 result = json.loads(result_path.read_text())
             else:
@@ -271,9 +278,11 @@ def _run_parent(args: argparse.Namespace) -> int:
     valid.sort(key=lambda result: result["median_ms"])
     print("\nRanked successful candidates:")
     for rank, result in enumerate(valid, 1):
-        print(f"{rank:2d}. median={result['median_ms']:.3f} ms "
-              f"bq={result['bq']} bkvp={result['bkvp']} "
-              f"q_split={result['q_split']} vmem={result['vmem_mib']}MiB")
+        print(
+            f"{rank:2d}. median={result['median_ms']:.3f} ms "
+            f"bq={result['bq']} bkvp={result['bkvp']} "
+            f"q_split={result['q_split']} vmem={result['vmem_mib']}MiB"
+        )
     return 0 if valid else 1
 
 

@@ -100,8 +100,8 @@ def test_both_returns_pipelined_first(fake_jax):
         time.sleep(slept)
 
     pipe, wall = kt.both_ms(slow, iters=20, warmup=1, bursts=1)
-    # Same work either way here (no real device), so the two agree; the
-    # contract under test is the order and the arity, not the gap.
+    # With no real device both clocks measure the same work, so this checks
+    # which value comes first, not how far apart they are.
     assert pipe == pytest.approx(wall, rel=0.5)
     assert pipe > 0 and wall > 0
 
@@ -114,7 +114,7 @@ def test_slope_cancels_a_fixed_per_burst_cost(fake_jax):
     def work():
         calls["n"] += 1
 
-    # Pins that slope times both n and 2n, i.e. that it is a difference.
+    # slope must run both an n-call and a 2n-call burst to take a difference.
     kt.slope_ms(work, iters=20, warmup=1, bursts=1)
     assert calls["n"] == 1 + 20 + 40, (
         f"slope must time both n and 2n bursts, saw {calls['n']} calls")
@@ -137,8 +137,8 @@ def test_paired_alternates_arm_order(fake_jax):
     order = []
     kt.paired_ms(lambda: order.append("a"), lambda: order.append("b"),
                  iters=20, warmup=1, bursts=2)
-    # warmup runs a then b once each; the two measured bursts follow, 20 calls
-    # of each arm per burst.
+    # Skip the two warmup calls; each of the two bursts that follow runs 20
+    # calls of each arm.
     measured = order[2:]
     burst1, burst2 = measured[:40], measured[40:]
     assert burst1[0] == "a" and burst2[0] == "b", (

@@ -23,10 +23,10 @@ import argparse
 import gc
 import time
 from dataclasses import dataclass
-from statistics import median
 
 import jax
 import jax.numpy as jnp
+import kernel_timing
 
 from vllm_torchtpu.kernels.flash_attention.kernel import (
     BlockSizes,
@@ -34,7 +34,6 @@ from vllm_torchtpu.kernels.flash_attention.kernel import (
     flash_attention,
 )
 from vllm_torchtpu.logger import init_logger
-import kernel_timing
 
 logger = init_logger(__name__)
 
@@ -139,8 +138,6 @@ def _benchmark_candidate(
     jax.block_until_ready(out)
     compile_and_warmup_seconds = time.perf_counter() - start
 
-    # Pipelined: a blocking clock adds ~150 us per sample, which compresses
-    # the gaps between candidates and makes selection near-arbitrary.
     def candidate():
         return flash_attention(
             inputs.q,
@@ -153,9 +150,9 @@ def _benchmark_candidate(
             vmem_limit_bytes=spec.vmem_limit_bytes,
         )
 
-    latency_ms = kernel_timing.pipelined_ms(candidate,
-                                            iters=benchmark_iterations,
-                                            warmup=1)
+    latency_ms = kernel_timing.pipelined_ms(
+        candidate, iters=benchmark_iterations, warmup=1
+    )
     return latency_ms * 1e6, compile_and_warmup_seconds
 
 
@@ -174,7 +171,8 @@ def tune_flash_attention(
         raise ValueError(
             f"benchmark_iterations must be at least "
             f"{kernel_timing.MIN_ITERS}; a shorter pipelined burst has not "
-            "converged and reads high on fast candidates")
+            "converged and reads high on fast candidates"
+        )
     if not spec.candidates:
         logger.warning("No flash-attention candidates configured for %s", spec.name)
         return None
@@ -273,11 +271,11 @@ def main() -> None:
         "--iterations",
         type=int,
         default=kernel_timing.DEFAULT_ITERS,
-        # Was 5, below MIN_ITERS: unconverged, and reads high on exactly the
-        # fast candidates a tuner must separate.
-        help=(f"calls per pipelined burst, at least "
-              f"{kernel_timing.MIN_ITERS} "
-              f"(default: {kernel_timing.DEFAULT_ITERS})"),
+        help=(
+            f"calls per pipelined burst, at least "
+            f"{kernel_timing.MIN_ITERS} "
+            f"(default: {kernel_timing.DEFAULT_ITERS})"
+        ),
     )
     parser.add_argument(
         "--device-index",

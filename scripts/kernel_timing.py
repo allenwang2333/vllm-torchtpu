@@ -13,31 +13,35 @@
 # limitations under the License.
 """The clock for standalone JAX/Pallas kernel microbenchmarks.
 
-Never call ``jax.block_until_ready`` inside a timing loop. It charges a host
-round trip -- ~150 us on tpu7x -- to every sample. The cost is additive, so it
-inflates fast kernels most (1.8x on a 0.22 ms kernel, 1.07x on a 2.35 ms one),
-drags every A/B ratio toward 1, and is ~8x noisier than the alternative.
+Never call ``jax.block_until_ready`` inside a timing loop: it charges a ~150 us
+host round trip to every sample, which is additive and so inflates fast kernels
+most (1.8x at 0.22 ms, 1.07x at 2.35 ms) and drags A/B ratios toward 1.
+Dispatch a burst and block once instead.
 
-Instead dispatch a burst and block once, so JAX's async dispatch overlaps call
-i+1's host cost with call i's device execution:
+Timing one kernel:
 
-    pipelined_ms   the default
-    slope_ms       (t(2n)-t(n))/n; cancels the fixed cost exactly, ~2x closer
-                   to true device time, for ~3x the calls
-    both_ms        (pipelined, blocking) to expose the gap as a diagnostic
-    paired_ms      an A/B with alternating arm order
+    pipelined_ms   the default clock
+    slope_ms       more accurate for ~3x the calls: (t(2n) - t(n)) / n
+    blocking_ms    a sync per call; diagnostic only, never rank on it
+    both_ms        (pipelined, blocking), to show the dispatch gap
+    burst_ms       one raw burst, no warmup or median; the primitive
 
-MIN_ITERS is measured, not chosen: per-call time is flat past 20 calls and a
-burst of 10 still reads ~8% high.
+Comparing two kernels:
+
+    paired_ms      A against B, alternating which runs first so that drift
+                   hits both arms equally. Each arm uses the burst above.
+
+MIN_ITERS is measured: per-call time is flat past 20 calls, and 10 reads ~8% high.
 """
 
 import statistics
 import time
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import jax
 
-MIN_ITERS = 20      # see module docstring
+MIN_ITERS = 20  # see module docstring
 
 DEFAULT_ITERS = 50
 DEFAULT_BURSTS = 3
@@ -49,7 +53,8 @@ def _check_iters(iters: int) -> None:
         raise ValueError(
             f"iters={iters} is below MIN_ITERS={MIN_ITERS}; a shorter burst "
             "has not converged and reads high on fast kernels. Pass "
-            f"iters>={MIN_ITERS} (default {DEFAULT_ITERS}).")
+            f"iters>={MIN_ITERS} (default {DEFAULT_ITERS})."
+        )
 
 
 def burst_ms(fn: Callable[..., Any], args: Sequence[Any], iters: int) -> float:
@@ -62,27 +67,30 @@ def burst_ms(fn: Callable[..., Any], args: Sequence[Any], iters: int) -> float:
     return (time.perf_counter() - start) * 1e3 / iters
 
 
-def pipelined_ms(fn: Callable[..., Any],
-                 *args: Any,
-                 iters: int = DEFAULT_ITERS,
-                 warmup: int = DEFAULT_WARMUP,
-                 bursts: int = DEFAULT_BURSTS) -> float:
-    """Median per-call ms over `bursts`. The clock to use."""
+def pipelined_ms(
+    fn: Callable[..., Any],
+    *args: Any,
+    iters: int = DEFAULT_ITERS,
+    warmup: int = DEFAULT_WARMUP,
+    bursts: int = DEFAULT_BURSTS,
+) -> float:
+    """Median per-call ms for one kernel, over `bursts`. The clock to use."""
     _check_iters(iters)
     for _ in range(max(warmup, 1)):
         jax.block_until_ready(fn(*args))
     return statistics.median(burst_ms(fn, args, iters) for _ in range(bursts))
 
 
-def slope_ms(fn: Callable[..., Any],
-             *args: Any,
-             iters: int = DEFAULT_ITERS,
-             warmup: int = DEFAULT_WARMUP,
-             bursts: int = DEFAULT_BURSTS) -> float:
-    """Marginal per-call ms: (t(2n) - t(n)) / n. Fixed cost cancels exactly.
+def slope_ms(
+    fn: Callable[..., Any],
+    *args: Any,
+    iters: int = DEFAULT_ITERS,
+    warmup: int = DEFAULT_WARMUP,
+    bursts: int = DEFAULT_BURSTS,
+) -> float:
+    """Marginal per-call ms: (t(2n) - t(n)) / n, so fixed cost cancels exactly.
 
-    Measurably closer to true device time than pipelined_ms, for ~3x the calls.
-    Use it when the number feeds a roofline or a close A/B.
+    Closer to device time than pipelined_ms for ~3x the calls; use it for rooflines.
     """
     _check_iters(iters)
     for _ in range(max(warmup, 1)):
@@ -95,14 +103,15 @@ def slope_ms(fn: Callable[..., Any],
     return statistics.median(out)
 
 
-def blocking_ms(fn: Callable[..., Any],
-                *args: Any,
-                iters: int = DEFAULT_ITERS,
-                warmup: int = DEFAULT_WARMUP) -> float:
+def blocking_ms(
+    fn: Callable[..., Any],
+    *args: Any,
+    iters: int = DEFAULT_ITERS,
+    warmup: int = DEFAULT_WARMUP,
+) -> float:
     """Per-call time with a sync every call. NOT a kernel time -- diagnostic only.
 
-    Kept so callers can show the gap beside `pipelined_ms`. Never rank on it.
-    Honours warmup=0, unlike `pipelined_ms`, so `both_ms` does not re-warm.
+    Honors warmup=0, unlike `pipelined_ms`, so `both_ms` does not re-warm.
     """
     for _ in range(warmup):
         jax.block_until_ready(fn(*args))
@@ -114,28 +123,34 @@ def blocking_ms(fn: Callable[..., Any],
     return statistics.median(samples)
 
 
-def both_ms(fn: Callable[..., Any],
-            *args: Any,
-            iters: int = DEFAULT_ITERS,
-            warmup: int = DEFAULT_WARMUP,
-            bursts: int = DEFAULT_BURSTS) -> tuple[float, float]:
+def both_ms(
+    fn: Callable[..., Any],
+    *args: Any,
+    iters: int = DEFAULT_ITERS,
+    warmup: int = DEFAULT_WARMUP,
+    bursts: int = DEFAULT_BURSTS,
+) -> tuple[float, float]:
     """(pipelined, blocking); the gap is this host's dispatch cost, ~0.15 ms.
 
-    Costs ~1% extra. Quote the pipelined value; a drifted gap means the
-    environment changed, not the kernel.
+    Quote the pipelined value; a drifted gap means the environment moved.
     """
     pipe = pipelined_ms(fn, *args, iters=iters, warmup=warmup, bursts=bursts)
     wall = blocking_ms(fn, *args, iters=iters, warmup=0)
     return pipe, wall
 
 
-def paired_ms(first: Callable[..., Any],
-              second: Callable[..., Any],
-              *args: Any,
-              iters: int = DEFAULT_ITERS,
-              warmup: int = DEFAULT_WARMUP,
-              bursts: int = DEFAULT_BURSTS) -> tuple[float, float]:
-    """A/B with alternating arm order, so drift penalises both arms equally."""
+def paired_ms(
+    first: Callable[..., Any],
+    second: Callable[..., Any],
+    *args: Any,
+    iters: int = DEFAULT_ITERS,
+    warmup: int = DEFAULT_WARMUP,
+    bursts: int = DEFAULT_BURSTS,
+) -> tuple[float, float]:
+    """Per-call ms for two kernels, A against B, as (first, second).
+
+    Alternates which arm leads each burst, so drift penalizes both equally.
+    """
     _check_iters(iters)
     for _ in range(max(warmup, 1)):
         jax.block_until_ready(first(*args))
