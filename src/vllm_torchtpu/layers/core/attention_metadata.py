@@ -6,7 +6,7 @@ from typing import Any
 
 import jax
 import torch
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import \
@@ -216,9 +216,25 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
         self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
+            # PCP only, not dcp * pcp. This must equal the stride the
+            # allocator fills a mamba row at, which is what
+            # _with_effective_block_size presents to the hybrid coordinator:
+            # AttentionSpec is restated at block_size * max(pcp, dcp), but
+            # MambaSpec at block_size * pcp, because the GDN recurrent state
+            # has a fixed per-sequence footprint that PCP partitions and DCP
+            # does not. Folding dcp in here indexes the row at dcp times the
+            # stride the scheduler filled it at: state_offsets lands on
+            # column n // dcp instead of n. Reads and writes stay on the same
+            # coarse column, so the target's recurrence is self-consistent and
+            # its output looks fine -- but the checkpoint columns derived from
+            # it (state_offsets + t, below) then name blocks belonging to
+            # other logical positions, or unfilled ones, and speculative
+            # decoding resumes the draft from the wrong recurrent state. That
+            # is a silent 0% acceptance at dcp > 1 and nothing at all at
+            # dcp == 1. Keep in step with the same derivation in
+            # TPUModelRunner._collect_mamba_state_seed_copies.
             try:
-                cp_world_size = (get_dcp_group().world_size *
-                                 get_pcp_group().world_size)
+                cp_world_size = get_pcp_group().world_size
             except Exception:
                 cp_world_size = 1
             self.target_block_size *= cp_world_size

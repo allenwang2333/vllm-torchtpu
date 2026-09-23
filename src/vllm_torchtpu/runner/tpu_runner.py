@@ -29,7 +29,7 @@ from jax.sharding import Mesh
 from packaging import version
 from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group,
                                           kv_transfer_state)
@@ -1494,21 +1494,28 @@ class TPUModelRunner(GPUModelRunner):
         #     per-rank, and cannot be stale: specs are created only after the
         #     platform finalizes block sizes;
         #   * the scheduler appends a block id to a mamba row only once per
-        #     mamba_block_size * total_cp_world logical tokens, because the
-        #     PCP coordinator patch presents specs to the hybrid coordinator
-        #     at that granularity (_patch_vllm_hybrid_pcp_block_sizes). Mamba
-        #     state is never token-sharded across CP ranks; the cp factor
-        #     exists purely to mirror that allocation cadence.
+        #     mamba_block_size * pcp logical tokens, because that is the
+        #     granularity _with_effective_block_size restates MambaSpec at
+        #     for the hybrid coordinator (_patch_vllm_hybrid_pcp_block_sizes).
+        #     It is pcp alone, not max(pcp, dcp) as for AttentionSpec and not
+        #     dcp * pcp: mamba state is never token-sharded across CP ranks,
+        #     it has a fixed per-sequence footprint that PCP partitions and
+        #     DCP leaves whole, so the cp factor here exists purely to mirror
+        #     that allocation cadence.
         # Every reader of these tables must divide logical token counts by
         # the allocator's stride. This is the same derivation
         # AttentionMetadataBuilder.target_block_size uses for its state-slot
-        # lookup -- spec block size times cp world -- so the two readers
-        # cannot diverge. A smaller divisor visits columns the scheduler
-        # never filled: beyond the row width it raises IndexError, within it
-        # the null block silently swallows the recurrent state.
+        # lookup -- spec block size times pcp -- so the two readers cannot
+        # diverge. A smaller divisor visits columns the scheduler never
+        # filled: beyond the row width it raises IndexError, within it the
+        # null block silently swallows the recurrent state. A larger one
+        # (folding dcp in) is worse still, because it stays in bounds: at
+        # dcp > 1 it lands every crossing on column n // dcp, so three of
+        # four crossings are missed, the checkpoint group never slides, and
+        # MTP resumes each draft from a stale GDN state -- 0% acceptance,
+        # with the target's own output intact and no error anywhere.
         try:
-            cp_world_size = (get_dcp_group().world_size *
-                             get_pcp_group().world_size)
+            cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
         col_stride = self._mamba_state_block_size * cp_world_size
