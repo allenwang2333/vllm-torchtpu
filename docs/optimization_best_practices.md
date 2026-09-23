@@ -54,11 +54,8 @@ Applies to all optimization work — performance (§1) and quantization
 - **P-5** Shard via jit signatures (`in_shardings`/`out_shardings`) instead
   of manual reshard functions; use the global mesh context instead of
   threading `mesh` through every signature.
-- **P-6** Before hand-coding a collective, try hinting XLA (a reshard before
-  return). Cast to bf16 *before* collectives when numerics tolerate it — and
-  verify like any dtype change. Fix mis-fusions at the HLO-pass level (flip
-  the responsible pass's flag), not by sprinkling `optimization_barrier`.
-  Compiler flags act globally — set them knowing the whole model.
+- **P-6** Cast to bf16 *before* collectives when numerics tolerate it — and
+  verify like any dtype change.
 
 ### 1.3 Reason at the hardware-resource level
 
