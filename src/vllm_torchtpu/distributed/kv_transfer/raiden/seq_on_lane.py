@@ -419,7 +419,7 @@ def lower_fa_spans_sol(
         tag=TAG_FA,
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=tuple(spans),
-        declared_bytes=local_kp * geometry.kernel_page_bytes,
+        declared_bytes=sum(span.size_bytes for span in spans),
         dst_space_version=1,
     )
 
