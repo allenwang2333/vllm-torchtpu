@@ -3913,26 +3913,31 @@ class TPUModelRunner(GPUModelRunner):
                                              AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
+        target_decode_query_sizes = []
         with set_vllm_model_wrapper_context(mesh=self.mesh,
                                             vllm_config=self.vllm_config):
             for name, attn_layer in layers.items():
                 if isinstance(getattr(attn_layer, "impl", None),
                               PallasAttentionBackendImpl):
-                    # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
-                    # (non-shard_map) kernel.
-                    if (name in draft_attn_names and
-                            self.speculative_config.draft_tensor_parallel_size
-                            == 1):
-                        # Instance attrs shadow the ClassVars; unique prefix
-                        # keeps the local kernel op out of the sharded registry.
-                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                        attn_layer.impl._kernel_op_prefix = (
-                            "pallas::rpa_kernel_local")
+                    if name in draft_attn_names:
+                        # Draft model propose decodes 1 token per request in loop steps.
                         attn_layer.impl.decode_query_size = 1
-                        logger.info(
-                            "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
-                            " | DRAFT_KV_BLOCK_CAP=%d", name,
-                            _DRAFT_KV_BLOCK_CAP)
+                        # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
+                        # (non-shard_map) kernel.
+                        if (self.speculative_config.draft_tensor_parallel_size
+                                == 1):
+                            # Instance attrs shadow the ClassVars; unique prefix
+                            # keeps the local kernel op out of the sharded registry.
+                            attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
+                            attn_layer.impl._kernel_op_prefix = (
+                                "pallas::rpa_kernel_local")
+                            logger.info(
+                                "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
+                                " | DRAFT_KV_BLOCK_CAP=%d", name,
+                                _DRAFT_KV_BLOCK_CAP)
+                    else:
+                        target_decode_query_sizes.append(
+                            attn_layer.impl.decode_query_size)
                     attn_layer.impl.initialize_kernel(attn_layer)
                     decode_query_sizes.append(
                         attn_layer.impl.decode_query_size)
@@ -3960,7 +3965,8 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
-        self.reorder_batch_threshold = min(decode_query_sizes, default=1)
+        self.reorder_batch_threshold = max(target_decode_query_sizes,
+                                           default=1)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count)

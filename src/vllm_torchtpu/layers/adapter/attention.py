@@ -1125,8 +1125,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             parallel_config, 'decode_context_parallel_size', 1) > 1)
         if dcp_configured:
             spec = vllm_config.speculative_config if vllm_config else None
-            if (spec is not None and envs.USE_BATCHED_RPA_LONGCTX
-                    and self.head_size != 64):
+            if spec is not None and self.head_size != 64:
                 self.decode_query_size = spec.num_speculative_tokens + 1
             else:
                 self.decode_query_size = 1
