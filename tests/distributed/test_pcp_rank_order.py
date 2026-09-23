@@ -46,6 +46,13 @@ def test_no_order_when_multiple_nodes():
     assert order_mod.resolve_pcp_topology_order(_config(nnodes=2)) is None
 
 
+@pytest.mark.parametrize("env_var", ["NNODES", "TPU_NUM_HOSTS"])
+def test_no_order_when_multihost_in_env(monkeypatch, env_var):
+    """NNODES or TPU_NUM_HOSTS in env signals multihost even if nnodes == 1."""
+    monkeypatch.setenv(env_var, "2")
+    assert order_mod.resolve_pcp_topology_order(_config(nnodes=1)) is None
+
+
 # --- resolve_pcp_topology_order: faults raise ------------------------------
 
 

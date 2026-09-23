@@ -37,6 +37,7 @@ EP group is the whole world, so no other group constrains this layout.
 
 import contextlib
 import inspect
+import os
 from collections.abc import Iterator
 
 import numpy
@@ -67,7 +68,11 @@ def resolve_pcp_topology_order(vllm_config) -> dict[str, list[list[int]]] | None
     # Multi-host workers already have a global rank order spanning the slice.
     # topology_aware_mesh can currently inspect only a single host, so retain
     # that global order instead of trying to derive a partial mesh locally.
-    nnodes = int(parallel_config.nnodes)
+    nnodes = max(
+        int(parallel_config.nnodes),
+        int(os.environ.get("NNODES", "1") or 1),
+        int(os.environ.get("TPU_NUM_HOSTS", "1") or 1),
+    )
     if nnodes > 1:
         logger.info(
             "Topology aware mesh not applied: nnodes=%d. Topology aware "
