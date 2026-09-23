@@ -12,8 +12,12 @@ from typing import Any
 import pytest
 
 
-def _isolated_test_worker(target: Callable[..., Any], args: tuple[Any, ...],
-                          kwargs: dict[str, Any], result_queue: Any) -> None:
+def _isolated_test_worker(
+    target: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result_queue: Any,
+) -> None:
     os.environ["VLLM_ISOLATED_PROCESS"] = "1"
     try:
         target(*args, **kwargs)
@@ -25,29 +29,32 @@ def _isolated_test_worker(target: Callable[..., Any], args: tuple[Any, ...],
         result_queue.put(("OK", None))
 
 
-def _run_isolated(target: Callable[..., Any],
-                  args: tuple[Any, ...],
-                  kwargs: dict[str, Any],
-                  *,
-                  timeout: float = 600) -> None:
+def _run_isolated(
+    target: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    timeout: float = 600,
+) -> None:
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    process = ctx.Process(target=_isolated_test_worker,
-                          args=(target, args, kwargs, result_queue))
+    process = ctx.Process(
+        target=_isolated_test_worker, args=(target, args, kwargs, result_queue)
+    )
     try:
         process.start()
         process.join(timeout)
         if process.is_alive():
             process.terminate()
             process.join()
-            raise AssertionError(
-                f"Isolated TPU test timed out after {timeout} seconds")
+            raise AssertionError(f"Isolated TPU test timed out after {timeout} seconds")
         try:
             status, payload = result_queue.get(timeout=5)
         except queue.Empty as exc:
             raise AssertionError(
                 "Isolated TPU test exited without reporting a result "
-                f"(exitcode={process.exitcode})") from exc
+                f"(exitcode={process.exitcode})"
+            ) from exc
     finally:
         result_queue.close()
 
@@ -56,17 +63,19 @@ def _run_isolated(target: Callable[..., Any],
     if status == "ERROR":
         raise AssertionError(f"Isolated TPU test failed:\n{payload}")
     if process.exitcode != 0:
-        raise AssertionError(
-            f"Isolated TPU test crashed (exitcode={process.exitcode})")
+        raise AssertionError(f"Isolated TPU test crashed (exitcode={process.exitcode})")
 
 
-def run_in_isolated_process(target: Callable[..., Any] | None = None,
-                            *,
-                            timeout: float = 600) -> Any:
+def run_in_isolated_process(
+    target: Callable[..., Any] | None = None,
+    *args: Any,
+    timeout: float = 600,
+    **kwargs: Any,
+) -> Any:
     """Run a TPU test in a spawned process and propagate its result.
 
     Can be invoked directly:
-        run_in_isolated_process(func, timeout=60)
+        run_in_isolated_process(func, *args, timeout=60, **kwargs)
 
     Or used as a decorator on a test function/method:
         @run_in_isolated_process(timeout=60)
@@ -75,20 +84,19 @@ def run_in_isolated_process(target: Callable[..., Any] | None = None,
     if target is None:
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-
             @functools.wraps(func)
-            def wrapper(*args: Any, **kwargs: Any) -> None:
+            def wrapper(*w_args: Any, **w_kwargs: Any) -> None:
                 if os.environ.get("VLLM_ISOLATED_PROCESS") == "1":
-                    func(*args, **kwargs)
+                    func(*w_args, **w_kwargs)
                     return
-                _run_isolated(func, args, kwargs, timeout=timeout)
+                _run_isolated(func, w_args, w_kwargs, timeout=timeout)
 
             return wrapper
 
         return decorator
 
     if os.environ.get("VLLM_ISOLATED_PROCESS") == "1":
-        target()
+        target(*args, **kwargs)
         return
 
-    _run_isolated(target, (), {}, timeout=timeout)
+    _run_isolated(target, args, kwargs, timeout=timeout)

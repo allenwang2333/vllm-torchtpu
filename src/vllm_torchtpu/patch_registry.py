@@ -129,8 +129,6 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
-    # Omni multimodal & diffusion runtime patches.
-    Patch("vllm_torchtpu.omni.patches:maybe_apply_omni_patches", _ACTIVE),
 )
 
 _applied: set[str] = set()

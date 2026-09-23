@@ -4,6 +4,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+
+from .mock_omni import vllm_omni_mock  # isort: split
+
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
@@ -12,9 +15,7 @@ from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
-from .mock_omni import vllm_omni_mock
-
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.omni]
 
 
 @pytest.fixture(scope="module", autouse=True)

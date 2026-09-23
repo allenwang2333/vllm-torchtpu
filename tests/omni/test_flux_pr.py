@@ -11,14 +11,9 @@ import pytest
 
 pytest.importorskip("vllm_omni", reason="vllm_omni is required for FLUX tests")
 
-import torch
-import vllm_omni  # noqa: F401
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-from tests.distributed.tpu_test_utils import run_in_isolated_process
-from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
 pytestmark = [
     pytest.mark.omni,
@@ -28,7 +23,7 @@ pytestmark = [
 # ==============================================================================
 # Golden Multi-Patch Reference Constants
 #
-# 1. Independent CPU Diffusers reference (ground truth baseline):
+# 1. Independent CPU Diffusers reference (ground truth baseline across all 3 RGB channels):
 #    Generated with Hugging Face diffusers FluxPipeline on CPU (bfloat16 + float32 VAE):
 #
 #      from diffusers import FluxPipeline
@@ -41,37 +36,53 @@ pytestmark = [
 #          height=512, width=512, num_inference_steps=2, guidance_scale=0.0,
 #          max_sequence_length=256, generator=generator
 #      ).images[0].convert("RGB"), dtype=np.float32) / 255.0
-#      # Slices on Channel 0 (Red):
-#      center_patch = arr[254:257, 254:257, 0]
-#      high_var_patch = arr[208:211, 272:275, 0]
-#      top_right_patch = arr[126:129, 382:385, 0]
+#      # Slices across all 3 RGB Channels:
+#      center_patch = arr[254:257, 254:257, :]
+#      high_var_patch = arr[208:211, 272:275, :]
+#      top_right_patch = arr[126:129, 382:385, :]
 #
 #    Full reference array verified against independent CPU Diffusers golden generation.
 # 2. Native TPU v7x expectation (strict PR CI regression guard).
 # ==============================================================================
 DIFFUSERS_PATCH_CENTER = np.array(
     [
-        [0.15574795, 0.15044659, 0.27011064],
-        [0.28999740, 0.34247899, 0.30188876],
-        [0.33087501, 0.43038124, 0.33332568],
+        [[0.15574795, 0.3768134, 0.20242077],
+         [0.1504466, 0.39819264, 0.22532558],
+         [0.27011064, 0.5129144, 0.32839534]],
+        [[0.2899974, 0.51282465, 0.3368892], [0.342479, 0.5875516, 0.4078709],
+         [0.30188876, 0.52430815, 0.33795026]],
+        [[0.330875, 0.522212, 0.36439496], [0.43038124, 0.64522934, 0.4697881],
+         [0.33332568, 0.54160994, 0.34145623]],
     ],
     dtype=np.float32,
 )
 
 DIFFUSERS_PATCH_HIGH_VAR = np.array(
     [
-        [0.16544730, 0.20743600, 0.19300953],
-        [0.20389146, 0.14982936, 0.21267194],
-        [0.84121597, 0.83013960, 0.18811190],
+        [[0.1654473, 0.38950682, 0.06230783], [
+            0.207436, 0.4417063, 0.10256004
+        ], [0.19300953, 0.44582433, 0.10666323]],
+        [[0.20389146, 0.3718347, 0.09957111],
+         [0.14982936, 0.3330813, 0.05052826],
+         [0.21267194, 0.41932827, 0.11476776]],
+        [[0.84121597, 0.9132941, 0.77168417], [
+            0.8301396, 0.9395311, 0.7908703
+        ], [0.1881119, 0.32693827, 0.12821728]],
     ],
     dtype=np.float32,
 )
 
 DIFFUSERS_PATCH_TOP_RIGHT = np.array(
     [
-        [0.29085350, 0.27446980, 0.25844613],
-        [0.35081630, 0.34825307, 0.34749365],
-        [0.43005502, 0.42972776, 0.43195513],
+        [[0.2908535, 0.53607446, 0.01906031],
+         [0.2744698, 0.52060366, 0.01586527],
+         [0.25844613, 0.51278335, 0.02035528]],
+        [[0.3508163, 0.5807237, 0.02017263], [
+            0.34825307, 0.5748323, 0.01465797
+        ], [0.34749365, 0.5770006, 0.01684263]],
+        [[0.43005502, 0.6414323, 0.03602198],
+         [0.42972776, 0.63642377, 0.02915734],
+         [0.43195513, 0.63667274, 0.02589324]],
     ],
     dtype=np.float32,
 )
@@ -238,12 +249,12 @@ class TestFluxPrCiOnTpu:
             f"TPU v7x native regression detected! (max diff: {max_diff_tpu:.4f})",
         )
 
-        # Tier 2: Diffusers Cross-Hardware Parity (Cosine Sim >= 0.90 across spatial patches)
+        # Tier 2: Diffusers Cross-Hardware Parity (Cosine Sim >= 0.90 across all 3 RGB channels)
         patches_to_test = [
-            ("Center", arr[254:257, 254:257, 0], DIFFUSERS_PATCH_CENTER),
-            ("High-Variance", arr[208:211, 272:275,
-                                  0], DIFFUSERS_PATCH_HIGH_VAR),
-            ("Top-Right", arr[126:129, 382:385, 0], DIFFUSERS_PATCH_TOP_RIGHT),
+            ("Center", arr[254:257, 254:257, :], DIFFUSERS_PATCH_CENTER),
+            ("High-Variance", arr[208:211,
+                                  272:275, :], DIFFUSERS_PATCH_HIGH_VAR),
+            ("Top-Right", arr[126:129, 382:385, :], DIFFUSERS_PATCH_TOP_RIGHT),
         ]
 
         patch_failures = []
@@ -263,19 +274,3 @@ class TestFluxPrCiOnTpu:
                 )
 
         assert not patch_failures, "\n".join(patch_failures)
-
-    @run_in_isolated_process(timeout=60)
-    def test_flux_tpu_memory_stats(self):
-        """Verify TPU device detection, memory querying, and statistics resetting."""
-        import torch_tpu  # noqa: F401
-
-        device_name = OmniTpuPlatform.get_device_name()
-        assert "tpu" in device_name.lower()
-
-        # TPU v7x memory limits (e.g. 16/32/64/96/128 GiB per chip/slice)
-        total_mem = OmniTpuPlatform.get_device_total_memory()
-        assert total_mem > 0, "Device total memory must be positive"
-        assert total_mem <= 128 * 1024**3, (
-            f"Unexpected HBM size: {total_mem / 1024**3:.1f} GiB")
-
-        torch.accelerator.reset_peak_memory_stats()

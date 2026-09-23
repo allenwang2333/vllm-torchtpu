@@ -2,12 +2,13 @@
 """Unit tests for FLUX models on TPU platform (hermetic, CPU/mock)."""
 
 import math
+import os
+
 import pytest
 
 pytest.importorskip("vllm_omni")
 
 import torch
-from vllm_omni.diffusion import diffusion_engine
 from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
 from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import \
     Flux2KleinPipeline
@@ -160,7 +161,7 @@ class TestFluxRuntimePatches:
     def test_omni_tpu_patches_configuration(self):
         apply_omni_tpu_patches.cache_clear()
         apply_omni_tpu_patches()
-        assert diffusion_engine._ASYNC_OUTPUT_TIMEOUT == 1800.0
+        assert os.environ.get("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT") == "1800.0"
 
 
 class TestFluxInputValidationAndSanitization:
