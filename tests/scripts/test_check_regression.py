@@ -391,10 +391,11 @@ def test_check_eval_missing_task_fails():
     assert failed.failed_rows[0].task == "mmlu_llama"
 
 
-# Baselines that predate the stderr-aware gate and carry no stderr, so they
-# fall back to the flat tolerance floor. The two mmmu_pro entries are an
-# lm-eval task limitation; the kimi-k3 entry was hand-written rather than
-# produced by --calibrate. Shrink this set, never grow it.
+# Baselines that predate stderr recording. The two mmmu_pro entries report no
+# stderr on either side (evalscope task limitation), so they stay on the flat
+# tolerance floor; the kimi-k3 entry was hand-written rather than produced by
+# --calibrate, so it gets only 1x the run's stderr (hypot(0, se_run)) instead
+# of the full sqrt(2) quadrature. Shrink this set, never grow it.
 _BASELINES_MISSING_STDERR = {
     "gemma-4-26b-fp8-dp4-tp2-multimodal.mmmu_pro.baseline.json:mmmu_pro",
     "gemma-4-31b-fp8-dp4-tp2-multimodal.mmmu_pro.baseline.json:mmmu_pro",
@@ -405,8 +406,8 @@ _BASELINES_MISSING_STDERR = {
 def test_shipped_baselines_are_well_formed():
     """Every checked-in eval baseline must carry an acc key and its stderr.
 
-    Guards against hand-written baselines, which silently opt out of the
-    stderr-aware gate and fall back to the flat tolerance floor.
+    Guards against hand-written baselines, which miss the baseline half of the
+    quadrature (or all of it, for tasks whose runner emits no stderr either).
     """
     files = sorted(_BASELINE_DIR.glob("*.baseline.json"))
     assert files, f"no baselines found under {_BASELINE_DIR}"
