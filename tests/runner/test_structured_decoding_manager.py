@@ -329,7 +329,8 @@ class TestStructuredDecode:
         with pytest.raises(
                 ValueError,
                 match=
-                r"Logits dimension \(32\) cannot be smaller than vocab_size \(64\)\.",
+                r"TPU logits vocab dimension must be at least vocab_size \(64\) "
+                r"\(padded to hardware alignment boundary\), but got logits\.shape\[-1\]=32",
         ):
             manager.apply_grammar_bitmask(logits, bitmask, arange)
 

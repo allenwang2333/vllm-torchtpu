@@ -318,8 +318,9 @@ class StructuredDecodingManager:
         target_dim = logits.shape[-1]
         if target_dim < self.vocab_size:
             raise ValueError(
-                f"Logits dimension ({target_dim}) cannot be smaller than "
-                f"vocab_size ({self.vocab_size}).")
+                f"TPU logits vocab dimension must be at least vocab_size ({self.vocab_size}) "
+                f"(padded to hardware alignment boundary), but got logits.shape[-1]={target_dim}"
+            )
         # Unpack the bitmask for the entire batch at once.
         # grammar_bitmask: (B, N) where B=num_reqs, N=cdiv(vocab_size, 32)
         # arange: (32,)
