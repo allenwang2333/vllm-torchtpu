@@ -2307,8 +2307,13 @@ class TPUModelRunner(GPUModelRunner):
             max(0, min(rpa_num_decode_reqs - start_index, num_reqs)),
             use_max_model_len)
 
-        request_major_input_ids_cpu: torch.Tensor
-        if self._pcp_mtp_k1_enabled:
+        request_major_input_ids_cpu: torch.Tensor | None = None
+        needs_request_major_tokens = (
+            self._pcp_mtp_k1_enabled
+            or (self.speculative_config is not None
+                and getattr(sequence_layout_planner, "enabled", False))
+        )
+        if needs_request_major_tokens:
             # prepare_real() may repack input_ids_cpu in place. Preserve only
             # the real request-major prefix before crossing that boundary.
             request_major_input_ids_cpu = self.input_ids_cpu.narrow(
@@ -2337,7 +2342,9 @@ class TPUModelRunner(GPUModelRunner):
         padded_total_num_scheduled_tokens = (
             layout_plan.global_padded_num_tokens)
         request_major_input_ids = None
-        if self._pcp_mtp_k1_enabled:
+        if (request_major_input_ids_cpu is not None
+                and (self._pcp_mtp_k1_enabled
+                     or layout_plan.kind is not SequenceLayoutKind.ALL)):
             request_major_input_ids_cpu_padded = torch.zeros(
                 layout_plan.global_padded_num_tokens,
                 dtype=request_major_input_ids_cpu.dtype,

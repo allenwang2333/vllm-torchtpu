@@ -187,6 +187,10 @@ def _localize_token_tensor_and_gather_indices(
 class SequenceLayoutPlanner(Protocol):
 
     @property
+    def enabled(self) -> bool:
+        ...
+
+    @property
     def requires_backend_preinit(self) -> bool:
         ...
 
@@ -253,6 +257,10 @@ def _first_ge(paddings: list[int] | tuple[int, ...], value: int) -> int:
 
 
 class AllSequenceLayoutPlanner:
+
+    @property
+    def enabled(self) -> bool:
+        return False
 
     @property
     def requires_backend_preinit(self) -> bool:
