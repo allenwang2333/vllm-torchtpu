@@ -2004,7 +2004,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # the gather above); no-op under plain DCP.
                 outputs = scatter_to_local_chunk(
                     outputs, attn_metadata.pcp_local_token_slice,
-                    attn_metadata.pcp_packed_to_request_major_token_indices)
+                    attn_metadata.pcp_packed_to_request_major_token_indices,
+                    local_num_tokens=q_nope.shape[0])
             else:
                 if (not hasattr(layer, "sparse_mla_op")
                         or layer.sparse_mla_op is None):
