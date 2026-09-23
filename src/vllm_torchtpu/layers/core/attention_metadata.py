@@ -182,6 +182,7 @@ def _staged_walk_products(
     return tuple(outs) + tuple(states) + tuple(ckpts)
 
 
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _staged_walk_products_compiled(
     staged_dev: torch.Tensor,
     seq_lens: torch.Tensor,
