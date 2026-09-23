@@ -2025,10 +2025,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         return sparse_mla_dcp_impl
 
     def _build_dense_decode_dcp_op(self, layer: Any):
+        from vllm.distributed.parallel_state import get_tp_group
+
         from vllm_torchtpu.distributed.dcp import get_dcp_rank
-        from vllm_torchtpu.kernels.mla.decode_dcp import decode_attention
+        from vllm_torchtpu.distributed.mesh_utils import get_or_create_cp_mesh
+        from vllm_torchtpu.kernels.mla.decode_dcp_fused import decode_attention
 
         rank = get_dcp_rank()
+        tp_group = get_tp_group()
+        if self.dcp_size != 2 or tp_group.rank_in_group % 2 != rank:
+            raise ValueError(
+                "Fused K3 MLA requires adjacent TP-rank DCP2 pairs")
+        mesh = get_or_create_cp_mesh("dcp", tp_group)
         if layer.kv_cache_quantized_dtype is not None:
             raise NotImplementedError(
                 "K3 decode DCP currently requires BF16 KV")
@@ -2036,39 +2044,58 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         def core(cache: jax.Array, q: jax.Array, q_pe: jax.Array,
                  kv: jax.Array, pe: jax.Array, lengths: jax.Array,
                  tables: jax.Array,
-                 starts: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-            if (getattr(self, "native_dense_decode_dcp", False)
-                    and cache.shape[1] * cache.shape[2]
-                    != self.dcp_interleave_size):
+                 starts: jax.Array) -> tuple[jax.Array, jax.Array]:
+            if (cache.shape[1] * cache.shape[2] != 16
+                    or self.dcp_interleave_size != 16):
                 raise ValueError(
-                    "Native K3 DCP requires page-sized KV interleave")
-            return decode_attention(cache,
-                                    q,
-                                    q_pe,
-                                    kv,
-                                    pe,
-                                    lengths,
-                                    tables,
-                                    starts,
-                                    rank=rank,
-                                    size=self.dcp_size,
-                                    scale=layer.scale)
+                    "Fused K3 DCP requires 16-token page striping")
+            small_group = next(g for g in (8, 4, 1) if q.shape[0] % g == 0)
+            large_group = 4 if q.shape[0] % 4 == 0 else 1
 
-        op = pallas.jax_op(
+            def attend(tile_pages, group_size):
+                return decode_attention(cache,
+                                        q,
+                                        q_pe,
+                                        kv,
+                                        pe,
+                                        lengths,
+                                        tables,
+                                        starts,
+                                        mesh=mesh,
+                                        cp_rank=rank,
+                                        scale=layer.scale,
+                                        tile_pages=tile_pages,
+                                        group_size=group_size)
+
+            # seq_lens is replicated over TP, so every CP peer selects the
+            # same collective branch. Short contexts need smaller KV tiles
+            # and larger exchange groups to amortize synchronization.
+            longest = jax.numpy.max(lengths)
+            return jax.lax.cond(
+                longest <= 128, lambda: attend(4, small_group),
+                lambda: jax.lax.cond(longest <= 2048, lambda: attend(
+                    64, small_group), lambda: attend(128, large_group)))
+
+        # The mesh spans TP so exported code has the same partition count as
+        # the enclosing Torch graph. Communication is confined to CP pairs.
+        op = pcp_streaming_jax_op(
             f"pallas::k3_decode_dcp_{layer.layer_name.replace('.', '_')}",
             core,
-            donate_argnums=(0, ))
+            donate_argnums=(0, ),
+            mesh=mesh,
+            input_partition_specs=(P("dcp"), P(None, "dcp"), P(None, "dcp"),
+                                   P(), P(), P(), P("dcp"), P()),
+            output_partition_specs=(P("dcp"), P(None, "dcp")))
 
         def fake(cache, q, *args):
-            return (torch.empty_like(cache), torch.empty_like(q),
-                    q.new_empty(q.shape[:2], dtype=torch.float32))
+            return torch.empty_like(cache), torch.empty_like(q)
 
         op.register_fake(fake)
 
         def run(cache, *args):
-            new_cache, output, lse = op(cache, *args)
+            new_cache, output = op(cache, *args)
             cache.copy_(new_cache)
-            return output, lse
+            return output
 
         return run
 
@@ -2183,12 +2210,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.request_distribution,
                 )
         elif getattr(self, "native_dense_decode_dcp", False):
-            partial, lse = layer.dense_decode_dcp_op(
-                kv_cache, all_gather_heads(ql_nope_flat),
-                all_gather_heads(q_pe_flat), kv_c_normed_flat, k_pe_flat,
-                attn_metadata.seq_lens, attn_metadata.block_tables,
-                attn_metadata.query_start_loc)
-            outputs = merge_lse_partials_scatter_heads(partial, lse)
+            outputs = layer.dense_decode_dcp_op(kv_cache, ql_nope_flat,
+                                                q_pe_flat, kv_c_normed_flat,
+                                                k_pe_flat,
+                                                attn_metadata.seq_lens,
+                                                attn_metadata.block_tables,
+                                                attn_metadata.query_start_loc)
         else:
             if not hasattr(layer, "mla_op") or layer.mla_op is None:
                 layer.mla_op = self._build_mla_op(layer,

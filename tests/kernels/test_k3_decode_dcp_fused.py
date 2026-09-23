@@ -72,20 +72,23 @@ def test_pipeline_all_empty_does_not_read_poisoned_cache():
     assert np.isneginf(lse).all()
 
 
+@pytest.mark.parametrize('query_len', [1, 4])
 @pytest.mark.parametrize('active', [0, 5])
 @pytest.mark.parametrize('group_size', [1, 4])
 @pytest.mark.parametrize('tile_pages', [2, 128])
 def test_distributed_owner_writes_and_bank_reuse(active, group_size,
-                                                 tile_pages):
+                                                 tile_pages, query_len):
     if jax.default_backend() != 'tpu' or jax.device_count() < 2:
         pytest.skip('Requires two TPU devices for remote DMA')
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ('dcp', ))
     rng = np.random.default_rng(817)
-    lengths = np.array([1, 17, 33, 65, 129, 0, 0, 0] if active else [0] * 8,
+    lengths = np.array(([1, 17, 33, 65, 129, 0, 0, 0] if query_len == 1 else
+                        [18, 32, 35, 65, 129, 0, 0, 0]) if active else [0] * 8,
                        np.int32)
-    starts = jnp.minimum(jnp.arange(9, dtype=jnp.int32), active)
-    q = jnp.asarray(rng.normal(size=(8, 24, 576)), jnp.bfloat16)
-    new = jnp.asarray(rng.normal(size=(8, 576)), jnp.bfloat16)
+    starts = jnp.minimum(jnp.arange(9, dtype=jnp.int32), active) * query_len
+    tokens = 8 * query_len
+    q = jnp.asarray(rng.normal(size=(tokens, 24, 576)), jnp.bfloat16)
+    new = jnp.asarray(rng.normal(size=(tokens, 576)), jnp.bfloat16)
     rows = [
         jnp.asarray(rng.normal(size=(max(int(n), 1), 640)), jnp.bfloat16)
         for n in lengths
@@ -108,11 +111,13 @@ def test_distributed_owner_writes_and_bank_reuse(active, group_size,
                                  local % 16].set(rows[b][token])
                 local += 1
         expected = cache
-        for b, length in enumerate(lengths):
-            if length and (length - 1) // 16 % 2 == rank:
-                pos = (length - 1) // 32 * 16 + (length - 1) % 16
-                expected = expected.at[table[b, pos // 16],
-                                       pos % 16].set(jnp.pad(new[b], (0, 64)))
+        for b, length in enumerate(lengths[:active]):
+            for offset in range(query_len):
+                position = length - query_len + offset
+                if position // 16 % 2 == rank:
+                    pos = position // 32 * 16 + position % 16
+                    expected = expected.at[table[b, pos // 16], pos % 16].set(
+                        jnp.pad(new[b * query_len + offset], (0, 64)))
         caches.append(cache.reshape(40, 8, 2, 640))
         expected_caches.append(expected.reshape(40, 8, 2, 640))
         tables.append(table)
@@ -121,10 +126,15 @@ def test_distributed_owner_writes_and_bank_reuse(active, group_size,
     expected_cache = jnp.concatenate(expected_caches)
     references = []
     for b, length in enumerate(lengths[:active]):
-        kv = rows[b][:length, :576].astype(jnp.float32).at[-1].set(
-            new[b].astype(jnp.float32))
-        scores = q[b].astype(jnp.float32) @ kv.T * 192**-.5
-        references.append(jax.nn.softmax(scores) @ kv[:, :512])
+        kv = rows[b][:length, :576].astype(jnp.float32).at[-query_len:].set(
+            new[b * query_len:(b + 1) * query_len].astype(jnp.float32))
+        for offset in range(query_len):
+            causal = kv[:length - query_len + offset + 1]
+            scores = q[b * query_len + offset].astype(jnp.float32) @ causal.T
+            references.append(
+                jnp.matmul(jax.nn.softmax(scores * 192**-.5),
+                           causal[:, :512],
+                           precision=jax.lax.Precision.HIGHEST))
     fn = jax.jit(lambda c: kernel.decode_attention(c,
                                                    q[:, :, :512],
                                                    q[:, :, 512:],
@@ -145,8 +155,51 @@ def test_distributed_owner_writes_and_bank_reuse(active, group_size,
                                    rtol=0,
                                    equal_nan=True)
         if active:
-            np.testing.assert_allclose(actual[:active].astype(jnp.float32),
+            np.testing.assert_allclose(actual[:active * query_len].astype(
+                jnp.float32),
                                        jnp.stack(references),
                                        atol=.005,
                                        rtol=.03)
-        np.testing.assert_array_equal(actual[active:], 0)
+        np.testing.assert_array_equal(actual[active * query_len:], 0)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("flatten_tables", [False, True])
+def test_mtp_suffix_positions_and_causal_lengths(rank, flatten_tables):
+    # Mixed query counts, an empty request, stripe boundaries and padded tokens.
+    lengths = jnp.array([18, 32, 0, 35, 0], jnp.int32)
+    starts = jnp.array([0, 4, 5, 5, 8, 8], jnp.int32)
+    tables = jnp.array([[3, 7], [2, 6], [0, 0], [1, 5], [0, 0]])
+    cache = jnp.full((8, 8, 2, 640), -7, jnp.bfloat16)
+    q = jnp.zeros((12, 12, 512), jnp.bfloat16)
+    qp = jnp.zeros((12, 12, 64), jnp.bfloat16)
+    values = jnp.broadcast_to(jnp.arange(12)[:, None], (12, 576))
+    updated, _, causal, token_tables, count = kernel._prepare_decode(
+        cache,
+        q,
+        qp,
+        values[:, :512],
+        values[:, 512:],
+        lengths,
+        tables.reshape(-1) if flatten_tables else tables,
+        starts,
+        rank=rank)
+    positions = [14, 15, 16, 17, 31, 32, 33, 34]
+    requests = [0, 0, 0, 0, 1, 3, 3, 3]
+    expected = np.asarray(cache).copy()
+    expected_lengths = np.zeros(12, np.int32)
+    for token, (position, req) in enumerate(zip(positions, requests)):
+        n = position + 1
+        expected_lengths[token] = n // 32 * 16 + min(
+            max(n % 32 - rank * 16, 0), 16)
+        if position // 16 % 2 == rank:
+            local = position // 32 * 16 + position % 16
+            expected[tables[req, local // 16], local % 16 // 2,
+                     local % 2, :576] = token
+            expected[tables[req, local // 16], local % 16 // 2, local % 2,
+                     576:] = 0
+    np.testing.assert_array_equal(updated, expected)
+    np.testing.assert_array_equal(causal, expected_lengths)
+    np.testing.assert_array_equal(token_tables[:8],
+                                  tables[jnp.array(requests)])
+    np.testing.assert_array_equal(count, [8])

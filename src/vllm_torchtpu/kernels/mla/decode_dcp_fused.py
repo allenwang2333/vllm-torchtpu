@@ -392,7 +392,9 @@ def distributed_attention(cache,
             pltpu.VMEM((group_size, total_heads, 512), jnp.float32),
             pltpu.VMEM((group_size, total_heads, 128), jnp.float32),
             pltpu.VMEM((group_size, total_heads, 128), jnp.float32),
-            pltpu.VMEM((group_size, total_heads, 512), jnp.bfloat16),
+            # Keep normalized local partials in FP32 until the CP merge;
+            # rounding before cancellation across stripes loses precision.
+            pltpu.VMEM((group_size, total_heads, 512), jnp.float32),
             pltpu.VMEM((group_size, total_heads, 128), jnp.float32),
             *[
                 pltpu.VMEM((2, group_size, padded_heads, 640), jnp.float32)
@@ -433,6 +435,39 @@ def distributed_attention(cache,
                                           active)
 
 
+def _prepare_decode(c, q, qp, kv, pe, lengths, tables, starts, *, rank):
+    """Scatter query suffixes and give each token its causal striped length.
+
+    ``lengths`` includes every scheduled query token, including MTP candidates.
+    Rejected candidates may remain in cache; subsequent steps overwrite them
+    and the per-token length prevents attention from reading stale suffixes.
+    """
+    # The serving metadata stores each rank's block table flattened.
+    tables = tables.reshape(lengths.shape[0], -1)
+    token = jnp.arange(q.shape[0], dtype=jnp.int32)
+    request = jnp.searchsorted(starts[1:], token, side="right")
+    safe = jnp.minimum(request, lengths.shape[0] - 1)
+    valid = (request < lengths.shape[0]) & (token < starts[-1])
+    query_len = starts[safe + 1] - starts[safe]
+    position = lengths[safe] - query_len + token - starts[safe]
+    valid &= (position >= 0) & (position < lengths[safe])
+    pos = jnp.maximum(position, 0)
+    owner = pos // 16 % 2
+    local_pos = pos // 32 * 16 + pos % 16
+    col = local_pos // 16
+    page = tables[safe, jnp.minimum(col, tables.shape[1] - 1)]
+    write = valid & (owner == rank) & (col < tables.shape[1])
+    page = jnp.where(write, page, c.shape[0])
+    values = jnp.pad(jnp.concatenate((kv, pe), axis=-1), ((0, 0), (0, 64)))
+    c = c.at[page, local_pos % 16 // 2, local_pos % 2].set(values, mode="drop")
+    causal_length = pos + 1
+    local = (causal_length // 32 * 16 +
+             jnp.clip(causal_length % 32 - rank * 16, 0, 16))
+    return (c, jnp.concatenate(
+        (q, qp), axis=-1), jnp.where(valid, local,
+                                     0), tables[safe], starts[-1:])
+
+
 def decode_attention(cache,
                      q_nope,
                      q_pe,
@@ -453,25 +488,15 @@ def decode_attention(cache,
 
     def prepare(c, q, qp, kv, pe, lengths, tables, starts):
         rank = lax.axis_index(axis_name) % 2 if cp_rank is None else cp_rank
-        token = jnp.arange(q.shape[0], dtype=jnp.int32)
-        request = jnp.searchsorted(starts[1:], token, side="right")
-        safe = jnp.minimum(request, lengths.shape[0] - 1)
-        valid = (request < lengths.shape[0]) & (token < starts[-1])
-        valid &= lengths[safe] > 0
-        pos = jnp.maximum(lengths[safe] - 1, 0)
-        owner = pos // 16 % 2
-        local_pos = pos // 32 * 16 + pos % 16
-        col = local_pos // 16
-        page = tables[safe, jnp.minimum(col, tables.shape[1] - 1)]
-        write = valid & (owner == rank) & (col < tables.shape[1])
-        page = jnp.where(write, page, c.shape[0])
-        values = jnp.pad(jnp.concatenate((kv, pe), axis=-1), ((0, 0), (0, 64)))
-        c = c.at[page, local_pos % 16 // 2, local_pos % 2].set(values,
-                                                               mode="drop")
-        local = lengths // 32 * 16 + jnp.clip(lengths % 32 - rank * 16, 0, 16)
-        return (c, jnp.concatenate(
-            (q, qp), axis=-1), jnp.where(valid, local[safe],
-                                         0), tables[safe], starts[-1:])
+        return _prepare_decode(c,
+                               q,
+                               qp,
+                               kv,
+                               pe,
+                               lengths,
+                               tables,
+                               starts,
+                               rank=rank)
 
     c, q, lengths, tables, count = jax.shard_map(
         prepare,
