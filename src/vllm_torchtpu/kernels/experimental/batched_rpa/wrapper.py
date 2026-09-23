@@ -368,7 +368,14 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
+    prefill_fixed_bq_sz = (
+        min(mxu_column_size, num_lanes)
+        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+        else None
+    )
+    prefill_block_sizes = find_best_block_sizes(
+        prefill_batch_size, n_buffer, fixed_bq_sz=prefill_fixed_bq_sz
+    )
 
     return decode_block_sizes, prefill_block_sizes
 
