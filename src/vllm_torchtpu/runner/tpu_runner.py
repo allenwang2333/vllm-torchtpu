@@ -224,7 +224,6 @@ def _substitute_placeholder_token(
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
     new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
-    new_token_values = torch.clamp_min(new_token_values, 0)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
