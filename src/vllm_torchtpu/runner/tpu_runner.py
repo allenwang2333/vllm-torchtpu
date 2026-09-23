@@ -5144,7 +5144,15 @@ class TPUModelRunner(GPUModelRunner):
             assert self.execute_model(so) is None
             self.sample_tokens(None)
             d = self.take_draft_token_ids()
-            cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
+            if d and d.draft_token_ids:
+                cur = [
+                    max(0, min(int(x), self.vocab_size - 1))
+                    for x in d.draft_token_ids[0]
+                ]
+            else:
+                cur = [0] * K
+            if len(cur) < K:
+                cur = cur + [0] * (K - len(cur))
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
                 all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
@@ -5160,13 +5168,23 @@ class TPUModelRunner(GPUModelRunner):
                 so.num_scheduled_tokens = {rid: 1 + K}
                 so.total_num_scheduled_tokens = 1 + K
                 so.scheduled_spec_decode_tokens = {
-                    rid: [int(x) for x in list(cur)[:K]]
+                    rid: [
+                        max(0, min(int(x), self.vocab_size - 1))
+                        for x in list(cur)[:K]
+                    ]
                 }
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
                 d = self.take_draft_token_ids()
                 if d and d.draft_token_ids:
-                    cur = d.draft_token_ids[0]
+                    cur = [
+                        max(0, min(int(x), self.vocab_size - 1))
+                        for x in d.draft_token_ids[0]
+                    ]
+                    if len(cur) < K:
+                        cur = cur + [0] * (K - len(cur))
+                else:
+                    cur = [0] * K
         except Exception:
             if quiet:
                 # First attempt: a SymInt from the draft forward's cold compile
