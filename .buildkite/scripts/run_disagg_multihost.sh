@@ -53,7 +53,8 @@ echo "Disagg script: ${DISAGG_SCRIPT}  results: ${DISAGG_RUN_ROOT}"
 # job. Both hosts need it, so the worker stages over ssh below.
 STAGE_MODEL_GCS="${STAGE_MODEL_GCS:-}"
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
+# shellcheck source=.buildkite/scripts/ci_image.sh
+source "${SCRIPT_DIR}/ci_image.sh"
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then

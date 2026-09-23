@@ -47,17 +47,12 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.11. vLLM 0.29.0 only sets a floor (>=5.10.4), and letting
-    # transformers float to 5.17.0 fails
-    # test_structured_output_spec_decode_correctness_greedy[single_chunk] with
-    # assert 1 == 0 -- a wrong answer under grammar-constrained decoding, not an
-    # import or API error, so nothing catches it before the test.
-    #
-    # 5.10.4 is vLLM's floor and the closest available release to 5.8.0, which
-    # was the last version this suite was green on. It is NOT a bisected ceiling:
-    # the break is somewhere in 5.11.0-5.17.0 and could be much later than 5.11.
-    # Widen it by bisecting against that test, not by bumping and hoping.
-    "transformers>=5.10.4,<5.11",
+    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
+    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
+    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
+    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
+    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
+    "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -114,7 +109,7 @@ benchmarking = [
 
 # vLLM-Omni optional dependency
 omni = [
-    "vllm-omni==0.27.0rc1",
+    "vllm-omni==0.29.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -188,42 +183,13 @@ ignore = [
 # .pre-commit-config.yaml. All three move together, otherwise two tools format
 # the same file. Use `dir/**` or a full path: in a `*` pattern the star also
 # matches `/`, so `dir/*.py` silently covers the whole subtree.
-# kernels/experimental
-"src/vllm_torchtpu/kernels/experimental/**" = ["I"]
-
-# kernels/deepseek_v4
-"src/vllm_torchtpu/kernels/deepseek_v4/**" = ["I"]
-
-# kernels: fused_moe, gdn, kimi_k3
-"src/vllm_torchtpu/kernels/fused_moe/**" = ["I"]
-"src/vllm_torchtpu/kernels/gdn/**" = ["I"]
-"src/vllm_torchtpu/kernels/kimi_k3/**" = ["I"]
-
-# kernels: attention and the rest
-"src/vllm_torchtpu/kernels/causal_conv1d/**" = ["I"]
-"src/vllm_torchtpu/kernels/collectives/**" = ["I"]
-"src/vllm_torchtpu/kernels/flash_attention/**" = ["I"]
-"src/vllm_torchtpu/kernels/megablox/**" = ["I"]
-"src/vllm_torchtpu/kernels/mla/**" = ["I"]
-"src/vllm_torchtpu/kernels/quantized_matmul/**" = ["I"]
-"src/vllm_torchtpu/kernels/ragged_paged_attention/**" = ["I"]
-"src/vllm_torchtpu/kernels/sparse_core/**" = ["I"]
-"src/vllm_torchtpu/kernels/__init__.py" = ["I"]
-"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["I"]
-"src/vllm_torchtpu/kernels/pool_adapters.py" = ["I"]
-"src/vllm_torchtpu/kernels/router_topk.py" = ["I"]
-"src/vllm_torchtpu/kernels/typed_ldst.py" = ["I"]
 
 
-# layers/adapter (src)
-"src/vllm_torchtpu/layers/adapter/**" = ["I"]
 
-# tests/layers
-"tests/layers/**" = ["I"]
 
-# layers/core
-"src/vllm_torchtpu/layers/core/**" = ["I"]
-"src/vllm_torchtpu/layers/__init__.py" = ["I"]
+
+
+
 
 
 # runner
@@ -292,42 +258,13 @@ docstring-code-format = true
 
 # Paths yapf still owns; see the note under [tool.ruff.lint.per-file-ignores].
 exclude = [
-    # kernels/experimental
-    "src/vllm_torchtpu/kernels/experimental/**",
-
-    # kernels/deepseek_v4
-    "src/vllm_torchtpu/kernels/deepseek_v4/**",
-
-    # kernels: fused_moe, gdn, kimi_k3
-    "src/vllm_torchtpu/kernels/fused_moe/**",
-    "src/vllm_torchtpu/kernels/gdn/**",
-    "src/vllm_torchtpu/kernels/kimi_k3/**",
-
-    # kernels: attention and the rest
-    "src/vllm_torchtpu/kernels/causal_conv1d/**",
-    "src/vllm_torchtpu/kernels/collectives/**",
-    "src/vllm_torchtpu/kernels/flash_attention/**",
-    "src/vllm_torchtpu/kernels/megablox/**",
-    "src/vllm_torchtpu/kernels/mla/**",
-    "src/vllm_torchtpu/kernels/quantized_matmul/**",
-    "src/vllm_torchtpu/kernels/ragged_paged_attention/**",
-    "src/vllm_torchtpu/kernels/sparse_core/**",
-    "src/vllm_torchtpu/kernels/__init__.py",
-    "src/vllm_torchtpu/kernels/partial_kv_update.py",
-    "src/vllm_torchtpu/kernels/pool_adapters.py",
-    "src/vllm_torchtpu/kernels/router_topk.py",
-    "src/vllm_torchtpu/kernels/typed_ldst.py",
 
 
-    # layers/adapter (src)
-    "src/vllm_torchtpu/layers/adapter/**",
 
-    # tests/layers
-    "tests/layers/**",
 
-    # layers/core
-    "src/vllm_torchtpu/layers/core/**",
-    "src/vllm_torchtpu/layers/__init__.py",
+
+
+
 
 
     # runner
