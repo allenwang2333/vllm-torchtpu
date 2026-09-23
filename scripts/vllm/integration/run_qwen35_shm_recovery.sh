@@ -356,7 +356,9 @@ RAIDEN_SHM_KEY=${shm_key}, PCP${PCP}, port ${PORT} ====="
 
 hard_kill_stack() {
   for pid in "${SERVER_PID}" "${NODE_PID}" "${REGISTRY_PID}"; do
-    [[ -n "${pid}" ]] && kill -KILL "${pid}" 2>/dev/null || true
+    if [[ -n "${pid}" ]]; then
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
   done
   # SIGKILL the retitled TP workers too, WITHOUT unlinking /dev/shm.
   pkill -KILL '^VLLM' 2>/dev/null || true
@@ -368,7 +370,12 @@ hard_kill_stack() {
   sleep 3
 }
 
-list_shm() { ls /dev/shm 2>/dev/null | grep -E "^/?${1}" || true; }
+list_shm() {
+  local f
+  for f in /dev/shm/"${1}"*; do
+    [[ -e "${f}" ]] && printf "%s\n" "${f##*/}"
+  done
+}
 unlink_shm() { local n; for n in $(list_shm "$1"); do rm -f "/dev/shm/${n}" 2>/dev/null || true; done; }
 
 # shellcheck disable=SC2317

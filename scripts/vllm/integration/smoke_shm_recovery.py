@@ -53,6 +53,7 @@ glue (Raiden recovery itself is proven by kv_cache_store_recovery_e2e_test).
 verify-cold showing any external hit => the signal is not attributable and the
 test is invalid.
 """
+
 import argparse
 import json
 import re
@@ -88,7 +89,6 @@ def _scrape(base):
 
 
 class Rig:
-
     def __init__(self, args):
         self.base = args.base
         self.model = args.model
@@ -113,7 +113,8 @@ class Rig:
         req = urllib.request.Request(
             self.base + "/v1/completions",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read())["choices"][0].get("token_ids")
 
@@ -141,7 +142,8 @@ class Rig:
         req = urllib.request.Request(
             self.base + "/reset_prefix_cache",
             data=b"{}",
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+        )
         for _ in range(attempts):
             try:
                 with urllib.request.urlopen(req, timeout=120) as r:
@@ -154,7 +156,8 @@ class Rig:
                 if e.code == 404:
                     raise SystemExit(
                         "POST /reset_prefix_cache is not mounted: relaunch the "
-                        "server with VLLM_SERVER_DEV_MODE=1")
+                        "server with VLLM_SERVER_DEV_MODE=1"
+                    )
             except urllib.error.URLError:
                 pass
             time.sleep(2)
@@ -166,8 +169,10 @@ def populate(rig, args):
     n, target = args.prompts, args.target
     fails = []
 
-    print(f"=== seeding {n} prompts of {rig.plen} tokens (target=prompt{target}) ===",
-          flush=True)
+    print(
+        f"=== seeding {n} prompts of {rig.plen} tokens (target=prompt{target}) ===",
+        flush=True,
+    )
     cold = {}
     cold_hits = cold_qs = 0.0
     for i in range(n):
@@ -175,20 +180,26 @@ def populate(rig, args):
         cold[i] = out
         cold_hits += r["hit"]
         cold_qs += r["q"]
-        print(f"  [seed] prompt{i} prefill={r['prefill']:.3f}s "
-              f"ext_hit={int(r['hit'])}/{int(r['q'])} gen={out[:4]}", flush=True)
+        print(
+            f"  [seed] prompt{i} prefill={r['prefill']:.3f}s "
+            f"ext_hit={int(r['hit'])}/{int(r['q'])} gen={out[:4]}",
+            flush=True,
+        )
         if not out:
             fails.append(f"populate: seed prompt{i} returned no token_ids")
     if cold_qs and 100 * cold_hits / cold_qs > 5:
         fails.append(
             f"populate: cold seed ext_hit_pct={100 * cold_hits / cold_qs:.1f} "
             "(>5%): the prompts are not fresh against this store, so a later "
-            "'recovered' hit would be indistinguishable from a stale seed hit")
+            "'recovered' hit would be indistinguishable from a stale seed hit"
+        )
     if not cold.get(target):
         return fails + [f"populate: target prompt{target} produced no baseline"]
 
-    print(f"  waiting {args.sweep_wait_s:.0f}s for offload (D2H save) to settle",
-          flush=True)
+    print(
+        f"  waiting {args.sweep_wait_s:.0f}s for offload (D2H save) to settle",
+        flush=True,
+    )
     time.sleep(args.sweep_wait_s)
 
     # Diagnostic: recall the target BEFORE clearing HBM. With a large HBM cache
@@ -196,40 +207,49 @@ def populate(rig, args):
     # (ext_hit=0, fast prefill) -- it is logged, never gated, to make the
     # local-vs-external contrast explicit in the run log.
     out, r = rig.measured(target)
-    print(f"  [pre-reset recall] prompt{target} prefill={r['prefill']:.3f}s "
-          f"ext_hit={int(r['hit'])}/{int(r['q'])} "
-          f"local_hit={int(r['local_hit'])}/{int(r['local_q'])} gen={out[:4]}",
-          flush=True)
+    print(
+        f"  [pre-reset recall] prompt{target} prefill={r['prefill']:.3f}s "
+        f"ext_hit={int(r['hit'])}/{int(r['q'])} "
+        f"local_hit={int(r['local_hit'])}/{int(r['local_q'])} gen={out[:4]}",
+        flush=True,
+    )
 
     # Empty HBM so the authoritative recall cannot be served locally and must
     # resolve through the external (shm-backed) store.
     print("  POST /reset_prefix_cache (external store kept)", flush=True)
     if not rig.reset_prefix_cache():
-        return fails + ["populate: /reset_prefix_cache never succeeded, so HBM "
-                        "cannot be proven empty and an external hit is unprovable"]
+        return fails + [
+            "populate: /reset_prefix_cache never succeeded, so HBM "
+            "cannot be proven empty and an external hit is unprovable"
+        ]
 
     out, r = rig.measured(target)
-    print(f"  [recall] prompt{target} prefill={r['prefill']:.3f}s "
-          f"ext_hit={int(r['hit'])}/{int(r['q'])} "
-          f"local_hit={int(r['local_hit'])}/{int(r['local_q'])} gen={out[:4]}",
-          flush=True)
+    print(
+        f"  [recall] prompt{target} prefill={r['prefill']:.3f}s "
+        f"ext_hit={int(r['hit'])}/{int(r['q'])} "
+        f"local_hit={int(r['local_hit'])}/{int(r['local_q'])} gen={out[:4]}",
+        flush=True,
+    )
     if r["local_hit"] > 0:
         fails.append(
             f"populate: recall of prompt{target} still saw {int(r['local_hit'])} "
             "LOCAL hits after /reset_prefix_cache -- HBM was not actually "
-            "cleared, so an external hit here cannot be attributed to the pool")
+            "cleared, so an external hit here cannot be attributed to the pool"
+        )
     if r["hit"] <= 0:
         fails.append(
             f"populate: recall of prompt{target} produced 0 external hits after "
             "HBM was cleared -- its KV was never offloaded to the shm-backed "
             "host pool (offload SAVE not happening for this config), or the "
             "store cannot resolve it. Nothing is in shm to recover, so the "
-            "recovery legs would prove nothing")
+            "recovery legs would prove nothing"
+        )
     if out and cold[target] and out[:2] != cold[target][:2]:
         fails.append(
             f"populate: in-process recall of prompt{target} diverged at the "
             f"first tokens (corrupt offloaded KV?): cold={cold[target][:4]} "
-            f"recalled={out[:4]}")
+            f"recalled={out[:4]}"
+        )
     if fails:
         return fails
 
@@ -243,9 +263,11 @@ def populate(rig, args):
     }
     with open(args.state, "w") as f:
         json.dump(state, f)
-    print(f"  recorded pre-crash state -> {args.state} "
-          f"(target=prompt{target}, expect an external hit on recovery)",
-          flush=True)
+    print(
+        f"  recorded pre-crash state -> {args.state} "
+        f"(target=prompt{target}, expect an external hit on recovery)",
+        flush=True,
+    )
     return []
 
 
@@ -265,8 +287,11 @@ def verify_recover(rig, args):
     st = _load_state(args, rig)
     target = st["target"]
     out, r = rig.measured(target)
-    print(f"  [recover] prompt{target} prefill={r['prefill']:.3f}s "
-          f"ext_hit={int(r['hit'])}/{int(r['q'])} gen={out[:4]}", flush=True)
+    print(
+        f"  [recover] prompt{target} prefill={r['prefill']:.3f}s "
+        f"ext_hit={int(r['hit'])}/{int(r['q'])} gen={out[:4]}",
+        flush=True,
+    )
     fails = []
     if r["hit"] <= 0:
         fails.append(
@@ -275,13 +300,15 @@ def verify_recover(rig, args):
             "from shm. Raiden recovery is proven by "
             "kv_cache_store_recovery_e2e_test, so the fault is the vLLM offload "
             "glue (enable_shm wiring, or a block-hash namespace not stable "
-            "across the restart -- is PYTHONHASHSEED pinned?)")
+            "across the restart -- is PYTHONHASHSEED pinned?)"
+        )
     if out and st["cold_target_tokens"] and out[:2] != st["cold_target_tokens"][:2]:
         fails.append(
             "verify-recover: recovered output diverged at the first tokens, so "
             "the KV reloaded from shm is not the KV that was offloaded\n"
             f"    pre-crash={st['cold_target_tokens'][:4]}\n"
-            f"    recovered={out[:4]}")
+            f"    recovered={out[:4]}"
+        )
     return fails
 
 
@@ -290,8 +317,11 @@ def verify_cold(rig, args):
     st = _load_state(args, rig)
     target = st["target"]
     out, r = rig.measured(target)
-    print(f"  [cold-neg] prompt{target} prefill={r['prefill']:.3f}s "
-          f"ext_hit={int(r['hit'])}/{int(r['q'])} gen={out[:4]}", flush=True)
+    print(
+        f"  [cold-neg] prompt{target} prefill={r['prefill']:.3f}s "
+        f"ext_hit={int(r['hit'])}/{int(r['q'])} gen={out[:4]}",
+        flush=True,
+    )
     fails = []
     if r["hit"] > 0:
         fails.append(
@@ -299,7 +329,8 @@ def verify_cold(rig, args):
             f"still produced {int(r['hit'])} external hits. The recovery hit is "
             "therefore NOT attributable to the shared key -- residual /dev/shm "
             "or a shared cache is leaking across keys, and the test is invalid "
-            "until this leg reads zero")
+            "until this leg reads zero"
+        )
     return fails
 
 
@@ -312,36 +343,61 @@ PHASES = {
 
 def main():
     ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--phase", required=True, choices=list(PHASES))
-    ap.add_argument("--state", required=True,
-                    help="JSON file carrying the pre-crash target across phases")
+    ap.add_argument(
+        "--state",
+        required=True,
+        help="JSON file carrying the pre-crash target across phases",
+    )
     ap.add_argument("--base", default="http://127.0.0.1:8100")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--prompts", type=int, default=12,
-                    help="distinct prompts to seed; must overflow HBM so the "
-                    "target is evicted into the host pool")
-    ap.add_argument("--prompt-tokens", dest="prompt_tokens", type=int,
-                    default=16448,
-                    help="tokens per prompt; must exceed a whole number of "
-                    "offload blocks (vLLM caps prefix hits at num_tokens-1)")
-    ap.add_argument("--target", type=int, default=0,
-                    help="prompt index to recover; 0 (oldest) is the most "
-                    "surely evicted from HBM and, with no store node, stays "
-                    "resident in the host pool")
-    ap.add_argument("--sweep-wait-s", dest="sweep_wait_s", type=float,
-                    default=15.0, help="settle time after seeding for offload")
-    ap.add_argument("--recall-tokens", dest="recall_tokens", type=int,
-                    default=8, help="generation budget per request")
-    ap.add_argument("--request-timeout-s", dest="request_timeout_s",
-                    type=float, default=900.0)
+    ap.add_argument(
+        "--prompts",
+        type=int,
+        default=12,
+        help="distinct prompts to seed; must overflow HBM so the "
+        "target is evicted into the host pool",
+    )
+    ap.add_argument(
+        "--prompt-tokens",
+        dest="prompt_tokens",
+        type=int,
+        default=16448,
+        help="tokens per prompt; must exceed a whole number of "
+        "offload blocks (vLLM caps prefix hits at num_tokens-1)",
+    )
+    ap.add_argument(
+        "--target",
+        type=int,
+        default=0,
+        help="prompt index to recover; 0 (oldest) is the most "
+        "surely evicted from HBM and, with no store node, stays "
+        "resident in the host pool",
+    )
+    ap.add_argument(
+        "--sweep-wait-s",
+        dest="sweep_wait_s",
+        type=float,
+        default=15.0,
+        help="settle time after seeding for offload",
+    )
+    ap.add_argument(
+        "--recall-tokens",
+        dest="recall_tokens",
+        type=int,
+        default=8,
+        help="generation budget per request",
+    )
+    ap.add_argument(
+        "--request-timeout-s", dest="request_timeout_s", type=float, default=900.0
+    )
     args = ap.parse_args()
 
     rig = Rig(args)
     fn, marker = PHASES[args.phase]
-    print(f"=== shm-recovery phase={args.phase} state={args.state} ===",
-          flush=True)
+    print(f"=== shm-recovery phase={args.phase} state={args.state} ===", flush=True)
     failures = fn(rig, args)
     print(flush=True)
     if failures:
