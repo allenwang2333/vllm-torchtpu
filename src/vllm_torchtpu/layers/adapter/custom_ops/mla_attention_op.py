@@ -22,6 +22,7 @@ from torch.nn import Parameter
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import \
     get_attention_context
@@ -65,6 +66,105 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+logger = init_logger(__name__)
+
+_TOPK_LAYOUT_LOGGED = False
+
+# `id(original) -> (original, grown)`. All MLA layers share one top-k buffer,
+# so grow it once per tensor, not once per layer. Holding the original keeps
+# its `id()` from being reused.
+_TOPK_BUFFER_GROWTH: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _positive_int(value: object) -> int:
+    return value if isinstance(value, int) and value > 0 else 1
+
+
+def _resolve_cp_sizes(impl: object) -> tuple[int, int]:
+    """Resolve (pcp_size, dcp_size) from the attention impl, falling back to
+    the vLLM config and then the process groups. The config is not always
+    populated where the MLA wrapper is built."""
+    pcp = _positive_int(getattr(impl, "pcp_size", None))
+    dcp = _positive_int(getattr(impl, "dcp_size", None))
+
+    if pcp <= 1 or dcp <= 1:
+        parallel_config = getattr(
+            get_current_vllm_config_or_none(), "parallel_config", None
+        )
+        if parallel_config is not None:
+            if pcp <= 1:
+                pcp = _positive_int(
+                    getattr(parallel_config, "prefill_context_parallel_size", None)
+                )
+            if dcp <= 1:
+                dcp = _positive_int(
+                    getattr(parallel_config, "decode_context_parallel_size", None)
+                )
+
+    if pcp <= 1:
+        try:
+            from vllm_torchtpu.distributed.pcp import get_pcp_world_size
+
+            pcp = _positive_int(get_pcp_world_size())
+        except Exception:  # noqa: BLE001 - group may not exist yet
+            pass
+    if dcp <= 1:
+        try:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp = _positive_int(get_dcp_group().world_size)
+        except Exception:  # noqa: BLE001 - group may not exist yet
+            pass
+    return pcp, dcp
+
+
+def _grow_topk_buffer(buf: torch.Tensor, pcp_size: int, dcp_size: int) -> torch.Tensor:
+    """Grow the shared top-k buffer from one PCP chunk of rows to the
+    `pcp_size` chunks the request-major indexer writes."""
+    cached = _TOPK_BUFFER_GROWTH.get(id(buf))
+    if cached is not None:
+        return cached[1]
+    rows = int(buf.shape[0])
+    target = pcp_size * rows
+    if dcp_size > 1:
+        # `gather_to_request_major` pads the token axis to a DCP multiple.
+        target = -(-target // dcp_size) * dcp_size
+    if target <= rows:
+        return buf
+    grown = torch.full(
+        (target, int(buf.shape[1])), -1, dtype=buf.dtype, device=buf.device
+    )
+    _TOPK_BUFFER_GROWTH[id(buf)] = (buf, grown)
+    # Idempotent if the grown tensor is ever handed back in.
+    _TOPK_BUFFER_GROWTH[id(grown)] = (grown, grown)
+    return grown
+
+
+def _repoint_topk_buffer(root: object, buf: torch.Tensor) -> list[str]:
+    """Point every `topk_indices_buffer` holder under `root` at `buf`.
+
+    Both `Indexer` and its `indexer_op` (the `SparseAttnIndexer` that writes
+    the rows) hold a reference, so walk the module tree.
+    """
+    candidates: list[object] = [root]
+    modules = getattr(root, "modules", None)
+    if callable(modules):
+        try:
+            candidates = list(modules())
+        except Exception:  # noqa: BLE001 - not an nn.Module after all
+            candidates = [root]
+    # `indexer_op` is not guaranteed to be a registered child module.
+    extra = getattr(root, "indexer_op", None)
+    if extra is not None and not any(obj is extra for obj in candidates):
+        candidates.append(extra)
+
+    repointed: list[str] = []
+    for obj in candidates:
+        if hasattr(obj, "topk_indices_buffer"):
+            obj.topk_indices_buffer = buf
+            repointed.append(type(obj).__name__)
+    return repointed
 
 
 def _cp_scatter_indexer_k(
@@ -440,6 +540,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
+        if topk_indices.shape[0] > self.topk_indices_buffer.shape[0]:
+            # Truncating would silently drop the other PCP chunks' rows.
+            raise ValueError(
+                "top-k buffer is short: the indexer produced "
+                f"{topk_indices.shape[0]} request-major rows but this "
+                f"SparseAttnIndexer's buffer holds only "
+                f"{self.topk_indices_buffer.shape[0]}. The request-major grow "
+                "in VllmTPUMultiHeadLatentAttentionWrapper.__init__ did not "
+                "reach this holder."
+            )
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
         # Under pcp_size == dcp_size the rows are request-major, so there are
         # more of them than this rank has hidden states; clear whichever span
@@ -786,16 +896,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.is_sparse = mla_modules.is_sparse
         self.skip_topk = skip_topk
         self.topk_indices_buffer = mla_modules.topk_indices_buffer
-        # Under pcp_size == dcp_size the indexer leaves its rows request-major
-        # -- more of them than this rank has hidden states -- so the buffer
-        # cannot be cut to the local chunk here. The attention impl narrows it
-        # to match the tensors it gathered.
-        _parallel_config = getattr(get_current_vllm_config_or_none(),
-                                   "parallel_config", None)
-        self.topk_is_request_major = _parallel_config is not None and (
-            is_pcp_dcp_compatible(
-                _parallel_config.prefill_context_parallel_size,
-                _parallel_config.decode_context_parallel_size))
+        # Set once `self.mla_attn` exists; see below.
+        self.topk_is_request_major = False
 
         if self.indexer is not None and not self.skip_topk:
             assert hasattr(self.indexer, "topk_tokens")
@@ -819,6 +921,46 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
 
         self.prefix = prefix
+
+        # Under PCP the top-k is request-major (`pcp_size` chunks of rows), so
+        # it is not cut to the local chunk and the buffer must be grown.
+        _impl = getattr(self.mla_attn, "impl", None)
+        _pcp, _dcp = _resolve_cp_sizes(_impl)
+        self.topk_is_request_major = is_pcp_dcp_compatible(_pcp, _dcp)
+
+        # `mla_modules`, `Indexer` and `indexer_op` each hold a reference.
+        _buf = self.topk_indices_buffer
+        if _buf is None and self.indexer is not None:
+            _buf = getattr(self.indexer, "topk_indices_buffer", None)
+        if _buf is None and self.indexer is not None:
+            _buf = getattr(
+                getattr(self.indexer, "indexer_op", None), "topk_indices_buffer", None
+            )
+        _holders: list[str] = []
+        if _buf is not None:
+            if self.topk_is_request_major:
+                _buf = _grow_topk_buffer(_buf, _pcp, _dcp)
+            self.topk_indices_buffer = _buf
+            mla_modules.topk_indices_buffer = _buf
+            _holders = ["wrapper", "mla_modules"]
+            if self.indexer is not None:
+                _holders += _repoint_topk_buffer(self.indexer, _buf)
+
+        global _TOPK_LAYOUT_LOGGED
+        if not _TOPK_LAYOUT_LOGGED:
+            _TOPK_LAYOUT_LOGGED = True
+            # WARNING: INFO from this logger is dropped by `logging.lastResort`.
+            logger.warning(
+                "top-k layout [%s]: pcp=%s dcp=%s request_major=%s rows=%s "
+                "impl=%s holders=%s",
+                prefix,
+                _pcp,
+                _dcp,
+                self.topk_is_request_major,
+                None if _buf is None else int(_buf.shape[0]),
+                type(_impl).__name__,
+                _holders,
+            )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
