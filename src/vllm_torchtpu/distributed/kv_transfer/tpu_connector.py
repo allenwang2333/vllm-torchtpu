@@ -20,6 +20,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 import dataclasses
 import importlib
 import json
+import os
 import queue
 import threading
 import time
@@ -1624,6 +1625,7 @@ class TPURaidenConnectorWorker:
         # Block ids of failed loads, drained by get_block_ids_with_load_errors().
         self._failed_block_ids: set[int] = set()
         self.transfer_stats = TpuKVConnectorStats()
+        os.environ.setdefault("LOCAL_RANK", str(self.tp_rank))
         dist_utils.configure_raiden_telemetry()
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
