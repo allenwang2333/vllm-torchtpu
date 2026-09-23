@@ -417,6 +417,7 @@ async def render_completion_prompt(
     )
 
 
+# stream the response from decode worker
 async def stream_from_decode(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
