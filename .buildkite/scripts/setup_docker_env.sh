@@ -19,7 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
-IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"
+# shellcheck source=.buildkite/scripts/ci_image.sh
+source "${SCRIPT_DIR}/ci_image.sh"
 COMMIT_HASH="${BUILDKITE_COMMIT:-latest}"
 # Resolve the target vLLM commit SHA from build metadata
 VLLM_COMMIT_HASH="$(buildkite-agent meta-data get "VLLM_COMMIT_HASH" --default "")"
