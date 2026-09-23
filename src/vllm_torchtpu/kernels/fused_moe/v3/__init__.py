@@ -16,7 +16,6 @@ weight formats, the VMEM accounting, and the layout facts a caller has to
 match."""
 from . import device, ffn, layer, layout, vmem
 from .config import Config
-from .env import config_from_env
 from .formats import (PACKED_ROW_TILE, WEIGHT_BLOCK_DEFAULT,
                       WEIGHT_FORMAT_NAMES, WEIGHT_FORMS, WeightFormat,
                       weight_form, weight_format_of_dtype)
@@ -46,7 +45,6 @@ __all__ = [
     "WEIGHT_FORMAT_NAMES",
     "WeightFormat",
     "chip_generation",
-    "config_from_env",
     "fused_ep_moe",
     "routing_block",
     "supported_on",

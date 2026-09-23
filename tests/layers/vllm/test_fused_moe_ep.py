@@ -347,7 +347,7 @@ def test_supports_internal_mk_tracks_both_owners():
     FP8 method owns the exchange whenever the fused EP kernel is enabled
     (USE_MOE_FUSED_EP_KERNEL): its `apply_monolithic` then runs the fused
     kernel on the shapes at or above TPU_MOE_FUSED_EP_STEP_MIN_TOKENS and the
-    gather/GMM/combine path below it, so ownership does not depend on an armed
+    few-token kernel or the grouped-matmul path below it, so ownership does not depend on an armed
     per-layer op the way the v2 dispatch's did."""
     from vllm_torchtpu.layers.vllm.quantization.fp8 import VllmFp8MoEMethodTPU
 

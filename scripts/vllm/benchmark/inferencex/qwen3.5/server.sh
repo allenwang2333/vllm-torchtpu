@@ -33,6 +33,15 @@ case "$MODEL" in
   gs://*) LOAD_FORMAT="${LOAD_FORMAT:-runai_streamer}" ;;
 esac
 EXTRA_ARGS=()
+# One threshold between the two MoE kernels, in rows per MoE call across the
+# node: at or below it the few-token kernel, above it the fused
+# expert-parallel kernel. Each layout sets its kernel settings from it. The
+# few-token kernel's vector memory holds up to 337 rows of this model.
+MOE_KERNEL_THRESHOLD="${MOE_KERNEL_THRESHOLD:-256}"
+# Expert parallelism over the eight cores on both lines: the fused kernel's
+# gate is the first row count per engine (or rank) above the threshold.
+EP_SIZE=8
+
 case "$SHARDING" in
   DP8_EP)
     # Data-parallel attention across all 8 cores + expert-parallel MoE, with
@@ -53,14 +62,12 @@ case "$SHARDING" in
     export DP_SCHED_ENABLED=1
     # Reserve 1024 tokens of headroom over ISL+OSL.
     MAX_MODEL_LEN_BUFFER="${MAX_MODEL_LEN_BUFFER:-1024}"
-    # The fused expert-parallel MoE kernel for compiled shapes of
-    # TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows per engine and above; smaller
-    # shapes (the decode steps up to 256 users, the smallest prompt
-    # remainders) take the few-token kernel up to TPU_MOE_LOWTOK_MAX_TOKENS
-    # gathered rows. Unsupported shapes retain the grouped-matmul fallback.
+    # The MoE kernels from MOE_KERNEL_THRESHOLD: the few-token kernel up to
+    # it (an engine's rows gathered from all eight), the fused expert-parallel
+    # kernel from the first row count per engine above it.
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
-    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-48}"
-    export TPU_MOE_LOWTOK_MAX_TOKENS="${TPU_MOE_LOWTOK_MAX_TOKENS:-256}"
+    export TPU_MOE_LOWTOK_MAX_TOKENS="$MOE_KERNEL_THRESHOLD"
+    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=$(( MOE_KERNEL_THRESHOLD / EP_SIZE + 1 ))
     # The DP router holds new prompts and releases a group together: an
     # idle-engine trigger, a 5 s deadline, a 2 s quiet period.
     export DP_PLACEMENT="${DP_PLACEMENT:-release}"
@@ -72,13 +79,10 @@ case "$SHARDING" in
     # at 128 users), applied when the checkpoint is loaded. Set it to empty
     # for the checkpoint's own order.
     export TPU_EXPERT_PLACEMENT="${TPU_EXPERT_PLACEMENT-$SCRIPT_DIR/expert_placement_dp8_ep8.json}"
-    # Split the vocabulary projection across engines; sweep.sh can override
-    # this per concurrency.
+    # Split the vocabulary projection across engines (on at every DP8 point).
     export TPU_SHARDED_LM_HEAD="${TPU_SHARDED_LM_HEAD:-1}"
-    # The grouped-matmul path's two expert matmuls as one call, the
-    # counting-sort routing prep, the norm weights computed once, the GDN
-    # output's gated norm and fp8 quantisation as one pass.
-    export USE_FUSED_MOE_GMM="${USE_FUSED_MOE_GMM:-1}"
+    # The counting-sort routing prep, the norm weights computed once, the
+    # GDN output's gated norm and fp8 quantisation as one pass.
     export USE_MOE_COUNTING_SORT="${USE_MOE_COUNTING_SORT:-1}"
     export TPU_NORM_WEIGHT_HOIST="${TPU_NORM_WEIGHT_HOIST:-1}"
     export TPU_GDN_FUSED_NORM_QUANT="${TPU_GDN_FUSED_NORM_QUANT:-1}"
@@ -104,8 +108,8 @@ case "$SHARDING" in
       --data-parallel-size=1
       --enable-expert-parallel
     )
-    # sweep.sh's POINT_FLAGS sets the attention kernel's decode batch and
-    # model-level expert placement. The few-token MoE kernel on decode-sized steps,
+    # sweep.sh sets the attention kernel's decode batch and the expert
+    # placement with copies per point. The few-token MoE kernel on decode-sized steps,
     # the attention kernel's decode VMEM limit, the GDN output's gated norm
     # and fp8 quantisation as one pass, the fused q/k norm, rope and gate,
     # and sequence parallelism for the prompt-sized steps (reduce-scatter
@@ -118,17 +122,17 @@ case "$SHARDING" in
     # Required for choosing exactly one holder of a replicated expert.
     export TPU_MOE_LOWTOK_FROM_SCORES="${TPU_MOE_LOWTOK_FROM_SCORES:-1}"
     export TPU_MOE_LOWTOK_SCORES_STRICT="${TPU_MOE_LOWTOK_SCORES_STRICT:-1}"
-    export TPU_SP_MIN_ROWS="${TPU_SP_MIN_ROWS:-1024}"
+    # Above MOE_KERNEL_THRESHOLD rows a step is sequence parallel and its MoE
+    # runs the fused expert-parallel kernel on each rank's own rows; at or
+    # below it the rows stay replicated for the few-token kernel.
+    export TPU_SP_MIN_ROWS=$(( MOE_KERNEL_THRESHOLD + 1 ))
     # The fp8 all-gather before the attention and GDN in-projections (each
-    # rank quantises its own rows once), the fused EP kernel on the prompt
-    # steps (each rank's own rows under sequence parallelism, from 128 rows
-    # per rank), the counting-sort routing prep on the generic path, and the
-    # few-token kernel up to TPU_MOE_LOWTOK_MAX_TOKENS replicated rows.
+    # rank quantises its own rows once), and the counting-sort routing prep.
     export TPU_SP_FP8_GATHER="${TPU_SP_FP8_GATHER:-1}"
     export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
-    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS="${TPU_MOE_FUSED_EP_STEP_MIN_TOKENS:-128}"
+    export TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=$(( MOE_KERNEL_THRESHOLD / EP_SIZE + 1 ))
     export USE_MOE_COUNTING_SORT="${USE_MOE_COUNTING_SORT:-1}"
-    export TPU_MOE_LOWTOK_MAX_TOKENS="${TPU_MOE_LOWTOK_MAX_TOKENS:-256}"
+    export TPU_MOE_LOWTOK_MAX_TOKENS="$MOE_KERNEL_THRESHOLD"
     # (1 + weight) of every norm kept as a buffer made once after loading
     # instead of recomputed in each forward; the fused q/k path reads the same
     # buffers, so the row buckets above and below its cap lift the same inputs.
@@ -226,7 +230,7 @@ args=(
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
   for key in SHARDING CONC MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS \
-      TPU_MOE_LOWTOK_MAX_TOKENS TPU_MOE_LOWTOK_FROM_SCORES \
+      MOE_KERNEL_THRESHOLD TPU_MOE_LOWTOK_MAX_TOKENS TPU_MOE_LOWTOK_FROM_SCORES \
       TPU_MOE_LOWTOK_SCORES_STRICT TPU_EXPERT_PLACEMENT \
       TPU_NORM_WEIGHT_HOIST TPU_SP_MIN_ROWS TPU_MOE_FUSED_EP_STEP_MIN_TOKENS \
       TPU_RPA_DECODE_BATCH TPU_RPA_DECODE_VMEM_MIB TPU_SP_FP8_GATHER \

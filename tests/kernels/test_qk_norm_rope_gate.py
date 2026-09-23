@@ -10,6 +10,13 @@ from vllm_torchtpu.kernels.qk_norm_rope_gate import (qk_norm_rope_gate,
                                                      reference)
 
 
+@pytest.fixture(autouse=True)
+def _needs_a_tpu():
+    import jax
+    if jax.default_backend() != "tpu":
+        pytest.skip("needs a TPU")
+
+
 def _operands(seed, tokens, heads, kv_heads, dim, rot):
     rng = np.random.default_rng(seed)
     q_gate = jnp.asarray(

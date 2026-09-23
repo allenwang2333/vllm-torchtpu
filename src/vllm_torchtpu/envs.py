@@ -72,7 +72,6 @@ if TYPE_CHECKING:
     TPU_MOE_LOWTOK_SCORES_STRICT: int = 0
     TPU_SP_MIN_ROWS: int = 0
     TPU_SP_FP8_GATHER: int = 0
-    TPU_EXPERT_PLACEMENT_COPIES_OFF: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -118,7 +117,6 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
-    USE_FUSED_MOE_GMM: bool = False
 
 
 def env_with_choices(
@@ -483,12 +481,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # loading instead of recomputing it in every forward.
     "TPU_NORM_WEIGHT_HOIST":
     env_bool("TPU_NORM_WEIGHT_HOIST"),
-    # Under a copies placement, load the copy slots but never route to them:
-    # the few-token kernel sees no copied expert (the primaries' routing of
-    # the placement's base), the tensors and tables stay as the copies build
-    # them. A measurement switch: what the copies cost with no expert moved.
-    "TPU_EXPERT_PLACEMENT_COPIES_OFF":
-    env_bool("TPU_EXPERT_PLACEMENT_COPIES_OFF"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED":
     lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
@@ -581,8 +573,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LATENT_PROJ_INTRA_CHIP_TP":
     env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
     # Compiled token shapes of at least this many rows per rank run the fused
-    # expert-parallel kernel; smaller shapes take the gather, grouped-matmul
-    # and combine path. 0 sends every shape to the kernel.
+    # expert-parallel kernel; smaller shapes take the few-token kernel or the
+    # grouped-matmul path. 0 sends every shape to the kernel.
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS":
     lambda: int(os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")),
 
@@ -751,11 +743,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD":
     env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
-    # Run the two grouped matmuls of the MoE expert path as one kernel with
-    # the intermediate kept in VMEM, for the shapes whose expert weights fit;
-    # other shapes keep the two calls.
-    "USE_FUSED_MOE_GMM":
-    env_bool("USE_FUSED_MOE_GMM"),
 }
 
 

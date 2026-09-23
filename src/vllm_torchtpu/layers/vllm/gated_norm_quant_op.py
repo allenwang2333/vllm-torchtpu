@@ -98,7 +98,7 @@ def install(model) -> bool:
 
     matmul.register_fake(_fake_matmul)
     _NORM_OP, _MATMUL_OP = norm, matmul
-    logger.warning(
+    logger.info(
         "TPU_GDN_FUSED_NORM_QUANT: the GDN output's gated norm and fp8 quantisation run as one pass (eps %g)",
         eps)
     return True

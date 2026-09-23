@@ -25,49 +25,35 @@ READY_TIMEOUT="${READY_TIMEOUT:-5400}"   # 90 min (covers a cold compile)
 # Both are overridable via env so per-point jobs can each own a slice.
 read -r -a WORKLOADS <<< "${WORKLOADS:-8192:1024}"
 read -r -a CONCS <<< "${CONCS:-4 8 16 32 64 128 256 512 1024}"
-# Per-point sharding, followed by DP8 slots, global token budget,
-# release group and sharded-head setting.
+# Per-point sharding, followed by DP8 slots, global token budget and
+# release group.
 declare -A POINT_TABLE=(
   [8192,1024,4]="TP8_EP"
   [8192,1024,8]="TP8_EP"
   [8192,1024,16]="TP8_EP"
   [8192,1024,32]="TP8_EP"
-  [8192,1024,64]="DP8_EP 16 8192 8 1"
-  [8192,1024,128]="DP8_EP 20 8192 16 1"
-  [8192,1024,256]="DP8_EP 40 3072 8 1"
-  [8192,1024,512]="DP8_EP 80 6144 16 1"
-  [8192,1024,1024]="DP8_EP 144 16384 16 1"
+  [8192,1024,64]="DP8_EP 16 8192 8"
+  [8192,1024,128]="DP8_EP 20 8192 16"
+  [8192,1024,256]="DP8_EP 40 3072 8"
+  [8192,1024,512]="DP8_EP 80 6144 16"
+  [8192,1024,1024]="DP8_EP 144 16384 16"
 )
 
-# TP8 uses expert copies at concurrency 8, 16 and 32; concurrency 4
-# retains the primary-only placement. Small-batch row limits match the runs.
+# The attention kernel's decode batch per point (the TP8 points' placement
+# with 128 expert copies is set in start_server).
 declare -A POINT_FLAGS=(
   [8192,1024,4]="TPU_RPA_DECODE_BATCH=4"
-  [8192,1024,8]="TPU_MOE_LOWTOK_MAX_TOKENS=32 TPU_RPA_DECODE_BATCH=8"
-  [8192,1024,16]="TPU_MOE_LOWTOK_MAX_TOKENS=32 TPU_RPA_DECODE_BATCH=8"
-  [8192,1024,32]="TPU_MOE_LOWTOK_MAX_TOKENS=32 TPU_RPA_DECODE_BATCH=8"
-  # The data-parallel line takes the few-token kernel to 128 rows: it wins at
-  # every row count to 128 and refuses at 256.
-  [8192,1024,64]="TPU_MOE_LOWTOK_MAX_TOKENS=128"
+  [8192,1024,8]="TPU_RPA_DECODE_BATCH=8"
+  [8192,1024,16]="TPU_RPA_DECODE_BATCH=8"
+  [8192,1024,32]="TPU_RPA_DECODE_BATCH=8"
 )
 
 sweep_status=0
 
 VLLM_PROCS='vllm serve|VLLM::'
 
-# A point's environment is built from scratch: only the paths and credentials a
-# server needs are carried over, so a variable left in the operator's shell
-# cannot change a point that does not name it. Add to PASS_THROUGH rather than
-# exporting into the sweep.
-PASS_THROUGH="${PASS_THROUGH:-HOME PATH USER LANG LC_ALL TZ TMPDIR PYTHONPATH VIRTUAL_ENV
-  HF_HOME HF_TOKEN HUGGING_FACE_HUB_TOKEN TRANSFORMERS_CACHE VLLM_CACHE_ROOT XDG_CACHE_HOME
-  HF_HUB_OFFLINE HF_DATASETS_OFFLINE TRANSFORMERS_OFFLINE VENV
-  TPU_LIBRARY_PATH JAX_PLATFORMS GOOGLE_APPLICATION_CREDENTIALS CLOUDSDK_CONFIG
-  INFERENCEX_REPO RESULT_DIR PORT DRY_RUN READY_TIMEOUT TPU_RELEASE_WAIT}"
-BASE_ENV=()
-for name in $PASS_THROUGH; do
-  [ -n "${!name+x}" ] && BASE_ENV+=("$name=${!name}")
-done
+# A point's settings are passed to server.sh explicitly (below); everything
+# else comes from the caller's environment, as upstream's sweep does.
 
 stop_server() {
   pkill -TERM -f "$VLLM_PROCS" 2>/dev/null || true
@@ -109,14 +95,14 @@ stop_server() {
 start_server() {
   # $1 = the point's settings: the sharding, then (DP8_EP points) requests
   # per engine, tokens per step across the engines, release group, head.
-  local sharding seqs budget group head
-  read -r sharding seqs budget group head <<< "$1"
+  local sharding seqs budget group
+  read -r sharding seqs budget group <<< "$1"
   # The point carries its own workload and concurrency rather than relying on
   # the sweep's exports reaching the server through the environment.
   local point_env=(SHARDING="$sharding" ISL="$ISL" OSL="$OSL" CONC="$CONC")
   if [ -n "${seqs:-}" ]; then
     point_env+=(MAX_NUM_SEQS="$seqs" GLOBAL_MAX_NUM_BATCHED_TOKENS="$budget"
-                DP_SCHED_BUFFER_THRESHOLD="$group" TPU_SHARDED_LM_HEAD="$head")
+                DP_SCHED_BUFFER_THRESHOLD="$group")
   fi
   local point_flags="${POINT_FLAGS[$ISL,$OSL,$CONC]:-}"
   local flags=()
@@ -124,17 +110,16 @@ start_server() {
   point_env+=("${flags[@]}")
   if [ "$ISL,$OSL" = "8192,1024" ] && [ "$sharding" = "TP8_EP" ]; then
     case "$CONC" in
-      4) point_env+=("TPU_EXPERT_PLACEMENT=${SCRIPT_DIR}/expert_placement_dp8_ep8.json") ;;
-      8|16|32) point_env+=("TPU_EXPERT_PLACEMENT=${SCRIPT_DIR}/expert_placement_dp8_ep8_copies128.json") ;;
+      4|8|16|32) point_env+=("TPU_EXPERT_PLACEMENT=${SCRIPT_DIR}/expert_placement_dp8_ep8_copies128.json") ;;
     esac
   fi
   if [ "${DRY_RUN:-0}" = "1" ]; then
-    env -i "${BASE_ENV[@]}" "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh"
+    env "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh"
     return
   fi
   SERVER_LOG="$(mktemp "/tmp/qwen3.5_sweep_server_isl${ISL}_osl${OSL}_conc${CONC}_XXXXXX.log")" || return 1
   echo "--- starting server ${point_env[*]} ISL=$ISL OSL=$OSL CONC=$CONC (log: $SERVER_LOG) ---"
-  env -i "${BASE_ENV[@]}" "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh" > >(tee -a "$SERVER_LOG") 2>&1 &
+  env "${point_env[@]}" bash "${SCRIPT_DIR}/server.sh" > >(tee -a "$SERVER_LOG") 2>&1 &
   SERVER_PID=$!
   local waited=0
   until grep -q "Application startup complete" "$SERVER_LOG" 2>/dev/null; do
@@ -173,7 +158,9 @@ for wl in "${WORKLOADS[@]}"; do
     echo "########## ISL=$ISL OSL=$OSL CONC=$CONC POINT=$point ##########"
     BENCH_LOG="$(mktemp "/tmp/qwen3.5_sweep_bench_isl${ISL}_osl${OSL}_conc${CONC}_XXXXXX.log")" || exit 1
     echo "--- benchmark (log: $BENCH_LOG) ---"
-    if ! bash "${SCRIPT_DIR}/bench.sh" 2>&1 | tee -a "$BENCH_LOG"; then
+    # CLIENT runs against each point's server: bench.sh (the InferenceX
+    # client), or eval.sh for the same points scored on GSM8K.
+    if ! bash "${CLIENT:-${SCRIPT_DIR}/bench.sh}" 2>&1 | tee -a "$BENCH_LOG"; then
       echo "ERROR: benchmark failed for concurrency $CONC (see $BENCH_LOG)" >&2
       sweep_status=1
     fi

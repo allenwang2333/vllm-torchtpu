@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from vllm_torchtpu.kernels.moe_lowtok.kernel import (
-    HOT_SLOTS, LANES, contiguous_tables, hot_onehot, hot_tables, moe_lowtok,
-    moe_lowtok_reference, moe_lowtok_scores, router_select_reference,
-    slot_table)
+from .kernel import (HOT_SLOTS, LANES, contiguous_tables, hot_onehot,
+                     hot_tables, moe_lowtok, moe_lowtok_reference,
+                     moe_lowtok_scores, router_select_reference, slot_table)
 
 __all__ = [
     "HOT_SLOTS", "LANES", "contiguous_tables", "hot_onehot", "hot_tables",

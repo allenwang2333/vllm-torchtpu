@@ -69,7 +69,7 @@ def install_if_enabled(model: torch.nn.Module) -> int:
     if not envs.TPU_NORM_WEIGHT_HOIST:
         return 0
     n = install(model)
-    logger.warning(
+    logger.info(
         "TPU_NORM_WEIGHT_HOIST: %d norms carry (1 + w) in f32 as a buffer; the per-step convert and add are gone",
         n)
     return n

@@ -215,13 +215,12 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     instead. So `moe_runner.py` all-reduces the already-combined output
     whenever `tp_size > 1 or ep_size > 1`.
 
-    Today it changes no answer, and the reason is worth stating exactly rather
-    than calling it luck: `prebuild_fused_moe_ep` refuses tp_size > 1, so the
-    kernel only ever arms with a tensor-parallel group of world size one, where
-    all three all-reduces this flag gates are `return input_`. The patch is the
-    guard that keeps that true if the TP refusal is ever lifted, at which point
-    the unpatched path would silently multiply every routed MoE output by
-    tp_size, with no test to catch it and no log to mention it.
+    Under data parallelism the tensor-parallel group has world size one and
+    all three all-reduces this flag gates are `return input_`, so the patch
+    changes no answer there. Under tensor parallelism the kernel arms for the
+    sequence-parallel steps and returns each rank's own rows; the patch keeps
+    the unpatched path, which would multiply every routed MoE output by
+    tp_size, from ever running.
 
     Reporting True here is the correct signal rather than deleting the
     all-reduce, because the SHARED expert genuinely is TP-partial
@@ -712,8 +711,8 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
             return original_attention_forward(self, positions, hidden_states)
         proj = self.qkv_proj
         bias = None if proj.skip_bias_add else proj.bias
-        qkv = proj.quant_method.apply_prequant(proj, prequant[0],
-                                               prequant[1], bias)
+        qkv = proj.quant_method.apply_prequant(proj, prequant[0], prequant[1],
+                                               bias)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:

@@ -11,6 +11,13 @@ from vllm_torchtpu.kernels.moe_lowtok import moe_lowtok, moe_lowtok_reference
 FP8 = jnp.float8_e4m3fn
 
 
+@pytest.fixture(autouse=True)
+def _needs_a_tpu():
+    import jax
+    if jax.default_backend() != "tpu":
+        pytest.skip("needs a TPU")
+
+
 def _operands(seed, tokens, experts, hidden, inter, topk, local_fraction=0.5):
     rng = np.random.default_rng(seed)
     x = jnp.asarray(

@@ -14,8 +14,7 @@
 """The layer's build-time settings, as one record with its constraints.
 
 Nothing inside the package reads the environment. A caller constructs a
-Config directly, or through env.config_from_env at its own process
-boundary (the serving adapter).
+Config directly (the serving adapter builds one from its own settings).
 """
 import dataclasses
 

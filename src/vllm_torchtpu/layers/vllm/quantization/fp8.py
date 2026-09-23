@@ -684,6 +684,18 @@ def _lowtok_scores_static_refusal(layer, activation_str):
         return f"scoring {getattr(layer, 'scoring_func', None)}"
     if getattr(layer, "custom_routing_function", None) is not None:
         return "custom routing"
+    # The kernel's router is the plain softmax top-k with renormalised weights
+    # on the output; the routing options moe_routing.route applies (an
+    # expert-selection bias, a routed scaling of the weights, grouped top-k,
+    # the weights on the input) keep the layer on that path.
+    if getattr(layer, "e_score_correction_bias", None) is not None:
+        return "expert-selection bias"
+    if getattr(layer, "routed_scaling_factor", 1.0) != 1.0:
+        return f"routed scaling {getattr(layer, 'routed_scaling_factor', 1.0)}"
+    if getattr(layer, "use_grouped_topk", False):
+        return "grouped top-k"
+    if getattr(layer, "apply_router_weight_on_input", False):
+        return "router weight on input"
     if getattr(layer, "w13_bias", None) is not None or getattr(
             layer, "w2_bias", None) is not None:
         return "expert bias"
@@ -706,6 +718,47 @@ def _lowtok_scores_static_refusal(layer, activation_str):
     return None
 
 
+def _lowtok_ids_static_refusal(layer, activation_str):
+    """The term on which the few-token kernel's ids hook (the grouped path's
+    entry inside fused_moe_func) refuses this layer, or None when its static
+    terms hold; the per-call terms are the row count and the activation
+    dtype. The terms mirror the hook's own condition in fused_moe_gmm on the
+    layer as it will be served, so the boot log shows the decision."""
+    w13_scale = getattr(layer, "w13_weight_scale_inv", None)
+    w2_scale = getattr(layer, "w2_weight_scale_inv", None)
+    if not envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+        return "TPU_MOE_LOWTOK_MAX_TOKENS unset"
+    if not layer.moe_config.moe_parallel_config.use_ep:
+        return "no expert parallelism"
+    if getattr(layer, "_experts_start", None) is None:
+        return "no experts_start buffer"
+    if activation_str != "silu":
+        return f"activation {activation_str}"
+    if getattr(layer, "w13_bias", None) is not None or getattr(
+            layer, "w2_bias", None) is not None:
+        return "expert bias"
+    if layer.w13_weight.dtype != torch.float8_e4m3fn or layer.w2_weight.dtype != torch.float8_e4m3fn:
+        return f"weights {layer.w13_weight.dtype}"
+    if w13_scale is None or w2_scale is None:
+        return "no scales under weight_scale_inv"
+    if w13_scale.dim(
+    ) != 4 or w13_scale.shape[1] != 1 or w13_scale.shape[2] != 1:
+        return f"w13 scale shape {tuple(w13_scale.shape)}"
+    if w2_scale.dim() != 4 or w2_scale.shape[1] != 1 or w2_scale.shape[2] != 1:
+        return f"w2 scale shape {tuple(w2_scale.shape)}"
+    in_dtype = getattr(layer.moe_config, "in_dtype", torch.bfloat16)
+    if in_dtype != torch.bfloat16:
+        return f"activations {in_dtype}"
+    hidden = getattr(layer, "hidden_size", layer.w13_weight.shape[1])
+    if layer.w13_weight.shape[1] != hidden:
+        return f"gate|up rows {layer.w13_weight.shape[1]} against hidden size {hidden}"
+    if layer.w13_weight.shape[0] > 128:
+        return f"{layer.w13_weight.shape[0]} local experts"
+    if layer.w13_weight.shape[2] % 512:
+        return f"gate|up width {layer.w13_weight.shape[2]}"
+    return None
+
+
 def _lowtok_lift_tables(layer, topk_ids):
     """Reference the scores entry's holder tables on the grouped-matmul side of the row-count fork, so both traces
     of a token bucket lift the same buffers: the compile flow hands a bucket's executable between traces, and
@@ -725,7 +778,8 @@ def _lowtok_scores_output(layer, x, router_logits, activation_str):
     """The few-token kernel's scores entry for this call, or None when the
     call is outside its terms: a few tokens under expert parallelism, silu,
     per-channel fp8 scales, no bias, the softmax router with renormalised
-    weights and no custom routing, 512 experts. The router's top-k and the
+    weights on the output and no custom routing, expert-selection bias,
+    routed scaling or grouped top-k, 512 experts. The router's top-k and the
     holder assignment run inside the kernel (kernels/moe_lowtok), so the
     router_topk call, the renormalisation and the table build leave the step;
     the layer's all-reduce follows as for every other path. No logging here:
@@ -915,14 +969,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 gid, prim, copy = expert_placement.holder_tables(n, rank)
                 owned = int(expert_placement.owned())
                 order = expert_placement.hot_order(n)
-                if envs.TPU_EXPERT_PLACEMENT_COPIES_OFF:
-                    # the copy slots stay loaded and unused: every expert has
-                    # its primary only, no copied expert to choose between
-                    copy = [-1] * len(copy)
-                    order = []
-                    logger.warning(
-                        "TPU_EXPERT_PLACEMENT_COPIES_OFF: the copies placement's copy slots are loaded but never routed to (layer %s)",
-                        n)
             else:
                 per_core = n_global // ranks
                 owned = per_core
@@ -1035,6 +1081,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+            # The evidence line for the grouped path's few-token entry: the
+            # hook decides inside the jitted function, so its verdict on the
+            # served layer is stated here, once.
+            ids_refusal = _lowtok_ids_static_refusal(layer, activation_str)
+            logger.info_once(
+                "few-token MoE ids hook %s (cap %d rows per call, %d local "
+                "experts)",
+                "armed" if ids_refusal is None else f"refused: {ids_refusal}",
+                envs.TPU_MOE_LOWTOK_MAX_TOKENS, layer.w13_weight.shape[0])
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph.
@@ -1111,7 +1167,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 x,
                 router_logits,
                 activation_str,
-                use_fused_kernel=x.shape[0] >= fused_ep_step_min_tokens,
+                use_fused_kernel=_fused_kernel_takes(x.shape[0],
+                                                     fused_ep_step_min_tokens),
             )
         # A few tokens under expert parallelism, with the router inside the
         # few-token kernel: the softmax scores go straight to the kernel, which
@@ -1247,11 +1304,30 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # directly).
         ep = get_ep_group()
         sequence_parallel = layer.moe_config.is_sequence_parallel
-        gathered_x, gathered_logits = ep.dispatch_router_logits(
-            x, router_logits, sequence_parallel)
+        dispatched = ep.dispatch_router_logits(x, router_logits,
+                                               sequence_parallel)
+        assert len(dispatched) == 2
+        gathered_x, gathered_logits = dispatched
         out = self.apply_monolithic_external_dispatch(layer, gathered_x,
                                                       gathered_logits)
         return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel))
+
+
+def _fused_kernel_takes(rows: int, gate: int) -> bool:
+    """Whether the fused EP kernel takes a step of `rows` rows as this rank
+    sees them. The kernel needs each rank's own rows: under tensor
+    parallelism the rows reach the layer replicated on every rank unless the
+    step is sequence parallel, so `rows` is a per-rank count only once
+    sequence parallelism has split them. A replicated step stays with the
+    few-token kernel or the grouped path whatever its count; under data
+    parallelism every step's rows are the rank's own."""
+    if rows < gate:
+        return False
+    from vllm_torchtpu.layers.vllm.fused_moe_ep_v3 import tensor_parallel_size
+    if tensor_parallel_size() <= 1:
+        return True
+    from vllm_torchtpu.layers.vllm import sequence_parallel as _sp
+    return _sp.is_active()
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

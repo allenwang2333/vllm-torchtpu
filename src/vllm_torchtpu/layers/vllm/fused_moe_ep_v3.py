@@ -29,8 +29,8 @@ grouped matmuls, the combine, and both collectives.
 ``MOE_FUSED_EP_KERNEL_MIN_TOKENS`` decides once, at weight load, against the
 scheduler's largest batch, whether to build this operation for the deployment.
 When it is built, ``TPU_MOE_FUSED_EP_STEP_MIN_TOKENS`` can keep smaller compiled
-token shapes on the gather/grouped-matmul/combine path while larger shapes use
-this fully fused path. Its default of zero preserves fused EP for every shape.
+token shapes on the few-token kernel or the grouped-matmul path while larger
+shapes use this fully fused path. Its default of zero preserves fused EP for every shape.
 
 The kernel binding. `kernels/fused_moe/v3` is the kernel's own package, whose
 entry point is `fused_ep_moe`. `_build_op` below gives the op a `run_moe`
@@ -228,7 +228,8 @@ def fused_moe_ep_supported(owner: Any = None) -> bool:
     """Whether `prebuild_fused_moe_ep` armed the fused path.
 
     Shape selection belongs to the FP8 method, which owns the EP exchange and
-    selects fused EP or gather/GMM/combine for each compiled static shape.
+    selects the fused kernel, the few-token kernel or the grouped-matmul path
+    for each compiled static shape.
     With no `owner` this reports whether the operation exists at all. `owner`
     is a MoE layer or its quant method: `prebuild_fused_moe_ep` marks both
     eligible when the layer's shape and routing match the operation, which is
@@ -384,6 +385,39 @@ def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
     return torch.tensor(order, dtype=torch.int32, device=device)
 
 
+def check_kernel_threshold(ep: int, tp: int) -> None:
+    """The fused EP kernel and the few-token kernel meet at one row count, so
+    no step falls to the grouped-matmul path between them. Row counts are per
+    MoE call across the node: the few-token cap is in those units already (a
+    step's rows replicated under tensor parallelism, an engine's rows gathered
+    from every engine under data parallelism). With the few-token kernel off,
+    the grouped-matmul path is the kernel below the fused one by choice."""
+    cap = int(envs.TPU_MOE_LOWTOK_MAX_TOKENS or 0)
+    if cap <= 0:
+        return
+    gate = int(envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS or 0)
+    if tp > 1:
+        from vllm_torchtpu.layers.vllm import sequence_parallel as _sp
+        start = _sp.min_rows()
+        # below the sequence-parallel start every rank holds the step's rows;
+        # from it each rank holds at least ceil(start / tp) of them
+        meets = cap >= start - 1 and gate <= -(-start // tp)
+        rule = (f"the few-token kernel up to {cap} rows, sequence parallelism "
+                f"and the fused EP kernel from {start} rows ({gate} per rank)")
+    else:
+        # an engine's rows below the gate are gathered from all ep engines
+        meets = cap >= ep * max(gate - 1, 0)
+        rule = (f"the few-token kernel up to {cap} rows across the node, the "
+                f"fused EP kernel from {gate} rows per engine "
+                f"({ep * gate} across the node)")
+    if not meets:
+        raise ValueError(
+            "The MoE kernel settings leave steps between the two kernels ("
+            f"{rule}). Set them from one threshold, as the Qwen3.5 recipe's "
+            "MOE_KERNEL_THRESHOLD does.")
+    logger.info_once("MoE kernels: %s.", rule)
+
+
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                           activation: str) -> None:
     """Resolve the mesh and register the fused-EP op, once per process.
@@ -398,12 +432,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return
     if envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS < 0:
         raise ValueError("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS must be >= 0")
-    # Tensor parallelism is refused: with the kernel armed under TP every
-    # worker hangs in the warmup's dummy run, and an independently written
-    # fused MoE kernel hangs at the same point, so the cause sits outside this
-    # kernel. Under replicated TP the op would also do ep_size times the
-    # expert work for one batch of output; lifting the refusal needs the
-    # bridge to hand each rank a distinct slice of the batch.
+    # Under tensor parallelism the kernel arms for the sequence-parallel steps,
+    # where each rank holds its own slice of the batch; a replicated step
+    # stays off the kernel (`_fused_kernel_takes` in the FP8 method), since
+    # the op would do ep_size times the expert work for one batch of output.
     # Prefill context parallelism has to be refused for a different reason,
     # and it is the more dangerous of the two because it is silent.
     # `do_naive_dispatch_combine` is not what runs the PCP exchange:
@@ -411,9 +443,9 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
     # PCP all-gather and reduce-scatter whenever `pcp_size > 1 and not
     # use_all2all_kernels`, and this tree's own
     # `_patch_moe_explicit_pcp_collectives` guarantees that condition for
-    # `use_ep and pcp_size > 1 and dp_size == 1`. At pcp>1/dp1/tp1 the TP
-    # refusal below does not fire -- `_tensor_parallel_size()` is 1 -- so the
-    # kernel would arm, return each rank's tokens already combined over every
+    # `use_ep and pcp_size > 1 and dp_size == 1`. At pcp>1/dp1/tp1 nothing
+    # below refuses the kernel, so it would arm, return each rank's tokens
+    # already combined over every
     # expert, and then have that reduce-scattered against seven identical
     # copies: every routed MoE output multiplied by pcp_size, with nothing
     # raised and nothing logged.
@@ -427,6 +459,11 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return
 
     tp = _tensor_parallel_size()
+    # Read here, under the loader's config context, and kept for the traced
+    # forward: the warm-up traces run outside any config context, where the
+    # lookup below silently reads 1.
+    global _TP_SIZE
+    _TP_SIZE = tp
     from vllm_torchtpu.layers.vllm import sequence_parallel as _sp
     if tp > 1 and not _sp.enabled():
         logger.warning_once(
@@ -450,6 +487,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
         return
     ep = mesh.shape[EP_AXIS_NAME]
     _EP_SIZE = ep
+    check_kernel_threshold(ep, tp)
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale = layer.w13_weight_scale_inv
@@ -552,6 +590,15 @@ def _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts, hidden,
     if _squeeze_channel_scale(w2_scale, local_experts, hidden) is None:
         return "w2_scale is not the per-output-channel form the kernel takes"
     return None
+
+
+_TP_SIZE: int | None = None
+
+
+def tensor_parallel_size() -> int:
+    """This deployment's tensor-parallel width as recorded at weight loading
+    (`prebuild_fused_moe_ep`), or the config's answer before that."""
+    return _TP_SIZE if _TP_SIZE is not None else _tensor_parallel_size()
 
 
 def _tensor_parallel_size() -> int:

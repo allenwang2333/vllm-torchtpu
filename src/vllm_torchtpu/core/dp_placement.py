@@ -53,7 +53,9 @@ def install_release(client_cls,
     assignments in this release, then the fewest in flight, ties cyclic, so a
     release of one per engine lands one per engine and an idle engine is fed
     first; a request pinned to a data-parallel rank keeps its engine. The
-    engines then admit at once.
+    engines then admit at once. The sends run in the client's own release
+    task; a request's `add_request_async` returns once its request has been
+    sent and raises its own send's error.
     """
     import asyncio
     import time as _time
@@ -86,6 +88,22 @@ def install_release(client_cls,
         counts = getattr(self, "lb_engines", None) or []
         return any(int(c[0]) == 0 and int(c[1]) == 0 for c in counts)
 
+    def _settle(fut, exc=None):
+        # A held request's outcome goes to its own add_request_async, which
+        # awaits this future; a waiter that has left (cancelled) is skipped.
+        if fut.done():
+            return
+        if exc is None:
+            fut.set_result(None)
+        else:
+            fut.set_exception(exc)
+
+    def _fail_held(self, exc):
+        buf = _buf(self)
+        for _t, _r, fut in buf:
+            _settle(fut, exc)
+        buf.clear()
+
     async def _send_one(self, request, idx):
         chosen = self.core_engines[idx]
         request.current_wave = self.current_wave
@@ -113,80 +131,116 @@ def install_release(client_cls,
         self._ensure_output_queue_task()
 
     async def _release_all(self):
-        lock = self.__dict__.setdefault("_release_lock", asyncio.Lock())
-        async with lock:
-            buf = _buf(self)
-            num = len(self.core_engines)
-            assigned = Counter()
-            start = getattr(self, "_rr_next", 0) % num
-            while buf:
-                # The request leaves the buffer before its send: a cancel that
-                # lands during the send finds it gone here and, through the
-                # send's registration, reaches the engine instead.
-                _t0, request = buf.pop(0)
-                pinned = getattr(request, "data_parallel_rank", None)
-                if pinned is not None:
-                    idx = int(pinned)
-                else:
-                    order = [(i + start) % num for i in range(num)]
-                    idx = min(order,
-                              key=lambda i: (assigned[i], self.engine_inflight[
-                                  self.core_engines[i]]))
-                    assigned[idx] += 1
-                    start = (idx + 1) % num
-                try:
-                    await _send_one(self, request, idx)
-                except BaseException:
-                    # A request whose send failed is reported; the rest stay
-                    # held for the next release.
-                    logger.exception(
-                        "DP placement: request %s could not be "
-                        "sent to engine %s", request.request_id,
-                        self.core_engines[idx])
-                    raise
-            self._rr_next = start
+        """Sends every held request. Runs in the client's own release task,
+        never in a request's, so a cancelled add_request_async (a client that
+        left) cancels no other request's send, and each send's outcome
+        reaches the request it belongs to."""
+        buf = _buf(self)
+        num = len(self.core_engines)
+        assigned = Counter()
+        start = getattr(self, "_rr_next", 0) % num
+        while buf:
+            # The request leaves the buffer before its send: a cancel that
+            # lands during the send finds it gone here and, through the
+            # send's registration, reaches the engine instead.
+            _t0, request, fut = buf.pop(0)
+            if fut.done():
+                continue  # its add was cancelled before the release reached it
+            pinned = getattr(request, "data_parallel_rank", None)
+            if pinned is not None:
+                idx = int(pinned)
+            else:
+                order = [(i + start) % num for i in range(num)]
+                idx = min(
+                    order,
+                    key=lambda i:
+                    (assigned[i], self.engine_inflight[self.core_engines[i]]))
+                assigned[idx] += 1
+                start = (idx + 1) % num
+            try:
+                await _send_one(self, request, idx)
+            except asyncio.CancelledError:
+                fut.cancel()  # the release task itself is being cancelled
+                raise
+            except Exception as exc:
+                # This request's add raises; the rest go out.
+                logger.exception(
+                    "DP placement: request %s could not be "
+                    "sent to engine %s", request.request_id,
+                    self.core_engines[idx])
+                _settle(fut, exc)
+                continue
+            _settle(fut)
+        self._rr_next = start
 
-    async def _maybe_release(self):
+    def _job_done(job):
+        if not job.cancelled() and job.exception() is not None:
+            logger.error("DP placement: release task failed",
+                         exc_info=job.exception())
+
+    def _start_release(self):
+        job = self.__dict__.get("_release_job")
+        if job is None or job.done():
+            self._release_job = asyncio.get_running_loop().create_task(
+                _release_all(self))
+            self._release_job.add_done_callback(_job_done)
+
+    def _maybe_release(self):
         buf = _buf(self)
         if not buf:
             return
         if getattr(getattr(self, "resources", None), "engine_dead", False):
-            buf.clear()
-            raise EngineDeadError()
+            _fail_held(self, EngineDeadError())
+            return
         now = _time.time()
         if (len(buf) >= _thresh(self) or now - buf[0][0] >= deadline_s
                 or (idle_trigger and _any_idle(self))
                 or (quiet_s > 0 and now - buf[-1][0] >= quiet_s)):
-            await _release_all(self)
+            _start_release(self)
 
     async def _poll(self):
         while True:
             await asyncio.sleep(poll_s)
             try:
-                await _maybe_release(self)
+                _maybe_release(self)
             except Exception:  # the poller stays alive; the failure is logged above
                 logger.exception("DP placement: release poller")
 
     async def add_request_async(self, request):
         self._ensure_stats_update_task()
+        loop = asyncio.get_running_loop()
         if self.__dict__.get("_release_task") is None:
-            self._release_task = asyncio.get_running_loop().create_task(
-                _poll(self))
-        _buf(self).append((_time.time(), request))
-        await _maybe_release(self)
+            self._release_task = loop.create_task(_poll(self))
+        fut = loop.create_future()
+        _buf(self).append((_time.time(), request, fut))
+        _maybe_release(self)
+        # Returns once this request has been sent, or raises its own send's
+        # error; the sends run in the release task.
+        await fut
 
     async def abort_requests_async(self, request_ids):
         ids = set(request_ids)
         buf = _buf(self)
         if buf:
             # Filtered in place: a release in progress holds this same list.
-            buf[:] = [(t, r) for t, r in buf if r.request_id not in ids]
+            kept = []
+            for entry in buf:
+                if entry[1].request_id in ids:
+                    entry[2].cancel()  # its add, if still waiting, returns
+                else:
+                    kept.append(entry)
+            buf[:] = kept
         await orig_abort(self, request_ids)
 
     def shutdown(self, *args, **kwargs):
-        task = self.__dict__.get("_release_task")
-        if task is not None:
-            task.cancel()
+        for name in ("_release_task", "_release_job"):
+            task = self.__dict__.get(name)
+            if task is not None:
+                task.cancel()
+        try:
+            _fail_held(self, EngineDeadError())
+        except Exception:  # the loop is gone: nobody is waiting
+            pass
         if orig_shutdown is not None:
             return orig_shutdown(self, *args, **kwargs)
 

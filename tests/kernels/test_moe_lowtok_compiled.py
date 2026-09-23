@@ -5,6 +5,13 @@ import pytest
 import torch
 
 
+@pytest.fixture(autouse=True)
+def _needs_a_tpu():
+    import jax
+    if jax.default_backend() != "tpu":
+        pytest.skip("needs a TPU")
+
+
 def _fp8_weight(rng, shape):
     """Build one expert at a time to bound host temporaries at served shapes."""
     weight = torch.empty(shape, dtype=torch.float8_e4m3fn)
@@ -16,17 +23,19 @@ def _fp8_weight(rng, shape):
     return weight
 
 
-@pytest.mark.parametrize("rank_source,replicas,tokens", [
-    # The rank reaches the kernel as a scalar-prefetch operand and must be a
-    # stored tensor: the compile flow cannot specialise one the traced forward
-    # computes, and the attempt aborts the process rather than raising. The
-    # served layer passes the expert-start buffer registered at load, which is
-    # the "experts_start" case below; "buffer" covers the same shape of input.
-    ("buffer", False, 4),
-    ("experts_start", False, 4),
-    ("experts_start", True, 4),
-    ("experts_start", True, 32),
-])
+@pytest.mark.parametrize(
+    "rank_source,replicas,tokens",
+    [
+        # The rank reaches the kernel as a scalar-prefetch operand and must be a
+        # stored tensor: the compile flow cannot specialise one the traced forward
+        # computes, and the attempt aborts the process rather than raising. The
+        # served layer passes the expert-start buffer registered at load, which is
+        # the "experts_start" case below; "buffer" covers the same shape of input.
+        ("buffer", False, 4),
+        ("experts_start", False, 4),
+        ("experts_start", True, 4),
+        ("experts_start", True, 32),
+    ])
 def test_scores_op_compiled_matches_eager(device, rank_source, replicas,
                                           tokens):
     if device.type != "tpu":
@@ -164,7 +173,6 @@ def test_grouped_fallback_with_copy_slots(device, monkeypatch, tokens):
                                                      prebuild_fused_moe_kernel)
 
     monkeypatch.setattr(envs, "TPU_MOE_LOWTOK_MAX_TOKENS", 0)
-    monkeypatch.setattr(envs, "USE_FUSED_MOE_GMM", 1)
     monkeypatch.setattr(envs, "USE_MOE_COUNTING_SORT", 1)
     owned, copies, hidden, inter, topk, start = 8, 2, 512, 256, 5, 24
     slots = owned + copies

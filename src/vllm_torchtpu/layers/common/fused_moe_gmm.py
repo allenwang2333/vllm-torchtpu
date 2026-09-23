@@ -19,7 +19,6 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.megablox.gmm_fused import can_fuse
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute, can_use_blockwise_onehot_unpermute)
@@ -363,79 +362,32 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    # can_fuse runs the fused kernel's own operand checks and configuration
-    # build over shapes and dtypes, so the decision is the kernel's and costs
-    # no kernel trace: a shape it would refuse (whole-expert weight slabs over
-    # VMEM, scales it does not take, rows it cannot tile) keeps the two-call
-    # path below.
-    # The fused kernel tiles rows by the 16-row sublane tile and refuses a
-    # count that is not a multiple of it (4 users x top-10 = 40 rows); the
-    # two-call path's gmm_v2 pads the same count to 48 internally. Pad the
-    # sorted rows the same way here: the padded rows sit after every group,
-    # so the zero-initialised kernel leaves them zero, and the result is
-    # sliced back to the routed rows.
-    num_rows = x.shape[0]
-    fused_pad = (-num_rows) % 16
-    x_fused = jnp.pad(x, ((0, fused_pad), (0, 0))) if fused_pad else x
-    use_fused = envs.USE_FUSED_MOE_GMM and can_fuse(x_fused,
-                                                    w1,
-                                                    w2,
-                                                    group_sizes,
-                                                    w1_scale,
-                                                    w2_scale,
-                                                    w1_bias,
-                                                    w2_bias,
-                                                    group_offset,
-                                                    fuse_act=activation)
-
-    if use_fused:
-        # The fused grouped matmul (kernels/megablox/gmm_fused.py): scalar group offset, zero-initialized rows
-        # outside the shard's expert window, the merged-body pipeline off.
-        from vllm_torchtpu.kernels.megablox.gmm_fused import (
-            GMM_FUSED_BUCKET_BASE, gmm_fused)
-        gmm2_res = gmm_fused(lhs=x_fused,
-                             w1=w1,
-                             w2=w2,
-                             group_sizes=group_sizes,
-                             w1_scale=w1_scale,
-                             w2_scale=w2_scale,
-                             w1_bias=w1_bias,
-                             w2_bias=w2_bias,
-                             group_offset=group_offset[0],
-                             fuse_act=activation,
-                             zero_initialize=True,
-                             unconditional_pipeline=False,
-                             bucket_base=GMM_FUSED_BUCKET_BASE)
-        if fused_pad:
-            gmm2_res = gmm2_res[:num_rows]
-    else:
-        gmm1_res = gmm_wrapper(
-            x,
-            w1,
-            w1_scale,
-            w1_bias,
-            group_sizes,
-            group_offset,
-            zero_initialize=False,
-            fuse_act=activation,
-            rhs_quant_dtype=rhs_quant_dtype,
-        )
-        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-        gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
-
-        gmm2_res = gmm_wrapper(gmm1_res,
-                               w2,
-                               w2_scale,
-                               w2_bias,
-                               group_sizes,
-                               group_offset,
-                               zero_initialize=False,
-                               preferred_element_type=x.dtype,
-                               rhs_quant_dtype=rhs_quant_dtype)
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, :w2.shape[1] * packing_factor]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
+    gmm2_res = gmm_wrapper(gmm1_res,
+                           w2,
+                           w2_scale,
+                           w2_bias,
+                           group_sizes,
+                           group_offset,
+                           zero_initialize=False,
+                           preferred_element_type=x.dtype,
+                           rhs_quant_dtype=rhs_quant_dtype)
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster

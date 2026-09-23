@@ -33,8 +33,8 @@ def test_gate_module_off_by_default(monkeypatch):
 
 
 @pytest.mark.parametrize("fp8_gather", [False, True])
-def test_attention_interface_does_not_require_qk_fusion(monkeypatch,
-                                                        fp8_gather):
+def test_attention_interface_does_not_require_qk_fusion(
+        monkeypatch, fp8_gather):
     import types
 
     import torch
@@ -79,8 +79,8 @@ def test_attention_interface_does_not_require_qk_fusion(monkeypatch,
     x = torch.ones(8, 16)
     positions = torch.arange(8)
     # The decoder supplies prequant=None even on ordinary decode steps.
-    torch.testing.assert_close(
-        attention.forward(positions, x, prequant=None), x + 1)
+    torch.testing.assert_close(attention.forward(positions, x, prequant=None),
+                               x + 1)
     torch.testing.assert_close(
         attention.forward(positions, x, prequant=(x, 2 * x)), 6 * x)
 
