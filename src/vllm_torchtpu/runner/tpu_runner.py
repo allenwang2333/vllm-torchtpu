@@ -1505,8 +1505,7 @@ class TPUModelRunner(GPUModelRunner):
         # never filled: beyond the row width it raises IndexError, within it
         # the null block silently swallows the recurrent state.
         try:
-            cp_world_size = (get_dcp_group().world_size *
-                             get_pcp_group().world_size)
+            cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
         col_stride = self._mamba_state_block_size * cp_world_size
