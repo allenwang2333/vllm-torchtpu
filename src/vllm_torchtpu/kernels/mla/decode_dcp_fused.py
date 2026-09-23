@@ -60,7 +60,14 @@ def _attention_group(first, lengths, tables, cache, kv_banks, q_buf, acc_buf,
                     lambda *, valid_pages=valid_pages, copy_page=copy_page: lax
                     .fori_loop(0, valid_pages, copy_page, None))
             else:
-                lax.fori_loop(0, valid_pages, copy_page, None)
+                # Expose full-tile DMA submissions to the compiler instead of
+                # paying dynamic loop control for every page. Keep tails exact.
+                lax.cond(
+                    valid_pages == tile_pages,
+                    lambda *, copy_page=copy_page: lax.fori_loop(
+                        0, tile_pages, copy_page, None, unroll=128),
+                    lambda *, valid_pages=valid_pages, copy_page=copy_page: lax
+                    .fori_loop(0, valid_pages, copy_page, None))
 
     start_queries()
 
