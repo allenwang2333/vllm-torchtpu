@@ -413,8 +413,7 @@ def parse_args():
             args.enable_gaad = 0
 
     # Auto-resolve default target model if user did not specify one.
-    # NOTE: treat "" as unset too -- the llm_jobs op-probe template always
-    # injects `--model ""` when no model is given via `lj job run -m`.
+    # NOTE: treat "" as unset too when no model is explicitly given.
     if not args.model:
         if args.spec_method == "dflash":
             args.model = "Qwen/Qwen3-4B"

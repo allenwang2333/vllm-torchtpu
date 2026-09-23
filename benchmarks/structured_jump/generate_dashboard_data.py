@@ -150,7 +150,7 @@ def build_dashboard():
 <body>
     <div class="header">
         <h1>🚀 GaaD 4-Arm Speculative Architecture Evaluation Dashboard (&gamma; = 8)</h1>
-        <p><strong>Hardware:</strong> Google Cloud TPU v7x-8 | <strong>Model:</strong> Meta-Llama-3.1-8B-Instruct | <strong>Workload:</strong> Character JSON Schema Regex</p>
+        <p><strong>Hardware:</strong> Cloud TPU v7x-8 | <strong>Model:</strong> Meta-Llama-3.1-8B-Instruct | <strong>Workload:</strong> Character JSON Schema Regex</p>
         <p><strong>Evaluated Architectural Arms:</strong>
             <br>&bull; <strong>Arm 0 (Vanilla Baseline):</strong> Pure autoregressive without speculative decoding (<code>num_spec=0</code>)
             <br>&bull; <strong>Arm 1 (Raw Spec):</strong> Standard N-gram drafter without grammar guidance (<code>gamma=8</code>)
@@ -284,11 +284,9 @@ def build_dashboard():
 </body>
 </html>"""
 
-    out_path = Path(
-        "/usr/local/google/home/johnqiangzhang/projects/llm_jobs_internal/publications/gaad/web_report/dashboard.html"
-    )
+    out_path = Path("dashboard.html")
     out_path.write_text(html_content)
-    print(f"✅ Dashboard generated at {out_path}")
+    print(f"✅ Dashboard generated at {out_path.resolve()}")
 
 
 if __name__ == "__main__":
