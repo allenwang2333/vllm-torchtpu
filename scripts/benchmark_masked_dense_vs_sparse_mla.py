@@ -56,10 +56,13 @@ from jax.sharding import PartitionSpec as P
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch  # noqa: E402
-from vllm_torchtpu.kernels.mla import kv_cache_utils as mla_kv_cache  # noqa: E402
+from vllm_torchtpu.kernels.mla import \
+    kv_cache_utils as mla_kv_cache  # noqa: E402
 from vllm_torchtpu.kernels.mla.masked_dense import csa_mask  # noqa: E402
-from vllm_torchtpu.kernels.mla.masked_dense import kernel as masked_dense  # noqa: E402
+from vllm_torchtpu.kernels.mla.masked_dense import \
+    kernel as masked_dense  # noqa: E402
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse  # noqa: E402
+import kernel_timing  # noqa: E402
 
 # GLM-5.2-FP8, read off the checkpoint config.
 LKV_DIM = 512  # kv_lora_rank
@@ -79,45 +82,22 @@ MAX_NUM_SEQS = 64
 KV_LENS = (512, 1024, 2048, 3072, 4096, 6144, 8192, 9216)
 
 
-def _time(fn, *args, warmup: int = 3, iters: int = 10) -> float:
-    """Median wall time of `fn` in milliseconds, device-synchronized."""
-    for _ in range(warmup):
-        jax.block_until_ready(fn(*args))
-    samples = []
-    for _ in range(iters):
-        start = time.perf_counter()
-        jax.block_until_ready(fn(*args))
-        samples.append((time.perf_counter() - start) * 1e3)
-    return statistics.median(samples)
-
-
-def _time_pair(
-    first, second, *args, warmup: int = 3, iters: int = 10
-) -> tuple[float, float]:
-    """Paired medians with alternating arm order to reduce TPU drift."""
-    for _ in range(warmup):
-        jax.block_until_ready(first(*args))
-        jax.block_until_ready(second(*args))
-    samples = ([], [])
-    for iteration in range(iters):
-        arms = ((first, samples[0]), (second, samples[1]))
-        if iteration % 2:
-            arms = arms[::-1]
-        for fn, values in arms:
-            start = time.perf_counter()
-            jax.block_until_ready(fn(*args))
-            values.append((time.perf_counter() - start) * 1e3)
-    return statistics.median(samples[0]), statistics.median(samples[1])
+_time = kernel_timing.pipelined_ms
+_time_pair = kernel_timing.paired_ms
 
 
 def _build_caches(rng, total_pages):
     """Random uint8 (nope, rope) caches in the native split sparse layout."""
     nope = jnp.asarray(
-        rng.integers(0, 200, size=(total_pages, PAGE_SIZE, 4, 128), dtype=np.uint8)
-    )
+        rng.integers(0,
+                     200,
+                     size=(total_pages, PAGE_SIZE, 4, 128),
+                     dtype=np.uint8))
     rope = jnp.asarray(
-        rng.integers(0, 200, size=(total_pages, PAGE_SIZE // 4, 4, 128), dtype=np.uint8)
-    )
+        rng.integers(0,
+                     200,
+                     size=(total_pages, PAGE_SIZE // 4, 4, 128),
+                     dtype=np.uint8))
     return nope, rope
 
 
@@ -168,22 +148,17 @@ def _case(shape: str, kv_len: int):
     total_pages = num_seqs * PAGES_PER_SEQ
     nope, rope = _build_caches(rng, total_pages)
     page_indices = jnp.asarray(rng.permutation(total_pages).astype(np.int32))
-    q = jnp.asarray(
-        rng.standard_normal((num_tokens, NUM_HEADS, LKV_DIM + ROPE_DIM)).astype(
-            np.float32
-        ),
-        dtype=jnp.bfloat16,
-    )
+    q = jnp.asarray(rng.standard_normal(
+        (num_tokens, NUM_HEADS, LKV_DIM + ROPE_DIM)).astype(np.float32),
+                    dtype=jnp.bfloat16)
     return dict(
         q=q,
         nope=nope,
         rope=rope,
         kv_lens=jnp.asarray(
-            ([MAX_MODEL_LEN] * (MAX_NUM_SEQS - 1) + [kv_len])
-            if shape == "mixed"
-            else [kv_len] * num_seqs,
-            jnp.int32,
-        ),
+            ([MAX_MODEL_LEN] * (MAX_NUM_SEQS - 1) +
+             [kv_len]) if shape == "mixed" else [kv_len] * num_seqs,
+            jnp.int32),
         topk_indices=_topk_indices(rng, positions, kv_len),
         page_indices=page_indices,
         cu_q_lens=jnp.asarray(cu_q_lens),
@@ -212,40 +187,22 @@ def _wrapper_args(c):
 
 def _build_wrapper(enable_dispatch: bool):
     """Stable production-equivalent cache-update + attention executable."""
-    mesh = Mesh(np.asarray(jax.local_devices()[:1]), ("model",))
+    mesh = Mesh(np.asarray(jax.local_devices()[:1]), ("model", ))
     sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
-    limits = (mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT, mla_dispatch.MASKED_DENSE_LIMIT)
+    limits = (mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT,
+              mla_dispatch.MASKED_DENSE_LIMIT)
 
-    def integrated(
-        ql_nope,
-        q_pe,
-        kv_c_normed,
-        k_pe,
-        nope,
-        rope,
-        topk,
-        seq_lens,
-        pages,
-        starts,
-        distribution,
-    ):
+    def integrated(ql_nope, q_pe, kv_c_normed, k_pe, nope, rope, topk,
+                   seq_lens, pages, starts, distribution):
         kv_packing = sparse.get_dtype_packing(kv_c_normed.dtype)
         nope_spec = mla_kv_cache.SparseMLAKVCacheSpec.create(
             mla_kv_cache.KVCacheType.NOPE,
-            mla_kv_cache.KVCacheLayout.TENSORCORE,
-            nope.shape[0],
-            PAGE_SIZE,
-            LKV_DIM,
-            kv_packing,
-        )
+            mla_kv_cache.KVCacheLayout.TENSORCORE, nope.shape[0], PAGE_SIZE,
+            LKV_DIM, kv_packing)
         rope_spec = mla_kv_cache.SparseMLAKVCacheSpec.create(
             mla_kv_cache.KVCacheType.ROPE,
-            mla_kv_cache.KVCacheLayout.TENSORCORE,
-            rope.shape[0],
-            PAGE_SIZE,
-            ROPE_DIM,
-            kv_packing,
-        )
+            mla_kv_cache.KVCacheLayout.TENSORCORE, rope.shape[0], PAGE_SIZE,
+            ROPE_DIM, kv_packing)
         nope, rope = mla_kv_cache.update_sparse_mla_kv_cache(
             nope,
             rope,
@@ -255,8 +212,7 @@ def _build_wrapper(enable_dispatch: bool):
             pages,
             starts,
             nope_spec=nope_spec,
-            rope_spec=rope_spec,
-        )
+            rope_spec=rope_spec)
         q = jnp.concatenate((ql_nope, q_pe), axis=-1)
 
         def gather(_):
@@ -272,10 +228,8 @@ def _build_wrapper(enable_dispatch: bool):
                 k_scale=1.0,
             )
 
-        if (
-            not enable_dispatch
-            or q.shape[0] < mla_dispatch.MASKED_DENSE_MIN_TOKEN_BUCKET
-        ):
+        if (not enable_dispatch
+                or q.shape[0] < mla_dispatch.MASKED_DENSE_MIN_TOKEN_BUCKET):
             output = gather(None)
         else:
 
@@ -297,42 +251,25 @@ def _build_wrapper(enable_dispatch: bool):
                 )
 
             tier = mla_dispatch.masked_dense_prefill_mla_tier(
-                seq_lens, distribution, starts, limits
-            )
+                seq_lens, distribution, starts, limits)
             output = jax.lax.switch(
                 tier,
-                (
-                    functools.partial(dense, limits[0]),
-                    functools.partial(dense, limits[1]),
-                    gather,
-                ),
+                (functools.partial(dense, limits[0]),
+                 functools.partial(dense, limits[1]), gather),
                 operand=None,
             )
         return output[..., :LKV_DIM], nope, rope
 
-    in_specs = (
-        P(None, None, None),
-        P(None, None, None),
-        P(None, None),
-        P(None, None),
-        P(None),
-        P(None),
-        P(None),
-        P(None),
-        P(None),
-        P(None),
-        P(None),
-    )
+    in_specs = (P(None, None, None), P(None, None,
+                                       None), P(None, None), P(None, None),
+                P(None), P(None), P(None), P(None), P(None), P(None), P(None))
     out_specs = (P(None, None, None), P(None), P(None))
     return jax.jit(
-        shard_map.shard_map(
-            integrated,
-            mesh=mesh,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_rep=False,
-        )
-    )
+        shard_map.shard_map(integrated,
+                            mesh=mesh,
+                            in_specs=in_specs,
+                            out_specs=out_specs,
+                            check_rep=False))
 
 
 def _time_prefill_requests(num_requests: int):
@@ -344,9 +281,16 @@ def _time_prefill_requests(num_requests: int):
     sparse_only = _build_wrapper(False)
 
     def run_request(fn):
+        # Dispatch all eight stages, block once -- see scripts/kernel_timing.
+        # The stages carry independent pre-built args and their outputs are
+        # discarded, so nothing here depends on the previous stage having
+        # landed; blocking per stage would just add eight ~150 us host round
+        # trips to both arms and pull their ratio toward 1.
         start = time.perf_counter()
+        out = None
         for stage_args in args:
-            jax.block_until_ready(fn(*stage_args))
+            out = fn(*stage_args)
+        jax.block_until_ready(out)
         return (time.perf_counter() - start) * 1e3
 
     for _ in range(2):
@@ -354,10 +298,8 @@ def _time_prefill_requests(num_requests: int):
         run_request(sparse_only)
     samples = {"prefill_dispatch_ms": [], "sparse_only_ms": []}
     for request in range(num_requests):
-        arms = (
-            (feature, samples["prefill_dispatch_ms"]),
-            (sparse_only, samples["sparse_only_ms"]),
-        )
+        arms = ((feature, samples["prefill_dispatch_ms"]),
+                (sparse_only, samples["sparse_only_ms"]))
         if request % 2:
             arms = arms[::-1]
         for fn, values in arms:
@@ -376,9 +318,8 @@ def _time_prefill_requests(num_requests: int):
     }
 
 
-def _run_point(
-    shape: str, kv_len: int, bkv_p: int, bq_sz: int, iters: int, measure_wrapper: bool
-):
+def _run_point(shape: str, kv_len: int, bkv_p: int, bq_sz: int, iters: int,
+               measure_wrapper: bool):
     c = _case(shape, kv_len)
     sm_scale = 1.0 / math.sqrt(LKV_DIM + ROPE_DIM)
 
@@ -412,11 +353,28 @@ def _run_point(
             k_scale=1.0,
         )
 
-    analytic_bound = min(mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT, MAX_MODEL_LEN)
+    analytic_bound = min(mla_dispatch.MASKED_DENSE_ANALYTIC_LIMIT,
+                         MAX_MODEL_LEN)
     bitmap_bound = min(mla_dispatch.MASKED_DENSE_LIMIT, MAX_MODEL_LEN)
 
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)
+
+    # Every arm is timed on both clocks. `<arm>_ms` is the pipelined figure and
+    # the only one to quote; `<arm>_wall_ms` is the same kernel with a sync
+    # after every call, recorded so each result carries the evidence of its own
+    # clock health. The gap should sit near 0.15 ms on tpu7x -- if it has
+    # drifted, the measurement environment changed, not the kernel. Costs ~1%.
+    def timed(fn, available=True):
+        if not available:
+            return float("nan"), float("nan")
+        return kernel_timing.both_ms(fn, iters=iters)
+
+    dense_available = shape == "prefill" and 0 < kv_len <= bitmap_bound
+    bitmap_ms, bitmap_wall = timed(functools.partial(dense_fn, bitmap_bound),
+                                   dense_available)
+    gather_ms, gather_wall = timed(sparse_fn)
+    mask_ms, mask_wall = timed(mask_fn, dense_available)
 
     row = dict(
         shape=shape,
@@ -424,49 +382,46 @@ def _run_point(
         bkv_p=bkv_p,
         bq_sz=bq_sz,
         num_tokens=c["num_tokens"],
-        bitmap_ms=(
-            _time(functools.partial(dense_fn, bitmap_bound), iters=iters)
-            if shape == "prefill" and 0 < kv_len <= bitmap_bound
-            else float("nan")
-        ),
-        gather_ms=_time(sparse_fn, iters=iters),
-        mask_only_ms=(
-            _time(mask_fn, iters=iters)
-            if shape == "prefill" and 0 < kv_len <= bitmap_bound
-            else float("nan")
-        ),
+        bitmap_ms=bitmap_ms,
+        bitmap_wall_ms=bitmap_wall,
+        gather_ms=gather_ms,
+        gather_wall_ms=gather_wall,
+        mask_only_ms=mask_ms,
+        mask_only_wall_ms=mask_wall,
     )
     # The analytic mask needs its static bound at or under `topk`, and the
     # bound must cover every sequence in the call.
-    if shape == "prefill" and 0 < kv_len <= analytic_bound:
-        row["analytic_ms"] = _time(
-            functools.partial(dense_fn, analytic_bound), iters=iters
-        )
-    else:
-        row["analytic_ms"] = float("nan")
+    row["analytic_ms"], row["analytic_wall_ms"] = timed(
+        functools.partial(dense_fn, analytic_bound),
+        shape == "prefill" and 0 < kv_len <= analytic_bound)
     row["wrapper_dispatch_ms"] = float("nan")
     row["wrapper_sparse_ms"] = float("nan")
     if measure_wrapper:
         dispatch_wrapper = _build_wrapper(True)
         sparse_wrapper = _build_wrapper(False)
-        (row["wrapper_dispatch_ms"], row["wrapper_sparse_ms"]) = _time_pair(
-            dispatch_wrapper, sparse_wrapper, *_wrapper_args(c), iters=iters
-        )
+        (row["wrapper_dispatch_ms"],
+         row["wrapper_sparse_ms"]) = _time_pair(dispatch_wrapper,
+                                                sparse_wrapper,
+                                                *_wrapper_args(c),
+                                                iters=iters)
     return row
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--shapes",
-        nargs="+",
-        default=["prefill", "decode"],
-        choices=["prefill", "decode", "mixed"],
-    )
+    parser.add_argument("--shapes",
+                        nargs="+",
+                        default=["prefill", "decode"],
+                        choices=["prefill", "decode", "mixed"])
     parser.add_argument("--kv-lens", nargs="+", type=int, default=KV_LENS)
     parser.add_argument("--num-kv-pages-per-block", type=int, default=1)
     parser.add_argument("--num-queries-per-block", type=int, default=32)
-    parser.add_argument("--iters", type=int, default=10)
+    # 50, not 10: a burst of 10 still reads 7.6% above the converged per-call
+    # time on the fastest arm here (decode gather). Sweeping burst length on
+    # tpu7x 2026-09-16 gave 425/304/250/235/224/219/218 us per call at
+    # iters=1/2/5/10/20/50/100 -- flat past 20, and 50 lands within 0.5 us of
+    # the iters=100 plateau for a few hundred ms per point.
+    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
         "--measure-wrapper",
         action="store_true",
@@ -476,10 +431,8 @@ def main():
         "--prefill-replay-requests",
         type=int,
         default=0,
-        help=(
-            "also measure this many complete 8K-input, batch-1, "
-            "prefill-only requests; no decode requests are scheduled"
-        ),
+        help=("also measure this many complete 8K-input, batch-1, "
+              "prefill-only requests; no decode requests are scheduled"),
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -487,83 +440,73 @@ def main():
         parser.error("--prefill-replay-requests must be nonnegative")
 
     print(f"device: {jax.devices()[0]}")
-    print(
-        f"heads={NUM_HEADS} head_dim={LKV_DIM + ROPE_DIM} topk={TOPK} "
-        f"page_size={PAGE_SIZE} pages_per_seq={PAGES_PER_SEQ}"
-    )
-    print(
-        f"bkv_sz={args.num_kv_pages_per_block * PAGE_SIZE} "
-        f"bq_sz={args.num_queries_per_block}\n"
-    )
+    print(f"heads={NUM_HEADS} head_dim={LKV_DIM + ROPE_DIM} topk={TOPK} "
+          f"page_size={PAGE_SIZE} pages_per_seq={PAGES_PER_SEQ}")
+    print(f"bkv_sz={args.num_kv_pages_per_block * PAGE_SIZE} "
+          f"bq_sz={args.num_queries_per_block}\n")
 
     rows = []
     for shape in args.shapes:
-        print(
-            f"{shape:>8} | {'kv_len':>7} | {'analytic':>9} | "
-            f"{'bitmap':>9} | {'gather':>9} | {'mask':>8} | "
-            f"{'best/gather':>11} | win"
-        )
-        print("-" * 88)
+        print(f"{shape:>8} | {'kv_len':>7} | {'analytic':>9} | "
+              f"{'bitmap':>9} | {'gather':>9} | {'mask':>8} | "
+              f"{'best/gather':>11} | {'win':<8} | {'dispatch':>7}")
+        print("-" * 100)
         for kv_len in args.kv_lens:
             if shape == "mixed" and kv_len < 1024:
                 continue
-            row = _run_point(
-                shape,
-                kv_len,
-                args.num_kv_pages_per_block,
-                args.num_queries_per_block,
-                args.iters,
-                args.measure_wrapper,
-            )
-            best_ms, win = min(
-                (m, n)
-                for m, n in (
-                    (row["analytic_ms"], "analytic"),
-                    (row["bitmap_ms"], "bitmap"),
-                    (row["gather_ms"], "gather"),
-                )
-                if not math.isnan(m)
-            )
+            row = _run_point(shape, kv_len, args.num_kv_pages_per_block,
+                             args.num_queries_per_block, args.iters,
+                             args.measure_wrapper)
+            best_ms, win = min((m, n)
+                               for m, n in ((row["analytic_ms"], "analytic"),
+                                            (row["bitmap_ms"], "bitmap"),
+                                            (row["gather_ms"], "gather"))
+                               if not math.isnan(m))
             row["ratio"] = best_ms / row["gather_ms"]
             row["win"] = win
+            # Dispatch cost this point actually saw, from the paired clocks.
+            # It is a host property, so it should be ~flat down the column;
+            # a row that departs is a warning about the environment.
+            row["dispatch_ms"] = row["gather_wall_ms"] - row["gather_ms"]
             rows.append(row)
-            print(
-                f"{shape:>8} | {kv_len:>7} | {row['analytic_ms']:>9.3f} | "
-                f"{row['bitmap_ms']:>9.3f} | {row['gather_ms']:>9.3f} | "
-                f"{row['mask_only_ms']:>8.3f} | {row['ratio']:>11.3f} | "
-                f"{win}"
-            )
+            print(f"{shape:>8} | {kv_len:>7} | {row['analytic_ms']:>9.3f} | "
+                  f"{row['bitmap_ms']:>9.3f} | {row['gather_ms']:>9.3f} | "
+                  f"{row['mask_only_ms']:>8.3f} | {row['ratio']:>11.3f} | "
+                  f"{win:<8} | {row['dispatch_ms']:>7.3f}")
             if args.measure_wrapper:
-                wrapper_ratio = row["wrapper_dispatch_ms"] / row["wrapper_sparse_ms"]
-                print(
-                    "         wrapper: "
-                    f"dispatch={row['wrapper_dispatch_ms']:.3f} ms "
-                    f"sparse={row['wrapper_sparse_ms']:.3f} ms "
-                    f"ratio={wrapper_ratio:.3f}"
-                )
+                wrapper_ratio = (row["wrapper_dispatch_ms"] /
+                                 row["wrapper_sparse_ms"])
+                print("         wrapper: "
+                      f"dispatch={row['wrapper_dispatch_ms']:.3f} ms "
+                      f"sparse={row['wrapper_sparse_ms']:.3f} ms "
+                      f"ratio={wrapper_ratio:.3f}")
         print()
 
     for shape in args.shapes:
         for tier in ("analytic", "bitmap"):
             wins = [
-                r["kv_len"] for r in rows if r["shape"] == shape and r["win"] == tier
+                r["kv_len"] for r in rows
+                if r["shape"] == shape and r["win"] == tier
             ]
-            print(f"{shape}: {tier} wins up to kv_len={max(wins) if wins else 'never'}")
+            print(f"{shape}: {tier} wins up to kv_len="
+                  f"{max(wins) if wins else 'never'}")
 
     replay = None
     if args.prefill_replay_requests:
         replay = _time_prefill_requests(args.prefill_replay_requests)
-        print(
-            "\n8K/1 prefill-only replay "
-            f"({replay['num_requests']} requests, "
-            f"{replay['decode_requests']} decode): "
-            f"dispatch={replay['prefill_dispatch_median_ms']:.3f} ms "
-            f"sparse={replay['sparse_only_median_ms']:.3f} ms "
-            f"ratio={replay['ratio']:.3f}"
-        )
+        print("\n8K/1 prefill-only replay "
+              f"({replay['num_requests']} requests, "
+              f"{replay['decode_requests']} decode): "
+              f"dispatch={replay['prefill_dispatch_median_ms']:.3f} ms "
+              f"sparse={replay['sparse_only_median_ms']:.3f} ms "
+              f"ratio={replay['ratio']:.3f}")
 
     if args.out:
-        args.out.write_text(json.dumps({"points": rows, "replay": replay}, indent=2))
+        args.out.write_text(
+            json.dumps({
+                "points": rows,
+                "replay": replay
+            }, indent=2))
         print(f"\nwrote {args.out}")
 
 
