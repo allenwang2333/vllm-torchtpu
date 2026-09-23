@@ -61,12 +61,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pages-per-seq", type=int, default=520)
     parser.add_argument("--total-pages", type=int, default=2112)
     parser.add_argument("--warmups", type=int, default=2)
-    # Calls per pipelined burst. 5 was the old per-call-blocking default and
-    # is far below convergence: on this host a burst reads 425/250/224/219 us
-    # per call at 1/5/20/50 calls. kernel_timing.MIN_ITERS rejects under 20.
-    # Literals, not kernel_timing.DEFAULT_*: that module imports jax, and the
-    # parent process builds this parser without wanting a TPU (jax is imported
-    # lazily in the child, below).
+    # Was 5, far below convergence (see kernel_timing). Literals, not
+    # kernel_timing.DEFAULT_*: that imports jax, and the parent wants no TPU.
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--bursts", type=int, default=3,
                         help="bursts to median over, to reject a hiccup")
@@ -172,11 +168,8 @@ def _run_child(args: argparse.Namespace) -> None:
         jax.block_until_ready((output, cache_kv))
         result["compile_and_first_s"] = time.perf_counter() - compile_start
 
-        # The carried cache makes each step depend on the last, so the burst
-        # chains on device; blocking per step instead charges a ~150 us host
-        # round trip to every sample (scripts/kernel_timing). That offset is
-        # additive, so it compresses the spread between candidates -- exactly
-        # what a tuner must not do.
+        # The carried cache chains the burst on device. Blocking per step adds
+        # ~150 us to every sample, compressing the spread between candidates.
         state = {"cache": cache_kv, "out": output}
 
         def step():

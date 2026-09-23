@@ -281,11 +281,8 @@ def _time_prefill_requests(num_requests: int):
     sparse_only = _build_wrapper(False)
 
     def run_request(fn):
-        # Dispatch all eight stages, block once -- see scripts/kernel_timing.
-        # The stages carry independent pre-built args and their outputs are
-        # discarded, so nothing here depends on the previous stage having
-        # landed; blocking per stage would just add eight ~150 us host round
-        # trips to both arms and pull their ratio toward 1.
+        # Eight stages, one block. Args are independent and outputs discarded,
+        # so per-stage blocking would only add 8 round trips to both arms.
         start = time.perf_counter()
         out = None
         for stage_args in args:
@@ -360,11 +357,8 @@ def _run_point(shape: str, kv_len: int, bkv_p: int, bq_sz: int, iters: int,
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)
 
-    # Every arm is timed on both clocks. `<arm>_ms` is the pipelined figure and
-    # the only one to quote; `<arm>_wall_ms` is the same kernel with a sync
-    # after every call, recorded so each result carries the evidence of its own
-    # clock health. The gap should sit near 0.15 ms on tpu7x -- if it has
-    # drifted, the measurement environment changed, not the kernel. Costs ~1%.
+    # Both clocks per arm: `<arm>_ms` is pipelined (quote this), `<arm>_wall_ms`
+    # is the blocking one. Gap ~0.15 ms; drift means the environment moved.
     def timed(fn, available=True):
         if not available:
             return float("nan"), float("nan")
@@ -416,11 +410,7 @@ def main():
     parser.add_argument("--kv-lens", nargs="+", type=int, default=KV_LENS)
     parser.add_argument("--num-kv-pages-per-block", type=int, default=1)
     parser.add_argument("--num-queries-per-block", type=int, default=32)
-    # 50, not 10: a burst of 10 still reads 7.6% above the converged per-call
-    # time on the fastest arm here (decode gather). Sweeping burst length on
-    # tpu7x 2026-09-16 gave 425/304/250/235/224/219/218 us per call at
-    # iters=1/2/5/10/20/50/100 -- flat past 20, and 50 lands within 0.5 us of
-    # the iters=100 plateau for a few hundred ms per point.
+    # Calls per pipelined burst; see kernel_timing for why 10 is too few.
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
         "--measure-wrapper",
@@ -464,9 +454,8 @@ def main():
                                if not math.isnan(m))
             row["ratio"] = best_ms / row["gather_ms"]
             row["win"] = win
-            # Dispatch cost this point actually saw, from the paired clocks.
-            # It is a host property, so it should be ~flat down the column;
-            # a row that departs is a warning about the environment.
+            # Host property, so ~flat down the column; a departing row is a
+            # warning about the environment, not the kernel.
             row["dispatch_ms"] = row["gather_wall_ms"] - row["gather_ms"]
             rows.append(row)
             print(f"{shape:>8} | {kv_len:>7} | {row['analytic_ms']:>9.3f} | "
