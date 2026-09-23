@@ -99,9 +99,8 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     stage_block_table_uploads,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
-    SequenceLayoutKind,
-    create_sequence_layout_planner,
-)
+    SequenceLayoutKind, create_sequence_layout_planner,
+    is_pcp_streaming_sequence_layout_descriptor)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -2699,13 +2698,35 @@ class TPUModelRunner(GPUModelRunner):
         if (self._pcp_dcp_compatible
                 and layout_plan._request_major_to_packed_token_indices
                 is not None):
-            # See layers/core/pcp_dcp_token_remap.py.
+            # Build complete int32 bijective permutations for device index_select
+            global_cap, local_cap = self._pcp_remap_index_capacities()
+            G = int(layout_plan.global_padded_num_tokens)
+            L = int(layout_plan.local_padded_num_tokens)
+            l_start = int(layout_plan.token_slice.start or 0)
+            l_end = int(layout_plan.token_slice.stop)
+            raw_req = layout_plan._request_major_to_packed_token_indices[:G]
+            valid_mask = raw_req >= 0
+            used = np.zeros(G, dtype=bool)
+            used[raw_req[valid_mask]] = True
+            unused = np.flatnonzero(~used).astype(np.int32)
+            full_perm = np.empty(G, dtype=np.int32)
+            n_valid = int(valid_mask.sum())
+            full_perm[:n_valid] = raw_req[valid_mask].astype(np.int32)
+            full_perm[n_valid:] = unused
+            req_to_packed_i32 = np.arange(global_cap, dtype=np.int32)
+            req_to_packed_i32[:G] = full_perm
+            inv_perm = np.empty(G, dtype=np.int32)
+            inv_perm[full_perm] = np.arange(G, dtype=np.int32)
+            local_packed_to_req_i32 = np.arange(local_cap, dtype=np.int32)
+            local_packed_to_req_i32[:L] = inv_perm[l_start:l_end]
             pcp_request_major_to_packed_token_indices = torch.from_numpy(
-                layout_plan._request_major_to_packed_token_indices).to(
-                    self.device, dtype=torch.long, non_blocking=True)
+                req_to_packed_i32).to(self.device,
+                                      dtype=torch.int32,
+                                      non_blocking=True)
             pcp_packed_to_request_major_token_indices = torch.from_numpy(
-                layout_plan._packed_to_request_major_token_indices).to(
-                    self.device, dtype=torch.long, non_blocking=True)
+                local_packed_to_req_i32).to(self.device,
+                                            dtype=torch.int32,
+                                            non_blocking=True)
             pcp_local_token_slice = layout_plan.token_slice
         padded_total_num_scheduled_tokens = (
             layout_plan.global_padded_num_tokens)
@@ -4656,15 +4677,23 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
-    def _dummy_run(
-        self,
-        num_tokens: int,
-        num_reqs: int,
-        num_blocks: int,
-        use_max_model_len: bool = True,
-        dp_lockstep: bool = False,
-        profile_prefix: int | None = None,
-    ) -> float | None:
+    def _pcp_remap_index_capacities(self) -> tuple[int, int]:
+        """Lengths of the request-major and local PCP remap index tensors.
+
+        Fixed across buckets so the dummy trace and every real step see the
+        same shapes; the remap slices them to the live bucket.
+        """
+        pcp_size = (
+            self.vllm_config.parallel_config.prefill_context_parallel_size)
+        return pcp_size * self.max_num_tokens, self.max_num_tokens
+
+    def _dummy_run(self,
+                   num_tokens: int,
+                   num_reqs: int,
+                   num_blocks: int,
+                   use_max_model_len: bool = True,
+                   dp_lockstep: bool = False,
+                   profile_prefix: int | None = None) -> float | None:
         """Run the forward at one bucket shape.
 
         With ``profile_prefix`` the batch is one prefill request of
@@ -4720,15 +4749,30 @@ class TPUModelRunner(GPUModelRunner):
         # Dummy runs use one scheduled token per active request, so model
         # them as pure decode to match the real single-chip path; a profile
         # run holds mixed requests, as a real prefill chunk does.
-        distribution = [0, 0, actual_num_reqs] if profiling else [actual_num_reqs] * 3
-        request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
-            self.device
-        )
-        dummy_layout_plan = _get_sequence_layout_planner_for_runner(self).prepare_dummy(
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            kv_cache_initialized=kv_cache_initialized,
-        )
+        distribution = ([0, 0, actual_num_reqs]
+                        if profiling else [actual_num_reqs] * 3)
+        request_distribution = torch.tensor(distribution,
+                                            dtype=torch.int32).to(self.device)
+        dummy_layout_plan = _get_sequence_layout_planner_for_runner(
+            self).prepare_dummy(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                kv_cache_initialized=kv_cache_initialized,
+            )
+        dummy_pcp_req_to_packed = None
+        dummy_pcp_packed_to_req = None
+        dummy_pcp_local_slice = None
+        if (self._pcp_dcp_compatible
+                and is_pcp_streaming_sequence_layout_descriptor(
+                    dummy_layout_plan.descriptor)):
+            global_cap, local_cap = self._pcp_remap_index_capacities()
+            dummy_pcp_req_to_packed = torch.arange(global_cap,
+                                                   dtype=torch.int32,
+                                                   device=self.device)
+            dummy_pcp_packed_to_req = torch.arange(local_cap,
+                                                   dtype=torch.int32,
+                                                   device=self.device)
+            dummy_pcp_local_slice = dummy_layout_plan.token_slice
 
         if self.kv_cache_config is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
@@ -4765,6 +4809,11 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
+                pcp_request_major_to_packed_token_indices=(
+                    dummy_pcp_req_to_packed),
+                pcp_packed_to_request_major_token_indices=(
+                    dummy_pcp_packed_to_req),
+                pcp_local_token_slice=dummy_pcp_local_slice,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -4798,6 +4847,11 @@ class TPUModelRunner(GPUModelRunner):
                 sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
                 sequence_layout_protocol=(dummy_layout_plan.descriptor.protocol),
                 sequence_layout_version=(dummy_layout_plan.descriptor.version),
+                pcp_request_major_to_packed_token_indices=(
+                    dummy_pcp_req_to_packed),
+                pcp_packed_to_request_major_token_indices=(
+                    dummy_pcp_packed_to_req),
+                pcp_local_token_slice=dummy_pcp_local_slice,
             )
 
             per_layer_attn_metadata = {
