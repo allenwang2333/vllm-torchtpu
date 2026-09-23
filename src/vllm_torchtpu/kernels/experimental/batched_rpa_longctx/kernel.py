@@ -281,6 +281,43 @@ def fetch_step_metadata(
     )
 
 
+def stitch_slot_gate(
+    step_meta: StepMetadata,
+    b_idx: int,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """Predicate guarding one slot's stitch.
+
+    A block of nothing but valid cache has no new tokens to splice and no page
+    tail to scrub. bkv_sz_frm_new is the wrong gate: CACHE_ONLY pins it to 0
+    while the final block still ends mid-page.
+    """
+    if cfgs.serve.stitch_strategy.is_probe:
+        # Always true, but sourced from SMEM so it cannot be folded away.
+        return step_meta.new_kv_len_start[b_idx] > -(1 << 20)
+    return step_meta.bkv_sz_frm_cache[b_idx] < cfgs.bkv_sz
+
+
+def stitch_batch_gate(
+    step_meta: StepMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> jax.Array:
+    """One predicate for the whole batch: any slot needing a stitch runs all.
+
+    Coarser than per-slot, so it fires more often, but it costs one scheduling
+    barrier instead of `batch_size` and leaves the batched fetch/store split
+    intact.
+    """
+    if cfgs.serve.stitch_strategy.is_probe:
+        return step_meta.new_kv_len_start[0] > -(1 << 20)
+    gate = step_meta.bkv_sz_frm_cache[0] < cfgs.bkv_sz
+    for b_idx in range(1, cfgs.batch_size):
+        gate = gate | (step_meta.bkv_sz_frm_cache[b_idx] < cfgs.bkv_sz)
+    return gate
+
+
 def generate_mask(
     shape: tuple[int, int, int, int],
     *,
@@ -351,6 +388,52 @@ def rpa_body(
         kv_new_lens_ref,
         cfgs=cfgs,
     )
+
+    def run_stitch():
+        """Splice this step's new KV tokens in behind the cached ones.
+
+        Callable rather than inline so `StitchPlacement` can choose where in the
+        input fetch it lands.
+        """
+        if cfgs.serve.kv_layout != configs.KVLayout.SEQ_ALONG_LANE:
+            return
+        strategy = cfgs.serve.stitch_strategy
+
+        def fetch(b_idx: int):
+            return stitch_utils.stitch_new_kv_lane(
+                kv_in_vref,
+                b_idx,
+                step_meta.bkv_sz_frm_cache[b_idx],
+                step_meta.new_kv_len_start[b_idx],
+                step_meta.bkv_sz_frm_new[b_idx],
+                cfgs=cfgs,
+            )
+
+        def store(b_idx: int, result):
+            stitch_utils.store_new_kv_lane(kv_in_vref, b_idx, result, cfgs=cfgs)
+
+        if strategy.is_per_slot:
+            for b_idx in range(cfgs.batch_size):
+                pl.when(stitch_slot_gate(step_meta, b_idx, cfgs=cfgs))(
+                    lambda b=b_idx: store(b, fetch(b))
+                )
+            return
+
+        def stitch_batch():
+            # Every slot is fetched before any is stored: reads and writes to
+            # kv_in_vref must not interleave, see `stitch_new_kv_lane`.
+            results = [fetch(b_idx) for b_idx in range(cfgs.batch_size)]
+            for b_idx, result in enumerate(results):
+                store(b_idx, result)
+
+        if strategy.is_gated:
+            pl.when(stitch_batch_gate(step_meta, cfgs=cfgs))(stitch_batch)
+        else:
+            stitch_batch()
+
+    if cfgs.serve.stitch_placement == configs.StitchPlacement.BEFORE_Q:
+        run_stitch()
+
     # Step 2: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
@@ -376,25 +459,10 @@ def rpa_body(
     k_b = []
     v_b = []
 
+    if cfgs.serve.stitch_placement == configs.StitchPlacement.AFTER_Q:
+        run_stitch()
+
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        stitch_results = []
-        for b_idx in range(cfgs.batch_size):
-            res = stitch_utils.stitch_new_kv_lane(
-                kv_in_vref,
-                b_idx,
-                step_meta.bkv_sz_frm_cache[b_idx],
-                step_meta.new_kv_len_start[b_idx],
-                step_meta.bkv_sz_frm_new[b_idx],
-                cfgs=cfgs,
-            )
-            stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
-            stitch_utils.store_new_kv_lane(
-                kv_in_vref,
-                b_idx,
-                stitch_results[b_idx],
-                cfgs=cfgs,
-            )
         for b_idx in range(cfgs.batch_size):
             ks = []
             vs = []
@@ -629,6 +697,12 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
+    # Tag only the experiment settings, so production traces keep comparing
+    # against every signature recorded before these knobs existed.
+    if serve.stitch_strategy != configs.StitchStrategy.WIDE:
+        name += f"-{serve.stitch_strategy.symbol}"
+    if serve.stitch_placement != configs.StitchPlacement.AFTER_Q:
+        name += f"-{serve.stitch_placement.symbol}"
     return name
 
 

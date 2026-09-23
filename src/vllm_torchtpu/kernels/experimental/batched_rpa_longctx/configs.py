@@ -82,6 +82,95 @@ class KVLayout(enum.StrEnum):
                 return "nhs"
 
 
+class StitchStrategy(enum.StrEnum):
+    """Which SEQ_ALONG_LANE KV-stitch implementation to compile.
+
+    Three real implementations plus a control. Gating the stitch trades skipped
+    work against a scheduling barrier, and which way that lands depends on the
+    shape, so the alternatives stay selectable rather than being hardcoded.
+
+    - NARROW: O(1) lane rotation only at bq_sz == 1, O(N) roll otherwise (pre-#1079).
+    - WIDE: O(1) rotation for any bq_sz <= num_lanes, on every block (#1079).
+    - WIDE_GATED: WIDE, skipped on blocks that hold only cached tokens. One
+      predicate for the whole batch, and the batched fetch/store split intact.
+    - WIDE_GATED_PER_SLOT: same skipping, but a predicate per slot and each
+      slot's fetch and store interleaved. Sharper predicate, more barriers.
+    - WIDE_BARRIER_ONLY / WIDE_BARRIER_ONLY_PER_SLOT: the two gated shapes with
+      an always-true predicate. Same barriers, nothing skipped, so subtracting
+      WIDE prices the barriers alone. Measurement controls, never for serving.
+    """
+
+    NARROW = enum.auto()
+    WIDE = enum.auto()
+    WIDE_GATED = enum.auto()
+    WIDE_GATED_PER_SLOT = enum.auto()
+    WIDE_BARRIER_ONLY = enum.auto()
+    WIDE_BARRIER_ONLY_PER_SLOT = enum.auto()
+
+    @property
+    def symbol(self):
+        # Spelled out: a two-letter tag would collide with the `-sw<window>`
+        # sliding-window suffix in `get_kernel_name`.
+        match self:
+            case StitchStrategy.NARROW:
+                return "narrow"
+            case StitchStrategy.WIDE:
+                return "wide"
+            case StitchStrategy.WIDE_GATED:
+                return "gated"
+            case StitchStrategy.WIDE_GATED_PER_SLOT:
+                return "gatedslot"
+            case StitchStrategy.WIDE_BARRIER_ONLY:
+                return "barrier"
+            case StitchStrategy.WIDE_BARRIER_ONLY_PER_SLOT:
+                return "barrierslot"
+
+    @property
+    def is_gated(self) -> bool:
+        """Whether a predicate guards the stitch at all."""
+        return self not in (StitchStrategy.NARROW, StitchStrategy.WIDE)
+
+    @property
+    def is_per_slot(self) -> bool:
+        """One predicate per batch slot instead of one for the batch."""
+        return self in (
+            StitchStrategy.WIDE_GATED_PER_SLOT,
+            StitchStrategy.WIDE_BARRIER_ONLY_PER_SLOT,
+        )
+
+    @property
+    def is_probe(self) -> bool:
+        """Predicate forced true: builds the branch but skips nothing."""
+        return self in (
+            StitchStrategy.WIDE_BARRIER_ONLY,
+            StitchStrategy.WIDE_BARRIER_ONLY_PER_SLOT,
+        )
+
+
+class StitchPlacement(enum.StrEnum):
+    """Where the KV stitch sits inside the step body.
+
+    It has to precede the k/v loads that consume it, so the only freedom is how
+    much of the input fetch it splits. This matters because a gated stitch is a
+    scheduling barrier, and a barrier between the q and k/v loads stops the two
+    from overlapping each other or the next block's DMA.
+
+    - AFTER_Q: between the q load and the k/v loads.
+    - BEFORE_Q: ahead of both, leaving the two loads contiguous.
+    """
+
+    AFTER_Q = enum.auto()
+    BEFORE_Q = enum.auto()
+
+    @property
+    def symbol(self):
+        match self:
+            case StitchPlacement.AFTER_Q:
+                return "afterq"
+            case StitchPlacement.BEFORE_Q:
+                return "beforeq"
+
+
 @dataclasses.dataclass(frozen=True)
 class ServingConfigs:
     """Serving config that can change depending on use cases."""
@@ -104,6 +193,8 @@ class ServingConfigs:
     decode_query_size: int = 1
     cp_group_size: int | None = None
     attention_scope: AttentionScope = AttentionScope.FULL
+    stitch_strategy: StitchStrategy = StitchStrategy.WIDE
+    stitch_placement: StitchPlacement = StitchPlacement.AFTER_Q
     return_lse: bool = False
 
     @property
@@ -330,6 +421,18 @@ class RpaConfigs:
     @property
     def fuse_accum(self) -> bool:
         return self.mode == RpaCase.DECODE
+
+    @property
+    def use_decode_stitch(self) -> bool:
+        """Whether the O(1) lane-rotation stitch covers this bq_sz.
+
+        The run of new tokens must fit the two destination VREG columns the
+        rotation can reach; NARROW predates that widening and only takes it for
+        a single token.
+        """
+        if self.serve.stitch_strategy == StitchStrategy.NARROW:
+            return self.block.bq_sz == 1
+        return self.block.bq_sz <= pltpu.get_tpu_info().num_lanes
 
     @property
     def kv_bytes_per_token(self) -> int:

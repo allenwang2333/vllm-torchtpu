@@ -139,7 +139,7 @@ def store_new_kv_lane(
     v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if cfgs.use_decode_stitch:
         cols, outer_dim, lanes_per_col, merged = stitch_result
         num_lanes = pltpu.get_tpu_info().num_lanes
         strided_vmem_ref = vmem_u32_ref.reshape(-1, num_lanes)
@@ -193,7 +193,7 @@ def stitch_new_kv_lane(
 
     # Up to num_lanes new kv tokens span at most two 128-lane registers, so they
     # can be rolled in place instead of rolling the entire bkv_sz.
-    if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
+    if cfgs.use_decode_stitch:
         return _stitch_decode_lane(
             vmem_u32_ref,
             bkv_sz_cache,

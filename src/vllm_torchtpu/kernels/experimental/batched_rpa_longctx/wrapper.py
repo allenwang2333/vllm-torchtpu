@@ -499,6 +499,8 @@ def calculate_block_sizes(
         "decode_query_size",
         "cp_group_size",
         "attention_scope",
+        "stitch_strategy",
+        "stitch_placement",
         "return_lse",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
@@ -540,6 +542,8 @@ def ragged_paged_attention(
     cp_group_size: int | None = None,
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
+    stitch_strategy: configs.StitchStrategy = configs.StitchStrategy.WIDE,
+    stitch_placement: configs.StitchPlacement = configs.StitchPlacement.AFTER_Q,
     return_lse: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
@@ -664,6 +668,8 @@ def ragged_paged_attention(
         decode_query_size=decode_query_size,
         cp_group_size=cp_group_size,
         attention_scope=attention_scope,
+        stitch_strategy=stitch_strategy,
+        stitch_placement=stitch_placement,
         return_lse=return_lse,
     )
     q_hbm, new_kv_hbm = prepare_inputs(
