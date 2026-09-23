@@ -67,10 +67,14 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self.strategy = getattr(weight_quant, "strategy", "group")
         self.group_size = getattr(weight_quant, "group_size", None)
         self.is_transposed = True
+        self.wna16_backend = None
 
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
 
     @property
     def supports_internal_mk(self) -> bool:

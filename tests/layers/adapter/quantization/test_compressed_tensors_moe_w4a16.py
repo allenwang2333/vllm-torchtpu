@@ -236,6 +236,17 @@ class TestW4MoEWeightPreprocessing:
             assert layer.w13_weight_packed[0, 0, 0].item() == expected_carrier
             assert layer.w13_weight_packed[1, 0, 0].item() == expected_carrier
 
+    def test_moe_quant_config_is_none(self):
+        """VllmCompressedTensorsW4A16MoEMethod should initialize wna16_backend and return None for get_fused_moe_quant_config."""
+        layer = FakeRoutedExperts(experts_per_token=2)
+        weight_quant = FakeQuantArgs(num_bits=4,
+                                     strategy="group",
+                                     group_size=16)
+        method = VllmCompressedTensorsW4A16MoEMethod(weight_quant, None,
+                                                     layer.moe_config)
+        assert method.wna16_backend is None
+        assert method.get_fused_moe_quant_config(layer) is None
+
 
 class TestW4MoECorrectness:
     """Verify computation correctness of W4 MoE."""
