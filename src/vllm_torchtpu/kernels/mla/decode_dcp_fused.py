@@ -47,6 +47,31 @@ def _attention_group(first, lengths, tables, cache, kv_banks, q_buf, acc_buf,
                 else:
                     copy.start()
 
+            def copy_tail(*,
+                          b=b,
+                          valid_pages=valid_pages,
+                          copy_page=copy_page):
+                if tile_pages > 64:
+                    lax.fori_loop(0, valid_pages, copy_page, None)
+                    return
+                # Aggregate exact complete chunks; only the last <8 pages use
+                # scalar copies. Never fetch a page beyond the valid prefix.
+                chunk_pages = min(8, tile_pages)
+
+                def chunk(k, _):
+                    if wait:
+                        ref = kv_banks.at[bank, b,
+                                          pl.ds(k * chunk_pages, chunk_pages)]
+                        pltpu.make_async_copy(ref, ref, kv_sems.at[bank,
+                                                                   b]).wait()
+                    else:
+                        for offset in range(chunk_pages):
+                            copy_page(k * chunk_pages + offset, None)
+
+                lax.fori_loop(0, valid_pages // chunk_pages, chunk, None)
+                lax.fori_loop(valid_pages // chunk_pages * chunk_pages,
+                              valid_pages, copy_page, None)
+
             if wait:
                 # Page copies share a byte-counting DMA semaphore. Consume
                 # a complete tile once, rather than replaying its page loop.
@@ -54,20 +79,14 @@ def _attention_group(first, lengths, tables, cache, kv_banks, q_buf, acc_buf,
                     ref = kv_banks.at[bank, b]
                     pltpu.make_async_copy(ref, ref, kv_sems.at[bank, b]).wait()
 
-                lax.cond(
-                    valid_pages == tile_pages,
-                    wait_tile,
-                    lambda *, valid_pages=valid_pages, copy_page=copy_page: lax
-                    .fori_loop(0, valid_pages, copy_page, None))
+                lax.cond(valid_pages == tile_pages, wait_tile, copy_tail)
             else:
                 # Expose full-tile DMA submissions to the compiler instead of
                 # paying dynamic loop control for every page. Keep tails exact.
-                lax.cond(
-                    valid_pages == tile_pages,
-                    lambda *, copy_page=copy_page: lax.fori_loop(
-                        0, tile_pages, copy_page, None, unroll=128),
-                    lambda *, valid_pages=valid_pages, copy_page=copy_page: lax
-                    .fori_loop(0, valid_pages, copy_page, None))
+                lax.cond(valid_pages == tile_pages,
+                         lambda *, copy_page=copy_page: lax.fori_loop(
+                             0, tile_pages, copy_page, None, unroll=128),
+                         copy_tail)
 
     start_queries()
 
@@ -81,7 +100,7 @@ def _attention_group(first, lengths, tables, cache, kv_banks, q_buf, acc_buf,
     l_buf[...] = jnp.zeros(l_buf.shape, jnp.float32)
 
     def broadcast_stat(x, width):
-        return jnp.concatenate([x] * pl.cdiv(width, 128), axis=-1)[:, :width]
+        return jnp.concatenate([x] * pl.cdiv(width, 128), axis=-1)[..., :width]
 
     def step(i, _):
         bank = i % 2
@@ -93,39 +112,81 @@ def _attention_group(first, lengths, tables, cache, kv_banks, q_buf, acc_buf,
             kv_dma(i + 1)
 
         kv_dma(i, wait=True)
-        for b in range(group_size):
-            length = lengths[first + b]
 
-            @pl.when(i * tile < length)
-            def compute(*, b=b, length=length):
-                rows = kv_banks.at[bank, b].reshape(tile, cache.shape[-1])[...]
-                q = q_buf[b]
-                scores = jnp.dot(q, rows.T,
-                                 preferred_element_type=jnp.float32) * scale
-                valid_scores = (
+        def batched():
+            rows = kv_banks[bank].reshape(group_size, tile, cache.shape[-1])
+            qs = q_buf[...]
+            lens = jnp.stack([lengths[first + b] for b in range(group_size)])
+            valid = i * tile + jnp.arange(tile)[None, :] < lens[:, None]
+            scores = jnp.einsum(
+                "bhd,btd->bht", qs, rows,
+                preferred_element_type=jnp.float32) * scale
+            scores = jnp.where(valid[:, None, :], scores, -jnp.inf)
+            old_m, old_l = m_buf[...], l_buf[...]
+            new_m = jnp.maximum(old_m, scores.max(axis=-1, keepdims=True))
+            safe_m = jnp.where(jnp.isfinite(new_m), new_m, 0)
+            correction = jnp.exp(old_m - safe_m)
+            probs = jnp.exp(scores - broadcast_stat(safe_m, tile))
+            values = jnp.stack([
+                jnp.where(
                     i * tile + lax.broadcasted_iota(jnp.int32,
-                                                    (heads, tile), 1)) < length
-                valid_values = (
-                    i * tile +
-                    lax.broadcasted_iota(jnp.int32,
-                                         (tile, latent), 0)) < length
-                # Unfetched tail pages must not contribute, including NaNs
-                # in unspecified VMEM. Select the masked score explicitly.
-                scores = jnp.where(valid_scores, scores, -jnp.inf)
-                new_m = jnp.maximum(m_buf[b], scores.max(axis=1,
-                                                         keepdims=True))
-                correction = jnp.exp(m_buf[b] - new_m)
-                probs = jnp.exp(scores - broadcast_stat(new_m, tile))
-                values = jnp.where(valid_values, rows[:, :latent], 0)
-                pv = jnp.dot(probs.astype(rows.dtype),
-                             values,
-                             preferred_element_type=jnp.float32)
-                acc_buf[b] = acc_buf[b] * broadcast_stat(correction,
-                                                         latent) + pv
-                l_buf[b] = jnp.broadcast_to(
-                    l_buf[b] * correction + probs.sum(axis=1, keepdims=True),
-                    (heads, 128))
-                m_buf[b] = jnp.broadcast_to(new_m, (heads, 128))
+                                                    (tile, latent), 0)
+                    < lengths[first + b], rows[b, :, :latent], 0)
+                for b in range(group_size)
+            ])
+            pv = jnp.einsum("bht,btd->bhd",
+                            probs.astype(rows.dtype),
+                            values,
+                            preferred_element_type=jnp.float32)
+            acc_buf[
+                ...] = acc_buf[...] * broadcast_stat(correction, latent) + pv
+            l_buf[...] = jnp.broadcast_to(
+                old_l * correction + probs.sum(axis=-1, keepdims=True),
+                (group_size, heads, 128))
+            m_buf[...] = jnp.broadcast_to(new_m, (group_size, heads, 128))
+
+        def scalar():
+            for b in range(group_size):
+                length = lengths[first + b]
+
+                @pl.when(i * tile < length)
+                def compute(*, b=b, length=length):
+                    rows = kv_banks.at[bank, b].reshape(tile,
+                                                        cache.shape[-1])[...]
+                    q = q_buf[b]
+                    scores = jnp.dot(
+                        q, rows.T, preferred_element_type=jnp.float32) * scale
+                    valid_scores = (
+                        i * tile +
+                        lax.broadcasted_iota(jnp.int32,
+                                             (heads, tile), 1)) < length
+                    valid_values = (
+                        i * tile +
+                        lax.broadcasted_iota(jnp.int32,
+                                             (tile, latent), 0)) < length
+                    # Unfetched tail pages must not contribute, including NaNs
+                    # in unspecified VMEM. Select the masked score explicitly.
+                    scores = jnp.where(valid_scores, scores, -jnp.inf)
+                    new_m = jnp.maximum(m_buf[b],
+                                        scores.max(axis=1, keepdims=True))
+                    correction = jnp.exp(m_buf[b] - new_m)
+                    probs = jnp.exp(scores - broadcast_stat(new_m, tile))
+                    values = jnp.where(valid_values, rows[:, :latent], 0)
+                    pv = jnp.dot(probs.astype(rows.dtype),
+                                 values,
+                                 preferred_element_type=jnp.float32)
+                    acc_buf[b] = acc_buf[b] * broadcast_stat(
+                        correction, latent) + pv
+                    l_buf[b] = jnp.broadcast_to(
+                        l_buf[b] * correction +
+                        probs.sum(axis=1, keepdims=True), (heads, 128))
+                    m_buf[b] = jnp.broadcast_to(new_m, (heads, 128))
+
+        if tile_pages in (32, 64) and group_size >= 4:
+            # Keep the scalar skip path for a final partial request group.
+            lax.cond(lengths[first + group_size - 1] > 0, batched, scalar)
+        else:
+            scalar()
 
     lax.fori_loop(0, iterations, step, None)
     for b in range(group_size):

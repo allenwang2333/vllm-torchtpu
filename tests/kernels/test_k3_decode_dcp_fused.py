@@ -57,6 +57,48 @@ def test_pipeline_uneven_noncontiguous_pages(group_size, tile_pages):
     assert np.isnan(cache[0]).all()
 
 
+@pytest.mark.parametrize('tile_pages', [16, 32])
+@pytest.mark.parametrize('group_size', [2, 4])
+@pytest.mark.parametrize('partial_group', [False, True])
+def test_pipeline_partial_dma_chunks(tile_pages, group_size, partial_group):
+    # Partial tiles straddle the 8-page DMA chunk boundary. Unused table
+    # entries point at a poisoned page, and physical pages are noncontiguous.
+    rng = np.random.default_rng(811)
+    lengths = [113, 128, 129, 0 if partial_group else 241]
+    tables = np.zeros((4, 32), np.int32)
+    cache = np.full((65, 16, 640), np.nan, np.float32)
+    physical = rng.permutation(64) + 1
+    q = jnp.asarray(rng.normal(0, .2, (4, 24, 640)), jnp.bfloat16)
+    refs = []
+    cursor = 0
+    for b, length in enumerate(lengths):
+        if not length:
+            refs.append(jnp.zeros((24, 512), jnp.float32))
+            continue
+        rows = jnp.asarray(rng.normal(0, .2, (length, 640)), jnp.bfloat16)
+        pages = (length + 15) // 16
+        tables[b, :pages] = physical[cursor:cursor + pages]
+        cursor += pages
+        for token in range(length):
+            cache[tables[b, token // 16], token % 16] = rows[token]
+        scores = q[b].astype(jnp.float32) @ rows.astype(
+            jnp.float32).T * 192**-.5
+        refs.append(jax.nn.softmax(scores) @ rows[:, :512].astype(jnp.float32))
+    actual, _ = kernel.local_attention(jnp.asarray(
+        cache.reshape(65, 8, 2, 640), jnp.bfloat16),
+                                       q,
+                                       jnp.asarray(lengths),
+                                       jnp.asarray(tables),
+                                       scale=192**-.5,
+                                       tile_pages=tile_pages,
+                                       group_size=group_size,
+                                       interpret=True)
+    np.testing.assert_allclose(actual.astype(jnp.float32),
+                               jnp.stack(refs),
+                               atol=.005,
+                               rtol=.03)
+
+
 def test_pipeline_all_empty_does_not_read_poisoned_cache():
     cache = jnp.full((1, 8, 2, 640), jnp.nan, jnp.bfloat16)
     q = jnp.ones((4, 24, 640), jnp.bfloat16)
