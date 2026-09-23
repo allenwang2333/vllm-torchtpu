@@ -16,7 +16,9 @@ steps:
       # --- Unit Tests ---
       - "unit_tests_general_pr"
       - "unit_tests_multichip_pr"
-      - "unit_tests_spec_decode_pr"
+      - "unit_tests_spec_decode_pr_1"
+      - "unit_tests_spec_decode_pr_2"
+      - "unit_tests_spec_decode_pr_3"
       - "unit_tests_spec_decode_multichip_pr"
     agents:
       queue: cpu

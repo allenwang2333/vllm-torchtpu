@@ -77,6 +77,41 @@ def _release_tpu_between_tests(request):
 #       sensitive: a loaded shared agent can push an otherwise healthy run
 #       under the floor, and the floors are re-measured against the nightly
 #       baselines anyway. They gate throughput, not correctness.
+#
+# The PR step splits the suite with --shard (tests/conftest.py). Tests whose
+# reference runs are identical share one shard_group so they land on the same
+# shard and the second reuses the first's reference (see _reference_texts).
+
+QWEN35_MTP_REFERENCE = "qwen35-4b-mtp-reference"
+LLAMA31_EAGLE3_REFERENCE = "llama31-8b-eagle3-reference"
+QWEN3_STRUCTURED_REFERENCE = "qwen3-0.6b-structured-reference"
+
+# Minutes per PR test on a tpu_v7x_2 agent (vllm-torchtpu-ci build 2187), used
+# only to balance --shard. Refresh when the suite changes shape; a stale or
+# missing entry just makes the shards less even.
+SHARD_DEFAULT_MINUTES = 5.0
+SHARD_MINUTES = {
+    "test_dflash_correctness_greedy[bs10-sync]": 9.7,
+    "test_dspark_correctness_greedy[bs10-sync]": 9.2,
+    "test_qwen35_mtp_correctness_greedy_multi_step": 8.6,
+    "test_eagle3_correctness_greedy[bs10-sync]": 7.1,
+    "test_qwen35_mtp_correctness_greedy[bs4-sync]": 7.0,
+    "test_qwen35_mtp_correctness_greedy[bs1-async]": 6.7,
+    "test_dflash_correctness_greedy[bs1-async]": 6.0,
+    "test_eagle3_sharded_draft": 5.8,
+    "test_structured_output_eagle3_greedy[async]": 5.6,
+    "test_dspark_correctness_greedy[bs1-async]": 5.0,
+    "test_ngram_correctness_greedy": 4.9,
+    "test_eagle3_correctness_greedy_multi_chunk": 4.9,
+    "test_structured_output_spec_decode_correctness_greedy[multi_chunk]": 4.9,
+    "test_structured_output_spec_decode_correctness_greedy[single_chunk]": 4.8,
+    "test_structured_output_eagle3_greedy[sync]": 4.7,
+    "test_eagle3_correctness_greedy[bs1-async]": 4.5,
+    "test_sd_correctness_greedy_multi_chunk": 4.2,
+    "test_sd_supports_non_greedy": 2.2,
+    "test_structured_output_eagle3_async_adversarial_choice": 2.1,
+    "test_structured_output_spec_decode_non_greedy": 2.1,
+}
 
 
 def _is_v7x():
@@ -430,6 +465,86 @@ def _engine(model_name: str, speculative_config: dict | None, kwargs: dict):
         wait_for_tpu_release()
 
 
+# A correctness test's reference run (no speculation) exercises none of the
+# spec-decode code: its text is fixed by the target model, the engine kwargs,
+# the prompts, the sampling params and the process environment. Tests whose
+# reference would be identical share one run instead of each starting and
+# compiling its own engine. Only the generated text is kept; every engine is
+# still torn down before the next one starts.
+#
+# A hit needs both tests in the same pytest process, so tests that share a
+# reference carry one shard_group marker, which keeps them on the same CI shard
+# (--shard in tests/conftest.py). The marker only affects the hit rate: the key
+# is the full reference configuration, so tests that drift apart just stop
+# sharing.
+_REFERENCE_TEXTS: dict[tuple, tuple[dict[str, str], list[str]]] = {}
+
+
+def _sampling_key(params: SamplingParams | list[SamplingParams]) -> str:
+    if isinstance(params, (list, tuple)):
+        return repr([_sampling_key(p) for p in params])
+    # Every declared field, not repr(): repr omits some of them.
+    fields = getattr(params, "__struct_fields__", None)
+    values = {f: getattr(params, f) for f in fields} if fields else vars(params)
+    return repr(sorted(values.items()))
+
+
+def _generate_reference(
+    model_name: str,
+    kwargs: dict,
+    prompts: list[str],
+    params: SamplingParams | list[SamplingParams],
+) -> list[str]:
+    """Run a no-spec LLM over the prompts, tear it down, return the texts."""
+    ref_llm = LLM(model=model_name, **kwargs)
+    try:
+        outputs = ref_llm.generate(prompts, params)
+    finally:
+        ref_llm.llm_engine.engine_core.shutdown()
+        del ref_llm
+        cleanup_dist_env_and_memory()
+        wait_for_tpu_release()
+    return [output.outputs[0].text for output in outputs]
+
+
+def _reference_texts(
+    model_name: str,
+    kwargs: dict,
+    prompts: list[str],
+    params: SamplingParams | list[SamplingParams],
+    generate=None,
+) -> list[str]:
+    """Reference texts, reused from an identical earlier run in this process.
+
+    `generate` produces the texts on a miss; by default a plain in-process LLM.
+    """
+    key = (
+        model_name,
+        repr(sorted(kwargs.items())),
+        tuple(prompts),
+        _sampling_key(params),
+    )
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+    cached = _REFERENCE_TEXTS.get(key)
+    if cached is not None:
+        cached_env, texts = cached
+        if cached_env == env:
+            print(f"Reusing cached reference outputs for {model_name}")
+            return list(texts)
+        changed = sorted(
+            k for k in env.keys() | cached_env.keys() if env.get(k) != cached_env.get(k)
+        )
+        print(
+            f"Not reusing reference for {model_name}: environment differs in {changed}"
+        )
+    if generate is None:
+        texts = _generate_reference(model_name, kwargs, prompts, params)
+    else:
+        texts = list(generate())
+    _REFERENCE_TEXTS[key] = (env, texts)
+    return list(texts)
+
+
 def _test_correctness_helper(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
@@ -452,8 +567,13 @@ def _test_correctness_helper(
             kwargs.update(extra_kwargs)
 
         # 1. Reference Run (no speculation)
-        with _engine(model_name, None, kwargs) as ref_engine:
-            ref_texts = ref_engine.generate(test_prompts, sampling_config)
+        def run_reference() -> list[str]:
+            with _engine(model_name, None, kwargs) as ref_engine:
+                return ref_engine.generate(test_prompts, sampling_config)
+
+        ref_texts = _reference_texts(
+            model_name, kwargs, test_prompts, sampling_config, run_reference
+        )
 
         # 2. Speculative Run
         with _engine(model_name, speculative_config, kwargs) as spec_engine:
@@ -597,7 +717,12 @@ def test_dspark_correctness_greedy(
     [
         pytest.param(1, False, id="bs1-sync", marks=pytest.mark.nightly),
         pytest.param(1, True, id="bs1-async"),
-        pytest.param(4, False, id="bs4-sync"),
+        pytest.param(
+            4,
+            False,
+            id="bs4-sync",
+            marks=pytest.mark.shard_group(QWEN35_MTP_REFERENCE),
+        ),
         pytest.param(4, True, id="bs4-async", marks=pytest.mark.nightly),
     ],
 )
@@ -626,6 +751,7 @@ def test_qwen35_mtp_correctness_greedy(
     )
 
 
+@pytest.mark.shard_group(QWEN35_MTP_REFERENCE)
 @pytest.mark.timeout(1800)
 def test_qwen35_mtp_correctness_greedy_multi_step(
     monkeypatch: pytest.MonkeyPatch,
@@ -926,10 +1052,6 @@ def test_sd_correctness_greedy_multi_chunk(
     model_name: str,
 ):
     with monkeypatch.context() as mp:
-        # collective_rpc below sends a Python function to TPU workers,
-        # which requires pickle fallback in vLLM's IPC encoder.
-        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
         test_prompts = get_ngram_test_prompts()
         kwargs = dict(
             max_model_len=256,
@@ -938,14 +1060,12 @@ def test_sd_correctness_greedy_multi_chunk(
             async_scheduling=False,
         )
 
-        ref_llm = LLM(model=model_name, **kwargs)
-        try:
-            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        finally:
-            ref_llm.llm_engine.engine_core.shutdown()
-            del ref_llm
-            cleanup_dist_env_and_memory()
-            wait_for_tpu_release()
+        ref_texts = _reference_texts(model_name, kwargs, test_prompts, sampling_config)
+
+        # collective_rpc below sends a Python function to TPU workers, which
+        # requires pickle fallback in vLLM's IPC encoder. Set after the
+        # reference run so its configuration matches tests that share it.
+        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
         spec_llm = LLM(
             model=model_name,
@@ -965,10 +1085,10 @@ def test_sd_correctness_greedy_multi_chunk(
             spec_outputs = spec_llm.generate(test_prompts, sampling_config)
 
             misses = 0
-            for ref, spec in zip(ref_outputs, spec_outputs):
-                if ref.outputs[0].text != spec.outputs[0].text:
+            for ref_text, spec in zip(ref_texts, spec_outputs):
+                if ref_text != spec.outputs[0].text:
                     misses += 1
-                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"ref:  {ref_text}")
                     print(f"spec: {spec.outputs[0].text}")
             assert misses == 0
         finally:
@@ -1017,6 +1137,7 @@ def _assert_valid_structured_json(text: str) -> None:
     assert isinstance(parsed.get("age"), int), text
 
 
+@pytest.mark.shard_group(QWEN3_STRUCTURED_REFERENCE)
 @pytest.mark.timeout(1800)
 @pytest.mark.parametrize(
     "multi_chunk",
@@ -1056,11 +1177,6 @@ def test_structured_output_spec_decode_correctness_greedy(
     unconstrained = SamplingParams(temperature=0, max_tokens=64)
 
     with monkeypatch.context() as mp:
-        if multi_chunk:
-            # collective_rpc below ships a Python function to the TPU
-            # workers, which needs pickle fallback in vLLM's IPC encoder.
-            mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
         test_prompts = get_structured_spec_prompts()
         params = [
             structured if i % 2 == 0 else unconstrained
@@ -1075,16 +1191,15 @@ def test_structured_output_spec_decode_correctness_greedy(
         )
 
         # 1. Reference run: structured outputs, no speculation.
-        ref_llm = LLM(model=model_name, **kwargs)
-        try:
-            ref_outputs = ref_llm.generate(test_prompts, params)
-        finally:
-            ref_llm.llm_engine.engine_core.shutdown()
-            del ref_llm
-            cleanup_dist_env_and_memory()
-            wait_for_tpu_release()
+        ref_texts = _reference_texts(model_name, kwargs, test_prompts, params)
 
         # 2. Speculative run with the same structured params.
+        if multi_chunk:
+            # collective_rpc below ships a Python function to the TPU
+            # workers, which needs pickle fallback in vLLM's IPC encoder. Set
+            # after the reference run so both variants share one reference.
+            mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
         spec_llm = LLM(
             model=model_name,
             speculative_config=_structured_spec_ngram_config(),
@@ -1110,7 +1225,6 @@ def test_structured_output_spec_decode_correctness_greedy(
             # prompt but not sampling params, so the group key carries the params
             # too; they must not vote in one majority. Every structured row is
             # still checked individually by (a) above.
-            ref_texts = [o.outputs[0].text for o in ref_outputs]
             spec_texts = [o.outputs[0].text for o in spec_outputs]
             group_keys = [
                 (prompt, "structured" if i % 2 == 0 else "free")
@@ -1242,14 +1356,7 @@ def test_structured_output_eagle3_greedy(
         )
 
         # 1. Reference run: structured outputs, no speculation.
-        ref_llm = LLM(model=model_name, **kwargs)
-        try:
-            ref_outputs = ref_llm.generate(test_prompts, params)
-        finally:
-            ref_llm.llm_engine.engine_core.shutdown()
-            del ref_llm
-            cleanup_dist_env_and_memory()
-            wait_for_tpu_release()
+        ref_texts = _reference_texts(model_name, kwargs, test_prompts, params)
 
         # 2. eagle3 speculative run with the same structured params.
         spec_llm = LLM(
@@ -1278,7 +1385,6 @@ def test_structured_output_eagle3_greedy(
             # prompt but not sampling params, so the group key carries the params
             # too; they must not vote in one majority. Every structured row is
             # still checked individually by (a) above.
-            ref_texts = [o.outputs[0].text for o in ref_outputs]
             spec_texts = [o.outputs[0].text for o in spec_outputs]
             group_keys = [
                 (prompt, "structured" if i % 2 == 0 else "free")
@@ -1426,6 +1532,7 @@ def test_structured_output_eagle3_async_adversarial_choice(
             wait_for_tpu_release()
 
 
+@pytest.mark.shard_group(LLAMA31_EAGLE3_REFERENCE)
 @pytest.mark.timeout(1200)
 def test_eagle3_correctness_greedy_multi_chunk(
     monkeypatch: pytest.MonkeyPatch,
@@ -1452,10 +1559,6 @@ def test_eagle3_correctness_greedy_multi_chunk(
         "draft_tensor_parallel_size": 1,
     }
     with monkeypatch.context() as mp:
-        # collective_rpc ships a Python function to the TPU workers, which
-        # needs pickle fallback in vLLM's IPC encoder.
-        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
         test_prompts = get_eagle3_test_prompts()
         kwargs = dict(
             max_model_len=256,
@@ -1467,16 +1570,14 @@ def test_eagle3_correctness_greedy_multi_chunk(
         )
 
         # 1. Reference run (no speculation).
-        ref_llm = LLM(model=model_name, **kwargs)
-        try:
-            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        finally:
-            ref_llm.llm_engine.engine_core.shutdown()
-            del ref_llm
-            cleanup_dist_env_and_memory()
-            wait_for_tpu_release()
+        ref_texts = _reference_texts(model_name, kwargs, test_prompts, sampling_config)
 
         # 2. Speculative run, forced multi-chunk.
+        # collective_rpc ships a Python function to the TPU workers, which
+        # needs pickle fallback in vLLM's IPC encoder. Set after the reference
+        # run so its configuration matches tests that share it.
+        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
         spec_llm = LLM(
             model=model_name, speculative_config=speculative_config, **kwargs
         )
@@ -1488,10 +1589,10 @@ def test_eagle3_correctness_greedy_multi_chunk(
 
             # (a) Chunked drafting must not change greedy output.
             misses = 0
-            for ref, spec in zip(ref_outputs, spec_outputs):
-                if ref.outputs[0].text != spec.outputs[0].text:
+            for ref_text, spec in zip(ref_texts, spec_outputs):
+                if ref_text != spec.outputs[0].text:
                     misses += 1
-                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"ref:  {ref_text}")
                     print(f"spec: {spec.outputs[0].text}")
             assert misses == 0
 
@@ -1517,6 +1618,7 @@ def test_eagle3_correctness_greedy_multi_chunk(
             wait_for_tpu_release()
 
 
+@pytest.mark.shard_group(LLAMA31_EAGLE3_REFERENCE)
 @pytest.mark.skipif(
     _get_tensor_parallel_size() < 2,
     reason="sharded draft (draft_tp == target_tp) needs TP>1",
@@ -1547,14 +1649,7 @@ def test_eagle3_sharded_draft(
         )
 
         # 1. Reference run (no speculation).
-        ref_llm = LLM(model=model_name, **kwargs)
-        try:
-            ref_outputs = ref_llm.generate(test_prompts, sampling_config)
-        finally:
-            ref_llm.llm_engine.engine_core.shutdown()
-            del ref_llm
-            cleanup_dist_env_and_memory()
-            wait_for_tpu_release()
+        ref_texts = _reference_texts(model_name, kwargs, test_prompts, sampling_config)
 
         # 2. Sharded eagle3 draft (draft_tp == target tp).
         spec_llm = LLM(
@@ -1572,10 +1667,10 @@ def test_eagle3_sharded_draft(
 
             # (a) Sharded drafting must not change greedy output.
             misses = 0
-            for ref, spec in zip(ref_outputs, spec_outputs):
-                if ref.outputs[0].text != spec.outputs[0].text:
+            for ref_text, spec in zip(ref_texts, spec_outputs):
+                if ref_text != spec.outputs[0].text:
                     misses += 1
-                    print(f"ref:  {ref.outputs[0].text}")
+                    print(f"ref:  {ref_text}")
                     print(f"spec: {spec.outputs[0].text}")
             assert misses == 0
 

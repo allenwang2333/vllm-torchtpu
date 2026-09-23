@@ -35,7 +35,7 @@ import pytest
 import torch
 
 
-def pytest_collection_modifyitems(items):
+def pytest_collection_modifyitems(config, items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
 
     Once the pytest process itself initializes the TPU runtime (any test that
@@ -48,16 +48,83 @@ def pytest_collection_modifyitems(items):
     """
     items.sort(key=lambda item: 0
                if item.get_closest_marker("spawns_tpu_workers") else 1)
+    _select_shard(config, items)
 
 
 def pytest_addoption(parser):
-    """Add --use-tpu command line option."""
+    """Add --use-tpu and --shard command line options."""
     parser.addoption(
         "--use-tpu",
         action="store_true",
         default=True,
         help="Run tests on TPU device instead of CPU",
     )
+    parser.addoption(
+        "--shard",
+        default=None,
+        metavar="I/N",
+        help="Run only shard I of N (1-based). Tests sharing a "
+        "shard_group marker always land on the same shard.",
+    )
+
+
+def _shard_weight(item):
+    """Relative cost of one test, used only to balance --shard.
+
+    A module can publish measured costs as SHARD_MINUTES, keyed by test id
+    (``test_x[param]``) or by function name; anything missing counts as
+    SHARD_DEFAULT_MINUTES, or 1 when the module publishes neither.
+    """
+    table = getattr(item.module, "SHARD_MINUTES", {})
+    default = getattr(item.module, "SHARD_DEFAULT_MINUTES", 1.0)
+    return table.get(item.name, table.get(item.originalname, default))
+
+
+def _select_shard(config, items):
+    """Deselect everything outside this process's --shard.
+
+    Groups (a shard_group marker, else the test on its own) are placed
+    heaviest-first on the least-loaded shard. Every shard computes the same
+    placement from the same collected items, so each test runs exactly once
+    across the N shards.
+
+    Skipped under --collect-only: Buildkite's test engine client (bktec)
+    plans its run from a plain collection and may hand one step's plan to
+    every job of that step. Listing the full selection there keeps every
+    job's plan identical, and the split happens when the tests actually run.
+    """
+    spec = config.getoption("--shard")
+    if not spec or config.getoption("collectonly"):
+        return
+    try:
+        index, count = (int(part) for part in spec.split("/"))
+    except ValueError:
+        raise pytest.UsageError(f"--shard expects I/N, got {spec!r}") from None
+    if not 1 <= index <= count:
+        raise pytest.UsageError(f"--shard {spec}: need 1 <= I <= N")
+
+    def group_of(item):
+        marker = item.get_closest_marker("shard_group")
+        return marker.args[0] if marker else item.nodeid
+
+    weights = {}
+    for item in items:
+        group = group_of(item)
+        weights[group] = weights.get(group, 0.0) + _shard_weight(item)
+    loads = [0.0] * count
+    placement = {}
+    for group in sorted(weights, key=lambda g: (-weights[g], g)):
+        shard = min(range(count), key=lambda s: (loads[s], s))
+        placement[group] = shard
+        loads[shard] += weights[group]
+
+    keep = [item for item in items if placement[group_of(item)] == index - 1]
+    dropped = [
+        item for item in items if placement[group_of(item)] != index - 1
+    ]
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = keep
 
 
 @pytest.fixture(autouse=True)
