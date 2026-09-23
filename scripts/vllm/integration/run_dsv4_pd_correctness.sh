@@ -191,7 +191,7 @@ unset TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
 
 launcher="${repo_root}/examples/disagg/launch_dsv4_disagg_multihost.sh"
 
-cd "${repo_root}"
+cd "${repo_root}" || exit 1
 
 case "${ROLE}" in
   prefill)
