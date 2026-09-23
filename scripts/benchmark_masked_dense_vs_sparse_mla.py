@@ -81,10 +81,6 @@ MAX_NUM_SEQS = 64
 KV_LENS = (512, 1024, 2048, 3072, 4096, 6144, 8192, 9216)
 
 
-_time = kernel_timing.pipelined_ms
-_time_pair = kernel_timing.paired_ms
-
-
 def _build_caches(rng, total_pages):
     """Random uint8 (nope, rope) caches in the native split sparse layout."""
     nope = jnp.asarray(
@@ -395,18 +391,18 @@ def _run_point(
     def mask_fn():
         return csa_mask.generate_mask_sc(c["topk_indices"], bitmap_bound)
 
-    def time_arm(fn, available=True):
-        """(pipelined, blocking) ms, or (nan, nan) where the arm does not apply."""
+    def measure(fn, available=True):
+        """(pipelined, blocking) ms, or (nan, nan) where this case does not apply."""
         if not available:
             return float("nan"), float("nan")
         return kernel_timing.both_ms(fn, iters=iters)
 
     dense_available = shape == "prefill" and 0 < kv_len <= bitmap_bound
-    bitmap_ms, bitmap_wall = time_arm(
+    bitmap_ms, bitmap_wall = measure(
         functools.partial(dense_fn, bitmap_bound), dense_available
     )
-    gather_ms, gather_wall = time_arm(sparse_fn)
-    mask_ms, mask_wall = time_arm(mask_fn, dense_available)
+    gather_ms, gather_wall = measure(sparse_fn)
+    mask_ms, mask_wall = measure(mask_fn, dense_available)
 
     row = dict(
         shape=shape,
@@ -423,7 +419,7 @@ def _run_point(
     )
     # The analytic mask needs its static bound at or under `topk`, and the
     # bound must cover every sequence in the call.
-    row["analytic_ms"], row["analytic_wall_ms"] = time_arm(
+    row["analytic_ms"], row["analytic_wall_ms"] = measure(
         functools.partial(dense_fn, analytic_bound),
         shape == "prefill" and 0 < kv_len <= analytic_bound,
     )
@@ -432,8 +428,10 @@ def _run_point(
     if measure_wrapper:
         dispatch_wrapper = _build_wrapper(True)
         sparse_wrapper = _build_wrapper(False)
-        (row["wrapper_dispatch_ms"], row["wrapper_sparse_ms"]) = _time_pair(
-            dispatch_wrapper, sparse_wrapper, *_wrapper_args(c), iters=iters
+        (row["wrapper_dispatch_ms"], row["wrapper_sparse_ms"]) = (
+            kernel_timing.paired_ms(
+                dispatch_wrapper, sparse_wrapper, *_wrapper_args(c), iters=iters
+            )
         )
     return row
 
@@ -509,8 +507,6 @@ def main():
             )
             row["ratio"] = best_ms / row["gather_ms"]
             row["win"] = win
-            # Dispatch is a host cost, so this column should be near-constant.
-            # A row that departs from it means the environment moved.
             row["dispatch_ms"] = row["gather_wall_ms"] - row["gather_ms"]
             rows.append(row)
             print(

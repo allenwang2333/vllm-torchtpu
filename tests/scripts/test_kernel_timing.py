@@ -15,8 +15,8 @@
 
 No TPU: the helpers are exercised against a fake callable, and the guard is a
 static AST scan. The bug being guarded is `jax.block_until_ready` *inside* a
-timing loop, which charged a ~150 us host round trip to every sample and read
-a 0.22 ms decode kernel as 0.40 ms.
+timing loop, which charged a host round trip to every sample and so read a fast
+kernel as far slower than it is.
 """
 
 import ast
@@ -27,9 +27,12 @@ import types
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-# Dev-only, so it lives in scripts/ rather than the installed package.
-# scripts/ is not importable, so load it by path.
-CLOCK = REPO / "scripts" / "kernel_timing.py"
+
+TIMED_SCRIPTS = (
+    "scripts/benchmark_masked_dense_vs_sparse_mla.py",
+    "scripts/mla_mixed_prefill_tuner.py",
+    "scripts/flash_attention_tuner.py",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +54,8 @@ def fake_jax(monkeypatch):
 def _mod():
     """Fresh module per test, so each binds to that test's fake jax."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("kernel_timing", CLOCK)
+    spec = importlib.util.spec_from_file_location(
+        "kernel_timing", REPO / "scripts" / "kernel_timing.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["kernel_timing"] = mod
     spec.loader.exec_module(mod)
@@ -62,7 +66,7 @@ def test_burst_blocks_once_not_per_call(fake_jax):
     """The whole point: N dispatches, one block."""
     kt = _mod()
     dispatched = []
-    kt.burst_ms(lambda: dispatched.append(1), (), 32)
+    kt.burst_ms(lambda: dispatched.append(1), iters=32)
     assert len(dispatched) == 32
     assert fake_jax["blocks"] == 1, (
         "one block per burst; blocking per call is the bug this replaced")
@@ -100,8 +104,7 @@ def test_both_returns_pipelined_first(fake_jax):
         time.sleep(slept)
 
     pipe, wall = kt.both_ms(slow, iters=20, warmup=1, bursts=1)
-    # With no real device both clocks measure the same work, so this checks
-    # which value comes first, not how far apart they are.
+    # No real device, so both clocks measure the same work: pin order, not gap.
     assert pipe == pytest.approx(wall, rel=0.5)
     assert pipe > 0 and wall > 0
 
@@ -121,7 +124,7 @@ def test_slope_cancels_a_fixed_per_burst_cost(fake_jax):
 
 
 def test_short_bursts_are_refused(fake_jax):
-    """Below MIN_ITERS the burst has not converged, so it must not run."""
+    """A burst below the floor is refused, not silently reported."""
     kt = _mod()
     with pytest.raises(ValueError, match="MIN_ITERS"):
         kt.pipelined_ms(lambda: None, iters=kt.MIN_ITERS - 1)
@@ -145,12 +148,12 @@ def test_paired_alternates_arm_order(fake_jax):
         f"arms did not alternate between bursts: {burst1[0]}, {burst2[0]}")
 
 
-# Scripts that time a kernel and must therefore use the shared clock.
-TIMED_SCRIPTS = (
-    "scripts/benchmark_masked_dense_vs_sparse_mla.py",
-    "scripts/mla_mixed_prefill_tuner.py",
-    "scripts/flash_attention_tuner.py",
-)
+def test_paired_refuses_an_odd_burst_count(fake_jax):
+    """An odd count lets the median land on the majority lead position."""
+    kt = _mod()
+    with pytest.raises(ValueError, match="odd"):
+        kt.paired_ms(lambda: None, lambda: None, iters=20, bursts=3)
+    assert kt.PAIRED_BURSTS % 2 == 0
 
 
 def _blocking_timing_loops(tree):

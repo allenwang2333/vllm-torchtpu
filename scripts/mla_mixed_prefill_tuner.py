@@ -63,8 +63,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pages-per-seq", type=int, default=520)
     parser.add_argument("--total-pages", type=int, default=2112)
     parser.add_argument("--warmups", type=int, default=2)
-    # Spelled out rather than read from kernel_timing, which imports jax: the
-    # parent must stay TPU-free so a child's crash cannot take the sweep down.
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument(
         "--bursts",
@@ -181,8 +179,6 @@ def _run_child(args: argparse.Namespace) -> None:
         jax.block_until_ready((output, cache_kv))
         result["compile_and_first_s"] = time.perf_counter() - compile_start
 
-        # Each call consumes the previous call's cache, so the burst chains on
-        # device and needs no host sync between steps.
         def step():
             nonlocal output, cache_kv
             output, cache_kv = invoke(cache_kv)
@@ -191,7 +187,7 @@ def _run_child(args: argparse.Namespace) -> None:
         for _ in range(args.warmups):
             jax.block_until_ready(step())
         samples_ms = [
-            kernel_timing.burst_ms(step, (), args.iterations)
+            kernel_timing.burst_ms(step, iters=args.iterations)
             for _ in range(args.bursts)
         ]
 
