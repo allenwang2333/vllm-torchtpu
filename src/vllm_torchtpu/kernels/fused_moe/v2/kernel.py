@@ -65,6 +65,15 @@ HEIGHT_RUNGS = 4
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
+# Contraction blocks a streamed eight-bit build splits each slab into: the
+# gate/up slab into FP8_STREAM_W1_BLOCKS and the down slab into
+# FP8_STREAM_W2_BLOCKS, each its own DMA on its own semaphore, so the first
+# matmul block waits for one block of the slab rather than all of it.
+FP8_STREAM_W1_BLOCKS = 4
+FP8_STREAM_W2_BLOCKS = 2
+# Tiles a phase-split eight-bit visit runs gate/up over before their down
+# matmuls: the chunk's intermediates wait in VMEM between the two phases.
+FP8_SPLIT_TILES = 4
 # The collective this kernel's barrier and remote copies belong to. Shared
 # with any other collective kernel built with the same id.
 COLLECTIVE_ID = 0
@@ -336,6 +345,41 @@ def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
     return acc2, mid_scale
 
 
+def expert_ffn_fp8_streamed(
+    act_q,
+    act_scale,
+    w1_block,
+    w2_block,
+    w1s,
+    *,
+    n1,
+    kb1,
+    n2,
+    kb2,
+    act_fn="silu",
+    w1b=None,
+    after_gate_up=None,
+):
+    """expert_ffn_fp8 with each slab handed over one contraction block at a
+    time, so a streamed slab can be waited block by block.
+
+    The per-channel scales apply after the whole contraction, exactly as in
+    expert_ffn_fp8, so the only difference in value is the f32 order of the
+    block partial sums. after_gate_up runs once the gate/up accumulator is
+    whole -- the last read of the gate/up slab has retired by then, which is
+    what makes it the place to start refilling that slab.
+    """
+    inter = w1s.shape[-1] // 2
+    acc1 = _chunked_dot(act_q, w1_block, n1, kb1)
+    if after_gate_up is not None:
+        after_gate_up()
+    mid_q, mid_scale = _intermediate_rows(
+        acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
+    )
+    acc2 = _chunked_dot(mid_q, w2_block, n2, kb2)
+    return acc2, mid_scale
+
+
 def expert_ffn_blockscale(
     act_q,
     act_scale,
@@ -481,6 +525,22 @@ def _slot_copy(src, vm, sems, slot):
     return pltpu.make_async_copy(src, vm.at[slot], sems.at[slot])
 
 
+class _BlockedCopy:
+    """One slab moved as several contraction-block DMAs, each on its own
+    semaphore. start/wait act on every block, in block order."""
+
+    def __init__(self, copies):
+        self.copies = copies
+
+    def start(self, **kwargs):
+        for copy in self.copies:
+            copy.start(**kwargs)
+
+    def wait(self):
+        for copy in self.copies:
+            copy.wait()
+
+
 def _rows_wait(sem, ref, rows):
     """Block until `rows` rows' worth of DMAs on `sem` have landed."""
     pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
@@ -528,6 +588,7 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    fp8_stream=False,
 ):
     """Build the pallas_call and the function that invokes it."""
     if act_fn not in ACT_FNS:
@@ -637,6 +698,36 @@ def _build_fused_ep_moe_kernel(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
     )
+    # A multi-tile eight-bit build that already lost its whole runway can
+    # still hide the next expert's gate/up slab behind this expert's down
+    # matmuls, by running each visit phase-split: gate/up over a chunk of
+    # tiles, then the chunk's down matmuls. Only offered at distance zero,
+    # so the chunk buffer it adds can never cost a build its prefetch.
+    split_tiles = 0
+    if (
+        fp8_stream
+        and weight_format == host.WeightFormat.FP8
+        and has_scales
+        and has_act_scale
+        and ragged_rows_alloc is not None
+        and ragged_rows_alloc > ep * g_local * capacity
+        and slots.distance == 0
+    ):
+        split_slots = host.fit_weight_slots(
+            g_local,
+            capacity,
+            hidden,
+            inter,
+            max_distance=0,
+            weight_format=weight_format,
+            rhs_qb=rhs_qb,
+            has_w1_bias=has_w1_bias,
+            has_w2_bias=has_w2_bias,
+            split_tiles=FP8_SPLIT_TILES,
+        )
+        if split_slots.fits:
+            slots = split_slots
+            split_tiles = FP8_SPLIT_TILES
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
     # The relation the whole schedule rests on: a refill writes its slot
@@ -659,7 +750,38 @@ def _build_fused_ep_moe_kernel(
     # fp4, fp8 expert FFN are running different code paths. This flag can
     # be activated only for fp4 expert FFN now. But the idea should be
     # applicable to fp8 expert FFN as well.
-    streams_weights = rhs_packed4
+    #
+    # For fp8 the slab is split into contraction blocks, each its own DMA,
+    # and every block is waited by the matmul block that reads it on the
+    # visit's first tile (fp8_stream).
+    #
+    # Only a build whose experts fit in one tile streams: there every tile is
+    # tile zero, so the block waits cover the whole visit. A multi-tile build
+    # would pay the blocked contraction's partial-sum adds on every tile for
+    # a wait that only its first tile owes -- measured slower at prefill.
+    streams_fp8 = (
+        bool(fp8_stream)
+        and weight_format == host.WeightFormat.FP8
+        and ragged_rows_alloc is not None
+        and ragged_rows_alloc <= ep * g_local * capacity
+    )
+    streams_weights = rhs_packed4 or streams_fp8
+    if streams_fp8:
+        n_w1_blocks, n_w2_blocks = FP8_STREAM_W1_BLOCKS, FP8_STREAM_W2_BLOCKS
+        # A block boundary has to sit on a lane block of the activations it
+        # contracts and on the fp8 sublane tile of the slab it slices.
+        if hidden % (n_w1_blocks * HIDDEN_LANE_BLOCK) or inter % (
+            n_w2_blocks * HIDDEN_LANE_BLOCK
+        ):
+            raise ValueError(
+                f"fp8_stream splits hidden={hidden} into {n_w1_blocks} and "
+                f"inter={inter} into {n_w2_blocks} contraction blocks, each a "
+                f"whole number of {HIDDEN_LANE_BLOCK}-lane blocks"
+            )
+        kb1, kb2 = hidden // n_w1_blocks, inter // n_w2_blocks
+    else:
+        n_w1_blocks = n_w2_blocks = 1
+        kb1, kb2 = hidden, inter
     # Whether issue async copy the NEXT expert's weights as soon as we finish
     # reading the current expert's weights, instead of at the beginning of the
     # next expert's visit.
@@ -855,6 +977,8 @@ def _build_fused_ep_moe_kernel(
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
         oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
+        # [split_tiles, tile_m, inter] fp8 and [split_tiles, tile_m, 1] f32.
+        mid_vm, mscl_vm = (next(it) for _ in range(2)) if split_tiles else (None, None)
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None
@@ -889,12 +1013,28 @@ def _build_fused_ep_moe_kernel(
             copy.start()
             copy.wait()
 
+        def _blocked(src_hbm, vm, sems, expert, slot, n_blocks, kb):
+            return _BlockedCopy(
+                [
+                    pltpu.make_async_copy(
+                        src_hbm.at[expert, pl.ds(b * kb, kb)],
+                        vm.at[slot, pl.ds(b * kb, kb)],
+                        sems.at[slot, b],
+                    )
+                    for b in range(n_blocks)
+                ]
+            )
+
         def w1_copy(expert, slot):
             """The gate/up weight slab of `expert`, into weight slot `slot`."""
+            if streams_fp8:
+                return _blocked(w1_hbm, w1_vm, w1_sems, expert, slot, n_w1_blocks, kb1)
             return _slot_copy(w1_hbm.at[expert], w1_vm, w1_sems, slot)
 
         def w2_copy(expert, slot):
             """The down weight slab of `expert`, into weight slot `slot`."""
+            if streams_fp8:
+                return _blocked(w2_hbm, w2_vm, w2_sems, expert, slot, n_w2_blocks, kb2)
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def w1s_copy(expert, slot):
@@ -993,6 +1133,34 @@ def _build_fused_ep_moe_kernel(
                     copy(expert, slot).wait()
 
             return wait
+
+        def _fp8_block_readers(expert, slot, first_tile):
+            """(w1_block, w2_block) streamed fp8 readers at weight slot `slot`.
+
+            Each waits its own block's DMA on the visit's first tile -- every
+            block is read by tile zero, so each started copy is waited
+            exactly once -- and later tiles read slabs already whole. Only
+            the waited block's descriptor is built.
+            """
+
+            def reader(src_hbm, vm, sems, kb):
+                def read(b):
+                    @pl.when(first_tile)
+                    def _():
+                        pltpu.make_async_copy(
+                            src_hbm.at[expert, pl.ds(b * kb, kb)],
+                            vm.at[slot, pl.ds(b * kb, kb)],
+                            sems.at[slot, b],
+                        ).wait()
+
+                    return vm[slot, pl.ds(b * kb, kb), :]
+
+                return read
+
+            return (
+                reader(w1_hbm, w1_vm, w1_sems, kb1),
+                reader(w2_hbm, w2_vm, w2_sems, kb2),
+            )
 
         def _fp4_block_readers(slot, wait_slab=None, slab_retired=None):
             """(w1_block, w2_block) fp4 block readers at weight slot `slot`.
@@ -1246,7 +1414,20 @@ def _build_fused_ep_moe_kernel(
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
             slot = lax.rem(visit_i, jnp.int32(nbuf))
-            if not prefetches and not starts_next_weights:
+            if split_tiles:
+                # The previous visit started this one's gate/up slab after its
+                # last gate/up phase and the scales and down slab after its
+                # last down phase; the first visit has nobody to do that. The
+                # down slab is waited before the first down phase instead,
+                # which the gate/up phase has had the whole time to land.
+                @pl.when(visit_i == 0)
+                def _():
+                    weight_starts(e, slot)
+
+                w1_copy(e, slot).wait()
+                w1s_copy(e, slot).wait()
+                w2s_copy(e, slot).wait()
+            elif not prefetches and not starts_next_weights:
                 # No runway: nobody started this visit's weights, so it
                 # starts them itself and waits on the two lines below.
                 # Refilling the one slot cannot race the previous visit's
@@ -1264,7 +1445,8 @@ def _build_fused_ep_moe_kernel(
                 def _():
                     weight_starts(e, slot)
 
-            weight_waits(e, slot)
+            if not split_tiles:
+                weight_waits(e, slot)
 
             # Refill the slot for the expert DISTANCE ahead: the previous
             # expert last read it, and DISTANCE < nbuf keeps it off both live
@@ -1431,31 +1613,10 @@ def _build_fused_ep_moe_kernel(
                     subs_out = subs_out + jnp.where(overlap > 0, 1, 0)
                 return rows_out, subs_out
 
-            def tile_body(t, carried):
-                """Compute tile t, stage it for the wire and ship it."""
-                tile_count = carried[0]
-                row_base = slab_base + t * tile_m
-                live_rows = jnp.minimum(rows - t * tile_m, tile_m)
-                live_blocks = live_rows // ROWBLK
-                tile_block_base = t * tile_blocks  # expert-local block base
-                parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
-
-                # out_vm[parity] reuse guard. Predicated on the outstanding
-                # count rather than on the tile count, because the drain
-                # zeroes them.
-                if push_from_vmem:
-                    wait_shipped(
-                        parity,
-                        jnp.where(parity == 0, carried[1], carried[2]),
-                        jnp.where(parity == 0, carried[3], carried[4]),
-                    )
-                else:
-                    pending = jnp.where(parity == 0, carried[1], carried[2])
-
-                    @pl.when(pending > 0)
-                    def _():
-                        wait_commits(parity, pending)
-
+            def lhs_step(t, parity, live_rows):
+                """Wait tile t's activation stream and issue what follows it:
+                tile t+1's rows, the index windows they need, and on the last
+                tile the next expert's first window."""
                 # Wait this tile's stream, then issue tile t+1's into the other
                 # slot before compute, so the fetch runs under the MXU window.
                 lhs_ready_tile(live_rows, parity)
@@ -1503,6 +1664,33 @@ def _build_fused_ep_moe_kernel(
                     issue_gather_window(
                         expert_base_sm[visit_sm[visit_i + 1]], next_wslot
                     )
+
+            def tile_body(t, carried):
+                """Compute tile t, stage it for the wire and ship it."""
+                tile_count = carried[0]
+                row_base = slab_base + t * tile_m
+                live_rows = jnp.minimum(rows - t * tile_m, tile_m)
+                live_blocks = live_rows // ROWBLK
+                tile_block_base = t * tile_blocks  # expert-local block base
+                parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
+
+                # out_vm[parity] reuse guard. Predicated on the outstanding
+                # count rather than on the tile count, because the drain
+                # zeroes them.
+                if push_from_vmem:
+                    wait_shipped(
+                        parity,
+                        jnp.where(parity == 0, carried[1], carried[2]),
+                        jnp.where(parity == 0, carried[3], carried[4]),
+                    )
+                else:
+                    pending = jnp.where(parity == 0, carried[1], carried[2])
+
+                    @pl.when(pending > 0)
+                    def _():
+                        wait_commits(parity, pending)
+
+                lhs_step(t, parity, live_rows)
 
                 def compute_tile(height):
                     """Run the FFN on the tile's leading `height` rows.
@@ -1571,6 +1759,26 @@ def _build_fused_ep_moe_kernel(
                             w2_vm[slot],
                             act_fn=act_fn,
                             w1b=w1b_row,
+                        )
+                    elif streams_fp8:
+                        w1_block, w2_block = _fp8_block_readers(e, slot, t == 0)
+                        acc2, mid_scale = expert_ffn_fp8_streamed(
+                            act_rows,
+                            act_scales,
+                            w1_block,
+                            w2_block,
+                            w1s_vm[pl.ds(slot, 1), :],
+                            n1=n_w1_blocks,
+                            kb1=kb1,
+                            n2=n_w2_blocks,
+                            kb2=kb2,
+                            act_fn=act_fn,
+                            w1b=w1b_row,
+                            after_gate_up=(
+                                _start_next_gate_up(visit_i, slot, t == n_tiles - 1)
+                                if starts_next_weights
+                                else None
+                            ),
                         )
                     else:
                         acc2, mid_scale = expert_ffn_fp8(
@@ -1664,7 +1872,130 @@ def _build_fused_ep_moe_kernel(
                     wslot,
                 )
 
-            carry = lax.fori_loop(0, n_tiles, tile_body, carry)
+            def split_visit(e, visit_i, slot, rows, slab_base, n_tiles, carry):
+                """The visit phase-split: per chunk of split_tiles tiles, every
+                gate/up first, then every down.
+
+                The last chunk's gate/up retires the gate/up slab, so the next
+                expert's starts there and lands under this expert's down
+                matmuls; its scales and down slab start after the last down
+                phase, as in the streamed schedule, and land under its own
+                gate/up phase. Tile parities are the tile counter's in both
+                phases -- the down phase advances it in the same order the
+                gate/up phase read it.
+                """
+                tile_count0 = carry[0]
+                wslot = carry[-1]
+                n_chunks = -(-n_tiles // split_tiles)
+                w1s_row = w1s_vm[pl.ds(slot, 1), :]
+                w2s_row = w2s_vm[pl.ds(slot, 1), :]
+                w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
+                w2b_row = w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None
+
+                def chunk_step(c, carried):
+                    t0 = c * split_tiles
+                    t1 = jnp.minimum(t0 + split_tiles, n_tiles)
+
+                    def gate_up(t, unused):
+                        parity = lax.rem(tile_count0 + t, jnp.int32(OUT_PARITIES))
+                        live_rows = jnp.minimum(rows - t * tile_m, tile_m)
+                        lhs_step(t, parity, live_rows)
+                        act_rows = lhs_vm[parity].reshape(tile_m, hidden)
+                        act_scales = _tile_row_scales(
+                            ls_vm[parity], slab_base + t * tile_m, tile_m
+                        )
+                        acc1 = lax.dot_general(
+                            act_rows,
+                            w1_vm[slot],
+                            DN,
+                            preferred_element_type=jnp.float32,
+                        )
+                        mid_q, mid_scale = _intermediate_rows(
+                            acc1,
+                            act_scales,
+                            inter,
+                            w1s=w1s_row,
+                            act_fn=act_fn,
+                            w1b=w1b_row,
+                        )
+                        mid_vm[t - t0] = mid_q
+                        mscl_vm[t - t0] = mid_scale
+                        return unused
+
+                    lax.fori_loop(t0, t1, gate_up, jnp.int32(0))
+
+                    @pl.when(jnp.logical_and(c == n_chunks - 1, visit_i + 1 < n_visit))
+                    def _():
+                        w1_copy(visit_sm[visit_i + 1], slot).start(
+                            priority=WEIGHT_DMA_PRIORITY
+                        )
+
+                    @pl.when(c == 0)
+                    def _():
+                        w2_copy(e, slot).wait()
+
+                    def down(t, carried):
+                        tile_count = carried[0]
+                        live_rows = jnp.minimum(rows - t * tile_m, tile_m)
+                        live_blocks = live_rows // ROWBLK
+                        tile_block_base = t * tile_blocks
+                        parity = lax.rem(tile_count, jnp.int32(OUT_PARITIES))
+                        pending = jnp.where(parity == 0, carried[1], carried[2])
+
+                        @pl.when(pending > 0)
+                        def _():
+                            wait_commits(parity, pending)
+
+                        acc2 = lax.dot_general(
+                            mid_vm[t - t0],
+                            w2_vm[slot],
+                            DN,
+                            preferred_element_type=jnp.float32,
+                        )
+                        wire_rows, wire_scales = wire_row_and_scale(
+                            acc2,
+                            mscl_vm[t - t0],
+                            w2s=w2s_row,
+                            w2b=w2b_row,
+                            wire_dtype=form.wire_dtype,
+                            tile_m=tile_m,
+                        )
+                        wire_rows = wire_rows.reshape(
+                            tile_m, lane_blocks, HIDDEN_LANE_BLOCK
+                        )
+                        wire_scales = wire_scales.reshape(1, tile_m)
+                        for p in range(OUT_PARITIES):
+
+                            @pl.when(parity == p)
+                            def _(p=p):
+                                out_vm[p] = wire_rows
+                                oscl_vm[p] = wire_scales
+
+                        commit_tile(parity, t, tile_block_base, live_blocks)
+                        return (
+                            tile_count + 1,
+                            jnp.where(parity == 0, live_blocks, carried[1]),
+                            jnp.where(parity == 1, live_blocks, carried[2]),
+                            wslot,
+                        )
+
+                    return lax.fori_loop(t0, t1, down, carried)
+
+                carry = lax.fori_loop(0, n_chunks, chunk_step, carry)
+
+                @pl.when(visit_i + 1 < n_visit)
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    w1s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+
+                return carry
+
+            if split_tiles:
+                carry = split_visit(e, visit_i, slot, rows, slab_base, n_tiles, carry)
+            else:
+                carry = lax.fori_loop(0, n_tiles, tile_body, carry)
 
             if starts_next_weights:
                 # What the tile loop was still reading to its last block: the
@@ -1861,6 +2192,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                split_tiles=split_tiles,
             )
         ]
         + [
@@ -1869,8 +2201,10 @@ def _build_fused_ep_moe_kernel(
             # lhs_sems. Parity-deep, not nbuf-deep: every index into it, and into
             # the lhs_vm and ls_vm buffers it guards, is an out-parity.
             pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
-            pltpu.SemaphoreType.DMA((nbuf,)),  # w1_sems
-            pltpu.SemaphoreType.DMA((nbuf,)),  # w2_sems
+            # w1_sems / w2_sems: one per slot, or per (slot, block) where the
+            # slabs stream in contraction blocks.
+            pltpu.SemaphoreType.DMA((nbuf, n_w1_blocks) if streams_fp8 else (nbuf,)),
+            pltpu.SemaphoreType.DMA((nbuf, n_w2_blocks) if streams_fp8 else (nbuf,)),
         ]
         + (
             [
@@ -1962,6 +2296,8 @@ def _build_fused_ep_moe_kernel(
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
+            f"{'_fp8s' if streams_fp8 else ''}"
+            f"{'_fp8p' if split_tiles else ''}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
         )
         return pl.pallas_call(

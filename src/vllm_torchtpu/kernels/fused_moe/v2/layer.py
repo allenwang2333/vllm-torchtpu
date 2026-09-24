@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -258,6 +259,7 @@ def fused_ep_moe_v2(
     score_bias=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    fp8_stream=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -295,6 +297,10 @@ def fused_ep_moe_v2(
     sharded_plan computes the same kernel operands from the two complementary
     1/ep slices their consumers read, plus one small expert-count all-gather.
     It changes routing-plan construction only, never the core kernel.
+
+    fp8_stream streams eight-bit weight slabs in contraction blocks and
+    starts the next expert's slabs early (see kernel.py); None reads
+    MOE_FUSED_EP_V2_FP8_STREAM, so a caller can pin either arm in-process.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -407,6 +413,9 @@ def fused_ep_moe_v2(
             f"score_bias must be one value per global expert, [{e_total}]; "
             f"got {tuple(score_bias.shape)}"
         )
+    if fp8_stream is None:
+        fp8_stream = envs.MOE_FUSED_EP_V2_FP8_STREAM
+    fp8_stream = bool(fp8_stream)
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -419,6 +428,7 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        fp8_stream=fp8_stream,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -723,6 +733,7 @@ def fused_ep_moe_v2(
         scoring_fn,
         has_score_bias and score_bias.dtype,
         float(routed_scaling_factor),
+        fp8_stream,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

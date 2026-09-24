@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_V2_FP8_STREAM: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -600,6 +601,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN":
     env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Stream fused EP MoE v2's eight-bit weight slabs in contraction blocks,
+    # each waited by the matmul block that first reads it, and start the next
+    # expert's slabs as soon as the current one's last reader has retired.
+    "MOE_FUSED_EP_V2_FP8_STREAM":
+    env_bool("MOE_FUSED_EP_V2_FP8_STREAM"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

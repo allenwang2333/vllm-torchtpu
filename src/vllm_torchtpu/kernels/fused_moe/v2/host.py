@@ -1355,6 +1355,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    split_tiles=0,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1445,6 +1446,20 @@ def vmem_scratch_arrays(
             form.wire_dtype,
         ),
         ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        # A phase-split visit (split_tiles > 0) runs gate/up over a chunk of
+        # split_tiles tiles before any of their down matmuls, so the chunk's
+        # requantized intermediates and their row scales wait here between
+        # the two phases. The tile index is the leading axis because it is
+        # a runtime value, and a runtime index is legal only off the two
+        # tiled dimensions.
+        *(
+            [
+                ("mid_vm", (split_tiles, tile_m, inter), form.weight_dtype),
+                ("mscl_vm", (split_tiles, tile_m, 1), jnp.float32),
+            ]
+            if split_tiles
+            else []
+        ),
     ]
 
 
@@ -1525,6 +1540,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    split_tiles=0,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1550,6 +1566,7 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        split_tiles=split_tiles,
     )
     arrays += vmem_tile_body_arrays(
         capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
@@ -1589,6 +1606,7 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    split_tiles=0,
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1631,6 +1649,7 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                split_tiles=split_tiles,
             ),
             limit,
         )
