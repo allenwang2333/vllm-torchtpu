@@ -50,8 +50,9 @@ class TestFluxNightlyOnTpu:
             ("black-forest-labs/FLUX.2-klein-4B", 4, 1.0),
         ],
     )
-    def test_flux_tri_model_matrix_tpu(self, model_id: str, steps: int,
-                                       guidance: float):
+    def test_flux_tri_model_matrix_tpu(
+        self, model_id: str, steps: int, guidance: float
+    ):
         """Validate common path execution across all three FLUX model variants on TPU v7x.
 
         Covers distilled guidance-free Schnell, full 10-step CFG guidance Dev with distribution
@@ -78,13 +79,16 @@ class TestFluxNightlyOnTpu:
 
             metrics = compute_distribution_metrics(img)
             assert 0.10 < metrics["mean"] < 0.90, (
-                f"Unnatural pixel mean on {model_id}: {metrics['mean']:.4f}")
+                f"Unnatural pixel mean on {model_id}: {metrics['mean']:.4f}"
+            )
             assert metrics["std"] > 0.05, (
                 f"Suspiciously low image contrast on {model_id} (std={metrics['std']:.4f})"
             )
             assert metrics["var"] > 0.01, (
-                f"Image variance too low on {model_id} ({metrics['var']:.4f})")
+                f"Image variance too low on {model_id} ({metrics['var']:.4f})"
+            )
             assert metrics["p90"] > metrics["p10"], (
-                f"Collapsed dynamic range on {model_id}")
+                f"Collapsed dynamic range on {model_id}"
+            )
         finally:
             omni.shutdown()

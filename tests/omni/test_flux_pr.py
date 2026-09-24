@@ -43,43 +43,63 @@ pytestmark = [
 # ==============================================================================
 DIFFUSERS_PATCH_CENTER = np.array(
     [
-        [[0.15574795, 0.3768134, 0.20242077],
-         [0.1504466, 0.39819264, 0.22532558],
-         [0.27011064, 0.5129144, 0.32839534]],
-        [[0.2899974, 0.51282465, 0.3368892], [0.342479, 0.5875516, 0.4078709],
-         [0.30188876, 0.52430815, 0.33795026]],
-        [[0.330875, 0.522212, 0.36439496], [0.43038124, 0.64522934, 0.4697881],
-         [0.33332568, 0.54160994, 0.34145623]],
+        [
+            [0.15574795, 0.3768134, 0.20242077],
+            [0.1504466, 0.39819264, 0.22532558],
+            [0.27011064, 0.5129144, 0.32839534],
+        ],
+        [
+            [0.2899974, 0.51282465, 0.3368892],
+            [0.342479, 0.5875516, 0.4078709],
+            [0.30188876, 0.52430815, 0.33795026],
+        ],
+        [
+            [0.330875, 0.522212, 0.36439496],
+            [0.43038124, 0.64522934, 0.4697881],
+            [0.33332568, 0.54160994, 0.34145623],
+        ],
     ],
     dtype=np.float32,
 )
 
 DIFFUSERS_PATCH_HIGH_VAR = np.array(
     [
-        [[0.1654473, 0.38950682, 0.06230783], [
-            0.207436, 0.4417063, 0.10256004
-        ], [0.19300953, 0.44582433, 0.10666323]],
-        [[0.20389146, 0.3718347, 0.09957111],
-         [0.14982936, 0.3330813, 0.05052826],
-         [0.21267194, 0.41932827, 0.11476776]],
-        [[0.84121597, 0.9132941, 0.77168417], [
-            0.8301396, 0.9395311, 0.7908703
-        ], [0.1881119, 0.32693827, 0.12821728]],
+        [
+            [0.1654473, 0.38950682, 0.06230783],
+            [0.207436, 0.4417063, 0.10256004],
+            [0.19300953, 0.44582433, 0.10666323],
+        ],
+        [
+            [0.20389146, 0.3718347, 0.09957111],
+            [0.14982936, 0.3330813, 0.05052826],
+            [0.21267194, 0.41932827, 0.11476776],
+        ],
+        [
+            [0.84121597, 0.9132941, 0.77168417],
+            [0.8301396, 0.9395311, 0.7908703],
+            [0.1881119, 0.32693827, 0.12821728],
+        ],
     ],
     dtype=np.float32,
 )
 
 DIFFUSERS_PATCH_TOP_RIGHT = np.array(
     [
-        [[0.2908535, 0.53607446, 0.01906031],
-         [0.2744698, 0.52060366, 0.01586527],
-         [0.25844613, 0.51278335, 0.02035528]],
-        [[0.3508163, 0.5807237, 0.02017263], [
-            0.34825307, 0.5748323, 0.01465797
-        ], [0.34749365, 0.5770006, 0.01684263]],
-        [[0.43005502, 0.6414323, 0.03602198],
-         [0.42972776, 0.63642377, 0.02915734],
-         [0.43195513, 0.63667274, 0.02589324]],
+        [
+            [0.2908535, 0.53607446, 0.01906031],
+            [0.2744698, 0.52060366, 0.01586527],
+            [0.25844613, 0.51278335, 0.02035528],
+        ],
+        [
+            [0.3508163, 0.5807237, 0.02017263],
+            [0.34825307, 0.5748323, 0.01465797],
+            [0.34749365, 0.5770006, 0.01684263],
+        ],
+        [
+            [0.43005502, 0.6414323, 0.03602198],
+            [0.42972776, 0.63642377, 0.02915734],
+            [0.43195513, 0.63667274, 0.02589324],
+        ],
     ],
     dtype=np.float32,
 )
@@ -87,14 +107,21 @@ DIFFUSERS_PATCH_TOP_RIGHT = np.array(
 # Native TPU v7x expectation (Center patch [254:257, 254:257, :])
 TPU_V7X_PATCH_CENTER = np.array(
     [
-        [[0.19607843, 0.40784314, 0.3137255],
-         [0.23529412, 0.43137255, 0.36078432],
-         [0.3372549, 0.5058824, 0.44313726]],
-        [[0.2, 0.40784314, 0.3137255], [0.26666668, 0.45882353, 0.3764706],
-         [0.30980393, 0.4745098, 0.39215687]],
-        [[0.3137255, 0.49411765, 0.4117647],
-         [0.31764707, 0.49803922, 0.40784314],
-         [0.19607843, 0.36862746, 0.27058825]],
+        [
+            [0.19607843, 0.40784314, 0.3137255],
+            [0.23529412, 0.43137255, 0.36078432],
+            [0.3372549, 0.5058824, 0.44313726],
+        ],
+        [
+            [0.2, 0.40784314, 0.3137255],
+            [0.26666668, 0.45882353, 0.3764706],
+            [0.30980393, 0.4745098, 0.39215687],
+        ],
+        [
+            [0.3137255, 0.49411765, 0.4117647],
+            [0.31764707, 0.49803922, 0.40784314],
+            [0.19607843, 0.36862746, 0.27058825],
+        ],
     ],
     dtype=np.float32,
 )
@@ -137,14 +164,12 @@ class TestFluxPrCiOnTpu:
         assert outputs, "Omni returned empty output list"
 
         img = _extract_image(outputs[0])
-        assert isinstance(img,
-                          Image.Image), f"Expected PIL Image, got {type(img)}"
+        assert isinstance(img, Image.Image), f"Expected PIL Image, got {type(img)}"
         assert img.size == (512, 512), f"Expected (512, 512), got {img.size}"
 
         # In-memory numerical sanity: image must not be blank / collapsed
         arr = np.array(img.convert("RGB"), dtype=np.float32)
-        assert np.all(
-            np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
+        assert np.all(np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
         variance = float(np.var(arr))
         assert variance > 10.0, (
             f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
@@ -199,13 +224,13 @@ class TestFluxPrCiOnTpu:
             arr2,
             atol=0.0,
             rtol=0.0,
-            err_msg=
-            "Identical seed 42 on TPU v7x must produce exact bitwise pixel match",
+            err_msg="Identical seed 42 on TPU v7x must produce exact bitwise pixel match",
         )
 
         # Distinct seed must diverge
         assert not np.array_equal(arr1, arr3), (
-            "Different seeds should produce divergent pixel values")
+            "Different seeds should produce divergent pixel values"
+        )
 
     def test_flux_golden_multi_patch_parity_tpu(self, schnell_engine):
         """Test Golden Multi-Patch Slice Parity against independent CPU Diffusers reference.
@@ -231,31 +256,29 @@ class TestFluxPrCiOnTpu:
         img = _extract_image(outputs[0])
         arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
 
-        assert np.all(
-            np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
+        assert np.all(np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
         assert 0.10 < float(np.mean(arr)) < 0.35, (
-            f"Suspicious image mean: {np.mean(arr):.4f}")
+            f"Suspicious image mean: {np.mean(arr):.4f}"
+        )
         assert float(np.var(arr)) > 0.01, (
-            f"Suspicious image variance: {np.var(arr):.4f}")
+            f"Suspicious image variance: {np.var(arr):.4f}"
+        )
 
         # Tier 1: Native TPU v7x Regression Guard (Strict atol=1e-2 across all 3 RGB channels)
         actual_center = arr[254:257, 254:257, :]
-        max_diff_tpu = float(
-            np.max(np.abs(actual_center - TPU_V7X_PATCH_CENTER)))
+        max_diff_tpu = float(np.max(np.abs(actual_center - TPU_V7X_PATCH_CENTER)))
         np.testing.assert_allclose(
             actual_center,
             TPU_V7X_PATCH_CENTER,
             atol=1e-2,
             rtol=1e-2,
-            err_msg=
-            f"TPU v7x native regression detected! (max diff: {max_diff_tpu:.4f})",
+            err_msg=f"TPU v7x native regression detected! (max diff: {max_diff_tpu:.4f})",
         )
 
         # Tier 2: Diffusers Cross-Hardware Parity (Cosine Sim >= 0.90 across all 3 RGB channels)
         patches_to_test = [
             ("Center", arr[254:257, 254:257, :], DIFFUSERS_PATCH_CENTER),
-            ("High-Variance", arr[208:211,
-                                  272:275, :], DIFFUSERS_PATCH_HIGH_VAR),
+            ("High-Variance", arr[208:211, 272:275, :], DIFFUSERS_PATCH_HIGH_VAR),
             ("Top-Right", arr[126:129, 382:385, :], DIFFUSERS_PATCH_TOP_RIGHT),
         ]
 
@@ -265,8 +288,9 @@ class TestFluxPrCiOnTpu:
             a_flat = actual.flatten().astype(np.float64)
             e_flat = expected.flatten().astype(np.float64)
             norm_prod = float(np.linalg.norm(a_flat) * np.linalg.norm(e_flat))
-            cos_sim = (float(np.dot(a_flat, e_flat) /
-                             norm_prod) if norm_prod > 0 else 0.0)
+            cos_sim = (
+                float(np.dot(a_flat, e_flat) / norm_prod) if norm_prod > 0 else 0.0
+            )
 
             # Diffusers standard: Cosine similarity >= 0.90 (cosine distance <= 0.10)
             # and mean absolute error <= 0.16 (accommodating sub-pixel edge shifts on high-contrast textures)
