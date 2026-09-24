@@ -3017,6 +3017,13 @@ class TPUModelRunner(GPUModelRunner):
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
+        # Every rank reads the same reduced values, so every rank takes the
+        # same branch -- which the megakernel's in-kernel collectives require.
+        self._mk_decode_step = (
+            getattr(self, "_glm5_mk", None) is not None
+            and int(t[0].item()) <= 1
+            and int(t[1].item()) == 1
+        )
         # Spec-decode draft forwards size themselves off the step's DP-wide
         # max per-chunk request count (see DFlashProposer), riding this same
         # all-reduce instead of paying the theoretical max bucket or a
@@ -3025,13 +3032,17 @@ class TPUModelRunner(GPUModelRunner):
         return bucket, int(t[1].item())
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
-        self._dummy_run(
-            bucket,
-            self.num_reqs_max_model_len,
-            self.max_num_blocks_per_req,
-            use_max_model_len=True,
-            dp_lockstep=True,
-        )
+        self._mk_idle = True
+        try:
+            self._dummy_run(
+                bucket,
+                self.num_reqs_max_model_len,
+                self.max_num_blocks_per_req,
+                use_max_model_len=True,
+                dp_lockstep=True,
+            )
+        finally:
+            self._mk_idle = False
 
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
         """Idle-rank EP-DP pairing: emit the same cross-DP collective stream a
@@ -3044,6 +3055,7 @@ class TPUModelRunner(GPUModelRunner):
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
+        self._mk_decode_step = False
         # Phase 2: all DRAFT dummy forwards (num_chunks * K).
         # use_eagle() covers every hidden-state drafter, dflash included.
         spec = self.speculative_config
@@ -3459,6 +3471,7 @@ class TPUModelRunner(GPUModelRunner):
 
             start_index = end_index
             chunk_index += 1
+        self._mk_decode_step = False
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
@@ -4292,6 +4305,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+
+        from vllm_torchtpu.kernels.glm5_megakernel.vllm_adapter import Glm5Megakernel
+
+        self._glm5_mk = Glm5Megakernel.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5179,6 +5196,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
+        if getattr(self, "_glm5_mk", None) is not None:
+            with self._precompile_timed("GLM-5.2 megakernel"):
+                self._glm5_mk.bind_caches(self)
+                self._glm5_mk.warmup(self)
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -5931,6 +5952,8 @@ class TPUModelRunner(GPUModelRunner):
     ):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
+        if getattr(self, "_mk_decode_step", False):
+            return self._glm5_mk_forward(input_ids, positions, inputs_embeds), None
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
@@ -5954,6 +5977,31 @@ class TPUModelRunner(GPUModelRunner):
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
         return out, aux_hidden_states
+
+    def _glm5_mk_forward(self, input_ids, positions, inputs_embeds):
+        idle = getattr(self, "_mk_idle", False)
+        n = input_ids.shape[0]
+        if not envs.GLM5_MEGAKERNEL_VERIFY:
+            return self._glm5_mk(input_ids, positions, idle, n)
+        # The stock forward writes this step's cache rows first; the kernel
+        # then rewrites the same rows, so both read identical history.
+        ref = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
+        if isinstance(ref, (list, tuple)):
+            ref = ref[0]
+        out = self._glm5_mk(input_ids, positions, idle, n)
+        if not idle:
+            a, b = out[0:1].float(), ref[0:1].float()
+            la = self.model.compute_logits(out[0:1])
+            lb = self.model.compute_logits(ref[0:1])
+            stats = torch.stack([
+                (a - b).norm() / b.norm().clamp_min(1e-30),
+                (la.argmax(-1) == lb.argmax(-1)).float()[0],
+                (la - lb).abs().max().float(),
+            ]).cpu()
+            logger.info(
+                "GLM5_MK_VERIFY pos=%d rel_hidden=%.5f argmax_eq=%d max_logit_diff=%.4f",
+                int(positions[0].item()), float(stats[0]), int(stats[1]), float(stats[2]))
+        return out
 
     def _pp_intermediate_tensors(
         self, num_tokens: int, zeros: bool, random: bool = False

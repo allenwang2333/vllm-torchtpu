@@ -62,6 +62,8 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
+    USE_GLM5_MEGAKERNEL: bool = False
+    GLM5_MEGAKERNEL_VERIFY: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -587,6 +589,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
         or env_bool("USE_MOE_FUSED_EP_KERNEL")()
     ),
+    # GLM-5.2 decode: when every DP rank has at most one token this step, run
+    # all decoder layers as one SPMD Pallas program (kernels/glm5_megakernel)
+    # instead of the per-layer graph. Anything else takes the stock path.
+    "USE_GLM5_MEGAKERNEL": env_bool("USE_GLM5_MEGAKERNEL"),
+    # Debug: on megakernel steps also run the stock forward and log how far
+    # the two final hidden states and greedy tokens are apart. Slow.
+    "GLM5_MEGAKERNEL_VERIFY": env_bool("GLM5_MEGAKERNEL_VERIFY"),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
