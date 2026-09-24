@@ -581,6 +581,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
+            num_spec_tokens=self.num_spec_tokens,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -788,12 +789,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             raise NotImplementedError(
                 "KDA does not support PCP streaming prefill with the unified KV pool"
             )
-        if metadata.mamba_slot_read_offsets is not None:
-            # Speculative verify needs per-window state checkpoints; the
-            # pooled gather/scatter path keeps a single state per block.
-            raise NotImplementedError(
-                "Speculative decoding is not supported with pooled KDA"
-            )
         state_indices = metadata.mamba_state_indices
         if state_indices is None:
             raise RuntimeError(
@@ -813,4 +808,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             state_indices,
             metadata.seq_lens,
             metadata.request_distribution,
+            metadata.mamba_request_distribution,
+            metadata.mamba_slot_read_offsets,
+            metadata.mamba_ckpt_indices,
         )

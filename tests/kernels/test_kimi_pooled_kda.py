@@ -85,13 +85,15 @@ def _initial_states(rng, num_seqs):
     return conv, ssm
 
 
-def _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads=None):
+def _pack_pool(
+    conv_init, ssm_init, block_ids, conv_shard_heads=None, num_blocks=NUM_BLOCKS
+):
     """Write the given states into the pool's state regions; the rest of the
     pool (including block 0 and the attention rows of every block) keeps its
     sentinel bytes."""
     rng = np.random.default_rng(99)
     pool = jnp.asarray(
-        rng.standard_normal((NUM_BLOCKS, BLOCK_SIZE, PACK, LANES)).astype(np.float32),
+        rng.standard_normal((num_blocks, BLOCK_SIZE, PACK, LANES)).astype(np.float32),
         dtype=jnp.bfloat16,
     )
     idx = jnp.asarray(block_ids, dtype=jnp.int32)
@@ -430,3 +432,121 @@ def test_pooled_kda_multistep_state_evolution():
         rtol=1e-2,
         atol=5e-4,
     )
+
+
+@pytest.mark.parametrize("split", [1, BLOCK_SIZE])
+@pytest.mark.parametrize("seed", [0, 17])
+def test_pooled_kda_speculative_checkpoints(split, seed):
+    """Noncontiguous blocks, ragged windows, rollback and padded requests.
+
+    The dense window is the oracle; compare every checkpoint, not just the
+    final output, while repeatedly selecting a different accepted prefix.
+    """
+    rng = np.random.default_rng(seed)
+    window, num_reqs = 6, 3
+    live_states = 2 * window
+    num_blocks = live_states + 2
+    physical = rng.permutation(np.arange(1, live_states + 1)).reshape(2, window)
+    ckpts = jnp.asarray(np.vstack([physical, np.zeros(window, np.int32)]), jnp.int32)
+    state_ids = ckpts[:, 0]
+    conv, ssm = _initial_states(rng, live_states + 1)
+    conv = conv.at[-1].set(0)
+    ssm = ssm.at[-1].set(0)
+    pool = _pack_pool(conv, ssm, [*physical.reshape(-1), 0], num_blocks=num_blocks)
+    sentinel = np.asarray(pool[-1].view(jnp.uint16)).copy()
+    pool = pool.reshape(num_blocks * split, BLOCK_SIZE // split, PACK, LANES)
+    conv_buf = jnp.concatenate(
+        [conv[-1:], conv[:-1], jnp.repeat(conv[-1:], window, axis=0)]
+    )
+    ssm_buf = jnp.concatenate(
+        [ssm[-1:], ssm[:-1], jnp.repeat(ssm[-1:], window, axis=0)]
+    )
+    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
+    steps = [
+        # Pure prefill must only seed checkpoint zero.
+        ([8, 7, 0], [8, 7, 0], 0, [0, 0, 0]),
+        ([6, 3, 0], [14, 10, 0], 2, [0, 0, 0]),
+        # Resume independently from last and intermediate checkpoints.
+        ([6, 1, 0], [20, 9, 0], 2, [5, 1, 0]),
+        ([1, 6, 0], [16, 14, 0], 2, [0, 0, 0]),
+        # Mixed verify + continuation prefill.
+        ([6, 9, 0], [22, 23, 0], 1, [0, 4, 0]),
+    ]
+    for lengths, seq_lens, window_end, offsets in steps:
+        inputs = _inputs(rng, lengths, seq_lens)
+        distribution = jnp.asarray([window_end, 2, 2], jnp.int32)
+        pool_offsets = (
+            jnp.zeros(num_blocks, jnp.int32).at[state_ids].set(jnp.asarray(offsets))
+        )
+        dense_offsets = (
+            jnp.zeros(num_reqs * window + 1, jnp.int32)
+            .at[identity]
+            .set(jnp.asarray(offsets))
+        )
+        out_ref, conv_buf, ssm_buf = _build_fused_core(-5.0, EPS, window - 1)(
+            inputs["mixed_qkv"],
+            inputs["raw_gate"],
+            inputs["beta"],
+            inputs["output_gate"],
+            conv_buf.reshape(num_reqs * window + 1, KERNEL_SIZE - 1, -1),
+            ssm_buf,
+            inputs["conv_weight"],
+            inputs["a_log"],
+            inputs["dt_bias"],
+            inputs["norm_weight"],
+            inputs["query_start_loc"],
+            identity,
+            inputs["seq_lens"],
+            distribution,
+            distribution,
+            dense_offsets,
+        )
+        out, pool = _pooled_kda_core(
+            inputs["mixed_qkv"],
+            inputs["raw_gate"],
+            inputs["beta"],
+            inputs["output_gate"],
+            pool,
+            inputs["conv_weight"],
+            inputs["a_log"],
+            inputs["dt_bias"],
+            inputs["norm_weight"],
+            inputs["query_start_loc"],
+            state_ids,
+            inputs["seq_lens"],
+            distribution,
+            distribution,
+            pool_offsets,
+            ckpts,
+            lower_bound=-5.0,
+            eps=EPS,
+            pool_block_tokens=BLOCK_SIZE * PACK,
+            num_spec_tokens=window - 1,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out, np.float32),
+            np.asarray(out_ref, np.float32),
+            rtol=5e-2,
+            atol=4e-3,
+        )
+        actual_conv, actual_ssm = _unpack_pool(
+            pool, list(physical.reshape(-1)), split=split
+        )
+        np.testing.assert_array_equal(
+            np.asarray(actual_conv.view(jnp.uint16)),
+            np.asarray(
+                conv_buf[1 : live_states + 1]
+                .reshape(actual_conv.shape)
+                .view(jnp.uint16)
+            ),
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_ssm),
+            np.asarray(ssm_buf[1 : live_states + 1]),
+            rtol=1e-2,
+            atol=5e-4,
+        )
+        restored = pool.reshape(num_blocks, BLOCK_SIZE, PACK, LANES)
+        np.testing.assert_array_equal(
+            np.asarray(restored[-1].view(jnp.uint16)), sentinel
+        )

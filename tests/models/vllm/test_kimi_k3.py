@@ -873,7 +873,10 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     )
 
 
-def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> None:
+@pytest.mark.parametrize("speculative", [False, True])
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
+    monkeypatch, speculative
+) -> None:
     """A one-tensor kv_cache means the unified pool: the layer must take the
     pooled op and never the dense dispatched op."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
@@ -905,7 +908,13 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
         mamba_slot_read_offsets=None,
+        mamba_request_distribution=None,
+        mamba_ckpt_indices=None,
     )
+    if speculative:
+        metadata.mamba_slot_read_offsets = torch.tensor([0, 1], dtype=torch.int32)
+        metadata.mamba_request_distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
+        metadata.mamba_ckpt_indices = torch.tensor([[1, 3]], dtype=torch.int32)
     layer._metadata = lambda: metadata
 
     calls: list[str] = []
@@ -913,6 +922,9 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
     def pooled_kda_op(mixed_qkv, *args):
         calls.append("pooled")
         assert args[3] is pool
+        assert args[-3] is metadata.mamba_request_distribution
+        assert args[-2] is metadata.mamba_slot_read_offsets
+        assert args[-1] is metadata.mamba_ckpt_indices
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     def unexpected(name):
