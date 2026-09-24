@@ -7,8 +7,11 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-_PATH = (Path(__file__).resolve().parents[2] /
-         "src/vllm_torchtpu/distributed" / "k3_decode_dcp.py")
+_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "src/vllm_torchtpu/distributed"
+    / "k3_decode_dcp.py"
+)
 _SPEC = importlib.util.spec_from_file_location("k3_decode_groups", _PATH)
 groups = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(groups)
@@ -16,15 +19,20 @@ _SPEC.loader.exec_module(groups)
 
 def native_config():
     return NS(
-        parallel_config=NS(tensor_parallel_size=8,
-                           decode_context_parallel_size=2,
-                           pipeline_parallel_size=1,
-                           prefill_context_parallel_size=1,
-                           world_size=8),
-        model_config=NS(architectures=["KimiK3ForConditionalGeneration"]),
+        parallel_config=NS(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=2,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            world_size=8,
+        ),
+        model_config=NS(
+            architectures=["KimiK3ForConditionalGeneration"], dtype="torch.bfloat16"
+        ),
         speculative_config=None,
         kv_transfer_config=NS(kv_connector="DecodeBenchConnector"),
-        cache_config=NS(cache_dtype="auto", block_size=16))
+        cache_config=NS(cache_dtype="auto", block_size=16),
+    )
 
 
 @pytest.mark.parametrize("dp", [1, 4])
@@ -48,9 +56,9 @@ def test_native_interleave_resolved_before_attention_build():
     assert c.parallel_config.cp_kv_cache_interleave_size == 16
     assert c.parallel_config.dcp_kv_cache_interleave_size == 16
     c.cache_config.block_size = 32
-    groups.configure_native_interleave(c)
-    assert c.parallel_config.cp_kv_cache_interleave_size == 32
-    assert c.parallel_config.dcp_kv_cache_interleave_size == 32
+    with pytest.raises(ValueError, match="block_size=16"):
+        groups.configure_native_interleave(c)
+    assert c.parallel_config.cp_kv_cache_interleave_size == 16
 
 
 @pytest.mark.parametrize("connector", [None, "TPURaidenConnector"])
@@ -69,12 +77,15 @@ def test_native_rejects_extend_but_allows_idle_steps():
         groups.validate_decode_step(c, NS(num_scheduled_tokens={"a": 2}))
 
 
-@pytest.mark.parametrize("field,value", [
-    ("decode_context_parallel_size", 4),
-    ("tensor_parallel_size", 7),
-    ("pipeline_parallel_size", 2),
-    ("prefill_context_parallel_size", 2),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("decode_context_parallel_size", 4),
+        ("tensor_parallel_size", 7),
+        ("pipeline_parallel_size", 2),
+        ("prefill_context_parallel_size", 2),
+    ],
+)
 def test_native_rejects_unsupported_topology(field, value):
     c = native_config()
     setattr(c.parallel_config, field, value)
@@ -99,3 +110,11 @@ def test_non_k3_native_dcp_unchanged():
     c.kv_transfer_config = None
     groups.validate_native_config(c)
     assert groups.native_size(c) == 1
+
+
+@pytest.mark.parametrize("dtype", ["torch.float16", "torch.float32"])
+def test_native_rejects_non_bf16_model(dtype):
+    c = native_config()
+    c.model_config.dtype = dtype
+    with pytest.raises(ValueError, match="BF16 model dtype"):
+        groups.validate_native_config(c)

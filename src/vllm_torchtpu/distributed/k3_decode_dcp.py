@@ -11,11 +11,11 @@ def native_size(config) -> int:
     model = getattr(config, "model_config", None)
     architectures = getattr(model, "architectures", ()) or ()
     if not any(
-            name in ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM")
-            for name in architectures):
+        name in ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM")
+        for name in architectures
+    ):
         return 1
-    return int(
-        getattr(config.parallel_config, "decode_context_parallel_size", 1))
+    return int(getattr(config.parallel_config, "decode_context_parallel_size", 1))
 
 
 def validate_native_config(config) -> None:
@@ -34,14 +34,16 @@ def validate_native_config(config) -> None:
         raise ValueError("Native K3 decode DCP requires PP1 and PCP1")
     if config.speculative_config is not None:
         raise ValueError("Native K3 DCP does not support speculative decode")
+    if str(config.model_config.dtype) != "torch.bfloat16":
+        raise ValueError("Native K3 DCP requires BF16 model dtype")
     transfer = config.kv_transfer_config
     if transfer is None or transfer.kv_connector != "DecodeBenchConnector":
         raise ValueError(
             "Native K3 DCP currently requires DecodeBenchConnector; "
-            "live PD KV placement is not implemented")
+            "live PD KV placement is not implemented"
+        )
     if config.cache_config.cache_dtype != "auto":
-        raise ValueError(
-            "Native K3 DCP currently requires BF16 KV (cache_dtype=auto)")
+        raise ValueError("Native K3 DCP currently requires BF16 KV (cache_dtype=auto)")
 
 
 def configure_native_interleave(config) -> None:
@@ -51,6 +53,8 @@ def configure_native_interleave(config) -> None:
     specs are known. Both its deprecated and current fields must agree.
     """
     if native_size(config) > 1:
+        if config.cache_config.block_size != 16:
+            raise ValueError("Native K3 DCP requires block_size=16")
         pc = config.parallel_config
         pc.cp_kv_cache_interleave_size = config.cache_config.block_size
         pc.dcp_kv_cache_interleave_size = config.cache_config.block_size
@@ -58,6 +62,9 @@ def configure_native_interleave(config) -> None:
 
 def validate_decode_step(config, scheduler_output) -> None:
     if native_size(config) > 1 and any(
-            n != 1 for n in scheduler_output.num_scheduled_tokens.values()):
-        raise ValueError("K3 DCP supports one decode token per request; "
-                         "prefill/extend must run on the P side")
+        n != 1 for n in scheduler_output.num_scheduled_tokens.values()
+    ):
+        raise ValueError(
+            "K3 DCP supports one decode token per request; "
+            "prefill/extend must run on the P side"
+        )
