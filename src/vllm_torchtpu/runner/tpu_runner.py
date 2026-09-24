@@ -34,7 +34,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -1640,7 +1640,7 @@ class TPUModelRunner(GPUModelRunner):
         # never filled: beyond the row width it raises IndexError, within it
         # the null block silently swallows the recurrent state.
         try:
-            cp_world_size = get_dcp_group().world_size * get_pcp_group().world_size
+            cp_world_size = get_pcp_group().world_size
         except Exception:
             cp_world_size = 1
         col_stride = self._mamba_state_block_size * cp_world_size
@@ -4345,7 +4345,7 @@ class TPUModelRunner(GPUModelRunner):
 
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
-        decode_query_sizes = []
+        target_decode_query_sizes = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -4353,25 +4353,29 @@ class TPUModelRunner(GPUModelRunner):
                 if isinstance(
                     getattr(attn_layer, "impl", None), PallasAttentionBackendImpl
                 ):
-                    # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
-                    # (non-shard_map) kernel.
-                    if (
-                        name in draft_attn_names
-                        and self.speculative_config.draft_tensor_parallel_size == 1
-                    ):
-                        # Instance attrs shadow the ClassVars; unique prefix
-                        # keeps the local kernel op out of the sharded registry.
-                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                        attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+                    if name in draft_attn_names:
+                        # Draft model propose decodes 1 token per request in loop steps.
                         attn_layer.impl.decode_query_size = 1
-                        logger.info(
-                            "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
-                            " | DRAFT_KV_BLOCK_CAP=%d",
-                            name,
-                            _DRAFT_KV_BLOCK_CAP,
+                        # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
+                        # (non-shard_map) kernel.
+                        if self.speculative_config.draft_tensor_parallel_size == 1:
+                            # Instance attrs shadow the ClassVars; unique prefix
+                            # keeps the local kernel op out of the sharded registry.
+                            attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
+                            attn_layer.impl._kernel_op_prefix = (
+                                "pallas::rpa_kernel_local"
+                            )
+                            logger.info(
+                                "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
+                                " | DRAFT_KV_BLOCK_CAP=%d",
+                                name,
+                                _DRAFT_KV_BLOCK_CAP,
+                            )
+                    else:
+                        target_decode_query_sizes.append(
+                            attn_layer.impl.decode_query_size
                         )
                     attn_layer.impl.initialize_kernel(attn_layer)
-                    decode_query_sizes.append(attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
@@ -4402,7 +4406,7 @@ class TPUModelRunner(GPUModelRunner):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
                             initialized_count += 1
-        self.reorder_batch_threshold = min(decode_query_sizes, default=1)
+        self.reorder_batch_threshold = min(target_decode_query_sizes, default=1)
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules.",
             initialized_count,

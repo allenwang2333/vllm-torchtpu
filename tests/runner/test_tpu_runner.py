@@ -1092,7 +1092,7 @@ class TestReorderBatchForRpa:
 
 class TestInitializeAttentionKernelsThreshold:
     """`reorder_batch_threshold` is the smallest DECODE query width across the
-    kernels `_initialize_attention_kernels` builds, draft layers included."""
+    kernels `_initialize_attention_kernels` builds, draft layers excluded."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -1144,13 +1144,15 @@ class TestInitializeAttentionKernelsThreshold:
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
         assert layers["target"].impl.decode_query_size == 4
-        assert runner.reorder_batch_threshold == 1
+        assert runner.reorder_batch_threshold == 4
 
-    def test_sharded_draft_keeps_width(self):
+    def test_sharded_draft_forces_one_token_decode(self):
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=2
         )
         self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["target"].impl.decode_query_size == 4
         assert runner.reorder_batch_threshold == 4
 
     def test_no_pallas_layers(self):
