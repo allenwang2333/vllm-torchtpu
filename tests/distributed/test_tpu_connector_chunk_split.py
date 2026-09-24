@@ -34,7 +34,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.v1.request import RequestStatus
 
-from vllm_torchtpu.distributed.kv_transfer.connector_metadata import SendMeta
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+    SendMeta, TPUConnectorMetadata)
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _chunk_base_req_id, _chunk_req_id, _DestinationCollector,
@@ -42,9 +43,6 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _fa_group_ordinals, _flatten_block_ids, _send_meta_fa_group,
     _send_meta_int, _Stage3Admission, _STAGE7_ARM_DEADLINE_S,
     _maybe_strand_stage7_watch_for_test)
-
-from vllm_torchtpu.distributed.kv_transfer.connector_metadata import \
-    TPUConnectorMetadata
 
 from .test_tpu_connector import (  # isort: skip
     _FakeRaidenControllerFacade, _FakeRaidenEngine, _MOD,
@@ -109,12 +107,12 @@ def _step(*, new=(), cached=(), scheduled=None):
     """
     return SimpleNamespace(
         scheduled_new_reqs=[
-            SimpleNamespace(req_id=r, block_ids=([list(b)]))
-            for r, b in new
+            SimpleNamespace(req_id=r, block_ids=([list(b)])) for r, b in new
         ],
-        scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[r for r, _ in cached],
-            new_block_ids=[[list(b)] for _, b in cached]),
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[r for r, _ in cached],
+                                              new_block_ids=[[list(b)]
+                                                             for _, b in cached
+                                                             ]),
         num_scheduled_tokens=dict(scheduled or {}),
     )
 
@@ -368,8 +366,8 @@ class TestChunkSends:
                 for ctx in _stage3_producer_env(900):
                     stack.enter_context(ctx)
                 stack.enter_context(
-                    patch(f"{_MOD}.get_uuid",
-                          side_effect=[900, 901, 902, 903]))
+                    patch(f"{_MOD}.get_uuid", side_effect=[900, 901, 902,
+                                                           903]))
                 producer.update_state_after_alloc(req, MagicMock(), 0)
         _give_destination(producer, "long",
                           _published_destination(900, list(range(200, 208))))
@@ -388,8 +386,7 @@ class TestChunkSends:
         producer, _req = self._admitted()
 
         meta = self._build(
-            producer,
-            _step(new=[("long", [100])], scheduled={"long": BUDGET}))
+            producer, _step(new=[("long", [100])], scheduled={"long": BUDGET}))
         assert meta.reqs_to_send == {}
 
         meta = self._build(
@@ -419,8 +416,9 @@ class TestChunkSends:
         producer, req = self._admitted()
         self._build(producer,
                     _step(new=[("long", [100])], scheduled={"long": BUDGET}))
-        self._build(producer,
-                    _step(cached=[("long", [101])], scheduled={"long": BUDGET}))
+        self._build(
+            producer,
+            _step(cached=[("long", [101])], scheduled={"long": BUDGET}))
 
         with _chunk_split_on():
             with ExitStack() as stack:
@@ -470,8 +468,9 @@ class TestChunkSends:
         collector = producer._destination_collector
         self._build(producer,
                     _step(new=[("long", [100])], scheduled={"long": BUDGET}))
-        self._build(producer,
-                    _step(cached=[("long", [101])], scheduled={"long": BUDGET}))
+        self._build(
+            producer,
+            _step(cached=[("long", [101])], scheduled={"long": BUDGET}))
 
         collector.take.assert_not_called()
         assert collector.peek.call_count == 1
@@ -521,8 +520,8 @@ class TestChunkSends:
             producer,
             _step(new=[("long", [100])], scheduled={"long": BUDGET + 8192}))
         meta = self._build(
-            producer,
-            _step(cached=[("long", [101])], scheduled={"long": 24576}))
+            producer, _step(cached=[("long", [101])],
+                            scheduled={"long": 24576}))
         assert set(meta.reqs_to_send) == {"long#c0"}
         assert meta.reqs_to_send["long#c0"].num_tokens == BUDGET
 
@@ -552,8 +551,7 @@ class TestChunkSends:
         # The step that would ship it finds no destination and shelves it.
         self._build(
             producer,
-            _step(cached=[("long", [101])],
-                  scheduled={"long": SENT - BUDGET}))
+            _step(cached=[("long", [101])], scheduled={"long": SENT - BUDGET}))
         assert producer._chunk_progress["long"].pending is not None
 
         _give_destination(producer, "long",
@@ -867,9 +865,8 @@ class TestPartRegistrationRelease:
             "long": "done",
         }
         worker._stage3_ready_producer_send_terminals()
-        assert set(worker._stage3_terminal_cleanup) == {
-            "long#c0", "long#c1", "long"
-        }
+        assert set(
+            worker._stage3_terminal_cleanup) == {"long#c0", "long#c1", "long"}
 
     def test_a_cancelled_part_is_released_without_forcing(self):
         """A force-release retires the controller's D5 row, and an expiry is
@@ -920,13 +917,15 @@ class TestDecodeExpectations:
     def test_an_unchunked_load_expects_one_arrival(self):
         worker = _make_raiden_worker(is_producer=False, block_size=PAGE)
         assert _send_meta_int(SimpleNamespace(), "num_chunks") == 0
-        assert max(1, _send_meta_int(SimpleNamespace(num_chunks=1),
-                                     "num_chunks")) == 1
+        assert max(1,
+                   _send_meta_int(SimpleNamespace(num_chunks=1),
+                                  "num_chunks")) == 1
         del worker
 
     def test_a_chunked_load_expects_one_arrival_per_chunk(self):
-        assert max(1, _send_meta_int(SimpleNamespace(num_chunks=3),
-                                     "num_chunks")) == 3
+        assert max(1,
+                   _send_meta_int(SimpleNamespace(num_chunks=3),
+                                  "num_chunks")) == 3
 
     def test_send_meta_defaults_reproduce_the_unchunked_send(self):
         """Every legacy caller builds a SendMeta without these fields, so the
@@ -1022,7 +1021,8 @@ class TestGdnStateRegistration:
         # 4096 tokens a page at 1024 bytes a token is the geometry the sibling
         # module's rank-stripe test uses, so the spans below are comparable.
         worker._raiden_manifest = SimpleNamespace(
-            geometry_by_tag=lambda: {"fa": {
+            geometry_by_tag=lambda:
+            {"fa": {
                 "live_bytes_per_block": 4096 * 1024
             }})
         # What makes this a hybrid model as far as registration is concerned.
@@ -1386,8 +1386,8 @@ class TestEarlyGroupEmittedBeforeItsForward:
         the last would fire against a prompt that is only part written."""
         producer, _req, _n = self._admitted(prompt=BUDGET * 2)
         meta = self._build(
-            producer,
-            _step(new=[("short", [100])], scheduled={"short": BUDGET}))
+            producer, _step(new=[("short", [100])],
+                            scheduled={"short": BUDGET}))
         assert meta.reqs_to_send == {}
 
     def test_request_finished_does_not_send_it_a_second_time(self):
@@ -1934,12 +1934,11 @@ class TestAWatchThatNeverFiresIsSweptAndSent:
 
     def _worker(self, *, cancels=True):
         worker = _make_raiden_worker(is_producer=True, block_size=PAGE)
-        worker.runner = SimpleNamespace(
-            _doorbell_watcher=SimpleNamespace(cancel=MagicMock(
-                return_value=cancels)))
+        worker.runner = SimpleNamespace(_doorbell_watcher=SimpleNamespace(
+            cancel=MagicMock(return_value=cancels)))
         facade = MagicMock()
-        worker._require_stage3_controller = MagicMock(
-            return_value=(facade, None))
+        worker._require_stage3_controller = MagicMock(return_value=(facade,
+                                                                    None))
         return worker, facade
 
     def _arm(self, worker, *, overdue, req_id="short#c0", uuid=901):

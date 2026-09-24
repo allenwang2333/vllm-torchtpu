@@ -4400,8 +4400,7 @@ class TestStage7cArmInsteadOfFire:
         armed = []
         timings = {}
         with self._stage6():
-            assert _dispatch_stage3_transfer(facade,
-                                             timings,
+            assert _dispatch_stage3_transfer(facade, timings,
                                              lambda r, u: armed.append((r, u)),
                                              **self._KWARGS) is True
         # The whole block list still goes out once, up front, exactly as it

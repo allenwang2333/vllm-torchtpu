@@ -58,10 +58,10 @@ import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu import host_gate
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
-from vllm_torchtpu.distributed.kv_transfer.raiden.tags import \
-    is_fa_tag as rpm_is_fa_tag
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta, ReqId, SendMeta, TPUConnectorMetadata)
+from vllm_torchtpu.distributed.kv_transfer.raiden.tags import \
+    is_fa_tag as rpm_is_fa_tag
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 # zmq/shm transport pieces: used only by the zmq-stack workers below
@@ -438,11 +438,15 @@ def _stage5_runtime_enabled() -> bool:
             path, _stage5_mode)
     if known and mode != _stage5_mode:
         _stage5_mode = mode
-        logger.info("%s", json.dumps({
-            "event": "kv_stage5_mode",
-            "mode": mode,
-            "t": time.time(),
-        }, sort_keys=True))
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "kv_stage5_mode",
+                    "mode": mode,
+                    "t": time.time(),
+                },
+                sort_keys=True))
     return _stage5_mode != "off"
 
 
@@ -1096,8 +1100,7 @@ def _maybe_strand_stage7_watch_for_test(generation: int) -> int:
 
 def _dispatch_stage3_transfer(facade: Any,
                               timings: Optional[dict[str, float]] = None,
-                              arm: Optional[Callable[[str, int],
-                                                     None]] = None,
+                              arm: Optional[Callable[[str, int], None]] = None,
                               **kwargs: Any) -> bool:
     """Sends one coordination call, as one RPC or as a prepare and a fire.
 
@@ -2520,10 +2523,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         progress.shipped_through = end_token
         return True
 
-    def _emit_early_group_send(self, req_id: str,
+    def _emit_early_group_send(self,
+                               req_id: str,
                                announced: Optional["_Stage3Admission"],
-                               block_ids: tuple[int, ...], num_tokens: int,
-                               start_token: int, expiration_time: float,
+                               block_ids: tuple[int, ...],
+                               num_tokens: int,
+                               start_token: int,
+                               expiration_time: float,
                                dst_params: Optional[dict],
                                arm_on_bells: bool = False,
                                dst_batch_url: Optional[str] = None) -> bool:
@@ -2714,9 +2720,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # the early layer groups in group order.
         leading_uuids = list(chunk_uuids) + list(early_uuids)
         announcement: dict[str, Any] = {
-            "req_id": request.request_id,
-            "uuid": uuid,
-            "num_tokens": num_tokens,
+            "req_id":
+            request.request_id,
+            "uuid":
+            uuid,
+            "num_tokens":
+            num_tokens,
             # Decode needs the count to know how many arrivals make a request
             # complete, and the uuids so it can attribute each one. Both are
             # absent for a single-chunk request, which is what keeps the
@@ -2966,12 +2975,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             announced = progress.admission
             early_group = True
         else:
-            early_group = self._emit_early_group_send(request.request_id,
-                                                      announced,
-                                                      normalized_ids,
-                                                      num_tokens, start_token,
-                                                      expiration_time,
-                                                      dst_params)
+            early_group = self._emit_early_group_send(
+                request.request_id, announced, normalized_ids, num_tokens,
+                start_token, expiration_time, dst_params)
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
             local_block_ids=list(normalized_ids),
@@ -3323,8 +3329,8 @@ class TPURaidenConnectorWorker:
         if stage3_enabled and cuts:
             fa_layers = rpm.ordered_fa_layer_names(named_kv_caches)
             fa_group_ordinal_by_layer = _fa_group_ordinals(fa_layers, cuts)
-            self._stage3_fa_tags = tuple(
-                f"{rpm.TAG_FA}.g{ordinal}" for ordinal in range(len(cuts) + 1))
+            self._stage3_fa_tags = tuple(f"{rpm.TAG_FA}.g{ordinal}"
+                                         for ordinal in range(len(cuts) + 1))
             self._stage3_early_fa_layers = tuple(fa_layers[:cuts[-1]])
         manifest = rpm.build_qwen35_pool_manifest(
             named_kv_caches=named_kv_caches,
@@ -4744,12 +4750,11 @@ class TPURaidenConnectorWorker:
             )
 
     @staticmethod
-    def _start_stage3_transfer_with_d5_retry(facade: Any,
-                                             timings: Optional[dict[
-                                                 str, float]] = None,
-                                             arm: Optional[Callable[
-                                                 [str, int], None]] = None,
-                                             **kwargs: Any) -> bool:
+    def _start_stage3_transfer_with_d5_retry(
+            facade: Any,
+            timings: Optional[dict[str, float]] = None,
+            arm: Optional[Callable[[str, int], None]] = None,
+            **kwargs: Any) -> bool:
         """Bridges the one-step P scheduler-to-worker registration window.
 
         vLLM returns producer transfer parameters from update_from_output(),
@@ -5034,7 +5039,8 @@ class TPURaidenConnectorWorker:
             with self._stage7_watch_lock:
                 while len(self._stage7_watches) >= _STAGE7_WATCH_HISTORY:
                     self._stage7_watches.pop(next(iter(self._stage7_watches)))
-                self._stage7_watches[(req_id, int(uuid))] = (watch_id, deadline)
+                self._stage7_watches[(req_id, int(uuid))] = (watch_id,
+                                                             deadline)
             self._ensure_stage7_watch_sweeper()
             logger.info(
                 "%s",
@@ -6065,8 +6071,8 @@ class TPURaidenConnectorWorker:
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
             if (destination_req_id in self._failed_recving
-                    or self._recv_arrivals.get(destination_req_id, 0) >=
-                    self._recv_expected.get(destination_req_id, 1)):
+                    or self._recv_arrivals.get(destination_req_id, 0)
+                    >= self._recv_expected.get(destination_req_id, 1)):
                 # The producer started this transfer and it has already
                 # landed. Its registration is released, so a second submit
                 # would fail the lookup and take a live request down with it.
@@ -6370,19 +6376,26 @@ class TPURaidenConnectorWorker:
                         "%s",
                         json.dumps(
                             {
-                                "event": "raiden_stage3_receiver_complete",
-                                "req_id": source_req_id,
-                                "destination_req_id": req_id,
-                                "uuid": uuid,
-                                "num_tokens": num_tokens,
-                                "reshard_e2e_latency_ms": latency_ms,
+                                "event":
+                                "raiden_stage3_receiver_complete",
+                                "req_id":
+                                source_req_id,
+                                "destination_req_id":
+                                req_id,
+                                "uuid":
+                                uuid,
+                                "num_tokens":
+                                num_tokens,
+                                "reshard_e2e_latency_ms":
+                                latency_ms,
                                 # Wall clock at both ends of the transfer, so
                                 # the proxy's decode_send and first_chunk can
                                 # be differenced against them. What is left on
                                 # either side is admission before the transfer
                                 # and the first decode step after it, which is
                                 # the split nothing in the tree has measured.
-                                "t": time.time(),
+                                "t":
+                                time.time(),
                                 "load_start_t":
                                 self._stage3_load_start_wall.get(req_id),
                             },
