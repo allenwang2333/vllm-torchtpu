@@ -1107,6 +1107,28 @@ class TestGdnStateRegistration:
             with pytest.raises(RuntimeError, match="mamba state block ids"):
                 worker.process_send_load(meta)
 
+    def test_an_early_group_registers_only_its_own_attention_tag(self):
+        """Its transfer asks for one tag, and each extra tag made the
+        registration RPC on the model runner bigger. The final send keeps
+        every tag, because decode's fallback pulls the whole request."""
+        worker, facade = self._gdn_producer()
+        worker._stage3_state_group_count = 0
+        worker._stage3_fa_tags = ("fa.g0", "fa.g1", "fa.g2")
+        early = self._meta(is_final=False)
+        early.reqs_to_send["chunked"].fa_group = 1
+        final = self._meta(is_final=True)
+        final.reqs_to_send["final"] = final.reqs_to_send.pop("chunked")
+        final.reqs_to_send["final"].uuid = 5678
+        final.reqs_to_send["final"].fa_group = 2
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(1234):
+                stack.enter_context(ctx)
+            worker.process_send_load(early)
+            worker.process_send_load(final)
+        tags = [[s.tag for s in call["pool_spans"]]
+                for call in facade.register_request_blocks_calls]
+        assert tags == [["fa.g1"], ["fa.g0", "fa.g1", "fa.g2"]]
+
 
 # ---------------------------------------------------------------------------
 # Stage 7: the early attention group as a transfer of its own

@@ -4096,8 +4096,12 @@ class TPURaidenConnectorWorker:
                 "%.1fs for req_ids=%s", delay_s, sorted(metadata.reqs_to_send))
             time.sleep(delay_s)
 
-    def _log_stage3_registration(self, req_id: str, uuid: int, num_tokens: int,
-                                 pages: int) -> None:
+    def _log_stage3_registration(self,
+                                 req_id: str,
+                                 uuid: int,
+                                 num_tokens: int,
+                                 pages: int,
+                                 register_ms: Optional[float] = None) -> None:
         """Records when the producer published its pages for a request.
 
         This is the event the consumer's parked submit is waiting for, and the
@@ -4117,6 +4121,7 @@ class TPURaidenConnectorWorker:
                     "num_tokens": num_tokens,
                     "source_pages": pages,
                     "rank": self.tp_rank,
+                    "register_ms": register_ms,
                     "wall_ts": time.time(),
                 },
                 sort_keys=True,
@@ -4205,8 +4210,17 @@ class TPURaidenConnectorWorker:
             # Stage 7. Every attention group has the same geometry and the
             # same ownership, so the lowering runs once and is registered
             # under each group's tag. Without the split this is the single
-            # "fa" registration it has always been.
-            for fa_tag in self._stage3_fa_tags:
+            # "fa" registration it has always been. An early group's send
+            # asks for its own tag only, so it registers only that one. With
+            # all fifteen, the fourteen early registrations took a median
+            # 24 ms per request on the model runner, ahead of the forward. The
+            # final send still registers every group.
+            is_final = getattr(req_meta, "is_final_chunk", True)
+            fa_group = _send_meta_fa_group(req_meta)
+            fa_tags = self._stage3_fa_tags
+            if not is_final and fa_group is not None:
+                fa_tags = fa_tags[fa_group:fa_group + 1]
+            for fa_tag in fa_tags:
                 fa_registration = lower_fa_spans(
                     num_tokens=num_tokens,
                     transfer_rank=transfer_rank,
@@ -4258,8 +4272,6 @@ class TPURaidenConnectorWorker:
                 # whose state is final once the group's bell rings. The final
                 # send still registers all of it, as it does every attention
                 # group, so decode's fallback can pull the whole request.
-                is_final = getattr(req_meta, "is_final_chunk", True)
-                fa_group = _send_meta_fa_group(req_meta)
                 if is_final or (self._stage3_gdn_fa_pairs
                                 and fa_group is not None):
                     pool_spans.extend(
@@ -4268,6 +4280,7 @@ class TPURaidenConnectorWorker:
                             transfer_rank,
                             parallelism,
                             fa_group=None if is_final else fa_group))
+                register_start = time.perf_counter()
                 facade.register_request_blocks(
                     req_id=req_id,
                     uuid=uuid,
@@ -4319,8 +4332,9 @@ class TPURaidenConnectorWorker:
             if base_req_id != req_id or base_req_id in self._chunk_send_parts:
                 self._chunk_send_parts.setdefault(base_req_id,
                                                   set()).add(req_id)
-            self._log_stage3_registration(req_id, uuid, num_tokens,
-                                          len(local_ids))
+            self._log_stage3_registration(
+                req_id, uuid, num_tokens, len(local_ids),
+                (time.perf_counter() - register_start) * 1000)
             self._maybe_start_producer_transfer(req_id=req_id,
                                                 req_meta=req_meta,
                                                 uuid=uuid,
