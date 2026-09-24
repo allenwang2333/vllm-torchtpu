@@ -39,6 +39,7 @@ GATED_METRICS = [
         "higher_is_better",
         ("output_throughput",),
     ),
+    Metric("block_efficiency", "block_efficiency", "higher_is_better"),
 ]
 
 COMPLETION_FLOOR_RATIO = 0.95

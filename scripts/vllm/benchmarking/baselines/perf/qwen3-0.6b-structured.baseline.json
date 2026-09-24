@@ -1,0 +1,26 @@
+{
+  "isl512_osl512_c1": {
+    "completed": 10,
+    "median_tpot_ms": 2.86,
+    "median_ttft_ms": 15.2,
+    "output_token_throughput": 349.8,
+    "total_token_throughput": 699.6,
+    "block_efficiency": 1.00
+  },
+  "isl512_osl512_c8": {
+    "completed": 40,
+    "median_tpot_ms": 3.10,
+    "median_ttft_ms": 28.5,
+    "output_token_throughput": 2580.0,
+    "total_token_throughput": 5160.0,
+    "block_efficiency": 1.00
+  },
+  "isl512_osl512_c32": {
+    "completed": 128,
+    "median_tpot_ms": 5.50,
+    "median_ttft_ms": 65.0,
+    "output_token_throughput": 5800.0,
+    "total_token_throughput": 11600.0,
+    "block_efficiency": 1.00
+  }
+}

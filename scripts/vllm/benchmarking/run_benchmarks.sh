@@ -425,6 +425,17 @@ run_benchmark_once() {
         fi
     fi
 
+    local dataset_args=(--dataset-name "${DATASET_NAME:-random}")
+    if [ -n "${DATASET_PATH:-}" ]; then
+        dataset_args+=(--dataset-path "$DATASET_PATH")
+    else
+        dataset_args+=(
+            --random-input-len "$bench_input_len"
+            --random-output-len "$bench_output_len"
+            --random-range-ratio "$bench_range_ratio"
+        )
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
@@ -433,10 +444,7 @@ run_benchmark_once() {
         --trust-remote-code \
         --host "$HOST" \
         --port "$PORT" \
-        --dataset-name random \
-        --random-input-len "$bench_input_len" \
-        --random-output-len "$bench_output_len" \
-        --random-range-ratio "$bench_range_ratio" \
+        "${dataset_args[@]}" \
         --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
@@ -450,6 +458,32 @@ run_benchmark_once() {
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
     set -e
+
+    if [ "$bench_exit" -eq 0 ] && [ -f "$result_file" ]; then
+        python3 -c "
+import json, urllib.request, sys
+result_file, host, port = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with urllib.request.urlopen(f'http://{host}:{port}/metrics', timeout=5) as resp:
+        content = resp.read().decode('utf-8')
+    gen_tokens, spec_steps = None, None
+    for line in content.splitlines():
+        if line.startswith('vllm:num_generation_tokens_total') or line.startswith('vllm_num_generation_tokens_total'):
+            gen_tokens = float(line.split()[-1])
+        elif line.startswith('vllm:spec_decode_num_steps_total') or line.startswith('vllm_spec_decode_num_steps_total'):
+            spec_steps = float(line.split()[-1])
+    with open(result_file, 'r') as f:
+        data = json.load(f)
+    if gen_tokens is not None and spec_steps is not None and spec_steps > 0:
+        data['block_efficiency'] = round(gen_tokens / spec_steps, 4)
+    elif 'block_efficiency' not in data:
+        data['block_efficiency'] = 1.0
+    with open(result_file, 'w') as f:
+        json.dump(data, f, indent=2)
+except Exception:
+    pass
+" "$result_file" "$HOST" "$PORT" 2>/dev/null || true
+    fi
 
     return "$bench_exit"
 }
