@@ -144,7 +144,7 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-pattern: "tests/omni/**/test_flux_*.py"
+              test-file-pattern: "tests/omni/models/**/{test_*,*_test}.py"
               test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
@@ -218,5 +218,5 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-pattern: "tests/omni/**/test_flux_*.py"
+              test-file-pattern: "tests/omni/models/**/{test_*,*_test}.py"
               test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
