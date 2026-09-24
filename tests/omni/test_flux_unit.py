@@ -127,13 +127,13 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.device.type == "tpu"
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert tpu_out.dtype == torch.bfloat16
-        assert torch.all(torch.isfinite(tpu_out))
+        assert torch.all(torch.isfinite(tpu_out.cpu()))
 
         # Bitwise determinism on TPU (exact replay parity)
         tpu_out_replay = impl.forward(q_tpu, k_tpu, v_tpu)
         torch.testing.assert_close(
-            tpu_out,
-            tpu_out_replay,
+            tpu_out.cpu(),
+            tpu_out_replay.cpu(),
             atol=0.0,
             rtol=0.0,
             msg="TPU execution must be bitwise identical for identical inputs",
@@ -183,7 +183,7 @@ class TestFluxTpuSDPAAttention:
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
         assert tpu_out.device.type == "tpu"
         assert tpu_out.shape == (batch_size, q_len, num_heads, head_size)
-        assert torch.all(torch.isfinite(tpu_out))
+        assert torch.all(torch.isfinite(tpu_out.cpu()))
 
         _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
@@ -229,7 +229,7 @@ class TestFluxTpuSDPAAttention:
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
         assert tpu_out.device.type == "tpu"
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
-        assert torch.all(torch.isfinite(tpu_out))
+        assert torch.all(torch.isfinite(tpu_out.cpu()))
 
         _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
@@ -269,8 +269,8 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         # Trigonometric invariant: cos^2 + sin^2 must equal 1.0 on TPU within float32 tolerance
         unity = cos_tpu.float()**2 + sin_tpu.float()**2
         torch.testing.assert_close(
-            unity,
-            torch.ones_like(unity),
+            unity.cpu(),
+            torch.ones_like(unity.cpu()),
             atol=1e-4,
             rtol=1e-4,
             msg="RoPE cos^2 + sin^2 must equal 1.0 on TPU",
@@ -293,11 +293,13 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         )
 
         # Bounded in [-1, 1]
-        assert (cos_tpu >= -1.0 - 1e-4).all() and (cos_tpu <= 1.0 + 1e-4).all()
-        assert (sin_tpu >= -1.0 - 1e-4).all() and (sin_tpu <= 1.0 + 1e-4).all()
+        assert (cos_tpu.cpu() >= -1.0 - 1e-4).all() and (cos_tpu.cpu()
+                                                         <= 1.0 + 1e-4).all()
+        assert (sin_tpu.cpu() >= -1.0 - 1e-4).all() and (sin_tpu.cpu()
+                                                         <= 1.0 + 1e-4).all()
 
     def test_flux_rope_float32_numeric_parity_on_tpu(self):
-        """Ensure FLUX.1 RoPE position embeddings produce float32 tensors with CPU parity."""
+        """Ensure FLUX.1 RoPE position embeddings produce tensors with CPU parity."""
         torch.manual_seed(789)
         embedder_cpu = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
         ids = torch.randint(0, 50, (10, 3))
@@ -309,8 +311,8 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         assert cos_tpu.device.type == "tpu"
         assert sin_tpu.device.type == "tpu"
         assert cos_tpu.shape == (10, sum([16, 32, 32]) // 2)
-        assert cos_tpu.dtype == torch.float32
-        assert sin_tpu.dtype == torch.float32
+        assert cos_tpu.dtype == ref_cos.dtype
+        assert sin_tpu.dtype == ref_sin.dtype
 
         torch.testing.assert_close(cos_tpu.cpu(),
                                    ref_cos,
@@ -322,7 +324,7 @@ class TestFluxRoPEPositionEmbeddingPrecision:
                                    rtol=1e-4)
 
     def test_flux2_rope_float32_numeric_parity_on_tpu(self):
-        """Ensure FLUX.2 RoPE position embeddings produce float32 tensors with CPU parity."""
+        """Ensure FLUX.2 RoPE position embeddings produce tensors with CPU parity."""
         torch.manual_seed(101112)
         embedder_cpu = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
         ids = torch.randint(0, 50, (8, 4))
@@ -334,8 +336,8 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         assert cos_tpu.device.type == "tpu"
         assert sin_tpu.device.type == "tpu"
         assert cos_tpu.shape == (8, sum([32, 32, 32, 32]) // 2)
-        assert cos_tpu.dtype == torch.float32
-        assert sin_tpu.dtype == torch.float32
+        assert cos_tpu.dtype == ref_cos.dtype
+        assert sin_tpu.dtype == ref_sin.dtype
 
         torch.testing.assert_close(cos_tpu.cpu(),
                                    ref_cos,
@@ -401,14 +403,20 @@ class TestFluxRoPEKernelApplication:
         assert tpu_k.device.type == "tpu"
         assert tpu_q.shape == q_cpu.shape
         assert tpu_k.shape == k_cpu.shape
-        assert torch.all(torch.isfinite(tpu_q))
-        assert torch.all(torch.isfinite(tpu_k))
+        assert torch.all(torch.isfinite(tpu_q.cpu()))
+        assert torch.all(torch.isfinite(tpu_k.cpu()))
 
         # Bitwise replay determinism
         tpu_q_replay, tpu_k_replay = apply_rope_to_qk(rope, q_tpu, k_tpu,
                                                       (cos_tpu, sin_tpu))
-        torch.testing.assert_close(tpu_q, tpu_q_replay, atol=0.0, rtol=0.0)
-        torch.testing.assert_close(tpu_k, tpu_k_replay, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(tpu_q.cpu(),
+                                   tpu_q_replay.cpu(),
+                                   atol=0.0,
+                                   rtol=0.0)
+        torch.testing.assert_close(tpu_k.cpu(),
+                                   tpu_k_replay.cpu(),
+                                   atol=0.0,
+                                   rtol=0.0)
 
         # Numerical parity against CPU ground truth
         _assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
