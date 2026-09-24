@@ -591,6 +591,8 @@ class VllmTPUMLAAttention(MLAAttention):
         if original_selector_get_backend is not None:
             selector.get_mla_prefill_backend = lambda config: TPUDummyMLAPrefillBackend
 
+        # vLLM consumes use_sparse; forward it to the shared TPU backend too.
+        extra_impl_args["is_sparse"] = use_sparse
         try:
             # Keyword-only: vLLM inserts new positional params into
             # MLAAttention.__init__ (e.g. dcp_q_replicate in v0.26.1rc0),
