@@ -930,18 +930,22 @@ def _send_meta_arm_group(meta: Any) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
-def _flatten_block_ids(block_ids: Any) -> list[int]:
-    """Normalises vLLM's per-kv-cache-group block tuples to one flat list.
+def _fa_block_ids(block_ids: Any, fa_group_index: int) -> list[int]:
+    """Picks the full-attention group's blocks out of scheduler output.
 
     Scheduler output gives block ids as a tuple with one list per KV cache
-    group. Stage 3 is a single FA group on the producer, so the tuple has one
-    element, but the shape differs between the new-request and cached-request
-    paths and this flattens both.
+    group. On Qwen3.5 the three mamba groups come first, because vLLM builds
+    groups in layer order and layer 0 is GDN, so the FA group has to be picked
+    by index exactly as request_finished_all_groups does. Concatenating the
+    groups instead made every early send register a mamba block as its FA
+    page.
     """
-    if block_ids is None:
+    if not block_ids:
         return []
-    if block_ids and isinstance(block_ids[0], (list, tuple)):
-        return [int(b) for group in block_ids for b in group]
+    if isinstance(block_ids[0], (list, tuple)):
+        if fa_group_index >= len(block_ids):
+            return []
+        return [int(b) for b in block_ids[fa_group_index]]
     return [int(b) for b in block_ids]
 
 
@@ -2312,7 +2316,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()):
             progress = self._chunk_progress.get(new_req.req_id)
             if progress is not None:
-                progress.block_ids = _flatten_block_ids(new_req.block_ids)
+                progress.block_ids = _fa_block_ids(new_req.block_ids,
+                                                   self._stage3_fa_group_index)
 
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached is not None:
@@ -2325,7 +2330,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     continue
                 entry = new_blocks[index]
                 if entry is not None:
-                    progress.block_ids.extend(_flatten_block_ids(entry))
+                    progress.block_ids.extend(
+                        _fa_block_ids(entry, self._stage3_fa_group_index))
 
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         for req_id, progress in list(self._chunk_progress.items()):

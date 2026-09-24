@@ -40,8 +40,8 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _chunk_base_req_id, _chunk_req_id, _DestinationCollector,
     _early_group_bells, _early_layer_split_enabled, _fa_group_cuts,
-    _fa_group_ordinals, _flatten_block_ids, _send_meta_fa_group,
-    _send_meta_int, _Stage3Admission, _STAGE7_ARM_DEADLINE_S,
+    _fa_block_ids, _fa_group_ordinals, _send_meta_fa_group, _send_meta_int,
+    _Stage3Admission, _STAGE7_ARM_DEADLINE_S,
     _maybe_strand_stage7_watch_for_test)
 
 from .test_tpu_connector import (  # isort: skip
@@ -164,19 +164,21 @@ class TestChunkRequestIds:
         assert _chunk_base_req_id(_chunk_req_id("job#c7", 2)) == "job#c7"
 
 
-class TestFlattenBlockIds:
-    """Scheduler output gives block ids one list per KV cache group, and the
-    two paths that carry them are shaped differently."""
+class TestFaBlockIds:
+    """Scheduler output gives block ids one list per KV cache group, and on
+    Qwen3.5 the FA group is not the first."""
 
-    def test_flattens_the_grouped_form(self):
-        assert _flatten_block_ids([[1, 2], [3]]) == [1, 2, 3]
+    def test_picks_the_fa_group_by_index(self):
+        # Three mamba groups, then FA, as vLLM orders Qwen3.5.
+        assert _fa_block_ids([[1], [2], [3], [4, 5]], 3) == [4, 5]
 
     def test_accepts_a_bare_list(self):
-        assert _flatten_block_ids([4, 5]) == [4, 5]
+        assert _fa_block_ids([4, 5], 3) == [4, 5]
 
-    def test_none_and_empty_are_empty(self):
-        assert _flatten_block_ids(None) == []
-        assert _flatten_block_ids([]) == []
+    def test_none_empty_and_absent_are_empty(self):
+        assert _fa_block_ids(None, 0) == []
+        assert _fa_block_ids([], 0) == []
+        assert _fa_block_ids([[1]], 2) == []
 
 
 class TestSendMetaInt:
@@ -1379,6 +1381,19 @@ class TestEarlyGroupEmittedBeforeItsForward:
         # The instruction that makes building it here legitimate.
         assert early.arm_on_bell == 0
         assert (early.start_token, early.num_tokens) == (0, PAGE)
+
+    def test_the_early_group_ships_the_fa_pages_on_a_hybrid_model(self):
+        """Qwen3.5's three mamba groups come before its FA group. Stage 8 on
+        397B concatenated them and registered mamba block 1 as every early
+        send's FA page, while the final send used the real page."""
+        producer, _req, _n = self._admitted()
+        producer._stage3_fa_group_index = 3
+        step = _step(scheduled={"short": PAGE + 1})
+        step.scheduled_new_reqs = [
+            SimpleNamespace(req_id="short", block_ids=([1], [2], [3], [100]))
+        ]
+        meta = self._build(producer, step)
+        assert meta.reqs_to_send["short#c0"].local_block_ids == [100]
 
     def test_a_step_that_does_not_finish_the_prompt_emits_nothing(self):
         """The test that says this is not simply 'emit earlier'. Group 0's
