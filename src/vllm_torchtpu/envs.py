@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
+    VLLM_TPU_PCP_LAYOUT: str = "zigzag"
     TPU_LOCAL_RANK_OFFSET: int = 0
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
@@ -826,6 +827,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT":
     env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
+    # Layout strategy for PCP input preparation: 'zigzag' or 'streaming'.
+    "VLLM_TPU_PCP_LAYOUT":
+    lambda: os.getenv("VLLM_TPU_PCP_LAYOUT", "zigzag").strip().lower(),
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET":

@@ -18,6 +18,7 @@ class SequenceLayoutKind(str, Enum):
 
 DEFAULT_SEQUENCE_LAYOUT_PROTOCOL = "default"
 PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL = "pcp_streaming"
+PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL = "pcp_zigzag"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,11 @@ class SequenceLayoutDescriptor:
 
 
 DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR = SequenceLayoutDescriptor()
+PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR = SequenceLayoutDescriptor(
+    kind=SequenceLayoutKind.PARTIAL,
+    protocol=PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
+    version=1,
+)
 
 
 def is_pcp_streaming_sequence_layout_descriptor(
@@ -40,6 +46,16 @@ def is_pcp_streaming_sequence_layout_descriptor(
     return descriptor.cache_key == (
         SequenceLayoutKind.PARTIAL.value,
         PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+        1,
+    )
+
+
+def is_pcp_zigzag_sequence_layout_descriptor(
+    descriptor: SequenceLayoutDescriptor,
+) -> bool:
+    return descriptor.cache_key == (
+        SequenceLayoutKind.PARTIAL.value,
+        PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
         1,
     )
 
@@ -56,6 +72,7 @@ class SequenceLayoutPlan:
     logits_local_indices_cpu: torch.Tensor | None = None
     logits_owner_mask_cpu: torch.Tensor | None = None
     requires_hidden_state_gather: bool = False
+    pcp_metadata: Any | None = None
     # Optional packed-global to request-major token order. Padding rows use
     # -1. Real PCP plans carry both mapping directions.
     _packed_to_request_major_token_indices: np.ndarray | None = None
@@ -378,6 +395,32 @@ def is_pcp_streaming_sequence_layout(
 
 def is_pcp_streaming_attention_metadata(attn_metadata: Any) -> bool:
     return is_pcp_streaming_sequence_layout(
+        kind=getattr(
+            attn_metadata, "sequence_layout_kind", SequenceLayoutKind.ALL.value
+        ),
+        protocol=getattr(
+            attn_metadata, "sequence_layout_protocol", DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
+        ),
+    )
+
+
+def is_pcp_zigzag_sequence_layout(
+    *,
+    kind: str | SequenceLayoutKind,
+    protocol: str,
+) -> bool:
+    if isinstance(kind, SequenceLayoutKind):
+        kind_value = kind.value
+    else:
+        kind_value = str(kind)
+    return (
+        kind_value == SequenceLayoutKind.PARTIAL.value
+        and protocol == PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL
+    )
+
+
+def is_pcp_zigzag_attention_metadata(attn_metadata: Any) -> bool:
+    return is_pcp_zigzag_sequence_layout(
         kind=getattr(
             attn_metadata, "sequence_layout_kind", SequenceLayoutKind.ALL.value
         ),

@@ -183,6 +183,7 @@ class AttentionMetadataBuilderContext:
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
     pcp: PCPMetadata | None = None
+    is_pcp_zigzag: bool = False
 
 
 def _staged_walk_products(
@@ -263,8 +264,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         # groups leave AttentionMetadata.mamba_state_indices None.
 
         block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
+        max_rows = (
+            2 * runner.max_num_reqs
+            if getattr(runner, "_pcp_enabled", False)
+            else runner.max_num_reqs
+        )
         self.block_tables_cpu = torch.zeros(
-            (runner.max_num_reqs, block_table_obj.max_num_blocks_per_req),
+            (max_rows, block_table_obj.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu",
         )
@@ -377,9 +383,20 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
             source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            if getattr(ctx, "is_pcp_zigzag", False):
+                for i in range(ctx.num_reqs):
+                    if 2 * i < target_num_reqs:
+                        block_tables[2 * i, :target_num_blocks] = source_block_tables[
+                            ctx.start_index + i, :target_num_blocks
+                        ]
+                    if 2 * i + 1 < target_num_reqs:
+                        block_tables[2 * i + 1, :target_num_blocks] = source_block_tables[
+                            ctx.start_index + i, :target_num_blocks
+                        ]
+            else:
+                block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+                ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
             block_tables_dev = block_tables.reshape(-1).to(
@@ -524,9 +541,16 @@ def stage_block_table_uploads(
                 num_reqs_padded, target_num_blocks
             )
             source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            if getattr(ctx, "is_pcp_zigzag", False):
+                for i in range(ctx.num_reqs):
+                    if 2 * i < num_reqs_padded:
+                        rows[2 * i] = source[ctx.start_index + i, :target_num_blocks]
+                    if 2 * i + 1 < num_reqs_padded:
+                        rows[2 * i + 1] = source[ctx.start_index + i, :target_num_blocks]
+            else:
+                rows[: ctx.num_reqs] = source[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+                ]
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 

@@ -97,6 +97,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     stage_block_table_uploads,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
+    PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
     SequenceLayoutKind,
     create_sequence_layout_planner,
 )
@@ -691,6 +692,23 @@ class TPUModelRunner(GPUModelRunner):
         # to avoid dynamic shapes. Also, avoid suboptimal alignment.
         self.max_num_reqs = max(self.max_num_reqs, MIN_NUM_SEQS)
         self.num_tokens_paddings = vllm_config.compilation_config.compile_sizes
+        pcp_size = getattr(self.parallel_config, "prefill_context_parallel_size", 1)
+        is_zigzag_pcp = pcp_size > 1 and (
+            (
+                getattr(self, "sequence_layout_planner", None) is not None
+                and getattr(self.sequence_layout_planner, "eligibility", None) is not None
+                and getattr(self.sequence_layout_planner.eligibility, "is_zigzag", False)
+            )
+            or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag")
+        )
+        if is_zigzag_pcp:
+            quantum = 2 * pcp_size * self.block_size
+            snapped = []
+            for sz in self.num_tokens_paddings:
+                snapped_sz = max(quantum, ((sz + quantum - 1) // quantum) * quantum)
+                if not snapped or snapped[-1] != snapped_sz:
+                    snapped.append(snapped_sz)
+            self.num_tokens_paddings = snapped
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
@@ -712,8 +730,11 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_tokens, dtype=torch.int32, device="cpu"
         )
         self.positions_np = self.positions_cpu.numpy()
+        max_req_rows = (
+            2 * self.max_num_reqs if self._pcp_enabled else self.max_num_reqs
+        )
         self.block_table_cpu = torch.zeros(
-            (self.max_num_reqs, self.max_num_blocks_per_req),
+            (max_req_rows, self.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu",
         )
@@ -2640,7 +2661,17 @@ class TPUModelRunner(GPUModelRunner):
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
-        if use_max_model_len:
+        is_pcp_zigzag = (
+            layout_plan.descriptor is not None
+            and layout_plan.descriptor.protocol == PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL
+        )
+        if is_pcp_zigzag:
+            target_num_reqs = max(target_num_reqs, 2 * num_reqs)
+            padded_num_reqs = max(padded_num_reqs, 2 * num_reqs)
+            seq_lens = self.seq_lens_cpu[:target_num_reqs].to(
+                self.device, non_blocking=True
+            )
+        elif use_max_model_len:
             seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
                 self.device, non_blocking=True
             )
@@ -2737,7 +2768,11 @@ class TPUModelRunner(GPUModelRunner):
             request_distribution = self._cached_request_distribution
         else:
             # Compute and copy to device (first call or shape changed).
-            if use_max_model_len:
+            if is_pcp_zigzag:
+                query_start_loc = self.query_start_loc_cpu[
+                    : target_num_reqs + 1
+                ].to(self.device, non_blocking=True)
+            elif use_max_model_len:
                 query_start_loc = self.query_start_loc_cpu[
                     : self.num_reqs_max_model_len + 1
                 ].to(self.device, non_blocking=True)
@@ -2840,6 +2875,8 @@ class TPUModelRunner(GPUModelRunner):
                 else None
             ),
             sequence_layout_descriptor=layout_plan.descriptor,
+            pcp=getattr(layout_plan, "pcp_metadata", None),
+            is_pcp_zigzag=is_pcp_zigzag,
         )
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -4506,6 +4543,11 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 request_distribution = combined_device[0:3]
                 dummy_mamba_request_distribution = combined_device[3:6]
+            is_pcp_zigzag = (
+                dummy_layout_plan.descriptor is not None
+                and dummy_layout_plan.descriptor.protocol
+                == PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL
+            )
             self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
@@ -4519,6 +4561,8 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_ckpt_window=self._mamba_ckpt_window,
                 mamba_request_distribution=dummy_mamba_request_distribution,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
+                pcp=getattr(dummy_layout_plan, "pcp_metadata", None),
+                is_pcp_zigzag=is_pcp_zigzag,
             )
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
@@ -4552,6 +4596,7 @@ class TPUModelRunner(GPUModelRunner):
                 sequence_layout_kind=(dummy_layout_plan.descriptor.kind.value),
                 sequence_layout_protocol=(dummy_layout_plan.descriptor.protocol),
                 sequence_layout_version=(dummy_layout_plan.descriptor.version),
+                pcp=getattr(dummy_layout_plan, "pcp_metadata", None),
             )
 
             per_layer_attn_metadata = {
