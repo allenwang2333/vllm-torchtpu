@@ -8,9 +8,6 @@ deterministic seed parity, and HBM memory metrics without file writes.
 
 import numpy as np
 import pytest
-
-pytest.importorskip("vllm_omni", reason="vllm_omni is required for FLUX tests")
-
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -87,12 +84,17 @@ DIFFUSERS_PATCH_TOP_RIGHT = np.array(
     dtype=np.float32,
 )
 
-# Native TPU v7x expectation (Center patch [254:257, 254:257, 0])
+# Native TPU v7x expectation (Center patch [254:257, 254:257, :])
 TPU_V7X_PATCH_CENTER = np.array(
     [
-        [0.196078, 0.235294, 0.337255],
-        [0.200000, 0.266667, 0.309804],
-        [0.313726, 0.317647, 0.196078],
+        [[0.19607843, 0.40784314, 0.3137255],
+         [0.23529412, 0.43137255, 0.36078432],
+         [0.3372549, 0.5058824, 0.44313726]],
+        [[0.2, 0.40784314, 0.3137255], [0.26666668, 0.45882353, 0.3764706],
+         [0.30980393, 0.4745098, 0.39215687]],
+        [[0.3137255, 0.49411765, 0.4117647],
+         [0.31764707, 0.49803922, 0.40784314],
+         [0.19607843, 0.36862746, 0.27058825]],
     ],
     dtype=np.float32,
 )
@@ -236,8 +238,8 @@ class TestFluxPrCiOnTpu:
         assert float(np.var(arr)) > 0.01, (
             f"Suspicious image variance: {np.var(arr):.4f}")
 
-        # Tier 1: Native TPU v7x Regression Guard (Strict atol=1e-2)
-        actual_center = arr[254:257, 254:257, 0]
+        # Tier 1: Native TPU v7x Regression Guard (Strict atol=1e-2 across all 3 RGB channels)
+        actual_center = arr[254:257, 254:257, :]
         max_diff_tpu = float(
             np.max(np.abs(actual_center - TPU_V7X_PATCH_CENTER)))
         np.testing.assert_allclose(

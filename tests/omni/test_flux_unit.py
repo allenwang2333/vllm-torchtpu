@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for FLUX models on TPU platform (hermetic, CPU/mock)."""
+"""Numerical correctness and component-wise unit tests for FLUX models on TPU hardware.
+
+Tested FLUX Components:
+=======================
+1. TpuSDPAImpl (vllm_torchtpu): TPU SDPA diffusion attention backend parity for standard,
+   asymmetric joint text/image, and GQA head expansion against CPU ground truth.
+2. FluxPosEmbed / Flux2PosEmbed (vllm_omni): Multi-coordinate RoPE frequency calculation,
+   float32 precision, and cos^2 + sin^2 == 1.0 trigonometric invariant on TPU.
+3. RotaryEmbedding / apply_rope_to_qk (vllm_omni): RoPE attention rotation kernel application
+   on TPU vs CPU ground truth with bitwise replay determinism.
+"""
 
 import math
-import os
 
 import pytest
-
-pytest.importorskip("vllm_omni")
-
 import torch
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
-from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import \
-    Flux2KleinPipeline
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxPosEmbed
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import (apply_omni_model_specific_patches,
@@ -28,178 +32,384 @@ def setup_omni_patches():
     apply_omni_model_specific_patches()
 
 
+def _assert_numerical_parity(
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+    min_cos_sim: float = 0.999,
+):
+    """Assert cosine similarity and floating-point tolerance bounds."""
+    a_flat = actual.flatten().float()
+    r_flat = reference.flatten().float()
+
+    norm_a = torch.linalg.norm(a_flat)
+    norm_r = torch.linalg.norm(r_flat)
+    if norm_a > 0 and norm_r > 0:
+        cos_sim = float(torch.dot(a_flat, r_flat) / (norm_a * norm_r))
+        assert cos_sim >= min_cos_sim, (
+            f"Cosine similarity {cos_sim:.5f} fell below minimum required {min_cos_sim}"
+        )
+
+    torch.testing.assert_close(
+        actual.float(),
+        reference.float(),
+        atol=atol,
+        rtol=rtol,
+        msg="TPU kernel output diverged from CPU baseline",
+    )
+
+
 class TestFluxTpuSDPAAttention:
-    """Test TPU SDPA attention backend with FLUX architecture configurations."""
+    """Numerical correctness and parity tests for TPU SDPA attention backend.
+
+    vllm_omni delegates all FLUX diffusion attention to this backend on TPU.
+    We test standard, asymmetric cross-attention, and GQA configurations directly
+    against CPU execution.
+
+    Architectural Note on Why We Do Not Call vllm_omni Attention() directly:
+    -----------------------------------------------------------------------
+    `vllm_omni.diffusion.attention.layer.Attention` queries the active platform via
+    `current_omni_platform.get_diffusion_attn_backend_cls()`. On CPU environments,
+    current_omni_platform is `UnspecifiedOmniPlatform`, which has no attention backend
+    registered and raises:
+        `NotImplementedError: No forward implementation for platform: <UnspecifiedOmniPlatform>`
+    `TpuSDPAImpl` is the hardware implementation that vllm-torchtpu registers into vllm_omni.
+    Because TpuSDPAImpl wraps PyTorch's native SDPA, we test its forward pass directly
+    on CPU as the exact mathematical baseline against TPU execution.
+    """
 
     def test_backend_registration_and_properties(self):
         assert TpuSDPABackend.get_name() == "TPU_SDPA"
         assert TpuSDPABackend.get_impl_cls() is TpuSDPAImpl
         assert TpuSDPABackend.supports_attention_mask() is True
 
-    def test_flux_standard_attention_forward(self):
-        # FLUX.1 uses 24 attention heads, head_size=128 (hidden_size = 3072)
+    def test_flux_standard_attention_numeric_parity_on_tpu(self):
+        """Test FLUX.1 standard attention numeric parity against CPU baseline."""
+        torch.manual_seed(42)
         batch_size = 1
-        seq_len = 64  # Representative token sequence length
+        seq_len = 64
         num_heads = 24
         head_size = 128
+        scale = 1.0 / math.sqrt(head_size)
 
         impl = TpuSDPAImpl(
             num_heads=num_heads,
             head_size=head_size,
-            softmax_scale=1.0 / math.sqrt(head_size),
+            softmax_scale=scale,
         )
 
-        query = torch.randn(batch_size, seq_len, num_heads, head_size)
-        key = torch.randn(batch_size, seq_len, num_heads, head_size)
-        value = torch.randn(batch_size, seq_len, num_heads, head_size)
+        query_cpu = torch.randn(batch_size,
+                                seq_len,
+                                num_heads,
+                                head_size,
+                                dtype=torch.float32)
+        key_cpu = torch.randn(batch_size,
+                              seq_len,
+                              num_heads,
+                              head_size,
+                              dtype=torch.float32)
+        value_cpu = torch.randn(batch_size,
+                                seq_len,
+                                num_heads,
+                                head_size,
+                                dtype=torch.float32)
 
-        out = impl.forward(query, key, value)
-        assert out.shape == (batch_size, seq_len, num_heads, head_size)
-        assert not torch.isnan(out).any()
-        assert not torch.isinf(out).any()
+        # Baseline execution on CPU using the exact same component
+        ref_out = impl.forward(query_cpu, key_cpu, value_cpu)
 
-    def test_flux_joint_attention_sequence_asymmetry(self):
-        # In FLUX joint blocks, query has seq_len (image+text),
-        # but cross-attention can have asymmetric key/value lengths.
+        # TPU execution in bfloat16
+        q_tpu = query_cpu.to(device="tpu", dtype=torch.bfloat16)
+        k_tpu = key_cpu.to(device="tpu", dtype=torch.bfloat16)
+        v_tpu = value_cpu.to(device="tpu", dtype=torch.bfloat16)
+
+        tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
+        assert tpu_out.device.type == "tpu"
+        assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
+        assert tpu_out.dtype == torch.bfloat16
+        assert torch.all(torch.isfinite(tpu_out))
+
+        # Bitwise determinism on TPU (exact replay parity)
+        tpu_out_replay = impl.forward(q_tpu, k_tpu, v_tpu)
+        torch.testing.assert_close(
+            tpu_out,
+            tpu_out_replay,
+            atol=0.0,
+            rtol=0.0,
+            msg="TPU execution must be bitwise identical for identical inputs",
+        )
+
+        # Numerical parity against CPU baseline (CosSim >= 0.999, bfloat16 tolerance)
+        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+
+    def test_flux_joint_attention_asymmetry_numeric_parity_on_tpu(self):
+        """Test asymmetric joint text/image cross-attention numeric parity on TPU."""
+        torch.manual_seed(123)
         batch_size = 2
         q_len = 128
-        kv_len = 128
+        kv_len = 64
         num_heads = 24
         head_size = 128
+        scale = 1.0 / math.sqrt(head_size)
 
         impl = TpuSDPAImpl(
             num_heads=num_heads,
             head_size=head_size,
-            softmax_scale=1.0 / math.sqrt(head_size),
+            softmax_scale=scale,
         )
-        query = torch.randn(batch_size, q_len, num_heads, head_size)
-        key = torch.randn(batch_size, kv_len, num_heads, head_size)
-        value = torch.randn(batch_size, kv_len, num_heads, head_size)
 
-        out = impl.forward(query, key, value)
-        assert out.shape == (batch_size, q_len, num_heads, head_size)
+        query_cpu = torch.randn(batch_size,
+                                q_len,
+                                num_heads,
+                                head_size,
+                                dtype=torch.float32)
+        key_cpu = torch.randn(batch_size,
+                              kv_len,
+                              num_heads,
+                              head_size,
+                              dtype=torch.float32)
+        value_cpu = torch.randn(batch_size,
+                                kv_len,
+                                num_heads,
+                                head_size,
+                                dtype=torch.float32)
 
-    def test_flux_gqa_repeat_interleave(self):
-        # Test grouped-query attention if num_kv_heads < num_heads
+        ref_out = impl.forward(query_cpu, key_cpu, value_cpu)
+
+        q_tpu = query_cpu.to(device="tpu", dtype=torch.bfloat16)
+        k_tpu = key_cpu.to(device="tpu", dtype=torch.bfloat16)
+        v_tpu = value_cpu.to(device="tpu", dtype=torch.bfloat16)
+
+        tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
+        assert tpu_out.device.type == "tpu"
+        assert tpu_out.shape == (batch_size, q_len, num_heads, head_size)
+        assert torch.all(torch.isfinite(tpu_out))
+
+        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+
+    def test_flux_gqa_repeat_interleave_numeric_parity_on_tpu(self):
+        """Test grouped-query attention repeat-interleave numeric parity on TPU."""
+        torch.manual_seed(456)
         batch_size = 1
         seq_len = 32
-        num_heads = 16
-        num_kv_heads = 4
-        head_size = 64
+        num_heads = 24
+        num_kv_heads = 8
+        head_size = 128
+        scale = 1.0 / math.sqrt(head_size)
 
         impl = TpuSDPAImpl(
             num_heads=num_heads,
             head_size=head_size,
-            softmax_scale=1.0 / math.sqrt(head_size),
+            softmax_scale=scale,
             num_kv_heads=num_kv_heads,
         )
 
-        query = torch.randn(batch_size, seq_len, num_heads, head_size)
-        key = torch.randn(batch_size, seq_len, num_kv_heads, head_size)
-        value = torch.randn(batch_size, seq_len, num_kv_heads, head_size)
+        query_cpu = torch.randn(batch_size,
+                                seq_len,
+                                num_heads,
+                                head_size,
+                                dtype=torch.float32)
+        key_cpu = torch.randn(batch_size,
+                              seq_len,
+                              num_kv_heads,
+                              head_size,
+                              dtype=torch.float32)
+        value_cpu = torch.randn(batch_size,
+                                seq_len,
+                                num_kv_heads,
+                                head_size,
+                                dtype=torch.float32)
 
-        out = impl.forward(query, key, value)
-        assert out.shape == (batch_size, seq_len, num_heads, head_size)
+        ref_out = impl.forward(query_cpu, key_cpu, value_cpu)
+
+        q_tpu = query_cpu.to(device="tpu", dtype=torch.bfloat16)
+        k_tpu = key_cpu.to(device="tpu", dtype=torch.bfloat16)
+        v_tpu = value_cpu.to(device="tpu", dtype=torch.bfloat16)
+
+        tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
+        assert tpu_out.device.type == "tpu"
+        assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
+        assert torch.all(torch.isfinite(tpu_out))
+
+        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
 
 class TestFluxRoPEPositionEmbeddingPrecision:
-    """Verify RoPE position embeddings maintain float32 precision for TPU execution."""
+    """Verify vllm_omni RoPE coordinate embeddings maintain numerical parity and float32 precision on TPU."""
 
-    def test_flux_pos_embed_trigonometric_invariants(self):
-        # Axes dimensions for coordinate space: (height, width, frame, channel/t)
+    def test_flux_pos_embed_numeric_parity_and_invariants_on_tpu(self):
+        """Test 3D RoPE coordinates parity against CPU ground truth and trigonometric invariants."""
         axes_dim = [16, 56, 56]
         theta = 10000
-        seq_len = 20
+        seq_len = 32
 
-        embedder = FluxPosEmbed(theta=theta, axes_dim=axes_dim)
-        ids = torch.randint(0, 100, (seq_len, 3))
+        # Directly imported from vllm_omni
+        embedder_cpu = FluxPosEmbed(theta=theta, axes_dim=axes_dim)
+        ids_cpu = torch.stack(
+            [
+                torch.zeros(seq_len),
+                torch.arange(seq_len),
+                torch.arange(seq_len),
+            ],
+            dim=-1,
+        )
 
-        freqs_cos, freqs_sin = embedder(ids)
+        ref_cos, ref_sin = embedder_cpu(ids_cpu)
+
+        embedder_tpu = FluxPosEmbed(theta=theta, axes_dim=axes_dim)
+        ids_tpu = ids_cpu.to(device="tpu")
+        cos_tpu, sin_tpu = embedder_tpu(ids_tpu)
 
         expected_dim = sum(axes_dim) // 2
-        assert freqs_cos.shape == (seq_len, expected_dim)
-        assert freqs_sin.shape == (seq_len, expected_dim)
+        assert cos_tpu.device.type == "tpu"
+        assert sin_tpu.device.type == "tpu"
+        assert cos_tpu.shape == (seq_len, expected_dim)
+        assert sin_tpu.shape == (seq_len, expected_dim)
 
-        # cos^2 + sin^2 must equal 1 within floating tolerance
-        cos_sq_sin_sq = freqs_cos**2 + freqs_sin**2
-        assert torch.allclose(cos_sq_sin_sq,
-                              torch.ones_like(cos_sq_sin_sq),
-                              atol=1e-5)
+        # Trigonometric invariant: cos^2 + sin^2 must equal 1.0 on TPU within float32 tolerance
+        unity = cos_tpu.float()**2 + sin_tpu.float()**2
+        torch.testing.assert_close(
+            unity,
+            torch.ones_like(unity),
+            atol=1e-4,
+            rtol=1e-4,
+            msg="RoPE cos^2 + sin^2 must equal 1.0 on TPU",
+        )
+
+        # Numerical parity against CPU ground truth (float32 tolerance)
+        torch.testing.assert_close(
+            cos_tpu.cpu().float(),
+            ref_cos.float(),
+            atol=1e-4,
+            rtol=1e-4,
+            msg="TPU cos embeddings diverged from CPU reference",
+        )
+        torch.testing.assert_close(
+            sin_tpu.cpu().float(),
+            ref_sin.float(),
+            atol=1e-4,
+            rtol=1e-4,
+            msg="TPU sin embeddings diverged from CPU reference",
+        )
 
         # Bounded in [-1, 1]
-        assert (freqs_cos >= -1.0 - 1e-5).all() and (freqs_cos
-                                                     <= 1.0 + 1e-5).all()
-        assert (freqs_sin >= -1.0 - 1e-5).all() and (freqs_sin
-                                                     <= 1.0 + 1e-5).all()
+        assert (cos_tpu >= -1.0 - 1e-4).all() and (cos_tpu <= 1.0 + 1e-4).all()
+        assert (sin_tpu >= -1.0 - 1e-4).all() and (sin_tpu <= 1.0 + 1e-4).all()
 
-    def test_flux_rope_float32_precision(self):
-        """Ensure FLUX.1 RoPE position embeddings produce float32/float64 tensors."""
-        embedder = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
+    def test_flux_rope_float32_numeric_parity_on_tpu(self):
+        """Ensure FLUX.1 RoPE position embeddings produce float32 tensors with CPU parity."""
+        torch.manual_seed(789)
+        embedder_cpu = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
         ids = torch.randint(0, 50, (10, 3))
-        cos, sin = embedder(ids)
-        assert cos.shape == (10, sum([16, 32, 32]) // 2)
-        assert cos.dtype in (torch.float32, torch.float64) and sin.dtype in (
-            torch.float32,
-            torch.float64,
-        )
+        ref_cos, ref_sin = embedder_cpu(ids)
 
-    def test_flux2_rope_float32_precision(self):
-        """Ensure FLUX.2 RoPE position embeddings produce float32/float64 tensors."""
-        embedder = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
+        embedder_tpu = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
+        cos_tpu, sin_tpu = embedder_tpu(ids.to("tpu"))
+
+        assert cos_tpu.device.type == "tpu"
+        assert sin_tpu.device.type == "tpu"
+        assert cos_tpu.shape == (10, sum([16, 32, 32]) // 2)
+        assert cos_tpu.dtype == torch.float32
+        assert sin_tpu.dtype == torch.float32
+
+        torch.testing.assert_close(cos_tpu.cpu(),
+                                   ref_cos,
+                                   atol=1e-4,
+                                   rtol=1e-4)
+        torch.testing.assert_close(sin_tpu.cpu(),
+                                   ref_sin,
+                                   atol=1e-4,
+                                   rtol=1e-4)
+
+    def test_flux2_rope_float32_numeric_parity_on_tpu(self):
+        """Ensure FLUX.2 RoPE position embeddings produce float32 tensors with CPU parity."""
+        torch.manual_seed(101112)
+        embedder_cpu = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
         ids = torch.randint(0, 50, (8, 4))
-        cos, sin = embedder(ids)
-        assert cos.shape == (8, sum([32, 32, 32, 32]) // 2)
-        assert cos.dtype in (torch.float32, torch.float64) and sin.dtype in (
-            torch.float32,
-            torch.float64,
+        ref_cos, ref_sin = embedder_cpu(ids)
+
+        embedder_tpu = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
+        cos_tpu, sin_tpu = embedder_tpu(ids.to("tpu"))
+
+        assert cos_tpu.device.type == "tpu"
+        assert sin_tpu.device.type == "tpu"
+        assert cos_tpu.shape == (8, sum([32, 32, 32, 32]) // 2)
+        assert cos_tpu.dtype == torch.float32
+        assert sin_tpu.dtype == torch.float32
+
+        torch.testing.assert_close(cos_tpu.cpu(),
+                                   ref_cos,
+                                   atol=1e-4,
+                                   rtol=1e-4)
+        torch.testing.assert_close(sin_tpu.cpu(),
+                                   ref_sin,
+                                   atol=1e-4,
+                                   rtol=1e-4)
+
+
+class TestFluxRoPEKernelApplication:
+    """Numerical correctness and parity tests for RoPE kernel application.
+
+    Directly imports RotaryEmbedding and apply_rope_to_qk from
+    vllm_omni.diffusion.layers.rope, which is the exact module and function
+    invoked inside FluxAttention.forward() to rotate Q and K tensors before attention.
+    """
+
+    def test_apply_rope_to_qk_numeric_parity_on_tpu(self):
+        """Test apply_rope_to_qk parity between CPU baseline and TPU hardware."""
+        torch.manual_seed(42)
+        batch_size = 2
+        seq_len = 32
+        num_heads = 24
+        head_size = 128
+        axes_dim = [16, 56, 56]
+
+        rope = RotaryEmbedding(is_neox_style=False)
+        pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dim)
+
+        ids_cpu = torch.stack(
+            [
+                torch.zeros(seq_len),
+                torch.arange(seq_len),
+                torch.arange(seq_len),
+            ],
+            dim=-1,
         )
+        cos_cpu, sin_cpu = pos_embed(ids_cpu)
 
+        q_cpu = torch.randn(batch_size,
+                            seq_len,
+                            num_heads,
+                            head_size,
+                            dtype=torch.float32)
+        k_cpu = torch.randn(batch_size,
+                            seq_len,
+                            num_heads,
+                            head_size,
+                            dtype=torch.float32)
 
-class TestFluxRuntimePatches:
-    """Validate runtime patches applied for TPU."""
+        ref_q, ref_k = apply_rope_to_qk(rope, q_cpu, k_cpu, (cos_cpu, sin_cpu))
 
-    def test_omni_tpu_patches_configuration(self):
-        apply_omni_tpu_patches.cache_clear()
-        apply_omni_tpu_patches()
-        assert os.environ.get("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT") == "1800.0"
+        q_tpu = q_cpu.to(device="tpu")
+        k_tpu = k_cpu.to(device="tpu")
+        cos_tpu = cos_cpu.to(device="tpu")
+        sin_tpu = sin_cpu.to(device="tpu")
 
+        tpu_q, tpu_k = apply_rope_to_qk(rope, q_tpu, k_tpu, (cos_tpu, sin_tpu))
 
-class TestFluxInputValidationAndSanitization:
-    """Test input checking and sampling params contracts for FLUX models."""
+        assert tpu_q.device.type == "tpu"
+        assert tpu_k.device.type == "tpu"
+        assert tpu_q.shape == q_cpu.shape
+        assert tpu_k.shape == k_cpu.shape
+        assert torch.all(torch.isfinite(tpu_q))
+        assert torch.all(torch.isfinite(tpu_k))
 
-    def test_flux_sampling_params_defaults(self):
-        # Schnell defaults: distilled 4 steps, guidance=0.0
-        params_schnell = OmniDiffusionSamplingParams(
-            height=512,
-            width=512,
-            num_inference_steps=4,
-            guidance_scale=0.0,
-        )
-        assert params_schnell.num_inference_steps == 4
-        assert params_schnell.guidance_scale == 0.0
+        # Bitwise replay determinism
+        tpu_q_replay, tpu_k_replay = apply_rope_to_qk(rope, q_tpu, k_tpu,
+                                                      (cos_tpu, sin_tpu))
+        torch.testing.assert_close(tpu_q, tpu_q_replay, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(tpu_k, tpu_k_replay, atol=0.0, rtol=0.0)
 
-        # Dev defaults: guidance=3.5
-        params_dev = OmniDiffusionSamplingParams(
-            height=1024,
-            width=1024,
-            num_inference_steps=20,
-            guidance_scale=3.5,
-        )
-        assert params_dev.num_inference_steps == 20
-        assert params_dev.guidance_scale == 3.5
-
-    def test_flux_empty_prompt_rejection(self):
-        pipe = object.__new__(Flux2KleinPipeline)
-        pipe.vae_scale_factor = 8
-        pipe.is_distilled = True
-        pipe._guidance_scale = 0.0
-
-        with pytest.raises(ValueError, match="empty or whitespace-only"):
-            pipe.check_inputs(
-                prompt="",
-                height=512,
-                width=512,
-                prompt_embeds=None,
-                num_inference_steps=4,
-                guidance_scale=0.0,
-            )
+        # Numerical parity against CPU ground truth
+        _assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
+        _assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)

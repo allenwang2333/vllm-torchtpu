@@ -137,13 +137,3 @@ def apply_omni_model_specific_patches() -> None:
 
     ltx2_runtime.LTXRuntime._decode_output = _safe_decode_output
     logger.info("Applied TPU patch: safe LTX-2 CPU decode output.")
-
-
-def maybe_apply_omni_patches() -> None:
-    """Entry point for vllm_torchtpu patch registry lifecycle."""
-    try:
-        import vllm_omni  # noqa: F401
-    except ImportError:
-        return
-    apply_omni_tpu_patches()
-    apply_omni_model_specific_patches()

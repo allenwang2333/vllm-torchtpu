@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 import sys
 from unittest.mock import patch
 
@@ -12,7 +13,8 @@ from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
-from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+from vllm_torchtpu.omni.patches import (apply_omni_model_specific_patches,
+                                        apply_omni_tpu_patches)
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.omni]
@@ -196,3 +198,9 @@ def test_safe_pack_tensor_if_large():
     res = ipc._pack_tensor_if_large(t)
     assert t.cpu_called is True
     assert res["device"] == "cpu"
+
+
+def test_omni_tpu_patches_configuration():
+    apply_omni_tpu_patches.cache_clear()
+    apply_omni_tpu_patches()
+    assert os.environ.get("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT") == "1800.0"
