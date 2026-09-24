@@ -4,9 +4,9 @@ How code review works in `vllm-project/vllm-torchtpu`, for both audiences:
 
 - **Human reviewers** — what to look for, in what order, and how to phrase
   and route findings.
-- **Review bots and coding agents** — treat the priority order and the output
-  format below as the review protocol; emit findings in the table format of
-  §4 and cite the rule each finding enforces.
+- **Review bots and coding agents** — treat the priority order below as the
+  review protocol: report findings in that order, most severe first, and
+  cite the rule each finding enforces.
 
 This is the third document of the engineering-standard set. It says *how to
 review*; the rules being enforced live in the other two:
@@ -22,7 +22,7 @@ and argue it on its merits.
 Process mechanics — the `ready` label, the CODEOWNERS approval check, the
 merge checklist, the revert policy — live in
 [PRE_PUBLIC_DEV_GUIDE.md](PRE_PUBLIC_DEV_GUIDE.md) and are referenced from
-§7 rather than restated here.
+§6 rather than restated here.
 
 ---
 
@@ -36,7 +36,8 @@ points lower, found weeks later. So silent-numerics risk outranks everything
 else in review, and "it ran and the output looked reasonable" is not
 evidence.
 
-**Upstream moves fast.** vLLM and JAX refactor constantly. Code that depends
+**Upstream moves fast.** vLLM and the torch stack refactor constantly. Code
+that depends
 on a *name* — a string-matched model id, a `getattr` with a default, a
 hard-coded module path, a copied helper — breaks silently the day upstream
 renames something. Code that depends on *structure* — shapes, dtypes, typed
@@ -45,23 +46,23 @@ name-based dispatch are review findings, not style preferences.
 
 ## 2. Priority order for findings
 
-Check in this order. The default severity assumes no other information;
-adjust it with a stated reason.
+Check in this order, and report findings most severe first. The default
+severity assumes no other information; adjust it with a stated reason.
 
 1. **Silent numeric corruption / kernel breakage.** Unasserted quantization
    assumptions (R-5.2); dtype casts hiding a mismatch (R-5.5); scale-layout
    errors — a weight transpose does not imply a scale transpose (Q-5); calls
    outside a kernel's supported envelope, meaning mesh rank, EP-only, dtype
-   packing, JAX version (P-17); a silent fallback where the result would be
+   packing, or the versions it was written against (P-17); a silent fallback where the result would be
    wrong instead of an actionable error (R-5.3); a swallowed exception that
    hides a shape or scale error (R-5.1); a kernel-backend switch that changes
    a compiled function's traced signature (R-5.6).
    *Default: blocker.*
-2. **Hot-path cost.** Work that belongs at weight-loading time (P-14); hidden
-   barriers — `jax.named_scope`, `lax.cond` in a kernel's main loop (P-13);
+2. **Hot-path cost.** Work that belongs at weight-loading time (P-14);
    unpipelined DMA, `start(); wait()` back-to-back (P-11); silent upcasts to
-   16-bit compute (P-9); a "no-op on the hot path" claim with no large-batch
-   trace (P-1).
+   16-bit compute (P-9); a construct in a kernel's main loop that blocks the
+   compiler from optimizing across it (P-13); a "no-op on the hot path"
+   claim with no large-batch trace (P-1).
    *Default: major; blocker once a regression is demonstrated.*
 3. **Duplication / wrong home.** vLLM upstream already has it and should be
    subclassed (R-3.1); a per-model fork of a shared layer (R-3.2); shared
@@ -98,11 +99,14 @@ adjust it with a stated reason.
    ("previously X", "this fixes…"), which belongs in the PR description
    (extends R-1.8).
    *Default: minor; major when a failure would be undiagnosable.*
-7. **Public-repo hygiene.** No internal-only references in anything that
-   lands: no `go/` links, no internal bug numbers in comments, no personal
-   buckets or paths, no links to private notes, in code, comments, yml,
-   scripts, commit message or PR text alike (R-7.12). The reviewer is the
-   last check before this is public.
+7. **Public-repo hygiene.** Every link and reference that lands must be one
+   an outside reader can open: a public issue, another PR, a Buildkite build,
+   a vLLM source path, a model card, a published paper. The same applies to
+   bug identifiers, storage paths, and dashboards — if it needs an internal
+   account to open, it does not belong in code, comments, yml, scripts, the
+   commit message or the PR text (R-7.12). When the reason behind a design
+   needs stating, inline the reasoning instead of linking to where it was
+   written down. The reviewer is the last check before this is public.
    *Default: blocker — it cannot be undone after merge.*
 8. **Nits last, labeled as nits**, and deferred explicitly.
 
@@ -115,29 +119,7 @@ adjust it with a stated reason.
 | `minor` | Readability, naming, dead code, one isolated fragility site — worth doing, does not block merge |
 | `nit` | Stylistic preference; say it is a nit and defer it |
 
-## 4. Output format
-
-One row per distinct site, ordered by severity, and within one severity by
-the §2 level:
-
-| ID | Severity | Rule | Location | Description |
-|---|---|---|---|---|
-| 1 | blocker | R-5.1 | `src/vllm_torchtpu/layers/adapter/fused_moe.py:142` | Bare `except` swallows the shape-mismatch error raised during weight processing, so a bad scale layout reaches the kernel silently; catch the specific exception or let it propagate. |
-
-- **ID** — sequential integer from 1.
-- **Rule** — the rule ID the finding enforces; leave empty when no rule
-  covers it.
-- **Location** — `path:line`, or `path:line-line` for a range. When the same
-  issue recurs, list the primary site and add "(also at L120, L155)" to the
-  description instead of repeating rows.
-- **Description** — what is wrong and what to do, in one sentence. Name the
-  exact reuse target or fix; "duplicated" alone is not actionable.
-
-After the table, add a short paragraph for any cross-cutting concern that
-does not fit one row (for example: the whole `process_weights` path is
-duplicated across two quant methods and should be lifted).
-
-## 5. Standard probes
+## 4. Standard probes
 
 Questions that repeatedly find real problems:
 
@@ -153,7 +135,7 @@ Questions that repeatedly find real problems:
   official one?* (Q-5, R-6.6)
 - *Does this test fail if you revert the fix?* (R-8.2)
 
-## 6. Review conduct
+## 5. Review conduct
 
 - **Ask more than you direct.** A question that makes the author explain the
   mechanism finds more bugs than an instruction, and is often how the
@@ -175,7 +157,7 @@ Questions that repeatedly find real problems:
 - **Name deferred scope in the thread** rather than letting it disappear on
   merge.
 
-## 7. Routing and merge gating
+## 6. Routing and merge gating
 
 - **Route approval by ownership.** `.github/CODEOWNERS` is the routing
   table, and the advisory `CODEOWNERS Approval` check reports it; a change
@@ -201,7 +183,7 @@ Questions that repeatedly find real problems:
   numerically wrong or breaks `main`, revert first and root-cause offline
   (PR-2, and the Emergency Reversion Policy in the dev guide).
 
-## 8. Reviewer quick checklist
+## 7. Reviewer quick checklist
 
 Run top to bottom on any PR:
 
@@ -210,8 +192,8 @@ Run top to bottom on any PR:
    (R-7.11)
 2. Anything under §2 item 1 — asserts, dtype casts, scale layout, kernel
    envelope, silent fallbacks, swallowed exceptions?
-3. Anything under §2 item 2 — work that belongs at load time, a barrier in a
-   kernel loop, an unpipelined DMA, a silent upcast?
+3. Anything under §2 item 2 — work that belongs at load time, an
+   unpipelined DMA, a silent upcast, an unproven no-op claim?
 4. Does vLLM upstream already have this, and is each file in the directory
    the R-2.1 table assigns it?
 5. Any string or `hasattr` dispatch, magic constant, or new knob?
@@ -219,6 +201,7 @@ Run top to bottom on any PR:
    it?
 7. Do the new log lines identify a root cause on their own, and do the new
    comments say what the code does rather than why it changed?
-8. Any internal-only reference that must not go public? (R-7.12)
+8. Can an outside reader open every link and reference in the diff?
+   (R-7.12)
 9. Is CI green on the current head, and is every deferred item named in a
    thread?
