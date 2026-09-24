@@ -702,13 +702,14 @@ class VllmTPUMLAAttention(MLAAttention):
 
         dcp_size = getattr(self.impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
-        self.dense_decode_dcp_op = None
-        if getattr(self.impl, "native_dense_decode_dcp", False):
-            self.dense_decode_dcp_op = self.impl._build_dense_decode_dcp_op(self)
-        elif dcp_size > 1:
-            self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
-                self, dcp_size, self.impl.dcp_interleave_size
-            )
+        self.dense_mla_dcp_op = None
+        if dcp_size > 1:
+            if self.use_sparse:
+                self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
+                    self, dcp_size, self.impl.dcp_interleave_size
+                )
+            else:
+                self.dense_mla_dcp_op = self.impl._build_dense_mla_dcp_op(self)
 
     def forward(
         self,

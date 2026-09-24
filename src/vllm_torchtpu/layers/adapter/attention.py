@@ -1817,32 +1817,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.dcp_interleave_size = getattr(
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
-        self._dcp_mesh = None
-        from vllm_torchtpu.platforms.k3_dcp_validation import native_size
-
-        self.native_dense_decode_dcp = (
-            native_size(get_current_vllm_config_or_none()) > 1
-        )
-        if self.dcp_size > 1 and not self.native_dense_decode_dcp:
-            # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`)
-            pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-            if isinstance(pcp_size, int) and pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
-                    "both >1; sparse MLA has one KV-position interleave, "
-                    "not two."
-                )
-            if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
-                raise ValueError(
-                    "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
-                    f"a multiple of {kv_cache_utils.WORD_BYTES} "
-                    f"(kv_cache_utils.WORD_BYTES), got "
-                    f"{self.dcp_interleave_size}. It is also the best value for "
-                    "top-k load balance across the shards -- coarser cycles "
-                    "let a contiguous run of winners land on fewer ranks."
-                )
-            self._dcp_mesh = get_or_create_dcp_mesh()
 
     def _get_kv_scales(
         self, layer: Any
@@ -2080,11 +2054,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
         also narrows the head axis back down.
         """
+        from vllm.distributed import get_pcp_group
+
         from vllm_torchtpu.layers.core.attention_interface import (
             sparse_mla_attention_dcp,
         )
 
-        mesh = self._dcp_mesh
+        pcp_size = get_pcp_group().world_size
+        if pcp_size > 1:
+            raise NotImplementedError(
+                f"pcp_size={pcp_size} and dcp_size={dcp_size} are "
+                "both >1; sparse MLA has one KV-position interleave, not two."
+            )
+        if interleave_size % kv_cache_utils.WORD_BYTES:
+            raise ValueError(
+                "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
+                f"a multiple of {kv_cache_utils.WORD_BYTES} "
+                f"(kv_cache_utils.WORD_BYTES), got {interleave_size}. "
+                "It is also the best value for top-k load balance across "
+                "the shards -- coarser cycles let a contiguous run of "
+                "winners land on fewer ranks."
+            )
+        mesh = get_or_create_dcp_mesh()
 
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
@@ -2185,7 +2176,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
-    def _build_dense_decode_dcp_op(self, layer: Any):
+    def _build_dense_mla_dcp_op(self, layer: Any):
         from vllm.distributed.parallel_state import get_tp_group
 
         from vllm_torchtpu.distributed.dcp import get_dcp_rank
@@ -2390,8 +2381,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
                 )
-        elif getattr(self, "native_dense_decode_dcp", False):
-            outputs = layer.dense_decode_dcp_op(
+        elif self.dcp_size > 1:
+            outputs = layer.dense_mla_dcp_op(
                 kv_cache,
                 ql_nope_flat,
                 q_pe_flat,

@@ -2162,6 +2162,7 @@ def test_mla_keeps_weight_cache_abi_across_token_buckets(monkeypatch):
     layer.W_UK_T = nn.Parameter(torch.empty(3, 128, 512, dtype=torch.bfloat16))
     layer.W_UV = nn.Parameter(torch.empty(3, 512, 128, dtype=torch.bfloat16))
     layer.impl = PallasMLAttentionBackendImpl.__new__(PallasMLAttentionBackendImpl)
+    layer.impl.dcp_size = 1
     layer.mla_op = latent_attention
     cache = torch.empty((64, 128, 2, 640), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
