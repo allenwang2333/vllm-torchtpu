@@ -1274,14 +1274,7 @@ def streamindex_topk_dcp(
       2. Candidate All-Gather: A single `all_gather` along the candidate axis
          (axis 1) exchanges candidate *scores* plus one trailing column naming
          the rank that produced them: `[T, k+1] -> [T, dcp_size * (k+1)]`,
-         reshaped to `[T, dcp_size, k+1]`. The indices are not exchanged: rank
-         `r` scores only its own `P(dcp_axis_name)` shard, so `cp_owner_rank` of
-         every candidate it emits is `r` -- source rank and owner rank coincide,
-         and a rank can resolve its own winners against its local indices. That
-         halves the exchanged bytes (scores are `int32`, so the old index lane
-         cost as much again) and replaces two collectives with one. The rank is
-         constant over a rank's `k` candidates, so naming it costs `4/k` bytes
-         per candidate and keeps step 4 independent of the gather order.
+         reshaped to `[T, dcp_size, k+1]`. The indices are not exchanged.
       3. SparseCore Merge: Each rank runs `sparsecore_topk` over the concatenated
          `[T, dcp_size * k]` scores to select the exact top-k global winners:
          `[T, dcp_size * k] -> [T, k]`.
@@ -1385,12 +1378,7 @@ def streamindex_topk_dcp(
             return_scores=True,
         )
 
-        # Stage 1. One all-gather carries two lanes: the candidate scores and the
-        # rank that produced them. The indices stay home -- a rank only ever
-        # scores its own shard, so every candidate it emits is also owned by it,
-        # and it can resolve its own winners against its local `idxs`.
-        # A rank is constant across its own k candidates, so it rides as one
-        # trailing column rather than a full lane: 4/k bytes, not another 4k.
+        # Stage 1. All-gather the scores; the indices stay home.
         rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
         payload = lax.all_gather(
             jnp.concatenate([scores, rank_col], axis=1),
@@ -1411,9 +1399,7 @@ def streamindex_topk_dcp(
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
             write_empty_rows=True,
         )
-        # Keep only winners this rank produced. Both `slot // k` (which chunk)
-        # and `slot % k` (where in it) follow from the chunk width alone; the
-        # chunk names its own producer, so neither depends on the gather order.
+        # Keep only winners this rank produced.
         safe = jnp.maximum(slots, 0)
         ours = (slots >= 0) & (
             jnp.take_along_axis(src, jnp.floor_divide(safe, k), axis=1) == dcp_rank
