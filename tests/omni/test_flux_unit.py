@@ -16,12 +16,14 @@ import math
 import pytest
 import torch
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
-from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxPosEmbed
+from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
 
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
-from vllm_torchtpu.omni.patches import (apply_omni_model_specific_patches,
-                                        apply_omni_tpu_patches)
+from vllm_torchtpu.omni.patches import (
+    apply_omni_model_specific_patches,
+    apply_omni_tpu_patches,
+)
 
 pytestmark = [pytest.mark.omni]
 
@@ -99,21 +101,15 @@ class TestFluxTpuSDPAAttention:
             softmax_scale=scale,
         )
 
-        query_cpu = torch.randn(batch_size,
-                                seq_len,
-                                num_heads,
-                                head_size,
-                                dtype=torch.float32)
-        key_cpu = torch.randn(batch_size,
-                              seq_len,
-                              num_heads,
-                              head_size,
-                              dtype=torch.float32)
-        value_cpu = torch.randn(batch_size,
-                                seq_len,
-                                num_heads,
-                                head_size,
-                                dtype=torch.float32)
+        query_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+        )
+        key_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+        )
+        value_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+        )
 
         # Baseline execution on CPU using the exact same component
         ref_out = impl.forward(query_cpu, key_cpu, value_cpu)
@@ -158,21 +154,15 @@ class TestFluxTpuSDPAAttention:
             softmax_scale=scale,
         )
 
-        query_cpu = torch.randn(batch_size,
-                                q_len,
-                                num_heads,
-                                head_size,
-                                dtype=torch.float32)
-        key_cpu = torch.randn(batch_size,
-                              kv_len,
-                              num_heads,
-                              head_size,
-                              dtype=torch.float32)
-        value_cpu = torch.randn(batch_size,
-                                kv_len,
-                                num_heads,
-                                head_size,
-                                dtype=torch.float32)
+        query_cpu = torch.randn(
+            batch_size, q_len, num_heads, head_size, dtype=torch.float32
+        )
+        key_cpu = torch.randn(
+            batch_size, kv_len, num_heads, head_size, dtype=torch.float32
+        )
+        value_cpu = torch.randn(
+            batch_size, kv_len, num_heads, head_size, dtype=torch.float32
+        )
 
         ref_out = impl.forward(query_cpu, key_cpu, value_cpu)
 
@@ -204,21 +194,15 @@ class TestFluxTpuSDPAAttention:
             num_kv_heads=num_kv_heads,
         )
 
-        query_cpu = torch.randn(batch_size,
-                                seq_len,
-                                num_heads,
-                                head_size,
-                                dtype=torch.float32)
-        key_cpu = torch.randn(batch_size,
-                              seq_len,
-                              num_kv_heads,
-                              head_size,
-                              dtype=torch.float32)
-        value_cpu = torch.randn(batch_size,
-                                seq_len,
-                                num_kv_heads,
-                                head_size,
-                                dtype=torch.float32)
+        query_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+        )
+        key_cpu = torch.randn(
+            batch_size, seq_len, num_kv_heads, head_size, dtype=torch.float32
+        )
+        value_cpu = torch.randn(
+            batch_size, seq_len, num_kv_heads, head_size, dtype=torch.float32
+        )
 
         ref_out = impl.forward(query_cpu, key_cpu, value_cpu)
 
@@ -267,7 +251,7 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         assert sin_tpu.shape == (seq_len, expected_dim)
 
         # Trigonometric invariant: cos^2 + sin^2 must equal 1.0 on TPU within float32 tolerance
-        unity = cos_tpu.float()**2 + sin_tpu.float()**2
+        unity = cos_tpu.float() ** 2 + sin_tpu.float() ** 2
         torch.testing.assert_close(
             unity.cpu(),
             torch.ones_like(unity.cpu()),
@@ -293,10 +277,12 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         )
 
         # Bounded in [-1, 1]
-        assert (cos_tpu.cpu() >= -1.0 - 1e-4).all() and (cos_tpu.cpu()
-                                                         <= 1.0 + 1e-4).all()
-        assert (sin_tpu.cpu() >= -1.0 - 1e-4).all() and (sin_tpu.cpu()
-                                                         <= 1.0 + 1e-4).all()
+        assert (cos_tpu.cpu() >= -1.0 - 1e-4).all() and (
+            cos_tpu.cpu() <= 1.0 + 1e-4
+        ).all()
+        assert (sin_tpu.cpu() >= -1.0 - 1e-4).all() and (
+            sin_tpu.cpu() <= 1.0 + 1e-4
+        ).all()
 
     def test_flux_rope_float32_numeric_parity_on_tpu(self):
         """Ensure FLUX.1 RoPE position embeddings produce tensors with CPU parity."""
@@ -314,14 +300,8 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         assert cos_tpu.dtype == ref_cos.dtype
         assert sin_tpu.dtype == ref_sin.dtype
 
-        torch.testing.assert_close(cos_tpu.cpu(),
-                                   ref_cos,
-                                   atol=1e-4,
-                                   rtol=1e-4)
-        torch.testing.assert_close(sin_tpu.cpu(),
-                                   ref_sin,
-                                   atol=1e-4,
-                                   rtol=1e-4)
+        torch.testing.assert_close(cos_tpu.cpu(), ref_cos, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(sin_tpu.cpu(), ref_sin, atol=1e-4, rtol=1e-4)
 
     def test_flux2_rope_float32_numeric_parity_on_tpu(self):
         """Ensure FLUX.2 RoPE position embeddings produce tensors with CPU parity."""
@@ -339,14 +319,8 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         assert cos_tpu.dtype == ref_cos.dtype
         assert sin_tpu.dtype == ref_sin.dtype
 
-        torch.testing.assert_close(cos_tpu.cpu(),
-                                   ref_cos,
-                                   atol=1e-4,
-                                   rtol=1e-4)
-        torch.testing.assert_close(sin_tpu.cpu(),
-                                   ref_sin,
-                                   atol=1e-4,
-                                   rtol=1e-4)
+        torch.testing.assert_close(cos_tpu.cpu(), ref_cos, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(sin_tpu.cpu(), ref_sin, atol=1e-4, rtol=1e-4)
 
 
 class TestFluxRoPEKernelApplication:
@@ -379,16 +353,12 @@ class TestFluxRoPEKernelApplication:
         )
         cos_cpu, sin_cpu = pos_embed(ids_cpu)
 
-        q_cpu = torch.randn(batch_size,
-                            seq_len,
-                            num_heads,
-                            head_size,
-                            dtype=torch.float32)
-        k_cpu = torch.randn(batch_size,
-                            seq_len,
-                            num_heads,
-                            head_size,
-                            dtype=torch.float32)
+        q_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+        )
+        k_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+        )
 
         ref_q, ref_k = apply_rope_to_qk(rope, q_cpu, k_cpu, (cos_cpu, sin_cpu))
 
@@ -407,16 +377,11 @@ class TestFluxRoPEKernelApplication:
         assert torch.all(torch.isfinite(tpu_k.cpu()))
 
         # Bitwise replay determinism
-        tpu_q_replay, tpu_k_replay = apply_rope_to_qk(rope, q_tpu, k_tpu,
-                                                      (cos_tpu, sin_tpu))
-        torch.testing.assert_close(tpu_q.cpu(),
-                                   tpu_q_replay.cpu(),
-                                   atol=0.0,
-                                   rtol=0.0)
-        torch.testing.assert_close(tpu_k.cpu(),
-                                   tpu_k_replay.cpu(),
-                                   atol=0.0,
-                                   rtol=0.0)
+        tpu_q_replay, tpu_k_replay = apply_rope_to_qk(
+            rope, q_tpu, k_tpu, (cos_tpu, sin_tpu)
+        )
+        torch.testing.assert_close(tpu_q.cpu(), tpu_q_replay.cpu(), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(tpu_k.cpu(), tpu_k_replay.cpu(), atol=0.0, rtol=0.0)
 
         # Numerical parity against CPU ground truth
         _assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
