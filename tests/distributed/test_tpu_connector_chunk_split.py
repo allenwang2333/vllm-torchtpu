@@ -40,8 +40,8 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     _chunk_base_req_id, _chunk_req_id, _DestinationCollector,
     _early_group_bells, _early_layer_split_enabled, _fa_group_cuts,
-    _fa_block_ids, _fa_group_ordinals, _send_meta_fa_group, _send_meta_int,
-    _Stage3Admission, _STAGE7_ARM_DEADLINE_S,
+    _fa_block_ids, _fa_group_ordinals, _gdn_fa_groups, _send_meta_fa_group,
+    _send_meta_int, _Stage3Admission, _STAGE7_ARM_DEADLINE_S,
     _maybe_strand_stage7_watch_for_test)
 
 from .test_tpu_connector import (  # isort: skip
@@ -1075,6 +1075,19 @@ class TestGdnStateRegistration:
             with pytest.raises(RuntimeError, match="mamba state block ids"):
                 worker.process_send_load(self._meta(is_final=True))
 
+    def test_with_gdn_split_an_early_group_registers_its_state(self):
+        """Not final, but it names a group, so it owes that group's GDN
+        layers. The missing ids are what prove it tried."""
+        worker, _ = self._gdn_producer()
+        worker._stage3_gdn_fa_pairs = ((0, 0), )
+        meta = self._meta(is_final=False)
+        meta.reqs_to_send["chunked"].fa_group = 0
+        with ExitStack() as stack:
+            for ctx in _stage3_producer_env(1234):
+                stack.enter_context(ctx)
+            with pytest.raises(RuntimeError, match="mamba state block ids"):
+                worker.process_send_load(meta)
+
 
 # ---------------------------------------------------------------------------
 # Stage 7: the early attention group as a transfer of its own
@@ -1310,6 +1323,54 @@ class TestEarlyLayerGroupLayout:
         assert _send_meta_fa_group(SimpleNamespace()) is None
         assert _send_meta_fa_group(SimpleNamespace(fa_group=1)) == 1
 
+    def test_gdn_layers_ride_the_next_attention_group(self):
+        layers = ["g0", "g1", "g2", "a0", "g3", "g4", "g5", "a1", "g6"]
+        groups = _gdn_fa_groups(layers,
+                                {"g0", "g1", "g2", "g3", "g4", "g5", "g6"}, {
+                                    "a0": 0,
+                                    "a1": 1
+                                })
+        assert groups == {
+            "g0": 0,
+            "g1": 0,
+            "g2": 0,
+            "g3": 1,
+            "g4": 1,
+            "g5": 1,
+            "g6": 1
+        }
+
+    def test_with_gdn_split_a_group_send_names_only_its_state_tags(self):
+        """Mamba group 0 has GDN layers in both attention groups and mamba
+        group 1 only in the second, the way vLLM fills groups in layer order.
+        Naming (1, 0) would ask for a tag no pool carries."""
+        worker = self._worker()
+        worker._stage3_state_group_count = 2
+        worker._stage3_gdn_fa_pairs = ((0, 0), (0, 1), (1, 1))
+        tags, blocks, _counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=[300, 301],
+            skip_tokens=0,
+            fa_group=0)
+        assert tags == ["fa.g0", "gdn.conv.g0.f0", "gdn.ssm.g0.f0"]
+        assert blocks == [200, 300, 300]
+
+    def test_with_gdn_split_no_group_names_every_state_tag(self):
+        """Decode's fallback pulls the base uuid with no group, and has to get
+        all the state."""
+        worker = self._worker()
+        worker._stage3_state_group_count = 2
+        worker._stage3_gdn_fa_pairs = ((0, 0), (0, 1), (1, 1))
+        tags, blocks, _counts, _clip, _skip = worker._stage3_transfer_layout(
+            dst_block_ids=[200],
+            mamba_state_block_ids=[300, 301],
+            skip_tokens=0)
+        assert tags[2:] == [
+            "gdn.conv.g0.f0", "gdn.conv.g0.f1", "gdn.conv.g1.f1",
+            "gdn.ssm.g0.f0", "gdn.ssm.g0.f1", "gdn.ssm.g1.f1"
+        ]
+        assert blocks[2:] == [300, 300, 301, 300, 300, 301]
+
 
 # ---------------------------------------------------------------------------
 # Stage 7c: the early group emitted in the step that computes it
@@ -1394,6 +1455,35 @@ class TestEarlyGroupEmittedBeforeItsForward:
         ]
         meta = self._build(producer, step)
         assert meta.reqs_to_send["short#c0"].local_block_ids == [100]
+
+    def test_with_gdn_split_the_early_group_names_committed_state(self):
+        """The early send has to name the producer's state blocks itself,
+        because request_finished has not run yet. With one speculative block
+        the committed one is second from last."""
+        producer, req, _n = self._admitted()
+        producer._stage3_fa_group_index = 3
+        producer._stage3_mamba_group_indices = [0, 1, 2]
+        producer._stage3_mamba_num_speculative_blocks = 1
+        step = _step(scheduled={"short": PAGE + 1})
+        step.scheduled_new_reqs = [
+            SimpleNamespace(req_id="short",
+                            block_ids=([1, 4], [2, 5], [3, 6], [100]))
+        ]
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_GDN_SPLIT", True, create=True):
+            meta = self._build(producer, step)
+            assert meta.reqs_to_send["short#c0"].mamba_state_block_ids == [
+                1, 2, 3
+            ]
+            producer.reqs_to_send.clear()
+            with _arming_on():
+                with ExitStack() as stack:
+                    for ctx in _stage3_producer_env(900):
+                        stack.enter_context(ctx)
+                    with pytest.raises(ValueError, match="drifted"):
+                        producer.request_finished(req, [100],
+                                                  mamba_block_ids=[[1, 4],
+                                                                   [2, 5],
+                                                                   [7, 6]])
 
     def test_a_step_that_does_not_finish_the_prompt_emits_nothing(self):
         """The test that says this is not simply 'emit earlier'. Group 0's

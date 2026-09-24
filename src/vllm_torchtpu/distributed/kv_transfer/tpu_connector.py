@@ -395,6 +395,9 @@ class _ChunkProgress:
     # of the two paths got there: the doorbell path in the step that computes
     # it, or request_finished afterwards.
     early_emitted: bool = False
+    # TPU_KV_GDN_SPLIT. Each mamba group's block table so far, so the early
+    # sends can name the recurrent state blocks before request_finished does.
+    mamba_tables: list[list[int]] = field(default_factory=list)
 
 
 _stage5_mode = "on"
@@ -1007,6 +1010,30 @@ def _early_layer_split_enabled() -> bool:
     transfers nobody would start and the request would never complete.
     """
     return bool(_fa_group_cuts() and tpu_envs.TPU_KV_PREFILL_SUBMIT)
+
+
+def _gdn_split_enabled() -> bool:
+    """Whether each early group also carries its GDN layers' state. See
+    TPU_KV_GDN_SPLIT."""
+    return bool(tpu_envs.TPU_KV_GDN_SPLIT and _early_layer_split_enabled())
+
+
+def _gdn_fa_groups(ordered_layers: list[str], gdn_layers: Any,
+                   fa_group_by_layer: dict[str, int]) -> dict[str, int]:
+    """Assigns each GDN layer the attention group of the next attention layer.
+
+    That group's bell rings after its attention layer has run, which is after
+    every GDN layer before it, so it can release their state as well. A GDN
+    layer with no attention layer after it rides the last group.
+    """
+    group = max(fa_group_by_layer.values())
+    result: dict[str, int] = {}
+    for name in reversed(ordered_layers):
+        if name in fa_group_by_layer:
+            group = fa_group_by_layer[name]
+        elif name in gdn_layers:
+            result[name] = group
+    return result
 
 
 def _early_group_bells() -> tuple[int, ...]:
@@ -2318,6 +2345,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if progress is not None:
                 progress.block_ids = _fa_block_ids(new_req.block_ids,
                                                    self._stage3_fa_group_index)
+                progress.mamba_tables = [
+                    _fa_block_ids(new_req.block_ids, index)
+                    for index in self._stage3_mamba_group_indices
+                ]
 
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached is not None:
@@ -2332,6 +2363,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 if entry is not None:
                     progress.block_ids.extend(
                         _fa_block_ids(entry, self._stage3_fa_group_index))
+                    for table, index in zip(progress.mamba_tables,
+                                            self._stage3_mamba_group_indices):
+                        table.extend(_fa_block_ids(entry, index))
 
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         for req_id, progress in list(self._chunk_progress.items()):
@@ -2426,6 +2460,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 "to cover %d tokens; leaving the early group to the late path",
                 len(progress.block_ids), req_id, needed, admission.num_tokens)
             return
+        mamba = None
+        if _gdn_split_enabled() and self._stage3_mamba_group_indices:
+            mamba = _select_committed_mamba_blocks(
+                progress.mamba_tables,
+                self._stage3_mamba_num_speculative_blocks)
         if self._emit_early_group_send(req_id,
                                        admission,
                                        tuple(progress.block_ids[:needed]),
@@ -2435,7 +2474,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                                        dist_utils.get_p2p_wait_pull_timeout(),
                                        dst_params,
                                        arm_on_bells=True,
-                                       dst_batch_url=dst_batch_url):
+                                       dst_batch_url=dst_batch_url,
+                                       mamba_state_block_ids=mamba):
             progress.early_emitted = True
 
     def _emit_chunk_send(self, req_id: str, progress: _ChunkProgress,
@@ -2529,16 +2569,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         progress.shipped_through = end_token
         return True
 
-    def _emit_early_group_send(self,
-                               req_id: str,
-                               announced: Optional["_Stage3Admission"],
-                               block_ids: tuple[int, ...],
-                               num_tokens: int,
-                               start_token: int,
-                               expiration_time: float,
-                               dst_params: Optional[dict],
-                               arm_on_bells: bool = False,
-                               dst_batch_url: Optional[str] = None) -> bool:
+    def _emit_early_group_send(
+            self,
+            req_id: str,
+            announced: Optional["_Stage3Admission"],
+            block_ids: tuple[int, ...],
+            num_tokens: int,
+            start_token: int,
+            expiration_time: float,
+            dst_params: Optional[dict],
+            arm_on_bells: bool = False,
+            dst_batch_url: Optional[str] = None,
+            mamba_state_block_ids: Optional[list[int]] = None) -> bool:
         """Queue each early attention group as a send of its own.
 
         A chunk splits a request by token and this splits it by layer, so the
@@ -2598,6 +2640,10 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 fa_group=group,
                 arm_on_bell=bell if arm_on_bells else None,
                 dst_batch_url=dst_batch_url,
+                # Only read with TPU_KV_GDN_SPLIT, where the group ships the
+                # GDN layers in front of it.
+                mamba_state_block_ids=(mamba_state_block_ids
+                                       if _gdn_split_enabled() else None),
             )
             logger.info(
                 "%s",
@@ -2980,10 +3026,28 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # a progress object only exists because one was made.
             announced = progress.admission
             early_group = True
+            if (_gdn_split_enabled() and mamba_state_block_ids
+                    and _select_committed_mamba_blocks(
+                        progress.mamba_tables,
+                        self._stage3_mamba_num_speculative_blocks)
+                    != mamba_state_block_ids):
+                # The early groups already named their state blocks from the
+                # running tables. Disagreeing here means they shipped the
+                # wrong state, which decodes silently wrong, so stop instead.
+                raise ValueError(
+                    f"Stage-7 early groups of req_id={request.request_id} "
+                    "named different GDN state blocks than the finished "
+                    "request: the scheduler's running mamba tables drifted")
         else:
             early_group = self._emit_early_group_send(
-                request.request_id, announced, normalized_ids, num_tokens,
-                start_token, expiration_time, dst_params)
+                request.request_id,
+                announced,
+                normalized_ids,
+                num_tokens,
+                start_token,
+                expiration_time,
+                dst_params,
+                mamba_state_block_ids=mamba_state_block_ids)
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
             local_block_ids=list(normalized_ids),
@@ -3113,6 +3177,9 @@ class TPURaidenConnectorWorker:
         # admission/metadata directory.
         self._stage3_source_facades: dict[str, Any] = {}
         self._stage3_state_group_count = 0
+        # TPU_KV_GDN_SPLIT: the (mamba ordinal, attention group) pairs that
+        # have GDN pools. Empty means GDN tags carry no attention group.
+        self._stage3_gdn_fa_pairs: tuple[tuple[int, int], ...] = ()
         # Which pool tags carry attention, in the order a transfer uploads
         # them. One tag until the layer split cuts them into groups; see
         # TPU_KV_GROUP_BOUNDS.
@@ -3338,12 +3405,22 @@ class TPURaidenConnectorWorker:
             self._stage3_fa_tags = tuple(f"{rpm.TAG_FA}.g{ordinal}"
                                          for ordinal in range(len(cuts) + 1))
             self._stage3_early_fa_layers = tuple(fa_layers[:cuts[-1]])
+        gdn_fa_group_by_layer = None
+        if (_gdn_split_enabled() and fa_group_ordinal_by_layer
+                and mamba_group_ordinal_by_layer):
+            gdn_fa_group_by_layer = _gdn_fa_groups(
+                rpm.canonical_layer_order(named_kv_caches),
+                mamba_group_ordinal_by_layer, fa_group_ordinal_by_layer)
+            self._stage3_gdn_fa_pairs = tuple(
+                sorted({(mamba_group_ordinal_by_layer[name], group)
+                        for name, group in gdn_fa_group_by_layer.items()}))
         manifest = rpm.build_qwen35_pool_manifest(
             named_kv_caches=named_kv_caches,
             kv_cache_groups=kv_cache_groups,
             raw_tensors=raw_tensors,
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
             fa_group_ordinal_by_layer=fa_group_ordinal_by_layer,
+            gdn_fa_group_by_layer=gdn_fa_group_by_layer,
             gdn_geometry=rpm.GdnHeadGeometry(
                 local_key_heads=self._local_gdn_head_count(
                     self._model_config_int("linear_num_key_heads", 0)),
@@ -4150,11 +4227,20 @@ class TPURaidenConnectorWorker:
                 # first prompt long enough to chunk. The submit path already
                 # drops the state classes for these chunks (fa_only=not
                 # is_final); this is the registration side of the same rule.
-                if getattr(req_meta, "is_final_chunk", True):
+                # TPU_KV_GDN_SPLIT gives an early group its own GDN layers,
+                # whose state is final once the group's bell rings. The final
+                # send still registers all of it, as it does every attention
+                # group, so decode's fallback can pull the whole request.
+                is_final = getattr(req_meta, "is_final_chunk", True)
+                fa_group = _send_meta_fa_group(req_meta)
+                if is_final or (self._stage3_gdn_fa_pairs
+                                and fa_group is not None):
                     pool_spans.extend(
                         self._stage3_state_pool_spans(
                             getattr(req_meta, "mamba_state_block_ids", None),
-                            transfer_rank, parallelism))
+                            transfer_rank,
+                            parallelism,
+                            fa_group=None if is_final else fa_group))
                 facade.register_request_blocks(
                     req_id=req_id,
                     uuid=uuid,
@@ -4517,8 +4603,26 @@ class TPURaidenConnectorWorker:
                 f"GDN state pools tagged {tag!r} disagree on live regions")
         return tuple(matching[0].regions)
 
-    def _stage3_state_pool_spans(self, mamba_state_block_ids,
-                                 transfer_rank: int, parallelism: int) -> list:
+    def _stage3_state_tag_suffixes(
+            self, fa_group: Optional[int]) -> list[tuple[int, str]]:
+        """(mamba ordinal, tag suffix) for each GDN tag a transfer names.
+
+        With TPU_KV_GDN_SPLIT, ``fa_group`` picks the one attention group's
+        layers and None picks every group; without it there is one tag per
+        mamba group and ``fa_group`` does not narrow it.
+        """
+        if not self._stage3_gdn_fa_pairs:
+            return [(ordinal, f".g{ordinal}")
+                    for ordinal in range(self._stage3_state_group_count)]
+        return [(ordinal, f".g{ordinal}.f{group}")
+                for ordinal, group in self._stage3_gdn_fa_pairs
+                if fa_group is None or group == fa_group]
+
+    def _stage3_state_pool_spans(self,
+                                 mamba_state_block_ids,
+                                 transfer_rank: int,
+                                 parallelism: int,
+                                 fa_group: Optional[int] = None) -> list:
         """Producer: the GDN state classes' span registrations.
 
         PCP GDN execution exchanges token shards for head shards.  Every PCP
@@ -4574,8 +4678,9 @@ class TPURaidenConnectorWorker:
 
         registrations = []
         for tag in _STAGE3_STATE_CLASS_TAGS:
-            for ordinal, block_id in enumerate(mamba_state_block_ids):
-                exact_tag = f"{tag}.g{ordinal}"
+            for ordinal, suffix in self._stage3_state_tag_suffixes(fa_group):
+                block_id = mamba_state_block_ids[ordinal]
+                exact_tag = tag + suffix
                 if aliased_raw:
                     matching_pools = tuple(
                         pool for pool in self._raiden_manifest.pools
@@ -5425,14 +5530,17 @@ class TPURaidenConnectorWorker:
                     start_token=0,
                     end_token=num_tokens,
                     local_skip_tokens=skip_tokens)
+            fa_group = _send_meta_fa_group(req_meta)
+            carries_state = is_final or bool(self._stage3_gdn_fa_pairs
+                                             and fa_group is not None)
             transfer_tags, dst_blocks, dst_counts, clip_kwargs, _ = (
                 self._stage3_transfer_layout(
                     dst_block_ids=dst_ids,
-                    mamba_state_block_ids=([int(slot) for slot in mamba]
-                                           if mamba and is_final else None),
+                    mamba_state_block_ids=([int(slot) for slot in mamba] if
+                                           mamba and carries_state else None),
                     skip_tokens=skip_tokens,
-                    fa_only=not is_final,
-                    fa_group=_send_meta_fa_group(req_meta)))
+                    fa_only=not carries_state,
+                    fa_group=fa_group))
             facade, src_controller_address = self._require_stage3_controller()
             call_kwargs: dict[str, Any] = dict(
                 src_units=src_units,
@@ -5696,9 +5804,10 @@ class TPURaidenConnectorWorker:
                 raise RuntimeError("GDN state load requires one destination "
                                    "state block per mamba group")
             for tag in _STAGE3_STATE_CLASS_TAGS:
-                for ordinal, slot in enumerate(mamba_state_block_ids):
-                    transfer_tags.append(f"{tag}.g{ordinal}")
-                    dst_blocks.append(int(slot))
+                for ordinal, suffix in self._stage3_state_tag_suffixes(
+                        fa_group):
+                    transfer_tags.append(tag + suffix)
+                    dst_blocks.append(int(mamba_state_block_ids[ordinal]))
                     dst_counts.append(1)
         # Prefix-aware suffix pull: clip the FA global destination byte space
         # at the locally-cached prefix; GDN state classes are not

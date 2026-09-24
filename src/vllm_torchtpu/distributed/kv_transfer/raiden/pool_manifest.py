@@ -557,6 +557,7 @@ def build_qwen35_pool_manifest(
     gdn_geometry: GdnHeadGeometry,
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
     fa_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    gdn_fa_group_by_layer: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -577,6 +578,9 @@ def build_qwen35_pool_manifest(
     pools, and a tag is how a transfer names the pools it carries. Splitting
     the tag is therefore all it takes to ship one group of layers ahead of the
     rest; no span or geometry changes. The same peer-agreement rule applies.
+
+    ``gdn_fa_group_by_layer`` further suffixes each GDN tag with the attention
+    group that layer ships with (``gdn.conv.g0.f3``), for the same reason.
     """
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
@@ -609,6 +613,8 @@ def build_qwen35_pool_manifest(
                     raise ManifestError(
                         f"GDN layer {layer_name} has no mamba group ordinal")
                 suffix = f".g{int(ordinal)}"
+            if gdn_fa_group_by_layer is not None:
+                suffix += f".f{int(gdn_fa_group_by_layer[layer_name])}"
             flat.append((TAG_GDN_CONV + suffix, layer_name, states[0]))
             flat.append((TAG_GDN_SSM + suffix, layer_name, states[1]))
         else:

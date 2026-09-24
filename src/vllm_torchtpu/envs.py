@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     TPU_KV_DOORBELL_ARM: bool = False
     TPU_KV_EARLY_LAYERS: int = 0
     TPU_KV_GROUP_BOUNDS: str = ""
+    TPU_KV_GDN_SPLIT: bool = False
     TPU_KV_ADMISSION_REORDER: bool = False
     TPU_KV_ADMISSION_CALLBACK_TIMEOUT_S: float = 2.0
     TPU_KV_PREFILL_SUBMIT: bool = False
@@ -517,6 +518,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split created, and only when the reader exists to arm against.
     "TPU_KV_DOORBELL_ARM":
     lambda: bool(int(os.getenv("TPU_KV_DOORBELL_ARM", "0"))),
+
+    # Ship each attention group's preceding GDN layers with that group,
+    # instead of all 45 layers of recurrent state in the final transfer. On
+    # 397B the state is 183 MiB per request, the largest thing left in the
+    # tail once the attention groups go early. The group's bell releases its
+    # GDN layers too, because they run before its attention layer. Needs the
+    # layer split (TPU_KV_GROUP_BOUNDS or TPU_KV_EARLY_LAYERS) to do anything.
+    "TPU_KV_GDN_SPLIT":
+    lambda: bool(int(os.getenv("TPU_KV_GDN_SPLIT", "0"))),
 
     # Stage 7. How many of the leading full-attention layers form the early
     # group, the one a doorbell can release before the forward pass has
