@@ -136,9 +136,9 @@ def test_decode_stripe_boundaries(rank):
     starts = jnp.array([0, 1, 2, 3, 4, 4], jnp.int32)
     tables = jnp.array([[1, 5], [2, 6], [3, 7], [4, 8], [0, 0]])
     cache = jnp.full((9, 8, 2, 640), -7, jnp.bfloat16)
-    q = jnp.zeros((5, 12, 512), jnp.bfloat16)
-    qp = jnp.zeros((5, 12, 64), jnp.bfloat16)
-    values = jnp.broadcast_to(jnp.arange(5)[:, None], (5, 576))
+    q = jnp.zeros((8, 12, 512), jnp.bfloat16)
+    qp = jnp.zeros((8, 12, 64), jnp.bfloat16)
+    values = jnp.broadcast_to(jnp.arange(8)[:, None], (8, 576))
     updated, _, causal, _, count = kernel._prepare_decode(
         cache,
         q,
@@ -160,6 +160,7 @@ def test_decode_stripe_boundaries(rank):
             expected[tables[token, local // 16], local % 16 // 2, local % 2, 576:] = 0
     np.testing.assert_array_equal(updated, expected)
     np.testing.assert_array_equal(
-        causal, [16, 16, 16, 17, 0] if rank == 0 else [0, 1, 16, 16, 0]
+        causal,
+        [16, 16, 16, 17, 0, 0, 0, 0] if rank == 0 else [0, 1, 16, 16, 0, 0, 0, 0],
     )
     np.testing.assert_array_equal(count, [4])

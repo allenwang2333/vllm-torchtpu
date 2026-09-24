@@ -463,36 +463,27 @@ def distributed_attention(
 
 
 def _prepare_decode(c, q, qp, kv, pe, lengths, tables, starts, *, rank):
-    """Scatter query suffixes and give each token its causal striped length.
-
-    ``lengths`` is the global sequence length after the scheduled query suffix.
-    Each query uses its own causal length before conversion to local stripes.
-    """
-    # The serving metadata stores each rank's block table flattened.
+    """One decode token per active request; padded requests never write KV."""
     tables = tables.reshape(lengths.shape[0], -1)
     token = jnp.arange(q.shape[0], dtype=jnp.int32)
-    request = jnp.searchsorted(starts[1:], token, side="right")
-    safe = jnp.minimum(request, lengths.shape[0] - 1)
-    valid = (request < lengths.shape[0]) & (token < starts[-1])
-    query_len = starts[safe + 1] - starts[safe]
-    position = lengths[safe] - query_len + token - starts[safe]
-    valid &= (position >= 0) & (position < lengths[safe])
-    pos = jnp.maximum(position, 0)
-    owner = pos // 16 % 2
+    safe = jnp.minimum(token, lengths.shape[0] - 1)
+    seq_lens = lengths if q.shape[0] == lengths.shape[0] else lengths[safe]
+    token_tables = tables if q.shape[0] == lengths.shape[0] else tables[safe]
+    valid = (token < lengths.shape[0]) & (token < starts[-1]) & (seq_lens > 0)
+    pos = jnp.maximum(seq_lens - 1, 0)
     local_pos = pos // 32 * 16 + pos % 16
     col = local_pos // 16
-    page = tables[safe, jnp.minimum(col, tables.shape[1] - 1)]
-    write = valid & (owner == rank) & (col < tables.shape[1])
+    page = token_tables[token, jnp.minimum(col, tables.shape[1] - 1)]
+    write = valid & (pos // 16 % 2 == rank) & (col < tables.shape[1])
     page = jnp.where(write, page, c.shape[0])
     values = jnp.pad(jnp.concatenate((kv, pe), axis=-1), ((0, 0), (0, 64)))
     c = c.at[page, local_pos % 16 // 2, local_pos % 2].set(values, mode="drop")
-    causal_length = pos + 1
-    local = causal_length // 32 * 16 + jnp.clip(causal_length % 32 - rank * 16, 0, 16)
+    local = seq_lens // 32 * 16 + jnp.clip(seq_lens % 32 - rank * 16, 0, 16)
     return (
         c,
         jnp.concatenate((q, qp), axis=-1),
         jnp.where(valid, local, 0),
-        tables[safe],
+        token_tables,
         starts[-1:],
     )
 
