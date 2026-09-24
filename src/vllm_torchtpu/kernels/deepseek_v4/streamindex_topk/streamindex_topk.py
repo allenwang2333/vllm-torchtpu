@@ -1391,9 +1391,7 @@ def streamindex_topk_dcp(
         # and it can resolve its own winners against its local `idxs`.
         # A rank is constant across its own k candidates, so it rides as one
         # trailing column rather than a full lane: 4/k bytes, not another 4k.
-        rank_col = jnp.broadcast_to(
-            dcp_rank.astype(scores.dtype), (scores.shape[0], 1)
-        )
+        rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
         payload = lax.all_gather(
             jnp.concatenate([scores, rank_col], axis=1),
             dcp_axis_name,
