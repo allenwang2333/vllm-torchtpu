@@ -48,11 +48,6 @@ if [ ! -f "${REPO_ROOT}/${DISAGG_SCRIPT#./}" ]; then
 fi
 echo "Disagg script: ${DISAGG_SCRIPT}  results: ${DISAGG_RUN_ROOT}"
 
-# Staging the checkpoint from GCS beats letting eight API servers each pull it
-# from HuggingFace, and DSv4 is large enough that the difference is the whole
-# job. Both hosts need it, so the worker stages over ssh below.
-STAGE_MODEL_GCS="${STAGE_MODEL_GCS:-}"
-
 # shellcheck source=.buildkite/scripts/ci_image.sh
 source "${SCRIPT_DIR}/ci_image.sh"
 # Point Test Steps to the Metadata-Driven Image Tag
@@ -232,13 +227,6 @@ CONTAINER_ENV_COMMON=(
 # ---------------------------------------------------------------------------
 # Start Worker container (ROLE=decode)
 # ---------------------------------------------------------------------------
-if [ -n "${STAGE_MODEL_GCS}" ]; then
-  echo "--- Staging ${STAGE_MODEL_GCS} onto both hosts"
-  bash "${SCRIPT_DIR}/stage_model_snapshot.sh" "${STAGE_MODEL_GCS}" "${HOST_HF_HOME}/hub"
-  ssh_retry "${SSH_USER}@${WORKER_IP}" "bash -s -- '${STAGE_MODEL_GCS}' \"\${HOME}/hf_home/hub\"" \
-    < "${SCRIPT_DIR}/stage_model_snapshot.sh"
-fi
-
 echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
