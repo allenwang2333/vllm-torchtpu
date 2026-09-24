@@ -155,9 +155,7 @@ steps:
 
       - label: "Integration: Nightly dsv4-pd-disagg-correctness"
         key: "integration_nightly_dsv4_pd_disagg_correctness"
-        # TEMPORARY, revert before merge: presubmit so this lane gets its first
-        # real run on PR #684. Restore `if: 'build.env("NIGHTLY") == "1"'`.
-        if: "build.pull_request.id != null"
+        if: 'build.env("NIGHTLY") == "1"'
         timeout_in_minutes: 150
         agents:
           queue: "tpu_v7x_16_queue"
