@@ -114,6 +114,10 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# ids of the built ops that take a per-row valid mask as their last operand.
+# The op's arity is decided once, at build, and this is how the call site
+# reads that decision back instead of consulting the env a second time.
+_DROP_PADDING_OPS: set[int] = set()
 
 
 def _squeeze_channel_scale(
@@ -175,6 +179,7 @@ def _build_op(
     routed_scaling_factor=1.0,
     *,
     token_replica_groups=None,
+    drop_padding=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -191,6 +196,7 @@ def _build_op(
         has_score_bias,
         routed_scaling_factor,
         token_replica_groups,
+        drop_padding,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -205,7 +211,7 @@ def _build_op(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
 
-    def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
+    def call(x, w1, w2, w1_scale, w2_scale, gating, rank, valid=None, **bias_kw):
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -230,6 +236,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            valid_rows=valid,
             **bias_kw,
             **routing_kw,
         )
@@ -268,6 +275,48 @@ def _build_op(
             score_bias=score_bias.astype(jnp.float32),
         )
 
+    def moe_valid(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        valid: jax.Array,
+    ) -> jax.Array:
+        return call(x, w1, w2, w1_scale, w2_scale, gating, rank, valid=valid)
+
+    def moe_with_score_bias_valid(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        valid: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            valid=valid,
+            score_bias=score_bias.astype(jnp.float32),
+        )
+
+    fns = {
+        (False, False): moe,
+        (True, False): moe_with_score_bias,
+        (False, True): moe_valid,
+        (True, True): moe_with_score_bias_valid,
+    }
+
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
@@ -275,14 +324,19 @@ def _build_op(
     # straight to shard_map, so a heterogeneous tuple is what it wants; the
     # bias is NOT closed over as a constant because it differs per layer and
     # `_OPS` would then key one exported program per MoE layer.
-    input_specs = (spec,) * 7 + ((PartitionSpec(),) if has_score_bias else ())
+    # The valid mask is per token, so it rides axis 0 like x, and goes last.
+    input_specs = (
+        (spec,) * 7
+        + ((PartitionSpec(),) if has_score_bias else ())
+        + ((spec,) if drop_padding else ())
+    )
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
     # where a shard_map result is recorded as replicated, so this rank's 2048
     # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
     # with only that line replaced.
     op = sharded_jax_op(
         name,
-        moe_with_score_bias if has_score_bias else moe,
+        fns[(bool(has_score_bias), bool(drop_padding))],
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias] -- and
         # the single output is sharded on axis 0 like x.
@@ -298,6 +352,8 @@ def _build_op(
         return torch.empty_like(x)
 
     op.register_fake(_fake)
+    if drop_padding:
+        _DROP_PADDING_OPS.add(id(op))
     _OPS[key] = op
     return op
 
@@ -335,9 +391,20 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    if score_bias is None:
-        return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, score_bias)
+    tail = () if score_bias is None else (score_bias,)
+    if id(op) in _DROP_PADDING_OPS:
+        from vllm_torchtpu.layers.adapter import token_padding
+
+        state = token_padding.get_padding_state()
+        if state is None:
+            raise RuntimeError(
+                "fused EP MoE was built to drop padding rows "
+                "(MOE_FUSED_EP_V2_DROP_PADDING) but the runner created no "
+                "token padding state to say which rows are padding"
+            )
+        is_pad = state.get_local_padding_mask(hidden_states.shape[0])
+        tail = tail + (torch.logical_not(is_pad).to(torch.int32),)
+    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *tail)
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -558,6 +625,14 @@ def prebuild_fused_moe_ep(
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    drop_padding = envs.MOE_FUSED_EP_V2_DROP_PADDING
+    if drop_padding and not sharded_plan:
+        logger.warning_once(
+            "MOE_FUSED_EP_V2_DROP_PADDING needs MOE_FUSED_EP_V2_SHARDED_PLAN "
+            "(only the sharded routing plan can drop a selection); padding "
+            "rows stay in dispatch."
+        )
+        drop_padding = False
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
@@ -575,6 +650,7 @@ def prebuild_fused_moe_ep(
         has_score_bias,
         routed_scale,
         token_replica_groups=token_replica_groups,
+        drop_padding=drop_padding,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

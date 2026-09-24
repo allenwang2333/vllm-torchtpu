@@ -260,6 +260,7 @@ def fused_ep_moe_v2(
     routed_scaling_factor=1.0,
     token_replica_groups=None,
     fp8_stream=None,
+    valid_rows=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -301,6 +302,13 @@ def fused_ep_moe_v2(
     fp8_stream streams eight-bit weight slabs in contraction blocks and
     starts the next expert's slabs early (see kernel.py); None reads
     MOE_FUSED_EP_V2_FP8_STREAM, so a caller can pin either arm in-process.
+
+    valid_rows [tokens] (nonzero = a real token) keeps every other row out of
+    dispatch: its selections take an expert id past the last expert, which
+    every count in the sharded plan excludes, so a padding row costs no
+    expert tiles, pushes or arrival rows, and its output is zero. Only the
+    sharded plan maps such an id off every shard, so it requires
+    sharded_plan=True.
 
     token_replica_groups lists ordered groups of device-mesh indices whose
     x and gating rows are identical (for example, a TP group). Each member
@@ -413,6 +421,26 @@ def fused_ep_moe_v2(
             f"score_bias must be one value per global expert, [{e_total}]; "
             f"got {tuple(score_bias.shape)}"
         )
+    has_valid_rows = valid_rows is not None
+    if has_valid_rows and not sharded_plan:
+        raise ValueError(
+            "valid_rows drops padding rows by routing them to an expert id "
+            "past the last expert; only the sharded routing plan maps that id "
+            "off every shard (the replicated plan would fold it into shard "
+            "zero's slab), so it requires sharded_plan=True"
+        )
+    if has_valid_rows and valid_rows.shape != (T,):
+        raise ValueError(
+            f"valid_rows must be one flag per token, [{T}]; got "
+            f"{tuple(valid_rows.shape)}"
+        )
+    # The drop only pays where padding lives: a batch small enough that every
+    # expert fits in one tile -- the decode buckets, the same bound the
+    # kernel uses to ship tiles straight from VMEM. A full prefill chunk has
+    # no padding to drop, and the output select plus the masked weights cost
+    # it about 1.5% of the layer (j-551064b0), so there the mask is carried
+    # (the op's arity is fixed) but not applied.
+    drops_padding = has_valid_rows and ragged_stride <= ep * g_local * capacity
     if fp8_stream is None:
         fp8_stream = envs.MOE_FUSED_EP_V2_FP8_STREAM
     fp8_stream = bool(fp8_stream)
@@ -432,6 +460,10 @@ def fused_ep_moe_v2(
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
+        valid_l = None
+        if has_valid_rows:
+            valid_l = scales_gating_biases[-1] if drops_padding else None
+            scales_gating_biases = scales_gating_biases[:-1]
         """One shard's half of the layer: route, dispatch, kernel, combine."""
         # The scales come before the gating logits and the biases after
         # them, which is the operand order the scaled formats have always
@@ -448,6 +480,10 @@ def fused_ep_moe_v2(
         me = rank_l[0, 0]
         x_l = token_layout.split(x_l, me)
         gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
+        if valid_l is not None:
+            valid_l = token_layout.split(
+                valid_l.astype(jnp.int32)[:, None], me, fill_value=0
+            )[:, 0]
         if len(token_layout.groups[0]) > 1 and form.quantized_activations:
             # Slicing fused into rowquant changes BF16 rounding on TPU.
             # Keep this boundary only for quantized replicated inputs.
@@ -502,6 +538,21 @@ def fused_ep_moe_v2(
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+        if valid_l is not None:
+            # A row routes only if it is a real token AND its raw logits carry
+            # a value: under sigmoid a -inf logit scores a finite zero, so the
+            # score test above cannot see replica padding either. Its
+            # selections go to an id past the last expert (after the mesh
+            # relabel, which would map that id back onto a real expert), so
+            # the plan's histograms, and every count and drain derived from
+            # them, never see the pair.
+            row_routes = (
+                row_routes
+                & (valid_l != 0)[:, None]
+                & jnp.any(jnp.isfinite(gate_l), axis=-1, keepdims=True)
+            )
+            topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+            topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -674,6 +725,12 @@ def fused_ep_moe_v2(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        if valid_l is not None:
+            # A dropped row's positions point at arrival rows nobody wrote
+            # for it, and a zero weight times a non-finite row is not zero,
+            # so its output is selected rather than weighted away. A row is
+            # dropped whole, so this is per token.
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -696,12 +753,23 @@ def fused_ep_moe_v2(
     # Sharding it would give each shard a 1/ep slice of the experts and
     # silently bias the wrong ones.
     score_bias_args = (score_bias,) if has_score_bias else ()
+    # valid_rows rides the token axis like x, and goes last so local_fn can
+    # peel it off before the positional operands.
+    valid_args = (valid_rows,) if has_valid_rows else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args))
         + (P(),) * len(score_bias_args)
         + (P(ax),) * len(bias_args)
+        + (P(ax),) * len(valid_args)
     )
-    args = (x, rank, w1, w2) + scale_args + (gating,) + score_bias_args + bias_args
+    args = (
+        (x, rank, w1, w2)
+        + scale_args
+        + (gating,)
+        + score_bias_args
+        + bias_args
+        + valid_args
+    )
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -734,6 +802,8 @@ def fused_ep_moe_v2(
         has_score_bias and score_bias.dtype,
         float(routed_scaling_factor),
         fp8_stream,
+        has_valid_rows,
+        drops_padding,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

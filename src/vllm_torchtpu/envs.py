@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_FP8_STREAM: bool = False
+    MOE_FUSED_EP_V2_DROP_PADDING: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -606,6 +607,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert's slabs as soon as the current one's last reader has retired.
     "MOE_FUSED_EP_V2_FP8_STREAM":
     env_bool("MOE_FUSED_EP_V2_FP8_STREAM"),
+    # Keep the runner's padding rows out of fused EP MoE v2's dispatch: they
+    # route nowhere, cost no expert work or transport, and return zero.
+    # Needs MOE_FUSED_EP_V2_SHARDED_PLAN, whose plan is the one that can drop
+    # a selection.
+    "MOE_FUSED_EP_V2_DROP_PADDING":
+    env_bool("MOE_FUSED_EP_V2_DROP_PADDING"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

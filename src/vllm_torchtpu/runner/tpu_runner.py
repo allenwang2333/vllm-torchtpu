@@ -4304,7 +4304,11 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        if (
+            envs.TPU_MOE_SKIP_PADDED_TOKENS
+            or uses_mxfp4_moe
+            or envs.MOE_FUSED_EP_V2_DROP_PADDING
+        ):
             self._token_padding_state = token_padding.TokenPaddingState.create(
                 self.max_num_tokens, self.device
             )
