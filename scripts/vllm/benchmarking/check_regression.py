@@ -280,20 +280,18 @@ def delta_stderr(
 ) -> float:
     """Standard error of (results - baseline) for one metric.
 
-    Both runs contribute noise, so the errors add in quadrature. Whichever
-    side reports a stderr sets the scale:
+    Both runs contribute noise, so the errors add in quadrature. The two
+    sides are not treated alike when one is missing: the baseline's stderr
+    sets the scale for both sides, the run's stderr for its own side only.
 
     - Both report: ``hypot(se_baseline, se_run)``.
     - Run reports none: assume it is as noisy as the baseline, recovering the
       ``sqrt(2) * se_baseline`` form.
-    - Baseline reports none: ``hypot(0.0, se_run) == se_run``, so the gate
-      still widens off the run's stderr rather than dropping back to the flat
-      tolerance. A baseline accuracy is itself a sampled estimate, so a
-      baseline that merely predates stderr recording is not a noiseless one;
-      treating it as exact would assert a precision nobody measured. The run's
-      stderr is a direct measurement of how precisely this metric can be
-      resolved at this sample size, and it is the best available estimate of
-      the noise on both sides.
+    - Baseline reports none: the baseline is treated as exact, giving
+      ``hypot(0.0, se_run) == se_run``. The gate still widens off the run's
+      measured stderr rather than dropping back to the flat tolerance, but by
+      ``1 / sqrt(2)`` less than when the same stderr is on the baseline side.
+      Regenerating the baseline with ``--calibrate`` restores the full width.
     - Neither reports: 0.0, and the caller falls back to the flat tolerance
       floor.
     """

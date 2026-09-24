@@ -56,9 +56,10 @@ the same live server:
   the noisy quantity is their *difference*, whose standard error combines both
   sides in quadrature; using one raw stderr would still fail ~24% of clean
   reruns on small benchmarks like `humaneval_plus_tpu` (N=164). When only one
-  side records a stderr it sets the scale for both, since the missing side is
-  an unmeasured error rather than a zero one; the flat tolerance governs only
-  where neither side records one.
+  side records a stderr the two cases differ: a baseline stderr sets the scale
+  for both sides (`sqrt(2) * stderr_baseline`), while a run stderr covers only
+  its own side and the baseline is treated as exact (`stderr_run`). The flat
+  tolerance governs only where neither side records one.
   `--run-lm-eval` walks `LM_EVAL_TASKS`
   (default `mmlu_llama mmlu_pro`; configs may narrow it). MMLU tasks
   (`mmlu_llama`, `mmlu_pro`) run against the chat-completions endpoint;
