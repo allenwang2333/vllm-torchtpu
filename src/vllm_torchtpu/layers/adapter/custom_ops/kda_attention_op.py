@@ -538,8 +538,6 @@ def _pooled_kda_core(
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
-    num_states = num_reqs * window
-    pool_indices = state_indices
     dense_offsets = None
     identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
     if num_spec_tokens:
@@ -553,9 +551,10 @@ def _pooled_kda_core(
             )
         # Manager blocks need not be contiguous. Keep every checkpoint in a
         # contiguous scratch window, including untouched ragged/prefill tails.
-        pool_indices = ckpt_indices.reshape(-1)
-        dense_offsets = jnp.zeros(num_states + 1, dtype=jnp.int32)
+        num_reqs *= window
+        dense_offsets = jnp.zeros(num_reqs + 1, dtype=jnp.int32)
         dense_offsets = dense_offsets.at[identity].set(slot_read_offsets[state_indices])
+        state_indices = ckpt_indices.reshape(-1)
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
     kernel_size = conv_weight.shape[0]
@@ -598,7 +597,7 @@ def _pooled_kda_core(
     # per typed row, so the leading H * D rows are exactly the state.
     ssm_gathered = pool_adapters.gather_region(
         pool,
-        pool_indices,
+        state_indices,
         tok0=0,
         ntok=layout.ssm_tokens,
         out_dtype=jnp.float32,
@@ -607,7 +606,7 @@ def _pooled_kda_core(
     )
     ssm_rows = num_heads * head_dim
     ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
-        num_states, num_heads, head_dim, head_dim
+        num_reqs, num_heads, head_dim, head_dim
     )
 
     # Stage-3 stores whole, padded prefill-head shards in rank order. Each
@@ -627,20 +626,20 @@ def _pooled_kda_core(
         raise ValueError("KDA conv shard exceeds its padded pool region")
     conv_gathered = pool_adapters.gather_region(
         pool,
-        pool_indices,
+        state_indices,
         tok0=layout.ssm_tokens,
         ntok=layout.conv_tokens,
         out_dtype=pool.dtype,
         split=split,
     )
-    conv_local = conv_gathered.reshape(num_states, conv_shards, padded_shard_elems)[
+    conv_local = conv_gathered.reshape(num_reqs, conv_shards, padded_shard_elems)[
         :, :, :shard_elems
     ]
     conv_local = conv_local.reshape(
-        num_states, conv_shards, kernel_size - 1, 3, shard_heads, head_dim
+        num_reqs, conv_shards, kernel_size - 1, 3, shard_heads, head_dim
     )
     conv_local = conv_local.transpose(0, 2, 3, 1, 4, 5).reshape(
-        num_states, kernel_size - 1, 3, num_heads, head_dim
+        num_reqs, kernel_size - 1, 3, num_heads, head_dim
     )
 
     # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
@@ -659,7 +658,7 @@ def _pooled_kda_core(
         raw_gate,
         beta,
         output_gate,
-        conv_buf.reshape(num_states + 1, kernel_size - 1, -1),
+        conv_buf.reshape(num_reqs + 1, kernel_size - 1, -1),
         ssm_buf,
         conv_weight,
         a_log,
@@ -673,32 +672,32 @@ def _pooled_kda_core(
         dense_offsets,
     )
     new_conv_buf = new_conv_buf.reshape(
-        num_states + 1, kernel_size - 1, 3, num_heads, head_dim
+        num_reqs + 1, kernel_size - 1, 3, num_heads, head_dim
     )
 
     # Scatter the real slots back; the padding rows/elems of each region are
     # zero-filled so the pool bytes stay deterministic.
     ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
-    new_ssm = new_ssm_buf[1:].reshape(num_states, ssm_rows, head_dim)
+    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
     new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
     pool = pool_adapters.scatter_region(
-        pool, new_ssm, pool_indices, tok0=0, ntok=layout.ssm_tokens, split=split
+        pool, new_ssm, state_indices, tok0=0, ntok=layout.ssm_tokens, split=split
     )
 
     new_conv = new_conv_buf[1:].reshape(
-        num_states, kernel_size - 1, 3, conv_shards, shard_heads, head_dim
+        num_reqs, kernel_size - 1, 3, conv_shards, shard_heads, head_dim
     )
     new_conv = new_conv.transpose(0, 3, 1, 2, 4, 5).reshape(
-        num_states, conv_shards, shard_elems
+        num_reqs, conv_shards, shard_elems
     )
     new_conv = jnp.pad(
         new_conv, ((0, 0), (0, 0), (0, padded_shard_elems - shard_elems))
     )
-    new_conv = new_conv.reshape(num_states, -1, pool.shape[-1])
+    new_conv = new_conv.reshape(num_reqs, -1, pool.shape[-1])
     pool = pool_adapters.scatter_region(
         pool,
         new_conv,
-        pool_indices,
+        state_indices,
         tok0=layout.ssm_tokens,
         ntok=layout.conv_tokens,
         split=split,
