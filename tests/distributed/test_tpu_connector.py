@@ -4198,6 +4198,7 @@ class TestStage5ProducerSubmitWorker:
         worker, facade, meta = self._consumer()
         self._stage_consumer(worker, meta, enabled=True)
         worker._stage3_terminal_loads.add("dst-1")
+        worker._recv_arrivals["dst-1"] = 1
         with patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", True,
                    create=True):
             worker._stage3_pending_submits["dst-1"].hold_until = 0.0
@@ -4205,6 +4206,19 @@ class TestStage5ProducerSubmitWorker:
             _flush_stage3_submits(worker)
         facade.start_transfer.assert_not_called()
         assert worker._stage3_pending_submits == {}
+
+    def test_one_early_group_landing_keeps_the_fallback(self):
+        """Fifteen arrivals expected and one landed is not a landed transfer.
+        Retiring the fallback here left the final transfer to nobody."""
+        worker, facade, meta = self._consumer()
+        self._stage_consumer(worker, meta, enabled=True)
+        worker._recv_expected["dst-1"] = 15
+        worker._stage3_terminal_loads.add("dst-1")
+        worker._recv_arrivals["dst-1"] = 1
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_PREFILL_SUBMIT", True,
+                   create=True):
+            worker._drain_stage3_pending_submits(None)
+        assert "dst-1" in worker._stage3_pending_submits
 
     def test_the_fallback_submits_once_the_hold_expires(self):
         worker, facade, meta = self._consumer()

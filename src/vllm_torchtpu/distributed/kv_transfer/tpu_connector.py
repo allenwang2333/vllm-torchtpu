@@ -2986,6 +2986,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # state. Without them it carries everything, which is fa_group=None
             # and the single tag list.
             fa_group=len(announced.early_uuids) if early_group else None,
+            # Early groups that went ahead count as arrivals on decode, and
+            # the first one cancels decode's fallback submit. So when the
+            # destination is late the final send must wait for it here, like
+            # the groups did, or nothing ever starts it.
+            dst_batch_url=(self._dst_batch_url
+                           if early_group and not dst_params else None),
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -5204,13 +5210,16 @@ class TPURaidenConnectorWorker:
         """
         arm_group = _send_meta_arm_group(req_meta)
         batch_url = getattr(req_meta, "dst_batch_url", None)
-        if arm_group is None or not isinstance(batch_url,
-                                               str) or not batch_url:
+        is_final = getattr(req_meta, "is_final_chunk", True) is not False
+        if (not isinstance(batch_url, str) or not batch_url
+                or (arm_group is None and not is_final)):
             # An ordinary send with nowhere to wait. The consumer starts this
             # one itself off its fallback timer, as it did before stage 5.
             return
-        arm_generation = self._arm_generation()
-        if arm_generation <= 0:
+        # A final send has no bell: its forward has run and its pages are
+        # written, so only the destination holds it.
+        arm_generation = 0 if arm_group is None else self._arm_generation()
+        if arm_group is not None and arm_generation <= 0:
             logger.error(
                 "Stage-7d send for req_id=%s uuid=%d asks to wait on group %d "
                 "but this worker has no doorbell reader, so nothing would ever "
@@ -6055,10 +6064,14 @@ class TPURaidenConnectorWorker:
         reattempt_interval_s = dist_utils.get_stage3_reattempt_interval_s()
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
-            if destination_req_id in self._stage3_terminal_loads:
+            if (destination_req_id in self._failed_recving
+                    or self._recv_arrivals.get(destination_req_id, 0) >=
+                    self._recv_expected.get(destination_req_id, 1)):
                 # The producer started this transfer and it has already
                 # landed. Its registration is released, so a second submit
                 # would fail the lookup and take a live request down with it.
+                # One early group landing is not the transfer landing, which
+                # is why this counts arrivals.
                 del self._stage3_pending_submits[destination_req_id]
                 continue
             if pending.hold_until is not None:

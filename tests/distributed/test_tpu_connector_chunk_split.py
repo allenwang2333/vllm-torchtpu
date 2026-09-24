@@ -1660,9 +1660,29 @@ class TestWorkerHoldsASendForItsDestination:
         they have always been the consumer's problem to start. Holding them
         would change a path this stage is not touching."""
         worker = self._worker()
-        self._defer(worker, self._meta(arm=None))
+        meta = self._meta(arm=None)
+        meta.is_final_chunk = False
+        self._defer(worker, meta)
         assert worker._stage7_pending_dst == {}
         assert worker._worker_destination_collector is None
+
+    def test_a_final_send_is_held_without_a_bell(self):
+        """Its early groups count as arrivals and cancel decode's fallback, so
+        a final send that is not held here is never started by anyone. That
+        was the concurrency-32 hang: the destination landed after the prompt
+        finished."""
+        worker = self._worker(generation=7)
+        meta = self._meta(arm=None)
+        meta.fa_group = 14
+        collector = self._defer(worker, meta, req_id="short")
+        assert worker._stage7_pending_dst["short"].arm_generation == 0
+        collector._entries["short"] = _published_destination(901, [200])
+        worker._maybe_start_producer_transfer = MagicMock()
+        worker._release_pending_destinations(["short"])
+        worker._stage3_submit_queue.get()()
+        kwargs = worker._maybe_start_producer_transfer.call_args.kwargs
+        assert kwargs["req_id"] == "short"
+        assert kwargs["req_meta"].dst_params is not None
 
     def test_a_send_with_no_url_is_not_held(self):
         worker = self._worker()
