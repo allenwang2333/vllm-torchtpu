@@ -1781,6 +1781,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # Stage 6.5, producer side: req_id -> how far its chunked prefill has
         # got. Only populated for requests long enough to be cut in two.
         self._chunk_progress: dict[str, _ChunkProgress] = {}
+        # Consumer side: loads the scheduler has heard finish whose request
+        # has not been scheduled since. Only feeds two log lines.
+        self._stage3_recv_reported: set[str] = set()
         self._admission_notifier: Optional[_AdmissionNotifier] = None
         if self.is_producer and _use_raiden_stage3_transport(
         ) and tpu_envs.TPU_KV_ADMISSION_REORDER:
@@ -2329,6 +2332,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         """
         if scheduler_output is not None and self._chunk_progress:
             self._collect_chunk_sends(scheduler_output)
+        if scheduler_output is not None and self._stage3_recv_reported:
+            scheduled = getattr(scheduler_output, "num_scheduled_tokens", {})
+            for req_id in self._stage3_recv_reported & scheduled.keys():
+                self._stage3_recv_reported.discard(req_id)
+                logger.info(
+                    "%s",
+                    json.dumps({
+                        "event": "raiden_first_decode_scheduled",
+                        "req_id": req_id,
+                        "t": time.time()
+                    }))
         return super().build_connector_meta()
 
     def _collect_chunk_sends(self, scheduler_output: Any) -> None:
@@ -3095,6 +3109,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     def update_connector_output(self, connector_output: Any) -> None:
         for req_id in connector_output.finished_sending or ():
             self._stage3_finished_sends.pop(req_id, None)
+        # The decode leg after receiver_complete is: the worker reports the
+        # load, the scheduler picks the request up, then the forward runs.
+        # These two stamps split it at the first two points.
+        for req_id in getattr(connector_output, "finished_recving",
+                              None) or ():
+            self._stage3_recv_reported.add(req_id)
+            logger.info(
+                "%s",
+                json.dumps({
+                    "event": "raiden_stage3_recv_reported",
+                    "req_id": req_id,
+                    "t": time.time()
+                }))
 
     def get_finished_count(self) -> int:
         if not _use_raiden_stage3_transport():

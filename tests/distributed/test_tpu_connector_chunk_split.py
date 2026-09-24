@@ -914,6 +914,25 @@ class TestPartRegistrationRelease:
 # ---------------------------------------------------------------------------
 
 
+class TestFirstDecodeStamps:
+
+    def test_the_first_schedule_after_a_load_is_stamped_once(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=PAGE)
+        with patch(f"{_MOD}.logger.info") as info:
+            consumer.update_connector_output(
+                SimpleNamespace(finished_sending=(), finished_recving={"r"}))
+            consumer.build_connector_meta(_step(scheduled={"other": 1}))
+            consumer.build_connector_meta(_step(scheduled={"r": 1}))
+            consumer.build_connector_meta(_step(scheduled={"r": 1}))
+        events = [
+            json.loads(c.args[1])["event"] for c in info.call_args_list
+            if len(c.args) > 1 and "raiden_" in str(c.args[1])
+        ]
+        assert events == [
+            "raiden_stage3_recv_reported", "raiden_first_decode_scheduled"
+        ]
+
+
 class TestDecodeExpectations:
 
     def test_an_unchunked_load_expects_one_arrival(self):
