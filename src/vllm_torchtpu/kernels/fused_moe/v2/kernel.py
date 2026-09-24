@@ -307,7 +307,7 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
     return mid_q, mid_scale
 
 
-def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
+def _chunked_dot(lhs, rhs_chunk, n_chunks, kb, after=None):
     """Contract lhs against a weight handed over one contraction chunk at a
     time, summing the chunks' partial products.
 
@@ -325,6 +325,9 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
             preferred_element_type=jnp.float32,
         )
         acc = part if acc is None else acc + part
+        if after is not None:
+            # Block b's partial product exists, so its last read has retired.
+            after(b)
     return acc
 
 
@@ -358,7 +361,8 @@ def expert_ffn_fp8_streamed(
     kb2,
     act_fn="silu",
     w1b=None,
-    after_gate_up=None,
+    after_w1_block=None,
+    after_w2_block=None,
 ):
     """expert_ffn_fp8 with each slab handed over one contraction block at a
     time, so a streamed slab can be waited block by block.
@@ -370,13 +374,11 @@ def expert_ffn_fp8_streamed(
     what makes it the place to start refilling that slab.
     """
     inter = w1s.shape[-1] // 2
-    acc1 = _chunked_dot(act_q, w1_block, n1, kb1)
-    if after_gate_up is not None:
-        after_gate_up()
+    acc1 = _chunked_dot(act_q, w1_block, n1, kb1, after=after_w1_block)
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
     )
-    acc2 = _chunked_dot(mid_q, w2_block, n2, kb2)
+    acc2 = _chunked_dot(mid_q, w2_block, n2, kb2, after=after_w2_block)
     return acc2, mid_scale
 
 
@@ -1025,6 +1027,13 @@ def _build_fused_ep_moe_kernel(
                 ]
             )
 
+        def _one_block(src_hbm, vm, sems, expert, slot, b, kb):
+            return pltpu.make_async_copy(
+                src_hbm.at[expert, pl.ds(b * kb, kb)],
+                vm.at[slot, pl.ds(b * kb, kb)],
+                sems.at[slot, b],
+            )
+
         def w1_copy(expert, slot):
             """The gate/up weight slab of `expert`, into weight slot `slot`."""
             if streams_fp8:
@@ -1111,6 +1120,24 @@ def _build_fused_ep_moe_kernel(
 
             return start
 
+        def _next_block_starter(visit_i, slot, last_tile, src_hbm, vm, sems, kb):
+            """`(b) -> ()`: start the NEXT expert's block b of this slab, called
+            once this expert's last tile has its block-b partial product.
+
+            Block by block rather than slab by slab, so the next expert's
+            weights queue behind this one's as soon as each block frees and
+            the weight stream runs one expert ahead with no gap.
+            """
+
+            def start(b):
+                @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_visit))
+                def _():
+                    _one_block(
+                        src_hbm, vm, sems, visit_sm[visit_i + 1], slot, b, kb
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+
+            return start
+
         def _slab_waiter(expert, slot, first_tile):
             """`(copy, block) -> ()`: land the slab that block `block` opens,
             on the expert's first tile.
@@ -1147,11 +1174,7 @@ def _build_fused_ep_moe_kernel(
                 def read(b):
                     @pl.when(first_tile)
                     def _():
-                        pltpu.make_async_copy(
-                            src_hbm.at[expert, pl.ds(b * kb, kb)],
-                            vm.at[slot, pl.ds(b * kb, kb)],
-                            sems.at[slot, b],
-                        ).wait()
+                        _one_block(src_hbm, vm, sems, expert, slot, b, kb).wait()
 
                     return vm[slot, pl.ds(b * kb, kb), :]
 
@@ -1774,8 +1797,29 @@ def _build_fused_ep_moe_kernel(
                             kb2=kb2,
                             act_fn=act_fn,
                             w1b=w1b_row,
-                            after_gate_up=(
-                                _start_next_gate_up(visit_i, slot, t == n_tiles - 1)
+                            after_w1_block=(
+                                _next_block_starter(
+                                    visit_i,
+                                    slot,
+                                    t == n_tiles - 1,
+                                    w1_hbm,
+                                    w1_vm,
+                                    w1_sems,
+                                    kb1,
+                                )
+                                if starts_next_weights
+                                else None
+                            ),
+                            after_w2_block=(
+                                _next_block_starter(
+                                    visit_i,
+                                    slot,
+                                    t == n_tiles - 1,
+                                    w2_hbm,
+                                    w2_vm,
+                                    w2_sems,
+                                    kb2,
+                                )
                                 if starts_next_weights
                                 else None
                             ),
@@ -2011,7 +2055,10 @@ def _build_fused_ep_moe_kernel(
                     if has_scales:
                         w1s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
                         w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
-                    w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    if not streams_fp8:
+                        # A streamed fp8 build started every down block
+                        # already, each as soon as its last reader retired.
+                        w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
 
             # Cross-expert lookahead: prime the next visited expert's first
             # activation tile before this expert's commit drain and push. Its
