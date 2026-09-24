@@ -305,6 +305,26 @@ def test_a_lost_admission_callback_falls_back_to_prefills_response() -> None:
     assert _MOD._ADMIT_WAITERS == {}
 
 
+def test_a_declined_transfer_leaves_decode_to_compute_the_prompt() -> None:
+    """A prompt under the PCP minimum gets no admission, and prefill answers
+    with empty params. Decode must then see no transfer params at all: the
+    callback URLs the proxy gave prefill would read as a transfer with no
+    num_tokens, which decode rejects by crashing its engine."""
+    harness = _ProxyHarness()
+    harness.prefill_response = {"kv_transfer_params": {}}
+
+    async def drive():
+        task = asyncio.ensure_future(
+            harness.run(reorder=True, admit=False, prefill_submit=True))
+        await asyncio.sleep(0.05)
+        harness.release_prefill.set()
+        return await task
+
+    chunks, _ = asyncio.run(drive())
+    assert chunks and b"hi" in chunks[0]
+    assert "kv_transfer_params" not in harness.decode_seen
+
+
 def test_a_late_admission_callback_is_ignored_rather_than_failing() -> None:
 
     async def drive():

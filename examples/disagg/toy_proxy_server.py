@@ -566,6 +566,13 @@ async def _handle_completions(api: str, request: Request):
             req_data = _replace_prompt_with_rendered_token_ids(
                 req_data, render_response.json())
 
+        # Prefill gets its own copy: req_data is rewritten below with the
+        # parameters decode needs, and with the reorder on that happens while
+        # the prefill request is still in flight. The callback URLs go only
+        # into this copy, because when prefill declines the transfer decode
+        # must see no params at all, not a transfer without num_tokens.
+        prefill_data = dict(req_data)
+
         # Ask prefill to announce this request the moment it is admitted, so
         # decode can allocate and register while the prefill is still running
         # instead of afterwards.
@@ -582,7 +589,7 @@ async def _handle_completions(api: str, request: Request):
                 # long poll and drains whatever has arrived.
                 kv_params_out["dst_batch_url"] = (
                     f"{global_args.admit_callback_url}/kv_dst_batch")
-            req_data["kv_transfer_params"] = kv_params_out
+            prefill_data["kv_transfer_params"] = kv_params_out
 
         # Send request to prefill service
         t_prefill_send = time.time()
@@ -590,11 +597,8 @@ async def _handle_completions(api: str, request: Request):
         print(
             f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
             flush=True)
-        # Prefill gets its own copy: req_data is rewritten below with the
-        # parameters decode needs, and with the reorder on that happens while
-        # the prefill request is still in flight.
         prefill_task = asyncio.ensure_future(
-            send_request_to_prefill(prefill_client_info, api, dict(req_data),
+            send_request_to_prefill(prefill_client_info, api, prefill_data,
                                     request_id))
 
         kv_transfer_params: dict | None = None
