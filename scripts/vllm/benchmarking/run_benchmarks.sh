@@ -31,6 +31,16 @@
 #                         attribution. Recorded as capture_profile + profile_dir
 #                         in config.json.
 #   PROFILE_NUM_PROMPTS   prompts for that run (default: the cell's concurrency).
+#
+# Structured decoding (see configs/qwen3-0.6b-structured-*.sh):
+#   BENCHMARK_EXTRA_BODY  JSON merged into every request body via
+#                         --extra-body, e.g. a `structured_outputs` grammar.
+#                         Passed as one quoted argument; EXTRA_BENCH_ARGS is
+#                         word-split and globbed, which mangles JSON.
+#   SD_TRACE_SUMMARY=1    after each profile run, fold the SD: scope timings,
+#                         bitmask memory and block efficiency into that cell's
+#                         result JSON (summarize_sd_traces.py). Needs
+#                         CAPTURE_PROFILE=1 and SD_VOCAB_SIZE.
 
 set -euo pipefail
 
@@ -133,6 +143,12 @@ BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 # passthrough that configs extend with "${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }".
 # E.g. --trust-remote-code for models whose repo ships a custom tokenizer.
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+# JSON for --extra-body, kept apart from EXTRA_BENCH_ARGS so it reaches the
+# client as one argument (see header). Empty => flag not passed.
+BENCHMARK_EXTRA_BODY="${BENCHMARK_EXTRA_BODY:-}"
+# Structured-decoding metrics from the profile run (see header).
+SD_TRACE_SUMMARY="${SD_TRACE_SUMMARY:-0}"
+SD_VOCAB_SIZE="${SD_VOCAB_SIZE:-}"
 # Server async scheduling (--async-scheduling / --no-async-scheduling).
 # Resolution order: env > config > harness default (true). Left empty here
 # so a config can tell "unset" from "forced by the operator".
@@ -157,6 +173,18 @@ ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
     echo "ERROR: ASYNC_SCHEDULING must be 'true' or 'false', got '$ASYNC_SCHEDULING'"
     exit 1
+fi
+if [ "$SD_TRACE_SUMMARY" = "1" ]; then
+    # Checked up front: discovering these after a full sweep would only show
+    # up as SKIP rows in the gate.
+    if [ "${CAPTURE_PROFILE:-0}" != "1" ]; then
+        echo "ERROR: SD_TRACE_SUMMARY=1 reads the profile run's traces; set CAPTURE_PROFILE=1"
+        exit 1
+    fi
+    if ! [[ "$SD_VOCAB_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SD_TRACE_SUMMARY=1 needs SD_VOCAB_SIZE (the model's vocab size), got '$SD_VOCAB_SIZE'"
+        exit 1
+    fi
 fi
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 
@@ -425,6 +453,11 @@ run_benchmark_once() {
         fi
     fi
 
+    local extra_body_arg=()
+    if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+        extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
@@ -446,6 +479,7 @@ run_benchmark_once() {
         --result-filename "$result_file" \
         $profile_arg \
         ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} \
+        "${extra_body_arg[@]}" \
         "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
@@ -670,9 +704,27 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
                 profile_file="${RESULTS_DIR}/${base_name}.profile.json"
                 profile_log="${RESULTS_DIR}/${base_name}.profile.log"
                 echo "    Profile run"
+                # Every cell profiles into the same PROFILE_DIR; remember what
+                # is already there so the summary reads only this cell's traces.
+                trace_snapshot="${RESULTS_DIR}/${base_name}.traces_before.txt"
+                if [ "$SD_TRACE_SUMMARY" = "1" ]; then
+                    find "$PROFILE_DIR" -name '*.pt.trace.json*' > "$trace_snapshot" 2>/dev/null || true
+                fi
                 # A failed profile run doesn't fail the measured run; a dead server does.
                 if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$profile_file" "$profile_log" profile; then
                     echo "    Profile OK -> $profile_file"
+                    if [ "$SD_TRACE_SUMMARY" = "1" ]; then
+                        # Metrics land in the measured cell's JSON (the one the
+                        # gate and uploader read), not in the .profile.json.
+                        python3 "$SCRIPT_DIR/summarize_sd_traces.py" \
+                            --result-file "$result_file" \
+                            --trace-dir "$PROFILE_DIR" \
+                            --exclude-list "$trace_snapshot" \
+                            --num-reqs "$concurrency" \
+                            --vocab-size "$SD_VOCAB_SIZE" \
+                            --metrics-url "http://${HOST}:${PORT}/metrics" ||
+                            echo "    WARNING: SD trace summary failed; SD metrics will SKIP in the gate"
+                    fi
                 else
                     echo "    PROFILE RUN FAILED (exit $?)"
                 fi

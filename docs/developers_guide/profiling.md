@@ -206,47 +206,51 @@ Prefer a single ISL/OSL cell so the trace maps to one workload shape.
 
 ## Structured decoding benchmark
 
-[`benchmarks/benchmark_structured_decoding.py`](../benchmarks/benchmark_structured_decoding.py)
-is a purpose-built sweep for grammar-constrained decoding. It drives the offline
-`LLM` API over a (batch size x schema) matrix and reports throughput, time per
-output token, and — with `--enable-trace-report` — the per-invocation cost of the
-two scopes the masking path emits:
-
-* `SD:PrepareInput` — host-side work: mapping the scheduler's bitmask rows onto
-  the runner's chunk-local batch rows, and the transfer to the device.
-* `SD:MaskLogits` — the compiled kernel that unpacks the bitmask and drives the
-  disallowed logits to `-inf`.
-
-Three workloads ship with it: `unconstrained` (the baseline to diff against),
-`flat_json` (a flat key/value object) and `complex_ast` (a recursive expression
-tree using `$ref`/`anyOf`, which keeps the grammar in states with large,
-frequently changing allowed-token sets).
+Grammar-constrained decoding is benchmarked through the same serving harness.
+Two configs ship: `qwen3-0.6b-structured-flat-json` (a flat key/value object)
+and `qwen3-0.6b-structured-complex-ast` (a recursive expression tree using
+`$ref`/`anyOf`, which keeps the grammar in states with large, frequently
+changing allowed-token sets). Each sets `BENCHMARK_EXTRA_BODY` to a
+`{"structured_outputs": {"json": <schema>}}` body from
+`scripts/vllm/benchmarking/structured_schemas/`, which `vllm bench serve`
+merges into every request.
 
 ```bash
-python benchmarks/benchmark_structured_decoding.py \
-  --model Qwen/Qwen2.5-0.5B-Instruct \
-  --batch-sizes 1 8 32 64 \
-  --output-len 512 \
-  --schemas unconstrained flat_json complex_ast \
-  --enable-trace-report \
-  --output-json sd_results.json
+bash scripts/vllm/benchmarking/run_benchmarks.sh \
+  --config qwen3-0.6b-structured-flat-json \
+  --results-dir sd_results
 ```
 
-`--enable-trace-report` runs one extra, profiled iteration per structured point:
-the script arms the workers with `start_profile()`/`stop_profile()`, then reads
-the Chrome-format traces they wrote under `--trace-dir` and aggregates every
-`SD:` scope it finds. Traces from all ranks in the run directory are counted, so
-the numbers hold for `--tensor-parallel-size > 1`. The unconstrained baseline is
-never profiled — with no grammar there are no `SD:` scopes to attribute.
+The configs also set `CAPTURE_PROFILE=1` and `SD_TRACE_SUMMARY=1`. After each
+cell's profiled run,
+[`summarize_sd_traces.py`](../../scripts/vllm/benchmarking/summarize_sd_traces.py)
+reads the new Chrome-format traces and adds the mean cost of the two scopes the
+masking path emits to that cell's result JSON:
 
-`--output-json` writes the same numbers in machine-readable form (per-point
-throughput, TPOT, scope count/mean/p50/p99, and packed-vs-dense mask bytes) for
-regression tracking in CI.
+* `SD:PrepareInput` (`sd_prepare_input_mean_ms`) — host-side work: mapping the
+  scheduler's bitmask rows onto the runner's chunk-local batch rows, and the
+  transfer to the device.
+* `SD:MaskLogits` (`sd_mask_logits_mean_ms`) — the compiled kernel that unpacks
+  the bitmask and drives the disallowed logits to `-inf`.
+
+It also records `sd_mask_memory` (packed int32 bitmask bytes versus a dense
+bool mask and a dense logits-sized mask, for `SD_VOCAB_SIZE`) and, when the
+server exposes speculative-decoding counters, `block_efficiency`. With tensor
+parallelism, the rank with the most samples is reported. To diff against
+unconstrained decoding, run the same shape with `BENCHMARK_EXTRA_BODY` unset.
+
+To summarize traces you already have:
+
+```bash
+python3 scripts/vllm/benchmarking/summarize_sd_traces.py \
+  --result-file sd_results/isl128_osl128_c8.json \
+  --trace-dir sd_results/profile \
+  --num-reqs 8 --vocab-size 151936
+```
 
 > [!NOTE]
-> `--ignore-eos` defaults to on so every step exercises the masking path and
-> token counts stay comparable across schemas. Pass `--no-ignore-eos` to measure
-> natural, grammar-terminated completions instead.
+> `vllm bench serve` runs the random dataset with `--ignore-eos`, so every step
+> exercises the masking path and token counts stay comparable across schemas.
 
 ## Phased profiling
 

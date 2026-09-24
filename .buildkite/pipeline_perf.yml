@@ -284,49 +284,24 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      # Structured decoding perf sweep: benchmarks/benchmark_structured_
-      # decoding.py driven through pytest so the per-point throughput floors
-      # land as ordinary test failures. Unlike the model steps above this one
-      # calls pytest directly rather than run_eval_flow.sh -- the sweep owns
-      # its own engine lifecycle (one module-scoped fixture: one engine build,
-      # one compile, all batch x schema cells) and emits its own JSON, so
-      # there is no config.json for the eval flow to consume.
-      #
-      # The pytest --timeout covers that whole sweep rather than a single
-      # assertion, hence 3600. Qwen3-0.6B at TP=1 fits the 2-chip queue.
-      #
-      # Results are date-stamped so the nightly artifacts form a time series:
-      # every build writes the same structured_decoding_benchmark.json (the
-      # name the test asserts on and any diffing tool looks for), and the
-      # dated copy beside it is what makes a downloaded artifact
-      # self-identifying once it is out of Buildkite. The stamp is taken in
-      # US/Pacific to match the profile-capture steps above, so "the nightly
-      # of the 14th" means the same day everywhere.
-      #
-      # rc is captured rather than letting the step die on a failed gate: a
-      # regression is exactly when the numbers are most worth keeping, so the
-      # JSON is archived first and the failure re-raised afterwards.
+      # Structured decoding: every request is constrained by a JSON grammar
+      # (config's BENCHMARK_EXTRA_BODY), one config per grammar so each has
+      # its own perf baseline. CAPTURE_PROFILE + SD_TRACE_SUMMARY add the
+      # SD:PrepareInput / SD:MaskLogits scope means to each cell's result so
+      # check_regression.py gates them next to TPOT and throughput.
       - label: "Perf: Nightly structured decoding (TPU v7x-2)"
         key: "perf_nightly_structured_decoding"
         if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 120
         agents:
           queue: "tpu_v7x_2_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          BENCHMARK_WARMUP_RUNS: "1"
+          RUN_LM_EVAL: "0"
         commands:
           - |
-            rc=0
-            bash .buildkite/scripts/run_in_docker.sh \
-              pytest -sv --timeout=3600 -m 'benchmark' \
-                --junit-xml=/perf_eval_results/structured_decoding_junit.xml \
-                tests/benchmarks/test_structured_decoding_nightly.py || rc=$$?
-            src=perf_eval_results/structured_decoding_benchmark.json
-            if [ -f "$$src" ]; then
-              stamp="$$(LC_ALL=C TZ=America/Los_Angeles date +%Y-%m-%d)"
-              cp "$$src" "perf_eval_results/structured_decoding_benchmark_$$stamp.json"
-              echo "Archived $$src as structured_decoding_benchmark_$$stamp.json"
-            else
-              echo "::warning::$$src missing; the sweep wrote no results to archive."
-            fi
-            exit $$rc
+            bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-0.6b-structured-flat-json \
+              qwen3-0.6b-structured-complex-ast
         artifact_paths:
           - "perf_eval_results/**/*"

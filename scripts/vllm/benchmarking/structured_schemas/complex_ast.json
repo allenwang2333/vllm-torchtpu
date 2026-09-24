@@ -1,0 +1,30 @@
+{
+  "structured_outputs": {
+    "json": {
+      "type": "object",
+      "$defs": {
+        "Expression": {
+          "type": "object",
+          "properties": {
+            "op": {"type": "string", "enum": ["+", "-", "*", "/", "==", "<", ">"]},
+            "left": {"$ref": "#/$defs/Node"},
+            "right": {"$ref": "#/$defs/Node"}
+          },
+          "required": ["op", "left", "right"]
+        },
+        "Node": {
+          "anyOf": [
+            {"type": "number"},
+            {"type": "string"},
+            {"$ref": "#/$defs/Expression"}
+          ]
+        }
+      },
+      "properties": {
+        "ast": {"$ref": "#/$defs/Expression"},
+        "description": {"type": "string"}
+      },
+      "required": ["ast", "description"]
+    }
+  }
+}

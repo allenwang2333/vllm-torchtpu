@@ -1,0 +1,15 @@
+{
+  "structured_outputs": {
+    "json": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "age": {"type": "integer"},
+        "email": {"type": "string"},
+        "is_active": {"type": "boolean"},
+        "role": {"type": "string", "enum": ["admin", "user", "guest"]}
+      },
+      "required": ["name", "age", "email", "is_active", "role"]
+    }
+  }
+}

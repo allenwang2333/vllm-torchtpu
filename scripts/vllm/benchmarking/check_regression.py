@@ -39,6 +39,13 @@ GATED_METRICS = [
         "higher_is_better",
         ("output_throughput",),
     ),
+    # Written by summarize_sd_traces.py for configs with SD_TRACE_SUMMARY=1;
+    # absent from every other baseline, so SKIP there. The SD scopes measure
+    # where structured-decoding overhead lands (host-side bitmask prep vs the
+    # in-kernel mask), which throughput alone cannot localize.
+    Metric("sd_prepare_input_mean_ms", "sd_prepare_input_mean_ms", "lower_is_better"),
+    Metric("sd_mask_logits_mean_ms", "sd_mask_logits_mean_ms", "lower_is_better"),
+    Metric("block_efficiency", "block_efficiency", "higher_is_better"),
 ]
 
 COMPLETION_FLOOR_RATIO = 0.95
