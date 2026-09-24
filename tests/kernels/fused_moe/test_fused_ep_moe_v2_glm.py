@@ -135,6 +135,10 @@ ORACLE_BOUNDS = {"prefill": (0.046, 0.053), "decode": (0.047, 0.049)}
 TWIN_REL_BOUND = 0.004
 
 HAS_FP8_STREAM = "fp8_stream" in inspect.signature(fused_ep_moe_v2).parameters
+HAS_VALID_ROWS = "valid_rows" in inspect.signature(fused_ep_moe_v2).parameters
+needs_valid_rows = pytest.mark.skipif(
+    not HAS_VALID_ROWS, reason="this tree has no valid_rows padding drop"
+)
 FP8_STREAM_PARAMS = [
     pytest.param(False, id="incumbent"),
     pytest.param(
@@ -209,10 +213,20 @@ def _device_batch(mesh, kind):
 
 
 def run_glm_layer(
-    x, gating, score_bias, weights, mesh, *, sharded_plan=False, fp8_stream=False
+    x,
+    gating,
+    score_bias,
+    weights,
+    mesh,
+    *,
+    sharded_plan=False,
+    fp8_stream=False,
+    valid_rows=None,
 ):
     w1, w2, w1s, w2s = weights
     kw = {"fp8_stream": bool(fp8_stream)} if HAS_FP8_STREAM else {}
+    if valid_rows is not None:
+        kw["valid_rows"] = valid_rows
     return fused_ep_moe_v2(
         x,
         w1,
@@ -577,3 +591,152 @@ def test_glm_positive_control_wrong_expert_turns_red(glm_weights, fp8_stream):
         "prefill", mild, glm_weights, label=f"MILD FAULT w2s[e{victim}]*1.01"
     )
     print(f"  mild fault trips the gate: {bool(mild_bad)} {mild_bad}")
+
+
+# --------------------------------------------------------------------------- #
+# valid_rows: padding rows kept out of dispatch.
+# --------------------------------------------------------------------------- #
+
+# The serving path's pad rows are not -inf rows: they are token 0 run through
+# the model, so every pad row on every core carries the SAME finite hidden
+# state and the SAME finite router logits, and all of them select the same
+# eight experts (~120 rows on each at EP8). This seed draws that one shared
+# row; the real rows are the "decode" batch's, untouched.
+FINITE_PAD_SEED = 15
+
+
+@functools.cache
+def _finite_pad_batch():
+    """(x, gating, pad) for decode with production-like pad rows: row 0 of
+    each core is the "decode" batch's real row, rows 1..15 share one finite
+    x row and one finite logit vector."""
+    x, g, pad, _ = _batch("decode")
+    x, g = x.copy(), g.copy()
+    popularity, _ = _expert_prior()
+    rng = np.random.default_rng(FINITE_PAD_SEED)
+    x_pad = rng.normal(0.0, 1.0, GLM["hidden"]).astype(ml_dtypes.bfloat16)
+    g_pad = (rng.normal(0.0, 2.0, GLM["e_total"]) + popularity).astype(np.float32)
+    x[pad] = x_pad[None, :]
+    g[pad] = g_pad[None, :]
+    return x, g, pad
+
+
+def _valid_rows(mesh, pad):
+    return jax.device_put((~pad).astype(np.int32), NamedSharding(mesh, P(AXIS)))
+
+
+@needs_valid_rows
+@pytest.mark.parametrize("fp8_stream", FP8_STREAM_PARAMS)
+def test_glm_decode_valid_rows_drops_finite_pads(glm_weights, fp8_stream):
+    """Production-like decode pads, with and without valid_rows.
+
+    With valid_rows the real rows must be BIT-IDENTICAL to the same batch
+    without it (dropping a pad row cannot change any real row's arithmetic),
+    the pad rows must be exactly zero, and the whole output must pass the
+    decode references -- which are the "decode" batch's, whose pad rows are
+    exactly zero too and whose real rows are these. Without valid_rows the
+    finite pads DO route, so they come back non-zero: that is what makes the
+    zero check discriminating rather than inherited from the -inf batch.
+    An all-padding step (the runner's warmup) must come back all zero.
+    """
+    mesh = _mesh()
+    weights, _ = glm_weights
+    x_h, g_h, pad = _finite_pad_batch()
+    x_dec, g_dec, pad_dec, _ = _batch("decode")
+    np.testing.assert_array_equal(pad, pad_dec)
+    np.testing.assert_array_equal(x_h[~pad], x_dec[~pad])
+    np.testing.assert_array_equal(g_h[~pad], g_dec[~pad])
+    assert np.all(np.isfinite(g_h)), "production pads carry finite logits"
+
+    shard = NamedSharding(mesh, P(AXIS))
+    x = jax.device_put(x_h, shard)
+    g = jax.device_put(g_h, shard)
+    bias = jnp.asarray(_score_bias_host())
+    idx, _, _ = oracle_routing(g_h, _score_bias_host(), GLM["topk"])
+    print(
+        f"\n[GLM decode finite pads fp8_stream={fp8_stream}] routing "
+        f"{routing_stats(idx, pad, GLM['e_total'] // EP)}"
+    )
+    run = functools.partial(
+        run_glm_layer,
+        x,
+        g,
+        bias,
+        weights,
+        mesh,
+        sharded_plan=True,
+        fp8_stream=fp8_stream,
+    )
+    without = np.asarray(run())
+    with_valid = np.asarray(run(valid_rows=_valid_rows(mesh, pad)))
+    assert with_valid.shape == x_h.shape
+
+    pads_live = int(np.any(without[pad] != 0, axis=1).sum())
+    assert pads_live == int(pad.sum()), (
+        f"only {pads_live} of {int(pad.sum())} finite pad rows came back "
+        "non-zero without valid_rows, so the pads are not being dispatched "
+        "and the drop below would be vacuous"
+    )
+    np.testing.assert_array_equal(
+        with_valid[~pad],
+        without[~pad],
+        err_msg="valid_rows changed a real row",
+    )
+    assert np.all(with_valid[pad] == 0.0), (
+        f"{int(np.any(with_valid[pad] != 0, axis=1).sum())} dropped pad rows "
+        "came back non-zero"
+    )
+    assert np.all(np.isfinite(with_valid))
+    bad, _, _ = _check(
+        "decode", with_valid, glm_weights, label=f"valid_rows fp8_stream={fp8_stream}"
+    )
+    assert not bad, bad
+
+    everything_pad = np.ones_like(pad)
+    idle = np.asarray(run(valid_rows=_valid_rows(mesh, everything_pad)))
+    assert np.all(idle == 0.0), "an all-padding step came back non-zero"
+
+
+@needs_valid_rows
+@pytest.mark.parametrize("fp8_stream", FP8_STREAM_PARAMS)
+def test_glm_prefill_all_valid_rows_is_bit_identical(glm_weights, fp8_stream):
+    """A full prefill chunk has no padding: an all-ones mask must not change
+    a single bit of the output."""
+    mesh = _mesh()
+    weights, _ = glm_weights
+    x, g, pad, _ = _device_batch(mesh, "prefill")
+    assert not pad.any()
+    bias = jnp.asarray(_score_bias_host())
+    run = functools.partial(
+        run_glm_layer,
+        x,
+        g,
+        bias,
+        weights,
+        mesh,
+        sharded_plan=True,
+        fp8_stream=fp8_stream,
+    )
+    a = np.asarray(run())
+    b = np.asarray(run(valid_rows=_valid_rows(mesh, pad)))
+    np.testing.assert_array_equal(a, b)
+
+
+@needs_valid_rows
+def test_glm_valid_rows_requires_sharded_plan(glm_weights):
+    """Only the sharded plan maps the drop id off every shard; the replicated
+    plan would fold it into shard zero's slab, so it must refuse."""
+    mesh = _mesh()
+    weights, _ = glm_weights
+    x, g, pad, _ = _device_batch(mesh, "decode")
+    bias = jnp.asarray(_score_bias_host())
+    with pytest.raises(ValueError, match="sharded_plan"):
+        run_glm_layer(
+            x,
+            g,
+            bias,
+            weights,
+            mesh,
+            sharded_plan=False,
+            valid_rows=_valid_rows(mesh, pad),
+        )
