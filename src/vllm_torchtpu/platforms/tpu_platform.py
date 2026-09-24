@@ -612,7 +612,7 @@ class TpuPlatform(Platform):
             )
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        from vllm_torchtpu.distributed.k3_decode_dcp import validate_native_config
+        from vllm_torchtpu.platforms.k3_dcp_validation import validate_native_config
 
         validate_native_config(vllm_config)
         # TPU's page geometry and block-size selection depend on layout while
@@ -1019,7 +1019,7 @@ class TpuPlatform(Platform):
                 )
                 cache_config.block_size = min_page_size  # type: ignore[assignment]
             logger.info("Using KV cache block size: %s", cache_config.block_size)
-            from vllm_torchtpu.distributed.k3_decode_dcp import (
+            from vllm_torchtpu.platforms.k3_dcp_validation import (
                 configure_native_interleave,
             )
 

@@ -224,131 +224,6 @@ def _attention_group(
         )
 
 
-def _local_kernel(
-    lengths,
-    tables,
-    cache,
-    queries,
-    output,
-    stats,
-    kv_banks,
-    q_buf,
-    acc_buf,
-    m_buf,
-    l_buf,
-    out_buf,
-    stat_buf,
-    kv_sems,
-    q_sem,
-    out_sem,
-    stat_sem,
-    *,
-    tile_pages,
-    group_size,
-    scale,
-):
-    first = pl.program_id(0) * group_size
-    query_copy = pltpu.make_async_copy(
-        queries.at[pl.ds(first, group_size)], q_buf, q_sem
-    )
-    _attention_group(
-        first,
-        lengths,
-        tables,
-        cache,
-        kv_banks,
-        q_buf,
-        acc_buf,
-        m_buf,
-        l_buf,
-        out_buf,
-        stat_buf,
-        kv_sems,
-        query_copy.start,
-        query_copy.wait,
-        tile_pages=tile_pages,
-        group_size=group_size,
-        scale=scale,
-    )
-    out_copy = pltpu.make_async_copy(
-        out_buf, output.at[pl.ds(first, group_size)], out_sem
-    )
-    stat_copy = pltpu.make_async_copy(
-        stat_buf, stats.at[pl.ds(first, group_size)], stat_sem
-    )
-    out_copy.start()
-    stat_copy.start()
-    out_copy.wait()
-    stat_copy.wait()
-
-
-def local_attention(
-    cache,
-    queries,
-    lengths,
-    tables,
-    *,
-    scale,
-    latent_dim=512,
-    tile_pages=128,
-    group_size=4,
-    interpret=False,
-):
-    """Read already-updated local KV and return output plus natural-log LSE.
-
-    Queries contain latent+RoPE, zero-padded to the cache row width. Lengths
-    and tables are token-indexed, with zero lengths for padded tokens. This
-    read-only contract makes cache ownership independent of DMA scheduling.
-    """
-    tokens, heads, width = queries.shape
-    if group_size <= 0 or tile_pages <= 0 or tokens % group_size:
-        raise ValueError("Positive group size must divide padded token bucket")
-    if cache.ndim != 4 or width != cache.shape[-1]:
-        raise ValueError("Expected packed cache and matching padded query width")
-    if width % 128 or latent_dim % 128:
-        raise ValueError("Cache row and latent widths must be 128-aligned")
-    if lengths.shape != (tokens,) or tables.shape[0] != tokens:
-        raise ValueError("Lengths and page tables must be token-indexed")
-    kv_shape = (2, group_size, tile_pages, *cache.shape[1:])
-    out_shape = (tokens, heads, latent_dim)
-    stat_shape = (tokens, heads, 128)
-    fn = pl.pallas_call(
-        functools.partial(
-            _local_kernel, tile_pages=tile_pages, group_size=group_size, scale=scale
-        ),
-        out_shape=(
-            jax.ShapeDtypeStruct(out_shape, queries.dtype),
-            jax.ShapeDtypeStruct(stat_shape, jnp.float32),
-        ),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            grid=(tokens // group_size,),
-            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),) * 2,
-            out_specs=(pl.BlockSpec(memory_space=pltpu.HBM),) * 2,
-            scratch_shapes=(
-                pltpu.VMEM(kv_shape, cache.dtype),
-                pltpu.VMEM((group_size, heads, width), queries.dtype),
-                pltpu.VMEM((group_size, heads, latent_dim), jnp.float32),
-                pltpu.VMEM((group_size, heads, 128), jnp.float32),
-                pltpu.VMEM((group_size, heads, 128), jnp.float32),
-                pltpu.VMEM((group_size, heads, latent_dim), queries.dtype),
-                pltpu.VMEM((group_size, heads, 128), jnp.float32),
-                pltpu.SemaphoreType.DMA((2, group_size)),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
-            ),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",), vmem_limit_bytes=60 * 2**20
-        ),
-        interpret=interpret,
-        name="k3_mla_cp_local_pipeline",
-    )
-    output, stats = fn(lengths, tables, cache, queries)
-    return output, stats[..., 0]
-
-
 def _distributed_kernel(
     lengths,
     tables,
@@ -590,9 +465,8 @@ def distributed_attention(
 def _prepare_decode(c, q, qp, kv, pe, lengths, tables, starts, *, rank):
     """Scatter query suffixes and give each token its causal striped length.
 
-    ``lengths`` includes every scheduled query token, including MTP candidates.
-    Rejected candidates may remain in cache; subsequent steps overwrite them
-    and the per-token length prevents attention from reading stale suffixes.
+    ``lengths`` is the global sequence length after the scheduled query suffix.
+    Each query uses its own causal length before conversion to local stripes.
     """
     # The serving metadata stores each rank's block table flattened.
     tables = tables.reshape(lengths.shape[0], -1)

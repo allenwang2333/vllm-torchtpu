@@ -3066,7 +3066,7 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | None:
-        from vllm_torchtpu.distributed.k3_decode_dcp import validate_decode_step
+        from vllm_torchtpu.platforms.k3_dcp_validation import validate_decode_step
 
         validate_decode_step(self.vllm_config, scheduler_output)
         if self.execute_model_state is not None:

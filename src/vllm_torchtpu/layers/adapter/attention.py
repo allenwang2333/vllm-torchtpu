@@ -1818,7 +1818,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
-        from vllm_torchtpu.distributed.k3_decode_dcp import native_size
+        from vllm_torchtpu.platforms.k3_dcp_validation import native_size
 
         self.native_dense_decode_dcp = (
             native_size(get_current_vllm_config_or_none()) > 1
@@ -2190,7 +2190,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         from vllm_torchtpu.distributed.dcp import get_dcp_rank
         from vllm_torchtpu.distributed.mesh_utils import get_or_create_cp_mesh
-        from vllm_torchtpu.kernels.mla.decode_dcp_fused import decode_attention
+        from vllm_torchtpu.kernels.mla.dcp import decode_attention
 
         rank = get_dcp_rank()
         tp_group = get_tp_group()

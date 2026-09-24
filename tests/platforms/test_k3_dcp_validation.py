@@ -9,8 +9,8 @@ import pytest
 
 _PATH = (
     Path(__file__).resolve().parents[2]
-    / "src/vllm_torchtpu/distributed"
-    / "k3_decode_dcp.py"
+    / "src/vllm_torchtpu/platforms"
+    / "k3_dcp_validation.py"
 )
 _SPEC = importlib.util.spec_from_file_location("k3_decode_groups", _PATH)
 groups = importlib.util.module_from_spec(_SPEC)
