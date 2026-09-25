@@ -643,3 +643,19 @@ def test_exact_topk_single_stage_edge_lengths():
     idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
     assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
     assert _score_bits_mismatch(scores, idx, bits) is None
+
+
+def test_all_rows_empty_then_decode_in_the_same_process():
+    """The idle-rank decode bucket (b=16, every row empty) issues no DMA; a
+    normal decode right after must still launch and be exact."""
+    b = 16
+    rng = np.random.default_rng(SEED + 1)
+    scores = _deploy_scores(b, N_256K, rng)
+    empty = _run(scores, DEPLOY_K, np.zeros(b, np.int32))
+    assert (empty == -1).all(), f"expected all -1, got {np.unique(empty)[:8]}"
+    row_lengths = np.zeros(b, np.int32)
+    row_lengths[0] = 131072
+    for _ in range(2):
+        idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+        assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+        assert _score_bits_mismatch(scores, idx, bits) is None
