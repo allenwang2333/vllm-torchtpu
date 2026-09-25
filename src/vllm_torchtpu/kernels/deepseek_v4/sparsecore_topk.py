@@ -15,20 +15,46 @@
 
 Hierarchical 2-stage multi-subcore selection:
 1. For any batch size B (including B = 1, 2, 4, 8, 16, 32) and N in 2048..256K,
-   rows are partitioned into P slices (where B * P <= 32) so that all 32
-   subcores
-   on the chip are utilized in parallel with zero inter-subcore synchronization.
-2. In Stage 1, all 32 subcores independently find local top-k candidates on
-their
-   slice in lock-free, single-subcore mode.
+   rows are partitioned into P sub-rows (where B * P <= 32) so that all 32
+   subcores on the chip are utilized in parallel with zero inter-subcore
+   synchronization.
+2. Stage 1 is length-bounded and rebalanced: sub-rows have a traced width
+   w = align16(cdiv(max(row_lengths), P)) (clamped to [16, N/P]); sub-row j of
+   row r covers columns [j*w, j*w + w). Each subcore walks its sub-rows with a
+   manual double-buffered DMA of exactly align16(sub-row length) words, so
+   columns at or beyond every row's length are never read, and empty rows
+   (e.g. decode padding rows) issue no DMA.
 3. In Stage 2, candidate scores are merged on SparseCore to produce the exact
-   global top-k column indices.
+   global top-k column indices. The single-stage path (P == 1) and stage 2 use
+   the same length-bounded kernel.
 
 Output rows are the top-k column indices in unspecified order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
 boundary scores may be broken differently). ``-inf`` scores and positions at
 or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 """
+
+# Pallas SparseCore APIs used, each learned from an upstream example
+# (jax @ce57049 = ce570497d55d, version 0.11.2):
+#   * pl.kernel over plsc.VectorSubcoreMesh with scratch_types of pltpu.VMEM
+#     and pltpu.SemaphoreType.DMA((n,)); manual make_async_copy .start()/.wait()
+#     double buffering in a lax.fori_loop, pl.when-gated prefetch/wait, drain
+#     after the loop (its 2-D .at[buf_idx] ring is replaced by a 1-D ring here):
+#       tests/pallas/tpu_sparsecore_pallas_test.py:3122-3197@ce57049 (test_manual)
+#   * traced-size DMA destination o_ref.at[pl.ds(0, traced_n)]:
+#       tests/pallas/tpu_sparsecore_pallas_test.py:920-945@ce57049
+#       (gather_1d_with_dynamically_sized_ref); contiguous traced-size DMA on
+#       TC: tests/pallas/tpu_pallas_test.py:3532-3558@ce57049.
+#   * rebuilding the descriptor (same traced size) for .wait():
+#       jax/_src/pallas/mosaic/sc_lowering.py:531-600@ce57049 (wait_dma2 sized
+#       by the src/dst memref types) + test_manual pattern above.
+#   * pltpu.sync_copy = make_async_copy start+wait on a scoped DMA semaphore:
+#       jax/_src/pallas/mosaic/helpers.py:25-50@ce57049
+#   * scalar from VMEM on a vector subcore = lane 0 of a vector load
+#       (ref[pl.ds(i, lanes)][0]): tests/pallas/tpu_sparsecore_pallas_test.py:
+#       1530-1542@ce57049 (test_scalar_load_emulated).
+#   * zero-size DMAs are never started (pl.when(ext > 0)), so every started DMA
+#     is waited.
 
 import functools
 
@@ -43,8 +69,8 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 LANES = 16
 NUM_BUCKETS = 256
-# Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered by
-# emit_pipeline to 256KB out of the 512KB tile memory).
+# Largest per-subcore resident slice, in 32-bit words (128KB; double-buffered
+# to 256KB out of the 512KB tile memory).
 MAX_SLICE_WORDS = 32 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
@@ -54,6 +80,8 @@ REFINEMENT_LEVELS = ((16, 0xFF), (8, 0xFF), (0, 0xFF))
 MONO_MASK = 0x7FFFFFFF
 BITS_NEG_INF = int(np.array(-np.inf, np.float32).view(np.int32))
 KEY_NEG_INF = int(np.int32(BITS_NEG_INF) ^ np.int32(0x7FFFFFFF))
+
+NUM_WORKERS = 32  # 2 SparseCores x 16 vector subcores (one chiplet)
 
 
 def _cdiv(a, b):
@@ -68,31 +96,43 @@ def _cdiv_dyn(x):
     return jnp.right_shift(x + (LANES - 1), 4)
 
 
-def _topk_body(
-    scores_hbm,  # i32[padded_b, slice_len] (fp32 score bits)
-    lengths_hbm,  # i32[padded_b, LANES]
-    out_hbm,  # i32[padded_b, k]
-    keys_hbm,  # i32[padded_b, k]          (fp32 winner score bits)
-    glob_vmem,  # i32[NUM_BUCKETS + LANES] (histogram, then its prefix sum)
-    rowbuf_vmem,  # i32[k + LANES]          (winner indices for one row)
-    keybuf_vmem,  # i32[k + LANES]          (winner score bits for one row)
+def _align16_dyn(x):
+    return jnp.bitwise_and(x + (LANES - 1), jnp.int32(-LANES))
+
+
+def _topk_rows_kernel(
+    scores_hbm,  # i32[total_words] flat fp32 score bits
+    lens_hbm,  # i32[NUM_WORKERS * tab_stride] row length per (worker, wave)
+    offs_hbm,  # i32[NUM_WORKERS * tab_stride] word offset per (worker, wave)
+    out_hbm,  # i32[padded_rows * k]
+    keys_hbm,  # i32[padded_rows * k]
+    glob_vmem,  # i32[NUM_BUCKETS + LANES]
+    rowbuf_vmem,  # i32[k + LANES]
+    keybuf_vmem,  # i32[k + LANES]
+    sbuf_vmem,  # i32[nbuf * slice_len]  score slices (manual ring, 1-D)
+    lens_vmem,  # i32[tab_stride]
+    offs_vmem,  # i32[tab_stride]
+    obuf_vmem,  # i32[nbuf * k]
+    kbuf_vmem,  # i32[nbuf * k]
+    in_sem,  # DMA[nbuf]
+    out_sem,  # DMA[nbuf]
     *,
-    b: int,
-    n: int,
+    rows: int,
     k: int,
     slice_len: int,
     num_waves: int,
-    write_empty: bool,
+    tab_stride: int,
 ):
-    # `keys_hbm` is i32[padded_b, k]: the fp32 score bits of each winner, paired
-    # slot for slot with out_hbm, so the caller need not gather the scores back.
-    del write_empty
-
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
     sub = lax.axis_index("subcore")
     flat = core * num_subcores + sub
+    nbuf = 1 if num_waves == 1 else 2
+
+    # Per-worker metadata, one contiguous row each (traced offset, static size).
+    pltpu.sync_copy(lens_hbm.at[pl.ds(flat * tab_stride, tab_stride)], lens_vmem)
+    pltpu.sync_copy(offs_hbm.at[pl.ds(flat * tab_stride, tab_stride)], offs_vmem)
 
     lane_iota = jnp.arange(LANES, dtype=jnp.int32)
     neg_inf_key = jnp.int32(KEY_NEG_INF)
@@ -153,13 +193,7 @@ def _topk_body(
             body
         )  # pytype: disable=bad-argument-type
 
-    def pipeline_step(scores_vmem, len_slice_vmem, out_vmem, keys_vmem):
-        w = pl.program_id(0)
-        row = w * (num_sc_cores * num_subcores) + flat
-        active = row < b
-        eff_len = jnp.minimum(vec_at(len_slice_vmem, 0), n)
-        eff_len = jnp.where(active, eff_len, 0)
-
+    def select_row(scores_vmem, eff_len, active, out_vmem, keys_vmem):
         i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len), 0)
         walk_chunks = _cdiv_dyn(i_hi)
 
@@ -319,111 +353,137 @@ def _topk_body(
 
         plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
 
-    cores_per_chip = num_sc_cores * num_subcores
-    buf_count = 1 if num_waves == 1 else 2
-    in_specs = (
-        pl.BlockSpec(
-            (slice_len,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-        pl.BlockSpec(
-            (LANES,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-    )
-    out_specs = (
-        pl.BlockSpec(
-            (k,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-        pl.BlockSpec(
-            (k,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-    )
-    pltpu.emit_pipeline(
-        pipeline_step,
-        grid=(num_waves,),
-        in_specs=in_specs,
-        out_specs=out_specs,
-    )(scores_hbm, lengths_hbm, out_hbm, keys_hbm)
+    def row_len(wv):
+        return vec_at(lens_vmem, wv)
+
+    def in_copy(wv, slot, ext):
+        off = vec_at(offs_vmem, wv)
+        # 1-D ring: a 2-D (nbuf, slice_len) VMEM buffer is tiled (2,128) on SC
+        # and a 1-row traced slice of it fails "Slice sizes along tiled
+        # dimensions must be aligned to tiles".
+        off = pl.multiple_of(off, LANES)
+        ext = pl.multiple_of(ext, LANES)
+        base = pl.multiple_of(slot * slice_len, LANES)
+        return pltpu.make_async_copy(
+            scores_hbm.at[pl.ds(off, ext)],
+            sbuf_vmem.at[pl.ds(base, ext)],
+            in_sem.at[slot],
+        )
+
+    def start_in(wv, slot):
+        ext = _align16_dyn(row_len(wv))
+
+        @pl.when(ext > 0)
+        def _():
+            in_copy(wv, slot, ext).start()
+
+    def wait_in(wv, slot):
+        ext = _align16_dyn(row_len(wv))
+
+        @pl.when(ext > 0)
+        def _():
+            in_copy(wv, slot, ext).wait()
+
+    def out_copies(wv, slot):
+        row = wv * (num_sc_cores * num_subcores) + flat
+        return (
+            pltpu.make_async_copy(
+                obuf_vmem.at[pl.ds(slot * k, k)],
+                out_hbm.at[pl.ds(row * k, k)],
+                out_sem.at[slot],
+            ),
+            pltpu.make_async_copy(
+                kbuf_vmem.at[pl.ds(slot * k, k)],
+                keys_hbm.at[pl.ds(row * k, k)],
+                out_sem.at[slot],
+            ),
+        )
+
+    start_in(0, 0)
+
+    def wave(wv, carry):
+        slot = 0 if nbuf == 1 else lax.rem(wv, 2)
+        if nbuf == 2:
+            # Prefetch the next row into the other slot (its previous content,
+            # row wv-1, was consumed in the previous iteration).
+            @pl.when(wv + 1 < num_waves)
+            def _():
+                start_in(wv + 1, 1 - slot)
+
+        wait_in(wv, slot)
+
+        # The out slot was last used by row wv - nbuf; drain it before reuse.
+        @pl.when(wv >= nbuf)
+        def _():
+            for c in out_copies(wv - nbuf, slot):
+                c.wait()
+
+        row = wv * (num_sc_cores * num_subcores) + flat
+        active = row < rows
+        eff_len = jnp.where(active, row_len(wv), 0)
+        select_row(
+            sbuf_vmem.at[pl.ds(pl.multiple_of(slot * slice_len, LANES), slice_len)],
+            eff_len,
+            active,
+            obuf_vmem.at[pl.ds(slot * k, k)],
+            kbuf_vmem.at[pl.ds(slot * k, k)],
+        )
+        for c in out_copies(wv, slot):
+            c.start()
+        if nbuf == 1:
+
+            @pl.when(wv + 1 < num_waves)
+            def _():
+                start_in(wv + 1, 0)
+
+        return carry
+
+    lax.fori_loop(0, num_waves, wave, jnp.int32(0))
+    for i in range(min(nbuf, num_waves)):
+        wv = num_waves - 1 - i
+        for c in out_copies(wv, wv % nbuf):
+            c.wait()
 
 
-def _topk_kernel(
-    scores_hbm,
-    lengths_hbm,
-    out_hbm,
-    keys_hbm,
-    glob_vmem,
-    rowbuf_vmem,
-    keybuf_vmem,
-    *,
-    b: int,
-    n: int,
+def worker_table(v, num_waves: int, tab_stride: int):
+    """Row-indexed i32[rows] -> flat [NUM_WORKERS, tab_stride]: worker f's wave
+    wv entry (at f*tab_stride + wv) is row wv*32 + f; padding rows read 0."""
+    rows = v.shape[0]
+    v = jnp.pad(v.astype(jnp.int32), (0, num_waves * NUM_WORKERS - rows))
+    v = v.reshape(num_waves, NUM_WORKERS).T
+    return jnp.pad(v, ((0, 0), (0, tab_stride - num_waves))).reshape(-1)
+
+
+def _sc_topk_rows(
+    words_flat: jax.Array,  # i32[total] flat fp32 bits
     k: int,
+    row_lens: jax.Array,  # i32[rows], already clipped to [0, slice_len]
+    row_offs: jax.Array,  # i32[rows], word offset of each row's first column
+    *,
     slice_len: int,
-    num_waves: int,
-    write_empty: bool,
-):
-    """Indices plus each winner's score."""
-    _topk_body(
-        scores_hbm,
-        lengths_hbm,
-        out_hbm,
-        keys_hbm,
-        glob_vmem,
-        rowbuf_vmem,
-        keybuf_vmem,
-        b=b,
-        n=n,
-        k=k,
-        slice_len=slice_len,
-        num_waves=num_waves,
-        write_empty=write_empty,
-    )
-
-
-def _sc_topk_direct(
-    scores: jax.Array,  # f32[b, n]
-    k: int,
-    row_lengths: jax.Array,  # i32[b]
-    *,
-    write_empty: bool = True,
     scheduling_group_id: int | None = None,
+    name: str,
 ) -> tuple[jax.Array, jax.Array]:
-    """Single-stage lock-free SparseCore top-k on 32 subcores.
+    """Selects top-k of each (offset, length) window of `words_flat` on 32 subcores.
 
-    ``scores`` may be f32 or the same values already bitcast to i32; the kernel
-    compares raw bits either way.
-
-    Returns each winner's score as i32 bits, paired slot-for-slot with the
-    returned indices, and the bits of ``-inf`` in the pad slots.
+    Row i reads words_flat[row_offs[i] : row_offs[i] + align16(row_lens[i])];
+    the caller guarantees that range is in bounds and align16(len) <= slice_len.
+    Returns (local indices, winner score bits), i32[rows, k] each.
     """
-    b, n = scores.shape
+    rows = row_lens.shape[0]
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
         raise NotImplementedError("SparseCore is not available")
+    assert sc.num_cores * sc.num_subcores == NUM_WORKERS, sc
+    assert slice_len % LANES == 0
 
-    words = (
-        scores
-        if scores.dtype == jnp.int32
-        else jax.lax.bitcast_convert_type(scores, jnp.int32)
-    )
-    slice_len = _align_to(n, LANES)
-    num_waves = _cdiv(b, 32)
-    padded_b = num_waves * 32
-    pad_b = padded_b - b
-    pad_n = slice_len - n
-    if pad_b > 0 or pad_n > 0:
-        words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
+    num_waves = _cdiv(rows, NUM_WORKERS)
+    padded_rows = num_waves * NUM_WORKERS
+    tab_stride = _align_to(num_waves, LANES) + LANES  # +LANES: vec_at reads 16
 
-    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
-    lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    lens_tab = worker_table(row_lens, num_waves, tab_stride)
+    offs_tab = worker_table(row_offs, num_waves, tab_stride)
 
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
@@ -431,41 +491,79 @@ def _sc_topk_direct(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
-    out_type = (slot_type, slot_type)
-
+    slot_type = jax.ShapeDtypeStruct((padded_rows * k,), jnp.int32)
+    nbuf = 1 if num_waves == 1 else 2
     scratch_types = (
         pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
         pltpu.VMEM((k + LANES,), jnp.int32),
         pltpu.VMEM((k + LANES,), jnp.int32),
+        pltpu.VMEM((nbuf * slice_len,), jnp.int32),
+        pltpu.VMEM((tab_stride,), jnp.int32),
+        pltpu.VMEM((tab_stride,), jnp.int32),
+        pltpu.VMEM((nbuf * k,), jnp.int32),
+        pltpu.VMEM((nbuf * k,), jnp.int32),
+        pltpu.SemaphoreType.DMA((nbuf,)),
+        pltpu.SemaphoreType.DMA((nbuf,)),
     )
-
     out = pl.kernel(
         functools.partial(
-            _topk_kernel,
-            b=b,
-            n=n,
+            _topk_rows_kernel,
+            rows=rows,
             k=k,
             slice_len=slice_len,
             num_waves=num_waves,
-            write_empty=write_empty,
+            tab_stride=tab_stride,
         ),
-        out_type=out_type,
+        out_type=(slot_type, slot_type),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True, needs_layout_passes=False
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}",
-    )(words.reshape(-1), lengths_2d.reshape(-1))
+        name=name,
+    )(words_flat, lens_tab, offs_tab)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
     slots, keys = out
-    slots_2d = slots.reshape(padded_b, k)[:b]
-    keys_2d = keys.reshape(padded_b, k)[:b]
-    return slots_2d, keys_2d
+    return slots.reshape(padded_rows, k)[:rows], keys.reshape(padded_rows, k)[:rows]
+
+
+def _as_words(scores):
+    return (
+        scores
+        if scores.dtype == jnp.int32
+        else jax.lax.bitcast_convert_type(scores, jnp.int32)
+    )
+
+
+def _sc_topk_direct(
+    scores: jax.Array,  # f32[b, n] or i32 bits
+    k: int,
+    row_lengths: jax.Array,  # i32[b]
+    *,
+    write_empty: bool = True,
+    scheduling_group_id: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Single-stage top-k; empty rows issue no DMA."""
+    del write_empty
+    b, n = scores.shape
+    words = _as_words(scores)
+    slice_len = _align_to(n, LANES)
+    if slice_len != n:
+        words = jnp.pad(words, ((0, 0), (0, slice_len - n)))
+    lens = jnp.clip(row_lengths.astype(jnp.int32), 0, n)
+    offs = jnp.arange(b, dtype=jnp.int32) * slice_len
+    return _sc_topk_rows(
+        words.reshape(-1),
+        k,
+        lens,
+        offs,
+        slice_len=slice_len,
+        scheduling_group_id=scheduling_group_id,
+        name=f"sc_topk_v2_direct_b{b}_n{n}_k{k}",
+    )
 
 
 def _pick_partition(b: int, n: int, k: int) -> int:
@@ -486,6 +584,28 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         else:
             break
     return p
+
+
+def stage1_geometry(row_lengths, n: int, p: int):
+    """Rebalanced stage-1 partition (pure jnp).
+
+    Returns (w, sub_lens i32[b*p], sub_offs i32[b*p], col_offsets i32[p]):
+    w = clip(align16(cdiv(max(len), p)), 16, n_p); sub-row j of row r covers
+    columns [j*w, j*w + w) and reads sub_lens[r*p+j] = clip(len_r - j*w, 0, w)
+    words from flat word offset r*n + j*w.
+    """
+    b = row_lengths.shape[0]
+    n_p = n // p
+    lens = jnp.clip(row_lengths.astype(jnp.int32), 0, n)
+    max_len = jnp.max(lens)
+    w = _align16_dyn((max_len + (p - 1)) // p)
+    w = jnp.clip(w, LANES, n_p).astype(jnp.int32)
+    col = jnp.arange(p, dtype=jnp.int32) * w
+    sub_lens = jnp.clip(lens[:, None] - col[None, :], 0, w).reshape(b * p)
+    sub_offs = (
+        jnp.arange(b, dtype=jnp.int32)[:, None] * jnp.int32(n) + col[None, :]
+    ).reshape(b * p)
+    return w, sub_lens, sub_offs, col
 
 
 @functools.partial(
@@ -511,7 +631,8 @@ def sparsecore_topk(
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
     Uses 2-stage hierarchical subcore selection when b < 32 or n > 64K to utilize
-    all 32 subcores in parallel without inter-core barrier overhead.
+    all 32 subcores in parallel without inter-core barrier overhead. Stage 1
+    reads only columns below ``max(row_lengths)`` (see the module docstring).
 
     On the two-stage path, stage 1 emits each winner's score alongside its index,
     feeding directly into stage 2 without an intermediate HBM score gather.
@@ -538,9 +659,31 @@ def sparsecore_topk(
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
+    # The kernel addresses the flat scores with i32 word offsets (plus up to
+    # LANES words of tail padding); split the rows so every part stays in range.
+    max_rows = (2**31 - 1 - LANES) // n // 32 * 32
+    if b > max_rows > 0:
+        parts = [
+            sparsecore_topk(
+                scores[r : r + max_rows],
+                k,
+                row_lengths[r : r + max_rows],
+                write_empty_rows=write_empty_rows,
+                scheduling_group_id=scheduling_group_id,
+                stage2_scheduling_group_id=stage2_scheduling_group_id,
+                return_scores=return_scores,
+            )
+            for r in range(0, b, max_rows)
+        ]
+        if return_scores:
+            return (
+                jnp.concatenate([idx for idx, _ in parts]),
+                jnp.concatenate([key for _, key in parts]),
+            )
+        return jnp.concatenate(parts)
+
     p = _pick_partition(b, n, k)
 
-    # Fast-path: single-stage execution when p == 1
     if p == 1:
         slots, keys = _sc_topk_direct(
             scores,
@@ -553,25 +696,30 @@ def sparsecore_topk(
             return slots, keys
         return slots
 
-    # Stage 1: Partition each row into P slices and find local top-k candidates
+    # Stage 1: rebalanced sub-rows of traced width w, length-bounded DMA.
     n_p = n // p
     k_p = min(k, n_p)
-    scores_p = scores.reshape(b * p, n_p)
+    slice_len = _align_to(n_p, LANES)
+    words = _as_words(scores).reshape(-1)
+    if slice_len != n_p:
+        # align16(sub_len) may then run past the last row's end; pad once.
+        words = jnp.pad(words, (0, LANES))
 
-    offsets = jnp.arange(p, dtype=jnp.int32) * n_p
-    lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
+    _, sub_lens, sub_offs, offsets = stage1_geometry(row_lengths, n, p)
 
-    local_slots, cand_scores = _sc_topk_direct(
-        scores_p,
+    local_slots, cand_scores = _sc_topk_rows(
+        words,
         k_p,
-        lengths_p,
-        write_empty=True,
+        sub_lens,
+        sub_offs,
+        slice_len=slice_len,
         scheduling_group_id=scheduling_group_id,
+        name=f"sc_topk_v2_s1_b{b * p}_n{n_p}_k{k_p}",
     )
     local_indices = local_slots.reshape(b, p, k_p)
     cand_scores = cand_scores.reshape(b, p * k_p)
 
-    # Map local indices to global column indices
+    # Map local indices to global column indices (offsets j*w, traced).
     global_cand_indices = jnp.where(
         local_indices < 0,
         -1,
