@@ -40,7 +40,14 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat, fused_ep_moe_v2
+from vllm_torchtpu.kernels.fused_moe.v2 import (
+    AXIS,
+    WeightFormat,
+    fused_ep_moe_v2,
+    host,
+    kernel,
+    layer,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -161,6 +168,35 @@ def _make_weights(mesh, seed, *, hidden, inter, e_total, weight_format):
     return built if quantized else (built[0], built[1], None, None)
 
 
+def _make_fp4_weights(mesh, seed, *, hidden, inter, e_total, rhs_qb):
+    """((w1, w2), (w1_scale, w2_scale), decoded) as fp4 e2m1 with block scales.
+
+    One scale per `rhs_qb` rows of each matmul's contraction axis, which is
+    the layout the kernel takes: w1_scale [E, hidden / qb, 2 * inter] and
+    w2_scale [E, inter / qb, hidden]. `decoded` is what those two decode to,
+    and is what the dense reference is computed over, so the band between
+    them is the kernel's transport rather than the four-bit rounding.
+    """
+    shard = NamedSharding(mesh, P(AXIS))
+    rng = np.random.default_rng(seed)
+    weights, scales, decoded = [], [], []
+    for shape in ((e_total, hidden, 2 * inter), (e_total, inter, hidden)):
+        raw = rng.normal(0, 0.1, shape).astype(np.float32)
+        grouped = raw.reshape(shape[0], shape[1] // rhs_qb, rhs_qb, shape[2])
+        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
+        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
+        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
+        s = jax.device_put(scale, shard)
+        weights.append(w)
+        scales.append(s)
+        decoded.append(
+            (w.astype(jnp.float32).reshape(grouped.shape) * s[:, :, None, :]).reshape(
+                shape
+            )
+        )
+    return weights, scales, decoded
+
+
 def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     """(x, gating) as global arrays sharded on the tokens."""
     (axis,) = mesh.axis_names
@@ -181,8 +217,14 @@ def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
     return build()
 
 
-def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
+def _dense_reference(
+    mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, hash_ids=None
+):
     """The plain MoE: softmax, top-k, dense per-expert FFN, weighted sum.
+
+    `hash_ids` [tokens, topk] replaces the top-k selection with ids the caller
+    chose, keeping the weights as the scores at those ids -- the reference
+    form of DeepSeek-V4's table router.
 
     Every expert is applied to every token in f32 and weighted by the router
     weight of the slots that chose it, which is zero for a token that did
@@ -200,10 +242,15 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
     inter = w1.shape[2] // 2
     scaled = w1_scale is not None
 
-    def local(x_g, gating_g, w1_l, w2_l, *scales):
-        s1, s2 = scales if scaled else (None, None)
+    def local(x_g, gating_g, w1_l, w2_l, *scales_and_ids):
+        s1, s2 = scales_and_ids[:2] if scaled else (None, None)
+        ids_g = scales_and_ids[-1] if hash_ids is not None else None
         scores = jax.nn.softmax(gating_g.astype(jnp.float32), axis=-1)
-        topk_weights, topk_idx = lax.top_k(scores, topk)
+        if ids_g is None:
+            topk_weights, topk_idx = lax.top_k(scores, topk)
+        else:
+            topk_idx = ids_g
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
         first = lax.axis_index(axis) * g_local
         x32 = x_g.astype(jnp.float32)
@@ -228,8 +275,16 @@ def _dense_reference(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk):
         mine = lax.fori_loop(0, g_local, expert, jnp.zeros_like(x32))
         return lax.psum(mine, axis)
 
-    in_specs = (P(), P(), P(axis), P(axis)) + ((P(axis),) * 2 if scaled else ())
-    args = (x, gating, w1, w2) + ((w1_scale, w2_scale) if scaled else ())
+    in_specs = (
+        (P(), P(), P(axis), P(axis))
+        + ((P(axis),) * 2 if scaled else ())
+        + ((P(),) if hash_ids is not None else ())
+    )
+    args = (
+        (x, gating, w1, w2)
+        + ((w1_scale, w2_scale) if scaled else ())
+        + ((hash_ids,) if hash_ids is not None else ())
+    )
     return jax.jit(
         jax.shard_map(
             local, mesh=mesh, in_specs=in_specs, out_specs=P(), check_vma=False
@@ -333,6 +388,81 @@ def test_small_shape_tracks_a_dense_reference(weight_format):
         batch_bound=FP8_RELATIVE_BOUND if quantized else BF16_RELATIVE_BOUND,
         token_bound=FP8_TOKEN_BOUND if quantized else BF16_TOKEN_BOUND,
     )
+
+
+def _make_hash_ids(mesh, seed, *, tokens, topk, e_total):
+    """Per-token expert ids, as DeepSeek-V4's table would hand them over.
+
+    Distinct within a row, because the real table is: a repeated id would
+    weight one expert twice, which is a routing question rather than a
+    kernel one and would make the reference the only thing under test.
+    """
+    rng = np.random.default_rng(seed)
+    ids = np.stack(
+        [rng.choice(e_total, size=topk, replace=False) for _ in range(tokens)]
+    ).astype(np.int32)
+    return jax.device_put(ids, NamedSharding(mesh, P(AXIS)))
+
+
+def test_hash_routing_serves_the_ids_it_was_given():
+    """DeepSeek-V4's bottom layers select by a table indexed on token id, not
+    by the gate. The gate is still scored -- the weights are its scores at the
+    given ids -- so the only thing that changes is which experts are chosen.
+
+    The control is the same layer with the ids withheld: if the operand were
+    ignored the kernel would fall back to its own top-k, and the two runs
+    would agree.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        30,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        31,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    hash_ids = _make_hash_ids(
+        mesh, 32, tokens=SMALL["tokens"], topk=SMALL["topk"], e_total=SMALL["e_total"]
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+    )
+    out = fused_ep_moe_v2(
+        x, w1, w2, w1_scale, w2_scale, gating, hash_topk_ids=hash_ids, **common
+    )
+    assert out.shape == x.shape
+    assert out.sharding.spec == x.sharding.spec
+
+    want = _dense_reference(
+        mesh,
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        gating,
+        topk=SMALL["topk"],
+        hash_ids=hash_ids,
+    )
+    error = _relative_l2(out, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(out, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"
+
+    selected = fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    assert _relative_l2(selected, want) > ROTATED_CONTROL_FACTOR * error
 
 
 def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
@@ -505,22 +635,9 @@ def test_any_mesh_axis_name_works():
 def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     """FP4 block scales and FP8 transport, including a single-block W2."""
     mesh = _mesh()
-    shard = NamedSharding(mesh, P(AXIS))
-    rng = np.random.default_rng(42)
-    weights, scales, decoded = [], [], []
-    for shape in ((32, 1024, 1024), (32, 512, 1024)):
-        raw = rng.normal(0, 0.1, shape).astype(np.float32)
-        grouped = raw.reshape(shape[0], shape[1] // 512, 512, shape[2])
-        scale = np.maximum(np.max(np.abs(grouped), axis=2) / 6, 1e-12)
-        normalized = (grouped / scale[:, :, None, :]).reshape(shape)
-        w = jax.device_put(normalized, shard).astype(jnp.float4_e2m1fn)
-        s = jax.device_put(scale, shard)
-        dequant = (
-            w.astype(jnp.float32).reshape(grouped.shape) * s[:, :, None, :]
-        ).reshape(shape)
-        weights.append(w)
-        scales.append(s)
-        decoded.append(dequant)
+    weights, scales, decoded = _make_fp4_weights(
+        mesh, 42, hidden=1024, inter=512, e_total=32, rhs_qb=512
+    )
     x, gating = _make_inputs(mesh, 43, tokens=256, hidden=1024, e_total=32)
     common = dict(
         topk=4,
@@ -552,3 +669,130 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
         topk=4,
     )
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
+
+
+# --------------------------------------------------------------------------- #
+# The weight-DMA schedule.
+#
+# How far ahead of the computing expert a weight refill goes out is not an
+# argument to the layer: the build asks `host.fit_weight_slots` for the
+# deepest runway this shape's VMEM affords, and every shape small enough to
+# test here affords the ceiling. So the schedules below are reached by
+# capping the fitter, which is the one line of the build that reads it.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def at_prefetch_depth(monkeypatch):
+    """Build at a named weight-prefetch depth, and report what was built.
+
+    Yields `depth -> observed`, where `observed` fills with the schedule each
+    build resolved to. Reporting it is not decoration: a cap that stopped
+    biting would leave every case running one schedule and agreeing trivially.
+
+    BOTH caches have to go, and the second one is the trap. `_BUILD_CACHE`
+    holds the kernel; `_LAYER_SM_CACHE` holds a shard_map over a `local_fn`
+    that CLOSES OVER the kernel built on the call that filled it, and its key
+    is the layer's arguments -- which the schedule is not one of, because the
+    build derives it from the device. Clearing only the first rebuilds the
+    kernel, logs it and fills `observed`, and then runs the cached shard_map's
+    older kernel: every depth passes, and a depth-zero-only fault is invisible.
+    """
+    observed = []
+    # Captured once, before the first cap: taken inside `at` it would be the
+    # PREVIOUS cap on the second use, and the two depths would compose.
+    real = host.fit_weight_slots
+
+    def clear():
+        kernel._BUILD_CACHE.clear()
+        layer._LAYER_SM_CACHE.clear()
+
+    def at(depth):
+        def capped(*args, **kwargs):
+            slots = real(*args, **{**kwargs, "max_distance": depth})
+            observed.append(slots)
+            return slots
+
+        monkeypatch.setattr(host, "fit_weight_slots", capped)
+        observed.clear()
+        clear()
+        return observed
+
+    yield at
+    clear()
+
+
+# An fp4 shape built for the streamed schedule: hidden and inter each span
+# several `rhs_qb` contraction blocks, so a slab's wait lands in a block that
+# is not also the one that retires it; and the batch puts 2048 * 4 / 32 = 256
+# rows on an expert against a tile of CAPACITY, so a visit runs more than one
+# tile and the wait has to be the first tile's alone.
+STREAM = dict(hidden=1024, inter=512, e_total=32, topk=4, tokens=2048)
+STREAM_QB = 256
+STREAM_DEPTHS = (2, 1, 0)
+
+
+def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
+    """The three fp4 weight schedules compute the same thing, bit for bit.
+
+    The depth changes only WHERE a weight DMA is started and waited. Depth two
+    starts an expert's slabs two visits ahead into a slot of its own; depth
+    zero has a single slot, streams the slabs into the blocks that read them,
+    and starts the next expert's where this expert's reads of the slot retire.
+    Same weights, same order, so the outputs have to agree exactly -- a refill
+    landing on a slot still being read is not a small numeric drift, it is
+    another expert's weights in the matmul.
+
+    The band against the dense reference is what stops that agreement from
+    being vacuous: three identically broken schedules would still match.
+    """
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        44,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        45,
+        tokens=STREAM["tokens"],
+        hidden=STREAM["hidden"],
+        e_total=STREAM["e_total"],
+    )
+    common = dict(
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+
+    outs = {}
+    for depth in STREAM_DEPTHS:
+        observed = at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+        assert observed, "the build never asked for a weight schedule"
+        assert [(s.distance, s.nbuf) for s in observed] == [
+            (depth, host.nbuf_for(depth))
+        ] * len(observed)
+
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=STREAM["topk"])
+    for depth, out in outs.items():
+        error = _relative_l2(out, ref)
+        worst = _worst_token_relative_l2(out, ref)
+        assert error < FP8_RELATIVE_BOUND, f"depth {depth}: relative L2 {error}"
+        assert worst < FP8_TOKEN_BOUND, f"depth {depth}: worst token {worst}"
+    deepest = outs[max(STREAM_DEPTHS)]
+    for depth in STREAM_DEPTHS:
+        np.testing.assert_array_equal(
+            outs[depth],
+            deepest,
+            err_msg=f"depth {depth} disagrees with the deepest schedule",
+        )
