@@ -39,7 +39,7 @@ def _coordinator():
     return get_kv_cache_coordinator(
         config,
         max_model_len=DSV4_CSA_BLOCK_TOKENS * 8,
-        max_num_batched_tokens=DSV4_CSA_BLOCK_TOKENS,
+        max_in_flight_tokens=DSV4_CSA_BLOCK_TOKENS,
         use_eagle=False,
         enable_caching=False,
         enable_kv_cache_events=False,
