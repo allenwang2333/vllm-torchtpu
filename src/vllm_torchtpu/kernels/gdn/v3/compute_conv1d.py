@@ -18,12 +18,34 @@ import jax.numpy as jnp
 from vllm_torchtpu.kernels.gdn.v3 import config
 
 
+def extract_final_conv_state(
+    real_sizes: jax.Array,  # [seq]
+    lhs: jax.Array,  # [seq, prev_kernel_size + chunk, q, dim_size]
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Extract masked conv state for the final tile of a sequence."""
+    real_sizes = real_sizes.reshape(-1, 1, 1, 1)
+    state_list = []
+    for w_idx in range(cfg.window_size):
+        last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
+        new_conv_state = lhs[:, last_row:last_row + cfg.prev_kernel_size]
+        for c_idx in range(1, last_row):
+            new_conv_state = jnp.where(
+                c_idx == real_sizes,
+                lhs[:, c_idx:c_idx + cfg.prev_kernel_size],
+                new_conv_state,
+            )
+        state_list.append(new_conv_state)
+    return jnp.stack(state_list, axis=1)
+
+
 def causal_conv1d(
     real_sizes: jax.Array,  # [seq]
     lhs: jax.Array,  # [seq, chunk, q, dim_size]
     conv_weight: jax.Array,  # [prev_kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
+    skip_partial_mask: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform causal Conv1D. Returns Conv1D output and convolution states.
 
@@ -35,43 +57,20 @@ def causal_conv1d(
 
     assert lhs.ndim == 4
 
-    out_list = []
+    out = jnp.zeros((cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size), jnp.float32)
+    for k in range(cfg.kernel_size):
+        w_k = conv_weight[k:k + 1].reshape(1, 1, 1, cfg.dim_size)
+        out = out + lhs[:, k:k + cfg.chunk_size] * w_k
 
-    for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
+    if conv_bias is not None:
+        out = out + conv_bias.reshape(1, 1, 1, cfg.dim_size)
 
-        end_idx = c_idx + cfg.prev_kernel_size
-        start_idx = 1 + end_idx - cfg.kernel_size
-        for k in range(cfg.kernel_size):
-            lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k:k + 1]
+    if skip_partial_mask:
+        state_list = [
+            lhs[:, (1 + cfg.chunk_size - cfg.window_size + w_idx):(1 + cfg.chunk_size - cfg.window_size + w_idx + cfg.prev_kernel_size)]
+            for w_idx in range(cfg.window_size)
+        ]
+        return out, jnp.stack(state_list, axis=1)
 
-        if conv_bias is not None:
-            out += conv_bias.reshape(1, 1, -1)
+    return out, extract_final_conv_state(real_sizes, lhs, cfg)
 
-        out_list.append(out)
-
-    # Last prev_kernel_size elements needs to be returned as conv_state. However,
-    # real_sizes may be smaller than chunk_size. Therefore, slicing last
-    # prev_kernel_size elements does not gurantee numeric correctness. Instead,
-    # kernel iterate each rows and perform masking to fetch correct values.
-    # NOTE: lhs[:, : prev_kernel_size] can be skipped since they were loaded from
-    # previous conv states.
-    real_sizes = real_sizes.reshape(-1, 1, 1, 1)
-    state_list = []
-    # NOTE: Even though for loop is invoked multiple times, since they are
-    # static loops, compiler will perform loop fusion.
-    for w_idx in range(cfg.window_size):
-        last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
-        # Checkpoint of sequences whose last real token is at or past this
-        # window position; shorter ones are picked by the masking loop below.
-        new_conv_state = lhs[:, last_row:last_row + cfg.prev_kernel_size]
-        for c_idx in range(1, last_row):
-            new_conv_state = jnp.where(
-                c_idx == real_sizes,
-                lhs[:, c_idx:c_idx + cfg.prev_kernel_size],
-                new_conv_state,
-            )
-        state_list.append(new_conv_state)
-
-    return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)

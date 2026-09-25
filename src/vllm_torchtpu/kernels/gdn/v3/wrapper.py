@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -100,12 +101,14 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
+    skip_partial = carry_conv_scratch_ref is not None and cfg.state_plan is not None
     qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
         real_sizes=real_sizes,
         lhs=qkv_in_compact,
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         cfg=cfg,
+        skip_partial_mask=skip_partial,
     )
 
     if cfg.state_plan is None:
@@ -117,14 +120,27 @@ def inner_kernel(
         for idx in range(cfg.seq_tile_size):
 
             for t in range(cfg.window_size):
-                args = (conv_state_slot_ref.at[idx, t], cfg.state_plan.conv,
-                        new_conv_state[idx, t])
                 if carry_conv_scratch_ref is None:
-                    vmem_ldst.store_state_region(*args)
+                    vmem_ldst.store_state_region(
+                        conv_state_slot_ref.at[idx, t],
+                        cfg.state_plan.conv,
+                        new_conv_state[idx, t],
+                    )
                 else:
                     # copy_out only DMAs the tile that ends a sequence.
+                    def _store_final_conv(idx=idx, t=t):
+                        final_conv = compute_conv1d.extract_final_conv_state(
+                            real_sizes, qkv_in_compact, cfg
+                        )
+                        vmem_ldst.store_state_region(
+                            conv_state_slot_ref.at[idx, t],
+                            cfg.state_plan.conv,
+                            final_conv[idx, t],
+                        )
+
                     pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])(
-                        functools.partial(vmem_ldst.store_state_region, *args))
+                        _store_final_conv
+                    )
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -136,15 +152,8 @@ def inner_kernel(
     # Step 2: GDN.
 
     # Prepare gdn weights.
-    if cfg.is_kda:
-        # KDA reshapes these per (head, channel) rather than padding out to
-        # a lane multiple over heads.
-        a_log = weights_ref.gdn.a_log[...]
-        dt_bias = weights_ref.gdn.dt_bias[...]
-    else:
-        padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
-        a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
-        dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+    a_log = weights_ref.gdn.a_log[...]
+    dt_bias = weights_ref.gdn.dt_bias[...]
 
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
@@ -351,7 +360,7 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
-    zero_initialize_out: bool = True,
+    zero_initialize_out: bool = False,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
@@ -504,7 +513,16 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(2 if batch_size <= 4 else decode_tile_size, batch_size)
+    env_dec_tile = os.environ.get("VLLM_TPU_GDN_DECODE_TILE_SIZE")
+    if env_dec_tile is not None:
+        decode_tile_size = min(int(env_dec_tile), batch_size)
+        if batch_size >= 32 and decode_tile_size == 4:
+            decode_tile_size = 8
+    else:
+        decode_tile_size = min(decode_tile_size, batch_size)
+    env_mix_tile = os.environ.get("VLLM_TPU_GDN_MIXED_TILE_SIZE")
+    if env_mix_tile is not None:
+        mixed_tile_size = int(env_mix_tile) if batch_size >= 1024 else 64
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
@@ -536,7 +554,8 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if batch_padding_size > 0:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
@@ -553,6 +572,9 @@ def fused_conv1d_gdn(
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
+    if not is_kda and num_v_padding_size > 0:
+        a_log = jnp.pad(a_log, ((0, num_v_padding_size), ))
+        dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size), ))
 
     # Step 4: Wrap inputs for the kernel.
     conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight,
@@ -643,7 +665,9 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        if in_act is None and (
+                zero_initialize_out
+                or batch_size <= envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS):
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
