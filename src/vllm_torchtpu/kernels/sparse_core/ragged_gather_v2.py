@@ -127,25 +127,36 @@ def main_kernel_v2(
     # the bubble's impact on E2E performance and, if needed, manually reimplement
     # this using primitive operations to eliminate the bubble entirely.
 
-    def col_loop(col_base, gather_ref, out_ref, idx_rem, unpack_col_chunk):
+    def col_loop(col_base, gather_ref, out_ref, idx_shift, unpack_col_chunk):
         col_slice = pl.ds(col_base, unpack_col_chunk)
         if packing == 1:
             gather_dt = gather_ref.bitcast(dtype)
             out_dt = out_ref.bitcast(dtype)
             out_dt[:, col_slice] = gather_dt[:, col_slice]
+        elif packing == 2:
+            for i in range(num_simd_lanes // 2):
+                k0 = i * 2
+                k1 = k0 + 1
+                lo = jnp.bitwise_and(
+                    jnp.bitwise_right_shift(gather_ref[pl.ds(k0, 1), col_slice],
+                                            idx_shift[k0]),
+                    0xFFFF,
+                )
+                hi = jnp.left_shift(
+                    jnp.bitwise_right_shift(gather_ref[pl.ds(k1, 1), col_slice],
+                                            idx_shift[k1]),
+                    16,
+                )
+                out_ref[pl.ds(i, 1), col_slice] = jnp.bitwise_or(lo, hi)
         else:
-            # Manual bitwise extraction and packing for packing >= 2 (bfloat16, int8, int4)
-            # bf16: 0xFFFF, int8: 0xFF, int4: 0xF
+            # Manual bitwise extraction and packing for packing > 2 (int8, int4)
             mask = (1 << dtype_bits) - 1
-            shift_multiplier = dtype_bits.bit_length() - 1
             for i in range(num_simd_lanes // packing):
                 packed_row = jnp.zeros((1, unpack_col_chunk), dtype=jnp.int32)
                 for j in range(packing):
                     k = i * packing + j
-                    dynamic_shift = jnp.left_shift(idx_rem[k],
-                                                   shift_multiplier)
                     val = jnp.bitwise_right_shift(
-                        gather_ref[pl.ds(k, 1), col_slice], dynamic_shift)
+                        gather_ref[pl.ds(k, 1), col_slice], idx_shift[k])
                     val = jnp.bitwise_and(val, mask)
                     pack_shift = j * dtype_bits
                     packed_row = jnp.bitwise_or(
@@ -157,16 +168,17 @@ def main_kernel_v2(
             pl.program_id(0) * row_subchunk_size, row_subchunk_size)
         subchunk_idxs = idx_ref[row_slice]
         if packing > 1:
-            # Equivalent to `subchunk_idxs % packing`
-            idx_rem = jnp.bitwise_and(subchunk_idxs, packing - 1)
+            shift_multiplier = dtype_bits.bit_length() - 1
+            idx_shift = jnp.left_shift(
+                jnp.bitwise_and(subchunk_idxs, packing - 1), shift_multiplier)
         else:
-            idx_rem = jnp.zeros_like(subchunk_idxs)
+            idx_shift = jnp.zeros_like(subchunk_idxs)
 
         col_loop_fn = functools.partial(
             col_loop,
             gather_ref=gather_ref,
             out_ref=out_ref,
-            idx_rem=idx_rem,
+            idx_shift=idx_shift,
             unpack_col_chunk=unpack_col_chunk,
         )
         plsc.parallel_loop(0, num_phys_cols,
@@ -250,9 +262,20 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
     num_cores = sc_info.num_cores * sc_info.num_subcores
     base_block_size = num_simd_lanes * num_cores
 
-    # Calculate ideal num_row_subchunks to avoid too much padding overhead.
+    # Calculate ideal num_row_subchunks to balance EP=2 tail block padding
+    # at smaller buckets against inner pipeline drain overhead at larger buckets.
+    if out_size <= 73728 and (out_size % (12 * base_block_size) == 0):
+        max_sub = 12
+    elif out_size > 73728 and (out_size % (24 * base_block_size) == 0):
+        max_sub = 24
+    elif out_size >= 368640 and (out_size % (36 * base_block_size) == 0):
+        max_sub = 36
+    elif out_size % (18 * base_block_size) == 0:
+        max_sub = 18
+    else:
+        max_sub = 4
     num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size))
+        1, min(max_sub, (out_size + base_block_size - 1) // base_block_size))
 
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
@@ -260,7 +283,8 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
 
     out_pad_size = (
         (out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size > 0:
+        indices = jnp.pad(indices, ((0, out_pad_size)))
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -268,7 +292,7 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    res = core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,
@@ -289,4 +313,7 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
         ],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(start, end, x, indices)
+    if out_pad_size > 0 or aligned_hidden_size != hidden_size:
+        res = res[:out_size, :hidden_size]
+    return res
