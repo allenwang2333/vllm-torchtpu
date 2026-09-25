@@ -17,7 +17,8 @@ import torch
 import vllm.envs as vllm_envs
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.layers.vllm.router_topk import rowmax_select
+from vllm_torchtpu.layers.vllm.router_topk import (rowmax_select,
+                                                   rowmax_select_softmax)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -272,9 +273,18 @@ def select_experts(
         )
         return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
     e_score_correction_bias = getattr(layer, "e_score_correction_bias",
                                       None) if layer is not None else None
+    if (_ROUTER_TOPK == "rowmax" and scoring_fn == "softmax"
+            and e_score_correction_bias is None and renormalize):
+        topk_weights, topk_ids = rowmax_select_softmax(router_logits, topk)
+        routed_scaling_factor = getattr(layer, "routed_scaling_factor",
+                                        1.0) if layer is not None else 1.0
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+
+    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
 
     if e_score_correction_bias is not None:
         bias_shape = [1] * (scores.dim() - 1) + [-1]

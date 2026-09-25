@@ -94,13 +94,6 @@ def zero_routing_weights_for_padding(
             is_padding = gathered_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)
-    if num_tokens <= envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS:
-        # Reference `is_padding` so Dynamo preserves `local_padding_mask` in
-        # the FX graph input signature (required by `shape_variants` across
-        # token buckets), while XLA's algebraic simplifier eliminates the op.
-        topk_weights = topk_weights + is_padding[:1, None].to(
-            topk_weights.dtype) * 0.0
-        return topk_ids, topk_weights
     topk_weights = torch.where(is_padding[:, None],
                                torch.zeros_like(topk_weights), topk_weights)
     return topk_ids, topk_weights
