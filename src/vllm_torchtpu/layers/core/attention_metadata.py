@@ -14,6 +14,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -186,7 +187,7 @@ def _staged_walk_products(
     return tuple(outs) + tuple(states) + tuple(ckpts)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _staged_walk_products_compiled(
     staged_dev: torch.Tensor,
     seq_lens: torch.Tensor,

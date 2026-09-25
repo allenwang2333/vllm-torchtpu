@@ -15,6 +15,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -626,7 +627,7 @@ class Eagle3Proposer:
             indexer_names,
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
         # Draft lm-head + greedy argmax, wrapped in one torch.compile region
         # keyed on input shape only (mirrors the target's compute_selected_logits).
@@ -647,7 +648,7 @@ class Eagle3Proposer:
         ).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_gather_carries(
         self,
         hidden: torch.Tensor,
@@ -671,7 +672,7 @@ class Eagle3Proposer:
             torch.index_select(last_hidden, 0, indices),
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_combine_hidden_states(
         self, aux0: torch.Tensor, aux1: torch.Tensor, aux2: torch.Tensor
     ) -> torch.Tensor:
@@ -686,7 +687,7 @@ class Eagle3Proposer:
             torch.cat((aux0, aux1, aux2), dim=-1)
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_seed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -1263,7 +1264,7 @@ class Eagle3Proposer:
         )
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _draft_gather_carries_and_propose(
         self,
         hidden: torch.Tensor,
@@ -1274,13 +1275,13 @@ class Eagle3Proposer:
         """`_draft_gather_carries` + `_draft_propose_token` on the gathered
         pre-lm-head hidden, as one program, for the default sequence layout
         (where the carry aggregation between them is the identity)."""
-        # Nested compiled methods are inlined into this graph by dynamo.
+        # The undecorated bodies, traced into this one graph.
         hidden_carry, positions_carry, last_hidden_carry = (
-            self._draft_gather_carries(
-                hidden, positions, last_hidden, indices.clamp_min(0)
+            _draft_gather_carries_body(
+                self, hidden, positions, last_hidden, indices.clamp_min(0)
             )
         )
-        token = self._draft_propose_token(last_hidden_carry)
+        token = _draft_propose_token_body(self, last_hidden_carry)
         return hidden_carry, positions_carry, token
 
     def _build_draft_attn_metadata(
@@ -1871,3 +1872,8 @@ class Eagle3Proposer:
             # Force the chunk to execute so its collectives fire in lockstep
             # with the peer ranks' real propose (nothing consumes the result).
             synchronize_tensors(tok)
+
+
+# Undecorated compiled-method bodies, for tracing into a fused graph.
+_draft_gather_carries_body = Eagle3Proposer._draft_gather_carries.__wrapped__
+_draft_propose_token_body = Eagle3Proposer._draft_propose_token.__wrapped__

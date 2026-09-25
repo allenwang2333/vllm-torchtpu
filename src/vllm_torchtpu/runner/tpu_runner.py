@@ -54,6 +54,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import \
@@ -163,7 +164,7 @@ def _rollback_offsets_migrate_impl(read_offsets: torch.Tensor,
     read_offsets.index_put_((dst_t, ), read_offsets[src_t])
 
 
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_tpu_compile = tpu_compile
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(
@@ -192,7 +193,7 @@ def _rollback_offsets_migrate(read_offsets: torch.Tensor, src_t: torch.Tensor,
     fn(read_offsets, src_t, dst_t)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _substitute_placeholder_token(
         input_ids: torch.Tensor, token_in_tpu_cur_input_indices: torch.Tensor,
         token_in_tpu_pre_next_tokens_indices: torch.Tensor,
@@ -2123,7 +2124,7 @@ class TPUModelRunner(GPUModelRunner):
                 device=drafts.device)
         return self._tpu_pin_drafts_to_rank0(drafts, self._tp_rank0_mask)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def _tpu_pin_drafts_to_rank0(self, drafts: torch.Tensor,
                                  rank0_mask: torch.Tensor) -> torch.Tensor:
         # Must be compiled (eager collectives wedge the TPU cores), and the
@@ -5853,7 +5854,7 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_selected_logits(
             self, hidden_states: torch.Tensor,
             indices_do_sample: torch.Tensor) -> torch.Tensor:
@@ -5862,12 +5863,12 @@ class TPUModelRunner(GPUModelRunner):
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_logits_from_hidden_states(
             self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def spec_bonus_and_target_logits(
         self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor
@@ -5885,7 +5886,7 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_token_ids, target_logits
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def spec_gather_bonus_and_target_logits(
         self, logits: torch.Tensor, bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor
@@ -5909,7 +5910,7 @@ class TPUModelRunner(GPUModelRunner):
 
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def sample_from_logits(self,
                            logits: torch.Tensor,
                            temperatures: torch.Tensor,
@@ -5934,7 +5935,7 @@ class TPUModelRunner(GPUModelRunner):
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def gather_logprobs(self, logits: torch.Tensor,
                         sampled_tokens: torch.Tensor) -> LogprobsTensors:
         """

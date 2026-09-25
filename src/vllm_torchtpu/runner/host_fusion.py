@@ -15,6 +15,7 @@ real request count changes.
 """
 import torch
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     _random_rejection_sample_with_segment)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
@@ -254,7 +255,7 @@ def draft_seed_prep_impl(
     return draft_input_ids, last_token_indices, rejected_out
 
 
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_tpu_compile = tpu_compile
 _async_spec_input_fixup_compiled = _tpu_compile(async_spec_input_fixup_impl)
 _spec_verify_sample_compiled = _tpu_compile(spec_verify_sample_impl)
 _assemble_async_spec_source_compiled = _tpu_compile(

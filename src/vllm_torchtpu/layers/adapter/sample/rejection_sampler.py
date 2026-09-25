@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 
 if TYPE_CHECKING:
@@ -200,7 +201,7 @@ def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
     return segment_ids, group_indices
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _greedy_rejection_sample_with_segment(
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,
@@ -338,7 +339,7 @@ def _greedy_rejection_sample_with_segment(
     return selected_tokens[:batch_size]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _random_rejection_sample_with_segment(
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,

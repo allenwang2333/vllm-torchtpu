@@ -677,6 +677,10 @@ class TPUWorker(WorkerBase):
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         self.model_runner.capture_model()
+        # Warmup is done (including the profiling run's dynamo reset): serve
+        # the compiled host helpers through the low-overhead dispatch.
+        from vllm_torchtpu.compilation import fast_dispatch
+        fast_dispatch.activate()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()

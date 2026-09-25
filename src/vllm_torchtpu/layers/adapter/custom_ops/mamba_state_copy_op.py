@@ -17,6 +17,7 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
 from vllm_torchtpu.kernels import pool_adapters
 
 # --- Unified-pool block seeding (block-table-derived state indexing) ---
@@ -46,7 +47,7 @@ def _fake_copy(pool: torch.Tensor, src: torch.Tensor, dst: torch.Tensor):
 _copy_op.register_fake(_fake_copy)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def copy_mamba_state_blocks(
     pools: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
 ) -> torch.Tensor:
