@@ -47,6 +47,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.k_cache_insert import (
+    insert_indexer_k_cache_auto,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -335,13 +338,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             # fp8+scale rows to match before scattering.
             k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
-            # Insert this step's K rows into the KV cache.
+            # Insert this step's K rows into the KV cache. KWRITE_DUS keeps the
+            # whole-page dynamic_update_slice write (stack3b, measured in-model);
+            # otherwise PR 1273's Pallas insert for prefill-sized token buckets
+            # and the XLA scatter for decode-sized ones (`KERNEL_MIN_TOKENS`).
             if kwrite_dus:
                 cache_kv = _write_indexer_k_pages(
                     cache_kv, k_packed, seq_lens, page_indices, cu_q_lens
                 )
             else:
-                cache_kv = _scatter_indexer_k(
+                cache_kv = insert_indexer_k_cache_auto(
                     cache_kv, k_packed, seq_lens, page_indices, cu_q_lens
                 )
 
