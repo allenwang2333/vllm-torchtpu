@@ -681,6 +681,16 @@ class TPUWorker(WorkerBase):
         # the compiled host helpers through the low-overhead dispatch.
         from vllm_torchtpu.compilation import fast_dispatch
         fast_dispatch.activate()
+        ds_config = getattr(self.compilation_config, "dynamic_shapes_config",
+                            None)
+        if ds_config is not None and not ds_config.evaluate_guards:
+            runner = self.model_runner
+            drafter = getattr(runner, "drafter", None)
+            n = fast_dispatch.disable_aot_guard_checks(
+                getattr(runner, "model", None),
+                getattr(drafter, "draft_model", None),
+                getattr(drafter, "_mtp_loop_model", None))
+            logger.info("Disabled per-call AOT guard checks on %d forwards", n)
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()

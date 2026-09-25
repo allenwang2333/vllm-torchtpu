@@ -132,3 +132,27 @@ def tpu_compile(fn: Callable) -> Callable:
     if not _ENABLED:
         return compiled
     return _FastCompiled(compiled, fn)
+
+
+def disable_aot_guard_checks(*roots: Any) -> int:
+    """Skip the per-call guard check of vLLM's AOT-compiled model forwards.
+
+    vLLM already drops it for artifacts loaded from disk unless
+    ``dynamic_shapes_config.evaluate_guards`` is set; a forward compiled in
+    this process keeps it, and it costs a signature bind plus a guard walk on
+    every draft and target forward. The check only raises on failure — it
+    selects nothing — so the caller applies the same ``evaluate_guards``
+    condition. Returns the number of forwards changed.
+    """
+    if not _ENABLED:
+        return 0
+    n = 0
+    for root in roots:
+        if not isinstance(root, torch.nn.Module):
+            continue
+        for module in root.modules():
+            fn = getattr(module, "aot_compiled_fn", None)
+            if fn is not None and hasattr(fn, "disable_guard_check"):
+                fn.disable_guard_check()
+                n += 1
+    return n
