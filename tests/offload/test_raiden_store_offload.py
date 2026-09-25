@@ -1747,17 +1747,48 @@ class TestNamespace(unittest.TestCase):
         )
 
 
-class TestHybridGeometry(unittest.TestCase):
-    """resolve_kernel_geometry on hybrid unified-pool group structures."""
+_ADDED_TORCH_TPU_STUB_MODS: list[str] = []
 
-    def _resolve(self, groups, unified=True):
+
+def setUpModule():
+    try:
+        import torch_tpu  # noqa: F401
+    except ImportError:
+        for mod in (
+            "torch_tpu",
+            "torch_tpu._internal",
+            "torch_tpu._internal.compile",
+            "torch_tpu._internal.sync",
+            "torch_tpu._internal.utils",
+            "torch_tpu._internal.utils.hardware",
+        ):
+            if mod not in sys.modules:
+                m = MagicMock()
+                m.__path__ = []
+                sys.modules[mod] = m
+                _ADDED_TORCH_TPU_STUB_MODS.append(mod)
+
+
+def tearDownModule():
+    for mod in _ADDED_TORCH_TPU_STUB_MODS:
+        sys.modules.pop(mod, None)
+    _ADDED_TORCH_TPU_STUB_MODS.clear()
+
+
+class TestHybridGeometry(unittest.TestCase):
+    """resolve_kernel_geometry on hybrid unified-pool and pure-attention HMA structures."""
+
+    def _resolve(self, groups, unified=True, shape_fn=None):
         from vllm_torchtpu.offload import raiden_store as rs
 
         kv_cache_config = SimpleNamespace(
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups]
         )
         backend = MagicMock()
-        backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
+        if shape_fn is not None:
+            backend.get_kv_cache_shape.side_effect = shape_fn
+        else:
+            backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
         backend.is_ssm.return_value = False
         with (
             patch(
@@ -1792,6 +1823,45 @@ class TestHybridGeometry(unittest.TestCase):
         spec.page_size_bytes = page
         return spec
 
+    def _gemma4_sliding_spec(
+        self,
+        *,
+        block_size=256,
+        num_kv_heads=2,
+        head_size=256,
+        page_size_padded=524288,
+    ):
+        import torch
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+        return SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+            page_size_padded=page_size_padded,
+        )
+
+    def _gemma4_full_spec(
+        self,
+        *,
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        page_size_padded=524288,
+    ):
+        import torch
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            page_size_padded=page_size_padded,
+        )
+
     def test_hybrid_uses_attention_geometry_with_mamba_group_first(self):
         # In hybrid models, group 0 may be Mamba; verify attention spec resolution.
         kernel, shape, dtype, device_block = self._resolve(
@@ -1812,6 +1882,330 @@ class TestHybridGeometry(unittest.TestCase):
     def test_dense_rejects_non_full_attention(self):
         with self.assertRaises(AssertionError):
             self._resolve([self._mamba_spec()])
+
+    def test_pure_attention_hma_gemma4_tp4_resolves_without_unified_pool(self):
+        # Gemma 4 26B A4B at TP=4: 5 sliding_attention groups (2 KV heads x 256)
+        # + 1 full_attention group (1 KV head x 512), sharing 524,288-byte pages
+        # via materialize_shared_attention_cache without unified_kv_layout_enabled.
+        import torch
+
+        groups = [self._gemma4_sliding_spec() for _ in range(5)] + [
+            self._gemma4_full_spec()
+        ]
+        kernel, shape, dtype, device_block = self._resolve(
+            groups,
+            unified=False,
+            shape_fn=lambda num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str: (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                2,
+                head_size,
+            ),
+        )
+        self.assertEqual((kernel, device_block), (256, 256))
+        self.assertEqual(dtype, torch.bfloat16)
+        # 256 * num_kv_heads * 2 * head_size * 2 bytes == 524,288 bytes
+        self.assertEqual(shape[0] * shape[1] * shape[2] * shape[3] * 2, 524288)
+
+    def test_pure_attention_hma_selects_max_real_page_size_spec(self):
+        # When sliding_attention has smaller real_page_size_bytes (e.g., TP=8:
+        # 1 KV head x 256 = 262,144B) and full_attention has 1 KV head x 512 = 524,288B,
+        # resolve_kernel_geometry must select the spec whose real_page_size_bytes
+        # matches the shared padded page_size_bytes (524,288B).
+        import torch
+
+        swa_smaller = self._gemma4_sliding_spec(
+            num_kv_heads=1, head_size=256, page_size_padded=524288
+        )
+        full_larger = self._gemma4_full_spec(
+            num_kv_heads=1, head_size=512, page_size_padded=524288
+        )
+        self.assertEqual(swa_smaller.real_page_size_bytes, 262144)
+        self.assertEqual(full_larger.real_page_size_bytes, 524288)
+
+        kernel, shape, dtype, device_block = self._resolve(
+            [swa_smaller, full_larger],
+            unified=False,
+            shape_fn=lambda num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str: (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                2,
+                head_size,
+            ),
+        )
+        self.assertEqual((kernel, device_block), (256, 256))
+        self.assertEqual(shape, (256, 1, 2, 512))
+        self.assertEqual(dtype, torch.bfloat16)
+
+    def test_pure_attention_hma_rejects_mismatched_shared_page_sizes(self):
+        swa = self._gemma4_sliding_spec(page_size_padded=524288)
+        full_bad = self._gemma4_full_spec(page_size_padded=1048576)
+        with self.assertRaises(AssertionError):
+            self._resolve([swa, full_bad], unified=False)
+
+    def test_pure_attention_hma_worker_view_registration(self):
+        # Verify RaidenStoreOffloadingWorker reconstructs zero-copy views over
+        # Gemma 4's 5 shared KVCacheTensor regions on CPU without assertion errors.
+        import torch
+        from vllm.v1.kv_offload.base import (
+            CanonicalKVCacheRef,
+            CanonicalKVCaches,
+            CanonicalKVCacheTensor,
+        )
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        groups = [self._gemma4_sliding_spec() for _ in range(5)] + [
+            self._gemma4_full_spec()
+        ]
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups]
+        )
+        num_blocks = 8
+        page_size_bytes = 524288
+        pool_tensors = []
+        for _ in range(5):
+            raw = torch.zeros((num_blocks, page_size_bytes), dtype=torch.int8)
+            pool_tensors.append(
+                CanonicalKVCacheTensor(tensor=raw, page_size_bytes=page_size_bytes)
+            )
+        canonical = CanonicalKVCaches(
+            tensors=pool_tensors,
+            group_data_refs=[
+                [
+                    CanonicalKVCacheRef(
+                        tensor_idx=i, page_size_bytes=page_size_bytes
+                    )
+                    for i in range(5)
+                ]
+                for _ in groups
+            ],
+        )
+        backend = MagicMock()
+        backend.get_kv_cache_shape.side_effect = (
+            lambda num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str: (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                2,
+                head_size,
+            )
+        )
+        backend.is_ssm.return_value = False
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=backend,
+            ),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+            patch(
+                "vllm_torchtpu.platforms.tpu_block_size_utils."
+                "unified_kv_layout_enabled",
+                return_value=False,
+            ),
+            patch.object(
+                RaidenStoreOffloadingWorker, "_init_registration"
+            ) as mock_init_reg,
+        ):
+            RaidenStoreOffloadingWorker(
+                canonical,
+                vllm_config=MagicMock(),
+                kv_cache_config=kv_cache_config,
+                host_blocks_to_allocate=64,
+                controller_address="127.0.0.1:51515",
+                rank=0,
+            )
+        mock_init_reg.assert_called_once()
+        registered_tensors = mock_init_reg.call_args[0][0]
+        self.assertEqual(len(registered_tensors), 5)
+        for t in registered_tensors:
+            self.assertEqual(t.dtype, torch.bfloat16)
+            self.assertEqual(t.shape[0], num_blocks)
+            self.assertEqual(t.numel() * t.element_size(), num_blocks * page_size_bytes)
+
+    def test_pure_attention_hma_connector_register_30_layers_shared_4d_pools(self):
+        # End-to-end verification of TPURaidenOffloadingConnector.register_kv_caches()
+        # with Gemma 4 26B's 30 layers (25 sliding_attention + 5 full_attention)
+        # sharing 5 4D tensors of shape (num_blocks, 256, 2, 512) created by
+        # materialize_shared_attention_cache().
+        import torch
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        num_blocks = 8
+        # materialize_shared_attention_cache allocates 5 4D tensors of shape (num_blocks, 256, 2, 512)
+        shared_4d_pools = [
+            torch.zeros((num_blocks, 256, 2, 512), dtype=torch.bfloat16)
+            for _ in range(5)
+        ]
+        # Map 30 layers (5 blocks of [5 sliding + 1 full]) onto the 5 shared pools
+        kv_caches = {}
+        for block_idx in range(5):
+            for pos_in_block in range(6):
+                layer_idx = block_idx * 6 + pos_in_block
+                kv_caches[f"model.layers.{layer_idx}.self_attn.attn"] = shared_4d_pools[
+                    pos_in_block % 5
+                ]
+
+        groups = [self._gemma4_sliding_spec() for _ in range(5)] + [
+            self._gemma4_full_spec()
+        ]
+        kv_cache_config = SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups],
+        )
+        conn = object.__new__(TPURaidenOffloadingConnector)
+        conn._pool_sync_tensors = []
+
+        captured_canonical = []
+
+        def _fake_init_worker(canonical_kv_caches):
+            captured_canonical.append(canonical_kv_caches)
+
+        conn.connector_worker = SimpleNamespace(
+            kv_cache_config=kv_cache_config,
+            _init_worker=_fake_init_worker,
+        )
+        conn.register_kv_caches(kv_caches)
+        self.assertEqual(len(captured_canonical), 1)
+        canonical = captured_canonical[0]
+        # 30 layers must deduplicate to exactly 5 underlying shared storages
+        self.assertEqual(len(canonical.tensors), 5)
+        self.assertEqual(len(conn._pool_sync_tensors), 5)
+
+        backend = MagicMock()
+        backend.get_kv_cache_shape.side_effect = (
+            lambda num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str: (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                2,
+                head_size,
+            )
+        )
+        backend.is_ssm.return_value = False
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=backend,
+            ),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+            patch.object(
+                RaidenStoreOffloadingWorker, "_init_registration"
+            ) as mock_init_reg,
+        ):
+            RaidenStoreOffloadingWorker(
+                canonical,
+                vllm_config=MagicMock(),
+                kv_cache_config=kv_cache_config,
+                host_blocks_to_allocate=64,
+                controller_address="127.0.0.1:51515",
+                rank=0,
+            )
+        registered_tensors = mock_init_reg.call_args[0][0]
+        self.assertEqual(len(registered_tensors), 5)
+        for idx, reg_t in enumerate(registered_tensors):
+            self.assertEqual(
+                reg_t.untyped_storage().data_ptr(),
+                shared_4d_pools[idx].untyped_storage().data_ptr(),
+            )
+
+    def test_pure_attention_hma_gemma4_tp2_ep_worker_view_registration(self):
+        # Verify RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (Gemma4ForCausalLM, bfloat16 KV)
+        # at TP=2 + EP (sliding_attention: 8/2=4 KV heads x 256 -> 1,048,576 B/page;
+        # full_attention: 2/2=1 KV head x 512 -> 524,288 B/page, padded to 1,048,576 B).
+        import torch
+        from vllm.v1.kv_offload.base import (
+            CanonicalKVCacheRef,
+            CanonicalKVCaches,
+            CanonicalKVCacheTensor,
+        )
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        shared_page_bytes = 1048576
+        groups = [
+            self._gemma4_sliding_spec(
+                num_kv_heads=4,
+                head_size=256,
+                page_size_padded=shared_page_bytes,
+            )
+            for _ in range(5)
+        ] + [
+            self._gemma4_full_spec(
+                num_kv_heads=1,
+                head_size=512,
+                page_size_padded=shared_page_bytes,
+            )
+        ]
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=s) for s in groups]
+        )
+        num_blocks = 8
+        pool_tensors = []
+        for _ in range(5):
+            raw = torch.zeros((num_blocks, shared_page_bytes), dtype=torch.int8)
+            pool_tensors.append(
+                CanonicalKVCacheTensor(tensor=raw, page_size_bytes=shared_page_bytes)
+            )
+        canonical = CanonicalKVCaches(
+            tensors=pool_tensors,
+            group_data_refs=[
+                [
+                    CanonicalKVCacheRef(
+                        tensor_idx=i, page_size_bytes=shared_page_bytes
+                    )
+                    for i in range(5)
+                ]
+                for _ in groups
+            ],
+        )
+        backend = MagicMock()
+        backend.get_kv_cache_shape.side_effect = (
+            lambda num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str: (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                2,
+                head_size,
+            )
+        )
+        backend.is_ssm.return_value = False
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=backend,
+            ),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+            patch(
+                "vllm_torchtpu.platforms.tpu_block_size_utils."
+                "unified_kv_layout_enabled",
+                return_value=False,
+            ),
+            patch.object(
+                RaidenStoreOffloadingWorker, "_init_registration"
+            ) as mock_init_reg,
+        ):
+            RaidenStoreOffloadingWorker(
+                canonical,
+                vllm_config=MagicMock(),
+                kv_cache_config=kv_cache_config,
+                host_blocks_to_allocate=64,
+                controller_address="127.0.0.1:51515",
+                rank=0,
+            )
+        mock_init_reg.assert_called_once()
+        registered_tensors = mock_init_reg.call_args[0][0]
+        self.assertEqual(len(registered_tensors), 5)
+        for t in registered_tensors:
+            self.assertEqual(t.dtype, torch.bfloat16)
+            self.assertEqual(t.shape, (num_blocks, 256, 4, 2, 256))
+            self.assertEqual(
+                t.numel() * t.element_size(), num_blocks * shared_page_bytes
+            )
 
     def test_scheduler_process_falls_back_to_attn_selector(self):
         # In EngineCore process, resolve attention backend via selector fallback.
@@ -1843,6 +2237,41 @@ class TestHybridGeometry(unittest.TestCase):
         self.assertEqual((kernel, device_block), (256, 1280))
         self.assertEqual(shape, (256, 8, 2, 128))
         selector.assert_called_once()
+
+    def test_pure_attention_hma_non_unified_preserves_device_block_size(self):
+        # For multi-group pure-attention HMA when unified_kv_layout_enabled is False,
+        # kernel_block_size must equal spec0.block_size so device_block_size_factor == 1.
+        from contextlib import nullcontext
+
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=self._attn_spec()),
+                SimpleNamespace(kv_cache_spec=self._attn_spec()),
+            ]
+        )
+        backend = MagicMock()
+        backend.get_kv_cache_shape.return_value = (1, 1280, 8, 2, 128)
+        backend.is_ssm.return_value = False
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=backend,
+            ),
+            patch(
+                "vllm_torchtpu.platforms.tpu_block_size_utils.unified_kv_layout_enabled",
+                return_value=False,
+            ),
+            patch("vllm.config.set_current_vllm_config", return_value=nullcontext()),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+        ):
+            kernel, shape, dtype, device_block = rs.resolve_kernel_geometry(
+                MagicMock(), kv_cache_config
+            )
+        self.assertEqual((kernel, device_block), (1280, 1280))
+        self.assertEqual(shape, (1280, 8, 2, 128))
 
 
 class TestRaidenStoreWorkerStub(unittest.TestCase):

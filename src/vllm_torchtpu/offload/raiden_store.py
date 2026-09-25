@@ -1215,50 +1215,6 @@ def resolve_kernel_geometry(
     if has_multi_shapes_kv_caches(vllm_config):
         return _resolve_multi_shapes_kv_geometry(kv_cache_config)
 
-    if len(groups) == 1:
-        spec0 = groups[0].kv_cache_spec
-        assert isinstance(spec0, FullAttentionSpec), (
-            "TPURaidenOffloadingConnector: single-group models must be full-attention; "
-            f"got {type(spec0).__name__}"
-        )
-    else:
-        # In hybrid models, group 0 may be a Mamba layer; filter for attention groups.
-        from vllm_torchtpu.platforms.tpu_block_size_utils import (
-            unified_kv_layout_enabled,
-        )
-
-        assert unified_kv_layout_enabled(vllm_config), (
-            "TPURaidenOffloadingConnector: hybrid models require the unified block pool "
-            "(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)"
-        )
-        attn_specs = [
-            g.kv_cache_spec
-            for g in groups
-            if isinstance(g.kv_cache_spec, AttentionSpec)
-        ]
-        assert attn_specs, (
-            "TPURaidenOffloadingConnector: hybrid model has no attention KV group"
-        )
-        spec0 = attn_specs[0]
-        assert all(
-            (s.block_size, s.num_kv_heads, s.head_size, s.dtype, s.page_size_bytes)
-            == (
-                spec0.block_size,
-                spec0.num_kv_heads,
-                spec0.head_size,
-                spec0.dtype,
-                spec0.page_size_bytes,
-            )
-            for s in attn_specs
-        ), "TPURaidenOffloadingConnector: attention groups disagree on geometry"
-        # Ensure all groups share the unified pool's padded page size.
-        assert all(
-            g.kv_cache_spec.page_size_bytes == spec0.page_size_bytes for g in groups
-        ), (
-            "TPURaidenOffloadingConnector: unified pool groups must share one "
-            "padded page size"
-        )
-
     from vllm.config import set_current_vllm_config
 
     attn_backend = TpuPlatform._find_non_ssm_backend(vllm_config)
@@ -1283,10 +1239,129 @@ def resolve_kernel_geometry(
         "TPURaidenOffloadingConnector: resolved attention backend is SSM: "
         f"{attn_backend.get_name()}"
     )
+
+    if len(groups) == 1:
+        spec0 = groups[0].kv_cache_spec
+        assert isinstance(spec0, FullAttentionSpec), (
+            "TPURaidenOffloadingConnector: single-group models must be full-attention; "
+            f"got {type(spec0).__name__}"
+        )
+    else:
+        # Multi-group models are either:
+        # 1. Pure-attention HMA models (e.g., Gemma 4 sliding + full attention),
+        #    which share attention pages via materialize_shared_attention_cache
+        #    padded to uniform_page_size_bytes = max(native_page_size_bytes).
+        # 2. Hybrid (Attention + Mamba) models, where group 0 may be a Mamba
+        #    layer and all groups share the TPU unified block pool.
+        is_pure_attention_hma = all(
+            isinstance(g.kv_cache_spec, AttentionSpec) for g in groups
+        )
+        if not is_pure_attention_hma:
+            from vllm_torchtpu.platforms.tpu_block_size_utils import (
+                unified_kv_layout_enabled,
+            )
+
+            assert unified_kv_layout_enabled(vllm_config), (
+                "TPURaidenOffloadingConnector: hybrid models require the unified block pool "
+                "(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)"
+            )
+        attn_specs = [
+            g.kv_cache_spec
+            for g in groups
+            if isinstance(g.kv_cache_spec, AttentionSpec)
+        ]
+        assert attn_specs, (
+            "TPURaidenOffloadingConnector: hybrid model has no attention KV group"
+        )
+
+        def _spec_page_rank(s: AttentionSpec) -> tuple[int, int]:
+            real_bytes = getattr(s, "real_page_size_bytes", None)
+            if not isinstance(real_bytes, int):
+                real_bytes = int(s.num_kv_heads) * int(s.head_size)
+            try:
+                import math
+
+                with set_current_vllm_config(vllm_config):
+                    k_blk = select_common_block_size(s.block_size, [attn_backend])
+                    shape = attn_backend.get_kv_cache_shape(
+                        num_blocks=1,
+                        block_size=k_blk,
+                        num_kv_heads=s.num_kv_heads,
+                        head_size=s.head_size,
+                        cache_dtype_str=s.dtype,
+                    )
+                itemsize = getattr(s.dtype, "itemsize", 2)
+                if not isinstance(itemsize, int):
+                    itemsize = 2
+                backend_bytes = (
+                    math.prod(shape[1:]) * itemsize * (s.block_size // k_blk)
+                )
+            except Exception:
+                logger.warning(
+                    "TPURaidenOffloadingConnector: backend page-size probe failed "
+                    "for spec (num_kv_heads=%s, head_size=%s, dtype=%s, "
+                    "block_size=%s); ranking by real_page_size_bytes=%s instead.",
+                    s.num_kv_heads,
+                    s.head_size,
+                    s.dtype,
+                    s.block_size,
+                    real_bytes,
+                    exc_info=True,
+                )
+                backend_bytes = real_bytes
+            return (backend_bytes, real_bytes)
+
+        spec0 = max(attn_specs, key=_spec_page_rank)
+        if is_pure_attention_hma:
+            assert all(
+                (s.block_size, s.dtype, s.page_size_bytes)
+                == (spec0.block_size, spec0.dtype, spec0.page_size_bytes)
+                for s in attn_specs
+            ), (
+                "TPURaidenOffloadingConnector: pure-attention HMA groups disagree "
+                "on block_size, dtype, or shared page_size_bytes"
+            )
+        else:
+            assert all(
+                (s.block_size, s.num_kv_heads, s.head_size, s.dtype, s.page_size_bytes)
+                == (
+                    spec0.block_size,
+                    spec0.num_kv_heads,
+                    spec0.head_size,
+                    spec0.dtype,
+                    spec0.page_size_bytes,
+                )
+                for s in attn_specs
+            ), "TPURaidenOffloadingConnector: attention groups disagree on geometry"
+        # Ensure all groups share the unified/shared pool's padded page size.
+        assert all(
+            g.kv_cache_spec.page_size_bytes == spec0.page_size_bytes for g in groups
+        ), (
+            "TPURaidenOffloadingConnector: unified pool groups must share one "
+            "padded page size"
+        )
+
     # Both calls resolve the KV cache layout, which falls through to the KV
     # connector and so needs a current config.
+    from vllm_torchtpu.platforms.tpu_block_size_utils import (
+        unified_kv_layout_enabled,
+    )
+
     with set_current_vllm_config(vllm_config):
-        kernel_block_size = select_common_block_size(spec0.block_size, [attn_backend])
+        if (
+            len(groups) > 1
+            and is_pure_attention_hma
+            and not unified_kv_layout_enabled(vllm_config)
+        ):
+            # Non-unified pure-attention HMA allocation (materialize_shared_attention_cache)
+            # allocates TPU base storage buffers with leading dimension num_blocks and
+            # page size spec0.block_size. Raiden's UnpackTorchTensor requires
+            # tensor.size(0) == base_ref.dimensions()[0].
+            kernel_block_size = spec0.block_size
+        else:
+            kernel_block_size = select_common_block_size(
+                spec0.block_size, [attn_backend]
+            )
         full_5d_shape = attn_backend.get_kv_cache_shape(
             num_blocks=1,
             block_size=kernel_block_size,
