@@ -1577,14 +1577,14 @@ def get_default_block_sizes(
         case 7:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_sz = min(1024, max_kv)
                 bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_csz = min(512, bkv_sz)
             else:
-                bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_sz = min(2048, max_kv)
-                bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
-                bkv_csz = min(512, align_to(max_kv // 2, page_size))
+                bq_sz = max(1, min(1024 // num_q_heads_per_kv_head, max_q // 2))
+                bkv_sz = min(1024, max_kv)
+                bq_csz = max(1, min(128 // num_q_heads_per_kv_head, max_q // 2))
+                bkv_csz = min(256, align_to(max_kv // 2, page_size))
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
