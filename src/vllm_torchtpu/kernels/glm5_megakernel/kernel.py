@@ -1139,8 +1139,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         out_specs=out_specs,
         scratch_shapes=[scratch[k] for k in s_names],
         compiler_params=pltpu.CompilerParams(
-            collective_id=0 if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024,
-            has_side_effects=True),
+            # No has_side_effects: every output is consumed, and a side-effecting custom call
+            # without a sharding is rejected by XLA's SPMD partitioner on the torch_tpu path.
+            collective_id=0 if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024),
         interpret=pltpu.InterpretParams() if interpret else False,
     )
 
