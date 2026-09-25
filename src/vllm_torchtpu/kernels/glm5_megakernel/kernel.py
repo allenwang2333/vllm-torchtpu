@@ -114,6 +114,9 @@ class Tiles:
     rings: tuple = ((("o_proj", "sw2", "ew2", "w2"), 8), (("idx_wq", "sw13", "ew13"), 6))
     # Per-phase jax.named_scope markers -> tpu.trace_start/stop (level 10) for an xprof capture.
     trace: bool = False
+    # Indexer-scan page ring: scan_depth - 1 pages (256 KiB each) in flight. 2 -> 8 takes the 256k
+    # page stream from 130 us to 37 us, under the 68 us page-body compute (j-f17f2938).
+    scan_depth: int = 8
 
     def nbuf(self, kind):
         return self.depth if kind in self.deep else 2
@@ -291,7 +294,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "kv_sem": pltpu.SemaphoreType.DMA((2,)),
         "ih": pltpu.VMEM((M, cfg.IDIM), F32),
         "rec": pltpu.VMEM((M, 256), U8), "igrp": pltpu.VMEM((1, 4, 256), U8),
-        "ipage": pltpu.VMEM((2, pg // 4, 4, 256), U8), "ip_sem": pltpu.SemaphoreType.DMA((2,)),
+        "ipage": pltpu.VMEM((tiles.scan_depth, pg // 4, 4, 256), U8),
+        "ip_sem": pltpu.SemaphoreType.DMA((tiles.scan_depth,)),
         "scores": pltpu.VMEM((ROWS, 128), F32),
         "keys": pltpu.VMEM((ROWS, 128), I32),
         "words_v": pltpu.VMEM((2, 4, ROWS), I32),
@@ -763,17 +767,19 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             return pltpu.make_async_copy(ref.at[bt[p]], scr["ipage"].at[sl_],
                                                          scr["ip_sem"].at[sl_])
 
-                        @pl.when(npages > 0)
-                        def _():
-                            pcopy(0, 0).start()
+                        SD = tiles.scan_depth
+                        for q in range(SD - 1):
+                            @pl.when(q < npages)
+                            def _():
+                                pcopy(q, q).start()
 
                         def pbody(p, c):
-                            sl_ = p % 2
-                            pcopy(0, sl_).wait()
+                            sl_ = p % SD
 
-                            @pl.when(p + 1 < npages)
+                            @pl.when(p + SD - 1 < npages)     # refills the slot freed last page
                             def _():
-                                pcopy(p + 1, 1 - sl_).start()
+                                pcopy(p + SD - 1, (p + SD - 1) % SD).start()
+                            pcopy(0, sl_).wait()
 
                             @pl.when(jnp.logical_and(active, p == pos >> lg_pg))
                             def _():
@@ -809,21 +815,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         t = jnp.maximum(scr["idx_s"][i >> 7, i & 127], 0)
                         page = bt[t >> lg_pg]
                         sl = t & (pg - 1)
-                        cur = jnp.logical_and(active, t == pos)   # this step's row: not in HBM yet
-
-                        @pl.when(cur)
-                        def _():
-                            pltpu.make_async_copy(scr["wrow"].at[pl.ds(0, 1)],
-                                                  scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
-                            pltpu.make_async_copy(scr["rrow"].at[pl.ds(0, 1)],
-                                                  scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
-
-                        @pl.when(jnp.logical_not(cur))
-                        def _():
-                            pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
-                                                  scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
-                            pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
-                                                  scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
+                        pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
+                                              scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
+                        pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
+                                              scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
                         return c
                     lax.fori_loop(0, KT, gbody, 0)
                 return f
@@ -831,6 +826,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 bswitch(l, {ll: gather(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
                 pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
                 pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
+                # This step's row is not in HBM yet (caches are read-only here). top-k emits
+                # ascending token ids and fills min(seq_len, KT) slots, and pos is the largest
+                # valid token: if selected it is the last filled slot. Patch it from VMEM.
+                il = jnp.maximum(jnp.minimum(seq_len, KT) - 1, 0)
+
+                @pl.when(jnp.logical_and(active, scr["idx_s"][il >> 7, il & 127] == pos))
+                def _():
+                    scr["g_nope"][pl.ds(il, 1), :] = scr["wrow"][0:1, :]
+                    scr["g_rope"][pl.ds(il, 1), :] = scr["rrow"][0:1, :]
 
             ph.mark("L_attn_s")
             # sparse MLA attention (served formula, two pass)
