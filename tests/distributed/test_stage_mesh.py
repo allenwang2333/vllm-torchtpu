@@ -146,3 +146,23 @@ def test_tagged_callable_needs_a_torch_tpu_that_takes_the_tag():
         sharded_jax_op.make_jax_callable(Old,
                                          collective_devices=[2, 3],
                                          name="a")
+
+
+def test_stage_mesh_1d_under_4059_mesh_device_assignment(monkeypatch):
+    monkeypatch.setattr(mesh_utils, "_STAGE_TABLE", TABLE)
+    monkeypatch.setattr(mesh_utils, "_uses_mesh_device_assignment",
+                        lambda: True)
+    monkeypatch.setattr(sharded_jax_op, "_uses_mesh_device_assignment",
+                        lambda: True)
+    devices = [SimpleNamespace(id=i) for i in range(8)]
+    monkeypatch.setattr(jax, "devices", Mock(return_value=devices))
+    mesh = Mock(side_effect=lambda *args, **kwargs: SimpleNamespace(axis_names=
+                                                                    ("pcp", )))
+    monkeypatch.setattr(jax.sharding, "Mesh", mesh)
+
+    first = mesh_utils.get_or_create_cp_mesh("pcp", group=None)
+    dev_ids = [d.id for d in mesh.call_args.args[0]]
+    # Stage 3 has world ranks (6, 7) -> physical PJRT device_ids (2, 3).
+    assert dev_ids == [2, 3]
+    assert mesh.call_args.kwargs == {"axis_names": ("pcp", )}
+    assert mesh_utils.get_or_create_stage_mesh("pcp") is first

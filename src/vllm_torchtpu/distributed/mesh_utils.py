@@ -228,18 +228,37 @@ def stage_collective_devices() -> list[int] | None:
     return list(table.rows()[table.stage])
 
 
+def _uses_mesh_device_assignment() -> bool:
+    """True when torch_tpu derives a custom kernel's XLA DeviceAssignment from
+    ``mesh.devices.flat`` (#4059) rather than ``JaxCallable(collective_devices=...)``
+    (#3931)."""
+    import inspect
+    try:
+        from torch_tpu._internal.pallas import pallas as pallas_impl
+        if "collective_devices" in inspect.signature(
+                pallas_impl.JaxCallable.__init__).parameters:
+            return False
+        return "process_group" in inspect.signature(
+            pallas_impl.get_pallas_mesh).parameters
+    except Exception:
+        return False
+
+
 def get_or_create_stage_mesh(axis_name: str) -> Any:
-    """A (stage, group) JAX mesh over the whole slice, row s being stage s's
-    ranks in group order. Kernels partition over ``axis_name`` only; the
-    stage axis exists so that a program tagged with one stage's devices is
-    compiled for that stage (see the module docstring)."""
+    """Build the JAX mesh for a pipeline stage's context-parallel or EP group.
+
+    - Under ``torch_tpu#3931`` (``JaxCallable(collective_devices=...)``), returns
+      a 2D ``(stage, axis_name)`` mesh over the whole slice in world-rank order;
+      C++ ``RewriteCollectivesForDeviceGroup`` projects ``mhlo.sharding`` onto
+      this stage's ``collective_devices``.
+    - Under ``torch_tpu#4059`` (``device_assignment`` derived from
+      ``mesh.devices.flat``), returns a 1D ``(axis_name,)`` mesh over this
+      stage's ``K`` physical PJRT device IDs (``table.stage_device_ids``),
+      matching ``ProcessGroupTpu::device_assignment()`` for the stage's group.
+    """
     table = get_stage_device_table()
     assert table is not None
     rows = table.rows()
-    cache_key = (axis_name, tuple(d for row in rows for d in row))
-    cached = _MESH_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
     width = len(rows[0])
     expected = tuple(
         tuple(range(s * width, (s + 1) * width)) for s in range(len(rows)))
@@ -249,6 +268,14 @@ def get_or_create_stage_mesh(axis_name: str) -> Any:
             f"group order, got rows {rows} instead of {expected}; the "
             "model-parallel groups were not built by stage_group_ranks")
 
+    use_1d_stage_mesh = _uses_mesh_device_assignment()
+    stage_dev_ids = table.stage_device_ids(table.stage)
+    cache_key = ((axis_name, "1d", stage_dev_ids) if use_1d_stage_mesh else
+                 (axis_name, tuple(d for row in rows for d in row)))
+    cached = _MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     import jax
     import numpy as np
     from jax.sharding import Mesh
@@ -257,18 +284,41 @@ def get_or_create_stage_mesh(axis_name: str) -> Any:
         int(getattr(device, "id", idx)): device
         for idx, device in enumerate(jax.devices())
     }
-    missing = [d for row in rows for d in row if d not in devices_by_id]
-    if missing:
-        raise RuntimeError(
-            f"Cannot build the '{axis_name}' stage mesh because JAX does not "
-            f"expose a device per rank of the slice: missing={missing}, "
-            f"rows={rows}, jax_device_ids={sorted(devices_by_id)}")
-    mesh = Mesh(
-        np.asarray([[devices_by_id[d] for d in row] for row in rows]),
-        axis_names=(STAGE_AXIS_NAME, axis_name),
-    )
-    logger.info("Stage mesh | axis=%s | this stage %d column %d | rows=%s",
-                axis_name, table.stage, table.column, rows)
+    if use_1d_stage_mesh:
+        missing = [d for d in stage_dev_ids if d not in devices_by_id]
+        if missing:
+            try:
+                from torch_tpu._internal.pallas._mock_device import \
+                    _PallasDevice
+                for d in missing:
+                    devices_by_id[d] = _PallasDevice(id=int(d),
+                                                     process_index=int(d))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Cannot build the '{axis_name}' 1D stage mesh because JAX "
+                    f"does not expose stage device ids: missing={missing}, "
+                    f"stage_dev_ids={stage_dev_ids}, "
+                    f"jax_device_ids={sorted(devices_by_id)}") from exc
+        mesh = Mesh(
+            np.asarray([devices_by_id[d] for d in stage_dev_ids]),
+            axis_names=(axis_name, ),
+        )
+        logger.info(
+            "Stage 1D mesh (#4059) | axis=%s | stage %d column %d | device_ids=%s",
+            axis_name, table.stage, table.column, stage_dev_ids)
+    else:
+        missing = [d for row in rows for d in row if d not in devices_by_id]
+        if missing:
+            raise RuntimeError(
+                f"Cannot build the '{axis_name}' stage mesh because JAX does not "
+                f"expose a device per rank of the slice: missing={missing}, "
+                f"rows={rows}, jax_device_ids={sorted(devices_by_id)}")
+        mesh = Mesh(
+            np.asarray([[devices_by_id[d] for d in row] for row in rows]),
+            axis_names=(STAGE_AXIS_NAME, axis_name),
+        )
+        logger.info("Stage mesh | axis=%s | this stage %d column %d | rows=%s",
+                    axis_name, table.stage, table.column, rows)
     _MESH_CACHE[cache_key] = mesh
     return mesh
 
