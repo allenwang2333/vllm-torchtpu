@@ -109,6 +109,33 @@ def _log_active_chunk_pipeline() -> None:
     )
 
 
+def _gather_routing_meta(
+    collective_group,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Pack bf16 topk_weights and int32 topk_ids into a single int32 AllGather."""
+    if not envs.TPU_MOE_LOCAL_ROUTING or topk_weights is None or topk_ids is None:
+        ag_tw = (
+            collective_group.all_gather(topk_weights, dim=0)
+            if topk_weights is not None
+            else None
+        )
+        ag_ti = (
+            collective_group.all_gather(topk_ids, dim=0)
+            if topk_ids is not None
+            else None
+        )
+        return ag_tw, ag_ti
+    k = topk_weights.shape[-1]
+    tw_i32 = topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    meta_local = torch.cat([tw_i32, topk_ids.to(torch.int32)], dim=-1)
+    ag_meta = collective_group.all_gather(meta_local, dim=0)
+    ag_tw = ag_meta[:, :k].to(torch.int16).view(torch.bfloat16).to(topk_weights.dtype)
+    ag_ti = ag_meta[:, k : 2 * k]
+    return ag_tw, ag_ti
+
+
 def pipelined_fused_moe_gmm(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -173,15 +200,8 @@ def pipelined_fused_moe_gmm(
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
+            ag_topk_weights, ag_topk_ids = _gather_routing_meta(
+                collective_group, topk_weights, topk_ids
             )
         else:
             ag_hidden_states = hidden_states
@@ -235,15 +255,8 @@ def pipelined_fused_moe_gmm(
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
+    ag_tw_curr, ag_ti_curr = _gather_routing_meta(
+        collective_group, weights_slices[0], ids_slices[0]
     )
 
     rs_outputs = []
@@ -252,15 +265,8 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            ag_tw_next = (
-                collective_group.all_gather(weights_slices[i + 1], dim=0)
-                if weights_slices[i + 1] is not None
-                else None
-            )
-            ag_ti_next = (
-                collective_group.all_gather(ids_slices[i + 1], dim=0)
-                if ids_slices[i + 1] is not None
-                else None
+            ag_tw_next, ag_ti_next = _gather_routing_meta(
+                collective_group, weights_slices[i + 1], ids_slices[i + 1]
             )
 
         # Compute MoE kernel for current gathered chunk

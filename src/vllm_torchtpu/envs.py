@@ -814,6 +814,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # Compute MoE top-k routing on the rank-local [S, H] hidden_states slice
+    # before the DP AllGather and pack [topk_weights, topk_ids] into a single
+    # int32 AllGather.
+    "TPU_MOE_LOCAL_ROUTING": env_bool("TPU_MOE_LOCAL_ROUTING", default=False),
 }
 
 

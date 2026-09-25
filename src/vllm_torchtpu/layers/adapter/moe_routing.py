@@ -149,6 +149,8 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
+    if isinstance(router_logits, tuple):
+        return router_logits
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:

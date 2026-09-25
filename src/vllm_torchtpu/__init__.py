@@ -363,6 +363,30 @@ def _patch_moe_explicit_pcp_collectives() -> None:
                 # upstream's generic DP/EP dispatch is a no-op.  The only work
                 # being bypassed here is its explicit PCP all-gather pair.
                 return hidden_states, router_logits
+            if (
+                envs.TPU_MOE_LOCAL_ROUTING
+                and self.do_naive_dispatch_combine
+                and self.routed_experts.quant_method.is_monolithic
+                and not self.moe_config.is_sequence_parallel
+                and self.moe_config.pcp_size <= 1
+                and self.moe_config.dp_size > 1
+            ):
+                from vllm.distributed import get_dp_group
+
+                from vllm_torchtpu.layers.adapter import moe_routing
+                from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+                    _gather_routing_meta,
+                )
+
+                dp = get_dp_group()
+                ag_hs = dp.all_gather(hidden_states, dim=0)
+                topk_weights, topk_ids = moe_routing.route(
+                    self.routed_experts,
+                    hidden_states,
+                    router_logits,
+                )
+                ag_tw, ag_ti = _gather_routing_meta(dp, topk_weights, topk_ids)
+                return ag_hs, (ag_tw, ag_ti)
             return upstream_dispatch(self, hidden_states, router_logits)
 
         def maybe_combine(self, shared_output, hidden_states):
