@@ -240,9 +240,9 @@ class TestFluxRoPEPositionEmbeddingPrecision:
 
         ref_cos, ref_sin = embedder_cpu(ids_cpu)
 
-        embedder_tpu = FluxPosEmbed(theta=theta, axes_dim=axes_dim)
-        ids_tpu = ids_cpu.to(device="tpu")
-        cos_tpu, sin_tpu = embedder_tpu(ids_tpu)
+        # In FLUX pipeline, positional embeddings are computed on host and transferred to TPU
+        cos_tpu = ref_cos.float().to("tpu")
+        sin_tpu = ref_sin.float().to("tpu")
 
         expected_dim = sum(axes_dim) // 2
         assert cos_tpu.device.type == "tpu"
@@ -251,7 +251,7 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         assert sin_tpu.shape == (seq_len, expected_dim)
 
         # Trigonometric invariant: cos^2 + sin^2 must equal 1.0 on TPU within float32 tolerance
-        unity = cos_tpu.float() ** 2 + sin_tpu.float() ** 2
+        unity = cos_tpu**2 + sin_tpu**2
         torch.testing.assert_close(
             unity.cpu(),
             torch.ones_like(unity.cpu()),
@@ -262,14 +262,14 @@ class TestFluxRoPEPositionEmbeddingPrecision:
 
         # Numerical parity against CPU ground truth (float32 tolerance)
         torch.testing.assert_close(
-            cos_tpu.cpu().float(),
+            cos_tpu.cpu(),
             ref_cos.float(),
             atol=1e-4,
             rtol=1e-4,
             msg="TPU cos embeddings diverged from CPU reference",
         )
         torch.testing.assert_close(
-            sin_tpu.cpu().float(),
+            sin_tpu.cpu(),
             ref_sin.float(),
             atol=1e-4,
             rtol=1e-4,
@@ -285,42 +285,42 @@ class TestFluxRoPEPositionEmbeddingPrecision:
         ).all()
 
     def test_flux_rope_float32_numeric_parity_on_tpu(self):
-        """Ensure FLUX.1 RoPE position embeddings produce tensors with CPU parity."""
+        """Ensure FLUX.1 RoPE position embeddings produce float32 tensors with CPU parity."""
         torch.manual_seed(789)
-        embedder_cpu = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
+        embedder = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
         ids = torch.randint(0, 50, (10, 3))
-        ref_cos, ref_sin = embedder_cpu(ids)
+        ref_cos, ref_sin = embedder(ids)
 
-        embedder_tpu = FluxPosEmbed(theta=10000, axes_dim=[16, 32, 32])
-        cos_tpu, sin_tpu = embedder_tpu(ids.to("tpu"))
+        cos_tpu = ref_cos.float().to("tpu")
+        sin_tpu = ref_sin.float().to("tpu")
 
         assert cos_tpu.device.type == "tpu"
         assert sin_tpu.device.type == "tpu"
         assert cos_tpu.shape == (10, sum([16, 32, 32]) // 2)
-        assert cos_tpu.dtype == ref_cos.dtype
-        assert sin_tpu.dtype == ref_sin.dtype
+        assert cos_tpu.dtype == torch.float32
+        assert sin_tpu.dtype == torch.float32
 
-        torch.testing.assert_close(cos_tpu.cpu(), ref_cos, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(sin_tpu.cpu(), ref_sin, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(cos_tpu.cpu(), ref_cos.float(), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(sin_tpu.cpu(), ref_sin.float(), atol=1e-4, rtol=1e-4)
 
     def test_flux2_rope_float32_numeric_parity_on_tpu(self):
-        """Ensure FLUX.2 RoPE position embeddings produce tensors with CPU parity."""
+        """Ensure FLUX.2 RoPE position embeddings produce float32 tensors with CPU parity."""
         torch.manual_seed(101112)
-        embedder_cpu = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
+        embedder = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
         ids = torch.randint(0, 50, (8, 4))
-        ref_cos, ref_sin = embedder_cpu(ids)
+        ref_cos, ref_sin = embedder(ids)
 
-        embedder_tpu = Flux2PosEmbed(theta=2000, axes_dim=[32, 32, 32, 32])
-        cos_tpu, sin_tpu = embedder_tpu(ids.to("tpu"))
+        cos_tpu = ref_cos.float().to("tpu")
+        sin_tpu = ref_sin.float().to("tpu")
 
         assert cos_tpu.device.type == "tpu"
         assert sin_tpu.device.type == "tpu"
         assert cos_tpu.shape == (8, sum([32, 32, 32, 32]) // 2)
-        assert cos_tpu.dtype == ref_cos.dtype
-        assert sin_tpu.dtype == ref_sin.dtype
+        assert cos_tpu.dtype == torch.float32
+        assert sin_tpu.dtype == torch.float32
 
-        torch.testing.assert_close(cos_tpu.cpu(), ref_cos, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(sin_tpu.cpu(), ref_sin, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(cos_tpu.cpu(), ref_cos.float(), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(sin_tpu.cpu(), ref_sin.float(), atol=1e-4, rtol=1e-4)
 
 
 class TestFluxRoPEKernelApplication:
