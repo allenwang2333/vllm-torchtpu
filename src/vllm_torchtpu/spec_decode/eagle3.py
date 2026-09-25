@@ -167,6 +167,8 @@ class Eagle3Proposer:
         self._loop_step_consts: dict[
             tuple[int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        # Last propose()'s bucket-padded [p, K] drafts per chunk.
+        self.last_padded_drafts: list[torch.Tensor] = []
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -951,7 +953,12 @@ class Eagle3Proposer:
         per_chunk_stacked = [
             torch.stack(toks, dim=1) for toks in draft_tokens_per_chunk
         ]
+        # Bucket-padded [p, K] per chunk, for consumers that want fixed shapes
+        # (the runner's fused async substitution assembler).
+        self.last_padded_drafts = per_chunk_stacked
         if return_device:
+            if len(chunks) == 1:
+                return per_chunk_stacked[0][: chunks[0].num_reqs]
             return torch.cat(
                 [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
             )

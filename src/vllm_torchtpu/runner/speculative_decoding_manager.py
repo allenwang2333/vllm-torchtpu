@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -191,6 +192,7 @@ class SpeculativeDecodingManager:
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        upload_draft_token_ids: bool = True,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and rejection sampling.
 
@@ -198,6 +200,9 @@ class SpeculativeDecodingManager:
       num_draft_tokens: The number of draft tokens for each request.
       cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
       padded_num_reqs: The padded number of requests.
+      upload_draft_token_ids: False when the caller re-derives
+        draft_token_ids on device (async fused fixup); the field is then
+        left None and the per-step H2D is skipped.
 
     Returns:
       A SpecDecodeMetadata object containing the necessary indices for
@@ -210,6 +215,9 @@ class SpeculativeDecodingManager:
             assert self._meta_cache_np is not None
             logits_indices, target_logits_indices, padded_logits_length = (
                 self._meta_cache_np)
+            if not upload_draft_token_ids:
+                return dataclasses.replace(self._meta_cache,
+                                           draft_token_ids=None)
             # draft_token_ids depends on this step's input_ids_cpu content —
             # always re-extracted and re-transferred.
             all_token_ids = self.runner.input_ids_cpu.numpy()
@@ -315,8 +323,9 @@ class SpeculativeDecodingManager:
         device = self.runner.device
 
         metadata = SpecDecodeMetadata(
-            draft_token_ids=torch.from_numpy(padded_draft_token_ids).to(
-                device, non_blocking=True),
+            draft_token_ids=(torch.from_numpy(padded_draft_token_ids).to(
+                device, non_blocking=True) if upload_draft_token_ids else
+                             None),
             draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
                 device, non_blocking=True),
             draft_lengths_cpu=num_draft_tokens,
