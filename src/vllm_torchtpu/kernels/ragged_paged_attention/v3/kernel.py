@@ -284,6 +284,50 @@ def get_kv_cache_shape(
 def _ragged_paged_attention_kernel(*args, **kwargs):
     distribution_ref = args[3]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
+    if (kwargs["case"] == RpaCase.DECODE and kwargs.get("sliding_window") is None
+            and kwargs.get("soft_cap") is None and kwargs.get("q_scale") is None
+            and kwargs.get("k_scale") is None and kwargs.get("v_scale") is None
+            and not envs.ENABLE_RPA_PV_FP8):
+        kv_lens_ref, page_indices_ref, _, _, sem_ids_ref = args[:5]
+        q_hbm_ref = args[7]
+        kv_cache_hbm_ref = args[9]
+        if q_hbm_ref.shape[0] == 1 and q_hbm_ref.shape[1] <= 16:
+            max_decode_tokens = q_hbm_ref.shape[1]
+            page_size = kv_cache_hbm_ref.shape[1]
+            pages_per_seq = page_indices_ref.shape[0] // kv_lens_ref.shape[0]
+            num_decode = distribution_ref[0]
+            last_seq = jnp.maximum(num_decode - 1, 0)
+            can_share = (
+                (num_decode >= 2)
+                & (num_decode <= max_decode_tokens)
+                & (kv_lens_ref[0] > 3 * page_size)
+                & (kv_lens_ref[last_seq] > 3 * page_size)
+                & (page_indices_ref[2] == page_indices_ref[last_seq * pages_per_seq + 2])
+            )
+
+            @pl.when(can_share)
+            def _init_shared_pages_smem():
+                sem_ids_ref[3] = (kv_lens_ref[0] - 1) // page_size
+
+                @pl.loop(1, num_decode)
+                def _min_kv_loop(s):
+                    sem_ids_ref[3] = jnp.minimum(sem_ids_ref[3], (kv_lens_ref[s] - 1) // page_size)
+
+                max_p = sem_ids_ref[3]
+
+                @pl.loop(0, max_p)
+                def _check_p_loop(p):
+                    p0 = page_indices_ref[p]
+
+                    @pl.loop(1, num_decode)
+                    def _check_s_loop(s):
+                        sem_ids_ref[3] = jnp.where(
+                            page_indices_ref[s * pages_per_seq + p] == p0,
+                            sem_ids_ref[3],
+                            jnp.minimum(sem_ids_ref[3], p),
+                        )
+
+                sem_ids_ref[3] = jnp.where(sem_ids_ref[3] >= 3, sem_ids_ref[3], 0)
 
     @pl.loop(start_seq_idx, end_seq_idx)
     def _(seq_idx):
@@ -321,6 +365,10 @@ def _ragged_paged_attention_kernel_loop(
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
+    bq_all_ref=None,
+    l_all_ref=None,
+    m_all_ref=None,
+    acc_all_ref=None,
     *,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -338,12 +386,13 @@ def _ragged_paged_attention_kernel_loop(
     bq_csz,  # bq compute size
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
+    q_already_scaled: bool = False,
     debug_mode: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
 
-    if bq_x2_ref.shape[0] == 1 and bq_sz > 2304:
+    if bq_x2_ref.shape[0] == 1 and bq_sz >= 2304:
         bo_x2_ref = bq_x2_ref
 
     if case == RpaCase.DECODE:
@@ -391,6 +440,8 @@ def _ragged_paged_attention_kernel_loop(
     q_len = q_end - q_start
     kv_len = kv_lens_ref[seq_idx]
     kv_q_gap = kv_len - q_len
+    shared_pages = sem_ids_ref[3] if (case == RpaCase.DECODE and sliding_window is None and max_num_tokens <= 16) else 0
+    shared_kv_len = shared_pages * page_size
     cur_seq_start_bkv_idx = 0
     next_seq_start_bkv_idx = 0
 
@@ -443,19 +494,21 @@ def _ragged_paged_attention_kernel_loop(
         effective_kv_len,
         apply_causal_mask: bool = use_causal_mask,
         skip_block_kv_mask: bool = skip_kv_mask,
+        q_already_scaled: bool = q_already_scaled,
+        v_already_masked: bool = False,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
         assert q.shape[1] == head_dim
         actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
-        assert k.shape == (bkv_csz, head_dim)
-        assert v.shape == (bkv_csz, head_dim)
+        assert k.shape[1] == head_dim and k.shape[0] % 128 == 0
+        assert v.shape[1] == head_dim
         assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert k.dtype == v.dtype
 
         # Follow FlashAttention-2 forward pass.
-        if q_scale is not None:
+        if q_scale is not None and not q_already_scaled:
             q = q / q_scale
             if jnp.issubdtype(k.dtype, jnp.floating):
                 dtype_info = jnp.finfo(k.dtype)
@@ -465,12 +518,13 @@ def _ragged_paged_attention_kernel_loop(
             q = q.astype(k.dtype)
 
         if soft_cap is None:
-            total_scale_log2 = sm_scale * 1.4426950408889634
-            if k_scale is not None:
-                total_scale_log2 *= k_scale
-            if q_scale is not None:
-                total_scale_log2 *= q_scale
-            q = (q.astype(jnp.float32) * total_scale_log2).astype(q.dtype)
+            if not q_already_scaled:
+                total_scale_log2 = sm_scale * 1.4426950408889634
+                if k_scale is not None:
+                    total_scale_log2 *= k_scale
+                if q_scale is not None:
+                    total_scale_log2 *= q_scale
+                q = (q.astype(jnp.float32) * total_scale_log2).astype(q.dtype)
             s = jnp.matmul(q, k.T,
                            preferred_element_type=jnp.float32).astype(out_dtype)
         else:
@@ -494,6 +548,7 @@ def _ragged_paged_attention_kernel_loop(
             effective_kv_len_int = effective_kv_len.astype(int_ty)
 
             mask = None
+            k_span = None
             if apply_causal_mask:
                 assert not skip_kv_mask
                 q_span = processed_q_len_int + (lax.broadcasted_iota(
@@ -503,12 +558,14 @@ def _ragged_paged_attention_kernel_loop(
                 mask = mask_and(mask, q_span >= k_span)
 
             if not skip_block_kv_mask:
-                k_span = processed_kv_len_int + lax.broadcasted_iota(
-                    int_ty, s.shape, 1)
-                v_span = processed_kv_len_int + lax.broadcasted_iota(
-                    int_ty, v.shape, 0)
+                if k_span is None:
+                    k_span = processed_kv_len_int + lax.broadcasted_iota(
+                        int_ty, s.shape, 1)
                 mask = mask_and(mask, k_span < effective_kv_len_int)
-                v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+                if not v_already_masked and v.dtype != jnp.bfloat16:
+                    v_span = processed_kv_len_int + lax.broadcasted_iota(
+                        int_ty, v.shape, 0)
+                    v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
             if sliding_window is not None:
                 q_span = processed_q_len_int + (lax.broadcasted_iota(
@@ -549,9 +606,9 @@ def _ragged_paged_attention_kernel_loop(
     ):
         assert len(p.shape) == 2
         assert p.shape[0] % num_q_heads_per_kv_head == 0
-        assert p.shape[1] == bkv_csz
+        assert p.shape[1] == v.shape[0]
         actual_bq_csz = p.shape[0] // num_q_heads_per_kv_head
-        assert v.shape == (bkv_csz, head_dim)
+        assert v.shape[1] == head_dim
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head,
                                     128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head,
@@ -584,8 +641,8 @@ def _ragged_paged_attention_kernel_loop(
         cache_hbm_ref = kv_cache_hbm_ref.reshape(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
         kv_len = kv_lens_ref[seq_idx]
-        kv_len_start = bkv_idx * bkv_sz
-        kv_p_start = bkv_idx * bkv_p
+        kv_len_start = shared_kv_len + bkv_idx * bkv_sz
+        kv_p_start = shared_pages + bkv_idx * bkv_p
         q_start = cu_q_lens_ref[seq_idx]
         q_end = cu_q_lens_ref[seq_idx + 1]
         q_len = q_end - q_start
@@ -703,11 +760,11 @@ def _ragged_paged_attention_kernel_loop(
         sem = sems.at[3, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
-        bkv_id = offset // bkv_sz
+        bkv_id = (offset - shared_kv_len) // bkv_sz
         kv_p_start = offset // page_size
         kv_p_end = cdiv(offset + update_sz, page_size)
         ignore = offset % page_size
-        p_ignore = kv_p_start - bkv_id * bkv_p
+        p_ignore = (kv_p_start - shared_pages) - bkv_id * bkv_p
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         cache_hbm_shape = updated_kv_cache_hbm_ref.shape
@@ -942,7 +999,8 @@ def _ragged_paged_attention_kernel_loop(
         kv = strided_load(kv_ref, start + offset, sz, step)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
-        k = kv >> (kv_idx_in_load * 2 * bitwidth)
+        shift_k = kv_idx_in_load * 2 * bitwidth
+        k = kv >> shift_k if shift_k > 0 else kv
         v = k >> bitwidth
         k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
         v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
@@ -1045,7 +1103,20 @@ def _ragged_paged_attention_kernel_loop(
         def compute_with_bq(bq_idx):
             # Re-initialize l, m, acc to 0 before bkv loop.
             num_init_chunks = actual_bq_sz // actual_bq_csz
-            if num_init_chunks <= 4:
+            if case == RpaCase.DECODE and sliding_window is None and actual_num_kv_heads == 1 and max_num_tokens <= 16:
+                @pl.when(shared_pages == 0)
+                def _init_zero_decode():
+                    l_ref[...] = jnp.full_like(l_ref, 0.0)
+                    m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+                    acc_ref[...] = jnp.full_like(acc_ref, 0.0)
+                @pl.when(shared_pages > 0)
+                def _init_from_shared_decode():
+                    s_off = seq_idx * num_q_heads_per_kv_head
+                    s_sl = pl.ds(s_off, num_q_heads_per_kv_head)
+                    l_ref.at[0, pl.ds(0, num_q_heads_per_kv_head)][...] = l_all_ref.at[0, s_sl][...].astype(out_dtype)
+                    m_ref.at[0, pl.ds(0, num_q_heads_per_kv_head)][...] = m_all_ref.at[0, s_sl][...].astype(out_dtype)
+                    acc_ref.at[0, pl.ds(0, num_q_heads_per_kv_head)][...] = acc_all_ref.at[0, s_sl][...].astype(out_dtype)
+            elif num_init_chunks <= 4:
                 l_ref[...] = jnp.full_like(l_ref, 0.0)
                 m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
                 acc_ref[...] = jnp.full_like(acc_ref, 0.0)
@@ -1077,7 +1148,7 @@ def _ragged_paged_attention_kernel_loop(
                                                processed_q_len + actual_bq_sz)
             else:
                 effective_kv_len = kv_len
-            end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+            end_bkv_idx = cdiv(effective_kv_len - shared_kv_len, bkv_sz)
 
             # Prefetch next bq (when double-buffered)
             if bq_x2_ref.shape[0] > 1:
@@ -1093,7 +1164,7 @@ def _ragged_paged_attention_kernel_loop(
                 bkv_sem_idx = sem_ids_ref[1]
                 next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
                     seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
-                processed_kv_len = bkv_idx * bkv_sz
+                processed_kv_len = shared_kv_len + bkv_idx * bkv_sz
 
                 # Prefetch next bkv
                 @pl.when(next_seq_idx < end_seq_idx)
@@ -1102,10 +1173,33 @@ def _ragged_paged_attention_kernel_loop(
                     start_fetch_bkv(next_seq_idx, next_bkv_idx,
                                     next_bkv_sem_idx)
 
+                pre_scale_bq_in_vmem = (
+                    case != RpaCase.DECODE
+                    and not q_already_scaled
+                    and soft_cap is None
+                    and q_scale is None
+                )
+
                 # Wait for cur bq if not ready yet
                 @pl.when(bkv_idx == start_bkv_idx)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                    if pre_scale_bq_in_vmem:
+                        total_scale_log2 = sm_scale * 1.4426950408889634
+                        if k_scale is not None:
+                            total_scale_log2 *= k_scale
+                        q_ref_all = bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx].reshape(
+                            actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head_per_packing,
+                            head_dim,
+                        )
+                        c_rows = actual_bq_csz * num_q_heads_per_kv_head_per_packing
+                        n_chunks = (actual_num_kv_heads * actual_bq_sz) // actual_bq_csz
+                        @pl.loop(0, n_chunks, unroll=False)
+                        def _scale_bq_loop(ci):
+                            r_start = ci * c_rows
+                            q_c = strided_load(q_ref_all, r_start, c_rows, 1, dtype=q_dtype)
+                            q_c = (q_c.astype(jnp.float32) * total_scale_log2).astype(q_dtype)
+                            strided_store(q_ref_all, r_start, c_rows, 1, pltpu.bitcast(q_c, jnp.uint32))
 
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
@@ -1129,7 +1223,7 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Flash attention with cur bkv and bq
                 effective_bkv_sz = jnp.minimum(
-                    effective_kv_len - bkv_idx * bkv_sz, bkv_sz)
+                    effective_kv_len - processed_kv_len, bkv_sz)
                 effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
 
                 num_loops = cdiv(effective_bkv_sz, bkv_csz)
@@ -1152,6 +1246,18 @@ def _ragged_paged_attention_kernel_loop(
                                 if all_bkv_heads is not None else
                                 load_bkv(bkv_sem_idx, kv_head_idx, bkv_start, bkv_csz)
                             )
+                            if not step_skip_block_kv_mask:
+                                max_kv_len = pages_per_seq * page_size
+                                int_ty = jnp.int32
+                                if (get_dtype_packing(q_dtype) != 1 and get_tpu_version() >= 6
+                                        and max_kv_len <= jnp.iinfo(jnp.int16).max):
+                                    int_ty = jnp.int16
+                                v_span = (processed_kv_len + bkv_start).astype(int_ty) + lax.broadcasted_iota(
+                                    int_ty, bv_c.shape, 0)
+                                bv_c = jnp.where(v_span < effective_kv_len.astype(int_ty), bv_c, 0.0)
+                                bv_masked = True
+                            else:
+                                bv_masked = False
                             for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                                 bq_c = load_bq(
                                     bq_sem_idx,
@@ -1176,6 +1282,8 @@ def _ragged_paged_attention_kernel_loop(
                                     effective_kv_len=effective_kv_len,
                                     apply_causal_mask=step_apply_causal_mask,
                                     skip_block_kv_mask=step_skip_block_kv_mask,
+                                    q_already_scaled=(q_already_scaled or pre_scale_bq_in_vmem),
+                                    v_already_masked=bv_masked,
                                 )
                                 if prev_lm_slice is not None:
                                     flash_attention_step2_pv(
@@ -1199,8 +1307,7 @@ def _ragged_paged_attention_kernel_loop(
                         )
                     else:
                         req_gc = envs.VLLM_TPU_PREFILL_GROUP_CHUNKS
-                        max_gc = req_gc if envs.ENABLE_RPA_PV_FP8 else min(
-                            req_gc, 3)
+                        max_gc = 9 if num_bq_chunks == 9 else req_gc
                         group_chunks = 1
                         for cand in [
                                 c for c in [max_gc, 9, 8, 6, 5, 4, 3, 2, 1]
@@ -1216,7 +1323,31 @@ def _ragged_paged_attention_kernel_loop(
                                 if all_bkv_heads is not None else
                                 load_bkv(bkv_sem_idx, kv_head_idx, bkv_start, bkv_csz)
                             )
-                            @pl.loop(0, num_groups, unroll=False)
+                            if not step_skip_block_kv_mask:
+                                if False:
+                                    bv_masked = True
+                                else:
+                                    max_kv_len = pages_per_seq * page_size
+                                    int_ty = jnp.int32
+                                    if (get_dtype_packing(q_dtype) != 1 and get_tpu_version() >= 6
+                                            and max_kv_len <= jnp.iinfo(jnp.int16).max):
+                                        int_ty = jnp.int16
+                                    v_span = (processed_kv_len + bkv_start).astype(int_ty) + lax.broadcasted_iota(
+                                        int_ty, bv_c.shape, 0)
+                                    bv_c = jnp.where(v_span < effective_kv_len.astype(int_ty), bv_c, 0.0)
+                                    bv_masked = True
+                            else:
+                                bv_masked = False
+                            first_g = (
+                                jnp.clip(
+                                    (processed_kv_len + bkv_start - processed_q_len)
+                                    // (group_chunks * actual_bq_csz),
+                                    0,
+                                    num_groups,
+                                )
+                                if step_apply_causal_mask else 0
+                            )
+                            @pl.loop(first_g, num_groups, unroll=False)
                             def bq_group_loop(g_idx):
                                 g_prev_lm_slice = None
                                 g_prev_p = None
@@ -1245,6 +1376,8 @@ def _ragged_paged_attention_kernel_loop(
                                         effective_kv_len=effective_kv_len,
                                         apply_causal_mask=step_apply_causal_mask,
                                         skip_block_kv_mask=step_skip_block_kv_mask,
+                                        q_already_scaled=(q_already_scaled or pre_scale_bq_in_vmem),
+                                        v_already_masked=bv_masked,
                                     )
                                     if g_prev_lm_slice is not None:
                                         flash_attention_step2_pv(
@@ -1279,42 +1412,153 @@ def _ragged_paged_attention_kernel_loop(
                 elif not apply_causal_mask and case == RpaCase.DECODE and actual_num_kv_heads == 1 and actual_bq_sz == actual_bq_csz:
                     static_num_loops = bkv_sz // bkv_csz
                     bq_c = load_bq(bq_sem_idx, 0, 0, actual_bq_csz)
+                    if not q_already_scaled and soft_cap is None and q_scale is None:
+                        total_scale_log2 = sm_scale * 1.4426950408889634
+                        if k_scale is not None:
+                            total_scale_log2 *= k_scale
+                        bq_c = (bq_c.astype(jnp.float32) * total_scale_log2).astype(bq_c.dtype)
+                        decode_q_scaled = True
+                    else:
+                        decode_q_scaled = q_already_scaled
                     lm_slice = (0, pl.ds(0, actual_bq_csz * num_q_heads_per_kv_head))
-                    prev_p = None
-                    prev_v = None
-                    prev_exp_m_diff = None
-                    for idx in range(static_num_loops):
-                        bkv_start = idx * bkv_csz
-                        bk_c, bv_c = load_bkv(bkv_sem_idx, 0, bkv_start, bkv_csz)
-                        cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
-                            bq_c,
-                            bk_c,
-                            bv_c,
-                            l_ref.at[*lm_slice],
-                            m_ref.at[*lm_slice],
-                            processed_q_len=processed_q_len,
-                            processed_kv_len=processed_kv_len + bkv_start,
-                            effective_kv_len=effective_kv_len,
-                            apply_causal_mask=False,
-                            skip_block_kv_mask=skip_block_kv_mask,
-                        )
-                        if prev_p is not None:
-                            flash_attention_step2_pv(
-                                prev_p,
-                                prev_v,
-                                prev_exp_m_diff,
-                                acc_ref.at[*lm_slice],
+                    if soft_cap is None and q_scale is None and k_scale is None and v_scale is None and not envs.ENABLE_RPA_PV_FP8:
+                        def _run_pipelined_decode_block(n_chunks=static_num_loops, mask_last_only=False):
+                            m_val = m_ref.at[*lm_slice][...]
+                            l_val = l_ref.at[*lm_slice][...]
+                            acc_val = acc_ref.at[*lm_slice][...]
+                            prev_p = None
+                            prev_v = None
+                            prev_exp_m_diff = None
+                            for idx in range(n_chunks):
+                                bkv_start = idx * bkv_csz
+                                bk_c, bv_c = load_bkv(bkv_sem_idx, 0, bkv_start, bkv_csz)
+                                s = jnp.matmul(bq_c, bk_c.T,
+                                               preferred_element_type=jnp.float32).astype(out_dtype)
+                                if (mask_last_only and idx == n_chunks - 1) or (not mask_last_only and not skip_block_kv_mask):
+                                    max_kv_len = pages_per_seq * page_size
+                                    int_ty = jnp.int32
+                                    if (get_dtype_packing(q_dtype) != 1 and get_tpu_version() >= 6
+                                            and max_kv_len <= jnp.iinfo(jnp.int16).max):
+                                        int_ty = jnp.int16
+                                    k_span = (processed_kv_len + bkv_start).astype(int_ty) + lax.broadcasted_iota(
+                                        int_ty, s.shape, 1)
+                                    s = jnp.where(k_span < effective_kv_len.astype(int_ty), s, mask_value)
+                                    v_span = (processed_kv_len + bkv_start).astype(int_ty) + lax.broadcasted_iota(
+                                        int_ty, bv_c.shape, 0)
+                                    bv_c = jnp.where(v_span < effective_kv_len.astype(int_ty), bv_c, 0.0)
+                                s_rowmax = jnp.max(s, axis=1, keepdims=True)
+                                m_prev = m_val
+                                m_val = jnp.maximum(m_prev, s_rowmax)
+                                cur_p = jax.lax.exp2(s - broadcast_minor(m_val, s.shape))
+                                cur_exp_m_diff = jax.lax.exp2(m_prev - m_val)
+                                p_rowsum = jnp.sum(cur_p, axis=1, keepdims=True, dtype=out_dtype)
+                                l_val = cur_exp_m_diff * l_val + p_rowsum
+                                if prev_p is not None:
+                                    pv = jnp.matmul(prev_p, prev_v,
+                                                    preferred_element_type=jnp.float32).astype(out_dtype)
+                                    acc_val = broadcast_minor(prev_exp_m_diff, acc_val.shape) * acc_val + pv
+                                prev_p = cur_p
+                                prev_v = bv_c
+                                prev_exp_m_diff = cur_exp_m_diff
+                            assert prev_p is not None
+                            pv = jnp.matmul(prev_p, prev_v,
+                                            preferred_element_type=jnp.float32).astype(out_dtype)
+                            acc_val = broadcast_minor(prev_exp_m_diff, acc_val.shape) * acc_val + pv
+                            m_ref.at[*lm_slice][...] = m_val
+                            l_ref.at[*lm_slice][...] = l_val
+                            acc_ref.at[*lm_slice][...] = acc_val
+
+                        if skip_block_kv_mask or static_num_loops != 3 or max_num_tokens < 16:
+                            _run_pipelined_decode_block(static_num_loops, False)
+                        else:
+                            @pl.when(effective_bkv_sz <= bkv_csz)
+                            def _d_tail_1():
+                                _run_pipelined_decode_block(1, True)
+                            @pl.when(jnp.logical_and(effective_bkv_sz > bkv_csz, effective_bkv_sz <= 2 * bkv_csz))
+                            def _d_tail_2():
+                                _run_pipelined_decode_block(2, True)
+                            @pl.when(effective_bkv_sz > 2 * bkv_csz)
+                            def _d_tail_3():
+                                _run_pipelined_decode_block(3, True)
+                    else:
+                        prev_p = None
+                        prev_v = None
+                        prev_exp_m_diff = None
+                        for idx in range(static_num_loops):
+                            bkv_start = idx * bkv_csz
+                            bk_c, bv_c = load_bkv(bkv_sem_idx, 0, bkv_start, bkv_csz)
+                            cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                                bq_c,
+                                bk_c,
+                                bv_c,
+                                l_ref.at[*lm_slice],
+                                m_ref.at[*lm_slice],
+                                processed_q_len=processed_q_len,
+                                processed_kv_len=processed_kv_len + bkv_start,
+                                effective_kv_len=effective_kv_len,
+                                apply_causal_mask=False,
+                                skip_block_kv_mask=skip_block_kv_mask,
+                                q_already_scaled=decode_q_scaled,
+                                v_already_masked=(bv_c.dtype == jnp.bfloat16),
                             )
-                        prev_p = cur_p
-                        prev_v = cur_v
-                        prev_exp_m_diff = cur_exp_m_diff
-                    assert prev_p is not None
-                    flash_attention_step2_pv(
-                        prev_p,
-                        prev_v,
-                        prev_exp_m_diff,
-                        acc_ref.at[*lm_slice],
-                    )
+                            if prev_p is not None:
+                                flash_attention_step2_pv(
+                                    prev_p,
+                                    prev_v,
+                                    prev_exp_m_diff,
+                                    acc_ref.at[*lm_slice],
+                                )
+                            prev_p = cur_p
+                            prev_v = cur_v
+                            prev_exp_m_diff = cur_exp_m_diff
+                        assert prev_p is not None
+                        flash_attention_step2_pv(
+                            prev_p,
+                            prev_v,
+                            prev_exp_m_diff,
+                            acc_ref.at[*lm_slice],
+                        )
+                elif skip_block_kv_mask and actual_num_kv_heads == 1 and soft_cap is None and q_scale is None and k_scale is None and v_scale is None and not envs.ENABLE_RPA_PV_FP8:
+                    static_num_loops = bkv_sz // bkv_csz
+                    num_bq_chunks = actual_bq_sz // actual_bq_csz
+                    total_scale_log2 = sm_scale * 1.4426950408889634
+
+                    @pl.loop(0, num_bq_chunks, unroll=False)
+                    def bq_outer_loop(c_idx):
+                        bq_start = c_idx * actual_bq_csz
+                        bq_c = load_bq(bq_sem_idx, 0, bq_start, actual_bq_csz)
+                        if not (q_already_scaled or pre_scale_bq_in_vmem):
+                            bq_c = (bq_c.astype(jnp.float32) * total_scale_log2).astype(bq_c.dtype)
+                        lm_slice = (0, pl.ds(bq_start * num_q_heads_per_kv_head, actual_bq_csz * num_q_heads_per_kv_head))
+                        m_val = m_ref.at[*lm_slice][...]
+                        l_val = l_ref.at[*lm_slice][...]
+                        acc_val = acc_ref.at[*lm_slice][...]
+                        prev_p = None
+                        prev_v = None
+                        prev_exp_m_diff = None
+                        for idx in range(static_num_loops):
+                            bkv_start = idx * bkv_csz
+                            bk_c, bv_c = load_bkv(bkv_sem_idx, 0, bkv_start, bkv_csz)
+                            s = jnp.matmul(bq_c, bk_c.T, preferred_element_type=jnp.float32).astype(out_dtype)
+                            s_rowmax = jnp.max(s, axis=1, keepdims=True)
+                            m_prev = m_val
+                            m_val = jnp.maximum(m_prev, s_rowmax)
+                            cur_p = jax.lax.exp2(s - broadcast_minor(m_val, s.shape))
+                            cur_exp_m_diff = jax.lax.exp2(m_prev - m_val)
+                            p_rowsum = jnp.sum(cur_p, axis=1, keepdims=True, dtype=out_dtype)
+                            l_val = cur_exp_m_diff * l_val + p_rowsum
+                            if prev_p is not None:
+                                pv = jnp.matmul(prev_p, prev_v, preferred_element_type=jnp.float32).astype(out_dtype)
+                                acc_val = broadcast_minor(prev_exp_m_diff, acc_val.shape) * acc_val + pv
+                            prev_p = cur_p
+                            prev_v = bv_c
+                            prev_exp_m_diff = cur_exp_m_diff
+                        assert prev_p is not None
+                        pv = jnp.matmul(prev_p, prev_v, preferred_element_type=jnp.float32).astype(out_dtype)
+                        acc_val = broadcast_minor(prev_exp_m_diff, acc_val.shape) * acc_val + pv
+                        m_ref.at[*lm_slice][...] = m_val
+                        l_ref.at[*lm_slice][...] = l_val
+                        acc_ref.at[*lm_slice][...] = acc_val
                 elif skip_block_kv_mask:
                     static_num_loops = bkv_sz // bkv_csz
                     if static_num_loops == 1:
@@ -1331,7 +1575,7 @@ def _ragged_paged_attention_kernel_loop(
             if use_causal_mask:
                 bkv_idx_of_first_mask = processed_q_len // bkv_sz
             else:
-                bkv_idx_of_first_mask = effective_kv_len // bkv_sz
+                bkv_idx_of_first_mask = (effective_kv_len - shared_kv_len) // bkv_sz
             unmasked_end_bkv_idx = jnp.maximum(start_bkv_idx, bkv_idx_of_first_mask)
             unmasked_end_bkv_idx = jnp.minimum(unmasked_end_bkv_idx, end_bkv_idx)
 
@@ -1344,7 +1588,7 @@ def _ragged_paged_attention_kernel_loop(
                 _run_bkv_body(bkv_idx, apply_causal_mask=use_causal_mask, skip_block_kv_mask=skip_kv_mask)
 
             # Prefetch next bq (when single-buffered with separate bo buffer, overlap with store_out_loop)
-            if bq_x2_ref.shape[0] == 1 and bq_sz <= 2304:
+            if bq_x2_ref.shape[0] == 1 and bq_sz < 2304:
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bq_single():
                     sem_ids_ref[0] = next_bq_sem_idx
@@ -1391,8 +1635,8 @@ def _ragged_paged_attention_kernel_loop(
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
-            # When single-buffered with shared bq/bo buffer (bq_sz > 2304), wait for send_bo first
-            if bq_x2_ref.shape[0] == 1 and bq_sz > 2304:
+            # When single-buffered with shared bq/bo buffer (bq_sz >= 2304), wait for send_bo first
+            if bq_x2_ref.shape[0] == 1 and bq_sz >= 2304:
                 wait_send_bo(bo_sem_idx)
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bq_single_shared():
@@ -1403,10 +1647,159 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
-        start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        start_fetch_bkv(seq_idx=start_seq_idx,
-                        bkv_idx=cur_seq_start_bkv_idx,
-                        bkv_sem_idx=0)
+        if (case == RpaCase.DECODE and sliding_window is None and actual_num_kv_heads == 1
+                and max_num_tokens <= 16 and soft_cap is None and q_scale is None
+                and k_scale is None and v_scale is None and not envs.ENABLE_RPA_PV_FP8):
+            @pl.when(shared_pages == 0)
+            def _prologue_no_shared():
+                start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+                start_fetch_bkv(seq_idx=start_seq_idx, bkv_idx=0, bkv_sem_idx=0)
+
+            @pl.when(shared_pages > 0)
+            def _prologue_shared():
+                max_decode_tokens = max_num_tokens
+                cache_hbm_shape = updated_kv_cache_hbm_ref.shape
+                cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
+                    cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
+
+                def _fetch_shared_block(blk_idx, sem_idx, num_p, *, wait=False):
+                    sem = sems.at[0, sem_idx]
+                    vmem_ref = bkv_x2_ref.at[sem_idx, :, :num_kv_heads_x2_per_kv_packing]
+                    base_p = blk_idx * bkv_p
+                    if not wait:
+                        @pl.when(num_p == bkv_p)
+                        def _full():
+                            for i in range(bkv_p):
+                                _async_copy(
+                                    cache_hbm_ref.at[pl.ds(page_indices_ref[base_p + i] * page_size, page_size)],
+                                    vmem_ref.at[pl.ds(i * page_size, page_size)],
+                                    sem,
+                                    wait=False,
+                                )
+                        @pl.when(num_p < bkv_p)
+                        def _part():
+                            for i in range(bkv_p):
+                                @pl.when(i < num_p)
+                                def _cp():
+                                    _async_copy(
+                                        cache_hbm_ref.at[pl.ds(page_indices_ref[base_p + i] * page_size, page_size)],
+                                        vmem_ref.at[pl.ds(i * page_size, page_size)],
+                                        sem,
+                                        wait=False,
+                                    )
+                    else:
+                        dst = vmem_ref.at[pl.ds(0, num_p * page_size)]
+                        _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+
+                total_shared_blks = cdiv(shared_pages, bkv_p)
+                first_num_p = jnp.minimum(shared_pages, bkv_p)
+                _fetch_shared_block(0, 0, first_num_p, wait=False)
+
+                q_all_sem = sems.at[1, 1]
+                _async_copy(
+                    q_hbm_ref.at[:, pl.ds(0, max_decode_tokens)],
+                    bq_all_ref.at[0, :, pl.ds(0, max_decode_tokens)],
+                    q_all_sem,
+                    wait=False,
+                )
+                _async_copy(
+                    q_hbm_ref.at[:, pl.ds(0, max_decode_tokens)],
+                    bq_all_ref.at[0, :, pl.ds(0, max_decode_tokens)],
+                    q_all_sem,
+                    wait=True,
+                )
+                q_all_u32 = bq_all_ref.bitcast(jnp.uint32).at[0, 0].reshape(
+                    max_decode_tokens * num_q_heads_per_kv_head_per_packing, head_dim
+                )
+                bq_all = strided_load(
+                    q_all_u32, 0, max_decode_tokens * num_q_heads_per_kv_head_per_packing, 1, dtype=q_dtype
+                )
+                total_scale_log2 = sm_scale * 1.4426950408889634
+                bq_all = (bq_all.astype(jnp.float32) * total_scale_log2).astype(bq_all.dtype)
+                l_all_ref[...] = jnp.full_like(l_all_ref, 0.0)
+                m_all_ref[...] = jnp.full_like(m_all_ref, -jnp.inf)
+                acc_all_ref[...] = jnp.full_like(acc_all_ref, 0.0)
+                static_num_loops = bkv_sz // bkv_csz
+
+                @pl.loop(0, total_shared_blks, unroll=False)
+                def _shared_bkv_loop(sb_idx):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    cur_num_p = jnp.minimum(shared_pages - sb_idx * bkv_p, bkv_p)
+                    is_last_sb = (sb_idx + 1 == total_shared_blks)
+                    @pl.when(jnp.logical_not(is_last_sb))
+                    def _prefetch_next_sb():
+                        next_num_p = jnp.minimum(shared_pages - (sb_idx + 1) * bkv_p, bkv_p)
+                        _fetch_shared_block(sb_idx + 1, next_bkv_sem_idx, next_num_p, wait=False)
+                    @pl.when(is_last_sb)
+                    def _prefetch_phase2_first():
+                        # Phase 2 starts at bkv_idx=0 (which is offset by shared_pages!)
+                        start_fetch_bkv(seq_idx=0, bkv_idx=0, bkv_sem_idx=next_bkv_sem_idx)
+
+                    _fetch_shared_block(sb_idx, bkv_sem_idx, cur_num_p, wait=True)
+
+                    @pl.when(cur_num_p == bkv_p)
+                    def _compute_full_sb():
+                        m_val = m_all_ref.at[0][...].astype(out_dtype)
+                        l_val = l_all_ref.at[0][...].astype(out_dtype)
+                        acc_val = acc_all_ref.at[0][...].astype(out_dtype)
+                        prev_p = None
+                        prev_v = None
+                        prev_exp_m_diff = None
+                        for idx in range(static_num_loops):
+                            bkv_start = idx * bkv_csz
+                            bk_c, bv_c = load_bkv(bkv_sem_idx, 0, bkv_start, bkv_csz)
+                            s = jnp.matmul(bq_all, bk_c.T, preferred_element_type=jnp.float32).astype(out_dtype)
+                            s_rowmax = jnp.max(s, axis=1, keepdims=True)
+                            m_prev = m_val
+                            m_val = jnp.maximum(m_prev, s_rowmax)
+                            cur_p = jax.lax.exp2(s - broadcast_minor(m_val, s.shape))
+                            cur_exp_m_diff = jax.lax.exp2(m_prev - m_val)
+                            p_rowsum = jnp.sum(cur_p, axis=1, keepdims=True, dtype=out_dtype)
+                            l_val = cur_exp_m_diff * l_val + p_rowsum
+                            if prev_p is not None:
+                                pv = jnp.matmul(prev_p, prev_v, preferred_element_type=jnp.float32).astype(out_dtype)
+                                acc_val = broadcast_minor(prev_exp_m_diff, acc_val.shape) * acc_val + pv
+                            prev_p = cur_p
+                            prev_v = bv_c
+                            prev_exp_m_diff = cur_exp_m_diff
+                        assert prev_p is not None
+                        pv = jnp.matmul(prev_p, prev_v, preferred_element_type=jnp.float32).astype(out_dtype)
+                        acc_val = broadcast_minor(prev_exp_m_diff, acc_val.shape) * acc_val + pv
+                        m_all_ref.at[0][...] = m_val.astype(jnp.float32)
+                        l_all_ref.at[0][...] = l_val.astype(jnp.float32)
+                        acc_all_ref.at[0][...] = acc_val.astype(jnp.float32)
+
+                    @pl.when(cur_num_p < bkv_p)
+                    def _compute_part_sb():
+                        for p_i in range(bkv_p):
+                            @pl.when(p_i < cur_num_p)
+                            def _page_step():
+                                m_val = m_all_ref.at[0][...].astype(out_dtype)
+                                l_val = l_all_ref.at[0][...].astype(out_dtype)
+                                acc_val = acc_all_ref.at[0][...].astype(out_dtype)
+                                bk_c, bv_c = load_bkv(bkv_sem_idx, 0, p_i * page_size, page_size)
+                                s = jnp.matmul(bq_all, bk_c.T, preferred_element_type=jnp.float32).astype(out_dtype)
+                                s_rowmax = jnp.max(s, axis=1, keepdims=True)
+                                m_prev = m_val
+                                m_val = jnp.maximum(m_prev, s_rowmax)
+                                cur_p = jax.lax.exp2(s - broadcast_minor(m_val, s.shape))
+                                cur_exp_m_diff = jax.lax.exp2(m_prev - m_val)
+                                p_rowsum = jnp.sum(cur_p, axis=1, keepdims=True, dtype=out_dtype)
+                                l_val = cur_exp_m_diff * l_val + p_rowsum
+                                pv = jnp.matmul(cur_p, bv_c, preferred_element_type=jnp.float32).astype(out_dtype)
+                                acc_val = broadcast_minor(cur_exp_m_diff, acc_val.shape) * acc_val + pv
+                                m_all_ref.at[0][...] = m_val.astype(jnp.float32)
+                                l_all_ref.at[0][...] = l_val.astype(jnp.float32)
+                                acc_all_ref.at[0][...] = acc_val.astype(jnp.float32)
+
+                start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+        else:
+            start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+            start_fetch_bkv(seq_idx=start_seq_idx,
+                            bkv_idx=cur_seq_start_bkv_idx,
+                            bkv_sem_idx=0)
 
     @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
     def pipeline():
@@ -1446,6 +1839,14 @@ def merge_kv(
     num_kv_heads_x2 = align_to(actual_num_kv_heads_x2, kv_packing)
 
     head_dim = align_to(actual_head_dim, 128)
+    if num_kv_heads_x2 == actual_num_kv_heads_x2 and head_dim == actual_head_dim:
+        if actual_num_kv_heads == 1:
+            return jnp.concatenate([k, v], axis=1).reshape(
+                max_num_tokens,
+                num_kv_heads_x2 // kv_packing,
+                kv_packing,
+                head_dim,
+            )
     kv = jnp.pad(
         jnp.concat([k, v],
                    axis=-1).reshape(max_num_tokens, actual_num_kv_heads_x2,
@@ -1482,6 +1883,29 @@ def prepare_inputs(
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head,
                                        q_packing)
     head_dim = align_to(actual_head_dim, 128)
+    if (
+        actual_num_kv_heads == 1
+        and num_q_heads_per_kv_head == actual_num_q_heads_per_kv_head
+        and head_dim == actual_head_dim
+    ):
+        if not fuse_non_tiling_axis_swap:
+            q = q.reshape(
+                1,
+                max_num_tokens,
+                num_q_heads_per_kv_head // q_packing,
+                q_packing,
+                head_dim,
+            )
+        else:
+            q = q.reshape(
+                max_num_tokens,
+                1,
+                num_q_heads_per_kv_head // q_packing,
+                q_packing,
+                head_dim,
+            )
+        kv = merge_kv(k, v)
+        return q, kv
     q_reshaped = (jnp.pad(
         q.reshape(
             max_num_tokens,
@@ -1532,7 +1956,25 @@ def prepare_outputs(
             q_packing,
             head_dim,
         ) = out.shape
-        actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+    else:
+        (
+            max_num_tokens,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head_per_q_packing,
+            q_packing,
+            head_dim,
+        ) = out.shape
+    actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
+    if (
+        actual_num_kv_heads == 1
+        and num_q_heads_per_kv_head_per_q_packing * q_packing
+        == actual_num_q_heads_per_kv_head
+        and head_dim == actual_head_dim
+    ):
+        return out.reshape(
+            max_num_tokens, actual_num_q_heads, actual_head_dim
+        )
+    if not fuse_non_tiling_axis_swap:
         return (out.swapaxes(0, 1).reshape(
             max_num_tokens,
             actual_num_kv_heads,
@@ -1542,14 +1984,6 @@ def prepare_outputs(
             max_num_tokens, actual_num_q_heads, actual_head_dim))
     else:
         # Direct reshape without redundant inverse axis swap
-        (
-            max_num_tokens,
-            actual_num_kv_heads,
-            num_q_heads_per_kv_head_per_q_packing,
-            q_packing,
-            head_dim,
-        ) = out.shape
-        actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
         return (out.reshape(
             max_num_tokens,
             actual_num_kv_heads,
@@ -2071,6 +2505,7 @@ def ragged_paged_attention(
     actual_num_kv_heads = k.shape[1]
 
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+    q_already_scaled = False
     q, kv = prepare_inputs(q, k, v, fuse_non_tiling_axis_swap=False)
     (
         _,
@@ -2133,7 +2568,7 @@ def ragged_paged_attention(
 
         bo_double_buf = (
             pltpu.VMEM((1, 1, 1, 1, 1, 128), q.dtype)
-            if (num_q_bufs == 1 and bq_sz > 2304) else bq_double_buf
+            if (num_q_bufs == 1 and bq_sz >= 2304) else bq_double_buf
         )
 
         l_scratch = pltpu.VMEM(
@@ -2147,25 +2582,48 @@ def ragged_paged_attention(
             out_dtype,
         )
 
-        scratch_shapes = [
-            bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
-            bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
-            bo_double_buf,  # (bo_x2_ref) Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-            pltpu.SemaphoreType.DMA((4, 2)),
-            # Intermediate buffers per kv head for flash attention.
-            l_scratch,
-            m_scratch,
-            acc_scratch,
-        ]
+        is_shared_decode_capable = (
+            case == RpaCase.DECODE and sliding_window is None and actual_num_kv_heads == 1
+            and max_num_tokens <= 16 and soft_cap is None and q_scale is None
+            and k_scale is None and v_scale is None and not envs.ENABLE_RPA_PV_FP8
+        )
+        if is_shared_decode_capable:
+            bq_all_scratch = pltpu.VMEM((1, actual_num_kv_heads, max_num_tokens, *q.shape[2:]), q.dtype)
+            l_all_scratch = pltpu.VMEM((1, max_num_tokens * num_q_heads_per_kv_head, 128), jnp.float32)
+            m_all_scratch = l_all_scratch
+            acc_all_scratch = pltpu.VMEM((1, max_num_tokens * num_q_heads_per_kv_head, head_dim), jnp.float32)
+            case_init_sem_ids = jnp.zeros((4,), jnp.int32)
+            scratch_shapes = [
+                bkv_double_buf,
+                bq_double_buf,
+                bo_double_buf,
+                pltpu.SemaphoreType.DMA((4, 2)),
+                l_scratch,
+                m_scratch,
+                acc_scratch,
+                bq_all_scratch,
+                l_all_scratch,
+                m_all_scratch,
+                acc_all_scratch,
+            ]
+        else:
+            case_init_sem_ids = init_sem_ids
+            scratch_shapes = [
+                bkv_double_buf,
+                bq_double_buf,
+                bo_double_buf,
+                pltpu.SemaphoreType.DMA((4, 2)),
+                l_scratch,
+                m_scratch,
+                acc_scratch,
+            ]
 
         scalar_prefetches = (
             kv_lens,
-            # TODO(jevinjiang): can we use ragged page_indices to save some smem?
             page_indices,
             cu_q_lens,
             distribution,
-            init_sem_ids,
+            case_init_sem_ids,
             init_bo_ids,
             init_bkv_update_ids,
         )
@@ -2192,6 +2650,7 @@ def ragged_paged_attention(
                 bq_csz=bq_csz,
                 bkv_csz=bkv_csz,
                 case=case,
+                q_already_scaled=q_already_scaled,
                 debug_mode=debug_mode,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
