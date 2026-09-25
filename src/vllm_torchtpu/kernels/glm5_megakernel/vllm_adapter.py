@@ -77,6 +77,13 @@ def _kn(weight: torch.Tensor, k: int, n: int, what: str) -> torch.Tensor:
     return weight.t().contiguous()
 
 
+def _kn_pad(weight: torch.Tensor, k: int, n: int, what: str) -> torch.Tensor:
+    """_kn, N zero-padded to a multiple of 128: an unaligned minor dim gets a
+    non-default XLA layout, i.e. a relayout copy in front of every step."""
+    w = _kn(weight, k, n, what)
+    return torch.nn.functional.pad(w, (0, rup(n) - n)) if n % 128 else w
+
+
 def _scale(layer, n: int, what: str) -> torch.Tensor:
     for name in ("weight_scale", "weight_scale_inv"):
         s = getattr(layer, name, None)
@@ -204,7 +211,7 @@ class Glm5Megakernel:
         sa = L.self_attn
         at = _attn_module(sa)
         d = {
-            "qkv_a": _kn(sa.fused_qkv_a_proj.weight, H, cfg.QKVA, "fused_qkv_a_proj"),
+            "qkv_a": _kn_pad(sa.fused_qkv_a_proj.weight, H, cfg.QKVA, "fused_qkv_a_proj"),
             "q_b": _kn(sa.q_b_proj.weight, cfg.QL, cfg.NH * cfg.DQ, "q_b_proj"),
             "w_uk": at.W_UK_T,
             "w_uv": at.W_UV,
@@ -214,8 +221,8 @@ class Glm5Megakernel:
         _need((idx is not None) == cfg.full_indexer(l), f"layer {l}: indexer pattern")
         if idx is not None:
             d["idx_wq"] = _kn(idx.wq_b.weight, cfg.QL, cfg.IH * cfg.IDIM, "indexer.wq_b")
-            d["idx_wk"] = _kn(idx.wk_weights_proj.weight, H, cfg.IDIM + cfg.IH,
-                              "indexer.wk_weights_proj")
+            d["idx_wk"] = _kn_pad(idx.wk_weights_proj.weight, H, cfg.IDIM + cfg.IH,
+                                  "indexer.wk_weights_proj")
         mlp = L.mlp
         if cfg.is_moe(l):
             g = _kn(mlp.gate.weight, H, cfg.E, "gate")

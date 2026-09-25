@@ -56,13 +56,14 @@ def weight_kinds(cfg):
     dense = [l for l in all_l if not cfg.is_moe(l)]
     H = cfg.H
     return {
-        "qkv_a": (all_l, (H, cfg.QKVA), FP8),
+        "qkv_a": (all_l, (H, rup(cfg.QKVA)), FP8),     # N padded: an unaligned minor dim
+                                                        # gets a non-default layout = a copy/step
         "q_b": (all_l, (cfg.QL, cfg.NH * cfg.DQ), FP8),
         "w_uk": (all_l, (cfg.NH, cfg.DN, cfg.KL), BF16),
         "w_uv": (all_l, (cfg.NH, cfg.KL, cfg.DV), BF16),
         "o_proj": (all_l, (cfg.NH * cfg.DV, H), FP8),
         "idx_wq": (full, (cfg.QL, cfg.IH * cfg.IDIM), FP8),
-        "idx_wk": (full, (H, cfg.IDIM + cfg.IH), BF16),
+        "idx_wk": (full, (H, rup(cfg.IDIM + cfg.IH)), BF16),
         "gate": (moe, (H, cfg.E), BF16),
         "ew13": (moe, (cfg.ER, H, 2 * cfg.I), FP8),
         "ew2": (moe, (cfg.ER, cfg.I, H), FP8),
@@ -97,8 +98,25 @@ def _pick_tk(K, N, nbytes, target, align):
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
-    target: int = 1 << 20          # bytes per streamed weight tile (x2 buffers x 13 kinds in 64 MiB VMEM)
+    target: int = 1 << 20          # bytes per streamed weight tile (all buffers share 64 MiB VMEM)
     head_group: int = 8            # heads per W_UK / W_UV tile
+    # Mosaic's fp8 x fp8 MXU dot on TPU7x is off by ~0.4% rel (j-da524a3e); the bf16 upcast is
+    # exact (e4m3 is a subset of bf16). "bf16": upcast both operands; "mixed": bf16 activation x
+    # fp8 weight (Mosaic picks the lowering); "fp8": native fp8 x fp8 (inexact on TPU7x).
+    dot: str = "mixed"
+    # HBM peak needs >= 4-8 MiB in flight per stream (j-220235a9: 1 MiB x2 ~1.0 TB/s, 2 MiB x4
+    # and 4 MiB x4 ~2.95 TB/s). `deep` kinds get `depth` buffers, the rest 2.
+    depth: int = 2
+    deep: tuple = ()
+    # Kinds consumed strictly one after another (each matmul drains before the next kind's start)
+    # share one ring of `depth` (tk, N) tiles, so the stream in flight gets the whole group's VMEM:
+    # 8 x 0.75 MiB for o_proj/ew2 instead of 2. (kinds, depth); tile size from `target`.
+    rings: tuple = ((("o_proj", "sw2", "ew2", "w2"), 8), (("idx_wq", "sw13", "ew13"), 6))
+    # Per-phase jax.named_scope markers -> tpu.trace_start/stop (level 10) for an xprof capture.
+    trace: bool = False
+
+    def nbuf(self, kind):
+        return self.depth if kind in self.deep else 2
 
     def tk(self, K, N, nbytes):
         # tk doubles as the dynamic lane offset into the activation row: 128-aligned (E2003).
@@ -174,6 +192,34 @@ def fp8_decode(b):
     return jnp.where(e == 0, sub, normal)
 
 
+def mxu(a, b, tiles):
+    """dot operands per tiles.dot (see Tiles)."""
+    if tiles.dot == "fp8" or (a.dtype != FP8 and b.dtype != FP8):
+        return a, b
+    if tiles.dot == "mixed":
+        return a.astype(BF16), b
+    return a.astype(BF16), b.astype(BF16)
+
+
+class Phases:
+    """Sequential trace regions without reindenting: mark("a") ... mark("b") ... end().
+    A no-op unless enabled; each traced body (layer, pl.when branch) keeps its own instance."""
+
+    def __init__(self, on):
+        self.on, self.cur = on, None
+
+    def mark(self, name):
+        self.end()
+        if self.on:
+            self.cur = jax.named_scope(name)
+            self.cur.__enter__()
+
+    def end(self):
+        if self.cur is not None:
+            self.cur.__exit__(None, None, None)
+            self.cur = None
+
+
 def fp8_bytes(x8):
     return lax.bitcast_convert_type(x8, U8).astype(I32)
 
@@ -182,9 +228,14 @@ def fp8_bytes(x8):
 # The kernel
 # ------------------------------------------------------------------------------------------
 
-def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
+ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk")
+
+
+def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset()):
     """Returns (step_fn, operand names). step_fn(meta, bt, h0, rope_tab, smalls, *weights,
-    *caches) -> (out [M, H] bf16, *caches) for ONE rank; wrap in shard_map."""
+    *caches) -> (out [M, H] bf16, *caches) for ONE rank; wrap in shard_map.
+    skip: timing ablations only (numerics are garbage), a subset of ABLATIONS."""
+    assert set(skip) <= set(ABLATIONS), skip
     R, L, H = cfg.R, cfg.L, cfg.H
     pg = cfg.page
     lg_pg = int(math.log2(pg))
@@ -199,6 +250,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
     assert cfg.NH % G == 0
     sm_scale = cfg.DQ ** -0.5
 
+    def kdim(kind):
+        return {"ew13": H, "ew2": cfg.I}.get(kind) or wk[kind][1][0]
+
     # --- tile sizes per streamed kind ---
     tk = {}
     for kind in ("qkv_a", "q_b", "o_proj", "idx_wq", "sw13", "sw2", "w13", "w2"):
@@ -206,7 +260,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
         tk[kind] = tiles.tk(K, N, 1)
     tk["ew13"] = tiles.tk(H, 2 * cfg.I, 1)
     tk["ew2"] = tiles.tk(cfg.I, H, 1)
-    tk["idx_wk"] = tiles.tk(H, cfg.IDIM + cfg.IH, 2)
+    tk["idx_wk"] = tiles.tk(H, rup(cfg.IDIM + cfg.IH), 2)
     tk["gate"] = tiles.tk(H, cfg.E, 2)
 
     NACC = max(cfg.QKVA + 128, cfg.NH * cfg.DQ, H, 2 * cfg.ID, 2 * cfg.I, 2 * cfg.IS,
@@ -263,37 +317,47 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
         "rs_send": pltpu.SemaphoreType.DMA(()), "rs_recv": pltpu.SemaphoreType.DMA(()),
     }
     wshape = {
-        "qkv_a": (tk["qkv_a"], cfg.QKVA), "q_b": (tk["q_b"], cfg.NH * cfg.DQ),
+        "qkv_a": (tk["qkv_a"], rup(cfg.QKVA)), "q_b": (tk["q_b"], cfg.NH * cfg.DQ),
         "o_proj": (tk["o_proj"], H), "idx_wq": (tk["idx_wq"], cfg.IH * cfg.IDIM),
-        "idx_wk": (tk["idx_wk"], cfg.IDIM + cfg.IH), "gate": (tk["gate"], cfg.E),
+        "idx_wk": (tk["idx_wk"], rup(cfg.IDIM + cfg.IH)), "gate": (tk["gate"], cfg.E),
         "sw13": (tk["sw13"], 2 * cfg.IS), "sw2": (tk["sw2"], H),
         "ew13": (tk["ew13"], 2 * cfg.I), "ew2": (tk["ew2"], H),
         "w13": (tk["w13"], 2 * cfg.ID), "w2": (tk["w2"], H),
         "w_uk": (G, cfg.DN, cfg.KL), "w_uv": (G, cfg.KL, cfg.DV),
     }
     wdtype = {k: (BF16 if k in ("idx_wk", "gate", "w_uk", "w_uv") else FP8) for k in wshape}
+    NBUF = {k: tiles.nbuf(k) for k in wshape}
+    BUF = {k: k for k in wshape}                      # kind -> its buffer (own, or a shared ring)
+    for i, (kinds, depth) in enumerate(tiles.rings):
+        N = wshape[kinds[0]][1]
+        Ks = [kdim(k) for k in kinds]
+        t_r = tiles.tk(min(Ks), N, 1)
+        assert all(wshape[k][1] == N and wdtype[k] == FP8 and K_ % t_r == 0
+                   for k, K_ in zip(kinds, Ks)), (kinds, Ks, t_r)
+        for k in kinds:
+            tk[k], wshape[k], NBUF[k], BUF[k] = t_r, (t_r, N), depth, "ring%d" % i
     for k, shp in wshape.items():
-        scratch["buf_" + k] = pltpu.VMEM((2,) + shp, wdtype[k])
-        scratch["sem_" + k] = pltpu.SemaphoreType.DMA((2,))
+        if "buf_" + BUF[k] not in scratch:
+            scratch["buf_" + BUF[k]] = pltpu.VMEM((NBUF[k],) + shp, wdtype[k])
+            scratch["sem_" + BUF[k]] = pltpu.SemaphoreType.DMA((NBUF[k],))
     s_names = list(scratch)
 
     def kernel(*refs):
         meta, bt, h0, rope_tab, smalls = refs[:n_fixed]
         w_in = refs[n_fixed:n_fixed + n_w]
         c_in = refs[n_fixed + n_w:n_fixed + n_w + len(c_names)]
-        out_ref = refs[n_fixed + n_w + len(c_names)]
-        c_out = refs[n_fixed + n_w + len(c_names) + 1:n_fixed + n_w + 2 * len(c_names) + 1]
-        rest = refs[n_fixed + n_w + 2 * len(c_names) + 1:]
+        out_ref, nrow_out, rrow_out, irow_out = refs[n_fixed + n_w + len(c_names):
+                                                     n_fixed + n_w + len(c_names) + 4]
+        rest = refs[n_fixed + n_w + len(c_names) + 4:]
         if debug:
             dbg_h, dbg_idx = rest[:2]
             rest = rest[2:]
         scr = dict(zip(s_names, rest))
-        del c_in
         W = {}
         for (k, l), r in zip(w_names, w_in):
             W.setdefault(k, {})[l] = r
         C = {}
-        for (k, l), r in zip(c_names, c_out):
+        for (k, l), r in zip(c_names, c_in):
             C.setdefault(k, {})[l] = r
 
         me = meta[0]
@@ -315,8 +379,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
             return ref.at[pl.ds(t * tk[kind], tk[kind])]
 
         def issue(kind, l, t, j=None):
-            buf, sem = scr["buf_" + kind], scr["sem_" + kind]
-            slot = t % 2
+            if "weights" in skip:
+                return
+            buf, sem = scr["buf_" + BUF[kind]], scr["sem_" + BUF[kind]]
+            slot = t % NBUF[kind]
 
             def one(ref):
                 return lambda: pltpu.make_async_copy(src_of(kind, ref, t, j), buf.at[slot],
@@ -324,38 +390,39 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
             bswitch(l, {ll: one(r) for ll, r in W[kind].items()})
 
         def wait(kind, t):
-            buf, sem = scr["buf_" + kind], scr["sem_" + kind]
-            slot = t % 2
+            if "weights" in skip:
+                return
+            buf, sem = scr["buf_" + BUF[kind]], scr["sem_" + BUF[kind]]
+            slot = t % NBUF[kind]
             ref = next(iter(W[kind].values()))
             pltpu.make_async_copy(src_of(kind, ref, 0, 0), buf.at[slot], sem.at[slot]).wait()
 
         def ntiles(kind):
             if kind in ("w_uk", "w_uv"):
                 return cfg.NH // G
-            K = {"ew13": H, "ew2": cfg.I}.get(kind, None) or wk[kind][1][0]
-            return K // tk[kind]
+            return kdim(kind) // tk[kind]
 
         def start(kind, l, j=None):
-            for t in range(min(2, ntiles(kind))):
+            for t in range(min(NBUF[kind], ntiles(kind))):
                 issue(kind, l, t, j)
 
         def matmul(kind, l, xref, K, N, j=None):
-            """acc[:, :N] = xref[:, :K] @ W  (tiles 0,1 already started)."""
+            """acc[:, :N] = xref[:, :K] @ W  (the first NBUF tiles already started)."""
             nt = ntiles(kind)
             t_k = tk[kind]
-            buf = scr["buf_" + kind]
+            buf = scr["buf_" + BUF[kind]]
             acc = scr["acc"]
             acc[:, :N] = jnp.zeros((M, N), F32)
 
             def body(t, c):
                 wait(kind, t)
                 k0 = pl.multiple_of(t * t_k, t_k)
-                acc[:, :N] += lax.dot_general(xref[:, pl.ds(k0, t_k)], buf[t % 2], NN,
-                                              preferred_element_type=F32)
+                xs, ws = mxu(xref[:, pl.ds(k0, t_k)], buf[t % NBUF[kind]], tiles)
+                acc[:, :N] += lax.dot_general(xs, ws, NN, preferred_element_type=F32)
 
-                @pl.when(t + 2 < nt)
+                @pl.when(t + NBUF[kind] < nt)
                 def _():
-                    issue(kind, l, t + 2, j)
+                    issue(kind, l, t + NBUF[kind], j)
                 return c
 
             lax.fori_loop(0, nt, body, 0)
@@ -376,7 +443,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
         def all_gather_rows():
             """hrow (1,H) bf16 on every rank -> xall[r] = rank r's row."""
             scr["xall"][me] = scr["hrow"][...]
-            if R == 1:
+            if R == 1 or "coll" in skip:
                 return
             for d in range(R):
                 @pl.when(me != d)
@@ -387,7 +454,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                         device_id=(jnp.int32(d),), device_id_type=pl.DeviceIdType.MESH).start()
 
         def ag_wait():
-            if R == 1:
+            if R == 1 or "coll" in skip:
                 return
             desc = pltpu.make_async_remote_copy(
                 src_ref=scr["hrow"], dst_ref=scr["xall"].at[0],
@@ -405,7 +472,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
             for d in range(R):
                 scr["psend"][d] = scr["part"][d:d + 1, :]
             scr["rsrecv"][me] = scr["psend"][me]
-            if R == 1:
+            if R == 1 or "coll" in skip:
                 return
             for d in range(R):
                 @pl.when(me != d)
@@ -510,6 +577,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
 
         # ---------------- one layer ----------------
         def layer(l, carry):
+            ph = Phases(tiles.trace)
+            ph.mark("L_qkva")
             slot = l % 2
             is_moe = l >= cfg.first_dense
             full_idx = jnp.logical_or(
@@ -527,7 +596,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                                       scr["sm_sem"].at[1 - slot]).start()
 
             for kind in ("qkv_a", "q_b", "w_uk", "w_uv", "o_proj"):
-                start(kind, l)
+                if not ("uk_uv" in skip and kind in ("w_uk", "w_uv")):
+                    start(kind, l)
 
             # input norm
             x = scr["h"][...] + scr["res"][...]
@@ -539,7 +609,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
             # fused_qkv_a
             xq, sx = quant_rows(hn)
             scr["xq"][:, :H] = xq
-            a = matmul("qkv_a", l, scr["xq"], H, cfg.QKVA)
+            a = matmul("qkv_a", l, scr["xq"], H, rup(cfg.QKVA))
             o_s, _ = lay["qkv_a_s"]
             qkv_s = scr["sm"][slot, :, o_s:o_s + cfg.QKVA]
             qc_raw = (a[:, :cfg.QL] * sx * qkv_s[:, :cfg.QL]).astype(BF16).astype(F32)
@@ -554,7 +624,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                             rope(kpe_raw, rope_tab[2:3, 0:128], rope_tab[3:4, 0:128]), 0.0) * row0
             scr["qc"][...] = qc
 
-            # KV write: nope row and rope row (RMW), SPARSECORE band packing
+            ph.mark("L_kvw")
+            # KV write: nope row and rope row (RMW), SPARSECORE band packing. Caches are read-only
+            # here (an aliased cache under a custom barrier costs XLA a full copy in and out); the
+            # merged rows go to nrow_out / rrow_out and `step` scatters them after the call.
             @pl.when(active)
             def _():
                 page = bt[pos >> lg_pg]
@@ -567,11 +640,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 rw = jnp.where(lane128 < 32, rb | shl(pltpu.roll(rb, 96, 1), 8), 0)
                 seg = sl & 3
 
-                def kvw(ref_n, ref_r):
+                cn = pltpu.make_async_copy(scr["wrow"], nrow_out.at[l], scr["kv_sem"].at[0])
+                cn.start()
+
+                def kvw(ref_r):
                     def f():
-                        cn = pltpu.make_async_copy(scr["wrow"].at[pl.ds(0, 1)],
-                                                   ref_n.at[page, pl.ds(sl, 1)], scr["kv_sem"].at[0])
-                        cn.start()
                         cr = pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
                                                    scr["rrow"].at[pl.ds(0, 1)], scr["kv_sem"].at[1])
                         cr.start()
@@ -582,14 +655,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                             new = jnp.where((seg == sg) & (lane128 // 32 == sg),
                                             pltpu.roll(rw, 32 * sg, 1) if sg else rw, new)
                         scr["rrow"][0:1, :] = lax.bitcast_convert_type(new, U32)
-                        cw = pltpu.make_async_copy(scr["rrow"].at[pl.ds(0, 1)],
-                                                   ref_r.at[page, pl.ds(sl >> 2, 1)], scr["kv_sem"].at[1])
-                        cw.start()
-                        cw.wait()
-                        cn.wait()
                     return f
-                bswitch(l, {ll: kvw(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                bswitch(l, {ll: kvw(C["rope"][ll]) for ll in range(L)})
+                cw = pltpu.make_async_copy(scr["rrow"], rrow_out.at[l], scr["kv_sem"].at[1])
+                cw.start()
+                cw.wait()
+                cn.wait()
 
+            ph.mark("L_qb")
             # q_b
             xq, sx = quant_rows(qc)
             scr["xq"][:, :cfg.QL] = xq
@@ -599,25 +672,30 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 scr["qh"][hh:hh + 1, :] = q[:, hh * cfg.DQ:(hh + 1) * cfg.DQ]
             scr["qh"][...] = rope(scr["qh"][...], rope_tab[0:1, 0:cfg.DQ], rope_tab[1:2, 0:cfg.DQ])
 
+            ph.mark("L_uk")
             # W_UK absorb (VPU): ql[h] = q_nope[h] @ W_UK_T[h]
             def uk_body(g, c):
                 wait("w_uk", g)
 
-                @pl.when(g + 2 < cfg.NH // G)
+                @pl.when(g + NBUF["w_uk"] < cfg.NH // G)
                 def _():
-                    issue("w_uk", l, g + 2)
+                    issue("w_uk", l, g + NBUF["w_uk"])
                 qgT = scr["qh"][pl.ds(pl.multiple_of(g * G, G), G), :].T      # [DQ, G]
                 wb = scr["buf_w_uk"]
                 for hh in range(G):
-                    y = jnp.sum(qgT[0:cfg.DN, hh:hh + 1] * wb[g % 2, hh].astype(F32), axis=0,
+                    y = jnp.sum(qgT[0:cfg.DN, hh:hh + 1] * wb[g % NBUF["w_uk"], hh].astype(F32), axis=0,
                                 keepdims=True)
                     scr["ql"][pl.ds(g * G + hh, 1), :] = y.astype(BF16).astype(F32)
                 return c
-            lax.fori_loop(0, cfg.NH // G, uk_body, 0)
+            if "uk_uv" not in skip:
+                lax.fori_loop(0, cfg.NH // G, uk_body, 0)
 
+            ph.mark("L_index")
             # indexer (full layers) -> idx_s / idx_v
-            @pl.when(full_idx)
+            @pl.when(jnp.logical_and(full_idx, "index" not in skip))
             def _():
+                phi = Phases(tiles.trace)
+                phi.mark("i_proj")
                 start("idx_wq", l)
                 start("idx_wk", l)
                 xq, sx = quant_rows(scr["qc"][...])
@@ -632,7 +710,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 sq = jnp.where(sq == 0, 1.0, sq)
                 iq8 = jnp.clip(iqh / sq, -FP8_MAX, FP8_MAX).astype(FP8)
                 scr["xbf"][...] = scr["hn"][...].astype(BF16)
-                NW = cfg.IDIM + cfg.IH
+                NW = rup(cfg.IDIM + cfg.IH)
                 a = matmul("idx_wk", l, scr["xbf"], H, NW)
                 kw = scr["acc"][:, 0:256].astype(BF16).astype(F32)
                 kx = kw[:, 0:128]
@@ -662,8 +740,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                     def f():
                         page = bt[pos >> lg_pg]
                         sl = pos & (pg - 1)
-                        # u8 HBM is (4,128)-tiled on the token-in-group axis: read-modify-write
-                        # the 4-token group instead of DMAing one record.
+                        # u8 HBM is (4,128)-tiled on the token-in-group axis: merge the record into
+                        # its 4-token group -> irow_out[l] (scattered by `step`); the scan patches
+                        # the group into the page it reads, since the cache itself is stale.
                         grp = ref.at[page, pl.ds(sl >> 2, 1)]
 
                         @pl.when(active)
@@ -675,7 +754,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                             r0 = scr["rec"][0:8].astype(I32)[0:1]
                             row = lax.broadcasted_iota(I32, (4, 256), 0)
                             scr["igrp"][0] = jnp.where(row == (sl & 3), r0, g).astype(U8)
-                            c = pltpu.make_async_copy(scr["igrp"], grp, scr["misc_sem"])
+                            c = pltpu.make_async_copy(scr["igrp"], irow_out.at[pl.ds(l, 1)],
+                                                      scr["misc_sem"])
                             c.start()
                             c.wait()
 
@@ -694,9 +774,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                             @pl.when(p + 1 < npages)
                             def _():
                                 pcopy(p + 1, 1 - sl_).start()
+
+                            @pl.when(jnp.logical_and(active, p == pos >> lg_pg))
+                            def _():
+                                scr["ipage"][sl_, pl.ds(sl >> 2, 1)] = scr["igrp"][...]
                             blk = scr["ipage"][sl_].reshape(pg, 256)
                             keys8 = pltpu.bitcast(blk[:, 0:128], FP8)
-                            dots = lax.dot_general(iq8, keys8, NT, preferred_element_type=F32)
+                            dots = lax.dot_general(*mxu(iq8, keys8, tiles), NT,
+                                                   preferred_element_type=F32)
                             scv = jnp.sum(jnp.maximum(dots, 0.0) * wcol, axis=0, keepdims=True)
                             sbyte = blk[:, 128:129].astype(I32).T                         # [1,pg]
                             scale = lax.bitcast_convert_type(shl(sbyte, 23), F32)
@@ -709,9 +794,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                             return c
                         lax.fori_loop(0, npages, pbody, 0)
                     return f
+                phi.mark("i_scan")
                 bswitch(l, {ll: scan(r) for ll, r in C["idx"].items()})
-                topk()
+                phi.mark("i_topk")
+                if "topk" not in skip:
+                    topk()
+                phi.end()
 
+            ph.mark("L_gather")
             # gather top-k rows of nope / rope
             def gather(ref_n, ref_r):
                 def f():
@@ -719,17 +809,30 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                         t = jnp.maximum(scr["idx_s"][i >> 7, i & 127], 0)
                         page = bt[t >> lg_pg]
                         sl = t & (pg - 1)
-                        pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
-                                              scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
-                        pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
-                                              scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
+                        cur = jnp.logical_and(active, t == pos)   # this step's row: not in HBM yet
+
+                        @pl.when(cur)
+                        def _():
+                            pltpu.make_async_copy(scr["wrow"].at[pl.ds(0, 1)],
+                                                  scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
+                            pltpu.make_async_copy(scr["rrow"].at[pl.ds(0, 1)],
+                                                  scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
+
+                        @pl.when(jnp.logical_not(cur))
+                        def _():
+                            pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
+                                                  scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
+                            pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
+                                                  scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
                         return c
                     lax.fori_loop(0, KT, gbody, 0)
                 return f
-            bswitch(l, {ll: gather(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
-            pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
-            pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
+            if "gather" not in skip:
+                bswitch(l, {ll: gather(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
+                pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
 
+            ph.mark("L_attn_s")
             # sparse MLA attention (served formula, two pass)
             qn = scr["ql"][...].astype(BF16)                                      # [NH,KL]
             xr = scr["qh"][:, cfg.DQ - 128:cfg.DQ]                                # rope in lanes 64..127
@@ -761,11 +864,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 s = jnp.where(iv >= 0, s, jnp.finfo(F32).min)
                 scr["s_all"][c] = s
                 return carry
-            lax.fori_loop(0, NC, s_body, 0)
+            if "attn" not in skip:
+                lax.fori_loop(0, NC, s_body, 0)
+
+            ph.mark("L_attn_pv")
 
             def m_body(c, m):
                 return jnp.maximum(m, jnp.max(scr["s_all"][c], axis=1, keepdims=True))
-            mx = lax.fori_loop(0, NC, m_body, jnp.full((cfg.NH, 1), -jnp.inf, F32))
+            nc_att = 0 if "attn" in skip else NC
+            mx = lax.fori_loop(0, nc_att, m_body, jnp.full((cfg.NH, 1), -jnp.inf, F32))
 
             def pv_body(c, carry):
                 lsum, pv = carry
@@ -774,30 +881,35 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 kv = scr["kvb"][pl.ds(r0, 128), :].astype(F32)
                 return (lsum + jnp.sum(p, axis=1, keepdims=True),
                         pv + lax.dot_general(p, kv, NN, preferred_element_type=F32))
-            lsum, pv = lax.fori_loop(0, NC, pv_body, (jnp.zeros((cfg.NH, 1), F32),
+            lsum, pv = lax.fori_loop(0, nc_att, pv_body, (jnp.zeros((cfg.NH, 1), F32),
                                                      jnp.zeros((cfg.NH, cfg.KL), F32)))
             att = (pv / lsum).astype(BF16).astype(F32)
+            if "attn" in skip:
+                att = jnp.zeros_like(pv)
             for gg in range(cfg.NH // G):
                 scr["att"][gg, 0:G, :] = att[gg * G:(gg + 1) * G]
 
+            ph.mark("L_uv")
             # W_UV (VPU): o[h] = att[h] @ W_UV[h]
             scr["orow"][...] = jnp.zeros((M, cfg.NH * cfg.DV), F32)
 
             def uv_body(g, c):
                 wait("w_uv", g)
 
-                @pl.when(g + 2 < cfg.NH // G)
+                @pl.when(g + NBUF["w_uv"] < cfg.NH // G)
                 def _():
-                    issue("w_uv", l, g + 2)
+                    issue("w_uv", l, g + NBUF["w_uv"])
                 agT = scr["att"][g].T                                               # [KL, 8]
                 wb = scr["buf_w_uv"]
                 for hh in range(G):
-                    y = jnp.sum(agT[:, hh:hh + 1] * wb[g % 2, hh].astype(F32), axis=0, keepdims=True)
+                    y = jnp.sum(agT[:, hh:hh + 1] * wb[g % NBUF["w_uv"], hh].astype(F32), axis=0, keepdims=True)
                     o0 = pl.multiple_of((g * G + hh) * cfg.DV, 128)
                     scr["orow"][0:1, pl.ds(o0, cfg.DV)] = y.astype(BF16).astype(F32)
                 return c
-            lax.fori_loop(0, cfg.NH // G, uv_body, 0)
+            if "uk_uv" not in skip:
+                lax.fori_loop(0, cfg.NH // G, uv_body, 0)
 
+            ph.mark("L_oproj")
             # o_proj
             xq, sx = quant_rows(scr["orow"][...])
             scr["xq"][:, :cfg.NH * cfg.DV] = xq
@@ -813,6 +925,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
             def silu_mul(gu, n):
                 g_, u_ = gu[:, :n], gu[:, n:2 * n]
                 return (g_ * jax.nn.sigmoid(g_) * u_).astype(BF16).astype(F32)
+
+            ph.mark("L_dense")
 
             @pl.when(jnp.logical_not(is_moe))
             def _dense():
@@ -833,8 +947,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 a = matmul("w2", l, scr["xq"], cfg.ID, H)
                 scr["h"][...] = (a * sx * sm(slot, "w2_s")).astype(BF16).astype(F32) * row0
 
+            ph.mark("L_moe")
+
             @pl.when(is_moe)
             def _moe():
+                phm = Phases(tiles.trace)
+                phm.mark("m_shared")
                 for kind in ("gate", "sw13", "sw2"):
                     start(kind, l)
 
@@ -857,6 +975,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 a = matmul("sw2", l, scr["xq"], cfg.IS, H)
                 scr["shared"][...] = (a * sx * sm(slot, "sw2_s")).astype(BF16).astype(F32)
 
+                phm.mark("m_agwait")
                 ag_wait()
                 xall = jnp.concatenate(
                     [scr["xall"][r].astype(F32) for r in range(R)] + [jnp.zeros((M - R, H), F32)], axis=0)
@@ -864,6 +983,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 xqm, sxm = quant_rows(xall)
                 scr["xqm"][...] = xqm
 
+                phm.mark("m_router")
                 # router: sigmoid, +bias, top-k (ties -> lowest id), renorm
                 logits = matmul("gate", l, scr["xbf"], H, cfg.E)
                 scv = jax.nn.sigmoid(logits)
@@ -904,7 +1024,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                         scr["hits"][1, n] = j
                     return n + h_.astype(I32)
                 n_hit = lax.fori_loop(0, cfg.ER, cbody, jnp.int32(0))
+                if "experts" in skip:
+                    n_hit = jnp.int32(0)
 
+                phm.mark("m_experts")
                 pltpu.make_async_copy(next(iter(W["es13"].values())), scr["es13"],
                                       scr["es_sem"].at[0]).wait()
                 pltpu.make_async_copy(next(iter(W["es2"].values())), scr["es2"],
@@ -935,6 +1058,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                     return c
                 lax.fori_loop(0, n_hit, ebody, 0)
 
+                phm.mark("m_rs")
                 reduce_scatter_rows()
                 routed = scr["rsrecv"][0]
                 for rr in range(1, R):
@@ -942,7 +1066,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                 routed = (routed.astype(BF16).astype(F32) * cfg.routed_scale).astype(BF16).astype(F32)
                 out = (scr["shared"][0:1] + routed).astype(BF16).astype(F32)
                 scr["h"][...] = jnp.concatenate([out, jnp.zeros((M - 1, H), F32)], axis=0)
+                phm.end()
 
+            ph.end()
             if debug:
                 dbg_h[pl.ds(2 * l, 1), :] = scr["h"][0:1, :]
                 dbg_h[pl.ds(2 * l + 1, 1), :] = scr["res"][0:1, :]
@@ -954,6 +1080,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
         scr["h"][...] = h0[...].astype(F32) * row0
         scr["res"][...] = jnp.zeros((M, H), F32)
         scr["idx_v"][...] = jnp.full((NC, 128), -1, I32)
+        if "weights" in skip:       # keep the ablated numerics finite (routing stays sane)
+            for k in wshape:
+                scr["buf_" + BUF[k]][...] = jnp.zeros(scr["buf_" + BUF[k]].shape, wdtype[k])
         lax.fori_loop(0, L, layer, 0)
         x = (scr["h"][...] + scr["res"][...]).astype(BF16).astype(F32)
         lay_o = smalls_layout(cfg)[0]
@@ -968,25 +1097,48 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False):
                  pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pltpu.VMEM),
                  pl.BlockSpec(memory_space=pl.ANY)]
                 + [pl.BlockSpec(memory_space=pl.ANY)] * (n_w + len(c_names)))
-    out_shape = [jax.ShapeDtypeStruct((M, H), BF16)] + [
-        jax.ShapeDtypeStruct(ck[k][1], ck[k][2]) for k, _ in c_names]
-    out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [
-        pl.BlockSpec(memory_space=pl.ANY)] * len(c_names)
+    out_shape = [jax.ShapeDtypeStruct((M, H), BF16), jax.ShapeDtypeStruct((L, 8, 128), U32),
+                 jax.ShapeDtypeStruct((L, 8, 128), U32), jax.ShapeDtypeStruct((L, 4, 256), U8)]
+    out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [pl.BlockSpec(memory_space=pl.ANY)] * 3
     if debug:
         out_shape += [jax.ShapeDtypeStruct((2 * L, H), F32), jax.ShapeDtypeStruct((L, NC, 128), I32)]
         out_specs += [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
-    aliases = {n_fixed + n_w + i: 1 + i for i in range(len(c_names))}
     call = pl.pallas_call(
         kernel,
         out_shape=out_shape,
         in_specs=in_specs,
         out_specs=out_specs,
         scratch_shapes=[scratch[k] for k in s_names],
-        input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
             collective_id=0 if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024,
             has_side_effects=True),
         interpret=pltpu.InterpretParams() if interpret else False,
     )
-    info = dict(w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck)
-    return call, info
+
+    def step(meta, bt, h0, rope_tab, smalls, *rest):
+        """The kernel, then this token's cache rows scattered into the (donated) caches: a DUS on
+        a donated buffer updates in place, where an alias through the kernel would copy it."""
+        outs = call(meta, bt, h0, rope_tab, smalls, *rest)
+        out, nrow, rrow, irow = outs[:4]
+        pos, active = meta[1], meta[2] > 0
+        page = bt[jnp.clip(pos >> lg_pg, 0, max_pages - 1)]
+        sl = pos & (pg - 1)
+        z = jnp.int32(0)
+        new = []
+        for (k, l), x in zip(c_names, rest[n_w:]):
+            if k == "nope":
+                row, at = nrow[l, 0:1][None], (page, sl, z)
+            elif k == "rope":
+                row, at = rrow[l, 0:1][None], (page, sl >> 2, z)
+            else:
+                row, at = irow[l][None, None], (page, sl >> 2, z, z)
+            old = lax.dynamic_slice(x, at, row.shape)
+            new.append(lax.dynamic_update_slice(x, jnp.where(active, row, old), at))
+        return (out, *new, *outs[4:])
+
+    vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
+               if str(getattr(v, "memory_space", "")) == "vmem"}
+    vmem = sum(vmem_by.values())
+    info = dict(w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck,
+                vmem_scratch_bytes=vmem, vmem_by=vmem_by)
+    return step, info
