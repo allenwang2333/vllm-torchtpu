@@ -183,7 +183,9 @@ class Glm5Megakernel:
         bb = _find_backbone(runner.model)
         self.backbone = bb
         _need(len(bb.layers) == cfg.L, f"{len(bb.layers)} layers")
-        self.embed = bb.embed_tokens.weight
+        # Inference-only operands: detached (shared storage) so the tpu backend's
+        # aot_autograd never builds a backward through the custom op.
+        self.embed = bb.embed_tokens.weight.detach()
         self.page = cfg.page
         self.max_pages = runner.max_num_blocks_per_req
         _need(runner.block_size == cfg.page, f"block_size {runner.block_size} != {cfg.page}")
@@ -191,8 +193,9 @@ class Glm5Megakernel:
         _need(self.rotary.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
 
         self.wk = K.weight_kinds(cfg)
-        self.weights = self._collect_weights()
-        self.smalls = self._build_smalls()
+        with torch.no_grad():
+            self.weights = [w.detach() for w in self._collect_weights()]
+            self.smalls = self._build_smalls().detach()
         self.op = None
         self.caches = None
         self._step = None
@@ -436,8 +439,9 @@ class Glm5Megakernel:
         assert isinstance(md, AttentionMetadata), type(md)
         return md
 
+    @torch.no_grad()
     def _run(self, ids, pos, busy, bt):
-        return self._step(ids, pos, busy, bt, self.embed, self.rotary.cos_sin_cache,
+        return self._step(ids, pos, busy, bt, self.embed, self.rotary.cos_sin_cache.detach(),
                           self.smalls, self.weights, self.caches)
 
     def __call__(self, input_ids: torch.Tensor, positions: torch.Tensor, idle: bool,
