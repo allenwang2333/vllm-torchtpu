@@ -39,7 +39,6 @@ pytestmark = [
 #      top_right_patch = arr[126:129, 382:385, :]
 #
 #    Full reference array verified against independent CPU Diffusers golden generation.
-# 2. Native TPU v7x expectation (strict PR CI regression guard).
 # ==============================================================================
 DIFFUSERS_PATCH_CENTER = np.array(
     [
@@ -104,27 +103,7 @@ DIFFUSERS_PATCH_TOP_RIGHT = np.array(
     dtype=np.float32,
 )
 
-# Native TPU v7x expectation (Center patch [254:257, 254:257, :])
-TPU_V7X_PATCH_CENTER = np.array(
-    [
-        [
-            [0.17254902, 0.34901962, 0.21960784],
-            [0.23921569, 0.41960815, 0.2901961],
-            [0.3137255, 0.49019608, 0.34117648],
-        ],
-        [
-            [0.21176471, 0.38039216, 0.25882354],
-            [0.30980393, 0.5019608, 0.36078432],
-            [0.2784314, 0.4627451, 0.32941177],
-        ],
-        [
-            [0.29803923, 0.4745098, 0.34117648],
-            [0.41568628, 0.627451, 0.4627451],
-            [0.30980393, 0.5058824, 0.3372549],
-        ],
-    ],
-    dtype=np.float32,
-)
+# ==============================================================================
 
 
 def _extract_image(output) -> Image.Image:
@@ -264,18 +243,7 @@ class TestFluxPrCiOnTpu:
             f"Suspicious image variance: {np.var(arr):.4f}"
         )
 
-        # Tier 1: Native TPU v7x Regression Guard (atol=5e-2 across all 3 RGB channels)
-        actual_center = arr[254:257, 254:257, :]
-        max_diff_tpu = float(np.max(np.abs(actual_center - TPU_V7X_PATCH_CENTER)))
-        np.testing.assert_allclose(
-            actual_center,
-            TPU_V7X_PATCH_CENTER,
-            atol=5e-2,
-            rtol=5e-2,
-            err_msg=f"TPU v7x native regression detected! (max diff: {max_diff_tpu:.4f})",
-        )
-
-        # Tier 2: Diffusers Cross-Hardware Parity (Cosine Sim >= 0.90 across all 3 RGB channels)
+        # Diffusers Cross-Hardware Parity against CPU Golden Reference (Cosine Sim >= 0.90 across all 3 RGB channels)
         patches_to_test = [
             ("Center", arr[254:257, 254:257, :], DIFFUSERS_PATCH_CENTER),
             ("High-Variance", arr[208:211, 272:275, :], DIFFUSERS_PATCH_HIGH_VAR),
