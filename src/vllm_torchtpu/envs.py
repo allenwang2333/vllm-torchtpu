@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SCORE_BF16_GROUP: int = 0
     TPU_STREAMIDX_EARLY_EXIT: bool = True
     TPU_STREAMIDX_TOPK_TAIL: str = ""
+    TPU_STREAMIDX_DECODE_KV_PAGES: int = 2
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -731,6 +732,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_TOPK_TAIL": env_with_choices(
         "TPU_STREAMIDX_TOPK_TAIL", "", ["", "seg", "segc", "segc2", "segcD"]
     ),
+    # KV pages per block on the decode pass of the GLM-5.2 StreamIndex top-k
+    # kernel (the first entry of `num_kv_pages_per_block`). Larger blocks mean
+    # fewer, bigger KV DMAs per decode token; 8 measured -14% decode indexer
+    # time at 256K context. The prefill passes keep 2.
+    "TPU_STREAMIDX_DECODE_KV_PAGES": env_int("TPU_STREAMIDX_DECODE_KV_PAGES", 2),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

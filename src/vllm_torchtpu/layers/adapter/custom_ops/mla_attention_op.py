@@ -318,6 +318,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         enable_early_exit = (
             STREAMIDX_ENABLE_EARLY_EXIT and envs.TPU_STREAMIDX_EARLY_EXIT
         )
+        decode_kv_pages = envs.TPU_STREAMIDX_DECODE_KV_PAGES
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -357,7 +358,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 # The following parameters are tuned based on microbenchmark
                 # results.
-                num_kv_pages_per_block=(2, 2, 2),
+                num_kv_pages_per_block=(decode_kv_pages, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=enable_early_exit,
                 chunk_tokens=chunk_tokens,

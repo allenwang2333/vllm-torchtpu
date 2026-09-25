@@ -68,6 +68,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 N_SHORT = 10240  # --max-model-len 9216
 N_128K = 133120  # --max-model-len 132096
 N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
+N_256K = 264192  # --max-model-len 263168, the GLM-5.2 256K-in / 1K-out shape
 
 SEED = 20260904
 
@@ -208,6 +209,7 @@ def test_shape_derivation_matches_max_model_len():
     assert _topk_n(9216) == N_SHORT
     assert _topk_n(132096) == N_128K
     assert _topk_n(1048576, page_size=256) == N_1M
+    assert _topk_n(263168) == N_256K
 
 
 @pytest.mark.parametrize("b,k", [(64, 2048), (128, 2048)])
@@ -407,7 +409,10 @@ SINGLE_STAGE = (64, N_SHORT, 2048)
 
 
 def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
-    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order.
+    """The `scheduling_group_id` each kernel launch receives, in order.
+
+    Every launch -- the single-stage path, stage 1 and stage 2 -- goes through
+    `_sc_topk_rows`, so stubbing it records one entry per stage.
 
     Calls `sparsecore_topk.__wrapped__` rather than the jitted wrapper so the
     stub is guaranteed to be the function that runs: a cached trace from an
@@ -415,12 +420,14 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     """
     seen: list[int | None] = []
 
-    def _stub(scores, k_, row_lengths, *, write_empty=True, scheduling_group_id=None):
+    def _stub(
+        words_flat, k_, row_lens, row_offs, *, slice_len, scheduling_group_id, name
+    ):
         seen.append(scheduling_group_id)
-        out = jnp.zeros((scores.shape[0], k_), jnp.int32)
+        out = jnp.zeros((row_lens.shape[0], k_), jnp.int32)
         return out, out
 
-    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
+    monkeypatch.setattr(sc_module, "_sc_topk_rows", _stub)
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
     return seen
 
@@ -500,3 +507,139 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+# --------------------------------------------------------------------------- #
+# The 256K deployment shape: length-bounded, rebalanced stage 1.
+# --------------------------------------------------------------------------- #
+# Stage 1 cuts each row into P sub-rows of a traced width
+# `w = align16(cdiv(max(row_lengths), P))` and DMAs only `align16(sub_len)`
+# words of each, so the batch's longest row -- not `n` -- sets how much is
+# read, and empty rows (decode's padding rows) read nothing. The risks are
+# therefore at row lengths that land on sub-row and 16-lane edges, at
+# batches whose longest row is short (small `w`), and at empty rows. `b=16`
+# is the decode bucket and `b=1024` the top prefill bucket.
+
+DEPLOY_K = 2048
+# 16512 = N_256K / 16 is the static sub-row width at P = 16.
+DEPLOY_EDGES = (0, 1, 2047, 2048, 16512, 16513, 131072, N_256K)
+
+
+def _deploy_scores(b: int, n: int, rng: np.random.Generator) -> np.ndarray:
+    """Random rows with the three tie / `-inf` patterns interleaved."""
+    x = rng.standard_normal((b, n), dtype=np.float32)
+    x[1::4] = np.round(x[1::4] * 2) / 2  # heavy ties: splits at the k-th score
+    x[2::4, ::7] = -np.inf  # `-inf` entries are never eligible
+    x[3::8] = 0.5  # all-equal rows
+    return x
+
+
+def _run_with_scores(scores, k, row_lengths):
+    idx, bits = jax.block_until_ready(
+        sparsecore_topk(
+            jnp.asarray(scores), k, jnp.asarray(row_lengths), return_scores=True
+        )
+    )
+    return np.asarray(idx), np.asarray(bits)
+
+
+def _score_bits_mismatch(scores, idx, bits) -> str | None:
+    """`return_scores` must pair each winner with its score's bits, and pad
+    slots with the bits of `-inf`."""
+    neg_inf_bits = np.float32(-np.inf).view(np.int32)
+    rows = np.arange(scores.shape[0])[:, None]
+    want = np.where(
+        idx >= 0, scores[rows, np.maximum(idx, 0)].view(np.int32), neg_inf_bits
+    )
+    bad = np.argwhere(bits != want)
+    if bad.size:
+        return f"row {bad[0][0]} slot {bad[0][1]}: score bits do not match"
+    return None
+
+
+@pytest.mark.parametrize("b", [16, 1024])
+def test_partition_factor_at_the_deployment_shape(b):
+    assert _pick_partition(b, N_256K, DEPLOY_K) == 16
+
+
+@pytest.mark.parametrize("b", [16, 1024])
+def test_exact_topk_deployment_edge_lengths(b):
+    """Every edge length, twice, then random lengths; longest row is `n`."""
+    rng = np.random.default_rng(SEED)
+    scores = _deploy_scores(b, N_256K, rng)
+    row_lengths = rng.integers(0, N_256K + 1, size=b).astype(np.int32)
+    edges = list(DEPLOY_EDGES) * 2
+    row_lengths[: len(edges)] = edges
+    idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+    assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+    assert _score_bits_mismatch(scores, idx, bits) is None
+
+
+@pytest.mark.parametrize("max_len", [2047, 2048, 16513, 131072])
+def test_exact_topk_deployment_short_batch(max_len):
+    """A batch whose longest row is short shrinks `w` below the static width.
+
+    `b=16` (decode bucket, one stage-1 wave) with the edges clipped to
+    `max_len`: sub-row boundaries move to multiples of the traced `w`.
+    """
+    b = 16
+    rng = np.random.default_rng(SEED + max_len)
+    scores = _deploy_scores(b, N_256K, rng)
+    row_lengths = np.array(
+        [min(DEPLOY_EDGES[i % len(DEPLOY_EDGES)], max_len) for i in range(b)],
+        np.int32,
+    )
+    row_lengths[-1] = max_len
+    idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+    assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+    assert _score_bits_mismatch(scores, idx, bits) is None
+
+
+def test_exact_topk_deployment_prefill_short_rows():
+    """The top prefill bucket at modest context: every row under 34817."""
+    b = 1024
+    rng = np.random.default_rng(SEED)
+    scores = _deploy_scores(b, N_256K, rng)
+    row_lengths = rng.integers(0, 34817, size=b).astype(np.int32)
+    row_lengths[:4] = [0, 1, 2048, 2049]
+    idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+    assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+    assert _score_bits_mismatch(scores, idx, bits) is None
+
+
+@pytest.mark.parametrize("real_len", [1, 2048, 131072, N_256K])
+def test_exact_topk_decode_bucket_one_real_row(real_len):
+    """Decode: one real row of 16, the 15 padding rows empty (no DMA)."""
+    b = 16
+    rng = np.random.default_rng(SEED)
+    scores = _deploy_scores(b, N_256K, rng)
+    row_lengths = np.zeros(b, np.int32)
+    row_lengths[0] = real_len
+    idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+    assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+    assert _score_bits_mismatch(scores, idx, bits) is None
+    assert (idx[1:] == -1).all(), "empty rows must select nothing"
+
+
+@pytest.mark.parametrize("b", [16, 1024])
+def test_all_rows_empty_select_nothing(b):
+    """Every row length 0: no DMA anywhere, every slot `-1`."""
+    rng = np.random.default_rng(SEED)
+    scores = _deploy_scores(b, N_256K, rng)
+    row_lengths = np.zeros(b, np.int32)
+    idx = _run(scores, DEPLOY_K, row_lengths)
+    assert (idx == -1).all(), f"expected all -1, got {np.unique(idx)[:8]}"
+
+
+def test_exact_topk_single_stage_edge_lengths():
+    """The single-stage path (P == 1) reads `align16(len)` words per row."""
+    b, n = 64, 32768
+    assert _pick_partition(b, n, DEPLOY_K) == 1
+    rng = np.random.default_rng(SEED)
+    scores = _deploy_scores(b, n, rng)
+    row_lengths = rng.integers(0, n + 1, size=b).astype(np.int32)
+    edges = [min(e, n) for e in (0, 1, 15, 17, 2047, 2048, n - 1, n)]
+    row_lengths[: len(edges)] = edges
+    idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+    assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+    assert _score_bits_mismatch(scores, idx, bits) is None
