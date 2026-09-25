@@ -2583,19 +2583,15 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # Compute and copy to device (first call or shape changed).
             if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[:self.
-                                                           num_reqs_max_model_len
-                                                           + 1].to(
-                                                               self.device,
-                                                               non_blocking=True
-                                                           )
+                query_start_loc = self._content_cached_upload(
+                    "query_start_loc",
+                    self.query_start_loc_cpu[:self.num_reqs_max_model_len +
+                                             1])
             else:
-                query_start_loc = self.query_start_loc_cpu[:self.
-                                                           num_reqs_most_model_len
-                                                           + 1].to(
-                                                               self.device,
-                                                               non_blocking=True
-                                                           )
+                query_start_loc = self._content_cached_upload(
+                    "query_start_loc",
+                    self.query_start_loc_cpu[:self.num_reqs_most_model_len +
+                                             1])
 
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
@@ -2614,11 +2610,15 @@ class TPUModelRunner(GPUModelRunner):
             # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
             chunk_num_decode = max(
                 0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            self._request_distribution_cpu[0] = chunk_num_decode
-            self._request_distribution_cpu[1] = chunk_num_decode
-            self._request_distribution_cpu[2] = num_reqs
-            request_distribution = self._request_distribution_cpu.to(
-                self.device, non_blocking=True)
+            if self.mamba_slot_read_offsets is not None:
+                # Replaced below by a view of the combined upload.
+                request_distribution = None
+            else:
+                self._request_distribution_cpu[0] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[2] = num_reqs
+                request_distribution = self._request_distribution_cpu.to(
+                    self.device, non_blocking=True)
 
             if can_cache_decode_metadata:
                 # Cache for future decode steps.
@@ -2666,7 +2666,8 @@ class TPUModelRunner(GPUModelRunner):
                     self._cached_comb_key = chunk_comb_key
                 combined_device = self._cached_comb_dev
             else:
-                combined_device = combined.to(self.device, non_blocking=True)
+                combined_device = self._content_cached_upload(
+                    "combined_request_distribution", combined)
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
 
@@ -2779,6 +2780,25 @@ class TPUModelRunner(GPUModelRunner):
              spec_decode_metadata.final_logits_indices,
              spec_decode_metadata.target_logits_indices)
         return seq_lens
+
+    def _content_cached_upload(self, slot: str,
+                               cpu: torch.Tensor) -> torch.Tensor:
+        """Upload a small host tensor, reusing the previous device copy for
+        ``slot`` when its contents are unchanged.
+
+        Steady decode and verify steps resend the same few bookkeeping
+        vectors every step; comparing a few dozen bytes is far cheaper than
+        an eager H2D. The device copies are never written in place (the
+        decode-only metadata cache already reuses them across steps).
+        """
+        key = (tuple(cpu.shape), cpu.numpy().tobytes())
+        cache = self.__dict__.setdefault("_content_upload_cache", {})
+        hit = cache.get(slot)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        dev = cpu.to(self.device, non_blocking=True)
+        cache[slot] = (key, dev)
+        return dev
 
     def _record_input_staging_fence(self) -> None:
         """Fence the uploads issued from the reusable host staging tensors.
