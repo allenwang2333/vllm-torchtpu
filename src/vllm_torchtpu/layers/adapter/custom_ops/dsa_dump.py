@@ -168,6 +168,8 @@ def after_forward(positions=None) -> None:
         if seq_len < min_seqlen or qlen <= 0:
             continue
         kv = module.k_cache.kv_cache
+        if not isinstance(kv, torch.Tensor) or kv.dim() != 4 or kv.numel() == 0:
+            continue  # memory-profiling run: no KV cache allocated yet
         num_pages, spp, pack, width = kv.shape
         page = spp * pack
         page_indices = md.block_tables.cpu().numpy().astype(np.int64)
