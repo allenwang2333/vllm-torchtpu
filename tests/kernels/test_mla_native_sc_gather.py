@@ -91,7 +91,12 @@ class NativeScGatherTest(absltest.TestCase):
         flat_indices = rng.integers(0, cache_tokens, count, dtype=np.int32)
         indices = jnp.asarray(flat_indices.reshape(query_tokens, topk))
 
+        # Zero live rows first (an idle rank's dummy batch): the zero-trip
+        # path must start no DMA it does not wait, or every later launch in
+        # this process fails.
         cases = [
+            (0, topk),
+            (0, 1),
             (1 * topk, topk),
             (5 * topk, topk),
             (16 * topk, topk),
