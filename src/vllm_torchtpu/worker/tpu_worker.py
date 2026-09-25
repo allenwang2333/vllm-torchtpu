@@ -689,7 +689,8 @@ class TPUWorker(WorkerBase):
             n = fast_dispatch.disable_aot_guard_checks(
                 getattr(runner, "model", None),
                 getattr(drafter, "draft_model", None),
-                getattr(drafter, "_mtp_loop_model", None))
+                getattr(drafter, "_mtp_loop_model", None),
+                getattr(drafter, "_mtp_fused_loop", None))
             logger.info("Disabled per-call AOT guard checks on %d forwards", n)
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
