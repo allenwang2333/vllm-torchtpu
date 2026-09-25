@@ -996,10 +996,17 @@ class KVCacheManager:
                 num_kv_heads = group.kv_cache_spec.num_kv_heads
                 parallel_config = self.runner.parallel_config
                 tp_size = parallel_config.tensor_parallel_size
-                assert num_kv_heads % tp_size == 0, (
-                    f"num_kv_heads {num_kv_heads} must be divisible by "
-                    f"tp_size {tp_size} under SPMD mode"
-                )
+                # KV cache Replication under SPMD mode.
+                if tp_size > num_kv_heads:
+                    assert tp_size % num_kv_heads == 0, (
+                        f"tp_size {tp_size} must be divisible by "
+                        f"num_kv_heads {num_kv_heads} under SPMD mode"
+                    )
+                else:
+                    assert num_kv_heads % tp_size == 0, (
+                        f"num_kv_heads {num_kv_heads} must be divisible by "
+                        f"tp_size {tp_size} under SPMD mode"
+                    )
             self.runner.attn_groups.append(
                 [
                     AttentionGroup(
@@ -1522,11 +1529,17 @@ class KVCacheManager:
                         num_kv_heads = kv_cache_spec.num_kv_heads
                         parallel_config = self.runner.parallel_config
                         tp_size = parallel_config.tensor_parallel_size
-                        # TODO: Handle kv cache duplication under SPMD mode.
-                        assert num_kv_heads % tp_size == 0, (
-                            f"num_kv_heads {num_kv_heads} must be divisible by "
-                            f"tp_size {tp_size} under SPMD mode"
-                        )
+                        # KV cache Replication under SPMD mode.
+                        if tp_size > num_kv_heads:
+                            assert tp_size % num_kv_heads == 0, (
+                                f"tp_size {tp_size} must be divisible by "
+                                f"num_kv_heads {num_kv_heads} under SPMD mode"
+                            )
+                        else:
+                            assert num_kv_heads % tp_size == 0, (
+                                f"num_kv_heads {num_kv_heads} must be divisible by "
+                                f"tp_size {tp_size} under SPMD mode"
+                            )
                     if region in shared_attention_caches:
                         kv_caches[layer_name] = shared_attention_caches[region]
                     elif use_block_major and layer_name in bundle_view_by_name:

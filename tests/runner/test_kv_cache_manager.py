@@ -1522,6 +1522,95 @@ class TestKVCacheManager:
         with pytest.raises(AssertionError, match="num_blocks"):
             self.runner.initialize_kv_cache(kv_cache_config)
 
+    @patch("vllm_torchtpu.utils.tpu_bind_kv_cache")
+    def test_initialize_kv_cache_spmd_replication(self, mock_bind):
+        """Verifies that SPMD mode allows tp_size > num_kv_heads (head replication)."""
+        attn_spec = FullAttentionSpec(
+            block_size=256,
+            num_kv_heads=2,
+            head_size=256,
+            dtype=torch.uint8,
+            page_size_padded=262144,
+        )
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec)
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=262144 * 4,
+                    layers=["attn.0"],
+                    layer_stride=262144 * 4,
+                    block_stride=262144,
+                )
+            ],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.use_spmd = True
+        self.runner.parallel_config = MagicMock()
+        self.runner.parallel_config.tensor_parallel_size = 8
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.kv_caches = []
+
+        mock_input_batch = MagicMock()
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 1
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1), dtype=torch.int32)
+        mock_input_batch.block_table = [mock_bt]
+        self.runner.input_batch = mock_input_batch
+
+        self.runner.initialize_kv_cache(kv_cache_config)
+        mock_bind.assert_called_once()
+        assert len(self.runner.attn_groups) == 1
+        created_caches = mock_bind.call_args[0][0]
+        assert len(created_caches) == 1
+
+    def test_initialize_kv_cache_spmd_invalid_configuration_rejected(self):
+        """Verifies that SPMD mode rejects non-divisible head configurations."""
+        # 3 kv_heads cannot be evenly replicated across tp_size=8
+        attn_spec = FullAttentionSpec(
+            block_size=256,
+            num_kv_heads=3,
+            head_size=256,
+            dtype=torch.uint8,
+            page_size_padded=393216,
+        )
+        kv_cache_groups = [
+            KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=attn_spec)
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=393216 * 4,
+                    layers=["attn.0"],
+                    layer_stride=393216 * 4,
+                    block_stride=393216,
+                )
+            ],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+        self.runner.use_spmd = True
+        self.runner.parallel_config = MagicMock()
+        self.runner.parallel_config.tensor_parallel_size = 8
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+        self.runner.kv_caches = []
+
+        mock_input_batch = MagicMock()
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 1
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 1), dtype=torch.int32)
+        mock_input_batch.block_table = [mock_bt]
+        self.runner.input_batch = mock_input_batch
+
+        with pytest.raises(AssertionError, match="must be divisible"):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
 
 def test_dsv4_layer_classification():
     """Every DSv4 layer is sorted by the kernel that reads its array.
