@@ -207,11 +207,59 @@ def assemble_async_spec_source_impl(
     return src, num_rejected
 
 
+def draft_seed_prep_impl(
+    input_ids: torch.Tensor,
+    next_tokens: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    row_idx: torch.Tensor,
+    rejected_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Async first-pass draft inputs for one chunk, in one program.
+
+    Replaces the async branch of ``Eagle3Proposer._prepare_draft_inputs``
+    (seed token / rejected count / seed position from the on-device
+    rejection output) plus the compiled ``_draft_seed_input_ids`` scatter and
+    the gather-index / rejected-count padding, at fixed bucket shapes.
+
+    Args:
+        next_tokens: ``[>=n, K+1]`` rejection output, ``-1`` past each
+            request's accepted prefix + bonus.
+        draft_lengths: ``[>=n]`` per-request verified draft count.
+        query_start_loc: ``[>=n+1]`` chunk query start offsets.
+        row_idx: ``[p]`` request row per loop-bucket slot; slots past the
+            real count ``n`` repeat row ``n-1`` so their seed scatter
+            rewrites that request's own slot with the same value.
+        rejected_idx: ``[R]`` request row per rejected-count slot, ``-1``
+            for the zero-filled tail.
+
+    Returns ``(draft_input_ids [T], gather_indices [p] int64,
+    num_rejected [R] int32)``.
+    """
+    nt = next_tokens[row_idx]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
+    next_token_ids = nt.gather(1, (num_valid - 1).unsqueeze(1)).squeeze(1)
+    num_draft = draft_lengths[row_idx].to(torch.int64)
+    num_rejected = num_draft - torch.minimum(num_valid - 1, num_draft)
+    last_token_indices = (query_start_loc[row_idx + 1].to(torch.int64) - 1 -
+                          num_rejected)
+    shifted = input_ids
+    if input_ids.shape[0] > 1:
+        shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
+    draft_input_ids = shifted.index_put((last_token_indices, ),
+                                        next_token_ids.to(input_ids.dtype))
+    rejected_out = torch.where(rejected_idx >= 0,
+                               num_rejected[rejected_idx.clamp(min=0)],
+                               0).to(torch.int32)
+    return draft_input_ids, last_token_indices, rejected_out
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 _async_spec_input_fixup_compiled = _tpu_compile(async_spec_input_fixup_impl)
 _spec_verify_sample_compiled = _tpu_compile(spec_verify_sample_impl)
 _assemble_async_spec_source_compiled = _tpu_compile(
     assemble_async_spec_source_impl)
+_draft_seed_prep_compiled = _tpu_compile(draft_seed_prep_impl)
 
 
 def async_spec_input_fixup(*args):
@@ -229,4 +277,10 @@ def spec_verify_sample(*args):
 def assemble_async_spec_source(*args):
     fn = (_assemble_async_spec_source_compiled
           if args[0].device.type == "tpu" else assemble_async_spec_source_impl)
+    return fn(*args)
+
+
+def draft_seed_prep(*args):
+    fn = (_draft_seed_prep_compiled
+          if args[0].device.type == "tpu" else draft_seed_prep_impl)
     return fn(*args)

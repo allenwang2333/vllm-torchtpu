@@ -16,6 +16,10 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    SequenceLayoutKind,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -169,6 +173,8 @@ class Eagle3Proposer:
         ] = {}
         # Last propose()'s bucket-padded [p, K] drafts per chunk.
         self.last_padded_drafts: list[torch.Tensor] = []
+        # (loop bucket, kernel num_reqs, num_reqs) -> fused draft-prep indices.
+        self._draft_prep_idx_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -818,6 +824,24 @@ class Eagle3Proposer:
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
+            if (
+                not self._share_mtp_indices
+                and chunk.sequence_layout_plan.descriptor
+                == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            ):
+                # Request-major layout: every gather index is a real row
+                # (no -1 owner markers), and the carry aggregation is the
+                # identity, so gather + first draft token run as one program.
+                with set_model_tag("eagle_head"):
+                    hidden_carry, positions_carry, first_token = (
+                        self._draft_gather_carries_and_propose(
+                            hidden, positions, last_hidden, last_token_indices
+                        )
+                    )
+                hidden_carry_per_chunk.append(hidden_carry)
+                positions_carry_per_chunk.append(positions_carry)
+                draft_tokens_per_chunk.append([first_token])
+                continue
             owner_mask = last_token_indices.ge(0)
             safe_gather_indices = last_token_indices.clamp_min(0)
             if self._share_mtp_indices:
@@ -1006,6 +1030,17 @@ class Eagle3Proposer:
         num_reqs = chunk.num_reqs
         start = chunk.start_index
 
+        if (
+            next_tokens_device is not None
+            and chunk.draft_lengths is not None
+            and chunk.sequence_layout_plan.kind is SequenceLayoutKind.ALL
+            and not any(
+                start <= i < start + num_reqs
+                for i in discard_sampled_tokens_req_indices
+            )
+        ):
+            return self._prepare_draft_inputs_fused(chunk, next_tokens_device)
+
         query_start_loc_np = chunk.query_start_loc_np[: num_reqs + 1]
         orig_num_tokens_per_req = query_start_loc_np[1:] - query_start_loc_np[:-1]
 
@@ -1182,6 +1217,71 @@ class Eagle3Proposer:
         )
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
+
+    def _prepare_draft_inputs_fused(
+        self, chunk: DraftChunkInputs, next_tokens_device: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Async `_prepare_draft_inputs` for the common case (request-major
+        layout, no partial-prefill seeds) as one fixed-shape program — see
+        `host_fusion.draft_seed_prep`.
+
+        Differences from the general path, none observable in the drafts:
+        the gather index tail past num_reqs repeats the last real request
+        instead of zeros (the sync path's convention; propose() slices those
+        rows off), and the rejected count comes back already padded to the
+        loop kernel's request count.
+        """
+        from vllm_torchtpu.runner.host_fusion import draft_seed_prep
+
+        runner = self.runner
+        num_reqs = chunk.num_reqs
+        p = self._loop_bucket(num_reqs)
+        knr = (
+            runner.num_reqs_max_model_len
+            if chunk.attn_ctx.use_max_model_len
+            else runner.num_reqs_most_model_len
+        )
+        key = (p, knr, num_reqs)
+        idx = self._draft_prep_idx_cache.get(key)
+        if idx is None:
+            row_idx = np.minimum(np.arange(p, dtype=np.int32), num_reqs - 1)
+            rej_idx = np.where(
+                np.arange(knr) < num_reqs, np.arange(knr), -1
+            ).astype(np.int32)
+            idx = (
+                torch.from_numpy(row_idx).to(runner.device),
+                torch.from_numpy(rej_idx).to(runner.device),
+            )
+            self._draft_prep_idx_cache[key] = idx
+        draft_input_ids, gather_indices, num_rejected = draft_seed_prep(
+            chunk.input_ids,
+            next_tokens_device,
+            chunk.draft_lengths,
+            chunk.attn_ctx.query_start_loc,
+            idx[0],
+            idx[1],
+        )
+        return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_gather_carries_and_propose(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        last_hidden: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`_draft_gather_carries` + `_draft_propose_token` on the gathered
+        pre-lm-head hidden, as one program, for the default sequence layout
+        (where the carry aggregation between them is the identity)."""
+        # Nested compiled methods are inlined into this graph by dynamo.
+        hidden_carry, positions_carry, last_hidden_carry = (
+            self._draft_gather_carries(
+                hidden, positions, last_hidden, indices.clamp_min(0)
+            )
+        )
+        token = self._draft_propose_token(last_hidden_carry)
+        return hidden_carry, positions_carry, token
 
     def _build_draft_attn_metadata(
         self,
