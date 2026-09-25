@@ -532,6 +532,7 @@ def prepare_outputs(
         "small_chunk_batch_size",
         "small_chunk_live_gather",
         "small_chunk_gather_atoms",
+        "live_gather_all_chunks",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -562,6 +563,7 @@ def sparse_ragged_paged_attention(
     small_chunk_batch_size: int | None = 1,
     small_chunk_live_gather: bool = True,
     small_chunk_gather_atoms: int = 1,
+    live_gather_all_chunks: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -602,6 +604,11 @@ def sparse_ragged_paged_attention(
         the native SparseCore gather to the rows the attention grid reads,
         `[start_pos, batch_end) x topk`; the remaining rows stay unwritten.
       small_chunk_gather_atoms: `atoms_per_batch` for that bounded gather.
+      live_gather_all_chunks: Also bound the native SparseCore gather of
+        larger chunks to `[start_pos, batch_end) x topk`, keeping
+        `sparsecore_atoms_per_batch` (live granularity: one owner round).
+        Fully dead chunks issue no gather; an all-live chunk traces the same
+        grid length as the unbounded gather.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -903,6 +910,12 @@ def sparse_ragged_paged_attention(
                 # Gather exactly the rows the attention grid will read,
                 # [start_pos, batch_end) x topk; the rest stay unwritten.
                 gather_atoms = small_chunk_gather_atoms
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
+            elif live_gather_all_chunks:
+                # Same bound for every chunk size, atoms kept.
                 live_kwargs = dict(
                     num_live_indices=num_valid_indices,
                     live_multiple=kernel_batch_size * topk,
