@@ -998,7 +998,9 @@ class TPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             get_kv_transfer_group().wait_for_save()
 
-    def get_finished_kv_transfers(self, scheduler_output):
+    def get_finished_kv_transfers(
+        self, scheduler_output, *, defer_finalize: bool = False
+    ):
         if not has_kv_transfer_group():
             return None, None, None, set(), None, None
         kv_connector = get_kv_transfer_group()
@@ -1020,9 +1022,10 @@ class TPUModelRunner(GPUModelRunner):
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
         kv_connector_stats = kv_connector.get_kv_connector_stats()
-        # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
-        # metadata is bound per-step and must be cleared after use.
-        kv_connector.clear_connector_metadata()
+        # Match the upstream mixin: speculative decoding retains metadata
+        # until finalize_kv_connector() runs after drafting.
+        if not defer_finalize:
+            kv_connector.clear_connector_metadata()
         return (
             finished_sending,
             finished_recving,
@@ -2143,6 +2146,24 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        invalidated_req_ids = (scheduler_output.preempted_req_ids or set()) | (
+            scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+        for req_id in invalidated_req_ids:
+            self._mamba_state_pos.pop(req_id, None)
+        self._mamba_offset_seeded.difference_update(invalidated_req_ids)
+        if self._pre_async_results is not None and invalidated_req_ids:
+            # A resumed request recomputes from the scheduler's token history.
+            # Its old async tokens, rejection correction and CPU writeback
+            # belong to the KV state that was freed. Keep other requests' source
+            # indices intact: their next decode step still needs those results.
+            for req_id in invalidated_req_ids:
+                self._pre_async_results.req_id_to_index_copy.pop(req_id, None)
+            self._pre_async_results.request_seq_lens = [
+                record
+                for record in self._pre_async_results.request_seq_lens
+                if record[3] not in invalidated_req_ids
+            ]
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
@@ -2206,7 +2227,9 @@ class TPUModelRunner(GPUModelRunner):
             # accepted. Now that the true acceptance is known, drop the entire
             # optimistic guess and append the actual sampled tokens.
             n_placeholder = 1 + (
-                pre_num_draft_per_req.get(pre_req_idx, 0)
+                pre_num_draft_per_req.get(
+                    pre_req_idx, pre_num_draft_per_req.get(req_id, 0)
+                )
                 if pre_num_draft_per_req
                 else 0
             )
@@ -2226,18 +2249,19 @@ class TPUModelRunner(GPUModelRunner):
 
             req_idx = self.input_batch.req_id_to_index[req_id]
 
-            # num_tokens_no_spec was advanced to (seq_len + n_placeholder)
+            # num_tokens_no_spec was advanced to (start_tok_idx + n_placeholder)
             # optimistically; roll back the over-count (= num_rejected) so it
             # reflects the real committed length (start_idx + len(sampled_ids)).
             end_idx = self.input_batch.num_tokens_no_spec[req_idx]
             start_idx = end_idx - n_placeholder
-            self.input_batch.num_tokens_no_spec[req_idx] = start_idx + len(sampled_ids)
+            end_tok_idx = start_idx + len(sampled_ids)
+            self.input_batch.num_tokens_no_spec[req_idx] = end_tok_idx
 
-            target_slice = slice(seq_len - len(sampled_ids) + 1, seq_len + 1)
+            target_slice = slice(start_idx, end_tok_idx)
             # The committed tokens must fit within token_ids_cpu
             # ([num_reqs, max_model_len]); writing past the end is a sizing bug.
-            assert seq_len + 1 <= self.input_batch.token_ids_cpu.shape[1], (
-                f"req {req_id}: write end {seq_len + 1} exceeds max_model_len "
+            assert end_tok_idx <= self.input_batch.token_ids_cpu.shape[1], (
+                f"req {req_id}: write end {end_tok_idx} exceeds max_model_len "
                 f"{self.input_batch.token_ids_cpu.shape[1]}"
             )
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
@@ -2255,11 +2279,18 @@ class TPUModelRunner(GPUModelRunner):
             if req_idx in discard_set:
                 continue
 
+            actual_idx = self.input_batch.req_id_to_index.get(req_id, req_idx)
             # Async spec: optimistically advance by 1 (bonus) + num_draft;
             # the over-count is corrected on-device next step by subtract_num_rejected_tokens.
-            n_new = 1 + (num_draft_per_req.get(req_idx, 0) if num_draft_per_req else 0)
-            end_idx = seq_len + n_new
-            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            n_draft = (
+                num_draft_per_req.get(req_idx, num_draft_per_req.get(req_id, 0))
+                if num_draft_per_req
+                else 0
+            )
+            n_new = 1 + n_draft
+            start_tok_idx = self.input_batch.num_tokens_no_spec[actual_idx]
+            end_idx = start_tok_idx + n_new
+            self.input_batch.num_tokens_no_spec[actual_idx] = end_idx
 
             req_state.output_token_ids.extend([0] * n_new)
 
@@ -3271,8 +3302,11 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
-                and len(cur_input_indices) > 0
             ):
+                assert len(cur_input_indices) > 0, (
+                    "spec_decode_metadata is present under async scheduling, "
+                    "but cur_input_indices is empty -- drafts cannot be extracted"
+                )
                 from vllm_torchtpu.runner.tpu_runner_async_output import (
                     extract_draft_token_ids,
                 )
@@ -3830,10 +3864,8 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
         elif is_spec_step:
-            if needs_logprobs:
-                raise NotImplementedError(
-                    "Logprobs are not supported with speculative decoding on TPU yet."
-                )
+            # Temporary debug bypass requested for traffic stability inspection.
+            # Speculative steps still do not produce logprobs.
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
@@ -4038,10 +4070,11 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
 
-        # Poll the KV connector only now: the wait above proves the previous
-        # forward finished, so a store deferred behind it can be handed to
-        # raiden in this step rather than the next.
-        self.maybe_wait_for_kv_save()
+        # Match vLLM's speculative lifecycle: keep completion polling here,
+        # but defer saves and metadata cleanup until after draft execution.
+        defer_finalize = self.speculative_config is not None
+        if not defer_finalize:
+            self.maybe_wait_for_kv_save()
         (
             finished_sending,
             finished_recving,
@@ -4049,7 +4082,9 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids,
             invalid_block_group_index,
             kv_connector_stats,
-        ) = self.get_finished_kv_transfers(scheduler_output)
+        ) = self.get_finished_kv_transfers(
+            scheduler_output, defer_finalize=defer_finalize
+        )
 
         kv_connector_output = (
             None
@@ -4262,9 +4297,12 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
-            return final_output
+        # Device drafters run above; ngram proposes after host bookkeeping.
+        # Both must retain connector metadata until this common finalization.
+        if defer_finalize:
+            self.finalize_kv_connector()
 
-        return async_output
+        return async_output if is_async else final_output
 
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")

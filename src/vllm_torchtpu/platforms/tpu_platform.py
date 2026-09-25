@@ -26,6 +26,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
+from vllm_torchtpu.worker.tpu_rank_binding import ensure_pcp_local_rank_remap
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -815,6 +816,11 @@ class TpuPlatform(Platform):
             # --data-parallel-size-local / --data-parallel-start-rank).
             dp_size = parallel_config.data_parallel_size
             if dp_size > 1:
+                if pcp_size > 1:
+                    ensure_pcp_local_rank_remap(
+                        parallel_config.world_size_across_dp,
+                        get_topology=cls._get_tpu_topology,
+                    )
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
@@ -863,6 +869,10 @@ class TpuPlatform(Platform):
                         "Preparing TorchTPU bootstrap env for native PCP "
                         "multiprocess world_size=%d.",
                         torch_tpu_world_size,
+                    )
+                    ensure_pcp_local_rank_remap(
+                        torch_tpu_world_size,
+                        get_topology=cls._get_tpu_topology,
                     )
                 cls._prepare_singlehost_tpu_env(torch_tpu_world_size)
             if (

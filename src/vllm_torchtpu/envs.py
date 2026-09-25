@@ -79,6 +79,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
+    TPU_PCP_REMAP_PROBE_TIMEOUT_S: float = 120.0
+    TPU_PCP_LOCAL_RANK_REMAP: str | None = None
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
@@ -505,12 +507,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD": env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
-    # Select the blockwise owner-output kernel after the outer one-hot MoE
-    # threshold has selected the TensorCore path. "off" keeps the dense
-    # one-hot combine; "on" enables the kernel for every shape that passes
-    # its dtype, alignment, and VMEM safety checks.
+    # Select owner combine after the one-hot MoE threshold selects the
+    # TensorCore path: "off" keeps dense combine, "on" uses a separate
+    # blockwise owner-output kernel, and "fused" combines within FP8 GMM2
+    # VMEM. Unsupported shapes retain the original path; "fused" does not
+    # fall back to the separate owner-output kernel.
     "TPU_MOE_OWNER_OUTPUT_MODE": env_with_choices(
-        "TPU_MOE_OWNER_OUTPUT_MODE", "off", ["off", "on"], case_sensitive=False
+        "TPU_MOE_OWNER_OUTPUT_MODE",
+        "off",
+        ["off", "on", "fused"],
+        case_sensitive=False,
     ),
     # Maximum hidden-state row count (after any EP all-gather) for dense
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
@@ -666,6 +672,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     .strip()
     .lower()
     not in ("0", "false", "off", "no"),
+    # 临时单机 PCP rank workaround：探测所有本地 rank 的超时秒数。
+    "TPU_PCP_REMAP_PROBE_TIMEOUT_S": lambda: float(
+        os.getenv("TPU_PCP_REMAP_PROBE_TIMEOUT_S", "120.0")
+    ),
+    # launcher 实测的 LOCAL_RANK 置换；未设置时动态探测。
+    # 空字符串仍是无效配置，不能作为未设置处理。
+    "TPU_PCP_LOCAL_RANK_REMAP": lambda: os.getenv("TPU_PCP_LOCAL_RANK_REMAP"),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
     "USE_RPA_PIPELINED_DMA_STAGING": lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")()

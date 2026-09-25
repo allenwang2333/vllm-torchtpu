@@ -314,7 +314,7 @@ class TPUWorker(WorkerBase):
                 "TPU DP worker: dp_size=%d dp_rank=%d per_engine_world=%d "
                 "self.rank=%d self.local_rank=%d -> tpu_rank=%d "
                 "tpu_local_rank=%d global_world=%d "
-                "init_local_rank=%d "
+                "init_local_rank=%d pcp_remap=%s source=%s "
                 "(vllm_init_rank=%d vllm_init_world=%d)",
                 dp_size,
                 dp_rank,
@@ -325,6 +325,8 @@ class TPUWorker(WorkerBase):
                 binding.local_rank,
                 binding.world_size,
                 binding.init_local_rank,
+                binding.pcp_local_rank_remap,
+                binding.pcp_remap_source,
                 init_rank,
                 init_world,
             )
@@ -350,13 +352,15 @@ class TPUWorker(WorkerBase):
                     "PCP native-rank TPU binding | rank=%d "
                     "native_local_rank=%d local_rank_env=%d "
                     "tpu_local_rank_env=%d local_world=%s "
-                    "tpu_local_world=%d",
+                    "tpu_local_world=%d remap=%s source=%s",
                     self.rank,
                     self.local_rank,
                     binding.init_local_rank,
                     binding.local_rank,
                     binding.world_size,
                     binding.local_world_size,
+                    binding.pcp_local_rank_remap,
+                    binding.pcp_remap_source,
                 )
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
@@ -419,7 +423,14 @@ class TPUWorker(WorkerBase):
         # below. topology_aware_mesh needs open chips and a live process
         # group, so this is the first point it can be asked -- and the last
         # point the answer can still be applied.
-        group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
+        # The temporary single-host remap already determines the arithmetic
+        # PCP/TP layout. Preserve upstream topology handling for every other
+        # binding, including multihost PCP, without remapping it a second time.
+        group_ranks_by_name = (
+            None
+            if binding.pcp_rank_remap_active
+            else resolve_pcp_topology_order(self.vllm_config)
+        )
         with (
             set_current_vllm_config(self.vllm_config),
             pcp_topology_order(group_ranks_by_name),
