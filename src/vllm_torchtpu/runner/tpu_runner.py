@@ -109,6 +109,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import maybe_create_mm_encoder_manager
+from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -2905,6 +2906,31 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
+    def _execute_mm_encoder(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[torch.Tensor]:
+        """Run the vision encoder with optional video frame chunking.
+
+        A long video encoded in one shot makes the vision attention kernel
+        process every `t*h*w` patch in a single forward, which can exhaust
+        VMEM. `MM_ENCODER_FRAME_CHUNK_PATCH_SIZE` bounds each forward to that
+        many patches by splitting the clip on the temporal axis (bit-exact, see
+        `vllm_torchtpu.runner.mm_video_chunking`). Everything else — batching,
+        multimodal LoRA, `prompt_embeds`, the encoder cudagraph path and the
+        encoder cache — stays on the base `GPUModelRunner` implementation.
+
+        Args:
+            scheduler_output: Scheduler output containing the scheduled batch
+                and multimodal inputs.
+
+        Returns:
+            List of multimodal embedding tensors for inputs processed by the
+            encoder.
+        """
+        with chunked_video_encoding(self.model, self.model_config):
+            return super()._execute_mm_encoder(scheduler_output)
+
     def _get_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -4346,6 +4372,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
+        pinned_draft_layers = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -4353,25 +4380,53 @@ class TPUModelRunner(GPUModelRunner):
                 if isinstance(
                     getattr(attn_layer, "impl", None), PallasAttentionBackendImpl
                 ):
-                    # Relocate a REPLICATED (tp=1) draft's attention to the LOCAL
-                    # (non-shard_map) kernel.
-                    if (
-                        name in draft_attn_names
-                        and self.speculative_config.draft_tensor_parallel_size == 1
-                    ):
-                        # Instance attrs shadow the ClassVars; unique prefix
-                        # keeps the local kernel op out of the sharded registry.
-                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                        attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+                    is_draft = name in draft_attn_names
+                    pre_w = attn_layer.impl.decode_query_size
+                    if is_draft:
+                        # A K+1-wide decode tile describes the TARGET's verify
+                        # step; a proposer runs one query token per draft step,
+                        # so pin it to 1. NOTE: on Gemma-4 the draft layers are
+                        # observed to already be 1 here, so this is a guard
+                        # rather than the fix for b/536992014.
                         attn_layer.impl.decode_query_size = 1
-                        logger.info(
-                            "Draft attn %s -> LOCAL (non-shard_map) RPA kernel"
-                            " | DRAFT_KV_BLOCK_CAP=%d",
-                            name,
-                            _DRAFT_KV_BLOCK_CAP,
-                        )
+                        # Relocate a REPLICATED (tp=1) draft's attention to the
+                        # LOCAL (non-shard_map) kernel. Independent of the tile
+                        # width above: this is about the draft's TP topology.
+                        if self.speculative_config.draft_tensor_parallel_size == 1:
+                            # Instance attrs shadow the ClassVars; unique prefix
+                            # keeps the local kernel op out of the sharded
+                            # registry.
+                            attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
+                            attn_layer.impl._kernel_op_prefix = (
+                                "pallas::rpa_kernel_local"
+                            )
+                            logger.info(
+                                "Draft attn %s -> LOCAL (non-shard_map) RPA "
+                                "kernel | DRAFT_KV_BLOCK_CAP=%d",
+                                name,
+                                _DRAFT_KV_BLOCK_CAP,
+                            )
                     attn_layer.impl.initialize_kernel(attn_layer)
-                    decode_query_sizes.append(attn_layer.impl.decode_query_size)
+                    pinned_draft_layers.append(
+                        (
+                            "draft" if is_draft else "target",
+                            type(attn_layer.impl).__name__,
+                            pre_w,
+                            attn_layer.impl.decode_query_size,
+                            getattr(attn_layer.impl, "head_size", None),
+                        )
+                    )
+                    # Target layers only. `reorder_batch_threshold` is read in
+                    # exactly one place (`rpa_num_decode_reqs` in
+                    # `_prepare_inputs`), which shapes the TARGET's batch; the
+                    # draft never reads it and builds its own pure-decode
+                    # distribution instead (eagle3 `_propose_step`). So draft
+                    # widths have no business in this min() -- folding the
+                    # draft's necessary 1 in would drag the threshold to 1 and
+                    # silently disable #1008 for every spec config that has a
+                    # draft, which is every config it was written for.
+                    if not is_draft:
+                        decode_query_sizes.append(attn_layer.impl.decode_query_size)
                     initialized_count += 1
 
             # Pre-build custom attention, compressor, and indexer kernels (e.g. DeepSeek-V4 SWA/CSA/HCA)
@@ -4403,9 +4458,24 @@ class TPUModelRunner(GPUModelRunner):
                             _ = getattr(module, op_name)
                             initialized_count += 1
         self.reorder_batch_threshold = min(decode_query_sizes, default=1)
+        # State it, don't infer it: a target-only [4] and an undetected-draft
+        # [4] print identically, so the draft count is the only way to tell
+        # whether the pinning below actually matched any layer.
+        from collections import Counter
+
         logger.info(
-            "Pre-built attention/indexing kernels for %d layers/modules.",
+            "Attn layer census (role, impl, width_before_init, "
+            "width_after_init, head_size) -> count: %s | draft names known=%d",
+            dict(Counter(pinned_draft_layers)),
+            len(draft_attn_names),
+        )
+        logger.info(
+            "Pre-built attention/indexing kernels for %d layers/modules. "
+            "decode_query_size=%s -> reorder_batch_threshold=%d "
+            "(>1 means speculative verify runs in the RPAd decode stage).",
             initialized_count,
+            sorted(set(decode_query_sizes)),
+            self.reorder_batch_threshold,
         )
         self._attention_kernels_initialized = True
 
