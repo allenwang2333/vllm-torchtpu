@@ -140,9 +140,20 @@ def _out_dir() -> str:
 
 
 def after_forward(positions=None) -> None:
-    """Host: save qualifying steps. Called by the runner after the forward."""
+    """Host: save qualifying steps. Called by the runner after the forward.
+
+    A failing dump is logged and disarms itself; it never takes the server down.
+    """
     if not _registry:
         return
+    try:
+        _after_forward(positions)
+    except Exception:  # noqa: BLE001 - debug tooling must not kill serving
+        logger.exception("[dsa_dump] dump failed; disarming")
+        _registry.clear()
+
+
+def _after_forward(positions) -> None:
     from vllm.forward_context import get_forward_context
 
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
