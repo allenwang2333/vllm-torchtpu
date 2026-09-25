@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     USE_MOE_FUSED_EP_KERNEL: bool = False
     USE_GLM5_MEGAKERNEL: bool = False
     GLM5_MEGAKERNEL_VERIFY: bool = False
+    GLM5_MEGAKERNEL_LAYERDIFF: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -596,6 +597,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug: on megakernel steps also run the stock forward and log how far
     # the two final hidden states and greedy tokens are apart. Slow.
     "GLM5_MEGAKERNEL_VERIFY": env_bool("GLM5_MEGAKERNEL_VERIFY"),
+    # Debug, with VERIFY: also log per-layer residual-stream error and top-k
+    # overlap against the stock layers (kernel built with debug outputs).
+    "GLM5_MEGAKERNEL_LAYERDIFF": env_bool("GLM5_MEGAKERNEL_LAYERDIFF"),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.

@@ -196,6 +196,11 @@ class Glm5Megakernel:
         with torch.no_grad():
             self.weights = [w.detach() for w in self._collect_weights()]
             self.smalls = self._build_smalls().detach()
+        # Debug: per-layer comparison against the stock layers (VERIFY + LAYERDIFF).
+        self.layerdiff = bool(envs.GLM5_MEGAKERNEL_VERIFY and envs.GLM5_MEGAKERNEL_LAYERDIFF)
+        self.dbg = None
+        if self.layerdiff:
+            self._install_layer_taps()
         self.op = None
         self.caches = None
         self._step = None
@@ -312,6 +317,35 @@ class Glm5Megakernel:
             f["w2_s"] = _scale(mlp.down_proj, cfg.H, "dense.down_proj")
         return f
 
+    def _install_layer_taps(self) -> None:
+        """Wrap each stock decoder layer (and indexer) so the stock forward copies row 0 of its
+        (hidden, residual) output and its top-k set into fixed buffers. Installed at model load,
+        before any compile, so the copies are traced into the stock graph."""
+        cfg = self.cfg
+        dev = self.embed.device
+        ref_s = torch.zeros(cfg.L, 2, cfg.H, dtype=torch.float32, device=dev)
+        ref_tk = torch.full((cfg.L, cfg.KT), -1, dtype=torch.int32, device=dev)
+        self.ref_s, self.ref_tk = ref_s, ref_tk
+        for l in range(cfg.L):
+            layer = self.backbone.layers[l]
+
+            def fwd(*a, _o=layer.forward, _l=l, **kw):
+                out = _o(*a, **kw)
+                ref_s[_l, 0].copy_(out[0][0].float())
+                ref_s[_l, 1].copy_(out[1][0].float())
+                return out
+
+            layer.forward = fwd
+            idx = getattr(layer.self_attn, "indexer", None)
+            if idx is not None:
+                def ifwd(*a, _o=idx.forward, _l=l, **kw):
+                    out = _o(*a, **kw)
+                    ref_tk[_l].copy_(out[0, : cfg.KT].to(torch.int32))
+                    return out
+
+                idx.forward = ifwd
+        logger.info("GLM-5.2 megakernel: layer-diff taps on %d layers", cfg.L)
+
     # ----------------------------------------------------------------- caches
 
     def bind_caches(self, runner) -> None:
@@ -352,7 +386,9 @@ class Glm5Megakernel:
 
     def _build_op(self) -> None:
         cfg = self.cfg
-        call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles())
+        dbg = self.layerdiff
+        call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(),
+                             debug=dbg)
         self.info = info
         n_w = len(self.weights)
         n_c = len(self.caches)
@@ -362,7 +398,7 @@ class Glm5Megakernel:
         # rank's torch tensor is its shard unmodified and the body sees the
         # kernel's per-rank shapes directly.
         in_specs = (A, A, A, A, P()) + tuple(self.w_specs) + (A,) * n_c
-        out_specs = (A,) * (1 + n_c)
+        out_specs = (A,) * (1 + n_c + (2 if dbg else 0))
 
         def body(*args):
             return tuple(call(*args))
@@ -371,7 +407,7 @@ class Glm5Megakernel:
                              check_vma=False)
         n_in = 5 + n_w + n_c
         args = [f"x{i}" for i in range(n_in)]
-        ret = "tuple[" + ", ".join(["jax.Array"] * (1 + n_c)) + "]"
+        ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
         src = (f"def glm5_megakernel({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
                f"    return _smap({', '.join(args)})\n")
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
@@ -392,7 +428,12 @@ class Glm5Megakernel:
 
         @op.register_fake
         def _(meta, bt, h0, rt, smalls, weights, caches):
-            return [torch.empty_like(h0)] + [torch.empty_like(c) for c in caches]
+            extra = []
+            if dbg:
+                extra = [torch.empty((2 * cfg.L, cfg.H), dtype=torch.float32, device=h0.device),
+                         torch.empty((cfg.L, cfg.KT // 128, 128), dtype=torch.int32,
+                                     device=h0.device)]
+            return [torch.empty_like(h0)] + [torch.empty_like(c) for c in caches] + extra
 
         self.op = op
 
@@ -422,8 +463,10 @@ class Glm5Megakernel:
                 torch.cat([s, zero[DR:]]),
                 zero, zero, zero, zero])
             outs = op(meta, bt, h0, rt, smalls, list(weights), list(caches))
-            for dst, src in zip(caches, outs[1:]):
+            for dst, src in zip(caches, outs[1:1 + n_c]):
                 dst.copy_(src)
+            if dbg:
+                return outs[0], outs[1 + n_c], outs[2 + n_c]
             return outs[0]
 
         self._step = torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
@@ -455,6 +498,8 @@ class Glm5Megakernel:
             bt = torch.nn.functional.pad(bt, (0, self.max_pages - bt.shape[0]))
         busy = torch.tensor([0 if idle else 1], dtype=torch.int32).to(input_ids.device)
         out = self._run(input_ids[0:1], positions[0:1], busy, bt.to(torch.int32))
+        if self.layerdiff:
+            out, *self.dbg = out
         if num_tokens <= K.M:
             return out[:num_tokens]
         return torch.nn.functional.pad(out, (0, 0, 0, num_tokens - K.M))
@@ -465,6 +510,8 @@ class Glm5Megakernel:
 
         z = torch.zeros(self.max_pages, dtype=torch.int32).to(runner.device)
         out = self._run(z[0:1], z[0:1], z[0:1], z)
+        if self.layerdiff:
+            out = out[0]
         synchronize_tensors([out])
         logger.info("GLM-5.2 megakernel compiled and warmed (%d operands)",
                     5 + len(self.weights) + len(self.caches))

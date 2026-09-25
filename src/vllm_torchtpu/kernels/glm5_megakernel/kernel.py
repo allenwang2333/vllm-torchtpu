@@ -346,6 +346,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         if "buf_" + BUF[k] not in scratch:
             scratch["buf_" + BUF[k]] = pltpu.VMEM((NBUF[k],) + shp, wdtype[k])
             scratch["sem_" + BUF[k]] = pltpu.SemaphoreType.DMA((NBUF[k],))
+    if debug:                                    # debug outputs live in HBM: VMEM is full
+        scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((2,))
     s_names = list(scratch)
 
     def kernel(*refs):
@@ -1099,9 +1101,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
             ph.end()
             if debug:
-                dbg_h[pl.ds(2 * l, 1), :] = scr["h"][0:1, :]
-                dbg_h[pl.ds(2 * l + 1, 1), :] = scr["res"][0:1, :]
-                dbg_idx[l] = scr["idx_v"][...]
+                dcs = [pltpu.make_async_copy(scr["h"].at[pl.ds(0, 1)], dbg_h.at[pl.ds(2 * l, 1)],
+                                             scr["dbg_sem"].at[0]),
+                       pltpu.make_async_copy(scr["res"].at[pl.ds(0, 1)],
+                                             dbg_h.at[pl.ds(2 * l + 1, 1)], scr["dbg_sem"].at[0]),
+                       pltpu.make_async_copy(scr["idx_v"], dbg_idx.at[l], scr["dbg_sem"].at[1])]
+                for d_ in dcs:
+                    d_.start()
+                for d_ in dcs:
+                    d_.wait()
             return carry
 
         # ---------------- step ----------------
@@ -1131,7 +1139,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [pl.BlockSpec(memory_space=pl.ANY)] * 3
     if debug:
         out_shape += [jax.ShapeDtypeStruct((2 * L, H), F32), jax.ShapeDtypeStruct((L, NC, 128), I32)]
-        out_specs += [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
+        out_specs += [pl.BlockSpec(memory_space=pl.ANY)] * 2
     call = pl.pallas_call(
         kernel,
         out_shape=out_shape,

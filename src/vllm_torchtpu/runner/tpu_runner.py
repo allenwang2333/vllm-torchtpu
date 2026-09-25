@@ -6001,7 +6001,34 @@ class TPUModelRunner(GPUModelRunner):
             logger.info(
                 "GLM5_MK_VERIFY pos=%d rel_hidden=%.5f argmax_eq=%d max_logit_diff=%.4f",
                 int(positions[0].item()), float(stats[0]), int(stats[1]), float(stats[2]))
+            if self._glm5_mk.layerdiff:
+                self._glm5_mk_log_layers(int(positions[0].item()))
         return out
+
+    def _glm5_mk_log_layers(self, pos: int) -> None:
+        """Per layer: residual-stream (h + res) error of the kernel vs the stock layer, and the
+        top-k set overlap (Jaccard) on layers that compute top-k, once past index_topk."""
+        mk = self._glm5_mk
+        cfg = mk.cfg
+        dbg_h, dbg_idx = mk.dbg
+        sk = (dbg_h[0::2] + dbg_h[1::2]).float()
+        sr = mk.ref_s[:, 0] + mk.ref_s[:, 1]
+        rel = ((sk - sr).norm(dim=-1) / sr.norm(dim=-1).clamp_min(1e-30)).cpu().tolist()
+        relh = ((dbg_h[0::2].float() - mk.ref_s[:, 0]).norm(dim=-1)
+                / mk.ref_s[:, 0].norm(dim=-1).clamp_min(1e-30)).cpu().tolist()
+        jac = []
+        if pos + 1 > cfg.KT:
+            ki = dbg_idx.reshape(cfg.L, -1).cpu()
+            ri = mk.ref_tk.cpu()
+            for l in range(cfg.L):
+                if not cfg.full_indexer(l):
+                    continue
+                a = set(ki[l][ki[l] >= 0].tolist())
+                b = set(ri[l][ri[l] >= 0].tolist())
+                jac.append(f"{l}:{len(a & b) / max(len(a | b), 1):.3f}/{len(a)}/{len(b)}")
+        logger.info("GLM5_MK_LAYERS pos=%d rel=%s relh=%s jac=%s", pos,
+                    ",".join(f"{x:.4f}" for x in rel), ",".join(f"{x:.4f}" for x in relh),
+                    " ".join(jac))
 
     def _pp_intermediate_tensors(
         self, num_tokens: int, zeros: bool, random: bool = False
