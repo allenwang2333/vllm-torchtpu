@@ -1044,7 +1044,9 @@ class TPUModelRunner(GPUModelRunner):
         if has_kv_transfer_group():
             get_kv_transfer_group().wait_for_save()
 
-    def get_finished_kv_transfers(self, scheduler_output):
+    def get_finished_kv_transfers(
+        self, scheduler_output, *, defer_finalize: bool = False
+    ):
         if not has_kv_transfer_group():
             return None, None, None, set(), None, None
         kv_connector = get_kv_transfer_group()
@@ -1066,9 +1068,10 @@ class TPUModelRunner(GPUModelRunner):
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
         kv_connector_stats = kv_connector.get_kv_connector_stats()
-        # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
-        # metadata is bound per-step and must be cleared after use.
-        kv_connector.clear_connector_metadata()
+        # Match the upstream mixin: speculative decoding retains metadata
+        # until finalize_kv_connector() runs after drafting.
+        if not defer_finalize:
+            kv_connector.clear_connector_metadata()
         return (
             finished_sending,
             finished_recving,
@@ -2289,7 +2292,9 @@ class TPUModelRunner(GPUModelRunner):
             # accepted. Now that the true acceptance is known, drop the entire
             # optimistic guess and append the actual sampled tokens.
             n_placeholder = 1 + (
-                pre_num_draft_per_req.get(pre_req_idx, 0)
+                pre_num_draft_per_req.get(
+                    pre_req_idx, pre_num_draft_per_req.get(req_id, 0)
+                )
                 if pre_num_draft_per_req
                 else 0
             )
@@ -3353,8 +3358,11 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
-                and len(cur_input_indices) > 0
             ):
+                assert len(cur_input_indices) > 0, (
+                    "spec_decode_metadata is present under async scheduling, "
+                    "but cur_input_indices is empty -- drafts cannot be extracted"
+                )
                 from vllm_torchtpu.runner.tpu_runner_async_output import (
                     extract_draft_token_ids,
                 )
@@ -4168,10 +4176,11 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
 
-        # Poll the KV connector only now: the wait above proves the previous
-        # forward finished, so a store deferred behind it can be handed to
-        # raiden in this step rather than the next.
-        self.maybe_wait_for_kv_save()
+        # Match vLLM's speculative lifecycle: keep completion polling here,
+        # but defer saves and metadata cleanup until after draft execution.
+        defer_finalize = self.speculative_config is not None
+        if not defer_finalize:
+            self.maybe_wait_for_kv_save()
         (
             finished_sending,
             finished_recving,
@@ -4179,7 +4188,9 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids,
             invalid_block_group_index,
             kv_connector_stats,
-        ) = self.get_finished_kv_transfers(scheduler_output)
+        ) = self.get_finished_kv_transfers(
+            scheduler_output, defer_finalize=defer_finalize
+        )
 
         kv_connector_output = (
             None
@@ -4398,9 +4409,12 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
-            return final_output
+        # Device drafters run above; ngram proposes after host bookkeeping.
+        # Both must retain connector metadata until this common finalization.
+        if defer_finalize:
+            self.finalize_kv_connector()
 
-        return async_output
+        return async_output if is_async else final_output
 
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
