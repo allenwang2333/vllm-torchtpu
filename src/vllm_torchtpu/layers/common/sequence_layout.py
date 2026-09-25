@@ -8,6 +8,7 @@ from typing import Any, Protocol
 import numpy as np
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
 
 
@@ -288,7 +289,8 @@ class AllSequenceLayoutPlanner:
         is_pure_decode = all(int(x) == 1 for x in num_scheduled_tokens_per_req)
         effective_tokens = (int(total_num_scheduled_tokens)
                             if is_pure_decode else max(
-                                int(total_num_scheduled_tokens), 16))
+                                int(total_num_scheduled_tokens),
+                                envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS + 1))
         padded_num_tokens = _first_ge(runner.num_tokens_paddings,
                                       effective_tokens)
         dp_target_bucket = runner._dp_target_bucket

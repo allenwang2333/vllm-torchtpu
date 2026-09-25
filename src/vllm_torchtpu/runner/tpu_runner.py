@@ -142,6 +142,7 @@ class ExecuteModelState:
     # and so contributes a single-element list.
     mamba_state_indices_list: list[list[torch.Tensor]
                                    | None] = field(default_factory=list)
+    greedy_tokens_list: list[torch.Tensor | None] = field(default_factory=list)
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -2889,6 +2890,13 @@ class TPUModelRunner(GPUModelRunner):
         return (next_tokens_tpu_chunks, next_token_indices, spec_num_rejected,
                 num_draft_per_req)
 
+    def _init_mrope_positions(self, req_state: Any) -> None:
+        if not self.supports_mm_inputs or not getattr(req_state, "mm_features", None):
+            req_state.mrope_positions = None
+            req_state.mrope_position_delta = 0
+            return
+        super()._init_mrope_positions(req_state)
+
     def _prepare_inputs(self,
                         scheduler_output: "SchedulerOutput",
                         start_index: int,
@@ -2949,7 +2957,7 @@ class TPUModelRunner(GPUModelRunner):
         sequence_layout_planner.reserve_host_token_capacity(
             self, int(total_num_scheduled_tokens))
 
-        if self.uses_mrope:
+        if self.uses_mrope and self.supports_mm_inputs:
             self._calc_mrope_positions(scheduler_output)
 
         # Fast path for decode-only: all requests have exactly 1 token.
@@ -3076,13 +3084,26 @@ class TPUModelRunner(GPUModelRunner):
         self.input_ids = self.input_ids_cpu[local_token_slice].to(
             self.device, non_blocking=True)
         if self.uses_mrope:
-            if layout_plan.kind is SequenceLayoutKind.ALL:
-                self.mrope_positions.cpu[:, total_num_scheduled_tokens:
-                                         padded_total_num_scheduled_tokens] = 0
-            self.position_ids = self.mrope_positions.cpu[:,
-                                                         local_token_slice].to(
-                                                             self.device,
-                                                             non_blocking=True)
+            if self.supports_mm_inputs:
+                if layout_plan.kind is SequenceLayoutKind.ALL:
+                    self.mrope_positions.cpu[:, total_num_scheduled_tokens:
+                                             padded_total_num_scheduled_tokens] = 0
+                self.position_ids = self.mrope_positions.cpu[:,
+                                                             local_token_slice].to(
+                                                                 self.device,
+                                                                 non_blocking=True)
+            else:
+                if layout_plan.kind is SequenceLayoutKind.ALL:
+                    self.positions_np[total_num_scheduled_tokens:
+                                      padded_total_num_scheduled_tokens] = 0
+                pos_slice = self.positions_np[local_token_slice]
+                self.mrope_positions.np[0, local_token_slice] = pos_slice
+                self.mrope_positions.np[1, local_token_slice] = pos_slice
+                self.mrope_positions.np[2, local_token_slice] = pos_slice
+                self.position_ids = self.mrope_positions.cpu[:,
+                                                             local_token_slice].to(
+                                                                 self.device,
+                                                                 non_blocking=True)
         else:
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True)
@@ -3522,7 +3543,8 @@ class TPUModelRunner(GPUModelRunner):
         effective_total_scheduled_tokens = (
             scheduler_output.total_num_scheduled_tokens
             if num_decode_reqs == self.input_batch.num_reqs else
-            max(scheduler_output.total_num_scheduled_tokens, 16)
+            max(scheduler_output.total_num_scheduled_tokens,
+                envs.VLLM_TPU_PURE_DECODE_MAX_TOKENS + 1)
         )
 
         # Profile the current batch composition (prefill vs decode) if phased profiling is enabled.
@@ -3586,6 +3608,7 @@ class TPUModelRunner(GPUModelRunner):
         start_index = 0
         chunk_index = 0
         logits_list = []
+        greedy_tokens_list = []
         pooler_output_list = []
         num_reqs_list = []
         spec_decode_metadata_list = []
@@ -3731,16 +3754,33 @@ class TPUModelRunner(GPUModelRunner):
             sample_hidden_states = (
                 sequence_layout_planner.maybe_select_logits_hidden_states(
                     hidden_states, layout_plan, logits_indices))
-            if sample_hidden_states is None:
+            can_fuse_greedy = (
+                self.input_batch.all_greedy
+                and self.input_batch.max_num_logprobs is None
+                and not self.is_pooling_model
+                and self.speculative_config is None
+                and sample_hidden_states is None
+            )
+            if can_fuse_greedy:
+                hidden_states = sequence_layout_planner.finalize_hidden_states(
+                    hidden_states,
+                    layout_plan,
+                )
+                logits = None
+                greedy_tokens = self._compute_selected_greedy_tokens_compiled(
+                    hidden_states, logits_indices)
+            elif sample_hidden_states is None:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
                 )
                 logits = self.compute_selected_logits(hidden_states,
                                                       logits_indices)
+                greedy_tokens = None
             else:
                 logits = self.compute_logits_from_hidden_states(
                     sample_hidden_states)
+                greedy_tokens = None
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
@@ -3766,6 +3806,7 @@ class TPUModelRunner(GPUModelRunner):
                 pooler_output_list.append(pooler_output)
 
             logits_list.append(logits)
+            greedy_tokens_list.append(greedy_tokens)
             num_reqs_list.append(num_reqs)
             spec_decode_metadata_list.append(spec_decode_metadata)
             ctx = self._attn_metadata_builder_ctx
@@ -3813,6 +3854,7 @@ class TPUModelRunner(GPUModelRunner):
             spec_decode_metadata_list=spec_decode_metadata_list,
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
+            greedy_tokens_list=greedy_tokens_list,
         )
 
         if self.is_pooling_model:
@@ -3863,7 +3905,8 @@ class TPUModelRunner(GPUModelRunner):
         step's GDN kernel resumes each request from checkpoint `offset` of
         its state block (the checkpoint of its last accepted token).
         """
-        if self.mamba_slot_read_offsets is None or not indices_per_group:
+        if (self.mamba_slot_read_offsets is None or not indices_per_group
+                or (self.speculative_config is None and next_tokens is None)):
             return
         offsets = torch.zeros(indices_per_group[0].shape[0],
                               dtype=torch.int32,
@@ -3988,16 +4031,25 @@ class TPUModelRunner(GPUModelRunner):
     def _greedy_sample(self, logits: torch.Tensor) -> torch.Tensor:
         """argmax logits, only used when `all_greedy` is True.
         """
-        dummy = torch.empty((1, 1), dtype=logits.dtype, device=logits.device)
+        cache = getattr(self, "_greedy_dummy_cache", None)
+        if cache is None:
+            cache = {}
+            self._greedy_dummy_cache = cache
+        key = (logits.dtype, str(logits.device))
+        dummies = cache.get(key)
+        if dummies is None:
+            dummies = (
+                torch.empty((1, 1), dtype=logits.dtype, device=logits.device),
+                torch.empty((1, 1), dtype=torch.int32, device=logits.device),
+                torch.empty((1, 1), dtype=torch.float32, device=logits.device),
+            )
+            cache[key] = dummies
+        dummy, dummy_i32, dummy_f32 = dummies
         return self.sample_from_logits_func(logits,
                                             dummy,
                                             dummy,
-                                            torch.empty((1, 1),
-                                                        dtype=torch.int32,
-                                                        device=logits.device),
-                                            torch.empty((1, 1),
-                                                        dtype=torch.float32,
-                                                        device=logits.device),
+                                            dummy_i32,
+                                            dummy_f32,
                                             all_greedy=True)
 
     def _sample_spec_verify_chunk(
@@ -4205,31 +4257,36 @@ class TPUModelRunner(GPUModelRunner):
                 list[str],
                 self.input_batch.req_ids[:self.input_batch.num_reqs])
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, mamba_indices in zip(state.logits_list,
-                                                       state.num_reqs_list,
-                                                       mamba_idx_list):
+            greedy_list = (state.greedy_tokens_list
+                           or [None] * len(state.logits_list))
+            for logits, greedy_tokens, num_reqs, mamba_indices in zip(
+                    state.logits_list, greedy_list, state.num_reqs_list,
+                    mamba_idx_list):
                 cur_end_idx = cur_start_idx + num_reqs
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
                 self._update_mamba_slot_read_offsets(mamba_indices, None,
                                                      num_reqs)
-                if grammar_output is not None:
-                    logits = self.structured_decoding_manager.mask_logits(
-                        logits, grammar_output, cur_start_idx, cur_end_idx)
-                if all_greedy:
-                    selected_token_ids = self._greedy_sample(logits)
+                if greedy_tokens is not None and grammar_output is None:
+                    selected_token_ids = greedy_tokens
                 else:
-                    temperatures_tpu, top_k_tpu, top_p_tpu = (
-                        self._build_padded_sampling_params(
-                            cur_start_idx, cur_end_idx, logits))
-                    u = torch.rand_like(logits, generator=sampling_generator)
-                    selected_token_ids = self.sample_from_logits_func(
-                        logits,
-                        temperatures_tpu,
-                        u,
-                        top_k_tpu,
-                        top_p_tpu,
-                        all_greedy=all_greedy)
+                    if grammar_output is not None:
+                        logits = self.structured_decoding_manager.mask_logits(
+                            logits, grammar_output, cur_start_idx, cur_end_idx)
+                    if all_greedy:
+                        selected_token_ids = self._greedy_sample(logits)
+                    else:
+                        temperatures_tpu, top_k_tpu, top_p_tpu = (
+                            self._build_padded_sampling_params(
+                                cur_start_idx, cur_end_idx, logits))
+                        u = torch.rand_like(logits, generator=sampling_generator)
+                        selected_token_ids = self.sample_from_logits_func(
+                            logits,
+                            temperatures_tpu,
+                            u,
+                            top_k_tpu,
+                            top_p_tpu,
+                            all_greedy=all_greedy)
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
                 # due to recompilations outside torch.compiled code, so just make
@@ -4827,6 +4884,9 @@ class TPUModelRunner(GPUModelRunner):
                                           device=self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
+                    out_greedy = self._compute_selected_greedy_tokens_compiled(
+                        dummy_hidden, indices)
+                    synchronize_tensors(out_greedy)
                     logger.info("  -- num_tokens: %d, num_seqs: %d",
                                 num_tokens, num_reqs)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
@@ -6617,6 +6677,14 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0, ), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _compute_selected_greedy_tokens_compiled(
+            self, hidden_states: torch.Tensor,
+            indices_do_sample: torch.Tensor) -> torch.Tensor:
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        logits = self.model.compute_logits(selected)
+        return torch.argmax(logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(

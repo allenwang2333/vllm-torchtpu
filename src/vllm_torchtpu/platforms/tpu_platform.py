@@ -370,6 +370,7 @@ def apply_tpu_patches() -> None:
     _patch_vllm_hybrid_producer_prefix_hits()
     tpu_plugin._patch_vllm_block_pool_lifo_free()
     tpu_plugin._patch_vllm_vocab_parallel_embedding()
+    tpu_plugin._patch_vllm_request_output_collector()
     from vllm_torchtpu import _patch_vllm_reset_compile_wrapper  # isort: skip
     from vllm_torchtpu import (  # isort: skip
         _patch_dflash_bypass_v2_runner_check,

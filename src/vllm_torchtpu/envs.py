@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_BQ_CSZ: int | None = None
     VLLM_TPU_PREFILL_BKV_SZ: int = 4608
     VLLM_TPU_PREFILL_BKV_CSZ: int = 1152
-    VLLM_TPU_PURE_DECODE_MAX_TOKENS: int = 8
+    VLLM_TPU_PURE_DECODE_MAX_TOKENS: int = 16
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "tensorcore"
@@ -580,7 +580,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PREFILL_BKV_CSZ":
     env_int("VLLM_TPU_PREFILL_BKV_CSZ", 1152),
     "VLLM_TPU_PURE_DECODE_MAX_TOKENS":
-    env_int("VLLM_TPU_PURE_DECODE_MAX_TOKENS", 8),
+    env_int("VLLM_TPU_PURE_DECODE_MAX_TOKENS", 16),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.

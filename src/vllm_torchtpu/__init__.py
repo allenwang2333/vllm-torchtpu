@@ -63,30 +63,77 @@ def _patch_vllm_hybrid_producer_prefix_hits() -> None:
 
 
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
-    """Align Mamba prefill splits to the scheduler block size.
-
-    vLLM 0.27.0 uses the rank-local physical ``CacheConfig.block_size`` in
-    ``Scheduler._mamba_block_aligned_split``.  Under hybrid PCP, prefix hashes
-    and reusable Mamba states instead advance at ``Scheduler.block_size``, the
-    logical block spanning all PCP ranks.  Calling the upstream method with a
-    scheduler-local cache-config view backports the corresponding one-line fix
-    without mutating the shared ``VllmConfig.cache_config`` or copying the
-    scheduling algorithm into this plugin.
-    """
+    """Align Mamba prefill splits to the scheduler block size and avoid redundant tail splits."""
     import copy
+    import os
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    orig_cache_blocks = MambaManager.cache_blocks
+    if not getattr(orig_cache_blocks, "_tpu_skip_unaligned_patch", False):
+        @wraps(orig_cache_blocks)
+        def patched_mamba_cache_blocks(self, request, num_tokens, retention_interval=None):
+            if self.mamba_cache_mode == "align" and num_tokens % self.block_size != 0:
+                num_full_tokens = (num_tokens // self.block_size) * self.block_size
+                prev_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+                if prev_cached_blocks == 0 and num_full_tokens > 0:
+                    orig_cache_blocks(self, request, num_full_tokens, retention_interval=retention_interval)
+                self.num_cached_block[request.request_id] = num_tokens // self.block_size
+                partial_hash = self._cache_partial_tail_block(request, num_tokens)
+                if partial_hash is not None:
+                    self.cached_blocks_this_step.add(partial_hash)
+                return
+            return orig_cache_blocks(self, request, num_tokens, retention_interval=retention_interval)
+
+        patched_mamba_cache_blocks._tpu_skip_unaligned_patch = True
+        MambaManager.cache_blocks = patched_mamba_cache_blocks
 
     original_split = Scheduler._mamba_block_aligned_split
     if getattr(original_split, "_tpu_scheduler_block_size_patch", False):
         return
 
     @wraps(original_split)
-    def split_with_scheduler_block_size(self, *args, **kwargs):
+    def split_with_scheduler_block_size(self, request, num_new_tokens, *args, **kwargs):
+        start = (
+            request.num_computed_tokens
+            + (args[0] if len(args) > 0 else kwargs.get("num_new_local_computed_tokens", 0))
+            + (args[1] if len(args) > 1 else kwargs.get("num_external_computed_tokens", 0))
+        )
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start < prefill_end:
+            rem = prefill_end - start
+            if (
+                start > 0
+                and start + num_new_tokens >= prefill_end
+                and not getattr(self, "use_eagle", False)
+                and not (start < getattr(request, "shared_prefix_boundary", 0) < prefill_end)
+            ):
+                return rem
+            if os.environ.get("VLLM_TPU_NO_PARTIAL_PREFILL_SPLIT") == "1":
+                max_sched = getattr(
+                    self,
+                    "max_num_scheduled_tokens",
+                    getattr(
+                        getattr(self, "scheduler_config", None),
+                        "max_num_batched_tokens",
+                        73728,
+                    ),
+                )
+                chunk_aligned = (num_new_tokens // self.block_size) * self.block_size
+                rem_after = rem - chunk_aligned
+                if (
+                    num_new_tokens < rem
+                    and rem <= max_sched - 128
+                    and num_new_tokens < max_sched - 1024
+                    and (chunk_aligned == 0 or rem_after > max_sched - 43776)
+                ):
+                    return 0
+
         physical_cache_config = self.cache_config
         if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args, **kwargs)
+            return original_split(self, request, num_new_tokens, *args, **kwargs)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
         scheduler_cache_config.block_size = self.block_size
@@ -94,7 +141,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         # and the upstream implementation contains no callback or await point.
         self.cache_config = scheduler_cache_config
         try:
-            return original_split(self, *args, **kwargs)
+            return original_split(self, request, num_new_tokens, *args, **kwargs)
         finally:
             self.cache_config = physical_cache_config
 
@@ -1404,3 +1451,56 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     logger.info(
         "Applied TPU patch: register shard index bounds as buffers in VocabParallelEmbedding"
     )
+
+
+def _patch_vllm_request_output_collector() -> None:
+    try:
+        import asyncio
+        from collections import deque
+        from vllm.v1.engine.output_processor import RequestOutputCollector
+
+        if getattr(RequestOutputCollector, "_tpu_deque_patch", False):
+            return
+
+        def patched_init(self, output_kind, request_id):
+            self.aggregate = False
+            self.request_id = request_id
+            self.outputs = deque()
+            self.ready = asyncio.Event()
+            self._input_stream_task = None
+
+        def patched_put(self, output) -> None:
+            self.outputs.append(output)
+            self.ready.set()
+
+        async def patched_get(self):
+            while not self.outputs:
+                await self.ready.wait()
+            output = self.outputs.popleft()
+            if not self.outputs:
+                self.ready.clear()
+            if isinstance(output, Exception):
+                raise output
+            return output
+
+        def patched_get_nowait(self):
+            if not self.outputs:
+                return None
+            output = self.outputs.popleft()
+            if not self.outputs:
+                self.ready.clear()
+            if isinstance(output, Exception):
+                raise output
+            return output
+
+        RequestOutputCollector.__init__ = patched_init
+        RequestOutputCollector.put = patched_put
+        RequestOutputCollector.get = patched_get
+        RequestOutputCollector.get_nowait = patched_get_nowait
+        RequestOutputCollector._tpu_deque_patch = True
+        logger.info(
+            "Applied TPU patch: FIFO deque RequestOutputCollector for unmerged SSE streaming."
+        )
+    except Exception as e:
+        logger.warning(f"Could not apply RequestOutputCollector patch: {e}")
+
