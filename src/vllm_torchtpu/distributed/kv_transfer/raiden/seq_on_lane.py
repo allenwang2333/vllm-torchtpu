@@ -357,9 +357,14 @@ def lower_fa_spans_sol(
     ``page_tokens`` is the manager block (a whole number of kernel pages).
     ``dst_shards`` counts destination TP workers, including DCP lanes. DCP
     groups are contiguous TP ranks holding identical KV heads. Global page
-    j goes to lane j % DCP at compact local page j // DCP. Replicated source
-    KV heads are sent by the first TP replica only; the other replicas still
-    register their local bytes and participate in GDN state transfer.
+    j goes to lane j % DCP at compact local page j // DCP. Each DCP group
+    of ranks holding the same KV heads receives one full copy. Copies are
+    dealt round-robin across the replicas of a source head, so each replica
+    ships its local bytes at most once when the destination needs no more
+    copies than the source has replicas (the controller rejects a
+    registration whose span sum exceeds ``declared_bytes``). Replicas that
+    are dealt no copy still register their local bytes and participate in
+    GDN state transfer.
 
     TP1/DCP1 use the same ownership intersection. total_kv_heads is required
     for a TP producer because its local shape cannot distinguish sharding
@@ -405,7 +410,13 @@ def lower_fa_spans_sol(
         ):
             raise SeqOnLaneError("DCP group ranks must own identical KV heads")
     source_replicas = producer_tp_size // min(heads, producer_tp_size)
-    is_source_owner = producer_tp_rank % source_replicas == 0
+    source_replica = producer_tp_rank % source_replicas
+    dst_replicas = dst_shards // min(heads, dst_shards)
+    # Destination shards whose copy of its heads this replica ships.
+    is_copy_owner = [
+        (shard % dst_replicas) // dst_dcp_size % source_replicas == source_replica
+        for shard in range(dst_shards)
+    ]
     kps_per_block = page_tokens // kp_tokens
     ranges = owned_token_ranges(
         num_tokens=num_tokens,
@@ -428,7 +439,7 @@ def lower_fa_spans_sol(
             for shard, (dst_start, dst_end) in enumerate(destinations):
                 head_start, head_end = max(src_start, dst_start), min(src_end, dst_end)
                 if (
-                    not is_source_owner
+                    not is_copy_owner[shard]
                     or head_start >= head_end
                     or global_kp % dst_dcp_size != shard % dst_dcp_size
                 ):

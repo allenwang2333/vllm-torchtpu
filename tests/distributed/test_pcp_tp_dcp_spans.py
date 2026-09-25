@@ -46,6 +46,7 @@ def _page(heads, page, slab_bytes):
         (1, 1, 1, 1, 4),
         (4, 4, 8, 2, 2),  # Replicas also exist across destination DCP groups.
         (4, 4, 2, 1, 8),  # Multiple producers contribute to a destination page.
+        (1, 8, 8, 1, 2),  # TP8 -> TP8 with 2 KV heads: 4 replicas per head.
     ],
 )
 @pytest.mark.parametrize("tokens", [1, 127, 128, 129, 1023, 4225])
@@ -103,6 +104,10 @@ def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pa
             # declared_bytes describes the local source, even for a KV
             # replica that contributes no FA spans (it still owns GDN).
             assert reg.declared_bytes == len(owned) * geometry.kernel_page_bytes
+            # The controller rejects a non-empty registration whose span sum
+            # differs from declared_bytes, so replicas must not fan out.
+            sent = sum(span.size_bytes for span in reg.spans)
+            assert sent in (0, reg.declared_bytes)
             for span in reg.spans:
                 rank = span.dst_unit_ordinal or 0
                 assert span.count == 1 and span.dst_block_index == 0
