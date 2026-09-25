@@ -246,6 +246,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     KT = cfg.KT
     NC = KT // 128
     ROWS = rup(max_pages * pg // 128, 128)
+    assert ROWS <= 32 * 128, "top-k row summary is one (1, 128) word row"
     lay, S = smalls_layout(cfg)
     wk = weight_kinds(cfg)
     ck = cache_kinds(cfg, nb)
@@ -300,6 +301,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "keys": pltpu.VMEM((ROWS, 128), I32),
         "words_v": pltpu.VMEM((2, 4, ROWS), I32),
         "words_s": pltpu.SMEM((2, 4, ROWS), I32),
+        "rsum_v": pltpu.VMEM((8, 128), I32), "rsum_s": pltpu.SMEM((8, 128), I32),
         "idx_s": pltpu.SMEM((NC, 128), I32),
         "idx_v": pltpu.VMEM((NC, 128), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
@@ -543,7 +545,23 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     words_v[m_i] = hh[:, 0, :] | shl(hh[:, 1, :], 16)
                 cp = pltpu.make_async_copy(words_v, words_s, scr["misc_sem"])
                 cp.start()
+                # bit b of rsum[0, q]: row 32q+b has a selected key. The extraction visits only
+                # those rows, in order (j-098a4a19: 125 -> 97 us). 16-bit halves on the MXU.
+                w = words_v[0]
+                nzb = jnp.broadcast_to((w[0:1] | w[1:2] | w[2:3] | w[3:4]) != 0,
+                                       (8, ROWS)).astype(F32).astype(BF16)
+                rr = lax.broadcasted_iota(I32, (ROWS, 128), 0)
+                blk = (rr >> 5) == lax.broadcasted_iota(I32, (ROWS, 128), 1)
+                bb = rr & 31
+                halves = [lax.dot_general(
+                    nzb, jnp.where(blk & (bb >= 16 * h), shl(jnp.int32(1), bb & 15), 0)
+                    .astype(F32).astype(BF16) * (bb < 16 * (h + 1)).astype(BF16),
+                    NN, preferred_element_type=F32).astype(I32) for h in (0, 1)]
+                scr["rsum_v"][...] = halves[0] | shl(halves[1], 16)
+                cr = pltpu.make_async_copy(scr["rsum_v"], scr["rsum_s"], scr["misc_sem"])
+                cr.start()
                 cp.wait()
+                cr.wait()
 
                 def row(r, carry):
                     def word(j, carry):
@@ -569,7 +587,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         return out, eq_taken
                     return lax.fori_loop(0, 4, word, carry, unroll=True)
 
-                n_out, _ = lax.fori_loop(0, ROWS, row, (jnp.int32(0), jnp.int32(0)))
+                def sword(q, carry):
+                    def sbody(c):
+                        wq, carry = c
+                        low = wq & (-wq)
+                        return wq ^ low, row(q * 32 + jnp.int32(31) - lax.clz(low), carry)
+                    return lax.while_loop(lambda c: c[0] != 0, sbody, (scr["rsum_s"][0, q], carry))[1]
+
+                n_out, _ = lax.fori_loop(0, ROWS // 32, sword, (jnp.int32(0), jnp.int32(0)))
 
                 def pad(i, c):
                     idx_s[i >> 7, i & 127] = jnp.int32(-1)
@@ -820,7 +845,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
                                               scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
                         return c
-                    lax.fori_loop(0, KT, gbody, 0)
+                    lax.fori_loop(0, KT, gbody, 0, unroll=4)   # issue-bound: 66 -> 51 us (j-098a4a19)
                 return f
             if "gather" not in skip:
                 bswitch(l, {ll: gather(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
