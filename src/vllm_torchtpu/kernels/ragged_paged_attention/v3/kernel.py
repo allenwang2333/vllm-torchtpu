@@ -1005,7 +1005,12 @@ def _ragged_paged_attention_kernel_loop(
                     prev_exp_m_diff = None
                     bkv_start = idx * bkv_csz
 
-                    for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                    def _run_bq_step(bq_start):
+                        nonlocal prev_lm_slice, prev_p, prev_v, prev_exp_m_diff
+                        prev_lm_slice = None
+                        prev_p = None
+                        prev_v = None
+                        prev_exp_m_diff = None
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(
                                 bkv_sem_idx,
@@ -1048,35 +1053,77 @@ def _ragged_paged_attention_kernel_loop(
                             prev_v = cur_v
                             prev_exp_m_diff = cur_exp_m_diff
 
-                    # Execute pv of last iteration.
-                    assert prev_lm_slice is not None
-                    flash_attention_step2_pv(
-                        prev_p,
-                        prev_v,
-                        prev_exp_m_diff,
-                        acc_ref.at[*prev_lm_slice],
-                    )
+                        assert prev_lm_slice is not None
+                        flash_attention_step2_pv(
+                            prev_p,
+                            prev_v,
+                            prev_exp_m_diff,
+                            acc_ref.at[*prev_lm_slice],
+                        )
 
-            # Load acc and calculate final output.
-            acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
-            out = (acc * pl.reciprocal(l, approx=True) if
-                   (l.dtype == jnp.float32 and out_dtype != jnp.float32) else
-                   lax.div(acc, l)).astype(out_dtype)
+                    if actual_bq_sz == actual_bq_csz:
+                        _run_bq_step(0)
+                    else:
+                        @pl.loop(0, actual_bq_sz // actual_bq_csz, unroll=False)
+                        def bq_compute_loop(bq_step):
+                            _run_bq_step(bq_step * actual_bq_csz)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
             sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
             wait_send_bo(bo_sem_idx)
 
-            # Store output from acc to bo.
-            out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                actual_num_kv_heads * bq_sz *
-                num_q_heads_per_kv_head_per_packing,
-                head_dim,
-            ))
-            out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-            strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+            if actual_bq_sz == actual_bq_csz:
+                # Load acc and calculate final output.
+                acc = acc_ref[...]
+                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+                out = (acc * pl.reciprocal(l, approx=True) if
+                       (l.dtype == jnp.float32 and out_dtype != jnp.float32) else
+                       lax.div(acc, l)).astype(out_dtype)
+
+                # Store output from acc to bo.
+                out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+                    actual_num_kv_heads * bq_sz *
+                    num_q_heads_per_kv_head_per_packing,
+                    head_dim,
+                ))
+                out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
+                strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+            else:
+                out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+                    actual_num_kv_heads,
+                    bq_sz * num_q_heads_per_kv_head_per_packing,
+                    head_dim,
+                ))
+                num_bq_steps = actual_bq_sz // actual_bq_csz
+                csz_rows = actual_bq_csz * num_q_heads_per_kv_head
+                csz_packed_rows = (
+                    actual_bq_csz * num_q_heads_per_kv_head_per_packing
+                )
+
+                @pl.loop(0, num_bq_steps, unroll=False)
+                def store_bq_loop(bq_step):
+                    row_start = bq_step * csz_rows
+                    packed_start = bq_step * csz_packed_rows
+                    for kv_h in range(actual_num_kv_heads):
+                        acc_tile = acc_ref[kv_h, pl.ds(row_start, csz_rows), :]
+                        l_tile = broadcast_minor(
+                            l_ref[kv_h, pl.ds(row_start, csz_rows)],
+                            acc_tile.shape,
+                        )
+                        out_tile = (
+                            acc_tile * pl.reciprocal(l_tile, approx=True)
+                            if (l_tile.dtype == jnp.float32 and
+                                out_dtype != jnp.float32) else
+                            lax.div(acc_tile, l_tile)
+                        ).astype(out_dtype)
+                        out_tile_cast = pltpu.bitcast(
+                            out_tile, out_ref.dtype
+                        ).reshape(csz_packed_rows, head_dim)
+                        strided_store(
+                            out_ref[kv_h], packed_start, csz_packed_rows, 1,
+                            out_tile_cast
+                        )
 
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
@@ -1519,14 +1566,14 @@ def get_default_block_sizes(
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
-                bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
-            else:
-                bq_sz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(1024, max_kv)
-                bq_csz = min(512 // num_q_heads_per_kv_head, max_q)
-                bkv_csz = min(512, align_to(max_kv // 2, page_size))
+                bq_csz = 1
+                bkv_csz = min(512, bkv_sz)
+            else:
+                bq_sz = max(1, min(1024 // num_q_heads_per_kv_head, max_q // 2))
+                bkv_sz = min(1024, max_kv)
+                bq_csz = max(1, min(128 // num_q_heads_per_kv_head, max_q // 2))
+                bkv_csz = min(256, align_to(max_kv // 2, page_size))
         case 7:
             if case == RpaCase.DECODE:
                 bq_sz = 1
