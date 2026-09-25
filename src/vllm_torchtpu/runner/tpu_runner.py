@@ -2486,9 +2486,9 @@ class TPUModelRunner(GPUModelRunner):
         fused_async_fixup = (
             async_spec_src_pos is not None and pre.next_tokens_tpu is not None
             and layout_plan.kind is SequenceLayoutKind.ALL
-            and not self.uses_mrope and not self._pcp_mtp_k1_enabled
+            and not self._pcp_mtp_k1_enabled
             and self.input_ids.shape[0] == padded_total_num_scheduled_tokens
-            and self.position_ids.shape[0]
+            and self.position_ids.shape[-1]
             == padded_total_num_scheduled_tokens)
         if async_spec_src_pos is not None and not fused_async_fixup:
             from vllm_torchtpu.runner.tpu_runner_async_output import \

@@ -56,7 +56,8 @@ def async_spec_input_fixup_impl(
       * ``[0, S)``           seq_lens slot  -> index into ``num_rejected``
       * ``[S, S+T)``         position slot  -> index into ``num_rejected``
       * ``[S+T, S+2T)``      input_ids slot -> index into ``next_tokens``
-    with ``S = len(seq_lens)`` and ``T = len(input_ids) == len(positions)``.
+    with ``S = len(seq_lens)`` and ``T = len(input_ids)``; ``positions`` is
+    ``[T]``, or ``[3, T]`` for mrope.
 
     Returns ``(input_ids, positions, seq_lens, draft_token_ids)``, all new
     tensors (no input is mutated).
@@ -69,8 +70,11 @@ def async_spec_input_fixup_impl(
     zero = num_rejected.new_zeros(())
     seq_lens = seq_lens - torch.where(
         seq_idx >= 0, num_rejected[seq_idx.clamp(min=0)], zero)
-    positions = positions - torch.where(
-        pos_idx >= 0, num_rejected[pos_idx.clamp(min=0)], zero)
+    pos_subtract = torch.where(pos_idx >= 0,
+                               num_rejected[pos_idx.clamp(min=0)], zero)
+    if positions.ndim == 2:  # mrope: [3, T], every section shifts alike
+        pos_subtract = pos_subtract.unsqueeze(0)
+    positions = positions - pos_subtract
     new_ids = next_tokens[src_idx.clamp(min=0)].to(input_ids.dtype)
     input_ids = torch.where(src_idx >= 0, new_ids, input_ids)
     draft_token_ids = input_ids[final_logits_indices][target_logits_indices +
