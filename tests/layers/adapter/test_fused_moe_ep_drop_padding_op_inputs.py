@@ -17,7 +17,7 @@ The fused EP op's operand count is decided at BUILD (`_build_op(...,
 drop_padding=)` picks a registered function with a trailing `valid` operand
 and one more partition spec) and read back at CALL (`fused_moe_ep` appends
 `~padding_mask` only for an op recorded in `_DROP_PADDING_OPS`). A mismatch
-is a torch arity error at the first trace, after a server start of most of
+is a torch wrong-number-of-arguments error at the first trace, after a server start of most of
 an hour, so the contract is pinned here: the drop-padding op takes EXACTLY
 ONE operand more than the op without it, for either score-bias setting, and
 the call site passes exactly the count the op was built with. Both counts
