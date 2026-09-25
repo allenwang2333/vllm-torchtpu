@@ -421,10 +421,22 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     seen: list[int | None] = []
 
     def _stub(
-        words_flat, k_, row_lens, row_offs, *, slice_len, scheduling_group_id, name
+        words_flat,
+        k_,
+        row_lens,
+        row_offs,
+        *,
+        slice_len,
+        scheduling_group_id,
+        name,
+        row_bases=None,
+        payload_flat=None,
+        flat_out=False,
     ):
         seen.append(scheduling_group_id)
         out = jnp.zeros((row_lens.shape[0], k_), jnp.int32)
+        if flat_out:
+            out = out.reshape(-1)
         return out, out
 
     monkeypatch.setattr(sc_module, "_sc_topk_rows", _stub)
@@ -659,3 +671,69 @@ def test_all_rows_empty_then_decode_in_the_same_process():
         idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
         assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
         assert _score_bits_mismatch(scores, idx, bits) is None
+
+
+# --------------------------------------------------------------------------- #
+# Two-stage path with in-kernel index carry.
+# --------------------------------------------------------------------------- #
+# When the `P * k_p` candidates fit one stage-2 slice, stage 1 emits global
+# column indices (sub-row base `j*w` added in-kernel) and stage 2 compacts
+# those indices as a payload alongside the keys; no XLA remap follows. The
+# risks are a payload/key misalignment (caught by the score-bits pairing) and
+# a wrong base (caught by the multiset check). `n = 270336` is the next
+# `--max-model-len` bucket above 256K.
+#
+# Not covered: `b = 1, n = N_256K` (P = 32, `P * k_p > MAX_SLICE_WORDS`) takes
+# the recursive fallback, which recurses without terminating in the code this
+# path was added to. It is unreachable in serving (the minimum token bucket is
+# 16) and the fallback is unchanged here.
+
+N_270K = 270336
+CARRY_SHAPES = [
+    pytest.param(b, n, id=f"b{b}-n{n}")
+    for n in (N_256K, N_270K)
+    for b in (16, 128, 1024)
+]
+
+
+def _carry_case(kind: str, b: int, n: int, rng: np.random.Generator):
+    scores = _deploy_scores(b, n, rng)
+    row_lengths = rng.integers(0, n + 1, size=b).astype(np.int32)
+    if kind == "edges":
+        edges = [min(e, n) for e in DEPLOY_EDGES] + [n]
+        edges = (edges * 2)[:b]
+        row_lengths[: len(edges)] = edges
+    elif kind == "decode":  # one real row, the rest decode padding rows
+        row_lengths[:] = 0
+        row_lengths[0] = min(262144, n)
+    elif kind == "short":  # prefill-like mid lengths + ties
+        row_lengths = rng.integers(0, 34817, size=b).astype(np.int32)
+        row_lengths[:4] = [0, 1, 2048, 2049]
+        scores[::5] = np.round(scores[::5] * 4) / 4
+    elif kind == "full":
+        row_lengths[:] = n
+        scores[::3] = np.round(scores[::3] * 8) / 8
+    return scores, row_lengths
+
+
+@pytest.mark.parametrize("b,n", CARRY_SHAPES)
+def test_index_carry_path_is_taken(b, n):
+    p = _pick_partition(b, n, DEPLOY_K)
+    k_p = min(DEPLOY_K, n // p)
+    assert p > 1
+    assert p * k_p <= MAX_SLICE_WORDS and (p * k_p) % LANES == 0
+
+
+@pytest.mark.parametrize("b,n", CARRY_SHAPES)
+@pytest.mark.parametrize("kind", ["edges", "decode", "short", "random", "full"])
+def test_exact_topk_index_carry(b, n, kind):
+    """Exact selection, winner/score pairing, and `return_scores=False`
+    returning the same indices, on the index-carry two-stage path."""
+    rng = np.random.default_rng(SEED + b + n)
+    scores, row_lengths = _carry_case(kind, b, n, rng)
+    idx, bits = _run_with_scores(scores, DEPLOY_K, row_lengths)
+    assert _mismatch(scores, idx, DEPLOY_K, row_lengths) is None
+    assert _score_bits_mismatch(scores, idx, bits) is None
+    np.testing.assert_array_equal(_run(scores, DEPLOY_K, row_lengths), idx)
+    if kind == "decode":
+        assert (idx[1:] == -1).all(), "empty rows must select nothing"
