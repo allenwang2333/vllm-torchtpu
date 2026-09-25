@@ -1188,8 +1188,8 @@ def test_build_draft_attn_metadata_loop_cache(device):
 
     build_calls = []
 
-    def fake_build_attention_metadata(**kw):
-        build_calls.append(kw)
+    def fake_build_attention_metadata_for_layers(layer_names, num_reqs_padded):
+        build_calls.append((set(layer_names), num_reqs_padded))
         ctx = runner._attn_metadata_builder_ctx
         md = AttentionMetadata(
             input_positions=torch.zeros(1, device=device),
@@ -1198,9 +1198,11 @@ def test_build_draft_attn_metadata_loop_cache(device):
             query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
         )
-        return {"draft.attn.0": md, "target.attn.0": md}, None
+        return {name: md for name in layer_names}
 
-    runner._build_attention_metadata = fake_build_attention_metadata
+    runner.build_attention_metadata_for_layers = (
+        fake_build_attention_metadata_for_layers
+    )
     loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
     loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
 
@@ -1210,13 +1212,13 @@ def test_build_draft_attn_metadata_loop_cache(device):
             step_idx=step,
             seq_lens_delta=step,
             num_rejected_np=np.array([1, 0], dtype=np.int32),
-            num_tokens_padded=8,
             loop_query_start_loc=loop_qsl,
             loop_request_distribution=loop_rd,
         )
 
     md1 = build(1)
-    assert len(build_calls) == 1
+    # Only the draft layers are requested, at the kernel's padded batch.
+    assert build_calls == [({"draft.attn.0"}, 8)]
     md2 = build(2)
     md3 = build(3)
     # No further upstream builder calls after step 1.
@@ -1255,7 +1257,7 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     proposer.runner = runner
     captured_descriptors = []
 
-    def fake_build_attention_metadata(**_kwargs):
+    def fake_build_attention_metadata_for_layers(layer_names, num_reqs_padded):
         ctx = runner._attn_metadata_builder_ctx
         captured_descriptors.append(ctx.sequence_layout_descriptor)
         md = AttentionMetadata(
@@ -1265,9 +1267,11 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
             query_start_loc=ctx.query_start_loc,
             request_distribution=ctx.request_distribution,
         )
-        return {"draft.attn.0": md}, None
+        return {"draft.attn.0": md}
 
-    runner._build_attention_metadata = fake_build_attention_metadata
+    runner.build_attention_metadata_for_layers = (
+        fake_build_attention_metadata_for_layers
+    )
     chunk = SimpleNamespace(
         num_reqs=2,
         start_index=0,
@@ -1291,10 +1295,202 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
         step_idx=0,
         seq_lens_delta=0,
         num_rejected_np=np.zeros(2, dtype=np.int32),
-        num_tokens_padded=3,
     )
 
     assert captured_descriptors == [descriptor]
+
+
+def _staging_runner(device, stage_log, *, mamba_products=None):
+    """Runner stub whose targeted walk stages block tables the way
+    `stage_block_table_uploads` does: only when the ctx carries none."""
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+    runner = SimpleNamespace(
+        # Hybrid (GDN) target: the loop-step metadata cache stays off, so every
+        # draft step goes through the builder walk.
+        _has_mamba_state=True,
+        _unified_kv_layout=False,
+        _build_mamba_state_indices=lambda *_a: None,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=8,
+        device=device,
+        _attn_metadata_builder_ctx=None,
+    )
+
+    def fake_build_attention_metadata_for_layers(layer_names, num_reqs_padded):
+        ctx = runner._attn_metadata_builder_ctx
+        if ctx.staged_block_tables is None:
+            ctx.staged_block_tables = {
+                0: torch.full((num_reqs_padded,), len(stage_log), device=device)
+            }
+            ctx.staged_mamba_products = mamba_products
+            stage_log.append(ctx.start_index)
+        md = AttentionMetadata(
+            input_positions=torch.zeros(1, device=device),
+            block_tables=ctx.staged_block_tables[0],
+            seq_lens=ctx.seq_lens,
+            query_start_loc=ctx.query_start_loc,
+            request_distribution=ctx.request_distribution,
+        )
+        return {name: md for name in layer_names}
+
+    runner.build_attention_metadata_for_layers = (
+        fake_build_attention_metadata_for_layers
+    )
+    return runner
+
+
+def _metadata_chunk(device, start_index):
+    return SimpleNamespace(
+        num_reqs=2,
+        start_index=start_index,
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            seq_lens=torch.tensor(
+                [5, 9, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device
+            ),
+            query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+            request_distribution=torch.tensor(
+                [2, 2, 2], dtype=torch.int32, device=device
+            ),
+            position_ids_override=None,
+            sequence_layout_descriptor=SequenceLayoutDescriptor(),
+        ),
+    )
+
+
+def test_build_draft_attn_metadata_stages_block_tables_once_per_chunk(device):
+    """Block tables can't change mid-propose: step 0 stages a chunk's tables
+    and every later step reuses that upload, per chunk, even when the loop-step
+    metadata cache is off (hybrid target)."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    stage_log = []
+    proposer.runner = _staging_runner(device, stage_log)
+    chunks = [_metadata_chunk(device, 0), _metadata_chunk(device, 2)]
+
+    tables = {}
+    for step in range(3):
+        for ci, chunk in enumerate(chunks):
+            md = proposer._build_draft_attn_metadata(
+                chunk,
+                step_idx=step,
+                seq_lens_delta=step,
+                num_rejected_np=np.zeros(2, dtype=np.int32),
+            )
+            tables.setdefault(ci, []).append(md["draft.attn.0"].block_tables)
+
+    # One staging per chunk, both at step 0.
+    assert stage_log == [0, 2]
+    for ci in range(2):
+        assert all(t is tables[ci][0] for t in tables[ci])
+    assert tables[0][0] is not tables[1][0]
+
+    # A new propose() stages afresh.
+    proposer.runner.input_batch = SimpleNamespace(num_reqs=0)
+    proposer.propose([], [], None, None)
+    assert proposer._draft_staged_tables == {}
+
+
+def test_build_draft_attn_metadata_restages_when_mamba_products_staged(device):
+    """Staged mamba products are derived from the step's seq_lens, so a
+    staging that carries them must not be reused by the next step."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    stage_log = []
+    proposer.runner = _staging_runner(
+        device, stage_log, mamba_products={0: (None, None)}
+    )
+    chunk = _metadata_chunk(device, 0)
+
+    for step in range(3):
+        proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step,
+            seq_lens_delta=step,
+            num_rejected_np=np.zeros(2, dtype=np.int32),
+        )
+
+    assert stage_log == [0, 0, 0]
+
+
+def test_propose_reuses_loop_step_constants_across_calls(device):
+    """Loop-step query_start_loc / request_distribution depend only on
+    (kernel_num_reqs, num_reqs), so a second propose() at the same shape must
+    hand the draft forward the same device tensors instead of new H2Ds."""
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    hidden_size = 8
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=2),
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        device=device,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    proposer.draft_chunks = [
+        _make_chunk(
+            input_ids=torch.zeros(16, dtype=torch.int32, device=device),
+            position_ids=torch.zeros(16, dtype=torch.int32, device=device),
+            query_start_loc_np=np.arange(3, dtype=np.int32),
+            start_index=0,
+            num_reqs=2,
+            hidden=hidden_size,
+            device=device,
+            attn_ctx=SimpleNamespace(use_max_model_len=True),
+        )
+    ]
+
+    class _StubDraftModel:
+        model = SimpleNamespace(use_aux_hidden_state=True)
+
+        def combine_hidden_states(self, x):
+            return x
+
+        def compute_logits(self, hidden):
+            return torch.nn.functional.one_hot(
+                hidden[:, 0].to(torch.int64), 16
+            ).to(torch.float32)
+
+    proposer.draft_model = _StubDraftModel()
+    proposer._prepare_draft_inputs = lambda chunk, *_a, **_k: (
+        torch.zeros(16, dtype=torch.int32, device=device),
+        torch.zeros(16, dtype=torch.int32, device=device),
+        torch.arange(chunk.num_reqs, device=device),
+        np.zeros(chunk.num_reqs, dtype=np.int32),
+    )
+    loop_consts = []
+
+    def _forward_draft(*, input_ids, step_idx, **kwargs):
+        if step_idx >= 1:
+            loop_consts.append(
+                (kwargs["loop_query_start_loc"], kwargs["loop_request_distribution"])
+            )
+        hidden = torch.zeros((input_ids.shape[0], hidden_size), device=device)
+        return hidden, hidden
+
+    proposer._forward_draft = _forward_draft
+
+    for _ in range(2):
+        proposer.propose(
+            sampled_token_ids=[[0], [0]],
+            discard_sampled_tokens_req_indices=[],
+            num_rejected_tokens_np=None,
+            scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+        )
+
+    # 2 loop steps per propose x 2 calls, all sharing one pair of tensors.
+    assert len(loop_consts) == 4
+    qsl, rd = loop_consts[0]
+    assert all(q is qsl and r is rd for q, r in loop_consts)
+    assert qsl.cpu().tolist() == [0, 1, 2] + [2] * 14
+    assert rd.cpu().tolist() == [2, 2, 2]
 
 
 def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):

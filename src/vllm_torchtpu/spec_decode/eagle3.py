@@ -155,6 +155,18 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of paying
         # the full upstream builder walk per iteration.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor]] = {}
+        # Per-propose-call cache of each chunk's staged draft block tables,
+        # keyed by id(chunk) (the chunk is held so its id can't be recycled).
+        # Every draft step of a chunk stages the same rows — block tables can't
+        # change mid-propose — so step 0 stages once and later steps reuse it
+        # instead of paying a pinned-buffer fill + H2D per step.
+        self._draft_staged_tables: dict[int, tuple[DraftChunkInputs, dict]] = {}
+        # Loop-step query_start_loc / request_distribution device tensors,
+        # keyed by (kernel_num_reqs, num_reqs). They depend on nothing else,
+        # so they're reused across propose calls instead of an H2D each call.
+        self._loop_step_consts: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -726,6 +738,7 @@ class Eagle3Proposer:
         """
         runner = self.runner
         self._draft_md_cache.clear()
+        self._draft_staged_tables.clear()
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
             return []
@@ -868,8 +881,8 @@ class Eagle3Proposer:
                 else:
                     rejected_dev_per_chunk.append(None)
             # Loop-step query_start_loc and request_distribution depend only on
-            # num_reqs (not the step), so build them once per chunk instead of
-            # rebuilding (with an H2D) on every one of the K-1 steps.
+            # (kernel_num_reqs, num_reqs), not the step, so they're built once
+            # per shape and reused across the K-1 steps and across propose calls.
             loop_qsl_per_chunk = []
             loop_reqdist_per_chunk = []
             for c in chunks:
@@ -878,13 +891,20 @@ class Eagle3Proposer:
                     if c.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
-                loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
+                consts = self._loop_step_consts.get((knr, c.num_reqs))
+                if consts is None:
+                    qsl_np = np.minimum(
+                        np.arange(knr + 1, dtype=np.int32), c.num_reqs
                     )
-                )
+                    consts = (
+                        torch.from_numpy(qsl_np).to(runner.device),
+                        torch.tensor(
+                            [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
+                        ),
+                    )
+                    self._loop_step_consts[(knr, c.num_reqs)] = consts
+                loop_qsl_per_chunk.append(consts[0])
+                loop_reqdist_per_chunk.append(consts[1])
             for step in range(1, K):
                 for ci, chunk in enumerate(chunks):
                     if self._share_mtp_indices:
@@ -1162,7 +1182,6 @@ class Eagle3Proposer:
         step_idx: int,
         seq_lens_delta: int,
         num_rejected_np: np.ndarray | None,
-        num_tokens_padded: int | None = None,
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
@@ -1216,12 +1235,7 @@ class Eagle3Proposer:
             seq_lens = chunk_ctx.seq_lens
             query_start_loc = chunk_ctx.query_start_loc
             request_distribution = chunk_ctx.request_distribution
-            num_tokens = int(chunk.query_start_loc_np[num_reqs])
-            # Placeholder: _build_attention_metadata requires max_query_len but
-            # the TPU backend never reads it. Any value is correct here.
-            max_query_len = 1
         else:
-            num_tokens = num_reqs
             # query_start_loc / request_distribution depend only on num_reqs;
             # the loop hoists them across steps. Fall back to building them here
             # when not supplied (keeps this helper usable standalone).
@@ -1266,9 +1280,6 @@ class Eagle3Proposer:
                     dtype=torch.int32,
                     device=runner.device,
                 )
-            max_query_len = 1
-
-        effective_num_tokens = num_tokens_padded if num_tokens_padded else num_tokens
 
         mamba_state_indices = (
             runner._build_mamba_state_indices(
@@ -1277,6 +1288,9 @@ class Eagle3Proposer:
             if runner._has_mamba_state
             else None
         )
+        staged = self._draft_staged_tables.get(id(chunk))
+        if staged is not None and staged[0] is not chunk:
+            staged = None
         saved_ctx = runner._attn_metadata_builder_ctx
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
@@ -1291,28 +1305,35 @@ class Eagle3Proposer:
             # instead of slicing the real (idle-rank) block table.
             position_ids_override=chunk.attn_ctx.position_ids_override,
             sequence_layout_descriptor=(chunk.attn_ctx.sequence_layout_descriptor),
+            # Every step of a chunk stages identical block-table rows; reuse
+            # step 0's upload (see _draft_staged_tables).
+            staged_block_tables=staged[1] if staged is not None else None,
         )
-        try:
-            slot_mappings = runner.empty_slot_mappings
-            per_layer_attn_metadata, _ = runner._build_attention_metadata(
-                num_tokens=effective_num_tokens,
-                num_reqs=kernel_num_reqs,
-                max_query_len=max_query_len,
-                num_tokens_padded=effective_num_tokens,
-                num_reqs_padded=kernel_num_reqs,
-                slot_mappings=slot_mappings,
-            )
-        finally:
-            runner._attn_metadata_builder_ctx = saved_ctx
-
         assert self._draft_attn_layer_names is not None, (
             "draft attn layer names were not captured during load_model"
         )
-        result = {
-            name: md
-            for name, md in per_layer_attn_metadata.items()
-            if name in self._draft_attn_layer_names
-        }
+        try:
+            # Only the draft layers' KV cache groups. The full walk would also
+            # stage and build every target group (the GDN/mamba groups of a
+            # hybrid model included) only for us to discard them — see
+            # `build_attention_metadata_for_layers`.
+            result = runner.build_attention_metadata_for_layers(
+                self._draft_attn_layer_names, kernel_num_reqs
+            )
+            built_ctx = runner._attn_metadata_builder_ctx
+        finally:
+            runner._attn_metadata_builder_ctx = saved_ctx
+        # Mamba products are derived from this step's seq_lens, so only a
+        # tables-only staging is step-invariant.
+        if (
+            staged is None
+            and built_ctx.staged_block_tables is not None
+            and built_ctx.staged_mamba_products is None
+        ):
+            self._draft_staged_tables[id(chunk)] = (
+                chunk,
+                built_ctx.staged_block_tables,
+            )
         if cacheable:
             self._draft_md_cache[id(chunk)] = (result, seq_lens)
         return result
@@ -1357,7 +1378,6 @@ class Eagle3Proposer:
             step_idx=step_idx,
             seq_lens_delta=seq_lens_delta,
             num_rejected_np=num_rejected_np,
-            num_tokens_padded=num_tokens_padded,
             num_rejected_dev=num_rejected_dev,
             loop_query_start_loc=loop_query_start_loc,
             loop_request_distribution=loop_request_distribution,
@@ -1602,6 +1622,7 @@ class Eagle3Proposer:
         if not self._dp_lockstep_sharded():
             return
         self._draft_md_cache.clear()
+        self._draft_staged_tables.clear()
         runner = self.runner
         K = self.speculative_config.num_speculative_tokens
         if num_chunks * K == 0:
