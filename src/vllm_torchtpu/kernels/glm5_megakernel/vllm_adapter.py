@@ -52,6 +52,9 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 EXPERT_KINDS = ("ew13", "ew2", "es13", "es2")
+# operands sharded over the EP axis (the local tensor is this rank's shard): experts, and
+# o_proj's head rows (TP over heads)
+SHARDED_KINDS = EXPERT_KINDS + ("o_proj",)
 
 
 class Unsupported(Exception):
@@ -223,7 +226,9 @@ class Glm5Megakernel:
             "q_b": _kn(sa.q_b_proj.weight, cfg.QL, cfg.NH * cfg.DQ, "q_b_proj"),
             "w_uk": at.W_UK_T,
             "w_uv": at.W_UV,
-            "o_proj": _kn(sa.o_proj.weight, cfg.NH * cfg.DV, H, "o_proj"),
+            # o_proj is TP over heads: this rank's rows, heads [rank * HR, (rank + 1) * HR)
+            "o_proj": _kn(sa.o_proj.weight, cfg.NH * cfg.DV, H, "o_proj")[
+                self.rank * cfg.HR * cfg.DV:(self.rank + 1) * cfg.HR * cfg.DV].contiguous(),
         }
         idx = getattr(sa, "indexer", None)
         _need((idx is not None) == cfg.full_indexer(l), f"layer {l}: indexer pattern")
@@ -263,7 +268,7 @@ class Glm5Megakernel:
                         "float32": torch.float32}[jax.numpy.dtype(dtype).name]
                 _need(t.dtype == want, f"{kind}[{l}]: {t.dtype} != {want}")
                 out.append(t)
-                self.w_specs.append(P(EP_AXIS_NAME) if kind in EXPERT_KINDS else P())
+                self.w_specs.append(P(EP_AXIS_NAME) if kind in SHARDED_KINDS else P())
         return out
 
     def _build_smalls(self) -> torch.Tensor:

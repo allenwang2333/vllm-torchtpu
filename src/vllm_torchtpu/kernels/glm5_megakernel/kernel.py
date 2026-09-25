@@ -1,4 +1,8 @@
-"""GLM-5.2 decode megakernel, v1: DP attention + EP MoE, all layers in one pallas_call.
+"""GLM-5.2 decode megakernel, v4_pipe: v2_tpo (DP attention + EP MoE, o_proj TP over heads) with ONE
+continuous weight stream: every streamed weight tile goes through a single ring of `nbank` byte banks in
+consumption order, and a cursor-driven producer refills each freed bank from wherever the stream is
+(next op, next layer, the routed experts once routing publishes the hit list), so HBM never drains at
+an op or layer boundary (upstream Qwen decode_megakernel global tile ring; Kimi expert prefetch).
 
 Per rank r (one decode token per rank, R ranks on a ("d",) mesh):
 
@@ -8,7 +12,9 @@ Per rank r (one decode token per rank, R ranks on a ("d",) mesh):
     KV write (nope row, rope row RMW) into the served SPARSECORE caches
     [full-indexer layers] indexer q/k/weights, idx-cache record write, page scan, TC top-k
     TC gather of the top-k nope / rope rows, sparse MLA softmax (two pass, served formula)
-    W_UV (VPU) -> o_proj (fp8 stream) -> residual + post RMSNorm
+    W_UV (VPU) -> quantize the row (per-token scale) -> A2A head slices (remote DMA) ->
+      o_proj on this rank's HR heads for all R tokens (fp8 stream, 1/R of the weight) ->
+      RS unscaled f32 partials to the owner -> x sx x o_proj_s -> residual + post RMSNorm
     dense layers: fp8 dense MLP on the own token
     MoE layers: AG normed rows (remote DMA) -> route all R tokens -> hit local experts on all
       tokens -> RS partial rows (remote DMA) -> owner sum; shared expert on the own token
@@ -21,6 +27,7 @@ matmul operand block needs >= 32 sublane rows. Numerics follow NUMERICS.md (serv
 import dataclasses
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +36,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from . import pool_alias
 from .layout import rup, smalls_layout
 
 FP8 = jnp.float8_e4m3fn
@@ -61,7 +69,7 @@ def weight_kinds(cfg):
         "q_b": (all_l, (cfg.QL, cfg.NH * cfg.DQ), FP8),
         "w_uk": (all_l, (cfg.NH, cfg.DN, cfg.KL), BF16),
         "w_uv": (all_l, (cfg.NH, cfg.KL, cfg.DV), BF16),
-        "o_proj": (all_l, (cfg.NH * cfg.DV, H), FP8),
+        "o_proj": (all_l, (cfg.HR * cfg.DV, H), FP8),  # rows of heads [r*HR, (r+1)*HR)
         "idx_wq": (full, (cfg.QL, cfg.IH * cfg.IDIM), FP8),
         "idx_wk": (full, (H, rup(cfg.IDIM + cfg.IH)), BF16),
         "gate": (moe, (H, cfg.E), BF16),
@@ -88,42 +96,36 @@ def cache_kinds(cfg, nb):
     }
 
 
-def _pick_tk(K, N, nbytes, target, align):
-    best = None
-    for tk in range(align, K + 1, align):
-        if K % tk == 0 and (best is None or tk * rup(N) * nbytes <= target):
-            best = tk
-    return best
-
-
 @dataclasses.dataclass(frozen=True)
 class Tiles:
-    target: int = 1 << 20          # bytes per streamed weight tile (all buffers share 64 MiB VMEM)
     head_group: int = 8            # heads per W_UK / W_UV tile
     # Mosaic's fp8 x fp8 MXU dot on TPU7x is off by ~0.4% rel (j-da524a3e); the bf16 upcast is
     # exact (e4m3 is a subset of bf16). "bf16": upcast both operands; "mixed": bf16 activation x
     # fp8 weight (Mosaic picks the lowering); "fp8": native fp8 x fp8 (inexact on TPU7x).
     dot: str = "mixed"
-    # HBM peak needs >= 4-8 MiB in flight per stream (j-220235a9: 1 MiB x2 ~1.0 TB/s, 2 MiB x4
-    # and 4 MiB x4 ~2.95 TB/s). `deep` kinds get `depth` buffers, the rest 2.
-    depth: int = 2
-    deep: tuple = ()
-    # Kinds consumed strictly one after another (each matmul drains before the next kind's start)
-    # share one ring of `depth` (tk, N) tiles, so the stream in flight gets the whole group's VMEM:
-    # 8 x 0.75 MiB for o_proj/ew2 instead of 2. (kinds, depth); tile size from `target`.
-    rings: tuple = ((("o_proj", "sw2", "ew2", "w2"), 8), (("idx_wq", "sw13", "ew13"), 6))
+    # v4: all streamed kinds share ONE ring of `nbank` banks of `bank` bytes (u8 VMEM pool, typed per
+    # tile through pool_alias views). Each kind's tile is the largest 128-row multiple that fits a bank.
+    bank: int = 3 << 20
+    nbank: int = 12
     # Per-phase jax.named_scope markers -> tpu.trace_start/stop (level 10) for an xprof capture.
     trace: bool = False
     # Indexer-scan page ring: scan_depth - 1 pages (256 KiB each) in flight. 2 -> 8 takes the 256k
     # page stream from 130 us to 37 us, under the 68 us page-body compute (j-f17f2938).
     scan_depth: int = 8
+    # Gather prefetch: a layer that reuses the last top-k set (no indexer) has its rows known once
+    # the previous layer's scores are done; each streamed matmul tile then issues `gpre` of them
+    # while it waits on its weight DMA (scalar-issue-bound gather, 54 us/layer j-f9a1bd50). 0: off.
+    gpre: int = 0
 
-    def nbuf(self, kind):
-        return self.depth if kind in self.deep else 2
-
-    def tk(self, K, N, nbytes):
-        # tk doubles as the dynamic lane offset into the activation row: 128-aligned (E2003).
-        return _pick_tk(K, N, nbytes, self.target, 128)
+    def tk(self, K, N, dtype):
+        """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank. tk doubles as the
+        dynamic lane offset into the activation row: 128-aligned (E2003)."""
+        best = None
+        for tk in range(128, K + 1, 128):
+            if K % tk == 0 and pool_alias.storage_size((tk, N), jnp.dtype(dtype)) <= self.bank:
+                best = tk
+        assert best is not None, ("no 128-row tile fits a bank", K, N, dtype, self.bank)
+        return best
 
 
 # ------------------------------------------------------------------------------------------
@@ -239,6 +241,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     *caches) -> (out [M, H] bf16, *caches) for ONE rank; wrap in shard_map.
     skip: timing ablations only (numerics are garbage), a subset of ABLATIONS."""
     assert set(skip) <= set(ABLATIONS), skip
+    typed = interpret or os.environ.get("MK_TYPED") == "1"   # diag: typed banks, no pool_alias
     R, L, H = cfg.R, cfg.L, cfg.H
     pg = cfg.page
     lg_pg = int(math.log2(pg))
@@ -259,18 +262,18 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
     # --- tile sizes per streamed kind ---
     tk = {}
-    for kind in ("qkv_a", "q_b", "o_proj", "idx_wq", "sw13", "sw2", "w13", "w2"):
+    for kind in ("qkv_a", "q_b", "o_proj", "idx_wq", "sw13", "sw2", "w13", "w2", "idx_wk", "gate"):
         K, N = wk[kind][1]
-        tk[kind] = tiles.tk(K, N, 1)
-    tk["ew13"] = tiles.tk(H, 2 * cfg.I, 1)
-    tk["ew2"] = tiles.tk(cfg.I, H, 1)
-    tk["idx_wk"] = tiles.tk(H, rup(cfg.IDIM + cfg.IH), 2)
-    tk["gate"] = tiles.tk(H, cfg.E, 2)
+        tk[kind] = tiles.tk(K, N, wk[kind][2])
+    tk["ew13"] = tiles.tk(H, 2 * cfg.I, FP8)
+    tk["ew2"] = tiles.tk(cfg.I, H, FP8)
 
     NACC = max(cfg.QKVA + 128, cfg.NH * cfg.DQ, H, 2 * cfg.ID, 2 * cfg.I, 2 * cfg.IS,
                cfg.IH * cfg.IDIM, rup(cfg.IDIM + cfg.IH, 128), cfg.E, cfg.NH * cfg.DV)
     NACC = rup(NACC)
     KX = max(H, cfg.QL, cfg.NH * cfg.DV, cfg.ID, cfg.I, cfg.IS)
+    KR = cfg.HR * cfg.DV                              # o_proj K per rank
+    assert KR % 128 == 0
 
     # --- operand lists ---
     w_names = [(k, l) for k, (ls, _, _) in wk.items() for l in ls]
@@ -314,6 +317,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "part": pltpu.VMEM((M, H), F32), "rsrecv": pltpu.VMEM((R, 1, H), F32),
         "psend": pltpu.VMEM((R, 1, H), F32),
         "shared": pltpu.VMEM((M, H), F32),
+        # o_proj A2A: fp8 values carried as bf16 (exact), one (1, KR) row per peer
+        "osend": pltpu.VMEM((R, 1, KR), BF16), "xrecv": pltpu.VMEM((R, 1, KR), BF16),
+        "xrq": pltpu.VMEM((M, KR), FP8),
+        "a2a_send": pltpu.SemaphoreType.DMA(()), "a2a_recv": pltpu.SemaphoreType.DMA(()),
         "wloc": pltpu.VMEM((M, 128), F32),
         "hitv": pltpu.VMEM((8, 128), I32), "hits": pltpu.SMEM((8, 128), I32),
         "es13": pltpu.VMEM((cfg.ER, 2 * cfg.I), F32), "es2": pltpu.VMEM((cfg.ER, H), F32),
@@ -332,20 +339,61 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "w_uk": (G, cfg.DN, cfg.KL), "w_uv": (G, cfg.KL, cfg.DV),
     }
     wdtype = {k: (BF16 if k in ("idx_wk", "gate", "w_uk", "w_uv") else FP8) for k in wshape}
-    NBUF = {k: tiles.nbuf(k) for k in wshape}
-    BUF = {k: k for k in wshape}                      # kind -> its buffer (own, or a shared ring)
-    for i, (kinds, depth) in enumerate(tiles.rings):
-        N = wshape[kinds[0]][1]
-        Ks = [kdim(k) for k in kinds]
-        t_r = tiles.tk(min(Ks), N, 1)
-        assert all(wshape[k][1] == N and wdtype[k] == FP8 and K_ % t_r == 0
-                   for k, K_ in zip(kinds, Ks)), (kinds, Ks, t_r)
-        for k in kinds:
-            tk[k], wshape[k], NBUF[k], BUF[k] = t_r, (t_r, N), depth, "ring%d" % i
+    NB = tiles.nbank
+    BROWS = tiles.bank // 128                          # u8 rows per bank
     for k, shp in wshape.items():
-        if "buf_" + BUF[k] not in scratch:
-            scratch["buf_" + BUF[k]] = pltpu.VMEM((NBUF[k],) + shp, wdtype[k])
-            scratch["sem_" + BUF[k]] = pltpu.SemaphoreType.DMA((NBUF[k],))
+        assert pool_alias.storage_size(shp, jnp.dtype(wdtype[k])) <= tiles.bank, (k, shp)
+    # pool_alias is a Mosaic lowering hack: interpret mode gets typed per-kind buffers with the
+    # same slot schedule, and so does any kind whose lane dim is not whole 128-lane columns
+    # (pool_alias lays out shape[-1]//128 columns; TINY's gate is (tk, E=8)).
+    tkinds = [k for k, shp in wshape.items() if typed or shp[-1] % 128]
+    for k in tkinds:
+        scratch["ibuf_" + k] = pltpu.VMEM((NB,) + wshape[k], wdtype[k])
+    if len(tkinds) < len(wshape):
+        scratch["pool"] = pltpu.VMEM((NB * BROWS, 128), U8)
+    scratch["pool_sem"] = pltpu.SemaphoreType.DMA((NB,))
+    scratch["st"] = pltpu.SMEM((8,), I32)              # stream cursor, see `pump`
+    scratch["gst"] = pltpu.SMEM((2,), I32)             # gather prefetch: rows issued, target layer
+    GPRE = 0 if "gather" in skip else tiles.gpre
+    NOIDX = [l for l in range(L) if not cfg.full_indexer(l)]
+    assert GPRE == 0 or KT % GPRE == 0, (KT, GPRE)
+
+    # --- the stream: one layer's tiles in consumption order, segment by segment ---
+    SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2",
+            "sw13", "sw2", "gate", "exp")
+    SID = {k: i for i, k in enumerate(SEGS)}
+    EXP = SID["exp"]
+    KSEG = {k: (EXP if k in ("ew13", "ew2") else SID[k]) for k in wshape}
+
+    def ntiles(kind):
+        if kind in ("w_uk", "w_uv"):
+            return cfg.NH // G
+        return kdim(kind) // tk[kind]
+    NTS = {k: ntiles(k) for k in SEGS if k != "exp"}
+    T13, T2 = ntiles("ew13"), ntiles("ew2")
+    TE = T13 + T2                                      # tiles per routed expert
+
+    def bits(ks):
+        return sum(1 << SID[k] for k in ks)
+    M_BASE = bits(["qkv_a", "q_b", "o_proj"] + ([] if "uk_uv" in skip else ["w_uk", "w_uv"]))
+    M_IDX = 0 if "index" in skip else bits(["idx_wq", "idx_wk"])
+    M_DENSE, M_MOE = bits(["w13", "w2"]), bits(["sw13", "sw2", "gate", "exp"])
+
+    def segs_py(l):
+        m = M_BASE | (M_IDX if cfg.full_indexer(l) else 0) | (M_MOE if cfg.is_moe(l) else M_DENSE)
+        return [k for k in SEGS if m >> SID[k] & 1]
+
+    # Which segments can a pump at each consume site reach (<= NB tiles ahead)? Only those get DMA
+    # code at that site (each is a when-cascade over the layers). Correctness does not depend on it:
+    # `take` pumps its own kind if the producer stopped short of it.
+    reach = {k: {SID[k]} for k in SEGS}
+    reach["init"] = set()
+    for nh in sorted({0, 1, cfg.ER}):
+        seq = [SID[k] for l in range(L) for k in segs_py(l)
+               for _ in range(nh * TE if k == "exp" else NTS[k])]
+        reach["init"] |= set(seq[:NB])
+        for p_, k in enumerate(seq):
+            reach[SEGS[k]] |= set(seq[p_ + 1:p_ + 1 + NB])
     if debug:                                    # debug outputs live in HBM: VMEM is full
         scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((2,))
     s_names = list(scratch)
@@ -378,7 +426,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         row_iota = lax.broadcasted_iota(I32, (M, 1), 0)
         row0 = (row_iota == 0).astype(F32)            # [M, 1] mask of the live row
 
-        # ---------------- weight streaming ----------------
+        # ---------------- weight streaming (one ring, one producer) ----------------
+        st, psem = scr["st"], scr["pool_sem"]
+
         def src_of(kind, ref, t, j=None):
             if kind in ("w_uk", "w_uv"):
                 return ref.at[pl.ds(t * G, G)]
@@ -386,51 +436,145 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 return ref.at[j, pl.ds(t * tk[kind], tk[kind])]
             return ref.at[pl.ds(t * tk[kind], tk[kind])]
 
-        def issue(kind, l, t, j=None):
+        def view(kind, slot):
+            if kind in tkinds:
+                return scr["ibuf_" + kind].at[slot]
+            shp, dt = wshape[kind], jnp.dtype(wdtype[kind])
+            return pool_alias.view(
+                scr["pool"].at[pl.ds(slot * BROWS, pool_alias.storage_size(shp, dt) // 128)], shp, dt)
+
+        def copy(kind, src, slot):
+            return pltpu.make_async_copy(src, view(kind, slot), psem.at[slot])
+
+        def seg_mask(l):
+            full = jnp.logical_or(l < cfg.idx_skip, (l - cfg.idx_skip) % cfg.idx_freq == cfg.idx_freq - 1)
+            return (jnp.int32(M_BASE) | jnp.where(full, jnp.int32(M_IDX), 0)
+                    | jnp.where(l >= cfg.first_dense, jnp.int32(M_MOE), jnp.int32(M_DENSE)))
+
+        def nt_dyn(sg):
+            v = st[6] * TE                             # exp: this layer's hits x tiles per expert
+            for k, n in NTS.items():
+                v = jnp.where(sg == SID[k], n, v)
+            return v
+
+        def issue_seg(a, l, t, slot):
+            kind = SEGS[a]
+            if kind != "exp":
+                bswitch(l, {ll: (lambda r=r: copy(kind, src_of(kind, r, t), slot).start())
+                            for ll, r in W[kind].items()})
+                return
+            i = t // TE
+            u = t - i * TE
+            j = scr["hits"][1, i]
+
+            @pl.when(u < T13)
+            def _():
+                bswitch(l, {ll: (lambda r=r: copy("ew13", src_of("ew13", r, u, j), slot).start())
+                            for ll, r in W["ew13"].items()})
+
+            @pl.when(u >= T13)
+            def _():
+                bswitch(l, {ll: (lambda r=r: copy("ew2", src_of("ew2", r, u - T13, j), slot).start())
+                            for ll, r in W["ew2"].items()})
+
+        def pump(site, allowed=None):
+            """Issue stream tiles while a bank is free. Cursor st: 0 issued, 1 consumed, 2 layer,
+            3 segment, 4 tile in segment, 5 layer whose hit list is published, 6 its hit count.
+            The producer stops at a layer's routed experts until routing publishes them."""
             if "weights" in skip:
                 return
-            buf, sem = scr["buf_" + BUF[kind]], scr["sem_" + BUF[kind]]
-            slot = t % NBUF[kind]
+            allowed = sorted(reach[site] if allowed is None else allowed)
+            amask = jnp.int32(sum(1 << a for a in allowed))
 
-            def one(ref):
-                return lambda: pltpu.make_async_copy(src_of(kind, ref, t, j), buf.at[slot],
-                                                     sem.at[slot]).start()
-            bswitch(l, {ll: one(r) for ll, r in W[kind].items()})
+            def cond(c):
+                l, sg = st[2], st[3]
+                ok = jnp.logical_and(st[0] - st[1] < NB, l < L)
+                ok = jnp.logical_and(ok, (lax.shift_right_logical(amask, sg) & 1) == 1)
+                return jnp.logical_and(ok, jnp.logical_or(sg != EXP, st[5] == l))
 
-        def wait(kind, t):
+            def body(c):
+                l, sg, t = st[2], st[3], st[4]
+                nt = nt_dyn(sg)
+
+                @pl.when(t < nt)
+                def _():
+                    slot = st[0] % NB
+                    bswitch(sg, {a: (lambda a=a: issue_seg(a, l, t, slot)) for a in allowed})
+                    st[0] = st[0] + 1
+                t1 = jnp.where(t < nt, t + 1, t)
+                st[4] = t1
+
+                @pl.when(t1 >= nt)
+                def _():
+                    rest = lax.shift_right_logical(seg_mask(l), sg + 1)
+                    low = rest & (-rest)
+                    has = rest != 0
+                    st[3] = jnp.where(has, sg + 1 + (jnp.int32(31) - lax.clz(low)), 0)
+                    st[2] = jnp.where(has, l, l + 1)
+                    st[4] = 0
+                return c + 1                           # a passthrough carry mis-lowers (scf.while)
+            lax.while_loop(cond, body, jnp.int32(0))
+
+        def take(kind):
+            """Wait for the next stream tile (must be of `kind`); its typed view."""
             if "weights" in skip:
+                return view(kind, 0)
+
+            @pl.when(st[0] <= st[1])                   # producer stopped short: pump this kind
+            def _():
+                pump(kind if kind in SID else "exp", allowed={KSEG[kind]})
+            slot = st[1] % NB
+            ref0 = next(iter(W[kind].values()))
+            copy(kind, src_of(kind, ref0, 0, 0), slot).wait()
+            return view(kind, slot)
+
+        def give(kind):
+            """Release the tile just used; refill from wherever the stream is."""
+            st[1] = st[1] + 1
+            pump(kind if kind in SID else "exp")
+
+        def gather_rows(ref_n, ref_r, i0, n):
+            """Issue top-k rows [i0, i0 + n) (n static) of one layer's nope / rope cache into
+            g_nope / g_rope. Issue-bound: 66 -> 51 us per 2048 rows at unroll 4 (j-098a4a19)."""
+            def gbody(k, c):
+                i = i0 + k
+                t = jnp.maximum(scr["idx_s"][i >> 7, i & 127], 0)
+                page = bt[t >> lg_pg]
+                sl = t & (pg - 1)
+                pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
+                                      scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
+                pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
+                                      scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
+                return c
+            lax.fori_loop(0, n, gbody, 0, unroll=4)
+
+        def gpump():
+            """Issue the next GPRE prefetched gather rows, if a layer is armed (gst[1] >= 0)."""
+            if not GPRE:
                 return
-            buf, sem = scr["buf_" + BUF[kind]], scr["sem_" + BUF[kind]]
-            slot = t % NBUF[kind]
-            ref = next(iter(W[kind].values()))
-            pltpu.make_async_copy(src_of(kind, ref, 0, 0), buf.at[slot], sem.at[slot]).wait()
+            gst = scr["gst"]
 
-        def ntiles(kind):
-            if kind in ("w_uk", "w_uv"):
-                return cfg.NH // G
-            return kdim(kind) // tk[kind]
-
-        def start(kind, l, j=None):
-            for t in range(min(NBUF[kind], ntiles(kind))):
-                issue(kind, l, t, j)
+            @pl.when(jnp.logical_and(gst[1] >= 0, gst[0] < KT))
+            def _():
+                i0 = gst[0]
+                bswitch(gst[1], {ll: (lambda ll=ll: gather_rows(C["nope"][ll], C["rope"][ll], i0,
+                                                                 GPRE)) for ll in NOIDX})
+                gst[0] = i0 + GPRE
 
         def matmul(kind, l, xref, K, N, j=None):
-            """acc[:, :N] = xref[:, :K] @ W  (the first NBUF tiles already started)."""
+            """acc[:, :N] = xref[:, :K] @ W, W's tiles taken off the stream in order."""
             nt = ntiles(kind)
             t_k = tk[kind]
-            buf = scr["buf_" + BUF[kind]]
             acc = scr["acc"]
             acc[:, :N] = jnp.zeros((M, N), F32)
 
             def body(t, c):
-                wait(kind, t)
+                gpump()
+                w_ = take(kind)
                 k0 = pl.multiple_of(t * t_k, t_k)
-                xs, ws = mxu(xref[:, pl.ds(k0, t_k)], buf[t % NBUF[kind]], tiles)
+                xs, ws = mxu(xref[:, pl.ds(k0, t_k)], w_[...], tiles)
                 acc[:, :N] += lax.dot_general(xs, ws, NN, preferred_element_type=F32)
-
-                @pl.when(t + NBUF[kind] < nt)
-                def _():
-                    issue(kind, l, t + NBUF[kind], j)
+                give(kind)
                 return c
 
             lax.fori_loop(0, nt, body, 0)
@@ -439,6 +583,13 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         def sm(slot, name):
             o, n = lay[name]
             return scr["sm"][slot, :, o:o + n]
+
+        # the stream starts before anything else (upstream Qwen: first fetches precede the barrier)
+        for i_, v_ in enumerate((0, 0, 0, 0, 0, -1, 0, 0)):
+            st[i_] = jnp.int32(v_)
+        scr["gst"][0] = jnp.int32(0)
+        scr["gst"][1] = jnp.int32(-1)
+        pump("init")
 
         # ---------------- collectives ----------------
         if R > 1:
@@ -467,6 +618,32 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             desc = pltpu.make_async_remote_copy(
                 src_ref=scr["hrow"], dst_ref=scr["xall"].at[0],
                 send_sem=scr["ag_send"], recv_sem=scr["ag_recv"],
+                device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
+            for _ in range(R - 1):
+                desc.wait_recv()
+            for _ in range(R - 1):
+                desc.wait_send()
+
+        def all_to_all_heads(row):
+            """row (1, NH*DV) bf16 on every rank -> xrecv[src] on rank d = src's head slice d.
+            No slot double-buffering (cf. upstream collectives32): a peer can only write xrecv
+            again at layer l+1, after it received this rank's layer-l o_proj/MoE RS rows, which
+            this rank sends only after it has consumed xrecv. Same argument for rsrecv."""
+            for d in range(R):
+                scr["osend"][d] = row[:, d * KR:(d + 1) * KR]
+            scr["xrecv"][me] = scr["osend"][me]
+            if R == 1 or "coll" in skip:
+                return
+            for d in range(R):
+                @pl.when(me != d)
+                def _(d=d):
+                    pltpu.make_async_remote_copy(
+                        src_ref=scr["osend"].at[d], dst_ref=scr["xrecv"].at[me],
+                        send_sem=scr["a2a_send"], recv_sem=scr["a2a_recv"],
+                        device_id=(jnp.int32(d),), device_id_type=pl.DeviceIdType.MESH).start()
+            desc = pltpu.make_async_remote_copy(
+                src_ref=scr["osend"].at[0], dst_ref=scr["xrecv"].at[0],
+                send_sem=scr["a2a_send"], recv_sem=scr["a2a_recv"],
                 device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
             for _ in range(R - 1):
                 desc.wait_recv()
@@ -626,10 +803,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 pltpu.make_async_copy(smalls.at[l + 1], scr["sm"].at[1 - slot],
                                       scr["sm_sem"].at[1 - slot]).start()
 
-            for kind in ("qkv_a", "q_b", "w_uk", "w_uv", "o_proj"):
-                if not ("uk_uv" in skip and kind in ("w_uk", "w_uv")):
-                    start(kind, l)
-
             # input norm
             x = scr["h"][...] + scr["res"][...]
             x = x.astype(BF16).astype(F32)
@@ -706,17 +879,13 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             ph.mark("L_uk")
             # W_UK absorb (VPU): ql[h] = q_nope[h] @ W_UK_T[h]
             def uk_body(g, c):
-                wait("w_uk", g)
-
-                @pl.when(g + NBUF["w_uk"] < cfg.NH // G)
-                def _():
-                    issue("w_uk", l, g + NBUF["w_uk"])
+                wb = take("w_uk")
                 qgT = scr["qh"][pl.ds(pl.multiple_of(g * G, G), G), :].T      # [DQ, G]
-                wb = scr["buf_w_uk"]
                 for hh in range(G):
-                    y = jnp.sum(qgT[0:cfg.DN, hh:hh + 1] * wb[g % NBUF["w_uk"], hh].astype(F32), axis=0,
+                    y = jnp.sum(qgT[0:cfg.DN, hh:hh + 1] * wb[hh].astype(F32), axis=0,
                                 keepdims=True)
                     scr["ql"][pl.ds(g * G + hh, 1), :] = y.astype(BF16).astype(F32)
+                give("w_uk")
                 return c
             if "uk_uv" not in skip:
                 lax.fori_loop(0, cfg.NH // G, uk_body, 0)
@@ -727,8 +896,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def _():
                 phi = Phases(tiles.trace)
                 phi.mark("i_proj")
-                start("idx_wq", l)
-                start("idx_wk", l)
                 xq, sx = quant_rows(scr["qc"][...])
                 scr["xq"][:, :cfg.QL] = xq
                 a = matmul("idx_wq", l, scr["xq"], cfg.QL, cfg.IH * cfg.IDIM)
@@ -836,21 +1003,20 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
             ph.mark("L_gather")
             # gather top-k rows of nope / rope
-            def gather(ref_n, ref_r):
-                def f():
-                    def gbody(i, c):
-                        t = jnp.maximum(scr["idx_s"][i >> 7, i & 127], 0)
-                        page = bt[t >> lg_pg]
-                        sl = t & (pg - 1)
-                        pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
-                                              scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
-                        pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
-                                              scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
-                        return c
-                    lax.fori_loop(0, KT, gbody, 0, unroll=4)   # issue-bound: 66 -> 51 us (j-098a4a19)
-                return f
             if "gather" not in skip:
-                bswitch(l, {ll: gather(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                # rows already issued by the prefetch (armed for this layer), then the rest
+                def rest(ref_n, ref_r):
+                    def f():
+                        if not GPRE:
+                            gather_rows(ref_n, ref_r, 0, KT)
+                            return
+                        c0 = jnp.where(scr["gst"][1] == l, scr["gst"][0], 0) // GPRE
+                        lax.fori_loop(c0, KT // GPRE, lambda c, x: (gather_rows(
+                            ref_n, ref_r, pl.multiple_of(c * GPRE, GPRE), GPRE), x)[1], 0)
+                    return f
+                bswitch(l, {ll: rest(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                if GPRE:
+                    scr["gst"][1] = jnp.int32(-1)
                 pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
                 pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
                 # This step's row is not in HBM yet (caches are read-only here). top-k emits
@@ -898,6 +1064,18 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             if "attn" not in skip:
                 lax.fori_loop(0, NC, s_body, 0)
 
+            # g_nope / g_rope are consumed (kvb holds the decoded nope): arm the next layer's gather
+            # when it reuses this top-k set
+            if GPRE:
+                nxt = l + 1
+                reuse = jnp.logical_and(nxt < L, jnp.logical_not(jnp.logical_or(
+                    nxt < cfg.idx_skip, (nxt - cfg.idx_skip) % cfg.idx_freq == cfg.idx_freq - 1)))
+
+                @pl.when(reuse)
+                def _():
+                    scr["gst"][0] = jnp.int32(0)
+                    scr["gst"][1] = nxt
+
             ph.mark("L_attn_pv")
 
             def m_body(c, m):
@@ -925,27 +1103,34 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             scr["orow"][...] = jnp.zeros((M, cfg.NH * cfg.DV), F32)
 
             def uv_body(g, c):
-                wait("w_uv", g)
-
-                @pl.when(g + NBUF["w_uv"] < cfg.NH // G)
-                def _():
-                    issue("w_uv", l, g + NBUF["w_uv"])
+                wb = take("w_uv")
                 agT = scr["att"][g].T                                               # [KL, 8]
-                wb = scr["buf_w_uv"]
                 for hh in range(G):
-                    y = jnp.sum(agT[:, hh:hh + 1] * wb[g % NBUF["w_uv"], hh].astype(F32), axis=0, keepdims=True)
+                    y = jnp.sum(agT[:, hh:hh + 1] * wb[hh].astype(F32), axis=0, keepdims=True)
                     o0 = pl.multiple_of((g * G + hh) * cfg.DV, 128)
                     scr["orow"][0:1, pl.ds(o0, cfg.DV)] = y.astype(BF16).astype(F32)
+                give("w_uv")
                 return c
             if "uk_uv" not in skip:
                 lax.fori_loop(0, cfg.NH // G, uv_body, 0)
 
             ph.mark("L_oproj")
-            # o_proj
+            # o_proj, TP over heads (K split). The owner quantizes its whole row (the served
+            # per-token scale sx stays on the owner), rank d gets head slice d of every token and
+            # multiplies them by its o_proj rows; the unscaled f32 partials reduce-scatter back and
+            # the owner applies sx * o_proj_s once: the served formula up to f32 summation order.
             xq, sx = quant_rows(scr["orow"][...])
-            scr["xq"][:, :cfg.NH * cfg.DV] = xq
-            a = matmul("o_proj", l, scr["xq"], cfg.NH * cfg.DV, H)
-            attn = (a * sx * sm(slot, "o_proj_s")).astype(BF16).astype(F32)
+            all_to_all_heads(xq[0:1].astype(BF16))
+            scr["xrq"][...] = jnp.concatenate(
+                [scr["xrecv"][r] for r in range(R)] + [jnp.zeros((M - R, KR), BF16)], axis=0
+            ).astype(FP8)
+            scr["part"][...] = matmul("o_proj", l, scr["xrq"], KR, H)
+            reduce_scatter_rows()
+            a = scr["rsrecv"][0]
+            for rr in range(1, R):
+                a = a + scr["rsrecv"][rr]
+            attn = (a * sx[0:1] * sm(slot, "o_proj_s")).astype(BF16).astype(F32)
+            attn = jnp.concatenate([attn, jnp.zeros((M - 1, H), F32)], axis=0)
 
             # post-attention norm
             x = (attn + scr["res"][...]).astype(BF16).astype(F32)
@@ -961,8 +1146,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
             @pl.when(jnp.logical_not(is_moe))
             def _dense():
-                start("w13", l)
-                start("w2", l)
 
                 def ld(ref):
                     return lambda: pltpu.make_async_copy(ref, scr["w13s"], scr["misc_sem"]).start()
@@ -984,9 +1167,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def _moe():
                 phm = Phases(tiles.trace)
                 phm.mark("m_shared")
-                for kind in ("gate", "sw13", "sw2"):
-                    start(kind, l)
-
                 def ldes(r13, r2):
                     def f():
                         pltpu.make_async_copy(r13, scr["es13"], scr["es_sem"].at[0]).start()
@@ -1057,6 +1237,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 n_hit = lax.fori_loop(0, cfg.ER, cbody, jnp.int32(0))
                 if "experts" in skip:
                     n_hit = jnp.int32(0)
+                # publish the hit list: the producer may now stream this layer's experts
+                st[6] = n_hit
+                st[5] = l
+                pump("gate")
 
                 phm.mark("m_experts")
                 pltpu.make_async_copy(next(iter(W["es13"].values())), scr["es13"],
@@ -1065,20 +1249,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                                       scr["es_sem"].at[1]).wait()
                 scr["part"][...] = jnp.zeros((M, H), F32)
 
-                @pl.when(n_hit > 0)
-                def _():
-                    start("ew13", l, scr["hits"][1, 0])
-
                 def ebody(i, c):
                     j = scr["hits"][1, i]
-                    start("ew2", l, j)
                     a = matmul("ew13", l, scr["xqm"], H, 2 * cfg.I, j)
                     s13 = scr["es13"][pl.ds(j, 1), :]
                     mid = silu_mul(a * sxm * s13, cfg.I)
-
-                    @pl.when(i + 1 < n_hit)
-                    def _():
-                        start("ew13", l, scr["hits"][1, i + 1])
                     xq, sx = quant_rows(mid)
                     scr["xq"][:, :cfg.I] = xq
                     a = matmul("ew2", l, scr["xq"], cfg.I, H, j)
@@ -1118,8 +1293,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         scr["res"][...] = jnp.zeros((M, H), F32)
         scr["idx_v"][...] = jnp.full((NC, 128), -1, I32)
         if "weights" in skip:       # keep the ablated numerics finite (routing stays sane)
-            for k in wshape:
-                scr["buf_" + BUF[k]][...] = jnp.zeros(scr["buf_" + BUF[k]].shape, wdtype[k])
+            for k in tkinds:
+                scr["ibuf_" + k][...] = jnp.zeros(scr["ibuf_" + k].shape, wdtype[k])
+            if len(tkinds) < len(wshape):
+                scr["pool"][...] = jnp.zeros(scr["pool"].shape, U8)
         lax.fori_loop(0, L, layer, 0)
         x = (scr["h"][...] + scr["res"][...]).astype(BF16).astype(F32)
         lay_o = smalls_layout(cfg)[0]
