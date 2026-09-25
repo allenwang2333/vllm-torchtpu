@@ -57,17 +57,31 @@ def _int_list(name: str) -> list[int] | None:
     return [int(x) for x in raw.split(",") if x.strip()]
 
 
-_LAYERS = _int_list("TPU_DSA_DUMP_LAYERS")
-_DP_RANKS = _int_list("TPU_DSA_DUMP_DP_RANKS")
-_MIN_SEQLEN = int(os.environ.get("TPU_DSA_DUMP_MIN_SEQLEN", "131072"))
-_MAX = int(os.environ.get("TPU_DSA_DUMP_MAX", "3"))
+# Read lazily, not at import: Ray workers can import this module before the
+# driver's env vars are applied to their process.
+def _layers() -> list[int] | None:
+    return _int_list("TPU_DSA_DUMP_LAYERS")
+
+
+def _min_seqlen() -> int:
+    return int(os.environ.get("TPU_DSA_DUMP_MIN_SEQLEN", "131072"))
+
+
+def _max_dumps() -> int:
+    return int(os.environ.get("TPU_DSA_DUMP_MAX", "3"))
+
 
 _ordinal = 0
 _registry: list = []  # modules that carry dump buffers
 
 
 def enabled() -> bool:
-    return _LAYERS is not None
+    return _layers() is not None
+
+
+def active() -> bool:
+    """Any layer armed in this process (cheap; checked every forward)."""
+    return bool(_registry)
 
 
 def maybe_register(module, dp_rank: int) -> None:
@@ -77,9 +91,11 @@ def maybe_register(module, dp_rank: int) -> None:
     _ordinal += 1
     module._dsa_dump = None
     module._dsa_dump_q = None
-    if _LAYERS is None or ordinal not in _LAYERS:
+    layers = _layers()
+    if layers is None or ordinal not in layers:
         return
-    if _DP_RANKS is not None and dp_rank not in _DP_RANKS:
+    dp_ranks = _int_list("TPU_DSA_DUMP_DP_RANKS")
+    if dp_ranks is not None and dp_rank not in dp_ranks:
         return
     ref = module.topk_indices_buffer
     rows = ref.shape[0]
@@ -137,9 +153,10 @@ def after_forward(positions=None) -> None:
         return
     if not isinstance(attn, dict):
         return
+    max_dumps, min_seqlen = _max_dumps(), _min_seqlen()
     for module in _registry:
         d = module._dsa_dump
-        if d["count"] >= _MAX:
+        if d["count"] >= max_dumps:
             continue
         md = attn.get(module.k_cache.prefix)
         if not isinstance(md, AttentionMetadata):
@@ -148,7 +165,7 @@ def after_forward(positions=None) -> None:
         cu = md.query_start_loc.cpu().numpy()
         seq_len = int(seq_lens[0])
         qlen = int(cu[1] - cu[0])
-        if seq_len < _MIN_SEQLEN or qlen <= 0:
+        if seq_len < min_seqlen or qlen <= 0:
             continue
         kv = module.k_cache.kv_cache
         num_pages, spp, pack, width = kv.shape

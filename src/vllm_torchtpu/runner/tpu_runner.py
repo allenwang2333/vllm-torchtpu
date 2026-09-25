@@ -5941,7 +5941,7 @@ class TPUModelRunner(GPUModelRunner):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        if _dsa_dump.enabled():
+        if _dsa_dump.active():
             _dsa_dump.after_forward(positions)
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
