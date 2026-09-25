@@ -26,7 +26,10 @@ Hierarchical 2-stage multi-subcore selection:
    (e.g. decode padding rows) issue no DMA.
 3. In Stage 2, candidate scores are merged on SparseCore to produce the exact
    global top-k column indices. The single-stage path (P == 1) and stage 2 use
-   the same length-bounded kernel.
+   the same length-bounded kernel. When the P * k_p candidates fit one slice,
+   stage 1 emits global column indices (per-sub-row base j*w added in-kernel)
+   and stage 2 compacts them as a payload loaded alongside the keys, so its
+   index output is already the global column (no XLA take_along_axis remap).
 
 Output rows are the top-k column indices in unspecified order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
@@ -55,6 +58,11 @@ or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 #       1530-1542@ce57049 (test_scalar_load_emulated).
 #   * zero-size DMAs are never started (pl.when(ext > 0)), so every started DMA
 #     is waited.
+#   * plsc.store_compressed of a VMEM-loaded vector (the stage-2 index payload,
+#     compacted with the same mask at the same traced offset as the keys):
+#       tests/pallas/tpu_sparsecore_pallas_test.py:1278-1291, 1495-1510@ce57049;
+#       signature and constraints (dtype(ref) == dtype(x), vector-sized VMEM
+#       view): jax/_src/pallas/mosaic/sc_primitives.py:119-185@ce57049.
 
 import functools
 
@@ -100,29 +108,54 @@ def _align16_dyn(x):
     return jnp.bitwise_and(x + (LANES - 1), jnp.int32(-LANES))
 
 
+MODE_SLOT = "slot"  # emit the column index within the row (direct path)
+MODE_BASE = "base"  # emit base[row] + column index (stage 1: global column)
+MODE_PAYLOAD = "payload"  # emit payload[off + column] (stage 2: carried index)
+
+
 def _topk_rows_kernel(
-    scores_hbm,  # i32[total_words] flat fp32 score bits
-    lens_hbm,  # i32[NUM_WORKERS * tab_stride] row length per (worker, wave)
-    offs_hbm,  # i32[NUM_WORKERS * tab_stride] word offset per (worker, wave)
-    out_hbm,  # i32[padded_rows * k]
-    keys_hbm,  # i32[padded_rows * k]
-    glob_vmem,  # i32[NUM_BUCKETS + LANES]
-    rowbuf_vmem,  # i32[k + LANES]
-    keybuf_vmem,  # i32[k + LANES]
-    sbuf_vmem,  # i32[nbuf * slice_len]  score slices (manual ring, 1-D)
-    lens_vmem,  # i32[tab_stride]
-    offs_vmem,  # i32[tab_stride]
-    obuf_vmem,  # i32[nbuf * k]
-    kbuf_vmem,  # i32[nbuf * k]
-    in_sem,  # DMA[nbuf]
-    out_sem,  # DMA[nbuf]
-    *,
+    *refs,
     rows: int,
     k: int,
     slice_len: int,
     num_waves: int,
     tab_stride: int,
+    mode: str = MODE_SLOT,
 ):
+    # Inputs:  scores_hbm i32[total_words] flat fp32 score bits,
+    #          lens_hbm / offs_hbm i32[NUM_WORKERS * tab_stride] per (worker, wave),
+    #          [MODE_BASE]    bases_hbm i32[NUM_WORKERS * tab_stride],
+    #          [MODE_PAYLOAD] payload_hbm i32[total_words] (same layout as scores).
+    # Outputs: out_hbm, keys_hbm i32[padded_rows * k].
+    # Scratch: glob, rowbuf, keybuf, sbuf (1-D ring), lens, offs, obuf, kbuf,
+    #          in_sem, out_sem, then [MODE_BASE] bases_vmem i32[tab_stride],
+    #          [MODE_PAYLOAD] pbuf_vmem i32[slice_len] + pay_sem DMA[1].
+    refs = list(refs)
+    scores_hbm, lens_hbm, offs_hbm = refs[:3]
+    del refs[:3]
+    bases_hbm = refs.pop(0) if mode == MODE_BASE else None
+    payload_hbm = refs.pop(0) if mode == MODE_PAYLOAD else None
+    (
+        out_hbm,
+        keys_hbm,
+        glob_vmem,
+        rowbuf_vmem,
+        keybuf_vmem,
+        sbuf_vmem,
+        lens_vmem,
+        offs_vmem,
+        obuf_vmem,
+        kbuf_vmem,
+        in_sem,
+        out_sem,
+    ) = refs[:12]
+    del refs[:12]
+    bases_vmem = refs.pop(0) if mode == MODE_BASE else None
+    if mode == MODE_PAYLOAD:
+        pbuf_vmem, pay_sem = refs
+    else:
+        assert not refs, len(refs)
+
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
@@ -133,6 +166,8 @@ def _topk_rows_kernel(
     # Per-worker metadata, one contiguous row each (traced offset, static size).
     pltpu.sync_copy(lens_hbm.at[pl.ds(flat * tab_stride, tab_stride)], lens_vmem)
     pltpu.sync_copy(offs_hbm.at[pl.ds(flat * tab_stride, tab_stride)], offs_vmem)
+    if mode == MODE_BASE:
+        pltpu.sync_copy(bases_hbm.at[pl.ds(flat * tab_stride, tab_stride)], bases_vmem)
 
     lane_iota = jnp.arange(LANES, dtype=jnp.int32)
     neg_inf_key = jnp.int32(KEY_NEG_INF)
@@ -193,7 +228,15 @@ def _topk_rows_kernel(
             body
         )  # pytype: disable=bad-argument-type
 
-    def select_row(scores_vmem, eff_len, active, out_vmem, keys_vmem):
+    def select_row(
+        scores_vmem,
+        eff_len,
+        active,
+        out_vmem,
+        keys_vmem,
+        idx_base=None,
+        before_emit=None,
+    ):
         i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len), 0)
         walk_chunks = _cdiv_dyn(i_hi)
 
@@ -277,6 +320,11 @@ def _topk_rows_kernel(
 
         my_take = jnp.where(keep_all, 0, quota)
 
+        if before_emit is not None:
+            # Stage 2 payload: the payload row must have landed before the emit
+            # passes read it (its DMA overlapped the histogram passes above).
+            before_emit()
+
         def fill_body(i):
             rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
             # Padding slots must read back as -inf, the same value the
@@ -302,9 +350,19 @@ def _topk_rows_kernel(
         emit_chunks = jnp.where(active, walk_chunks, 0)
 
         def emit(i, woff, key, sel):
+            if mode == MODE_PAYLOAD:
+                # Compact the carried global column index (loaded from the
+                # payload row at the same position as the key) instead of the
+                # slot index, so stage 2's output IS the global index.
+                val = pbuf_vmem[pl.ds(i * LANES, LANES)]
+            elif mode == MODE_BASE:
+                # Stage 1: global column = sub-row base j*w + local column.
+                val = i * LANES + lane_iota + idx_base
+            else:
+                val = i * LANES + lane_iota
             plsc.store_compressed(
                 rowbuf_vmem.at[pl.ds(woff, LANES)],
-                i * LANES + lane_iota,
+                val,
                 mask=sel,
             )
             # monotone_key is an involution, so this recovers the original
@@ -399,10 +457,38 @@ def _topk_rows_kernel(
             ),
         )
 
+    def pay_copy(wv, ext):
+        # Payload row wv: same traced word offset and extent as its scores,
+        # into a single static buffer (consumed by row wv's emit before row
+        # wv + 1's copy is started, so one buffer suffices).
+        off = pl.multiple_of(vec_at(offs_vmem, wv), LANES)
+        ext = pl.multiple_of(ext, LANES)
+        return pltpu.make_async_copy(
+            payload_hbm.at[pl.ds(off, ext)],
+            pbuf_vmem.at[pl.ds(0, ext)],
+            pay_sem.at[0],
+        )
+
+    def start_pay(wv):
+        ext = _align16_dyn(row_len(wv))
+
+        @pl.when(ext > 0)
+        def _():
+            pay_copy(wv, ext).start()
+
+    def wait_pay(wv):
+        ext = _align16_dyn(row_len(wv))
+
+        @pl.when(ext > 0)
+        def _():
+            pay_copy(wv, ext).wait()
+
     start_in(0, 0)
 
     def wave(wv, carry):
         slot = 0 if nbuf == 1 else lax.rem(wv, 2)
+        if mode == MODE_PAYLOAD:
+            start_pay(wv)
         if nbuf == 2:
             # Prefetch the next row into the other slot (its previous content,
             # row wv-1, was consumed in the previous iteration).
@@ -427,6 +513,8 @@ def _topk_rows_kernel(
             active,
             obuf_vmem.at[pl.ds(slot * k, k)],
             kbuf_vmem.at[pl.ds(slot * k, k)],
+            idx_base=vec_at(bases_vmem, wv) if mode == MODE_BASE else None,
+            before_emit=(lambda: wait_pay(wv)) if mode == MODE_PAYLOAD else None,
         )
         for c in out_copies(wv, slot):
             c.start()
@@ -463,13 +551,29 @@ def _sc_topk_rows(
     slice_len: int,
     scheduling_group_id: int | None = None,
     name: str,
+    row_bases: jax.Array | None = None,
+    payload_flat: jax.Array | None = None,
+    flat_out: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Selects top-k of each (offset, length) window of `words_flat` on 32 subcores.
 
     Row i reads words_flat[row_offs[i] : row_offs[i] + align16(row_lens[i])];
     the caller guarantees that range is in bounds and align16(len) <= slice_len.
     Returns (local indices, winner score bits), i32[rows, k] each.
+
+    With `row_bases` (i32[rows]) the emitted index is row_bases[i] + local;
+    with `payload_flat` (same layout as `words_flat`) it is
+    payload_flat[row_offs[i] + local]. -1 padding is unchanged. `flat_out`
+    returns the raw i32[padded_rows * k] buffers (rows padded to 32).
     """
+    assert row_bases is None or payload_flat is None
+    mode = (
+        MODE_BASE
+        if row_bases is not None
+        else MODE_PAYLOAD
+        if payload_flat is not None
+        else MODE_SLOT
+    )
     rows = row_lens.shape[0]
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
@@ -505,6 +609,16 @@ def _sc_topk_rows(
         pltpu.SemaphoreType.DMA((nbuf,)),
         pltpu.SemaphoreType.DMA((nbuf,)),
     )
+    extra_in = ()
+    if mode == MODE_BASE:
+        extra_in = (worker_table(row_bases, num_waves, tab_stride),)
+        scratch_types += (pltpu.VMEM((tab_stride,), jnp.int32),)
+    elif mode == MODE_PAYLOAD:
+        extra_in = (payload_flat,)
+        scratch_types += (
+            pltpu.VMEM((slice_len,), jnp.int32),
+            pltpu.SemaphoreType.DMA((1,)),
+        )
     out = pl.kernel(
         functools.partial(
             _topk_rows_kernel,
@@ -513,6 +627,7 @@ def _sc_topk_rows(
             slice_len=slice_len,
             num_waves=num_waves,
             tab_stride=tab_stride,
+            mode=mode,
         ),
         out_type=(slot_type, slot_type),
         compiler_params=pltpu.CompilerParams(
@@ -521,12 +636,14 @@ def _sc_topk_rows(
         scratch_types=scratch_types,
         mesh=mesh,
         name=name,
-    )(words_flat, lens_tab, offs_tab)
+    )(words_flat, lens_tab, offs_tab, *extra_in)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
     slots, keys = out
+    if flat_out:
+        return slots, keys
     return slots.reshape(padded_rows, k)[:rows], keys.reshape(padded_rows, k)[:rows]
 
 
@@ -707,6 +824,45 @@ def sparsecore_topk(
 
     _, sub_lens, sub_offs, offsets = stage1_geometry(row_lengths, n, p)
 
+    # Stage 2: Merge the P * k_p candidates to select the final top-k
+    cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
+
+    if p * k_p <= MAX_SLICE_WORDS and (p * k_p) % LANES == 0:
+        # Stage 1 emits global column indices (base j*w added in-kernel;
+        # -1 for empty slots) and stage 2 carries them as the compaction
+        # payload, so stage 2's index output is already the global column.
+        # Stage 1's flat outputs are consumed in place: row r's candidates
+        # are words [r*p*k_p, (r+1)*p*k_p) of both buffers (sub-row r*p+j at
+        # (r*p+j)*k_p), which is exactly the stage-2 row layout.
+        sub_bases = jnp.broadcast_to(offsets[None, :], (b, p)).reshape(b * p)
+        cand_idx_flat, cand_keys_flat = _sc_topk_rows(
+            words,
+            k_p,
+            sub_lens,
+            sub_offs,
+            slice_len=slice_len,
+            scheduling_group_id=scheduling_group_id,
+            name=f"sc_topk_v3_s1_b{b * p}_n{n_p}_k{k_p}",
+            row_bases=sub_bases,
+            flat_out=True,
+        )
+        m = p * k_p
+        final_indices, final_cand_scores = _sc_topk_rows(
+            cand_keys_flat,
+            k,
+            cand_lengths,
+            jnp.arange(b, dtype=jnp.int32) * jnp.int32(m),
+            slice_len=m,
+            scheduling_group_id=stage2_scheduling_group_id,
+            name=f"sc_topk_v3_s2_b{b}_n{m}_k{k}",
+            payload_flat=cand_idx_flat,
+        )
+        if return_scores:
+            return final_indices, final_cand_scores
+        return final_indices
+
+    # Too wide for one stage-2 slice (p * k_p > MAX_SLICE_WORDS, e.g. b == 1
+    # with p == 32): recurse, then remap candidate slots to columns in XLA.
     local_slots, cand_scores = _sc_topk_rows(
         words,
         k_p,

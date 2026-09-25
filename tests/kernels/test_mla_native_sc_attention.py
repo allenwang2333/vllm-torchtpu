@@ -321,6 +321,76 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             2e-2,
         )
 
+    @parameterized.parameters(1, 100)
+    def test_mixed_step_bucket_real_rows_match_reference(self, real_tokens):
+        """A DP-padded mixed step: the T=1024 bucket with `real_tokens` live.
+
+        Chunks larger than `small_chunk_tokens` also bound the SparseCore
+        gather to the live rows by default (`live_gather_all_chunks`), so fully
+        dead chunks issue no gather. The real rows must match both the
+        TensorCore layout and the SparseCore path with that bound disabled.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        problem = _build_problem(
+            np.random.default_rng(20260927),
+            k_scale=0.75,
+            query_tokens=1024,
+            topk=2048,
+        )
+        cu_q_lens = jnp.array([0, real_tokens], jnp.int32)
+        distribution = (
+            jnp.array([1, 1, 1], jnp.int32)
+            if real_tokens == 1
+            else jnp.array([0, 1, 1], jnp.int32)
+        )
+        kwargs = {
+            "sm_scale": 0.125,
+            "k_scale": 0.75,
+            "gather_and_attention_chunk_size": 64,
+            "attention_kernel_batch_size": 16,
+        }
+
+        def run(nope, rope, **extra):
+            return sparse_mla.sparse_ragged_paged_attention(
+                problem["q"],
+                nope,
+                rope,
+                problem["topk"],
+                problem["page_table"],
+                cu_q_lens,
+                distribution,
+                **kwargs,
+                **extra,
+            )
+
+        tensorcore_out = run(problem["tensorcore_nope"], problem["tensorcore_rope"])
+        sc = {"cache_layout": sparse_mla.SPARSECORE_CACHE_LAYOUT}
+        bounded_out = run(problem["sparsecore_nope"], problem["sparsecore_rope"], **sc)
+        unbounded_out = run(
+            problem["sparsecore_nope"],
+            problem["sparsecore_rope"],
+            live_gather_all_chunks=False,
+            **sc,
+        )
+        tensorcore_out, bounded_out, unbounded_out = jax.block_until_ready(
+            (tensorcore_out, bounded_out, unbounded_out)
+        )
+
+        real = np.asarray(bounded_out, dtype=np.float32)[:real_tokens]
+        for reference in (tensorcore_out, unbounded_out):
+            np.testing.assert_allclose(
+                real,
+                np.asarray(reference, dtype=np.float32)[:real_tokens],
+                rtol=2e-2,
+                atol=2e-2,
+            )
+        # Positive control: the comparison must be able to fail.
+        self.assertGreater(
+            np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
+            2e-2,
+        )
+
     def test_decode_bucket_zero_real_tokens_then_decode(self):
         """An idle rank's dummy step: T=16, no real token, all top-k `-1`.
 
