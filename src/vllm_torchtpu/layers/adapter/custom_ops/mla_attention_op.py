@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.layers.adapter.custom_ops import dsa_dump
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     VllmTPUDeepseekV32IndexerBackend,
@@ -184,6 +185,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
+            )
+        # Offline-analysis dump; strictly off unless TPU_DSA_DUMP_LAYERS is set.
+        self._dsa_dump = None
+        self._dsa_dump_q = None
+        if dsa_dump.enabled():
+            dsa_dump.maybe_register(
+                self, getattr(parallel_config, "data_parallel_rank", 0) or 0
             )
 
     def _build_streamidx_op(self):
@@ -441,6 +449,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cu_q_lens,
                 distribution,
             )
+
+        if self._dsa_dump_q is not None:
+            dsa_dump.record(self, q_values.view(torch.uint8), weights, topk_indices)
 
         self.topk_indices_buffer[: hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])

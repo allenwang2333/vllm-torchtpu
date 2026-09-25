@@ -84,6 +84,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
 )
+from vllm_torchtpu.layers.adapter.custom_ops import dsa_dump as _dsa_dump
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
 )
@@ -5940,6 +5941,8 @@ class TPUModelRunner(GPUModelRunner):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+        if _dsa_dump.enabled():
+            _dsa_dump.after_forward(positions)
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):
