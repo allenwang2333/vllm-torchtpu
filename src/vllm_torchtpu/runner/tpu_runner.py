@@ -5950,6 +5950,36 @@ class TPUModelRunner(GPUModelRunner):
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        every = envs.GLM5_STEP_TIMING
+        if not every:
+            return self._forward_model(input_ids, positions, inputs_embeds, intermediate_tensors)
+        st = self.__dict__.setdefault("_step_timing", {"n": 0, "mk": 0, "small": 0, "big": 0,
+                                                        "last": None, "period": 0.0, "np": 0})
+        mk = bool(getattr(self, "_mk_decode_step", False))
+        n = int(input_ids.shape[0])
+        st["n"] += 1
+        st["mk" if mk else "small" if n <= 16 else "big"] += 1
+        now = time.perf_counter()
+        if st["last"] is not None:
+            st["period"] += now - st["last"]
+            st["np"] += 1
+        if st["n"] % every:
+            st["last"] = now
+            return self._forward_model(input_ids, positions, inputs_embeds, intermediate_tensors)
+        synchronize_tensors()   # all pending work, cache writes included
+        started = time.perf_counter()
+        out = self._forward_model(input_ids, positions, inputs_embeds, intermediate_tensors)
+        synchronize_tensors()
+        logger.info(
+            "GLM5_STEP_TIMING n=%d mk=%s toks=%d sync_ms=%.3f | since_last: mk=%d small=%d big=%d "
+            "mean_period_ms=%.3f", st["n"], mk, n, (time.perf_counter() - started) * 1e3,
+            st["mk"], st["small"], st["big"], st["period"] * 1e3 / max(st["np"], 1))
+        st.update(mk=0, small=0, big=0, period=0.0, np=0, last=None)
+        return out
+
+    def _forward_model(
+        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+    ):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         if getattr(self, "_mk_decode_step", False):

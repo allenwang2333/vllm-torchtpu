@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     USE_GLM5_MEGAKERNEL: bool = False
     GLM5_MEGAKERNEL_VERIFY: bool = False
     GLM5_MEGAKERNEL_LAYERDIFF: bool = False
+    GLM5_STEP_TIMING: int = 0
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -600,6 +601,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug, with VERIFY: also log per-layer residual-stream error and top-k
     # overlap against the stock layers (kernel built with debug outputs).
     "GLM5_MEGAKERNEL_LAYERDIFF": env_bool("GLM5_MEGAKERNEL_LAYERDIFF"),
+    # Measurement: every Nth forward, synchronize around it and log its latency plus how many
+    # forwards since the last line took the megakernel / the stock path, and the host period.
+    "GLM5_STEP_TIMING": env_int("GLM5_STEP_TIMING", 0),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
