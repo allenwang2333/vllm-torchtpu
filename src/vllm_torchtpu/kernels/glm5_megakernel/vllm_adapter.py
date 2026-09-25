@@ -42,7 +42,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     ep_rank_order,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
 from vllm_torchtpu.kernels.glm5_megakernel import kernel as K
 from vllm_torchtpu.kernels.glm5_megakernel.config import FULL
 from vllm_torchtpu.kernels.glm5_megakernel.layout import rup, smalls_layout
@@ -373,15 +373,24 @@ class Glm5Megakernel:
                f"    return _smap({', '.join(args)})\n")
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
         exec(compile(src, "<glm5_megakernel>", "exec"), ns)  # noqa: S102 - arity is data
-        op = sharded_jax_op(
+        flat = sharded_jax_callable(
             "glm5_megakernel::step", ns["glm5_megakernel"], mesh=self.mesh,
             input_partition_specs=in_specs, output_partition_specs=out_specs,
             donate_argnums=tuple(range(n_in - n_c, n_in)))
 
-        def _fake(meta, bt, h0, *rest):
-            return (torch.empty_like(h0),) + tuple(torch.empty_like(c) for c in rest[-n_c:])
+        # The dispatcher caps a schema at 64 arguments and this has ~1150, so
+        # the op takes the weights and caches as two Tensor[] arguments and
+        # hands the flat callable its operands positionally.
+        @torch.library.custom_op("glm5_megakernel::step", mutates_args=())
+        def op(meta: torch.Tensor, bt: torch.Tensor, h0: torch.Tensor, rt: torch.Tensor,
+               smalls: torch.Tensor, weights: list[torch.Tensor],
+               caches: list[torch.Tensor]) -> list[torch.Tensor]:
+            return list(flat(meta, bt, h0, rt, smalls, *weights, *caches))
 
-        op.register_fake(_fake)
+        @op.register_fake
+        def _(meta, bt, h0, rt, smalls, weights, caches):
+            return [torch.empty_like(h0)] + [torch.empty_like(c) for c in caches]
+
         self.op = op
 
         rank = self.rank
@@ -409,7 +418,7 @@ class Glm5Megakernel:
                 torch.cat([c, one[DR:]]),
                 torch.cat([s, zero[DR:]]),
                 zero, zero, zero, zero])
-            outs = op(meta, bt, h0, rt, smalls, *weights, *caches)
+            outs = op(meta, bt, h0, rt, smalls, list(weights), list(caches))
             for dst, src in zip(caches, outs[1:]):
                 dst.copy_(src)
             return outs[0]
