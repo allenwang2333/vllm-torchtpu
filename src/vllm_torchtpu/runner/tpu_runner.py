@@ -10,6 +10,7 @@ import copy
 import dataclasses
 import math
 import os
+import sys
 import time
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
@@ -5970,10 +5971,12 @@ class TPUModelRunner(GPUModelRunner):
         started = time.perf_counter()
         out = self._forward_model(input_ids, positions, inputs_embeds, intermediate_tensors)
         synchronize_tensors()
-        logger.info(
+        # stderr, not logger: Ray drops worker logger.info once serving starts; stderr is forwarded.
+        print(
             "GLM5_STEP_TIMING n=%d mk=%s toks=%d sync_ms=%.3f | since_last: mk=%d small=%d big=%d "
-            "mean_period_ms=%.3f", st["n"], mk, n, (time.perf_counter() - started) * 1e3,
-            st["mk"], st["small"], st["big"], st["period"] * 1e3 / max(st["np"], 1))
+            "mean_period_ms=%.3f" % (st["n"], mk, n, (time.perf_counter() - started) * 1e3,
+            st["mk"], st["small"], st["big"], st["period"] * 1e3 / max(st["np"], 1)),
+            file=sys.stderr, flush=True)
         st.update(mk=0, small=0, big=0, period=0.0, np=0, last=None)
         return out
 
