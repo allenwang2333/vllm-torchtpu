@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
+from vllm.model_executor.layers.pooler.seqwise.methods import LastPool
 from vllm.model_executor.layers.pooler.tokwise.methods import StepPool
 from vllm.pooling_params import PoolingParams
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
@@ -343,3 +344,56 @@ def test_steppool_metadata_tag_resolution():
     assert torch.allclose(
         step_out[0][0], hidden_states[1]
     )  # Corresponds to index 1 (token 1000)
+
+
+def test_last_pool_indices():
+    """Verify pooling_cursor.last_token_indices_gpu correctly extracts the final token of each sequence for LastPool."""
+    # 3 requests with lengths 3, 5, 2 in a packed batch (total 10 tokens)
+    prompt_lens = [3, 5, 2]
+    total_tokens = sum(prompt_lens)
+    dim = 8
+    hidden_states = torch.randn(total_tokens, dim, dtype=torch.float32)
+
+    runner_requests = {}
+    req_ids = []
+    for i, plen in enumerate(prompt_lens):
+        rid = f"req-{i}"
+        req_ids.append(rid)
+        r = MagicMock()
+        r.req_id = rid
+        r.prompt_token_ids = list(range(plen))
+        r.num_prompt_tokens = plen
+        r.prompt_token_ids_len = plen
+        r.pooling_params = PoolingParams(task="embed")
+        r.pooling_states = PoolingStates()
+        runner_requests[rid] = r
+
+    batch = MagicMock()
+    batch.requests = None
+    batch.req_ids = req_ids
+    batch.num_reqs = len(req_ids)
+
+    metadata = build_pooling_metadata(batch, runner_requests)
+    metadata.build_pooling_cursor(
+        num_scheduled_tokens_np=np.array(prompt_lens, dtype=np.int32),
+        seq_lens_cpu=torch.tensor(prompt_lens, dtype=torch.int32),
+        device=torch.device("cpu"),
+    )
+
+    # 1. Verify cursor indices
+    cursor = metadata.get_pooling_cursor()
+    # Sequence boundaries in packed hidden_states:
+    # seq 0: indices [0, 1, 2] -> last index is 2
+    # seq 1: indices [3, 4, 5, 6, 7] -> last index is 7
+    # seq 2: indices [8, 9] -> last index is 9
+    expected_last_indices = torch.tensor([2, 7, 9], dtype=torch.int64)
+    assert torch.equal(cursor.last_token_indices_gpu, expected_last_indices)
+
+    # 2. Test LastPool forward pass
+    last_pool = LastPool()
+    pooled = last_pool.forward(hidden_states, metadata)
+
+    assert pooled.shape == (3, dim)
+    assert torch.allclose(pooled[0], hidden_states[2])
+    assert torch.allclose(pooled[1], hidden_states[7])
+    assert torch.allclose(pooled[2], hidden_states[9])
