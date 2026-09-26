@@ -248,9 +248,14 @@ ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "
              "agdiag")
 AGDIAG_SPIN = int(os.environ.get("MK_AGDIAG_SPIN", "1000000"))
 AGDIAG_TAG0 = 9
+# The barrier semaphore is keyed by collective_id. 0 is also the fused EP MoE kernel's (fused_moe/v2), so a
+# peer still inside that kernel satisfied this kernel's entry barrier and the two kernels' remote DMAs landed
+# on each other's semaphores (j-c4e6dce4, j-bf0ef082). Unique per kernel, as upstream does (21 / 25 / 45).
+COLLECTIVE_ID = int(os.environ.get("MK_COLLECTIVE_ID", "37"))
 
 
-def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset()):
+def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset(),
+          axis_name=None):
     """Returns (step_fn, operand names). step_fn(meta, bt, h0, rope_tab, smalls, *weights,
     *caches) -> (out [M, H] bf16, *caches) for ONE rank; wrap in shard_map.
     skip: timing ablations only (numerics are garbage), a subset of ABLATIONS."""
@@ -432,7 +437,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         for (k, l), r in zip(c_names, c_in):
             C.setdefault(k, {})[l] = r
 
-        me = meta[0]
+        # axis_name: the rank from Mosaic's device id (upstream collectives32.py), not meta[0] -- the
+        # served torch graph must not carry a rank constant (j-c4e6dce4), and XLA's partition-id is
+        # rejected on that path (j-a28e43a5)
+        me = meta[0] if axis_name is None else lax.axis_index(axis_name).astype(I32)
         pos = meta[1]
         seq_len = meta[2]
         npages = meta[3]
@@ -1433,7 +1441,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         compiler_params=pltpu.CompilerParams(
             # No has_side_effects: every output is consumed, and a side-effecting custom call
             # without a sharding is rejected by XLA's SPMD partitioner on the torch_tpu path.
-            collective_id=0 if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024),
+            collective_id=COLLECTIVE_ID if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024),
         interpret=pltpu.InterpretParams() if interpret else False,
     )
 
