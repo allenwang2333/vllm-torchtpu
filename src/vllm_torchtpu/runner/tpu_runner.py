@@ -196,7 +196,43 @@ def _rollback_offsets_migrate_impl(
     read_offsets.index_put_((dst_t,), read_offsets[src_t])
 
 
+def _update_read_offsets_impl(
+    read_offsets: torch.Tensor,
+    indices_per_group: list[torch.Tensor],
+    next_tokens: torch.Tensor | None,
+    row_valid: torch.Tensor,
+) -> None:
+    """Write one chunk's mamba read offsets to every group's slots.
+
+    Offset = accepted drafts (num_valid - 1) per verify row, 0 for non-spec
+    chunks and for rows past the real num_reqs (``row_valid`` False).
+    """
+    width = indices_per_group[0].shape[0]
+    if next_tokens is None:
+        offsets = torch.zeros(width, dtype=read_offsets.dtype, device=row_valid.device)
+    else:
+        if next_tokens.shape[0] >= width:
+            nt = next_tokens[:width]
+        else:
+            nt = torch.cat(
+                [
+                    next_tokens,
+                    torch.full(
+                        (width - next_tokens.shape[0], *next_tokens.shape[1:]),
+                        INVALID_TOKEN_ID,
+                        dtype=next_tokens.dtype,
+                        device=next_tokens.device,
+                    ),
+                ]
+            )
+        num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).to(read_offsets.dtype)
+        offsets = torch.where(row_valid, (num_valid - 1).clamp(min=0), 0)
+    indices = torch.cat(indices_per_group, dim=0).long()
+    read_offsets.index_put_((indices,), offsets.repeat(len(indices_per_group)))
+
+
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -3935,26 +3971,27 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return
-        offsets = torch.zeros(
-            indices_per_group[0].shape[0],
-            dtype=torch.int32,
-            device=indices_per_group[0].device,
+        # One fixed-shape program: the real-row mask enters as data (cached
+        # per num_reqs) instead of [:num_reqs] slices, which compiled an eager
+        # program per batch size and fusion context.
+        width = indices_per_group[0].shape[0]
+        device = indices_per_group[0].device
+        cache = self.__dict__.setdefault("_read_offsets_row_valid", {})
+        row_valid = cache.get((width, num_reqs))
+        if row_valid is None:
+            row_valid = torch.from_numpy(np.arange(width) < num_reqs).to(device)
+            cache[(width, num_reqs)] = row_valid
+        fn = (
+            _update_read_offsets_compiled
+            if device.type == "tpu"
+            else _update_read_offsets_impl
         )
-        if next_tokens is not None:
-            # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
-            # last accepted token is at offset num_valid - 1.
-            num_valid = (
-                (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
-            )
-            offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        if len(indices_per_group) == 1:
-            self.mamba_slot_read_offsets.index_put_(
-                (indices_per_group[0].long(),), offsets
-            )
-        else:
-            all_indices = torch.cat(indices_per_group, dim=0).long()
-            all_offsets = offsets.repeat(len(indices_per_group))
-            self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
+        fn(
+            self.mamba_slot_read_offsets,
+            list(indices_per_group),
+            next_tokens,
+            row_valid,
+        )
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
