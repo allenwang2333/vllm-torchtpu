@@ -388,6 +388,7 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "GLM5_LIBTPU_EXTRA_ARGS",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

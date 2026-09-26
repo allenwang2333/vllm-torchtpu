@@ -158,6 +158,9 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
 
 
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
+if envs.GLM5_LIBTPU_EXTRA_ARGS:
+    _existing_libtpu_args = (_existing_libtpu_args + " " + envs.GLM5_LIBTPU_EXTRA_ARGS).strip()
+    os.environ["LIBTPU_INIT_ARGS"] = _existing_libtpu_args
 
 
 def _user_has_flag(flag_name: str) -> bool:

@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     GLM5_MEGAKERNEL_LAYERDIFF: bool = False
     GLM5_STEP_TIMING: int = 0
     GLM5_MEGAKERNEL_BISECT: str = ""
+    GLM5_LIBTPU_EXTRA_ARGS: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -609,6 +610,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ','-separated subset of kernel.ABLATIONS, or "all"), logging each that returns, to locate a
     # step that never returns. Numerics of the ablated steps are garbage; seq_len 0 writes no cache.
     "GLM5_MEGAKERNEL_BISECT": env_str("GLM5_MEGAKERNEL_BISECT", ""),
+    # appended to LIBTPU_INIT_ARGS (which itself does not reach Ray workers); serving-hang diag
+    "GLM5_LIBTPU_EXTRA_ARGS": env_str("GLM5_LIBTPU_EXTRA_ARGS", ""),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
