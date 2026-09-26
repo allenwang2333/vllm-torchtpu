@@ -248,7 +248,8 @@ class InputConfigs:
 
     @property
     def should_unpack(self) -> bool:
-        """True if rhs weights are sub-byte (e.g. INT4) packed in INT32/UINT32 carriers."""
+        """True if rhs weights are sub-byte (e.g. INT4) packed in
+        INT32/UINT32 carriers."""
         return get_packing_factor(self.dtype, self.quant_dtype) > 1
 
     @property
@@ -1206,9 +1207,8 @@ def make_gmm_configs(
             is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
             if is_rhs_float or is_rhs_4bits:
                 lhs_q_dtype = jnp.float8_e4m3fn.dtype
-        if tpu_info.int8_ops_per_second > 0:
-            if not is_rhs_float:
-                lhs_q_dtype = jnp.int8.dtype
+        if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:
+            lhs_q_dtype = jnp.int8.dtype
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
@@ -1299,7 +1299,8 @@ def gmm_v2(
 
     Args:
         lhs: lhs with shape [size_m, size_k].
-        rhs: rhs with shape  native -> [size_group, size_k, size_n], packed -> [size_group, size_k/8, size_n]
+        rhs: rhs with shape  native -> [size_group, size_k, size_n],
+            packed -> [size_group, size_k/8, size_n]
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
         rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size].
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
@@ -1312,7 +1313,8 @@ def gmm_v2(
         maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
         zero_initialize: Whether to initialize unvisited output elements to zero.
         fuse_act: Activation function to fuse with GMM, None if no fusion.
-        rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier. Packed along k-axis
+        rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
+            Packed along k-axis
 
     Returns:
         Output of shape [size_m, size_n].

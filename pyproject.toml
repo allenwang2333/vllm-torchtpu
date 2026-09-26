@@ -139,11 +139,12 @@ force-exclude = true
 exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
 
 [tool.ruff.lint]
-# E4 import placement, E7 statement mistakes, E9 unreadable file, F pyflakes,
-# I import sorting, UP outdated syntax, B likely bugs, SIM needless complexity,
-# G logging calls, ISC string concatenation.
-# Line length (E501) is in E5 and is not selected.
-select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+# E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
+# bugs, SIM needless complexity, G logging calls, ISC string concatenation.
+# E501 fails a line longer than 88 characters, the width `ruff format` wraps
+# code at. The formatter does not split comments or strings, so wrap those by
+# hand.
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC"]
 
 ignore = [
     # Off on purpose, matching upstream vllm.
@@ -154,10 +155,6 @@ ignore = [
     # Firing today and not fixed yet. `ruff check --fix` does not clear any of
     # them; a few have fixes that ruff marks unsafe. Each one is a follow-up
     # change. Delete the entry once its count reaches zero.
-    "G004",    #  39  f-string passed to a logging call
-    "SIM108",  #  15  if/else that could be a conditional expression
-    "SIM102",  #  13  nested if that could be one
-    "SIM105",  #  12  try/except/pass that could be contextlib.suppress
     "SIM115",  #   1  open() outside a context manager
 ]
 

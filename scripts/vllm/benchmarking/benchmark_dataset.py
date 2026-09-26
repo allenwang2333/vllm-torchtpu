@@ -306,9 +306,10 @@ class MMLUDataset(BenchmarkDataset):
                     )  # consider turning on thinking=False
                 except Exception as e:
                     logger.error(
-                        f"Could not apply chat template: {e}. "
+                        "Could not apply chat template: %s. "
                         "Falling back to raw prompt. "
-                        "This will likely fail for fine-tuned models"
+                        "This will likely fail for fine-tuned models",
+                        e,
                     )
 
             prompt_ids = tokenizer(prompt).input_ids
@@ -324,7 +325,8 @@ class MMLUDataset(BenchmarkDataset):
             #     continue
             if input_len is not None and input_len <= prompt_len:
                 raise ValueError(
-                    f"prompt is too short: prompt_len is {prompt_len} but input_len is {input_len}"
+                    f"prompt is too short: prompt_len is {prompt_len} "
+                    f"but input_len is {input_len}"
                 )
             samples.append(
                 SampleRequest(
@@ -414,7 +416,8 @@ class MLPerfDataset(BenchmarkDataset):
             # at all, but it could be done here
             if input_len is not None and input_len <= prompt_len:
                 raise ValueError(
-                    f"prompt is too short: prompt_len is {prompt_len} but input_len is {input_len}"
+                    f"prompt is too short: prompt_len is {prompt_len} "
+                    f"but input_len is {input_len}"
                 )
             samples.append(
                 SampleRequest(
@@ -531,8 +534,9 @@ Express your final answer as the corresponding option 'A', 'B', 'C', or 'D'."""
                     )
                 except Exception as e:
                     logger.error(
-                        f"Could not apply chat template: {e}. "
-                        "Falling back to raw prompt."
+                        "Could not apply chat template: %s. "
+                        "Falling back to raw prompt.",
+                        e,
                     )
 
             prompt_ids = tokenizer(prompt).input_ids
