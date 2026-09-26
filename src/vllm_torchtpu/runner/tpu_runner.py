@@ -6031,9 +6031,11 @@ class TPUModelRunner(GPUModelRunner):
                 (la.argmax(-1) == lb.argmax(-1)).float()[0],
                 (la - lb).abs().max().float(),
             ]).cpu()
-            logger.info(
-                "GLM5_MK_VERIFY pos=%d rel_hidden=%.5f argmax_eq=%d max_logit_diff=%.4f",
-                int(positions[0].item()), float(stats[0]), int(stats[1]), float(stats[2]))
+            # stderr, not logger: Ray dropped every 256k-decode line (j-d3d09993)
+            print(
+                "GLM5_MK_VERIFY pos=%d rel_hidden=%.5f argmax_eq=%d max_logit_diff=%.4f" % (
+                    int(positions[0].item()), float(stats[0]), int(stats[1]), float(stats[2])),
+                file=sys.stderr, flush=True)
             if self._glm5_mk.layerdiff:
                 self._glm5_mk_log_layers(int(positions[0].item()))
         return out
