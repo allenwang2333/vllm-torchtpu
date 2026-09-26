@@ -521,6 +521,38 @@ class Glm5Megakernel:
             return out[:num_tokens]
         return torch.nn.functional.pad(out, (0, 0, 0, num_tokens - K.M))
 
+    def _program_fingerprint(self) -> None:
+        """Serving-hang diag (j-c4e6dce4, j-bf0ef082: one rank halts at its own PC, i.e. runs a
+        different executable). Per rank: the XLA-relevant environment, and a hash of every dumped
+        HLO module holding a Mosaic call (whole file, and the custom-call lines alone), so ranks
+        can be compared line by line in the log. Needs --xla_dump_to in LIBTPU_INIT_ARGS or XLA_FLAGS."""
+        import hashlib
+        import os
+        import re
+
+        def h(b):
+            return hashlib.sha256(b).hexdigest()[:12]
+        tag = f"GLM5_MEGAKERNEL_FP rank {self.rank}"
+        for k in sorted(os.environ):
+            if re.match(r"(TPU|XLA|LIBTPU|JAX|MEGASCALE|PJRT|TORCH_TPU|CLOUD_TPU)", k):
+                print(f"{tag} env {k}={os.environ[k][:300]}", file=sys.stderr, flush=True)
+        m = re.search(r"--xla_dump_to=(\S+)", os.environ.get("LIBTPU_INIT_ARGS", "") + " " + os.environ.get("XLA_FLAGS", ""))
+        if not m or not os.path.isdir(m.group(1)):
+            print(f"{tag} no dump dir", file=sys.stderr, flush=True)
+            return
+        for root, _, files in os.walk(m.group(1)):
+            for f in sorted(files):
+                path = os.path.join(root, f)
+                try:
+                    data = open(path, "rb").read()
+                except OSError:
+                    continue
+                if b"tpu_custom_call" not in data:
+                    continue
+                cc = b"\n".join(ln for ln in data.split(b"\n") if b"tpu_custom_call" in ln)
+                print(f"{tag} file {f} size {len(data)} all {h(data)} cc {h(cc)} n_cc {cc.count(b'tpu_custom_call')}",
+                      file=sys.stderr, flush=True)
+
     def warmup(self, runner) -> None:
         """Compile and run once as an idle step on every rank (seq_len 0 touches no cache)."""
         from vllm_torchtpu.utils import synchronize_tensors
@@ -532,8 +564,12 @@ class Glm5Megakernel:
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} start", file=sys.stderr,
                   flush=True)
             t0 = time.monotonic()
-            out = self._run(z[0:1], z[0:1], z[0:1], z, step=self._build_op(skip, f"_bisect{i}"))
-            synchronize_tensors([out])
+            try:
+                out = self._run(z[0:1], z[0:1], z[0:1], z, step=self._build_op(skip, f"_bisect{i}"))
+                synchronize_tensors([out])
+            finally:
+                if i == 0:
+                    self._program_fingerprint()
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} returned in "
                   f"{time.monotonic() - t0:.1f} s", file=sys.stderr, flush=True)
             if "agdiag" in skip:   # out row 1: see kernel.ABLATIONS
