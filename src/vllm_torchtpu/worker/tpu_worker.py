@@ -168,6 +168,10 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def init_device(self):
+        if os.environ.get("GLM5_LIBTPU_EXTRA_ARGS"):
+            from vllm_torchtpu.env_override import apply_glm5_libtpu_extra_args
+            print(f"GLM5_LIBTPU_EXTRA_ARGS applied: LIBTPU_INIT_ARGS={apply_glm5_libtpu_extra_args()}",
+                  flush=True)
         # vLLM's MultiprocExecutor passes per-engine rank/local_rank as
         # constructor args. Native vLLM DP keeps those values local to the DP
         # engine and lets init_distributed_environment() derive the global

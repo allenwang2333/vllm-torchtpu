@@ -202,6 +202,21 @@ if _libtpu_extra_args:
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 
+def apply_glm5_libtpu_extra_args() -> str:
+    """Re-apply GLM5_LIBTPU_EXTRA_ARGS in a Ray worker, where it arrives via
+    additional_env_vars only after this module ran at import time. Each extra
+    flag replaces any same-named flag already present. Must run before the
+    TPU client is created (libtpu reads LIBTPU_INIT_ARGS once)."""
+    extra = os.environ.get("GLM5_LIBTPU_EXTRA_ARGS", "").split()
+    if not extra:
+        return os.environ.get("LIBTPU_INIT_ARGS", "")
+    names = {t.split("=", 1)[0] for t in extra}
+    kept = [t for t in os.environ.get("LIBTPU_INIT_ARGS", "").split()
+            if t.split("=", 1)[0] not in names]
+    os.environ["LIBTPU_INIT_ARGS"] = " ".join(kept + extra)
+    return os.environ["LIBTPU_INIT_ARGS"]
+
+
 def _patch_jax_pallas_fori_lowering() -> None:
     """Elide the dead remainder ``scf.for`` from Pallas ``fori_loop`` lowering.
 
