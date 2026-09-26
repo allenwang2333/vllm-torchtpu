@@ -1228,12 +1228,20 @@ class Eagle3Proposer:
             - 1
             - num_rejected_np.astype(np.int64)
         )
-        # The async (next_tokens_device) path recomputes last_token_indices
-        # fully on-device below, only the sync / device_seed paths consume this H2D.
+        # Bucket the seed scatter + the returned gather index to the chunk's loop
+        # bucket p so neither recompiles as num_reqs shrinks (the dominant draft
+        # propose recompile). Pad by repeating the last real entry: the padded
+        # rows re-write request (num_reqs-1)'s seed to its own slot (idempotent),
+        # so draft_input_ids stays correct, and the padded gather tail re-reads a
+        # real row that propose() slices off. The async (next_tokens_device)
+        # path recomputes last_token_indices fully on-device below; the sync /
+        # device_seed paths H2D the padded host indices.
+        p = self._loop_bucket(num_reqs)
+        pad_rows_np = np.minimum(np.arange(p), num_reqs - 1)
         if next_tokens_device is None:
-            last_token_indices = torch.from_numpy(last_token_indices_np).to(
-                runner.device
-            )
+            last_token_indices = torch.from_numpy(
+                last_token_indices_np[pad_rows_np]
+            ).to(runner.device)
 
         discard_set = set(discard_sampled_tokens_req_indices)
         req_ids = runner.input_batch.req_ids[start : start + num_reqs]
@@ -1291,20 +1299,28 @@ class Eagle3Proposer:
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
             num_rejected_out = num_rejected_np
-            next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
+            # Gather the seed already padded to [p] (rows as in
+            # last_token_indices) so the seed scatter below runs at a
+            # precompiled [p] shape rather than compiling per real num_reqs.
+            next_token_ids = device_seed[
+                torch.from_numpy(start + pad_rows_np).to(runner.device)
+            ].to(torch.int32)
             # Partial-prefill (discard) reqs: override seed from host req_state.
-            ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
-            if ov_i:
-                next_token_ids = next_token_ids.clone()
-                ov_v = [
-                    runner.requests[req_ids[i]].get_token_id(
-                        runner.requests[req_ids[i]].num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
+            ov_j = [j for j, i in enumerate(pad_rows_np) if (start + i) in discard_set]
+            if ov_j:
+                ov_v = []
+                for j in ov_j:
+                    req_state = runner.requests[req_ids[pad_rows_np[j]]]
+                    ov_v.append(
+                        req_state.get_token_id(
+                            req_state.num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[
+                                req_ids[pad_rows_np[j]]
+                            ]
+                        )
                     )
-                    for i in ov_i
-                ]
                 next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
+                    torch.tensor(ov_j, dtype=torch.long, device=runner.device)
                 ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
         else:
             num_rejected_out = num_rejected_np
@@ -1326,41 +1342,23 @@ class Eagle3Proposer:
                         else []
                     )
                     next_token_ids_np[i] = ids[-1] if ids else 0
-            next_token_ids = torch.from_numpy(next_token_ids_np).to(runner.device)
-        # Bucket the seed scatter + the returned gather index to the chunk's loop
-        # bucket p so neither recompiles as num_reqs shrinks (the dominant draft
-        # propose recompile). Pad by repeating the last real entry: the padded
-        # rows re-write request (num_reqs-1)'s seed to its own slot (idempotent),
-        # so draft_input_ids stays correct, and the padded gather tail re-reads a
-        # real row that propose() slices off.
-        p = self._loop_bucket(num_reqs)
-        if next_tokens_device is None and device_seed is None:
-            # Pure sync: build the padded index + values on the host (free H2D,
-            # no recompile), then scatter at the constant [p] shape.
-            lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
-            lti_p_np[:num_reqs] = last_token_indices_np
-            ntids_p_np = np.full(
-                p, next_token_ids_np[-1], dtype=next_token_ids_np.dtype
+            # Pad the values on the host too (free H2D, no recompile).
+            next_token_ids = torch.from_numpy(next_token_ids_np[pad_rows_np]).to(
+                runner.device
             )
-            ntids_p_np[:num_reqs] = next_token_ids_np
-            last_token_indices = torch.from_numpy(lti_p_np).to(runner.device)
-            next_token_ids = torch.from_numpy(ntids_p_np).to(runner.device)
+        if next_tokens_device is None:
+            # Sync / bootstrap: scatter at the constant [p] shape.
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
             gather_indices = last_token_indices
         else:
-            # Async / bootstrap: the seed scatter stays real [num_reqs] (its
+            # Async spec step: the seed scatter stays real [num_reqs] (its
             # recompile is async-only); pad just the returned gather index.
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
-            if next_tokens_device is not None:
-                gather_indices = _maybe_pad_dim0(last_token_indices, p)
-            else:
-                padded_lti_np = np.zeros(p, dtype=np.int64)
-                padded_lti_np[:num_reqs] = last_token_indices_np
-                gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
+            gather_indices = _maybe_pad_dim0(last_token_indices, p)
 
         draft_input_ids, gather_indices = (
             chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
