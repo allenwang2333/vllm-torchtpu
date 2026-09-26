@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, MambaSpec)
 from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.distributed.kv_transfer import tpu_connector
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics, TpuKVConnectorStats)
 
@@ -3407,15 +3408,20 @@ class TestTPURaidenConnectorWorker:
         assert worker._raiden_transfer_engine is engine
         assert worker.raiden_admission_summary() == {"admitted": False}
 
-    def test_v1_admission_rejects_the_v2_tp2dp4_decode_topology(self):
+    def test_v1_admission_takes_tp2dp4_decode_as_columns_of_a_store(self):
         worker = _make_raiden_worker(tp_rank=0,
                                      tp_size=2,
                                      is_producer=False,
                                      dp_size=4,
                                      pcp_size=1)
-
-        with unittest.TestCase().assertRaisesRegex(ValueError,
-                                                   "dp8_decode.*requires"):
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL",
+                   "store",
+                   create=True):
+            assert worker._raiden_qwen35_admission_topology() == "dp4_decode"
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL",
+                   "controller",
+                   create=True), pytest.raises(ValueError,
+                                               match="RESHARD_IMPL=store"):
             worker._raiden_qwen35_admission_topology()
 
     @pytest.mark.parametrize("dp_size", [4, 8])
@@ -4463,6 +4469,152 @@ class TestPipelineParallelConsumer:
                    create=True):
             scheduler = TPURaidenConnectorScheduler(cfg)
             assert scheduler.get_finished_count() == 8
+
+
+class TestTensorParallelColumns:
+    """PP x TP2 prefill -> DP x TP2 decode: every tensor-parallel column is
+    its own reshard domain (store, units, plans), column t pulling from
+    column t."""
+
+    @staticmethod
+    def _store_mode():
+        return patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL",
+                     "store",
+                     create=True)
+
+    def test_store_index_and_engine_id_name_the_column(self):
+        assert tpu_connector._reshard_store_index(5) == 5
+        assert tpu_connector._reshard_store_index(5, 2, 1) == 11
+        assert tpu_connector._tp_column_engine_id("e", 1, 0) == "e"
+        assert tpu_connector._tp_column_engine_id("e", 2, 1) == "e-tp1"
+
+    def test_pipeline_producer_columns_are_separate_domains(self):
+        worker = _make_raiden_worker(tp_rank=1, tp_size=2, pp_size=8)
+        assert worker._raiden_tp_columns() == 2
+        assert worker._raiden_tp_column() == 1
+        assert worker._reshard_store_index() == 1
+        fields = worker._raiden_work_unit_fields(3)
+        assert fields["job_replica_id"].endswith("-tp1-rank3")
+        group = SimpleNamespace(rank_in_group=3)
+        with self._store_mode(), patch.object(
+                worker, "_raiden_stage3_enabled", return_value=True), patch(
+                    "vllm.distributed.parallel_state.get_pp_group",
+                    return_value=group):
+            # Node 3 (the stage), on the column's own control port.
+            assert worker._raiden_endpoint_identity() == (7, 3)
+            assert worker._raiden_qwen35_admission_topology() == "pp8_prefill"
+
+    def test_columns_need_a_store_per_column(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=2, pp_size=8)
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL",
+                   "controller",
+                   create=True), pytest.raises(ValueError,
+                                               match="RESHARD_IMPL=store"):
+            worker._raiden_qwen35_admission_topology()
+
+    def test_glm_and_context_parallel_producers_keep_one_domain(self):
+        worker = _make_raiden_worker(tp_rank=1, tp_size=4, pp_size=1)
+        with patch(f"{_MOD}._use_raiden_glm_admission", return_value=True):
+            assert worker._raiden_tp_columns() == 1
+            assert worker._reshard_store_index() == worker.dp_rank
+        assert "-tp" not in worker._raiden_work_unit_fields(
+            1)["job_replica_id"]
+
+    def test_decode_column_is_its_own_unit_store_and_endpoint(self):
+        worker = _make_raiden_worker(tp_rank=1,
+                                     tp_size=2,
+                                     is_producer=False,
+                                     dp_rank=5,
+                                     dp_size=8)
+        assert worker._reshard_store_index() == 11
+        fields = worker._raiden_work_unit_fields(0)
+        assert fields["job_replica_id"].endswith("-tp1")
+        assert "-rank" not in fields["job_replica_id"]
+        assert fields["data_replica_idx"] == 5
+        with self._store_mode(), patch.object(worker,
+                                              "_raiden_stage3_enabled",
+                                              return_value=True):
+            assert worker._raiden_endpoint_identity() == (1, 5)
+            assert worker._raiden_qwen35_admission_topology() == "dp8_decode"
+
+    def test_decode_column_pulls_its_column_of_every_stage(self):
+        worker = _make_raiden_worker(tp_rank=1,
+                                     tp_size=2,
+                                     is_producer=False,
+                                     dp_size=8)
+        meta = SimpleNamespace(src_parallelism=8,
+                               src_job_name="prefill",
+                               src_engine_id="p",
+                               src_data_replica_idx=0,
+                               src_tp_size=2,
+                               src_controller_address="h:27000",
+                               src_controller_addresses=("h:27000", "h:27001"))
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   8,
+                   create=True):
+            units = worker._stage3_source_work_units(meta)
+        assert [unit.job_replica_id for unit in units
+                ] == [f"p-tp1-rank{rank}" for rank in range(8)]
+        assert worker._stage3_source_controller_address(meta) == "h:27001"
+
+    def test_head_split_must_match_across_the_hand_off(self):
+        worker = _make_raiden_worker(tp_rank=0,
+                                     tp_size=2,
+                                     is_producer=False,
+                                     dp_size=8)
+        meta = SimpleNamespace(src_parallelism=8,
+                               src_job_name="prefill",
+                               src_engine_id="p",
+                               src_data_replica_idx=0,
+                               src_tp_size=1,
+                               src_controller_address="h:27000",
+                               src_controller_addresses=("h:27000", ))
+        with patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                   8,
+                   create=True), pytest.raises(ValueError,
+                                               match="column count"):
+            worker._stage3_source_work_units(meta)
+
+    def test_one_column_producer_metadata_still_parses(self):
+        params = {"src_parallelism": 8}
+        assert tpu_connector._stage3_source_columns(params,
+                                                    "h:1") == (1, ("h:1", ))
+        params = {"src_tp_size": 2, "src_controller_addresses": ["h:1", "h:2"]}
+        assert tpu_connector._stage3_source_columns(params,
+                                                    "h:1") == (2, ("h:1",
+                                                                   "h:2"))
+        with pytest.raises(ValueError, match="one source controller"):
+            tpu_connector._stage3_source_columns(
+                {
+                    "src_tp_size": 2,
+                    "src_controller_addresses": ["h:1"]
+                }, "h:1")
+
+    def test_scheduler_advertises_one_controller_per_column(self):
+        cfg = _make_vllm_config(is_producer=True, pp_size=8, tp_size=2)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            scheduler = TPURaidenConnectorScheduler(cfg)
+        assert scheduler._stage3_source_tp_columns() == 2
+        # A context-parallel producer shards one domain over its ranks.
+        cfg = _make_vllm_config(is_producer=True, pcp_size=8, tp_size=1)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            assert TPURaidenConnectorScheduler(
+                cfg)._stage3_source_tp_columns() == 1
+
+    def test_every_column_of_every_stage_reports(self):
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT",
+                   "raiden",
+                   create=True):
+            producer = TPURaidenConnectorScheduler(
+                _make_vllm_config(is_producer=True, pp_size=8, tp_size=2))
+            assert producer.get_finished_count() == 16
+            consumer = TPURaidenConnectorScheduler(
+                _make_vllm_config(is_producer=False, dp_size=8, tp_size=2))
+            assert consumer.get_finished_count() == 2
 
 
 # ---------------------------------------------------------------------------

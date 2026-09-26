@@ -154,6 +154,11 @@ class _Stage3LoadMeta:
     src_engine_id: str
     src_data_replica_idx: int
     src_parallelism: int
+    # Tensor-parallel columns of the producer, each its own reshard domain
+    # with its own controller address; a destination column pulls from the
+    # producer column holding the same KV heads.
+    src_tp_size: int = 1
+    src_controller_addresses: tuple[str, ...] = ()
     # Uniform-mamba-layout destination state slots, one per mamba kv-cache
     # group ordinal: the block holding the recurrent state for the resumed
     # request (state follows each group's block table; None for FA-only
@@ -341,26 +346,68 @@ def _reshard_advertise_host() -> str:
     return host
 
 
-def _reshard_service_port(dp_rank: int) -> int:
-    return int(tpu_envs.TPU_RAIDEN_RESHARD_PORT_BASE) + int(dp_rank)
+def _reshard_store_index(dp_rank: int,
+                         tp_columns: int = 1,
+                         tp_column: int = 0) -> int:
+    """Which in-engine reshard store a worker belongs to.
+
+    One store per engine, numbered by data-parallel rank -- except that
+    when an engine's tensor-parallel columns are separate reshard domains
+    (see ``_raiden_tp_columns``) each column has a store of its own, and
+    the stores of a host are numbered ``dp_rank * tp_columns + tp_column``.
+    """
+    return int(dp_rank) * int(tp_columns) + int(tp_column)
 
 
-def _reshard_service_address(dp_rank: int) -> str:
-    return f"{_reshard_advertise_host()}:{_reshard_service_port(dp_rank)}"
+def _reshard_service_port(store_index: int) -> int:
+    return int(tpu_envs.TPU_RAIDEN_RESHARD_PORT_BASE) + int(store_index)
 
 
-def _reshard_dispatch_address(dp_rank: int) -> str:
-    port = int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) + int(dp_rank)
+def _reshard_service_address(store_index: int) -> str:
+    return f"{_reshard_advertise_host()}:{_reshard_service_port(store_index)}"
+
+
+def _reshard_dispatch_address(store_index: int) -> str:
+    port = (int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) +
+            int(store_index))
     return f"{_reshard_advertise_host()}:{port}"
 
 
-def _resolved_reshard_controller_address(dp_rank: int) -> str:
+def _resolved_reshard_controller_address(store_index: int) -> str:
     """The address the facade dials and the handoff advertises: the
-    per-engine in-process store under store mode, else the role-level
-    external controller from the environment."""
+    per-engine (or per-column) in-process store under store mode, else the
+    role-level external controller from the environment."""
     if _reshard_store_mode():
-        return _reshard_service_address(dp_rank)
+        return _reshard_service_address(store_index)
     return str(tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS).strip()
+
+
+def _tp_column_engine_id(engine_id: str, tp_columns: int,
+                         tp_column: int) -> str:
+    """The engine id a tensor-parallel column registers under when the
+    columns are separate reshard domains: ``<engine>-tp<column>``."""
+    if int(tp_columns) <= 1:
+        return engine_id
+    return f"{engine_id}-tp{int(tp_column)}"
+
+
+def _stage3_source_columns(
+        params: dict[str, Any],
+        src_controller_address: str) -> tuple[int, tuple[str, ...]]:
+    """The producer's tensor-parallel column count and per-column controller
+    addresses from its finish params; a producer of one column advertises
+    one address."""
+    src_tp_size = int(params.get("src_tp_size", 1) or 1)
+    addresses = params.get("src_controller_addresses") or ()
+    addresses = tuple(str(a).strip() for a in addresses)
+    if not addresses:
+        addresses = (src_controller_address, )
+    if src_tp_size < 1 or len(addresses) != src_tp_size:
+        raise ValueError(
+            "Stage-3 metadata must name one source controller per producer "
+            f"tensor-parallel column: src_tp_size={src_tp_size}, "
+            f"addresses={list(addresses)}")
+    return src_tp_size, addresses
 
 
 def _use_raiden_glm_admission() -> bool:
@@ -1175,6 +1222,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         src_engine_id = str(params.get("src_engine_id", "")).strip()
         src_data_replica_idx = int(params.get("src_data_replica_idx", -1))
         src_parallelism = int(params.get("src_parallelism", 0))
+        src_tp_size, src_controller_addresses = _stage3_source_columns(
+            params, src_controller_address)
         if uuid <= 0:
             raise ValueError("Stage-3 request UUID must be positive")
         if num_tokens <= 0:
@@ -1256,6 +1305,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_engine_id=src_engine_id,
             src_data_replica_idx=src_data_replica_idx,
             src_parallelism=src_parallelism,
+            src_tp_size=src_tp_size,
+            src_controller_addresses=src_controller_addresses,
             mamba_state_block_ids=mamba_state_block_ids,
             skip_tokens=skip_tokens,
         )
@@ -1297,6 +1348,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         uuid = int(params.get("uuid", 0) or 0)
         src_controller_address = str(params.get("src_controller_address",
                                                 "")).strip()
+        src_tp_size, src_controller_addresses = _stage3_source_columns(
+            params, src_controller_address)
         if (not isinstance(source_req_id, str) or not source_req_id
                 or uuid <= 0 or not src_controller_address):
             logger.warning(
@@ -1314,6 +1367,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             src_engine_id=str(params.get("src_engine_id", "")),
             src_data_replica_idx=int(params.get("src_data_replica_idx", -1)),
             src_parallelism=int(params.get("src_parallelism", 0) or 0),
+            src_tp_size=src_tp_size,
+            src_controller_addresses=src_controller_addresses,
             release_only=True,
         )
         logger.info(
@@ -1512,8 +1567,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
         producer_dp_rank = (self.vllm_config.parallel_config.data_parallel_rank
                             if self.vllm_config.parallel_config else 0)
-        controller_address = _resolved_reshard_controller_address(
-            producer_dp_rank)
+        src_tp_size = self._stage3_source_tp_columns()
+        controller_addresses = [
+            _resolved_reshard_controller_address(
+                _reshard_store_index(producer_dp_rank, src_tp_size, column))
+            for column in range(src_tp_size)
+        ]
+        controller_address = controller_addresses[0]
         if not controller_address:
             raise ValueError("Stage-3 producer metadata requires "
                              "TPU_RAIDEN_CONTROLLER_ADDRESS")
@@ -1602,6 +1662,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "src_data_replica_idx": src_data_replica_idx,
             "src_parallelism": src_parallelism,
         }
+        if src_tp_size > 1:
+            params["src_tp_size"] = src_tp_size
+            params["src_controller_addresses"] = controller_addresses
         self._stage3_finished_sends[request.request_id] = (
             uuid,
             normalized_ids,
@@ -1623,19 +1686,32 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         for req_id in connector_output.finished_sending or ():
             self._stage3_finished_sends.pop(req_id, None)
 
+    def _stage3_source_tp_columns(self) -> int:
+        """Tensor-parallel columns of this producer that are separate
+        reshard domains (see ``TPURaidenConnectorWorker._raiden_tp_columns``)."""
+        parallel_config = self.vllm_config.parallel_config
+        tp_size = int(parallel_config.tensor_parallel_size or 1)
+        if (tp_size > 1 and not _use_raiden_glm_admission()
+                and _engine_is_pipeline(self.vllm_config)):
+            return tp_size
+        return 1
+
     def get_finished_count(self) -> int:
         if not _use_raiden_stage3_transport():
             # Preserve the legacy connector's model-runner-world aggregation.
             return 0
+        parallel_config = self.vllm_config.parallel_config
+        tp_size = int(parallel_config.tensor_parallel_size or 1)
         if not self.is_producer:
             # DP8 routes one request to one decode engine; a pipeline decode
-            # engine loads each stage's layers on that stage.
-            return _pipeline_parallel_size(self.vllm_config)
-        parallel_config = self.vllm_config.parallel_config
+            # engine loads each stage's layers on that stage, and each
+            # tensor-parallel column of a decode engine pulls its own heads.
+            return _pipeline_parallel_size(self.vllm_config) * tp_size
         if _use_raiden_glm_admission():
-            return int(parallel_config.tensor_parallel_size or 1)
+            return tp_size
         if _engine_is_pipeline(self.vllm_config):
-            return _pipeline_parallel_size(self.vllm_config)
+            # Every stage registers its layers, every column its heads.
+            return _pipeline_parallel_size(self.vllm_config) * tp_size
         return int(parallel_config.prefill_context_parallel_size or 1)
 
 
@@ -1843,7 +1919,7 @@ class TPURaidenConnectorWorker:
         if stage3_enabled:
             self._maybe_host_reshard_store()
             controller_address = _resolved_reshard_controller_address(
-                self.dp_rank)
+                self._reshard_store_index())
             if not controller_address:
                 raise ValueError(
                     "TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
@@ -1983,7 +2059,8 @@ class TPURaidenConnectorWorker:
             raise RuntimeError("TPU_RAIDEN_GLM_ADMISSION requires "
                                "TPU_KV_RESHARD_TRANSPORT=raiden")
         self._maybe_host_reshard_store()
-        controller_address = _resolved_reshard_controller_address(self.dp_rank)
+        controller_address = _resolved_reshard_controller_address(
+            self._reshard_store_index())
         if not controller_address:
             raise ValueError("TPU_RAIDEN_CONTROLLER_ADDRESS is required when "
                              "TPU_KV_RESHARD_TRANSPORT=raiden")
@@ -2175,6 +2252,38 @@ class TPURaidenConnectorWorker:
                 "TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
         return parallelism
 
+    def _raiden_tp_columns(self) -> int:
+        """Tensor-parallel columns of this engine that are separate reshard
+        domains, else 1.
+
+        A pipeline stage's TP ranks hold different KV heads of the same
+        layers, and a decode engine's TP ranks each pull their own heads,
+        so column t of the prefill engine pairs with column t of the decode
+        engine and nothing else: each column keeps its own store, work
+        units and plans (the byte layouts are TP-local on both sides). The
+        GLM path shards the transfer over the TP ranks of one domain
+        instead.
+        """
+        if (self.tp_size > 1 and not _use_raiden_glm_admission() and
+            (_engine_is_pipeline(self.vllm_config) or not self.is_producer)):
+            return int(self.tp_size)
+        return 1
+
+    def _raiden_tp_column(self) -> int:
+        return int(self.tp_rank) if self._raiden_tp_columns() > 1 else 0
+
+    def _reshard_store_index(self) -> int:
+        return _reshard_store_index(self.dp_rank, self._raiden_tp_columns(),
+                                    self._raiden_tp_column())
+
+    def _raiden_column_engine_id(self) -> str:
+        """The engine id this worker's work units and store register under:
+        the engine id, suffixed with the column when the columns are
+        separate reshard domains."""
+        return _tp_column_engine_id(self._raiden_engine_id(),
+                                    self._raiden_tp_columns(),
+                                    self._raiden_tp_column())
+
     def _local_raiden_transfer_rank(self) -> int:
         if _engine_is_pipeline(self.vllm_config):
             from vllm.distributed.parallel_state import get_pp_group
@@ -2216,24 +2325,25 @@ class TPURaidenConnectorWorker:
 
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job
+        store_index = self._reshard_store_index()
         self._reshard_store = ReshardStore(
             raiden_id=_StoreRaidenId(
                 job_name=job_name,
-                job_replica_id=self._raiden_engine_id(),
+                job_replica_id=self._raiden_column_engine_id(),
                 data_name="reshard_store",
                 data_replica_idx=self.dp_rank,
             ),
             store_server_ip=_reshard_advertise_host(),
             raiden_controller_port=(
                 int(tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE) +
-                int(self.dp_rank)),
-            reshard_service_port=_reshard_service_port(self.dp_rank),
+                store_index),
+            reshard_service_port=_reshard_service_port(store_index),
         )
         logger.info(
             "TPURaidenConnectorWorker rank%d --> hosting reshard store "
             "service=%s dispatch=%s", self.tp_rank,
-            _reshard_service_address(self.dp_rank),
-            _reshard_dispatch_address(self.dp_rank))
+            _reshard_service_address(store_index),
+            _reshard_dispatch_address(store_index))
 
     def _raiden_interleave_tokens(self, page_tokens: int,
                                   transfer_parallelism: int) -> int:
@@ -2267,7 +2377,7 @@ class TPURaidenConnectorWorker:
     def _raiden_work_unit_fields(self, transfer_rank: int) -> dict[str, Any]:
         default_job = "prefill" if self.is_producer else "decode"
         job_name = str(tpu_envs.TPU_RAIDEN_JOB_NAME).strip() or default_job
-        engine_id = self._raiden_engine_id()
+        engine_id = self._raiden_column_engine_id()
         return stage3_fa_raiden_id_fields(
             job_name=job_name,
             engine_id=engine_id,
@@ -2382,8 +2492,13 @@ class TPURaidenConnectorWorker:
         tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         pp_size = _pipeline_parallel_size(self.vllm_config)
+        if self._raiden_tp_columns() > 1 and not _reshard_store_mode():
+            raise ValueError(
+                "Raiden Qwen3.5 admission with tensor_parallel_size>1 keeps "
+                "one reshard store per tensor-parallel column, which needs "
+                "TPU_RAIDEN_RESHARD_IMPL=store")
         if self.is_producer:
-            if (tp_size == 1 and pcp_size == 1 and dp_size == 1
+            if (tp_size in (1, 2, 4) and pcp_size == 1 and dp_size == 1
                     and pp_size in (2, 4, 8)):
                 return f"pp{pp_size}_prefill"
             if tp_size == 1 and pcp_size in (4, 8) and dp_size == 1:
@@ -2399,7 +2514,8 @@ class TPURaidenConnectorWorker:
                 "data_parallel_size=1; or "
                 "prefill_context_parallel_size=1, "
                 "data_parallel_size in (4, 8, 16); or "
-                "pipeline_parallel_size in (2, 4, 8) alone; got "
+                "pipeline_parallel_size in (2, 4, 8) with "
+                "tensor_parallel_size in (1, 2, 4); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}, "
@@ -2407,13 +2523,16 @@ class TPURaidenConnectorWorker:
         if (tp_size == 1 and pcp_size == 1 and dp_size == 1
                 and pp_size in (2, 4, 8)):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size != 1 or dp_size not in (4, 8, 16):
+        if (pcp_size != 1 or tp_size not in (1, 2, 4)
+                or dp_size not in (4, 8, 16)):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp8_decode, dp4_decode, "
                 "dp16_decode, or pp{2,4,8}_decode requires kv_consumer with "
-                "prefill_context_parallel_size=1, tensor_parallel_size=1 and "
-                "either data_parallel_size in (4, 8, 16) or "
-                "pipeline_parallel_size in (2, 4, 8); got "
+                "prefill_context_parallel_size=1 and either "
+                "data_parallel_size in (4, 8, 16) with "
+                "tensor_parallel_size in (1, 2, 4), or "
+                "pipeline_parallel_size in (2, 4, 8) with "
+                "tensor_parallel_size=1; got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}, "
@@ -2977,16 +3096,41 @@ class TPURaidenConnectorWorker:
                     "A pipeline decode stage pulls from the prefill stage "
                     "with the same layers, so both engines need the same "
                     f"stage count: source={parallelism}, decode={pp_size}")
+        column = self._stage3_source_column(req_meta)
+        engine_id = _tp_column_engine_id(
+            req_meta.src_engine_id,
+            int(getattr(req_meta, "src_tp_size", 1) or 1), column)
         return [
             self._new_raiden_id(
                 stage3_fa_raiden_id_fields(
                     job_name=req_meta.src_job_name,
-                    engine_id=req_meta.src_engine_id,
+                    engine_id=engine_id,
                     dp_rank=req_meta.src_data_replica_idx,
                     transfer_rank=rank,
                     is_producer=True,
                 )) for rank in ranks
         ]
+
+    def _stage3_source_column(self, req_meta: _Stage3LoadMeta) -> int:
+        """The producer column this destination pulls from: its own, since
+        the producer must split the KV heads the way this engine does."""
+        src_tp_size = int(getattr(req_meta, "src_tp_size", 1) or 1)
+        columns = self._raiden_tp_columns()
+        if src_tp_size != columns:
+            raise ValueError(
+                "Stage-3 source and destination must split KV heads over "
+                "the same tensor-parallel column count: "
+                f"source={src_tp_size}, destination={columns}")
+        return self._raiden_tp_column()
+
+    def _stage3_source_controller_address(self,
+                                          req_meta: _Stage3LoadMeta) -> str:
+        """The controller of the producer column this destination pulls
+        from."""
+        addresses = tuple(getattr(req_meta, "src_controller_addresses", ()))
+        if len(addresses) > 1:
+            return str(addresses[self._stage3_source_column(req_meta)]).strip()
+        return str(req_meta.src_controller_address).strip()
 
     def _record_stage3_load_failure(self, req_id: str,
                                     block_ids: list[int]) -> None:
@@ -3366,7 +3510,7 @@ class TPURaidenConnectorWorker:
         claimed (in-flight) registration refuses cancellation — and the TTL
         remains the backstop, so this is best-effort fire-and-forget and
         rides the submit workers instead of the model-runner thread."""
-        address = str(req_meta.src_controller_address).strip()
+        address = self._stage3_source_controller_address(req_meta)
         facade = self._stage3_source_facades.get(address)
         if facade is None:
             facade = self._new_raiden_controller_facade(address)
@@ -3485,8 +3629,8 @@ class TPURaidenConnectorWorker:
         local_blocks = pending.local_blocks
         try:
             src_units = self._stage3_source_work_units(req_meta)
-            src_controller_address = str(
-                req_meta.src_controller_address).strip()
+            src_controller_address = self._stage3_source_controller_address(
+                req_meta)
             if not src_controller_address:
                 raise ValueError("empty Stage-3 source controller address")
             source_facade = self._stage3_source_facades.get(
@@ -4263,7 +4407,8 @@ class TPURaidenConnectorWorker:
                 # Register this worker with its engine store's dispatch
                 # controller: the reshard coordinator submits transfer
                 # programs over the persistent channel this creates.
-                dispatch_address = _reshard_dispatch_address(self.dp_rank)
+                dispatch_address = _reshard_dispatch_address(
+                    self._reshard_store_index())
                 self._wait_for_address_ready(dispatch_address, timeout_s=30.0)
                 manager_kwargs.update(
                     raiden_worker_port=0,
@@ -4316,14 +4461,18 @@ class TPURaidenConnectorWorker:
 
         The endpoint rank offsets the control port. A Stage-3 producer and
         every pipeline stage are their own endpoint and node (the transfer
-        rank); a non-pipelined consumer is one endpoint per engine, its
-        node being the data-parallel replica.
+        rank, one endpoint per tensor-parallel column of it); a
+        non-pipelined consumer is one endpoint per tensor-parallel rank of
+        the engine, its node being the data-parallel replica.
         """
         stage3_enabled = self._raiden_stage3_enabled()
         if stage3_enabled and (self.is_producer
                                or _engine_is_pipeline(self.vllm_config)):
             rank = self._local_raiden_transfer_rank()
-            return rank, rank
+            # The columns of a stage share a host: each takes its own port.
+            endpoint = rank * self._raiden_tp_columns(
+            ) + self._raiden_tp_column()
+            return endpoint, rank
         if stage3_enabled:
             return self.tp_rank, self.dp_rank
         return self.tp_rank, self.tp_rank
