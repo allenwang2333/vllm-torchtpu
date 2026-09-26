@@ -240,8 +240,8 @@ def fp8_bytes(x8):
 SEM_UNIT = 32         # bytes per DMA-semaphore count (probe 06, j-232ba686: counts up bytes/32, wait -> 0)
 GATHER_UNROLL = int(os.environ.get("MK_GUNROLL", "16"))  # A/B knob; 16 taken (probe 07)
 # "ag"/"a2a"/"rs" drop one collective each ("coll" drops all): serving-hang bisect at R=16.
-# "agdiag": one AG right after the barrier, arrivals and send completion polled (bounded, never
-# blocks; drains only whole rows the semaphores hold); out row 1
+# "agdiag": one AG right after the barrier, arrivals and both semaphores polled (bounded), then
+# exactly the landed counts drained (never blocks); out row 1
 # lanes = [me, spins/256, arrived, recv sem (3 base-256 digits, pre-drain), send sem (same),
 # then from AGDIAG_TAG0 the tag in xall[r] (src + 1, 0 = never arrived) for r < R].
 ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk", "ag", "a2a", "rs",
@@ -655,11 +655,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 return n
 
             # a remote row counts bytes/16 on the semaphores (j-480a968f: 64 per 1 KiB row at R=8), not
-            # the local stream's bytes/32; the drain is capped at one wait per row either way
+            # the local stream's bytes/32
             U = H * 2 // 16
 
             def cond(c):
-                done = jnp.logical_and(c[1] >= R - 1, pl.semaphore_read(scr["ag_send"]) >= (R - 1) * U)
+                done = jnp.logical_and(c[1] >= R - 1, jnp.minimum(pl.semaphore_read(scr["ag_send"]),
+                                                                 pl.semaphore_read(scr["ag_recv"])) >= (R - 1) * U)
                 return jnp.logical_and(c[0] < AGDIAG_SPIN, jnp.logical_not(done))
 
             def body(c):
@@ -672,16 +673,27 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 send_sem=scr["ag_send"], recv_sem=scr["ag_recv"],
                 device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
 
-            # never blocks: drains only what the semaphores already hold (whole rows)
-            def wr(i, c):
-                desc.wait_recv()
-                return c
+            # DMA semaphores cannot be signalled (j-42a0905c), so a timeout drains exactly what landed:
+            # whole rows, then the rest in 128-lane chunks. Anything landing after the read halts the
+            # core at exit (nonzero semaphore, j-1cc2e439), which is itself the report.
+            small = pltpu.make_async_remote_copy(
+                src_ref=scr["hrow"].at[:, 0:128], dst_ref=scr["xall"].at[0, :, 0:128],
+                send_sem=scr["ag_send"], recv_sem=scr["ag_recv"],
+                device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
+            US = 128 * 2 // 16
 
-            def ws(i, c):
-                desc.wait_send()
-                return c
-            lax.fori_loop(0, jnp.minimum(jnp.minimum(vr // U, n_arr), R - 1), wr, 0)
-            lax.fori_loop(0, jnp.minimum(vs // U, R - 1), ws, 0)
+            def drain(v_, row_wait, small_wait):
+                def w1(i, c):
+                    row_wait()
+                    return c
+
+                def w2(i, c):
+                    small_wait()
+                    return c
+                lax.fori_loop(0, v_ // U, w1, 0)
+                lax.fori_loop(0, (v_ % U) // US, w2, 0)
+            drain(vr, desc.wait_recv, small.wait_recv)
+            drain(vs, desc.wait_send, small.wait_send)
             vals = (me, spins // 256, n_arr, vr % 256, (vr // 256) % 256, vr // 65536,
                     vs % 256, (vs // 256) % 256, vs // 65536)
             acc = jnp.zeros((1, 128), F32)
