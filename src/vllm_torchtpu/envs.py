@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     GLM5_MEGAKERNEL_VERIFY: bool = False
     GLM5_MEGAKERNEL_LAYERDIFF: bool = False
     GLM5_STEP_TIMING: int = 0
+    GLM5_MEGAKERNEL_BISECT: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -604,6 +605,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Measurement: every Nth forward, synchronize around it and log its latency plus how many
     # forwards since the last line took the megakernel / the stock path, and the host period.
     "GLM5_STEP_TIMING": env_int("GLM5_STEP_TIMING", 0),
+    # Debug: before the real warm-up, run one idle step per ';'-separated ablation set (each a
+    # ','-separated subset of kernel.ABLATIONS, or "all"), logging each that returns, to locate a
+    # step that never returns. Numerics of the ablated steps are garbage; seq_len 0 writes no cache.
+    "GLM5_MEGAKERNEL_BISECT": env_str("GLM5_MEGAKERNEL_BISECT", ""),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.

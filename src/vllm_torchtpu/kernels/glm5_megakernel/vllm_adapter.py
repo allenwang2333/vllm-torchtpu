@@ -29,6 +29,8 @@ expert weight.
 
 import dataclasses
 import math
+import sys
+import time
 from typing import Any
 
 import jax
@@ -387,13 +389,14 @@ class Glm5Megakernel:
                 caches.append(t)
         self.caches = caches
         self.nb = nb
-        self._build_op()
+        self._step = self._build_op()
 
-    def _build_op(self) -> None:
+    def _build_op(self, skip: frozenset = frozenset(), tag: str = ""):
+        """The compiled step; `skip` (kernel.ABLATIONS) and `tag` are for GLM5_MEGAKERNEL_BISECT."""
         cfg = self.cfg
-        dbg = self.layerdiff
+        dbg = self.layerdiff and not skip
         call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(),
-                             debug=dbg)
+                             debug=dbg, skip=skip)
         self.info = info
         n_w = len(self.weights)
         n_c = len(self.caches)
@@ -417,15 +420,16 @@ class Glm5Megakernel:
                f"    return _smap({', '.join(args)})\n")
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
         exec(compile(src, "<glm5_megakernel>", "exec"), ns)  # noqa: S102 - arity is data
+        name = "glm5_megakernel::step" + tag
         flat = sharded_jax_callable(
-            "glm5_megakernel::step", ns["glm5_megakernel"], mesh=self.mesh,
+            name, ns["glm5_megakernel"], mesh=self.mesh,
             input_partition_specs=in_specs, output_partition_specs=out_specs,
             donate_argnums=tuple(range(n_in - n_c, n_in)))
 
         # The dispatcher caps a schema at 64 arguments and this has ~1150, so
         # the op takes the weights and caches as two Tensor[] arguments and
         # hands the flat callable its operands positionally.
-        @torch.library.custom_op("glm5_megakernel::step", mutates_args=())
+        @torch.library.custom_op(name, mutates_args=())
         def op(meta: torch.Tensor, bt: torch.Tensor, h0: torch.Tensor, rt: torch.Tensor,
                smalls: torch.Tensor, weights: list[torch.Tensor],
                caches: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -440,7 +444,8 @@ class Glm5Megakernel:
                                      device=h0.device)]
             return [torch.empty_like(h0)] + [torch.empty_like(c) for c in caches] + extra
 
-        self.op = op
+        if not skip:
+            self.op = op
 
         rank = self.rank
         page = self.page
@@ -474,7 +479,7 @@ class Glm5Megakernel:
                 return outs[0], outs[1 + n_c], outs[2 + n_c]
             return outs[0]
 
-        self._step = torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
+        return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
     # ------------------------------------------------------------------- run
 
@@ -488,9 +493,10 @@ class Glm5Megakernel:
         return md
 
     @torch.no_grad()
-    def _run(self, ids, pos, busy, bt):
-        return self._step(ids, pos, busy, bt, self.embed, self.rotary.cos_sin_cache.detach(),
-                          self.smalls, self.weights, self.caches)
+    def _run(self, ids, pos, busy, bt, step=None):
+        return (step or self._step)(ids, pos, busy, bt, self.embed,
+                                    self.rotary.cos_sin_cache.detach(), self.smalls,
+                                    self.weights, self.caches)
 
     def __call__(self, input_ids: torch.Tensor, positions: torch.Tensor, idle: bool,
                  num_tokens: int) -> torch.Tensor:
@@ -514,6 +520,16 @@ class Glm5Megakernel:
         from vllm_torchtpu.utils import synchronize_tensors
 
         z = torch.zeros(self.max_pages, dtype=torch.int32).to(runner.device)
+        for i, sk in enumerate(s for s in envs.GLM5_MEGAKERNEL_BISECT.split(";") if s):
+            skip = frozenset(K.ABLATIONS if sk == "all" else sk.split(","))
+            # stderr: Ray drops worker logger.info lines
+            print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} start", file=sys.stderr,
+                  flush=True)
+            t0 = time.monotonic()
+            out = self._run(z[0:1], z[0:1], z[0:1], z, step=self._build_op(skip, f"_bisect{i}"))
+            synchronize_tensors([out])
+            print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} returned in "
+                  f"{time.monotonic() - t0:.1f} s", file=sys.stderr, flush=True)
         out = self._run(z[0:1], z[0:1], z[0:1], z)
         if self.layerdiff:
             out = out[0]
