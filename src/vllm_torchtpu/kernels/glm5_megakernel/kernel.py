@@ -1461,6 +1461,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
                if str(getattr(v, "memory_space", "")) == "vmem"}
     vmem = sum(vmem_by.values())
-    info = dict(w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck,
+    info = dict(s_names=s_names, w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck,
                 vmem_scratch_bytes=vmem, vmem_by=vmem_by)
     return step, info
