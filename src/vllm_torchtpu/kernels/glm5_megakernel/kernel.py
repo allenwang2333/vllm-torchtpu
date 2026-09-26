@@ -1127,11 +1127,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         lax.fori_loop(c0, KT // GPRE, lambda c, x: (gather_rows(
                             ref_n, ref_r, pl.multiple_of(c * GPRE, GPRE), GPRE), x)[1], 0)
                     return f
-                bswitch(l, {ll: rest(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                # an idle rank (seq_len 0) gathers nothing: its KT row DMAs all hit one row and
+                # were the slowest rank's gather in the one-busy proxy, stalling o_proj everywhere
+                @pl.when(active)
+                def _():
+                    bswitch(l, {ll: rest(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                    pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
+                    pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
                 if GPRE:
                     scr["gst"][1] = jnp.int32(-1)
-                pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
-                pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
                 # This step's row is not in HBM yet (caches are read-only here). top-k emits
                 # ascending token ids and fills min(seq_len, KT) slots, and pos is the largest
                 # valid token: if selected it is the last filled slot. Patch it from VMEM.
@@ -1174,14 +1178,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 s = jnp.where(iv >= 0, s, jnp.finfo(F32).min)
                 scr["s_all"][c] = s
                 return carry
-            if "attn" not in skip:
-                lax.fori_loop(0, NC, s_body, 0)
+            nc_att = jnp.where(active, 0 if "attn" in skip else NC, 0)
+            lax.fori_loop(0, nc_att, s_body, 0)
 
             # g_nope / g_rope are consumed (kvb holds the decoded nope): arm the next layer's gather
             # when it reuses this top-k set
             if GPRE:
                 nxt = l + 1
-                reuse = jnp.logical_and(nxt < L, jnp.logical_not(jnp.logical_or(
+                reuse = jnp.logical_and(active & (nxt < L), jnp.logical_not(jnp.logical_or(
                     nxt < cfg.idx_skip, (nxt - cfg.idx_skip) % cfg.idx_freq == cfg.idx_freq - 1)))
 
                 @pl.when(reuse)
@@ -1193,7 +1197,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
             def m_body(c, m):
                 return jnp.maximum(m, jnp.max(scr["s_all"][c], axis=1, keepdims=True))
-            nc_att = 0 if "attn" in skip else NC
             mx = lax.fori_loop(0, nc_att, m_body, jnp.full((cfg.NH, 1), -jnp.inf, F32))
 
             def pv_body(c, carry):
@@ -1205,7 +1208,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         pv + lax.dot_general(p, kv, NN, preferred_element_type=F32))
             lsum, pv = lax.fori_loop(0, nc_att, pv_body, (jnp.zeros((cfg.NH, 1), F32),
                                                      jnp.zeros((cfg.NH, cfg.KL), F32)))
-            att = (pv / lsum).astype(BF16).astype(F32)
+            att = jnp.where(active, pv / jnp.maximum(lsum, 1e-30), 0.0).astype(BF16).astype(F32)
             if "attn" in skip:
                 att = jnp.zeros_like(pv)
             for gg in range(cfg.NH // G):
@@ -1286,7 +1289,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         pltpu.make_async_copy(r2, scr["es2"], scr["es_sem"].at[1]).start()
                     return f
                 bswitch(l, {ll: ldes(W["es13"][ll], W["es2"][ll]) for ll in W["es13"]})
-                scr["hrow"][...] = scr["hn"][0:1, :].astype(BF16)
+                # an idle rank publishes a zero row: routing drops it (below), so its dummy token
+                # no longer pulls experts onto the busy ranks' critical path
+                scr["hrow"][...] = jnp.where(active, scr["hn"][0:1, :], 0.0).astype(BF16)
                 all_gather_rows()
 
                 # shared expert on the own token
@@ -1322,7 +1327,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     choice = jnp.where(sel, -jnp.inf, choice)
                 wsum = jnp.sum(wsel, axis=1, keepdims=True)
                 wn = (wsel / jnp.maximum(wsum, 1e-20)).astype(BF16).astype(F32)
-                valid_tok = (row_iota < R)
+                live = jnp.max(jnp.abs(xall), axis=1, keepdims=True) > 0
+                valid_tok = jnp.logical_and(row_iota < R, live)
                 wn = jnp.where(valid_tok, wn, 0.0)
                 # local expert columns -> wloc lanes j, hit counts -> SMEM
                 wloc = jnp.zeros((M, 128), F32)
