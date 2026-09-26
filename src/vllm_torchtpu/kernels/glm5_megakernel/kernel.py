@@ -116,6 +116,10 @@ class Tiles:
     # the previous layer's scores are done; each streamed matmul tile then issues `gpre` of them
     # while it waits on its weight DMA (scalar-issue-bound gather, 54 us/layer j-f9a1bd50). 0: off.
     gpre: int = 0
+    # With gpre: issue gather rows only while take() would block (the next tile's DMA semaphore is
+    # short of a full tile), not on every tile -- resident tiles are compute-bound and the issue
+    # cost adds there (j-a067267f: m_shared 7.7 -> 29.5 us). `gpre` rows per poll.
+    gwait: bool = False
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank. tk doubles as the
@@ -233,7 +237,10 @@ def fp8_bytes(x8):
 # The kernel
 # ------------------------------------------------------------------------------------------
 
-ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk")
+SEM_UNIT = 32         # bytes per DMA-semaphore count (probe 06, j-232ba686: counts up bytes/32, wait -> 0)
+GATHER_UNROLL = int(os.environ.get("MK_GUNROLL", "16"))  # A/B knob; 16 taken (probe 07)
+# "ag"/"a2a"/"rs" drop one collective each ("coll" drops all): serving-hang bisect at R=16
+ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk", "ag", "a2a", "rs")
 
 
 def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset()):
@@ -515,8 +522,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 return c + 1                           # a passthrough carry mis-lowers (scf.while)
             lax.while_loop(cond, body, jnp.int32(0))
 
-        def take(kind):
-            """Wait for the next stream tile (must be of `kind`); its typed view."""
+        def take(kind, poll=False):
+            """Wait for the next stream tile (must be of `kind`); its typed view. poll: while the
+            tile is still landing, issue prefetched gather rows (gwait)."""
             if "weights" in skip:
                 return view(kind, 0)
 
@@ -524,6 +532,18 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def _():
                 pump(kind if kind in SID else "exp", allowed={KSEG[kind]})
             slot = st[1] % NB
+            if poll and GPRE and not interpret:
+                gst = scr["gst"]
+                full = sem_full(kind)
+
+                def pcond(c):
+                    armed = jnp.logical_and(gst[1] >= 0, gst[0] < KT)
+                    return jnp.logical_and(armed, pl.semaphore_read(psem.at[slot]) < full)
+
+                def pbody(c):
+                    gpump()
+                    return c + 1
+                lax.while_loop(pcond, pbody, jnp.int32(0))
             ref0 = next(iter(W[kind].values()))
             copy(kind, src_of(kind, ref0, 0, 0), slot).wait()
             return view(kind, slot)
@@ -535,7 +555,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
         def gather_rows(ref_n, ref_r, i0, n):
             """Issue top-k rows [i0, i0 + n) (n static) of one layer's nope / rope cache into
-            g_nope / g_rope. Issue-bound: 66 -> 51 us per 2048 rows at unroll 4 (j-098a4a19)."""
+            g_nope / g_rope. Issue-bound, ~14 ns per row DMA: 59 -> 56 us per 2048 tokens at
+            unroll 4 -> 16 (probe 07, j-9f61168b); the DMA count, not the address math, is the cost."""
             def gbody(k, c):
                 i = i0 + k
                 t = jnp.maximum(scr["idx_s"][i >> 7, i & 127], 0)
@@ -546,7 +567,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
                                       scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
                 return c
-            lax.fori_loop(0, n, gbody, 0, unroll=4)
+            lax.fori_loop(0, n, gbody, 0, unroll=min(GATHER_UNROLL, n))
+
+        def sem_full(kind):
+            """DMA-semaphore value of a landed `kind` tile (probe 06: SEM_UNIT bytes per count)."""
+            shp, dt = wshape[kind], jnp.dtype(wdtype[kind])
+            return math.prod(shp) * dt.itemsize // SEM_UNIT
 
         def gpump():
             """Issue the next GPRE prefetched gather rows, if a layer is armed (gst[1] >= 0)."""
@@ -569,8 +595,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             acc[:, :N] = jnp.zeros((M, N), F32)
 
             def body(t, c):
-                gpump()
-                w_ = take(kind)
+                if not tiles.gwait:
+                    gpump()
+                w_ = take(kind, poll=tiles.gwait)
                 k0 = pl.multiple_of(t * t_k, t_k)
                 xs, ws = mxu(xref[:, pl.ds(k0, t_k)], w_[...], tiles)
                 acc[:, :N] += lax.dot_general(xs, ws, NN, preferred_element_type=F32)
@@ -602,7 +629,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         def all_gather_rows():
             """hrow (1,H) bf16 on every rank -> xall[r] = rank r's row."""
             scr["xall"][me] = scr["hrow"][...]
-            if R == 1 or "coll" in skip:
+            if R == 1 or "coll" in skip or "ag" in skip:
                 return
             for d in range(R):
                 @pl.when(me != d)
@@ -613,7 +640,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         device_id=(jnp.int32(d),), device_id_type=pl.DeviceIdType.MESH).start()
 
         def ag_wait():
-            if R == 1 or "coll" in skip:
+            if R == 1 or "coll" in skip or "ag" in skip:
                 return
             desc = pltpu.make_async_remote_copy(
                 src_ref=scr["hrow"], dst_ref=scr["xall"].at[0],
@@ -632,7 +659,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             for d in range(R):
                 scr["osend"][d] = row[:, d * KR:(d + 1) * KR]
             scr["xrecv"][me] = scr["osend"][me]
-            if R == 1 or "coll" in skip:
+            if R == 1 or "coll" in skip or "a2a" in skip:
                 return
             for d in range(R):
                 @pl.when(me != d)
@@ -657,7 +684,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             for d in range(R):
                 scr["psend"][d] = scr["part"][d:d + 1, :]
             scr["rsrecv"][me] = scr["psend"][me]
-            if R == 1 or "coll" in skip:
+            if R == 1 or "coll" in skip or "rs" in skip:
                 return
             for d in range(R):
                 @pl.when(me != d)
