@@ -313,6 +313,7 @@ class _CarryAggregationAfterGatherPlan:
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        max_num_reqs=2,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -364,6 +365,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     rejection counts by the chunk's offset."""
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        max_num_reqs=4,
         input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2", "r3"]),
         device=device,
         requests={},
@@ -414,6 +416,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     draft input and gather values cross the chunk-local PCP layout boundary."""
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(
+        max_num_reqs=2,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -482,6 +485,7 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(
+        max_num_reqs=2,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -529,6 +533,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.speculative_config.num_speculative_tokens = 1
     proposer.runner = SimpleNamespace(
+        max_num_reqs=2,
         input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -592,6 +597,7 @@ def test_prepare_draft_inputs_async_device(device):
     output — matching the host path fed the equivalent num_rejected."""
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
+        max_num_reqs=2,
         input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
         device=device,
         requests={},
@@ -961,10 +967,9 @@ def test_propose_pads_to_coordinated_chunk_bound(device):
     assert dummy_chunks == [2]
 
 
-def test_loop_bucket_constant_under_sharded_lockstep():
-    """Sharded EP-DP lockstep pins the loop bucket to pad(max_num_reqs) so
-    collective shapes match across DP ranks regardless of per-rank load;
-    the replicated draft keeps the per-chunk bucket."""
+def test_loop_bucket_pinned_to_max_num_reqs():
+    """The loop bucket is pad(max_num_reqs) for every chunk, lockstep or not,
+    so every [p]-keyed drafter program has a single shape."""
     proposer = _make_proposer(draft_tp=2, target_tp=2)
     proposer.runner = SimpleNamespace(
         num_tokens_paddings=[16, 32, 64, 128],
@@ -976,9 +981,11 @@ def test_loop_bucket_constant_under_sharded_lockstep():
 
     rep = _make_proposer(draft_tp=1, target_tp=2)
     rep.runner = SimpleNamespace(
-        num_tokens_paddings=[16, 32, 64, 128], _dp_lockstep_enabled=lambda: False
+        num_tokens_paddings=[16, 32, 64, 128],
+        max_num_reqs=50,
+        _dp_lockstep_enabled=lambda: False,
     )
-    assert rep._loop_bucket(1) == 16
+    assert rep._loop_bucket(1) == 64
     assert rep._loop_bucket(33) == 64
 
 
