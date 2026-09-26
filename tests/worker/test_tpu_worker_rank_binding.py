@@ -107,10 +107,12 @@ def test_ray_placed_pcp_worker_uses_the_executors_local_rank():
     the worker's local rank, so a two-host PCP16 worker binds that chip
     rather than every worker of a host opening chip 0."""
     b = binding.get_tpu_worker_binding(
-        _parallel_config(prefill_context_parallel_size=16,
-                         world_size=16,
-                         local_world_size=8,
-                         enable_expert_parallel=True),
+        _parallel_config(
+            prefill_context_parallel_size=16,
+            world_size=16,
+            local_world_size=8,
+            enable_expert_parallel=True,
+        ),
         rank=13,
         local_rank=5,
         env={"LOCAL_WORLD_SIZE": "8"},
