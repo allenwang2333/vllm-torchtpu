@@ -526,6 +526,59 @@ class Glm5Megakernel:
             return out[:num_tokens]
         return torch.nn.functional.pad(out, (0, 0, 0, num_tokens - K.M))
 
+    def _row_block(self, pos: int):
+        md = self._metadata()
+        bt = md.block_tables.reshape(md.seq_lens.shape[0], -1)[0]
+        return int(bt[pos // self.cfg.page].item()), pos % self.cfg.page
+
+    @torch.no_grad()
+    def snapshot_block(self, pos: int) -> list[torch.Tensor]:
+        """VERIFY: every cache's block holding `pos`, after the stock forward wrote row `pos`."""
+        blk, _ = self._row_block(pos)
+        return [c[blk].clone() for c in self.caches]
+
+    @torch.no_grad()
+    def diff_block(self, snap: list[torch.Tensor], pos: int) -> str:
+        """VERIFY: compare the kernel's rewrite of row `pos` with the stock write in `snap`.
+
+        The stock forward writes row pos first and the kernel rewrites it, so both forwards read the
+        kernel's rows afterwards and the hidden-state check is blind to a wrong cache value. This
+        reads the rows directly: per kind, the byte-mismatch fraction and dequantized rel error of
+        this token's rows, the worst layer, and whether ANY other row of the block changed."""
+        blk, off = self._row_block(pos)
+        g = off // 4
+        acc = {}
+        for (kind, l), c, s in zip(self.info["c_names"], self.caches, snap):
+            now = c[blk]
+            if kind == "nope":
+                a, b = now[off], s[off]
+                other = torch.cat([now[:off], now[off + 1:]]).ne(
+                    torch.cat([s[:off], s[off + 1:]])).sum()
+            elif kind == "rope":
+                a, b = now[g, (off % 4) * 32:(off % 4 + 1) * 32], s[g, (off % 4) * 32:(off % 4 + 1) * 32]
+                other = now.ne(s).sum() - a.ne(b).sum()
+            else:  # idx: bytes only, the packed layout mixes fp8 and scales
+                a, b = now[g, off % 4], s[g, off % 4]
+                other = now.ne(s).sum() - a.ne(b).sum()
+            # fp8 bytes in a band-permuted order: the norm of a difference does not care
+            a, b = a.cpu().contiguous(), b.cpu().contiguous()
+            ba, bb = (x.view(torch.uint8) if x.dtype != torch.uint8 else x for x in (a, b))
+            mis = float(ba.ne(bb).float().mean())
+            if kind == "idx":
+                rel = 0.0
+            else:
+                fa, fb = (x.view(torch.float8_e4m3fn).float() for x in (ba, bb))
+                rel = float((fa - fb).norm() / fb.norm().clamp_min(1e-30))
+            st = [mis, rel, int(other.item())]
+            e = acc.setdefault(kind, [0, 0.0, 0.0, -1, 0])
+            e[0] += 1
+            e[1] = max(e[1], st[0])
+            if st[1] > e[2]:
+                e[2], e[3] = st[1], l
+            e[4] += int(st[2])
+        return " ".join(f"{k}:n={n},max_mis={m:.4f},max_rel={r:.5f}@L{wl},other_rows_changed={o}"
+                        for k, (n, m, r, wl, o) in acc.items())
+
     def _program_fingerprint(self) -> None:
         """Serving-hang diag (j-c4e6dce4, j-bf0ef082: one rank halts at its own PC, i.e. runs a
         different executable). Per rank: the XLA-relevant environment, and a hash of every dumped

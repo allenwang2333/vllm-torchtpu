@@ -6016,12 +6016,26 @@ class TPUModelRunner(GPUModelRunner):
         n = input_ids.shape[0]
         if not envs.GLM5_MEGAKERNEL_VERIFY:
             return self._glm5_mk(input_ids, positions, idle, n)
-        # The stock forward writes this step's cache rows first; the kernel
-        # then rewrites the same rows, so both read identical history.
-        ref = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
-        if isinstance(ref, (list, tuple)):
-            ref = ref[0]
-        out = self._glm5_mk(input_ids, positions, idle, n)
+        # Both forwards write this step's cache rows; the second writer's rows
+        # are the history every later step reads. Default: stock first, kernel
+        # last, kernel sampled. STOCK_DRIVES: kernel first, stock last, stock
+        # sampled -- the history stays stock-written. Either way the block is
+        # snapshotted between the two and the second writer's rows diffed.
+        drives = envs.GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES
+        p0 = int(positions[0].item())
+
+        def stock():
+            r = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
+            return r[0] if isinstance(r, (list, tuple)) else r
+
+        if drives:
+            out = self._glm5_mk(input_ids, positions, idle, n)
+            snap = None if idle else self._glm5_mk.snapshot_block(p0)
+            ref = stock()
+        else:
+            ref = stock()
+            snap = None if idle else self._glm5_mk.snapshot_block(p0)
+            out = self._glm5_mk(input_ids, positions, idle, n)
         if not idle:
             a, b = out[0:1].float(), ref[0:1].float()
             la = self.model.compute_logits(out[0:1])
@@ -6034,11 +6048,14 @@ class TPUModelRunner(GPUModelRunner):
             # stderr, not logger: Ray dropped every 256k-decode line (j-d3d09993)
             print(
                 "GLM5_MK_VERIFY pos=%d rel_hidden=%.5f argmax_eq=%d max_logit_diff=%.4f" % (
-                    int(positions[0].item()), float(stats[0]), int(stats[1]), float(stats[2])),
+                    p0, float(stats[0]), int(stats[1]), float(stats[2])),
+                file=sys.stderr, flush=True)
+            print("GLM5_MK_KVDIFF pos=%d second=%s %s" % (
+                p0, "stock" if drives else "mk", self._glm5_mk.diff_block(snap, p0)),
                 file=sys.stderr, flush=True)
             if self._glm5_mk.layerdiff:
-                self._glm5_mk_log_layers(int(positions[0].item()))
-        return out
+                self._glm5_mk_log_layers(p0)
+        return ref if drives else out
 
     def _glm5_mk_log_layers(self, pos: int) -> None:
         """Per layer: residual-stream (h + res) error of the kernel vs the stock layer, and the

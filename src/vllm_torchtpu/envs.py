@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     USE_GLM5_MEGAKERNEL: bool = False
     GLM5_MEGAKERNEL_VERIFY: bool = False
     GLM5_MEGAKERNEL_LAYERDIFF: bool = False
+    GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES: bool = False
     GLM5_STEP_TIMING: int = 0
     GLM5_MEGAKERNEL_BISECT: str = ""
     GLM5_LIBTPU_EXTRA_ARGS: str = ""
@@ -603,6 +604,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug, with VERIFY: also log per-layer residual-stream error and top-k
     # overlap against the stock layers (kernel built with debug outputs).
     "GLM5_MEGAKERNEL_LAYERDIFF": env_bool("GLM5_MEGAKERNEL_LAYERDIFF"),
+    # Debug, with VERIFY: run the kernel first and the stock forward last, and sample
+    # stock's output, so the KV history stays stock-written and the kernel is scored on it.
+    "GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES": env_bool("GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES"),
     # Measurement: every Nth forward, synchronize around it and log its latency plus how many
     # forwards since the last line took the megakernel / the stock path, and the host period.
     "GLM5_STEP_TIMING": env_int("GLM5_STEP_TIMING", 0),
