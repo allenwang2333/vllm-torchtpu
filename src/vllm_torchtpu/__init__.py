@@ -456,6 +456,10 @@ def _patch_vllm_compile_all_ranges() -> None:
 
     Compilation rotation allows vllm to compile multiple sizes at the same time,
     which greatly reduce the vllm startup time.
+
+    On top of that, the ranks of a host split the buckets: a bucket another
+    rank claimed is not compiled here but replayed from that rank's artifact
+    once it is published (see vllm_torchtpu.compilation.rank_share).
     """
     import os
     from collections import deque
@@ -465,6 +469,8 @@ def _patch_vllm_compile_all_ranges() -> None:
         create_concrete_args,
         get_fake_args_from_graph,
     )
+
+    from vllm_torchtpu.compilation import rank_share
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -484,15 +490,7 @@ def _patch_vllm_compile_all_ranges() -> None:
         d.rotate(-local_rank * (len(d) // 8))
         indexes = list(d)
 
-        for i in indexes:
-            if i >= len(range_entry_list):
-                continue
-
-            range_entry = range_entry_list[i]
-
-            if range_entry.compiled:
-                continue
-
+        def compile_range(range_entry) -> None:
             self._log_compile_start(range_entry.compile_range)
 
             if range_entry.compile_range.is_single_size():
@@ -514,6 +512,39 @@ def _patch_vllm_compile_all_ranges() -> None:
             )
 
             range_entry.compiled = True
+
+        session = rank_share.open_session(self.graph)
+        claimed_by_peers = []
+        for i in indexes:
+            if i >= len(range_entry_list):
+                continue
+
+            range_entry = range_entry_list[i]
+
+            if range_entry.compiled:
+                continue
+
+            cr = range_entry.compile_range
+            bucket = f"{self.piecewise_compile_index}/{cr.start}_{cr.end}"
+            if session is not None and not session.claim(bucket):
+                claimed_by_peers.append((bucket, range_entry))
+                continue
+            with rank_share.compiling(session, bucket):
+                compile_range(range_entry)
+
+        # Only after this rank's own claims, so no rank waits while holding one.
+        for bucket, range_entry in rank_share.as_published(session, claimed_by_peers):
+            with rank_share.compiling(session, bucket):
+                compile_range(range_entry)
+
+        if session is not None:
+            logger.info(
+                "[bucket-share] Subgraph %d: compiled %d bucket(s), replayed %d "
+                "from peers",
+                self.piecewise_compile_index,
+                session.compiled,
+                session.replayed,
+            )
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
