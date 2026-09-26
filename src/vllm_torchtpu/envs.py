@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     GLM5_MEGAKERNEL_VERIFY: bool = False
     GLM5_MEGAKERNEL_LAYERDIFF: bool = False
     GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES: bool = False
+    GLM5_MEGAKERNEL_TRACE: bool = False
     GLM5_STEP_TIMING: int = 0
     GLM5_MEGAKERNEL_BISECT: str = ""
     GLM5_LIBTPU_EXTRA_ARGS: str = ""
@@ -607,6 +608,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug, with VERIFY: run the kernel first and the stock forward last, and sample
     # stock's output, so the KV history stays stock-written and the kernel is scored on it.
     "GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES": env_bool("GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES"),
+    # Profiling: build the kernel with its per-phase trace regions (L_*, i_*, m_*) so an
+    # xprof capture splits the one custom call by phase.
+    "GLM5_MEGAKERNEL_TRACE": env_bool("GLM5_MEGAKERNEL_TRACE"),
     # Measurement: every Nth forward, synchronize around it and log its latency plus how many
     # forwards since the last line took the megakernel / the stock path, and the host period.
     "GLM5_STEP_TIMING": env_int("GLM5_STEP_TIMING", 0),
