@@ -448,6 +448,8 @@ class Glm5Megakernel:
 
         if not skip:
             self.op = op
+        if tag == "_bisect0":
+            self._fp = (flat, in_specs)
 
         page = self.page
         max_pages = self.max_pages
@@ -536,6 +538,46 @@ class Glm5Megakernel:
         for k in sorted(os.environ):
             if re.match(r"(TPU|XLA|LIBTPU|JAX|MEGASCALE|PJRT|TORCH_TPU|CLOUD_TPU)", k):
                 print(f"{tag} env {k}={os.environ[k][:300]}", file=sys.stderr, flush=True)
+        # operand signature per weight kind / cache kind: shape, dtype, stride, storage offset,
+        # device -- a per-rank layout difference would compile a different executable
+        groups: dict[str, list[str]] = {}
+
+        def sig(t):
+            return f"{tuple(t.shape)}|{t.dtype}|{t.stride()}|{t.storage_offset()}|{t.device}"
+        for (k, l), t in zip(self.info["w_names"], self.weights):
+            groups.setdefault(f"w:{k}", []).append(f"{l}:{sig(t)}")
+        for (k, l), t in zip(self.info["c_names"], self.caches):
+            groups.setdefault(f"c:{k}", []).append(f"{l}:{sig(t)}")
+        for nm, t in (("smalls", self.smalls), ("embed", self.embed), ("rank_t", self.rank_t),
+                      ("cos_sin", self.rotary.cos_sin_cache)):
+            groups[nm] = [sig(t)]
+        for g, v in groups.items():
+            print(f"{tag} sig {g} n {len(v)} {h(chr(10).join(v).encode())} first {v[0][:160]}",
+                  file=sys.stderr, flush=True)
+        print(f"{tag} sig ALL {h(repr(sorted(groups.items())).encode())} nb {self.nb} "
+              f"max_pages {self.max_pages} specs {h(repr(self.w_specs).encode())}",
+              file=sys.stderr, flush=True)
+        # the exact served module (SPMD, Mosaic payload included), exported like the op's fake impl
+        try:
+            from torch_tpu._internal.pallas import pallas as pallas_impl
+            flat, in_specs = self._fp
+            dev = self.smalls.device
+            small = [torch.zeros(4, dtype=torch.int32, device=dev),
+                     torch.zeros(self.max_pages, dtype=torch.int32, device=dev),
+                     torch.zeros(K.M, self.cfg.H, dtype=self.embed.dtype, device=dev),
+                     torch.zeros(8, 256, dtype=torch.float32, device=dev)]
+            jax_args = pallas_impl.jax_placeholders(
+                small + [self.smalls, *self.weights, *self.caches], mesh=self.mesh,
+                partition_specs=in_specs)
+            with jax._src.config.export_ignore_forward_compatibility(True):
+                txt = flat.exported(*jax_args).mlir_module()
+            cc = [ln for ln in txt.split("\n") if "tpu_custom_call" in ln]
+            print(f"{tag} exported {h(txt.encode())} len {len(txt)} cc {h(chr(10).join(cc).encode())} "
+                  f"n_cc {len(cc)}", file=sys.stderr, flush=True)
+            for i, ln in enumerate(cc[:4]):
+                print(f"{tag} cc{i} len {len(ln)} {h(ln.encode())}", file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001 - diag only
+            print(f"{tag} exported FAILED {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
         m = re.search(r"--xla_dump_to=(\S+)", os.environ.get("LIBTPU_INIT_ARGS", "") + " " + os.environ.get("XLA_FLAGS", ""))
         if not m or not os.path.isdir(m.group(1)):
             print(f"{tag} no dump dir", file=sys.stderr, flush=True)
@@ -564,12 +606,11 @@ class Glm5Megakernel:
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} start", file=sys.stderr,
                   flush=True)
             t0 = time.monotonic()
-            try:
-                out = self._run(z[0:1], z[0:1], z[0:1], z, step=self._build_op(skip, f"_bisect{i}"))
-                synchronize_tensors([out])
-            finally:
-                if i == 0:
-                    self._program_fingerprint()
+            step = self._build_op(skip, f"_bisect{i}")
+            if i == 0:     # before the run: a halt must not hide it
+                self._program_fingerprint()
+            out = self._run(z[0:1], z[0:1], z[0:1], z, step=step)
+            synchronize_tensors([out])
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} returned in "
                   f"{time.monotonic() - t0:.1f} s", file=sys.stderr, flush=True)
             if "agdiag" in skip:   # out row 1: see kernel.ABLATIONS
