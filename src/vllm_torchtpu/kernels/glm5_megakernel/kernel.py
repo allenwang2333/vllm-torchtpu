@@ -654,7 +654,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     n = n + (jnp.max(scr["xall"][r_][:, 0:128].astype(F32)) > 0).astype(I32)
                 return n
 
-            U = H * 2 // 32                        # DMA semaphore units per row (bytes / 32)
+            # a remote row counts bytes/16 on the semaphores (j-480a968f: 64 per 1 KiB row at R=8), not
+            # the local stream's bytes/32; the drain is capped at one wait per row either way
+            U = H * 2 // 16
 
             def cond(c):
                 done = jnp.logical_and(c[1] >= R - 1, pl.semaphore_read(scr["ag_send"]) >= (R - 1) * U)
@@ -678,8 +680,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def ws(i, c):
                 desc.wait_send()
                 return c
-            lax.fori_loop(0, vr // U, wr, 0)
-            lax.fori_loop(0, vs // U, ws, 0)
+            lax.fori_loop(0, jnp.minimum(jnp.minimum(vr // U, n_arr), R - 1), wr, 0)
+            lax.fori_loop(0, jnp.minimum(vs // U, R - 1), ws, 0)
             vals = (me, spins // 256, n_arr, vr % 256, (vr // 256) % 256, vr // 65536,
                     vs % 256, (vs // 256) % 256, vs // 65536)
             acc = jnp.zeros((1, 128), F32)
