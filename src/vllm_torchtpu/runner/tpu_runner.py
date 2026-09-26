@@ -5078,15 +5078,22 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source lengths the runtime produces: stride-1 num_reqs
-        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
-        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
-        # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        # next_tokens sources the runtime produces. Pure async parks the
+        # stride-1 int64 sampled tokens, bucketed by num_reqs. Async eagle3
+        # rebuilds every step's source (spec step and prefill bootstrap alike)
+        # as int32 [bonus, draft_1..K] rows padded to the stride-(1+K) bound
+        # max_num_reqs*(1+K) (see sample_tokens), so it only ever uses that one
+        # shape and dtype.
         if self._is_async_drafter:
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
-            )
+            next_srcs = [
+                (
+                    self.max_num_reqs
+                    * (1 + self.speculative_config.num_speculative_tokens),
+                    torch.int32,
+                )
+            ]
+        else:
+            next_srcs = [(n, torch.int64) for n in self.num_reqs_paddings]
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -5098,8 +5105,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for nlen, next_dtype in next_srcs:
+                    next_tokens = torch.zeros(nlen, dtype=next_dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
