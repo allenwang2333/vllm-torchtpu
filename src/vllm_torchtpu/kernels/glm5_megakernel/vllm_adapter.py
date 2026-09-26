@@ -398,7 +398,7 @@ class Glm5Megakernel:
         cfg = self.cfg
         dbg = self.layerdiff and not skip
         call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(),
-                             debug=dbg, skip=skip)
+                             debug=dbg, skip=skip, axis_name=EP_AXIS_NAME)
         self.info = info
         n_w = len(self.weights)
         n_c = len(self.caches)
