@@ -4148,7 +4148,20 @@ class TPUModelRunner(GPUModelRunner):
                         cur_start_idx, cur_end_idx, bonus_logits
                     )
                 )
+                # Draw all three uniform buffers back to back, ahead of any
+                # other eager op: interleaved with the bonus sample and the
+                # per-token param gathers, each rand fused into a different
+                # program per dispatch context.
                 bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
+                accept_u_ng = torch.rand(
+                    md.draft_token_ids.shape,
+                    dtype=torch.float32,
+                    device=target_logits.device,
+                    generator=sampling_generator,
+                )
+                recover_u = torch.rand_like(
+                    target_logits, dtype=torch.float32, generator=sampling_generator
+                )
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -4158,7 +4171,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                 ).view(-1)
         accept_u = None
-        if self.rejection_sampler.synthetic_mode or not all_greedy:
+        if not all_greedy:
+            accept_u = accept_u_ng
+        elif self.rejection_sampler.synthetic_mode:
             accept_u = torch.rand(
                 md.draft_token_ids.shape,
                 dtype=torch.float32,
@@ -4177,9 +4192,6 @@ class TPUModelRunner(GPUModelRunner):
                 accept_u=accept_u,
             )
         assert accept_u is not None
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
-        )
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -4188,12 +4200,13 @@ class TPUModelRunner(GPUModelRunner):
             segment_ids=md.segment_ids,
             group_indices=md.group_indices,
             max_draft_tokens=self.speculative_config.num_speculative_tokens,
-            temperatures=req_temperatures[md.segment_ids],
-            top_k=req_top_k[md.segment_ids],
-            top_p=req_top_p[md.segment_ids],
+            temperatures=req_temperatures,
+            top_k=req_top_k,
+            top_p=req_top_p,
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
+            per_request_params=True,
         )
 
     def sample_tokens(
@@ -5693,14 +5706,16 @@ class TPUModelRunner(GPUModelRunner):
                     _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                         dummy_logits, bonus_logits_indices, target_logits_indices
                     )
+                    # Per-request [num_reqs, 1] params, expanded in-graph
+                    # (per_request_params=True), as _sample_spec_verify_chunk.
                     warm_temps = torch.zeros(
-                        (num_tokens, 1),
+                        (num_reqs, 1),
                         dtype=self._hidden_states_dtype,
                     ).to(self.device)
-                    warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
+                    warm_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                         self.device
                     )
-                    warm_top_p = torch.ones((num_tokens, 1), dtype=torch.float32).to(
+                    warm_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                         self.device
                     )
                     warm_recover_u = torch.zeros(
@@ -5721,6 +5736,7 @@ class TPUModelRunner(GPUModelRunner):
                         accept_u=warm_accept_u,
                         recover_u=warm_recover_u,
                         do_sampling=True,
+                        per_request_params=True,
                     )
                     synchronize_tensors(out)
                     logger.info(
