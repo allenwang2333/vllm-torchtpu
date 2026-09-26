@@ -521,7 +521,7 @@ class Glm5Megakernel:
 
         z = torch.zeros(self.max_pages, dtype=torch.int32).to(runner.device)
         for i, sk in enumerate(s for s in envs.GLM5_MEGAKERNEL_BISECT.split("/") if s):
-            skip = frozenset(K.ABLATIONS if sk == "all" else sk.split(","))
+            skip = frozenset(set(K.ABLATIONS) - {"agdiag"} if sk == "all" else sk.split(","))
             # stderr: Ray drops worker logger.info lines
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} start", file=sys.stderr,
                   flush=True)
@@ -530,6 +530,10 @@ class Glm5Megakernel:
             synchronize_tensors([out])
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} returned in "
                   f"{time.monotonic() - t0:.1f} s", file=sys.stderr, flush=True)
+            if "agdiag" in skip:   # out row 1: see kernel.ABLATIONS
+                d = out[1, :K.AGDIAG_TAG0 + self.cfg.R].float().cpu().tolist()
+                print(f"GLM5_MEGAKERNEL_AGDIAG rank {self.rank} {[int(v) for v in d]}",
+                      file=sys.stderr, flush=True)
         out = self._run(z[0:1], z[0:1], z[0:1], z)
         if self.layerdiff:
             out = out[0]

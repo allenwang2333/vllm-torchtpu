@@ -239,8 +239,14 @@ def fp8_bytes(x8):
 
 SEM_UNIT = 32         # bytes per DMA-semaphore count (probe 06, j-232ba686: counts up bytes/32, wait -> 0)
 GATHER_UNROLL = int(os.environ.get("MK_GUNROLL", "16"))  # A/B knob; 16 taken (probe 07)
-# "ag"/"a2a"/"rs" drop one collective each ("coll" drops all): serving-hang bisect at R=16
-ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk", "ag", "a2a", "rs")
+# "ag"/"a2a"/"rs" drop one collective each ("coll" drops all): serving-hang bisect at R=16.
+# "agdiag": one AG right after the barrier, arrivals polled (bounded) from the source tags; out row 1
+# lanes = [me, spins/256, arrived, recv sem (3 base-256 digits, pre-drain), send sem (same),
+# then from AGDIAG_TAG0 the tag in xall[r] (src + 1, 0 = never arrived) for r < R].
+ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk", "ag", "a2a", "rs",
+             "agdiag")
+AGDIAG_SPIN = int(os.environ.get("MK_AGDIAG_SPIN", "1000000"))
+AGDIAG_TAG0 = 9
 
 
 def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset()):
@@ -401,6 +407,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         reach["init"] |= set(seq[:NB])
         for p_, k in enumerate(seq):
             reach[SEGS[k]] |= set(seq[p_ + 1:p_ + 1 + NB])
+    if "agdiag" in skip:
+        scratch["agdiag"] = pltpu.VMEM((1, 128), F32)
     if debug:                                    # debug outputs live in HBM: VMEM is full
         scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((2,))
     s_names = list(scratch)
@@ -625,6 +633,54 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 pl.semaphore_signal(barrier, inc=1, device_id=(jnp.int32(d),),
                                     device_id_type=pl.DeviceIdType.MESH)
             pl.semaphore_wait(barrier, R)
+
+        if "agdiag" in skip and R > 1:
+            # arrivals are counted from the source tags, not the semaphore: its per-row unit is what
+            # this measures (raw values reported), so the drain waits exactly one desc per arrival
+            scr["xall"][...] = jnp.zeros(scr["xall"].shape, BF16)
+            scr["hrow"][...] = jnp.full((1, H), me + 1, I32).astype(F32).astype(BF16)
+            for d in range(R):
+                @pl.when(me != d)
+                def _(d=d):
+                    pltpu.make_async_remote_copy(
+                        src_ref=scr["hrow"], dst_ref=scr["xall"].at[me],
+                        send_sem=scr["ag_send"], recv_sem=scr["ag_recv"],
+                        device_id=(jnp.int32(d),), device_id_type=pl.DeviceIdType.MESH).start()
+
+            def arrived():
+                n = jnp.int32(0)
+                for r_ in range(R):
+                    n = n + (jnp.max(scr["xall"][r_][:, 0:128].astype(F32)) > 0).astype(I32)
+                return n
+
+            def cond(c):
+                return jnp.logical_and(c[0] < AGDIAG_SPIN, c[1] < R - 1)
+
+            def body(c):
+                return c[0] + 1, arrived()
+            spins, n_arr = lax.while_loop(cond, body, (jnp.int32(0), arrived()))
+            vr = pl.semaphore_read(scr["ag_recv"])
+            vs = pl.semaphore_read(scr["ag_send"])
+            desc = pltpu.make_async_remote_copy(
+                src_ref=scr["hrow"], dst_ref=scr["xall"].at[0],
+                send_sem=scr["ag_send"], recv_sem=scr["ag_recv"],
+                device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
+
+            def wr(i, c):
+                desc.wait_recv()
+                return c
+            lax.fori_loop(0, n_arr, wr, 0)
+            for _ in range(R - 1):
+                desc.wait_send()
+            vals = (me, spins // 256, n_arr, vr % 256, (vr // 256) % 256, vr // 65536,
+                    vs % 256, (vs // 256) % 256, vs // 65536)
+            acc = jnp.zeros((1, 128), F32)
+            for j_, v_ in enumerate(vals):
+                acc = jnp.where(lane128 == j_, jnp.asarray(v_).astype(F32), acc)
+            for r_ in range(R):
+                acc = jnp.where(lane128 == AGDIAG_TAG0 + r_,
+                                jnp.max(scr["xall"][r_][:, 0:128].astype(F32)), acc)
+            scr["agdiag"][...] = acc
 
         def all_gather_rows():
             """hrow (1,H) bf16 on every rank -> xall[r] = rank r's row."""
@@ -1332,6 +1388,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         pltpu.make_async_copy(smalls.at[L], scr["sm"].at[0], scr["sm_sem"].at[0]).wait()
         o, n = lay_o["in_ln"]
         out_ref[...] = rmsnorm(x, scr["sm"][0, :, o:o + n], cfg.eps).astype(BF16)
+        if "agdiag" in skip and R > 1:
+            out_ref[1:2, 0:128] = scr["agdiag"][...].astype(BF16)
 
     # ---------------- pallas_call ----------------
     in_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=pltpu.SMEM),
