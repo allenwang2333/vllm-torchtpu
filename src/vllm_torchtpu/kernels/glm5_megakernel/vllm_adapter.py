@@ -230,9 +230,12 @@ class Glm5Megakernel:
             "q_b": _kn(sa.q_b_proj.weight, cfg.QL, cfg.NH * cfg.DQ, "q_b_proj"),
             "w_uk": at.W_UK_T,
             "w_uv": at.W_UV,
-            # o_proj is TP over heads: this rank's rows, heads [rank * HR, (rank + 1) * HR)
+            # o_proj is TP over heads: this rank's rows, heads [rank * HR, (rank + 1) * HR).
+            # clone, not contiguous(): the row slice is already contiguous, so contiguous() kept a
+            # view at storage offset rank * 6 MiB -- the only per-rank operand difference
+            # (j-45afbf20; the exported module is identical on all 16 ranks)
             "o_proj": _kn(sa.o_proj.weight, cfg.NH * cfg.DV, H, "o_proj")[
-                self.rank * cfg.HR * cfg.DV:(self.rank + 1) * cfg.HR * cfg.DV].contiguous(),
+                self.rank * cfg.HR * cfg.DV:(self.rank + 1) * cfg.HR * cfg.DV].clone(),
         }
         idx = getattr(sa, "indexer", None)
         _need((idx is not None) == cfg.full_indexer(l), f"layer {l}: indexer pattern")
