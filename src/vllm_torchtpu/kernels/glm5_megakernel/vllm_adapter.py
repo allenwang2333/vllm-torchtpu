@@ -520,7 +520,7 @@ class Glm5Megakernel:
         from vllm_torchtpu.utils import synchronize_tensors
 
         z = torch.zeros(self.max_pages, dtype=torch.int32).to(runner.device)
-        for i, sk in enumerate(s for s in envs.GLM5_MEGAKERNEL_BISECT.split(";") if s):
+        for i, sk in enumerate(s for s in envs.GLM5_MEGAKERNEL_BISECT.split("/") if s):
             skip = frozenset(K.ABLATIONS if sk == "all" else sk.split(","))
             # stderr: Ray drops worker logger.info lines
             print(f"GLM5_MEGAKERNEL_BISECT rank {self.rank} skip={sk} start", file=sys.stderr,

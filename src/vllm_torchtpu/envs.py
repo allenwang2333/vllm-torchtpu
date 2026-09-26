@@ -605,7 +605,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Measurement: every Nth forward, synchronize around it and log its latency plus how many
     # forwards since the last line took the megakernel / the stock path, and the host period.
     "GLM5_STEP_TIMING": env_int("GLM5_STEP_TIMING", 0),
-    # Debug: before the real warm-up, run one idle step per ';'-separated ablation set (each a
+    # Debug: before the real warm-up, run one idle step per '/'-separated ablation set (each a
     # ','-separated subset of kernel.ABLATIONS, or "all"), logging each that returns, to locate a
     # step that never returns. Numerics of the ablated steps are garbage; seq_len 0 writes no cache.
     "GLM5_MEGAKERNEL_BISECT": env_str("GLM5_MEGAKERNEL_BISECT", ""),
