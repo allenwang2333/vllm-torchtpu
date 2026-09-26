@@ -6028,18 +6028,27 @@ class TPUModelRunner(GPUModelRunner):
             r = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
             return r[0] if isinstance(r, (list, tuple)) else r
 
-        if drives:
-            out = self._glm5_mk(input_ids, positions, idle, n)
-            snap = None if idle else self._glm5_mk.snapshot_block(p0)
-            ref = stock()
-        else:
-            ref = stock()
-            snap = None if idle else self._glm5_mk.snapshot_block(p0)
-            out = self._glm5_mk(input_ids, positions, idle, n)
+        def mk():
+            return self._glm5_mk(input_ids, positions, idle, n)
+
+        first, second = (mk, stock) if drives else (stock, mk)
+        o1 = first()
+        snap = None
         if not idle:
-            a, b = out[0:1].float(), ref[0:1].float()
-            la = self.model.compute_logits(out[0:1])
-            lb = self.model.compute_logits(ref[0:1])
+            # materialize the first writer's results before the second runs: it
+            # donates the cache buffers (j-88596a93: "Buffer has been deleted or
+            # donated" when a lazy clone was read after the second forward)
+            snap = self._glm5_mk.snapshot_block(p0)
+            h1 = o1[0:1].float().clone()
+            l1 = self.model.compute_logits(o1[0:1]).float().clone()
+            synchronize_tensors([h1, l1, *snap])
+        o2 = second()
+        out, ref = (o1, o2) if drives else (o2, o1)
+        if not idle:
+            h2 = o2[0:1].float()
+            l2 = self.model.compute_logits(o2[0:1]).float()
+            a, b = (h1, h2) if drives else (h2, h1)
+            la, lb = (l1, l2) if drives else (l2, l1)
             stats = torch.stack([
                 (a - b).norm() / b.norm().clamp_min(1e-30),
                 (la.argmax(-1) == lb.argmax(-1)).float()[0],
