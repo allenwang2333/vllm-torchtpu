@@ -37,6 +37,12 @@
 #                         --extra-body, e.g. a `structured_outputs` grammar.
 #                         Passed as one quoted argument; EXTRA_BENCH_ARGS is
 #                         word-split and globbed, which mangles JSON.
+#   SD_TRACE_SUMMARY=1    after each profile run, fold the SD: scope timings,
+#                         bitmask memory and block efficiency into that cell's
+#                         result JSON (summarize_sd_traces.py). Needs
+#                         CAPTURE_PROFILE=1 and SD_VOCAB_SIZE. The cell's
+#                         traces are deleted once summarized (they run to
+#                         hundreds of MB); SD_KEEP_TRACES=1 keeps them.
 
 set -euo pipefail
 
@@ -142,6 +148,10 @@ EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 # JSON for --extra-body, kept apart from EXTRA_BENCH_ARGS so it reaches the
 # client as one argument (see header). Empty => flag not passed.
 BENCHMARK_EXTRA_BODY="${BENCHMARK_EXTRA_BODY:-}"
+# Structured-decoding metrics from the profile run (see header).
+SD_TRACE_SUMMARY="${SD_TRACE_SUMMARY:-0}"
+SD_VOCAB_SIZE="${SD_VOCAB_SIZE:-}"
+SD_KEEP_TRACES="${SD_KEEP_TRACES:-0}"
 # Server async scheduling (--async-scheduling / --no-async-scheduling).
 # Resolution order: env > config > harness default (true). Left empty here
 # so a config can tell "unset" from "forced by the operator".
@@ -166,6 +176,18 @@ ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-true}"
 if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
     echo "ERROR: ASYNC_SCHEDULING must be 'true' or 'false', got '$ASYNC_SCHEDULING'"
     exit 1
+fi
+if [ "$SD_TRACE_SUMMARY" = "1" ]; then
+    # Checked up front: discovering these after a full sweep would only show
+    # up as SKIP rows in the gate.
+    if [ "${CAPTURE_PROFILE:-0}" != "1" ]; then
+        echo "ERROR: SD_TRACE_SUMMARY=1 reads the profile run's traces; set CAPTURE_PROFILE=1"
+        exit 1
+    fi
+    if ! [[ "$SD_VOCAB_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: SD_TRACE_SUMMARY=1 needs SD_VOCAB_SIZE (the model's vocab size), got '$SD_VOCAB_SIZE'"
+        exit 1
+    fi
 fi
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 # Fail on bad JSON here rather than after server startup and compile, at the
@@ -698,9 +720,39 @@ for isl_osl_config in $ISL_OSL_CONFIGS; do
                 profile_file="${RESULTS_DIR}/${base_name}.profile.json"
                 profile_log="${RESULTS_DIR}/${base_name}.profile.log"
                 echo "    Profile run"
+                # Every cell profiles into the same PROFILE_DIR; remember what
+                # is already there so the summary reads only this cell's traces.
+                trace_snapshot="${RESULTS_DIR}/${base_name}.traces_before.txt"
+                if [ "$SD_TRACE_SUMMARY" = "1" ]; then
+                    find "$PROFILE_DIR" -name '*.pt.trace.json*' > "$trace_snapshot" 2>/dev/null || true
+                fi
                 # A failed profile run doesn't fail the measured run; a dead server does.
                 if run_benchmark_once "$input_len" "$output_len" "$concurrency" "$profile_file" "$profile_log" profile; then
                     echo "    Profile OK -> $profile_file"
+                    if [ "$SD_TRACE_SUMMARY" = "1" ]; then
+                        # Metrics land in the measured cell's JSON (the one the
+                        # gate and uploader read), not in the .profile.json.
+                        if python3 "$SCRIPT_DIR/summarize_sd_traces.py" \
+                            --result-file "$result_file" \
+                            --trace-dir "$PROFILE_DIR" \
+                            --exclude-list "$trace_snapshot" \
+                            --num-reqs "$concurrency" \
+                            --vocab-size "$SD_VOCAB_SIZE" \
+                            --metrics-url "http://${HOST}:${PORT}/metrics"; then
+                            if [ "$SD_KEEP_TRACES" != "1" ]; then
+                                # The numbers are in the result JSON now; drop
+                                # this cell's traces (xplane + Kineto, ~100 MB+
+                                # each). Only files newer than the snapshot go,
+                                # so a caller's pre-existing traces survive.
+                                # Directories stay: the profiler reuses them.
+                                find "$PROFILE_DIR" -type f -newer "$trace_snapshot" -delete ||
+                                    echo "    WARNING: could not delete this cell's traces"
+                            fi
+                        else
+                            echo "    WARNING: SD trace summary failed; SD metrics will SKIP in the gate (traces kept)"
+                        fi
+                        rm -f "$trace_snapshot"
+                    fi
                 else
                     echo "    PROFILE RUN FAILED (exit $?)"
                 fi
@@ -731,6 +783,15 @@ done
     echo "EXIT CODE: $exit_code"
     echo "========================================"
 } >> "$log_file"
+
+# One small file with a row per cell (throughput, TPOT, SD scope means, mask
+# savings) so nobody has to open every isl*_osl*_c*.json.
+if [ "$SD_TRACE_SUMMARY" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+    python3 "$SCRIPT_DIR/summarize_sd_traces.py" \
+        --summarize "$RESULTS_DIR" \
+        --output "$RESULTS_DIR/structured_decoding_summary.json" ||
+        echo "WARNING: structured decoding summary failed"
+fi
 
 echo ""
 echo "================================================"
