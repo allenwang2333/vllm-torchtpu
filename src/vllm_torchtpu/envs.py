@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
+    TPU_SKIP_UNUSED_CHECKPOINT_WEIGHTS: bool = True
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -681,6 +682,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # after loading into TPU HBM.
     "TPU_EVICT_WEIGHTS_PAGE_CACHE": env_bool(
         "TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False
+    ),
+    # Skip checkpoint tensors and shard files the model being loaded drops
+    # (see model_loader_patches._SkipState) before reading them.
+    "TPU_SKIP_UNUSED_CHECKPOINT_WEIGHTS": env_bool(
+        "TPU_SKIP_UNUSED_CHECKPOINT_WEIGHTS", default=True
     ),
     # KV transfer / Raiden knobs. Each getter in distributed/utils.py
     # documents what its knob does; this is the parsing and the default.

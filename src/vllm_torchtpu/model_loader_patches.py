@@ -50,13 +50,22 @@ in the allowlist and stay unfiltered.
 
 import functools
 import gc
+import inspect
+import json
 import os
-from collections.abc import Generator
+import re
+import sys
+from collections.abc import Callable, Generator, Iterable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
 
@@ -77,14 +86,62 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     return expert_id not in local_expert_ids
 
 
+@dataclass
+class _SkipState:
+    """Checkpoint skipping for one ``DefaultModelLoader.load_weights`` call.
+
+    Checkpoint names ``mapper`` maps to None are skipped before they are
+    read. ``mapper`` is either set up front, for a ``load_weights`` that
+    drops names by hand (``_mirrored_mapper``), or it is the mapper the
+    model's ``load_weights`` passes to ``AutoWeightsLoader`` together with
+    ``weights``, the stream ``get_all_weights`` returned, before anything
+    has read from it. That mapper sees every name as stored in the
+    checkpoint; ``AutoWeightsLoader`` extends it only with KV-cache scale
+    renames and more drops.
+    """
+
+    mapper: "WeightsMapper | None" = None
+    weights: Iterable | None = None
+    skipped: int = 0
+
+    def drops(self, name: str) -> bool:
+        return self.mapper is not None and self.mapper._map_name(name) is None
+
+    def record_weights(self, weights: Iterable) -> None:
+        """Remember the stream ``get_all_weights`` returned."""
+        if self.weights is None and inspect.isgenerator(weights):
+            self.weights = weights
+
+    def record_mapper(self, weights: Iterable, mapper: "WeightsMapper | None") -> None:
+        """Adopt ``mapper`` if it is given the whole unread stream."""
+        if (
+            self.mapper is None
+            and mapper is not None
+            and self.weights is not None
+            and weights is self.weights
+            and inspect.getgeneratorstate(weights) == inspect.GEN_CREATED
+        ):
+            self.mapper = mapper
+
+
+# Set while the patched DefaultModelLoader.load_weights runs; see
+# patch_default_loader_skip_unused_weights.
+_skip_state: _SkipState | None = None
+
+
 def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. Names the model being
+    loaded drops are skipped too; see ``_SkipState``.
     """
+    state = _skip_state
+    if state is not None and state.drops(name):
+        state.skipped += 1
+        return True
     if local_expert_ids is None:
         return False
     return _should_skip(name, local_expert_ids)
@@ -351,7 +408,8 @@ def patch_default_loader_ep_weight_filter() -> None:
     reads all 896 experts on every rank. ``weight_utils`` imports the
     predicate by value, so both module references are replaced. Inert when
     the EP weight filter is off: ``safetensors_weights_iterator`` then
-    passes ``local_expert_ids=None`` and the predicate keeps everything.
+    passes ``local_expert_ids=None`` and the predicate keeps everything
+    except names the model being loaded drops (see ``_SkipState``).
     """
     from vllm.model_executor.model_loader import ep_weight_filter, weight_utils
 
@@ -363,6 +421,185 @@ def patch_default_loader_ep_weight_filter() -> None:
     logger.info(
         "Applied TPU patch: EP weight filter covers "
         ".weight_packed/.weight_scale (DefaultModelLoader)."
+    )
+
+
+@functools.cache
+def _qwen3_5_mtp_mapper() -> "WeightsMapper":
+    """Drops the names upstream ``Qwen3_5MTP.load_weights`` drops by hand.
+
+    Its ``remap_weight_names`` keeps ``mtp.*`` and every name containing
+    ``embed_tokens`` or ``lm_head``. Only the drops matter for skipping, so
+    this renames nothing.
+    """
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    return WeightsMapper(
+        orig_to_new_regex={re.compile(r"^(?!mtp\.|.*embed_tokens|.*lm_head)"): None}
+    )
+
+
+def _mirrored_mapper(model_cls: type) -> "WeightsMapper | None":
+    """Mapper for a ``load_weights`` that drops names before any mapper.
+
+    ``_SkipState`` cannot learn what such a ``load_weights`` drops, so the
+    known ones are mirrored here: upstream ``Qwen3_5MTP`` and its
+    ``Qwen3_5MoeMTP`` subclass. The module is looked up, never imported,
+    so the patch does not change model import order. Once upstream gives
+    ``Qwen3_5MTP`` an ``hf_to_vllm_mapper``, the mirror steps aside.
+    """
+    module = sys.modules.get("vllm.model_executor.models.qwen3_5_mtp")
+    mtp_cls = getattr(module, "Qwen3_5MTP", None)
+    if (
+        mtp_cls is None
+        or getattr(model_cls, "load_weights", None) is not mtp_cls.load_weights
+        or getattr(mtp_cls, "hf_to_vllm_mapper", None) is not None
+    ):
+        return None
+    return _qwen3_5_mtp_mapper()
+
+
+_orig_filter_duplicate_safetensors_files: Callable[..., list[str]] | None = None
+
+
+def _filter_duplicate_safetensors_files_tpu(
+    hf_weights_files: list[str], hf_folder: str, index_file: str
+) -> list[str]:
+    """Drop shard files whose every tensor the model being loaded drops.
+
+    Extends upstream's index-duplicate filter with the ``_SkipState``
+    mapper: files holding only tensors it maps to None are left out before
+    they are opened.
+    """
+    assert _orig_filter_duplicate_safetensors_files is not None
+    files = _orig_filter_duplicate_safetensors_files(
+        hf_weights_files, hf_folder, index_file
+    )
+    state = _skip_state
+    if (
+        state is None
+        or state.mapper is None
+        or not envs.TPU_SKIP_UNUSED_CHECKPOINT_WEIGHTS
+    ):
+        return files
+
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return files
+
+    try:
+        with open(index_file_name) as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return files
+
+    needed_files = {
+        os.path.join(hf_folder, file_name)
+        for name, file_name in weight_map.items()
+        if not state.drops(name)
+    }
+    listed_files = {os.path.join(hf_folder, f) for f in weight_map.values()}
+    kept = [f for f in files if f not in listed_files or f in needed_files]
+
+    if len(kept) == len(files) or needed_files.isdisjoint(files):
+        return files
+
+    logger.info(
+        "[tpu-model-loader] Skipping %d/%d weight files holding no tensor the "
+        "model loads.",
+        len(files) - len(kept),
+        len(files),
+    )
+    return kept
+
+
+def patch_default_loader_skip_unused_weights() -> None:
+    """Skip checkpoint tensors and files the model discards before reading.
+
+    ``DefaultModelLoader`` reads every tensor of every shard and leaves it
+    to ``model.load_weights`` to drop the unused ones. While a model loads,
+    the names its ``WeightsMapper`` drops (see ``_SkipState``) are skipped
+    instead: ``filter_duplicate_safetensors_files`` leaves out shard files
+    holding only such tensors, and ``should_skip_weight`` skips them before
+    ``get_tensor``. A ``load_weights`` that renames or filters names before
+    any mapper sees them is not filtered, unless ``_mirrored_mapper``
+    mirrors it.
+
+    Models with ``secondary_weights`` are not filtered: those names get a
+    prefix after the filter sees them. Guarded by
+    TPU_SKIP_UNUSED_CHECKPOINT_WEIGHTS (default: True).
+    """
+    if not envs.TPU_SKIP_UNUSED_CHECKPOINT_WEIGHTS:
+        return
+
+    from vllm.config import ModelConfig
+    from vllm.model_executor.model_loader import default_loader as dl
+    from vllm.model_executor.model_loader import weight_utils
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    patch_default_loader_ep_weight_filter()
+
+    if getattr(dl.DefaultModelLoader, "_tpu_skip_unused_patch", False):
+        return
+
+    global _orig_filter_duplicate_safetensors_files
+    _orig_filter_duplicate_safetensors_files = (
+        weight_utils.filter_duplicate_safetensors_files
+    )
+    weight_utils.filter_duplicate_safetensors_files = (
+        _filter_duplicate_safetensors_files_tpu
+    )
+    dl.filter_duplicate_safetensors_files = _filter_duplicate_safetensors_files_tpu
+
+    original_get_all_weights = dl.DefaultModelLoader.get_all_weights
+    original_load_weights = dl.DefaultModelLoader.load_weights
+    original_auto_load_weights = AutoWeightsLoader.load_weights
+
+    def get_all_weights(
+        self, model_config: ModelConfig, model: torch.nn.Module
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        weights = original_get_all_weights(self, model_config, model)
+        state = _skip_state
+        if state is not None:
+            state.record_weights(weights)
+        return weights
+
+    def auto_load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        mapper: "WeightsMapper | None" = None,
+    ) -> set[str]:
+        state = _skip_state
+        if state is not None:
+            state.record_mapper(weights, mapper)
+        return original_auto_load_weights(self, weights, mapper=mapper)
+
+    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
+        global _skip_state
+        state = None
+        if not getattr(model, "secondary_weights", ()):
+            state = _SkipState(mapper=_mirrored_mapper(type(model)))
+        previous, _skip_state = _skip_state, state
+        try:
+            original_load_weights(self, model, model_config)
+        finally:
+            _skip_state = previous
+        if state is not None and state.skipped:
+            logger.info(
+                "[tpu-model-loader] Skipped %d checkpoint tensors %s drops "
+                "without reading them.",
+                state.skipped,
+                type(model).__name__,
+            )
+
+    dl.DefaultModelLoader.get_all_weights = get_all_weights
+    dl.DefaultModelLoader.load_weights = load_weights
+    AutoWeightsLoader.load_weights = auto_load_weights
+    dl.DefaultModelLoader._tpu_skip_unused_patch = True
+    logger.info(
+        "Applied TPU patch: DefaultModelLoader skips checkpoint tensors and "
+        "files the model drops."
     )
 
 

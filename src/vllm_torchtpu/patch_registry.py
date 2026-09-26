@@ -98,6 +98,10 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch(
+        "vllm_torchtpu.model_loader_patches:patch_default_loader_skip_unused_weights",
+        _ACTIVE,
+    ),
+    Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,
     ),
