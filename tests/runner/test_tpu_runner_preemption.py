@@ -13,7 +13,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
-@pytest.mark.parametrize("transition", ["preempt", "resume", "continue"])
+@pytest.mark.parametrize("transition", ["preempt", "resume", "finish", "continue"])
 @pytest.mark.parametrize("num_drafts", [0, 3])
 def test_async_results_do_not_overwrite_recomputed_request(transition, num_drafts):
     runner = object.__new__(TPUModelRunner)
@@ -54,6 +54,7 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     runner._mamba_state_pos = {"resumed": 9, "continuing": 12}
     runner._mamba_offset_seeded = {"resumed", "continuing"}
     output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"resumed"} if transition == "finish" else set()
     output.preempted_req_ids = {"resumed"} if transition == "preempt" else None
     output.scheduled_cached_reqs.resumed_req_ids = (
         {"resumed"} if transition == "resume" else set()
