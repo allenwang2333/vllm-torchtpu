@@ -5556,7 +5556,7 @@ class TPUModelRunner(GPUModelRunner):
                         fli,
                         tli,
                     )
-                    synchronize_tensors(out)
+                    synchronize_tensors(list(out))
                     logger.info("  -- num_tokens: %d, num_reqs: %d", num_tokens, kn)
 
     def _precompile_rejection_sampler(self) -> None:
