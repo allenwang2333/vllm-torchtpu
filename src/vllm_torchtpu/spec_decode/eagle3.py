@@ -79,7 +79,9 @@ def _static_shape_args(fn):
     return wrapper
 
 
-# Attributes torch._dynamo.mark_dynamic / mark_unbacked leave on a tensor.
+# Attributes torch._dynamo.mark_dynamic / mark_unbacked leave on a tensor
+# (plus any other `_dynamo_*` / `_has_dynamo_*` marker, e.g. the
+# `_has_dynamo_dim_marking` flag guards check for).
 _DYNAMO_DIM_MARKS = (
     "_dynamo_dynamic_indices",
     "_dynamo_unbacked_indices",
@@ -99,9 +101,12 @@ def _clear_dynamo_dim_marks(*tensors: torch.Tensor) -> None:
     has already happened when this runs.
     """
     for t in tensors:
-        for attr in _DYNAMO_DIM_MARKS:
-            if attr in t.__dict__:
-                delattr(t, attr)
+        for attr in [
+            a
+            for a in t.__dict__
+            if a in _DYNAMO_DIM_MARKS or a.startswith(("_dynamo_", "_has_dynamo_"))
+        ]:
+            delattr(t, attr)
 
 
 def _maybe_pad_dim0(t: torch.Tensor, target_len: int) -> torch.Tensor:
