@@ -201,6 +201,8 @@ class Glm5Megakernel:
         with torch.no_grad():
             self.weights = [w.detach() for w in self._collect_weights()]
             self.smalls = self._build_smalls().detach()
+            # a runtime input, not a graph constant: see _build_op
+            self.rank_t = torch.tensor([self.rank], dtype=torch.int32, device=self.smalls.device)
         # Debug: per-layer comparison against the stock layers (VERIFY + LAYERDIFF).
         self.layerdiff = bool(envs.GLM5_MEGAKERNEL_VERIFY and envs.GLM5_MEGAKERNEL_LAYERDIFF)
         self.dbg = None
@@ -408,13 +410,8 @@ class Glm5Megakernel:
         in_specs = (A, A, A, A, P()) + tuple(self.w_specs) + (A,) * n_c
         out_specs = (A,) * (1 + n_c + (2 if dbg else 0))
 
-        # meta[0] (this rank's mesh index) is filled in here, not by the torch graph: a rank
-        # constant there made the ranks' executables differ (j-c4e6dce4: rank 1 halted at its own
-        # PC), and remote DMAs name the receiver's semaphore by the sender's allocation, so peers'
-        # all-gather counts landed on other ranks' pool_sem / g_sem.
-        def body(meta, *args):
-            meta = meta.at[0].set(jax.lax.axis_index(EP_AXIS_NAME).astype(meta.dtype))
-            return tuple(call(meta, *args))
+        def body(*args):
+            return tuple(call(*args))
 
         smap = jax.shard_map(body, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
                              check_vma=False)
@@ -459,11 +456,16 @@ class Glm5Megakernel:
         # Every input is sliced to a fixed shape before this is called, so the
         # (minutes-long) compile happens once, at warmup, whatever bucket the
         # runner padded the step to.
-        def step(ids, pos, busy, bt, embed, cos_sin, smalls, weights, caches):
+        def step(ids, pos, busy, bt, rank_t, embed, cos_sin, smalls, weights, caches):
             pos = pos.to(torch.int32)
             seq = (pos + 1) * busy
             npages = (seq + (page - 1)) // page
-            meta = torch.cat([torch.zeros_like(pos), pos, seq, npages])  # [0]: see body
+            # The rank comes in as a tensor: a rank constant in this graph made the ranks'
+            # executables differ (j-c4e6dce4: rank 1 halted at its own PC), and a remote DMA names
+            # the receiver's semaphore by the sender's allocation, so peers' all-gather counts
+            # landed on other ranks' pool_sem / g_sem. (lax.axis_index in the body instead lowers
+            # to partition-id, which the SPMD partitioner rejects: j-a28e43a5.)
+            meta = torch.cat([rank_t, pos, seq, npages])
             h0 = torch.nn.functional.pad(embed[ids.long()], (0, 0, 0, K.M - 1))
             cs = cos_sin[pos.long()].reshape(-1).float()
             c = cs[: DR // 2].repeat_interleave(2)
@@ -498,7 +500,7 @@ class Glm5Megakernel:
 
     @torch.no_grad()
     def _run(self, ids, pos, busy, bt, step=None):
-        return (step or self._step)(ids, pos, busy, bt, self.embed,
+        return (step or self._step)(ids, pos, busy, bt, self.rank_t, self.embed,
                                     self.rotary.cos_sin_cache.detach(), self.smalls,
                                     self.weights, self.caches)
 
