@@ -397,3 +397,47 @@ def test_last_pool_indices():
     assert torch.allclose(pooled[0], hidden_states[2])
     assert torch.allclose(pooled[1], hidden_states[7])
     assert torch.allclose(pooled[2], hidden_states[9])
+
+
+def test_pooling_metadata_chunk_slice():
+    """Slicing metadata to a chunk window keeps dict lookup and shared states."""
+    prompt_lens = [3, 5, 2]
+    runner_requests = {}
+    req_ids = []
+    for i, plen in enumerate(prompt_lens):
+        rid = f"req-{i}"
+        req_ids.append(rid)
+        r = MagicMock()
+        r.req_id = rid
+        r.prompt_token_ids = list(range(100 * i, 100 * i + plen))
+        r.num_prompt_tokens = plen
+        r.prompt_token_ids_len = plen
+        r.pooling_params = PoolingParams(task="embed")
+        r.pooling_states = PoolingStates()
+        runner_requests[rid] = r
+
+    batch = MagicMock()
+    batch.requests = None
+    batch.req_ids = req_ids
+    batch.num_reqs = len(req_ids)
+
+    # Second chunk of the batch: requests [1, 3)
+    sliced = build_pooling_metadata(batch, runner_requests)[1:3]
+
+    assert torch.equal(sliced.prompt_lens, torch.tensor([5, 2], dtype=torch.int32))
+    assert isinstance(sliced.prompt_token_ids_cpu, PromptTokenIdsTensor)
+    assert sliced.prompt_token_ids_cpu.shape[0] == 2
+    assert sliced.prompt_token_ids_cpu["req-1"] == list(range(100, 105))
+    assert sliced.pooling_states[0] is runner_requests["req-1"].pooling_states
+    assert sliced.pooling_states[1] is runner_requests["req-2"].pooling_states
+
+    # Cursor built from the chunk's own scheduled tokens now lines up.
+    sliced.build_pooling_cursor(
+        num_scheduled_tokens_np=np.array([5, 2], dtype=np.int32),
+        seq_lens_cpu=torch.tensor([5, 2], dtype=torch.int32),
+        device=torch.device("cpu"),
+    )
+    cursor = sliced.get_pooling_cursor()
+    assert torch.equal(
+        cursor.last_token_indices_gpu, torch.tensor([4, 6], dtype=torch.int64)
+    )

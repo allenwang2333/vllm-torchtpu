@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import torch
 from vllm.model_executor.layers.pooler.seqwise import heads, methods
 from vllm.model_executor.layers.pooler.seqwise.methods import (
@@ -75,9 +77,14 @@ class TPUMeanPool(SequencePoolingMethod):
             if num_seqs == 0:
                 return hidden_states.new_empty((0, hidden_size), dtype=torch.float32)
 
-            prompt_lens = async_tensor_h2d(
-                prompt_lens_cpu, device=hidden_states.device, dtype=torch.int64
-            )
+            if isinstance(prompt_lens_cpu, torch.Tensor):
+                prompt_lens = prompt_lens_cpu.to(
+                    device=hidden_states.device, dtype=torch.int64, non_blocking=True
+                )
+            else:
+                prompt_lens = async_tensor_h2d(
+                    prompt_lens_cpu, device=hidden_states.device, dtype=torch.int64
+                )
             segment_ids = torch.repeat_interleave(
                 torch.arange(num_seqs, device=hidden_states.device, dtype=torch.long),
                 prompt_lens,
@@ -136,16 +143,21 @@ class TPUMeanPool(SequencePoolingMethod):
         return output_list
 
 
+_tpu_pooling_patches_lock = threading.Lock()
 _tpu_pooling_patches_installed = False
 
 
 def install_tpu_pooling_patches() -> None:
-    """Install TPU-native pooling patches non-invasively."""
+    """Install TPU-native pooling patches non-invasively (thread-safe, idempotent)."""
     global _tpu_pooling_patches_installed
-    if _tpu_pooling_patches_installed:
-        return
-    _tpu_pooling_patches_installed = True
+    with _tpu_pooling_patches_lock:
+        if _tpu_pooling_patches_installed:
+            return
+        _install_tpu_pooling_patches_locked()
+        _tpu_pooling_patches_installed = True
 
+
+def _install_tpu_pooling_patches_locked() -> None:
     # 1. Patch MeanPool to use TPU online accumulation in Chunked Prefill
     methods.MeanPool.forward = TPUMeanPool.forward
 
@@ -155,12 +167,16 @@ def install_tpu_pooling_patches() -> None:
     def safe_embed_forward(self, pooled_data, pooling_metadata):
         if isinstance(pooled_data, list) and any(d is None for d in pooled_data):
             outputs = []
-            for d, p in zip(pooled_data, pooling_metadata.pooling_params):
+            for i, (d, p) in enumerate(
+                zip(pooled_data, pooling_metadata.pooling_params)
+            ):
                 if d is None:
                     outputs.append(None)
                 else:
+                    # d is the pooled [hidden_size] vector, so d.shape[0] is
+                    # hidden_size, not the prompt length. Use the real one.
                     sub_meta = PoolingMetadata(
-                        prompt_lens=torch.tensor([d.shape[0]], dtype=torch.int32),
+                        prompt_lens=pooling_metadata.prompt_lens[i : i + 1],
                         prompt_token_ids=None,
                         prompt_token_ids_cpu=None,
                         pooling_params=[p],

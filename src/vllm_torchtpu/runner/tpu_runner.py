@@ -3410,7 +3410,12 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 logits = torch.empty((0,), device=self.device)
 
-                pooling_metadata = self.input_batch.get_pooling_metadata()
+                # Slice to this chunk's request window. When the batch runs as a
+                # single chunk this is a no-op ([0:num_reqs]); with multiple
+                # chunks, unsliced metadata would not match the cursor below.
+                pooling_metadata = self.input_batch.get_pooling_metadata()[
+                    start_index : start_index + num_reqs
+                ]
                 # num_scheduled_tokens_np, seq_lens_cpu for this chunk
                 req_ids = self.input_batch.req_ids[start_index : start_index + num_reqs]
                 num_scheduled_tokens_np = np.array(
