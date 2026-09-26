@@ -240,7 +240,8 @@ def fp8_bytes(x8):
 SEM_UNIT = 32         # bytes per DMA-semaphore count (probe 06, j-232ba686: counts up bytes/32, wait -> 0)
 GATHER_UNROLL = int(os.environ.get("MK_GUNROLL", "16"))  # A/B knob; 16 taken (probe 07)
 # "ag"/"a2a"/"rs" drop one collective each ("coll" drops all): serving-hang bisect at R=16.
-# "agdiag": one AG right after the barrier, arrivals polled (bounded) from the source tags; out row 1
+# "agdiag": one AG right after the barrier, arrivals and send completion polled (bounded, never
+# blocks; drains only whole rows the semaphores hold); out row 1
 # lanes = [me, spins/256, arrived, recv sem (3 base-256 digits, pre-drain), send sem (same),
 # then from AGDIAG_TAG0 the tag in xall[r] (src + 1, 0 = never arrived) for r < R].
 ABLATIONS = ("weights", "gather", "index", "attn", "experts", "coll", "uk_uv", "topk", "ag", "a2a", "rs",
@@ -653,8 +654,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     n = n + (jnp.max(scr["xall"][r_][:, 0:128].astype(F32)) > 0).astype(I32)
                 return n
 
+            U = H * 2 // 32                        # DMA semaphore units per row (bytes / 32)
+
             def cond(c):
-                return jnp.logical_and(c[0] < AGDIAG_SPIN, c[1] < R - 1)
+                done = jnp.logical_and(c[1] >= R - 1, pl.semaphore_read(scr["ag_send"]) >= (R - 1) * U)
+                return jnp.logical_and(c[0] < AGDIAG_SPIN, jnp.logical_not(done))
 
             def body(c):
                 return c[0] + 1, arrived()
@@ -666,12 +670,16 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 send_sem=scr["ag_send"], recv_sem=scr["ag_recv"],
                 device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
 
+            # never blocks: drains only what the semaphores already hold (whole rows)
             def wr(i, c):
                 desc.wait_recv()
                 return c
-            lax.fori_loop(0, n_arr, wr, 0)
-            for _ in range(R - 1):
+
+            def ws(i, c):
                 desc.wait_send()
+                return c
+            lax.fori_loop(0, vr // U, wr, 0)
+            lax.fori_loop(0, vs // U, ws, 0)
             vals = (me, spins // 256, n_arr, vr % 256, (vr // 256) % 256, vr // 65536,
                     vs % 256, (vs // 256) % 256, vs // 65536)
             acc = jnp.zeros((1, 128), F32)
