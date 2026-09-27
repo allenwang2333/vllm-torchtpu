@@ -1130,7 +1130,8 @@ def streamindex_topk(
             )
             if (
                 os.environ.get("GLM5_TOPK_STATS")
-                and scores.shape[1] % (16 * k) == 0
+                and scores.shape[1] % k == 0
+                and scores.shape[1] % 16 == 0
             ):
                 _topk_stats(
                     scores,
