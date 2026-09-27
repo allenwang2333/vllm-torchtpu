@@ -31,6 +31,7 @@ Forward splits into two kernel passes, merged with LSE-weighted combination:
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 import jax
 import torch

@@ -168,7 +168,10 @@ def build_pcp_streaming_callable(
     rebuild the callable from freshly reloaded kernel modules and swap it in
     behind the already-registered torch op.
     """
-    signature = inspect.signature(fn, follow_wrapped=False)
+    try:
+        signature = inspect.signature(fn, follow_wrapped=False, eval_str=True)
+    except Exception:
+        signature = inspect.signature(fn, follow_wrapped=False)
     pallas_impl._verify_signature(signature)
     static_argnums = pallas_impl._infer_static_argnums(signature)
     donate_argnums_tuple = tuple(donate_argnums or ())
