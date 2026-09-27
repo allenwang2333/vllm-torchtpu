@@ -284,12 +284,7 @@ def fetch_step_metadata(
 
     total_kv_len = kv_cache_len_val + kv_new_len_val
 
-    q_len = jnp.where(
-        is_valid, cu_q_lens_ref[safe_s_idx + 1] - cu_q_lens_ref[safe_s_idx], 0
-    )
-    q_sz = jnp.where(
-        is_valid, jnp.clip(q_len - q_idx * cfgs.bq_sz, 0, cfgs.bq_sz), 0
-    )
+    q_sz = jnp.where(is_valid, schedule_ref.dma_q[step, b_idx, 1], 0)
     is_valid_list.append(is_valid)
     q_sz_list.append(q_sz)
     k_id_list.append(k_id)
@@ -401,12 +396,7 @@ def ring_fetch_step_metadata(
 
     total_kv_len = kv_cache_len_val + kv_new_len_val
 
-    q_len = jnp.where(
-        is_valid, cu_q_lens_ref[safe_s_idx + 1] - cu_q_lens_ref[safe_s_idx], 0
-    )
-    q_sz = jnp.where(
-        is_valid, jnp.clip(q_len - q_idx * cfgs.bq_sz, 0, cfgs.bq_sz), 0
-    )
+    q_sz = jnp.where(is_valid, schedule_ref.dma_q[step, b_idx, 1], 0)
     is_valid_list.append(is_valid)
     q_sz_list.append(q_sz)
     k_id_list.append(k_id)

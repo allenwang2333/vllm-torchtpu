@@ -184,14 +184,14 @@ def flash_attention_pv(
     o_next_list.append(o_next_b)
     if is_last_k is not None and step is not None:
       o_prev_next = jnp.where(
-          utils.broadcast_minor(is_last_k[step, b_idx], o_prev.shape),
+          is_last_k[step, b_idx] == 1,
           0.0,
           o_next_b,
       )
     else:
       o_prev_next = o_next_b
     o_prev = jnp.where(
-        utils.broadcast_minor(lane_valid, o_prev.shape),
+        lane_valid,
         o_prev_next,
         o_prev,
     )
