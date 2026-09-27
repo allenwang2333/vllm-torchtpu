@@ -867,8 +867,6 @@ class Eagle3Proposer:
         ).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
-    @_static_shape_args
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
         self,
         hidden: torch.Tensor,
@@ -877,20 +875,27 @@ class Eagle3Proposer:
         indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # First-pass per-request carries: gather the last-token hidden, position,
-        # and pre-lm-head hidden in one compiled region. Run raw (advanced
-        # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
-        # fuses with the step's seq_lens/positions arithmetic into a per-context
-        # program. index_select is value-identical to hidden[indices].
+        # and pre-lm-head hidden as one isolated program. Left pending (advanced
+        # indexing), these gathers are eager ops the DEFER_AND_FUSE path fuses
+        # with the step's seq_lens/positions arithmetic into a per-context
+        # program; materializing them here pins the program to the gathers (and
+        # the pending clamp on indices). It is keyed on num_tokens, so it is
+        # enqueued without a host wait: as a compiled region its compile was
+        # synchronous, ~3 s per num_tokens bucket back to back in the spec
+        # warmup; eager, it compiles on the background pool while the next
+        # region compiles. index_select is value-identical to hidden[indices].
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
             else torch.index_select(positions, 0, indices)
         )
-        return (
+        out = (
             torch.index_select(hidden, 0, indices),
             pos_carry,
             torch.index_select(last_hidden, 0, indices),
         )
+        synchronize_tensors(list(out), wait=False)
+        return out
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
