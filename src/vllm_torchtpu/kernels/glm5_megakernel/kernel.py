@@ -780,26 +780,33 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             for _ in range(R - 1):
                 desc.wait_send()
 
-        def exchange(src_of_d, dst, ss, rs):
+        def exchange(src_of_d, dst, ss, rs, wait=True):
             """v9: start src_of_d(d) -> dst[me] on every peer d; wait R-1 receives and sends.
+            v10: wait=False returns the wait as a callable, so independent work (indexer, gather
+            issue) overlaps the transfer; the caller must run it before the next collective.
             Race freedom as all_to_all_heads: a peer rewrites dst at layer l+1 only after this
             rank's next collective's rows, sent after dst was consumed (chain per layer:
             qall -> qarecv -> xrecv -> rsrecv -> xall -> rsrecv -> qall)."""
             if R == 1 or "coll" in skip or "qtp" in skip:
-                return
+                return None if wait else (lambda: None)
             for d in range(R):
                 @pl.when(me != d)
                 def _(d=d):
                     pltpu.make_async_remote_copy(
                         src_ref=src_of_d(d), dst_ref=dst.at[me], send_sem=scr[ss], recv_sem=scr[rs],
                         device_id=(jnp.int32(d),), device_id_type=pl.DeviceIdType.MESH).start()
-            desc = pltpu.make_async_remote_copy(
-                src_ref=src_of_d(0), dst_ref=dst.at[0], send_sem=scr[ss], recv_sem=scr[rs],
-                device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
-            for _ in range(R - 1):
-                desc.wait_recv()
-            for _ in range(R - 1):
-                desc.wait_send()
+
+            def finish():
+                desc = pltpu.make_async_remote_copy(
+                    src_ref=src_of_d(0), dst_ref=dst.at[0], send_sem=scr[ss], recv_sem=scr[rs],
+                    device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
+                for _ in range(R - 1):
+                    desc.wait_recv()
+                for _ in range(R - 1):
+                    desc.wait_send()
+            if not wait:
+                return finish
+            finish()
 
         def reduce_scatter_rows():
             """part[t] (row per token/rank t) -> rsrecv[src] on owner t."""
@@ -1003,6 +1010,13 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             kpe = jnp.where(lane128 < cfg.DR,
                             rope(kpe_raw, rope_tab[2:3, 0:128], rope_tab[3:4, 0:128]), 0.0) * row0
             scr["qc"][...] = qc
+            # v10: the q all-gather (L_qb below) starts here, so it flies under the KV write
+            xq, sx = quant_rows(qc)
+            scr["qsend"][...] = jnp.concatenate(
+                [xq[0:1].astype(F32), jnp.where(lane128 == 0, sx[0:1], 0.0)], axis=1)
+            scr["qall"][me] = scr["qsend"][...]
+            qag_wait = exchange(lambda d: scr["qsend"], scr["qall"], "qag_send", "qag_recv",
+                                wait=False)
 
             ph.mark("L_kvw")
             # KV write: nope row and rope row (RMW), SPARSECORE band packing. Caches are read-only
@@ -1049,11 +1063,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             # nope lanes through W_UK on the MXU, and A2As (absorbed q | pre-rope q lanes
             # DQ-128..DQ) back to each owner, which applies its own rope. Idle ranks send a zero
             # row (qc is masked to row 0 and zero when idle) and run every collective.
-            xq, sx = quant_rows(qc)
-            scr["qsend"][...] = jnp.concatenate(
-                [xq[0:1].astype(F32), jnp.where(lane128 == 0, sx[0:1], 0.0)], axis=1)
-            scr["qall"][me] = scr["qsend"][...]
-            exchange(lambda d: scr["qsend"], scr["qall"], "qag_send", "qag_recv")
+            qag_wait()
             ph.mark("L_qbmm")
             qa = [scr["qall"][t] for t in range(R)]                             # (1, QW) each
             scr["xq"][:, :cfg.QL] = jnp.concatenate(
@@ -1086,17 +1096,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     give("w_uk")
             ph.mark("L_qa2a")
             scr["qarecv"][me] = scr["qasend"][me]
-            exchange(lambda d: scr["qasend"].at[d], scr["qarecv"], "qa2a_send", "qa2a_recv")
-            ph.mark("L_qasm")
-            for src in range(R):                     # owner: heads [src*HR, (src+1)*HR) of its q
-                blk = scr["qarecv"][src]
-                scr["ql"][src * cfg.HR:(src + 1) * cfg.HR, :] = blk[:, 0:cfg.KL]
-                scr["qh"][src * cfg.HR:(src + 1) * cfg.HR, cfg.DQ - 128:] = blk[:, cfg.KL:]
-            # rope on the window only: lane pairs are aligned (DQ - 128 even), and nope lanes are
-            # rope-identity, so this equals v8's full-width rope on the lanes attention reads
-            scr["qh"][:, cfg.DQ - 128:] = rope(scr["qh"][:, cfg.DQ - 128:],
-                                               rope_tab[0:1, cfg.DQ - 128:cfg.DQ],
-                                               rope_tab[1:2, cfg.DQ - 128:cfg.DQ])
+            qa2a_wait = exchange(lambda d: scr["qasend"].at[d], scr["qarecv"], "qa2a_send",
+                                 "qa2a_recv", wait=False)
+            # v10: the return A2A is waited after L_index / L_gather (neither reads ql / qh), so the
+            # transfer and the peers' skew hide under the indexer and the gather issue loop
 
             ph.mark("L_index")
             # indexer (full layers) -> idx_s / idx_v
@@ -1240,6 +1243,19 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 def _():
                     scr["g_nope"][pl.ds(il, 1), :] = scr["wrow"][0:1, :]
                     scr["g_rope"][pl.ds(il, 1), :] = scr["rrow"][0:1, :]
+
+            ph.mark("L_qa2a_w")
+            qa2a_wait()
+            ph.mark("L_qasm")
+            for src in range(R):                     # owner: heads [src*HR, (src+1)*HR) of its q
+                blk = scr["qarecv"][src]
+                scr["ql"][src * cfg.HR:(src + 1) * cfg.HR, :] = blk[:, 0:cfg.KL]
+                scr["qh"][src * cfg.HR:(src + 1) * cfg.HR, cfg.DQ - 128:] = blk[:, cfg.KL:]
+            # rope on the window only: lane pairs are aligned (DQ - 128 even), and nope lanes are
+            # rope-identity, so this equals v8's full-width rope on the lanes attention reads
+            scr["qh"][:, cfg.DQ - 128:] = rope(scr["qh"][:, cfg.DQ - 128:],
+                                               rope_tab[0:1, cfg.DQ - 128:cfg.DQ],
+                                               rope_tab[1:2, cfg.DQ - 128:cfg.DQ])
 
             ph.mark("L_attn_s")
             # sparse MLA attention (served formula, two pass)
