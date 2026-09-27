@@ -590,8 +590,10 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
-#      (backbone, compute_selected_logits, sample_from_logits/structured_decode,
-#      gather_logprobs) so _dummy_run and execute_model trace identically.
+#      (backbone, compute_logits_from_hidden_states, sample_from_logits/
+#      structured_decode, gather_logprobs) so _dummy_run and execute_model trace
+#      identically. compute_selected_logits' row gather is an isolated eager
+#      program in front of the lm-head subgraph.
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
@@ -5410,6 +5412,9 @@ class TPUModelRunner(GPUModelRunner):
                             self._dummy_logits(pinned_rows), num_reqs
                         )
                         synchronize_tensors(out)
+            # No per-shape host wait: the gathers compile concurrently on the
+            # background pool. Wait once at the end.
+            outs = []
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -5417,8 +5422,7 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device)
                 for num_reqs in rows:
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
-                    out = self.compute_selected_logits(dummy_hidden, indices)
-                    synchronize_tensors(out)
+                    outs.append(self.compute_selected_logits(dummy_hidden, indices))
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -5426,6 +5430,7 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens, self.max_num_reqs
                     ):
                         break
+            synchronize_tensors(outs)
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -6709,14 +6714,19 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
         if self.is_pooling_model:
             return torch.empty((0,), device=hidden_states.device)
+        # The row gather is the only part that depends on num_tokens. Run it
+        # as its own eager program (enqueued without a host wait, so its
+        # compile runs on the background compile pool), and keep the lm-head
+        # in a compiled region keyed on the row count alone. As one compiled
+        # region it was a synchronous ~4 s compile per num_tokens bucket.
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
-        return self.model.compute_logits(selected)
+        synchronize_tensors([selected], wait=False)
+        return self.compute_logits_from_hidden_states(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _leading_logits_rows(self, logits: torch.Tensor, n: int) -> torch.Tensor:
