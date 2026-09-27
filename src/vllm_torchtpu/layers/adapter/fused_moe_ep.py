@@ -596,18 +596,25 @@ def prebuild_fused_moe_ep(
         routed_scale,
         token_replica_groups,
     )
-    # Two knobs stop applying the moment this arms, and neither would say so on
-    # its own: the fused call returns before `apply_monolithic` reaches either
-    # the padding mask or the chunked path. Padding costs expert work and
-    # transport rather than correctness -- and it is not free at warmup, where
-    # `_dummy_run` marks the whole batch as padding.
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
+    # TPU_MOE_COLLECTION_CHUNK_SIZE stops applying the moment this arms, and
+    # would not say so on its own: the fused call returns before
+    # `apply_monolithic` reaches the chunked path. TPU_MOE_SKIP_PADDED_TOKENS
+    # does apply, but only where the method writes the padding mask into the
+    # router logits before the call (fp8 does); elsewhere padding rows are
+    # routed and computed as real tokens.
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
         logger.warning_once(
-            "Fused EP MoE armed, so TPU_MOE_SKIP_PADDED_TOKENS=%s and "
-            "TPU_MOE_COLLECTION_CHUNK_SIZE=%s are not in effect for this "
-            "layer: the kernel routes and exchanges inside its own program.",
-            envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            "Fused EP MoE armed, so TPU_MOE_COLLECTION_CHUNK_SIZE=%s is not in "
+            "effect for this layer: the kernel routes and exchanges inside its "
+            "own program.",
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
+        )
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS and weight_format != "fp8":
+        logger.warning_once(
+            "Fused EP MoE armed for %s weights, so TPU_MOE_SKIP_PADDED_TOKENS "
+            "is not in effect for this layer: only the fp8 method masks "
+            "padding rows in the router logits.",
+            weight_format,
         )
     return op
 

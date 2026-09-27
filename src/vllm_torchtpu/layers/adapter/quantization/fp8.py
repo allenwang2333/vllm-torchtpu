@@ -1067,6 +1067,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
 
         if fused_moe_ep_supported(self):
+            # The kernel selects its own experts, so padding is marked on the
+            # logits it routes from: an all -inf row routes nowhere and costs
+            # no expert work or transport. x and router_logits are this rank's
+            # own rows, so the local mask applies directly.
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                router_logits = token_padding.mask_router_logits_for_padding(
+                    router_logits
+                )
             return fused_moe_ep(
                 self,
                 x,

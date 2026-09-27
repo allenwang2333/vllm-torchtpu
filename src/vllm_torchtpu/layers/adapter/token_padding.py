@@ -87,3 +87,22 @@ def zero_routing_weights_for_padding(
         is_padding[:, None], torch.zeros_like(topk_weights), topk_weights
     )
     return topk_ids, topk_weights
+
+
+def mask_router_logits_for_padding(router_logits: torch.Tensor) -> torch.Tensor:
+    """Set this rank's padded rows of the router logits to -inf.
+
+    For a router that selects its own experts (the fused EP kernel), where
+    zeroing a weight after selection is not reachable. The kernel treats a row
+    of all -inf logits as routing nowhere: no expert computes it, it is not
+    exchanged, and its output row is zero. `router_logits` must be this rank's
+    local rows, [local tokens, experts].
+    """
+    if _padding_state is None:
+        return router_logits
+    is_padding = _padding_state.get_local_padding_mask(router_logits.shape[0])
+    return torch.where(
+        is_padding[:, None],
+        torch.full_like(router_logits, float("-inf")),
+        router_logits,
+    )

@@ -405,6 +405,84 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "scoring_fn,score_bias", [("softmax", False), ("sigmoid", True)]
+)
+def test_dead_rows_route_nowhere_and_leave_live_rows_bit_exact(
+    sharded_plan, scoring_fn, score_bias
+):
+    """A row of all -inf logits is padding: zero output, no effect on the rest.
+
+    Dead rows are every row of shards 1..7 (idle DP ranks) plus a scattered
+    set on shard 0. Their pairs are left out of the plan, so the live rows
+    compute on different slab rows than in the all-live run -- and must still
+    come out bit for bit the same, since each expert row is computed and
+    combined independently. sigmoid is the case `row_routes` cannot catch:
+    sigmoid(-inf) is a finite 0.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        30,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    tokens = SMALL["tokens"]
+    x, gating = _make_inputs(
+        mesh, 31, tokens=tokens, hidden=SMALL["hidden"], e_total=SMALL["e_total"]
+    )
+    t_local = tokens // EP
+    rng = np.random.default_rng(32)
+    dead = np.arange(tokens) >= t_local
+    dead[:t_local] = rng.random(t_local) < 0.25
+    shard = NamedSharding(mesh, P(AXIS))
+    dead_gating = jax.device_put(
+        np.where(dead[:, None], -np.inf, np.asarray(gating)).astype(np.float32),
+        shard,
+    )
+    bias = (
+        jax.device_put(
+            jax.random.normal(jax.random.key(33), (SMALL["e_total"],)) / 4,
+            NamedSharding(mesh, P()),
+        )
+        if score_bias
+        else None
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=sharded_plan,
+        scoring_fn=scoring_fn,
+        score_bias=bias,
+    )
+    live_run = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    )
+    dead_run = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, dead_gating, **common)
+    )
+    assert not (dead_run[dead] != 0).any()
+    np.testing.assert_array_equal(dead_run[~dead], live_run[~dead])
+    all_dead = np.asarray(
+        fused_ep_moe_v2(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            jax.device_put(np.full(gating.shape, -np.inf, np.float32), shard),
+            **common,
+        )
+    )
+    assert not (all_dead != 0).any()
+
+
 def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     """Physical expert placement may follow device order, not EP-rank order.
 

@@ -219,6 +219,11 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     return mesh_block * g_local + topk_idx % g_local
 
 
+def _dead_rows(gating):
+    """[t] bool: rows whose gate logits are all -inf, which route nowhere."""
+    return jnp.all(gating == -jnp.inf, axis=-1)
+
+
 # Local tokens at or above which the activation all-gather is enqueued ahead
 # of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
 # -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
@@ -476,6 +481,15 @@ def fused_ep_moe_v2(
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
         )
+        # A dead row -- every gate logit -inf, which is how the serving
+        # adapter marks TPU_MOE_SKIP_PADDED_TOKENS padding and how the token
+        # layout pads a replica slice -- routes nowhere. Its pairs take the
+        # sentinel expert id e_total: no histogram bin matches it, so it is in
+        # no count, table or transport, and the plan builders send its slab
+        # row off-shard so every slab scatter drops it. `row_routes` below
+        # cannot say this: sigmoid maps -inf to a finite 0.
+        dead_row = _dead_rows(gate_l)
+        topk_idx = jnp.where(dead_row[:, None], jnp.int32(e_total), topk_idx)
         # A row of scores carrying no real value routes nowhere. It was
         # dropped by arithmetic accident: the selector gives every slot of
         # such a row a large negative sentinel, and the renormalization below
@@ -664,6 +678,9 @@ def fused_ep_moe_v2(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        # A dead row's positions point at arrival rows nothing wrote for it,
+        # which can hold fp8 NaN, and a zero weight does not cancel NaN.
+        combined = jnp.where(dead_row[:, None], jnp.zeros((), combined.dtype), combined)
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they

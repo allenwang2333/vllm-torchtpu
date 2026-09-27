@@ -615,7 +615,16 @@ def build_routing_tables(
         mirror_blocks, expert_blocks, bins
     ).reshape(-1)
 
-    slab_row = base_of_pair + slot  # always < total
+    # A pair with the sentinel expert id e_total (a dead row) matched no bin
+    # above, so it is in no count and every lookup gave it 0; its slab row
+    # would alias expert 0's. Send it off-shard instead, as the sharded plan
+    # does for every pair it does not own, so each mode="drop" scatter drops
+    # it.
+    slab_row = jnp.where(
+        expert_of_pair < e_total,
+        base_of_pair + slot,  # always < total
+        jnp.int32(off_shard_slab_row(shard_stride, ep)),
+    )
 
     return RoutingTables(
         arrival_row=pos.reshape(T, K),
