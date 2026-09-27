@@ -456,7 +456,16 @@ def _patch_vllm_compile_all_ranges() -> None:
 
     Compilation rotation allows vllm to compile multiple sizes at the same time,
     which greatly reduce the vllm startup time.
+
+    Each bucket's FX/AOT/MLIR trace allocates millions of short-lived objects
+    that promote into generation 2 mid-compile and trigger multi-second full GC
+    scans across the model and every bucket compiled so far. Freezing the
+    already-loaded model heap before the loop, pausing cyclic GC across the
+    loop (while reference counting still frees non-cyclic temporaries), and
+    running a single collection + freeze at the end avoids both mid-loop full
+    scans and redundant multi-generation rescans of the model heap.
     """
+    import gc
     import os
     from collections import deque
 
@@ -484,36 +493,45 @@ def _patch_vllm_compile_all_ranges() -> None:
         d.rotate(-local_rank * (len(d) // 8))
         indexes = list(d)
 
-        for i in indexes:
-            if i >= len(range_entry_list):
-                continue
+        was_gc_enabled = gc.isenabled()
+        gc.freeze()
+        gc.disable()
+        try:
+            for i in indexes:
+                if i >= len(range_entry_list):
+                    continue
 
-            range_entry = range_entry_list[i]
+                range_entry = range_entry_list[i]
 
-            if range_entry.compiled:
-                continue
+                if range_entry.compiled:
+                    continue
 
-            self._log_compile_start(range_entry.compile_range)
+                self._log_compile_start(range_entry.compile_range)
 
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
+                if range_entry.compile_range.is_single_size():
+                    args_list = create_concrete_args(
+                        self.graph, range_entry.compile_range.start
+                    )
+                else:
+                    args_list = get_fake_args_from_graph(self.graph)
+
+                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                    self.graph,
+                    args_list,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    compile_range=range_entry.compile_range,
+                    graph_index=self.piecewise_compile_index,
+                    num_graphs=self.total_piecewise_compiles,
+                    is_encoder=self.vllm_backend.is_encoder,
                 )
-            else:
-                args_list = get_fake_args_from_graph(self.graph)
 
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
-            )
-
-            range_entry.compiled = True
+                range_entry.compiled = True
+        finally:
+            if was_gc_enabled:
+                gc.enable()
+            gc.collect()
+            gc.freeze()
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
