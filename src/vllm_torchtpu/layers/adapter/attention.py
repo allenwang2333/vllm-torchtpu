@@ -1269,6 +1269,31 @@ class PallasAttentionBackendImpl(AttentionImpl):
             and parallel_config.prefill_context_parallel_size > 1
         )
         if pcp_configured:
+            if (
+                envs.VLLM_TPU_PCP_LAYOUT == "zigzag"
+                and isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+            ):
+                from vllm_torchtpu.distributed.pcp import (
+                    get_pcp_rank,
+                    get_pcp_world_size,
+                )
+
+                self.decode_query_size = 1
+                self._pcp_streaming = False
+                _build_pcp_kernels(
+                    sliding_window=self.sliding_window,
+                    sm_scale=self.scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    cp_group_size=get_pcp_world_size(),
+                    cp_rank=get_pcp_rank(),
+                    use_causal_mask=self.use_causal_mask,
+                    kv_layout=self.kv_layout,
+                )
+                return
+
             self._validate_pcp_streaming_support(skip_kv_update)
             self.decode_query_size = 1
             self._pcp_streaming = True

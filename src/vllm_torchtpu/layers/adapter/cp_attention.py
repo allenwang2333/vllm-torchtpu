@@ -395,6 +395,24 @@ def forward_with_dcp(
 # ---------------------------------------------------------------------------
 
 
+_PCP_CACHE_INPUT_PARTITION_SPECS = (
+    jax.sharding.PartitionSpec("pcp"),  # kv_cache
+    jax.sharding.PartitionSpec("pcp"),  # query
+    jax.sharding.PartitionSpec("pcp"),  # key
+    jax.sharding.PartitionSpec("pcp"),  # value
+    jax.sharding.PartitionSpec(),  # seq_lens
+    jax.sharding.PartitionSpec(),  # block_tables
+    jax.sharding.PartitionSpec(),  # cu_q_lens
+    jax.sharding.PartitionSpec(),  # distribution
+    jax.sharding.PartitionSpec(),  # kv_new_lens
+)
+_PCP_CACHE_OUTPUT_PARTITION_SPECS = (
+    jax.sharding.PartitionSpec("pcp"),  # new_kv_cache
+    jax.sharding.PartitionSpec("pcp"),  # output
+    jax.sharding.PartitionSpec("pcp"),  # lse
+)
+
+
 def _pallas_rpa_kernel_pcp_cache(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -405,10 +423,10 @@ def _pallas_rpa_kernel_pcp_cache(
     cu_q_lens: jax.Array,
     distribution: jax.Array,
     kv_new_lens: jax.Array,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
     *,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
@@ -416,9 +434,77 @@ def _pallas_rpa_kernel_pcp_cache(
     cp_rank_val: int,
     pcp_ring_axis_name: str | None = "pcp",
     pcp_ring_mesh_axis_names: tuple[str, ...] | None = None,
+    mesh: Any = None,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     import jax.numpy as jnp
+    from jax import lax
+
+    if mesh is not None and getattr(mesh, "size", 1) > 1 and pcp_ring_axis_name is not None:
+        mesh_axis_names = (
+            pcp_ring_mesh_axis_names
+            if pcp_ring_mesh_axis_names is not None
+            else tuple(mesh.axis_names)
+        )
+
+        def _shard_fn(
+            kv_cache_local,
+            query_local,
+            key_local,
+            value_local,
+            seq_lens_local,
+            block_tables_local,
+            cu_q_lens_local,
+            distribution_local,
+            kv_new_lens_local,
+        ):
+            cp_rank_arr = jnp.reshape(
+                lax.axis_index(pcp_ring_axis_name), (1,)
+            ).astype(jnp.int32)
+            output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
+                queries=query_local,
+                keys=key_local,
+                values=value_local,
+                kv_cache=kv_cache_local,
+                kv_lens=seq_lens_local,
+                page_indices=block_tables_local,
+                cu_q_lens=cu_q_lens_local,
+                distribution=distribution_local,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                cp_group_size=cp_group_size,
+                cp_rank=cp_rank_arr,
+                kv_new_lens=kv_new_lens_local,
+                attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
+                pcp_ring_axis_name=pcp_ring_axis_name,
+                pcp_ring_mesh_axis_names=mesh_axis_names,
+                update_kv_cache=False,
+                return_lse=True,
+                kv_layout=kv_layout,
+            )
+            return new_kv_cache, output, lse
+
+        return jax.shard_map(
+            _shard_fn,
+            mesh=mesh,
+            in_specs=_PCP_CACHE_INPUT_PARTITION_SPECS,
+            out_specs=_PCP_CACHE_OUTPUT_PARTITION_SPECS,
+            check_vma=False,
+        )(
+            kv_cache,
+            query,
+            key,
+            value,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            distribution,
+            kv_new_lens,
+        )
 
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
     output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
@@ -440,8 +526,8 @@ def _pallas_rpa_kernel_pcp_cache(
         cp_rank=cp_rank_arr,
         kv_new_lens=kv_new_lens,
         attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
-        pcp_ring_axis_name=pcp_ring_axis_name,
-        pcp_ring_mesh_axis_names=pcp_ring_mesh_axis_names,
+        pcp_ring_axis_name=None,
+        pcp_ring_mesh_axis_names=None,
         update_kv_cache=False,
         return_lse=True,
         kv_layout=kv_layout,
@@ -462,10 +548,10 @@ def _pallas_rpa_kernel_pcp_new(
     q_positions: jax.Array,
     update_kv_cache: jax.Array,
     new_kv_page_indices: jax.Array,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
     *,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
@@ -518,10 +604,34 @@ def _alloc_pcp_instance_id() -> int:
     return _id
 
 
-def _build_pcp_kernel_op(op_name: str, fn, mesh: Any = None):
-    op = pallas.jax_op(
-        op_name, fn, donate_argnums=(0,), mesh=mesh, input_partition_specs=None
-    )
+def _build_pcp_kernel_op(
+    op_name: str,
+    fn,
+    mesh: Any = None,
+    input_partition_specs: tuple | None = None,
+    output_partition_specs: tuple | None = None,
+):
+    if (
+        mesh is not None
+        and getattr(mesh, "size", 1) > 1
+        and input_partition_specs is not None
+    ):
+        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
+            pcp_streaming_jax_op,
+        )
+
+        op = pcp_streaming_jax_op(
+            op_name,
+            fn,
+            donate_argnums=(0,),
+            mesh=mesh,
+            input_partition_specs=input_partition_specs,
+            output_partition_specs=output_partition_specs,
+        )
+    else:
+        op = pallas.jax_op(
+            op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
+        )
     op.register_fake(_fake_dcp)
 
     def kernel_impl(kv_cache, *args, **kwargs):
@@ -571,25 +681,38 @@ def build_pcp_kernels(
     except Exception:
         mesh = None
 
+    mesh_axis_names = tuple(mesh.axis_names) if mesh is not None else None
+
     if cached_cache is None:
         fn = functools.partial(
             _pallas_rpa_kernel_pcp_cache,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             sliding_window=sliding_window,
             sm_scale=sm_scale,
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
             pcp_ring_axis_name="pcp",
-            pcp_ring_mesh_axis_names=None,
+            pcp_ring_mesh_axis_names=mesh_axis_names,
+            mesh=mesh,
             kv_layout=kv_layout,
         )
         cached_cache = _PCP_KERNEL_REGISTRY[cache_key] = _build_pcp_kernel_op(
-            f"pallas::rpa_pcp_cache_{_alloc_pcp_instance_id()}", fn, mesh=mesh
+            f"pallas::rpa_pcp_cache_{_alloc_pcp_instance_id()}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=_PCP_CACHE_INPUT_PARTITION_SPECS,
+            output_partition_specs=_PCP_CACHE_OUTPUT_PARTITION_SPECS,
         )
 
     if cached_new is None:
         fn = functools.partial(
             _pallas_rpa_kernel_pcp_new,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             sliding_window=sliding_window,
             sm_scale=sm_scale,
             soft_cap=logits_soft_cap,
@@ -599,7 +722,7 @@ def build_pcp_kernels(
             kv_layout=kv_layout,
         )
         cached_new = _PCP_KERNEL_REGISTRY[new_key] = _build_pcp_kernel_op(
-            f"pallas::rpa_pcp_new_{_alloc_pcp_instance_id()}", fn, mesh=mesh
+            f"pallas::rpa_pcp_new_{_alloc_pcp_instance_id()}", fn, mesh=None
         )
 
     return cached_cache, cached_new
@@ -740,9 +863,6 @@ def forward_with_pcp(
             cu_cache,
             dist_cache,
             kv_new_lens_req,
-            q_scale,
-            k_scale,
-            v_scale,
         )
 
     # ---- 2. NEW_TOKENS_ONLY pass ----
@@ -764,9 +884,6 @@ def forward_with_pcp(
         q_positions,
         update_kv_cache_local,
         pcp_new_pages,
-        q_scale,
-        k_scale,
-        v_scale,
     )
 
     # ---- 3. Combine ----
