@@ -2824,7 +2824,14 @@ class TPUModelRunner(GPUModelRunner):
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
             # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
-            if not is_pcp_zigzag:
+            if is_pcp_zigzag:
+                num_zigzag_seqs = 2 * num_reqs
+                is_decode = (rpa_num_decode_reqs - start_index >= num_reqs)
+                chunk_num_decode = num_zigzag_seqs if is_decode else 0
+                self._request_distribution_cpu[0] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[2] = num_zigzag_seqs
+            else:
                 chunk_num_decode = max(
                     0, min(rpa_num_decode_reqs - start_index, num_reqs)
                 )
@@ -2863,8 +2870,16 @@ class TPUModelRunner(GPUModelRunner):
         # while RPA includes verify only when its decode tile supports it.
         mamba_request_distribution = None
         if self.mamba_slot_read_offsets is not None:
-            chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+            if is_pcp_zigzag:
+                num_zigzag_seqs = 2 * num_reqs
+                is_decode = (rpa_num_decode_reqs - start_index >= num_reqs)
+                chunk_num_decode = num_zigzag_seqs if is_decode else 0
+                chunk_num_windowed = num_zigzag_seqs if is_decode else 0
+                total_seqs = num_zigzag_seqs
+            else:
+                chunk_num_windowed = max(0, min(num_windowed_reqs - start_index, num_reqs))
+                chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+                total_seqs = num_reqs
             # One H2D copy, two views (see the staging tensor's comment for
             # why these must not be independent device tensors). Overrides
             # the RPA tensor built above so both fields always come from the
@@ -2872,10 +2887,10 @@ class TPUModelRunner(GPUModelRunner):
             combined = self._combined_request_distribution_cpu
             combined[0] = chunk_num_decode
             combined[1] = chunk_num_decode
-            combined[2] = num_reqs
+            combined[2] = total_seqs
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
-            combined[5] = num_reqs
+            combined[5] = total_seqs
             if getattr(self, "_fast_token_substitution", False):
                 chunk_comb_key = (chunk_num_decode, chunk_num_windowed, num_reqs)
                 if (
