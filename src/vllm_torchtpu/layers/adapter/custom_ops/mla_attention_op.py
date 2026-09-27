@@ -13,6 +13,7 @@
 # limitations under the License.
 """Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
+import os
 from typing import Any
 
 import jax
@@ -46,6 +47,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    stash_topk_stats,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -66,6 +70,23 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+
+def topk_stats_enabled(prefix: str) -> bool:
+    """Debug: GLM5_TOPK_STATS stashes per-row indexer top-k stats into the last
+    page of this layer's indexer K cache (read back by the runner).
+    GLM5_TOPK_STATS_LAYERS (comma list of layer ids) limits it to those layers."""
+    if not os.environ.get("GLM5_TOPK_STATS"):
+        return False
+    layers = os.environ.get("GLM5_TOPK_STATS_LAYERS")
+    if not layers:
+        return True
+    ids = {int(x) for x in layers.split(",") if x.strip()}
+    parts = prefix.split(".")
+    for a, b in zip(parts, parts[1:]):
+        if a == "layers" and b.isdigit():
+            return int(b) in ids
+    return False
 
 
 def _cp_scatter_indexer_k(
@@ -188,6 +209,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        with_stats = topk_stats_enabled(self.k_cache.prefix)
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -239,7 +261,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 chunk_tokens=chunk_tokens,
+                return_stats=with_stats,
             )
+            if with_stats:
+                topk_indices, stats = topk_indices
+                cache_kv = stash_topk_stats(cache_kv, stats, page_indices)
             return cache_kv, topk_indices
 
         op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"

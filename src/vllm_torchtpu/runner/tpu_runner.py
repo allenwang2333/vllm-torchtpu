@@ -279,6 +279,10 @@ def _substitute_placeholder_token(
 
 logger = init_logger(__name__)
 
+# Debug: log indexer top-k stats stashed by the streamidx op (see
+# `mla_attention_op.topk_stats_enabled`). Off by default.
+_GLM5_TOPK_STATS = bool(os.environ.get("GLM5_TOPK_STATS"))
+
 
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
@@ -5949,6 +5953,97 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
+        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+    ):
+        out = self._forward_model_timed(
+            input_ids, positions, inputs_embeds, intermediate_tensors
+        )
+        if (
+            _GLM5_TOPK_STATS
+            and not getattr(self, "_mk_decode_step", False)
+            and int(input_ids.shape[0]) >= 128
+        ):
+            self._glm5_topk_stats_log()
+        return out
+
+    def _glm5_topk_stats_log(self) -> None:
+        """Debug (GLM5_TOPK_STATS): read the stats the streamidx op stashed in
+        the last page of sampled layers' indexer K caches and log a summary."""
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+            STATS_HDR, STATS_MAGIC, STATS_P, STATS_ROW)
+        caches = self.__dict__.get("_topk_stats_caches")
+        if caches is None:
+            ctx = self.vllm_config.compilation_config.static_forward_context
+            found = []
+            for name, mod in ctx.items():
+                if not name.endswith(".indexer.k_cache"):
+                    continue
+                parts = name.split(".")
+                lid = next((int(b) for a, b in zip(parts, parts[1:])
+                            if a == "layers" and b.isdigit()), -1)
+                found.append((lid, mod))
+            found.sort(key=lambda x: x[0])
+            env = os.environ.get("GLM5_TOPK_STATS_LAYERS")
+            if env:
+                want = {int(x) for x in env.split(",") if x.strip()}
+            elif found:
+                want = {found[0][0], found[len(found) // 2][0], found[-1][0]}
+            else:
+                want = set()
+            caches = [(lid, mod) for lid, mod in found if lid in want]
+            self._topk_stats_caches = caches
+            print("GLM5_TOPK_STATS indexer_layers=%s sampled=%s" % (
+                [l for l, _ in found], [l for l, _ in caches]), file=sys.stderr, flush=True)
+        min_ctx = int(os.environ.get("GLM5_TOPK_STATS_MIN_CTX", "100000"))
+        for lid, mod in caches:
+            kv = mod.kv_cache
+            if isinstance(kv, (list, tuple)):
+                kv = kv[0]
+            if not isinstance(kv, torch.Tensor) or kv.numel() == 0:
+                continue
+            a = kv[kv.shape[0] - 1].cpu().numpy().reshape(-1).view(np.int32)
+            h = a[:STATS_HDR]
+            if int(h[0]) != STATS_MAGIC or int(h[4]) < min_ctx:
+                continue
+            n, k, nrows, maxlen, chunk_len = (int(h[1]), int(h[2]), int(h[3]),
+                                              int(h[4]), int(h[6]))
+            max_page, nblocks, stored = int(h[7]), int(h[8]), int(h[9])
+            rows = a[STATS_HDR:STATS_HDR + stored * STATS_ROW].reshape(stored, STATS_ROW)
+            scopes = [("step", rows)]
+            if stored == nrows and chunk_len < nrows:
+                scopes.append(("last", rows[-chunk_len:]))
+            for scope, r in scopes:
+                r = r[r[:, 3] > 0]
+                if r.shape[0] == 0:
+                    continue
+                t = r[:, 0].copy().view(np.float32)
+                vk = r[:, 1].copy().view(np.float32)
+                tot = r[:, 2].astype(np.int64)
+                rl = r[:, 3].astype(np.int64)
+                sc = r[:, 4:4 + STATS_P].astype(np.int64)
+                pct = 100.0 * tot / n
+                fin = np.isfinite(t) & np.isfinite(vk)
+                print(
+                    "GLM5_TOPK_STATS layer=%d scope=%s maxlen=%d n=%d k=%d rows=%d "
+                    "rowlen_min=%d rowlen_max=%d tot_pct_mean=%.3f tot_pct_p50=%.3f "
+                    "tot_pct_p90=%.3f tot_pct_max=%.3f tot_mean=%.0f tot_max=%d "
+                    "slice_max=%d overflow_slices=%d/%d overflow_rows=%d "
+                    "ninf_T=%d T_p50=%.5g vk_p50=%.5g T_gt_vk=%d vkminusT_p50=%.5g "
+                    "per_slice_mean=%s per_slice_max=%s max_page=%d nblocks=%d%s" % (
+                        lid, scope, maxlen, n, k, r.shape[0], rl.min(), rl.max(),
+                        pct.mean(), np.median(pct), np.percentile(pct, 90), pct.max(),
+                        tot.mean(), tot.max(), sc.max(), int((sc > 2048).sum()), sc.size,
+                        int((sc > 2048).any(axis=1).sum()), int(np.isneginf(t).sum()),
+                        float(np.median(t)), float(np.median(vk)),
+                        int((t[fin] > vk[fin]).sum()),
+                        float(np.median(vk[fin] - t[fin])) if fin.any() else float("nan"),
+                        ",".join(str(int(x)) for x in sc.mean(0)),
+                        ",".join(str(int(x)) for x in sc.max(0)),
+                        max_page, nblocks,
+                        " COLLISION" if max_page >= nblocks - 1 else ""),
+                    file=sys.stderr, flush=True)
+
+    def _forward_model_timed(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
         every = envs.GLM5_STEP_TIMING
