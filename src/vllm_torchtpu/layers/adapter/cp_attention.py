@@ -838,10 +838,7 @@ def forward_with_pcp(
 
     kv_new_lens = attn_metadata.seq_lens - pcp_cache_lens
 
-    is_decode = getattr(pcp_meta, "is_decode", False) or (
-        attn_metadata.request_distribution.numel() > 0
-        and int(attn_metadata.request_distribution[0].item()) > 0
-    )
+    is_decode = bool(getattr(pcp_meta, "is_decode", False))
 
     idx = torch.arange(
         query.shape[0], device=query.device, dtype=cu_q_lens_local.dtype
@@ -866,19 +863,12 @@ def forward_with_pcp(
         cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
         dist_cache = attn_metadata.request_distribution.clone()
         if is_decode:
-            req_dec = (
-                int(attn_metadata.request_distribution[0].item())
-                if attn_metadata.request_distribution.numel() > 0
-                else 0
+            dist_cache[0] = torch.maximum(
+                torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
+                attn_metadata.request_distribution[0] // 2,
             )
-            dec_count = (
-                req_dec // 2
-                if (req_dec > 0 and req_dec % 2 == 0)
-                else max(1, req_dec if req_dec > 0 else num_seqs // 2)
-            )
-            dist_cache[0] = dec_count
-            dist_cache[1] = dec_count
-            dist_cache[2] = dec_count
+            dist_cache[1] = dist_cache[0]
+            dist_cache[2] = dist_cache[0]
         else:
             dist_cache[0] = 0
             dist_cache[1] = 0
