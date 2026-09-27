@@ -550,6 +550,7 @@ def _pallas_rpa_kernel_pcp_new(
     update_kv_cache: jax.Array,
     new_kv_page_indices: jax.Array,
     *,
+    is_decode: bool = False,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -564,7 +565,9 @@ def _pallas_rpa_kernel_pcp_new(
     import jax.numpy as jnp
 
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
-    new_kv_pages_arg = None if new_kv_page_indices.size == 0 else new_kv_page_indices
+    new_kv_pages_arg = (
+        None if is_decode or new_kv_page_indices.size == 0 else new_kv_page_indices
+    )
     output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
         queries=query,
         keys=key,
@@ -600,9 +603,9 @@ _PCP_KERNEL_INSTANCE_COUNTER = 0
 
 def _alloc_pcp_instance_id() -> int:
     global _PCP_KERNEL_INSTANCE_COUNTER
-    _id = _PCP_KERNEL_INSTANCE_COUNTER
+    i = _PCP_KERNEL_INSTANCE_COUNTER
     _PCP_KERNEL_INSTANCE_COUNTER += 1
-    return _id
+    return i
 
 
 def _build_pcp_kernel_op(
@@ -654,6 +657,7 @@ def build_pcp_kernels(
     cp_rank: int,
     use_causal_mask: bool = True,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+    is_decode: bool = False,
 ) -> tuple:
     """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops for PCP."""
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
@@ -668,6 +672,7 @@ def build_pcp_kernels(
         cp_rank,
         use_causal_mask,
         kv_layout,
+        is_decode,
     )
     cache_key = ("pcp_cache", *base_key)
     new_key = ("pcp_new", *base_key)
@@ -711,6 +716,7 @@ def build_pcp_kernels(
     if cached_new is None:
         fn = functools.partial(
             _pallas_rpa_kernel_pcp_new,
+            is_decode=is_decode,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -791,6 +797,8 @@ def forward_with_pcp(
     k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
     v_scale = layer._v_scale_float if kv_cache_quantized_dtype else None
 
+    is_decode = bool(getattr(pcp_meta, "is_decode", False))
+
     cache_kernel, new_kernel = build_pcp_kernels(
         sliding_window=sliding_window,
         sm_scale=sm_scale,
@@ -802,6 +810,7 @@ def forward_with_pcp(
         cp_rank=pcp_rank,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        is_decode=is_decode,
     )
 
     num_seqs = attn_metadata.seq_lens.shape[0]
@@ -837,8 +846,6 @@ def forward_with_pcp(
         update_kv_cache_local = pcp_update
 
     kv_new_lens = attn_metadata.seq_lens - pcp_cache_lens
-
-    is_decode = bool(getattr(pcp_meta, "is_decode", False))
 
     idx = torch.arange(
         query.shape[0], device=query.device, dtype=cu_q_lens_local.dtype

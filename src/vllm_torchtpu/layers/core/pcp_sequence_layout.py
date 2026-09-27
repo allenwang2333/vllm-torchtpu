@@ -1246,7 +1246,8 @@ def prepare_pcp_zigzag_sequence_layout(
             if 2 * num_reqs < n_off:
                 cu_q_lens_np[r, 2 * num_reqs + 1 :] = num_reqs
 
-        pcp_table_np = np.zeros((0,), dtype=np.int32)
+        max_req_pages = max(1, (s_pad // 2) // block_size)
+        pcp_table_np = np.zeros((n_off, two_p * max_req_pages), dtype=np.int32)
         max_computed = max(computed) if computed else 0
         cache_pages = max(1, (max_computed + block_size - 1) // block_size)
 
