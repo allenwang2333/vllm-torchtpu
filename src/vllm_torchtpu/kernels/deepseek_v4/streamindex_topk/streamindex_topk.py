@@ -14,6 +14,9 @@
 """TPU-Friendly StreamIndex Top-K kernel."""
 
 import functools
+import os
+
+import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -1125,6 +1128,16 @@ def streamindex_topk(
                 stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
             )
+            if (
+                os.environ.get("GLM5_TOPK_STATS")
+                and scores.shape[1] % (16 * k) == 0
+            ):
+                _topk_stats(
+                    scores,
+                    eff_row_lengths[start : start + chunk_len],
+                    chunk_topk_scores,
+                    k,
+                )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)
@@ -1439,4 +1452,48 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+    )
+
+
+_STATS_CALLS = [0]
+
+
+def _topk_stats_host(L, tot, t, vk, slice_cnt, n_rows):
+    _STATS_CALLS[0] += 1
+    if int(L) < 100_000 or _STATS_CALLS[0] % 16:
+        return
+    tot = np.asarray(tot); slice_cnt = np.asarray(slice_cnt)
+    act = np.asarray(n_rows)
+    m = act > 0
+    if not m.any():
+        return
+    tot, sc, t, vk = tot[m], slice_cnt[m], np.asarray(t)[m], np.asarray(vk)[m]
+    print(
+        "GLM5_TOPK_STATS L=%d rows=%d tot_mean=%.0f tot_p50=%.0f tot_max=%d "
+        "slice_max=%d overflow=%d/%d per_slice_max=%s per_slice_mean=%s "
+        "T_p50=%.4g vk_p50=%.4g ninf_T=%d"
+        % (int(L), int(m.sum()), tot.mean(), np.median(tot), tot.max(),
+           sc.max(), int((sc > 2048).sum()), sc.size,
+           ",".join(str(int(x)) for x in sc.max(0)),
+           ",".join(str(int(x)) for x in sc.mean(0)),
+           float(np.median(t)), float(np.median(vk)), int(np.isinf(t).sum())),
+        flush=True,
+    )
+
+
+def _topk_stats(scores_bits, row_lengths, winner_bits, k, p=16):
+    """Debug: per-row lower bound T = min over k col-mod-k groups of the group max."""
+    b, n = scores_bits.shape
+    s = lax.bitcast_convert_type(scores_bits, jnp.float32)
+    col = lax.broadcasted_iota(jnp.int32, (b, n), 1)
+    valid = col < row_lengths[:, None]
+    s = jnp.where(valid, s, -jnp.inf)
+    t = s.reshape(b, n // k, k).max(axis=1).min(axis=1)
+    ge = valid & (s >= t[:, None])
+    tot = ge.sum(axis=1)
+    slice_cnt = ge.reshape(b, p, n // p).sum(axis=2)
+    w = lax.bitcast_convert_type(winner_bits, jnp.float32)
+    vk = jnp.where(jnp.isfinite(w), w, jnp.inf).min(axis=1)
+    jax.debug.callback(
+        _topk_stats_host, row_lengths.max(), tot, t, vk, slice_cnt, row_lengths
     )
