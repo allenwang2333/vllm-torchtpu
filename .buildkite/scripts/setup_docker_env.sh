@@ -21,9 +21,11 @@ bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 TARGET="${1:-dev}"
 IMAGE_SUFFIX=""
-if [ "${TARGET}" = "omni" ] || [ "${TARGET}" = "--omni" ]; then
-  TARGET="omni"
+if [ "${TARGET}" = "omni" ]; then
   IMAGE_SUFFIX="-omni"
+elif [ "${TARGET}" != "dev" ]; then
+  echo "[FATAL] Unsupported target '${TARGET}'; expected dev or omni." >&2
+  exit 1
 fi
 
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"

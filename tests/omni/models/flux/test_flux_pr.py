@@ -2,8 +2,8 @@
 """PR CI running tests for FLUX models on TPU v7x.
 
 Fast end-to-end tests designed to run in PR CI (< 3 minutes) on TPU v7x machines.
-Covers fast inference with FLUX.1-schnell, in-code expected_slice validation,
-deterministic seed parity, and HBM memory metrics without file writes.
+Covers fast inference with FLUX.1-schnell, golden-image parity with a CPU diffusers
+reference, and deterministic seed parity, without file writes.
 """
 
 import numpy as np
@@ -18,90 +18,84 @@ pytestmark = [
 ]
 
 # ==============================================================================
-# Golden Multi-Patch Reference Constants
+# Golden reference: the same config run through diffusers on CPU, reduced to
+# what the test compares. Regenerate with diffusers 0.40.0:
 #
-# 1. Independent CPU Diffusers reference (ground truth baseline across all 3 RGB channels):
-#    Generated with Hugging Face diffusers FluxPipeline on CPU (bfloat16 + float32 VAE):
+#   import torch
+#   from diffusers import FluxPipeline
 #
-#      from diffusers import FluxPipeline
-#      pipe = FluxPipeline.from_pretrained(
-#          "black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16
-#      ).to("cpu")
-#      generator = torch.Generator(device="cpu").manual_seed(0)
-#      arr = np.array(pipe(
-#          prompt="A vibrant green leaf with glistening morning water droplets",
-#          height=512, width=512, num_inference_steps=2, guidance_scale=0.0,
-#          max_sequence_length=256, generator=generator
-#      ).images[0].convert("RGB"), dtype=np.float32) / 255.0
-#      # Slices across all 3 RGB Channels:
-#      center_patch = arr[254:257, 254:257, :]
-#      high_var_patch = arr[208:211, 272:275, :]
-#      top_right_patch = arr[126:129, 382:385, :]
-#
-#    Full reference array verified against independent CPU Diffusers golden generation.
+#   torch.set_num_threads(8)
+#   pipe = FluxPipeline.from_pretrained(
+#       "black-forest-labs/FLUX.1-schnell",
+#       revision="741f7c3ce8b383c54771c7003378a50191e9efe9",
+#       torch_dtype=torch.bfloat16,
+#   )
+#   # float32 VAE (bf16 convolutions are very slow on CPU); cast the latents.
+#   pipe.vae.to(torch.float32)
+#   decode = pipe.vae.decode
+#   pipe.vae.decode = lambda z, *args, **kwargs: decode(z.float(), *args, **kwargs)
+#   img = pipe(
+#       prompt="A vibrant green leaf with glistening morning water droplets",
+#       height=512,
+#       width=512,
+#       num_inference_steps=2,
+#       guidance_scale=0.0,
+#       max_sequence_length=512,
+#       generator=torch.Generator(device="cpu").manual_seed(0),
+#       output_type="np",
+#   ).images[0]
+#   DIFFUSERS_THUMBNAIL = _thumbnail(img).round(3)
+#   DIFFUSERS_HF_ENERGY = round(_high_freq_energy(img), 5)
 # ==============================================================================
-DIFFUSERS_PATCH_CENTER = np.array(
+DIFFUSERS_THUMBNAIL = np.array(
     [
         [
-            [0.15574795, 0.3768134, 0.20242077],
-            [0.1504466, 0.39819264, 0.22532558],
-            [0.27011064, 0.5129144, 0.32839534],
+            [0.191, 0.145, 0.151, 0.123, 0.092, 0.072, 0.070, 0.168],
+            [0.124, 0.134, 0.100, 0.069, 0.058, 0.140, 0.389, 0.321],
+            [0.061, 0.059, 0.028, 0.029, 0.230, 0.426, 0.538, 0.120],
+            [0.026, 0.081, 0.025, 0.100, 0.402, 0.503, 0.259, 0.112],
+            [0.033, 0.031, 0.015, 0.335, 0.473, 0.377, 0.099, 0.097],
+            [0.025, 0.029, 0.115, 0.419, 0.507, 0.059, 0.085, 0.075],
+            [0.015, 0.040, 0.232, 0.462, 0.149, 0.109, 0.134, 0.078],
+            [0.041, 0.062, 0.267, 0.205, 0.343, 0.449, 0.387, 0.128],
         ],
         [
-            [0.2899974, 0.51282465, 0.3368892],
-            [0.342479, 0.5875516, 0.4078709],
-            [0.30188876, 0.52430815, 0.33795026],
+            [0.421, 0.419, 0.431, 0.393, 0.316, 0.262, 0.237, 0.326],
+            [0.357, 0.361, 0.314, 0.286, 0.266, 0.348, 0.587, 0.517],
+            [0.164, 0.143, 0.101, 0.125, 0.387, 0.622, 0.676, 0.307],
+            [0.082, 0.120, 0.063, 0.151, 0.570, 0.653, 0.417, 0.293],
+            [0.098, 0.061, 0.050, 0.456, 0.639, 0.496, 0.302, 0.289],
+            [0.092, 0.070, 0.165, 0.605, 0.642, 0.165, 0.260, 0.227],
+            [0.077, 0.158, 0.400, 0.631, 0.306, 0.292, 0.288, 0.187],
+            [0.160, 0.246, 0.419, 0.333, 0.517, 0.616, 0.562, 0.253],
         ],
         [
-            [0.330875, 0.522212, 0.36439496],
-            [0.43038124, 0.64522934, 0.4697881],
-            [0.33332568, 0.54160994, 0.34145623],
+            [0.076, 0.142, 0.161, 0.090, 0.022, 0.012, 0.011, 0.012],
+            [0.121, 0.122, 0.074, 0.030, 0.015, 0.033, 0.139, 0.030],
+            [0.006, 0.008, 0.009, 0.009, 0.130, 0.071, 0.101, 0.015],
+            [0.006, 0.020, 0.007, 0.028, 0.125, 0.186, 0.053, 0.020],
+            [0.015, 0.011, 0.008, 0.119, 0.183, 0.091, 0.092, 0.051],
+            [0.014, 0.015, 0.017, 0.117, 0.093, 0.021, 0.070, 0.049],
+            [0.010, 0.050, 0.079, 0.094, 0.040, 0.023, 0.015, 0.010],
+            [0.043, 0.092, 0.064, 0.034, 0.021, 0.071, 0.043, 0.009],
         ],
-    ],
-    dtype=np.float32,
+    ]
 )
+DIFFUSERS_HF_ENERGY = 0.02016
 
-DIFFUSERS_PATCH_HIGH_VAR = np.array(
-    [
-        [
-            [0.1654473, 0.38950682, 0.06230783],
-            [0.207436, 0.4417063, 0.10256004],
-            [0.19300953, 0.44582433, 0.10666323],
-        ],
-        [
-            [0.20389146, 0.3718347, 0.09957111],
-            [0.14982936, 0.3330813, 0.05052826],
-            [0.21267194, 0.41932827, 0.11476776],
-        ],
-        [
-            [0.84121597, 0.9132941, 0.77168417],
-            [0.8301396, 0.9395311, 0.7908703],
-            [0.1881119, 0.32693827, 0.12821728],
-        ],
-    ],
-    dtype=np.float32,
-)
-
-DIFFUSERS_PATCH_TOP_RIGHT = np.array(
-    [
-        [
-            [0.2908535, 0.53607446, 0.01906031],
-            [0.2744698, 0.52060366, 0.01586527],
-            [0.25844613, 0.51278335, 0.02035528],
-        ],
-        [
-            [0.3508163, 0.5807237, 0.02017263],
-            [0.34825307, 0.5748323, 0.01465797],
-            [0.34749365, 0.5770006, 0.01684263],
-        ],
-        [
-            [0.43005502, 0.6414323, 0.03602198],
-            [0.42972776, 0.63642377, 0.02915734],
-            [0.43195513, 0.63667274, 0.02589324],
-        ],
-    ],
-    dtype=np.float32,
-)
+# Tolerances come from measurements against the reference (thumbnail MAE,
+# minimum per-channel thumbnail Pearson, high-frequency energy ratio):
+#   TPU v7x                          0.008  0.992  0.98-1.05
+#   same recipe on a different CPU   0.006  0.995  1.00
+#   max_sequence_length=256          0.073  0.623  0.97
+#   another seed                     0.167  0.060  1.40
+#   brightness +0.03                 0.030  0.992  0.98
+#   R/B channels swapped             0.085  0.581  0.98
+#   5x5 box blur                     0.008  0.992  0.18
+#   Gaussian noise, sigma 0.02       0.008  0.991  3.73
+THUMBNAIL_MAE_MAX = 0.02
+THUMBNAIL_PEARSON_MIN = 0.95
+HF_ENERGY_RATIO_RANGE = (0.8, 1.25)
 
 # ==============================================================================
 
@@ -111,13 +105,33 @@ def _extract_image(output) -> Image.Image:
     return output.images[0]
 
 
+def _thumbnail(img: np.ndarray) -> np.ndarray:
+    """Area-downsample a (512, 512, 3) image to a channel-first (3, 8, 8) grid.
+
+    Averaging 64x64 blocks removes pixel-level drift between backends but keeps
+    layout, color and brightness.
+    """
+    return img.reshape(8, 64, 8, 64, 3).mean(axis=(1, 3)).transpose(2, 0, 1)
+
+
+def _high_freq_energy(img: np.ndarray) -> float:
+    """Mean absolute Laplacian: drops with blur, rises with noise or blocking."""
+    laplacian = (
+        4 * img[1:-1, 1:-1]
+        - img[:-2, 1:-1]
+        - img[2:, 1:-1]
+        - img[1:-1, :-2]
+        - img[1:-1, 2:]
+    )
+    return float(np.abs(laplacian).mean())
+
+
 class TestFluxPrCiOnTpu:
     """Fast PR CI functional and numerical tests for FLUX on TPU v7x."""
 
     @pytest.fixture(scope="class")
-    @classmethod
-    def schnell_engine(cls):
-        """Class-scoped Omni engine fixture: loads FLUX.1-schnell once for all PR CI tests."""
+    def schnell_engine(self):
+        """Class-scoped Omni engine fixture: loads FLUX.1-schnell once per class."""
         omni = Omni(
             "black-forest-labs/FLUX.1-schnell",
             init_timeout=600,
@@ -129,9 +143,12 @@ class TestFluxPrCiOnTpu:
             omni.shutdown()
 
     def test_flux1_schnell_fast_t2i_tpu(self, schnell_engine):
-        """Test FLUX.1-schnell 2-step fast generation on TPU v7x without file writing."""
+        """Test FLUX.1-schnell 2-step fast generation on TPU v7x without file writes."""
 
-        prompt = "A photo of a majestic snow leopard perched atop a mountain peak at golden hour, 8k"
+        prompt = (
+            "A photo of a majestic snow leopard perched atop a mountain peak at "
+            "golden hour, 8k"
+        )
         sampling_params = OmniDiffusionSamplingParams(
             height=512,
             width=512,
@@ -148,10 +165,10 @@ class TestFluxPrCiOnTpu:
 
         # In-memory numerical sanity: image must not be blank / collapsed
         arr = np.array(img.convert("RGB"), dtype=np.float32)
-        assert np.all(np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
         variance = float(np.var(arr))
         assert variance > 10.0, (
-            f"Generated image has suspiciously low variance ({variance:.2f}), likely blank"
+            f"Generated image has suspiciously low variance ({variance:.2f}), "
+            "likely blank"
         )
 
     def test_flux_deterministic_seed_parity_tpu(self, schnell_engine):
@@ -198,12 +215,10 @@ class TestFluxPrCiOnTpu:
         arr3 = np.array(img3.convert("RGB"), dtype=np.float32)
 
         # Identical seeds must match exactly bitwise
-        np.testing.assert_allclose(
+        np.testing.assert_array_equal(
             arr1,
             arr2,
-            atol=0.0,
-            rtol=0.0,
-            err_msg="Identical seed 42 on TPU v7x must produce exact bitwise pixel match",
+            err_msg="Identical seed 42 on TPU v7x must produce a bitwise pixel match",
         )
 
         # Distinct seed must diverge
@@ -211,13 +226,13 @@ class TestFluxPrCiOnTpu:
             "Different seeds should produce divergent pixel values"
         )
 
-    def test_flux_golden_multi_patch_parity_tpu(self, schnell_engine):
-        """Test Golden Multi-Patch Slice Parity against independent CPU Diffusers reference.
+    def test_flux_golden_thumbnail_parity_tpu(self, schnell_engine):
+        """Compare the golden image with the independent CPU diffusers reference.
 
-        Evaluates 3 distinct 3x3 patches on Channel 0 (Red) across spatial regions:
-          1. Center patch [254:257, 254:257] (main subject attention)
-          2. High-variance patch [208:211, 272:275] (highest gradient details)
-          3. Top-right interior patch [126:129, 382:385] (off-center features)
+        The 8x8 thumbnail catches layout, color and brightness errors; the
+        high-frequency energy of the full image catches blur, noise and blocking.
+        Full-resolution pixels are not compared: with 2-step bf16 sampling,
+        single pixels differ by up to 0.83 even between CPU runs on two machines.
         """
 
         prompt = "A vibrant green leaf with glistening morning water droplets"
@@ -226,6 +241,9 @@ class TestFluxPrCiOnTpu:
             width=512,
             num_inference_steps=2,
             guidance_scale=0.0,
+            # T5 pads the prompt to this length without a mask, so it changes the
+            # image and must match the reference.
+            max_sequence_length=512,
             seed=0,
             generator_device="cpu",
         )
@@ -235,7 +253,6 @@ class TestFluxPrCiOnTpu:
         img = _extract_image(outputs[0])
         arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
 
-        assert np.all(np.isfinite(arr)), "Generated image contains NaN or Inf pixels"
         assert 0.10 < float(np.mean(arr)) < 0.35, (
             f"Suspicious image mean: {np.mean(arr):.4f}"
         )
@@ -243,28 +260,23 @@ class TestFluxPrCiOnTpu:
             f"Suspicious image variance: {np.var(arr):.4f}"
         )
 
-        # Diffusers Cross-Hardware Parity against CPU Golden Reference (Cosine Sim >= 0.90 across all 3 RGB channels)
-        patches_to_test = [
-            ("Center", arr[254:257, 254:257, :], DIFFUSERS_PATCH_CENTER),
-            ("High-Variance", arr[208:211, 272:275, :], DIFFUSERS_PATCH_HIGH_VAR),
-            ("Top-Right", arr[126:129, 382:385, :], DIFFUSERS_PATCH_TOP_RIGHT),
-        ]
+        thumb = _thumbnail(arr)
+        mae = float(np.abs(thumb - DIFFUSERS_THUMBNAIL).mean())
+        pearson = min(
+            float(np.corrcoef(thumb[c].ravel(), DIFFUSERS_THUMBNAIL[c].ravel())[0, 1])
+            for c in range(3)
+        )
+        hf_ratio = _high_freq_energy(arr) / DIFFUSERS_HF_ENERGY
+        lo, hi = HF_ENERGY_RATIO_RANGE
 
-        patch_failures = []
-        for p_name, actual, expected in patches_to_test:
-            mae = float(np.mean(np.abs(actual - expected)))
-            a_flat = actual.flatten().astype(np.float64)
-            e_flat = expected.flatten().astype(np.float64)
-            norm_prod = float(np.linalg.norm(a_flat) * np.linalg.norm(e_flat))
-            cos_sim = (
-                float(np.dot(a_flat, e_flat) / norm_prod) if norm_prod > 0 else 0.0
-            )
-
-            # Diffusers standard: Cosine similarity >= 0.90 (cosine distance <= 0.10)
-            # and mean absolute error <= 0.16 (accommodating sub-pixel edge shifts on high-contrast textures)
-            if cos_sim < 0.90 or mae > 0.16:
-                patch_failures.append(
-                    f"Patch '{p_name}' exceeded tolerance: cos_sim={cos_sim:.4f} (limit >= 0.90), MAE={mae:.4f} (limit <= 0.16)"
-                )
-
-        assert not patch_failures, "\n".join(patch_failures)
+        summary = (
+            f"thumbnail MAE={mae:.4f} (max {THUMBNAIL_MAE_MAX}), "
+            f"min channel Pearson={pearson:.4f} (min {THUMBNAIL_PEARSON_MIN}), "
+            f"high-frequency energy ratio={hf_ratio:.3f} (range {lo}-{hi})"
+        )
+        print(summary)
+        assert (
+            mae <= THUMBNAIL_MAE_MAX
+            and pearson >= THUMBNAIL_PEARSON_MIN
+            and lo <= hf_ratio <= hi
+        ), f"TPU image diverged from the CPU diffusers reference: {summary}"

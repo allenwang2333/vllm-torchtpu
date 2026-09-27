@@ -3,7 +3,7 @@
 
 Focused integration and numerical correctness tests for nightly builds (~5 minutes).
 Focuses on accuracy of common paths: tri-model matrix validation (FLUX.1-schnell,
-FLUX.1-dev, FLUX.2-klein-4B) with distribution metric signatures and RoPE sequence length alignment.
+FLUX.1-dev, FLUX.2-klein-4B) with pixel-statistics sanity checks.
 All tests run in-memory without PNG writes.
 """
 
@@ -30,10 +30,7 @@ def compute_distribution_metrics(img: Image.Image) -> dict[str, float]:
     arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
     return {
         "mean": float(np.mean(arr)),
-        "std": float(np.std(arr)),
-        "energy": float(np.mean(np.square(arr))),
         "p10": float(np.percentile(arr, 10)),
-        "p50": float(np.percentile(arr, 50)),
         "p90": float(np.percentile(arr, 90)),
         "var": float(np.var(arr)),
     }
@@ -53,12 +50,14 @@ class TestFluxNightlyOnTpu:
     def test_flux_tri_model_matrix_tpu(
         self, model_id: str, steps: int, guidance: float
     ):
-        """Validate common path execution across all three FLUX model variants on TPU v7x.
+        """Validate common path execution across the three FLUX variants on TPU v7x.
 
-        Covers distilled guidance-free Schnell, full 10-step CFG guidance Dev with distribution
-        metric signatures, and Klein-4B with RoPE sequence length alignment.
+        Covers distilled guidance-free Schnell, 10-step guided Dev, and Klein-4B.
         """
-        prompt = "A futuristic glowing crystal monolith in a misty desert at night, neon reflections"
+        prompt = (
+            "A futuristic glowing crystal monolith in a misty desert at night, "
+            "neon reflections"
+        )
 
         omni = Omni(model_id, init_timeout=600, stage_init_timeout=600)
         try:
@@ -80,9 +79,6 @@ class TestFluxNightlyOnTpu:
             metrics = compute_distribution_metrics(img)
             assert 0.10 < metrics["mean"] < 0.90, (
                 f"Unnatural pixel mean on {model_id}: {metrics['mean']:.4f}"
-            )
-            assert metrics["std"] > 0.05, (
-                f"Suspiciously low image contrast on {model_id} (std={metrics['std']:.4f})"
             )
             assert metrics["var"] > 0.01, (
                 f"Image variance too low on {model_id} ({metrics['var']:.4f})"

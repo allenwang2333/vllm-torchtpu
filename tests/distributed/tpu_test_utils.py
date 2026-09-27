@@ -3,7 +3,6 @@
 
 import functools
 import multiprocessing
-import os
 import queue
 import traceback
 from collections.abc import Callable
@@ -12,35 +11,30 @@ from typing import Any
 import pytest
 
 
-def _isolated_test_worker(
-    target: Callable[..., Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result_queue: Any,
-) -> None:
-    os.environ["VLLM_ISOLATED_PROCESS"] = "1"
+def _isolated_test_worker(target: Callable[[], None], result_queue: Any) -> None:
     try:
-        target(*args, **kwargs)
+        target()
     except pytest.skip.Exception as exc:
         result_queue.put(("SKIP", str(exc)))
-    except BaseException:  # noqa: BLE001
+    except BaseException:
         result_queue.put(("ERROR", traceback.format_exc()))
     else:
         result_queue.put(("OK", None))
 
 
-def _run_isolated(
-    target: Callable[..., Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    *,
-    timeout: float = 600,
+def run_in_isolated_process(
+    target: Callable[..., None], *args: Any, timeout: float = 600, **kwargs: Any
 ) -> None:
+    """Run a TPU test in a spawned process and propagate its result.
+
+    PJRT keeps TPU device handles alive for the lifetime of its process. Running
+    device tests in a child prevents those handles from blocking later tests
+    that start their own engine processes. ``timeout`` is not passed to ``target``.
+    """
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    process = ctx.Process(
-        target=_isolated_test_worker, args=(target, args, kwargs, result_queue)
-    )
+    call = functools.partial(target, *args, **kwargs)
+    process = ctx.Process(target=_isolated_test_worker, args=(call, result_queue))
     try:
         process.start()
         process.join(timeout)
@@ -64,39 +58,3 @@ def _run_isolated(
         raise AssertionError(f"Isolated TPU test failed:\n{payload}")
     if process.exitcode != 0:
         raise AssertionError(f"Isolated TPU test crashed (exitcode={process.exitcode})")
-
-
-def run_in_isolated_process(
-    target: Callable[..., Any] | None = None,
-    *args: Any,
-    timeout: float = 600,
-    **kwargs: Any,
-) -> Any:
-    """Run a TPU test in a spawned process and propagate its result.
-
-    Can be invoked directly:
-        run_in_isolated_process(func, *args, timeout=60, **kwargs)
-
-    Or used as a decorator on a test function/method:
-        @run_in_isolated_process(timeout=60)
-        def test_something(self): ...
-    """
-    if target is None:
-
-        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-            @functools.wraps(func)
-            def wrapper(*w_args: Any, **w_kwargs: Any) -> None:
-                if os.environ.get("VLLM_ISOLATED_PROCESS") == "1":
-                    func(*w_args, **w_kwargs)
-                    return
-                _run_isolated(func, w_args, w_kwargs, timeout=timeout)
-
-            return wrapper
-
-        return decorator
-
-    if os.environ.get("VLLM_ISOLATED_PROCESS") == "1":
-        target(*args, **kwargs)
-        return
-
-    _run_isolated(target, args, kwargs, timeout=timeout)

@@ -198,7 +198,12 @@ def test_safe_pack_tensor_if_large():
     assert res["device"] == "cpu"
 
 
-def test_omni_tpu_patches_configuration():
-    apply_omni_tpu_patches.cache_clear()
-    apply_omni_tpu_patches()
-    assert os.environ.get("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT") == "1800.0"
+def test_omni_tpu_patches_configuration(monkeypatch):
+    # Call the undecorated body so the run-once cache is left alone, and
+    # restore the process-global state it edits (env var, F.interpolate).
+    orig_interpolate = torch.nn.functional.interpolate
+    monkeypatch.setattr(torch.nn.functional, "interpolate", orig_interpolate)
+    with patch.dict(os.environ):
+        os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
+        apply_omni_tpu_patches.__wrapped__()
+        assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
