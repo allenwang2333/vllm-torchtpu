@@ -2611,12 +2611,26 @@ class TPUModelRunner(GPUModelRunner):
         # requests have zero length instead of a negative q_len.
         self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[
-                start_index : start_index + num_reqs
-            ]
-            + num_scheduled_tokens_per_req
+        is_zigzag_pcp = self._pcp_enabled and (
+            (getattr(self.vllm_config.model_config, "is_hybrid_mamba_model", False))
+            or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag")
         )
+        if is_zigzag_pcp:
+            for i in range(num_reqs):
+                total_len = (
+                    self.input_batch.num_computed_tokens_cpu[start_index + i]
+                    + num_scheduled_tokens_per_req[i]
+                )
+                self.seq_lens_np[2 * i] = total_len
+                self.seq_lens_np[2 * i + 1] = total_len
+            self.seq_lens_np[2 * num_reqs :] = 0
+        else:
+            self.seq_lens_np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[
+                    start_index : start_index + num_reqs
+                ]
+                + num_scheduled_tokens_per_req
+            )
         self._check_attention_schedule(
             num_reqs,
             num_scheduled_tokens_per_req,

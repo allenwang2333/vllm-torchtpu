@@ -176,7 +176,6 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
         q_end=q_end,
         q_src=q_src,
         q_sz_task=q_sz_task,
-        q_position=q_position,
         kv_cache_len=kv_cache_len,
         kv_new_len=kv_new_len,
         kv_new_start=kv_new_start,
@@ -203,7 +202,6 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
       kv_new_len,
       end_k_idx,
       update_kv_cache,
-      q_position=0,
       kv_new_start=0,
       num_k=0,
       num_q=0,
@@ -351,10 +349,10 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
           ) + i * cfgs.serve.page_size
           fetch_vmem = (cache_pages + i) * cfgs.serve.page_size
 
-          tok_idx = q_position + (dst_vmem - bkv_sz_cache)
+          tok_idx = kv_len_start + dst_vmem
           p_idx = jnp.minimum(
               tok_idx >> cfgs.serve.page_size_log2,
-              cfgs.serve.pages_per_seq - 1,
+              cfgs.serve.pages_per_seq * cp_group_size - 1,
           )
           p_off = tok_idx & cfgs.serve.page_size_mask
           dst, lead, wb_val = utils.align_span(
@@ -363,13 +361,15 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
           dma_entry.fetch_hbm[...] = new_page_start
           dma_entry.fetch_vmem[...] = fetch_vmem
           dma_entry.wb_hbm[...] = (
-              (s_idx * cfgs.serve.pages_per_seq + p_idx)
+              (s_idx * cfgs.serve.pages_per_seq + p_idx // cp_group_size)
               << cfgs.serve.page_size_log2
           ) | dst
           dma_entry.wb_vmem[...] = dst_vmem - lead
           dma_entry.set_flags(
               fetch_val,
-              jnp.where(dma_sz > 0, wb_val, 0),
+              jnp.where(
+                  (dma_sz > 0) & (p_idx % cp_group_size == self.rank), wb_val, 0
+              ),
           )
         else:
           align = cfgs.kv_token_align
@@ -405,36 +405,28 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
               ),
           )
       else:
+        tok_idx = kv_len_start + dst_vmem
+        p_idx = jnp.minimum(
+            tok_idx >> cfgs.serve.page_size_log2,
+            cfgs.serve.pages_per_seq * cp_group_size - 1,
+        )
+        p_off = tok_idx & cfgs.serve.page_size_mask
+        local_slot = p_idx // cp_group_size
+        dst_hbm = (
+            (s_idx * cfgs.serve.pages_per_seq + local_slot)
+            << cfgs.serve.page_size_log2
+        ) | p_off
+        wb_val = jnp.where(
+            p_idx % cp_group_size == self.rank, dma_sz, jnp.int32(0)
+        )
+
+        fetch_hbm = src_hbm
         if cfgs.serve.paged_new_kv:
-          tok_idx = q_position + (dst_vmem - bkv_sz_cache)
-          p_idx = jnp.minimum(
-              tok_idx >> cfgs.serve.page_size_log2,
-              cfgs.serve.pages_per_seq - 1,
-          )
-          p_off = tok_idx & cfgs.serve.page_size_mask
-          dst_hbm = (
-              (s_idx * cfgs.serve.pages_per_seq + p_idx)
-              << cfgs.serve.page_size_log2
-          ) | p_off
-          wb_val = dma_sz
+          # With a page table the new KV is not contiguous, so
+          # store the offset within the sequence's own new KV and let
+          # copy_in resolve it.
           offset = dst_vmem - bkv_sz_cache
           fetch_hbm = new_kv_pos + offset
-        else:
-          tok_idx = kv_len_start + dst_vmem
-          p_idx = jnp.minimum(
-              tok_idx >> cfgs.serve.page_size_log2,
-              cfgs.serve.pages_per_seq * cp_group_size - 1,
-          )
-          p_off = tok_idx & cfgs.serve.page_size_mask
-          local_slot = p_idx // cp_group_size
-          dst_hbm = (
-              (s_idx * cfgs.serve.pages_per_seq + local_slot)
-              << cfgs.serve.page_size_log2
-          ) | p_off
-          wb_val = jnp.where(
-              p_idx % cp_group_size == self.rank, dma_sz, jnp.int32(0)
-          )
-          fetch_hbm = src_hbm
         dma_entry.fetch_hbm[...] = fetch_hbm
         dma_entry.fetch_vmem[...] = dst_vmem
         dma_entry.wb_hbm[...] = dst_hbm
