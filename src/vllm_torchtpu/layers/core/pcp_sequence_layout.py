@@ -286,18 +286,25 @@ class PcpSequenceLayoutEligibility:
         max_num_tokens: int | None,
         dp_target_bucket: int | None,
     ) -> PcpSequenceLayoutDecision:
-        if all(span.scheduled_tokens == 1 and span.computed_tokens > 0 for span in spans):
-            return PcpSequenceLayoutDecision(
-                mode=PcpSequenceLayoutMode.DISABLED,
-                spans=spans,
-                pcp_size=self.pcp_size,
-                interleave_size=self.interleave_size,
+        has_decode = any(
+            span.scheduled_tokens == 1 and span.computed_tokens > 0
+            for span in spans
+        )
+        has_prefill = any(
+            span.scheduled_tokens > 1 or span.computed_tokens == 0
+            for span in spans
+        )
+        if has_decode and has_prefill:
+            raise NotImplementedError(
+                "PCP batched RPA zigzag layout does not support mixed decode and prefill batches."
             )
 
         q_lens = [span.scheduled_tokens for span in spans]
         two_p = 2 * self.pcp_size
         pcp_quantum = two_p * self.block_size
-        chunk, off, s_live = pcp_zigzag_token_layout(q_lens, self.pcp_size)
+        chunk, off, s_live = pcp_zigzag_token_layout(
+            q_lens, self.pcp_size, self.block_size
+        )
         global_required_tokens = s_live * self.pcp_size
 
         local_padded_tokens = None
@@ -893,20 +900,22 @@ def prepare_pcp_sequence_layout(
 def pcp_zigzag_token_layout(
     num_scheduled_tokens: list[int] | np.ndarray,
     pcp_size: int,
+    block_size: int = 16,
 ) -> tuple[list[int], list[int], int]:
     """Per-request zigzag chunking for multi-request PCP.
 
     Each request is split into 2 * pcp_size chunks.
     Rank r owns chunk r (head) and chunk 2P - 1 - r (tail).
     Returns (chunk, off, s_live):
-      chunk[i]: chunk size of request i, ceil(n_i / (2 * P))
+      chunk[i]: chunk size of request i, multiple of block_size
       off[i]: start offset of request i's slot within one rank's region
       s_live: live tokens per rank; the global buffer needs pcp_size * s_live rows
     """
     two_p = 2 * pcp_size
+    quantum = two_p * block_size
     off, acc, chunk = [], 0, []
     for n in num_scheduled_tokens:
-        c = int(np.ceil(int(n) / two_p))
+        c = max(block_size, int(np.ceil(int(n) / quantum)) * block_size)
         chunk.append(c)
         off.append(acc)
         acc += 2 * c
@@ -1080,12 +1089,13 @@ def prepare_pcp_zigzag_sequence_layout(
     assert padded_total_num_tokens is not None
     s_pad = padded_total_num_tokens // pcp_size
 
+    block_size = getattr(runner, "block_size", 16)
     if num_reqs == 1:
         pcp_chunk_size = padded_total_num_tokens // two_p
         chunk = [pcp_chunk_size]
         off = [0]
     else:
-        chunk, off, _ = pcp_zigzag_token_layout(counts, pcp_size)
+        chunk, off, _ = pcp_zigzag_token_layout(counts, pcp_size, block_size)
 
     _ensure_host_token_buffer_capacity(runner, padded_total_num_tokens)
 

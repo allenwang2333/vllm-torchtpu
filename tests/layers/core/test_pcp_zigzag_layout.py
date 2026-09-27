@@ -65,12 +65,14 @@ def test_pcp_zigzag_token_layout_single_request():
 def test_pcp_zigzag_token_layout_multi_request():
     pcp_size = 4
     counts = [200, 300]
-    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size)
+    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size, block_size=16)
 
-    # two_p = 8. ceil(200 / 8) = 25. ceil(300 / 8) = 38.
-    assert chunk == [25, 38]
-    assert off == [0, 50]
-    assert s_live == 126
+    # two_p = 8, quantum = 128.
+    # req 0: ceil(200 / 128) * 16 = 32
+    # req 1: ceil(300 / 128) * 16 = 48
+    assert chunk == [32, 48]
+    assert off == [0, 64]
+    assert s_live == 160
 
 
 def test_pcp_zigzag_seq_arrays():
@@ -216,3 +218,61 @@ def test_pcp_zigzag_planner_prepare_dummy():
     assert plan.pcp_metadata is not None
     assert plan.pcp_metadata.cache_pages == 0
     assert plan.pcp_metadata.query_start_loc.shape[0] == 2
+
+
+def test_pcp_zigzag_decode_single_request():
+    eligibility = PcpSequenceLayoutEligibility(
+        pcp_size=4,
+        interleave_size=16,
+        is_zigzag=True,
+        block_size=16,
+    )
+    decision = eligibility.evaluate_runner_chunk(
+        input_batch=_input_batch(computed=[256], prompt=[256]),
+        scheduler_output=_scheduler_output([1]),
+        start_index=0,
+        num_reqs=1,
+        num_scheduled_tokens_per_req=np.array([1], dtype=np.int32),
+        num_tokens_paddings=[128, 256, 512],
+        max_num_tokens=512,
+    )
+    assert decision.mode is PcpSequenceLayoutMode.ZIGZAG
+    assert decision.local_required_tokens == 32
+
+
+def test_pcp_zigzag_decode_multi_request():
+    eligibility = PcpSequenceLayoutEligibility(
+        pcp_size=4,
+        interleave_size=16,
+        is_zigzag=True,
+        block_size=16,
+    )
+    decision = eligibility.evaluate_runner_chunk(
+        input_batch=_input_batch(computed=[256, 512], prompt=[256, 512]),
+        scheduler_output=_scheduler_output([1, 1]),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.array([1, 1], dtype=np.int32),
+        num_tokens_paddings=[128, 256, 512],
+        max_num_tokens=512,
+    )
+    assert decision.mode is PcpSequenceLayoutMode.ZIGZAG
+
+
+def test_pcp_zigzag_rejects_mixed_decode_prefill():
+    eligibility = PcpSequenceLayoutEligibility(
+        pcp_size=4,
+        interleave_size=16,
+        is_zigzag=True,
+        block_size=16,
+    )
+    with pytest.raises(NotImplementedError, match="mixed decode and prefill"):
+        eligibility.evaluate_runner_chunk(
+            input_batch=_input_batch(computed=[256, 0], prompt=[256, 256]),
+            scheduler_output=_scheduler_output([1, 256]),
+            start_index=0,
+            num_reqs=2,
+            num_scheduled_tokens_per_req=np.array([1, 256], dtype=np.int32),
+            num_tokens_paddings=[128, 256, 512],
+            max_num_tokens=512,
+        )
