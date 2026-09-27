@@ -105,16 +105,12 @@ def resolve_pcp_zigzag_page_size(
     On hybrid models with a unified KV block pool, `cache_config.block_size` is
     sized to fit the Mamba state (e.g. 640 or 4096), while `prepare_kernel_block_sizes`
     splits each manager block into attention kernel pages of size 256 or 128.
+    In all cases, the returned page size must exactly match the attention KV cache
+    page size (kv_cache.shape[1]).
     """
     if kernel_block_size is not None and kernel_block_size > 0:
         return int(kernel_block_size)
-    block_size = int(block_size)
-    if block_size > 256:
-        if block_size % 256 == 0:
-            return 256
-        if block_size % 128 == 0:
-            return 128
-    return block_size
+    return int(block_size)
 
 
 class PcpSequenceLayoutEligibility:
@@ -323,11 +319,14 @@ class PcpSequenceLayoutEligibility:
                 "PCP batched RPA zigzag layout does not support mixed decode and prefill batches."
             )
 
-        q_lens = [span.scheduled_tokens for span in spans]
         local_quantum = 2 * self.block_size
-        chunk, off, s_live = pcp_zigzag_token_layout(
-            q_lens, self.pcp_size, self.block_size
-        )
+        if has_decode:
+            s_live = len(spans)
+        else:
+            q_lens = [span.scheduled_tokens for span in spans]
+            chunk, off, s_live = pcp_zigzag_token_layout(
+                q_lens, self.pcp_size, self.block_size
+            )
         global_required_tokens = s_live * self.pcp_size
 
         local_padded_tokens = None
@@ -443,10 +442,10 @@ class PcpPreparedBatch:
     local_total_num_scheduled_tokens: int
     local_padded_total_num_scheduled_tokens: int
     logits_indices_cpu: torch.Tensor
-    logits_local_indices_cpu: torch.Tensor
-    logits_owner_mask_cpu: torch.Tensor
     packed_to_request_major_token_indices: np.ndarray
     request_major_to_packed_token_indices: np.ndarray
+    logits_local_indices_cpu: torch.Tensor | None = None
+    logits_owner_mask_cpu: torch.Tensor | None = None
     pcp_metadata: Any | None = None
 
 
@@ -662,9 +661,37 @@ class PcpSequenceLayoutPlanner:
             hidden_states.device, non_blocking=True
         )
         selected = torch.index_select(hidden_states, 0, local_indices)
+        is_owner = bool(plan.logits_owner_mask_cpu.any().item())
+        try:
+            rank = _get_native_pcp_rank()
+            n_tokens = hidden_states.shape[0]
+            # Log first token, last real token (e.g. 117), and padding tokens
+            hs_0_nan = bool(torch.isnan(hidden_states[0]).any().item()) if n_tokens > 0 else None
+            hs_0_max = float(hidden_states[0].max().item()) if n_tokens > 0 else 0.0
+            last_idx = int(local_indices[0].item()) if local_indices.numel() > 0 else 0
+            hs_last_nan = bool(torch.isnan(hidden_states[last_idx]).any().item()) if n_tokens > last_idx else None
+            hs_last_max = float(hidden_states[last_idx].max().item()) if n_tokens > last_idx else 0.0
+            sel_nan = bool(torch.isnan(selected).any().item())
+            sel_max = float(selected.max().item())
+            logger.info(
+                "[PCP_HS_TRACE] rank=%d is_owner=%s last_idx=%d hs_shape=%s hs0_nan=%s hs0_max=%.4f hslast_nan=%s hslast_max=%.4f sel_nan=%s sel_max=%.4f",
+                rank,
+                is_owner,
+                last_idx,
+                list(hidden_states.shape),
+                hs_0_nan,
+                hs_0_max,
+                hs_last_nan,
+                hs_last_max,
+                sel_nan,
+                sel_max,
+            )
+        except Exception as e:
+            logger.warning("[PCP_HS_TRACE] logging error: %s", e)
         selected = torch.where(
             owner_mask.unsqueeze(1), selected, torch.zeros_like(selected)
         )
+        selected = torch.nan_to_num(selected, nan=0.0, posinf=0.0, neginf=0.0)
         return _pcp_all_reduce_sum(selected)
 
 
@@ -972,15 +999,24 @@ def pcp_zigzag_seq_arrays(
         for i in range(n_reqs):
             c_i = chunk[i]
             o_i = off[i]
+            head_off = r * c_i
+            head_real = int(np.clip(counts[i] - head_off, 0, c_i))
             tail_off = (two_p - 1 - r) * c_i
             tail_real = int(np.clip(counts[i] - tail_off, 0, c_i))
-            cu_q_lens[r, 2 * i + 1] = o_i + c_i
-            cu_q_lens[r, 2 * i + 2] = o_i + c_i + (
-                tail_real if i == n_reqs - 1 else c_i
-            )
-            q_pos_offsets[r, 2 * i] = r * c_i
+
+            cu_q_lens[r, 2 * i] = o_i
+            if head_real < c_i:
+                cu_q_lens[r, 2 * i + 1] = o_i + head_real
+                cu_q_lens[r, 2 * i + 2] = o_i + head_real
+            else:
+                cu_q_lens[r, 2 * i + 1] = o_i + c_i
+                cu_q_lens[r, 2 * i + 2] = o_i + c_i + tail_real
+
+            q_pos_offsets[r, 2 * i] = head_off
             q_pos_offsets[r, 2 * i + 1] = tail_off
-            pcp_write_flags[r, 2 * i + (1 if tail_real > 0 else 0)] = True
+
+            pcp_write_flags[r, 2 * i] = (head_real > 0)
+            pcp_write_flags[r, 2 * i + 1] = (tail_real > 0)
 
         if 2 * n_reqs < n_off:
             cu_q_lens[r, 2 * n_reqs + 1 :] = cu_q_lens[r, 2 * n_reqs]
@@ -995,6 +1031,7 @@ def pcp_zigzag_page_table(
     n_off: int,
     off: list[int] | None = None,
     s_pad: int | None = None,
+    counts: list[int] | None = None,
 ) -> np.ndarray:
     """Page table for the all-gathered current KV under zigzag sharding."""
     two_p = 2 * pcp_size
@@ -1130,72 +1167,18 @@ def prepare_pcp_zigzag_sequence_layout(
         getattr(runner, "block_size", 16),
         getattr(runner, "_attention_kernel_block_size", None),
     )
-    if num_reqs == 1:
-        pcp_chunk_size = padded_total_num_tokens // two_p
-        chunk = [pcp_chunk_size]
-        off = [0]
-    else:
-        chunk, off, _ = pcp_zigzag_token_layout(counts, pcp_size, block_size)
+
+    is_decode = any(
+        span.scheduled_tokens == 1 and span.computed_tokens > 0
+        for span in decision.spans
+    )
 
     _ensure_host_token_buffer_capacity(runner, padded_total_num_tokens)
-
-    mrope_np = None
-    if runner.uses_mrope:
-        mrope_np = runner.mrope_positions.cpu[:, :padded_total_num_tokens].numpy()
-
-    input_ids_np = runner.input_ids_cpu[:padded_total_num_tokens].numpy()
-    positions_np = runner.positions_np[:padded_total_num_tokens]
-
-    request_major_to_packed, packed_to_request_major = apply_pcp_zigzag_token_order(
-        input_ids_np,
-        positions_np,
-        counts,
-        chunk,
-        off,
-        pcp_size,
-        padded_total_num_tokens,
-        mrope_positions=mrope_np,
-    )
-
-    local_start = pcp_rank * s_pad
-    local_end = local_start + s_pad
-    local_token_slice = slice(local_start, local_end)
-    local_total_tokens = (
-        int(decision.local_token_counts[pcp_rank])
-        if decision.local_token_counts is not None
-        else s_pad
-    )
-
-    logits_indices_cpu = torch.full(
-        (padded_num_reqs,), -1, dtype=torch.int32, device="cpu"
-    )
-    logits_local_indices_cpu = torch.zeros(
-        (padded_num_reqs,), dtype=torch.int32, device="cpu"
-    )
-    logits_owner_mask_cpu = torch.zeros(
-        (padded_num_reqs,), dtype=torch.bool, device="cpu"
-    )
-    for i in range(num_reqs):
-        last = counts[i] - 1
-        c_idx = last // chunk[i]
-        owner_rank = c_idx if c_idx < pcp_size else two_p - 1 - c_idx
-        h = 0 if c_idx < pcp_size else 1
-        g_slot = owner_rank * s_pad + off[i] + h * chunk[i] + (last % chunk[i])
-        logits_indices_cpu[i] = int(g_slot)
-        if owner_rank == pcp_rank:
-            local_offset = off[i] + h * chunk[i] + (last % chunk[i])
-            logits_local_indices_cpu[i] = int(local_offset)
-            logits_owner_mask_cpu[i] = True
 
     from vllm_torchtpu.layers.core.attention_metadata import PCPMetadata
 
     n_off = max(target_num_reqs, 2 * num_reqs)
-    cu_q_lens_np, q_pos_offsets_np, pcp_write_np = pcp_zigzag_seq_arrays(
-        chunk, off, pcp_size, n_off, counts
-    )
-    pcp_table_np = pcp_zigzag_page_table(
-        chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad
-    )
+    dev = runner.device
 
     computed = [
         int(runner.input_batch.num_computed_tokens_cpu[start_index + i])
@@ -1206,26 +1189,153 @@ def prepare_pcp_zigzag_sequence_layout(
         kv_cache_lens_np[2 * i] = computed[i]
         kv_cache_lens_np[2 * i + 1] = computed[i]
 
-    max_computed = max(computed) if computed else 0
-    cache_pages = 1 if max_computed > 0 else 0
+    logits_indices_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.int32, device="cpu"
+    )
+    logits_local_indices_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.int32, device="cpu"
+    )
+    logits_owner_mask_cpu = torch.zeros(
+        (padded_num_reqs,), dtype=torch.bool, device="cpu"
+    )
 
-    gdn_rm_to_packed_np = np.where(
-        request_major_to_packed >= 0, request_major_to_packed, 0
-    ).astype(np.int32)
-    local_packed_to_rm = packed_to_request_major[local_start:local_end]
-    gdn_packed_to_local_np = np.where(
-        local_packed_to_rm >= 0, local_packed_to_rm, 0
-    ).astype(np.int32)
-    gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
-    acc_q = 0
-    for i in range(num_reqs):
-        acc_q += counts[i]
-        gdn_qsl_np[2 * i + 1] = acc_q
-        gdn_qsl_np[2 * i + 2] = acc_q
-    if 2 * num_reqs < n_off:
-        gdn_qsl_np[2 * num_reqs + 1 :] = acc_q
+    if is_decode:
+        local_start = 0
+        local_end = s_pad
+        local_token_slice = slice(local_start, local_end)
+        local_total_tokens = num_reqs
 
-    dev = runner.device
+        request_major_to_packed = np.arange(padded_total_num_tokens, dtype=np.int64)
+        packed_to_request_major = np.arange(padded_total_num_tokens, dtype=np.int64)
+
+        for i in range(num_reqs):
+            logits_indices_cpu[i] = i
+            logits_local_indices_cpu[i] = i
+            logits_owner_mask_cpu[i] = (pcp_rank == 0)
+        if num_reqs < padded_num_reqs:
+            logits_indices_cpu[num_reqs:] = (
+                logits_indices_cpu[num_reqs - 1] if num_reqs > 0 else 0
+            )
+            logits_local_indices_cpu[num_reqs:] = 0
+            logits_owner_mask_cpu[num_reqs:] = False
+
+        cu_q_lens_np = np.zeros((pcp_size, n_off + 1), dtype=np.int32)
+        q_pos_offsets_np = np.zeros((pcp_size, n_off), dtype=np.int32)
+        pcp_write_np = np.zeros((pcp_size, n_off), dtype=bool)
+
+        for r in range(pcp_size):
+            for i in range(num_reqs):
+                cu_q_lens_np[r, 2 * i] = i
+                cu_q_lens_np[r, 2 * i + 1] = i + 1
+                cu_q_lens_np[r, 2 * i + 2] = i + 1
+                q_pos_offsets_np[r, 2 * i] = 0
+                q_pos_offsets_np[r, 2 * i + 1] = 0
+                pcp_write_np[r, 2 * i] = True
+                pcp_write_np[r, 2 * i + 1] = False
+            if 2 * num_reqs < n_off:
+                cu_q_lens_np[r, 2 * num_reqs + 1 :] = num_reqs
+
+        max_req_pages = max(1, (s_pad // 2) // block_size)
+        pcp_table_np = np.zeros((n_off, two_p * max_req_pages), dtype=np.int32)
+        for i in range(num_reqs):
+            pcp_table_np[2 * i, :] = i // block_size
+            pcp_table_np[2 * i + 1, :] = i // block_size
+
+        cache_pages = 1
+
+        gdn_rm_to_packed_np = np.arange(padded_total_num_tokens, dtype=np.int32)
+        gdn_packed_to_local_np = np.arange(s_pad, dtype=np.int32)
+        gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
+        for i in range(num_reqs):
+            gdn_qsl_np[2 * i + 1] = i + 1
+            gdn_qsl_np[2 * i + 2] = i + 1
+        if 2 * num_reqs < n_off:
+            gdn_qsl_np[2 * num_reqs + 1 :] = num_reqs
+
+        runner._request_distribution_cpu[0] = 2 * num_reqs
+        runner._request_distribution_cpu[1] = 2 * num_reqs
+        runner._request_distribution_cpu[2] = 2 * num_reqs
+    else:
+        chunk, off, _ = pcp_zigzag_token_layout(counts, pcp_size, block_size)
+
+        mrope_np = None
+        if runner.uses_mrope:
+            mrope_np = runner.mrope_positions.cpu[:, :padded_total_num_tokens].numpy()
+
+        input_ids_np = runner.input_ids_cpu[:padded_total_num_tokens].numpy()
+        positions_np = runner.positions_np[:padded_total_num_tokens]
+
+        request_major_to_packed, packed_to_request_major = apply_pcp_zigzag_token_order(
+            input_ids_np,
+            positions_np,
+            counts,
+            chunk,
+            off,
+            pcp_size,
+            padded_total_num_tokens,
+            mrope_positions=mrope_np,
+        )
+
+        local_start = pcp_rank * s_pad
+        local_end = local_start + s_pad
+        local_token_slice = slice(local_start, local_end)
+        local_total_tokens = (
+            int(decision.local_token_counts[pcp_rank])
+            if decision.local_token_counts is not None
+            else s_pad
+        )
+
+        for i in range(num_reqs):
+            last = counts[i] - 1
+            c_idx = last // chunk[i]
+            owner_rank = c_idx if c_idx < pcp_size else two_p - 1 - c_idx
+            h = 0 if c_idx < pcp_size else 1
+            local_offset = off[i] + h * chunk[i] + (last % chunk[i])
+            g_slot = owner_rank * s_pad + local_offset
+            logits_indices_cpu[i] = int(g_slot)
+            if owner_rank == pcp_rank:
+                logits_local_indices_cpu[i] = int(local_offset)
+                logits_owner_mask_cpu[i] = True
+            else:
+                logits_local_indices_cpu[i] = 0
+                logits_owner_mask_cpu[i] = False
+        if num_reqs < padded_num_reqs:
+            logits_indices_cpu[num_reqs:] = (
+                logits_indices_cpu[num_reqs - 1] if num_reqs > 0 else 0
+            )
+            logits_local_indices_cpu[num_reqs:] = 0
+            logits_owner_mask_cpu[num_reqs:] = False
+
+        cu_q_lens_np, q_pos_offsets_np, pcp_write_np = pcp_zigzag_seq_arrays(
+            chunk, off, pcp_size, n_off, counts
+        )
+        pcp_table_np = pcp_zigzag_page_table(
+            chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad, counts=counts
+        )
+
+        max_computed = max(computed) if computed else 0
+        cache_pages = 1 if max_computed > 0 else 0
+
+        gdn_rm_to_packed_np = np.where(
+            request_major_to_packed >= 0, request_major_to_packed, 0
+        ).astype(np.int32)
+        local_packed_to_rm = packed_to_request_major[local_start:local_end]
+        gdn_packed_to_local_np = np.where(
+            local_packed_to_rm >= 0, local_packed_to_rm, 0
+        ).astype(np.int32)
+        gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
+        acc_q = 0
+        for i in range(num_reqs):
+            acc_q += counts[i]
+            gdn_qsl_np[2 * i + 1] = acc_q
+            gdn_qsl_np[2 * i + 2] = acc_q
+        if 2 * num_reqs < n_off:
+            gdn_qsl_np[2 * num_reqs + 1 :] = acc_q
+
+        runner._request_distribution_cpu[0] = 0
+        runner._request_distribution_cpu[1] = 0
+        runner._request_distribution_cpu[2] = 2 * num_reqs
+
     pcp_metadata = PCPMetadata(
         query_start_loc=torch.from_numpy(cu_q_lens_np).to(dev, non_blocking=True),
         kv_cache_lens=torch.from_numpy(kv_cache_lens_np).to(dev, non_blocking=True),
@@ -1251,9 +1361,6 @@ def prepare_pcp_zigzag_sequence_layout(
     runner.seq_lens_cpu[2 * num_reqs :] = 0
 
     runner.query_start_loc_cpu[: n_off + 1] = torch.from_numpy(cu_q_lens_np[pcp_rank])
-    runner._request_distribution_cpu[0] = 0
-    runner._request_distribution_cpu[1] = 0
-    runner._request_distribution_cpu[2] = 2 * num_reqs
 
     return PcpPreparedBatch(
         local_token_slice=local_token_slice,

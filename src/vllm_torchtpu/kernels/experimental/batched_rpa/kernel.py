@@ -83,14 +83,16 @@ def calculate_and_store_out(
 
   def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
     batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
+    safe_l = jnp.where(batch_l == 0.0, 1.0, batch_l)
 
     if (
         cfgs.serve.dtype_out == jnp.float32
         or cfgs.serve.dtype_out == batch_l.dtype == jnp.bfloat16
     ):
-      result = lax.div(batch_acc, batch_l)
+      result = lax.div(batch_acc, safe_l)
     else:
-      result = batch_acc * pl.reciprocal(batch_l, approx=True)
+      result = batch_acc * pl.reciprocal(safe_l, approx=True)
+    result = jnp.where(batch_l == 0.0, 0.0, result)
     out = result.astype(cfgs.serve.dtype_out)
 
     o_u32_vref = o_vref.at[b_idx].bitcast(jnp.uint32)
@@ -102,7 +104,10 @@ def calculate_and_store_out(
     utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
   def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
-    lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
+    safe_m = jnp.where(batch_m == -jnp.inf, 0.0, batch_m)
+    safe_l = jnp.maximum(batch_l, 1e-9)
+    lse_val = safe_m + jnp.log(safe_l)
+    lse_val = jnp.where((batch_l == 0.0) | (batch_m == -jnp.inf), -jnp.inf, lse_val)
     lse_val = lse_val.astype(cfgs.serve.dtype_out)
     kv_heads, _, lanes = lse_val.shape
     num_heads = cfgs.aligned_num_q_heads_per_kv_head

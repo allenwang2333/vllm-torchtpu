@@ -886,6 +886,26 @@ def forward_with_pcp(
         pcp_new_pages,
     )
 
+    if getattr(layer, "layer_id", 0) == 0:
+        try:
+            logger.warning(
+                "[PCP_ATTN_TRACE] rank=%d q_shape=%s k_shape=%s cu_q=%s q_pos=%s "
+                "cur_nan=%s cur_min=%.4f cur_max=%.4f lse_nan=%s lse_min=%.4f lse_max=%.4f",
+                pcp_rank,
+                list(query.shape),
+                list(k_curr.shape),
+                cu_q_lens_local.tolist() if hasattr(cu_q_lens_local, "tolist") else str(cu_q_lens_local),
+                q_positions.tolist() if hasattr(q_positions, "tolist") else str(q_positions),
+                bool(torch.isnan(curr_output).any().item()),
+                float(curr_output.min().item()),
+                float(curr_output.max().item()),
+                bool(torch.isnan(curr_lse).any().item()),
+                float(curr_lse.min().item()),
+                float(curr_lse.max().item()),
+            )
+        except Exception as e:
+            logger.warning("[PCP_ATTN_TRACE] logging error: %s", e)
+
     # ---- 3. Combine ----
     if ctx_output is None:
         output = curr_output

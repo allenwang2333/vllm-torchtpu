@@ -77,12 +77,20 @@ def flash_attention_qk_softmax(
     qk = cfgs.model.soft_cap * jnp.tanh(qk / cfgs.model.soft_cap)
 
   qk_masked = []
+  m_curr_list = []
+  custom_mask_list = []
   for b_idx in range(cfgs.block.batch_size):
     mask_b = custom_mask[b_idx]
-    qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
+    custom_mask_list.append(mask_b)
+    has_valid_keys_b = jnp.any(mask_b, axis=-1, keepdims=True)
+    qk_b = jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value)
+    qk_masked.append(qk_b)
+    m_curr_list.append(
+        jnp.where(has_valid_keys_b, jnp.max(qk_b, axis=-1, keepdims=True), -jnp.inf)
+    )
   qk = jnp.stack(qk_masked, axis=0)
-
-  m_curr = jnp.max(qk, axis=-1, keepdims=True)
+  m_curr = jnp.stack(m_curr_list, axis=0)
+  custom_mask_stacked = jnp.stack(custom_mask_list, axis=0)
 
   alpha_list = []
   m_next_list = []
@@ -90,13 +98,18 @@ def flash_attention_qk_softmax(
   for b_idx in range(cfgs.block.batch_size):
     m_curr_b = m_curr[b_idx]
     m_next_b = jnp.maximum(m_prev, m_curr_b)
-    alpha_b = jnp.exp(m_prev - m_next_b)
+    safe_m_prev = jnp.where(m_prev == -jnp.inf, 0.0, m_prev)
+    safe_m_next_b = jnp.where(m_next_b == -jnp.inf, 0.0, m_next_b)
+    alpha_b = jnp.where(m_prev == -jnp.inf, 0.0, jnp.exp(safe_m_prev - safe_m_next_b))
     alpha_list.append(alpha_b)
     m_next_list.append(m_next_b)
     m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
 
   m_next = jnp.stack(m_next_list, axis=0)
-  p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+  safe_m_next = jnp.where(m_next == -jnp.inf, 0.0, m_next)
+  safe_qk = jnp.where(custom_mask_stacked, qk, utils.broadcast_minor(safe_m_next, qk.shape))
+  p_unmasked = jnp.exp(safe_qk - utils.broadcast_minor(safe_m_next, qk.shape))
+  p = jnp.where(custom_mask_stacked, p_unmasked, 0.0)
   p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
   l_next_list = []

@@ -1203,7 +1203,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         self.A_log,
                         self.dt_bias,
                         state_indices,
-                        attn_metadata.query_start_loc,
+                        gdn_qsl,
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens,
                     )

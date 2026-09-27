@@ -3492,6 +3492,36 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 logits = self.compute_logits_from_hidden_states(sample_hidden_states)
 
+            if getattr(self, "_pcp_diag_counter", 0) < 10 or os.environ.get("VLLM_TPU_PCP_DEBUG", "0") == "1":
+                self._pcp_diag_counter = getattr(self, "_pcp_diag_counter", 0) + 1
+                try:
+                    from vllm_torchtpu.distributed.pcp import get_pcp_rank
+                    rank = get_pcp_rank()
+                    tgt_hs = sample_hidden_states if sample_hidden_states is not None else hidden_states
+                    raw_nan = bool(torch.isnan(hidden_states).any().item())
+                    raw_max = float(hidden_states.max().item())
+                    is_owner = (
+                        bool(layout_plan.logits_owner_mask_cpu.any().item())
+                        if layout_plan and layout_plan.logits_owner_mask_cpu is not None
+                        else False
+                    )
+                    logger.info(
+                        "[PCP_DIAG] step=%d rank=%d is_owner=%s raw_nan=%s raw_max=%.4f hs_nan=%s hs_max=%.4f log_nan=%s argmax=%s top5=%s",
+                        self._pcp_diag_counter,
+                        rank,
+                        is_owner,
+                        raw_nan,
+                        raw_max,
+                        bool(torch.isnan(tgt_hs).any().item()),
+                        float(tgt_hs.max().item()),
+                        bool(torch.isnan(logits).any().item()),
+                        int(logits[0].argmax().item()),
+                        logits[0].topk(5).indices.tolist(),
+                    )
+                except Exception as e:
+                    logger.warning("[PCP_DIAG] logging error: %s", e)
+
+
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()
                 # num_scheduled_tokens_np, seq_lens_cpu for this chunk
