@@ -1109,13 +1109,15 @@ class TestReorderBatchForRpa:
 
 
 class TestInitializeAttentionKernelsThreshold:
-    """`reorder_batch_threshold` is the smallest DECODE query width across the
-    TARGET kernels `_initialize_attention_kernels` builds.
+    """`reorder_batch_threshold` is the smallest DECODE query width across all
+    target and draft kernels `_initialize_attention_kernels` builds.
 
-    Draft layers are excluded, and are always pinned to a 1-token tile. A
-    K+1-wide decode tile describes the target's verify step; a proposer runs
-    one query token per draft step and builds its own pure-decode request
-    distribution, so it never reads this threshold and must never widen it."""
+    The drafter's first pass (`step_idx == 0`) reuses the target's
+    `request_distribution`, so every draft layer must be at least as wide as
+    `reorder_batch_threshold`. Sharded drafts keep their K+1-wide decode tile;
+    replicated (`draft_tensor_parallel_size == 1`) drafts relocated to the
+    local RPA kernel are pinned to 1, which pulls the shared threshold down
+    to 1."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl

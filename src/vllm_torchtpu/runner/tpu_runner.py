@@ -4411,7 +4411,7 @@ class TPUModelRunner(GPUModelRunner):
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         initialized_count = 0
         decode_query_sizes = []
-        pinned_draft_layers = []
+        layer_widths = []
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -4449,7 +4449,7 @@ class TPUModelRunner(GPUModelRunner):
                             _DRAFT_KV_BLOCK_CAP,
                         )
                     attn_layer.impl.initialize_kernel(attn_layer)
-                    pinned_draft_layers.append(
+                    layer_widths.append(
                         (
                             "draft" if is_draft else "target",
                             type(attn_layer.impl).__name__,
@@ -4498,13 +4498,13 @@ class TPUModelRunner(GPUModelRunner):
         self.reorder_batch_threshold = min(decode_query_sizes, default=1)
         # State it, don't infer it: a target-only [4] and an undetected-draft
         # [4] print identically, so the draft count is the only way to tell
-        # whether the pinning below actually matched any layer.
+        # whether any draft layer was detected.
         from collections import Counter
 
         logger.info(
             "Attn layer census (role, impl, width_before_init, "
             "width_after_init, head_size) -> count: %s | draft names known=%d",
-            dict(Counter(pinned_draft_layers)),
+            dict(Counter(layer_widths)),
             len(draft_attn_names),
         )
         logger.info(
