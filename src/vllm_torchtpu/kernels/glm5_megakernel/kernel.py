@@ -36,7 +36,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import pool_alias
+from . import pool_alias, vtopk
 from .layout import rup, smalls_layout
 
 FP8 = jnp.float8_e4m3fn
@@ -268,9 +268,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     KT = cfg.KT
     NC = KT // 128
     ROWS = rup(max_pages * pg // 128, 128)
-    NQ = ROWS // 8                                   # top-k word-map words (32 word ids each)
-    NQP = rup(NQ, 128)
-    assert NQP == -(-ROWS // 1024) * 128
     assert ROWS <= 32 * 128, "top-k row summary is one (1, 128) word row"
     lay, S = smalls_layout(cfg)
     wk = weight_kinds(cfg)
@@ -327,11 +324,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "rec": pltpu.VMEM((M, 256), U8), "igrp": pltpu.VMEM((1, 4, 256), U8),
         "ipage": pltpu.VMEM((tiles.scan_depth, pg // 4, 4, 256), U8),
         "ip_sem": pltpu.SemaphoreType.DMA((tiles.scan_depth,)),
-        "scores": pltpu.VMEM((ROWS, 128), F32),
         "keys": pltpu.VMEM((ROWS, 128), I32),
-        "words_v": pltpu.VMEM((2, 4, ROWS), I32),
-        "words_s": pltpu.SMEM((2, 4, ROWS), I32),
-        "wm_v": pltpu.VMEM((8, NQP), I32), "wm_s": pltpu.SMEM((8, NQP), I32),
         "idx_s": pltpu.SMEM((NC, 128), I32),
         "idx_v": pltpu.VMEM((NC, 128), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
@@ -849,14 +842,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
             @pl.when(seq_len > K)
             def _slow():
+                # the scan wrote order-preserving keys (INT_MIN = invalid); rows past its pages hold
+                # stale keys from an earlier layer
                 keys = scr["keys"]
-                s = scr["scores"][...]
-                b = lax.bitcast_convert_type(s, I32)
-                key = jnp.where(b >= 0, b, b ^ jnp.int32(0x7FFFFFFF))
                 p_ = (lax.broadcasted_iota(I32, (ROWS, 128), 0) * 128
                       + lax.broadcasted_iota(I32, (ROWS, 128), 1))
-                invalid = (p_ >= seq_len) | (s == -jnp.inf)
-                keys[...] = jnp.where(invalid, INT_MIN, key)
+                keys[...] = jnp.where(p_ >= seq_len, INT_MIN, keys[...])
 
                 # threshold search, 2 bits per pass: the 3 candidates share one read of the keys and
                 # counts fall with the candidate, so the digit is how many have cnt >= K
@@ -872,97 +863,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
                 p = lax.fori_loop(0, 16, pass_, jnp.int32(0))
                 T = p ^ INT_MIN
-                kk = keys[...]
-                gt = kk > T
-                eq = kk == T
-                need_eq = jnp.where(T == INT_MIN, 0, K - jnp.sum(gt.astype(I32)))
-                lane = lax.broadcasted_iota(I32, (8, 128), 1)
-                grp = lax.broadcasted_iota(I32, (8, 128), 0)
-                pw = jnp.where(lane // 16 == grp, shl(jnp.int32(1), lane % 16), 0)
-                pw = pw.astype(F32).astype(BF16)
-                words_v, words_s = scr["words_v"], scr["words_s"]
-                for m_i, m in enumerate((gt | eq, eq)):
-                    hh = lax.dot_general(pw, m.astype(BF16), NT, preferred_element_type=F32)
-                    hh = hh.astype(I32).reshape(4, 2, ROWS)
-                    words_v[m_i] = hh[:, 0, :] | shl(hh[:, 1, :], 16)
-                cp = pltpu.make_async_copy(words_v, words_s, scr["misc_sem"])
-                cp.start()
-                # bit b of wmap[0, q]: word id 32q + b (row (32q+b) >> 2, word (32q+b) & 3) holds a
-                # selected key; the extraction visits only those words, in order. Row r's words sit
-                # at bits (r & 7) * 4 + j: r & 7 < 4 / >= 4 are 16-bit halves (powers of two, exact
-                # on the MXU), word row j shifted by j (topk_probe j-34587ead: 118 -> 94 us at 256k).
-                w = words_v[0]
-                nz = (w != 0).astype(F32).astype(BF16)                               # (4, ROWS)
-                lhs = jnp.concatenate([nz, jnp.zeros((4, ROWS), BF16)], axis=0)
-                # the (row -> word bit) matrix repeats every 1024 rows (128 words): one (1024, 128)
-                # block reused per row block (a whole (ROWS, NQP) one overflows VMEM at R=8)
-                RB = 1024
-                rr = lax.broadcasted_iota(I32, (RB, 128), 0)
-                col = (rr >> 3) == lax.broadcasted_iota(I32, (RB, 128), 1)
-                r7 = rr & 7
-                rhs = [jnp.where(col & ((r7 >> 2) == h), shl(jnp.int32(1), (r7 & 3) * 4), 0)
-                       .astype(F32).astype(BF16) for h in (0, 1)]
-                for b0 in range(0, ROWS, RB):
-                    n_ = min(RB, ROWS - b0)
-                    acc = jnp.zeros((1, 128), I32)
-                    for h in (0, 1):
-                        res = lax.dot_general(lhs[:, b0:b0 + n_], rhs[h][0:n_], NN,
-                                              preferred_element_type=F32).astype(I32)
-                        for j in range(4):
-                            acc = acc | shl(res[j:j + 1], j + 16 * h)
-                    scr["wm_v"][:, b0 // 8:b0 // 8 + 128] = jnp.broadcast_to(acc, (8, 128))
-                cr = pltpu.make_async_copy(scr["wm_v"], scr["wm_s"], scr["misc_sem"])
-                cr.start()
-                cp.wait()
-                cr.wait()
-
-                def word(r, j, carry):
-                    out, eq_taken = carry
-                    w0 = words_s[0, j, r]
-                    we = words_s[1, j, r]
-                    base = r * 128 + j * 32
-
-                    def body(c):
-                        w, out, eq_taken = c
-                        low = w & (-w)
-                        bit = jnp.int32(31) - lax.clz(low)
-                        is_eq = (we & low) != 0
-                        take = jnp.logical_or(jnp.logical_not(is_eq), eq_taken < need_eq)
-                        o = jnp.minimum(out, K - 1)
-                        prev = idx_s[o >> 7, o & 127]
-                        idx_s[o >> 7, o & 127] = jnp.where(take, base + bit, prev)
-                        return (w ^ low, out + take.astype(I32),
-                                eq_taken + (is_eq & take).astype(I32))
-
-                    def fbody(c):                   # no tie in this word: every bit is taken
-                        w, out = c
-                        low = w & (-w)
-                        idx_s[out >> 7, out & 127] = base + jnp.int32(31) - lax.clz(low)
-                        return w ^ low, out + 1
-
-                    def fast():
-                        return lax.while_loop(lambda c: c[0] != 0, fbody, (w0, out))[1], eq_taken
-
-                    def slow():
-                        r_ = lax.while_loop(lambda c: c[0] != 0, body, (w0, out, eq_taken))
-                        return r_[1], r_[2]
-                    return lax.cond(we == 0, fast, slow)
-
-                def sword(q, carry):
-                    def sbody(c):
-                        wq, carry = c
-                        low = wq & (-wq)
-                        wi = q * 32 + jnp.int32(31) - lax.clz(low)
-                        return wq ^ low, word(wi >> 2, wi & 3, carry)
-                    return lax.while_loop(lambda c: c[0] != 0, sbody, (scr["wm_s"][0, q], carry))[1]
-
-                n_out, _ = lax.fori_loop(0, NQ, sword, (jnp.int32(0), jnp.int32(0)))
-
-                def pad(i, c):
-                    idx_s[i >> 7, i & 127] = jnp.int32(-1)
-                    return c
-                lax.fori_loop(n_out, K, pad, 0)
-                cp = pltpu.make_async_copy(idx_s, idx_v, scr["misc_sem"])
+                # vectorized extraction: counting prefix sums + one one-hot matmul per k chunk, no scalar
+                # loop (topk_vec_probe j-5c210072, kc 512: thr+extract 90 -> 38 us rand, 106 -> 44 ties, exact)
+                vtopk.extract(keys, T, K, idx_v)
+                cp = pltpu.make_async_copy(idx_v, idx_s, scr["misc_sem"])
                 cp.start()
                 cp.wait()
 
@@ -1198,10 +1102,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             scale = lax.bitcast_convert_type(shl(sbyte, 23), F32)
                             score = scv * scale
                             pp = p * pg + lax.broadcasted_iota(I32, (1, pg), 1)
-                            score = jnp.where(pp < seq_len, score, -jnp.inf)
+                            # order-preserving i32 key, written in place of the f32 score (one
+                            # (ROWS, 128) buffer fewer: v11's top-k temporaries overflowed VMEM)
+                            b = lax.bitcast_convert_type(score, I32)
+                            key = jnp.where(b >= 0, b, b ^ jnp.int32(0x7FFFFFFF))
+                            key = jnp.where((pp < seq_len) & (score != -jnp.inf), key, INT_MIN)
                             for j in range(pg // 128):
-                                scr["scores"][pl.ds(p * (pg // 128) + j, 1), :] = \
-                                    score[:, j * 128:(j + 1) * 128]
+                                scr["keys"][pl.ds(p * (pg // 128) + j, 1), :] = \
+                                    key[:, j * 128:(j + 1) * 128]
                             return c
                         lax.fori_loop(0, npages, pbody, 0)
                     return f
@@ -1558,7 +1466,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         compiler_params=pltpu.CompilerParams(
             # No has_side_effects: every output is consumed, and a side-effecting custom call
             # without a sharding is rejected by XLA's SPMD partitioner on the torch_tpu path.
-            collective_id=COLLECTIVE_ID if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024),
+            # No DMA bounds checks: each DMA start otherwise carries two ~7-bundle serial check
+            # chains, which bound the 4096-DMA sparse gather (gather_llo j-050f4e3f: 86 -> 47 us per
+            # layer, byte-identical). Every data-dependent index is clamped before it is used.
+            collective_id=COLLECTIVE_ID if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024,
+            disable_bounds_checks=True),
         interpret=pltpu.InterpretParams() if interpret else False,
     )
 
