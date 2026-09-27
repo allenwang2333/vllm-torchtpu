@@ -133,7 +133,11 @@ from vllm_torchtpu.tracing.utils import (
     extract_kv_lens_for_tracing,
     extract_request_ids_for_tracing,
 )
-from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+from vllm_torchtpu.utils import (
+    rank_rotated,
+    synchronize_device,
+    synchronize_tensors,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -5561,7 +5565,8 @@ class TPUModelRunner(GPUModelRunner):
         num_rejected = torch.zeros(rows, dtype=torch.int32).to(self.device)
         fli, tli = self._zero_logits_indices()
         with self._precompile_timed("async_spec_step_inputs"):
-            for num_tokens in self.num_tokens_paddings:
+            # Collective-free: rotate so the ranks share compiles via Tier-2.
+            for num_tokens in rank_rotated(self.num_tokens_paddings):
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 cur_input_indices = torch.arange(num_tokens, dtype=torch.int32).to(
                     self.device
