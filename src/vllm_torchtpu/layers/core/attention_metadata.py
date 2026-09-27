@@ -34,7 +34,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "gdn_packed_to_local",
         "gdn_query_start_loc",
     ],
-    meta_fields=["cache_pages"],
+    meta_fields=["cache_pages", "is_decode"],
 )
 @dataclass
 class PCPMetadata:
@@ -59,6 +59,7 @@ class PCPMetadata:
     gdn_packed_to_local: jax.Array | None = None
     # (max_num_reqs+1,) int32 — cumulative query lengths across 2*num_reqs virtual sequences for GDN.
     gdn_query_start_loc: jax.Array | None = None
+    is_decode: bool = False
 
 
 @functools.partial(

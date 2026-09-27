@@ -612,6 +612,7 @@ class PcpSequenceLayoutPlanner:
                 gdn_packed_to_local=torch.zeros((num_tokens,), dtype=torch.int32, device=dev),
                 gdn_query_start_loc=torch.zeros((n_off + 1,), dtype=torch.int32, device=dev),
                 cache_pages=0,
+                is_decode=False,
             )
             return SequenceLayoutPlan(
                 descriptor=PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -1032,6 +1033,7 @@ def pcp_zigzag_page_table(
     off: list[int] | None = None,
     s_pad: int | None = None,
     counts: list[int] | None = None,
+    source_block_tables: list[np.ndarray] | np.ndarray | None = None,
 ) -> np.ndarray:
     """Page table for the all-gathered current KV under zigzag sharding."""
     two_p = 2 * pcp_size
@@ -1049,13 +1051,22 @@ def pcp_zigzag_page_table(
         req_pages = max(1, c_i // block_size)
         o_i = off[i] if off is not None else sum(2 * c for c in chunk[:i])
         for c in range(two_p):
-            rank = c if c < pcp_size else two_p - 1 - c
-            base = (
-                rank * s_pad_val + o_i + (c_i if c >= pcp_size else 0)
-            ) // block_size
             cols = slice(c * req_pages, (c + 1) * req_pages)
-            pcp_table_np[2 * i, cols] = base + np.arange(req_pages)
-            pcp_table_np[2 * i + 1, cols] = base + np.arange(req_pages)
+            if source_block_tables is not None and i < len(source_block_tables):
+                bt = source_block_tables[i]
+                if isinstance(bt, torch.Tensor):
+                    bt = bt.cpu().numpy()
+                n_copy = min(max(0, len(bt) - c * req_pages), req_pages)
+                if n_copy > 0:
+                    pcp_table_np[2 * i, c * req_pages : c * req_pages + n_copy] = bt[c * req_pages : c * req_pages + n_copy]
+                    pcp_table_np[2 * i + 1, c * req_pages : c * req_pages + n_copy] = bt[c * req_pages : c * req_pages + n_copy]
+            else:
+                rank = c if c < pcp_size else two_p - 1 - c
+                base = (
+                    rank * s_pad_val + o_i + (c_i if c >= pcp_size else 0)
+                ) // block_size
+                pcp_table_np[2 * i, cols] = base + np.arange(req_pages)
+                pcp_table_np[2 * i + 1, cols] = base + np.arange(req_pages)
     return pcp_table_np
 
 
@@ -1235,13 +1246,9 @@ def prepare_pcp_zigzag_sequence_layout(
             if 2 * num_reqs < n_off:
                 cu_q_lens_np[r, 2 * num_reqs + 1 :] = num_reqs
 
-        max_req_pages = max(1, (s_pad // 2) // block_size)
-        pcp_table_np = np.zeros((n_off, two_p * max_req_pages), dtype=np.int32)
-        for i in range(num_reqs):
-            pcp_table_np[2 * i, :] = i // block_size
-            pcp_table_np[2 * i + 1, :] = i // block_size
-
-        cache_pages = 1
+        pcp_table_np = np.zeros((0,), dtype=np.int32)
+        max_computed = max(computed) if computed else 0
+        cache_pages = max(1, (max_computed + block_size - 1) // block_size)
 
         gdn_rm_to_packed_np = np.arange(padded_total_num_tokens, dtype=np.int32)
         gdn_packed_to_local_np = np.arange(s_pad, dtype=np.int32)
@@ -1306,15 +1313,34 @@ def prepare_pcp_zigzag_sequence_layout(
             logits_local_indices_cpu[num_reqs:] = 0
             logits_owner_mask_cpu[num_reqs:] = False
 
+        source_block_tables = None
+        if hasattr(runner, "input_batch") and runner.input_batch is not None:
+            if hasattr(runner.input_batch, "block_table") and runner.input_batch.block_table:
+                try:
+                    bt_cpu = runner.input_batch.block_table[0].get_cpu_tensor()
+                    source_block_tables = [
+                        bt_cpu[start_index + i].clone().numpy()
+                        for i in range(num_reqs)
+                    ]
+                except Exception as e:
+                    logger.warning("Failed to extract source_block_tables: %s", e)
+
         cu_q_lens_np, q_pos_offsets_np, pcp_write_np = pcp_zigzag_seq_arrays(
             chunk, off, pcp_size, n_off, counts
         )
         pcp_table_np = pcp_zigzag_page_table(
-            chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad, counts=counts
+            chunk,
+            pcp_size,
+            block_size,
+            n_off,
+            off=off,
+            s_pad=s_pad,
+            counts=counts,
+            source_block_tables=source_block_tables,
         )
 
         max_computed = max(computed) if computed else 0
-        cache_pages = 1 if max_computed > 0 else 0
+        cache_pages = max(1, (max_computed + block_size - 1) // block_size) if max_computed > 0 else 0
 
         gdn_rm_to_packed_np = np.where(
             request_major_to_packed >= 0, request_major_to_packed, 0
@@ -1352,6 +1378,7 @@ def prepare_pcp_zigzag_sequence_layout(
         ),
         gdn_query_start_loc=torch.from_numpy(gdn_qsl_np).to(dev, non_blocking=True),
         cache_pages=cache_pages,
+        is_decode=is_decode,
     )
 
     for i in range(num_reqs):

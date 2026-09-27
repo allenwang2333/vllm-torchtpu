@@ -838,6 +838,26 @@ def forward_with_pcp(
 
     kv_new_lens = attn_metadata.seq_lens - pcp_cache_lens
 
+    is_decode = getattr(pcp_meta, "is_decode", False) or (
+        attn_metadata.request_distribution.numel() > 0
+        and int(attn_metadata.request_distribution[0].item()) > 0
+    )
+
+    idx = torch.arange(
+        query.shape[0], device=query.device, dtype=cu_q_lens_local.dtype
+    )
+    starts = cu_q_lens_local[:-1]
+    ends = cu_q_lens_local[1:]
+    valid_q_mask = (
+        (idx.unsqueeze(1) >= starts.unsqueeze(0))
+        & (idx.unsqueeze(1) < ends.unsqueeze(0))
+    ).any(dim=-1)
+
+    key = torch.where(valid_q_mask[:, None, None], key, torch.zeros_like(key))
+    key = torch.nan_to_num(key, nan=0.0, posinf=0.0, neginf=0.0)
+    value = torch.where(valid_q_mask[:, None, None], value, torch.zeros_like(value))
+    value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+
     # ---- 1. CACHE_ONLY pass ----
     cache_pages = pcp_meta.cache_pages
     if cache_pages == 0:
@@ -845,9 +865,24 @@ def forward_with_pcp(
     else:
         cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
         dist_cache = attn_metadata.request_distribution.clone()
-        dist_cache[0] = 0
-        dist_cache[1] = 0
-        dist_cache[2] = attn_metadata.request_distribution[2] // 2
+        if is_decode:
+            req_dec = (
+                int(attn_metadata.request_distribution[0].item())
+                if attn_metadata.request_distribution.numel() > 0
+                else 0
+            )
+            dec_count = (
+                req_dec // 2
+                if (req_dec > 0 and req_dec % 2 == 0)
+                else max(1, req_dec if req_dec > 0 else num_seqs // 2)
+            )
+            dist_cache[0] = dec_count
+            dist_cache[1] = dec_count
+            dist_cache[2] = dec_count
+        else:
+            dist_cache[0] = 0
+            dist_cache[1] = 0
+            dist_cache[2] = attn_metadata.request_distribution[2] // 2
 
         seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
         block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
@@ -864,10 +899,21 @@ def forward_with_pcp(
             dist_cache,
             kv_new_lens_req,
         )
+        if is_decode:
+            pcp_group = get_pcp_group()
+            ctx_output, ctx_lse = dcp_allgather_lse_combine(
+                ctx_output, ctx_lse, pcp_group, pcp_world_size
+            )
 
     # ---- 2. NEW_TOKENS_ONLY pass ----
-    k_curr = all_gather_equal_tokens(key, dim=0)
-    v_curr = all_gather_equal_tokens(value, dim=0)
+    if is_decode:
+        k_curr = key
+        v_curr = value
+    else:
+        k_curr = all_gather_equal_tokens(key, dim=0)
+        v_curr = all_gather_equal_tokens(value, dim=0)
+        k_curr = torch.nan_to_num(k_curr, nan=0.0, posinf=0.0, neginf=0.0)
+        v_curr = torch.nan_to_num(v_curr, nan=0.0, posinf=0.0, neginf=0.0)
 
     q_positions = pcp_cache_lens + q_pos_offsets_local
 
@@ -891,6 +937,9 @@ def forward_with_pcp(
         output = curr_output
     else:
         output, _ = lse_weighted_combine(ctx_output, ctx_lse, curr_output, curr_lse)
+
+    output = torch.where(valid_q_mask[:, None, None], output, torch.zeros_like(output))
+    output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
 
     if not torch.compiler.is_compiling():
         synchronize_tensors(kv_cache, wait=False)
