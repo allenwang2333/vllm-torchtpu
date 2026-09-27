@@ -133,11 +133,8 @@ class PcpSequenceLayoutEligibility:
         attention_backend = getattr(attention_config, "backend", None)
         block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", 16)
 
-        env_layout = envs.VLLM_TPU_PCP_LAYOUT
-        is_zigzag = (
-            env_layout == "zigzag"
-            or str(attention_backend).upper() in ("CUSTOM", "ATTENTIONBACKENDFLAVOR.CUSTOM", "ATTENTIONBACKENDENUM.CUSTOM")
-        )
+        env_layout = envs.VLLM_TPU_PCP_LAYOUT.lower()
+        is_zigzag = env_layout == "zigzag"
 
         return cls(
             pcp_size=parallel_config.prefill_context_parallel_size,

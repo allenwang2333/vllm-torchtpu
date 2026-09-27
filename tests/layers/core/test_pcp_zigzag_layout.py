@@ -54,49 +54,32 @@ def _scheduler_output(scheduled):
 
 def test_pcp_zigzag_token_layout_single_request():
     pcp_size = 2
-    block_size = 16
-    counts = np.array([256], dtype=np.int32)
-    chunk, off, s_live, s_pad = pcp_zigzag_token_layout(counts, pcp_size, block_size)
+    counts = [256]
+    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size)
 
-    two_p = 2 * pcp_size  # 4 chunks
-    assert chunk.shape == (1,)
-    # 256 / 4 = 64 tokens per chunk, multiple of 16
-    assert chunk[0] == 64
-    assert off[0] == 0
-    # s_live is chunk[0] * 2 = 128 tokens per rank
+    assert chunk == [64]
+    assert off == [0]
     assert s_live == 128
-    # s_pad matches or exceeds s_live snapped to quantum
-    assert s_pad >= s_live
-    assert s_pad % (2 * block_size) == 0
 
 
 def test_pcp_zigzag_token_layout_multi_request():
     pcp_size = 4
-    block_size = 16
-    counts = np.array([200, 300], dtype=np.int32)
-    chunk, off, s_live, s_pad = pcp_zigzag_token_layout(counts, pcp_size, block_size)
+    counts = [200, 300]
+    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size)
 
-    two_p = 2 * pcp_size  # 8 chunks
-    # req 0: ceil(200 / (8*16)) * 16 = ceil(200 / 128) * 16 = 2 * 16 = 32
-    assert chunk[0] == 32
-    # req 1: ceil(300 / (8*16)) * 16 = ceil(300 / 128) * 16 = 3 * 16 = 48
-    assert chunk[1] == 48
-
-    assert off[0] == 0
-    # off[1] = off[0] + 2 * chunk[0] = 64
-    assert off[1] == 64
-    # s_live = off[1] + 2 * chunk[1] = 64 + 96 = 160
-    assert s_live == 160
-    assert s_pad >= s_live
+    # two_p = 8. ceil(200 / 8) = 25. ceil(300 / 8) = 38.
+    assert chunk == [25, 38]
+    assert off == [0, 50]
+    assert s_live == 126
 
 
 def test_pcp_zigzag_seq_arrays():
     pcp_size = 2
     two_p = 4
     n_off = 4
-    chunk = np.array([32], dtype=np.int32)
-    off = np.array([0], dtype=np.int32)
-    counts = np.array([100], dtype=np.int32)  # chunk is 32, so 4 chunks = 128 total capacity
+    chunk = [32]
+    off = [0]
+    counts = [100]  # chunk is 32, so 4 chunks = 128 total capacity
 
     cu_q_lens, q_pos_offsets, pcp_write = pcp_zigzag_seq_arrays(
         chunk, off, pcp_size, n_off, counts
@@ -127,10 +110,10 @@ def test_pcp_zigzag_seq_arrays_writer_fallback():
     pcp_size = 2
     two_p = 4
     n_off = 4
-    chunk = np.array([32], dtype=np.int32)
-    off = np.array([0], dtype=np.int32)
+    chunk = [32]
+    off = [0]
     # Total tokens is only 64, so chunks 2 and 3 have 0 real tokens
-    counts = np.array([64], dtype=np.int32)
+    counts = [64]
 
     cu_q_lens, q_pos_offsets, pcp_write = pcp_zigzag_seq_arrays(
         chunk, off, pcp_size, n_off, counts
@@ -147,40 +130,44 @@ def test_pcp_zigzag_page_table():
     pcp_size = 2
     block_size = 16
     n_off = 4
-    chunk = np.array([32], dtype=np.int32)  # pages_per_chunk = 32 // 16 = 2
+    chunk = [32]  # pages_per_chunk = 32 // 16 = 2
 
     table = pcp_zigzag_page_table(chunk, pcp_size, block_size, n_off)
-    assert table.shape == (n_off, 2 * pcp_size, 2)
-    # Verify sequential mapping of pages
-    assert np.array_equal(table[0, 0], [0, 1])
-    assert np.array_equal(table[0, 1], [2, 3])
-    assert np.array_equal(table[0, 2], [4, 5])
-    assert np.array_equal(table[0, 3], [6, 7])
+    assert table.shape == (n_off, 2 * pcp_size * 2)
+    # Chunk 0 (rank 0 head): pages 0, 1
+    assert np.array_equal(table[0, 0:2], [0, 1])
+    # Chunk 1 (rank 1 head): pages 4, 5
+    assert np.array_equal(table[0, 2:4], [4, 5])
+    # Chunk 2 (rank 1 tail): pages 6, 7
+    assert np.array_equal(table[0, 4:6], [6, 7])
+    # Chunk 3 (rank 0 tail): pages 2, 3
+    assert np.array_equal(table[0, 6:8], [2, 3])
 
 
 def test_apply_pcp_zigzag_token_order():
     pcp_size = 2
-    block_size = 16
-    counts = np.array([128], dtype=np.int32)
-    chunk, off, s_live, s_pad = pcp_zigzag_token_layout(counts, pcp_size, block_size)
+    counts = [128]
+    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size)
+    s_pad = 64
+    padded_total_num_tokens = s_pad * pcp_size  # 128
 
-    input_ids = torch.arange(128, dtype=torch.int32)
+    input_ids = np.arange(128, dtype=np.int32)
     positions_np = np.arange(128, dtype=np.int32)
 
-    packed_to_req, req_to_packed = apply_pcp_zigzag_token_order(
-        input_ids, positions_np, None, chunk, off, counts, pcp_size, s_pad
+    req_to_packed, packed_to_req = apply_pcp_zigzag_token_order(
+        input_ids, positions_np, counts, chunk, off, pcp_size, padded_total_num_tokens
     )
 
     # Verify that the permutation is invertible
     assert np.array_equal(packed_to_req[req_to_packed], np.arange(128))
 
     # Verify rank 0 slot contains chunk 0 (head, 0..31) and chunk 3 (tail, 96..127)
-    rank0_tokens = input_ids[:s_pad].numpy()
+    rank0_tokens = input_ids[:s_pad]
     assert np.array_equal(rank0_tokens[0:32], np.arange(0, 32))
     assert np.array_equal(rank0_tokens[32:64], np.arange(96, 128))
 
     # Verify rank 1 slot contains chunk 1 (head, 32..63) and chunk 2 (tail, 64..95)
-    rank1_tokens = input_ids[s_pad : 2 * s_pad].numpy()
+    rank1_tokens = input_ids[s_pad : 2 * s_pad]
     assert np.array_equal(rank1_tokens[0:32], np.arange(32, 64))
     assert np.array_equal(rank1_tokens[32:64], np.arange(64, 96))
 

@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs
 from vllm_torchtpu.layers.adapter import attention, cp_attention
@@ -26,6 +28,19 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     PCPMetadata,
 )
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
+
+
+@pytest.fixture
+def cpu_vllm_config_context():
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config), set_vllm_model_wrapper_context(
+        mesh=None, vllm_config=config
+    ):
+        yield
 
 
 def test_make_cu_cache():
@@ -104,7 +119,7 @@ def test_build_pcp_kernels_mock():
         assert callable(new_k)
 
 
-def test_pcp_forward_dispatch():
+def test_pcp_forward_dispatch(cpu_vllm_config_context):
     backend = attention.PallasBatchedRPAAttentionBackendImpl(
         num_heads=4,
         head_size=128,
