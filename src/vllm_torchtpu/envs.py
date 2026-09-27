@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_KWRITE_DUS: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -681,6 +682,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Write the StreamIndex indexer's per-step K rows into its paged cache as
+    # whole pages (dynamic_slice + select + dynamic_update_slice) when it touches
+    # few pages, as a prefill chunk does, instead of one row scatter. At
+    # prefill size the row scatter makes XLA relayout the whole uint8 cache
+    # and back on every call. Bitwise-identical result.
+    "TPU_STREAMIDX_KWRITE_DUS": env_bool("TPU_STREAMIDX_KWRITE_DUS"),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

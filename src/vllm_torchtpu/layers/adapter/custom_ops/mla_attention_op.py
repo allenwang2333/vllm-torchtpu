@@ -68,6 +68,128 @@ from vllm_torchtpu.utils import synchronize_tensors
 STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
+def _scatter_indexer_k(
+    cache_kv: jax.Array,  # uint8 [num_blocks, block_size // kv_packing, kv_packing, lkv_dim]
+    k_packed: jax.Array,  # uint8 [num_tokens, lkv_dim], already lane-padded
+    seq_lens: jax.Array,  # i32 [num_seqs]
+    page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
+) -> jax.Array:
+    """Write this step's K rows into the paged cache with one row scatter."""
+    _, block_size_per_kv_packing, kv_packing, _ = cache_kv.shape
+    block_size = block_size_per_kv_packing * kv_packing
+    tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+    seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
+    q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+    pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+    page = jnp.where(
+        tok < cu_q_lens[-1],
+        page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
+        jnp.int32(2**30),
+    )
+    slot = pos % block_size
+    return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(k_packed)
+
+
+def _page_write_indexer_k(
+    cache_kv: jax.Array,  # uint8 [num_blocks, block_size // kv_packing, kv_packing, lkv_dim]
+    k_packed: jax.Array,  # uint8 [num_tokens, lkv_dim], already lane-padded
+    seq_lens: jax.Array,  # i32 [num_seqs]
+    page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
+    max_pages: int,
+) -> jax.Array:
+    """Write this step's K rows into the paged cache one page at a time.
+
+    Correct only when the step touches at most `max_pages` (sequence, page)
+    pairs; `_write_indexer_k_pages` checks that and falls back otherwise.
+
+    Unrolled over `max_pages` slots. Slot j reads page j of the step with a
+    dynamic_slice, takes the page-long window of `k_packed` aligned to it,
+    keeps the old bytes at slots outside the sequence's new positions, and
+    writes the page back with a dynamic_update_slice. Unused slots rewrite a
+    page with its own bytes. Page-sized dynamic slices keep the cache in its
+    native tiled layout. The row scatter in `_scatter_indexer_k` makes XLA
+    flatten the cache to [num_blocks * block_size, lkv_dim] once the step is
+    prefill-sized -- a relayout of the whole cache and back on every call --
+    and a page-axis gather/scatter still retiles the whole cache.
+    """
+    _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+    block_size = block_size_per_kv_packing * kv_packing
+    num_seqs = seq_lens.shape[0]
+    pages = page_indices.reshape(num_seqs, -1)
+    # A page-long window at any offset of any sequence stays in bounds.
+    k_pad = jnp.pad(k_packed, ((block_size, block_size), (0, 0)))
+
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    start_pos = seq_lens - q_lens
+    first_page = start_pos // block_size
+    num_pages = jnp.where(
+        q_lens > 0, (seq_lens - 1) // block_size - first_page + 1, 0
+    ).astype(jnp.int32)
+    cum_pages = jnp.cumsum(num_pages)
+    slot_pos = jnp.arange(block_size, dtype=jnp.int32)
+    shape = (1, block_size_per_kv_packing, kv_packing, lkv_dim)
+
+    for j in range(max_pages):
+        s = jnp.minimum(
+            jnp.searchsorted(cum_pages, j, side="right").astype(jnp.int32),
+            num_seqs - 1,
+        )
+        used = j < cum_pages[-1]
+        logical_page = first_page[s] + j - (cum_pages[s] - num_pages[s])
+        phys = pages[s, logical_page]
+        page_base = logical_page * block_size
+        # Token index that lands in slot 0 of this page (may be out of range).
+        tok0 = cu_q_lens[s] + page_base - start_pos[s]
+        window = jax.lax.dynamic_slice_in_dim(k_pad, tok0 + block_size, block_size)
+        pos = page_base + slot_pos
+        keep_new = used & (pos >= start_pos[s]) & (pos < seq_lens[s])
+        old = jax.lax.dynamic_slice(cache_kv, (phys, 0, 0, 0), shape)
+        new = jnp.where(
+            keep_new.reshape(1, block_size_per_kv_packing, kv_packing, 1),
+            window.reshape(shape),
+            old,
+        )
+        cache_kv = jax.lax.dynamic_update_slice(cache_kv, new, (phys, 0, 0, 0))
+    return cache_kv
+
+def _write_indexer_k_pages(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+) -> jax.Array:
+    """TPU_STREAMIDX_KWRITE_DUS: page writes where they are cheaper, else scatter.
+
+    Bit-identical to `_scatter_indexer_k` in every case. Steps smaller than a
+    page (decode buckets) keep the row scatter, which XLA already lowers in
+    the native layout there. Larger steps take the page path when they touch
+    at most num_tokens // block_size + 2 pages -- one sequence's prefill
+    chunk, aligned or not, or a chunk plus a decode row -- and the scatter
+    otherwise.
+    """
+    _, block_size_per_kv_packing, kv_packing, _ = cache_kv.shape
+    block_size = block_size_per_kv_packing * kv_packing
+    num_tokens = k_packed.shape[0]
+    args = (cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+    if num_tokens < block_size:
+        return _scatter_indexer_k(*args)
+    max_pages = num_tokens // block_size + 2
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    start_page = (seq_lens - q_lens) // block_size
+    touched = jnp.sum(
+        jnp.where(q_lens > 0, (seq_lens - 1) // block_size - start_page + 1, 0)
+    )
+    return jax.lax.cond(
+        touched <= max_pages,
+        lambda *a: _page_write_indexer_k(*a, max_pages=max_pages),
+        _scatter_indexer_k,
+        *args,
+    )
+
+
 def _cp_scatter_indexer_k(
     cache_kv: jax.Array,
     k_packed: jax.Array,
@@ -188,6 +310,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kwrite_dus = envs.TPU_STREAMIDX_KWRITE_DUS
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -199,28 +322,20 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
+            lkv_dim = cache_kv.shape[-1]
             # Cache rows are padded to the 128-lane HBM width; pad the packed
             # fp8+scale rows to match before scattering.
             k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
 
             # Insert this step's K rows into the KV cache.
-            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-            seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                jnp.int32
-            )
-            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(
-                tok < cu_q_lens[-1],
-                page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
-                jnp.int32(2**30),
-            )
-            slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                k_packed
-            )
+            if kwrite_dus:
+                cache_kv = _write_indexer_k_pages(
+                    cache_kv, k_packed, seq_lens, page_indices, cu_q_lens
+                )
+            else:
+                cache_kv = _scatter_indexer_k(
+                    cache_kv, k_packed, seq_lens, page_indices, cu_q_lens
+                )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
