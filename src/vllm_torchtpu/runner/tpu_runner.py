@@ -4415,30 +4415,25 @@ class TPUModelRunner(GPUModelRunner):
                 ):
                     is_draft = name in draft_attn_names
                     pre_w = attn_layer.impl.decode_query_size
-                    if is_draft:
-                        # A K+1-wide decode tile describes the TARGET's verify
-                        # step; a proposer runs one query token per draft step,
-                        # so pin it to 1. NOTE: on Gemma-4 the draft layers are
-                        # observed to already be 1 here, so this is a guard
-                        # rather than the fix for b/536992014.
+                    # Batched draft step 0 inherits the target's K+1 verify
+                    # queries. Preserve its backend width so stitching and
+                    # KV writeback cover every new token, including page crossings.
+                    if (
+                        is_draft
+                        and self.speculative_config.draft_tensor_parallel_size == 1
+                    ):
+                        # Replicated drafts use the separate local RPA kernel.
                         attn_layer.impl.decode_query_size = 1
-                        # Relocate a REPLICATED (tp=1) draft's attention to the
-                        # LOCAL (non-shard_map) kernel. Independent of the tile
-                        # width above: this is about the draft's TP topology.
-                        if self.speculative_config.draft_tensor_parallel_size == 1:
-                            # Instance attrs shadow the ClassVars; unique prefix
-                            # keeps the local kernel op out of the sharded
-                            # registry.
-                            attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
-                            attn_layer.impl._kernel_op_prefix = (
-                                "pallas::rpa_kernel_local"
-                            )
-                            logger.info(
-                                "Draft attn %s -> LOCAL (non-shard_map) RPA "
-                                "kernel | DRAFT_KV_BLOCK_CAP=%d",
-                                name,
-                                _DRAFT_KV_BLOCK_CAP,
-                            )
+                        # Instance attrs shadow the ClassVars; unique prefix
+                        # keeps the local kernel op out of the sharded registry.
+                        attn_layer.impl._kernel_entry = _pallas_rpa_kernel_local
+                        attn_layer.impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+                        logger.info(
+                            "Draft attn %s -> LOCAL (non-shard_map) RPA "
+                            "kernel | DRAFT_KV_BLOCK_CAP=%d",
+                            name,
+                            _DRAFT_KV_BLOCK_CAP,
+                        )
                     attn_layer.impl.initialize_kernel(attn_layer)
                     pinned_draft_layers.append(
                         (
@@ -4451,13 +4446,9 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     # Target layers only. `reorder_batch_threshold` is read in
                     # exactly one place (`rpa_num_decode_reqs` in
-                    # `_prepare_inputs`), which shapes the TARGET's batch; the
-                    # draft never reads it and builds its own pure-decode
-                    # distribution instead (eagle3 `_propose_step`). So draft
-                    # widths have no business in this min() -- folding the
-                    # draft's necessary 1 in would drag the threshold to 1 and
-                    # silently disable #1008 for every spec config that has a
-                    # draft, which is every config it was written for.
+                    # `_prepare_inputs`), which shapes the TARGET's batch.
+                    # Including a local draft's width 1 here would incorrectly
+                    # disable the target's K+1 verify decode path.
                     if not is_draft:
                         decode_query_sizes.append(attn_layer.impl.decode_query_size)
                     initialized_count += 1
