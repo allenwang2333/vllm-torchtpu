@@ -702,12 +702,22 @@ class TPUModelRunner(GPUModelRunner):
             or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag")
         )
         if is_zigzag_pcp:
-            quantum = 2 * pcp_size * self.block_size
+            local_quantum = 2 * self.block_size
+            min_max_tokens = local_quantum * self.max_num_reqs
             snapped = []
             for sz in self.num_tokens_paddings:
-                snapped_sz = max(quantum, ((sz + quantum - 1) // quantum) * quantum)
+                snapped_sz = max(
+                    local_quantum,
+                    ((sz + local_quantum - 1) // local_quantum) * local_quantum,
+                )
                 if not snapped or snapped[-1] != snapped_sz:
                     snapped.append(snapped_sz)
+            while snapped[-1] < min_max_tokens:
+                nxt = max(snapped[-1] * 2, local_quantum)
+                snapped_nxt = (
+                    (nxt + local_quantum - 1) // local_quantum
+                ) * local_quantum
+                snapped.append(snapped_nxt)
             self.num_tokens_paddings = snapped
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
@@ -741,7 +751,7 @@ class TPUModelRunner(GPUModelRunner):
         # CPU staging for compact-mamba per-request recurrent-slot ids; H2D
         # copied each step into `AttentionMetadata.mamba_state_indices`.
         self.mamba_state_indices_cpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device="cpu"
+            max_req_rows, dtype=torch.int32, device="cpu"
         )
         # Block-table-derived mamba state: the state-block position each
         # request's state currently lives at, the mamba-group -> raw-pool
@@ -764,15 +774,16 @@ class TPUModelRunner(GPUModelRunner):
             self.mrope_positions = self._make_buffer(
                 3, self.max_num_tokens + 1, dtype=torch.int32
             )
+        seq_cap = max(self.max_num_tokens, max_req_rows)
         self.query_start_loc_cpu = torch.zeros(
-            self.max_num_tokens + 1,
+            seq_cap + 1,
             dtype=torch.int32,
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
         self.query_start_loc_np = self.query_start_loc_cpu.numpy()
         self.seq_lens_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            seq_cap, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
@@ -794,8 +805,8 @@ class TPUModelRunner(GPUModelRunner):
                 PallasAttentionBackend.get_max_num_seqs(
                     self.most_model_len, self.block_size
                 ),
-                self.max_num_reqs,
-                self.max_num_tokens,
+                max_req_rows,
+                seq_cap,
             )
             if self.most_model_len is not None
             else None
@@ -804,8 +815,8 @@ class TPUModelRunner(GPUModelRunner):
             PallasAttentionBackend.get_max_num_seqs(
                 self.max_model_len, self.block_size
             ),
-            self.max_num_reqs,
-            self.max_num_tokens,
+            max_req_rows,
+            seq_cap,
         )
 
         self.sample_from_logits_func = self.sample_from_logits
@@ -1501,7 +1512,12 @@ class TPUModelRunner(GPUModelRunner):
         self._has_mamba_state = True
 
     def _build_mamba_state_indices(
-        self, start_index: int, num_reqs: int, target_num_reqs: int
+        self,
+        start_index: int,
+        num_reqs: int,
+        target_num_reqs: int,
+        *,
+        is_pcp_zigzag: bool = False,
     ) -> torch.Tensor:
         """Build the device `mamba_state_indices` for the current chunk.
 
@@ -1546,7 +1562,13 @@ class TPUModelRunner(GPUModelRunner):
                 # batch holds at most max_num_reqs requests.
                 slot = self._free_mamba_slots.pop()
                 self._mamba_slot_by_req_id[req_id] = slot
-            indices[i] = slot
+            if is_pcp_zigzag:
+                if 2 * i < target_num_reqs:
+                    indices[2 * i] = slot
+                if 2 * i + 1 < target_num_reqs:
+                    indices[2 * i + 1] = slot
+            else:
+                indices[i] = slot
         return indices.to(self.device, non_blocking=True)
 
     def _build_mamba_copy_plan(
@@ -2667,7 +2689,6 @@ class TPUModelRunner(GPUModelRunner):
         )
         if is_pcp_zigzag:
             target_num_reqs = max(target_num_reqs, 2 * num_reqs)
-            padded_num_reqs = max(padded_num_reqs, 2 * num_reqs)
             seq_lens = self.seq_lens_cpu[:target_num_reqs].to(
                 self.device, non_blocking=True
             )
@@ -2797,10 +2818,13 @@ class TPUModelRunner(GPUModelRunner):
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
             # no dedicated prefill-only bucket, and all remaining requests in mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
-            self._request_distribution_cpu[0] = chunk_num_decode
-            self._request_distribution_cpu[1] = chunk_num_decode
-            self._request_distribution_cpu[2] = num_reqs
+            if not is_pcp_zigzag:
+                chunk_num_decode = max(
+                    0, min(rpa_num_decode_reqs - start_index, num_reqs)
+                )
+                self._request_distribution_cpu[0] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[2] = num_reqs
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True
             )
@@ -2817,7 +2841,12 @@ class TPUModelRunner(GPUModelRunner):
         # initialize_kv_cache); None otherwise so non-mamba models are
         # unaffected.
         mamba_state_indices = (
-            self._build_mamba_state_indices(start_index, num_reqs, target_num_reqs)
+            self._build_mamba_state_indices(
+                start_index,
+                num_reqs,
+                target_num_reqs,
+                is_pcp_zigzag=is_pcp_zigzag,
+            )
             if self._has_mamba_state
             else None
         )
@@ -5946,12 +5975,17 @@ class TPUModelRunner(GPUModelRunner):
                     self.max_num_blocks_per_req = int(
                         self.input_batch.block_table[0].get_cpu_tensor().shape[1]
                     )
+                    max_req_rows = (
+                        2 * self.max_num_reqs
+                        if self._pcp_enabled
+                        else self.max_num_reqs
+                    )
                     if (
-                        self.block_table_cpu.shape[0] != self.max_num_reqs
+                        self.block_table_cpu.shape[0] != max_req_rows
                         or self.block_table_cpu.shape[1] != self.max_num_blocks_per_req
                     ):
                         self.block_table_cpu = torch.zeros(
-                            (self.max_num_reqs, self.max_num_blocks_per_req),
+                            (max_req_rows, self.max_num_blocks_per_req),
                             dtype=torch.int32,
                             device="cpu",
                         )

@@ -208,8 +208,10 @@ def _hybrid_mamba_state_layout(
             hf_config.linear_value_head_dim,
             conv_dim_axis=0 if is_conv_state_dim_first() else -1,
         )
+    from vllm_torchtpu import envs
+
     pcp_size = parallel_config.prefill_context_parallel_size
-    if pcp_size > 1:
+    if pcp_size > 1 and envs.VLLM_TPU_PCP_LAYOUT.lower() != "zigzag":
         if model_config.architecture in QWEN_GDN_ARCHITECTURES:
             shapes = _localize_gdn_state_shapes_for_pcp(
                 vllm_config, tp_local_shapes, pcp_size

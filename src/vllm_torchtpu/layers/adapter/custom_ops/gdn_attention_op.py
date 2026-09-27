@@ -31,7 +31,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (
+    all_gather_equal_tokens,
     get_or_create_pcp_mesh,
     get_pcp_rank,
     get_pcp_world_size,
@@ -262,6 +264,8 @@ def gdn_attention_core_tpu_pcp_prefill(
 
 
 def _get_pcp_size(vllm_config: VllmConfig) -> int:
+    if envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag":
+        return 1
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     return pcp_size if pcp_size > 1 else 1
 
@@ -474,6 +478,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     @staticmethod
     def _pcp_streaming_enabled() -> bool:
+        if envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag":
+            return False
         vllm_context = get_vllm_model_wrapper_context()
         if vllm_context.vllm_config is None:
             return False
@@ -1044,6 +1050,32 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             recurrent_state = None
         else:
             attn_metadata = get_forward_context().attn_metadata[self.prefix]
+            pcp_meta = getattr(attn_metadata, "pcp", None)
+            is_pcp_zigzag = (
+                pcp_meta is not None and pcp_meta.gdn_rm_to_packed is not None
+            )
+            if is_pcp_zigzag:
+                mixed_qkv_gdn = torch.index_select(
+                    all_gather_equal_tokens(mixed_qkv, dim=0),
+                    0,
+                    pcp_meta.gdn_rm_to_packed,
+                )
+                b_gdn = torch.index_select(
+                    all_gather_equal_tokens(b, dim=0),
+                    0,
+                    pcp_meta.gdn_rm_to_packed,
+                )
+                a_gdn = torch.index_select(
+                    all_gather_equal_tokens(a, dim=0),
+                    0,
+                    pcp_meta.gdn_rm_to_packed,
+                )
+                gdn_qsl = pcp_meta.gdn_query_start_loc
+            else:
+                mixed_qkv_gdn = mixed_qkv
+                b_gdn = b
+                a_gdn = a
+                gdn_qsl = attn_metadata.query_start_loc
 
             if len(kv_cache) == 1:
                 # Unified block pool: the attention-shaped pool carries the
@@ -1073,21 +1105,25 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
                 core_attn_out = self.gdn_pooled_op(
-                    mixed_qkv,
-                    b,
-                    a,
+                    mixed_qkv_gdn,
+                    b_gdn,
+                    a_gdn,
                     recurrent_state,
                     self.conv1d.weight,
                     self.conv1d.bias,
                     self.A_log,
                     self.dt_bias,
                     state_indices,
-                    attn_metadata.query_start_loc,
+                    gdn_qsl,
                     request_distribution,
                     attn_metadata.seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
                 )
+                if is_pcp_zigzag:
+                    core_attn_out = torch.index_select(
+                        core_attn_out, 0, pcp_meta.gdn_packed_to_local
+                    )
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")
             else:
@@ -1134,9 +1170,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # Execute the TorchTPU custom op
                 if not use_pcp_streaming:
                     core_attn_out = self.gdn_op(
-                        mixed_qkv,
-                        b,
-                        a,
+                        mixed_qkv_gdn,
+                        b_gdn,
+                        a_gdn,
                         conv_state,
                         recurrent_state,
                         self.conv1d.weight,
@@ -1144,7 +1180,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         self.A_log,
                         self.dt_bias,
                         state_indices,
-                        attn_metadata.query_start_loc,
+                        gdn_qsl,
                         request_distribution,
                         attn_metadata.seq_lens,
                         slot_read_offsets,
@@ -1170,6 +1206,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.query_start_loc,
                         attn_metadata.request_distribution,
                         attn_metadata.seq_lens,
+                    )
+                if is_pcp_zigzag:
+                    core_attn_out = torch.index_select(
+                        core_attn_out, 0, pcp_meta.gdn_packed_to_local
                     )
                 if core_attn_out.shape[0] != num_tokens:
                     if not use_pcp_streaming:

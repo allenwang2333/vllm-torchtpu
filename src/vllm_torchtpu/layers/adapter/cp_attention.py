@@ -731,9 +731,8 @@ def build_pcp_kernels(
 def _make_cu_cache(cu_q_lens: torch.Tensor, num_seqs: int) -> torch.Tensor:
     cu = cu_q_lens[::2]
     if cu.shape[0] < num_seqs + 1:
-        last_val = cu[-1]
         pad_len = num_seqs + 1 - cu.shape[0]
-        padding = torch.full((pad_len,), last_val.item(), dtype=cu.dtype, device=cu.device)
+        padding = cu[-1:].expand(pad_len)
         cu = torch.cat([cu, padding], dim=0)
     return cu
 

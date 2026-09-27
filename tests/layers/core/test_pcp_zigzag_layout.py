@@ -276,3 +276,38 @@ def test_pcp_zigzag_rejects_mixed_decode_prefill():
             num_tokens_paddings=[128, 256, 512],
             max_num_tokens=512,
         )
+
+
+def test_pcp_zigzag_seq_arrays_multi_request():
+    pcp_size = 2
+    n_off = 4
+    counts = [1, 1]
+    chunk, off, _ = pcp_zigzag_token_layout(counts, pcp_size, block_size=16)
+    cu_q_lens, q_pos_offsets, pcp_write = pcp_zigzag_seq_arrays(
+        chunk, off, pcp_size, n_off, counts
+    )
+    # Req 0 tail is empty (counts[0]=1 <= 16), but intermediate cu_q_lens[r, 2]
+    # must advance to off[1] = 32 socu_q_lens stays monotonic!
+    assert np.all(np.diff(cu_q_lens, axis=1) >= 0)
+    assert cu_q_lens[0, 2] == 32
+    assert cu_q_lens[0, 3] == 48
+    assert cu_q_lens[0, 4] == 48
+
+
+def test_pcp_zigzag_page_table_multi_request():
+    pcp_size = 2
+    block_size = 16
+    n_off = 4
+    counts = [64, 64]
+    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size, block_size=block_size)
+    s_pad = 128
+    table = pcp_zigzag_page_table(
+        chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad
+    )
+    # Static width: two_p * (s_pad // 2 // block_size) = 4 * 4 = 16
+    assert table.shape == (n_off, 16)
+    # Req 0 and Req 1 should map to disjoint page sets in the all-gathered buffer
+    req0_pages = set(table[0, :4].tolist())
+    req1_pages = set(table[2, :4].tolist())
+    assert req0_pages.isdisjoint(req1_pages)
+

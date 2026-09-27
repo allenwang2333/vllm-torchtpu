@@ -30,6 +30,9 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "q_pos_offsets",
         "new_kv_page_indices",
         "update_kv_cache",
+        "gdn_rm_to_packed",
+        "gdn_packed_to_local",
+        "gdn_query_start_loc",
     ],
     meta_fields=["cache_pages"],
 )
@@ -50,6 +53,12 @@ class PCPMetadata:
     new_kv_page_indices: jax.Array | None = None
     # (pcp_size, max_num_reqs) bool / int32 — which virtual sequence writes its share of the current KV back, per rank.
     update_kv_cache: jax.Array | None = None
+    # (global_padded_tokens,) int32 — maps request-major token index to packed zigzag buffer index for GDN.
+    gdn_rm_to_packed: jax.Array | None = None
+    # (local_padded_tokens,) int32 — maps local zigzag slot index to request-major token index for GDN.
+    gdn_packed_to_local: jax.Array | None = None
+    # (max_num_reqs+1,) int32 — cumulative query lengths across 2*num_reqs virtual sequences for GDN.
+    gdn_query_start_loc: jax.Array | None = None
 
 
 @functools.partial(
