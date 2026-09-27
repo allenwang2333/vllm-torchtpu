@@ -32,6 +32,7 @@ def flash_attention_qk_softmax(
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
+    is_valid: list[jax.Array] | None = None,
 ):
   """Flash attention kernel."""
   b, k_heads, tq, h_size = q.shape
@@ -96,14 +97,17 @@ def flash_attention_qk_softmax(
   m_next_list = []
 
   for b_idx in range(cfgs.block.batch_size):
+    lane_valid = is_valid[b_idx] if is_valid is not None else True
     m_curr_b = m_curr[b_idx]
     m_next_b = jnp.maximum(m_prev, m_curr_b)
     safe_m_prev = jnp.where(m_prev == -jnp.inf, 0.0, m_prev)
     safe_m_next_b = jnp.where(m_next_b == -jnp.inf, 0.0, m_next_b)
     alpha_b = jnp.where(m_prev == -jnp.inf, 0.0, jnp.exp(safe_m_prev - safe_m_next_b))
+    alpha_b = jnp.where(lane_valid, alpha_b, 0.0)
     alpha_list.append(alpha_b)
     m_next_list.append(m_next_b)
-    m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
+    m_prev_next = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
+    m_prev = jnp.where(lane_valid, m_prev_next, m_prev)
 
   m_next = jnp.stack(m_next_list, axis=0)
   safe_m_next = jnp.where(m_next == -jnp.inf, 0.0, m_next)
@@ -114,13 +118,16 @@ def flash_attention_qk_softmax(
 
   l_next_list = []
   for b_idx in range(cfgs.block.batch_size):
-    l_next_b = alpha_list[b_idx] * l_prev + p_rowsum[b_idx]
+    lane_valid = is_valid[b_idx] if is_valid is not None else True
+    term_prev = jnp.where(m_prev == -jnp.inf, 0.0, alpha_list[b_idx] * l_prev)
+    l_next_b = term_prev + p_rowsum[b_idx]
     l_next_list.append(l_next_b)
-    l_prev = l_next_b
+    l_prev_next = jnp.where(is_last_k[step, b_idx], 0.0, l_next_b)
+    l_prev = jnp.where(lane_valid, l_prev_next, l_prev)
 
   l_next = jnp.stack(l_next_list, axis=0)
 
-  return p, alpha_list, m_next, l_next, m_prev
+  return p, alpha_list, m_next, l_next, m_prev, l_prev
 
 
 def flash_attention_pv(
@@ -130,6 +137,9 @@ def flash_attention_pv(
     o_prev: jax.Array,  # [KV, TQ, H]
     cfgs: configs.RpaConfigs,
     v_scale: jax.Array | None = None,  # [B, KV, S]
+    is_valid: list[jax.Array] | None = None,
+    is_last_k: jax.Ref | None = None,
+    step: jax.Array | None = None,
 ):
   """Flash attention kernel."""
   b, k_heads, tq, s = p.shape
@@ -167,10 +177,24 @@ def flash_attention_pv(
 
   o_next_list = []
   for b_idx in range(cfgs.block.batch_size):
+    lane_valid = is_valid[b_idx] if is_valid is not None else True
     alpha_b = utils.broadcast_minor(alpha_list[b_idx], o_prev.shape)
-    o_next_b = alpha_b * o_prev + pv[b_idx]
+    term_prev = jnp.where(alpha_b == 0.0, 0.0, alpha_b * o_prev)
+    o_next_b = term_prev + pv[b_idx]
     o_next_list.append(o_next_b)
-    o_prev = o_next_b
+    if is_last_k is not None and step is not None:
+      o_prev_next = jnp.where(
+          utils.broadcast_minor(is_last_k[step, b_idx], o_prev.shape),
+          0.0,
+          o_next_b,
+      )
+    else:
+      o_prev_next = o_next_b
+    o_prev = jnp.where(
+        utils.broadcast_minor(lane_valid, o_prev.shape),
+        o_prev_next,
+        o_prev,
+    )
   o_next = jnp.stack(o_next_list, axis=0)
 
-  return o_next
+  return o_next, o_prev

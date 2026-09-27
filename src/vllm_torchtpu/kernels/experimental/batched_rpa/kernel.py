@@ -136,7 +136,8 @@ def calculate_and_store_out(
     # batch sizes, we almost always use accumulation on every block. Please
     # tune `fuse_accum` for your use case.
     for b in range(cfgs.batch_size):
-      is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
+      is_valid = schedule_ref.s_idx[step_idx, b] != -1
+      is_last_k = (schedule_ref.is_last_k[step_idx, b] == 1) & is_valid
       acc_val = acc_list[b]
       l_val = l_list[b]
       accum_named_call = jax.named_call(_accum, name=f"accum_{b}")
@@ -146,7 +147,8 @@ def calculate_and_store_out(
 
   if cfgs.serve.return_lse:
     for b in range(cfgs.batch_size):
-      is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
+      is_valid = schedule_ref.s_idx[step_idx, b] != -1
+      is_last_k = (schedule_ref.is_last_k[step_idx, b] == 1) & is_valid
       m_val = m_list[b]
       l_val = l_list[b]
       jax.lax.cond(is_last_k, _stage_lse, lambda *_: None, b, m_val, l_val)
@@ -224,6 +226,10 @@ class StepMetadata:
   causal_offset: list[jax.Array]
   bkv_sz_frm_cache: list[jax.Array]
   new_kv_len_start: list[jax.Array]
+  is_valid: list[jax.Array]
+  q_sz: list[jax.Array]
+  k_id: list[jax.Array]
+  total_kv_len: list[jax.Array]
   local_k_start: list[jax.Array] | None = None
   local_k_end: list[jax.Array] | None = None
 
@@ -243,6 +249,10 @@ def fetch_step_metadata(
   causal_offset_list = []
   bkv_sz_frm_cache_list = []
   new_kv_len_start_list = []
+  is_valid_list = []
+  q_sz_list = []
+  k_id_list = []
+  total_kv_len_list = []
   cp_rank = cp_rank_ref[0]
 
   local_k_start_list = (
@@ -259,19 +269,31 @@ def fetch_step_metadata(
   for b_idx in range(cfgs.batch_size):
     s_idx = schedule_ref.s_idx[step, b_idx]
     is_valid = s_idx != -1
+    safe_s_idx = jnp.maximum(s_idx, 0)
     q_idx = schedule_ref.q_idx[step, b_idx]
     k_idx = schedule_ref.k_idx[step, b_idx]
     k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
     global_kv_cache_len = jnp.where(
-        is_valid, global_kv_cache_lens_ref[s_idx], 0
+        is_valid, global_kv_cache_lens_ref[safe_s_idx], 0
     )
     kv_cache_len_val = cfgs.local_kv_cache_len(global_kv_cache_len, cp_rank)
-    kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
+    kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[safe_s_idx], 0)
     # Without a page table the new KV is the sequence's own Q.
-    kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[s_idx], 0)
-    q_position = jnp.where(is_valid, q_positions_ref[s_idx], 0)
+    kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx], 0)
+    q_position = jnp.where(is_valid, q_positions_ref[safe_s_idx], 0)
 
     total_kv_len = kv_cache_len_val + kv_new_len_val
+
+    q_len = jnp.where(
+        is_valid, cu_q_lens_ref[safe_s_idx + 1] - cu_q_lens_ref[safe_s_idx], 0
+    )
+    q_sz = jnp.where(
+        is_valid, jnp.clip(q_len - q_idx * cfgs.bq_sz, 0, cfgs.bq_sz), 0
+    )
+    is_valid_list.append(is_valid)
+    q_sz_list.append(q_sz)
+    k_id_list.append(k_id)
+    total_kv_len_list.append(total_kv_len)
 
     # Causal base offset: K_base - Q_base
     q_base = q_idx * cfgs.bq_sz + q_position
@@ -300,6 +322,10 @@ def fetch_step_metadata(
       causal_offset=causal_offset_list,
       bkv_sz_frm_cache=bkv_sz_frm_cache_list,
       new_kv_len_start=new_kv_len_start_list,
+      is_valid=is_valid_list,
+      q_sz=q_sz_list,
+      k_id=k_id_list,
+      total_kv_len=total_kv_len_list,
       local_k_start=local_k_start_list,
       local_k_end=local_k_end_list,
   )
@@ -330,6 +356,10 @@ def ring_fetch_step_metadata(
   causal_offset_list = []
   bkv_sz_frm_cache_list = []
   new_kv_len_start_list = []
+  is_valid_list = []
+  q_sz_list = []
+  k_id_list = []
+  total_kv_len_list = []
   cp_size = cfgs.serve.cp_group_size
   assert cp_size is not None
   cp_rank = cp_rank_ref[0]
@@ -348,6 +378,7 @@ def ring_fetch_step_metadata(
   for b_idx in range(cfgs.batch_size):
     s_idx = schedule_ref.s_idx[step, b_idx]
     is_valid = s_idx != -1
+    safe_s_idx = jnp.maximum(s_idx, 0)
     q_idx = schedule_ref.q_idx[step, b_idx]
     # k_idx packs (local block, hop); see CPMetadataComputer. After `hop`
     # hops the buffer holds the stripe of the rank that far back around
@@ -360,15 +391,26 @@ def ring_fetch_step_metadata(
     # stays local even though the data belongs to `src_rank`.
     k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
     global_kv_cache_len = jnp.where(
-        is_valid, global_kv_cache_lens_ref[s_idx], 0
+        is_valid, global_kv_cache_lens_ref[safe_s_idx], 0
     )
     # Every rank runs rank 0's schedule, so rank 0's stripe sets the walk.
     kv_cache_len_val = cfgs.local_kv_cache_len(global_kv_cache_len, 0)
-    kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
-    kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[s_idx], 0)
-    q_position = jnp.where(is_valid, q_positions_ref[s_idx], 0)
+    kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[safe_s_idx], 0)
+    kv_new_start_val = jnp.where(is_valid, cu_q_lens_ref[safe_s_idx], 0)
+    q_position = jnp.where(is_valid, q_positions_ref[safe_s_idx], 0)
 
     total_kv_len = kv_cache_len_val + kv_new_len_val
+
+    q_len = jnp.where(
+        is_valid, cu_q_lens_ref[safe_s_idx + 1] - cu_q_lens_ref[safe_s_idx], 0
+    )
+    q_sz = jnp.where(
+        is_valid, jnp.clip(q_len - q_idx * cfgs.bq_sz, 0, cfgs.bq_sz), 0
+    )
+    is_valid_list.append(is_valid)
+    q_sz_list.append(q_sz)
+    k_id_list.append(k_id)
+    total_kv_len_list.append(total_kv_len)
 
     # Causal base offset: K_base - Q_base
     q_base = q_idx * cfgs.bq_sz + q_position
@@ -398,6 +440,10 @@ def ring_fetch_step_metadata(
       causal_offset=causal_offset_list,
       bkv_sz_frm_cache=bkv_sz_frm_cache_list,
       new_kv_len_start=new_kv_len_start_list,
+      is_valid=is_valid_list,
+      q_sz=q_sz_list,
+      k_id=k_id_list,
+      total_kv_len=total_kv_len_list,
       local_k_start=local_k_start_list,
       local_k_end=local_k_end_list,
   )
@@ -441,6 +487,17 @@ def generate_mask(
       )
     if step_meta.local_k_end is not None:
       mask_b = jnp.logical_and(mask_b, kv_iota < step_meta.local_k_end[b_idx])
+
+    # Bound KV to valid tokens for this sequence
+    kv_valid = (step_meta.k_id[b_idx] + kv_iota) < step_meta.total_kv_len[b_idx]
+    mask_b = jnp.logical_and(mask_b, kv_valid)
+
+    # Bound Query to valid tokens in this query block
+    q_valid = (bq_start + q_iota) < step_meta.q_sz[b_idx]
+    mask_b = jnp.logical_and(mask_b, q_valid)
+
+    # Invalidate completely if this batch lane is inactive (s_idx == -1)
+    mask_b = jnp.where(step_meta.is_valid[b_idx], mask_b, False)
 
     masks.append(mask_b)
 
@@ -730,6 +787,12 @@ def rpa_body(
   l_val = l_scratch_ref[...]
   acc_val = acc_scratch_ref[...]
 
+  # If m is -inf, this query tile has no previous accumulation; reset l and acc.
+  l_val = jnp.where(m_val == -jnp.inf, 0.0, l_val)
+  acc_val = jnp.where(
+      utils.broadcast_minor(m_val == -jnp.inf, acc_val.shape), 0.0, acc_val
+  )
+
   l_new_list = []
   m_new_list = []
   acc_new_list = []
@@ -753,7 +816,7 @@ def rpa_body(
         cfgs=cfgs,
     )
 
-    p, alpha_list, m_next, l_next, m_carry = (
+    p, alpha_list, m_next, l_next, m_carry, l_carry = (
         flash_attention.flash_attention_qk_softmax(
             step,
             q[:, :, q_slice],
@@ -765,24 +828,28 @@ def rpa_body(
             cfgs=cfgs,
             bq_start=bq_start,
             k_scale=k_scale,
+            is_valid=step_meta.is_valid,
         )
     )
     m_scratch_ref[:, q_slice] = m_carry
-    l_scratch_ref[:, q_slice] = l_next[-1]
+    l_scratch_ref[:, q_slice] = l_carry
     if cfgs.serve.return_lse:
       m_new_list.append(m_next)
     l_new_list.append(l_next)
 
     if prev_p is not None:
-      o_next = flash_attention.flash_attention_pv(
+      o_next, o_carry = flash_attention.flash_attention_pv(
           prev_p,
           v,
           prev_alpha_list,
           acc_val[:, prev_q_slice],
           cfgs=cfgs,
           v_scale=v_scale,
+          is_valid=step_meta.is_valid,
+          is_last_k=schedule_ref.is_last_k,
+          step=step,
       )
-      acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+      acc_scratch_ref[:, prev_q_slice] = o_carry
       acc_new_list.append(o_next)
 
     prev_p = p
@@ -790,15 +857,18 @@ def rpa_body(
     prev_q_slice = q_slice
 
   assert prev_p is not None
-  o_next = flash_attention.flash_attention_pv(
+  o_next, o_carry = flash_attention.flash_attention_pv(
       prev_p,
       v,
       prev_alpha_list,
       acc_val[:, prev_q_slice],
       cfgs=cfgs,
       v_scale=v_scale,
+      is_valid=step_meta.is_valid,
+      is_last_k=schedule_ref.is_last_k,
+      step=step,
   )
-  acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+  acc_scratch_ref[:, prev_q_slice] = o_carry
   acc_new_list.append(o_next)
   if cfgs.serve.return_lse:
     m_next = jnp.concatenate(m_new_list, axis=2)
