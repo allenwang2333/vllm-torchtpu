@@ -1082,7 +1082,16 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             def _():
                                 pcopy(q, q).start()
 
-                        def pbody(p, c):
+                        # scan_llo j-e39a2fd5/j-3d41a563: 79.5 -> 56-58 us/layer, keys bit-exact. The
+                        # page is read as u32 (512,128): even rows are fp8 keys (no relayout), odd rows
+                        # carry the ue8m0 byte, gathered to (8,128) token order; two-stage software
+                        # pipeline (the matmul of page p overlaps the key math of page p-1).
+                        NR, NCH = pg // 128, max(1, pg // 512)     # key rows per page, 128-lane chunks
+                        assert pg % 256 == 0, pg
+                        sub8 = lax.broadcasted_iota(I32, (NR, 128), 0)
+                        ln8 = lax.broadcasted_iota(I32, (NR, 128), 1)
+
+                        def stage1(p):
                             sl_ = p % SD
 
                             @pl.when(p + SD - 1 < npages)     # refills the slot freed last page
@@ -1093,25 +1102,48 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             @pl.when(jnp.logical_and(active, p == pos >> lg_pg))
                             def _():
                                 scr["ipage"][sl_, pl.ds(sl >> 2, 1)] = scr["igrp"][...]
-                            blk = scr["ipage"][sl_].reshape(pg, 256)
-                            keys8 = pltpu.bitcast(blk[:, 0:128], FP8)
+                            if interpret:    # the interpreter has no raw views: same values, old load
+                                blk = scr["ipage"][sl_].reshape(pg, 256)
+                                keys8 = pltpu.bitcast(blk[:, 0:128], FP8)
+                                dots = lax.dot_general(*mxu(iq8, keys8, tiles), NT,
+                                                       preferred_element_type=F32)
+                                return dots, blk[:, 128:129].astype(I32).reshape(NR, 128)
+                            v = pool_alias.view(scr["ipage"].at[sl_], (pg // 2, 128), U32)
+                            keys8 = pltpu.bitcast(pltpu.bitcast(v[pl.ds(0, pg // 4, stride=2), :], U8),
+                                                  FP8)
                             dots = lax.dot_general(*mxu(iq8, keys8, tiles), NT,
                                                    preferred_element_type=F32)
+                            # lane 0 of odd u32 row r packs the scale bytes of tokens 4r .. 4r+3
+                            tw = lax.bitcast_convert_type(v[pl.ds(1, pg // 4, stride=2), :], I32).T[0:1]
+                            if pg < 512:
+                                tw = jnp.concatenate([tw, jnp.zeros((1, 128 - pg // 4), I32)], axis=1)
+                            rr = jnp.broadcast_to(tw[:, 0:128], (NR, 128))
+                            for ch in range(1, NCH):
+                                rr = jnp.where(sub8 // 4 == ch,
+                                               jnp.broadcast_to(tw[:, ch * 128:(ch + 1) * 128], (NR, 128)),
+                                               rr)
+                            g = jnp.take_along_axis(rr, 32 * (sub8 % 4) + ln8 // 4, axis=1,
+                                                    mode="promise_in_bounds")
+                            return dots, shr(g, 8 * (ln8 % 4)) & 255              # token 128 r + l
+
+                        def stage2(p, dots, sbyte):
                             scv = jnp.sum(jnp.maximum(dots, 0.0) * wcol, axis=0, keepdims=True)
-                            sbyte = blk[:, 128:129].astype(I32).T                         # [1,pg]
-                            scale = lax.bitcast_convert_type(shl(sbyte, 23), F32)
-                            score = scv * scale
-                            pp = p * pg + lax.broadcasted_iota(I32, (1, pg), 1)
+                            scv = jnp.concatenate([scv[:, j * 128:(j + 1) * 128] for j in range(NR)],
+                                                  axis=0)
+                            score = scv * lax.bitcast_convert_type(shl(sbyte, 23), F32)
+                            pp = p * pg + 128 * sub8 + ln8
                             # order-preserving i32 key, written in place of the f32 score (one
                             # (ROWS, 128) buffer fewer: v11's top-k temporaries overflowed VMEM)
                             b = lax.bitcast_convert_type(score, I32)
                             key = jnp.where(b >= 0, b, b ^ jnp.int32(0x7FFFFFFF))
                             key = jnp.where((pp < seq_len) & (score != -jnp.inf), key, INT_MIN)
-                            for j in range(pg // 128):
-                                scr["keys"][pl.ds(p * (pg // 128) + j, 1), :] = \
-                                    key[:, j * 128:(j + 1) * 128]
-                            return c
-                        lax.fori_loop(0, npages, pbody, 0)
+                            scr["keys"][pl.ds(pl.multiple_of(p * NR, NR), NR), :] = key
+
+                        @pl.when(npages > 0)
+                        def _():
+                            carry = lax.fori_loop(
+                                1, npages, lambda p, c: (stage1(p), stage2(p - 1, *c))[0], stage1(0))
+                            stage2(npages - 1, *carry)
                     return f
                 phi.mark("i_scan")
                 bswitch(l, {ll: scan(r) for ll, r in C["idx"].items()})
