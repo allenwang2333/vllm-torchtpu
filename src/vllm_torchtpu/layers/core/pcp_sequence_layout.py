@@ -97,6 +97,26 @@ class PcpSequenceLayoutDecision:
         return self.mode is not PcpSequenceLayoutMode.DISABLED
 
 
+def resolve_pcp_zigzag_page_size(
+    block_size: int, kernel_block_size: int | None = None
+) -> int:
+    """Return the attention kernel page size used by batched RPA under zigzag PCP.
+
+    On hybrid models with a unified KV block pool, `cache_config.block_size` is
+    sized to fit the Mamba state (e.g. 640 or 4096), while `prepare_kernel_block_sizes`
+    splits each manager block into attention kernel pages of size 256 or 128.
+    """
+    if kernel_block_size is not None and kernel_block_size > 0:
+        return int(kernel_block_size)
+    block_size = int(block_size)
+    if block_size > 256:
+        if block_size % 256 == 0:
+            return 256
+        if block_size % 128 == 0:
+            return 128
+    return block_size
+
+
 class PcpSequenceLayoutEligibility:
     _BOUNDARY_MESSAGE = (
         "PCP partial sequence layout does not support prompt/decode "
@@ -120,7 +140,11 @@ class PcpSequenceLayoutEligibility:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
         self.is_zigzag = bool(is_zigzag)
-        self.block_size = int(block_size)
+        self.block_size = (
+            resolve_pcp_zigzag_page_size(block_size)
+            if self.is_zigzag
+            else int(block_size)
+        )
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "PcpSequenceLayoutEligibility":
@@ -1102,7 +1126,10 @@ def prepare_pcp_zigzag_sequence_layout(
     assert padded_total_num_tokens is not None
     s_pad = padded_total_num_tokens // pcp_size
 
-    block_size = getattr(runner, "block_size", 16)
+    block_size = resolve_pcp_zigzag_page_size(
+        getattr(runner, "block_size", 16),
+        getattr(runner, "_attention_kernel_block_size", None),
+    )
     if num_reqs == 1:
         pcp_chunk_size = padded_total_num_tokens // two_p
         chunk = [pcp_chunk_size]
@@ -1166,7 +1193,6 @@ def prepare_pcp_zigzag_sequence_layout(
     cu_q_lens_np, q_pos_offsets_np, pcp_write_np = pcp_zigzag_seq_arrays(
         chunk, off, pcp_size, n_off, counts
     )
-    block_size = getattr(runner, "block_size", 16)
     pcp_table_np = pcp_zigzag_page_table(
         chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad
     )

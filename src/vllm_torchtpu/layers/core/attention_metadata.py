@@ -398,7 +398,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                         block_tables[2 * i, :target_num_blocks] = source_block_tables[
                             ctx.start_index + i, :target_num_blocks
                         ]
-                    if 2 * i + 1 < target_num_reqs:
+                    if not self.is_mamba_group and 2 * i + 1 < target_num_reqs:
                         block_tables[2 * i + 1, :target_num_blocks] = source_block_tables[
                             ctx.start_index + i, :target_num_blocks
                         ]
@@ -545,7 +545,8 @@ def stage_block_table_uploads(
 
     if ctx.position_ids_override is None:
         offset = 0
-        for _, block_table_obj, target_num_blocks in entries:
+        for idx, (_, block_table_obj, target_num_blocks) in enumerate(entries):
+            is_mamba = entry_builders[idx].is_mamba_group
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
                 num_reqs_padded, target_num_blocks
             )
@@ -554,7 +555,7 @@ def stage_block_table_uploads(
                 for i in range(ctx.num_reqs):
                     if 2 * i < num_reqs_padded:
                         rows[2 * i] = source[ctx.start_index + i, :target_num_blocks]
-                    if 2 * i + 1 < num_reqs_padded:
+                    if not is_mamba and 2 * i + 1 < num_reqs_padded:
                         rows[2 * i + 1] = source[ctx.start_index + i, :target_num_blocks]
             else:
                 rows[: ctx.num_reqs] = source[

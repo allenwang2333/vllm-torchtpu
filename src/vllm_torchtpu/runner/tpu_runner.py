@@ -702,8 +702,14 @@ class TPUModelRunner(GPUModelRunner):
             or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag")
         )
         if is_zigzag_pcp:
-            local_quantum = 2 * self.block_size
-            min_max_tokens = local_quantum * self.max_num_reqs
+            from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+                resolve_pcp_zigzag_page_size,
+            )
+
+            page_size = resolve_pcp_zigzag_page_size(
+                self.block_size, getattr(self, "_attention_kernel_block_size", None)
+            )
+            local_quantum = 2 * page_size
             snapped = []
             for sz in self.num_tokens_paddings:
                 snapped_sz = max(
@@ -712,13 +718,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 if not snapped or snapped[-1] != snapped_sz:
                     snapped.append(snapped_sz)
-            while snapped[-1] < min_max_tokens:
-                nxt = max(snapped[-1] * 2, local_quantum)
-                snapped_nxt = (
-                    (nxt + local_quantum - 1) // local_quantum
-                ) * local_quantum
-                snapped.append(snapped_nxt)
             self.num_tokens_paddings = snapped
+            vllm_config.compilation_config.compile_sizes = list(self.num_tokens_paddings)
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
@@ -733,11 +734,16 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = False
 
         # CPU staging tensors (TPU prepares inputs on CPU then transfers).
+        host_token_cap = (
+            self.max_num_tokens * pcp_size
+            if self._pcp_enabled
+            else self.max_num_tokens
+        )
         self.input_ids_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu"
+            host_token_cap, dtype=torch.int32, device="cpu"
         )
         self.positions_cpu = torch.zeros(
-            self.max_num_tokens, dtype=torch.int32, device="cpu"
+            host_token_cap, dtype=torch.int32, device="cpu"
         )
         self.positions_np = self.positions_cpu.numpy()
         max_req_rows = (
@@ -772,7 +778,7 @@ class TPUModelRunner(GPUModelRunner):
             # dtype-identical to what the TPU model expects. Parent's
             # _calc_mrope_positions writes via .cpu and .np — both route here.
             self.mrope_positions = self._make_buffer(
-                3, self.max_num_tokens + 1, dtype=torch.int32
+                3, host_token_cap + 1, dtype=torch.int32
             )
         seq_cap = max(self.max_num_tokens, max_req_rows)
         self.query_start_loc_cpu = torch.zeros(
@@ -789,12 +795,12 @@ class TPUModelRunner(GPUModelRunner):
         self._block_table_stage_cpu: torch.Tensor | None = None
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
-                self.max_num_tokens,
+                host_token_cap,
                 dtype=torch.bool,
                 device="cpu",
                 pin_memory=PIN_MEMORY,
             )
-        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
+        self.arange_np = np.arange(host_token_cap, dtype=np.int64)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
