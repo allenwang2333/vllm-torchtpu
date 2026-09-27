@@ -4162,6 +4162,10 @@ class TPUModelRunner(GPUModelRunner):
                 recover_u = torch.rand_like(
                     target_logits, dtype=torch.float32, generator=sampling_generator
                 )
+                # Materialize the draws now (enqueue only, no host wait) so they
+                # run as one fixed program instead of fusing into whatever eager
+                # op consumes them next.
+                synchronize_tensors([bonus_u, accept_u_ng, recover_u], wait=False)
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -4180,6 +4184,7 @@ class TPUModelRunner(GPUModelRunner):
                 device=target_logits.device,
                 generator=sampling_generator,
             )
+            synchronize_tensors([accept_u], wait=False)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -4318,6 +4323,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                         u = torch.rand_like(logits, generator=sampling_generator)
+                        synchronize_tensors([u], wait=False)
                         selected = self.sample_from_logits_func(
                             logits,
                             temperatures_tpu,
@@ -4370,6 +4376,7 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
                     u = torch.rand_like(logits, generator=sampling_generator)
+                    synchronize_tensors([u], wait=False)
                     selected_token_ids = self.sample_from_logits_func(
                         logits,
                         temperatures_tpu,
