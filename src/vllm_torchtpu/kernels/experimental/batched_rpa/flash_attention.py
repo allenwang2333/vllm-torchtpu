@@ -79,10 +79,8 @@ def flash_attention_qk_softmax(
 
   qk_masked = []
   m_curr_list = []
-  custom_mask_list = []
   for b_idx in range(cfgs.block.batch_size):
     mask_b = custom_mask[b_idx]
-    custom_mask_list.append(mask_b)
     has_valid_keys_b = jnp.any(mask_b, axis=-1, keepdims=True)
     qk_b = jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value)
     qk_masked.append(qk_b)
@@ -91,7 +89,6 @@ def flash_attention_qk_softmax(
     )
   qk = jnp.stack(qk_masked, axis=0)
   m_curr = jnp.stack(m_curr_list, axis=0)
-  custom_mask_stacked = jnp.stack(custom_mask_list, axis=0)
 
   alpha_list = []
   m_next_list = []
@@ -106,15 +103,14 @@ def flash_attention_qk_softmax(
     alpha_b = jnp.where(lane_valid, alpha_b, 0.0)
     alpha_list.append(alpha_b)
     m_next_list.append(m_next_b)
-    m_prev_next = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
+    m_prev_next = jnp.where(is_last_k[step, b_idx] == 1, -jnp.inf, m_next_b)
     m_prev = jnp.where(lane_valid, m_prev_next, m_prev)
 
   m_next = jnp.stack(m_next_list, axis=0)
   safe_m_next = jnp.where(m_next == -jnp.inf, 0.0, m_next)
-  safe_qk = jnp.where(custom_mask_stacked, qk, utils.broadcast_minor(safe_m_next, qk.shape))
-  p_unmasked = jnp.exp(safe_qk - utils.broadcast_minor(safe_m_next, qk.shape))
-  p = jnp.where(custom_mask_stacked, p_unmasked, 0.0)
+  p = jnp.exp(qk - utils.broadcast_minor(safe_m_next, qk.shape))
   p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
+  p_rowsum = jnp.where(m_next == -jnp.inf, 0.0, p_rowsum)
 
   l_next_list = []
   for b_idx in range(cfgs.block.batch_size):
@@ -122,7 +118,7 @@ def flash_attention_qk_softmax(
     term_prev = jnp.where(m_prev == -jnp.inf, 0.0, alpha_list[b_idx] * l_prev)
     l_next_b = term_prev + p_rowsum[b_idx]
     l_next_list.append(l_next_b)
-    l_prev_next = jnp.where(is_last_k[step, b_idx], 0.0, l_next_b)
+    l_prev_next = jnp.where(is_last_k[step, b_idx] == 1, 0.0, l_next_b)
     l_prev = jnp.where(lane_valid, l_prev_next, l_prev)
 
   l_next = jnp.stack(l_next_list, axis=0)

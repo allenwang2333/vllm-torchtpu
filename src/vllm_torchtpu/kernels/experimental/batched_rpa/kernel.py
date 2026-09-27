@@ -486,9 +486,6 @@ def generate_mask(
     q_valid = (bq_start + q_iota) < step_meta.q_sz[b_idx]
     mask_b = jnp.logical_and(mask_b, q_valid)
 
-    # Invalidate completely if this batch lane is inactive (s_idx == -1)
-    mask_b = jnp.where(step_meta.is_valid[b_idx], mask_b, False)
-
     masks.append(mask_b)
 
   return masks
@@ -776,12 +773,6 @@ def rpa_body(
   m_val = m_scratch_ref[...]
   l_val = l_scratch_ref[...]
   acc_val = acc_scratch_ref[...]
-
-  # If m is -inf, this query tile has no previous accumulation; reset l and acc.
-  l_val = jnp.where(m_val == -jnp.inf, 0.0, l_val)
-  acc_val = jnp.where(
-      utils.broadcast_minor(m_val == -jnp.inf, acc_val.shape), 0.0, acc_val
-  )
 
   l_new_list = []
   m_new_list = []
