@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     GLM5_MEGAKERNEL_LAYERDIFF: bool = False
     GLM5_MEGAKERNEL_VERIFY_STOCK_DRIVES: bool = False
     GLM5_MEGAKERNEL_TRACE: bool = False
+    GLM5_MEGAKERNEL_TILES: str = ""
     GLM5_STEP_TIMING: int = 0
     GLM5_MEGAKERNEL_BISECT: str = ""
     GLM5_LIBTPU_EXTRA_ARGS: str = ""
@@ -611,6 +612,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Profiling: build the kernel with its per-phase trace regions (L_*, i_*, m_*) so an
     # xprof capture splits the one custom call by phase.
     "GLM5_MEGAKERNEL_TRACE": env_bool("GLM5_MEGAKERNEL_TRACE"),
+    # Measurement: override kernel.Tiles fields, "gpre=0,gpre_rs=0,shlate=0" (ints; 0/1 for bools).
+    "GLM5_MEGAKERNEL_TILES": env_str("GLM5_MEGAKERNEL_TILES", ""),
     # Measurement: every Nth forward, synchronize around it and log its latency plus how many
     # forwards since the last line took the megakernel / the stock path, and the host period.
     "GLM5_STEP_TIMING": env_int("GLM5_STEP_TIMING", 0),

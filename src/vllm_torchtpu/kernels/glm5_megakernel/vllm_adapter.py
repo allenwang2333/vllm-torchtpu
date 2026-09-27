@@ -403,7 +403,12 @@ class Glm5Megakernel:
         """The compiled step; `skip` (kernel.ABLATIONS) and `tag` are for GLM5_MEGAKERNEL_BISECT."""
         cfg = self.cfg
         dbg = self.layerdiff and not skip
-        call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE),
+        tiles = K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE)
+        if envs.GLM5_MEGAKERNEL_TILES:
+            kv = dict(f.split("=") for f in envs.GLM5_MEGAKERNEL_TILES.split(","))
+            tiles = dataclasses.replace(tiles, **{k: type(getattr(tiles, k))(int(v)) for k, v in kv.items()})
+            print(f"GLM5 megakernel tiles override: {tiles}", file=sys.stderr, flush=True)
+        call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=tiles,
                              debug=dbg, skip=skip)
         self.info = info
         n_w = len(self.weights)
