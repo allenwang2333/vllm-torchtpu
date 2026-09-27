@@ -14,7 +14,6 @@
 """TPU-Friendly StreamIndex Top-K kernel."""
 
 import functools
-import os
 
 import numpy as np
 
@@ -622,6 +621,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "return_stats",
     ),
 )
 def streamindex_topk(
@@ -650,8 +650,12 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    return_stats: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    Debug: `return_stats=True` appends an i32 stats vector to the return value
+    (see `topk_stats_layout`); the default path is unchanged.
 
     Args:
       q: concatenated all sequences' queries.
@@ -1092,6 +1096,8 @@ def streamindex_topk(
         )
         topk_idxs = []
         topk_scores_list = []
+        stats_rows = []
+        stats_n = 0
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
@@ -1128,17 +1134,19 @@ def streamindex_topk(
                 stage2_scheduling_group_id=sc2_group,
                 return_scores=True,
             )
-            if (
-                os.environ.get("GLM5_TOPK_STATS")
-                and scores.shape[1] % k == 0
-                and scores.shape[1] % 16 == 0
-            ):
-                _topk_stats(
-                    scores,
-                    eff_row_lengths[start : start + chunk_len],
-                    chunk_topk_scores,
-                    k,
-                )
+            if return_stats:
+                if scores.shape[1] % k == 0 and scores.shape[1] % STATS_P == 0:
+                    stats_rows.append(
+                        _topk_stats(
+                            scores,
+                            eff_row_lengths[start : start + chunk_len],
+                            chunk_topk_scores,
+                            k,
+                        )
+                    )
+                else:
+                    stats_rows.append(jnp.zeros((chunk_len, STATS_ROW), jnp.int32))
+                stats_n = scores.shape[1]
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)
@@ -1146,6 +1154,21 @@ def streamindex_topk(
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
 
+        if return_stats:
+            rows = jnp.concatenate(stats_rows)[:max_num_tokens]
+            hdr = jnp.zeros((STATS_HDR,), jnp.int32)
+            hdr = hdr.at[0].set(STATS_MAGIC)
+            hdr = hdr.at[1].set(stats_n)
+            hdr = hdr.at[2].set(k)
+            hdr = hdr.at[3].set(max_num_tokens)
+            hdr = hdr.at[4].set(jnp.max(seq_lens).astype(jnp.int32))
+            hdr = hdr.at[5].set(num_chunks)
+            hdr = hdr.at[6].set(chunk_len)
+            stats = jnp.concatenate([hdr, rows.reshape(-1)])
+            return _common_result(out, topk_scores_list, need_scores), stats
+        return _common_result(out, topk_scores_list, need_scores)
+
+    def _common_result(out, topk_scores_list, need_scores):
         if cp_size == 1 and not return_scores:
             return out
 
@@ -1185,11 +1208,19 @@ def streamindex_topk(
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
+    def _fast_path_maybe_stats(_):
+        out = _fast_path(None)
+        if not return_stats:
+            return out
+        if cp_size > 1 or return_scores:
+            raise NotImplementedError("return_stats with the early exit needs cp_size == 1")
+        return out, jnp.zeros((topk_stats_layout(q.shape[0])[0],), jnp.int32)
+
     if not enable_early_exit:
         return _common_path(None)
     return jax.lax.cond(
         jnp.max(seq_lens) // compression_ratio <= k,
-        _fast_path,
+        _fast_path_maybe_stats,
         _common_path,
         None,
     )
@@ -1456,34 +1487,27 @@ def streamindex_topk_dcp(
     )
 
 
-_STATS_CALLS = [0]
+# Debug (GLM5_TOPK_STATS): per-row stats of the indexer scores, returned as an
+# i32 vector [STATS_HDR header | max_num_tokens rows x STATS_ROW]. Header:
+# magic, n (score columns), k, rows, max(seq_lens), num_chunks, chunk_len, then
+# words 7-9 filled by `stash_topk_stats` (max page index used, num_blocks, rows
+# stored). Row: T (f32
+# bits), vk (f32 bits), count(score >= T), row_length, STATS_P slice counts.
+STATS_MAGIC = 0x51A75000
+STATS_HDR = 16
+STATS_P = 16
+STATS_ROW = 4 + STATS_P
 
 
-def _topk_stats_host(L, tot, t, vk, slice_cnt, n_rows):
-    _STATS_CALLS[0] += 1
-    if int(L) < 100_000 or _STATS_CALLS[0] % 16:
-        return
-    tot = np.asarray(tot); slice_cnt = np.asarray(slice_cnt)
-    act = np.asarray(n_rows)
-    m = act > 0
-    if not m.any():
-        return
-    tot, sc, t, vk = tot[m], slice_cnt[m], np.asarray(t)[m], np.asarray(vk)[m]
-    print(
-        "GLM5_TOPK_STATS L=%d rows=%d tot_mean=%.0f tot_p50=%.0f tot_max=%d "
-        "slice_max=%d overflow=%d/%d per_slice_max=%s per_slice_mean=%s "
-        "T_p50=%.4g vk_p50=%.4g ninf_T=%d"
-        % (int(L), int(m.sum()), tot.mean(), np.median(tot), tot.max(),
-           sc.max(), int((sc > 2048).sum()), sc.size,
-           ",".join(str(int(x)) for x in sc.max(0)),
-           ",".join(str(int(x)) for x in sc.mean(0)),
-           float(np.median(t)), float(np.median(vk)), int(np.isinf(t).sum())),
-        flush=True,
-    )
+def topk_stats_layout(max_num_tokens: int) -> tuple[int, int, int]:
+    """(total words, header words, words per row)."""
+    return STATS_HDR + max_num_tokens * STATS_ROW, STATS_HDR, STATS_ROW
 
 
-def _topk_stats(scores_bits, row_lengths, winner_bits, k, p=16):
-    """Debug: per-row lower bound T = min over k col-mod-k groups of the group max."""
+def _topk_stats(scores_bits, row_lengths, winner_bits, k, p=STATS_P):
+    """Per row: T = min over the k col-mod-k groups of the group max (invalid
+    columns -inf); count(score >= T) in total and per p equal column slices;
+    vk = min of the top-k winners. Returns i32 [b, STATS_ROW]."""
     b, n = scores_bits.shape
     s = lax.bitcast_convert_type(scores_bits, jnp.float32)
     col = lax.broadcasted_iota(jnp.int32, (b, n), 1)
@@ -1491,10 +1515,40 @@ def _topk_stats(scores_bits, row_lengths, winner_bits, k, p=16):
     s = jnp.where(valid, s, -jnp.inf)
     t = s.reshape(b, n // k, k).max(axis=1).min(axis=1)
     ge = valid & (s >= t[:, None])
-    tot = ge.sum(axis=1)
-    slice_cnt = ge.reshape(b, p, n // p).sum(axis=2)
+    tot = ge.sum(axis=1, dtype=jnp.int32)
+    slice_cnt = ge.reshape(b, p, n // p).sum(axis=2, dtype=jnp.int32)
     w = lax.bitcast_convert_type(winner_bits, jnp.float32)
     vk = jnp.where(jnp.isfinite(w), w, jnp.inf).min(axis=1)
-    jax.debug.callback(
-        _topk_stats_host, row_lengths.max(), tot, t, vk, slice_cnt, row_lengths
+    return jnp.concatenate(
+        [
+            lax.bitcast_convert_type(t, jnp.int32)[:, None],
+            lax.bitcast_convert_type(vk, jnp.int32)[:, None],
+            tot[:, None],
+            row_lengths.astype(jnp.int32)[:, None],
+            slice_cnt,
+        ],
+        axis=1,
     )
+
+
+def stash_topk_stats(cache_kv, stats, page_indices):
+    """Debug: write `stats` (i32) into the last page of `cache_kv` (uint8).
+
+    The only data leaving the exported op are its outputs and the donated
+    cache, so the stats ride in a page the block pool hands out last. Header
+    words 7/8 get max(page_indices) and the page count so the reader can tell
+    if that page was ever live (word 7 == word 8 - 1).
+    """
+    page_shape = cache_kv.shape[1:]
+    page_words = int(np.prod(page_shape)) * cache_kv.dtype.itemsize // 4
+    hdr, row = STATS_HDR, STATS_ROW
+    if stats.shape[0] > page_words:
+        # Keep the header and the last rows (the last chunk is the one we want).
+        keep = (page_words - hdr) // row
+        stats = jnp.concatenate([stats[:hdr], stats[stats.shape[0] - keep * row :]])
+    stats = stats.at[7].set(jnp.max(page_indices).astype(jnp.int32))
+    stats = stats.at[8].set(cache_kv.shape[0])
+    stats = stats.at[9].set((stats.shape[0] - hdr) // row)  # rows stored (the last ones)
+    stats = jnp.pad(stats, (0, page_words - stats.shape[0]))
+    page = lax.bitcast_convert_type(stats, cache_kv.dtype).reshape(page_shape)
+    return cache_kv.at[cache_kv.shape[0] - 1].set(page)
