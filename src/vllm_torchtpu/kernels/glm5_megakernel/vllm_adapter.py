@@ -55,8 +55,8 @@ logger = init_logger(__name__)
 
 EXPERT_KINDS = ("ew13", "ew2", "es13", "es2")
 # operands sharded over the EP axis (the local tensor is this rank's shard): experts, and
-# o_proj's head rows (TP over heads)
-SHARDED_KINDS = EXPERT_KINDS + ("o_proj",)
+# the per-head projections that are TP over heads: o_proj's rows, q_b's columns, W_UK's heads
+SHARDED_KINDS = EXPERT_KINDS + ("o_proj", "q_b", "w_uk")
 
 
 class Unsupported(Exception):
@@ -227,8 +227,11 @@ class Glm5Megakernel:
         at = _attn_module(sa)
         d = {
             "qkv_a": _kn_pad(sa.fused_qkv_a_proj.weight, H, cfg.QKVA, "fused_qkv_a_proj"),
-            "q_b": _kn(sa.q_b_proj.weight, cfg.QL, cfg.NH * cfg.DQ, "q_b_proj"),
-            "w_uk": at.W_UK_T,
+            # q_b and W_UK are TP over heads (heads [rank * HR, (rank + 1) * HR)): q_b's columns
+            # are head-major, so this rank's are one contiguous column range
+            "q_b": _kn(sa.q_b_proj.weight, cfg.QL, cfg.NH * cfg.DQ, "q_b_proj")[
+                :, self.rank * cfg.HR * cfg.DQ:(self.rank + 1) * cfg.HR * cfg.DQ].contiguous(),
+            "w_uk": at.W_UK_T[self.rank * cfg.HR:(self.rank + 1) * cfg.HR].clone(),
             "w_uv": at.W_UV,
             # o_proj is TP over heads: this rank's rows, heads [rank * HR, (rank + 1) * HR).
             # clone, not contiguous(): the row slice is already contiguous, so contiguous() kept a
