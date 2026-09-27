@@ -1167,23 +1167,33 @@ class TestInitializeAttentionKernelsThreshold:
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
         assert layers["target"].impl.decode_query_size == 4
-        # The draft's 1 must not leak into the threshold: it would disable the
-        # RPAd verify lane for the target, which is unrelated to draft TP.
-        assert runner.reorder_batch_threshold == 4
+        # The drafter's first pass attends with the target's distribution, so
+        # a 1-wide draft must hold the threshold at 1: K+1-token verify windows
+        # must not reach its DECODE stage.
+        assert runner.reorder_batch_threshold == 1
 
-    def test_sharded_draft_also_pinned_to_one_token(self):
-        """Regression: `PallasBatchedRPAAttentionBackendImpl.__init__` stamps
-        K+1 on every layer it builds, draft included, because it only keys on
-        "a spec config exists". A sharded draft left at K+1 mistiles its single
-        query token and degenerates after one token -- while acceptance reads a
-        perfect 100%, because target and draft agree on the same garbage."""
+    def test_sharded_draft_keeps_verify_width(self):
+        """Regression: pinning a sharded draft to 1 while the threshold stayed
+        at K+1 sent K+1-token verify windows into the draft's 1-wide DECODE
+        stage on the drafter's first pass (it reuses the target's
+        request_distribution). Qwen3.5 DCP4 + MTP3 acceptance fell to ~0.5%."""
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=2
         )
         self._run(runner, layers)
-        assert layers["draft"].impl.decode_query_size == 1
+        assert layers["draft"].impl.decode_query_size == 4
         assert layers["target"].impl.decode_query_size == 4
         assert runner.reorder_batch_threshold == 4
+
+    def test_narrow_draft_caps_threshold(self):
+        """A draft whose tile is narrower than the target's (e.g. an impl that
+        never widens) caps the threshold at the draft's width."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 1}, draft_names=("draft",), draft_tp=2
+        )
+        self._run(runner, layers)
+        assert layers["target"].impl.decode_query_size == 4
+        assert runner.reorder_batch_threshold == 1
 
     def test_no_pallas_layers(self):
         runner, layers = self._make_runner({})
