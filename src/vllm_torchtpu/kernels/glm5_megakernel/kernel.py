@@ -115,11 +115,20 @@ class Tiles:
     # Gather prefetch: a layer that reuses the last top-k set (no indexer) has its rows known once
     # the previous layer's scores are done; each streamed matmul tile then issues `gpre` of them
     # while it waits on its weight DMA (scalar-issue-bound gather, 54 us/layer j-f9a1bd50). 0: off.
-    gpre: int = 0
+    gpre: int = 64
     # With gpre: issue gather rows only while take() would block (the next tile's DMA semaphore is
     # short of a full tile), not on every tile -- resident tiles are compute-bound and the issue
     # cost adds there (j-a067267f: m_shared 7.7 -> 29.5 us). `gpre` rows per poll.
     gwait: bool = False
+    # v16, with gpre: issue gather rows only while the busy rank waits on the MoE RS (the slowest
+    # expert owner: m_rs 23 us mean, v13 j-18959d7a), never inside a matmul tile loop
+    gpre_rs: bool = True
+    # v19: per-128-row gather semaphores; attention scores chunk c as soon as its rows land, and
+    # the rows of chunk c + 1 are issued inside the score loop (issue-bound gather || MXU scores)
+    gpipe: bool = False
+    # v20: route first, shared expert after publishing the hit list (stream: gate, sw13, sw2, exp)
+    # -- the owners' experts no longer queue behind the shared-expert phase
+    shlate: bool = True
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank. tk doubles as the
@@ -329,7 +338,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "idx_v": pltpu.VMEM((NC, 128), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
         "g_nope": pltpu.VMEM((KT, 128), U32), "g_rope": pltpu.VMEM((KT, 128), U32),
-        "g_sem": pltpu.SemaphoreType.DMA((2,)),
+        "g_sem": pltpu.SemaphoreType.DMA((2 * NC,) if tiles.gpipe else (2,)),
         "kvb": pltpu.VMEM((KT, cfg.KL), BF16),
         "s_all": pltpu.VMEM((NC, cfg.NH, 128), F32),
         # MoE
@@ -384,8 +393,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     assert GPRE == 0 or KT % GPRE == 0, (KT, GPRE)
 
     # --- the stream: one layer's tiles in consumption order, segment by segment ---
-    SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2",
-            "sw13", "sw2", "gate", "exp")
+    SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2") + (
+        ("gate", "sw13", "sw2", "exp") if tiles.shlate else ("sw13", "sw2", "gate", "exp"))
     SID = {k: i for i, k in enumerate(SEGS)}
     EXP = SID["exp"]
     KSEG = {k: (EXP if k in ("ew13", "ew2") else SID[k]) for k in wshape}
@@ -405,9 +414,13 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     M_BASE = bits(["qkv_a", "q_b", "o_proj"] + ([] if "uk_uv" in skip else ["w_uk", "w_uv"]))
     M_IDX = 0 if "index" in skip else bits(["idx_wq", "idx_wk"])
     M_DENSE, M_MOE = bits(["w13", "w2"]), bits(["sw13", "sw2", "gate", "exp"])
+    # v15: an idle rank's token is dead, so it streams no shared expert and routes straight after
+    # the AG (v13 j-18959d7a: owners' experts started 7.9 us m_shared late, on the busy critical path)
+    M_MOE_IDLE = bits(["gate", "exp"])
 
-    def segs_py(l):
-        m = M_BASE | (M_IDX if cfg.full_indexer(l) else 0) | (M_MOE if cfg.is_moe(l) else M_DENSE)
+    def segs_py(l, idle=False):
+        m = M_BASE | (M_IDX if cfg.full_indexer(l) else 0) | (
+            (M_MOE_IDLE if idle else M_MOE) if cfg.is_moe(l) else M_DENSE)
         return [k for k in SEGS if m >> SID[k] & 1]
 
     # Which segments can a pump at each consume site reach (<= NB tiles ahead)? Only those get DMA
@@ -415,8 +428,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     # `take` pumps its own kind if the producer stopped short of it.
     reach = {k: {SID[k]} for k in SEGS}
     reach["init"] = set()
-    for nh in sorted({0, 1, cfg.ER}):
-        seq = [SID[k] for l in range(L) for k in segs_py(l)
+    for nh, idle in [(n, i) for n in sorted({0, 1, cfg.ER}) for i in (False, True)]:
+        seq = [SID[k] for l in range(L) for k in segs_py(l, idle)
                for _ in range(nh * TE if k == "exp" else NTS[k])]
         reach["init"] |= set(seq[:NB])
         for p_, k in enumerate(seq):
@@ -451,7 +464,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         me = meta[0] if axis_name is None else lax.axis_index(axis_name).astype(I32)
         pos = meta[1]
         seq_len = meta[2]
-        npages = meta[3]
+        npages = jnp.minimum(meta[3], max_pages)     # indexes bt; bounds checks off
         active = seq_len > 0
 
         lane128 = lax.broadcasted_iota(I32, (1, 128), 1)
@@ -483,7 +496,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         def seg_mask(l):
             full = jnp.logical_or(l < cfg.idx_skip, (l - cfg.idx_skip) % cfg.idx_freq == cfg.idx_freq - 1)
             return (jnp.int32(M_BASE) | jnp.where(full, jnp.int32(M_IDX), 0)
-                    | jnp.where(l >= cfg.first_dense, jnp.int32(M_MOE), jnp.int32(M_DENSE)))
+                    | jnp.where(l >= cfg.first_dense,
+                                jnp.where(active, jnp.int32(M_MOE), jnp.int32(M_MOE_IDLE)),
+                                jnp.int32(M_DENSE)))
 
         def nt_dyn(sg):
             v = st[6] * TE                             # exp: this layer's hits x tiles per expert
@@ -587,14 +602,27 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def gbody(k, c):
                 i = i0 + k
                 t = jnp.maximum(scr["idx_s"][i >> 7, i & 127], 0)
-                page = bt[t >> lg_pg]
+                page = bt[jnp.minimum(t >> lg_pg, max_pages - 1)]   # bounds checks are off
                 sl = t & (pg - 1)
+                sn, sr = ((i >> 7), NC + (i >> 7)) if tiles.gpipe else (0, 1)
                 pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
-                                      scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
+                                      scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[sn]).start()
                 pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
-                                      scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
+                                      scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[sr]).start()
                 return c
             lax.fori_loop(0, n, gbody, 0, unroll=min(GATHER_UNROLL, n))
+
+        def issue_chunk(l, c, issued0):
+            """gpipe: issue the rows of 128-row chunk c not already issued by the prefetch
+            (the prefetch issues whole GPRE blocks in order from row 0, up to issued0)."""
+            blk = GPRE if GPRE else 128
+            for b in range(128 // blk):
+                i0 = c * 128 + b * blk
+
+                @pl.when(i0 >= issued0)
+                def _(i0=i0):
+                    bswitch(l, {ll: (lambda ll=ll: gather_rows(
+                        C["nope"][ll], C["rope"][ll], pl.multiple_of(i0, blk), blk)) for ll in range(L)})
 
         def sem_full(kind):
             """DMA-semaphore value of a landed `kind` tile (probe 06: SEM_UNIT bytes per count)."""
@@ -622,7 +650,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             acc[:, :N] = jnp.zeros((M, N), F32)
 
             def body(t, c):
-                if not tiles.gwait:
+                if not (tiles.gwait or tiles.gpre_rs):
                     gpump()
                 w_ = take(kind, poll=tiles.gwait)
                 k0 = pl.multiple_of(t * t_k, t_k)
@@ -801,8 +829,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 return finish
             finish()
 
-        def reduce_scatter_rows():
-            """part[t] (row per token/rank t) -> rsrecv[src] on owner t."""
+        def reduce_scatter_rows(poll=False):
+            """part[t] (row per token/rank t) -> rsrecv[src] on owner t. poll (gpre_rs): issue
+            prefetched gather rows until the R - 1 rows have landed."""
             # rows are staged into a [R, 1, H] buffer: a single-row slice of a 2D VMEM ref at
             # an unaligned (or dynamic) offset is not a legal DMA source
             for d in range(R):
@@ -817,6 +846,20 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         src_ref=scr["psend"].at[d], dst_ref=scr["rsrecv"].at[me],
                         send_sem=scr["rs_send"], recv_sem=scr["rs_recv"],
                         device_id=(jnp.int32(d),), device_id_type=pl.DeviceIdType.MESH).start()
+            if poll and GPRE and tiles.gpre_rs and not interpret:
+                gst = scr["gst"]
+                # a remote row counts bytes/16 (j-480a968f). A wrong unit only shortens or lengthens
+                # the prefetch: the loop also ends once the armed layer's KT rows are issued.
+                full = (R - 1) * (H * 4 // 16)
+
+                def pcond(c):
+                    armed = jnp.logical_and(gst[1] >= 0, gst[0] < KT)
+                    return jnp.logical_and(armed, pl.semaphore_read(scr["rs_recv"]) < full)
+
+                def pbody(c):
+                    gpump()
+                    return c + 1
+                lax.while_loop(pcond, pbody, jnp.int32(0))
             desc = pltpu.make_async_remote_copy(
                 src_ref=scr["psend"].at[0], dst_ref=scr["rsrecv"].at[0],
                 send_sem=scr["rs_send"], recv_sem=scr["rs_recv"],
@@ -928,7 +971,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             # merged rows go to nrow_out / rrow_out and `step` scatters them after the call.
             @pl.when(active)
             def _():
-                page = bt[pos >> lg_pg]
+                page = bt[jnp.clip(pos >> lg_pg, 0, max_pages - 1)]   # as step(); checks off
                 sl = pos & (pg - 1)
                 nb8 = fp8_bytes(jnp.clip(kvc, -FP8_MAX, FP8_MAX).astype(FP8))[0:1]
                 word = (nb8[:, 0:128] | shl(nb8[:, 128:256], 8)
@@ -1051,7 +1094,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
                 def scan(ref):
                     def f():
-                        page = bt[pos >> lg_pg]
+                        page = bt[jnp.clip(pos >> lg_pg, 0, max_pages - 1)]
                         sl = pos & (pg - 1)
                         # u8 HBM is (4,128)-tiled on the token-in-group axis: merge the record into
                         # its 4-token group -> irow_out[l] (scattered by `step`); the scan patches
@@ -1167,11 +1210,20 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     return f
                 # an idle rank (seq_len 0) gathers nothing: its KT row DMAs all hit one row and
                 # were the slowest rank's gather in the one-busy proxy, stalling o_proj everywhere
-                @pl.when(active)
-                def _():
-                    bswitch(l, {ll: rest(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
-                    pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
-                    pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
+                if tiles.gpipe:
+                    # rows [0, issued0) came from the prefetch; chunk 0 now, chunk c + 1 in s_body
+                    issued0 = (jnp.where(scr["gst"][1] == l, scr["gst"][0], 0) if GPRE
+                               else jnp.int32(0))
+
+                    @pl.when(active)
+                    def _():
+                        issue_chunk(l, 0, issued0)
+                else:
+                    @pl.when(active)
+                    def _():
+                        bswitch(l, {ll: rest(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                        pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
+                        pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
                 if GPRE:
                     scr["gst"][1] = jnp.int32(-1)
                 # This step's row is not in HBM yet (caches are read-only here). top-k emits
@@ -1179,10 +1231,13 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 # valid token: if selected it is the last filled slot. Patch it from VMEM.
                 il = jnp.maximum(jnp.minimum(seq_len, KT) - 1, 0)
 
-                @pl.when(jnp.logical_and(active, scr["idx_s"][il >> 7, il & 127] == pos))
-                def _():
-                    scr["g_nope"][pl.ds(il, 1), :] = scr["wrow"][0:1, :]
-                    scr["g_rope"][pl.ds(il, 1), :] = scr["rrow"][0:1, :]
+                patch_own = jnp.logical_and(active, scr["idx_s"][il >> 7, il & 127] == pos)
+
+                if not tiles.gpipe:
+                    @pl.when(patch_own)
+                    def _():
+                        scr["g_nope"][pl.ds(il, 1), :] = scr["wrow"][0:1, :]
+                        scr["g_rope"][pl.ds(il, 1), :] = scr["rrow"][0:1, :]
 
             ph.mark("L_qa2a_w")
             qa2a_wait()
@@ -1209,6 +1264,19 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
             def s_body(c, carry):
                 r0 = pl.multiple_of(c * 128, 128)
+                if tiles.gpipe and "gather" not in skip:
+                    @pl.when(c + 1 < NC)
+                    def _():
+                        issue_chunk(l, c + 1, issued0)
+                    pltpu.make_async_copy(scr["g_nope"].at[pl.ds(0, 128)], scr["g_nope"].at[pl.ds(0, 128)],
+                                          scr["g_sem"].at[c]).wait()
+                    pltpu.make_async_copy(scr["g_rope"].at[pl.ds(0, 128)], scr["g_rope"].at[pl.ds(0, 128)],
+                                          scr["g_sem"].at[NC + c]).wait()
+
+                    @pl.when(jnp.logical_and(patch_own, (il >> 7) == c))
+                    def _():
+                        scr["g_nope"][pl.ds(il, 1), :] = scr["wrow"][0:1, :]
+                        scr["g_rope"][pl.ds(il, 1), :] = scr["rrow"][0:1, :]
                 w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(r0, 128), :], I32)
                 s = jnp.zeros((cfg.NH, 128), F32)
                 for b in range(4):
@@ -1340,20 +1408,35 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         pltpu.make_async_copy(r2, scr["es2"], scr["es_sem"].at[1]).start()
                     return f
                 bswitch(l, {ll: ldes(W["es13"][ll], W["es2"][ll]) for ll in W["es13"]})
+                phm.mark("m_ag")
                 # an idle rank publishes a zero row: routing drops it (below), so its dummy token
                 # no longer pulls experts onto the busy ranks' critical path
                 scr["hrow"][...] = jnp.where(active, scr["hn"][0:1, :], 0.0).astype(BF16)
                 all_gather_rows()
+                def shared_expert():
+                    phm.mark("m_sh")
 
-                # shared expert on the own token
-                xq, sx = quant_rows(scr["hn"][...])
-                scr["xq"][:, :H] = xq
-                a = matmul("sw13", l, scr["xq"], H, 2 * cfg.IS)
-                mid = silu_mul((a * sx * sm(slot, "sw13_s")).astype(BF16).astype(F32), cfg.IS) * row0
-                xq, sx = quant_rows(mid)
-                scr["xq"][:, :cfg.IS] = xq
-                a = matmul("sw2", l, scr["xq"], cfg.IS, H)
-                scr["shared"][...] = (a * sx * sm(slot, "sw2_s")).astype(BF16).astype(F32)
+                    # shared expert on the own token (an idle rank's stream carries no shared tiles)
+                    @pl.when(active)
+                    def _():
+                        xq, sx = quant_rows(scr["hn"][...])
+                        scr["xq"][:, :H] = xq
+                        a = matmul("sw13", l, scr["xq"], H, 2 * cfg.IS)
+                        mid = silu_mul((a * sx * sm(slot, "sw13_s")).astype(BF16).astype(F32),
+                                       cfg.IS) * row0
+                        xq, sx = quant_rows(mid)
+                        scr["xq"][:, :cfg.IS] = xq
+                        a = matmul("sw2", l, scr["xq"], cfg.IS, H)
+                        scr["shared"][...] = (a * sx * sm(slot, "sw2_s")).astype(BF16).astype(F32)
+
+                    phm.mark("m_z")
+                    @pl.when(jnp.logical_not(active))
+                    def _():
+                        # v18: only row 0 is read (out = shared[0:1] + routed)
+                        scr["shared"][0:1] = jnp.zeros((1, H), F32)
+
+                if not tiles.shlate:
+                    shared_expert()
 
                 phm.mark("m_agwait")
                 ag_wait()
@@ -1382,16 +1465,18 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 valid_tok = jnp.logical_and(row_iota < R, live)
                 wn = jnp.where(valid_tok, wn, 0.0)
                 # local expert columns -> wloc lanes j, hit counts -> SMEM
-                wloc = jnp.zeros((M, 128), F32)
-                hitv = jnp.zeros((1, 128), I32)
-                for j in range(cfg.ER):
-                    e = me * cfg.ER + j
-                    col = jnp.sum(jnp.where(eio == e, wn, 0.0), axis=1, keepdims=True)
-                    cnt = jnp.sum(jnp.where(eio == e, (wsel > 0).astype(I32), 0) * valid_tok.astype(I32))
-                    wloc = jnp.where(lane128 == j, col, wloc)
-                    hitv = jnp.where(lane128 == j, cnt, hitv)
+                # v15: one-hot matmuls instead of 2 x ER cross-lane reductions; exact (wn is
+                # bf16-rounded, one nonzero per output, counts <= R, f32 accumulation)
+                ecol = lax.broadcasted_iota(I32, (cfg.E, 128), 0)
+                jcol = lax.broadcasted_iota(I32, (cfg.E, 128), 1)
+                oh = ((ecol == me * cfg.ER + jcol) & (jcol < cfg.ER)).astype(BF16)   # (E, 128)
+                wloc = lax.dot_general(wn.astype(BF16), oh, NN, preferred_element_type=F32)
+                hsel = jnp.where(valid_tok & (wsel > 0), 1.0, 0.0).astype(BF16)          # (M, E)
+                hitv = jnp.sum(lax.dot_general(hsel, oh, NN, preferred_element_type=F32),
+                               axis=0, keepdims=True).astype(I32)
                 scr["wloc"][...] = wloc
                 scr["hitv"][0:1, :] = hitv
+                phm.mark("m_hits")
                 cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
                 cp.start()
                 cp.wait()
@@ -1410,7 +1495,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 # publish the hit list: the producer may now stream this layer's experts
                 st[6] = n_hit
                 st[5] = l
+                phm.mark("m_pub")
                 pump("gate")
+                if tiles.shlate:
+                    shared_expert()
 
                 phm.mark("m_experts")
                 pltpu.make_async_copy(next(iter(W["es13"].values())), scr["es13"],
@@ -1435,7 +1523,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 lax.fori_loop(0, n_hit, ebody, 0)
 
                 phm.mark("m_rs")
-                reduce_scatter_rows()
+                reduce_scatter_rows(poll=True)
                 routed = scr["rsrecv"][0]
                 for rr in range(1, R):
                     routed = routed + scr["rsrecv"][rr]
