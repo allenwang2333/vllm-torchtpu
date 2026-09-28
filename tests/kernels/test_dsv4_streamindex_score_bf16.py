@@ -23,6 +23,11 @@ identity but the output that matters, the top-k set:
   row, so T stays a valid lower bound on v_k. Decode rows are unchanged, and
   the scores really differ from f32 (the flag reached the kernel).
 * **G = 0.** Lowers to the default program and selects the same indices.
+* **Context gate (`score_bf16_min_ctx`).** A prefill call whose longest
+  sequence is below the threshold is bit-identical (indices and scores) to
+  G = 0; at or above it, bit-identical to G. The gate is per call: every row
+  of the pass takes the branch its longest sequence picks. MIN_CTX = 0 lowers
+  to the ungated G program, and MIN_CTX with G = 0 to the default program.
 
 The recall metric is asserted red on a reference with one head dropped.
 """
@@ -177,3 +182,83 @@ def test_recall_check_goes_red_on_a_wrong_reference():
     rec = _recall(a, b, rows)
     print(f"drop-head control: recall min {rec.min():.5f}")
     assert rec.min() < RECALL_MIN, "recall gate cannot see a dropped head"
+
+
+# (T_list, S_list, min_ctx, expect): `expect` is the ungated arm the gated call
+# must equal bit for bit. The mixed batch's prefill pass tops out at 230000;
+# its 250000-token decode is in another pass and must not count.
+GATE_CASES = [
+    pytest.param((1024,), (30000,), 30001, 0, id="30k-below"),
+    pytest.param((1024,), (30000,), 30000, 8, id="30k-at"),
+    pytest.param((1024,), (30000,), 16384, 8, id="30k-above"),
+    pytest.param(
+        (1, 1, 1, 1, 600, 300),
+        (250000, 1500, 64, 200000, 230000, 3000),
+        240000,
+        0,
+        id="mixed-below",
+    ),
+    pytest.param(
+        (1, 1, 1, 1, 600, 300),
+        (250000, 1500, 64, 200000, 230000, 3000),
+        100000,
+        8,
+        id="mixed-above",
+    ),
+]
+
+
+@pytest.mark.parametrize("sctopk_l1", [True, False])
+@pytest.mark.parametrize("T_list,S_list,min_ctx,expect", GATE_CASES)
+def test_min_ctx_gate_picks_one_program(T_list, S_list, min_ctx, expect, sctopk_l1):
+    kw = _call_kwargs(T_list, S_list, hot=True)
+    g_i, g_s = streamindex_topk(
+        **kw,
+        sctopk_l1=sctopk_l1,
+        score_bf16_group=8,
+        score_bf16_min_ctx=min_ctx,
+        return_scores=True,
+    )
+    e_i, e_s = streamindex_topk(
+        **kw, sctopk_l1=sctopk_l1, score_bf16_group=expect, return_scores=True
+    )
+    other = 8 if expect == 0 else 0
+    o_s = streamindex_topk(
+        **kw, sctopk_l1=sctopk_l1, score_bf16_group=other, return_scores=True
+    )[1]
+    g_i, g_s, e_i, e_s, o_s = map(np.asarray, (g_i, g_s, e_i, e_s, o_s))
+    np.testing.assert_array_equal(g_i, e_i)
+    np.testing.assert_array_equal(g_s, e_s)
+    # Positive control: the two ungated arms really differ here, so equality
+    # above picked a side.
+    assert not np.array_equal(e_s, o_s), "G=8 and G=0 scores are identical"
+    print(f"min_ctx={min_ctx}: bit-equal to G={expect}, differs from G={other}")
+
+
+def test_min_ctx_identity_lowering():
+    kw = _call_kwargs((1024,), (230000,))
+    for l1 in (False, True):
+
+        def low(**extra):
+            return _normalized(
+                streamindex_topk.lower(**kw, sctopk_l1=l1, **extra).as_text()
+            )
+
+        g8 = low(score_bf16_group=8)
+        default = low()
+        for name, a, b in (
+            ("G=8 MIN_CTX=0", g8, low(score_bf16_group=8, score_bf16_min_ctx=0)),
+            (
+                "G=0 MIN_CTX=65536",
+                default,
+                low(score_bf16_group=0, score_bf16_min_ctx=65536),
+            ),
+        ):
+            diff = list(
+                difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="")
+            )
+            assert not diff, name + "\n" + "\n".join(diff[:60])
+        gated = low(score_bf16_group=8, score_bf16_min_ctx=65536)
+        assert gated != g8 and gated != default, "the gate was not compiled in"
+    with pytest.raises(ValueError, match="score_bf16_min_ctx must be >= 0"):
+        streamindex_topk.lower(**kw, score_bf16_group=8, score_bf16_min_ctx=-1)

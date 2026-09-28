@@ -313,6 +313,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         kwrite_dus = envs.TPU_STREAMIDX_KWRITE_DUS
         sctopk_l1 = envs.TPU_STREAMIDX_SCTOPK_L1
         score_bf16_group = envs.TPU_STREAMIDX_SCORE_BF16_GROUP
+        score_bf16_min_ctx = envs.TPU_STREAMIDX_SCORE_BF16_MIN_CTX
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -358,6 +359,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 chunk_tokens=chunk_tokens,
                 sctopk_l1=sctopk_l1,
                 score_bf16_group=score_bf16_group,
+                score_bf16_min_ctx=score_bf16_min_ctx,
             )
             return cache_kv, topk_indices
 

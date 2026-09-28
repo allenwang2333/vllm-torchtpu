@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_KWRITE_DUS: bool = False
     TPU_STREAMIDX_SCTOPK_L1: bool = False
     TPU_STREAMIDX_SCORE_BF16_GROUP: int = 0
+    TPU_STREAMIDX_SCORE_BF16_MIN_CTX: int = 0
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -703,6 +704,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scores at the top-k boundary can swap.
     "TPU_STREAMIDX_SCORE_BF16_GROUP": env_nonnegative_int(
         "TPU_STREAMIDX_SCORE_BF16_GROUP", 0
+    ),
+    # With TPU_STREAMIDX_SCORE_BF16_GROUP > 0: prefill scoring calls whose
+    # longest sequence is shorter than this many tokens use the f32 head sum
+    # (the grouped scores' ties slow the SparseCore top-k while it binds).
+    # 0 (default) applies the group at every context.
+    "TPU_STREAMIDX_SCORE_BF16_MIN_CTX": env_nonnegative_int(
+        "TPU_STREAMIDX_SCORE_BF16_MIN_CTX", 0
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

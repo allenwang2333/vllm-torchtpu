@@ -104,6 +104,7 @@ def kernel(
     chunk_idx: int = 0,
     emit_t: bool = False,
     score_bf16_group: int = 0,
+    score_bf16_min_ctx: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     if emit_t:
@@ -257,7 +258,7 @@ def kernel(
         """[n_tok*H, D] head-minor rows -> [H*n_tok, D] head-major rows."""
         return bq_rows.transpose(1, 0, 2).reshape(num_q_heads * n_tok, head_dim)
 
-    def reduce_heads(bq_rows, bkv, bq_weights, head_major=False):
+    def reduce_heads(bq_rows, bkv, bq_weights, head_major=False, group=0):
         """relu(q @ k) weighted-summed over heads.
 
         Args:
@@ -291,7 +292,7 @@ def kernel(
 
         # Prefill. Transpose to head-major if needed.
         rows_hm = bq_rows if head_major else transpose_to_head_major(bq_rows, n_tok)
-        if score_bf16_group:
+        if group:
             # Grouped bf16 head sum. Mosaic needs a 32-bit matmul accumulator,
             # so the dot pops f32 and is narrowed to bf16 once; relu, the weight
             # multiply and a pairwise sum over each group of `score_bf16_group`
@@ -303,10 +304,10 @@ def kernel(
             wb = bq_weights.astype(jnp.bfloat16)
             zero = jnp.bfloat16(0)
             acc = None
-            for g0 in range(0, num_q_heads, score_bf16_group):
+            for g0 in range(0, num_q_heads, group):
                 terms = [
                     jnp.maximum(st[h], zero) * wb[:, h : h + 1]
-                    for h in range(g0, g0 + score_bf16_group)
+                    for h in range(g0, g0 + group)
                 ]
                 while len(terms) > 1:
                     terms = [
@@ -333,6 +334,7 @@ def kernel(
         batch_start_seq_idx,
         cp_rank=0,
         q_is_head_major=False,
+        group=0,
     ):
         assert len(bq_vec) == seq_batch_size
         assert len(bkv_vec) == seq_batch_size
@@ -348,7 +350,9 @@ def kernel(
             bq_weights = bq_weights_vec[batch_idx]
             bq_pos_compressed = bq_pos_compressed_vec[batch_idx]
 
-            s_summed = reduce_heads(bq, bkv, bq_weights, head_major=q_is_head_major)
+            s_summed = reduce_heads(
+                bq, bkv, bq_weights, head_major=q_is_head_major, group=group
+            )
             s_summed = s_summed * scale_val
             k_local = bkv_idx * bkv_sz + lax.broadcasted_iota(
                 jnp.int32, s_summed.shape, 1
@@ -417,7 +421,13 @@ def kernel(
             copy.wait()
 
     def step_body(
-        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, t_refs=None
+        q_vmem,
+        weights_vmem,
+        bkv_vmem,
+        scores_vmem,
+        q_hm_ref=None,
+        t_refs=None,
+        group=0,
     ):
         p_id = pl.program_id(0)
         batch_start_seq_idx = seq_tile(p_id)
@@ -494,17 +504,20 @@ def kernel(
             batch_start_seq_idx,
             q_is_head_major=q_hm_ref is not None,
             cp_rank=cp_rank,
+            group=group,
         )
         scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
         if t_refs is not None:
             t_epilogue(p_id, bkv_idx, scores, *t_refs)
 
-    def _run_all(q_hm_ref=None, t_refs=None):
+    def _run_all(q_hm_ref=None, t_refs=None, group=0):
         @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
         def _run_pipeline(final_allocs):
             q_buf, weights_buf, kv_buf, o_buf = final_allocs
             pipeline_fn = pltpu.emit_pipeline(
-                functools.partial(step_body, q_hm_ref=q_hm_ref, t_refs=t_refs),
+                functools.partial(
+                    step_body, q_hm_ref=q_hm_ref, t_refs=t_refs, group=group
+                ),
                 grid=(metadata_ref.num_steps[chunk_idx],),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
                 out_specs=o_buf.spec,
@@ -520,27 +533,54 @@ def kernel(
 
         _run_pipeline()
 
-    def _dispatch(t_refs=None):
+    def _dispatch(t_refs=None, group=0):
         # Only the multi-token path reorders q, and only a single sequence per
         # tile keeps the cached block unambiguous.
         if seq_batch_size == 1 and bq_sz > 1:
             pl.run_scoped(
-                functools.partial(_run_all, t_refs=t_refs),
+                functools.partial(_run_all, t_refs=t_refs, group=group),
                 pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
             )
         else:
-            _run_all(t_refs=t_refs)
+            _run_all(t_refs=t_refs, group=group)
+
+    def _gated_dispatch(t_refs=None):
+        if not (score_bf16_group and score_bf16_min_ctx and bq_sz > 1):
+            _dispatch(t_refs, group=score_bf16_group)
+            return
+        # Context gate, once per call: the grouped bf16 scores are quantised
+        # (about half have 13 zero low mantissa bits), and the ties that makes
+        # push the SparseCore radix top-k onto its serial tie-split path. Below
+        # `score_bf16_min_ctx` the SparseCore binds and the ties cost more than
+        # the faster head sum saves, so score in f32 there. The call's context
+        # is the longest sequence in this pass; both head sums are compiled and
+        # one scalar branch picks the whole pipeline.
+        ctx = lax.fori_loop(
+            start_end_seq_idx_ref[0],
+            start_end_seq_idx_ref[1],
+            lambda i, m: jnp.maximum(m, seq_lens_ref[i]),
+            jnp.int32(0),
+        )
+        use_group = ctx >= score_bf16_min_ctx
+
+        @pl.when(use_group)
+        def _():
+            _dispatch(t_refs, group=score_bf16_group)
+
+        @pl.when(jnp.logical_not(use_group))
+        def _():
+            _dispatch(t_refs, group=0)
 
     if emit_t:
         tile_rows = seq_batch_size * bq_sz
         pl.run_scoped(
-            lambda *t_refs: _dispatch(t_refs),
+            lambda *t_refs: _gated_dispatch(t_refs),
             pltpu.VMEM((tile_rows, num_sublanes_bkv, 128), jnp.float32),
             pltpu.VMEM((tile_rows, 128), jnp.int32),
             pltpu.SemaphoreType.DMA,
         )
     else:
-        _dispatch()
+        _gated_dispatch()
 
     ### ------- Kernel end ------- ###
 
@@ -729,6 +769,7 @@ def _effective_row_lengths(
         "return_scores",
         "sctopk_l1",
         "score_bf16_group",
+        "score_bf16_min_ctx",
     ),
 )
 def streamindex_topk(
@@ -759,6 +800,7 @@ def streamindex_topk(
     return_scores: bool = False,
     sctopk_l1: bool = False,
     score_bf16_group: int = 0,
+    score_bf16_min_ctx: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -827,6 +869,10 @@ def streamindex_topk(
         and in f32 across groups. Not bit-exact: it can reorder near-tied
         scores at the top-k boundary (recall, not identity, is the contract).
         Decode steps are unchanged.
+      score_bf16_min_ctx: with `score_bf16_group` > 0, a prefill scoring call
+        whose longest sequence (seq_lens, tokens) is shorter than this scores
+        in f32 instead, bit-identical to `score_bf16_group=0`. 0 (default)
+        applies the group everywhere. Ignored when `score_bf16_group` is 0.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -839,6 +885,10 @@ def streamindex_topk(
 
     if score_bf16_group < 0:
         raise ValueError(f"score_bf16_group must be >= 0, got {score_bf16_group}.")
+    if score_bf16_min_ctx < 0:
+        raise ValueError(
+            f"score_bf16_min_ctx must be >= 0, got {score_bf16_min_ctx}."
+        )
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
     if cp_size > 1:
@@ -1055,6 +1105,11 @@ def streamindex_topk(
                     **(
                         dict(score_bf16_group=score_bf16_group)
                         if score_bf16_group
+                        else {}
+                    ),
+                    **(
+                        dict(score_bf16_min_ctx=score_bf16_min_ctx)
+                        if score_bf16_group and score_bf16_min_ctx
                         else {}
                     ),
                 ),
