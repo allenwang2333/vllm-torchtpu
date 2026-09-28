@@ -1,9 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Offline inference example for vLLM-TorchTPU.
 
+``--use-chat-template`` sends each prompt through the tokenizer's chat template
+(``LLM.chat``) and ``--no-use-chat-template`` sends it as raw text
+(``LLM.generate``). With neither flag, the chat template is used only when it
+adds a BOS token that encoding raw text leaves out. Gemma-4 instruction-tuned
+checkpoints are like this: without the chat template they get no ``<bos>``, and
+"The capital of France is" continues as " France is France is ...".
+"""
+
+import argparse
 import json
 
 from vllm import LLM, EngineArgs
+from vllm.tokenizers.protocol import TokenizerLike
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_torchtpu.logger import init_logger
@@ -34,12 +45,58 @@ def create_parser():
 
     # Chat params
     chat_group = parser.add_argument_group("Chat parameters")
-    chat_group.add_argument("--use-chat-template", action="store_true")
+    chat_group.add_argument(
+        "--use-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Send prompts through the chat template (LLM.chat) rather than as "
+        "raw text (LLM.generate). Default: on only when the chat template adds "
+        "a BOS token that raw text would miss (e.g. Gemma-4 instruction-tuned "
+        "models).",
+    )
     # A few models (like Qwen3.5) can use this to disable thinking using,
     # `--chat-template-kwargs='{"enable_thinking": false}'`
     chat_group.add_argument("--chat-template-kwargs", type=json.loads, default={})
 
     return parser
+
+
+def _chat_template_adds_missing_bos(tokenizer: TokenizerLike) -> bool:
+    """Return whether the chat template adds a BOS token that raw text misses."""
+    # bos_token and chat_template are HF tokenizer attributes, not part of
+    # vLLM's TokenizerLike protocol, so custom tokenizers may lack them.
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if not bos_token or not getattr(tokenizer, "chat_template", None):
+        return False
+    if tokenizer.encode("x")[:1] == [tokenizer.bos_token_id]:
+        # Raw text already starts with BOS (e.g. Llama-3).
+        return False
+    rendered_prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return isinstance(rendered_prompt, str) and rendered_prompt.startswith(bos_token)
+
+
+def _resolve_use_chat_template(use_chat_template: bool | None, llm: LLM) -> bool:
+    """Resolve --[no-]use-chat-template, applying the default when unset."""
+    if use_chat_template:
+        return True
+    if not _chat_template_adds_missing_bos(llm.get_tokenizer()):
+        return False
+    if use_chat_template is None:
+        logger.info(
+            "The chat template adds a BOS token that raw prompts would miss, so "
+            "prompts are sent through it. Pass --no-use-chat-template to send "
+            "raw text instead."
+        )
+        return True
+    logger.warning(
+        "Sending raw prompts without the BOS token that the chat template adds. "
+        "The model may produce repetitive output."
+    )
+    return False
 
 
 def main(args: dict):
@@ -58,6 +115,7 @@ def main(args: dict):
 
     # Create an LLM
     llm = LLM(**args)
+    use_chat_template = _resolve_use_chat_template(use_chat_template, llm)
 
     # Create a sampling params object
     sampling_params = llm.get_default_sampling_params()
