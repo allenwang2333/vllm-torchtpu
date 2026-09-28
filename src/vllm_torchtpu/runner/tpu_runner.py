@@ -830,6 +830,30 @@ class TPUModelRunner(GPUModelRunner):
         self._cached_request_distribution: torch.Tensor | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
+        self._dspark_pd_context_only = bool(
+            transfer_config is not None
+            and transfer_config.kv_connector == "TPURaidenConnector"
+            and transfer_config.is_kv_producer
+            and self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+        )
+        if self._dspark_pd_context_only:
+            if not self._unified_kv_layout:
+                raise ValueError("DSpark PD requires the unified block pool.")
+            if self.scheduler_config.async_scheduling:
+                raise ValueError(
+                    "DSpark PD producer currently requires sync scheduling."
+                )
+            if self.cache_config.enable_prefix_caching:
+                raise ValueError(
+                    "DSpark PD producer prefix caching requires joint target/context "
+                    "cache recovery; disable prefix caching for the initial path."
+                )
+            if (
+                self.parallel_config.data_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+            ):
+                raise ValueError("DSpark PD producer currently requires DP=PP=1.")
         # Maximum query length to be considered a decode.
         self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
@@ -4072,6 +4096,12 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
 
+        if self._dspark_pd_context_only:
+            self.drafter.prepare_prefill_handoff()
+            # Context projections are deferred TPU graphs. A hardware-only
+            # barrier does not materialize their writes before Raiden reads.
+            synchronize_tensors()
+
         # Poll the KV connector only now: the wait above proves the previous
         # forward finished, so a store deferred behind it can be handed to
         # raiden in this step rather than the next.
@@ -4117,7 +4147,11 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = self.scheduler_config.async_scheduling
         eagle3_drafts = None
-        if self._is_async_drafter and combined_selected_tokens:
+        if (
+            self._is_async_drafter
+            and combined_selected_tokens
+            and not self._dspark_pd_context_only
+        ):
             if is_spec_step:
                 eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                     sampled_token_ids=None,
