@@ -104,6 +104,7 @@ def kernel(
     chunk_idx: int = 0,
     emit_t: bool = False,
     score_bf16_group: int = 0,
+    score_null_reorder: bool = False,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     if emit_t:
@@ -316,6 +317,14 @@ def kernel(
                 acc = part if acc is None else acc + part
             return acc
         st = qk(rows_hm).reshape(num_q_heads, n_tok, -1)
+        if score_null_reorder:
+            # Accuracy-test null arm: the same f32 relu/multiply/add terms as
+            # below, summed over the heads in reverse order (H-1 .. 0). Exact
+            # arithmetic gives the default scores; f32 rounding differs.
+            acc = jnp.maximum(st[num_q_heads - 1], 0.0) * w[:, num_q_heads - 1 :]
+            for h in range(num_q_heads - 2, -1, -1):
+                acc = acc + jnp.maximum(st[h], 0.0) * w[:, h : h + 1]
+            return acc
         acc = jnp.maximum(st[0], 0.0) * w[:, 0:1]
         # Loop over heads 1..H-1, accumulating the sum of relu(st[h] * w[:, h]).
         for h in range(1, num_q_heads):
@@ -729,6 +738,7 @@ def _effective_row_lengths(
         "return_scores",
         "sctopk_l1",
         "score_bf16_group",
+        "score_null_reorder",
     ),
 )
 def streamindex_topk(
@@ -759,6 +769,7 @@ def streamindex_topk(
     return_scores: bool = False,
     sctopk_l1: bool = False,
     score_bf16_group: int = 0,
+    score_null_reorder: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -826,6 +837,10 @@ def streamindex_topk(
         scoring kernel's relu/weight/head sum in bf16 within groups of G heads
         and in f32 across groups. Not bit-exact: it can reorder near-tied
         scores at the top-k boundary (recall, not identity, is the contract).
+        Decode steps are unchanged.
+      score_null_reorder: accuracy-test null arm. True sums the f32 prefill
+        head terms in reverse head order: semantically the default scoring,
+        numerically different rounding. Ignored when score_bf16_group > 0.
         Decode steps are unchanged.
 
     Returns:
@@ -1055,6 +1070,11 @@ def streamindex_topk(
                     **(
                         dict(score_bf16_group=score_bf16_group)
                         if score_bf16_group
+                        else {}
+                    ),
+                    **(
+                        dict(score_null_reorder=True)
+                        if score_null_reorder and not score_bf16_group
                         else {}
                     ),
                 ),

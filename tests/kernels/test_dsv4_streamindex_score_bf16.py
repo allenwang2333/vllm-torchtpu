@@ -177,3 +177,30 @@ def test_recall_check_goes_red_on_a_wrong_reference():
     rec = _recall(a, b, rows)
     print(f"drop-head control: recall min {rec.min():.5f}")
     assert rec.min() < RECALL_MIN, "recall gate cannot see a dropped head"
+
+
+def test_null_reorder_is_a_benign_non_identity():
+    """`score_null_reorder` (accuracy-test null): off lowers to the default
+    program; on lowers differently, changes some scores, keeps recall."""
+    T_list, S_list = (1024,), (230000,)
+    kw = _call_kwargs(T_list, S_list)
+    default = _normalized(streamindex_topk.lower(**kw, sctopk_l1=True).as_text())
+    off = _normalized(
+        streamindex_topk.lower(**kw, sctopk_l1=True, score_null_reorder=False).as_text()
+    )
+    assert off == default, "score_null_reorder=False changed the program"
+    on_txt = _normalized(
+        streamindex_topk.lower(**kw, sctopk_l1=True, score_null_reorder=True).as_text()
+    )
+    assert on_txt != default, "score_null_reorder=True lowered to the default program"
+    on_i, on_s = streamindex_topk(
+        **kw, sctopk_l1=True, score_null_reorder=True, return_scores=True
+    )
+    off_i, off_s = streamindex_topk(**kw, sctopk_l1=True, return_scores=True)
+    rows = np.flatnonzero(_row_len(T_list, S_list) > K)
+    rec = _recall(np.asarray(on_i), np.asarray(off_i), rows)
+    print(f"null reorder: recall min {rec.min():.5f} mean {rec.mean():.5f}")
+    assert rec.min() >= RECALL_MIN
+    assert not np.array_equal(np.asarray(on_s)[rows], np.asarray(off_s)[rows]), (
+        "null reorder scores are bit-identical to the default"
+    )
