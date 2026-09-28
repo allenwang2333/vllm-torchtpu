@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
 import os
+import weakref
 from typing import Any
 
 import jax
@@ -294,7 +295,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             n_head = get_current_vllm_config_or_none().model_config.hf_config.index_n_heads
             self._dump_q = torch.zeros((rows, n_head, self.head_dim), dtype=torch.uint8, device=dev)
             self._dump_w = torch.zeros((rows, n_head), dtype=torch.bfloat16, device=dev)
-            self.k_cache._accdump_owner = self
+            # weakref, not the module: assigning an nn.Module would register it as a
+            # child of k_cache and make a module cycle (eval()/apply() recurse forever).
+            self.k_cache._accdump_owner_ref = weakref.ref(self)
 
         parallel_config = getattr(
             get_current_vllm_config_or_none(), "parallel_config", None

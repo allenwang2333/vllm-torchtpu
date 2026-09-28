@@ -39,7 +39,8 @@ def _find_owners(runner):
     ctx = runner.vllm_config.compilation_config.static_forward_context
     _owners = {}
     for name, mod in ctx.items():
-        owner = getattr(mod, "_accdump_owner", None)
+        ref = getattr(mod, "_accdump_owner_ref", None)
+        owner = ref() if ref is not None else None
         m = _LAYER_RE.search(name)
         if owner is None or m is None:
             continue
@@ -110,7 +111,11 @@ def maybe_dump(runner, scheduler_output, start_index, num_reqs, hidden_states, a
     if _TF_MINLEN and num_prompt >= _TF_MINLEN and end == num_prompt:
         t0 = time.time()
         idx = torch.arange(n, dtype=torch.int32).to(hidden_states.device)
-        logits = runner.compute_selected_logits(hidden_states, idx)
+        try:
+            logits = runner.compute_selected_logits(hidden_states, idx)
+        except Exception as e:  # recompile limit etc.: eager fallback
+            _log(f"compiled logits failed ({e!r:.200}); eager fallback")
+            logits = runner.model.compute_logits(hidden_states[:n])
         logits = logits.float().cpu()
         V = runner.model_config.get_vocab_size()
         lp = torch.log_softmax(logits[:, :V].double(), dim=-1)
