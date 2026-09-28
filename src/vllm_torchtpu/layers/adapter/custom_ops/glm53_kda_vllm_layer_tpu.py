@@ -778,11 +778,15 @@ class TpuKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
       )
 
     if len(kv_cache) == 1:
-      if m.mamba_slot_read_offsets is not None:
+      if self.num_spec > 0 or m.mamba_slot_read_offsets is not None:
         # Speculative verify needs per-window state checkpoints; the pooled
-        # gather/scatter path keeps a single state per block.
+        # gather/scatter path keeps a single state per block. Checking
+        # `num_spec` as well keeps a speculative step that arrives without
+        # slot offsets from silently running on the pooled state.
         raise NotImplementedError(
-            "Speculative decoding is not supported with pooled KDA"
+            "Speculative decoding is not supported with pooled KDA; set "
+            "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0 to use the dedicated "
+            "conv/recurrent state caches."
         )
       output = self.pooled_kda_op(
           mixed_qkv,
