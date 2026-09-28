@@ -499,12 +499,13 @@ class Eagle3Proposer:
     def _build_mtp_fused_loop(self) -> None:
         """Compile an MTP draft's loop steps 1..K-1 as one program, so the
         host dispatches once per propose for them instead of twice per step.
+        Opt-in with `VLLM_TPU_FUSED_DRAFT_LOOP=1`; off, the per-step loop runs.
 
         Only for the plain case: IndexShare restores top-k rows between steps
         on the host, a draft->target id map would need its gather in the
         program, and a cross-model KV-sharing draft (Gemma-4 MTP) keeps
         positions and seq_lens fixed across steps where the program advances
-        them. `VLLM_TPU_FUSED_DRAFT_LOOP=0` keeps the per-step loop.
+        them.
         """
         if (
             not envs.VLLM_TPU_FUSED_DRAFT_LOOP
