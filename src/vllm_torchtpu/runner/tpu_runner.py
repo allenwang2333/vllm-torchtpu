@@ -3020,6 +3020,10 @@ class TPUModelRunner(GPUModelRunner):
         if phased:
             profiler = self.phase_based_profiler
             values.append(profiler.capture_signal() if profiler else 0)
+            # Negated so the MAX all-reduce yields the DP-wide MIN token
+            # count (t[4] = -min); idle ranks contribute 0. Read by the DP
+            # phase trigger (PhaseBasedProfiler.dp_step).
+            values.append(-int(local_num_tokens))
         t = torch.tensor(values, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
@@ -3039,6 +3043,17 @@ class TPUModelRunner(GPUModelRunner):
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
+        if phased and self.phase_based_profiler is not None:
+            self.phase_based_profiler.dp_step(
+                int(t[0].item()),
+                -int(t[4].item()),
+                extra_stats={
+                    "local_num_tokens": int(local_num_tokens),
+                    "dp_max_chunks": int(t[1].item()),
+                    "dp_bucket": bucket,
+                    "mk_decode_step": bool(self._mk_decode_step),
+                },
+            )
         return bucket, int(t[1].item())
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:

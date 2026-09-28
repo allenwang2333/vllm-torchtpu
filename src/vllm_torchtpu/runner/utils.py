@@ -28,6 +28,38 @@ PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
 PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD = -1
 
+# DP-wide phase trigger. The per-rank classifier labels a step by the local
+# batch of the rank that owns it, so under DP (one request per rank) a
+# "prefill_only" capture can land on a step where only one rank prefills and a
+# "decode_only" one on a step where the other ranks prefill. With this env set,
+# every rank instead classifies each DP-synchronized step from the all-reduced
+# token counts, so all ranks open and close the same capture on the same step:
+#   prefill_all: DP-wide MIN scheduled tokens > 1 (every rank prefills), after
+#                skipping the first *_DP_PREFILL_SKIP such steps.
+#   decode_all:  DP-wide MAX == MIN == 1 (every rank decodes one token, the
+#                megakernel path) and at least *_DP_DECODE_AFTER_MIXED steps
+#                since the last step in which any rank scheduled > 1 token.
+# Each capture spans *_DP_STEPS DP steps (default 1: the 2 GB xplane limit).
+# VLLM_ prefix so vLLM's Ray executor copies them to the second host.
+PHASED_PROFILER_DP_TRIGGER_ENV = "VLLM_TPU_PHASED_PROFILER_DP_TRIGGER"
+PHASED_PROFILER_DP_DECODE_AFTER_MIXED_ENV = (
+    "VLLM_TPU_PHASED_PROFILER_DP_DECODE_AFTER_MIXED"
+)
+PHASED_PROFILER_DP_PREFILL_SKIP_ENV = "VLLM_TPU_PHASED_PROFILER_DP_PREFILL_SKIP"
+PHASED_PROFILER_DP_STEPS_ENV = "VLLM_TPU_PHASED_PROFILER_DP_STEPS"
+PHASED_PROFILER_DP_DECODE_AFTER_MIXED = 200
+PHASED_PROFILER_DP_PREFILL_SKIP = 3
+PHASED_PROFILER_DP_STEPS = 1
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        return int(raw) if raw.strip() else default
+    except ValueError:
+        logger.warning("Ignoring non-integer %s=%r", name, raw)
+        return default
+
 # Tuning knobs with no `profiler_config` equivalent, so they stay in
 # `additional_config`.
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
@@ -55,6 +87,10 @@ class InferencePhase(Enum):
     AMBIGUOUS = 3
     PREFILL_ONLY = 4
     DECODE_ONLY = 5
+    # DP-wide phases; only the DP trigger (`PhaseBasedProfiler.dp_step`)
+    # opens these, never the per-rank classifier.
+    PREFILL_ALL = 6
+    DECODE_ALL = 7
 
 
 def determine_phase_from_batch_composition_stats(
@@ -158,6 +194,7 @@ class PhaseBasedProfiler:
         prefill_kv_len_threshold: int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
         standard_opts: dict[str, Any] | None = None,
         advanced_opts: dict[str, Any] | None = None,
+        dp_trigger: bool | None = None,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str | None = None
@@ -190,6 +227,38 @@ class PhaseBasedProfiler:
         # (see `follow`); such a capture is opened and closed by the DP-wide
         # signal, never by this rank's own step budget.
         self._following: bool = False
+
+        # DP-wide trigger state (see PHASED_PROFILER_DP_TRIGGER_ENV).
+        if dp_trigger is None:
+            dp_trigger = _env_int(PHASED_PROFILER_DP_TRIGGER_ENV, 0) > 0
+        self.dp_trigger: bool = dp_trigger
+        self.dp_decode_after_mixed: int = _env_int(
+            PHASED_PROFILER_DP_DECODE_AFTER_MIXED_ENV,
+            PHASED_PROFILER_DP_DECODE_AFTER_MIXED,
+        )
+        self.dp_prefill_skip: int = _env_int(
+            PHASED_PROFILER_DP_PREFILL_SKIP_ENV, PHASED_PROFILER_DP_PREFILL_SKIP
+        )
+        self.dp_steps: int = max(
+            1, _env_int(PHASED_PROFILER_DP_STEPS_ENV, PHASED_PROFILER_DP_STEPS)
+        )
+        self.dp_phase_seen: dict[InferencePhase, bool] = {
+            InferencePhase.PREFILL_ALL: False,
+            InferencePhase.DECODE_ALL: False,
+        }
+        self.dp_step_count: int = 0
+        self.dp_prefill_all_steps: int = 0
+        self.dp_steps_since_mixed: int = 0
+        self._dp_steps_left: int = 0
+        if self.dp_trigger:
+            logger.info(
+                "Phased profiler DP trigger: prefill_all after %d all-prefill "
+                "steps, decode_all after %d decode steps since the last mixed "
+                "step, %d step(s) per capture.",
+                self.dp_prefill_skip,
+                self.dp_decode_after_mixed,
+                self.dp_steps,
+            )
 
         logger.info(
             "Phase-based profiler enabled. Traces will be saved to: %s",
@@ -395,6 +464,9 @@ class PhaseBasedProfiler:
         # /stop_profile, ignoring max_iterations and filing every later step
         # under the phase that opened it.
         has_scheduled_work = batch_composition_stats["total_num_scheduled_tokens"] > 0
+        if self.dp_trigger:
+            # Phases are chosen DP-wide in `dp_step`, not from this rank.
+            return
         if self._following:
             # A follower capture is driven by `follow`, not by this rank's
             # own batches.
@@ -414,7 +486,7 @@ class PhaseBasedProfiler:
         running, else 0. A follower contributes 0, so the signal drops as
         soon as every rank that owns a capture has closed it.
         """
-        if not self.current_phase or self._following:
+        if not self.current_phase or self._following or self.dp_trigger:
             return 0
         return InferencePhase[self.current_phase.upper()].value + 1
 
@@ -428,6 +500,8 @@ class PhaseBasedProfiler:
         DP-synchronized step on every rank, after the busy ranks' `step`, so
         followers open and close on the same step as the owner.
         """
+        if self.dp_trigger:
+            return  # every rank decides for itself in `dp_step`
         if self.current_phase and not self._following:
             return  # this rank owns a capture of its own
         want = InferencePhase(dp_signal - 1) if dp_signal > 0 else None
@@ -443,6 +517,86 @@ class PhaseBasedProfiler:
         self._open_capture(want, {"dp_follower": True, "phase": want.name})
         if self.current_phase:
             self._following = True
+
+    def dp_step(
+        self,
+        dp_max_tokens: int,
+        dp_min_tokens: int,
+        extra_stats: dict | None = None,
+    ) -> InferencePhase | None:
+        """DP-wide phase trigger; call once per DP-synchronized step.
+
+        Every DP rank calls this with the same all-reduced MAX/MIN scheduled
+        token counts (idle ranks contribute 0), right after the all-reduce and
+        before the step's forward, so all ranks open and close each capture on
+        the same step. A capture opened here is closed `dp_steps` calls later,
+        after a device barrier so the captured step's device work is in the
+        trace. Returns the phase opened on this step, if any. No-op unless
+        `dp_trigger`.
+        """
+        if not self.dp_trigger:
+            return None
+        self.dp_step_count += 1
+        if dp_max_tokens > 1:
+            self.dp_steps_since_mixed = 0
+        elif dp_max_tokens == 1:
+            self.dp_steps_since_mixed += 1
+        prefill_all = dp_min_tokens > 1
+        decode_all = dp_max_tokens == 1 and dp_min_tokens == 1
+        if prefill_all:
+            self.dp_prefill_all_steps += 1
+        stats = {
+            "dp_trigger": True,
+            "dp_step": self.dp_step_count,
+            "dp_max_tokens": int(dp_max_tokens),
+            "dp_min_tokens": int(dp_min_tokens),
+            "dp_prefill_all_steps": self.dp_prefill_all_steps,
+            "dp_steps_since_mixed": self.dp_steps_since_mixed,
+            "worker_rank": self.worker_rank,
+            **(extra_stats or {}),
+        }
+
+        if self.current_phase:
+            self._dp_steps_left -= 1
+            if self._dp_steps_left > 0:
+                self._write_batch_composition_stats_to_file_helper(stats)
+                return None
+            self._dp_barrier()
+            self._finish_current_phase()
+            return None  # never reopen on the step that closed
+
+        phase = None
+        if (
+            prefill_all
+            and not self.dp_phase_seen[InferencePhase.PREFILL_ALL]
+            and self.dp_prefill_all_steps > self.dp_prefill_skip
+        ):
+            phase = InferencePhase.PREFILL_ALL
+        elif (
+            decode_all
+            and not self.dp_phase_seen[InferencePhase.DECODE_ALL]
+            and self.dp_steps_since_mixed >= self.dp_decode_after_mixed
+        ):
+            phase = InferencePhase.DECODE_ALL
+        if phase is None:
+            return None
+        self.dp_phase_seen[phase] = True
+        stats["phase"] = phase.name
+        self._open_capture(phase, stats)
+        if not self.current_phase:
+            return None
+        self._dp_steps_left = self.dp_steps
+        return phase
+
+    @staticmethod
+    def _dp_barrier() -> None:
+        """Wait for enqueued device work so the captured step is complete."""
+        try:
+            from vllm_torchtpu.utils import synchronize_device
+
+            synchronize_device()
+        except Exception as e:  # diagnostics only; never fail the step
+            logger.warning("Phased profiler DP barrier failed: %s", e)
 
 
 # (dtype, shape) -> minor_to_major, for buffers whose device layout is not

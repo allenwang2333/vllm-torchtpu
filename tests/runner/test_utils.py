@@ -634,3 +634,107 @@ def test_phased_profiler_follow_zero_signal_is_a_noop(profiler_fixture):
     profiler_fixture["mock_profile"].assert_not_called()
     assert profiler.current_phase == ""
     assert profiler.capture_signal() == 0
+
+
+def _dp_profiler(owner, rank):
+    return PhaseBasedProfiler(
+        profile_dir=owner.profile_dir,
+        worker_rank=rank,
+        world_size=16,
+        standard_opts=owner.standard_opts,
+        advanced_opts=owner.advanced_opts,
+        dp_trigger=True,
+    )
+
+
+def test_phased_profiler_dp_trigger_captures_true_all_rank_phases(profiler_fixture):
+    """DP trigger: phases come from the all-reduced MAX/MIN token counts.
+
+    Regression (j-827bbdf5 c16): the per-rank classifier filed a step where
+    only DP0 prefilled under prefill_only and a mixed step under decode_only.
+    """
+    owner = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_context = profiler_fixture["mock_context"]
+    ranks = [_dp_profiler(owner, r) for r in range(4)]
+    for p in ranks:
+        p.dp_prefill_skip = 2
+        p.dp_decode_after_mixed = 5
+        p.dp_steps = 1
+
+    def dp(local):
+        mx, mn = max(local), min(local)
+        return [p.dp_step(mx, mn) for p in ranks]
+
+    with patch.object(PhaseBasedProfiler, "_dp_barrier") as barrier:
+        # Only rank 0 prefills (the old mislabel): never prefill_all.
+        for _ in range(5):
+            assert dp([1024, 0, 0, 0]) == [None] * 4
+        # Mixed (some prefill, some decode): neither phase.
+        assert dp([1024, 1, 1, 1]) == [None] * 4
+        # All-prefill steps: first 2 skipped as warmup, 3rd opens.
+        assert dp([1024, 1024, 512, 1024]) == [None] * 4
+        assert dp([1024, 1024, 512, 1024]) == [None] * 4
+        opened = dp([1024, 1024, 512, 1024])
+        assert opened == [InferencePhase.PREFILL_ALL] * 4
+        assert all(p.current_phase == "prefill_all" for p in ranks)
+        assert mock_profile.call_count == 4
+        # Exactly one step: closes on the next DP step, behind a barrier.
+        assert dp([1024, 1024, 1024, 1024]) == [None] * 4
+        assert all(p.current_phase == "" for p in ranks)
+        assert mock_context.__exit__.call_count == 4
+        assert barrier.call_count == 4
+        # Further all-prefill steps never reopen it.
+        dp([1024] * 4)
+        assert mock_profile.call_count == 4
+
+        # Decode, but a mixed step resets the since-mixed counter.
+        for _ in range(4):
+            assert dp([1, 1, 1, 1]) == [None] * 4
+        assert dp([1, 1024, 1, 1]) == [None] * 4
+        # Some rank idle (max 1, min 0): counted, but not all-decode.
+        for _ in range(6):
+            assert dp([1, 1, 0, 1]) == [None] * 4
+        # 6 decode steps since mixed >= 5 and every rank decodes -> opens.
+        assert dp([1, 1, 1, 1]) == [InferencePhase.DECODE_ALL] * 4
+        assert mock_profile.call_count == 8
+        dp([1, 1, 1, 1])
+        assert mock_context.__exit__.call_count == 8
+        for _ in range(20):
+            assert dp([1, 1, 1, 1]) == [None] * 4
+        assert mock_profile.call_count == 8
+
+    # The per-rank path is inert under the DP trigger.
+    p = ranks[0]
+    p.step({"num_reqs": 1, "total_num_scheduled_tokens": 1024, "min_kv_len": 0})
+    assert p.capture_signal() == 0
+    p.follow(InferencePhase.PREFILL_ONLY.value + 1)
+    assert mock_profile.call_count == 8
+
+
+def test_phased_profiler_dp_trigger_env_and_multi_step(profiler_fixture, monkeypatch):
+    from vllm_torchtpu.runner import utils as ru
+
+    monkeypatch.setenv(ru.PHASED_PROFILER_DP_TRIGGER_ENV, "1")
+    monkeypatch.setenv(ru.PHASED_PROFILER_DP_PREFILL_SKIP_ENV, "0")
+    monkeypatch.setenv(ru.PHASED_PROFILER_DP_STEPS_ENV, "2")
+    owner = profiler_fixture["profiler"]
+    p = PhaseBasedProfiler(
+        profile_dir=owner.profile_dir,
+        standard_opts=owner.standard_opts,
+        advanced_opts=owner.advanced_opts,
+    )
+    assert p.dp_trigger and p.dp_decode_after_mixed == 200
+    with patch.object(PhaseBasedProfiler, "_dp_barrier"):
+        assert p.dp_step(1024, 1024) == InferencePhase.PREFILL_ALL
+        p.dp_step(1024, 1024)
+        assert p.current_phase == "prefill_all"
+        p.dp_step(1024, 1024)
+        assert p.current_phase == ""
+
+
+def test_phased_profiler_dp_step_is_noop_without_trigger(profiler_fixture):
+    profiler = profiler_fixture["profiler"]
+    assert not profiler.dp_trigger
+    assert profiler.dp_step(1024, 1024) is None
+    profiler_fixture["mock_profile"].assert_not_called()
