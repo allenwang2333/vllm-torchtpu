@@ -452,13 +452,16 @@ def _patch_vllm_disable_compile_ranges() -> None:
 
 
 def _patch_vllm_compile_all_ranges() -> None:
-    """Patch vllm compile all ranges to support compilation rotation.
+    """Patch vllm compile all ranges to support true parallel compilation across ranks.
 
-    Compilation rotation allows vllm to compile multiple sizes at the same time,
-    which greatly reduce the vllm startup time.
+    Divides the token bucket compilation workload among local TPU ranks, shares
+    the compiled artifacts via the compilation cache, and loads completed artifacts
+    from peers to eliminate redundant compilation.
     """
+    import glob
     import os
-    from collections import deque
+    import shutil
+    import time
 
     from vllm.compilation.piecewise_backend import (
         PiecewiseBackend,
@@ -474,46 +477,203 @@ def _patch_vllm_compile_all_ranges() -> None:
             "compile_all_ranges should not be called."
         )
 
-        local_rank = int(os.environ["LOCAL_RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 8))
         range_entry_list = list(self.range_entries.values())
+        local_cache_dir = self.compilation_config.local_cache_dir
+        if local_cache_dir:
+            os.makedirs(local_cache_dir, exist_ok=True)
 
-        range_entry_len = len(range_entry_list)
-
-        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
-        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
-        d.rotate(-local_rank * (len(d) // 8))
-        indexes = list(d)
-
-        for i in indexes:
-            if i >= len(range_entry_list):
-                continue
-
-            range_entry = range_entry_list[i]
-
-            if range_entry.compiled:
-                continue
-
-            self._log_compile_start(range_entry.compile_range)
-
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
-                )
+        def _get_key_and_args(range_entry):
+            compile_range = range_entry.compile_range
+            if compile_range.is_single_size():
+                args_list = create_concrete_args(self.graph, compile_range.start)
             else:
                 args_list = get_fake_args_from_graph(self.graph)
-
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
+            key = (
+                f"artifact_compile_range_{compile_range.start}_{compile_range.end}"
+                f"_subgraph_{self.piecewise_compile_index}"
             )
+            return key, args_list
 
-            range_entry.compiled = True
+        def _find_peer_artifact(key: str) -> str | None:
+            if not local_cache_dir:
+                return None
+            local_path = os.path.join(local_cache_dir, key)
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                return local_path
+
+            cache_dir = self.compilation_config.cache_dir
+            if not cache_dir or not os.path.exists(cache_dir):
+                return None
+
+            prefix = getattr(self.vllm_backend, "prefix", "") or "*"
+            pattern = os.path.join(cache_dir, "rank_*", prefix, key)
+            matches = glob.glob(pattern)
+            for m in sorted(matches):
+                if m.endswith(".tmp") or not os.path.exists(m) or os.path.getsize(m) == 0:
+                    continue
+                ready_marker = m + ".ready"
+                if os.path.exists(ready_marker) or os.path.getsize(m) > 1024:
+                    return m
+            return None
+
+        def _load_artifact(range_entry, args_list, key, source_path) -> bool:
+            if not local_cache_dir:
+                return False
+            local_path = os.path.join(local_cache_dir, key)
+            if os.path.abspath(source_path) != os.path.abspath(local_path):
+                try:
+                    if os.path.islink(local_path) or os.path.exists(local_path):
+                        os.remove(local_path)
+                    os.symlink(source_path, local_path)
+                except OSError:
+                    try:
+                        shutil.copyfile(source_path, local_path)
+                    except Exception as e:
+                        logger.warning(
+                            "[TPU_PARALLEL_PRECOMPILE] Failed to copy artifact %s: %s",
+                            source_path,
+                            e,
+                        )
+                        return False
+
+            handle = (key, local_path, False)
+            try:
+                runnable = self.vllm_backend.compiler_manager.compiler.load(
+                    handle,
+                    self.graph,
+                    args_list,
+                    self.piecewise_compile_index,
+                    range_entry.compile_range,
+                )
+                if runnable is not None:
+                    range_entry.runnable = runnable
+                    range_entry.compiled = True
+                    cache_key = (
+                        range_entry.compile_range,
+                        self.piecewise_compile_index,
+                        self.vllm_backend.compiler_manager.compiler.name,
+                    )
+                    self.vllm_backend.compiler_manager.cache[cache_key] = {
+                        "graph_handle": handle,
+                        "cache_key": key,
+                    }
+                    self.vllm_backend.compiler_manager.is_cache_updated = True
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "[TPU_PARALLEL_PRECOMPILE] Error loading artifact %s: %s",
+                    local_path,
+                    e,
+                )
+            return False
+
+        # Step 1: Check existing cache for all ranges
+        for range_entry in range_entry_list:
+            if range_entry.compiled:
+                continue
+            key, args_list = _get_key_and_args(range_entry)
+            existing = _find_peer_artifact(key)
+            if existing:
+                if _load_artifact(range_entry, args_list, key, existing):
+                    logger.info(
+                        "[TPU_PARALLEL_PRECOMPILE] Loaded pre-existing artifact for range %s from %s",
+                        range_entry.compile_range,
+                        existing,
+                    )
+
+        # Step 2: Compile assigned uncompiled ranges in parallel across local ranks
+        uncompiled_entries = [
+            (idx, r) for idx, r in enumerate(range_entry_list) if not r.compiled
+        ]
+
+        for idx, range_entry in uncompiled_entries:
+            if range_entry.compiled:
+                continue
+            if (idx % local_world_size) == local_rank:
+                self._log_compile_start(range_entry.compile_range)
+                key, args_list = _get_key_and_args(range_entry)
+                logger.info(
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d starting compilation for range %s (%s)",
+                    local_rank,
+                    range_entry.compile_range,
+                    key,
+                )
+                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                    self.graph,
+                    args_list,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    compile_range=range_entry.compile_range,
+                    graph_index=self.piecewise_compile_index,
+                    num_graphs=self.total_piecewise_compiles,
+                    is_encoder=self.vllm_backend.is_encoder,
+                )
+                range_entry.compiled = True
+                if local_cache_dir:
+                    ready_marker = os.path.join(local_cache_dir, f"{key}.ready")
+                    try:
+                        with open(ready_marker, "w") as f:
+                            f.write("done\n")
+                    except OSError:
+                        pass
+                logger.info(
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d completed compilation for range %s",
+                    local_rank,
+                    range_entry.compile_range,
+                )
+
+        # Step 3: Wait and load remaining ranges compiled by peer ranks
+        for idx, range_entry in uncompiled_entries:
+            if range_entry.compiled:
+                continue
+            key, args_list = _get_key_and_args(range_entry)
+            assigned_rank = idx % local_world_size
+            logger.info(
+                "[TPU_PARALLEL_PRECOMPILE] Rank %d waiting for range %s (%s) from rank %d...",
+                local_rank,
+                range_entry.compile_range,
+                key,
+                assigned_rank,
+            )
+            wait_start = time.time()
+            found_artifact = None
+            while time.time() - wait_start < 7200:
+                found_artifact = _find_peer_artifact(key)
+                if found_artifact:
+                    break
+                time.sleep(3)
+
+            loaded = False
+            if found_artifact:
+                loaded = _load_artifact(range_entry, args_list, key, found_artifact)
+                if loaded:
+                    logger.info(
+                        "[TPU_PARALLEL_PRECOMPILE] Rank %d successfully loaded range %s from peer artifact %s",
+                        local_rank,
+                        range_entry.compile_range,
+                        found_artifact,
+                    )
+
+            if not loaded:
+                logger.warning(
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d falling back to local compile for range %s",
+                    local_rank,
+                    range_entry.compile_range,
+                )
+                self._log_compile_start(range_entry.compile_range)
+                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                    self.graph,
+                    args_list,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    compile_range=range_entry.compile_range,
+                    graph_index=self.piecewise_compile_index,
+                    num_graphs=self.total_piecewise_compiles,
+                    is_encoder=self.vllm_backend.is_encoder,
+                )
+                range_entry.compiled = True
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
