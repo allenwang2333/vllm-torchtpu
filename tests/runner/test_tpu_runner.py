@@ -1730,6 +1730,7 @@ class TestAsyncSpecDecodeTokenAccounting:
         runner.input_batch = SimpleNamespace(
             token_ids_cpu=np.zeros((max_num_reqs, max_model_len), dtype=np.int32),
             num_tokens_no_spec=np.zeros((max_num_reqs,), dtype=np.int32),
+            num_prompt_tokens=np.zeros((max_num_reqs,), dtype=np.int32),
             req_id_to_index={},
         )
         runner.requests = {}
@@ -1755,6 +1756,7 @@ class TestAsyncSpecDecodeTokenAccounting:
         )
         runner.requests[req_id] = req_state
         runner.input_batch.req_id_to_index[req_id] = 0
+        runner.input_batch.num_prompt_tokens[0] = prompt_len
         runner.input_batch.num_tokens_no_spec[0] = prompt_len
         runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
 
@@ -1788,18 +1790,18 @@ class TestAsyncSpecDecodeTokenAccounting:
         )
         TPUModelRunner._modify_prev_results(runner)
 
-        # Rollback check:
-        # output_token_ids should have 4 zeros dropped and [100] added
+        # Output tokens updated
         assert req_state.output_token_ids == [100]
-        # num_tokens_no_spec should be rolled back: 14 - 4 + 1 = 11
+        # num_tokens_no_spec rolled back to true committed: 10 prompt + 1 output = 11
         assert runner.input_batch.num_tokens_no_spec[0] == 11
-        # token_ids_cpu slot 10 should be 100
+        # token_ids_cpu committed contiguously: slot 10 has 100
         assert runner.input_batch.token_ids_cpu[0, 10] == 100
         assert np.array_equal(
             runner.input_batch.token_ids_cpu[0, :11], prompt_tokens + [100]
         )
 
-        # Step 1: End of Decode Step 1. _update_placeholder called with K=3 drafts
+        # End of Decode Step 1. _update_placeholder called with K=3 drafts.
+        # seq_len is 14 (10 computed + 4 scheduled)
         request_seq_lens_1 = [(0, req_state, 14, req_id)]
         num_draft_1 = {0: 3}
         TPUModelRunner._update_placeholder(
@@ -1809,13 +1811,12 @@ class TestAsyncSpecDecodeTokenAccounting:
             next_token_indices=next_token_indices,
             num_draft_per_req=num_draft_1,
         )
-        # num_tokens_no_spec should advance from committed (11) + 4 = 15,
-        # NOT seq_len (14) + 4 = 18!
-        assert runner.input_batch.num_tokens_no_spec[0] == 15
+        # 14 + 4 = 18
+        assert runner.input_batch.num_tokens_no_spec[0] == 18
         assert req_state.output_token_ids == [100, 0, 0, 0, 0]
 
         # Step 2: Start of Decode Step 2. _modify_prev_results for Step 1 result.
-        # Step 1 accepted 2 drafts (101, 102) + bonus (103) = 3 tokens.
+        # Step 1 accepted 2 drafts (101, 102) + 1 bonus token (103): 3 tokens.
         copy_mock_1 = MagicMock()
         copy_mock_1.wait_for_copy.return_value = torch.tensor(
             [[101, 102, 103, INVALID_TOKEN_ID]], dtype=torch.int32
@@ -1829,20 +1830,18 @@ class TestAsyncSpecDecodeTokenAccounting:
         )
         TPUModelRunner._modify_prev_results(runner)
 
-        # Rollback check:
-        # output_token_ids should drop 4 zeros and add [101, 102, 103]
+        # Output tokens updated
         assert req_state.output_token_ids == [100, 101, 102, 103]
-        # num_tokens_no_spec: 15 - 4 + 3 = 14
+        # num_tokens_no_spec committed: 10 + 4 = 14
         assert runner.input_batch.num_tokens_no_spec[0] == 14
-        # token_ids_cpu should have contiguous committed tokens at [10, 11, 12, 13]
-        # Previous token 100 at index 10 MUST NOT BE OVERWRITTEN!
-        # Slots 11, 12, 13 must contain 101, 102, 103!
+        # token_ids_cpu slots 10..14 must be [100, 101, 102, 103]
         expected_committed = prompt_tokens + [100, 101, 102, 103]
         assert np.array_equal(
             runner.input_batch.token_ids_cpu[0, :14], expected_committed
         )
 
-        # Step 2: End of Decode Step 2. _update_placeholder with K=3 drafts
+        # End of Decode Step 2. _update_placeholder with K=3 drafts.
+        # seq_len is 18
         request_seq_lens_2 = [(0, req_state, 18, req_id)]
         num_draft_2 = {0: 3}
         TPUModelRunner._update_placeholder(
@@ -1852,8 +1851,7 @@ class TestAsyncSpecDecodeTokenAccounting:
             next_token_indices=next_token_indices,
             num_draft_per_req=num_draft_2,
         )
-        # Advance from committed 14 + 4 = 18
-        assert runner.input_batch.num_tokens_no_spec[0] == 18
+        assert runner.input_batch.num_tokens_no_spec[0] == 22
         assert req_state.output_token_ids == [100, 101, 102, 103, 0, 0, 0, 0]
 
         # Step 3: Start of Decode Step 3. _modify_prev_results for Step 2 result.
@@ -1875,9 +1873,9 @@ class TestAsyncSpecDecodeTokenAccounting:
         # Rollback check:
         # output_token_ids: drops 4 zeros and adds [108]
         assert req_state.output_token_ids == [100, 101, 102, 103, 108]
-        # num_tokens_no_spec: 18 - 4 + 1 = 15
+        # num_tokens_no_spec: 10 + 5 = 15
         assert runner.input_batch.num_tokens_no_spec[0] == 15
-        # token_ids_cpu slots 10..15 must be [100, 101, 102, 103, 108]
+        # token_ids_cpu slots 10..15 must be contiguous: [100, 101, 102, 103, 108]
         expected_committed_step3 = prompt_tokens + [100, 101, 102, 103, 108]
         assert np.array_equal(
             runner.input_batch.token_ids_cpu[0, :15], expected_committed_step3
@@ -1894,7 +1892,8 @@ class TestAsyncSpecDecodeTokenAccounting:
 
         runner.requests = {req_id_0: state_0, req_id_1: state_1}
         runner.input_batch.req_id_to_index = {req_id_0: 0, req_id_1: 1}
-        # Both staged at 14
+        runner.input_batch.num_prompt_tokens[0] = 10
+        runner.input_batch.num_prompt_tokens[1] = 10
         runner.input_batch.num_tokens_no_spec[0] = 14
         runner.input_batch.num_tokens_no_spec[1] = 14
 
@@ -1919,8 +1918,8 @@ class TestAsyncSpecDecodeTokenAccounting:
 
         TPUModelRunner._modify_prev_results(runner)
 
-        assert runner.input_batch.num_tokens_no_spec[0] == 14  # 14 - 4 + 4
-        assert runner.input_batch.num_tokens_no_spec[1] == 11  # 14 - 4 + 1
+        assert runner.input_batch.num_tokens_no_spec[0] == 14  # 10 + 4
+        assert runner.input_batch.num_tokens_no_spec[1] == 11  # 10 + 1
         assert np.array_equal(
             runner.input_batch.token_ids_cpu[0, 10:14], [10, 11, 12, 13]
         )
@@ -1933,6 +1932,7 @@ class TestAsyncSpecDecodeTokenAccounting:
         state = SimpleNamespace(req_id=req_id, output_token_ids=[0])
         runner.requests = {req_id: state}
         runner.input_batch.req_id_to_index = {req_id: 0}
+        runner.input_batch.num_prompt_tokens[0] = 10
         runner.input_batch.num_tokens_no_spec[0] = 11
 
         copy_mock = MagicMock()
@@ -1978,6 +1978,7 @@ class TestAsyncSpecDecodeTokenAccounting:
 
         # Step 0: Request starts at row 0
         runner.input_batch.req_id_to_index = {req_id: 0}
+        runner.input_batch.num_prompt_tokens[0] = prompt_len
         runner.input_batch.num_tokens_no_spec[0] = prompt_len
         runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
 
@@ -1994,6 +1995,7 @@ class TestAsyncSpecDecodeTokenAccounting:
         # Step 1: Request moves to row 1 (another request was assigned row 0)
         # Prefill token 100 commits
         runner.input_batch.req_id_to_index = {req_id: 1, "other-req": 0}
+        runner.input_batch.num_prompt_tokens[1] = prompt_len
         runner.input_batch.num_tokens_no_spec[1] = 14
         runner.input_batch.token_ids_cpu[1, :prompt_len] = prompt_tokens
 
@@ -2025,4 +2027,4 @@ class TestAsyncSpecDecodeTokenAccounting:
             next_token_indices={1: 0},
             num_draft_per_req={1: 3},
         )
-        assert runner.input_batch.num_tokens_no_spec[1] == 15
+        assert runner.input_batch.num_tokens_no_spec[1] == 18
