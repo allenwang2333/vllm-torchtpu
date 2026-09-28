@@ -254,7 +254,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         def op(*args):
             new_cache, topk_indices = jax_op(*args)
-            args[2].copy_(new_cache)
+            self.k_cache.kv_cache = new_cache
             return topk_indices
 
         self._streamidx_op = op
@@ -377,7 +377,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         def op(*args):
             new_cache, local_topk = jax_op(*args)
-            args[2].copy_(new_cache)
+            self.k_cache.kv_cache = new_cache
             return local_topk
 
         return op
@@ -462,6 +462,12 @@ class VllmTPUIndexerCache(DeepseekV32IndexerCache):
 
     def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
         return VllmTPUDeepseekV32IndexerBackend
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1:
+            self.kv_cache = kv_cache.squeeze(1).contiguous()
+        else:
+            self.kv_cache = kv_cache.contiguous()
 
 
 class VllmTPUIndexer(Indexer):
