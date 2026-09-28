@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Helpers for tests that must not retain TPU runtime state in pytest."""
 
-import functools
 import multiprocessing
 import queue
 import traceback
@@ -23,18 +22,17 @@ def _isolated_test_worker(target: Callable[[], None], result_queue: Any) -> None
 
 
 def run_in_isolated_process(
-    target: Callable[..., None], *args: Any, timeout: float = 600, **kwargs: Any
+    target: Callable[[], None], *, timeout: float = 600
 ) -> None:
     """Run a TPU test in a spawned process and propagate its result.
 
     PJRT keeps TPU device handles alive for the lifetime of its process. Running
     device tests in a child prevents those handles from blocking later tests
-    that start their own engine processes. ``timeout`` is not passed to ``target``.
+    that start their own engine processes.
     """
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
-    call = functools.partial(target, *args, **kwargs)
-    process = ctx.Process(target=_isolated_test_worker, args=(call, result_queue))
+    process = ctx.Process(target=_isolated_test_worker, args=(target, result_queue))
     try:
         process.start()
         process.join(timeout)
