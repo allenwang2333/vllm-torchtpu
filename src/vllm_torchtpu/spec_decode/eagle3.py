@@ -30,7 +30,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_embeddings,
     maybe_share_lm_head,
 )
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import rank_rotated, synchronize_tensors
 
 # Sentinel for rejected / padding slots in the rejection-sampler output (and the
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
@@ -1857,7 +1857,8 @@ class Eagle3Proposer:
         # indexes with p=8 (pad rows repeat the last real row).
         p = self._loop_bucket(runner.max_num_reqs)
         with runner._precompile_timed("drafter seed_input_ids"):
-            for T in runner.num_tokens_paddings:
+            # Collective-free: rotate so the ranks share compiles via Tier-2.
+            for T in rank_rotated(runner.num_tokens_paddings):
                 ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
                 lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
                 nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
