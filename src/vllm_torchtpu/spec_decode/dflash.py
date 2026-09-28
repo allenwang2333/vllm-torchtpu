@@ -484,6 +484,36 @@ class DFlashProposer:
                 target_hidden, positions, draft_md_tuple
             )
 
+    def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
+        """Update all context chunks before any draft forward (DP lockstep)."""
+        extra_chunks = 0
+        if self._dp_lockstep_sharded():
+            extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
+        for chunk in chunks:
+            self._update_draft_kv_cache_from_target(chunk)
+        for _ in range(extra_chunks):
+            self._dp_dummy_kv_update()
+        return extra_chunks
+
+    @torch.no_grad()
+    def prepare_prefill_handoff(self) -> None:
+        """Build draft context without proposing tokens on a PD producer.
+
+        The caller must materialize cache writes before publishing the handoff.
+        Missing aux states are an error here: transferring target KV alone is
+        insufficient to resume DFlash/DSpark on the consumer.
+        """
+        chunks = self.draft_chunks
+        if not chunks:
+            raise RuntimeError("PD context update requires captured prefill chunks.")
+        for chunk in chunks:
+            aux = chunk.aux_hidden_states
+            if aux is None or (isinstance(aux, (list, tuple)) and not aux):
+                raise RuntimeError(
+                    "PD context update requires target aux hidden states."
+                )
+        self._update_context_kv(chunks)
+
     @torch.no_grad()
     def propose(
         self,
@@ -520,15 +550,8 @@ class DFlashProposer:
         # collectives pair across ranks by emission order, and propose emits
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
-        extra_chunks = 0
-        if self._dp_lockstep_sharded():
-            extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
-
         # 1. Hoist all KV cache updates across chunks to the top of propose
-        for chunk in chunks:
-            self._update_draft_kv_cache_from_target(chunk)
-        for _ in range(extra_chunks):
-            self._dp_dummy_kv_update()
+        extra_chunks = self._update_context_kv(chunks)
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
