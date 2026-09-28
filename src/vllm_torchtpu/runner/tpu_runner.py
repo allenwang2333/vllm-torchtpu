@@ -909,14 +909,16 @@ class TPUModelRunner(GPUModelRunner):
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
-        self._dspark_pd_context_only = bool(
+        speculative_config = self.speculative_config
+        # The producer populates draft context KV without generating proposals.
+        self._is_dspark_pd_producer = bool(
             transfer_config is not None
             and transfer_config.kv_connector == "TPURaidenConnector"
             and transfer_config.is_kv_producer
-            and self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
+            and speculative_config is not None
+            and speculative_config.method == "dspark"
         )
-        if self._dspark_pd_context_only:
+        if self._is_dspark_pd_producer:
             if not self._unified_kv_layout:
                 raise ValueError("DSpark PD requires the unified block pool.")
             if self.scheduler_config.async_scheduling:
@@ -4582,7 +4584,7 @@ class TPUModelRunner(GPUModelRunner):
         if (
             self._is_async_drafter
             and combined_selected_tokens
-            and not self._dspark_pd_context_only
+            and not self._is_dspark_pd_producer
         ):
             if is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
@@ -4616,7 +4618,7 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
-        if self._dspark_pd_context_only:
+        if self._is_dspark_pd_producer:
             self.drafter.prepare_prefill_handoff()
             # Context projections are deferred TPU graphs. A hardware-only
             # barrier does not materialize their writes before Raiden reads.
