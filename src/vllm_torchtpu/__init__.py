@@ -675,6 +675,23 @@ def _patch_vllm_compile_all_ranges() -> None:
                 )
                 range_entry.compiled = True
 
+        # Step 4: Synchronize all ranks across hosts before returning to avoid
+        # fast ranks proceeding to _dummy_run while peer ranks are still compiling.
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                logger.info(
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d waiting at dist.barrier()...",
+                    local_rank,
+                )
+                dist.barrier()
+                logger.info(
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d passed dist.barrier().",
+                    local_rank,
+                )
+        except Exception as e:
+            logger.warning("[TPU_PARALLEL_PRECOMPILE] Rank %d barrier failed: %s", local_rank, e)
+
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
         logger.info("Applied TPU patch: compile_all_ranges.")
