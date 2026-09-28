@@ -73,6 +73,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
 from vllm_torchtpu import envs, utils
+from vllm_torchtpu.runner import accdump as _accdump
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
@@ -3403,6 +3404,23 @@ class TPUModelRunner(GPUModelRunner):
                 logits = self.compute_selected_logits(hidden_states, logits_indices)
             else:
                 logits = self.compute_logits_from_hidden_states(sample_hidden_states)
+
+            if _accdump.ENABLED:
+                try:
+                    _hs = (
+                        hidden_states
+                        if sample_hidden_states is None
+                        else sequence_layout_planner.finalize_hidden_states(
+                            hidden_states, layout_plan
+                        )
+                    )
+                    _accdump.maybe_dump(
+                        self, scheduler_output, start_index, num_reqs, _hs, attn_metadata
+                    )
+                except Exception as _e:  # never kill the server for a probe
+                    import traceback
+
+                    print(f"ACCDUMP-ERROR {_e!r}\n{traceback.format_exc()}", flush=True)
 
             if self.is_pooling_model:
                 pooling_metadata = self.input_batch.get_pooling_metadata()

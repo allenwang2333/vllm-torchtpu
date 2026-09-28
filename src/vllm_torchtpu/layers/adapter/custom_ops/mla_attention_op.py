@@ -13,6 +13,7 @@
 # limitations under the License.
 """Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
+import os
 from typing import Any
 
 import jax
@@ -283,6 +284,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
+        # accdump (probe 05): side buffers holding this step's exact kernel
+        # inputs, read on the host by vllm_torchtpu.runner.accdump. Env-gated;
+        # changes no numerics.
+        self._accdump = bool(os.environ.get("VLLM_ACCDUMP_DIR"))
+        if self._accdump:
+            rows = self.topk_indices_buffer.shape[0]
+            dev = self.topk_indices_buffer.device
+            n_head = get_current_vllm_config_or_none().model_config.hf_config.index_n_heads
+            self._dump_q = torch.zeros((rows, n_head, self.head_dim), dtype=torch.uint8, device=dev)
+            self._dump_w = torch.zeros((rows, n_head), dtype=torch.bfloat16, device=dev)
+            self.k_cache._accdump_owner = self
 
         parallel_config = getattr(
             get_current_vllm_config_or_none(), "parallel_config", None
@@ -313,6 +325,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         kwrite_dus = envs.TPU_STREAMIDX_KWRITE_DUS
         sctopk_l1 = envs.TPU_STREAMIDX_SCTOPK_L1
         score_bf16_group = envs.TPU_STREAMIDX_SCORE_BF16_GROUP
+        print(
+            f"ACCDUMP-CFG pid={os.getpid()} prefix={self.k_cache.prefix} "
+            f"score_bf16_group={score_bf16_group} sctopk_l1={sctopk_l1} "
+            f"chunk_tokens={chunk_tokens} kwrite_dus={kwrite_dus}",
+            flush=True,
+        )
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -568,6 +586,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
+        if self._accdump:
+            nq = min(q_values.shape[0], self._dump_q.shape[0])
+            self._dump_q[:nq] = q_values.view(torch.uint8)[:nq]
+            self._dump_w[:nq] = weights[:nq].to(torch.bfloat16)
         self.topk_indices_buffer[: hidden_states.shape[0]] = -1
         num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
         # Both branches return `topk_tokens`-wide rows.
