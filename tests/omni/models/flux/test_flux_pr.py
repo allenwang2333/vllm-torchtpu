@@ -6,6 +6,8 @@ Covers fast inference with FLUX.1-schnell, golden-image parity with a CPU diffus
 reference, and deterministic seed parity, without file writes.
 """
 
+import os
+
 import numpy as np
 import pytest
 from PIL import Image
@@ -18,8 +20,9 @@ pytestmark = [
 ]
 
 # ==============================================================================
-# Golden reference: the same config run through diffusers on CPU, reduced to
-# what the test compares. Regenerate with diffusers 0.40.0:
+# Golden reference: full 512x512 CPU diffusers reference image staged from
+# gs://tpu-commons-ci/golden/flux_schnell_cpu_golden_img.npy.
+# Regenerate with diffusers 0.40.0 on CPU:
 #
 #   import torch
 #   from diffusers import FluxPipeline
@@ -44,74 +47,58 @@ pytestmark = [
 #       generator=torch.Generator(device="cpu").manual_seed(0),
 #       output_type="np",
 #   ).images[0]
-#   DIFFUSERS_THUMBNAIL = _thumbnail(img).round(3)
-#   DIFFUSERS_HF_ENERGY = round(_high_freq_energy(img), 5)
+#   np.save("flux_schnell_cpu_golden_img.npy", img)
 # ==============================================================================
-DIFFUSERS_THUMBNAIL = np.array(
-    [
-        [
-            [0.191, 0.145, 0.151, 0.123, 0.092, 0.072, 0.070, 0.168],
-            [0.124, 0.134, 0.100, 0.069, 0.058, 0.140, 0.389, 0.321],
-            [0.061, 0.059, 0.028, 0.029, 0.230, 0.426, 0.538, 0.120],
-            [0.026, 0.081, 0.025, 0.100, 0.402, 0.503, 0.259, 0.112],
-            [0.033, 0.031, 0.015, 0.335, 0.473, 0.377, 0.099, 0.097],
-            [0.025, 0.029, 0.115, 0.419, 0.507, 0.059, 0.085, 0.075],
-            [0.015, 0.040, 0.232, 0.462, 0.149, 0.109, 0.134, 0.078],
-            [0.041, 0.062, 0.267, 0.205, 0.343, 0.449, 0.387, 0.128],
-        ],
-        [
-            [0.421, 0.419, 0.431, 0.393, 0.316, 0.262, 0.237, 0.326],
-            [0.357, 0.361, 0.314, 0.286, 0.266, 0.348, 0.587, 0.517],
-            [0.164, 0.143, 0.101, 0.125, 0.387, 0.622, 0.676, 0.307],
-            [0.082, 0.120, 0.063, 0.151, 0.570, 0.653, 0.417, 0.293],
-            [0.098, 0.061, 0.050, 0.456, 0.639, 0.496, 0.302, 0.289],
-            [0.092, 0.070, 0.165, 0.605, 0.642, 0.165, 0.260, 0.227],
-            [0.077, 0.158, 0.400, 0.631, 0.306, 0.292, 0.288, 0.187],
-            [0.160, 0.246, 0.419, 0.333, 0.517, 0.616, 0.562, 0.253],
-        ],
-        [
-            [0.076, 0.142, 0.161, 0.090, 0.022, 0.012, 0.011, 0.012],
-            [0.121, 0.122, 0.074, 0.030, 0.015, 0.033, 0.139, 0.030],
-            [0.006, 0.008, 0.009, 0.009, 0.130, 0.071, 0.101, 0.015],
-            [0.006, 0.020, 0.007, 0.028, 0.125, 0.186, 0.053, 0.020],
-            [0.015, 0.011, 0.008, 0.119, 0.183, 0.091, 0.092, 0.051],
-            [0.014, 0.015, 0.017, 0.117, 0.093, 0.021, 0.070, 0.049],
-            [0.010, 0.050, 0.079, 0.094, 0.040, 0.023, 0.015, 0.010],
-            [0.043, 0.092, 0.064, 0.034, 0.021, 0.071, 0.043, 0.009],
-        ],
-    ]
-)
-DIFFUSERS_HF_ENERGY = 0.02016
 
-# Tolerances come from measurements against the reference (thumbnail MAE,
-# minimum per-channel thumbnail Pearson, high-frequency energy ratio):
-#   TPU v7x                          0.008  0.992  0.98-1.05
-#   same recipe on a different CPU   0.006  0.995  1.00
-#   max_sequence_length=256          0.073  0.623  0.97
-#   another seed                     0.167  0.060  1.40
-#   brightness +0.03                 0.030  0.992  0.98
-#   R/B channels swapped             0.085  0.581  0.98
-#   5x5 box blur                     0.008  0.992  0.18
-#   Gaussian noise, sigma 0.02       0.008  0.991  3.73
-THUMBNAIL_MAE_MAX = 0.02
-THUMBNAIL_PEARSON_MIN = 0.95
-HF_ENERGY_RATIO_RANGE = (0.8, 1.25)
+# Full-image comparison metrics (calibrated against CPU reference across 512x512x3):
+#   Image vs CPU ref                 MAE    SSIM   min Pearson  HF ratio
+#   TPU v7x (dev20260912)           0.0181 0.9616    0.9389      0.982
+#   TPU v7x (dev20260924)           0.0184 0.9618    0.9373      1.049
+#   Same recipe, different CPU      0.0164 0.9698    0.9462      1.002
+#   max_sequence_length=256         0.1021 0.6240    0.5376      0.970
+#   Different seed                  0.2041 0.1066    0.0430      1.395
+#   Different prompt                0.1947 0.2174    0.1371      0.676
+#   Brightness +0.03                0.0300 0.9659    1.0000      0.999
+#   R/B channels swapped            0.0843 0.4825    0.4802      1.000
+#   5x5 box blur                    0.0063 0.9908    0.9817      0.438
+#   Gaussian noise, sigma 0.02      0.0150 0.9916    0.9838      3.818
+FULL_IMAGE_MAE_MAX = 0.025
+FULL_IMAGE_SSIM_MIN = 0.940
+FULL_IMAGE_PEARSON_MIN = 0.900
+HF_ENERGY_RATIO_RANGE = (0.80, 1.25)
 
 # ==============================================================================
+
+
+def _load_golden_reference_image() -> np.ndarray:
+    """Load the CPU diffusers golden reference image staged by CI."""
+    path = os.path.join(
+        os.environ.get("HF_HOME", "/local_hf_cache"),
+        "golden",
+        "flux_schnell_cpu_golden_img.npy",
+    )
+    return np.load(path).astype(np.float32)
+
+
+def _compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
+    """Mean SSIM across RGB channels."""
+    c1 = (0.01 * 1.0) ** 2
+    c2 = (0.03 * 1.0) ** 2
+    ssims = []
+    for c in range(3):
+        x, y = img1[..., c], img2[..., c]
+        mu_x, mu_y = x.mean(), y.mean()
+        var_x, var_y = x.var(), y.var()
+        cov_xy = np.mean((x - mu_x) * (y - mu_y))
+        num = (2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)
+        den = (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
+        ssims.append(float(num / den))
+    return float(np.mean(ssims))
 
 
 def _extract_image(output) -> Image.Image:
     """Extract PIL Image from Omni generate output."""
     return output.images[0]
-
-
-def _thumbnail(img: np.ndarray) -> np.ndarray:
-    """Area-downsample a (512, 512, 3) image to a channel-first (3, 8, 8) grid.
-
-    Averaging 64x64 blocks removes pixel-level drift between backends but keeps
-    layout, color and brightness.
-    """
-    return img.reshape(8, 64, 8, 64, 3).mean(axis=(1, 3)).transpose(2, 0, 1)
 
 
 def _high_freq_energy(img: np.ndarray) -> float:
@@ -226,14 +213,15 @@ class TestFluxPrCiOnTpu:
             "Different seeds should produce divergent pixel values"
         )
 
-    def test_flux_golden_thumbnail_parity_tpu(self, schnell_engine):
-        """Compare the golden image with the independent CPU diffusers reference.
+    def test_flux_golden_full_image_parity_tpu(self, schnell_engine):
+        """Compare full 512x512 image against CPU diffusers golden reference.
 
-        The 8x8 thumbnail catches layout, color and brightness errors; the
-        high-frequency energy of the full image catches blur, noise and blocking.
-        Full-resolution pixels are not compared: with 2-step bf16 sampling,
-        single pixels differ by up to 0.83 even between CPU runs on two machines.
+        The reference image is staged from gs://tpu-commons-ci/golden/.
+        Asserts full-image Mean Absolute Error (MAE), Structural Similarity (SSIM),
+        per-channel Pearson correlation, and high-frequency Laplacian energy ratio.
         """
+
+        ref_img = _load_golden_reference_image()
 
         prompt = "A vibrant green leaf with glistening morning water droplets"
         params = OmniDiffusionSamplingParams(
@@ -260,23 +248,27 @@ class TestFluxPrCiOnTpu:
             f"Suspicious image variance: {np.var(arr):.4f}"
         )
 
-        thumb = _thumbnail(arr)
-        mae = float(np.abs(thumb - DIFFUSERS_THUMBNAIL).mean())
-        pearson = min(
-            float(np.corrcoef(thumb[c].ravel(), DIFFUSERS_THUMBNAIL[c].ravel())[0, 1])
+        mae = float(np.mean(np.abs(arr - ref_img)))
+        ssim_val = _compute_ssim(arr, ref_img)
+        pearsons = [
+            float(np.corrcoef(arr[..., c].ravel(), ref_img[..., c].ravel())[0, 1])
             for c in range(3)
-        )
-        hf_ratio = _high_freq_energy(arr) / DIFFUSERS_HF_ENERGY
+        ]
+        min_pearson = min(pearsons)
+        ref_hf = _high_freq_energy(ref_img)
+        hf_ratio = _high_freq_energy(arr) / ref_hf
         lo, hi = HF_ENERGY_RATIO_RANGE
 
         summary = (
-            f"thumbnail MAE={mae:.4f} (max {THUMBNAIL_MAE_MAX}), "
-            f"min channel Pearson={pearson:.4f} (min {THUMBNAIL_PEARSON_MIN}), "
+            f"full image MAE={mae:.4f} (max {FULL_IMAGE_MAE_MAX}), "
+            f"SSIM={ssim_val:.4f} (min {FULL_IMAGE_SSIM_MIN}), "
+            f"min channel Pearson={min_pearson:.4f} (min {FULL_IMAGE_PEARSON_MIN}), "
             f"high-frequency energy ratio={hf_ratio:.3f} (range {lo}-{hi})"
         )
         print(summary)
         assert (
-            mae <= THUMBNAIL_MAE_MAX
-            and pearson >= THUMBNAIL_PEARSON_MIN
+            mae <= FULL_IMAGE_MAE_MAX
+            and ssim_val >= FULL_IMAGE_SSIM_MIN
+            and min_pearson >= FULL_IMAGE_PEARSON_MIN
             and lo <= hf_ratio <= hi
         ), f"TPU image diverged from the CPU diffusers reference: {summary}"
