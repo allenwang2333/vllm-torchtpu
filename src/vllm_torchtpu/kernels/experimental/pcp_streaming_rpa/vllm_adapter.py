@@ -191,15 +191,19 @@ def build_pcp_streaming_callable(
             "output_partition_specs": tuple(map(str, output_partition_specs_tuple)),
         },
     )
-    return _PcpStreamingJaxCallable(
-        name=name,
-        jit_fn=jit_fn,
-        trace_key=trace_key,
-        mesh=mesh,
-        input_partition_specs=tuple(input_partition_specs),
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums_tuple,
-    )
+    kwargs = {
+        "name": name,
+        "jit_fn": jit_fn,
+        "trace_key": trace_key,
+        "mesh": mesh,
+        "input_partition_specs": tuple(input_partition_specs),
+        "static_argnums": static_argnums,
+        "donate_argnums": donate_argnums_tuple,
+    }
+    init_params = inspect.signature(pallas_impl.JaxCallable.__init__).parameters
+    if "output_partition_specs" in init_params:
+        kwargs["output_partition_specs"] = output_partition_specs_tuple
+    return _PcpStreamingJaxCallable(**kwargs)
 
 
 def pcp_streaming_jax_op(
