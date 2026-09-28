@@ -72,7 +72,8 @@ def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
                 hbm_used = device.memory_stats()["bytes_in_use"]
                 hbm_limit = device.memory_stats()["bytes_limit"]
                 logger.info(
-                    "Get memory stats for device %s. Assuming all devices have the same usage.",
+                    "Get memory stats for device %s. "
+                    "Assuming all devices have the same usage.",
                     device,
                 )
                 usage.extend([(hbm_used, hbm_limit)] * len(devices))
@@ -259,7 +260,7 @@ def time_function(func):
         end_time = time.perf_counter()
         execution_time = end_time - start_time
         logger.debug(
-            f"Function '{func.__name__}' executed in {execution_time:.4f} seconds."
+            "Function '%s' executed in %.4f seconds.", func.__name__, execution_time
         )
         return result
 
@@ -300,29 +301,51 @@ def synchronize_device() -> None:
 
     Differences vs. `synchronize_tensors(tensors=...)`:
     - `synchronize_device()` is equivalent to `torch.cuda.synchronize()`. It waits for
-      enqueued hardware stream operations to finish on PJRT, but does NOT trigger deferred
-      graph compilation or materialization for uninstantiated PyTorch Eager tensors.
+      enqueued hardware stream operations to finish on PJRT, but does NOT trigger
+      deferred graph compilation or materialization for uninstantiated
+      PyTorch Eager tensors.
     - Use this for stream barriers, Dynamo resets, or device-level synchronization after
       a computation.
     """
     torch.accelerator.synchronize()
 
 
+def rank_rotated(items: Sequence[Any]) -> list[Any]:
+    """Order a per-bucket precompile loop so local ranks start apart.
+
+    Under TPU_PARALLEL_PRECOMPILE, rank r visits buckets r, r+8, r+1, r+9, ...
+    (the compile_all_ranges rotation), so each bucket is XLA-compiled by one
+    rank and the rest load it from the Tier-2 cache. Only for loops whose
+    programs have no collectives: ranks run different buckets concurrently.
+    """
+    items = list(items)
+    if not envs.TPU_PARALLEL_PRECOMPILE or len(items) < 2:
+        return items
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    padded = (len(items) + 7) // 8 * 8
+    order = sorted(range(padded), key=lambda x: (x % 8, x))
+    shift = local_rank % 8 * (padded // 8)
+    order = order[shift:] + order[:shift]
+    return [items[i] for i in order if i < len(items)]
+
+
 def synchronize_tensors(
     tensors: torch.Tensor | Sequence[torch.Tensor] | None = None,
     wait: bool = True,
 ) -> None:
-    """Synchronize TPU execution and force materialization of deferred tensors (Graph Sync).
+    """Synchronize TPU execution and force materialization of deferred tensors
+    (Graph Sync).
 
     Differences vs. `synchronize_device()`:
-    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the deferred tensor
-      graph producing `tensors`, compile and enqueue the graph to PJRT, and materialize the
-      resulting buffers in device memory.
-    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands without
-      building/compiling pending deferred graphs.
-    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should be synchronized
-      (e.g., weight materialization across multiple tensors). Prefer `synchronize_device()` when
-      synchronizing immediately after a computation or across the entire device.
+    - `synchronize_tensors(tensors=...)` forces PyTorch TPU Eager mode to traverse the
+      deferred tensor graph producing `tensors`, compile and enqueue the graph to PJRT,
+      and materialize the resulting buffers in device memory.
+    - `synchronize_device()` only waits on already-enqueued PJRT hardware commands
+      without building/compiling pending deferred graphs.
+    - Use `synchronize_tensors(tensors=...)` when only a subset of active tensors should
+      be synchronized (e.g., weight materialization across multiple tensors). Prefer
+      `synchronize_device()` when synchronizing immediately after a computation or
+      across the entire device.
     """
     from torch_tpu._internal import sync
 

@@ -16,17 +16,22 @@ if TYPE_CHECKING:
 
 @dataclass
 class SpecDecodeMetadata:
-    """Metadata for speculative decoding on Torch/TPU, containing all necessary indices."""
+    """Metadata for speculative decoding on Torch/TPU, containing all
+    necessary indices.
+    """
 
-    # [padded_logits_length] draft token id validated at each target_logits_indices slot.
+    # [padded_logits_length] draft token id validated at each
+    # target_logits_indices slot.
     draft_token_ids: torch.Tensor
     # [padded_num_reqs] per-request draft-token count (device copy).
     draft_lengths: torch.Tensor
     # [num_reqs] per-request draft-token count (host copy, unpadded).
     draft_lengths_cpu: np.ndarray
-    # [padded_logits_length] row into this step's logits/hidden-states for each draft token being validated.
+    # [padded_logits_length] row into this step's logits/hidden-states for each draft
+    # token being validated.
     target_logits_indices: torch.Tensor
-    # [padded_num_reqs] row into this step's logits/hidden-states for each request's bonus (last sampled) token.
+    # [padded_num_reqs] row into this step's logits/hidden-states for each request's
+    # bonus (last sampled) token.
     bonus_logits_indices: torch.Tensor
     # [padded_logits_length] row into the input batch for every draft + bonus
     # position the target model forward needs logits for.
@@ -39,7 +44,9 @@ class SpecDecodeMetadata:
 
 
 class SpeculativeDecodingManager:
-    """Manages speculative decoding operations, including draft proposal and metadata generation."""
+    """Manages speculative decoding operations, including draft proposal and
+    metadata generation.
+    """
 
     def __init__(self, runner: TPUModelRunner):
         self.runner = runner
@@ -49,7 +56,7 @@ class SpeculativeDecodingManager:
         # as (cpu_tensor, ready_event, req_ids snapshot). See
         # stage_draft_token_ids_for_host.
         self._staged_draft_copy: (
-            tuple[torch.Tensor, torch.Event | None, list[str]] | None
+            tuple[torch.Tensor, torch.Event | None, list[str], list[int] | None] | None
         ) = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
@@ -67,10 +74,12 @@ class SpeculativeDecodingManager:
             # For async scheduling: the engine only asks when a step carries
             # structured-output requests, to swap real drafts into the
             # deferred grammar-bitmask computation.
-            drafts_cpu, ready_event, req_ids = self._staged_draft_copy
+            drafts_cpu, ready_event, req_ids, rows = self._staged_draft_copy
             self._staged_draft_copy = None
             if ready_event is not None:
                 ready_event.synchronize()
+            if rows is not None:
+                drafts_cpu = drafts_cpu[rows]
             return DraftTokenIds(req_ids, drafts_cpu.tolist())
         if self._draft_token_ids is None:
             return None
@@ -80,7 +89,9 @@ class SpeculativeDecodingManager:
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
-    def stage_draft_token_ids_for_host(self, drafts: torch.Tensor) -> None:
+    def stage_draft_token_ids_for_host(
+        self, drafts: torch.Tensor, rows: list[int] | None = None
+    ) -> None:
         """Starts a non-blocking D2H copy of drafts on device.
 
         Async scheduling keeps drafts on device (return_device=True), but the
@@ -91,16 +102,23 @@ class SpeculativeDecodingManager:
         is called after the next step's execute_model mutates input_batch.
         """
         num_reqs = self.runner.input_batch.num_reqs
-        assert drafts.shape[0] == num_reqs, (
-            f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
-        )
+        # rows: the real requests' rows of a row-padded proposal (see
+        # TPUModelRunner._async_spec_rows), selected on the host at take time.
+        if rows is None:
+            assert drafts.shape[0] == num_reqs, (
+                f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
+            )
+        else:
+            assert len(rows) == num_reqs, (
+                f"draft rows {len(rows)} != num_reqs {num_reqs}"
+            )
         req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
         drafts_cpu = drafts.to("cpu", non_blocking=True)
         ready_event = None
         if drafts.device.type != "cpu":
             ready_event = torch.tpu.Event()
             ready_event.record()
-        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids)
+        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids, rows)
 
     def propose_draft_token_ids(
         self,
@@ -199,7 +217,8 @@ class SpeculativeDecodingManager:
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
     ) -> SpecDecodeMetadata:
-        """Calculates indices for speculative decoding forward pass and rejection sampling.
+        """Calculates indices for speculative decoding forward pass and
+        rejection sampling.
 
         Args:
           num_draft_tokens: The number of draft tokens for each request.
@@ -290,6 +309,11 @@ class SpeculativeDecodingManager:
         padded_logits_length = _get_padded_token_len(
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
+        # One verify length for every step (see _pinned_logits_rows), so the
+        # verify prelude and rejection sampler never compile per batch size.
+        pinned_rows = self.runner._pinned_logits_rows()
+        if pinned_rows is not None:
+            padded_logits_length = max(padded_logits_length, pinned_rows)
 
         padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_logits_indices[: logits_indices.shape[0]] = logits_indices
