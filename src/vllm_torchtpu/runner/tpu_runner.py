@@ -1738,6 +1738,14 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((src, dst))
                 if spec_seed:
                     state_srcs.append(src)
+                    req_id = req_ids[row]
+                    if req_id not in self._mamba_offset_seeded:
+                        # A restored prefix contains committed state, not a
+                        # live speculative window. Its physical block can
+                        # retain another request's read offset. Select the
+                        # restored state without modifying shared cache data.
+                        ckpt_rows.append([src] * window)
+                        continue
                     # The pre-crossing group's checkpoint blocks. A column
                     # the manager has not filled reads past the row or lands
                     # on the null block; either way fall back to the state
