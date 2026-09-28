@@ -59,40 +59,40 @@ from __future__ import annotations
 import functools
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.glm53_kda import kda_decode_ref as ref
 
 
 def _l2_normalize(x: jax.Array, eps: float = ref.L2NORM_EPS) -> jax.Array:
-  """L2-normalize over the last (lane) axis, in fp32."""
-  xf = x.astype(jnp.float32)
-  return xf * jax.lax.rsqrt(jnp.sum(xf * xf, axis=-1, keepdims=True) + eps)
+    """L2-normalize over the last (lane) axis, in fp32."""
+    xf = x.astype(jnp.float32)
+    return xf * jax.lax.rsqrt(jnp.sum(xf * xf, axis=-1, keepdims=True) + eps)
 
 
 def select_decode_h_block(num_seqs: int, num_heads: int = ref.NUM_HEADS) -> int:
-  """Selects optimal Pallas head block size `h_block` for KDA decode on TPU v7x."""
-  if num_seqs <= 4 and num_heads % 32 == 0:
-    return 32
-  if num_seqs <= 16 and num_heads % 16 == 0:
-    return 16
-  return num_heads
+    """Selects optimal Pallas head block size `h_block` for KDA decode on TPU v7x."""
+    if num_seqs <= 4 and num_heads % 32 == 0:
+        return 32
+    if num_seqs <= 16 and num_heads % 16 == 0:
+        return 16
+    return num_heads
 
 
 def select_prefill_h_block(
     num_seqs: int, chunk_len: int, num_heads: int = ref.NUM_HEADS
 ) -> int:
-  """Selects optimal Pallas head block size `h_block` for KDA chunked prefill."""
-  del num_seqs
-  if chunk_len <= 64 and num_heads % 32 == 0:
-    return 32
-  if chunk_len <= 256 and num_heads % 16 == 0:
-    return 16
-  if num_heads % 8 == 0:
-    return 8
-  return num_heads
+    """Selects optimal Pallas head block size `h_block` for KDA chunked prefill."""
+    del num_seqs
+    if chunk_len <= 64 and num_heads % 32 == 0:
+        return 32
+    if chunk_len <= 256 and num_heads % 16 == 0:
+        return 16
+    if num_heads % 8 == 0:
+        return 8
+    return num_heads
 
 
 def _kda_decode_kernel(
@@ -112,52 +112,52 @@ def _kda_decode_kernel(
     math_repeats: int,
     null_slot: int = -1,
 ):
-  """One `(seq_idx, head_block)` decode tile in VMEM.
+    """One `(seq_idx, head_block)` decode tile in VMEM.
 
-  With `null_slot >= 0`, a sequence whose state slot is `null_slot` is batch
-  padding: its state block passes through unchanged and its output is zeros.
-  That is what lets the kernel run directly on the whole slot cache, where
-  padded entries all point at the (never assigned) null slot.
-  """
+    With `null_slot >= 0`, a sequence whose state slot is `null_slot` is batch
+    padding: its state block passes through unchanged and its output is zeros.
+    That is what lets the kernel run directly on the whole slot cache, where
+    padded entries all point at the (never assigned) null slot.
+    """
 
-  def _step():
-    state = state_ref[0].astype(jnp.float32)
-    out = jnp.zeros(out_ref.shape[1:], jnp.float32)
+    def _step():
+        state = state_ref[0].astype(jnp.float32)
+        out = jnp.zeros(out_ref.shape[1:], jnp.float32)
 
-    if math_repeats:
-      q = q_norm_ref[0].astype(jnp.float32)  # [h_block, d_k]
-      k = k_norm_ref[0].astype(jnp.float32)  # [h_block, d_k]
-      v = v_ref[0].astype(jnp.float32)  # [h_block, d_v]
-      decay = decay_ref[0].astype(jnp.float32)  # [h_block, d_k]
-      bk = bk_ref[0].astype(jnp.float32)[:, None, :]  # [h_block, 1, d_k]
+        if math_repeats:
+            q = q_norm_ref[0].astype(jnp.float32)  # [h_block, d_k]
+            k = k_norm_ref[0].astype(jnp.float32)  # [h_block, d_k]
+            v = v_ref[0].astype(jnp.float32)  # [h_block, d_v]
+            decay = decay_ref[0].astype(jnp.float32)  # [h_block, d_k]
+            bk = bk_ref[0].astype(jnp.float32)[:, None, :]  # [h_block, 1, d_k]
 
-      for _ in range(math_repeats):
-        state = state * decay[:, None, :]
-        pred = jnp.sum(k[:, None, :] * state, axis=2)  # [h_block, d_v]
-        resid = v - pred
-        state = state + resid[:, :, None] * bk
-        out = jnp.sum(q[:, None, :] * state, axis=2)  # [h_block, d_v]
+            for _ in range(math_repeats):
+                state = state * decay[:, None, :]
+                pred = jnp.sum(k[:, None, :] * state, axis=2)  # [h_block, d_v]
+                resid = v - pred
+                state = state + resid[:, :, None] * bk
+                out = jnp.sum(q[:, None, :] * state, axis=2)  # [h_block, d_v]
 
-    new_state_ref[0] = state.astype(new_state_ref.dtype)
-    out_ref[0] = out.astype(out_ref.dtype)
+        new_state_ref[0] = state.astype(new_state_ref.dtype)
+        out_ref[0] = out.astype(out_ref.dtype)
 
-  if null_slot < 0:
-    del state_indices_ref  # Consumed by the index maps, not the body.
-    _step()
-    return
+    if null_slot < 0:
+        del state_indices_ref  # Consumed by the index maps, not the body.
+        _step()
+        return
 
-  slot = state_indices_ref[pl.program_id(0)]
+    slot = state_indices_ref[pl.program_id(0)]
 
-  @pl.when(slot != null_slot)
-  def _execute():
-    _step()
+    @pl.when(slot != null_slot)
+    def _execute():
+        _step()
 
-  @pl.when(slot == null_slot)
-  def _passthrough():
-    # The output block aliases the input block, so it must be written even
-    # here: an unwritten VMEM buffer would flush stale data into the slot.
-    new_state_ref[0] = state_ref[0]
-    out_ref[0] = jnp.zeros(out_ref.shape[1:], out_ref.dtype)
+    @pl.when(slot == null_slot)
+    def _passthrough():
+        # The output block aliases the input block, so it must be written even
+        # here: an unwritten VMEM buffer would flush stale data into the slot.
+        new_state_ref[0] = state_ref[0]
+        out_ref[0] = jnp.zeros(out_ref.shape[1:], out_ref.dtype)
 
 
 @functools.partial(
@@ -192,13 +192,24 @@ def kda_decode(
     h_block: int = 0,
     null_slot: int = -1,
 ) -> tuple[jax.Array, jax.Array]:
-  """`jax.jit`-wrapped KDA decode. See `_kda_decode_impl` for the semantics."""
-  del num_heads, head_dim
-  return _kda_decode_impl(
-      q, k, v, g_raw, beta, a_log, dt_bias, recurrent_state, state_indices,
-      lower_bound, qk_scale, math_repeats, h_block=h_block,
-      null_slot=null_slot,
-  )
+    """`jax.jit`-wrapped KDA decode. See `_kda_decode_impl` for the semantics."""
+    del num_heads, head_dim
+    return _kda_decode_impl(
+        q,
+        k,
+        v,
+        g_raw,
+        beta,
+        a_log,
+        dt_bias,
+        recurrent_state,
+        state_indices,
+        lower_bound,
+        qk_scale,
+        math_repeats,
+        h_block=h_block,
+        null_slot=null_slot,
+    )
 
 
 def kda_decode_jax(
@@ -216,12 +227,23 @@ def kda_decode_jax(
     h_block: int = 0,
     null_slot: int = -1,
 ) -> tuple[jax.Array, jax.Array]:
-  """Un-jitted entry point, shaped for the torch_tpu Pallas bridge."""
-  return _kda_decode_impl(
-      q, k, v, g_raw, beta, a_log, dt_bias, recurrent_state, state_indices,
-      lower_bound, qk_scale, math_repeats=1, h_block=h_block,
-      null_slot=null_slot,
-  )
+    """Un-jitted entry point, shaped for the torch_tpu Pallas bridge."""
+    return _kda_decode_impl(
+        q,
+        k,
+        v,
+        g_raw,
+        beta,
+        a_log,
+        dt_bias,
+        recurrent_state,
+        state_indices,
+        lower_bound,
+        qk_scale,
+        math_repeats=1,
+        h_block=h_block,
+        null_slot=null_slot,
+    )
 
 
 def _kda_decode_impl(
@@ -240,74 +262,71 @@ def _kda_decode_impl(
     h_block: int = 0,
     null_slot: int = -1,
 ) -> tuple[jax.Array, jax.Array]:
-  """Fused KDA decode: one token per sequence, tiled by `h_block`.
+    """Fused KDA decode: one token per sequence, tiled by `h_block`.
 
-  Sequence `s` reads and writes state slot `state_indices[s]` of
-  `recurrent_state` in place (the state is aliased to the output). The slots
-  may index a dense, already-gathered batch or the serving layer's whole slot
-  cache; in the latter case pass the cache's padding slot as `null_slot` (see
-  `_kda_decode_kernel`) so padded entries neither advance nor emit anything.
-  Slots must be unique apart from `null_slot`.
-  """
-  num_seqs, num_heads, head_dim = q.shape
-  if h_block <= 0:
-    h_block = select_decode_h_block(num_seqs, num_heads)
-  num_h_blocks = num_heads // h_block
+    Sequence `s` reads and writes state slot `state_indices[s]` of
+    `recurrent_state` in place (the state is aliased to the output). The slots
+    may index a dense, already-gathered batch or the serving layer's whole slot
+    cache; in the latter case pass the cache's padding slot as `null_slot` (see
+    `_kda_decode_kernel`) so padded entries neither advance nor emit anything.
+    Slots must be unique apart from `null_slot`.
+    """
+    num_seqs, num_heads, head_dim = q.shape
+    if h_block <= 0:
+        h_block = select_decode_h_block(num_seqs, num_heads)
+    num_h_blocks = num_heads // h_block
 
-  q_norm = _l2_normalize(q) * qk_scale
-  k_norm = _l2_normalize(k)
-  bk = beta.astype(jnp.float32)[..., None] * k_norm
-  g = g_raw.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :, :]
-  a = jnp.exp(a_log.astype(jnp.float32))[None, :, None]
-  decay = jnp.exp(lower_bound * jax.nn.sigmoid(a * g))
+    q_norm = _l2_normalize(q) * qk_scale
+    k_norm = _l2_normalize(k)
+    bk = beta.astype(jnp.float32)[..., None] * k_norm
+    g = g_raw.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :, :]
+    a = jnp.exp(a_log.astype(jnp.float32))[None, :, None]
+    decay = jnp.exp(lower_bound * jax.nn.sigmoid(a * g))
 
-  def seq_hb_map(s, hb, _):
-    return (s, hb, 0)
+    def seq_hb_map(s, hb, _):
+        return (s, hb, 0)
 
-  def state_map(s, hb, state_indices_ref):
-    # Clamped so that a negative padding id can never address memory outside
-    # the cache.
-    return (jnp.maximum(state_indices_ref[s], 0), hb, 0, 0)
+    def state_map(s, hb, state_indices_ref):
+        # Clamped so that a negative padding id can never address memory outside
+        # the cache.
+        return (jnp.maximum(state_indices_ref[s], 0), hb, 0, 0)
 
-  tok_spec = lambda: pl.BlockSpec((1, h_block, head_dim), seq_hb_map)
+    def tok_spec():
+        return pl.BlockSpec((1, h_block, head_dim), seq_hb_map)
 
-  kernel = pl.pallas_call(
-      functools.partial(
-          _kda_decode_kernel,
-          math_repeats=math_repeats,
-          null_slot=null_slot,
-      ),
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=1,
-          grid=(num_seqs, num_h_blocks),
-          in_specs=[
-              tok_spec(),  # q_norm
-              tok_spec(),  # k_norm
-              tok_spec(),  # v
-              tok_spec(),  # decay
-              tok_spec(),  # bk
-              pl.BlockSpec(
-                  (1, h_block, head_dim, head_dim), state_map
-              ),
-          ],
-          out_specs=[
-              pl.BlockSpec((1, h_block, head_dim), seq_hb_map),
-              pl.BlockSpec((1, h_block, head_dim, head_dim), state_map),
-          ],
-      ),
-      out_shape=[
-          jax.ShapeDtypeStruct((num_seqs, num_heads, head_dim), jnp.float32),
-          jax.ShapeDtypeStruct(recurrent_state.shape, recurrent_state.dtype),
-      ],
-      input_output_aliases={6: 1},
-      compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("arbitrary", "parallel"),
-      ),
-  )
+    kernel = pl.pallas_call(
+        functools.partial(
+            _kda_decode_kernel,
+            math_repeats=math_repeats,
+            null_slot=null_slot,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_seqs, num_h_blocks),
+            in_specs=[
+                tok_spec(),  # q_norm
+                tok_spec(),  # k_norm
+                tok_spec(),  # v
+                tok_spec(),  # decay
+                tok_spec(),  # bk
+                pl.BlockSpec((1, h_block, head_dim, head_dim), state_map),
+            ],
+            out_specs=[
+                pl.BlockSpec((1, h_block, head_dim), seq_hb_map),
+                pl.BlockSpec((1, h_block, head_dim, head_dim), state_map),
+            ],
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((num_seqs, num_heads, head_dim), jnp.float32),
+            jax.ShapeDtypeStruct(recurrent_state.shape, recurrent_state.dtype),
+        ],
+        input_output_aliases={6: 1},
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary", "parallel"),
+        ),
+    )
 
-  return kernel(
-      state_indices, q_norm, k_norm, v, decay, bk, recurrent_state
-  )
+    return kernel(state_indices, q_norm, k_norm, v, decay, bk, recurrent_state)
 
 
 def _kda_prefill_chunk_kernel(
@@ -321,39 +340,38 @@ def _kda_prefill_chunk_kernel(
     out_ref,  # VMEM: [1, chunk_len, h_block, d_v]
     new_state_ref,  # VMEM: [1, h_block, d_v, d_k] (aliased to state_ref)
 ):
-  """Fused VMEM multi-token prefill chunk kernel for `(seq_idx, head_block)`."""
-  seq_idx = pl.program_id(0)
-  valid_len = valid_lens_ref[seq_idx]
-  chunk_len = q_norm_ref.shape[1]
+    """Fused VMEM multi-token prefill chunk kernel for `(seq_idx, head_block)`."""
+    seq_idx = pl.program_id(0)
+    valid_len = valid_lens_ref[seq_idx]
+    chunk_len = q_norm_ref.shape[1]
 
-  # Early-exit / skip execution if this is a padded dummy sequence (valid_len == 0)
-  @pl.when(valid_len > 0)
-  def _execute():
-    state = state_ref[0].astype(jnp.float32)
+    # Early-exit / skip execution if this is a padded dummy sequence (valid_len == 0)
+    @pl.when(valid_len > 0)
+    def _execute():
+        state = state_ref[0].astype(jnp.float32)
 
-    def _step_body(t, st):
-      decay = decay_ref[0, t].astype(jnp.float32)
-      q = q_norm_ref[0, t].astype(jnp.float32)
-      k = k_norm_ref[0, t].astype(jnp.float32)
-      v = v_ref[0, t].astype(jnp.float32)
-      bk = bk_ref[0, t].astype(jnp.float32)[:, None, :]
+        def _step_body(t, st):
+            decay = decay_ref[0, t].astype(jnp.float32)
+            q = q_norm_ref[0, t].astype(jnp.float32)
+            k = k_norm_ref[0, t].astype(jnp.float32)
+            v = v_ref[0, t].astype(jnp.float32)
+            bk = bk_ref[0, t].astype(jnp.float32)[:, None, :]
 
-      st_decayed = st * decay[:, None, :]
-      pred = jnp.sum(k[:, None, :] * st_decayed, axis=2)
-      resid = v - pred
-      next_st = st_decayed + resid[:, :, None] * bk
-      out_t = jnp.sum(q[:, None, :] * next_st, axis=2)
+            st_decayed = st * decay[:, None, :]
+            pred = jnp.sum(k[:, None, :] * st_decayed, axis=2)
+            resid = v - pred
+            next_st = st_decayed + resid[:, :, None] * bk
+            out_t = jnp.sum(q[:, None, :] * next_st, axis=2)
 
-      out_ref[0, t] = out_t.astype(out_ref.dtype)
-      return jnp.where(t < valid_len, next_st, st)
+            out_ref[0, t] = out_t.astype(out_ref.dtype)
+            return jnp.where(t < valid_len, next_st, st)
 
-    final_st = jax.lax.fori_loop(0, chunk_len, _step_body, state)
-    new_state_ref[0] = final_st.astype(new_state_ref.dtype)
+        final_st = jax.lax.fori_loop(0, chunk_len, _step_body, state)
+        new_state_ref[0] = final_st.astype(new_state_ref.dtype)
 
-  @pl.when(valid_len <= 0)
-  def _passthrough():
-    new_state_ref[0] = state_ref[0]
-
+    @pl.when(valid_len <= 0)
+    def _passthrough():
+        new_state_ref[0] = state_ref[0]
 
 
 def kda_prefill_chunk_jax(
@@ -370,60 +388,55 @@ def kda_prefill_chunk_jax(
     qk_scale: float,
     h_block: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
-  """Un-jitted Pallas chunk prefill entry point for `torch_tpu`'s `jax_op`."""
-  num_seqs, chunk_len, num_heads, head_dim = q.shape
-  if h_block <= 0:
-    h_block = select_prefill_h_block(num_seqs, chunk_len, num_heads)
-  num_h_blocks = num_heads // h_block
+    """Un-jitted Pallas chunk prefill entry point for `torch_tpu`'s `jax_op`."""
+    num_seqs, chunk_len, num_heads, head_dim = q.shape
+    if h_block <= 0:
+        h_block = select_prefill_h_block(num_seqs, chunk_len, num_heads)
+    num_h_blocks = num_heads // h_block
 
-  q_norm = _l2_normalize(q) * qk_scale
-  k_norm = _l2_normalize(k)
-  bk = beta.astype(jnp.float32)[..., None] * k_norm
-  g = g_raw.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, None, :, :]
-  a = jnp.exp(a_log.astype(jnp.float32))[None, None, :, None]
-  decay = jnp.exp(lower_bound * jax.nn.sigmoid(a * g))
+    q_norm = _l2_normalize(q) * qk_scale
+    k_norm = _l2_normalize(k)
+    bk = beta.astype(jnp.float32)[..., None] * k_norm
+    g = g_raw.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, None, :, :]
+    a = jnp.exp(a_log.astype(jnp.float32))[None, None, :, None]
+    decay = jnp.exp(lower_bound * jax.nn.sigmoid(a * g))
 
-  def seq_chunk_map(s, hb, _):
-    return (s, 0, hb, 0)
+    def seq_chunk_map(s, hb, _):
+        return (s, 0, hb, 0)
 
-  def state_seq_map(s, hb, _):
-    return (s, hb, 0, 0)
+    def state_seq_map(s, hb, _):
+        return (s, hb, 0, 0)
 
-  chunk_spec = lambda: pl.BlockSpec(
-      (1, chunk_len, h_block, head_dim), seq_chunk_map
-  )
+    def chunk_spec():
+        return pl.BlockSpec((1, chunk_len, h_block, head_dim), seq_chunk_map)
 
-  kernel = pl.pallas_call(
-      _kda_prefill_chunk_kernel,
-      grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=1,
-          grid=(num_seqs, num_h_blocks),
-          in_specs=[
-              chunk_spec(),  # q_norm
-              chunk_spec(),  # k_norm
-              chunk_spec(),  # v
-              chunk_spec(),  # decay
-              chunk_spec(),  # bk
-              pl.BlockSpec(
-                  (1, h_block, head_dim, head_dim), state_seq_map
-              ),
-          ],
-          out_specs=[
-              chunk_spec(),
-              pl.BlockSpec((1, h_block, head_dim, head_dim), state_seq_map),
-          ],
-      ),
-      out_shape=[
-          jax.ShapeDtypeStruct(
-              (num_seqs, chunk_len, num_heads, head_dim), jnp.float32
-          ),
-          jax.ShapeDtypeStruct(recurrent_state.shape, recurrent_state.dtype),
-      ],
-      input_output_aliases={6: 1},
-      compiler_params=pltpu.CompilerParams(
-          dimension_semantics=("parallel", "parallel"),
-      ),
-  )
-  return kernel(
-      valid_lens, q_norm, k_norm, v, decay, bk, recurrent_state
-  )
+    kernel = pl.pallas_call(
+        _kda_prefill_chunk_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_seqs, num_h_blocks),
+            in_specs=[
+                chunk_spec(),  # q_norm
+                chunk_spec(),  # k_norm
+                chunk_spec(),  # v
+                chunk_spec(),  # decay
+                chunk_spec(),  # bk
+                pl.BlockSpec((1, h_block, head_dim, head_dim), state_seq_map),
+            ],
+            out_specs=[
+                chunk_spec(),
+                pl.BlockSpec((1, h_block, head_dim, head_dim), state_seq_map),
+            ],
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct(
+                (num_seqs, chunk_len, num_heads, head_dim), jnp.float32
+            ),
+            jax.ShapeDtypeStruct(recurrent_state.shape, recurrent_state.dtype),
+        ],
+        input_output_aliases={6: 1},
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+        ),
+    )
+    return kernel(valid_lens, q_norm, k_norm, v, decay, bk, recurrent_state)

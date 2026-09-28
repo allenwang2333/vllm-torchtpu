@@ -33,6 +33,7 @@ state in this order. See `kda_decode_kernel`'s module docstring.
 from __future__ import annotations
 
 import collections
+
 import torch
 from torch_tpu._internal import pallas
 
@@ -69,19 +70,30 @@ def kda_decode(
     h_block: int = 0,
     null_slot: int = -1,
 ) -> torch.Tensor:
-  """One KDA decode step per sequence, with the state updated in place.
+    """One KDA decode step per sequence, with the state updated in place.
 
-  `recurrent_state` may be the serving cache itself: sequence `s` reads and
-  writes slot `state_indices[s]`, and with `null_slot >= 0` entries pointing
-  at that slot are padding (state untouched, output zeros).
-  """
-  out, new_state = kda_decode_op(
-      q, k, v, g_raw, beta, a_log, dt_bias, recurrent_state, state_indices,
-      lower_bound, qk_scale, h_block, null_slot,
-  )
-  _STORAGE_KEEPALIVE.append(recurrent_state.untyped_storage())
-  recurrent_state.set_(new_state)
-  return out
+    `recurrent_state` may be the serving cache itself: sequence `s` reads and
+    writes slot `state_indices[s]`, and with `null_slot >= 0` entries pointing
+    at that slot are padding (state untouched, output zeros).
+    """
+    out, new_state = kda_decode_op(
+        q,
+        k,
+        v,
+        g_raw,
+        beta,
+        a_log,
+        dt_bias,
+        recurrent_state,
+        state_indices,
+        lower_bound,
+        qk_scale,
+        h_block,
+        null_slot,
+    )
+    _STORAGE_KEEPALIVE.append(recurrent_state.untyped_storage())
+    recurrent_state.set_(new_state)
+    return out
 
 
 def activate_gate(
@@ -90,10 +102,10 @@ def activate_gate(
     dt_bias: torch.Tensor,  # [num_heads, d_k]
     lower_bound: float = ref.LOWER_BOUND,
 ) -> torch.Tensor:
-  """GLM's bounded safe-gate, in PyTorch. Returns log-decay in [lower_bound, 0]."""
-  g = g_raw.float() + dt_bias.float()
-  a = torch.exp(a_log.float()).unsqueeze(-1)
-  return lower_bound * torch.sigmoid(a * g)
+    """GLM's bounded safe-gate, in PyTorch. Returns log-decay in [lower_bound, 0]."""
+    g = g_raw.float() + dt_bias.float()
+    a = torch.exp(a_log.float()).unsqueeze(-1)
+    return lower_bound * torch.sigmoid(a * g)
 
 
 kda_prefill_chunk_op = pallas.jax_op(
@@ -117,11 +129,21 @@ def kda_prefill_chunk(
     qk_scale: float = ref.QK_SCALE,
     h_block: int = 0,
 ) -> torch.Tensor:
-  """Runs one fused VMEM chunk of KDA prefill, updating `recurrent_state` in place."""
-  out, new_state = kda_prefill_chunk_op(
-      q, k, v, g_raw, beta, a_log, dt_bias, recurrent_state, valid_lens,
-      lower_bound, qk_scale, h_block,
-  )
-  _STORAGE_KEEPALIVE.append(recurrent_state.untyped_storage())
-  recurrent_state.set_(new_state)
-  return out
+    """Runs one fused VMEM chunk of KDA prefill, updating `recurrent_state` in place."""
+    out, new_state = kda_prefill_chunk_op(
+        q,
+        k,
+        v,
+        g_raw,
+        beta,
+        a_log,
+        dt_bias,
+        recurrent_state,
+        valid_lens,
+        lower_bound,
+        qk_scale,
+        h_block,
+    )
+    _STORAGE_KEEPALIVE.append(recurrent_state.untyped_storage())
+    recurrent_state.set_(new_state)
+    return out

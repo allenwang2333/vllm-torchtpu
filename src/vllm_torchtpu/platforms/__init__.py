@@ -46,6 +46,7 @@ def register_tpu_platform() -> str:
     _log_tpu_info()
     try:
         from vllm_torchtpu.models.vllm import register_models
+
         register_models()
     except Exception:
         pass

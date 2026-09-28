@@ -49,9 +49,21 @@ def _ref_step(state, q, k, v, g_raw, beta_sig, a_log, dt_bias, scale):
     return state, (qn[:, None, :] * state).sum(-1)
 
 
-def _fake_kda_decode(q, k, v, g_raw, beta, a_log, dt_bias, recurrent_state,
-                     state_indices, lower_bound, qk_scale, h_block=0,
-                     null_slot=-1):
+def _fake_kda_decode(
+    q,
+    k,
+    v,
+    g_raw,
+    beta,
+    a_log,
+    dt_bias,
+    recurrent_state,
+    state_indices,
+    lower_bound,
+    qk_scale,
+    h_block=0,
+    null_slot=-1,
+):
     """Torch twin of the Pallas decode kernel, including its padding rule."""
     del h_block
     assert lower_bound == LB
@@ -63,23 +75,50 @@ def _fake_kda_decode(q, k, v, g_raw, beta, a_log, dt_bias, recurrent_state,
             out[i] = 0  # Padding: the slot is left alone.
             continue
         recurrent_state[s], out[i] = _ref_step(
-            recurrent_state[s].clone(), q[i], k[i], v[i], g_raw[i], beta[i],
-            a_log, dt_bias, qk_scale)
+            recurrent_state[s].clone(),
+            q[i],
+            k[i],
+            v[i],
+            g_raw[i],
+            beta[i],
+            a_log,
+            dt_bias,
+            qk_scale,
+        )
     return out
 
 
-def _fake_kda_prefill_chunk(q, k, v, g_raw, beta, a_log, dt_bias,
-                            recurrent_state, valid_lens, lower_bound, qk_scale,
-                            h_block=0):
+def _fake_kda_prefill_chunk(
+    q,
+    k,
+    v,
+    g_raw,
+    beta,
+    a_log,
+    dt_bias,
+    recurrent_state,
+    valid_lens,
+    lower_bound,
+    qk_scale,
+    h_block=0,
+):
     del h_block
     assert lower_bound == LB
     out = torch.full((*q.shape[:2], H, D), float("nan"))
     for s in range(q.shape[0]):
         st = recurrent_state[s].clone()
         for t in range(int(valid_lens[s])):
-            st, out[s, t] = _ref_step(st, q[s, t], k[s, t], v[s, t],
-                                      g_raw[s, t], beta[s, t], a_log, dt_bias,
-                                      qk_scale)
+            st, out[s, t] = _ref_step(
+                st,
+                q[s, t],
+                k[s, t],
+                v[s, t],
+                g_raw[s, t],
+                beta[s, t],
+                a_log,
+                dt_bias,
+                qk_scale,
+            )
         recurrent_state[s] = st
     return out
 
@@ -98,7 +137,8 @@ class _Layer:
         self.head_dim = D
         self.gate_lower_bound = LB
         self.conv1d = types.SimpleNamespace(
-            weight=torch.randn(DIM, 1, W) * 0.5, bias=torch.randn(DIM) * 0.1)
+            weight=torch.randn(DIM, 1, W) * 0.5, bias=torch.randn(DIM) * 0.1
+        )
         self.A_log = torch.randn(H) * 0.3
         self.dt_bias = torch.randn(H * D) * 0.3
         self.o_norm = L.FusedRMSNormGated(D, eps=1e-5, activation="sigmoid")
@@ -110,7 +150,6 @@ class _Layer:
 
 
 class _Request:
-
     def __init__(self, prompt_len, max_new=12):
         total = prompt_len + max_new
         self.prompt_len = prompt_len
@@ -133,23 +172,31 @@ class _Request:
             self.window = window[1:]
             q, k, v = conv.split(PROJ)
             self.state, o = _ref_step(
-                self.state, q.view(H, D), k.view(H, D), v.view(H, D), self.g1[t],
-                torch.sigmoid(self.beta[t]), layer.A_log,
-                layer.dt_bias.view(H, D), D**-0.5)
+                self.state,
+                q.view(H, D),
+                k.view(H, D),
+                v.view(H, D),
+                self.g1[t],
+                torch.sigmoid(self.beta[t]),
+                layer.A_log,
+                layer.dt_bias.view(H, D),
+                D**-0.5,
+            )
             outs.append(o)
         o = torch.stack(outs)
         o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + 1e-5)
         o = o * layer.o_norm.weight
-        return o * torch.sigmoid(self.g2[self.computed:self.computed + n])
+        return o * torch.sigmoid(self.g2[self.computed : self.computed + n])
 
 
 class TestGlm53KdaLayerBatching(unittest.TestCase):
-
     def setUp(self):
         torch.manual_seed(0)
         self.rng = np.random.default_rng(0)
-        for name, fake in (("kda_decode", _fake_kda_decode),
-                           ("kda_prefill_chunk", _fake_kda_prefill_chunk)):
+        for name, fake in (
+            ("kda_decode", _fake_kda_decode),
+            ("kda_prefill_chunk", _fake_kda_prefill_chunk),
+        ):
             patcher = mock.patch.object(kdt, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -165,22 +212,26 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
         q_lens = [n for _, n in sched]
         n_tok = sum(q_lens)
         qsl = np.zeros(MAX_REQS + 1, np.int32)
-        qsl[1:len(sched) + 1] = np.cumsum(q_lens)
-        qsl[len(sched) + 1:] = qsl[len(sched)]
+        qsl[1 : len(sched) + 1] = np.cumsum(q_lens)
+        qsl[len(sched) + 1 :] = qsl[len(sched)]
         seq_lens = self.rng.integers(0, 10**6, MAX_REQS).astype(np.int32)
         slots = np.zeros(MAX_REQS, np.int32)
         for i, (req, n) in enumerate(sched):
             seq_lens[i] = req.computed + n
             slots[i] = req.slot
         num_dec = 0
-        while (num_dec < len(sched) and sched[num_dec][1] == 1
-               and sched[num_dec][0].computed > 0):
+        while (
+            num_dec < len(sched)
+            and sched[num_dec][1] == 1
+            and sched[num_dec][0].computed > 0
+        ):
             num_dec += 1
         meta = types.SimpleNamespace(
             query_start_loc=torch.from_numpy(qsl),
             seq_lens=torch.from_numpy(seq_lens),
             request_distribution=torch.tensor(
-                [num_dec, num_dec, len(sched)], dtype=torch.int32),
+                [num_dec, num_dec, len(sched)], dtype=torch.int32
+            ),
             mamba_state_indices=torch.from_numpy(slots),
             block_tables=torch.zeros(MAX_REQS * 4, dtype=torch.int32),
         )
@@ -199,7 +250,8 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
             row += n
         # Like the base class: mixed_qkv is a split view, g1/beta get a batch dim.
         mixed_view = torch.cat([mixed, torch.zeros(t_pad, 5)], -1).split(
-            [DIM, 5], dim=-1)[0]
+            [DIM, 5], dim=-1
+        )[0]
         core = torch.full((1, t_pad, H, D), float("nan"))
         with mock.patch.object(L, "get_forward_context", lambda: ctx):
             layer._forward(mixed_view, g1.unsqueeze(0), g2, beta.unsqueeze(0), core)
@@ -207,9 +259,12 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
         row = 0
         for req, n in sched:
             torch.testing.assert_close(
-                core[0, row:row + n], req.ref_outputs(layer, n),
-                rtol=0, atol=2e-4,
-                msg=f"tokens {req.computed}..{req.computed + n}")
+                core[0, row : row + n],
+                req.ref_outputs(layer, n),
+                rtol=0,
+                atol=2e-4,
+                msg=f"tokens {req.computed}..{req.computed + n}",
+            )
             req.computed += n
             row += n
         self.assertTrue((core[0, n_tok:] == 0).all(), "padded rows not zero")
@@ -235,11 +290,11 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
             g, h = _Request(100), _Request(28)
             others = [_Request(int(self.rng.integers(2, 9))) for _ in range(4)]
             sched = [(r, 1) for r in (b, c, d, e, f)] + [(g, 100), (h, 28)]
-            self._step(layer, free, sched + [(r, r.prompt_len) for r in others],
-                       256)
+            self._step(layer, free, sched + [(r, r.prompt_len) for r in others], 256)
             for _ in range(2):
-                self._step(layer, free,
-                           [(r, 1) for r in [b, c, d, e, f, g, h] + others], 16)
+                self._step(
+                    layer, free, [(r, 1) for r in [b, c, d, e, f, g, h] + others], 16
+                )
 
     def test_batching_conv_state_seq_first(self):
         self._scenario(dim_first=False)
@@ -255,14 +310,31 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
         a_log, dt_bias = torch.randn(H) * 0.3, torch.randn(H * D) * 0.3
         init = torch.randn(2, H, D, D)
         out, final = P.chunk_kda_with_fused_gate(
-            q, k, v, g, b, a_log, dt_bias, LB, init.clone(),
-            cu_seqlens=torch.tensor(bounds, dtype=torch.int32))
+            q,
+            k,
+            v,
+            g,
+            b,
+            a_log,
+            dt_bias,
+            LB,
+            init.clone(),
+            cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+        )
         for s in range(2):
             st = init[s].clone()
             for t in range(bounds[s], bounds[s + 1]):
-                st, o = _ref_step(st, q[0, t], k[0, t], v[0, t], g[0, t],
-                                  torch.sigmoid(b[0, t]), a_log,
-                                  dt_bias.view(H, D), D**-0.5)
+                st, o = _ref_step(
+                    st,
+                    q[0, t],
+                    k[0, t],
+                    v[0, t],
+                    g[0, t],
+                    torch.sigmoid(b[0, t]),
+                    a_log,
+                    dt_bias.view(H, D),
+                    D**-0.5,
+                )
                 torch.testing.assert_close(out[0, t], o, rtol=0, atol=1e-4)
             torch.testing.assert_close(final[s], st, rtol=0, atol=1e-4)
 
@@ -274,8 +346,9 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
             mamba_state_indices=torch.tensor([3, 0, 0], dtype=torch.int32),
             block_tables=torch.zeros(12, dtype=torch.int32),
         )
-        plan = L._build_tpu_step_plan(meta, padded_tokens=1024, state_len=SL,
-                                      device=torch.device("cpu"))
+        plan = L._build_tpu_step_plan(
+            meta, padded_tokens=1024, state_len=SL, device=torch.device("cpu")
+        )
         self.assertIsNotNone(plan)
         self.assertEqual(plan.num_prefills, 1)
         self.assertEqual(plan.prefill_slots.numel(), 1)
@@ -322,8 +395,7 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
             self.assertIs(state, layer.kv_cache[1])
             self.assertEqual(null_slot, L._NULL_SLOT)
             self.assertEqual(slots.tolist(), [r.slot for r in reqs] + [0] * 3)
-        torch.testing.assert_close(layer.kv_cache[1][0], null_before,
-                                   rtol=0, atol=0)
+        torch.testing.assert_close(layer.kv_cache[1][0], null_before, rtol=0, atol=0)
 
     def test_decode_bucket_wider_than_step_takes_gather_path(self):
         # 3 decodes -> plan bucket 8, but the step holds only 4 rows.
@@ -355,9 +427,11 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
         self.assertFalse(V.can_update_in_place(view))
 
         out_a, state_a = V.fused_recurrent_kda_packed_decode(
-            mixed, g, b, a_log, dt_bias, LB, cache, slots.long(), null_slot=0)
+            mixed, g, b, a_log, dt_bias, LB, cache, slots.long(), null_slot=0
+        )
         out_b, _ = V.fused_recurrent_kda_packed_decode(
-            mixed, g, b, a_log, dt_bias, LB, view, slots, null_slot=0)
+            mixed, g, b, a_log, dt_bias, LB, view, slots, null_slot=0
+        )
         self.assertIs(state_a, cache)
         torch.testing.assert_close(out_a, out_b, rtol=0, atol=0)
         torch.testing.assert_close(cache, view, rtol=0, atol=0)
@@ -367,8 +441,16 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
         null_before = cache[0].clone()
         slot7_before = cache[7].clone()
         out_c, _ = V.fused_recurrent_kda_packed_decode(
-            mixed, g, b, a_log, dt_bias, LB, cache,
-            torch.tensor([7, 3, 0, 0], dtype=torch.int32), null_slot=0)
+            mixed,
+            g,
+            b,
+            a_log,
+            dt_bias,
+            LB,
+            cache,
+            torch.tensor([7, 3, 0, 0], dtype=torch.int32),
+            null_slot=0,
+        )
         self.assertTrue((out_c[0, 2:] == 0).all())
         self.assertFalse((out_c[0, :2] == 0).all())
         torch.testing.assert_close(cache[0], null_before, rtol=0, atol=0)
@@ -376,9 +458,9 @@ class TestGlm53KdaLayerBatching(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "state indices"):
             V.fused_recurrent_kda_packed_decode(
-                mixed, g, b, a_log, dt_bias, LB, cache, slots[:2])
+                mixed, g, b, a_log, dt_bias, LB, cache, slots[:2]
+            )
 
 
 if __name__ == "__main__":
     unittest.main()
-

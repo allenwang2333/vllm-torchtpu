@@ -1,4 +1,4 @@
-"""Unit and serving tests for GLM 5.3 Flash (`zai-org/GLM-5.3-Flash`) on vLLM + TorchTPU."""
+"""Unit and serving tests for GLM 5.3 Flash (`zai-org/GLM-5.3-Flash`) on TorchTPU."""
 
 from __future__ import annotations
 
@@ -7,15 +7,16 @@ import unittest
 
 import torch
 
-from vllm_torchtpu.layers.adapter.custom_ops import glm53_kda_conv_tpu
-from vllm_torchtpu.layers.adapter.custom_ops import glm53_kda_vllm_layer_tpu
-from vllm_torchtpu.layers.adapter.custom_ops import glm53_mhc_tpu
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    glm53_kda_conv_tpu,
+    glm53_kda_vllm_layer_tpu,
+    glm53_mhc_tpu,
+)
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.glm5_next import model as glm5_next_model
 
 
 class TestGlm53FlashTorchTpu(unittest.TestCase):
-
     def test_model_registry_and_oot_kda_layer(self):
         register_models()
         from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
@@ -44,17 +45,13 @@ class TestGlm53FlashTorchTpu(unittest.TestCase):
         self.assertEqual(cfg.linear_attn_config["num_heads"], 64)
         self.assertEqual(cfg.linear_attn_config["head_dim"], 128)
         self.assertEqual(cfg.linear_attn_config["short_conv_kernel_size"], 4)
-        self.assertEqual(
-            sum(1 for t in cfg.layer_types if t == "linear_attention"), 34
-        )
+        self.assertEqual(sum(1 for t in cfg.layer_types if t == "linear_attention"), 34)
         self.assertEqual(
             sum(1 for t in cfg.layer_types if t == "deepseek_sparse_attention"),
             11,
         )
         self.assertEqual(sum(1 for t in cfg.mlp_layer_types if t == "dense"), 3)
-        self.assertEqual(
-            sum(1 for t in cfg.mlp_layer_types if t == "sparse"), 42
-        )
+        self.assertEqual(sum(1 for t in cfg.mlp_layer_types if t == "sparse"), 42)
 
     def test_mhc_vpu_fp32_stream_combine(self):
         mod = glm53_mhc_tpu.FusedGlm53HyperConnectionTpu(
@@ -92,4 +89,3 @@ class TestGlm53FlashTorchTpu(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

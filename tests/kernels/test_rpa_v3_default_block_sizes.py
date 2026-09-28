@@ -21,8 +21,15 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel as rpa
 _TPU7X_VMEM = 64 * 1024 * 1024
 
 
-def _defaults(monkeypatch, *, num_q_heads, num_kv_heads, head_dim, max_tokens,
-              case=rpa.RpaCase.MIXED):
+def _defaults(
+    monkeypatch,
+    *,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    max_tokens,
+    case=rpa.RpaCase.MIXED,
+):
     monkeypatch.setattr(rpa, "get_tpu_version", lambda: 7)
     return rpa.get_default_block_sizes(
         jnp.bfloat16,
@@ -59,9 +66,7 @@ def _estimate(bs, *, num_q_heads, num_kv_heads, head_dim):
         (2048, dict(bq_sz=512, bkv_sz=512, bq_csz=512, bkv_csz=512)),
     ],
 )
-def test_glm53_nope_mla_mixed_blocks_fit_tpu7x_vmem(
-    monkeypatch, max_tokens, expected
-):
+def test_glm53_nope_mla_mixed_blocks_fit_tpu7x_vmem(monkeypatch, max_tokens, expected):
     # GLM 5.3 Flash NoPE MLA as MHA at TP=8: 8 q / 8 kv heads, head_dim 256.
     shape = dict(num_q_heads=8, num_kv_heads=8, head_dim=256)
     bs = _defaults(monkeypatch, max_tokens=max_tokens, **shape)
@@ -76,8 +81,12 @@ def test_glm53_nope_mla_mixed_blocks_fit_tpu7x_vmem(
 def test_blocks_that_fit_are_unchanged(monkeypatch, case):
     # 1 kv head / 8 q heads at head_dim 128 is well inside VMEM.
     bs = _defaults(
-        monkeypatch, num_q_heads=8, num_kv_heads=1, head_dim=128,
-        max_tokens=2048, case=case,
+        monkeypatch,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_dim=128,
+        max_tokens=2048,
+        case=case,
     )
     if case == rpa.RpaCase.DECODE:
         assert bs == dict(bq_sz=1, bkv_sz=8192, bq_csz=1, bkv_csz=8192)

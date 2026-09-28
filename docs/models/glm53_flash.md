@@ -29,11 +29,11 @@ independent of context length (see [Long context](#long-context)).
   checkpoint-name mapping, `packed_modules_mapping`, and config registration
   for `glm5_next` / `glm5_next_text`.
 - **KDA backends** (`GLM53_KDA_BACKEND`):
-    - `kimi` (default): the Kimi pooled / dispatched KDA ops. With the unified
-      block pool (default) the KDA state lives in the same block pool as the
-      MLA KV cache. The conv weight is folded after weight loading.
-    - `legacy`: the earlier Pallas KDA prefill/decode kernels with per-layer
-      state caches (set `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0`).
+  - `kimi` (default): the Kimi pooled / dispatched KDA ops. With the unified
+    block pool (default) the KDA state lives in the same block pool as the
+    MLA KV cache. The conv weight is folded after weight loading.
+  - `legacy`: the earlier Pallas KDA prefill/decode kernels with per-layer
+    state caches (set `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0`).
 - **mHC** as a fused VPU fp32 op; RPA v3 default block sizes for this model;
   GDN pool layout and platform hooks for the hybrid KV / state pool.
 

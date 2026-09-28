@@ -188,9 +188,7 @@ def test_glm53_runs_on_the_unified_pool_by_default(
     assert architecture in gdn_pool_layout.POOLED_GDN_ARCHITECTURES
     assert gdn_pool_layout.unified_kv_layout_enabled_for_architecture(architecture)
     monkeypatch.setenv(UNIFIED_POOL_ENV, "0")
-    assert not gdn_pool_layout.unified_kv_layout_enabled_for_architecture(
-        architecture
-    )
+    assert not gdn_pool_layout.unified_kv_layout_enabled_for_architecture(architecture)
 
 
 # The state contract between the layer and the pool sizing.
@@ -471,7 +469,12 @@ def _inputs():
     """What the base class hands `_forward`: a split view of the fused
     projection, g1 and beta with a batch dim, g2 without one."""
     mixed_qkv = torch.randn(T, DIM + 5).split([DIM, 5], dim=-1)[0]
-    return mixed_qkv, torch.randn(1, T, H, D), torch.randn(T, H, D), torch.randn(1, T, H)
+    return (
+        mixed_qkv,
+        torch.randn(1, T, H, D),
+        torch.randn(T, H, D),
+        torch.randn(1, T, H),
+    )
 
 
 def _kimi_layer(monkeypatch: pytest.MonkeyPatch, kv_cache):
@@ -603,9 +606,7 @@ def test_forward_requires_mamba_state_indices(
 ) -> None:
     layer = _kimi_layer(monkeypatch, [_pool()])
     with pytest.raises(RuntimeError, match="mamba_state_indices"):
-        _run_forward(
-            monkeypatch, layer, _metadata(mamba_state_indices=None), _inputs()
-        )
+        _run_forward(monkeypatch, layer, _metadata(mamba_state_indices=None), _inputs())
 
 
 def test_forward_rejects_gdn_metadata(

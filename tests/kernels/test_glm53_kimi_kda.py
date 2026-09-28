@@ -119,9 +119,7 @@ def _initial_states(geom, rng, num_seqs):
     """Per-request states. The conv state is bf16 values, as in the pool."""
     h, d = geom.num_heads, HEAD_DIM
     conv = _bf16(rng, (num_seqs, KERNEL_SIZE - 1, 3, h, d), 0.5)
-    ssm = jnp.asarray(
-        rng.standard_normal((num_seqs, h, d, d)).astype(np.float32) * 0.1
-    )
+    ssm = jnp.asarray(rng.standard_normal((num_seqs, h, d, d)).astype(np.float32) * 0.1)
     return conv, ssm
 
 
@@ -369,7 +367,9 @@ MIXED = ([1, 15, 16], [9, 15, 24], 1)
         pytest.param(
             TP1,
             marks=pytest.mark.xfail(
-                reason="64 heads per shard exceeds TPU v7x VMEM capacity in fused kernel",
+                reason=(
+                    "64 heads per shard exceeds TPU v7x VMEM capacity in fused kernel"
+                ),
                 raises=jax.errors.JaxRuntimeError,
             ),
         ),
@@ -428,7 +428,9 @@ def test_dense_matches_fp64_reference(geom):
             TP1,
             *MIXED,
             marks=pytest.mark.xfail(
-                reason="64 heads per shard exceeds TPU v7x VMEM capacity in fused kernel",
+                reason=(
+                    "64 heads per shard exceeds TPU v7x VMEM capacity in fused kernel"
+                ),
                 raises=jax.errors.JaxRuntimeError,
             ),
         ),
@@ -471,7 +473,9 @@ def test_pooled_rpa_matches_dense(geom, query_lens, seq_lens, decode_end):
             np.testing.assert_array_equal(after[block], before[block])
     region_end = geom.layout.required_tokens
     for block in block_ids:
-        np.testing.assert_array_equal(after[block, region_end:], before[block, region_end:])
+        np.testing.assert_array_equal(
+            after[block, region_end:], before[block, region_end:]
+        )
 
 
 @pytest.mark.cpu_test
@@ -637,7 +641,8 @@ def test_prefix_cache_hit_matches_miss_bitwise():
     out_miss, pool = _pooled(weights, suffix, pool, [3], prefill)
 
     np.testing.assert_array_equal(_bits(out_miss_prefix), _bits(out_a))
-    # Suffix output is numerically equal across hit and miss up to floating-point rounding.
+    # Suffix output is numerically equal across hit and miss up to floating-point
+    # rounding.
     np.testing.assert_allclose(_f64(out_hit), _f64(out_miss), rtol=5e-3, atol=2e-3)
     region = slice(0, geom.layout.required_tokens)
     final = _bits(pool)
