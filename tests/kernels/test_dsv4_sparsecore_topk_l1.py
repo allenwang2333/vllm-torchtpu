@@ -24,17 +24,21 @@
   radix fallback runs), heavy ties (T lands inside a tie), and rows too short
   for any threshold.
 * **Call site.** `streamindex_topk(sctopk_l1=True)` against `sctopk_l1=False`
-  at the production shape, with long, short, decode and padded rows.
+  at the production shape, with long, short, decode and padded rows. There T
+  comes from the StreamIdxTC scoring epilogue (no T kernel), and it must equal
+  the T kernel's `row_threshold_keys` on every live row.
 
 A passing oracle proves something only if it can fail, so the positive controls
-are asserted red: a threshold one key above the true k-th score, and stage 1'
-with the per-slice fallback removed.
+are asserted red: a threshold one key above the true k-th score (kernel and
+call site), stage 1' with the per-slice fallback removed, and an epilogue whose
+group maxima are inflated.
 
 `python test_dsv4_sparsecore_topk_l1.py` runs the flag on/off microbench
 instead of the tests.
 """
 
 import difflib
+import importlib
 import re
 import statistics
 import time
@@ -52,6 +56,10 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import sctopk_l1 as l1
+
+sim = importlib.import_module(
+    "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+)
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -433,34 +441,157 @@ CALL_CASES = [
     pytest.param((1024,), (230000,), True, dict(chunk_tokens=None), id="unchunked"),
     # A small token bucket (16 does not divide by 128, so unchunked b=16).
     pytest.param((16,), (230000,), True, dict(num_tokens=16), id="bucket16"),
+    # The contexts the L1v2 microbench sweeps.
+    pytest.param((1024,), (29000,), True, {}, id="prefill-29k-hot"),
+    pytest.param((1024,), (100000,), False, {}, id="prefill-100k"),
+    pytest.param((1024,), (185000,), True, {}, id="prefill-185k-hot"),
+    # Every row shorter than k (T = -inf), and rows straddling k.
+    pytest.param((1024,), (2048,), False, {}, id="prefill-2048"),
+    pytest.param((1024,), (2600,), False, {}, id="prefill-2600"),
+    # Two sequences inside one 128-row chunk (rows 640..767 split at 700), a
+    # context ending mid KV block, and a decode block ahead of them.
+    pytest.param(
+        (1, 1, 698, 324),
+        (70001, 99, 150001, 3333),
+        True,
+        {},
+        id="two-seqs-in-chunk",
+    ),
 ]
 
 
-@pytest.mark.parametrize("T_list,S_list,hot,extra", CALL_CASES)
-def test_call_site_flag_on_matches_off(T_list, S_list, hot, extra):
-    kw = _call_kwargs(T_list, S_list, hot=hot, **extra)
-    hlo = streamindex_topk.lower(**kw, sctopk_l1=True).as_text()
-    assert "sc_topk_l1" in hlo and "tc_rowT" in hlo, "flag on did not reach L1"
-    on_i, on_s = streamindex_topk(**kw, sctopk_l1=True, return_scores=True)
+def _red_rows(kw, T_list, **on_kw):
+    """Rows whose flag-on selection differs from flag-off beyond v_k ties."""
+    on_i, on_s = streamindex_topk(**kw, sctopk_l1=True, return_scores=True, **on_kw)
     off_i, off_s = streamindex_topk(**kw, sctopk_l1=False, return_scores=True)
     on_i, off_i = np.asarray(on_i), np.asarray(off_i)
     on_s = np.asarray(on_s).view(np.float32)
     off_s = np.asarray(off_s).view(np.float32)
-    # The selected scores agree exactly as multisets ...
-    np.testing.assert_array_equal(np.sort(on_s, 1), np.sort(off_s, 1))
-    # ... and the index sets agree except among scores tied at v_k.
+    red = []
     for i in range(on_i.shape[0]):
+        # The selected scores must agree exactly as multisets ...
+        if not np.array_equal(np.sort(on_s[i]), np.sort(off_s[i])):
+            red.append(i)
+            continue
+        # ... and the index sets except among scores tied at v_k.
         a = dict(zip(on_i[i].tolist(), on_s[i].tolist()))
         b = dict(zip(off_i[i].tolist(), off_s[i].tolist()))
         a.pop(-1, None), b.pop(-1, None)
         if a.keys() == b.keys():
             continue
         vk = min(b.values())
-        off_ties = [c for c in a.keys() ^ b.keys() if {**a, **b}[c] != vk]
-        assert not off_ties, f"row {i}: {len(off_ties)} indices differ off the tie"
+        if any({**a, **b}[c] != vk for c in a.keys() ^ b.keys()):
+            red.append(i)
     # Rows past cu_q_lens[-1] are padding: empty either way.
     pad0 = sum(T_list)
-    assert (on_i[pad0:] == -1).all() and (off_i[pad0:] == -1).all()
+    assert (off_i[pad0:] == -1).all()
+    if (on_i[pad0:] != -1).any():
+        red.extend(range(pad0, on_i.shape[0]))
+    return sorted(set(red))
+
+
+@pytest.fixture
+def patched_sim(monkeypatch):
+    """Monkeypatch `streamindex_topk`'s module globals with fresh jit caches."""
+    jax.clear_caches()
+    yield lambda name, value: monkeypatch.setattr(sim, name, value)
+    monkeypatch.undo()
+    jax.clear_caches()
+
+
+@pytest.mark.parametrize("T_list,S_list,hot,extra", CALL_CASES)
+def test_call_site_flag_on_matches_off(T_list, S_list, hot, extra):
+    kw = _call_kwargs(T_list, S_list, hot=hot, **extra)
+    hlo = streamindex_topk.lower(**kw, sctopk_l1=True).as_text()
+    assert "sc_topk_l1" in hlo, "flag on did not reach L1"
+    # T comes from the scoring epilogue: no T kernel, no relayout for it.
+    assert "tc_rowT" not in hlo, "flag on still runs the T kernel"
+    red = _red_rows(kw, T_list)
+    assert not red, f"{len(red)} rows differ, first {red[:8]}"
+
+
+def _capture_t(store):
+    """A `sparsecore_topk_l1` that records (epilogue T, T kernel T, lengths)."""
+
+    def wrapped(scores, k, row_lengths=None, *, t_rows=None, **kw):
+        assert t_rows is not None, "the call site passed no epilogue T"
+        ref = l1.row_threshold_keys(scores, k, row_lengths)
+        jax.debug.callback(
+            lambda a, b, c: store.append(
+                (np.asarray(a), np.asarray(b), np.asarray(c))
+            ),
+            t_rows[:, 0],
+            ref,
+            row_lengths,
+        )
+        return l1.sparsecore_topk_l1(scores, k, row_lengths, t_rows=t_rows, **kw)
+
+    return wrapped
+
+
+@pytest.mark.parametrize(
+    "T_list,S_list,hot,extra",
+    [c for c in CALL_CASES if c.id in (
+        "prefill-230k-hot", "prefill-4k", "mixed-padded", "unchunked",
+        "prefill-2600", "two-seqs-in-chunk")],
+)
+def test_epilogue_t_equals_threshold_kernel(patched_sim, T_list, S_list, hot, extra):
+    """The scoring epilogue's T is the T kernel's T on every live row."""
+    store = []
+    patched_sim("sparsecore_topk_l1", _capture_t(store))
+    kw = _call_kwargs(T_list, S_list, hot=hot, **extra)
+    jax.block_until_ready(streamindex_topk(**kw, sctopk_l1=True))
+    jax.effects_barrier()
+    assert store, "no chunk reached sparsecore_topk_l1"
+    live = 0
+    for chunk, (t_epi, t_ref, lens) in enumerate(store):
+        m = lens > 0
+        live += int(m.sum())
+        bad = np.flatnonzero(m & (t_epi != t_ref))
+        assert not bad.size, (
+            f"chunk {chunk}: {bad.size} rows differ, row {bad[0]} "
+            f"epi={t_epi[bad[0]]} ref={t_ref[bad[0]]} len={lens[bad[0]]}"
+        )
+    assert live == sum(T_list), (live, sum(T_list))
+
+
+def _t_above_vk(scores, k, row_lengths=None, *, t_rows=None, **kw):
+    """Positive control: T one key above v_k, the row's true k-th score."""
+    b, n = scores.shape
+    bits = (
+        scores
+        if scores.dtype == jnp.int32
+        else jax.lax.bitcast_convert_type(scores, jnp.int32)
+    )
+    key = l1._monotone_key(bits)
+    col = jax.lax.broadcasted_iota(jnp.int32, (b, n), 1)
+    key = jnp.where(col < row_lengths[:, None], key, jnp.int32(KEY_NEG_INF))
+    vk = jax.lax.top_k(key, k)[0][:, -1]
+    bad = jnp.broadcast_to((vk + 1)[:, None], (b, 128))
+    return l1.sparsecore_topk_l1(scores, k, row_lengths, t_rows=bad, **kw)
+
+
+def test_call_site_control_t_above_vk_goes_red(patched_sim):
+    """Every row with >= k live scores must fail when T = v_k + 1."""
+    patched_sim("sparsecore_topk_l1", _t_above_vk)
+    T_list, S_list = (1024,), (230000,)
+    kw = _call_kwargs(T_list, S_list)
+    red = _red_rows(kw, T_list)
+    assert len(red) == 1024, f"only {len(red)}/1024 rows red with T = v_k + 1"
+
+
+def test_call_site_control_inflated_epilogue_max_goes_red(patched_sim):
+    """Group maxima inflated by one binade in the epilogue put T above v_k.
+
+    Only rows whose min group max sits within one binade (x2) of v_k go red:
+    812/1024 at this shape [measured: j-061c0789]. The bar is half the rows.
+    """
+    patched_sim("_TEST_EPILOGUE_T_FAULT", "inflate")
+    T_list, S_list = (1024,), (230000,)
+    kw = _call_kwargs(T_list, S_list)
+    red = _red_rows(kw, T_list)
+    print(f"inflate control: {len(red)}/1024 rows red")
+    assert len(red) >= 512, f"only {len(red)}/1024 rows red with inflated maxima"
 
 
 def test_call_site_unsupported_shape_falls_back():
@@ -468,6 +599,10 @@ def test_call_site_unsupported_shape_falls_back():
     kw = _call_kwargs((1024,), (9000,), pages_per_seq=9)
     hlo = streamindex_topk.lower(**kw, sctopk_l1=True).as_text()
     assert "sc_topk_l1" not in hlo and "tc_rowT" not in hlo
+    assert (
+        streamindex_topk.lower(**kw, sctopk_l1=False).as_text().count("pallas")
+        == hlo.count("pallas")
+    ), "an unsupported shape still grew a scoring output"
     on = np.asarray(streamindex_topk(**kw, sctopk_l1=True))
     off = np.asarray(streamindex_topk(**kw, sctopk_l1=False))
     np.testing.assert_array_equal(on, off)

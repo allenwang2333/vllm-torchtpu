@@ -118,6 +118,18 @@ def l1_supported(b: int, n: int, k: int) -> bool:
     return _t_block_factor(b, n, k) > 0
 
 
+def epilogue_t_supported(b: int, n: int, k: int, group_widths) -> bool:
+    """Whether the StreamIdxTC scoring epilogue can supply T for this call.
+
+    The epilogue's groups are columns equal mod the scoring kernel's KV block
+    width `g` (one running max per block lane), so T = min over g >= k groups
+    of the group max is still <= v_k. Every pass must use such a block.
+    """
+    return l1_supported(b, n, k) and all(
+        g >= k and g % 128 == 0 and n % g == 0 for g in group_widths
+    )
+
+
 def _monotone_key(bits):
     """fp32 bits -> i32 key with the same total order; an involution."""
     m = jnp.bitwise_and(jnp.right_shift(bits, 31), jnp.int32(MONO_MASK))
@@ -191,6 +203,19 @@ def row_threshold_keys(
     scheduling_group_id: int | None = None,
 ) -> jax.Array:  # i32[b]
     """`T_r = min_g max{key[r, c] : c mod k == g, c < len_r}` as an i32 key."""
+    return row_threshold_rows(
+        scores, k, row_lengths, scheduling_group_id=scheduling_group_id
+    )[:, 0]
+
+
+def row_threshold_rows(
+    scores: jax.Array,  # i32[b, n] of f32 bits, or f32[b, n]
+    k: int,
+    row_lengths: jax.Array,  # i32[b]
+    *,
+    scheduling_group_id: int | None = None,
+) -> jax.Array:  # i32[b, 128]
+    """`row_threshold_keys` broadcast over 128 lanes, as stage 1' reads it."""
     b, n = scores.shape
     J = _t_block_factor(b, n, k)
     if J == 0:
@@ -238,7 +263,7 @@ def row_threshold_keys(
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
-    return out[:b, 0]
+    return out[:b]
 
 
 # --------------------------------------------------------------------------- #
@@ -248,7 +273,8 @@ def row_threshold_keys(
 
 def _topk_body_l1(
     scores_hbm,  # i32[padded_b, slice_len] (fp32 score bits)
-    lengths_hbm,  # i32[padded_b, LANES]  lane 0 = length, lane 1 = T key
+    lengths_hbm,  # i32[padded_b, LANES]  lane 0 = length
+    t_hbm,  # i32[t_rows, 128]  lane 0 = T key of slices [r * p, (r + 1) * p)
     out_hbm,  # i32[padded_b, k]
     keys_hbm,  # i32[padded_b, k]
     glob_vmem,  # i32[NUM_BUCKETS + LANES]
@@ -263,6 +289,8 @@ def _topk_body_l1(
     slice_len: int,
     num_waves: int,
     fallback: bool,
+    p: int,
+    t_rows: int,
 ):
     # `fallback=False` exists only for the test's positive control: it copies the
     # first k survivors out of an overflowing slice, which is wrong.
@@ -455,14 +483,14 @@ def _topk_body_l1(
 
         plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
 
-    def pipeline_step(scores_vmem, len_slice_vmem, out_vmem, keys_vmem):
+    def pipeline_step(scores_vmem, len_slice_vmem, t_vmem, out_vmem, keys_vmem):
         w = pl.program_id(0)
         row = w * cores_per_chip + slot_of(w)
         active = row < b
         lvec = len_slice_vmem[pl.ds(0, LANES)]
         eff_len = jnp.minimum(lvec[0], n)
         eff_len = jnp.where(active, eff_len, 0)
-        t_key = lvec[1]
+        t_key = t_vmem[pl.ds(0, LANES)][0]
         # key >= T  <=>  key > T - 1, floored so -inf (and the poisoned tail) is
         # never selected even when T is the -inf key.
         gate_excl = jnp.maximum(t_key - 1, neg_inf_key)
@@ -531,9 +559,16 @@ def _topk_body_l1(
     def imap(w):
         return (w * cores_per_chip + slot_of(w),)
 
+    def tmap(w):
+        # Slice s reads T of its row s // p; one row is 128 words = 128 / LANES
+        # blocks. Padded slices (s >= b) clamp to the last row; they are empty.
+        r = jnp.minimum((w * cores_per_chip + slot_of(w)) // p, t_rows - 1)
+        return (r * (128 // LANES),)
+
     in_specs = (
         pl.BlockSpec((slice_len,), imap, pipeline_mode=pl.Buffered(buf_count)),
         pl.BlockSpec((LANES,), imap, pipeline_mode=pl.Buffered(buf_count)),
+        pl.BlockSpec((LANES,), tmap, pipeline_mode=pl.Buffered(buf_count)),
     )
     out_specs = (
         pl.BlockSpec((k,), imap, pipeline_mode=pl.Buffered(buf_count)),
@@ -544,19 +579,24 @@ def _topk_body_l1(
         grid=(num_waves,),
         in_specs=in_specs,
         out_specs=out_specs,
-    )(scores_hbm, lengths_hbm, out_hbm, keys_hbm)
+    )(scores_hbm, lengths_hbm, t_hbm, out_hbm, keys_hbm)
 
 
 def _sc_topk_stage1_l1(
     scores: jax.Array,  # f32/i32 [b, n] (slices)
     k: int,
     row_lengths: jax.Array,  # i32[b]
-    t_keys: jax.Array,  # i32[b]  monotone-key lower bound per slice
+    t_rows: jax.Array,  # i32[b // p, 128]  lane 0 = monotone-key lower bound
+    p: int,  # slices per T row
     *,
     fallback: bool = True,
     scheduling_group_id: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Stage 1': threshold compaction with per-slice radix fallback.
+
+    Slice s is gated by `t_rows[s // p, 0]`, read straight from the array the
+    scoring epilogue (or the T kernel) wrote, so no XLA op sits between the
+    T producer and this kernel.
 
     Same output format as `_sc_topk_direct`: slots i32[b, k], `-1` suffix
     padded, and each slot's fp32 bits as i32, `-inf` bits in the pad. A slice's
@@ -583,11 +623,9 @@ def _sc_topk_stage1_l1(
     if pad_b > 0 or pad_n > 0:
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, pad_b))
-    tk = jnp.pad(t_keys.astype(jnp.int32), (0, pad_b), constant_values=KEY_NEG_INF)
-    lengths_2d = jnp.concatenate(
-        [lengths[:, None], tk[:, None], jnp.zeros((padded_b, LANES - 2), jnp.int32)],
-        axis=1,
-    )
+    lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    if t_rows.shape != (b // p, 128) or b % p:
+        raise ValueError(f"t_rows {t_rows.shape} does not cover {b} slices / {p}")
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
         num_subcores=sc.num_subcores,
@@ -611,6 +649,8 @@ def _sc_topk_stage1_l1(
             slice_len=slice_len,
             num_waves=num_waves,
             fallback=fallback,
+            p=p,
+            t_rows=b // p,
         ),
         out_type=(slot_type, slot_type),
         compiler_params=pltpu.CompilerParams(
@@ -619,7 +659,7 @@ def _sc_topk_stage1_l1(
         scratch_types=scratch_types,
         mesh=mesh,
         name=f"sc_topk_l1_b{b}_n{n}_k{k}{'' if fallback else '_nofb'}",
-    )(words.reshape(-1), lengths_2d.reshape(-1))
+    )(words.reshape(-1), lengths_2d.reshape(-1), t_rows.astype(jnp.int32).reshape(-1))
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
@@ -637,38 +677,47 @@ def _sparsecore_topk_l1_impl(
     scheduling_group_id: int | None,
     stage2_scheduling_group_id: int | None,
     threshold_scheduling_group_id: int | None,
+    t_rows: jax.Array | None = None,
     t_keys: jax.Array | None = None,
     fallback: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
-    """The threshold path. `t_keys` / `fallback` are test-only overrides."""
+    """The threshold path.
+
+    `t_rows` (i32[b, 128], lane 0 = T) is T from the scoring epilogue; None
+    runs the TensorCore T kernel here. `t_keys` (i32[b]) / `fallback` are
+    test-only overrides.
+    """
     b, n = scores.shape
     p = _pick_partition(b, n, k)
     n_p = n // p
     k_p = min(k, n_p)
-    if t_keys is None:
-        t_keys = row_threshold_keys(
+    if t_keys is not None:
+        t_rows = jnp.broadcast_to(t_keys.astype(jnp.int32)[:, None], (b, 128))
+    elif t_rows is None:
+        t_rows = row_threshold_rows(
             scores,
             k,
             row_lengths,
             scheduling_group_id=threshold_scheduling_group_id,
         )
-    if b % 64 != 0:
-        # Without this barrier XLA's memory-space assignment fails to compile
-        # ("Too many buffers are colored in the alternate memory") for i32
-        # scores at b=32/40, n=264192 (b=8..128 otherwise measured fine). It
-        # serialises T against the scores producer, which costs ~0.7 ms per
-        # chunked prefill call at b=128, so the 128-row chunk shape skips it.
-        scores, t_keys = jax.lax.optimization_barrier((scores, t_keys))
+        if b % 64 != 0:
+            # Without this barrier XLA's memory-space assignment fails to
+            # compile ("Too many buffers are colored in the alternate memory")
+            # for i32 scores at b=32/40, n=264192 (b=8..128 otherwise measured
+            # fine). It serialises T against the scores producer, which costs
+            # ~0.7 ms per chunked prefill call at b=128, so the 128-row chunk
+            # shape skips it. T from the scoring epilogue needs neither.
+            scores, t_rows = jax.lax.optimization_barrier((scores, t_rows))
     scores_p = scores.reshape(b * p, n_p)
     offsets = jnp.arange(p, dtype=jnp.int32) * n_p
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
-    t_p = jnp.repeat(t_keys.astype(jnp.int32), p)
 
     local_slots, cand_scores = _sc_topk_stage1_l1(
         scores_p,
         k_p,
         lengths_p,
-        t_p,
+        t_rows,
+        p,
         fallback=fallback,
         scheduling_group_id=scheduling_group_id,
     )
@@ -716,12 +765,16 @@ def sparsecore_topk_l1(
     stage2_scheduling_group_id: int | None = None,
     threshold_scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    t_rows: jax.Array | None = None,  # i32[b, 128], lane 0 = T key
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """`sparsecore_topk` with the threshold-gated stage 1.
 
     Same arguments, outputs and contract as `sparsecore_topk`, plus
     `threshold_scheduling_group_id`, the XLA scheduling group of the
-    TensorCore T kernel. Shapes outside `l1_supported` run `sparsecore_topk`.
+    TensorCore T kernel, and `t_rows`, a precomputed T per row (the
+    StreamIdxTC scoring epilogue's) that replaces the T kernel. Any
+    `t_rows[r, 0] <= v_k(r)` keeps the result exact. Shapes outside
+    `l1_supported` run `sparsecore_topk` and ignore `t_rows`.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -751,6 +804,7 @@ def sparsecore_topk_l1(
         scheduling_group_id=scheduling_group_id,
         stage2_scheduling_group_id=stage2_scheduling_group_id,
         threshold_scheduling_group_id=threshold_scheduling_group_id,
+        t_rows=t_rows,
     )
     if return_scores:
         return idx, cand_scores

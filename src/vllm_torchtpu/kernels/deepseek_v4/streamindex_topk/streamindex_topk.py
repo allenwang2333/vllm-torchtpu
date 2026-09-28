@@ -33,6 +33,8 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.sctopk_l1 import (
+    _monotone_key,
+    epilogue_t_supported,
     sparsecore_topk_l1,
 )
 
@@ -40,6 +42,10 @@ MlaCase = config.MlaCase
 KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# Test-only positive control, read at trace time: "inflate" adds one binade
+# (1 << 23 in key space) to every epilogue group max before the min over
+# groups, so T lands above v_k and `sctopk_l1` must go wrong.
+_TEST_EPILOGUE_T_FAULT = None
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global
@@ -82,6 +88,8 @@ def kernel(
     # SEQ_ALONG_LANE: [total_num_pages, kv_sublane_groups, kv_packing, page_size]
     # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
     # (donated_in, out) after the first pass. Only the last is ever read.
+    # With `emit_t`, the row threshold rows [chunk_tokens, 128] follow the
+    # same pattern: (s_out, t_out) or (s_in, t_in, s_out, t_out).
     *score_refs,
     compression_ratio: int,
     static_q_len: int | None,
@@ -94,9 +102,13 @@ def kernel(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    emit_t: bool = False,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
-    scores_hbm_ref = score_refs[-1]
+    if emit_t:
+        scores_hbm_ref, t_hbm_ref = score_refs[-2], score_refs[-1]
+    else:
+        scores_hbm_ref = score_refs[-1]
     buffer_cnt = buffer_count
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
 
@@ -327,7 +339,61 @@ def kernel(
             ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
         return jnp.concatenate(ret, axis=0)
 
-    def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
+    def t_epilogue(p_id, bkv_idx, scores, acc_ref, stage_ref, sem):
+        """Per-row threshold key T for `sctopk_l1`, from the scores in hand.
+
+        `acc_ref` keeps the running elementwise max of this q block's score
+        tiles, so `acc[r, j]` is row r's max over columns c = j (mod bkv_sz):
+        the L1 group max, with group width = bkv_sz (= k at the production
+        shape). Masked columns are already -inf in `scores`, so no length mask
+        is needed. At the q block's last KV step, T = min_j key(acc[r, j]) goes
+        to HBM for the rows this step's scores go to. Rows no step writes
+        (row length 0) are left unwritten; stage 1' selects nothing there.
+        """
+
+        @pl.when(bkv_idx == 0)
+        def _():
+            acc_ref[...] = scores
+
+        @pl.when(bkv_idx != 0)
+        def _():
+            acc_ref[...] = jnp.maximum(acc_ref[...], scores)
+
+        # KV blocks run innermost from 0, so the q block ends where the next
+        # step restarts at bkv 0, or at the chunk's last step.
+        last_row = metadata_ref.bkv_idx.shape[0] - 1
+        nxt = jnp.minimum(step_offset + p_id + 1, last_row)
+        is_last = (p_id == metadata_ref.num_steps[chunk_idx] - 1) | (
+            metadata_ref.bkv_idx[nxt] == 0
+        )
+
+        @pl.when(is_last)
+        def _():
+            key = _monotone_key(pltpu.bitcast(acc_ref[...], jnp.int32))
+            if _TEST_EPILOGUE_T_FAULT == "inflate":
+                key = key + jnp.int32(1 << 23)
+            t = jnp.min(jnp.min(key, axis=1), axis=1, keepdims=True)
+            stage_ref[...] = jnp.broadcast_to(t, stage_ref.shape)
+            token_start, total_sz = bref_override._token_window(
+                (scores_hbm_ref, cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref),
+                p_id,
+                scores_hbm_ref.shape[0],
+                bq_sz=bq_sz,
+                seq_batch_size=seq_batch_size,
+                chunk_idx=chunk_idx,
+            )
+            dst_start = token_start - start_end_seq_idx_ref[2]
+            copy = pltpu.make_async_copy(
+                stage_ref.at[pl.ds(0, total_sz)],
+                t_hbm_ref.at[pl.ds(dst_start, total_sz)],
+                sem,
+            )
+            copy.start()
+            copy.wait()
+
+    def step_body(
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, t_refs=None
+    ):
         p_id = pl.program_id(0)
         batch_start_seq_idx = seq_tile(p_id)
         bq_idx = bq_block(p_id)
@@ -405,13 +471,15 @@ def kernel(
             cp_rank=cp_rank,
         )
         scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
+        if t_refs is not None:
+            t_epilogue(p_id, bkv_idx, scores, *t_refs)
 
-    def _run_all(q_hm_ref=None):
+    def _run_all(q_hm_ref=None, t_refs=None):
         @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
         def _run_pipeline(final_allocs):
             q_buf, weights_buf, kv_buf, o_buf = final_allocs
             pipeline_fn = pltpu.emit_pipeline(
-                functools.partial(step_body, q_hm_ref=q_hm_ref),
+                functools.partial(step_body, q_hm_ref=q_hm_ref, t_refs=t_refs),
                 grid=(metadata_ref.num_steps[chunk_idx],),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
                 out_specs=o_buf.spec,
@@ -427,15 +495,27 @@ def kernel(
 
         _run_pipeline()
 
-    # Only the multi-token path reorders q, and only a single sequence per tile
-    # keeps the cached block unambiguous.
-    if seq_batch_size == 1 and bq_sz > 1:
+    def _dispatch(t_refs=None):
+        # Only the multi-token path reorders q, and only a single sequence per
+        # tile keeps the cached block unambiguous.
+        if seq_batch_size == 1 and bq_sz > 1:
+            pl.run_scoped(
+                functools.partial(_run_all, t_refs=t_refs),
+                pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+            )
+        else:
+            _run_all(t_refs=t_refs)
+
+    if emit_t:
+        tile_rows = seq_batch_size * bq_sz
         pl.run_scoped(
-            _run_all,
-            pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+            lambda *t_refs: _dispatch(t_refs),
+            pltpu.VMEM((tile_rows, num_sublanes_bkv, 128), jnp.float32),
+            pltpu.VMEM((tile_rows, 128), jnp.int32),
+            pltpu.SemaphoreType.DMA,
         )
     else:
-        _run_all()
+        _dispatch()
 
     ### ------- Kernel end ------- ###
 
@@ -852,6 +932,8 @@ def streamindex_topk(
         chunk_tokens=None,
         scheduling_group_id=None,
         chunk_idx=0,
+        emit_t=False,
+        t_init=None,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         # Only support batching for decode sequences.
@@ -880,6 +962,11 @@ def streamindex_topk(
         if aliased:
             in_specs.append(hbm_spec)  # scores_init, aliased to out
         out_specs = hbm_spec
+        t_aliased = emit_t and t_init is not None
+        if t_aliased:
+            in_specs.append(hbm_spec)  # t_init, aliased to the T output
+        if emit_t:
+            out_specs = (hbm_spec, hbm_spec)
 
         scratch_shapes = []
 
@@ -897,6 +984,8 @@ def streamindex_topk(
         num_flat_prefetches = len(jax.tree_util.tree_leaves(scalar_prefetches))
         # The aliased `scores_init` is the 4th operand after the flat prefetches.
         input_output_aliases = {num_flat_prefetches + 3: 0} if aliased else {}
+        if t_aliased:
+            input_output_aliases[num_flat_prefetches + 3 + int(aliased)] = 1
 
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
@@ -904,6 +993,10 @@ def streamindex_topk(
             # The chunk count is part of the kernel's identity, so a sweep over chunk
             # sizes shows up in the profile instead of silently reusing one shape.
             scope_name += f"-c{max_num_tokens // chunk_tokens}"
+        scores_shape = jax.ShapeDtypeStruct(
+            shape=(chunk_tokens, num_sublanes_total, 128),
+            dtype=out_dtype,
+        )
         pallas_kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
@@ -919,6 +1012,7 @@ def streamindex_topk(
                     cp_size=cp_size,
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
+                    **(dict(emit_t=True) if emit_t else {}),
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -932,9 +1026,11 @@ def streamindex_topk(
                     vmem_limit_bytes=vmem_limit_bytes,
                     disable_bounds_checks=True,
                 ),
-                out_shape=jax.ShapeDtypeStruct(
-                    shape=(chunk_tokens, num_sublanes_total, 128),
-                    dtype=out_dtype,
+                out_shape=scores_shape
+                if not emit_t
+                else (
+                    scores_shape,
+                    jax.ShapeDtypeStruct((chunk_tokens, 128), jnp.int32),
                 ),
                 input_output_aliases=input_output_aliases,
                 name=scope_name,
@@ -946,6 +1042,7 @@ def streamindex_topk(
             prepared_indexer_weights,
             cache_kv,
             *((scores_init,) if aliased else ()),
+            *((t_init,) if t_aliased else ()),
         )
         if scheduling_group_id is not None:
             scores = xla_metadata.set_xla_metadata(
@@ -1022,13 +1119,41 @@ def streamindex_topk(
         chunk_tokens,
         out_dtype,
         scheduling_group_id,
+        emit_t=False,
     ):
-        """Scores for one window of the flat token axis, in a private buffer."""
+        """Scores for one window of the flat token axis, in a private buffer.
+
+        With `emit_t`, also the per-row threshold rows i32[chunk_tokens, 128]
+        (lane 0 = T) for `sparsecore_topk_l1`, from the scoring epilogue.
+        """
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
+        t_rows = None
         for spec, pass_meta in passes:
+            if emit_t:
+                # Each pass writes T only for its own rows; the buffer is
+                # donated pass to pass like the scores.
+                scores, t_rows = run_scores_kernel(
+                    q,
+                    prepared_indexer_weights,
+                    cache_kv,
+                    scores,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    pass_meta=pass_meta,
+                    chunk_idx=chunk_idx,
+                    chunk_token_start=chunk_token_start,
+                    chunk_tokens=chunk_tokens,
+                    out_dtype=out_dtype,
+                    scheduling_group_id=scheduling_group_id,
+                    emit_t=True,
+                    t_init=t_rows,
+                    **spec,
+                )
+                continue
             scores = run_scores_kernel(
                 q,
                 prepared_indexer_weights,
@@ -1045,6 +1170,8 @@ def streamindex_topk(
                 scheduling_group_id=scheduling_group_id,
                 **spec,
             )
+        if emit_t:
+            return scores, t_rows
         return scores
 
     def _common_path(_):
@@ -1096,6 +1223,14 @@ def streamindex_topk(
             (spec, _pass_metadata(spec, chunk_starts, chunk_len))
             for spec in _pass_specs(decode_batch_end)
         )
+        # The scoring epilogue emits T when every pass's KV block is a whole
+        # number of L1 groups; `sparsecore_topk_l1` then runs no T pass.
+        emit_t = sctopk_l1 and epilogue_t_supported(
+            chunk_len,
+            num_sublanes_total * 128,
+            k,
+            [page_size * bkv_p for bkv_p in num_kv_pages_per_blocks],
+        )
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
@@ -1116,7 +1251,11 @@ def streamindex_topk(
                 chunk_len,
                 out_dtype,
                 tc_group,
+                **(dict(emit_t=True) if emit_t else {}),
             )
+            t_rows = None
+            if emit_t:
+                scores, t_rows = scores
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1126,8 +1265,9 @@ def streamindex_topk(
                 )
 
             if sctopk_l1:
-                # The TensorCore threshold pass joins its own chunk's scoring
-                # group, so it too overlaps the previous chunk's stage 1.
+                # T comes from this chunk's scoring epilogue (`t_rows`), so
+                # stage 1' depends only on its own chunk, like stage 1. The
+                # standalone T pass (t_rows=None) joins the scoring group.
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk_l1(
                     scores,
                     k,
@@ -1137,6 +1277,7 @@ def streamindex_topk(
                     stage2_scheduling_group_id=sc2_group,
                     threshold_scheduling_group_id=tc_group,
                     return_scores=True,
+                    t_rows=t_rows,
                 )
             else:
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
