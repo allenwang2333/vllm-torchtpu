@@ -103,6 +103,7 @@ def kernel(
     interleave_c: int = 1,
     chunk_idx: int = 0,
     emit_t: bool = False,
+    score_bf16_group: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     if emit_t:
@@ -290,6 +291,30 @@ def kernel(
 
         # Prefill. Transpose to head-major if needed.
         rows_hm = bq_rows if head_major else transpose_to_head_major(bq_rows, n_tok)
+        if score_bf16_group:
+            # Grouped bf16 head sum. Mosaic needs a 32-bit matmul accumulator,
+            # so the dot pops f32 and is narrowed to bf16 once; relu, the weight
+            # multiply and a pairwise sum over each group of `score_bf16_group`
+            # heads then run on packed bf16. Each group partial is widened once
+            # and the partials are summed in f32: an all-bf16 final score loses
+            # the top-k ordering near the boundary (8 mantissa bits), a per-term
+            # widen costs more than the packed arithmetic saves.
+            st = qk(rows_hm).astype(jnp.bfloat16).reshape(num_q_heads, n_tok, -1)
+            wb = bq_weights.astype(jnp.bfloat16)
+            zero = jnp.bfloat16(0)
+            acc = None
+            for g0 in range(0, num_q_heads, score_bf16_group):
+                terms = [
+                    jnp.maximum(st[h], zero) * wb[:, h : h + 1]
+                    for h in range(g0, g0 + score_bf16_group)
+                ]
+                while len(terms) > 1:
+                    terms = [
+                        terms[i] + terms[i + 1] for i in range(0, len(terms) - 1, 2)
+                    ] + ([terms[-1]] if len(terms) % 2 else [])
+                part = terms[0].astype(jnp.float32)
+                acc = part if acc is None else acc + part
+            return acc
         st = qk(rows_hm).reshape(num_q_heads, n_tok, -1)
         acc = jnp.maximum(st[0], 0.0) * w[:, 0:1]
         # Loop over heads 1..H-1, accumulating the sum of relu(st[h] * w[:, h]).
@@ -703,6 +728,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "sctopk_l1",
+        "score_bf16_group",
     ),
 )
 def streamindex_topk(
@@ -732,6 +758,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     sctopk_l1: bool = False,
+    score_bf16_group: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -795,6 +822,11 @@ def streamindex_topk(
         threshold, then a threshold-gated SparseCore stage 1) instead of
         `sparsecore_topk`. Same contract; shapes it does not cover run
         `sparsecore_topk`.
+      score_bf16_group: 0 (default) scores in f32. G > 0 runs the prefill
+        scoring kernel's relu/weight/head sum in bf16 within groups of G heads
+        and in f32 across groups. Not bit-exact: it can reorder near-tied
+        scores at the top-k boundary (recall, not identity, is the contract).
+        Decode steps are unchanged.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -805,6 +837,8 @@ def streamindex_topk(
 
     kv_layout = KVLayout.parse(kv_layout)
 
+    if score_bf16_group < 0:
+        raise ValueError(f"score_bf16_group must be >= 0, got {score_bf16_group}.")
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
     if cp_size > 1:
@@ -936,6 +970,11 @@ def streamindex_topk(
         t_init=None,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
+        if score_bf16_group and num_q_heads % score_bf16_group:
+            raise ValueError(
+                f"score_bf16_group={score_bf16_group} must divide the padded head "
+                f"count {num_q_heads}."
+            )
         # Only support batching for decode sequences.
         # TODO: support batching for decode sequences with speculative decoding
         # enabled, e.g. static_q_len = gamma + 1.
@@ -1013,6 +1052,11 @@ def streamindex_topk(
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
                     **(dict(emit_t=True) if emit_t else {}),
+                    **(
+                        dict(score_bf16_group=score_bf16_group)
+                        if score_bf16_group
+                        else {}
+                    ),
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,

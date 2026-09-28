@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_KWRITE_DUS: bool = False
     TPU_STREAMIDX_SCTOPK_L1: bool = False
+    TPU_STREAMIDX_SCORE_BF16_GROUP: int = 0
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -695,6 +696,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # exact local top-k of every slice. Same selection; shapes it does not
     # cover run the default top-k.
     "TPU_STREAMIDX_SCTOPK_L1": env_bool("TPU_STREAMIDX_SCTOPK_L1"),
+    # StreamIndex prefill scoring: 0 (default) sums relu(q.k) * w over the
+    # indexer heads in f32. G > 0 does the relu, weight multiply and head sum in
+    # bf16 within groups of G heads (G must divide the head count; 8 or 16 at
+    # 32 heads) and in f32 across groups. Faster, not bit-exact: near-tied
+    # scores at the top-k boundary can swap.
+    "TPU_STREAMIDX_SCORE_BF16_GROUP": env_nonnegative_int(
+        "TPU_STREAMIDX_SCORE_BF16_GROUP", 0
+    ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
