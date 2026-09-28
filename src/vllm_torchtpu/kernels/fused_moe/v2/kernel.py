@@ -319,20 +319,52 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     return acc
 
 
-def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
+def expert_ffn_fp8(
+    act_q,
+    act_scale,
+    w1,
+    w2,
+    w1s,
+    act_fn="silu",
+    w1b=None,
+    *,
+    w1_ready=None,
+    w1_retired=None,
+    w2_ready=None,
+    w2_retired=None,
+):
     """One expert's FFN on eight-bit weights: the gate/up matmul, the
     activation, the intermediate requantization and the down matmul.
 
     act_q fp8 [m, k] and act_scale f32 [m, 1] are the row-quantized
     activation rows. Returns the down matmul's accumulator and the
     intermediate row scale the caller still has to apply to it.
+
+    w1 and w2 are either the weight arrays or zero-argument readers of them.
+    A reader lets a streamed build land each slab where it is first read:
+    `w1_ready()` runs before the gate/up slab is read and `w2_ready()`
+    before the down slab is, so the down slab's DMA runs under the whole
+    gate/up matmul and activation. `w1_retired()` runs once the gate/up
+    matmul has consumed its slab, which is where the NEXT expert's gate/up
+    slab may start into the same buffer, and `w2_retired()` likewise after
+    the down matmul.
     """
+    if w1_ready is not None:
+        w1_ready()
+    w1 = w1() if callable(w1) else w1
     inter = w1.shape[-1] // 2
     acc1 = lax.dot_general(act_q, w1, DN, preferred_element_type=jnp.float32)
+    if w1_retired is not None:
+        w1_retired()
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
     )
+    if w2_ready is not None:
+        w2_ready()
+    w2 = w2() if callable(w2) else w2
     acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
+    if w2_retired is not None:
+        w2_retired()
     return acc2, mid_scale
 
 
@@ -656,10 +688,19 @@ def _build_fused_ep_moe_kernel(
 
     # Whether each expert's weights are waited by the block that first reads
     # it rather than waiting at the beginning of each expert's visit.
-    # fp4, fp8 expert FFN are running different code paths. This flag can
-    # be activated only for fp4 expert FFN now. But the idea should be
-    # applicable to fp8 expert FFN as well.
-    streams_weights = rhs_packed4
+    # fp4, fp8 expert FFN are running different code paths. The fp4 path
+    # waits per slab at its first contraction block. The fp8 path takes each
+    # slab in one matmul, so it waits the gate/up slab before the gate/up
+    # matmul and the down slab only before the down matmul -- which is what
+    # hides the down slab's DMA under the gate/up matmul and the activation.
+    #
+    # fp8 streams only where the schedule has NO runway (one weight slot):
+    # a build whose VMEM leaves room for a prefetch distance already hides
+    # the refill a visit ahead, and is left exactly as it was. The one-slot
+    # case is the big-expert one (e.g. 36MiB fp8 slabs of hidden 6144 x
+    # inter 2048), where the whole-slab head wait was fully exposed.
+    streams_fp8 = weight_format == host.WeightFormat.FP8 and not prefetches
+    streams_weights = rhs_packed4 or streams_fp8
     # Whether issue async copy the NEXT expert's weights as soon as we finish
     # reading the current expert's weights, instead of at the beginning of the
     # next expert's visit.
@@ -1571,6 +1612,31 @@ def _build_fused_ep_moe_kernel(
                             w2_vm[slot],
                             act_fn=act_fn,
                             w1b=w1b_row,
+                        )
+                    elif streams_fp8:
+                        # One-slot fp8: land each slab where it is first read
+                        # and start the next expert's gate/up slab into the
+                        # same buffer the moment the last tile's gate/up
+                        # matmul retires it, so it streams under this
+                        # expert's down matmul, epilogue and push. The readers
+                        # are closures so the VMEM loads sit AFTER the waits.
+                        first_tile, last_tile = t == 0, t == n_tiles - 1
+                        wait_slab = _slab_waiter(e, slot, first_tile)
+                        acc2, mid_scale = expert_ffn_fp8(
+                            act_rows,
+                            act_scales,
+                            lambda: w1_vm[slot],
+                            lambda: w2_vm[slot],
+                            w1s_vm[pl.ds(slot, 1), :],
+                            act_fn=act_fn,
+                            w1b=w1b_row,
+                            w1_ready=lambda: wait_slab(w1_copy, 0),
+                            w1_retired=(
+                                _start_next_gate_up(visit_i, slot, last_tile)
+                                if starts_next_weights
+                                else None
+                            ),
+                            w2_ready=lambda: wait_slab(w2_copy, 0),
                         )
                     else:
                         acc2, mid_scale = expert_ffn_fp8(
