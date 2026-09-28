@@ -3009,14 +3009,23 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        t = torch.tensor(
-            [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        values = [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)]
+        # Phased profiling: only the engine holding a request steps the
+        # profiler, but a chip's device plane is written by one of the two DP
+        # ranks sharing it. Ride the capture signal on this all-reduce so every
+        # rank opens/closes on the same step. Gated on the env-derived dir,
+        # which every rank shares from startup, so the tensor shape agrees
+        # across ranks and the non-profiling path is unchanged.
+        phased = bool(getattr(self, "phased_profiling_dir", ""))
+        if phased:
+            profiler = self.phase_based_profiler
+            values.append(profiler.capture_signal() if profiler else 0)
+        t = torch.tensor(values, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
+        if phased and self.phase_based_profiler is not None:
+            self.phase_based_profiler.follow(int(t[3].item()))
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         # Every rank reads the same reduced values, so every rank takes the
         # same branch -- which the megakernel's in-kernel collectives require.
