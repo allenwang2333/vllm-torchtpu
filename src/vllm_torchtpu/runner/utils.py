@@ -186,6 +186,10 @@ class PhaseBasedProfiler:
         self.world_size = world_size
         self.profile_context: Any | None = None
         self._canonical_dst_ts: str | None = None
+        # True while this rank captures only because another DP rank does
+        # (see `follow`); such a capture is opened and closed by the DP-wide
+        # signal, never by this rank's own step budget.
+        self._following: bool = False
 
         logger.info(
             "Phase-based profiler enabled. Traces will be saved to: %s",
@@ -270,51 +274,58 @@ class PhaseBasedProfiler:
                     )
                     break
 
-            self.inference_phase_seen[phase] = True
-            self.profiling_n_steps_left = self.num_steps_to_profile_for
-            self.current_phase = phase.name.lower()
-
-            logger.info(f"Starting profiling for {self.current_phase} phase")
-            logger.info(f"Batch composition stats: {batch_composition_stats}")
-            phase_dir = os.path.join(self.profile_dir, self.current_phase)
-            os.makedirs(phase_dir, exist_ok=True)
-
-            self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
-            self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
-                phase_dir, self.worker_rank
-            )
-            os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
-
-            self._write_batch_composition_stats_to_file_helper(batch_composition_stats)
-
-            # Start PyTorch/XLA profiler
-            handler = torch.profiler.tensorboard_trace_handler(
-                dir_name=self.profile_dir_with_phase_suffix, use_gzip=True
-            )
-
-            config = TpuProfilerConfig(
-                run_dir=self.profile_dir_with_phase_suffix,
-                host_tracer_level=self.standard_opts["host_tracer_level"],
-                device_tracer_level=self.standard_opts["device_tracer_level"],
-                python_tracer_level=self.standard_opts["python_tracer_level"],
-                experimental_options=self.advanced_opts,
-            )
-            self.profile_context = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.PrivateUse1,
-                ],
-                on_trace_ready=handler,
-                experimental_config=config,
-            )
-            try:
-                self.profile_context.__enter__()
-            except Exception as e:
-                logger.error("Failed to start PyTorch profiler: %s", e)
-                self.profile_context = None
-                self.current_phase = ""
-                self.profiling_n_steps_left = 0
+            self._open_capture(phase, batch_composition_stats)
             break
+
+    def _open_capture(
+        self, phase: InferencePhase, batch_composition_stats: dict
+    ) -> None:
+        """Opens a capture for `phase`; shared by the own and follower paths."""
+        self.inference_phase_seen[phase] = True
+        self.profiling_n_steps_left = self.num_steps_to_profile_for
+        self.current_phase = phase.name.lower()
+
+        logger.info(f"Starting profiling for {self.current_phase} phase")
+        logger.info(f"Batch composition stats: {batch_composition_stats}")
+        phase_dir = os.path.join(self.profile_dir, self.current_phase)
+        os.makedirs(phase_dir, exist_ok=True)
+
+        self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
+        self.profile_dir_with_phase_suffix = profiler_trace.rank_capture_dir(
+            phase_dir, self.worker_rank
+        )
+        os.makedirs(self.profile_dir_with_phase_suffix, exist_ok=True)
+
+        self._write_batch_composition_stats_to_file_helper(batch_composition_stats)
+
+        # Start PyTorch/XLA profiler
+        handler = torch.profiler.tensorboard_trace_handler(
+            dir_name=self.profile_dir_with_phase_suffix, use_gzip=True
+        )
+
+        config = TpuProfilerConfig(
+            run_dir=self.profile_dir_with_phase_suffix,
+            host_tracer_level=self.standard_opts["host_tracer_level"],
+            device_tracer_level=self.standard_opts["device_tracer_level"],
+            python_tracer_level=self.standard_opts["python_tracer_level"],
+            experimental_options=self.advanced_opts,
+        )
+        self.profile_context = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ],
+            on_trace_ready=handler,
+            experimental_config=config,
+        )
+        try:
+            self.profile_context.__enter__()
+        except Exception as e:
+            logger.error("Failed to start PyTorch profiler: %s", e)
+            self.profile_context = None
+            self.current_phase = ""
+            self.profiling_n_steps_left = 0
+            self._following = False
 
     def _step_or_stop_profiling(self, batch_composition_stats: dict) -> None:
         """Steps or stops the profiler."""
@@ -338,6 +349,7 @@ class PhaseBasedProfiler:
         logger.info(f"Profiling for {self.current_phase} phase finished")
         self.current_phase = ""
         self.profiling_n_steps_left = 0
+        self._following = False
 
     def finish(self) -> None:
         """Force-stops a phase capture in progress.
@@ -383,6 +395,10 @@ class PhaseBasedProfiler:
         # /stop_profile, ignoring max_iterations and filing every later step
         # under the phase that opened it.
         has_scheduled_work = batch_composition_stats["total_num_scheduled_tokens"] > 0
+        if self._following:
+            # A follower capture is driven by `follow`, not by this rank's
+            # own batches.
+            return
         if has_scheduled_work and (
             not have_seen_all_phases or self.current_phase != ""
         ):
@@ -390,6 +406,43 @@ class PhaseBasedProfiler:
                 self._start_profiling(batch_composition_stats)
             else:
                 self._step_or_stop_profiling(batch_composition_stats)
+
+    def capture_signal(self) -> int:
+        """This rank's contribution to the DP-wide capture signal.
+
+        `InferencePhase.value + 1` while a capture this rank opened itself is
+        running, else 0. A follower contributes 0, so the signal drops as
+        soon as every rank that owns a capture has closed it.
+        """
+        if not self.current_phase or self._following:
+            return 0
+        return InferencePhase[self.current_phase.upper()].value + 1
+
+    def follow(self, dp_signal: int) -> None:
+        """Mirror the DP-wide capture signal (MAX of `capture_signal`).
+
+        Only the DP engine holding a request steps `step`; idle engines run
+        dummy forwards. Two DP ranks share a chip, and the device plane is
+        written by only one of them, so an idle rank must capture whenever a
+        busy rank does or its chip's device trace is lost. Called once per
+        DP-synchronized step on every rank, after the busy ranks' `step`, so
+        followers open and close on the same step as the owner.
+        """
+        if self.current_phase and not self._following:
+            return  # this rank owns a capture of its own
+        want = InferencePhase(dp_signal - 1) if dp_signal > 0 else None
+        if self._following:
+            if want is not None and self.current_phase == want.name.lower():
+                self._write_batch_composition_stats_to_file_helper(
+                    {"dp_follower": True, "phase": want.name}
+                )
+                return
+            self._finish_current_phase()
+        if want is None:
+            return
+        self._open_capture(want, {"dp_follower": True, "phase": want.name})
+        if self.current_phase:
+            self._following = True
 
 
 # (dtype, shape) -> minor_to_major, for buffers whose device layout is not

@@ -576,3 +576,61 @@ def test_merge_profile_directories_multiworker(tmp_path):
         ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def test_phased_profiler_idle_dp_rank_follows_the_busy_rank(profiler_fixture):
+    """An idle DP rank must capture exactly while the busy rank does.
+
+    Regression (j-60e03ae0): at max-num-seqs=1 on DP16 only the engine holding
+    the request steps the profiler; idle engines run dummy forwards. The chip's
+    device plane is written by the even rank of the pair, which never armed, so
+    the capture was host-only. The runner now MAX-reduces `capture_signal` on
+    the per-step DP all-reduce and every rank calls `follow` with the result.
+    """
+    owner = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_context = profiler_fixture["mock_context"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+    follower = PhaseBasedProfiler(
+        profile_dir=owner.profile_dir,
+        worker_rank=4,
+        world_size=16,
+        standard_opts=owner.standard_opts,
+        advanced_opts=owner.advanced_opts,
+    )
+
+    stats = {"num_reqs": 1, "total_num_scheduled_tokens": 1024, "min_kv_len": 0}
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+
+    def dp_step():
+        owner.step(stats)  # only the busy engine reaches execute_model's step
+        signal = max(owner.capture_signal(), follower.capture_signal())
+        owner.follow(signal)
+        follower.follow(signal)
+
+    dp_step()
+    assert owner.current_phase == follower.current_phase == "prefill_only"
+    assert mock_profile.call_count == 2
+    assert follower.capture_signal() == 0  # a follower never keeps it alive
+    assert follower.inference_phase_seen[InferencePhase.PREFILL_ONLY]
+
+    # The follower's own (idle) steps and batches never close its capture.
+    follower.step({"num_reqs": 0, "total_num_scheduled_tokens": 0})
+    for _ in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR - 1):
+        dp_step()
+        assert follower.current_phase == "prefill_only"
+    assert mock_context.__exit__.call_count == 0
+
+    # The owner's budget runs out; the follower closes on the same step.
+    dp_step()
+    assert owner.current_phase == follower.current_phase == ""
+    assert mock_context.__exit__.call_count == 2
+    assert not follower._following
+
+
+def test_phased_profiler_follow_zero_signal_is_a_noop(profiler_fixture):
+    profiler = profiler_fixture["profiler"]
+    profiler.follow(0)
+    profiler_fixture["mock_profile"].assert_not_called()
+    assert profiler.current_phase == ""
+    assert profiler.capture_signal() == 0
