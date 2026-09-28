@@ -479,10 +479,32 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 8))
+        try:
+            import torch.distributed as dist
+            global_rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else local_rank
+            world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else local_world_size
+        except Exception:
+            global_rank = local_rank
+            world_size = local_world_size
         range_entry_list = list(self.range_entries.values())
         local_cache_dir = self.compilation_config.local_cache_dir
         if local_cache_dir:
             os.makedirs(local_cache_dir, exist_ok=True)
+
+        barrier_dir = None
+        ready_file = None
+        if self.compilation_config.cache_dir:
+            barrier_dir = os.path.join(
+                self.compilation_config.cache_dir,
+                f"barrier_subgraph_{self.piecewise_compile_index}",
+            )
+            try:
+                os.makedirs(barrier_dir, exist_ok=True)
+                ready_file = os.path.join(barrier_dir, f"rank_{global_rank}.ready")
+                if os.path.exists(ready_file):
+                    os.remove(ready_file)
+            except Exception:
+                pass
 
         def _get_key_and_args(range_entry):
             compile_range = range_entry.compile_range
@@ -677,20 +699,53 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         # Step 4: Synchronize all ranks across hosts before returning to avoid
         # fast ranks proceeding to _dummy_run while peer ranks are still compiling.
-        try:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
+        # We use a file-based barrier on the shared compile cache filesystem instead of
+        # dist.barrier() because dist.barrier() on TPU executes an in-graph XLA
+        # all-reduce requiring >9GB device HBM, causing device buffer allocation OOMs
+        # when HBM is tightly allocated for weights and KV cache.
+        if barrier_dir and ready_file:
+            try:
+                with open(ready_file, "w") as f:
+                    f.write(f"rank={global_rank} pid={os.getpid()} time={time.time()}\n")
                 logger.info(
-                    "[TPU_PARALLEL_PRECOMPILE] Rank %d waiting at dist.barrier()...",
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d (global %d/%d) waiting at file barrier (%s)...",
                     local_rank,
+                    global_rank,
+                    world_size,
+                    barrier_dir,
                 )
-                dist.barrier()
-                logger.info(
-                    "[TPU_PARALLEL_PRECOMPILE] Rank %d passed dist.barrier().",
+                barrier_start = time.time()
+                while time.time() - barrier_start < 1800:
+                    try:
+                        ready_files = [
+                            f for f in os.listdir(barrier_dir)
+                            if f.startswith("rank_") and f.endswith(".ready")
+                        ]
+                        if len(ready_files) >= world_size:
+                            logger.info(
+                                "[TPU_PARALLEL_PRECOMPILE] Rank %d (global %d) passed file barrier (%d/%d ready).",
+                                local_rank,
+                                global_rank,
+                                len(ready_files),
+                                world_size,
+                            )
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1)
+            except Exception as e:
+                logger.warning(
+                    "[TPU_PARALLEL_PRECOMPILE] Rank %d file barrier error: %s",
                     local_rank,
+                    e,
                 )
-        except Exception as e:
-            logger.warning("[TPU_PARALLEL_PRECOMPILE] Rank %d barrier failed: %s", local_rank, e)
+        else:
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+            except Exception as e:
+                logger.warning("[TPU_PARALLEL_PRECOMPILE] Rank %d fallback barrier failed: %s", local_rank, e)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
