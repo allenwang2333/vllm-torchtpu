@@ -923,11 +923,6 @@ class TPUModelRunner(GPUModelRunner):
                 raise ValueError(
                     "DSpark PD producer currently requires sync scheduling."
                 )
-            if self.cache_config.enable_prefix_caching:
-                raise ValueError(
-                    "DSpark PD producer prefix caching requires joint target/context "
-                    "cache recovery; disable prefix caching for the initial path."
-                )
             if (
                 self.parallel_config.data_parallel_size != 1
                 or self.parallel_config.pipeline_parallel_size != 1
