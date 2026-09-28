@@ -6,6 +6,7 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -13,6 +14,7 @@ import importlib.util
 import json
 import os
 import pickle
+import sys
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -28,10 +30,65 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import rank_share, shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _patch_torchtpu_backend_serialization() -> None:
+    """Backport two TorchTPU compile-backend fixes onto older releases.
+
+    1. ``make_backend_compiler`` (google-pytorch/torch_tpu#3535): return
+       ``StaticCompiler`` directly when
+       ``TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS`` is disabled.
+       Wrapping it in ``SplitCompiler`` pickles the full pre- and post-split FX
+       ``GraphModule`` into every cached entry, and unpickling a
+       ``_SplitCompiledExecutable`` outside ``FakeTensorMode`` re-traces the
+       graph in eager ``DEFER_AND_FUSE`` mode on ``tpu:0``.
+    2. ``_serialization_context``: when ``AOTAutogradCache`` is disabled
+       (``aot_config.cache_info is None``), TorchTPU injects a synthetic
+       ``torchtpu_<hash>`` key so ``_cache_inference_info`` builds and returns
+       the bundled entry for ``.serialize()``. Skip ``AOTAutogradCache.save``
+       for that synthetic key so the entry is not pickled a second time into
+       ``/tmp/torchinductor_root/aotautograd`` where ``try_load`` never reads
+       it.
+    """
+    backend_mod = sys.modules.get("torch_tpu._internal.compile._backend")
+    original_make_compiler = getattr(backend_mod, "make_backend_compiler", None)
+    if original_make_compiler is not None and not getattr(
+        original_make_compiler, "_tpu_skip_split_compiler_patch", False
+    ):
+
+        def make_backend_compiler(*args: Any, **kwargs: Any):
+            result = original_make_compiler(*args, **kwargs)
+            materialize = (
+                os.getenv("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "true")
+                .strip()
+                .lower()
+            )
+            if materialize in ("0", "false", "no", "off"):
+                return getattr(result, "base_compiler", result)
+            return result
+
+        make_backend_compiler._tpu_skip_split_compiler_patch = True
+        backend_mod.make_backend_compiler = make_backend_compiler
+
+    from torch._functorch._aot_autograd import autograd_cache
+
+    original_save = autograd_cache.AOTAutogradCache.save
+    if not getattr(original_save, "_tpu_skip_synthetic_save_patch", False):
+
+        def save(key: str, entry: Any, remote: bool = False) -> None:
+            if isinstance(key, str) and key.startswith("torchtpu_"):
+                return
+            original_save(key, entry, remote=remote)
+
+        save._tpu_skip_synthetic_save_patch = True
+        autograd_cache.AOTAutogradCache.save = staticmethod(save)
+
+
+_patch_torchtpu_backend_serialization()
 
 
 @dataclasses.dataclass
@@ -77,6 +134,13 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
         deserialize_bundled_cache_entry,
     )
 
+    # `deserialize_bundled_cache_entry` starts with `deepcopy(entry)` so the
+    # returned runnable can be `.serialize()`d again. For a TorchTPU entry that
+    # round-trips the PjRt binary through `load_serialized_executable` a second
+    # time, pinning a duplicate executable in HBM on `compiled_fn.serialize`.
+    # A replayed artifact is already on disk and never re-serialized.
+    with contextlib.suppress(AttributeError, TypeError):
+        entry.__deepcopy__ = lambda _memo: None
     return deserialize_bundled_cache_entry(entry)
 
 
@@ -98,6 +162,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    # Decides which rank compiles a bucket, not what the bucket compiles to.
+    "TPU_PRECOMPILE_SHARE_BUCKETS",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -329,6 +395,21 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
 
 # TODO(geyuhao): Switch this cache-key hashing to upstream vllm.ir.util.hash_source
 # once our local vLLM checkout exposes that helper.
+def _output_node(graph: fx.GraphModule) -> fx.Node | None:
+    for node in graph.graph.nodes:
+        if node.op == "output":
+            return node
+    return None
+
+
+def _needs_tuple_output(graph: fx.GraphModule) -> bool:
+    """Whether `graph` returns a single value that aot_autograd needs wrapped."""
+    output_node = _output_node(graph)
+    return output_node is not None and not isinstance(
+        output_node.args[0], (tuple, list)
+    )
+
+
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     """Wrap a graph module to return a tuple if it returns a single tensor.
 
@@ -337,22 +418,14 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 
     Returns (wrapped_graph, was_wrapped).
     """
-    output_node = None
-    for node in graph.graph.nodes:
-        if node.op == "output":
-            output_node = node
-            break
-
-    if output_node is None:
+    if not _needs_tuple_output(graph):
         return graph, False
 
-    output_args = output_node.args[0]
-    if isinstance(output_args, (tuple, list)):
-        return graph, False
-
+    output_node = _output_node(graph)
+    assert output_node is not None
     # Single return value — wrap in a tuple
     with graph.graph.inserting_before(output_node):
-        output_node.args = ((output_args,),)
+        output_node.args = ((output_node.args[0],),)
     graph.graph.lint()
     graph.recompile()
     return graph, True
@@ -570,6 +643,11 @@ class TpuCompilerAdaptor(CompilerInterface):
             if elsewhere is not None:
                 return elsewhere, None
 
+        was_wrapped = _needs_tuple_output(graph)
+        adopted = self._adopt_peer_artifact(key, graph, was_wrapped, compile_range)
+        if adopted is not None:
+            return adopted
+
         logger.info(
             "[TpuCompilerAdaptor] Compiling FX graph for range %s",
             compile_range,
@@ -615,6 +693,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                 "it will be recompiled on the next start",
                 compile_range,
             )
+        # Peers waiting on this bucket replay the artifact just saved, or
+        # compile the bucket themselves if there is none (see rank_share).
+        rank_share.publish(handle[1] if handle is not None else None)
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -622,6 +703,40 @@ class TpuCompilerAdaptor(CompilerInterface):
         if key is not None and size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
+
+    def _adopt_peer_artifact(
+        self,
+        key: str | None,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        compile_range: Range,
+    ) -> tuple[Callable[..., Any], Any] | None:
+        """Replay the artifact a peer rank compiled for this bucket, if any.
+
+        Returns what `compile` returns, or None to compile here. The artifact
+        is hard-linked into this rank's cache directory, so the handle vLLM
+        records points at this rank's own copy, as if it had compiled it.
+        """
+        if key is None or self.cache_dir is None or self._disable_cache:
+            return None
+        peer_path = rank_share.peer_artifact()
+        if peer_path is None:
+            return None
+        compiled_fn = self._replay(peer_path, graph, was_wrapped)
+        if compiled_fn is None:
+            return None
+        path = rank_share.link(peer_path, os.path.join(self.cache_dir, key))
+        rank_share.replayed()
+        logger.info(
+            "[TpuCompilerAdaptor] Replayed range %s from a peer's artifact %s",
+            compile_range,
+            peer_path,
+        )
+        if was_wrapped:
+            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+        if _single_size(compile_range) is not None:
+            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+        return compiled_fn, (key, path, was_wrapped)
 
     def load(
         self,
@@ -657,13 +772,11 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
-        # artifact is checked against is shaped the way it was when saved.
-        graph = copy.deepcopy(graph)
-        graph, was_wrapped = _ensure_tuple_output(graph)
-
+        was_wrapped = _needs_tuple_output(graph)
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
+            graph = copy.deepcopy(graph)
+            graph, was_wrapped = _ensure_tuple_output(graph)
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.

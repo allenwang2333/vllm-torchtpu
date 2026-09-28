@@ -456,7 +456,6 @@ def _patch_vllm_compile_all_ranges() -> None:
 
     Compilation rotation allows vllm to compile multiple sizes at the same time,
     which greatly reduce the vllm startup time.
-
     Each bucket's FX/AOT/MLIR trace allocates millions of short-lived objects
     that promote into generation 2 mid-compile and trigger multi-second full GC
     scans across the model and every bucket compiled so far. Freezing the
@@ -464,6 +463,10 @@ def _patch_vllm_compile_all_ranges() -> None:
     loop (while reference counting still frees non-cyclic temporaries), and
     running a single collection + freeze at the end avoids both mid-loop full
     scans and redundant multi-generation rescans of the model heap.
+
+    On top of that, the ranks of a host split the buckets: a bucket another
+    rank claimed is not compiled here but replayed from that rank's artifact
+    once it is published (see vllm_torchtpu.compilation.rank_share).
     """
     import gc
     import os
@@ -474,6 +477,8 @@ def _patch_vllm_compile_all_ranges() -> None:
         create_concrete_args,
         get_fake_args_from_graph,
     )
+
+    from vllm_torchtpu.compilation import rank_share
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -493,10 +498,35 @@ def _patch_vllm_compile_all_ranges() -> None:
         d.rotate(-local_rank * (len(d) // 8))
         indexes = list(d)
 
+        def compile_range(range_entry) -> None:
+            self._log_compile_start(range_entry.compile_range)
+
+            if range_entry.compile_range.is_single_size():
+                args_list = create_concrete_args(
+                    self.graph, range_entry.compile_range.start
+                )
+            else:
+                args_list = get_fake_args_from_graph(self.graph)
+
+            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                self.graph,
+                args_list,
+                self.vllm_backend.inductor_config,
+                self.compilation_config,
+                compile_range=range_entry.compile_range,
+                graph_index=self.piecewise_compile_index,
+                num_graphs=self.total_piecewise_compiles,
+                is_encoder=self.vllm_backend.is_encoder,
+            )
+
+            range_entry.compiled = True
+
         was_gc_enabled = gc.isenabled()
         gc.freeze()
         gc.disable()
         try:
+            session = rank_share.open_session(self.graph)
+            claimed_by_peers = []
             for i in indexes:
                 if i >= len(range_entry_list):
                     continue
@@ -506,27 +536,29 @@ def _patch_vllm_compile_all_ranges() -> None:
                 if range_entry.compiled:
                     continue
 
-                self._log_compile_start(range_entry.compile_range)
+                cr = range_entry.compile_range
+                bucket = f"{self.piecewise_compile_index}/{cr.start}_{cr.end}"
+                if session is not None and not session.claim(bucket):
+                    claimed_by_peers.append((bucket, range_entry))
+                    continue
+                with rank_share.compiling(session, bucket):
+                    compile_range(range_entry)
 
-                if range_entry.compile_range.is_single_size():
-                    args_list = create_concrete_args(
-                        self.graph, range_entry.compile_range.start
-                    )
-                else:
-                    args_list = get_fake_args_from_graph(self.graph)
+            # Only after this rank's own claims, so no rank waits while holding one.
+            for bucket, range_entry in rank_share.as_published(
+                session, claimed_by_peers
+            ):
+                with rank_share.compiling(session, bucket):
+                    compile_range(range_entry)
 
-                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                    self.graph,
-                    args_list,
-                    self.vllm_backend.inductor_config,
-                    self.compilation_config,
-                    compile_range=range_entry.compile_range,
-                    graph_index=self.piecewise_compile_index,
-                    num_graphs=self.total_piecewise_compiles,
-                    is_encoder=self.vllm_backend.is_encoder,
+            if session is not None:
+                logger.info(
+                    "[bucket-share] Subgraph %d: compiled %d bucket(s), replayed %d "
+                    "from peers",
+                    self.piecewise_compile_index,
+                    session.compiled,
+                    session.replayed,
                 )
-
-                range_entry.compiled = True
         finally:
             if was_gc_enabled:
                 gc.enable()
@@ -1362,11 +1394,12 @@ if "proxy" in envs.JAX_PLATFORMS:
         import traceback
 
         import pathwaysutils
-        import vllm
         from vllm.platforms import (
             resolve_current_platform_cls_qualname,
             resolve_obj_by_qualname,
         )
+
+        import vllm
 
         pathwaysutils.initialize()
         logger.info("Module pathwaysutils is imported.")

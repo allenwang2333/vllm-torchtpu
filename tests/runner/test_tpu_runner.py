@@ -1574,10 +1574,8 @@ def test_spec_token_room_guard_caps_writes_at_context_limit():
         requests={},
     )
     calls = []
-    runner.input_batch.update_req_spec_token_ids = (
-        lambda request, scheduled: calls.append(
-            (request.req_id, list(scheduled[request.req_id]))
-        )
+    runner.input_batch.update_req_spec_token_ids = lambda request, scheduled: (
+        calls.append((request.req_id, list(scheduled[request.req_id])))
     )
     TPUModelRunner._install_spec_token_room_guard(runner)
 
@@ -2022,3 +2020,66 @@ class TestAsyncSpecDecodeTokenAccounting:
             num_draft_per_req={1: 3},
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
+
+
+def test_rotate_for_parallel_precompile_distributes_initial_buckets(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner.tpu_runner import _rotate_for_parallel_precompile
+
+    monkeypatch.setattr(envs, "TPU_PARALLEL_PRECOMPILE", True)
+    buckets = list(range(15))
+    first_buckets = set()
+    for rank in range(8):
+        monkeypatch.setenv("LOCAL_RANK", str(rank))
+        rotated = _rotate_for_parallel_precompile(buckets)
+        assert sorted(rotated) == buckets
+        first_buckets.add(rotated[0])
+    assert len(first_buckets) == 8
+
+
+def test_precompile_compute_selected_logits_decouples_lm_head_and_uses_no_grad(
+    monkeypatch,
+):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_PARALLEL_PRECOMPILE", True)
+    monkeypatch.setenv("LOCAL_RANK", "3")
+
+    select_calls: list[tuple[int, int, bool]] = []
+    logits_calls: list[tuple[int, bool]] = []
+
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        model_config=SimpleNamespace(get_hidden_size=lambda: 16),
+        num_tokens_paddings=[4, 8, 16, 24, 32, 64],
+        num_reqs_paddings=[4, 8],
+        max_num_reqs=8,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        _pcp_enabled=False,
+        _mtp_enabled=True,
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.bfloat16,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        _select_hidden_states=lambda h, idx: (
+            select_calls.append((h.shape[0], idx.shape[0], torch.is_grad_enabled()))
+            or h.index_select(0, idx)
+        ),
+        compute_logits_from_hidden_states=lambda h: (
+            logits_calls.append((h.shape[0], torch.is_grad_enabled())) or h
+        ),
+    )
+
+    TPUModelRunner._precompile_compute_selected_logits(runner)
+
+    # compute_logits_from_hidden_states is compiled only once per index size
+    # (including spec-decode padded_logits_length buckets up to 8*(3+1)=32),
+    # in lockstep order, and under torch.no_grad().
+    assert logits_calls == [
+        (4, False),
+        (8, False),
+        (16, False),
+        (24, False),
+        (32, False),
+    ]
+    assert all(not grad_enabled for _, _, grad_enabled in select_calls)
+    assert len(select_calls) == 1 + 2 + 3 + 4 + 5 + 5

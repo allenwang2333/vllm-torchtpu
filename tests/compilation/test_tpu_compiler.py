@@ -448,3 +448,33 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    def test_torchtpu_backend_serialization_patches(self, monkeypatch):
+        """Verify that SplitCompiler is bypassed when collective materialization
+        is off and synthetic torchtpu_ AOTAutogradCache saves are skipped."""
+        from torch._functorch._aot_autograd import autograd_cache
+        from torch_tpu._internal.compile import _backend
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        base = object()
+        split = SimpleNamespace(base_compiler=base)
+        monkeypatch.setattr(_backend, "make_backend_compiler", lambda *a, **kw: split)
+        tpu_compiler._patch_torchtpu_backend_serialization()
+
+        monkeypatch.setenv("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+        assert _backend.make_backend_compiler([]) is base
+
+        monkeypatch.setenv("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "true")
+        assert _backend.make_backend_compiler([]) is split
+
+        saved = []
+        monkeypatch.setattr(
+            autograd_cache.AOTAutogradCache,
+            "save",
+            staticmethod(lambda key, entry, remote=False: saved.append(key)),
+        )
+        tpu_compiler._patch_torchtpu_backend_serialization()
+        autograd_cache.AOTAutogradCache.save("torchtpu_deadbeef", "entry")
+        autograd_cache.AOTAutogradCache.save("real_key", "entry")
+        assert saved == ["real_key"]

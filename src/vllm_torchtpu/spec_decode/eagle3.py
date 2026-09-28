@@ -1772,7 +1772,10 @@ class Eagle3Proposer:
                 logger.info("  -- drafter combine num_tokens: %d", num_tokens)
 
     def _precompile_draft_seed(self) -> None:
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+        from vllm_torchtpu.runner.tpu_runner import (
+            _get_padded_token_len,
+            _rotate_for_parallel_precompile,
+        )
 
         runner = self.runner
         # input_ids length = first-pass token bucket; index length = p =
@@ -1786,16 +1789,16 @@ class Eagle3Proposer:
             set(runner.num_reqs_paddings)
             | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
         )
+        buckets = [
+            (T, p) for T in runner.num_tokens_paddings for p in idx_sizes if p <= T
+        ]
         with runner._precompile_timed("drafter seed_input_ids"):
-            for T in runner.num_tokens_paddings:
-                for p in idx_sizes:
-                    if p > T:
-                        continue
-                    ids = torch.zeros(T, dtype=torch.int32, device=runner.device)
-                    lti = torch.zeros(p, dtype=torch.int64, device=runner.device)
-                    nti = torch.zeros(p, dtype=torch.int32, device=runner.device)
-                    out = self._draft_seed_input_ids(ids, lti, nti)
-                    synchronize_tensors(out)
+            for T, p in _rotate_for_parallel_precompile(buckets):
+                ids = torch.zeros(T, dtype=torch.int32, device=runner.device)
+                lti = torch.zeros(p, dtype=torch.int64, device=runner.device)
+                nti = torch.zeros(p, dtype=torch.int32, device=runner.device)
+                out = self._draft_seed_input_ids(ids, lti, nti)
+                synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
