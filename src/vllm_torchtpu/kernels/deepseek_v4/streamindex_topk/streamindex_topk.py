@@ -32,6 +32,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     config,
     metadata,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.sctopk_l1 import (
+    sparsecore_topk_l1,
+)
 
 MlaCase = config.MlaCase
 KVLayout = config.KVLayout
@@ -619,6 +622,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "sctopk_l1",
     ),
 )
 def streamindex_topk(
@@ -647,6 +651,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    sctopk_l1: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -706,6 +711,10 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      sctopk_l1: select with `sctopk_l1.sparsecore_topk_l1` (a TensorCore row
+        threshold, then a threshold-gated SparseCore stage 1) instead of
+        `sparsecore_topk`. Same contract; shapes it does not cover run
+        `sparsecore_topk`.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -1116,15 +1125,29 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
-            chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                scores,
-                k,
-                row_lengths=eff_row_lengths[start : start + chunk_len],
-                write_empty_rows=True,
-                scheduling_group_id=sc_group,
-                stage2_scheduling_group_id=sc2_group,
-                return_scores=True,
-            )
+            if sctopk_l1:
+                # The TensorCore threshold pass joins its own chunk's scoring
+                # group, so it too overlaps the previous chunk's stage 1.
+                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk_l1(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    stage2_scheduling_group_id=sc2_group,
+                    threshold_scheduling_group_id=tc_group,
+                    return_scores=True,
+                )
+            else:
+                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    stage2_scheduling_group_id=sc2_group,
+                    return_scores=True,
+                )
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)

@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_KWRITE_DUS: bool = False
+    TPU_STREAMIDX_SCTOPK_L1: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -688,6 +689,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill size the row scatter makes XLA relayout the whole uint8 cache
     # and back on every call. Bitwise-identical result.
     "TPU_STREAMIDX_KWRITE_DUS": env_bool("TPU_STREAMIDX_KWRITE_DUS"),
+    # StreamIndex top-k: compute a per-row lower bound on the k-th score on the
+    # TensorCore, and have SparseCore stage 1 keep only the scores above it
+    # (falling back to the radix per slice when too many survive) instead of an
+    # exact local top-k of every slice. Same selection; shapes it does not
+    # cover run the default top-k.
+    "TPU_STREAMIDX_SCTOPK_L1": env_bool("TPU_STREAMIDX_SCTOPK_L1"),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

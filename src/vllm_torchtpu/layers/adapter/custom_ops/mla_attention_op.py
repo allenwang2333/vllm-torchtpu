@@ -311,6 +311,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         kwrite_dus = envs.TPU_STREAMIDX_KWRITE_DUS
+        sctopk_l1 = envs.TPU_STREAMIDX_SCTOPK_L1
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -354,6 +355,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 chunk_tokens=chunk_tokens,
+                sctopk_l1=sctopk_l1,
             )
             return cache_kv, topk_indices
 
