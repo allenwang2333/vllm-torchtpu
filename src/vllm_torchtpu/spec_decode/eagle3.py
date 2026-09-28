@@ -1218,12 +1218,39 @@ class Eagle3Proposer:
                         [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
                     )
                 )
-            # Chunks the fused program served; the step loop skips them. The
-            # loop is step-major only for IndexShare's shared top-k buffer,
-            # which the fused program never runs with, so running each chunk's
-            # steps back to back here is equivalent.
-            fused_chunks: set[int] = set()
+
+            def run_draft_step(ci: int, step: int) -> None:
+                """One separate draft step for chunk `ci`: a draft forward
+                and an lm-head + argmax, each its own dispatch."""
+                chunk = chunks[ci]
+                if self.advance_draft_positions:
+                    loop_positions[ci] = loop_positions[ci] + 1
+                # Prev step's [p] tokens feed directly — already bucketed.
+                loop_input_ids = draft_tokens_per_chunk[ci][-1]
+                last_hidden, hidden = self._forward_draft(
+                    chunk=chunk,
+                    input_ids=loop_input_ids,
+                    positions=loop_positions[ci],
+                    target_hidden_states=loop_hidden[ci],
+                    step_idx=step,
+                    seq_lens_delta=(step if self.advance_draft_positions else 0),
+                    num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
+                    num_tokens_padded=padded_nr_per_chunk[ci],
+                    num_rejected_dev=rejected_dev_per_chunk[ci],
+                    loop_query_start_loc=loop_qsl_per_chunk[ci],
+                    loop_request_distribution=loop_reqdist_per_chunk[ci],
+                )
+                with set_model_tag("eagle_head"):
+                    draft_tokens_per_chunk[ci].append(
+                        self._draft_propose_token(last_hidden)
+                    )
+                loop_hidden[ci] = hidden
+
             if self._mtp_fused_loop is not None and not runner._dp_lockstep_enabled():
+                # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
+                # is fine here: the separate path is step-major only for
+                # IndexShare's shared top-k buffer, which the fused program
+                # never runs with.
                 for ci, chunk in enumerate(chunks):
                     fused = self._run_mtp_fused_loop(
                         chunk=chunk,
@@ -1237,40 +1264,23 @@ class Eagle3Proposer:
                     )
                     if fused is not None:
                         draft_tokens_per_chunk[ci].extend(fused)
-                        fused_chunks.add(ci)
-            for step in range(1, K):
-                for ci, chunk in enumerate(chunks):
-                    if ci in fused_chunks:
                         continue
-                    if self._share_mtp_indices:
-                        # The loop is step-major, so chunks interleave and each
-                        # one finds the buffer holding its predecessor's rows.
-                        # Restore unconditionally: one rule, no dependence on
-                        # the chunk count. With a single chunk this is a
-                        # self-copy of a few hundred KiB.
-                        self._mtp_restore_topk(saved_topk_per_chunk[ci])
-                    if self.advance_draft_positions:
-                        loop_positions[ci] = loop_positions[ci] + 1
-                    # Prev step's [p] tokens feed directly — already bucketed.
-                    loop_input_ids = draft_tokens_per_chunk[ci][-1]
-                    last_hidden, hidden = self._forward_draft(
-                        chunk=chunk,
-                        input_ids=loop_input_ids,
-                        positions=loop_positions[ci],
-                        target_hidden_states=loop_hidden[ci],
-                        step_idx=step,
-                        seq_lens_delta=(step if self.advance_draft_positions else 0),
-                        num_rejected_np=(None if is_async else rejected_per_chunk[ci]),
-                        num_tokens_padded=padded_nr_per_chunk[ci],
-                        num_rejected_dev=rejected_dev_per_chunk[ci],
-                        loop_query_start_loc=loop_qsl_per_chunk[ci],
-                        loop_request_distribution=loop_reqdist_per_chunk[ci],
-                    )
-                    with set_model_tag("eagle_head"):
-                        draft_tokens_per_chunk[ci].append(
-                            self._draft_propose_token(last_hidden)
-                        )
-                    loop_hidden[ci] = hidden
+                    # This chunk's metadata doesn't fit the program.
+                    for step in range(1, K):
+                        run_draft_step(ci, step)
+            else:
+                # Separate: one draft forward and one lm-head per step.
+                for step in range(1, K):
+                    for ci in range(len(chunks)):
+                        if self._share_mtp_indices:
+                            # The loop is step-major, so chunks interleave and
+                            # each one finds the buffer holding its
+                            # predecessor's rows. Restore unconditionally: one
+                            # rule, no dependence on the chunk count. With a
+                            # single chunk this is a self-copy of a few
+                            # hundred KiB.
+                            self._mtp_restore_topk(saved_topk_per_chunk[ci])
+                        run_draft_step(ci, step)
 
         # EP-DP lockstep: pad this rank's draft-forward count up to the
         # step's coordinated chunk bound so ranks with fewer chunks still
