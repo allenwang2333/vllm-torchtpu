@@ -3495,7 +3495,7 @@ class TPUModelRunner(GPUModelRunner):
         independent request streams, so they decorrelate, which is fine.)
         """
         if self._sampling_generator is None:
-            gen = torch.Generator(device=self.device)
+            gen = torch.Generator(device="cpu")
             gen.manual_seed(int(self.model_config.seed or 0))
             self._sampling_generator = gen
         return self._sampling_generator
@@ -3695,12 +3695,17 @@ class TPUModelRunner(GPUModelRunner):
             if all_greedy:
                 bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
             else:
+                bonus_logits = bonus_logits.contiguous()
                 req_temperatures, req_top_k, req_top_p = (
                     self._build_padded_sampling_params(
                         cur_start_idx, cur_end_idx, bonus_logits
                     )
                 )
-                bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
+                bonus_u = torch.rand(
+                    bonus_logits.shape,
+                    dtype=bonus_logits.dtype,
+                    generator=sampling_generator,
+                ).to(self.device)
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -3714,9 +3719,8 @@ class TPUModelRunner(GPUModelRunner):
             accept_u = torch.rand(
                 md.draft_token_ids.shape,
                 dtype=torch.float32,
-                device=target_logits.device,
                 generator=sampling_generator,
-            )
+            ).to(self.device)
         if all_greedy:
             return self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
@@ -3729,9 +3733,12 @@ class TPUModelRunner(GPUModelRunner):
                 accept_u=accept_u,
             )
         assert accept_u is not None
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
-        )
+        target_logits = target_logits.contiguous()
+        recover_u = torch.rand(
+            target_logits.shape,
+            dtype=torch.float32,
+            generator=sampling_generator,
+        ).to(self.device)
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -3848,6 +3855,7 @@ class TPUModelRunner(GPUModelRunner):
                             cur_start_idx,
                             cur_end_idx,
                         )
+                    logits = logits.contiguous()
                     if all_greedy:
                         selected = self._greedy_sample(logits)
                     else:
@@ -3856,7 +3864,11 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, logits
                             )
                         )
-                        u = torch.rand_like(logits, generator=sampling_generator)
+                        u = torch.rand(
+                            logits.shape,
+                            dtype=logits.dtype,
+                            generator=sampling_generator,
+                        ).to(self.device)
                         selected = self.sample_from_logits_func(
                             logits,
                             temperatures_tpu,
@@ -3892,6 +3904,7 @@ class TPUModelRunner(GPUModelRunner):
             for logits, num_reqs, mamba_indices in zip(
                 state.logits_list, state.num_reqs_list, mamba_idx_list
             ):
+                logits = logits.contiguous()
                 cur_end_idx = cur_start_idx + num_reqs
                 # Non-spec step (prefill / plain decode): reset the mamba
                 # read offsets so the next step resumes from the group base.
@@ -3908,7 +3921,11 @@ class TPUModelRunner(GPUModelRunner):
                             cur_start_idx, cur_end_idx, logits
                         )
                     )
-                    u = torch.rand_like(logits, generator=sampling_generator)
+                    u = torch.rand(
+                        logits.shape,
+                        dtype=logits.dtype,
+                        generator=sampling_generator,
+                    ).to(self.device)
                     selected_token_ids = self.sample_from_logits_func(
                         logits,
                         temperatures_tpu,
@@ -6096,9 +6113,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            temps_cpu.unsqueeze(1).contiguous().to(logits.device, non_blocking=True),
+            top_k_cpu.unsqueeze(1).contiguous().to(logits.device, non_blocking=True),
+            top_p_cpu.unsqueeze(1).contiguous().to(logits.device, non_blocking=True),
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
