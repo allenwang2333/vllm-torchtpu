@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_KWRITE_DUS: bool = False
+    TPU_STREAMIDX_OVERLAP_S2: int = 0
     TPU_STREAMIDX_SCTOPK_L1: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -689,6 +690,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill size the row scatter makes XLA relayout the whole uint8 cache
     # and back on every call. Bitwise-identical result.
     "TPU_STREAMIDX_KWRITE_DUS": env_bool("TPU_STREAMIDX_KWRITE_DUS"),
+    # StreamIndex top-k scheduling, a bit mask (0 = default program). Bit 0
+    # runs each chunk's SparseCore stage 2 and gather under later chunks'
+    # scoring instead of after the last one; bit 1 gathers the winners from
+    # stage 1's flat output instead of relaying out every candidate. 3 = both.
+    # Bitwise-identical result.
+    "TPU_STREAMIDX_OVERLAP_S2": env_int("TPU_STREAMIDX_OVERLAP_S2", 0),
     # StreamIndex top-k: compute a per-row lower bound on the k-th score on the
     # TensorCore, and have SparseCore stage 1 keep only the scores above it
     # (falling back to the radix per slice when too many survive) instead of an

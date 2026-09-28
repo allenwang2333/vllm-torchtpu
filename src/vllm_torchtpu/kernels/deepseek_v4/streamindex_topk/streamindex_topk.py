@@ -26,6 +26,9 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
     sparsecore_topk,
+    sparsecore_topk_stage1,
+    sparsecore_topk_stage2,
+    staged_topk_supported,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
@@ -622,6 +625,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "overlap_s2",
         "sctopk_l1",
     ),
 )
@@ -651,6 +655,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    overlap_s2: int = 0,
     sctopk_l1: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
@@ -711,6 +716,13 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      overlap_s2: bit mask, 0 = the default program. Bit 0 orders chunk m's
+        scoring after chunk m-2's SparseCore stage 1 and m-3's stage 2, so each
+        chunk's stage 2 and gather run under later chunks' scoring instead of
+        all after the last one. Bit 1 gathers the winners' slots from stage 1's
+        flat output, skipping the per-chunk relayout of the whole candidate
+        array. Same selection bit for bit; ignored with `sctopk_l1` or on
+        shapes `sparsecore_topk` does not run in two stages.
       sctopk_l1: select with `sctopk_l1.sparsecore_topk_l1` (a TensorCore row
         threshold, then a threshold-gated SparseCore stage 1) instead of
         `sparsecore_topk`. Same contract; shapes it does not cover run
@@ -1022,6 +1034,7 @@ def streamindex_topk(
         chunk_tokens,
         out_dtype,
         scheduling_group_id,
+        q_in=None,
     ):
         """Scores for one window of the flat token axis, in a private buffer."""
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
@@ -1030,7 +1043,7 @@ def streamindex_topk(
         scores = None
         for spec, pass_meta in passes:
             scores = run_scores_kernel(
-                q,
+                q if q_in is None else q_in,
                 prepared_indexer_weights,
                 cache_kv,
                 scores,
@@ -1098,6 +1111,13 @@ def streamindex_topk(
         )
         topk_idxs = []
         topk_scores_list = []
+        staged = (
+            overlap_s2 != 0
+            and not sctopk_l1
+            and staged_topk_supported(chunk_len, num_positions, k)
+        )
+        sched = staged and bool(overlap_s2 & 1) and num_chunks > 1
+        stage_raw = []  # per chunk: (stage-1 outputs, stage-2 outputs), flat
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
@@ -1109,6 +1129,13 @@ def streamindex_topk(
             sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
             start = m * chunk_len
+            q_in = None
+            if sched and m >= 2:
+                # Both finished on SparseCore under chunk m-1's scoring. Without
+                # the edge the scheduler sinks every stage-1 done to the end, so
+                # stage 2 can only start after the last chunk's stage 1.
+                s2_prev = stage_raw[m - 3][1] if m >= 3 else ()
+                q_in, _ = lax.optimization_barrier((q, (stage_raw[m - 2][0], s2_prev)))
             scores = _scores_for_chunk(
                 passes,
                 m,
@@ -1116,6 +1143,7 @@ def streamindex_topk(
                 chunk_len,
                 out_dtype,
                 tc_group,
+                q_in=q_in,
             )
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
@@ -1137,6 +1165,28 @@ def streamindex_topk(
                     stage2_scheduling_group_id=sc2_group,
                     threshold_scheduling_group_id=tc_group,
                     return_scores=True,
+                )
+            elif staged:
+                # The gather joins chunk m + 3's scoring group, one after its
+                # stage 2's.
+                row_lengths = eff_row_lengths[start : start + chunk_len]
+                s1 = sparsecore_topk_stage1(
+                    scores, k, row_lengths, scheduling_group_id=sc_group
+                )
+                chunk_topk_idxs, chunk_topk_scores, s2 = sparsecore_topk_stage2(
+                    s1,
+                    scores.shape[1],
+                    k,
+                    row_lengths,
+                    write_empty_rows=True,
+                    scheduling_group_id=sc2_group,
+                    gather_scheduling_group_id=(
+                        group_base + m + 2 if sched and m < num_chunks - 3 else None
+                    ),
+                    flat_gather=bool(overlap_s2 & 2),
+                )
+                stage_raw.append(
+                    (tuple(x.reshape(-1) for x in s1), tuple(x.reshape(-1) for x in s2))
                 )
             else:
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(

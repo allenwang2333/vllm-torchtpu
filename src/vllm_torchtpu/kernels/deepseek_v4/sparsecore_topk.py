@@ -609,3 +609,111 @@ def sparsecore_topk(
     if return_scores:
         return final_indices, final_cand_scores
     return final_indices
+
+
+# --------------------------------------------------------------------------- #
+# The two-stage path of `sparsecore_topk`, split so a caller that pipelines
+# several top-k calls can place each stage (and the final gather) itself.
+# Same kernels, same inputs, same outputs, bit for bit.
+# --------------------------------------------------------------------------- #
+
+
+def staged_topk_supported(b: int, n: int, k: int) -> bool:
+    """Whether `sparsecore_topk` takes its non-recursive two-stage path."""
+    if n % LANES or k % LANES or not 0 < k <= 4096:
+        return False
+    p = _pick_partition(b, n, k)
+    return p > 1 and p * min(k, n // p) <= MAX_SLICE_WORDS
+
+
+def sparsecore_topk_stage1(
+    scores: jax.Array,  # i32[b, n] of f32 bits, or f32[b, n]
+    k: int,
+    row_lengths: jax.Array,  # i32[b]
+    *,
+    scheduling_group_id: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """`sparsecore_topk`'s stage 1: `(local_slots, cand_keys)`, each [b*p, k_p]."""
+    b, n = scores.shape
+    assert staged_topk_supported(b, n, k), (b, n, k)
+    p = _pick_partition(b, n, k)
+    n_p = n // p
+    k_p = min(k, n_p)
+    offsets = jnp.arange(p, dtype=jnp.int32) * n_p
+    lengths_p = jnp.clip(
+        row_lengths.astype(jnp.int32)[:, None] - offsets[None, :], 0, n_p
+    ).reshape(b * p)
+    return _sc_topk_direct(
+        scores.reshape(b * p, n_p),
+        k_p,
+        lengths_p,
+        write_empty=True,
+        scheduling_group_id=scheduling_group_id,
+    )
+
+
+def sparsecore_topk_stage2(
+    stage1: tuple[jax.Array, jax.Array],
+    n: int,
+    k: int,
+    row_lengths: jax.Array,  # i32[b]
+    *,
+    write_empty_rows: bool = True,
+    scheduling_group_id: int | None = None,
+    gather_scheduling_group_id: int | None = None,
+    flat_gather: bool = False,
+) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array]]:
+    """Stage 2 and the index remap of `sparsecore_topk` on a stage-1 result.
+
+    Returns `(indices, scores, stage2_raw)`; `stage2_raw` is the stage-2 kernel
+    output, for a caller that wants to order later work after it.
+
+    `flat_gather` reads each winner's local slot straight out of stage 1's
+    flat output buffer and applies the slice offset to the k winners only.
+    The default builds `global_cand_indices` [b, p*k_p] first, which needs the
+    1D SparseCore buffer relaid out into the TensorCore's tiled 2D layout (an
+    HBM copy of the whole candidate array per call) plus a full-width
+    elementwise pass. Both select `local[r, s] + (s // k_p) * n_p` for the same
+    `s`, so the result is identical.
+    """
+    local_slots, cand_keys = stage1
+    b = row_lengths.shape[0]
+    p = _pick_partition(b, n, k)
+    n_p = n // p
+    k_p = min(k, n_p)
+    cand_lengths = jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0))
+    final_cand_slots, final_cand_scores = _sc_topk_direct(
+        cand_keys.reshape(b, p * k_p),
+        k,
+        cand_lengths,
+        write_empty=write_empty_rows,
+        scheduling_group_id=scheduling_group_id,
+    )
+    safe_slots = jnp.maximum(final_cand_slots, 0)
+    if flat_gather:
+        # Row r's candidates sit at [r * p * k_p, (r + 1) * p * k_p) of the
+        # row-major stage-1 buffer; `reshape(-1)` undoes `_sc_topk_direct`'s
+        # own reshape, so XLA sees the kernel's 1D output.
+        row_base = jnp.arange(b, dtype=jnp.int32)[:, None] * jnp.int32(p * k_p)
+        local = jnp.take(local_slots.reshape(-1), row_base + safe_slots)
+        if gather_scheduling_group_id is not None:
+            local = xla_metadata.set_xla_metadata(
+                local, _scheduling_group_id=gather_scheduling_group_id
+            )
+        final_indices = jnp.where(
+            local < 0, -1, (safe_slots // jnp.int32(k_p)) * jnp.int32(n_p) + local
+        )
+    else:
+        offsets = jnp.arange(p, dtype=jnp.int32) * n_p
+        global_cand_indices = jnp.where(
+            local_slots.reshape(b, p, k_p) < 0,
+            -1,
+            offsets[None, :, None] + local_slots.reshape(b, p, k_p),
+        ).reshape(b, p * k_p)
+        final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
+        if gather_scheduling_group_id is not None:
+            final_indices = xla_metadata.set_xla_metadata(
+                final_indices, _scheduling_group_id=gather_scheduling_group_id
+            )
+    final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
+    return final_indices, final_cand_scores, (final_cand_slots, final_cand_scores)
