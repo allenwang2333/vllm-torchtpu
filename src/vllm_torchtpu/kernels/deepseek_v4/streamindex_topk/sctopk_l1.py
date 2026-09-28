@@ -652,14 +652,17 @@ def _sparsecore_topk_l1_impl(
             row_lengths,
             scheduling_group_id=threshold_scheduling_group_id,
         )
+    if b % 64 != 0:
+        # Without this barrier XLA's memory-space assignment fails to compile
+        # ("Too many buffers are colored in the alternate memory") for i32
+        # scores at b=32/40, n=264192 (b=8..128 otherwise measured fine). It
+        # serialises T against the scores producer, which costs ~0.7 ms per
+        # chunked prefill call at b=128, so the 128-row chunk shape skips it.
+        scores, t_keys = jax.lax.optimization_barrier((scores, t_keys))
     scores_p = scores.reshape(b * p, n_p)
     offsets = jnp.arange(p, dtype=jnp.int32) * n_p
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
     t_p = jnp.repeat(t_keys.astype(jnp.int32), p)
-    # Without this barrier XLA's memory-space assignment fails to compile
-    # ("Too many buffers are colored in the alternate memory") for i32 scores
-    # at b=32/40, n=264192; the SparseCore call waits for T either way.
-    scores_p, lengths_p, t_p = jax.lax.optimization_barrier((scores_p, lengths_p, t_p))
 
     local_slots, cand_scores = _sc_topk_stage1_l1(
         scores_p,

@@ -220,7 +220,7 @@ SHAPES = [
     pytest.param(B, N_PROD, K, id="prod-b128-n264192"),
     pytest.param(B, N_128K, K, id="b128-n133120"),
     pytest.param(16, N_SHORT, K, id="p2-b16-n10240"),
-    # b=32/40 with i32 scores failed XLA memory-space assignment before the
+    # b=32/40 with i32 scores fail XLA memory-space assignment without the
     # optimization_barrier in _sparsecore_topk_l1_impl; keep them as regressions.
     pytest.param(40, N_PROD, 512, id="b40-n264192-k512"),
     pytest.param(32, N_PROD, K, id="b32-n264192"),
