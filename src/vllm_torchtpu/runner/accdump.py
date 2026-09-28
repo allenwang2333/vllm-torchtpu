@@ -36,11 +36,12 @@ def _find_owners(runner):
     global _owners
     if _owners is not None:
         return _owners
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import ACCDUMP_OWNERS
+
     ctx = runner.vllm_config.compilation_config.static_forward_context
     _owners = {}
-    for name, mod in ctx.items():
-        ref = getattr(mod, "_accdump_owner_ref", None)
-        owner = ref() if ref is not None else None
+    for name, owner in ACCDUMP_OWNERS.items():
+        mod = ctx.get(name, owner.k_cache)
         m = _LAYER_RE.search(name)
         if owner is None or m is None:
             continue

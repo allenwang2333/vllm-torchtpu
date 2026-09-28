@@ -14,7 +14,6 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for Multi-Head Latent Attention (MLA)."""
 
 import os
-import weakref
 from typing import Any
 
 import jax
@@ -278,6 +277,9 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
 
+ACCDUMP_OWNERS: dict = {}  # probe-05 accdump: k_cache prefix -> indexer
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -295,9 +297,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             n_head = get_current_vllm_config_or_none().model_config.hf_config.index_n_heads
             self._dump_q = torch.zeros((rows, n_head, self.head_dim), dtype=torch.uint8, device=dev)
             self._dump_w = torch.zeros((rows, n_head), dtype=torch.bfloat16, device=dev)
-            # weakref, not the module: assigning an nn.Module would register it as a
-            # child of k_cache and make a module cycle (eval()/apply() recurse forever).
-            self.k_cache._accdump_owner_ref = weakref.ref(self)
+            # Module-level registry, not an attribute: assigning an nn.Module to
+            # k_cache would register a child and make a module cycle.
+            ACCDUMP_OWNERS[self.k_cache.prefix] = self
 
         parallel_config = getattr(
             get_current_vllm_config_or_none(), "parallel_config", None
