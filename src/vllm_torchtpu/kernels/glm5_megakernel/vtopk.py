@@ -11,6 +11,7 @@ that reads each slot's row and within-row prefix back. Every value is a small in
 """
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import pallas as pl
 
 F32, I32, BF16 = jnp.float32, jnp.int32, jnp.bfloat16
 NT = (((1,), (1,)), ((), ()))
@@ -108,4 +109,109 @@ def extract(keys_ref, T, K, idx_v, kc=256):
         tok = jnp.where(kr < n_sel.astype(F32), rr * 128 + lane, -1.0).astype(I32)
         for q in range(kc // 128):
             idx_v[c0 // 128 + q:c0 // 128 + q + 1, :] = tok[:, q * 128:(q + 1) * 128]
+    return n_sel
+
+
+def extract_blk(keys_ref, T, K, idx_v, vt_ref, acc_ref, cc_ref, kc=256):
+    """probe 27 tb: extract() with the same counting math, 128-row block by block. Output slot k
+    lives in the row r with CE[r] <= k < CI[r]; CE / CI are non-decreasing in r, so the rows a k
+    chunk [c0, c0 + kc) can read form one contiguous range, found by two counts. Each chunk's
+    one-hot matmul then runs over only the 128-row blocks of that range (<= NBK + #chunks block
+    matmuls in total, against NBK x #chunks) and nothing ROWS-sized is ever a live value.
+    vt_ref (ROWS, 256) bf16: row r = [within-row inclusive prefix (128) | r_hi, r_lo, CE_hi, CE_lo].
+    acc_ref (kc, 256) f32, cc_ref (2, 128, 128) f32 (CE, CI in [block, row-in-block] layout).
+    Bit-identical to extract(): every one-hot column selects exactly one row (sums with zeros)."""
+    ROWS = keys_ref.shape[0]
+    assert ROWS % 128 == 0 and K % 128 == 0 and K <= 2 ** 15 and ROWS <= 128 * 128
+    NBK = ROWS // 128
+    kc = min(kc, K)
+    assert K % kc == 0
+    ri = lax.broadcasted_iota(I32, (128, 128), 0)
+    li = lax.broadcasted_iota(I32, (128, 128), 1)
+
+    def blk(b):
+        return keys_ref[b * 128:(b + 1) * 128, :]
+
+    def posb(b):
+        return (b * 128 + ri) * 128 + li
+
+    cgt = jnp.zeros((128, 128), I32)
+    ceq = jnp.zeros((128, 128), I32)
+    for b in range(NBK):
+        kb = blk(b)
+        cgt = cgt + (kb > T).astype(I32)
+        ceq = ceq + (kb == T).astype(I32)
+    n_gt = jnp.sum(cgt)
+    n_eq = jnp.sum(ceq)
+    need_eq = jnp.where(T == jnp.int32(INT_MIN), 0, K - n_gt)
+    excess = n_eq > need_eq
+    PB = (ROWS * 128).bit_length()
+
+    def pbit(i, p):
+        cand = p | shl(jnp.int32(1), jnp.int32(PB - 1) - i)
+        cv = jnp.zeros((128, 128), I32)
+        for b in range(NBK):
+            cv = cv + ((blk(b) == T) & (posb(b) < cand)).astype(I32)
+        return jnp.where(jnp.sum(cv) <= need_eq, cand, p)
+    P = lax.fori_loop(0, jnp.where(excess, PB, 0), pbit, jnp.int32(0))
+    P = jnp.where(excess, P, jnp.int32(INT_MAX))
+
+    ones8 = jnp.ones((8, 128), BF16)
+    upper = (ri <= li).astype(BF16)                                          # [l', l] = l' <= l
+    rows_c = []
+    for b in range(NBK):
+        kb = blk(b)
+        selb = ((kb > T) | ((kb == T) & (posb(b) < P))).astype(F32).astype(BF16)
+        rows_c.append(lax.dot_general(ones8, selb, NT, preferred_element_type=F32)[0:1])
+        vt_ref[b * 128:(b + 1) * 128, 0:128] = lax.dot_general(
+            selb, upper, NN, preferred_element_type=F32).astype(BF16)          # within-row incl
+    C = jnp.concatenate(rows_c + [jnp.zeros((128 - NBK, 128), F32)], axis=0)  # [b, j]
+    n_sel = jnp.sum(C).astype(I32)
+    W = lax.dot_general(C.astype(BF16), upper, NN, preferred_element_type=F32)
+    tot = W[:, 127:128]
+    th = jnp.floor(tot * (1.0 / 128))
+    tl = tot - 128 * th
+    Ls = (li < ri).astype(BF16)                                              # Ls[b, b'] = b' < b
+    off = (128 * lax.dot_general(Ls, jnp.broadcast_to(th, (128, 128)).astype(BF16), NN,
+                                 preferred_element_type=F32)
+           + lax.dot_general(Ls, jnp.broadcast_to(tl, (128, 128)).astype(BF16), NN,
+                             preferred_element_type=F32))
+    CI = W + off
+    CE = CI - C
+    cc_ref[0] = CE
+    cc_ref[1] = CI
+    CEt = CE.T                                                               # [j, b]
+    for b in range(NBK):
+        ce_c = CEt[:, b:b + 1]
+        ceh = jnp.floor(ce_c * (1.0 / 128))
+        tail = jnp.where(li == 0, float(b), jnp.where(li == 1, ri.astype(F32), jnp.where(
+            li == 2, ceh, jnp.where(li == 3, ce_c - 128 * ceh, 0.0))))
+        vt_ref[b * 128:(b + 1) * 128, 128:256] = tail.astype(BF16)
+
+    valid = ri < NBK
+    for c0 in range(0, K, kc):
+        kr = (c0 + lax.broadcasted_iota(I32, (kc, 1), 0)).astype(F32)       # (kc, 1)
+        r_first = jnp.sum(((CI <= c0) & valid).astype(I32))
+        r_end = jnp.sum(((CE < c0 + kc) & valid).astype(I32))
+        b_lo = r_first // 128
+        b_hi = jnp.maximum((r_end + 127) // 128, b_lo)
+        acc_ref[...] = jnp.zeros(acc_ref.shape, F32)
+
+        def body(b, c):
+            ce_r = cc_ref[0, pl.ds(b, 1), :]                                 # (1, 128)
+            ci_r = cc_ref[1, pl.ds(b, 1), :]
+            oht = ((ce_r <= kr) & (kr < ci_r)).astype(F32).astype(BF16)      # (kc, 128)
+            r0 = pl.multiple_of(b * 128, 128)
+            acc_ref[...] += lax.dot_general(oht, vt_ref[pl.ds(r0, 128), :], NN,
+                                            preferred_element_type=F32)
+            return c
+        lax.fori_loop(b_lo, b_hi, body, 0)
+        RT = acc_ref[...]                                                    # (kc, 256)
+        rr = 128 * RT[:, 128:129] + RT[:, 129:130]
+        ce = 128 * RT[:, 130:131] + RT[:, 131:132]
+        lane = jnp.sum((RT[:, 0:128] <= kr - ce).astype(F32), axis=1, keepdims=True)
+        tok = jnp.where(kr < n_sel.astype(F32), rr * 128 + lane, -1.0)       # (kc, 1)
+        tokr = jnp.transpose(jnp.broadcast_to(tok, (kc, 128)))[0:1].astype(I32)   # (1, kc)
+        for q in range(kc // 128):
+            idx_v[c0 // 128 + q:c0 // 128 + q + 1, :] = tokr[:, q * 128:(q + 1) * 128]
     return n_sel
