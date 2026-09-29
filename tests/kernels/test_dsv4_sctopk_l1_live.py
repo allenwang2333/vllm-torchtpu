@@ -162,28 +162,33 @@ def test_live_chain_bit_exact():
 
 @pytest.mark.parametrize("c", CONTEXTS)
 def test_control_live_shift_fault_goes_red(c):
-    """A stage 1 that reads each slice 16 words early must fail both the
-    oracle and the bit comparison."""
+    """A stage 1 that reads each slice 16 words early must go red.
+
+    At C=0 every row is shorter than k, so the selected index set is "all
+    live columns" whatever the scores are, and only the returned score bits
+    can show the fault; for C >= k the oracle on indices must fail too."""
     rng = np.random.default_rng(SEED + 63)
     lens = _causal_lengths(c)
     scores = _scores("iid", B, N_PROD, rng, lens)
-    off_i, _ = _impl(scores, lens, topk_tail="segc2")
-    bad_i, _ = _impl(scores, lens, topk_tail="segc2", live=True, live_fault="shift")
+    off_i, off_s = _impl(scores, lens, topk_tail="segc2")
+    bad_i, bad_s = _impl(scores, lens, topk_tail="segc2", live=True, live_fault="shift")
     red = sum(
         _mismatch(scores[r : r + 1], bad_i[r : r + 1], K, lens[r : r + 1]) is not None
         for r in range(B)
     )
-    print(f"CONTROL live shift C={c}: red rows {red} of {B}")
-    assert _first_diff(bad_i, off_i) is not None
-    assert red > 0
+    red_bits = int(np.any((bad_i != off_i) | (bad_s != off_s), axis=1).sum())
+    print(f"CONTROL live shift C={c}: oracle-red rows {red}, bit-red rows {red_bits} of {B}")
+    assert red_bits > 0
+    if c >= K:
+        assert red > 0
 
 
 def test_control_live_shift_fault_goes_red_on_chain():
     chunks = _chain_inputs(SEED + 64)[:3]
     off = _chain(chunks)
     bad = _chain(chunks, live=True, live_fault="shift")
-    for m, ((oi, _), (bi, _)) in enumerate(zip(off, bad)):
-        assert _first_diff(bi, oi) is not None, m
+    for m, ((oi, os_), (bi, bs)) in enumerate(zip(off, bad)):
+        assert _first_diff(bi, oi) is not None or _first_diff(bs, os_) is not None, m
 
 
 @pytest.mark.parametrize(
