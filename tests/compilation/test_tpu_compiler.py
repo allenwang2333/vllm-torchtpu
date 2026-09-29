@@ -448,3 +448,54 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    @staticmethod
+    def _claiming_compilers(tmp_path, n=2):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compilers = []
+        for rank in range(n):
+            compiler = TpuCompilerAdaptor()
+            compiler.initialize_cache(
+                cache_dir=str(tmp_path / f"rank_{rank}_0" / "backbone")
+            )
+            compilers.append(compiler)
+        return compilers
+
+    def test_bucket_claim_is_shared_across_ranks(self, tmp_path):
+        """One rank wins a bucket; the others defer it, and once it is done
+        they compile it themselves (hitting the Tier-2 cache)."""
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            DeferCompile,
+            defer_claimed_buckets,
+        )
+
+        owner, peer = self._claiming_compilers(tmp_path)
+        claim = owner._claim_bucket("k", compile_range="(4096, 4096)")
+        assert claim == str(tmp_path / "_claims" / "0-backbone-k")
+
+        with defer_claimed_buckets(), pytest.raises(DeferCompile):
+            peer._claim_bucket("k", compile_range="(4096, 4096)")
+
+        owner._release_claim(claim)
+        assert peer._claim_bucket("k", compile_range="(4096, 4096)") is None
+        # A different bucket is still free to claim.
+        assert peer._claim_bucket("k2", compile_range="(16, 16)") is not None
+
+    def test_stale_bucket_claim_is_taken_over(self, tmp_path):
+        """A claim its owner stopped refreshing goes to the next rank."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        owner, peer = self._claiming_compilers(tmp_path)
+        claim = owner._claim_bucket("k", compile_range="(4096, 4096)")
+        old = os.stat(claim).st_mtime - tpu_compiler._CLAIM_STALE_S - 1
+        os.utime(claim, (old, old))
+
+        assert peer._claim_bucket("k", compile_range="(4096, 4096)") == claim
+
+    def test_no_bucket_claim_outside_a_rank_cache_dir(self, tmp_path):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "somewhere"))
+        assert compiler._claim_bucket("k", compile_range="(16, 16)") is None
