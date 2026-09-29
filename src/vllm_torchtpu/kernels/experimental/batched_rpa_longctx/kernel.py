@@ -764,20 +764,28 @@ def rpa_kernel(
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
 
-            with jax.named_scope("rpa_init"):
-                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+            # A call with no scheduled steps (e.g. the mixed pass on a decode-only
+            # batch) runs no pipeline iterations, so skip the VMEM init as well.
+            @pl.when(actual_steps > 0)
+            def _init():
+                with jax.named_scope("rpa_init"):
+                    scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
-                num_lanes = pltpu.get_tpu_info().num_lanes
-                q_ref_flat = (
-                    final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-                )
-                kv_ref_flat = (
-                    final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-                )
+                    num_lanes = pltpu.get_tpu_info().num_lanes
+                    q_ref_flat = (
+                        final_allocs[0]
+                        .window_ref.bitcast(jnp.uint32)
+                        .reshape(-1, num_lanes)
+                    )
+                    kv_ref_flat = (
+                        final_allocs[1]
+                        .window_ref.bitcast(jnp.uint32)
+                        .reshape(-1, num_lanes)
+                    )
 
-                # Explicitly zero out scratches and Q/KV buffers.
-                for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                    ref[...] = jnp.zeros_like(ref)
+                    # Explicitly zero out scratches and Q/KV buffers.
+                    for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                        ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
