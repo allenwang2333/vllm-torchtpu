@@ -793,6 +793,9 @@ FP8_RING_SCHEDULES = (
     (0, 10),
     (0, 12),  # the ceiling
 )
+# STREAM with hidden 2048: the ring needs K blocks (hidden / 8) that are
+# whole 256-deep MXU passes, and STREAM's 1024 gives 128.
+RING_SHAPE = dict(STREAM, hidden=2048)
 
 
 @pytest.mark.parametrize("tokens", (64, 2048))
@@ -803,25 +806,28 @@ def test_fp8_w1_ring_agrees_across_every_weight_schedule(
 
     The ring changes where the gate/up blocks land and when they are started
     and waited, and splits the gate/up matmul into K blocks accumulated in
-    f32. Ring depths share one K blocking, so they have to agree bit for bit;
-    against the one-slab schedules they are held to the dense-reference band
-    and to each other's distance. 64 tokens is the one-hop ship path, 2048
-    the multi-tile HBM-commit path.
+    f32. With K blocks that are whole MXU passes that sum is the one-slab
+    matmul's, so every schedule has to agree bit for bit. 64 tokens is the
+    one-hop ship path, 2048 the multi-tile HBM-commit path.
     """
     mesh = _mesh()
     w1, w2, w1s, w2s = _make_weights(
         mesh,
         46,
-        hidden=STREAM["hidden"],
-        inter=STREAM["inter"],
-        e_total=STREAM["e_total"],
+        hidden=RING_SHAPE["hidden"],
+        inter=RING_SHAPE["inter"],
+        e_total=RING_SHAPE["e_total"],
         weight_format=WeightFormat.FP8,
     )
     x, gating = _make_inputs(
-        mesh, 47, tokens=tokens, hidden=STREAM["hidden"], e_total=STREAM["e_total"]
+        mesh,
+        47,
+        tokens=tokens,
+        hidden=RING_SHAPE["hidden"],
+        e_total=RING_SHAPE["e_total"],
     )
     common = dict(
-        topk=STREAM["topk"],
+        topk=RING_SHAPE["topk"],
         renormalize=True,
         mesh=mesh,
         capacity=CAPACITY,
@@ -851,21 +857,13 @@ def test_fp8_w1_ring_agrees_across_every_weight_schedule(
         }
         assert set(rings) == {ring or 0}, (depth, ring, rings)
 
-    ref = _dense_reference(mesh, x, w1, w2, w1s, w2s, gating, topk=STREAM["topk"])
+    ref = _dense_reference(mesh, x, w1, w2, w1s, w2s, gating, topk=RING_SHAPE["topk"])
     for key, out in outs.items():
         error = _relative_l2(out, ref)
         worst = _worst_token_relative_l2(out, ref)
         assert error < FP8_RELATIVE_BOUND, f"{key}: relative L2 {error}"
         assert worst < FP8_TOKEN_BOUND, f"{key}: worst token {worst}"
-    for ring in (8, 10):
+    for key, out in outs.items():
         np.testing.assert_array_equal(
-            outs[(0, ring)], outs[(0, 12)], err_msg=f"ring {ring} vs ring 12"
+            out, outs[(2, None)], err_msg=f"{key} vs the prefetch schedule"
         )
-    np.testing.assert_array_equal(
-        outs[(0, 0)], outs[(2, None)], err_msg="one-slab stream vs prefetch"
-    )
-    # The K-blocked f32 sum may round differently from the one-slab matmul;
-    # it may not move further from it than the fp8 wire does.
-    drift = _relative_l2(outs[(0, 12)], outs[(0, 0)])
-    print(f"ring-12 vs one-slab relative L2 at tokens={tokens}: {drift:.3e}")
-    assert drift < 0.1 * FP8_RELATIVE_BOUND, drift

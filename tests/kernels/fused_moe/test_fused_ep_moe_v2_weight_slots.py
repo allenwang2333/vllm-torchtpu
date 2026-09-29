@@ -234,9 +234,19 @@ def test_no_ring_off_the_fp8_one_slot_stream(kw, chip):
     assert host.fit_w1_ring_slots(**GLM52, info=chip, **kw)[0] == 0
 
 
-def test_no_ring_when_a_k_block_is_not_whole_lane_blocks(chip):
-    shape = dict(GLM52, hidden=5120 + 128)
-    assert host.fit_w1_ring_slots(**shape, nbuf=1, info=chip)[0] == 0
+@pytest.mark.parametrize(
+    "hidden, ring",
+    [
+        (5120 + 128, False),  # K block 656: not even whole lane blocks
+        (1024, False),  # K block 128: splits a 256-deep MXU pass
+        (3072, False),  # K block 384: likewise
+        (2048, True),  # K block 256
+        (6144, True),  # K block 768: GLM-5.2
+    ],
+)
+def test_ring_only_when_a_k_block_is_whole_mxu_passes(chip, hidden, ring):
+    shape = dict(GLM52, hidden=hidden)
+    assert (host.fit_w1_ring_slots(**shape, nbuf=1, info=chip)[0] > 0) == ring
 
 
 def test_ring_scratch_shapes():

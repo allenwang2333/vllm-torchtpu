@@ -1278,6 +1278,12 @@ W1_RING_BLOCKS = 8
 # slot at a time until the build fits, and a build where even
 # W1_RING_BLOCKS slots do not fit keeps the one-slab schedule.
 MAX_W1_RING_SLOTS = 12
+# Each K block must be a whole number of MXU contraction passes. An fp8 dot
+# accumulates K in 256-deep passes; a block boundary inside a pass regroups
+# the accumulation and rounds differently from the one-slab matmul: K blocks
+# of 128 and 384 drift ~5e-3 from it, 256 and 768 are bit-exact
+# [measured: j-58d6d7d2]. 256 is a whole number of 128-lane blocks too.
+W1_RING_K_ALIGN = 256
 
 
 def w1_ring_supported(weight_format, hidden, nbuf):
@@ -1285,13 +1291,14 @@ def w1_ring_supported(weight_format, hidden, nbuf):
 
     Only the eight-bit one-slot (no prefetch runway) stream has the ring:
     every other schedule already hides its refill or reads the slab through
-    its own block readers. Each K block has to be a whole number of lane
-    blocks, because the gate/up matmul slices the activation row along K.
+    its own block readers. Each K block has to be a whole number of MXU
+    contraction passes (W1_RING_K_ALIGN), so the K-blocked gate/up sum is
+    bit-exact with the one-slab matmul it replaces.
     """
     return (
         weight_format == WeightFormat.FP8
         and nbuf == 1
-        and hidden % (W1_RING_BLOCKS * HIDDEN_LANE_BLOCK) == 0
+        and hidden % (W1_RING_BLOCKS * W1_RING_K_ALIGN) == 0
     )
 
 
