@@ -20,9 +20,9 @@ each expert to every row with that row's routing weight as the mask. The
 output is the shard's partial sum; the combine across shards stays the
 caller's. Activations are quantized per row to FP8 before each matmul (W8A8).
 
-Two entries share the streaming body: `moe_lowtok` takes the caller's local
-top-k ids, and `moe_lowtok_scores` takes the router's softmax scores and runs
-the top-k selection in the kernel.
+The routing arrives either as a table built from the caller's local top-k ids
+(`routing_table`) or as the router's softmax scores, with the top-k selection
+run in the kernel.
 """
 
 import functools
@@ -274,96 +274,17 @@ def _stream(
     out_ref[...] = acc[...].astype(out_ref.dtype)
 
 
-def _kernel_ids(
-    gid_ref,
-    hit_ref,
-    x_ref,
-    wtab_ref,
-    s13_hbm,
-    s2_hbm,
-    w13_hbm,
-    w2_hbm,
-    out_ref,
-    ids,
-    w13_buf,
-    w2_buf,
-    s13_buf,
-    s2_buf,
-    w13_sem,
-    w2_sem,
-    h_acc,
-    acc,
-    *,
-    n_experts,
-    inter,
-    w13_parts,
-):
-    _stream(
-        gid_ref,
-        hit_ref,
-        wtab_ref,
-        x_ref,
-        s13_hbm,
-        s2_hbm,
-        w13_hbm,
-        w2_hbm,
-        out_ref,
-        ids,
-        w13_buf,
-        w2_buf,
-        s13_buf,
-        s2_buf,
-        w13_sem,
-        w2_sem,
-        h_acc,
-        acc,
-        n_experts=n_experts,
-        inter=inter,
-        w13_parts=w13_parts,
-    )
-
-
-def _kernel_scores(
-    gid_s,
-    x_ref,
-    scores_ref,
-    s13_hbm,
-    s2_hbm,
-    w13_hbm,
-    w2_hbm,
-    out_ref,
-    ids,
-    wtab_ref,
-    hits_v,
-    hits_s,
-    hsem,
-    w13_buf,
-    w2_buf,
-    s13_buf,
-    s2_buf,
-    w13_sem,
-    w2_sem,
-    h_acc,
-    acc,
-    *,
-    n_experts,
-    inter,
-    w13_parts,
-    topk,
-):
-    """Router top-k in the kernel, then the shared streaming body.
+def _select_topk(scores, topk):
+    """The served router as a routing table over global expert ids.
 
     `topk` max-and-mask passes over the softmax scores (ties to the lowest
-    id), weights renormalized and rounded through bf16 as the served router
-    does, written as the routing table over global expert ids.
+    id), weights renormalized and rounded through bf16.
     """
-    rows = x_ref.shape[0]
-    lane = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 1)
-    x = scores_ref[...]
-    x = jnp.where(x > _NEG, x, _NEG)
+    lane = jax.lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+    x = jnp.where(scores > _NEG, scores, _NEG)
     masked = jnp.finfo(jnp.float32).min
     sel = jnp.zeros_like(x)
-    wsum = jnp.zeros((rows, 1), jnp.float32)
+    wsum = jnp.zeros((x.shape[0], 1), jnp.float32)
     for _ in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)
         idx = jnp.min(jnp.where(x == m, lane, LANES - 1), axis=1, keepdims=True)
@@ -371,10 +292,36 @@ def _kernel_scores(
         sel = jnp.where(pick, m, sel)
         wsum = wsum + m
         x = jnp.where(pick, masked, x)
-    wt = jnp.where(wsum > 0, sel / wsum, 0.0).astype(jnp.bfloat16).astype(jnp.float32)
-    wtab_ref[...] = wt
+    wt = jnp.where(wsum > 0, sel / wsum, 0.0)
+    return wt.astype(jnp.bfloat16).astype(jnp.float32)
+
+
+def _kernel(
+    gid_s,
+    x_ref,
+    route_ref,
+    s13_hbm,
+    s2_hbm,
+    w13_hbm,
+    w2_hbm,
+    out_ref,
+    ids,
+    hits_v,
+    hits_s,
+    hsem,
+    *scratch,
+    n_experts,
+    inter,
+    w13_parts,
+    topk,
+):
+    if topk is None:
+        wtab_ref = route_ref
+    else:
+        wtab_ref, *scratch = scratch
+        wtab_ref[...] = _select_topk(route_ref[...], topk)
     # Lanes some row routes to; `collect` keeps the ones in this shard's gid.
-    hit = jnp.any(wt != 0, axis=0, keepdims=True)
+    hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
     hits_v[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
     copy = pltpu.make_async_copy(hits_v, hits_s, hsem.at[0])
     copy.start()
@@ -390,14 +337,7 @@ def _kernel_scores(
         w2_hbm,
         out_ref,
         ids,
-        w13_buf,
-        w2_buf,
-        s13_buf,
-        s2_buf,
-        w13_sem,
-        w2_sem,
-        h_acc,
-        acc,
+        *scratch,
         n_experts=n_experts,
         inter=inter,
         w13_parts=w13_parts,
@@ -432,79 +372,44 @@ def _stream_scratch(rows, hidden, inter, w13_parts):
     )
 
 
-@jax.jit
-def moe_lowtok(x, topk_ids_local, topk_weights, w13, s13, w2, s2):
-    """This shard's MoE output for a few tokens, from local top-k ids.
-
-    topk_ids_local is -1 for experts the shard does not hold. Scales use
-    [E, 1, 1, N]. Callers must first check can_use_moe_lowtok.
-    """
-    tokens, hidden = x.shape
-    n_experts, inter, w13_parts, rows = _layout(x, w13)
-    if n_experts > LANES:
-        raise ValueError(f"the routing table holds up to {LANES} experts per shard")
+def routing_table(topk_ids_local, topk_weights, n_experts):
+    """[tokens, n_experts] routing weights from local top-k ids (-1: remote)."""
     valid = topk_ids_local >= 0
     onehot = jax.nn.one_hot(
         jnp.where(valid, topk_ids_local, 0), n_experts, dtype=jnp.float32
     )
-    wtab = jnp.einsum(
-        "tke,tk->te", onehot, jnp.where(valid, topk_weights, 0).astype(jnp.float32)
-    )
-    hit = jnp.pad(
-        jnp.any(wtab != 0, axis=0).astype(jnp.int32), (0, LANES - n_experts)
-    ).reshape(1, LANES)
-    gid = jnp.arange(n_experts, dtype=jnp.int32).reshape(1, n_experts)
-    wtab = jnp.pad(wtab, ((0, rows - tokens), (0, LANES - n_experts)))
-    x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
-    s13 = s13.reshape(n_experts, 1, 2 * inter).astype(jnp.float32)
-    s2 = s2.reshape(n_experts, 1, hidden).astype(jnp.float32)
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    out = pl.pallas_call(
-        functools.partial(
-            _kernel_ids, n_experts=n_experts, inter=inter, w13_parts=w13_parts
-        ),
-        out_shape=jax.ShapeDtypeStruct((rows, hidden), x.dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[vmem, vmem, hbm, hbm, hbm, hbm],
-            out_specs=vmem,
-            scratch_shapes=(
-                pltpu.SMEM((n_experts,), jnp.int32),
-                *_stream_scratch(rows, hidden, inter, w13_parts),
-            ),
-            grid=(),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=_vmem_budget(rows, hidden, inter, w13_parts)
-        ),
-        name="moe_lowtok",
-    )(gid, hit, x_rows, wtab, s13, s2, w13, w2)
-    return out[:tokens]
+    weights = jnp.where(valid, topk_weights, 0).astype(jnp.float32)
+    return jnp.einsum("tke,tk->te", onehot, weights)
 
 
 @functools.partial(jax.jit, static_argnames=("topk",))
-def moe_lowtok_scores(x, scores, experts_start, w13, s13, w2, s2, *, topk):
-    """This shard's MoE output for a few tokens, with the router in the kernel.
+def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
+    """This shard's MoE output for a few tokens.
 
-    scores [tokens, LANES] f32 is the softmax over all experts; this shard
-    holds experts [experts_start, experts_start + E). A row of zero scores
-    (a padded token) selects nothing.
+    With `topk` None, `route` is the routing table over local experts (see
+    routing_table). With `topk`, `route` is the router's softmax scores over
+    all LANES experts, the top-k runs in the kernel, and this shard holds
+    experts [experts_start, experts_start + E); a zero score row (a padded
+    token) selects nothing. Scales use [E, 1, 1, N]. Callers must first check
+    can_use_moe_lowtok.
     """
     tokens, hidden = x.shape
     n_experts, inter, w13_parts, rows = _layout(x, w13)
-    if scores.shape[1] != LANES:
+    if route.shape[1] > LANES or (topk is not None and route.shape[1] != LANES):
         raise ValueError(f"the routing table is {LANES} experts wide")
     x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
-    sc = jnp.pad(scores.astype(jnp.float32), ((0, rows - tokens), (0, 0)))
+    route = jnp.pad(
+        route.astype(jnp.float32), ((0, rows - tokens), (0, LANES - route.shape[1]))
+    )
     s13 = s13.reshape(n_experts, 1, 2 * inter).astype(jnp.float32)
     s2 = s2.reshape(n_experts, 1, hidden).astype(jnp.float32)
     gid = (experts_start + jnp.arange(n_experts, dtype=jnp.int32)).reshape(1, n_experts)
+    wtab = () if topk is None else (pltpu.VMEM((rows, LANES), jnp.float32),)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
         functools.partial(
-            _kernel_scores,
+            _kernel,
             n_experts=n_experts,
             inter=inter,
             w13_parts=w13_parts,
@@ -517,10 +422,10 @@ def moe_lowtok_scores(x, scores, experts_start, w13, s13, w2, s2, *, topk):
             out_specs=vmem,
             scratch_shapes=(
                 pltpu.SMEM((n_experts,), jnp.int32),
-                pltpu.VMEM((rows, LANES), jnp.float32),
                 pltpu.VMEM((1, LANES), jnp.int32),
                 pltpu.SMEM((1, LANES), jnp.int32),
                 pltpu.SemaphoreType.DMA((1,)),
+                *wtab,
                 *_stream_scratch(rows, hidden, inter, w13_parts),
             ),
             grid=(),
@@ -529,5 +434,5 @@ def moe_lowtok_scores(x, scores, experts_start, w13, s13, w2, s2, *, topk):
             vmem_limit_bytes=_vmem_budget(rows, hidden, inter, w13_parts)
         ),
         name="moe_lowtok",
-    )(gid, x_rows, sc, s13, s2, w13, w2)
+    )(gid, x_rows, route, s13, s2, w13, w2)
     return out[:tokens]

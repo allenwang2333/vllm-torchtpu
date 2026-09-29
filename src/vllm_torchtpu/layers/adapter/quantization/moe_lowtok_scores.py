@@ -14,9 +14,9 @@
 """Small-batch MoE with the router in the kernel, for the FP8 MoE method.
 
 With TPU_MOE_LOWTOK=1, a layer whose routing is a plain softmax top-k with
-renormalized weights hands its router scores to `moe_lowtok_scores`, which
-selects the experts itself. Other layers keep vLLM-side routing and reach
-`moe_lowtok` through `fused_moe_func`.
+renormalized weights hands its router scores to `moe_lowtok`, which selects
+the experts itself. Other layers keep vLLM-side routing and reach the same
+kernel with a routing table through `fused_moe_func`.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     LANES,
     MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
-    moe_lowtok_scores,
+    moe_lowtok,
 )
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -134,8 +134,8 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
         w2_scale: jax.Array,
         experts_start: jax.Array,
     ) -> jax.Array:
-        return moe_lowtok_scores(
-            x, scores, experts_start, w13, w13_scale, w2, w2_scale, topk=topk
+        return moe_lowtok(
+            x, scores, w13, w13_scale, w2, w2_scale, experts_start, topk=topk
         )
 
     op = jax_op(f"pallas::moe_lowtok_scores_k{topk}", moe)

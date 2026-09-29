@@ -18,7 +18,7 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
     MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
     moe_lowtok,
-    moe_lowtok_scores,
+    routing_table,
 )
 
 __all__ = [
@@ -26,5 +26,5 @@ __all__ = [
     "MOE_LOWTOK_MAX_TOKENS",
     "can_use_moe_lowtok",
     "moe_lowtok",
-    "moe_lowtok_scores",
+    "routing_table",
 ]

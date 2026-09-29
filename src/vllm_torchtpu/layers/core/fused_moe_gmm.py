@@ -28,6 +28,9 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok import (
     can_use_moe_lowtok,
     moe_lowtok,
 )
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    routing_table as moe_lowtok_routing_table,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -650,9 +653,8 @@ def fused_moe_func(
         )
     ):
         logger.info_once("Selected experimental small-batch MoE")
-        return moe_lowtok(
-            hidden_states, topk_ids, topk_weights, w1, w1_scale, w2, w2_scale
-        )
+        route = moe_lowtok_routing_table(topk_ids, topk_weights, w1.shape[0])
+        return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.

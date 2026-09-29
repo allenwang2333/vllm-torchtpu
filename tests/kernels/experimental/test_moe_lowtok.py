@@ -39,10 +39,8 @@ def interpret(monkeypatch):
         lambda: SimpleNamespace(vmem_capacity_bytes=64 * 1024**2),
     )
     kernel.moe_lowtok.clear_cache()
-    kernel.moe_lowtok_scores.clear_cache()
     yield
     kernel.moe_lowtok.clear_cache()
-    kernel.moe_lowtok_scores.clear_cache()
 
 
 def _quantize_rows(v):
@@ -112,11 +110,20 @@ def _scores_operands(seed, tokens, experts, hidden, inter, start):
     return x, scores, _weights(rng, experts, hidden, inter)
 
 
+def _ids_call(x, ids, weights, w13, s13, w2, s2):
+    route = kernel.routing_table(ids, weights, w13.shape[0])
+    return kernel.moe_lowtok(x, route, w13, s13, w2, s2)
+
+
+def _scores_call(x, scores, start, weights, topk):
+    return kernel.moe_lowtok(x, scores, *weights, jnp.int32(start), topk=topk)
+
+
 def _scores_want(x, scores, weights, topk, start, experts):
     w13, s13, w2, s2 = weights
     w, ids = _router(scores, topk)
     local = jnp.where((ids >= start) & (ids < start + experts), ids - start, -1)
-    return kernel.moe_lowtok(x, local, w, w13, s13, w2, s2)
+    return _ids_call(x, local, w, w13, s13, w2, s2)
 
 
 def _assert_close(got, want, rel_l2=1e-2):
@@ -138,14 +145,14 @@ def test_ids_entry_matches_reference(tokens, shape):
     _needs("tpu")
     experts, hidden, inter, topk = shape
     ops = _ids_operands(tokens * 7 + experts, tokens, experts, hidden, inter, topk)
-    got = jax.block_until_ready(kernel.moe_lowtok(*ops))
+    got = jax.block_until_ready(_ids_call(*ops))
     _assert_close(got, _reference(*ops), 2.5e-2 if tokens < 4 else 1e-2)
 
 
 def test_no_local_expert_is_zero():
     _needs("tpu")
     x, ids, weights, *w = _ids_operands(3, 4, 8, 512, 256, 4)
-    got = kernel.moe_lowtok(x, jnp.full_like(ids, -1), weights, *w)
+    got = _ids_call(x, jnp.full_like(ids, -1), weights, *w)
     assert np.all(np.asarray(got, np.float32) == 0)
 
 
@@ -158,7 +165,7 @@ def test_scores_entry_matches_router_then_ids_entry(tokens, shape):
     x, scores, weights = _scores_operands(
         tokens * 11 + experts, tokens, experts, hidden, inter, start
     )
-    got = kernel.moe_lowtok_scores(x, scores, jnp.int32(start), *weights, topk=topk)
+    got = _scores_call(x, scores, start, weights, topk)
     _assert_close(got, _scores_want(x, scores, weights, topk, start, experts))
 
 
@@ -169,7 +176,7 @@ def test_scores_entry_zero_score_rows_select_nothing():
     x, scores, weights = _scores_operands(23, 5, experts, hidden, inter, start)
     scores = scores.at[2].set(0.0)
     got = np.asarray(
-        kernel.moe_lowtok_scores(x, scores, jnp.int32(start), *weights, topk=topk),
+        _scores_call(x, scores, start, weights, topk),
         np.float32,
     )
     assert np.all(got[2] == 0)
@@ -181,7 +188,7 @@ def test_scores_entry_zero_score_rows_select_nothing():
 @pytest.mark.parametrize("tokens", [5, 33])
 def test_interpreted_ids_entry_matches_reference(interpret, tokens):
     ops = _ids_operands(tokens, tokens, 8, 512, 256, 4)
-    _assert_close(kernel.moe_lowtok(*ops), _reference(*ops), 2.5e-2)
+    _assert_close(_ids_call(*ops), _reference(*ops), 2.5e-2)
 
 
 def test_interpreted_scores_entry_matches_router_then_reference(interpret):
@@ -189,7 +196,7 @@ def test_interpreted_scores_entry_matches_router_then_reference(interpret):
     x, scores, weights = _scores_operands(9, 6, experts, hidden, inter, start)
     scores = scores.at[2].set(0.0)
     got = np.asarray(
-        kernel.moe_lowtok_scores(x, scores, jnp.int32(start), *weights, topk=topk),
+        _scores_call(x, scores, start, weights, topk),
         np.float32,
     )
     assert np.all(got[2] == 0)
