@@ -747,7 +747,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("sparse MLA kernels require a TPU (SparseCore).")
 
-    def _run(self, q_lens, seq_lens, num_decode, limits):
+    def _run(self, q_lens, seq_lens, num_decode, limits, packed=False):
         """Runs one step under `limits` and returns the attention output.
 
         Any prior context is written by a preceding prefill step, so every
@@ -794,6 +794,7 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
             pad_seqs,
             num_seqs,
             seq_lens,
+            packed=packed,
         )
         assert np.any(out), "degenerate case: both kernels would return zeros"
         return out
@@ -811,8 +812,12 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
         pad_seqs,
         num_seqs,
         seq_lens=None,
+        packed=False,
     ):
-        """One `sparse_mla_attention` call; returns (caches, output)."""
+        """One `sparse_mla_attention` call; returns (caches, output).
+
+        `packed`: pass the kernel's pre-padded [T, N, 640] q with `q_pe=None`.
+        """
         total = sum(q_lens)
         num_tokens = max(TOKEN_PAD, math.ceil(total / TOKEN_PAD) * TOKEN_PAD)
         starts = np.zeros(pad_seqs + 1, np.int32)
@@ -851,6 +856,10 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
                 mla_dispatch, "matches_glm52_tpu7x_profile", return_value=True
             ),
         ):
+            if packed:
+                q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+                ql_nope = jnp.pad(q, ((0, 0), (0, 0), (0, 640 - q.shape[-1])))
+                q_pe = None
             nope, rope, output = attention_interface.sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -913,6 +922,18 @@ class MaskedDenseDispatchTest(parameterized.TestCase):
             self._run(q_lens, seq_lens, num_decode, GATHER_ONLY),
             rtol=2e-2,
             atol=2e-2,
+        )
+
+    @parameterized.named_parameters(
+        dict(testcase_name="analytic", limits=(128, 4096), num_decode=0),
+        dict(testcase_name="bitmap", limits=(0, 4096), num_decode=0),
+        dict(testcase_name="gather", limits=GATHER_ONLY, num_decode=0),
+    )
+    def test_packed_q_matches_split_q(self, limits, num_decode):
+        """A caller-built padded q is bit-identical to ql_nope + q_pe."""
+        np.testing.assert_array_equal(
+            self._run([40, 24], [40, 24], num_decode, limits, packed=True),
+            self._run([40, 24], [40, 24], num_decode, limits),
         )
 
     @parameterized.named_parameters(
@@ -1045,6 +1066,17 @@ class MaskedDenseProfileTest(parameterized.TestCase):
 
     def test_exact_glm52_profile_is_enabled(self):
         self.assertTrue(mla_dispatch.matches_glm52_tpu7x_profile(*self._operands()))
+
+    def test_prepadded_q_matches_profile(self):
+        q, nope, rope, topk = self._operands()
+        q640 = jax.ShapeDtypeStruct((q.shape[0], q.shape[1], 640), q.dtype)
+        q704 = jax.ShapeDtypeStruct((q.shape[0], q.shape[1], 704), q.dtype)
+        self.assertTrue(
+            mla_dispatch.matches_glm52_tpu7x_profile(q640, nope, rope, topk)
+        )
+        self.assertFalse(
+            mla_dispatch.matches_glm52_tpu7x_profile(q704, nope, rope, topk)
+        )
 
     @parameterized.parameters(dict(heads=16), dict(topk=1024), dict(page_size=512))
     def test_other_sparse_mla_profiles_fall_back(self, **overrides):

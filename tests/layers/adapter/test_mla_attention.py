@@ -554,6 +554,37 @@ def test_gptj_rope_fast_is_bit_exact(use_pair_cache, num_tokens):
     assert not torch.equal(bad_q.view(torch.int16), ref_q.view(torch.int16))
 
 
+def test_mla_forward_sparse_packed_q_bf16():
+    """bf16 sparse non-DCP layers hand the op one pre-padded q (q_pe=None):
+    [ql_nope | q_pe | 0] at the kernel's 640 width."""
+    impl, layer, inputs, op_out = _make_impl_and_layer(num_tokens=4)
+    layer.W_UK_T = layer.W_UK_T.to(torch.bfloat16)
+    q_nope_in, q_pe_in = (t.to(torch.bfloat16) for t in inputs["q"])
+    inputs["q"] = (q_nope_in, q_pe_in)
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    layer.W_UV = layer.W_UV.to(torch.bfloat16)
+    layer.sparse_mla_op.return_value = op_out.to(torch.bfloat16)
+
+    impl.forward(
+        layer=layer, **inputs, topk_indices=torch.zeros((4, 8), dtype=torch.int32)
+    )
+
+    layer.sparse_mla_op.assert_called_once()
+    args = layer.sparse_mla_op.call_args.args
+    q, q_pe = args[1], args[2]
+    assert q_pe is None
+    assert q.shape == (4, 16, 640) and q.dtype == torch.bfloat16
+    expected_ql = torch.bmm(q_nope_in.transpose(0, 1), layer.W_UK_T).transpose(0, 1)
+    torch.testing.assert_close(q[..., :512], expected_ql)
+    assert torch.equal(q[..., 512:576], q_pe_in)
+    assert not q[..., 576:].any()
+
+
 def test_mla_forward_dense_dispatch_without_topk():
     """No topk_indices: the dense op is called, the sparse op is not."""
     k_scale = 2.0

@@ -797,7 +797,7 @@ def mla_attention(
 
 def sparse_mla_attention(
     ql_nope: jax.Array,
-    q_pe: jax.Array,
+    q_pe: jax.Array | None,
     kv_c_normed: jax.Array,
     k_pe: jax.Array,
     kv_cache_nope: jax.Array,
@@ -817,7 +817,11 @@ def sparse_mla_attention(
 
     Args:
       ql_nope: Query nope latents (`[num_tokens, num_heads, lkv_dim]`).
-      q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
+      q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`),
+        or None when `ql_nope` is already the packed kernel q: `[num_tokens,
+        num_heads, align_to(lkv_dim + rope_dim, 128)]` with the nope latents
+        in `[:lkv_dim]`, q_pe in `[lkv_dim:lkv_dim + rope_dim]` and zeros after
+        (bit-identical to what the concat + `prepare_q_inputs` pad would build).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
       k_pe: Decoupled RoPE keys (`[num_tokens, rope_dim]`).
       kv_cache_nope: Paged nope cache, shaped and typed by `nope_spec`.
@@ -863,9 +867,16 @@ def sparse_mla_attention(
         f"{rope_dim}"
     )
 
+    packed_q = q_pe is None
+    if packed_q:
+        expected = -(-(lkv_dim + rope_dim) // 128) * 128
+        assert ql_nope.shape[-1] == expected, (
+            f"packed q must be {expected} wide, got {ql_nope.shape[-1]}"
+        )
+    qs = (ql_nope,) if packed_q else (ql_nope, q_pe)
+
     in_specs = (
-        P(None, None, None),  # ql_nope
-        P(None, None, None),  # q_pe
+        tuple(P(None, None, None) for _ in qs),  # (q,) or (ql_nope, q_pe)
         P(None, None),  # kv_c_normed
         P(None, None),  # k_pe
         P(None),  # kv_cache_nope
@@ -891,8 +902,7 @@ def sparse_mla_attention(
     cache_layout = nope_spec.layout.value
 
     def _sparse_mla_ragged_paged_attention(
-        ql_nope,
-        q_pe,
+        qs_,
         kv_c_normed,
         k_pe,
         kv_cache_nope,
@@ -915,7 +925,7 @@ def sparse_mla_attention(
             rope_spec=rope_spec,
         )
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        q = qs_[0] if packed_q else jnp.concatenate(qs_, axis=-1)
         output = mla_dispatch.ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -930,7 +940,6 @@ def sparse_mla_attention(
             cache_layout=cache_layout,
         )
 
-        lkv_dim = ql_nope.shape[-1]
         # The kernel's output is lkv_dim + rope_dim wide because it attends
         # over concatenated (nope + rope) keys. Only the nope part is the MLA
         # value (P @ latent); drop the rope tail before the W_UV projection.
@@ -945,8 +954,7 @@ def sparse_mla_attention(
             check_rep=False,
         )
     )(
-        ql_nope,
-        q_pe,
+        qs,
         kv_c_normed,
         k_pe,
         kv_cache_nope,

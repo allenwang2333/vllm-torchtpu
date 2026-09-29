@@ -42,6 +42,10 @@ from vllm_torchtpu.kernels.mla.sparse.kernel import sparse_ragged_paged_attentio
 GLM52_NUM_HEADS = 64
 GLM52_NOPE_DIM = 512
 GLM52_ROPE_DIM = 64
+GLM52_Q_HEAD_DIMS = (
+    GLM52_NOPE_DIM + GLM52_ROPE_DIM,
+    -(-(GLM52_NOPE_DIM + GLM52_ROPE_DIM) // 128) * 128,
+)
 GLM52_INDEX_TOPK = 2048
 GLM52_PAGE_SIZE = 1024
 
@@ -93,7 +97,10 @@ def matches_glm52_tpu7x_profile(
     """Whether static operands match the calibrated GLM-5.2 kernel profile."""
     return bool(
         q.ndim == 3
-        and q.shape[1:] == (GLM52_NUM_HEADS, GLM52_NOPE_DIM + GLM52_ROPE_DIM)
+        and q.shape[1] == GLM52_NUM_HEADS
+        # 576 = nope + rope, or the same q already zero-padded to the
+        # kernel's 128-aligned 640 (what `prepare_q_inputs` would produce).
+        and q.shape[2] in GLM52_Q_HEAD_DIMS
         and topk_indices.ndim == 2
         and topk_indices.shape[-1] == GLM52_INDEX_TOPK
         and kv_cache_nope.ndim == 4

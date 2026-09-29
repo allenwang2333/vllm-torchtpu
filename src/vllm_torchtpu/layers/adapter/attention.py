@@ -1746,6 +1746,25 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
         return PallasMLAttentionBackend.get_min_page_size(vllm_config)
 
 
+def _packed_sparse_q(
+    layer: Any, q_nope: torch.Tensor, q_pe: torch.Tensor
+) -> torch.Tensor:
+    """The sparse MLA kernel's q, [T, H, align_to(lkv + rope, 128)], in one pass.
+
+    W_UK_T is zero-padded on N (K is unchanged, so every real output column is
+    the same dot product as the unpadded bmm) and q_pe is written into columns
+    [lkv, lkv + rope) of the bmm output; the rest of the pad stays exactly zero.
+    Bit-identical to `prepare_q_inputs(concat(ql_nope, q_pe))`, without the
+    separate concat + pad pass over the whole q.
+    """
+    lkv, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
+    width = cdiv(lkv + rope, 128) * 128
+    w_uk_t = torch.nn.functional.pad(layer.W_UK_T, (0, width - lkv))
+    q = torch.bmm(q_nope.transpose(0, 1), w_uk_t).transpose(0, 1)
+    q_pe = q_pe.reshape(q.shape[0], layer.num_heads, rope)
+    return torch.slice_scatter(q, q_pe, dim=-1, start=lkv, end=lkv + rope)
+
+
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def __init__(
         self,
@@ -2004,10 +2023,60 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         sparse_mla_jax_op.register_fake(_fake_sparse_mla)
 
+        # Packed-q entry: `q` is the kernel's [T, H, 640] query, built by the
+        # caller (see `_packed_sparse_q`) so the concat + pad never runs.
+        def sparse_mla_attention_packed_core_tpu(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            q: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention(
+                q,
+                None,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                vllm_context.mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+            )
+
+        sparse_mla_packed_jax_op = pallas.jax_op(
+            op_name + "_packed_q",
+            sparse_mla_attention_packed_core_tpu,
+            donate_argnums=(0, 1),
+        )
+
+        def _fake_sparse_mla_packed(kv_cache_nope, kv_cache_rope, q, *args, **kwargs):
+            out_shape = (q.size(0), layer.num_heads, layer.kv_lora_rank)
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty(out_shape, dtype=q.dtype, device=q.device),
+            )
+
+        sparse_mla_packed_jax_op.register_fake(_fake_sparse_mla_packed)
+
         def sparse_mla_impl(
             kv_cache: tuple[torch.Tensor, torch.Tensor],
             ql_nope: torch.Tensor,
-            q_pe: torch.Tensor,
+            q_pe: torch.Tensor | None,
             kv_c_normed: torch.Tensor,
             k_pe: torch.Tensor,
             topk_indices: torch.Tensor,
@@ -2016,12 +2085,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
         ) -> torch.Tensor:
+            """`q_pe=None`: `ql_nope` is the packed [T, H, 640] kernel q."""
             nope_cache, rope_cache = kv_cache
-            new_nope, new_rope, outputs = sparse_mla_jax_op(
+            jax_op = sparse_mla_jax_op if q_pe is not None else sparse_mla_packed_jax_op
+            q_args = (ql_nope, q_pe) if q_pe is not None else (ql_nope,)
+            new_nope, new_rope, outputs = jax_op(
                 nope_cache,
                 rope_cache,
-                ql_nope,
-                q_pe,
+                *q_args,
                 kv_c_normed,
                 k_pe,
                 topk_indices,
@@ -2187,18 +2258,33 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             output.fill_(1)
             return output
 
-        # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
-        # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
-        q_nope_t = q_nope.transpose(0, 1)
-        w_uk_t = (
-            layer.W_UK_T.to(q_nope_t.dtype)
-            if layer.W_UK_T.dtype != q_nope_t.dtype
-            else layer.W_UK_T
+        topk_indices = kwargs.get("topk_indices")
+        # Sparse, non-DCP, unscaled bf16 W_UK: build the kernel's padded q
+        # directly instead of ql_nope + q_pe -> concat -> pad.
+        packed_q = (
+            topk_indices is not None
+            and self.dcp_size <= 1
+            and not hasattr(layer, "W_UK_T_scale")
+            and input_dtype == torch.bfloat16
+            and layer.W_UK_T.dtype == input_dtype
+            and q_pe.dtype == input_dtype
         )
-        ql_nope = torch.bmm(q_nope_t, w_uk_t)
-        if hasattr(layer, "W_UK_T_scale"):
-            ql_nope = ql_nope * layer.W_UK_T_scale
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+
+        if packed_q:
+            q_packed = _packed_sparse_q(layer, q_nope, q_pe)
+        else:
+            # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)
+            # without dynamic `.to(torch.float32)` casting right before `torch.bmm`.
+            q_nope_t = q_nope.transpose(0, 1)
+            w_uk_t = (
+                layer.W_UK_T.to(q_nope_t.dtype)
+                if layer.W_UK_T.dtype != q_nope_t.dtype
+                else layer.W_UK_T
+            )
+            ql_nope = torch.bmm(q_nope_t, w_uk_t)
+            if hasattr(layer, "W_UK_T_scale"):
+                ql_nope = ql_nope * layer.W_UK_T_scale
+            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
@@ -2210,12 +2296,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
             )
 
-        ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
-        q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
+        if not packed_q:
+            ql_nope_flat = ql_nope.view(-1, layer.num_heads, layer.kv_lora_rank)
+            q_pe_flat = q_pe.view(-1, layer.num_heads, layer.qk_rope_head_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 
-        topk_indices = kwargs.get("topk_indices")
         if topk_indices is not None:
             assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
                 "sparse MLA layers use a native (nope, rope) split "
@@ -2256,8 +2342,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
                 outputs = layer.sparse_mla_op(
                     kv_cache,
-                    ql_nope_flat,
-                    q_pe_flat,
+                    q_packed if packed_q else ql_nope_flat,
+                    None if packed_q else q_pe_flat,
                     kv_c_normed_flat,
                     k_pe_flat,
                     topk_indices,
