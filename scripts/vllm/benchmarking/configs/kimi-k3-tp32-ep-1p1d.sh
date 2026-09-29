@@ -34,7 +34,10 @@ if [ "$EXTRA_SERVE_ARGS" = "$_before" ]; then
     return 1
 fi
 # --enable-prompt-tokens-details: the stages read usage.cached_tokens.
-EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --mamba-cache-mode align --enable-prompt-tokens-details"
+# --reasoning-parser: K3 ends an answer by closing its response and message
+# channels, and without its parser a chat response carries those markers as
+# text ("4 <|close|> response <|sep|> <|close|> message <|sep|>").
+EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --mamba-cache-mode align --enable-prompt-tokens-details --reasoning-parser kimi_k3"
 
 # ---- Raiden Stage 3, both engines --------------------------------------------
 export TPU_KV_RESHARD_TRANSPORT=raiden

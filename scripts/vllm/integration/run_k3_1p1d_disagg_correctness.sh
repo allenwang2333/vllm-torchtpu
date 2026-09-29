@@ -187,11 +187,13 @@ run_stages() {
   local target=(--host "${PROXY_HOST}" --port "${PROXY_PORT}"
                 --model "${SERVED_MODEL_NAME}")
   local chat=("${target[@]}" --chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}")
+  # --min-max-tokens: room for the six tokens K3 closes its channels with.
+  # --skip-short-qa: that suite asserts trivia in Qwen3.5's phrasing.
+  local fixtures=("${chat[@]}" --min-max-tokens 32 --skip-short-qa)
 
   stage quick_probe python3 "${smoke}" "${chat[@]}" --quick-probe-only
-  # --skip-short-qa: that suite asserts trivia in Qwen3.5's phrasing.
-  stage correctness python3 "${smoke}" "${chat[@]}" --skip-short-qa
-  stage correctness_concurrent python3 "${smoke}" "${chat[@]}" --skip-short-qa \
+  stage correctness python3 "${smoke}" "${fixtures[@]}"
+  stage correctness_concurrent python3 "${smoke}" "${fixtures[@]}" \
     --concurrent-requests "${K3_PD_CONCURRENCY}"
   # 120 lines is ~4.2k tokens.
   stage divergence python3 "${script_dir}/smoke_prefix_cache_e2e_divergence.py" \
