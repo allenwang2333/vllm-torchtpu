@@ -55,6 +55,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
+from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -63,7 +64,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     ep_rank_order,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
 from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
@@ -376,11 +376,12 @@ def _build_op(
         input_specs = (PartitionSpec(EP_AXIS_NAME),) * 7
 
     spec = PartitionSpec(EP_AXIS_NAME)
-    # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
-    # where a shard_map result is recorded as replicated, so this rank's 2048
-    # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
-    # with only that line replaced.
-    op = sharded_jax_op(
+    # Stock jax_op, as the v2 dispatch uses since #952: Torchtpu takes
+    # output_partition_specs itself, so this rank's rows come back sized
+    # locally. `sharded_jax_op` patches the placeholder line in Torchtpu's
+    # JaxCallable source, which the pinned Torchtpu no longer matches; there
+    # it falls back to sizing outputs mesh-wide.
+    op = jax_op(
         FUSED_MOE_EP_OP_NAME,
         moe,
         mesh=mesh,

@@ -34,10 +34,10 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
+from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -101,7 +101,9 @@ def head_fn(mesh):
 def build_op(mesh):
     """The sharded projection op on the expert-parallel mesh."""
     n = mesh.shape[EP_AXIS_NAME]
-    op = sharded_jax_op(
+    # Stock jax_op with output_partition_specs, as fused_moe_ep.py since #952;
+    # `sharded_jax_op` sizes outputs mesh-wide on the pinned Torchtpu.
+    op = jax_op(
         OP_NAME,
         head_fn(mesh),
         mesh=mesh,
