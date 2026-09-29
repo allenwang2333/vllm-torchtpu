@@ -8161,6 +8161,21 @@
       "concise_description": "Object of type `((obj: ((...) -> Unknown) | None = None, *, span_name: str = ..., attributes: dict[str, str] | None = ..., record_exception: bool = ...) -> ((...) -> Unknown) | partial[Unknown] | Any) | ((...) -> Unknown) | BreakableCUDAGraphWrapper | CUDAGraphWrapper | Module | UBatchWrapper | Unknown | None` has no attribute `compute_logits`"
     },
     {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `list[int | str] | None` is not assignable to parameter `iterable` with type `Iterable[int | str]` in function `sorted`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `TPUModelRunner._spec_verify_bucket_reachable`"
+    },
+    {
+      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | str | Unknown` is not assignable to parameter `num_tokens` with type `int` in function `TPUModelRunner._spec_verify_bucket_reachable`"
+    },
+    {
       "path": "src/vllm_torchtpu/runner/tpu_runner_async_output.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"
@@ -8819,6 +8834,21 @@
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unbound-name",
       "concise_description": "`combine_plain` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Unknown | None` is not assignable to parameter `mtp` with type `Module` in function `vllm_torchtpu.spec_decode.mtp_fused_loop.build_mtp_fused_loop`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Tensor | ndarray | None` is not assignable to parameter `num_rejected_np` with type `ndarray | None` in function `Eagle3Proposer._run_mtp_fused_loop`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/mtp_fused_loop.py",
+      "name": "not-callable",
+      "concise_description": "Expected a callable, got `Tensor`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/mtp_loop_model.py",
