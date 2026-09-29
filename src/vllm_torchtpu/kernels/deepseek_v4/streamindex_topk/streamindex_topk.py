@@ -47,6 +47,25 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # (1 << 23 in key space) to every epilogue group max before the min over
 # groups, so T lands above v_k and `sctopk_l1` must go wrong.
 _TEST_EPILOGUE_T_FAULT = None
+# Test-only positive control for `score_epilogue`, read at trace time: "assoc"
+# sums each bf16 head group as (t0+t2)+(t1+t3) instead of (t0+t1)+(t2+t3) (f32
+# path: heads summed in reverse), so top-k must differ from the default.
+_TEST_SCORE_EPI_FAULT = None
+_GI_SLAB = 256
+
+
+def _parse_score_epilogue(score_epilogue: str) -> tuple[int, str]:
+    """"gi{TG}-{mode}" -> (TG, mode); "" -> (0, "")."""
+    if not score_epilogue:
+        return 0, ""
+    head, _, mode = score_epilogue.partition("-")
+    modes = ("full", "slab", "loop", "loopslab")
+    if not head.startswith("gi") or mode not in modes:
+        raise ValueError(f"bad score_epilogue {score_epilogue!r}")
+    tg = int(head[2:])
+    if tg not in (8, 16, 32, 64):
+        raise ValueError(f"bad score_epilogue token group {tg}")
+    return tg, mode
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global
@@ -105,6 +124,7 @@ def kernel(
     chunk_idx: int = 0,
     emit_t: bool = False,
     score_bf16_group: int = 0,
+    score_epilogue: str = "",
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     if emit_t:
@@ -324,6 +344,139 @@ def kernel(
             acc = acc + relu_st * w[:, h : h + 1]  # fused multiply-add.
         return acc
 
+    gi_tg, gi_mode = _parse_score_epilogue(score_epilogue)
+    # Token-group-interleaved q rows: (group g of gi_tg tokens, head h, token t)
+    # instead of head-major (h, token). Consecutive MXU pops then belong to the
+    # heads of the same gi_tg tokens, so the head sum can accumulate in a few
+    # registers as the pops arrive instead of materializing the whole
+    # [H*bq, bkv_sz] f32 tile. The per-element arithmetic (and its order) is
+    # exactly `reduce_heads`', so the scores are bit-identical.
+    use_gi = (
+        bool(gi_tg)
+        and seq_batch_size == 1
+        and bq_sz > 1
+        and not seq_along_lane
+        and bq_sz % gi_tg == 0
+    )
+    gi_rows = gi_tg * num_q_heads
+
+    def qk_has(rows, bkv):
+        return jnp.einsum("nd,md->nm", rows, bkv, preferred_element_type=jnp.float32)
+
+    def gi_fill(q_vmem, weights_vmem, q_gi_ref, w_gi_ref):
+        """Writes the gi-ordered q rows and lane-broadcast weights, once per q block."""
+        q_hm = transpose_to_head_major(q_vmem[...], bq_sz)
+        w = weights_vmem[...].reshape(bq_sz, num_q_heads)
+        w = w.astype(w_gi_ref.dtype)
+        for g in range(bq_sz // gi_tg):
+            for h in range(num_q_heads):
+                r = g * gi_rows + h * gi_tg
+                src = h * bq_sz + g * gi_tg
+                q_gi_ref[r : r + gi_tg, :] = q_hm[src : src + gi_tg]
+                w_gi_ref[r : r + gi_tg, :] = jnp.broadcast_to(
+                    w[g * gi_tg : (g + 1) * gi_tg, h : h + 1], (gi_tg, 128)
+                )
+
+    def gi_head_sum(st, wv):
+        """[H*gi_tg, S] f32 (rows (h, t)) -> [gi_tg, S] weighted relu head sum."""
+        reps = st.shape[1] // 128
+
+        def wrow(h):
+            v = wv[h * gi_tg : (h + 1) * gi_tg]
+            return v if reps == 1 else jnp.concatenate([v] * reps, axis=1)
+
+        def rows(x, h):
+            return x[h * gi_tg : (h + 1) * gi_tg]
+
+        if score_bf16_group:
+            stb = st.astype(jnp.bfloat16)
+            zero = jnp.bfloat16(0)
+            acc = None
+            for g0 in range(0, num_q_heads, score_bf16_group):
+                terms = [
+                    jnp.maximum(rows(stb, h), zero) * wrow(h)
+                    for h in range(g0, g0 + score_bf16_group)
+                ]
+                if _TEST_SCORE_EPI_FAULT == "assoc" and len(terms) == 4:
+                    terms = [terms[0], terms[2], terms[1], terms[3]]
+                while len(terms) > 1:
+                    terms = [
+                        terms[i] + terms[i + 1] for i in range(0, len(terms) - 1, 2)
+                    ] + ([terms[-1]] if len(terms) % 2 else [])
+                part = terms[0].astype(jnp.float32)
+                acc = part if acc is None else acc + part
+            return acc
+        order = list(range(num_q_heads))
+        if _TEST_SCORE_EPI_FAULT == "assoc":
+            order = order[::-1]
+        acc = jnp.maximum(rows(st, order[0]), 0.0) * wrow(order[0])
+        for h in order[1:]:
+            acc = acc + jnp.maximum(rows(st, h), 0.0) * wrow(h)
+        return acc
+
+    def gi_group_sum(q_rows, w_rows, bkv, st_full=None):
+        """One token group's [gi_tg, bkv_sz] head sum."""
+        if gi_mode in ("slab", "loopslab"):
+            parts = []
+            for c in range(0, bkv_sz, _GI_SLAB):
+                parts.append(gi_head_sum(qk_has(q_rows, bkv[c : c + _GI_SLAB]), w_rows))
+            return jnp.concatenate(parts, axis=1)
+        st = qk_has(q_rows, bkv) if st_full is None else st_full
+        return gi_head_sum(st, w_rows)
+
+    def finish_scores(s_summed, scale_val, bkv_idx, seq_len, q_pos_compressed, cp_rank):
+        """Scale, mask and lay out a [rows, bkv_sz] head sum (as compute_scores)."""
+        s_summed = s_summed * scale_val
+        k_local = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s_summed.shape, 1)
+        k_span = cp_local_to_global(k_local, cp_rank, cp_size, interleave_c)
+        kv_len = seq_len >> shift_comp
+        valid_mask = k_span < kv_len
+        causal_mask = k_span <= q_pos_compressed[:, None]
+        mask = jnp.logical_and(valid_mask, causal_mask)
+        s_summed = jnp.where(mask, s_summed, -jnp.inf)
+        return s_summed.reshape(-1, num_sublanes_bkv, 128)
+
+    def gi_scores(
+        q_gi_ref, w_gi_ref, bkv, scale_val, bkv_idx, seq_len, q_pos_base, cp_rank,
+        scores_vmem,
+    ):
+        """gi scoring for one step; writes scores_vmem and returns the f32 scores."""
+        n_groups = bq_sz // gi_tg
+        if gi_mode in ("loop", "loopslab"):
+
+            def body(g, carry):
+                r0 = pl.multiple_of(g * gi_rows, gi_rows)
+                acc = gi_group_sum(
+                    q_gi_ref[pl.ds(r0, gi_rows), :], w_gi_ref[pl.ds(r0, gi_rows), :], bkv
+                )
+                q_pos = (
+                    q_pos_base + g * gi_tg + jnp.arange(gi_tg, dtype=jnp.int32)
+                ) >> shift_comp
+                s = finish_scores(acc, scale_val, bkv_idx, seq_len, q_pos, cp_rank)
+                t0 = pl.multiple_of(g * gi_tg, gi_tg)
+                scores_vmem[pl.ds(t0, gi_tg)] = pltpu.bitcast(s, jnp.int32)
+                return carry
+
+            lax.fori_loop(0, n_groups, body, 0)
+            return pltpu.bitcast(scores_vmem[...], jnp.float32)
+        q_all = q_gi_ref[...]
+        w_all = w_gi_ref[...]
+        st_all = qk_has(q_all, bkv) if gi_mode == "full" else None
+        accs = []
+        for g in range(n_groups):
+            sl = slice(g * gi_rows, (g + 1) * gi_rows)
+            accs.append(
+                gi_group_sum(
+                    q_all[sl], w_all[sl], bkv,
+                    st_full=None if st_all is None else st_all[sl],
+                )
+            )
+        acc = jnp.concatenate(accs, axis=0)
+        q_pos = (q_pos_base + jnp.arange(bq_sz, dtype=jnp.int32)) >> shift_comp
+        s = finish_scores(acc, scale_val, bkv_idx, seq_len, q_pos, cp_rank)
+        scores_vmem[...] = pltpu.bitcast(s, jnp.int32)
+        return s
+
     def compute_scores(
         bq_vec,
         bkv_vec,
@@ -418,13 +571,42 @@ def kernel(
             copy.wait()
 
     def step_body(
-        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, t_refs=None
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, t_refs=None,
+        w_gi_ref=None,
     ):
         p_id = pl.program_id(0)
         batch_start_seq_idx = seq_tile(p_id)
         bq_idx = bq_block(p_id)
         bkv_idx = bkv_block(p_id)
         cp_rank = cp_rank_ref[0]
+
+        if w_gi_ref is not None:
+            # q_hm_ref holds the gi-ordered rows here; see `use_gi`.
+            @pl.when(bkv_idx == 0)
+            def _():
+                gi_fill(q_vmem, weights_vmem, q_hm_ref, w_gi_ref)
+
+            chunk_start = start_end_seq_idx_ref[2]
+            s_l = seq_lens_ref[batch_start_seq_idx]
+            q_s = cu_q_lens_ref[batch_start_seq_idx]
+            q_l = cu_q_lens_ref[batch_start_seq_idx + 1] - q_s
+            block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
+            q_pos_base = s_l - q_l + block_start
+            bkv = bkv_vmem[0, :bkv_sz_per_kv_packing][...]
+            flat_bkv = bkv.reshape(-1, bkv.shape[-1])
+            fp8_val = pltpu.bitcast(
+                flat_bkv[:, :head_dim], jnp.float8_e4m3fn
+            ).reshape(bkv_sz, head_dim)
+            scale_val = pltpu.bitcast(
+                flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
+            ).astype(jnp.bfloat16)
+            scores = gi_scores(
+                q_hm_ref, w_gi_ref, fp8_val, scale_val, bkv_idx, s_l, q_pos_base,
+                cp_rank, scores_vmem,
+            )
+            if t_refs is not None:
+                t_epilogue(p_id, bkv_idx, scores, *t_refs)
+            return
 
         if q_hm_ref is not None:
             # The head-major reordering depends only on the q block, but the grid
@@ -500,12 +682,14 @@ def kernel(
         if t_refs is not None:
             t_epilogue(p_id, bkv_idx, scores, *t_refs)
 
-    def _run_all(q_hm_ref=None, t_refs=None):
+    def _run_all(q_hm_ref=None, w_gi_ref=None, t_refs=None):
         @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
         def _run_pipeline(final_allocs):
             q_buf, weights_buf, kv_buf, o_buf = final_allocs
             pipeline_fn = pltpu.emit_pipeline(
-                functools.partial(step_body, q_hm_ref=q_hm_ref, t_refs=t_refs),
+                functools.partial(
+                    step_body, q_hm_ref=q_hm_ref, t_refs=t_refs, w_gi_ref=w_gi_ref
+                ),
                 grid=(metadata_ref.num_steps[chunk_idx],),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
                 out_specs=o_buf.spec,
@@ -524,7 +708,16 @@ def kernel(
     def _dispatch(t_refs=None):
         # Only the multi-token path reorders q, and only a single sequence per
         # tile keeps the cached block unambiguous.
-        if seq_batch_size == 1 and bq_sz > 1:
+        if use_gi:
+            pl.run_scoped(
+                lambda q_ref, w_ref: _run_all(q_ref, w_ref, t_refs=t_refs),
+                pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+                pltpu.VMEM(
+                    (num_q_heads * bq_sz, 128),
+                    jnp.bfloat16 if score_bf16_group else jnp.float32,
+                ),
+            )
+        elif seq_batch_size == 1 and bq_sz > 1:
             pl.run_scoped(
                 functools.partial(_run_all, t_refs=t_refs),
                 pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
@@ -753,6 +946,7 @@ SEGCD_BASE = "segc2"
         "score_bf16_group",
         "topk_tail",
         "l1_live",
+        "score_epilogue",
     ),
 )
 def streamindex_topk(
@@ -785,6 +979,7 @@ def streamindex_topk(
     score_bf16_group: int = 0,
     topk_tail: str = "",
     l1_live: bool = False,
+    score_epilogue: str = "",
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -863,6 +1058,11 @@ def streamindex_topk(
       l1_live: with `sctopk_l1`, stage 1 DMAs only each slice's live columns
         (align16 of its length) and nothing for slices past a row's context,
         instead of every slice of the full-width score row. Bit-identical.
+      score_epilogue: "" (default) or "gi{TG}-{full|slab|loop|loopslab}": run
+        the prefill scoring kernel's head sum over token-group-interleaved q
+        rows (groups of TG tokens) so it can stay register-resident.
+        Bit-identical scores. Only the single-sequence multi-token HEAD_ALONG_SUBLANE
+        tiles take it; others run the default.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -875,6 +1075,7 @@ def streamindex_topk(
 
     if score_bf16_group < 0:
         raise ValueError(f"score_bf16_group must be >= 0, got {score_bf16_group}.")
+    _parse_score_epilogue(score_epilogue)
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
     if cp_size > 1:
@@ -1093,6 +1294,7 @@ def streamindex_topk(
                         if score_bf16_group
                         else {}
                     ),
+                    **(dict(score_epilogue=score_epilogue) if score_epilogue else {}),
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
