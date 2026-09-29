@@ -36,7 +36,7 @@ from vllm_torchtpu import envs
 
 # Rows from which a step is sequence parallel. PR #989's value, kept pending a
 # probe: at TP8 its first sequence-parallel bucket (512) gives each rank 64
-# rows, above the fused EP v3 step gate.
+# rows.
 MIN_ROWS = 257
 
 _active = False

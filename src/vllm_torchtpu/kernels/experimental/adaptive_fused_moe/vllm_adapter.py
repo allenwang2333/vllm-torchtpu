@@ -21,6 +21,7 @@ experimental path always builds sharded routing and never returns a GMM fallback
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -46,7 +47,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     PACK4,
     U32_SUBLANE_TILE,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import moe_routing, sequence_parallel, token_padding
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -164,10 +165,10 @@ def prebuild_adaptive_fused_moe(
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
-    groups = ep_token_replica_groups(is_sequence_parallel=parallel.is_sequence_parallel)
     # Decided here, at weight load, so the forward reads no env.
     skip_padded_tokens = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS) and _in_backbone_graph()
-    op = _build_op(
+    build = functools.partial(
+        _build_op,
         mesh,
         topk,
         renormalize,
@@ -175,9 +176,22 @@ def prebuild_adaptive_fused_moe(
         order,
         weight_format,
         rhs_qb,
-        token_replica_groups=groups,
         skip_padded_tokens=skip_padded_tokens,
     )
+    if parallel.is_sequence_parallel:
+        op = _by_step_form(
+            sliced=build(
+                token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
+                sliced_rows=True,
+            ),
+            replicated=build(
+                token_replica_groups=ep_token_replica_groups(is_sequence_parallel=False)
+            ),
+        )
+    else:
+        op = build(
+            token_replica_groups=ep_token_replica_groups(is_sequence_parallel=False)
+        )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
         "hidden=%d inter=%d local_experts=%d rhs_qb=%s estimated_vmem_bytes=%d "
@@ -193,6 +207,22 @@ def prebuild_adaptive_fused_moe(
         skip_padded_tokens,
     )
     return op
+
+
+def _by_step_form(
+    *, sliced: Callable[..., torch.Tensor], replicated: Callable[..., torch.Tensor]
+) -> Callable[..., torch.Tensor]:
+    """The op of a sequence-parallel layer: `sliced` on a step whose rows are
+    sliced over the ranks, `replicated` on a smaller step whose rows every rank
+    holds whole (layers/adapter/sequence_parallel).
+
+    Each form is its own trace; both take the same operands.
+    """
+
+    def run(*args):
+        return (sliced if sequence_parallel.is_active() else replicated)(*args)
+
+    return run
 
 
 def _in_backbone_graph() -> bool:
@@ -438,8 +468,13 @@ def _build_op(
     *,
     token_replica_groups: tuple[tuple[int, ...], ...] | None = None,
     skip_padded_tokens: bool = False,
+    sliced_rows: bool = False,
 ) -> Callable[..., torch.Tensor]:
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+
+    `sliced_rows`: each rank holds a contiguous slice of the step's rows (a
+    sequence-parallel step), so it skips that slice of the step's padding mask.
+    """
     key = (
         mesh,
         topk,
@@ -450,6 +485,7 @@ def _build_op(
         rhs_qb,
         token_replica_groups,
         skip_padded_tokens,
+        sliced_rows,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -544,10 +580,18 @@ def _build_op(
     op.register_fake(_fake)
     run = op
     if skip_padded_tokens:
+        ep = mesh.shape[EP_AXIS_NAME] if sliced_rows else None
 
         def run(x, *args):
-            # This rank's rows: the op takes each rank's own tokens.
-            padded = token_padding.local_padding_mask(x.shape[0])
+            if sliced_rows:
+                # The rank operand is this rank's mesh index, which is its EP
+                # rank and, with sequence parallelism, its TP rank.
+                padded = token_padding.rank_padding_mask(
+                    x.shape[0], ep, args[-1].reshape(1)
+                )
+            else:
+                # This rank's rows: the op takes each rank's own tokens.
+                padded = token_padding.local_padding_mask(x.shape[0])
             if padded is None:
                 raise RuntimeError(
                     "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "

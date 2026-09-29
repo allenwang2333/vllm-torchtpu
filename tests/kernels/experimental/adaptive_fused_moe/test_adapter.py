@@ -200,16 +200,39 @@ def test_built_bridge_calls_experimental_kernel_and_separates_formats(monkeypatc
     assert "sharded_plan" not in kernel.call_args.kwargs
 
 
-@pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_prebuild_passes_native_token_groups(context, monkeypatch, sequence_parallel):
-    value = layer()
-    value.moe_config.moe_parallel_config.is_sequence_parallel = sequence_parallel
-    groups = ((0,), (1,)) if sequence_parallel else ((1, 0),)
-    discover = Mock(return_value=groups)
+def test_prebuild_passes_native_token_groups(context, monkeypatch):
+    discover = Mock(return_value=((1, 0),))
     monkeypatch.setattr(bridge, "ep_token_replica_groups", discover)
-    prebuild(value)
-    discover.assert_called_once_with(is_sequence_parallel=sequence_parallel)
-    assert context[1].call_args.kwargs["token_replica_groups"] == groups
+    prebuild(layer())
+    discover.assert_called_once_with(is_sequence_parallel=False)
+    assert context[1].call_args.kwargs["token_replica_groups"] == ((1, 0),)
+    assert "sliced_rows" not in context[1].call_args.kwargs
+
+
+def test_a_sequence_parallel_layer_prebuilds_an_op_per_step_form(context, monkeypatch):
+    """Sliced steps give each rank its own rows (singleton groups); smaller
+    steps keep the rows replicated over TP (layers/adapter/sequence_parallel)."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    _, build = context
+    build.side_effect = lambda *a, **kw: lambda: (
+        kw["token_replica_groups"],
+        kw.get("sliced_rows", False),
+    )
+    replicas = {True: ((0,), (1,)), False: ((0, 1),)}
+    monkeypatch.setattr(
+        bridge,
+        "ep_token_replica_groups",
+        lambda is_sequence_parallel: replicas[is_sequence_parallel],
+    )
+    value = layer()
+    value.moe_config.moe_parallel_config.is_sequence_parallel = True
+    ops = prebuild(value)
+    assert build.call_count == 2
+    monkeypatch.setattr(sequence_parallel, "_active", True)
+    assert ops() == (((0,), (1,)), True)
+    monkeypatch.setattr(sequence_parallel, "_active", False)
+    assert ops() == (((0, 1),), False)
 
 
 def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch):
