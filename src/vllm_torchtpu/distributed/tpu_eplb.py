@@ -91,6 +91,54 @@ def _log(msg: str) -> None:
     print(f"TPU_EPLB pid={os.getpid()} {msg}", file=sys.stderr, flush=True)
 
 
+def _flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes")
+
+
+# --------------------------------------------------------------------------
+# Stall diagnostics (VLLM_TPU_EPLB_TRACE=1, default off): compile counters
+# read around the rebalance and the forwards right after it.
+# --------------------------------------------------------------------------
+
+_JAX_COMPILES = [0, 0.0]  # count, seconds
+_JAX_LISTENER = [False]
+
+
+def _jax_compile_listener(event, duration_secs=0.0, *a, **kw) -> None:
+    if "compile" in str(event) and "cache" not in str(event):
+        _JAX_COMPILES[0] += 1
+        _JAX_COMPILES[1] += float(duration_secs)
+
+
+def _install_jax_listener() -> None:
+    if _JAX_LISTENER[0]:
+        return
+    try:
+        import jax.monitoring
+
+        jax.monitoring.register_event_duration_secs_listener(_jax_compile_listener)
+        _JAX_LISTENER[0] = True
+    except Exception as e:  # diagnostic only
+        _log(f"trace: no jax compile listener ({e!r})")
+
+
+def _compile_snapshot() -> tuple:
+    """(torch_tpu deferred-graph cache misses, jax compiles, jax compile s)."""
+    misses = -1
+    try:
+        from torch_tpu._internal.device import _device_ops_backend
+
+        misses = int(_device_ops_backend._get_cache_misses())
+    except Exception:
+        pass
+    return misses, _JAX_COMPILES[0], _JAX_COMPILES[1]
+
+
+def _compile_delta(a: tuple, b: tuple) -> str:
+    return (f"tt_cache_miss={b[0] - a[0] if a[0] >= 0 else 'na'} "
+            f"jax_compiles={b[1] - a[1]} jax_compile_ms={(b[2] - a[2]) * 1e3:.1f}")
+
+
 # --------------------------------------------------------------------------
 # Placement algorithm (pure numpy; identical input -> identical output on
 # every rank, which is what lets every rank decide alone).
@@ -406,6 +454,14 @@ def step_trigger(count: int, next_at: int, interval: int) -> tuple[bool, int]:
 class EplbRebalancer:
     """Owns the placement of every registered fused-EP layer of one model."""
 
+    # Diagnostics defaults (overridden in __init__ from the environment).
+    trace = False
+    trace_fwd_left = 0
+    trace_steps_left = 0
+    _last_step_t = None
+    _step_ring: list = []
+    _saver = None
+
     def __init__(self, model, megakernel=None):
         from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, ep_rank_order
 
@@ -435,6 +491,14 @@ class EplbRebalancer:
         self.window = {lid: np.zeros(self.E, np.float64) for lid in self.layers}
         self.log_dir = os.environ.get("VLLM_TPU_EPLB_LOG_DIR", "")
         self.debug_skip = os.environ.get("VLLM_TPU_EPLB_DEBUG_SKIP", "")
+        # Diagnostics / stall fixes, all default off.
+        self.trace = _flag("VLLM_TPU_EPLB_TRACE")
+        self.warm_exchange = _flag("VLLM_TPU_EPLB_WARM_EXCHANGE")
+        self.trace_fwd_left = 0
+        self.trace_steps_left = 0
+        self._last_step_t = None
+        self._step_ring: list = []
+        self._saver = None
         self.megakernel = megakernel
         self.count = 0
         self.next_at = self.first
@@ -456,10 +520,41 @@ class EplbRebalancer:
             getattr(layer, LOAD_ATTR).zero_()
         self.count = 0
         self.next_at = self.first
+        if self.trace:
+            _install_jax_listener()
+        if self.warm_exchange:
+            self._warm_exchange()
         self.armed = True
         _log("counting from here (warmup loads discarded)")
 
-    def on_step(self, agreed_count: int, min_count: int, n_forwards: int) -> None:
+    def _warm_exchange(self) -> None:
+        """Compile every exchange program at boot instead of inside the first
+        rebalance (~4 s at epoch 1). Runs an all-self-send identity plan whose
+        result is discarded: collective, so it is called on every rank at the
+        same point (arm(), the end of capture_model)."""
+        import torch
+
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        t0 = time.perf_counter()
+        layer = next(iter(self.layers.values()))
+        ident = initial_phys2log_mesh(self.E, self.ep, self.order)
+        xp = exchange_plan(ident, ident, self.ep)
+        dev = getattr(layer, MAP_ATTR).device
+        ops = [
+            torch.tensor(a[self.me:self.me + 1], dtype=torch.int32, device=dev)
+            for a in (xp.send_idx, xp.in_off, xp.send_sz, xp.out_off, xp.recv_sz)
+        ]
+        outs = []
+        for _, t in _expert_tensors(layer):
+            outs.append(_exchange_op(self.mesh, tuple(t.shape), t.dtype)(t, *ops))
+        synchronize_tensors(outs)
+        del outs
+        _log(f"warm exchange programs={len(_EXCHANGE_OPS)} ms={(time.perf_counter() - t0) * 1e3:.1f}")
+
+    def on_step(
+        self, agreed_count: int, min_count: int, n_forwards: int, allreduce_ms: float = 0.0
+    ) -> None:
         """Called once per engine step on every DP rank, right after the step's
         CPU all-reduce and before any of the step's device work.
 
@@ -478,10 +573,48 @@ class EplbRebalancer:
                 f"WARNING forward counts disagree across ranks: min={min_count} "
                 f"max={agreed_count} local={self.count}; following max"
             )
+        now = time.perf_counter()
+        if self.trace:
+            period = (now - self._last_step_t) * 1e3 if self._last_step_t is not None else -1.0
+            self._step_ring = (self._step_ring + [(agreed_count, period, allreduce_ms, n_forwards)])[-12:]
+            if self.trace_steps_left > 0:
+                k = 12 - self.trace_steps_left
+                _log(f"trace post_step epoch={self.epoch} k={k} count={agreed_count} "
+                     f"n_fwd={n_forwards} period_ms={period:.1f} allreduce_ms={allreduce_ms:.1f}")
+                self.trace_steps_left -= 1
         due, self.next_at = step_trigger(agreed_count, self.next_at, self.interval)
         if due:
+            if self.trace:
+                ring = " ".join(f"{c}:{p:.0f}/{a:.0f}/{n}" for c, p, a, n in self._step_ring)
+                _log(f"trace pre_steps (count:period_ms/allreduce_ms/n_fwd) {ring}")
             self.rebalance(agreed_count)
+            if self.trace:
+                self.trace_fwd_left = 3
+                self.trace_steps_left = 12
+            now = time.perf_counter()
+        self._last_step_t = now
         self.count = agreed_count + n_forwards
+
+    def traced_forward(self, fn, mk: bool, n: int):
+        """One of the first forwards after a rebalance, timed alone with its
+        compile counters (VLLM_TPU_EPLB_TRACE)."""
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        k = 3 - self.trace_fwd_left
+        self.trace_fwd_left -= 1
+        t0 = time.perf_counter()
+        synchronize_tensors()
+        t1 = time.perf_counter()
+        c0 = _compile_snapshot()
+        out = fn()
+        t2 = time.perf_counter()
+        synchronize_tensors()
+        t3 = time.perf_counter()
+        c1 = _compile_snapshot()
+        _log(f"trace post_fwd epoch={self.epoch} k={k} mk={mk} toks={n} "
+             f"drain_ms={(t1 - t0) * 1e3:.1f} host_ms={(t2 - t1) * 1e3:.1f} "
+             f"total_ms={(t3 - t1) * 1e3:.1f} {_compile_delta(c0, c1)}")
+        return out
 
     # Rebalance -------------------------------------------------------------
 
@@ -498,10 +631,12 @@ class EplbRebalancer:
         from vllm_torchtpu.utils import synchronize_tensors
 
         t0 = time.perf_counter()
+        c_start = _compile_snapshot() if self.trace else None
         # Drain everything this rank has queued (the step's input prep on a
         # busy rank, nothing on an idle one) so the exchange programs below are
         # compiled from the same ops on every rank.
         synchronize_tensors()
+        t_drain = time.perf_counter() - t0
         _log(f"rebalance enter at_forward={at}")
         phys_loads = self._read_loads()  # mesh-order physical slot -> pairs
         t_read = time.perf_counter() - t0
@@ -528,10 +663,13 @@ class EplbRebalancer:
         moved_total = 0
         bytes_out_me = 0
         t_x0 = time.perf_counter()
+        tm = {"xenq": 0.0, "xsync": 0.0, "map": 0.0, "mk_rebuild": 0.0, "mk_sync": 0.0,
+              "zero_sync": 0.0, "save": 0.0}
         for lid, new in plans.items():
             layer = self.layers[lid]
             xp = exchange_plan(self.phys2log[lid], new, self.ep)
             moved_total += xp.moved_experts
+            ta = time.perf_counter()
             if self.debug_skip != "weights":
                 dev = getattr(layer, MAP_ATTR).device
                 ops = [
@@ -546,7 +684,11 @@ class EplbRebalancer:
                     del new_t
                     per_expert = t[0].numel() * t.element_size()
                     bytes_out_me += int(xp.per_rank_out[self.me]) * per_expert
+                tb = time.perf_counter()
+                tm["xenq"] += tb - ta
                 synchronize_tensors([t for _, t in _expert_tensors(layer)])
+                tm["xsync"] += time.perf_counter() - tb
+            tc = time.perf_counter()
             if self.debug_skip != "map":
                 l2p = np.empty(self.E, np.int64)
                 l2p[new] = np.arange(self.E)
@@ -554,6 +696,7 @@ class EplbRebalancer:
                 getattr(layer, MAP_ATTR).copy_(
                     torch.tensor(ep_ids, dtype=torch.int32, device=getattr(layer, MAP_ATTR).device)
                 )
+            tm["map"] += time.perf_counter() - tc
             old = self.phys2log[lid]
             self.phys2log[lid] = new
             infos[lid]["old_phys2log"] = old
@@ -561,9 +704,14 @@ class EplbRebalancer:
             self.megakernel.set_expert_placement(
                 {lid: self.phys2log[lid] for lid in plans}
             )
+            mk_t = getattr(self.megakernel, "last_placement_timing", None)
+            if mk_t:
+                tm["mk_rebuild"], tm["mk_sync"] = mk_t
+        td = time.perf_counter()
         for layer in self.layers.values():
             getattr(layer, LOAD_ATTR).zero_()
         synchronize_tensors()
+        tm["zero_sync"] = time.perf_counter() - td
         t_x = time.perf_counter() - t_x0
         self.epoch += 1
         om = np.array([infos[l]["old_max_over_mean"] for l in sorted(infos)])
@@ -578,11 +726,11 @@ class EplbRebalancer:
             f"(mean {om.mean():.3f} -> {nm.mean():.3f}) bytes_out_this_rank={bytes_out_me} "
             f"read_ms={t_read * 1e3:.1f} plan_ms={t_plan * 1e3:.1f} exchange_ms={t_x * 1e3:.1f}"
         )
+        te = time.perf_counter()
         if self.log_dir:
-            os.makedirs(self.log_dir, exist_ok=True)
             lids = sorted(infos)
             path = os.path.join(self.log_dir, f"eplb_me{self.me}_pid{os.getpid()}_e{self.epoch}.npz")
-            np.savez_compressed(
+            self._save_npz(
                 path,
                 epoch=self.epoch,
                 at_forward=at,
@@ -598,7 +746,36 @@ class EplbRebalancer:
                 exchange_ms=t_x * 1e3,
                 bytes_out_this_rank=bytes_out_me,
                 experts_moved=moved_total,
+                drain_ms=t_drain * 1e3,
+                **{f"{k}_ms": v * 1e3 for k, v in tm.items() if k != "save"},
             )
+        tm["save"] = time.perf_counter() - te
+        if self.trace:
+            _log(f"trace rebalance epoch={self.epoch} layers_moved={len(plans)} "
+                 f"drain_ms={t_drain * 1e3:.1f} read_ms={(t_read - t_drain) * 1e3:.1f} "
+                 f"plan_ms={t_plan * 1e3:.1f} "
+                 + " ".join(f"{k}_ms={v * 1e3:.1f}" for k, v in tm.items())
+                 + f" total_ms={(time.perf_counter() - t0) * 1e3:.1f} "
+                 + _compile_delta(c_start, _compile_snapshot()))
+
+    def _save_npz(self, path: str, **arrays) -> None:
+        """Write the epoch record off the serving thread (VLLM_TPU_EPLB_ASYNC_SAVE,
+        default off: then it is written inline, as before)."""
+        def write():
+            t = time.perf_counter()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            np.savez_compressed(path, **arrays)
+            if self.trace:
+                _log(f"trace npz_written ms={(time.perf_counter() - t) * 1e3:.1f} path={path}")
+
+        if not _flag("VLLM_TPU_EPLB_ASYNC_SAVE"):
+            write()
+            return
+        if self._saver is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._saver = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tpu_eplb_save")
+        self._saver.submit(write)
 
 
 _REBALANCER: EplbRebalancer | None = None

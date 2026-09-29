@@ -160,3 +160,24 @@ def test_trigger_agrees_across_busy_and_idle_ranks():
     assert fired_in_c1
     assert all(r.fired == ranks[0].fired for r in ranks)
     assert all(r.count == ranks[0].count for r in ranks)
+
+
+def test_trace_arms_post_rebalance_forwards_and_steps():
+    r = _fake_rebalancer(first=4, interval=4)
+    r.trace, r.epoch = True, 0
+    for _ in range(5):  # counts 0..4; the step that sees count 4 fires
+        r.on_step(r.count, r.count, 1, allreduce_ms=0.5)
+    assert r.fired == [4] and r.trace_fwd_left == 3 and r.trace_steps_left == 12
+    r.on_step(r.count, r.count, 1)
+    assert r.trace_steps_left == 11
+
+
+def test_async_save_writes_npz(tmp_path, monkeypatch):
+    import numpy as np
+
+    monkeypatch.setenv("VLLM_TPU_EPLB_ASYNC_SAVE", "1")
+    r = _fake_rebalancer(first=4, interval=4)
+    path = str(tmp_path / "sub" / "e1.npz")
+    r._save_npz(path, epoch=1, x=np.arange(3))
+    r._saver.shutdown(wait=True)
+    assert np.load(path)["x"].tolist() == [0, 1, 2]

@@ -283,8 +283,11 @@ class Glm5Megakernel:
         operand keeps its shape, dtype and layout: a runtime input of the
         compiled step, not a recompile.
         """
+        import time
+
         from vllm_torchtpu.utils import synchronize_tensors
 
+        t0 = time.perf_counter()
         for l, p2l in phys2log_mesh.items():
             self.layer_perm[int(l)] = torch.as_tensor(p2l, dtype=torch.long)
         changed = {int(l) for l in phys2log_mesh}
@@ -302,7 +305,10 @@ class Glm5Megakernel:
                        "es2": lambda: _expert_scale(r, "w2_weight", (self.cfg.ER, self.cfg.H))}[kind]()
                 self.weights[i] = new.detach()
         self.smalls = self._build_smalls().detach()
+        t1 = time.perf_counter()
         synchronize_tensors(self.weights + [self.smalls])
+        # (host rebuild s, device sync s), read by the EPLB stall trace.
+        self.last_placement_timing = (t1 - t0, time.perf_counter() - t1)
 
     def _collect_weights(self) -> list[torch.Tensor]:
         per_layer = {}

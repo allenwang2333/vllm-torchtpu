@@ -3017,9 +3017,11 @@ class TPUModelRunner(GPUModelRunner):
         if eplb is not None:
             vals += [int(eplb.count), -int(eplb.count)]
         t = torch.tensor(vals, dtype=torch.int64, device="cpu")
+        t_ar = time.perf_counter()
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
+        ar_ms = (time.perf_counter() - t_ar) * 1e3
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         # Every rank reads the same reduced values, so every rank takes the
         # same branch -- which the megakernel's in-kernel collectives require.
@@ -3042,6 +3044,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(t[3].item()),
                 -int(t[4].item()),
                 0 if self._mk_decode_step else int(t[1].item()),
+                allreduce_ms=ar_ms,
             )
         return bucket, int(t[1].item())
 
@@ -6039,6 +6042,19 @@ class TPUModelRunner(GPUModelRunner):
     def _forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        eplb = getattr(self, "_tpu_eplb", None)
+        if eplb is not None and eplb.trace_fwd_left > 0 and not getattr(self, "_eplb_tracing", False):
+            # VLLM_TPU_EPLB_TRACE: time the first forwards after a rebalance alone.
+            self._eplb_tracing = True
+            try:
+                return eplb.traced_forward(
+                    lambda: self._forward_model(
+                        input_ids, positions, inputs_embeds, intermediate_tensors),
+                    mk=bool(getattr(self, "_mk_decode_step", False)),
+                    n=int(input_ids.shape[0]),
+                )
+            finally:
+                self._eplb_tracing = False
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         if getattr(self, "_mk_decode_step", False):
