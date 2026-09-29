@@ -371,7 +371,11 @@ def _random_rejection_sample_with_segment(
     scaled_logits = target_logits.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
-    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+    # scaled_logits is non-decreasing in the (bf16) target logits row-wise,
+    # which lets apply_top_k_top_p use its 16-step key search.
+    masked_logits = apply_top_k_top_p(
+        scaled_logits, top_k, top_p, order_source=target_logits
+    )
     target_probs = torch.softmax(masked_logits, dim=-1)
 
     # Accept test is the Leviathan ratio min(1, p(x) / q(x))

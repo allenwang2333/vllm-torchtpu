@@ -239,9 +239,10 @@ def topp_mask(
     return torch.where(probs >= threshold, logits, replace_tensor)
 
 
-def apply_top_k_top_p(
+def _apply_top_k_top_p_float_search(
     logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
 ) -> torch.Tensor:
+    """`apply_top_k_top_p` via 32-step float32 threshold searches."""
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
     topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)
@@ -249,3 +250,131 @@ def apply_top_k_top_p(
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+# Fast path: 16-step searches over bf16 order keys.
+#
+# `topk_mask` and `topp_mask` each binary-search a float32 threshold, i.e. 32
+# full-vocab reductions apiece. When the logits come from a bf16 tensor, their
+# order is fully described by a 16-bit key, so 16 steps suffice to find the
+# boundary element; the float threshold is then read back from that element.
+# The result is the same masked tensor the float32 searches return.
+#
+# Why it is exact: let `values` be a non-decreasing function of `order_source`
+# (a bf16 tensor) within each row, e.g. `order_source / temperature` in any
+# dtype. Every set the float32 searches keep is an upper set of `values`
+# ({values >= cutoff}), and every such set is also an upper set of the keys.
+# The search finds the smallest key upper set that satisfies the criterion
+# (count >= k, or mass >= p), which is contained in the reference set; closing
+# it under value ties ({values >= its smallest value}) gives back exactly the
+# reference set, because the reference set is the smallest value upper set
+# that satisfies the criterion.
+
+
+def bf16_order_key(x: torch.Tensor) -> torch.Tensor:
+    """bf16 -> int32 key in [-32768, 32767], strictly monotonic in float order.
+
+    Same "xor trick" as `_monotonic_int32_to_float32_bit_pattern`, on 16 bits:
+    negative floats have their magnitude bits flipped so larger magnitudes map
+    to smaller keys.
+    """
+    bits = x.view(torch.int16).to(torch.int32)
+    return bits ^ ((bits >> 15) & 0x7FFF)
+
+
+def _int16_key_bsearch(
+    batch_shape: Sequence[int],
+    predicate: Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Largest key t in [-32768, 32767] with predicate(t) True.
+
+    `predicate` must be monotonic decreasing in t (True up to a threshold,
+    False above it). Returns -32768 when it is False everywhere. [batch..., 1]
+    """
+    lo = torch.full((*batch_shape, 1), -(1 << 15), dtype=torch.int32, device=device)
+    for bit in range(15, -1, -1):
+        mid = lo + (1 << bit)
+        lo = torch.where(predicate(mid), mid, lo)
+    return lo
+
+
+def _min_where(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Row-wise min of `values` over `mask`; +inf for empty rows. [batch..., 1]"""
+    inf = torch.full_like(values, float("inf"))
+    return torch.where(mask, values, inf).amin(dim=-1, keepdim=True)
+
+
+def topk_mask_by_key(
+    logits: torch.Tensor,
+    key: torch.Tensor,
+    k: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+) -> torch.Tensor:
+    """Same result as `topk_mask(logits, k)`; `key` orders `logits` (see above)."""
+
+    def predicate(mid: torch.Tensor) -> torch.Tensor:
+        return (key >= mid).sum(dim=-1, keepdim=True, dtype=torch.int32) >= k
+
+    boundary = _int16_key_bsearch(logits.shape[:-1], predicate, logits.device)
+    cutoff = _min_where(logits, key >= boundary)
+    # topk_mask only searches finite thresholds, so its cutoff never drops
+    # below -max and it masks -inf logits even when fewer than k are finite.
+    cutoff = cutoff.clamp(min=-torch.finfo(logits.dtype).max)
+    return torch.where(logits >= cutoff, logits, torch.full_like(logits, replace_val))
+
+
+def topp_mask_by_key(
+    logits: torch.Tensor,
+    key: torch.Tensor,
+    p: torch.Tensor,
+    replace_val: float = MASKED_LOGIT_VALUE,
+) -> torch.Tensor:
+    """Same result as `topp_mask(logits, p)`; `key` orders `logits` (see above)."""
+    probs = torch.softmax(logits, dim=-1)
+    zero = torch.zeros_like(probs)
+
+    def predicate(mid: torch.Tensor) -> torch.Tensor:
+        mass = torch.where(key >= mid, probs, zero).sum(dim=-1, keepdim=True)
+        return mass >= p
+
+    boundary = _int16_key_bsearch(logits.shape[:-1], predicate, logits.device)
+    threshold = _min_where(probs, key >= boundary)
+    return torch.where(probs >= threshold, logits, torch.full_like(logits, replace_val))
+
+
+def apply_top_k_top_p(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    order_source: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masks `logits` to each row's top-k, then to its top-p nucleus.
+
+    Args:
+      logits: Values to mask (e.g. temperature-scaled). [batch, vocab_size]
+      top_k: [batch, 1] int. Rows with top_k <= 0 skip top-k. Ties with the
+        k-th largest value are kept.
+      top_p: [batch, 1] float. Rows with top_p >= 1 skip top-p.
+      order_source: Optional tensor that `logits` is a row-wise non-decreasing
+        function of, e.g. the unscaled logits. Defaults to `logits`. When it is
+        bf16, the thresholds are found with 16-step searches over bf16 order
+        keys instead of 32-step float32 searches (about half the vocab-wide
+        reductions); the result is identical either way. [batch, vocab_size]
+
+    Returns:
+      Masked logits, MASKED_LOGIT_VALUE where dropped. [batch, vocab_size]
+    """
+    if order_source is None:
+        order_source = logits
+    if order_source.dtype != torch.bfloat16:
+        return _apply_top_k_top_p_float_search(logits, top_k, top_p)
+    key = bf16_order_key(order_source)
+
+    topk_masked = topk_mask_by_key(logits, key, top_k)
+    masked_logits = torch.where(top_k > 0, topk_masked, logits)
+
+    # Masked entries hold the row's smallest value, so masked_logits is still
+    # non-decreasing in `key`.
+    topp_masked = topp_mask_by_key(masked_logits, key, top_p)
+    return torch.where(top_p < 1.0, topp_masked, masked_logits)
