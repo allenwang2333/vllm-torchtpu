@@ -85,13 +85,15 @@ def weight_kinds(cfg):
     }
 
 
-def cache_kinds(cfg, nb):
+def cache_kinds(cfg, nb, rope_packed=False):
+    """rope_packed: the served ROPE cache holds 64 B/token, eight tokens per 128-word row
+    (kv_cache_utils SparseMLAKVCacheSpec.rope_packed), instead of 128 B/token, four per row."""
     all_l = list(range(cfg.L))
     full = [l for l in all_l if cfg.full_indexer(l)]
     pg = cfg.page
     return {
         "nope": (all_l, (nb, pg, 128), U32),
-        "rope": (all_l, (nb, pg // 4, 128), U32),
+        "rope": (all_l, (nb, pg // (8 if rope_packed else 4), 128), U32),
         "idx": (full, (nb, pg // 4, 4, 256), U8),
     }
 
@@ -190,6 +192,26 @@ def rope(x, cos, sin_signed):
     return (x * cos + lane_swap(x) * sin_signed).astype(BF16).astype(F32)
 
 
+def packed_rope_to_padded(p, iv):
+    """Gathered PACKED rope rows -> the padded rope lane layout the score math reads.
+
+    p: [128, 128] i32, row r = the 128-word cache row holding gathered token t_r = iv[0, r] in its
+    eighth s8 = t_r & 7 (lanes 16*s8 + j, word j = key bytes (j, 16+j, 32+j, 48+j)).
+    Returns rows with that token's key in quarter s4 = t_r & 3 (lanes 32*s4 + j', word j' = bytes
+    (j', 32+j') in bytes 0 and 1) -- exactly the lanes and bytes a padded row carries there, so
+    the per-quarter q0s / q1s dots see identical operands. Other lanes hold finite fp8 garbage that
+    only meets zero q lanes (fp8_decode has no NaN), as the padded layout's other tokens do."""
+    s8 = jnp.transpose(jnp.broadcast_to(iv & 7, (128, 128)))         # per-row (sublane) eighth
+    lane = lax.broadcasted_iota(I32, (128, 128), 1)
+    b0, b1, b2 = (s8 & 1) == 1, (s8 & 2) == 2, (s8 & 4) == 4
+    p = jnp.where(b2, pltpu.roll(p, 64, 1), p)                         # eighth s8 -> s4 (x16 lanes)
+    lo = (p & 0xFF) | shl(shr(p, 16) & 0xFF, 8)                        # bytes (j, 32+j)
+    hi = pltpu.roll((shr(p, 8) & 0xFF) | shl(shr(p, 24) & 0xFF, 8), 16, 1)   # (16+j, 48+j), +16 lanes
+    c = jnp.where((shr(lane, 4) & 1) == (s8 & 1), lo, hi)             # key at lanes 16*s4 .. +32
+    c = jnp.where(b0, pltpu.roll(c, 16, 1), c)
+    return jnp.where(b1, pltpu.roll(c, 32, 1), c)                      # key at lanes 32*s4 .. +32
+
+
 def fp8_decode(b):
     """int32 byte (e4m3fn bit pattern) -> f32 value."""
     s = shr(b, 7) & 1
@@ -255,10 +277,13 @@ COLLECTIVE_ID = int(os.environ.get("MK_COLLECTIVE_ID", "37"))
 
 
 def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset(),
-          axis_name=None):
+          axis_name=None, rope_packed=False):
     """Returns (step_fn, operand names). step_fn(meta, bt, h0, rope_tab, smalls, *weights,
     *caches) -> (out [M, H] bf16, *caches) for ONE rank; wrap in shard_map.
-    skip: timing ablations only (numerics are garbage), a subset of ABLATIONS."""
+    skip: timing ablations only (numerics are garbage), a subset of ABLATIONS.
+    rope_packed: the ROPE caches are the 64 B/token PACKED layout (see cache_kinds). The gather,
+    the KV write and the post-call scatter address row sl >> 3; attention re-lays each gathered
+    chunk into the padded lane layout first, so the score math is unchanged (bit-exact)."""
     assert set(skip) <= set(ABLATIONS), skip
     typed = interpret or os.environ.get("MK_TYPED") == "1"   # diag: typed banks, no pool_alias
     R, L, H = cfg.R, cfg.L, cfg.H
@@ -271,7 +296,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     assert ROWS <= 32 * 128, "top-k row summary is one (1, 128) word row"
     lay, S = smalls_layout(cfg)
     wk = weight_kinds(cfg)
-    ck = cache_kinds(cfg, nb)
+    ck = cache_kinds(cfg, nb, rope_packed)
+    # rope row of token slot sl: sl >> RSH; RSEG tokens of RW words per row
+    RSH = 3 if rope_packed else 2
+    RSEG, RW = 1 << RSH, 128 >> RSH
     G = tiles.head_group
     assert cfg.NH % G == 0
     GU = min(G, cfg.HR)                              # v9: heads per W_UK tile (of this rank's HR)
@@ -591,7 +619,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 sl = t & (pg - 1)
                 pltpu.make_async_copy(ref_n.at[page, pl.ds(sl, 1)],
                                       scr["g_nope"].at[pl.ds(i, 1)], scr["g_sem"].at[0]).start()
-                pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
+                pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> RSH, 1)],
                                       scr["g_rope"].at[pl.ds(i, 1)], scr["g_sem"].at[1]).start()
                 return c
             lax.fori_loop(0, n, gbody, 0, unroll=min(GATHER_UNROLL, n))
@@ -935,23 +963,28 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         | shl(nb8[:, 256:384], 16) | shl(nb8[:, 384:512], 24))
                 scr["wrow"][0:1, :] = lax.bitcast_convert_type(word, U32)
                 rb = fp8_bytes(jnp.clip(kpe, -FP8_MAX, FP8_MAX).astype(FP8))[0:1]
-                rw = jnp.where(lane128 < 32, rb | shl(pltpu.roll(rb, 96, 1), 8), 0)
-                seg = sl & 3
+                if rope_packed:   # word j = bytes (j, 16+j, 32+j, 48+j) of the 64 B key
+                    rw = jnp.where(lane128 < 16, rb | shl(pltpu.roll(rb, 112, 1), 8)
+                                   | shl(pltpu.roll(rb, 96, 1), 16)
+                                   | shl(pltpu.roll(rb, 80, 1), 24), 0)
+                else:             # word j = bytes (j, 32+j, 64+j, 96+j); 64..127 are zero
+                    rw = jnp.where(lane128 < 32, rb | shl(pltpu.roll(rb, 96, 1), 8), 0)
+                seg = sl & (RSEG - 1)
 
                 cn = pltpu.make_async_copy(scr["wrow"], nrow_out.at[l], scr["kv_sem"].at[0])
                 cn.start()
 
                 def kvw(ref_r):
                     def f():
-                        cr = pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> 2, 1)],
+                        cr = pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> RSH, 1)],
                                                    scr["rrow"].at[pl.ds(0, 1)], scr["kv_sem"].at[1])
                         cr.start()
                         cr.wait()
                         old = lax.bitcast_convert_type(scr["rrow"][0:1, :], I32)
                         new = old
-                        for sg in range(4):
-                            new = jnp.where((seg == sg) & (lane128 // 32 == sg),
-                                            pltpu.roll(rw, 32 * sg, 1) if sg else rw, new)
+                        for sg in range(RSEG):
+                            new = jnp.where((seg == sg) & (lane128 // RW == sg),
+                                            pltpu.roll(rw, RW * sg, 1) if sg else rw, new)
                         scr["rrow"][0:1, :] = lax.bitcast_convert_type(new, U32)
                     return f
                 bswitch(l, {ll: kvw(C["rope"][ll]) for ll in range(L)})
@@ -1217,9 +1250,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     s = s + lax.dot_general(qn[:, b * 128:(b + 1) * 128], band, NT,
                                             preferred_element_type=F32)
                 rw_ = lax.bitcast_convert_type(scr["g_rope"][pl.ds(r0, 128), :], I32)
+                iv = scr["idx_v"][pl.ds(c, 1), :]                                  # [1,128]
+                if rope_packed:
+                    rw_ = packed_rope_to_padded(rw_, iv)
                 B0 = fp8_decode(rw_ & 0xFF).astype(BF16)
                 B1 = fp8_decode(shr(rw_, 8) & 0xFF).astype(BF16)
-                iv = scr["idx_v"][pl.ds(c, 1), :]                                  # [1,128]
                 seg = iv & 3
                 for sg in range(4):
                     ss = (lax.dot_general(q0s[sg], B0, NT, preferred_element_type=F32)
@@ -1520,7 +1555,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             if k == "nope":
                 row, at = nrow[l, 0:1][None], (page, sl, z)
             elif k == "rope":
-                row, at = rrow[l, 0:1][None], (page, sl >> 2, z)
+                row, at = rrow[l, 0:1][None], (page, sl >> RSH, z)
             else:
                 row, at = irow[l][None, None], (page, sl >> 2, z, z)
             old = lax.dynamic_slice(x, at, row.shape)

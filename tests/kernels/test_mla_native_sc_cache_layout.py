@@ -71,6 +71,43 @@ class NativeScCacheLayoutTest(absltest.TestCase):
             native_sc_cache_layout.flatten_rope_rows(packed_rope).shape, (768, 32)
         )
 
+    def test_rope_packed_word_bytes_and_inverse_are_exact(self):
+        rope = (
+            np.arange(3 * 16 * 64, dtype=np.int32).astype(np.uint8).reshape(3, 16, 64)
+        )
+
+        packed = native_sc_cache_layout.pack_rope_packed(rope)
+
+        # eight 64 B tokens per 128-word row
+        self.assertEqual(packed.shape, (3, 2, 128))
+        words_as_bytes = packed.reshape(3, 16, 16).view(np.uint8).reshape(3, 16, 16, 4)
+        # word w of a token = bytes (w, 16+w, 32+w, 48+w)
+        expected = rope.reshape(3, 16, 4, 16).swapaxes(-2, -1)
+        np.testing.assert_array_equal(words_as_bytes, expected)
+        np.testing.assert_array_equal(
+            native_sc_cache_layout.unpack_rope_packed(packed), rope
+        )
+
+    def test_packed_rope_allocation_is_64_bytes_per_token(self):
+        nope = np.zeros((3, 256, 4, 128), np.uint8)
+        rope = np.zeros((3, 256, 128), np.uint8)
+
+        packed_nope, packed_rope = native_sc_cache_layout.pack_native_caches(
+            nope, rope, page_size=256, rope_packed=True
+        )
+
+        self.assertEqual(packed_rope.shape, (3, 32, 128))
+        self.assertEqual(
+            native_sc_cache_layout.source_bytes_per_token(packed_nope, packed_rope),
+            (512, 64),
+        )
+        self.assertEqual(
+            native_sc_cache_layout.rope_words_per_token(packed_nope, packed_rope), 16
+        )
+        self.assertEqual(
+            native_sc_cache_layout.flatten_rope_rows(packed_rope, 16).shape, (768, 16)
+        )
+
     def test_selected_rope_oracle_groups_four_tokens_for_tensorcore(self):
         rope = np.arange(8 * 128, dtype=np.int32).astype(np.uint8).reshape(8, 128)
 

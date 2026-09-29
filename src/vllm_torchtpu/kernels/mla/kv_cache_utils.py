@@ -30,6 +30,9 @@ from torch_tpu._internal.pallas import pallas
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
 WORD_BYTES = 4
 TILE_LANE_BYTES = 128  # lane width of a TensorCore tile, in bytes
+# A packed SPARSECORE RoPE token: the fp8 rope key's own 64 B (16 words), not a
+# TILE_LANE_BYTES slot. Eight tokens share one 128-word row.
+SC_ROPE_PACKED_BYTES = 64
 
 # Sentinels for tokens that must not be written. JAX drops out-of-bounds
 # scatters; the Pallas writers predicate on the sign instead.
@@ -82,8 +85,14 @@ def get_kv_cache_shape(
     kv_dim: int,
     kv_dtype: jnp.dtype | None = None,
     kv_packing: int | None = None,
+    lane_align: int = TILE_LANE_BYTES,
 ) -> tuple[int, int, int, int]:
-    """Computes padded 4D shape `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`."""
+    """Computes padded 4D shape `(total_num_pages, page_size // kv_packing, kv_packing, kv_dim)`.
+
+    `kv_dim` is padded to `lane_align` bytes: a TensorCore tile row
+    (TILE_LANE_BYTES) by default, SC_ROPE_PACKED_BYTES for a packed
+    SPARSECORE RoPE cache.
+    """
     if kv_packing is None:
         assert kv_dtype is not None, "must pass kv_dtype if kv_packing is None"
         kv_packing = get_dtype_packing(kv_dtype)
@@ -91,7 +100,7 @@ def get_kv_cache_shape(
         total_num_pages,
         align_to(page_size, kv_packing) // kv_packing,
         kv_packing,
-        align_to(kv_dim, TILE_LANE_BYTES),
+        align_to(kv_dim, lane_align),
     )
 
 
@@ -103,6 +112,7 @@ class SparseMLAKVCacheSpec:
     page_size: int
     head_dim: int
     kv_packing: int
+    rope_packed: bool = False
 
     @classmethod
     def create(
@@ -113,12 +123,34 @@ class SparseMLAKVCacheSpec:
         page_size: int,
         head_dim: int,
         kv_packing: int = 4,
+        rope_packed: bool = False,
     ) -> "SparseMLAKVCacheSpec":
-        """Builds a spec with the kernel's page/head-dim padding applied."""
+        """Builds a spec with the kernel's page/head-dim padding applied.
+
+        `rope_packed` (SPARSECORE RoPE only) pads the token to
+        SC_ROPE_PACKED_BYTES instead of TILE_LANE_BYTES: a 64-dim fp8 rope key
+        then takes 64 B, not 128 B of which half is zero.
+        """
+        rope_packed = bool(
+            rope_packed
+            and cache_type is KVCacheType.ROPE
+            and layout is KVCacheLayout.SPARSECORE
+        )
         num_pages, packed_page_size, kv_packing, head_dim = get_kv_cache_shape(
-            num_pages, page_size, head_dim, None, kv_packing
+            num_pages,
+            page_size,
+            head_dim,
+            None,
+            kv_packing,
+            lane_align=SC_ROPE_PACKED_BYTES if rope_packed else TILE_LANE_BYTES,
         )
         page_size = packed_page_size * kv_packing
+        if rope_packed:
+            # One 128-word row holds 512 // head_dim whole tokens.
+            assert (page_size * head_dim) % (WORD_BYTES * TILE_LANE_BYTES) == 0, (
+                f"packed rope page ({page_size} x {head_dim}B) must fill whole "
+                f"{WORD_BYTES * TILE_LANE_BYTES}B rows"
+            )
 
         if layout is KVCacheLayout.SPARSECORE:
             assert head_dim % WORD_BYTES == 0, (
@@ -143,6 +175,7 @@ class SparseMLAKVCacheSpec:
             page_size=page_size,
             head_dim=head_dim,
             kv_packing=kv_packing,
+            rope_packed=rope_packed,
         )
 
     @property
@@ -176,6 +209,14 @@ class SparseMLAKVCacheSpec:
                     self.page_size // self.kv_packing,
                     self.kv_packing,
                     self.head_dim,
+                )
+            if self.rope_packed:
+                # Same bytes as [num_pages, page_size, head_dim // 4] words, but
+                # with the 128-word rows the kernels address.
+                return (
+                    self.num_pages,
+                    self.page_size * self.head_dim // (WORD_BYTES * TILE_LANE_BYTES),
+                    TILE_LANE_BYTES,
                 )
             return (self.num_pages, self.page_size // WORD_BYTES, self.head_dim)
         raise ValueError(f"unsupported cache type {self.cache_type}")

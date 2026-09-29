@@ -1638,6 +1638,8 @@ class PallasMLAttentionBackend(AttentionBackend):
                 block_size,
                 rope_dim,
                 kv_packing,
+                # sparsecore only: 64 B/token instead of a padded 128 B slot.
+                rope_packed=envs.TPU_SPARSE_MLA_ROPE_PACKED,
             ),
         )
 

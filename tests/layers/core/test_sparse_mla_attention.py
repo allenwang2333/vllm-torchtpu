@@ -88,6 +88,16 @@ ROPE_SC_SPEC = SparseMLAKVCacheSpec.create(
     ROPE_DIM,
     KV_PACKING,
 )
+# PACKED 64 B/token RoPE cache (TPU_SPARSE_MLA_ROPE_PACKED, the serving default).
+ROPE_SC_PACKED_SPEC = SparseMLAKVCacheSpec.create(
+    KVCacheType.ROPE,
+    KVCacheLayout.SPARSECORE,
+    TOTAL_PAGES,
+    PAGE_SIZE,
+    ROPE_DIM,
+    KV_PACKING,
+    rope_packed=True,
+)
 
 _LIMIT_NAMES = ("MASKED_DENSE_ANALYTIC_LIMIT", "MASKED_DENSE_LIMIT")
 
@@ -299,6 +309,64 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             [_dequantize(k_pe_fp8, self.k_scale)],
         )
         self._check(output, expected, valid)
+
+    def test_sparsecore_packed_rope_writer_to_attention(self):
+        """The PACKED 64 B RoPE cache end to end through `sparse_mla_attention`:
+        allocated at 8:1, written by the serving writer, read by the kernel's
+        packed gather -- and bit-identical to the padded cache's output."""
+        self._require_tpu()
+        from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+        self.assertTrue(ROPE_SC_PACKED_SPEC.rope_packed)
+        self.assertEqual(ROPE_SC_PACKED_SPEC.shape, (TOTAL_PAGES, PAGE_SIZE // 8, 128))
+        q_len, topk = 64, 128  # the packed gather needs topk >= 128
+        kv_c, k_pe = self._random_latents(q_len)
+        kv_c_fp8 = _quantize_fp8(kv_c, self.k_scale)
+        k_pe_fp8 = _quantize_fp8(k_pe, self.k_scale)
+        ql_nope, q_pe = self._random_queries(q_len)
+        topk_rows = _causal_topk(list(range(q_len)), topk)
+        block_tables = self._block_tables(1)
+        outs, caches = {}, {}
+        for name, rope_spec in (("padded", ROPE_SC_SPEC), ("packed", ROPE_SC_PACKED_SPEC)):
+            sparse_kernel._LOGGED_ROPE_LAYOUTS.clear()
+            empty = _empty_pair(NOPE_SC_SPEC, rope_spec)
+            nope_bytes = empty[0].size * empty[0].dtype.itemsize
+            rope_bytes = empty[1].size * empty[1].dtype.itemsize
+            self.assertEqual(nope_bytes // rope_bytes, 8 if rope_spec.rope_packed else 4)
+            caches[name], outs[name] = self._call(
+                empty,
+                ql_nope,
+                q_pe,
+                kv_c_fp8,
+                k_pe_fp8,
+                topk_rows,
+                [q_len],
+                [0, q_len],
+                [0, 1, 1],
+                block_tables,
+                self._make_mesh(),
+                nope_spec=NOPE_SC_SPEC,
+                rope_spec=rope_spec,
+            )
+            if rope_spec.rope_packed:
+                # The kernel's own trace-time record of the gather it compiled
+                # (these packed shapes are traced only by this test).
+                self.assertEqual(sparse_kernel._LOGGED_ROPE_LAYOUTS, {True})
+        self.assertEqual(caches["packed"][1].shape, ROPE_SC_PACKED_SPEC.shape)
+        expected, valid = self._reference(
+            ql_nope,
+            q_pe,
+            topk_rows,
+            [q_len],
+            [0, q_len],
+            [_dequantize(kv_c_fp8, self.k_scale)],
+            [_dequantize(k_pe_fp8, self.k_scale)],
+        )
+        self._check(outs["packed"], expected, valid)
+        np.testing.assert_array_equal(
+            np.asarray(outs["packed"]).view(np.uint8),
+            np.asarray(outs["padded"]).view(np.uint8),
+        )
 
     def _reference(
         self, ql_nope, q_pe, topk_rows, q_lens, query_start_loc, kv_c_deq, k_pe_deq

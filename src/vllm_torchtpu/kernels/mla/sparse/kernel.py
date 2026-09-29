@@ -23,6 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
+from vllm_torchtpu.logger import init_logger
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -567,6 +568,21 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+logger = init_logger(__name__)
+_LOGGED_ROPE_LAYOUTS: set = set()
+
+
+def _log_rope_layout_once(rope_packed: bool, rope_shape: tuple) -> None:
+    """Trace-time record of which ROPE gather the SPARSECORE path compiled."""
+    if rope_packed not in _LOGGED_ROPE_LAYOUTS:
+        _LOGGED_ROPE_LAYOUTS.add(rope_packed)
+        logger.info(
+            "sparse MLA kernel: %s ROPE gather, rope cache %s",
+            "PACKED 64 B/token (_r16)" if rope_packed else "PADDED 128 B/token",
+            rope_shape,
+        )
+
+
 # Main attention kernel for GLM-5.2 DSA (top-k gather and attention).
 # The KV entries referenced by `topk_indices` (including the current batch's
 # own tokens) must already be resident in the caches before this call;
@@ -656,6 +672,7 @@ def sparse_ragged_paged_attention(
     rope_packed = sparsecore_layout and cache_kv_nope.size == 8 * cache_kv_rope.size
     rope_group = 8 if rope_packed else 4
     if sparsecore_layout:
+        _log_rope_layout_once(rope_packed, tuple(cache_kv_rope.shape))
         if (
             cache_kv_nope.dtype != jnp.uint32
             or cache_kv_nope.ndim != 3
