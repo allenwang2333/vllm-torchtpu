@@ -205,6 +205,23 @@ def test_dead_engine_fails_every_held_request():
     assert c.sent == [] and c._held == []
 
 
+def test_shutdown_fails_every_held_request(monkeypatch):
+    monkeypatch.setattr(core_client.DPLBAsyncMPClient, "shutdown", lambda *a: None)
+    c = _client()
+
+    async def go():
+        held = [_add(c, _request(i)) for i in range(2)]
+        await asyncio.sleep(0.01)
+        c.shutdown()
+        for t in held:
+            with pytest.raises(EngineDeadError):
+                await t
+        return c._poller
+
+    assert asyncio.run(go()).cancelled()
+    assert c.sent == [] and c._held == []
+
+
 def test_install_if_enabled_selects_the_client(monkeypatch):
     monkeypatch.setattr(core_client, "DPLBAsyncMPClient", core_client.DPLBAsyncMPClient)
     monkeypatch.delenv("DP_PLACEMENT", raising=False)

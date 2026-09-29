@@ -14,6 +14,7 @@
 """The DP load-balancing client behind DP_PLACEMENT=release (dp_placement.py)."""
 
 import asyncio
+import contextlib
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -77,6 +78,11 @@ class ReleaseDPLBAsyncMPClient(DPLBAsyncMPClient):
                 f"but {client_count} API servers would each hold a fraction of "
                 "them. Pass --api-server-count=1, or unset DP_PLACEMENT."
             )
+        self._held: list[_Held] = []
+        self._assigned: Counter[int] = Counter()
+        self._next_engine = 0
+        self._poller: asyncio.Task | None = None
+        self._release: asyncio.Task | None = None
         super().__init__(
             vllm_config,
             executor_class,
@@ -85,11 +91,6 @@ class ReleaseDPLBAsyncMPClient(DPLBAsyncMPClient):
             client_count,
             client_index,
         )
-        self._held: list[_Held] = []
-        self._assigned: Counter[int] = Counter()
-        self._next_engine = 0
-        self._poller: asyncio.Task | None = None
-        self._release: asyncio.Task | None = None
         logger.info(
             "DP release router: group of %d, deadline %.1f s, quiet %.1f s",
             len(self.core_engines),
@@ -145,14 +146,17 @@ class ReleaseDPLBAsyncMPClient(DPLBAsyncMPClient):
         await super().abort_requests_async(request_ids)
 
     def shutdown(self, timeout: float | None = None) -> None:
-        try:
-            for task in (self._poller, self._release):
-                if task is not None:
-                    task.cancel()
-            self._fail_held(EngineDeadError())
-        except RuntimeError:
-            pass  # The event loop is closed: nobody is waiting.
+        # The engine monitor thread calls shutdown too.
+        if self._poller is not None:
+            with contextlib.suppress(RuntimeError):  # The loop is closed.
+                self._poller.get_loop().call_soon_threadsafe(self._stop_releasing)
         super().shutdown(timeout)
+
+    def _stop_releasing(self) -> None:
+        for task in (self._poller, self._release):
+            if task is not None:
+                task.cancel()
+        self._fail_held(EngineDeadError())
 
     def _fail_held(self, exc: BaseException) -> None:
         for held in self._held:
