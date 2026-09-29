@@ -78,7 +78,7 @@ from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import sharded_lm_head, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -813,6 +813,9 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            # The sharded head runs at one fixed row count.
+            self.num_reqs_paddings = [self.max_num_reqs]
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (
@@ -2671,6 +2674,8 @@ class TPUModelRunner(GPUModelRunner):
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             num_reqs, self.max_num_reqs
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            padded_num_reqs = self.num_reqs_paddings[-1]
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -4431,6 +4436,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if envs.TPU_SHARDED_LM_HEAD:
+            sharded_lm_head.install(model, self.num_reqs_paddings)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
