@@ -33,6 +33,7 @@ SP_RANK_ATTR = "_tpu_sp_rank"
 
 def install() -> None:
     """Patch the decoder layers and the forwards around them, if selected."""
+    sequence_parallel.check_fp8_gather()
     if not sequence_parallel.enabled():
         return
     from vllm.model_executor.models import (
@@ -48,7 +49,11 @@ def install() -> None:
     # Qwen3.5's layer has its own __init__ and skips Qwen3-Next's.
     for cls in (layer_cls, qwen3_5.Qwen3_5DecoderLayer):
         cls.__init__ = _build_row_gated(cls.__init__)
-    layer_cls.forward = _row_gated_forward(layer_cls.forward)
+    fp8_gather = sequence_parallel.fp8_gather()
+    layer_cls.forward = _row_gated_forward(layer_cls.forward, fp8_gather)
+    if fp8_gather:
+        attention_cls = qwen3_next.Qwen3NextAttention
+        attention_cls.forward = _attention_forward(attention_cls.forward)
     model_cls = qwen3_next.Qwen3NextModel
     model_cls.forward = _gather_model_rows(model_cls.forward)
     for cls in (
@@ -79,6 +84,12 @@ def _build_row_gated(original_init):
             vllm_config.compilation_config.compile_sizes or (), tp_size
         )
         self.use_attn_reduce_scatter_for_moe = False
+        if sequence_parallel.fp8_gather():
+            # Built here, before any trace: a build inside one is not allowed.
+            from vllm_torchtpu.layers.adapter import linear_common
+
+            linear_common._get_quantize_rows_op()
+            linear_common._get_prequant_matmul_op()
         setattr(
             self,
             SP_RANK_ATTR,
@@ -93,13 +104,15 @@ def _build_row_gated(original_init):
     return __init__
 
 
-def _row_gated_forward(original_forward):
+def _row_gated_forward(original_forward, fp8_gather=False):
     from vllm.distributed import (
         get_tensor_model_parallel_world_size,
         tensor_model_parallel_all_gather,
         tensor_model_parallel_all_reduce,
         tensor_model_parallel_reduce_scatter,
     )
+
+    from vllm_torchtpu.layers.adapter import linear_common
 
     @functools.wraps(original_forward)
     def forward(self, hidden_states, residual, positions, **kwargs):
@@ -118,14 +131,24 @@ def _row_gated_forward(original_forward):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            if sp:
-                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+
+        attn_kwargs = {}
+        if sp and not first_layer and fp8_gather:
+            # Each rank quantizes its own rows once; the in-projections take
+            # the gathered fp8 rows and scales, and read only the row count
+            # of `hidden_states`.
+            x_q, x_s = linear_common.quantize_rows(hidden_states)
+            x_q = tensor_model_parallel_all_gather(x_q, 0)
+            attn_kwargs["prequant"] = (x_q, tensor_model_parallel_all_gather(x_s, 0))
+            hidden_states = x_q
+        elif sp and not first_layer:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
 
         if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(hidden_states=hidden_states)
+            hidden_states = self.linear_attn(hidden_states=hidden_states, **attn_kwargs)
         elif self.layer_type == "full_attention":
             hidden_states = self.self_attn(
-                hidden_states=hidden_states, positions=positions
+                hidden_states=hidden_states, positions=positions, **attn_kwargs
             )
         else:
             raise ValueError("Invalid layer_type")
@@ -153,6 +176,25 @@ def _row_gated_forward(original_forward):
         if self.layer_scale:
             hidden_states = _scale(hidden_states, self.ffn_layer_scale)
         return hidden_states, residual
+
+    return forward
+
+
+def _attention_forward(original_forward):
+    """Qwen3NextAttention.forward, with the in-projection from gathered fp8
+    rows when the decoder passes them; otherwise vLLM's own."""
+
+    @functools.wraps(original_forward)
+    def forward(self, positions, hidden_states, prequant=None):
+        if prequant is None:
+            return original_forward(self, positions, hidden_states)
+        qkv = sequence_parallel.project(self.qkv_proj, hidden_states, prequant)
+        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        attn_output = self.attn(q, k, v)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+        output, _ = self.o_proj(attn_output)
+        return output
 
     return forward
 

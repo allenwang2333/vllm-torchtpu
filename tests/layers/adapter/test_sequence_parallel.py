@@ -20,12 +20,14 @@ MoE block goes through the real communicator.
 
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import vllm.distributed as vllm_distributed
 
 from vllm_torchtpu.distributed import tpu_communicator as comm
+from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter import sequence_parallel as sp
 from vllm_torchtpu.models.vllm import qwen3_next_sp_patch as patch
 
@@ -180,7 +182,11 @@ class _Attention(torch.nn.Module):
         super().__init__()
         self.w = w
 
-    def forward(self, hidden_states, positions=None):
+    def forward(self, hidden_states, positions=None, prequant=None):
+        if prequant is not None:
+            x_q, x_s = prequant
+            assert hidden_states is x_q
+            hidden_states = x_q * x_s
         return torch.cumsum(hidden_states, 0) @ self.w
 
 
@@ -319,7 +325,15 @@ def _bind(module, forward):
 @pytest.mark.parametrize(
     "rows", [4, _MIN_ROWS, 2 * _MIN_ROWS], ids=lambda r: f"{r}rows"
 )
-def test_the_target_model_matches_one_device(tp, rows):
+@pytest.mark.parametrize("fp8_gather", [False, True], ids=["bf16", "fp8"])
+def test_the_target_model_matches_one_device(tp, monkeypatch, rows, fp8_gather):
+    # A stand-in quantization whose scale the projections must apply.
+    monkeypatch.setattr(
+        linear_common,
+        "quantize_rows",
+        lambda x: (x * 2, torch.full((x.shape[0], 1), 0.5)),
+    )
+    forward = patch._row_gated_forward(None, fp8_gather)
     weights = _weights(3)
     layer_types = ["linear_attention", "linear_attention", "full_attention"]
     embeds = torch.randn(rows, _H, generator=torch.Generator().manual_seed(1))
@@ -340,7 +354,7 @@ def test_the_target_model_matches_one_device(tp, rows):
         layers = [
             _bind(
                 _layer(_shares(w, rank), _shares(s, rank), communicator, rank, t),
-                tp.forward,
+                forward,
             )
             for (w, s), t in zip(weights, layer_types)
         ]
@@ -414,7 +428,8 @@ def test_a_stale_step_form_breaks_the_draft(tp):
         assert not torch.allclose(out, expected)
 
 
-def test_both_forms_lift_the_same_inputs(enabled, monkeypatch):
+@pytest.mark.parametrize("fp8_gather", [False, True], ids=["bf16", "fp8"])
+def test_both_forms_lift_the_same_inputs(enabled, monkeypatch, fp8_gather):
     """A bucket compiled by one form's trace is handed to the other's
     (compilation/shape_variants): their graphs must take the same inputs."""
     from vllm_torchtpu.compilation import shape_variants
@@ -427,7 +442,10 @@ def test_both_forms_lift_the_same_inputs(enabled, monkeypatch):
     )
     for name, fn in identity.items():
         monkeypatch.setattr(vllm_distributed, name, fn)
-    forward = patch._row_gated_forward(None)
+    monkeypatch.setattr(
+        linear_common, "quantize_rows", lambda x: (x, x.new_ones(x.shape[0], 1))
+    )
+    forward = patch._row_gated_forward(None, fp8_gather)
     layers = [
         _bind(_layer(w, s, None, 0, t), forward)
         for (w, s), t in zip(_weights(2), ["linear_attention", "full_attention"])
@@ -540,3 +558,138 @@ def test_a_layer_is_built_for_the_row_gated_form(
             Layer(vllm_config, "full_attention")
     else:
         assert not hasattr(layer, patch.SP_RANK_ATTR)
+
+
+def test_the_fp8_gather_needs_sequence_parallelism(monkeypatch):
+    monkeypatch.delenv("TPU_SEQUENCE_PARALLEL_PREFILL", raising=False)
+    monkeypatch.setenv("TPU_SEQUENCE_PARALLEL_FP8_GATHER", "1")
+    assert not sp.fp8_gather()
+    with pytest.raises(ValueError, match="TPU_SEQUENCE_PARALLEL_PREFILL"):
+        patch.install()
+
+
+def test_prequantized_rows_give_the_quantizing_matmul_exactly():
+    """The fp8 gather changes no fp8 projection's result: the rows and scales
+    each rank quantizes are the ones the projection would compute."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    g = torch.Generator().manual_seed(3)
+    x = jnp.asarray(torch.randn(16, 256, generator=g).numpy(), jnp.bfloat16)
+    w_q = jnp.asarray(
+        (0.05 * torch.randn(256, 96, generator=g)).numpy(), jnp.float8_e4m3fn
+    )
+    w_s = jnp.asarray((0.02 + 0.01 * torch.rand(96, generator=g)).numpy())
+    x_q, x_s = linear_common._quantize_rows_jax(x)
+    assert x_q.dtype == jnp.float8_e4m3fn and x_s.shape == (16, 1)
+    np.testing.assert_array_equal(
+        np.asarray(linear_common._prequant_matmul_jax(x_q, x_s, w_q, w_s), np.float32),
+        np.asarray(linear_common._quantized_matmul_jax(x, w_q, w_s), np.float32),
+    )
+
+
+def _fp8_linear(n_in, n_out, keep_vllm_layout=False, bias=None):
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8Config,
+        VllmFp8LinearMethodTPU,
+    )
+
+    shape = (n_out, n_in) if keep_vllm_layout else (n_in, n_out)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros(shape, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(torch.ones(n_out), requires_grad=False)
+    layer.bias, layer.skip_bias_add = bias, False
+    layer.quant_method = VllmFp8LinearMethodTPU(
+        VllmFp8Config.from_config({"activation_scheme": "dynamic"})
+    )
+    if keep_vllm_layout:
+        setattr(layer, linear_common.KEEP_VLLM_LAYOUT_ATTR, True)
+    return layer
+
+
+@pytest.mark.parametrize("keep_vllm_layout", [False, True])
+def test_a_per_channel_fp8_projection_takes_the_gathered_rows(
+    monkeypatch, keep_vllm_layout
+):
+    calls = []
+    monkeypatch.setattr(
+        linear_common,
+        "quantized_matmul_prequant",
+        lambda x_q, x_s, w, s: calls.append((x_q, x_s, w, s)) or torch.ones(4, 6),
+    )
+    layer = _fp8_linear(8, 6, keep_vllm_layout, bias=torch.full((6,), 2.0))
+    x_q, x_s = torch.zeros(4, 8, dtype=torch.float8_e4m3fn), torch.ones(4, 1)
+    out = sp.project(layer, x_q, (x_q, x_s))
+    torch.testing.assert_close(out, torch.full((4, 6), 3.0))
+    ((got_q, got_s, w, s),) = calls
+    assert got_q is x_q and got_s is x_s and s is layer.weight_scale
+    assert w.shape == (8, 6)
+    assert w.data_ptr() == layer.weight.data_ptr()
+
+
+def test_another_projection_is_given_the_rows_dequantized():
+    """The checkpoint leaves the GDN's b/a projection in bf16."""
+    layer = Mock(return_value=(torch.ones(4, 2), None), spec=["quant_method"])
+    x_q = torch.full((4, 8), 2.0).to(torch.float8_e4m3fn)
+    x_s = torch.full((4, 1), 0.25)
+    out = sp.project(layer, x_q, (x_q, x_s))
+    torch.testing.assert_close(out, torch.ones(4, 2))
+    (rows,), _ = layer.call_args
+    assert rows.dtype == torch.bfloat16
+    torch.testing.assert_close(rows, torch.full((4, 8), 0.5, dtype=torch.bfloat16))
+    # Without gathered rows the projection runs as before.
+    x = torch.randn(4, 8)
+    sp.project(layer, x, None)
+    assert layer.call_args.args == (x,)
+
+
+def test_the_gdn_in_projections_take_the_gathered_rows(monkeypatch):
+    from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
+
+    seen = []
+
+    def project(layer, x, prequant):
+        seen.append((layer, x, prequant))
+        return torch.zeros(x.shape[0], layer.out)
+
+    monkeypatch.setattr(gdn_attention_op, "project", project)
+    attn = gdn_attention_op.VllmGatedDeltaNetAttention.__new__(
+        gdn_attention_op.VllmGatedDeltaNetAttention
+    )
+    torch.nn.Module.__init__(attn)
+    attn.in_proj_qkv, attn.in_proj_z, attn.in_proj_ba = (
+        SimpleNamespace(out=n) for n in (96, 64, 32)
+    )
+    attn.head_v_dim, attn.num_v_heads, attn.tp_size = 16, 4, 1
+    attn.kv_cache = None
+    attn._has_active_pooled_pcp_state = lambda kv_cache: False
+    attn._apply_output_projection = lambda core, z, n: core
+    x = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
+    prequant = (x, torch.ones(4, 1))
+    attn.forward(x, prequant=prequant)
+    assert {id(layer) for layer, _, _ in seen} == {
+        id(attn.in_proj_qkv),
+        id(attn.in_proj_z),
+        id(attn.in_proj_ba),
+    }
+    assert all(got_x is x and got is prequant for _, got_x, got in seen)
+
+
+def test_the_attention_projects_the_gathered_rows(monkeypatch):
+    original = Mock(return_value="upstream")
+    forward = patch._attention_forward(original)
+    monkeypatch.setattr(sp, "project", lambda layer, x, prequant: prequant[0] + 1)
+    attn = SimpleNamespace(
+        qkv_proj=object(),
+        _project_qkv_gate=lambda qkv, positions: (qkv, qkv, qkv, None),
+        attn=lambda q, k, v: q + k + v,
+        o_proj=lambda x: (x * 2, None),
+    )
+    positions, x = torch.arange(4), torch.ones(4, 8)
+    assert forward(attn, positions, x) == "upstream"
+    original.assert_called_once_with(attn, positions, x)
+    torch.testing.assert_close(
+        forward(attn, positions, x, prequant=(x, None)), torch.full((4, 8), 12.0)
+    )
