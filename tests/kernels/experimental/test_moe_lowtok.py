@@ -101,10 +101,10 @@ def _ids_operands(seed, tokens, experts, hidden, inter, topk):
     return (x, local, weights, *_weights(rng, experts, hidden, inter))
 
 
-def _scores_operands(seed, tokens, experts, hidden, inter, start):
+def _scores_operands(seed, tokens, experts, hidden, inter, start, n_global=512):
     rng = np.random.default_rng(seed)
     x = jnp.asarray(rng.standard_normal((tokens, hidden)), jnp.bfloat16)
-    logits = rng.standard_normal((tokens, kernel.LANES)) * 2
+    logits = rng.standard_normal((tokens, n_global)) * 2
     logits[:, start : start + experts] += 5.0
     scores = jax.nn.softmax(jnp.asarray(logits, jnp.float32), axis=-1)
     return x, scores, _weights(rng, experts, hidden, inter)
@@ -191,9 +191,10 @@ def test_interpreted_ids_entry_matches_reference(interpret, tokens):
     _assert_close(_ids_call(*ops), _reference(*ops), 2.5e-2)
 
 
-def test_interpreted_scores_entry_matches_router_then_reference(interpret):
+@pytest.mark.parametrize("n_global", [512, 160])
+def test_interpreted_scores_entry_matches_router_then_reference(interpret, n_global):
     experts, hidden, inter, topk, start = 8, 512, 256, 4, 16
-    x, scores, weights = _scores_operands(9, 6, experts, hidden, inter, start)
+    x, scores, weights = _scores_operands(9, 6, experts, hidden, inter, start, n_global)
     scores = scores.at[2].set(0.0)
     got = np.asarray(
         _scores_call(x, scores, start, weights, topk),

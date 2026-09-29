@@ -14,7 +14,6 @@
 """Experimental small-batch FP8 MoE that streams hit experts' weight units."""
 
 from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
-    LANES,
     MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
     moe_lowtok,
@@ -22,7 +21,6 @@ from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
 )
 
 __all__ = [
-    "LANES",
     "MOE_LOWTOK_MAX_TOKENS",
     "can_use_moe_lowtok",
     "moe_lowtok",

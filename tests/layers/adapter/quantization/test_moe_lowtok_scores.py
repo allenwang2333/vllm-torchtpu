@@ -90,7 +90,6 @@ def test_layer_the_kernel_cannot_serve_is_refused(enabled, layer, activation, ma
         ("hash_indices_table", torch.zeros(8, 10)),
         ("routed_scaling_factor", 2.5),
         ("apply_router_weight_on_input", True),
-        ("global_num_experts", 256),
     ],
 )
 def test_routing_the_kernel_does_not_reproduce_keeps_the_ids_entry(

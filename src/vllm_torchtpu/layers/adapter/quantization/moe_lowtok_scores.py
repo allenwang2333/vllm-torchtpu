@@ -30,7 +30,6 @@ from torch_tpu._internal.pallas import jax_op
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.moe_lowtok import (
-    LANES,
     MOE_LOWTOK_MAX_TOKENS,
     can_use_moe_lowtok,
     moe_lowtok,
@@ -111,8 +110,6 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
         return "apply_router_weight_on_input"
     if moe_routing._SIMULATION_STRATEGY is not None:
         return "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set"
-    if layer.global_num_experts != LANES:
-        return f"{layer.global_num_experts} experts; the router table has {LANES}"
     if enable_pipelined_collective_and_compute():
         return "MoE chunk pipelining keeps the router input rank-local"
     return None

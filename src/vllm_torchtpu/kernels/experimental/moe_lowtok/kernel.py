@@ -37,7 +37,6 @@ MOE_LOWTOK_MAX_TOKENS = 256
 _MAX_LOCAL_EXPERTS = 128
 
 _ROW_TILE = 32  # FP8 sublane packing
-LANES = 512  # the routing table's expert axis, by global expert id
 _NEG = -3.0e38  # router scores at or below this never win a pass
 _LANE = 128
 _VMEM_FRACTION = 0.75
@@ -69,7 +68,7 @@ def can_use_moe_lowtok(hidden, w1, w2, s1, s2, b1, b2, *, activation, rhs_quant_
     return s1.shape == (e, 1, 1, 2 * i) and s2.shape == (e, 1, 1, h)
 
 
-def _vmem_budget(rows, hidden, inter, w13_parts):
+def _vmem_budget(rows, hidden, inter, w13_parts, lanes):
     """Declared scratch and VMEM operands plus a compiler margin, capped.
 
     A shape-dependent reservation leaves room for neighbouring ops to
@@ -81,7 +80,7 @@ def _vmem_budget(rows, hidden, inter, w13_parts):
     accumulators = rows * 4 * (2 * inter + hidden)
     # x in and out, scores, tables, one-hot.
     operands = (
-        rows * 2 * hidden * 2 + rows * 4 * LANES + 4 * LANES * 8 + 2 * LANES * LANES
+        rows * 2 * hidden * 2 + rows * 4 * lanes + 4 * lanes * 8 + 2 * lanes * lanes
     )
     need = int((weights + scales + accumulators + operands) * _VMEM_MARGIN)
     capacity = int(pltpu.get_tpu_info().vmem_capacity_bytes * _VMEM_FRACTION)
@@ -122,15 +121,14 @@ def _stream(
     """Stream the hit experts of this shard and accumulate their outputs.
 
     gid_s [1, E] (SMEM) is the table lane of each local expert; hits_s
-    [1, LANES] (SMEM) is 1 on lanes some row routes to; wtab_ref [rows, LANES]
+    [1, lanes] (SMEM) is 1 on lanes some row routes to; wtab_ref [rows, lanes]
     holds the routing weights. Each expert is `w13_parts` gate|up units then
     one down unit; the ring has one slot per unit, so slot == part.
     """
-    rows = x_ref.shape[0]
     half = inter // w13_parts
     units = w13_parts + 1
     slots = units
-    lane = jax.lax.broadcasted_iota(jnp.int32, (rows, LANES), 1)
+    lane = jax.lax.broadcasted_iota(jnp.int32, wtab_ref.shape, 1)
 
     def collect(e, n):
         h = hits_s[0, gid_s[0, e]]
@@ -287,7 +285,7 @@ def _select_topk(scores, topk):
     wsum = jnp.zeros((x.shape[0], 1), jnp.float32)
     for _ in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)
-        idx = jnp.min(jnp.where(x == m, lane, LANES - 1), axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, lane, x.shape[1] - 1), axis=1, keepdims=True)
         pick = lane == idx
         sel = jnp.where(pick, m, sel)
         wsum = wsum + m
@@ -388,23 +386,23 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
 
     With `topk` None, `route` is the routing table over local experts (see
     routing_table). With `topk`, `route` is the router's softmax scores over
-    all LANES experts, the top-k runs in the kernel, and this shard holds
+    all experts, the top-k runs in the kernel, and this shard holds
     experts [experts_start, experts_start + E); a zero score row (a padded
     token) selects nothing. Scales use [E, 1, 1, N]. Callers must first check
     can_use_moe_lowtok.
     """
     tokens, hidden = x.shape
     n_experts, inter, w13_parts, rows = _layout(x, w13)
-    if route.shape[1] > LANES or (topk is not None and route.shape[1] != LANES):
-        raise ValueError(f"the routing table is {LANES} experts wide")
+    # The table's lanes are local expert ids, or global ones for the scores.
+    lanes = pl.cdiv(route.shape[1], _LANE) * _LANE
     x_rows = jnp.pad(x, ((0, rows - tokens), (0, 0)))
     route = jnp.pad(
-        route.astype(jnp.float32), ((0, rows - tokens), (0, LANES - route.shape[1]))
+        route.astype(jnp.float32), ((0, rows - tokens), (0, lanes - route.shape[1]))
     )
     s13 = s13.reshape(n_experts, 1, 2 * inter).astype(jnp.float32)
     s2 = s2.reshape(n_experts, 1, hidden).astype(jnp.float32)
     gid = (experts_start + jnp.arange(n_experts, dtype=jnp.int32)).reshape(1, n_experts)
-    wtab = () if topk is None else (pltpu.VMEM((rows, LANES), jnp.float32),)
+    wtab = () if topk is None else (pltpu.VMEM((rows, lanes), jnp.float32),)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     out = pl.pallas_call(
@@ -422,8 +420,8 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
             out_specs=vmem,
             scratch_shapes=(
                 pltpu.SMEM((n_experts,), jnp.int32),
-                pltpu.VMEM((1, LANES), jnp.int32),
-                pltpu.SMEM((1, LANES), jnp.int32),
+                pltpu.VMEM((1, lanes), jnp.int32),
+                pltpu.SMEM((1, lanes), jnp.int32),
                 pltpu.SemaphoreType.DMA((1,)),
                 *wtab,
                 *_stream_scratch(rows, hidden, inter, w13_parts),
@@ -431,7 +429,7 @@ def moe_lowtok(x, route, w13, s13, w2, s2, experts_start=0, *, topk=None):
             grid=(),
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=_vmem_budget(rows, hidden, inter, w13_parts)
+            vmem_limit_bytes=_vmem_budget(rows, hidden, inter, w13_parts, lanes)
         ),
         name="moe_lowtok",
     )(gid, x_rows, route, s13, s2, w13, w2)
