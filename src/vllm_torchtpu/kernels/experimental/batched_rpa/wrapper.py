@@ -432,35 +432,45 @@ def calculate_block_sizes(
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
 
         # Step 3: Given current tile size, calculate compute tile size.
+        # For decode mode (fixed_bq_sz is not None), query chunking
+        # (bq_c_sz < bq_sz) is unnecessary because the query tile size is already
+        # very small (<= 8 tokens). Query chunking was designed for prefill
+        # workloads where query lengths are large; applying it to decode causes
+        # redundant KV cache iterations and softmax carry state save/restores.
+        # Therefore, decode mode directly keeps bq_c_sz = bq_sz.
+        if fixed_bq_sz is not None:
+            last_valid_bq_c_sz = bq_sz
+        else:
+            # Threshold value based on hardware generation and precision.
+            tpu_info = pltpu.get_tpu_info()
+            is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
-        # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
+            match tpu_info.generation:
+                case 8 if _is_sfs(tpu_info):
+                    threshold = 800
+                case 7:
+                    threshold = 1500
+                case _:
+                    threshold = 1500
 
-        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
+            if is_8bit:
+                flops_ratio = (
+                    tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
+                )
+                threshold *= flops_ratio
 
-        match tpu_info.generation:
-            case 8 if _is_sfs(tpu_info):
-                threshold = 800
-            case 7:
-                threshold = 1500
-            case _:
-                threshold = 1500
+            num_bq_c = 1
+            last_valid_bq_c_sz = bq_c_sz = bq_sz
+            bq_c_rem = 0
 
-        if is_8bit:
-            flops_ratio = tpu_info.fp8_ops_per_second // tpu_info.bf16_ops_per_second
-            threshold *= flops_ratio
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
-
-        while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
-        ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+            while (
+                calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
+                or bq_c_rem != 0
+            ) and num_bq_c < bq_sz:
+                if bq_c_rem == 0:
+                    last_valid_bq_c_sz = bq_c_sz
+                num_bq_c += 1
+                bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
 
         return configs.BlockSizes(
             bq_sz=bq_sz,
