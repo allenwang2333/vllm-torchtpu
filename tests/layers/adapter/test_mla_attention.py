@@ -512,6 +512,79 @@ def test_mla_forward_sparse_dispatch_and_quantization():
     torch.testing.assert_close(out, expected_out)
 
 
+def _gptj_rope_table(max_pos: int, dim: int) -> torch.Tensor:
+    # RotaryEmbeddingBase._compute_cos_sin_cache math, bf16 like GLM-5.2.
+    inv_freq = 1.0 / (1e6 ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+    freqs = torch.einsum(
+        "i,j -> ij", torch.arange(max_pos, dtype=torch.float), inv_freq
+    )
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("use_pair_cache", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 7, 64])
+def test_gptj_rope_fast_is_bit_exact(use_pair_cache, num_tokens):
+    """The prefill fast path reproduces upstream GPT-J RoPE bit for bit, for q
+    and k, at even and odd positions up to the last table row."""
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        build_rope_pair_cache,
+        gptj_rope_fast,
+    )
+
+    max_pos, dim, heads = 4096, 64, 4
+    table = _gptj_rope_table(max_pos, dim)
+    pair = build_rope_pair_cache(table) if use_pair_cache else None
+    g = torch.Generator().manual_seed(num_tokens)
+    positions = torch.randint(0, max_pos, (num_tokens,), generator=g)
+    positions[-1] = max_pos - 1
+    q_pe = (torch.randn(num_tokens, heads, dim, generator=g) * 3).to(torch.bfloat16)
+    k_pe = (torch.randn(num_tokens, 1, dim, generator=g) * 3).to(torch.bfloat16)
+
+    ref_q, ref_k = RotaryEmbedding.forward_static(
+        positions, q_pe, k_pe, dim, dim, table, False
+    )
+    got_q, got_k = gptj_rope_fast(positions, q_pe, k_pe, table, pair)
+    assert torch.equal(got_q.view(torch.int16), ref_q.view(torch.int16))
+    assert torch.equal(got_k.view(torch.int16), ref_k.view(torch.int16))
+
+    # Positive control: the comparison can fail.
+    bad_q, _ = gptj_rope_fast((positions + 1) % max_pos, q_pe, k_pe, table, pair)
+    assert not torch.equal(bad_q.view(torch.int16), ref_q.view(torch.int16))
+
+
+def test_mla_forward_sparse_packed_q_bf16():
+    """bf16 sparse non-DCP layers hand the op one pre-padded q (q_pe=None):
+    [ql_nope | q_pe | 0] at the kernel's 640 width."""
+    impl, layer, inputs, op_out = _make_impl_and_layer(num_tokens=4)
+    layer.W_UK_T = layer.W_UK_T.to(torch.bfloat16)
+    q_nope_in, q_pe_in = (t.to(torch.bfloat16) for t in inputs["q"])
+    inputs["q"] = (q_nope_in, q_pe_in)
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    layer.W_UV = layer.W_UV.to(torch.bfloat16)
+    layer.sparse_mla_op.return_value = op_out.to(torch.bfloat16)
+
+    impl.forward(
+        layer=layer, **inputs, topk_indices=torch.zeros((4, 8), dtype=torch.int32)
+    )
+
+    layer.sparse_mla_op.assert_called_once()
+    args = layer.sparse_mla_op.call_args.args
+    q, q_pe = args[1], args[2]
+    assert q_pe is None
+    assert q.shape == (4, 16, 640) and q.dtype == torch.bfloat16
+    expected_ql = torch.bmm(q_nope_in.transpose(0, 1), layer.W_UK_T).transpose(0, 1)
+    torch.testing.assert_close(q[..., :512], expected_ql)
+    assert torch.equal(q[..., 512:576], q_pe_in)
+    assert not q[..., 576:].any()
+
+
 def test_mla_forward_dense_dispatch_without_topk():
     """No topk_indices: the dense op is called, the sparse op is not."""
     k_scale = 2.0
