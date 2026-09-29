@@ -35,13 +35,12 @@ P = jax.sharding.PartitionSpec
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 def test_candidate_all_gather_is_rank_major(dcp_size):
-    """The merge reads a winner's position in its own list as `slot % k`.
+    """The merge resolves a winner as rank `slot // k`, position `slot % k`.
 
-    The source rank now travels as its own lane, so the chunk *order* no longer
-    matters -- but the chunk *width* still does, and nothing else in the merge
-    would notice it changing: every rank would resolve the wrong candidate and
-    still return a full, plausible, silently wrong list. Asserting the full
-    rank-major arange pins width and order together.
+    Both readings assume this layout, and nothing else in the merge would
+    notice it changing: every rank would resolve the wrong candidate and still
+    return a full, plausible, silently wrong list. Asserting the full
+    rank-major arange pins order and chunk width together.
     """
     devices = jax.devices()
     if len(devices) < dcp_size:

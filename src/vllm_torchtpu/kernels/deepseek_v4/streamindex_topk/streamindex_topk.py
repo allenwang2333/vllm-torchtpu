@@ -1346,17 +1346,7 @@ def streamindex_topk_dcp(
         )
 
         # Stage 1. All-gather the scores; the indices stay home.
-        rank_col = jnp.broadcast_to(dcp_rank.astype(scores.dtype), (scores.shape[0], 1))
-        payload = lax.all_gather(
-            jnp.concatenate([scores, rank_col], axis=1),
-            dcp_axis_name,
-            axis=1,
-            tiled=True,
-        )
-        # [T, dcp * (k+1)] -> [T, dcp, k+1]: column k is the chunk's source rank.
-        payload = payload.reshape(payload.shape[0], dcp_size, k + 1)
-        src = payload[:, :, k].astype(jnp.int32)
-        scores = payload[:, :, :k].reshape(payload.shape[0], dcp_size * k)
+        scores = lax.all_gather(scores, dcp_axis_name, axis=1, tiled=True)
 
         # Stage 2. Full width as the row length: -inf entries (unfilled local
         # slots, padding tokens) are never selected, so they need no masking.
@@ -1366,11 +1356,10 @@ def streamindex_topk_dcp(
             row_lengths=jnp.full((scores.shape[0],), scores.shape[1], dtype=jnp.int32),
             write_empty_rows=True,
         )
-        # Keep only winners this rank produced.
+        # Keep only winners this rank produced. The gather is rank-major, so
+        # flat column c came from rank c // k -- no source-rank column needed.
         safe = jnp.maximum(slots, 0)
-        ours = (slots >= 0) & (
-            jnp.take_along_axis(src, jnp.floor_divide(safe, k), axis=1) == dcp_rank
-        )
+        ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
         merged = jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1)
         merged = jnp.where(ours, merged, -1)
 
