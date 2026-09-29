@@ -1021,6 +1021,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # 'score_bias'`. Passing the operand at the call site is not
             # sufficient on its own; it has to exist.
             register_score_bias_buffer(layer)
+            import vllm_torchtpu.envs as _envs
+
+            if _envs.VLLM_TPU_EPLB:
+                # Online expert load balancing: the op was built with the map
+                # operand and the load output; give this layer both buffers.
+                from vllm_torchtpu.distributed import tpu_eplb
+                from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+                    FUSED_MOE_EP_EPLB_ATTR,
+                )
+
+                tpu_eplb.register_layer(
+                    layer, int(layer.global_num_experts), layer.w13_weight.device
+                )
+                setattr(self, FUSED_MOE_EP_EPLB_ATTR, [layer])
 
     def apply_monolithic(
         self,

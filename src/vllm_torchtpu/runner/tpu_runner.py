@@ -4311,6 +4311,12 @@ class TPUModelRunner(GPUModelRunner):
 
         self._glm5_mk = Glm5Megakernel.maybe_create(self)
 
+        # Online expert load balancing (VLLM_TPU_EPLB): None unless armed and
+        # at least one MoE layer took the fused EP path with the map operand.
+        from vllm_torchtpu.distributed import tpu_eplb
+
+        self._tpu_eplb = tpu_eplb.create(self.model, self._glm5_mk)
+
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
@@ -5180,6 +5186,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        self._capture_model()
+        eplb = getattr(self, "_tpu_eplb", None)
+        if eplb is not None:
+            # Warmup routed nothing real; count serving traffic from here.
+            eplb.arm()
+
+    def _capture_model(self) -> None:
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
@@ -5987,6 +6000,12 @@ class TPUModelRunner(GPUModelRunner):
         # supports torch.compile
         if getattr(self, "_mk_decode_step", False):
             return self._glm5_mk_forward(input_ids, positions, inputs_embeds), None
+        eplb = getattr(self, "_tpu_eplb", None)
+        if eplb is not None:
+            # Every rank runs every non-megakernel forward in lockstep (each
+            # one carries the fused MoE's EP collectives), so this count, and
+            # the rebalance it triggers, is the same on all of them.
+            eplb.before_forward()
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors

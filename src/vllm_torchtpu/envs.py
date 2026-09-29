@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    VLLM_TPU_EPLB: bool = False
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -649,6 +650,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
+    # Online expert-parallel load balancing for the fused EP MoE kernel
+    # (distributed/tpu_eplb.py). The remaining VLLM_TPU_EPLB_* knobs are read
+    # there, at rebalancer creation.
+    "VLLM_TPU_EPLB": env_bool("VLLM_TPU_EPLB"),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its

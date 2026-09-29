@@ -184,6 +184,9 @@ class Glm5Megakernel:
         ER = cfg.ER
         self.perm = torch.tensor([order[j // ER] * ER + j % ER for j in range(cfg.E)],
                                  dtype=torch.long)
+        # Online EPLB (distributed/tpu_eplb.py) moves experts between ranks; a
+        # moved layer's router columns and bias follow the layer's own table.
+        self.layer_perm: dict[int, torch.Tensor] = {}
 
         bb = _find_backbone(runner.model)
         self.backbone = bb
@@ -250,7 +253,7 @@ class Glm5Megakernel:
         mlp = L.mlp
         if cfg.is_moe(l):
             g = _kn(mlp.gate.weight, H, cfg.E, "gate")
-            d["gate"] = g[:, self.perm.to(g.device)].contiguous()
+            d["gate"] = g[:, self._perm(l).to(g.device)].contiguous()
             r = _routed(mlp)
             d["ew13"] = r.w13_weight
             d["ew2"] = r.w2_weight
@@ -265,12 +268,50 @@ class Glm5Megakernel:
             d["w2"] = _kn(mlp.down_proj.weight, cfg.ID, H, "dense.down_proj")
         return d
 
+    def _perm(self, l: int) -> torch.Tensor:
+        """Kernel expert slot j -> logical expert, for layer l."""
+        return self.layer_perm.get(l, self.perm)
+
+    @torch.no_grad()
+    def set_expert_placement(self, phys2log_mesh: dict) -> None:
+        """Follow an online EPLB rebalance: {layer: logical expert at mesh slot q}.
+
+        The expert tensors were rewritten in place by the rebalancer, so only
+        the router columns and bias -- the kernel's own load-time copies --
+        change. Kernel slot j is mesh slot j (both are j // ER on mesh index
+        j // ER), so the new permutation is the table itself. Every replaced
+        operand keeps its shape, dtype and layout: a runtime input of the
+        compiled step, not a recompile.
+        """
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        for l, p2l in phys2log_mesh.items():
+            self.layer_perm[int(l)] = torch.as_tensor(p2l, dtype=torch.long)
+        changed = {int(l) for l in phys2log_mesh}
+        for i, (kind, l) in enumerate(self._w_index):
+            if l not in changed:
+                continue
+            if kind == "gate":
+                L = self.backbone.layers[l]
+                g = _kn(L.mlp.gate.weight, self.cfg.H, self.cfg.E, "gate")
+                self.weights[i] = g[:, self._perm(l).to(g.device)].contiguous().detach()
+            elif kind in EXPERT_KINDS:
+                r = _routed(self.backbone.layers[l].mlp)
+                new = {"ew13": lambda: r.w13_weight, "ew2": lambda: r.w2_weight,
+                       "es13": lambda: _expert_scale(r, "w13_weight", (self.cfg.ER, 2 * self.cfg.I)),
+                       "es2": lambda: _expert_scale(r, "w2_weight", (self.cfg.ER, self.cfg.H))}[kind]()
+                self.weights[i] = new.detach()
+        self.smalls = self._build_smalls().detach()
+        synchronize_tensors(self.weights + [self.smalls])
+
     def _collect_weights(self) -> list[torch.Tensor]:
         per_layer = {}
         out = []
         self.w_specs = []
+        self._w_index = []
         for kind, (layers, shape, dtype) in self.wk.items():
             for l in layers:
+                self._w_index.append((kind, l))
                 if l not in per_layer:
                     per_layer[l] = self._layer_weights(l)
                 t = per_layer[l][kind]
@@ -326,7 +367,7 @@ class Glm5Megakernel:
         mlp = L.mlp
         if cfg.is_moe(l):
             b = mlp.gate.e_score_correction_bias
-            f["gate_bias"] = b.float()[self.perm.to(b.device)]
+            f["gate_bias"] = b.float()[self._perm(l).to(b.device)]
             f["sw13_s"] = _scale(mlp.shared_experts.gate_up_proj, 2 * cfg.IS, "shared.gate_up_proj")
             f["sw2_s"] = _scale(mlp.shared_experts.down_proj, cfg.H, "shared.down_proj")
         else:
