@@ -30,6 +30,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
+    dcp_sc_compact,
     metadata,
 )
 
@@ -1183,49 +1184,6 @@ def streamindex_topk(
     )
 
 
-def _select_owned_winners(
-    merged: jax.Array,
-    dcp_size: int,
-    interleave_c: int,
-    dcp_rank: jax.Array | int,
-) -> jax.Array:
-    """Keep the winners this rank owns, left-packed as rank-local indices.
-
-    Every rank filters the identical `merged` global top-k list with its own
-    `dcp_rank`. Because `cp_owner_rank` partitions `[0, total_kv_positions)` onto
-    `range(dcp_size)`, the results across all ranks form an exact partition of
-    the global top-k: no winner is duplicated and none is lost. This is an
-    arithmetic identity regardless of buffer occupancy, which is why this requires
-    no capacity bounding and never truncates -- a rank owns at most all `k`
-    winners, and the output width is `k`.
-
-    Args:
-      merged: i32[num_rows, k] global compressed positions in `sparsecore_topk`
-        order, `-1` padded. Identical on every rank.
-      dcp_size: number of context-parallel ranks.
-      interleave_c: chunk-interleave width in compressed tokens.
-      dcp_rank: i32 scalar, this shard's index along the DCP axis.
-
-    Returns:
-      i32[num_rows, k] of rank-local cache indices for the winners this rank owns,
-      packed into a prefix and `-1` padded.
-    """
-    num_rows, width = merged.shape
-    mine = (merged >= 0) & (cp_owner_rank(merged, dcp_size, interleave_c) == dcp_rank)
-    local = cp_global_to_local(jnp.maximum(merged, 0), dcp_size, interleave_c)
-
-    # Exclusive prefix count of owned winners gives each entry's destination slot.
-    # At most `width` entries can be `mine`, so `slot <= width - 1`.
-    slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
-    rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
-
-    # An extra column past the end (`width`) absorbs entries owned by other ranks;
-    # they all write -1 to the dump column, which is sliced off at the end.
-    out = jnp.full((num_rows, width + 1), -1, dtype=jnp.int32)
-    out = out.at[rows, jnp.where(mine, slot, width)].set(jnp.where(mine, local, -1))
-    return out[:, :width]
-
-
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1287,7 +1245,7 @@ def streamindex_topk_dcp(
          indices at `slot % k`. Both `slot // k` and `slot % k` are functions of
          the chunk width alone, not of the order the chunks arrived in. The rest
          are marked `-1`,
-         then `_select_owned_winners` maps them to local shard coordinates
+         then `dcp_sc_compact.pack_owned_winners` maps them to local
          (`cp_global_to_local`) and packs them into a `-1` padded prefix. The
          ranks' outputs still form an exact partition of the global top-k.
 
@@ -1416,7 +1374,9 @@ def streamindex_topk_dcp(
         merged = jnp.take_along_axis(idxs, jnp.mod(safe, k), axis=1)
         merged = jnp.where(ours, merged, -1)
 
-        return _select_owned_winners(merged, dcp_size, interleave_c, dcp_rank)
+        return dcp_sc_compact.pack_owned_winners(
+            merged, dcp_size, interleave_c, dcp_rank
+        )
 
     replicated = P()
     return jax.shard_map(
