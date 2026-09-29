@@ -41,7 +41,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
     ep_mesh_index,
-    ep_rank_order,
 )
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _v3_layer
@@ -75,10 +74,6 @@ FUSED_MOE_EP_V3_OP_ATTR = "_fused_moe_ep_v3_op"
 # This rank's mesh index, as a device tensor: the kernel takes it as data,
 # because `lax.axis_index` lowers to a partition-id the export path refuses.
 _RANK_BUFFER: Any = None
-# Which EP rank's expert block sits at each mesh index, or None for the
-# identity. See `_to_mesh_expert_order`.
-_EXPERT_ORDER: Any = None
-_EP_SIZE: int | None = None
 
 
 def mask_local_rows(x: jax.Array, gating: jax.Array, valid_tokens: jax.Array):
@@ -308,7 +303,7 @@ def fused_moe_ep_v3(
         w2,
         _squeeze_channel_scale_checked(w1_scale),
         _squeeze_channel_scale_checked(w2_scale),
-        _to_mesh_expert_order(router_logits),
+        router_logits,
         _RANK_BUFFER,
     )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
@@ -320,36 +315,6 @@ def fused_moe_ep_v3(
             )
         return op(*args, valid_tokens)
     return op(*args)
-
-
-def _to_mesh_expert_order(router_logits: torch.Tensor) -> torch.Tensor:
-    """Reindex the expert axis from EP-rank order to mesh order.
-
-    The kernel reads a token's expert id as `mesh_index * experts_per_shard +
-    j`. `_EXPERT_ORDER` is None when the two orders agree.
-    """
-    if _EXPERT_ORDER is None:
-        return router_logits
-    # Split and rejoin the expert axis without naming the token axis: reading
-    # `shape[0]` here would put the token count in the traced graph.
-    blocks = router_logits.unflatten(-1, (_EP_SIZE, -1))
-    return blocks.index_select(-2, _EXPERT_ORDER).flatten(-2)
-
-
-def _expert_block_permutation(ep: int, device) -> torch.Tensor | None:
-    """Which EP rank's expert block belongs at each mesh index, or None for
-    the identity, so the hot path can skip the gather."""
-    order = ep_rank_order()
-    if order is None or tuple(order) == tuple(range(ep)):
-        return None
-    if sorted(order) != list(range(ep)):
-        raise ValueError(f"EP rank order {order} is not a permutation of range({ep})")
-    logger.info_once(
-        "Fused EP MoE v3: EP ranks are not in device-id order, so the expert "
-        "axis is reindexed to mesh order | ep_rank_at_mesh_index=%s",
-        tuple(order),
-    )
-    return torch.tensor(order, dtype=torch.int32, device=device)
 
 
 def _check_deployment(layer) -> None:
@@ -405,7 +370,7 @@ def prebuild_fused_moe_ep_v3(
     deployment v3 cannot serve; returns None for a layer it declines, which
     keeps the grouped-matmul path.
     """
-    global _RANK_BUFFER, _EXPERT_ORDER, _EP_SIZE
+    global _RANK_BUFFER
     _check_deployment(layer)
     mesh = build_ep_mesh()
     if mesh is None:
@@ -442,11 +407,11 @@ def prebuild_fused_moe_ep_v3(
         logger.warning_once("Fused EP MoE v3 not engaged for a layer: %s", reason)
         return None
 
+    # The mesh is rank-ordered (google-pytorch/torch_tpu#3522), so this rank's
+    # mesh index is its EP rank and its expert block needs no reordering.
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=w1.device
     )
-    _EXPERT_ORDER = _expert_block_permutation(ep, w1.device)
-    _EP_SIZE = ep
     skip_padded_tokens = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
     op = _build_op(
         mesh,

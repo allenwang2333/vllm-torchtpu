@@ -84,7 +84,6 @@ def v3(monkeypatch):
         lambda: SimpleNamespace(shape={bridge.EP_AXIS_NAME: _EP}),
     )
     monkeypatch.setattr(bridge, "ep_mesh_index", lambda: 0)
-    monkeypatch.setattr(bridge, "ep_rank_order", lambda: tuple(range(_EP)))
     monkeypatch.setattr(bridge, "_max_node_tokens", lambda ep: 4096)
     config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1))
     monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)

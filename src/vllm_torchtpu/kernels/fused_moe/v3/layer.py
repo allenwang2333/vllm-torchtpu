@@ -14,26 +14,14 @@
 """The fused expert-parallel MoE layer.
 
 fused_ep_moe validates the operands, builds (and caches) the FFN kernel for
-the layer's shape, and runs one shard_map over the expert-parallel mesh
-axis. The per-shard body (_pallas_step) is the package's own Pallas
-programs end to end: the select kernel, the transport, the routing-tables
-kernel, the row-tables scatter, the FFN kernel, the gather and the combine.
-
-  xla     any expert-parallel width. XLA all-gathers the token rows and the
-          routing message, routing_tables builds the routing tables (dense
-          passes or the single-call kernel), XLA scatters build the routed rows
-          tables, and an XLA gather and weighted sum combine the arrivals.
-  pallas  a power-of-two mesh of 1 to 32 shards. The package's own programs
-          replace every XLA
-          piece: the select kernel writes the routing message, the transport's
-          start call quantizes the rows and issues the token exchange, the
-          shard-tables kernel builds every table and hosts the transport's
-          middle step, a sparse-core program scatters the row tables, and
-          the combine is a sparse-core gather with a TensorCore sum.
-
-Both pass the FFN kernel the same operands and read back the same arrival
-routed rows and arrival scale rows. _xla_step and _pallas_step are the
-two bodies.
+the layer's shape, and runs one shard_map over the expert-parallel mesh axis
+on a power-of-two mesh of 1 to 32 shards. The per-shard body (_pallas_step)
+is the package's own programs end to end: the select kernel writes the routing
+message, the transport's start call quantizes the rows and issues the token
+exchange, the shard-tables kernel builds every table and hosts the transport's
+middle step, a SparseCore program scatters the row tables, the FFN kernel
+computes and pushes results, and the combine is a SparseCore gather with a
+TensorCore sum.
 """
 
 import math
