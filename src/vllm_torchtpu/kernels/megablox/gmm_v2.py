@@ -215,6 +215,61 @@ class FusedWeightsRef(RhsRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class RhsStreamRef:
+    """Scratch for streaming whole-expert rhs slabs outside emit_pipeline."""
+
+    weight: Any  # [RHS_STREAM_SLOTS, size_k, size_n] VMEM
+    scale: Any | None  # [RHS_STREAM_SLOTS, num_blocks, 1, size_n] VMEM
+    sems: Any  # DMA[RHS_STREAM_SLOTS]
+    run_to_group: Any  # int32[size_group] SMEM, group id of each run of gm tiles
+    run: Any  # int32[2] SMEM, (current run, number of runs)
+
+
+RHS_STREAM_SLOTS = 3
+
+
+def use_rhs_stream(cfgs: "GmmConfigs") -> bool:
+    """Whether rhs slabs are streamed by hand instead of by emit_pipeline.
+
+    Covers whole-expert tiles (one n tile, one k tile), where every grid step
+    of a group needs the same slab. Streaming them by hand lets the first slab's
+    DMA start before fill_metadata instead of after it.
+    """
+    return (
+        cfgs.tiles.tile_n == cfgs.out_size_n
+        and cfgs.tiles.tile_k == cfgs.dims.size_k
+        and not cfgs.rhs_cfgs.has_bias
+        and not cfgs.rhs_cfgs.should_unpack
+    )
+
+
+def rhs_stream_copies(
+    rhs_ref: "WeightsRef", stream_ref: RhsStreamRef, group_id, slot, *, num_chunks: int
+):
+    """DMA descriptors that bring rhs[group_id] into stream slot `slot`."""
+    size_k = rhs_ref.weight.shape[1]
+    chunk_k = size_k // num_chunks
+    copies = [
+        pltpu.make_async_copy(
+            rhs_ref.weight.at[group_id, pl.ds(c * chunk_k, chunk_k)],
+            stream_ref.weight.at[slot, pl.ds(c * chunk_k, chunk_k)],
+            stream_ref.sems.at[slot],
+        )
+        for c in range(num_chunks)
+    ]
+    if stream_ref.scale is not None:
+        copies.append(
+            pltpu.make_async_copy(
+                rhs_ref.scale.at[group_id],
+                stream_ref.scale.at[slot],
+                stream_ref.sems.at[slot],
+            )
+        )
+    return copies
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class MetadataRef:
     gm_id_to_group_id: jax.Array
     gm_id_to_m_offset: jax.Array
@@ -658,6 +713,7 @@ def fill_metadata(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    run_to_group_ref: jax.Array | None = None,
 ) -> jax.Array:
     """Fills the metadata for the given lhs group sizes and group offset.
 
@@ -698,7 +754,7 @@ def fill_metadata(
 
     @jax.named_scope("outer_group_loop")
     def outer_group_loop(lhs_group_id, carry):
-        num_gm, start_m_offset = carry
+        num_gm, start_m_offset, num_runs = carry
 
         group_id = lhs_group_id - group_offset
         group_size = lhs_group_sizes_ref[lhs_group_id]
@@ -736,9 +792,18 @@ def fill_metadata(
         )
         lax.fori_loop(num_gm, next_num_gm, tm_loop_fn, start_m_offset)
 
-        return next_num_gm, end_m_offset
+        # Each processed group is one run of consecutive gm tiles on one slab.
+        if run_to_group_ref is not None:
+            run_to_group_ref[jnp.minimum(num_runs, cfgs.dims.size_group - 1)] = group_id
+        num_runs += (curr_num_gm > 0).astype(jnp.int32)
 
-    num_gm, _ = lax.fori_loop(0, max_num_group, outer_group_loop, (0, 0))
+        return next_num_gm, end_m_offset, num_runs
+
+    num_gm, _, num_runs = lax.fori_loop(
+        0, max_num_group, outer_group_loop, (0, 0, jnp.int32(0))
+    )
+    if run_to_group_ref is not None:
+        return num_gm, num_runs
     return num_gm
 
 
@@ -839,6 +904,7 @@ def kernel_main(
     metadata_ref: MetadataRef,
     zero_ref: jax.Array | None,  # [tile_zero_m, num_lanes]
     semaphore_ref: jax.Array | None,  # [1]
+    stream_ref: RhsStreamRef | None,
     *,
     cfgs: GmmConfigs,
 ):
@@ -876,6 +942,29 @@ def kernel_main(
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
+    rhs_hbm_ref = rhs_ref
+    num_chunks = 2 if cfgs.fuse_act is not None else 1
+    if stream_ref is not None:
+        # Start the first active group's slab now, so it lands while
+        # fill_metadata runs. Groups with no rows are the ones fill skips.
+        with jax.named_scope("gmm_stream_first"):
+            group_offset = group_offset_ref[0]
+            first_group = lax.while_loop(
+                lambda g: jnp.logical_and(
+                    g < cfgs.dims.size_group,
+                    lhs_group_sizes_ref[g + group_offset] == 0,
+                ),
+                lambda g: g + 1,
+                jnp.int32(0),
+            )
+
+            @pl.when(first_group < cfgs.dims.size_group)
+            def _():
+                for copy in rhs_stream_copies(
+                    rhs_hbm_ref, stream_ref, first_group, 0, num_chunks=num_chunks
+                ):
+                    copy.start()
+
     # Fill metadata buffer and return number of group & m interations.
     with jax.named_scope("gmm_fill_metadata"):
         num_gm = fill_metadata(
@@ -883,7 +972,10 @@ def kernel_main(
             group_offset_ref,
             metadata_ref,
             cfgs=cfgs,
+            run_to_group_ref=None if stream_ref is None else stream_ref.run_to_group,
         )
+        if stream_ref is not None:
+            num_gm, num_runs = num_gm
         _trace_value("num_gm", num_gm)
         _trace_value("rows", metadata_ref.gm_id_to_m_offset[num_gm])
 
@@ -910,21 +1002,103 @@ def kernel_main(
             up=rhs_spec,
         )
 
-    # Execute the inner kernel.
-    pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(inner_kernel, cfgs=cfgs),
-        grid=(num_n, num_gm, num_k),
-        in_specs=(lhs_spec, rhs_spec),
-        out_specs=out_spec,
-    )
-
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
-    with jax.named_scope("gmm_pipeline"):
-        pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+
+    if stream_ref is None:
+        # Execute the inner kernel.
+        pipeline_fn = pltpu.emit_pipeline(
+            functools.partial(inner_kernel, cfgs=cfgs),
+            grid=(num_n, num_gm, num_k),
+            in_specs=(lhs_spec, rhs_spec),
+            out_specs=out_spec,
+        )
+        with jax.named_scope("gmm_pipeline"):
+            pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+    else:
+        stream_ref.run[1] = num_runs
+
+        # Run 0 is in flight; queue run 1 behind it.
+        @pl.when(num_runs > 1)
+        def _():
+            for copy in rhs_stream_copies(
+                rhs_hbm_ref,
+                stream_ref,
+                stream_ref.run_to_group[1],
+                1,
+                num_chunks=num_chunks,
+            ):
+                copy.start()
+
+        def slot_rhs_ref(slot) -> RhsRef:
+            def view(lo, hi):
+                return WeightsRef(
+                    weight=stream_ref.weight.at[slot, :, lo:hi],
+                    scale=None
+                    if stream_ref.scale is None
+                    else stream_ref.scale.at[slot, :, :, lo:hi],
+                    bias=None,
+                )
+
+            n = cfgs.out_size_n
+            if cfgs.fuse_act is not None:
+                return FusedWeightsRef(gate=view(0, n), up=view(n, 2 * n))
+            return view(0, n)
+
+        def streamed_kernel(tiled_lhs_ref, tiled_out_ref, *scratch_refs):
+            gm_id = pl.program_id(1)
+            group_id = metadata_ref.gm_id_to_group_id[gm_id]
+            prev_group_id = metadata_ref.gm_id_to_group_id[jnp.maximum(gm_id - 1, 0)]
+            is_new_run = jnp.logical_or(gm_id == 0, group_id != prev_group_id)
+
+            @pl.when(is_new_run)
+            @jax.named_scope("gmm_stream_wait")
+            def _():
+                run = jnp.where(gm_id == 0, 0, stream_ref.run[0] + 1)
+                stream_ref.run[0] = run
+                # The slot for run + 2 held run - 1, whose last step is done.
+                ahead = run + (RHS_STREAM_SLOTS - 1)
+
+                @pl.when(ahead < stream_ref.run[1])
+                def _():
+                    for copy in rhs_stream_copies(
+                        rhs_hbm_ref,
+                        stream_ref,
+                        stream_ref.run_to_group[ahead],
+                        ahead % RHS_STREAM_SLOTS,
+                        num_chunks=num_chunks,
+                    ):
+                        copy.start()
+
+                for copy in rhs_stream_copies(
+                    rhs_hbm_ref,
+                    stream_ref,
+                    group_id,
+                    run % RHS_STREAM_SLOTS,
+                    num_chunks=num_chunks,
+                ):
+                    copy.wait()
+
+            slot = stream_ref.run[0] % RHS_STREAM_SLOTS
+            inner_kernel(
+                tiled_lhs_ref,
+                slot_rhs_ref(slot),
+                tiled_out_ref,
+                *scratch_refs,
+                cfgs=cfgs,
+            )
+
+        pipeline_fn = pltpu.emit_pipeline(
+            streamed_kernel,
+            grid=(num_n, num_gm, num_k),
+            in_specs=(lhs_spec,),
+            out_specs=out_spec,
+        )
+        with jax.named_scope("gmm_pipeline"):
+            pipeline_fn(lhs_in, out_in, scratches=scratches)
 
     if cfgs.zero_init:
         with jax.named_scope("gmm_zero_wait"):
@@ -1419,6 +1593,26 @@ def gmm_v2(
         ]
     else:
         scratch_shapes += [None, None]
+
+    if use_rhs_stream(cfgs):
+        rhs_storage = rhs.dtype
+        scratch_shapes.append(
+            RhsStreamRef(
+                weight=pltpu.VMEM(
+                    (RHS_STREAM_SLOTS, dims.size_k, dims.size_n), rhs_storage
+                ),
+                scale=None
+                if rhs_scale is None
+                else pltpu.VMEM(
+                    (RHS_STREAM_SLOTS,) + rhs_scale.shape[1:], jnp.float32
+                ),
+                sems=pltpu.SemaphoreType.DMA((RHS_STREAM_SLOTS,)),
+                run_to_group=pltpu.SMEM((dims.size_group,), jnp.int32),
+                run=pltpu.SMEM((2,), jnp.int32),
+            )
+        )
+    else:
+        scratch_shapes.append(None)
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
