@@ -86,6 +86,7 @@ MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
 EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.29.0}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-0}"
+STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-1800}"
 
 SERVE_HOST="${P4D2_BIND_HOST:-127.0.0.1}"
 PREFILL_PORT="${PREFILL_PORT:-8400}"
@@ -332,6 +333,7 @@ TORCHTPU_VLLM_PYTHONPATH=${TORCHTPU_VLLM_SRC}
 MODEL_PATH=${MODEL_PATH}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
 EXPECTED_VLLM_VERSION=${EXPECTED_VLLM_VERSION}
+STARTUP_TIMEOUT_S=${STARTUP_TIMEOUT_S}
 CONNECTOR=TPUMultiConnector
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
@@ -475,7 +477,8 @@ echo "prefill pid $(cat "${RUN_DIR}/prefill.pid")"
 echo "decode pid $(cat "${RUN_DIR}/decode.pid")"
 
 health_log="${RUN_DIR}/logs/health_poll.log"
-for ((attempt = 1; attempt <= 120; attempt++)); do
+deadline=$((SECONDS + STARTUP_TIMEOUT_S))
+while ((SECONDS < deadline)); do
   p_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${PREFILL_PORT}/health" 2>/dev/null || true)
   d_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${DECODE_PORT}/health" 2>/dev/null || true)
   echo "$(date +%H:%M:%S) P=${p_code:-NA} D=${d_code:-NA}" | tee -a "${health_log}"
