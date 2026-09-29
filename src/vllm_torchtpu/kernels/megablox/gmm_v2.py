@@ -818,6 +818,12 @@ def zero_out_end(
     ).wait()
 
 
+def _trace_value(name: str, value: jax.Array) -> None:
+    """Attach a scalar to the enclosing trace region, when this jax supports it."""
+    if hasattr(pltpu, "trace_value"):
+        pltpu.trace_value(name, value)
+
+
 def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
@@ -871,22 +877,27 @@ def kernel_main(
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
     # Fill metadata buffer and return number of group & m interations.
-    num_gm = fill_metadata(
-        lhs_group_sizes_ref,
-        group_offset_ref,
-        metadata_ref,
-        cfgs=cfgs,
-    )
+    with jax.named_scope("gmm_fill_metadata"):
+        num_gm = fill_metadata(
+            lhs_group_sizes_ref,
+            group_offset_ref,
+            metadata_ref,
+            cfgs=cfgs,
+        )
+        _trace_value("num_gm", num_gm)
+        _trace_value("rows", metadata_ref.gm_id_to_m_offset[num_gm])
 
     if cfgs.zero_init:
-        zero_size = zero_out_start(
-            out_ref,
-            zero_ref,
-            semaphore_ref,
-            metadata_ref,
-            num_gm,
-            dims=cfgs.dims,
-        )
+        with jax.named_scope("gmm_zero_start"):
+            zero_size = zero_out_start(
+                out_ref,
+                zero_ref,
+                semaphore_ref,
+                metadata_ref,
+                num_gm,
+                dims=cfgs.dims,
+            )
+            _trace_value("zero_rows", zero_size)
 
     (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
 
@@ -912,10 +923,12 @@ def kernel_main(
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
-    pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+    with jax.named_scope("gmm_pipeline"):
+        pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
 
     if cfgs.zero_init:
-        zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
+        with jax.named_scope("gmm_zero_wait"):
+            zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
 
 
 def calculate_tiling(
