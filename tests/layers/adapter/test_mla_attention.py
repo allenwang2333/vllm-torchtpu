@@ -585,6 +585,49 @@ def test_mla_forward_sparse_packed_q_bf16():
     assert not q[..., 576:].any()
 
 
+def test_mla_forward_sparse_packed_full_width_output_bf16():
+    """The packed op returns the kernel's full [T, H, 640] output; W_UV is
+    zero-padded on K so columns >= kv_lora_rank never reach the result, and
+    the projection is bit-identical to slicing to 512 first."""
+    impl, layer, inputs, op_out = _make_impl_and_layer(num_tokens=4)
+    layer.W_UK_T = layer.W_UK_T.to(torch.bfloat16)
+    inputs["q"] = tuple(t.to(torch.bfloat16) for t in inputs["q"])
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    layer.W_UV = layer.W_UV.to(torch.bfloat16)
+    lkv = op_out.shape[-1]
+    g = torch.Generator().manual_seed(5)
+    tail = (torch.randn(*op_out.shape[:-1], 640 - lkv, generator=g) * 7).to(
+        torch.bfloat16
+    )
+    full = torch.cat([op_out.to(torch.bfloat16), tail], dim=-1)
+    layer.sparse_mla_op.return_value = full
+
+    out = impl.forward(
+        layer=layer, **inputs, topk_indices=torch.zeros((4, 8), dtype=torch.int32)
+    )
+
+    expected = (
+        torch.bmm(full[..., :lkv].transpose(0, 1), layer.W_UV)
+        .transpose(0, 1)
+        .reshape(4, -1)
+    )
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+    # Positive control: a change in a real column must show up.
+    bad = full.clone()
+    bad[0, 0, 0] += 1
+    layer.sparse_mla_op.return_value = bad
+    out_bad = impl.forward(
+        layer=layer, **inputs, topk_indices=torch.zeros((4, 8), dtype=torch.int32)
+    )
+    assert not torch.equal(out_bad.view(torch.int16), expected.view(torch.int16))
+
+
 def test_mla_forward_dense_dispatch_without_topk():
     """No topk_indices: the dense op is called, the sparse op is not."""
     k_scale = 2.0

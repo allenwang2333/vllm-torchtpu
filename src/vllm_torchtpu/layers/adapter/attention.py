@@ -1767,6 +1767,20 @@ def _packed_sparse_q(
     return torch.slice_scatter(q, q_pe, dim=-1, start=lkv, end=lkv + rope)
 
 
+def _w_uv_bmm(outputs: torch.Tensor, w_uv: torch.Tensor) -> torch.Tensor:
+    """`outputs` [T, H, K'] @ `w_uv` [H, K, V] -> head-major [H, T, V].
+
+    When K' > K (the sparse kernel's full-width output, see
+    `full_width_output`), W_UV gets K' - K zero rows instead of slicing
+    `outputs` to K: the extra products are exact zeros in the f32
+    accumulator, and the whole-output slice copy never runs.
+    """
+    extra = outputs.shape[-1] - w_uv.shape[1]
+    if extra:
+        w_uv = torch.nn.functional.pad(w_uv, (0, 0, 0, extra))
+    return torch.bmm(outputs.transpose(0, 1), w_uv)
+
+
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def __init__(
         self,
@@ -2057,6 +2071,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 rope_spec,
                 sm_scale=layer.scale,
                 k_scale=k_scale,
+                full_width_output=True,
             )
 
         sparse_mla_packed_jax_op = pallas.jax_op(
@@ -2066,7 +2081,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         def _fake_sparse_mla_packed(kv_cache_nope, kv_cache_rope, q, *args, **kwargs):
-            out_shape = (q.size(0), layer.num_heads, layer.kv_lora_rank)
+            # Full kernel width: the caller's `_w_uv_bmm` zero-pads W_UV on K.
+            out_shape = (q.size(0), layer.num_heads, q.size(-1))
             return (
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
@@ -2087,7 +2103,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
         ) -> torch.Tensor:
-            """`q_pe=None`: `ql_nope` is the packed [T, H, 640] kernel q."""
+            """`q_pe=None`: `ql_nope` is the packed [T, H, 640] kernel q, and the
+            output is the kernel's full [T, H, 640] (cols >= lkv are not MLA
+            values; `_w_uv_bmm` multiplies them by zero rows)."""
             nope_cache, rope_cache = kv_cache
             jax_op = sparse_mla_jax_op if q_pe is not None else sparse_mla_packed_jax_op
             q_args = (ql_nope, q_pe) if q_pe is not None else (ql_nope,)
@@ -2372,15 +2390,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
-            0, 1
-        )
+        # Packed sparse path: the op hands back the kernel's full width.
+        width = outputs.shape[-1] if packed_q else layer.kv_lora_rank
+        outputs = outputs.reshape(-1, layer.num_heads, width)
         w_uv = (
-            layer.W_UV.to(outputs_t.dtype)
-            if layer.W_UV.dtype != outputs_t.dtype
+            layer.W_UV.to(outputs.dtype)
+            if layer.W_UV.dtype != outputs.dtype
             else layer.W_UV
         )
-        out_proj = torch.bmm(outputs_t, w_uv)
+        out_proj = _w_uv_bmm(outputs, w_uv)
         if hasattr(layer, "W_UV_scale"):
             out_proj = out_proj * layer.W_UV_scale
         outputs = (

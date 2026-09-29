@@ -870,6 +870,7 @@ def sparse_mla_attention(
     rope_spec: SparseMLAKVCacheSpec,
     sm_scale: float | None = None,
     k_scale: float | None = None,
+    full_width_output: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -894,12 +895,17 @@ def sparse_mla_attention(
       rope_spec: Layout descriptor the rope cache was allocated from.
       sm_scale: Softmax temperature scale.
       k_scale: Dequantization scale for fp8 keys.
+      full_width_output: Return the kernel's whole `align_to(lkv_dim +
+        rope_dim, 128)`-wide output instead of slicing it to `lkv_dim`. The
+        caller must then ignore columns `[lkv_dim:]` (e.g. zero rows of a
+        K-padded W_UV); this skips a whole-output slice copy.
 
     Returns:
       A tuple containing:
         - The updated `kv_cache_nope`.
         - The updated `kv_cache_rope`.
-        - The sparse attention output (`[num_tokens, num_heads, lkv_dim]`).
+        - The sparse attention output (`[num_tokens, num_heads, lkv_dim]`, or
+          the kernel's full width with `full_width_output`).
 
     Contract notes:
       * The kernel takes a SINGLE `q` of shape (T, N, nope+rope) in
@@ -992,7 +998,10 @@ def sparse_mla_attention(
 
         # The kernel's output is lkv_dim + rope_dim wide because it attends
         # over concatenated (nope + rope) keys. Only the nope part is the MLA
-        # value (P @ latent); drop the rope tail before the W_UV projection.
+        # value (P @ latent); drop the rope tail before the W_UV projection
+        # (or leave it to the caller's zero-padded W_UV rows).
+        if full_width_output:
+            return output, kv_cache_nope, kv_cache_rope
         return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
