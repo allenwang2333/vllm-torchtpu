@@ -11,21 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Undefined bytes past a sequence's cached tokens must not reach the output.
+"""Undefined K/V bytes outside a sequence's valid tokens must not reach the output.
 
-Under SEQ_ALONG_LANE the kernel DMAs whole pages, so the tail of the last
-cache page (and any page it never wrote) lands in VMEM. Those bytes are
-undefined: with the unified hybrid block pool they are recycled Mamba state,
-which often decodes as an fp8 NaN. Score masking alone cannot neutralize them
-because 0 * NaN = NaN in the P @ V matmul, so the stitch must zero them.
+Under SEQ_ALONG_LANE the kernel DMAs whole pages, both from the KV cache and
+from the new-token K/V. Slots past a sequence's valid tokens in those pages
+are undefined: page tails in the cache (recycled Mamba state under the unified
+hybrid block pool, often fp8 NaN) and rows past the new tokens, such as batch
+padding. Score masking cannot neutralize them because 0 * NaN = NaN in the
+P @ V matmul, so the stitch must zero those lanes.
 
-The CACHE_ONLY pass used by decode context parallelism fetches no new tokens,
-so every lane past the local cache is such a tail. With a prefill block
-larger than one lane register (bq_sz > 128) the MIXED kernel takes the
-`_stitch_prefill_lane` path, which used to leave those lanes untouched.
+With a prefill block larger than one lane register (bq_sz > 128) the MIXED
+kernel takes the `_stitch_prefill_lane` path, which used to leave lanes past
+the new tokens untouched.
 
-Each case fills every non-cached token slot with NaN and with 0, and checks
-that both runs are finite, identical, and match a float32 reference.
+Each case fills every undefined slot (non-cached page slots and new-token
+padding rows) with NaN and with 0, and checks that both runs are finite,
+identical, and match a float32 reference.
 """
 
 import jax.numpy as jnp
@@ -71,7 +72,7 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
     def rand(*shape):
         # Round through kv_dtype so the reference sees the stored values.
         x = rng.standard_normal(shape).astype(np.float32) * 0.5
-        return np.asarray(jnp.asarray(x, kv_dtype).astype(jnp.float32))
+        return np.array(jnp.asarray(x, kv_dtype).astype(jnp.float32))
 
     cache_shape = wrapper.get_kv_cache_shape(
         total_pages,
@@ -106,6 +107,10 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
     query = np.asarray(jnp.asarray(query, jnp.bfloat16).astype(jnp.float32))
     new_k = rand(max_tokens, _NUM_KV_HEADS, _HEAD_DIM)
     new_v = rand(max_tokens, _NUM_KV_HEADS, _HEAD_DIM)
+    # Padding tokens are undefined too. New tokens are fetched page by page,
+    # so the last sequence's page brings these rows into VMEM.
+    new_k[num_tokens:] = fill_value
+    new_v[num_tokens:] = fill_value
 
     cu_q_lens = np.zeros(_MAX_NUM_SEQS + 1, np.int32)
     cu_q_lens[1 : num_seqs + 1] = np.cumsum(q_lens)

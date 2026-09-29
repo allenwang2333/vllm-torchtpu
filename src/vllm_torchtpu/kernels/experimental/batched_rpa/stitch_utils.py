@@ -108,13 +108,11 @@ def _stitch_prefill_lane(
     """O(N) Prefill Path: Roll the entire new tokens buffer into place.
 
     Lanes past the last valid token (``bkv_sz_cache + bkv_sz_new``) are zeroed,
-    as in `_stitch_decode_lane`. Otherwise they would take whatever the roll
-    brings in from unfetched VMEM, which can be a raw page tail from an earlier
-    step: page bytes past a sequence's length are undefined (in the unified
-    hybrid pool they are recycled Mamba state, often an fp8 NaN pattern), and
-    score masking cannot neutralize them because 0 * NaN = NaN in the P @ V
-    matmul. The CACHE_ONLY pass hits this on every step, since it fetches no
-    new tokens and so every lane past the cache is rolled-in garbage.
+    as in `_stitch_decode_lane`. New tokens are fetched a whole page at a time,
+    so without this those lanes keep the rest of the last fetched page: rows
+    past the sequence's new tokens, e.g. batch padding, whose K/V is undefined
+    and may be NaN. Score masking cannot neutralize them because 0 * NaN = NaN
+    in the P @ V matmul.
     """
     total_head_words = (
         cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
