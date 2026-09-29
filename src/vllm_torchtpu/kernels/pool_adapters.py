@@ -39,6 +39,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from vllm import envs
 
+from vllm_torchtpu.gdn_pool_layout import DEFAULT_POOLED_GDN_CONV_STATE_DTYPE
+
 from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 
@@ -584,7 +586,8 @@ def v3_state_source(
     # 128-aligned lane concat, which needs whole rows per conv row.
     assert conv_dim % lanes == 0, (conv_dim, lanes)
     conv_rows = (kernel_size - 1) * conv_dim // lanes
-    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (
+    conv_view_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1])
+    assert conv_rows * conv_view_dtype.itemsize * lanes <= conv_ntok * tok_bytes, (
         conv_rows,
         conv_ntok,
         tok_bytes,
@@ -599,7 +602,7 @@ def v3_state_source(
         nblocks=1,
         row0=row0,
         nrows=conv_ntok,
-        view_dtype=jnp.dtype(jnp.bfloat16),
+        view_dtype=conv_view_dtype,
         lane_split=1,
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,

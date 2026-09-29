@@ -41,7 +41,7 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
 # These are torch dtype *names*, not torch.dtype objects: this module is
 # imported by the JAX kernel path and by deviceless tests, so it must stay
 # importable without torch.
-DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
+DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.float32"
 DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
 _ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
 
