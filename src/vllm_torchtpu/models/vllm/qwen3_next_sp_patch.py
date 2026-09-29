@@ -71,13 +71,22 @@ def install() -> None:
 def _build_row_gated(original_init):
     @functools.wraps(original_init)
     def __init__(self, vllm_config, *args, **kwargs):
-        with sequence_parallel.building_layer():
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        # A replicated MTP draft (draft_tensor_parallel_size=1) is built under
+        # a TP group collapsed to one rank and runs unsharded.
+        if get_tensor_model_parallel_world_size() > 1:
+            with sequence_parallel.building_layer():
+                original_init(self, vllm_config, *args, **kwargs)
+        else:
             original_init(self, vllm_config, *args, **kwargs)
         row_gated = self.use_attn_reduce_scatter_for_moe
         setattr(self, SP_LAYER_ATTR, row_gated)
         if not row_gated:
             return
-        from vllm.distributed import get_tensor_model_parallel_rank
 
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         sequence_parallel.check_buckets(
