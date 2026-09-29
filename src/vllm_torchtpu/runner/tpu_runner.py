@@ -814,9 +814,7 @@ class TPUModelRunner(GPUModelRunner):
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
         if envs.TPU_SHARDED_LM_HEAD:
-            self.num_reqs_paddings = sharded_lm_head.request_buckets(
-                self.vllm_config, self.max_num_reqs
-            )
+            self.num_reqs_paddings = sharded_lm_head.request_buckets(self.max_num_reqs)
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (
@@ -4437,8 +4435,6 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
-        if envs.TPU_SHARDED_LM_HEAD:
-            sharded_lm_head.install(model, self.num_reqs_paddings)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -4459,6 +4455,17 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
+        # After the drafter: a draft that copies the target head needs it whole.
+        if envs.TPU_SHARDED_LM_HEAD:
+            sharded_lm_head.install(
+                model,
+                sharded_lm_head.logits_rows(
+                    self.max_num_reqs,
+                    self.num_tokens_paddings,
+                    self.speculative_config,
+                ),
+                drafter=self.drafter if self._is_async_drafter else None,
+            )
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
