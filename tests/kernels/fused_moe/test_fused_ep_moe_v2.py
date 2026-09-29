@@ -780,3 +780,92 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# The fp8 one-slot schedule streams its gate/up slab as W1_RING_BLOCKS K
+# blocks through a ring of `w1_ring_slots` slots (0 keeps the one-slab
+# stream). Every ring depth the VMEM fallback can pick, and the one-slab
+# stream it falls back to, against the prefetch schedules.
+FP8_RING_SCHEDULES = (
+    (2, None),  # prefetch runway: no ring
+    (0, 0),  # one slot, ring disabled: the one-slab stream
+    (0, 8),  # the shallowest ring (no visit-ahead blocks)
+    (0, 10),
+    (0, 12),  # the ceiling
+)
+
+
+@pytest.mark.parametrize("tokens", (64, 2048))
+def test_fp8_w1_ring_agrees_across_every_weight_schedule(
+    at_prefetch_depth, monkeypatch, tokens
+):
+    """The w1 K-block ring computes what the other fp8 schedules compute.
+
+    The ring changes where the gate/up blocks land and when they are started
+    and waited, and splits the gate/up matmul into K blocks accumulated in
+    f32. Ring depths share one K blocking, so they have to agree bit for bit;
+    against the one-slab schedules they are held to the dense-reference band
+    and to each other's distance. 64 tokens is the one-hop ship path, 2048
+    the multi-tile HBM-commit path.
+    """
+    mesh = _mesh()
+    w1, w2, w1s, w2s = _make_weights(
+        mesh,
+        46,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh, 47, tokens=tokens, hidden=STREAM["hidden"], e_total=STREAM["e_total"]
+    )
+    common = dict(
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=True,
+    )
+    real_ring = host.fit_w1_ring_slots
+    outs = {}
+    for depth, ring in FP8_RING_SCHEDULES:
+        rings = []
+
+        def capped_ring(*args, ring=ring, rings=rings, **kwargs):
+            if ring is not None:
+                kwargs["max_slots"] = ring
+            got = real_ring(*args, **kwargs)
+            rings.append(got[0])
+            return got
+
+        observed = at_prefetch_depth(depth)
+        monkeypatch.setattr(host, "fit_w1_ring_slots", capped_ring)
+        outs[(depth, ring)] = np.asarray(
+            fused_ep_moe_v2(x, w1, w2, w1s, w2s, gating, **common)
+        )
+        assert observed and rings, "the build never asked for a weight schedule"
+        assert {(s.distance, s.nbuf) for s in observed} == {
+            (depth, host.nbuf_for(depth))
+        }
+        assert set(rings) == {ring or 0}, (depth, ring, rings)
+
+    ref = _dense_reference(mesh, x, w1, w2, w1s, w2s, gating, topk=STREAM["topk"])
+    for key, out in outs.items():
+        error = _relative_l2(out, ref)
+        worst = _worst_token_relative_l2(out, ref)
+        assert error < FP8_RELATIVE_BOUND, f"{key}: relative L2 {error}"
+        assert worst < FP8_TOKEN_BOUND, f"{key}: worst token {worst}"
+    for ring in (8, 10):
+        np.testing.assert_array_equal(
+            outs[(0, ring)], outs[(0, 12)], err_msg=f"ring {ring} vs ring 12"
+        )
+    np.testing.assert_array_equal(
+        outs[(0, 0)], outs[(2, None)], err_msg="one-slab stream vs prefetch"
+    )
+    # The K-blocked f32 sum may round differently from the one-slab matmul;
+    # it may not move further from it than the fp8 wire does.
+    drift = _relative_l2(outs[(0, 12)], outs[(0, 0)])
+    print(f"ring-12 vs one-slab relative L2 at tokens={tokens}: {drift:.3e}")
+    assert drift < 0.1 * FP8_RELATIVE_BOUND, drift

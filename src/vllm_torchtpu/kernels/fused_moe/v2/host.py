@@ -1266,8 +1266,33 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
     ).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
-P08_RB = 8
-P08_RS = 12
+# The fp8 one-slot build can stream its gate/up slab as this many equal
+# contraction (K) blocks through a ring of weight slots rather than as one
+# slab (probe 08 v1_bAK12P). A ring deeper than the block count lets the NEXT
+# visit's leading `slots - W1_RING_BLOCKS` blocks go out a whole visit ahead,
+# into the slots the previous visit's trailing blocks held; the rest go out
+# when this visit's last gate/up matmul retires its leading blocks. The ring
+# is correct for W1_RING_BLOCKS <= slots <= 2 * W1_RING_BLOCKS.
+W1_RING_BLOCKS = 8
+# The ring depth a build starts from; `fit_w1_ring_slots` steps it down one
+# slot at a time until the build fits, and a build where even
+# W1_RING_BLOCKS slots do not fit keeps the one-slab schedule.
+MAX_W1_RING_SLOTS = 12
+
+
+def w1_ring_supported(weight_format, hidden, nbuf):
+    """Whether this build's schedule can take the gate/up K-block ring.
+
+    Only the eight-bit one-slot (no prefetch runway) stream has the ring:
+    every other schedule already hides its refill or reads the slab through
+    its own block readers. Each K block has to be a whole number of lane
+    blocks, because the gate/up matmul slices the activation row along K.
+    """
+    return (
+        weight_format == WeightFormat.FP8
+        and nbuf == 1
+        and hidden % (W1_RING_BLOCKS * HIDDEN_LANE_BLOCK) == 0
+    )
 
 
 def vmem_limit(info=None):
@@ -1368,6 +1393,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    w1_ring_slots=0,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1406,13 +1432,24 @@ def vmem_scratch_arrays(
         ]
     else:
         weights = [
-            ("w1_vm", (P08_RS, hidden // P08_RB, 2 * inter), form.weight_dtype),  # probe 08 P5-K
+            (
+                "w1_vm",
+                (
+                    (w1_ring_slots, hidden // W1_RING_BLOCKS, 2 * inter)
+                    if w1_ring_slots
+                    else (nbuf, hidden, 2 * inter)
+                ),
+                form.weight_dtype,
+            ),
             ("w2_vm", (nbuf, inter, hidden), form.weight_dtype),
         ]
         if form.has_scales:
+            # The ring build double-buffers the scale tables so the next
+            # visit's go out a visit ahead (probe 08 v1_sp).
+            sdepth = max(nbuf, 2) if w1_ring_slots else nbuf
             weights += [
-                ("w1s_vm", (max(nbuf, 2), 2 * inter), jnp.float32),
-                ("w2s_vm", (max(nbuf, 2), hidden), jnp.float32),
+                ("w1s_vm", (sdepth, 2 * inter), jnp.float32),
+                ("w2s_vm", (sdepth, hidden), jnp.float32),
             ]
     # The optional expert biases are resident for every local expert, one
     # row per expert on each matmul's output channels. They carry no block
@@ -1538,6 +1575,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    w1_ring_slots=0,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1563,6 +1601,7 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        w1_ring_slots=w1_ring_slots,
     )
     arrays += vmem_tile_body_arrays(
         capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
@@ -1652,3 +1691,51 @@ def fit_weight_slots(
     # The first depth that fits, or distance zero over budget for the
     # caller to refuse by name.
     return slots
+
+
+def fit_w1_ring_slots(
+    g_local,
+    capacity,
+    hidden,
+    inter,
+    *,
+    nbuf,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    has_w1_bias=False,
+    has_w2_bias=False,
+    max_slots=MAX_W1_RING_SLOTS,
+    info=None,
+    limit=None,
+):
+    """The deepest gate/up K-block ring this build's VMEM leaves room for.
+
+    Returns (slots, vmem_bytes, limit). `slots` is 0 where the schedule has
+    no ring (`w1_ring_supported`) or where not even W1_RING_BLOCKS slots fit
+    -- the build then keeps the one-slab schedule, which
+    `fit_weight_slots` already sized -- so no shape is refused here.
+    """
+    if info is None:
+        info = pltpu.get_tpu_info()
+    if limit is None:
+        limit = vmem_limit(info)
+    if not w1_ring_supported(weight_format, hidden, nbuf):
+        return 0, None, limit
+    top = min(max_slots, 2 * W1_RING_BLOCKS)
+    for slots in range(top, W1_RING_BLOCKS - 1, -1):
+        vmem = vmem_estimate_bytes(
+            g_local,
+            capacity,
+            hidden,
+            inter,
+            nbuf=nbuf,
+            weight_format=weight_format,
+            rhs_qb=rhs_qb,
+            has_w1_bias=has_w1_bias,
+            has_w2_bias=has_w2_bias,
+            info=info,
+            w1_ring_slots=slots,
+        )
+        if vmem <= limit:
+            return slots, vmem, limit
+    return 0, None, limit

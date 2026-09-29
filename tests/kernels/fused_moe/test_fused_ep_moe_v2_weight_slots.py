@@ -180,3 +180,70 @@ def test_the_height_ladder_override(monkeypatch, override, want):
     # never the short one.
     assert rungs[-1] == TILE_M
     assert all(step % host.ROWBLK == 0 for step in rungs)
+
+
+# ---- the fp8 one-slot gate/up K-block ring (probe 08 v1_bAK12P) ------------
+
+GLM52 = dict(g_local=16, capacity=128, hidden=6144, inter=2048)
+
+
+def _ring(shape, slots, chip):
+    return host.vmem_estimate_bytes(**shape, nbuf=1, info=chip, w1_ring_slots=slots)
+
+
+def test_glm52_takes_the_twelve_slot_ring_on_a_64mib_chip():
+    """The served GLM-5.2-FP8 shape: one weight slot, and the 12-slot ring
+    (+12 MiB over the one-slab stream) still inside the budget. Nothing the
+    estimate reads depends on the token count, the mesh width or the routing
+    plan -- capacity is the adapter's fixed tile height -- so this holds for
+    every prefill and decode bucket."""
+    chip = _FakeChip(64 * 2**20)
+    slots = host.fit_weight_slots(**GLM52, info=chip)
+    assert (slots.distance, slots.nbuf) == (0, 1)
+    got, vmem, limit = host.fit_w1_ring_slots(**GLM52, nbuf=1, info=chip)
+    assert got == host.MAX_W1_RING_SLOTS == 12
+    assert vmem == _ring(GLM52, 12, chip) <= limit
+    assert vmem - slots.vmem_bytes == 12 * 2**20
+
+
+@pytest.mark.parametrize("slots", range(8, 12))
+def test_the_ring_descends_one_slot_at_a_time(slots, chip):
+    """A budget a byte under ring `slots + 1` lands on exactly `slots`."""
+    limit = _ring(GLM52, slots + 1, chip) - 1
+    got, vmem, _ = host.fit_w1_ring_slots(**GLM52, nbuf=1, info=chip, limit=limit)
+    assert got == slots
+    assert vmem == _ring(GLM52, slots, chip)
+
+
+def test_no_ring_when_even_the_shallowest_does_not_fit(chip):
+    """Below ring 8 the build keeps the one-slab stream: 0, never a refusal."""
+    limit = _ring(GLM52, 8, chip) - 1
+    assert host.fit_w1_ring_slots(**GLM52, nbuf=1, info=chip, limit=limit)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        pytest.param(dict(nbuf=2), id="prefetch-runway"),
+        pytest.param(dict(nbuf=1, weight_format=host.WeightFormat.FP4), id="fp4"),
+        pytest.param(dict(nbuf=1, weight_format=host.WeightFormat.INT8), id="int8"),
+        pytest.param(dict(nbuf=1, weight_format=host.WeightFormat.BF16), id="bf16"),
+    ],
+)
+def test_no_ring_off_the_fp8_one_slot_stream(kw, chip):
+    assert host.fit_w1_ring_slots(**GLM52, info=chip, **kw)[0] == 0
+
+
+def test_no_ring_when_a_k_block_is_not_whole_lane_blocks(chip):
+    shape = dict(GLM52, hidden=5120 + 128)
+    assert host.fit_w1_ring_slots(**shape, nbuf=1, info=chip)[0] == 0
+
+
+def test_ring_scratch_shapes():
+    arrays = {
+        name: s
+        for name, s, _ in host.vmem_scratch_arrays(**GLM52, nbuf=1, w1_ring_slots=12)
+    }
+    assert arrays["w1_vm"] == (12, 6144 // host.W1_RING_BLOCKS, 2 * 2048)
+    assert arrays["w2_vm"] == (1, 2048, 6144)
+    assert arrays["w1s_vm"][0] == arrays["w2s_vm"][0] == 2

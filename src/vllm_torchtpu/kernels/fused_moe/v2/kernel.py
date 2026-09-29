@@ -16,11 +16,6 @@ expert half of an MoE layer for one expert-parallel shard and pushes each
 result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 
-P08_W1_BLOCKS = 1
-P08_SP = True
-P08_P5 = 'v1_bAK12P'
-P08_RB = 8
-P08_RS = 12
 import functools
 import threading
 
@@ -44,6 +39,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     PACK4,
     QB4,
     ROWBLK,
+    W1_RING_BLOCKS,
 )
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
@@ -357,7 +353,7 @@ def expert_ffn_fp8(
     if w1_ready is not None:
         w1_ready()
     if isinstance(w1, tuple):
-        # probe 08 P5-K: K-blocked gate/up over ring block slots.
+        # K-blocked gate/up over the ring's block slots (probe 08 P5-K).
         _nb, _rd = w1
         _kb = act_q.shape[-1] // _nb
         acc1 = None
@@ -766,6 +762,33 @@ def _build_fused_ep_moe_kernel(
             slots.limit / 2**20,
             host.MAX_WEIGHT_PREFETCH_DISTANCE,
         )
+    # The one-slot fp8 stream's gate/up slab as a K-block ring (probe 08
+    # v1_bAK12P): the deepest ring the budget leaves room for, walked down
+    # from MAX_W1_RING_SLOTS; 0 keeps the one-slab schedule above.
+    w1_ring_slots, w1_ring_vmem, _ = host.fit_w1_ring_slots(
+        g_local,
+        capacity,
+        hidden,
+        inter,
+        nbuf=nbuf,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+        limit=slots.limit,
+    )
+    # The ring rides the streamed, next-weights-starting one-slot schedule
+    # and nothing else. This function's own arithmetic, hence an assert.
+    assert not w1_ring_slots or (
+        streams_fp8
+        and starts_next_weights
+        and has_scales
+        and nbuf == 1
+        and not rhs_packed4
+        and W1_RING_BLOCKS <= w1_ring_slots <= 2 * W1_RING_BLOCKS
+    ), (w1_ring_slots, streams_fp8, starts_next_weights, nbuf)
+    # Scale-table depth, as vmem_scratch_arrays sizes it.
+    sdepth = max(nbuf, 2) if w1_ring_slots else nbuf
     # ragged_rows_alloc must cover every tile READ as well as every commit
     # -- the shard's total rows plus tile_m, aligned to tile_m -- because a
     # tail tile reads a full window.
@@ -802,6 +825,24 @@ def _build_fused_ep_moe_kernel(
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    logger.info(
+        "fused EP MoE plan: g_local=%d ep=%d %dx%d capacity=%d "
+        "ragged_rows_alloc=%d format=%s nbuf=%d distance=%d w1_ring_slots=%d "
+        "vmem=%.1fMiB of %.1fMiB push_from_vmem=%s",
+        g_local,
+        ep,
+        hidden,
+        inter,
+        capacity,
+        ragged_rows_alloc,
+        weight_format,
+        nbuf,
+        prefetch_distance,
+        w1_ring_slots,
+        (w1_ring_vmem if w1_ring_slots else slots.vmem_bytes) / 2**20,
+        slots.limit / 2**20,
+        push_from_vmem,
+    )
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
@@ -956,12 +997,14 @@ def _build_fused_ep_moe_kernel(
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
-        def p5_rs(visit, b):
-            return lax.rem(visit * P08_RB + b, jnp.int32(P08_RS))
+        def w1_ring_slot(visit, b):
+            """The ring slot K block `b` of visit `visit` lands in."""
+            return lax.rem(visit * W1_RING_BLOCKS + b, jnp.int32(w1_ring_slots))
 
         def w1_ring_copy(expert, visit, b):
-            kb = hidden // P08_RB
-            rs = p5_rs(visit, b)
+            """K block `b` of `expert`'s gate/up slab, into its ring slot."""
+            kb = hidden // W1_RING_BLOCKS
+            rs = w1_ring_slot(visit, b)
             return pltpu.make_async_copy(
                 w1_hbm.at[expert, pl.ds(b * kb, kb), :], w1_vm.at[rs], w1_sems.at[rs]
             )
@@ -986,14 +1029,13 @@ def _build_fused_ep_moe_kernel(
                 w1s_copy(expert, sslot).start(priority=WEIGHT_DMA_PRIORITY)
                 w2s_copy(expert, sslot).start(priority=WEIGHT_DMA_PRIORITY)
             if visit is not None:
-                for _b in range(P08_RB):
+                for _b in range(W1_RING_BLOCKS):
                     w1_ring_copy(expert, visit, _b).start(priority=WEIGHT_DMA_PRIORITY)
             else:
                 w1_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
             w2_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
 
         def weight_waits(expert, slot, sslot=None):
-            sslot = slot if sslot is None else sslot
             """Wait for what the expert's first block needs.
 
             A streamed slab is not waited for here: its wait sits in the block
@@ -1001,6 +1043,7 @@ def _build_fused_ep_moe_kernel(
             this head waits for the scale tables alone. Every other format
             takes the slab in one matmul and keeps the whole-slab head wait.
             """
+            sslot = slot if sslot is None else sslot
             if not streams_weights:
                 w1_copy(expert, slot).wait()
                 w2_copy(expert, slot).wait()
@@ -1026,10 +1069,12 @@ def _build_fused_ep_moe_kernel(
 
         prologue()
 
-        # probe 08 P5-P: visit 0's weights go out before the entry barrier.
-        @pl.when(n_visit > 0)
-        def _():
-            weight_starts(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.int32(0))
+        if w1_ring_slots:
+            # Visit 0's weights go out before the entry barrier rather than
+            # at its head after it (probe 08 P5-P).
+            @pl.when(n_visit > 0)
+            def _():
+                weight_starts(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.int32(0))
 
         _all_pairs_barrier(ep)
 
@@ -1046,8 +1091,15 @@ def _build_fused_ep_moe_kernel(
             def start():
                 @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_visit))
                 def _():
-                    for _b in range(P08_RS - P08_RB, P08_RB):
-                        w1_ring_copy(visit_sm[visit_i + 1], visit_i + 1, _b).start(
+                    if w1_ring_slots:
+                        # The next visit's trailing K blocks, into the slots
+                        # this visit's leading blocks just retired.
+                        for _b in range(w1_ring_slots - W1_RING_BLOCKS, W1_RING_BLOCKS):
+                            w1_ring_copy(visit_sm[visit_i + 1], visit_i + 1, _b).start(
+                                priority=WEIGHT_DMA_PRIORITY
+                            )
+                    else:
+                        w1_copy(visit_sm[visit_i + 1], slot).start(
                             priority=WEIGHT_DMA_PRIORITY
                         )
 
@@ -1328,7 +1380,8 @@ def _build_fused_ep_moe_kernel(
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
             slot = lax.rem(visit_i, jnp.int32(nbuf))
-            sp_ring = bool(has_scales and starts_next_weights and nbuf == 1)
+            # The ring build double-buffers the scale tables (probe 08 v1_sp).
+            sp_ring = bool(w1_ring_slots)
             sslot = lax.rem(visit_i, jnp.int32(2)) if sp_ring else slot
             if not prefetches and not starts_next_weights:
                 # No runway: nobody started this visit's weights, so it
@@ -1346,21 +1399,24 @@ def _build_fused_ep_moe_kernel(
 
                 @pl.when(visit_i == 0)
                 def _():
-                    pass  # probe 08 P5-P: started in the prologue
+                    # The ring build started them in the prologue.
+                    if not w1_ring_slots:
+                        weight_starts(e, slot)
 
             weight_waits(e, slot, sslot)
             if sp_ring:
-                # probe 08 A1: next visit's scale tables, a visit ahead and
-                # ahead of its w1 in the queue. Slot 1-sslot was last read by
-                # visit i-1, whose reads all retired inside its tile loop.
+                # The next visit's scale tables, a visit ahead and ahead of
+                # its w1 in the queue. Slot 1-sslot was last read by visit
+                # i-1, whose reads all retired inside its tile loop.
                 @pl.when(visit_i + 1 < n_visit)
                 def _():
                     nxt_s = visit_sm[visit_i + 1]
                     w1s_copy(nxt_s, 1 - sslot).start(priority=WEIGHT_DMA_PRIORITY)
                     w2s_copy(nxt_s, 1 - sslot).start(priority=WEIGHT_DMA_PRIORITY)
-                    # probe 08 P5-K: the next visit's early w1 blocks go into the
-                    # ring slots visit i-1's late blocks held; a whole visit ahead.
-                    for _b in range(P08_RS - P08_RB):
+                    # The next visit's leading w1 K blocks go into the ring
+                    # slots visit i-1's trailing blocks held; a whole visit
+                    # ahead.
+                    for _b in range(w1_ring_slots - W1_RING_BLOCKS):
                         w1_ring_copy(nxt_s, visit_i + 1, _b).start(
                             priority=WEIGHT_DMA_PRIORITY
                         )
@@ -1611,19 +1667,13 @@ def _build_fused_ep_moe_kernel(
                     rung that still covers them.
                     """
                     full = height == tile_m
-                    p5_fp8 = (
-                        streams_fp8
-                        and not rhs_packed4
-                        and weight_format != host.WeightFormat.INT8
-                        and weight_format != host.WeightFormat.BF16
-                    )
-                    if p5_fp8:
-                        # probe 08 P5-A: the first-tile w1 wait ahead of the
-                        # relayout, so relayout, row scales and dot1 share
-                        # one basic block.
+                    if w1_ring_slots:
+                        # The first-tile w1 wait ahead of the relayout, so
+                        # relayout, row scales and dot1 share one basic block
+                        # (probe 08 P5-A).
                         @pl.when(t == 0)
                         def _():
-                            for _b in range(P08_RB):
+                            for _b in range(W1_RING_BLOCKS):
                                 w1_ring_copy(e, visit_i, _b).wait()
                     act_rows = (
                         lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
@@ -1697,12 +1747,23 @@ def _build_fused_ep_moe_kernel(
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
                             act_scales,
-                            (P08_RB, lambda b: w1_vm[p5_rs(visit_i, b)]),
+                            (
+                                (
+                                    W1_RING_BLOCKS,
+                                    lambda b: w1_vm[w1_ring_slot(visit_i, b)],
+                                )
+                                if w1_ring_slots
+                                else (lambda: w1_vm[slot])
+                            ),
                             lambda: w2_vm[slot],
                             w1s_vm[pl.ds(sslot, 1), :],
                             act_fn=act_fn,
                             w1b=w1b_row,
-                            w1_ready=None,
+                            w1_ready=(
+                                None
+                                if w1_ring_slots
+                                else (lambda: wait_slab(w1_copy, 0))
+                            ),
                             w1_retired=(
                                 _start_next_gate_up(visit_i, slot, last_tile)
                                 if starts_next_weights
@@ -1999,6 +2060,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                w1_ring_slots=w1_ring_slots,
             )
         ]
         + [
@@ -2007,15 +2069,15 @@ def _build_fused_ep_moe_kernel(
             # lhs_sems. Parity-deep, not nbuf-deep: every index into it, and into
             # the lhs_vm and ls_vm buffers it guards, is an out-parity.
             pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
-            pltpu.SemaphoreType.DMA((P08_RS,)),  # w1_sems
+            pltpu.SemaphoreType.DMA((w1_ring_slots or nbuf,)),  # w1_sems
             pltpu.SemaphoreType.DMA((nbuf,)),  # w2_sems
         ]
         + (
             [
                 # The scale tables travel with the slabs they scale, so they are
                 # slot-deep and need their own sems: a wait is per-buffer.
-                pltpu.SemaphoreType.DMA((max(nbuf, 2),)),  # w1s_sems
-                pltpu.SemaphoreType.DMA((max(nbuf, 2),)),  # w2s_sems
+                pltpu.SemaphoreType.DMA((sdepth,)),  # w1s_sems
+                pltpu.SemaphoreType.DMA((sdepth,)),  # w2s_sems
             ]
             if has_scales
             else []
