@@ -311,12 +311,14 @@ def test_padded_rows_through_the_combine_kernel(setup, real):
     _check_rows(out, _oracle(x, gating, weights), padded, unmasked)
 
 
-def _mutated_layer(old, new):
-    """layer.py with one edit, as a fresh module with its own op cache."""
+def _mutated_layer(*edits):
+    """layer.py with (old, new) edits, as a fresh module with its own op cache."""
     source = inspect.getsource(layer_mod)
-    assert source.count(old) == 1, f"fault anchor not found once: {old!r}"
+    for old, new in zip(edits[::2], edits[1::2]):
+        assert source.count(old) == 1, f"anchor not found once: {old!r}"
+        source = source.replace(old, new)
     module = types.ModuleType(f"{layer_mod.__name__}_fault")
-    exec(compile(source.replace(old, new), layer_mod.__file__, "exec"), module.__dict__)
+    exec(compile(source, layer_mod.__file__, "exec"), module.__dict__)
     return module
 
 
@@ -366,7 +368,7 @@ def _fault_f1_sentinel_before_relabel(setup, monkeypatch):
 
 def _fault_f2_select_removed(setup, monkeypatch):
     mesh, weights, x, gating, want, _ = setup
-    layer = _mutated_layer(_SELECT, "\n")
+    layer = _mutated_layer(_SELECT, "pass\n")
     padded = _mask(CELLS["U0"])
     _, stash = _record_run_rows(layer, monkeypatch)
     _poison_unwritten_arrivals(layer, stash, monkeypatch)
@@ -580,7 +582,7 @@ def test_stand_in_kernels_catch_fault(monkeypatch, fault):
             {"mesh_ep_ranks": ORDER},
         )
     elif fault == "select_removed":
-        layer, valid = _mutated_layer(_SELECT, "\n"), CELLS["U0"]
+        layer, valid = _mutated_layer(_SELECT, "pass\n"), CELLS["U0"]
     elif fault == "mask_off_by_one":
         mask = _mask(valid, 1)
     elif fault == "not_split":
@@ -590,3 +592,82 @@ def test_stand_in_kernels_catch_fault(monkeypatch, fault):
         layer = _mutated_layer(_SENTINEL, "\n")
     with pytest.raises(AssertionError):
         _run_stand_in(layer, monkeypatch, valid, mask, **options)
+
+
+# (this change, main) pairs: layer.py without the padded-row skip, which is
+# main's program. An anchor that drifts fails the test rather than passing it.
+_WITHOUT_SKIP = (
+    "    padded=None,\n):",
+    "):",
+    "    if padded is not None and padded.shape != (T,):\n"
+    '        raise ValueError("padded must have shape [tokens]")\n',
+    "",
+    "    has_padded = padded is not None\n",
+    "",
+    "        if has_padded:\n"
+    "            *scales_gating_biases, padded_l = scales_gating_biases\n",
+    "",
+    "        if has_padded:\n"
+    "            padded_l = token_layout.split(padded_l[:, None], me, fill_value=1)\n",
+    "",
+    "        if has_padded:\n"
+    "            # With the skip armed, a row that routes nowhere takes the expert\n"
+    "            # id one past the last. Every count, table and slab bins over\n"
+    "            # arange(e_total), so its pairs get none of them and no expert\n"
+    "            # computes it. After the relabel, which would map this id onto\n"
+    "            # expert 0.\n"
+    "            row_routes = row_routes & (padded_l == 0)\n"
+    "            " + _SENTINEL,
+    "",
+    "        if has_padded:\n"
+    "            # Such a row indexes arrival rows nothing wrote this step, and a\n"
+    "            # zero weight times a NaN there is NaN: select, not scale.\n"
+    "            " + _SELECT,
+    "",
+    "    padded_args = (padded,) if has_padded else ()\n"
+    "    in_specs = (P(ax),) * (5 + len(scale_args) + len(bias_args)"
+    " + len(padded_args))\n"
+    "    args = (x, rank, w1, w2) + scale_args + (gating,) + bias_args + padded_args\n",
+    "    in_specs = (P(ax),) * (5 + len(scale_args) + len(bias_args))\n"
+    "    args = (x, rank, w1, w2) + scale_args + (gating,) + bias_args\n",
+    "        has_padded and padded.dtype,\n",
+    "",
+)
+
+
+@pytest.mark.multichip
+def test_flags_off_program_is_mains(monkeypatch):
+    """Without `padded` the layer lowers to the program it did before the
+    skip: rows with no finite gating keep weight 0, not the sentinel."""
+    if jax.device_count() < 8:
+        pytest.skip("needs eight devices; CPU virtual devices are sufficient")
+    if jax.devices()[0].platform != "tpu":
+        from jax._src.pallas.mosaic import tpu_info
+
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+        monkeypatch.setattr(tpu_info, "get_tpu_info", lambda: info)
+    mesh = _mesh()
+    weights = _weights(mesh)
+    x, gating = _inputs(mesh, TP2_GROUPS)
+    main = _mutated_layer(*_WITHOUT_SKIP)
+    assert "padded" not in inspect.signature(main.adaptive_fused_moe).parameters
+
+    def lowered(layer):
+        def run(x, gating, *weights):
+            return layer.adaptive_fused_moe(
+                x,
+                *weights,
+                gating,
+                topk=SMALL["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                token_replica_groups=TP2_GROUPS,
+            )
+
+        traced = jax.jit(run).trace(x, gating, *weights)
+        return traced.lower(lowering_platforms=("tpu",)).as_text()
+
+    assert lowered(layer_mod) == lowered(main)
