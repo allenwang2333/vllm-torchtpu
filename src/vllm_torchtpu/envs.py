@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SHARDED_LM_HEAD: bool = False
+    TPU_GDN_QKVZ_LINEAR_LAYOUT: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -705,6 +706,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dense-layer plumbing.
     # Split the LM head by vocabulary rows over the expert-parallel group.
     "TPU_SHARDED_LM_HEAD": env_bool("TPU_SHARDED_LM_HEAD"),
+    # Give GDN's in_proj_qkvz weight the (k, n) layout of every other linear
+    # layer outside prefill context parallelism, which needs [n_out, n_in].
+    "TPU_GDN_QKVZ_LINEAR_LAYOUT": env_bool("TPU_GDN_QKVZ_LINEAR_LAYOUT"),
     # KV transfer / Raiden knobs. Each getter in distributed/utils.py
     # documents what its knob does; this is the parsing and the default.
     # TCP port the KV wire transfer listens on.
