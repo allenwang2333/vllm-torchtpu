@@ -521,18 +521,21 @@ def _gptj_rope_table(max_pos: int, dim: int) -> torch.Tensor:
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("use_pair_cache", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 64])
-def test_gptj_rope_fast_is_bit_exact(num_tokens):
+def test_gptj_rope_fast_is_bit_exact(use_pair_cache, num_tokens):
     """The prefill fast path reproduces upstream GPT-J RoPE bit for bit, for q
     and k, at even and odd positions up to the last table row."""
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        build_rope_pair_cache,
         gptj_rope_fast,
     )
 
     max_pos, dim, heads = 4096, 64, 4
     table = _gptj_rope_table(max_pos, dim)
+    pair = build_rope_pair_cache(table) if use_pair_cache else None
     g = torch.Generator().manual_seed(num_tokens)
     positions = torch.randint(0, max_pos, (num_tokens,), generator=g)
     positions[-1] = max_pos - 1
@@ -542,12 +545,12 @@ def test_gptj_rope_fast_is_bit_exact(num_tokens):
     ref_q, ref_k = RotaryEmbedding.forward_static(
         positions, q_pe, k_pe, dim, dim, table, False
     )
-    got_q, got_k = gptj_rope_fast(positions, q_pe, k_pe, table)
+    got_q, got_k = gptj_rope_fast(positions, q_pe, k_pe, table, pair)
     assert torch.equal(got_q.view(torch.int16), ref_q.view(torch.int16))
     assert torch.equal(got_k.view(torch.int16), ref_k.view(torch.int16))
 
     # Positive control: the comparison can fail.
-    bad_q, _ = gptj_rope_fast((positions + 1) % max_pos, q_pe, k_pe, table)
+    bad_q, _ = gptj_rope_fast((positions + 1) % max_pos, q_pe, k_pe, table, pair)
     assert not torch.equal(bad_q.view(torch.int16), ref_q.view(torch.int16))
 
 
