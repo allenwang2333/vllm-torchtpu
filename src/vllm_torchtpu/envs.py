@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SCTOPK_L1: bool = False
     TPU_STREAMIDX_SCORE_BF16_GROUP: int = 0
     TPU_STREAMIDX_EARLY_EXIT: bool = True
+    TPU_STREAMIDX_TOPK_TAIL: str = ""
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -712,6 +713,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # always runs the common path; same indices whenever any sequence is past
     # index_topk, and it costs a full scoring pass on all-short batches.
     "TPU_STREAMIDX_EARLY_EXIT": env_bool("TPU_STREAMIDX_EARLY_EXIT", True),
+    # StreamIndex top-k tail, with TPU_STREAMIDX_SCTOPK_L1: "" (default) runs
+    # the SparseCore stage 2 over all P * k_p candidate words of a row; "seg"
+    # has stage 1 emit each slice's candidate count and stage 2 walk only those
+    # (bit-identical indices, most candidate words are -inf pad); "segc" also
+    # folds the index remap (take_along_axis) into that stage-2 kernel.
+    "TPU_STREAMIDX_TOPK_TAIL": env_with_choices(
+        "TPU_STREAMIDX_TOPK_TAIL", "", ["", "seg", "segc"]
+    ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

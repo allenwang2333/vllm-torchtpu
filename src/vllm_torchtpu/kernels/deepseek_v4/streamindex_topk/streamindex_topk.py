@@ -729,6 +729,7 @@ def _effective_row_lengths(
         "return_scores",
         "sctopk_l1",
         "score_bf16_group",
+        "topk_tail",
     ),
 )
 def streamindex_topk(
@@ -759,6 +760,7 @@ def streamindex_topk(
     return_scores: bool = False,
     sctopk_l1: bool = False,
     score_bf16_group: int = 0,
+    topk_tail: str = "",
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -827,6 +829,10 @@ def streamindex_topk(
         and in f32 across groups. Not bit-exact: it can reorder near-tied
         scores at the top-k boundary (recall, not identity, is the contract).
         Decode steps are unchanged.
+      topk_tail: with `sctopk_l1`, "seg" runs the SparseCore stage 2 over only
+        the live candidates stage 1 emitted per slice (bit-identical output);
+        "segc" also folds the index remap into that kernel. "" (default)
+        is the incumbent stage 2.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -1322,6 +1328,7 @@ def streamindex_topk(
                     threshold_scheduling_group_id=tc_group,
                     return_scores=True,
                     t_rows=t_rows,
+                    topk_tail=topk_tail,
                 )
             else:
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
