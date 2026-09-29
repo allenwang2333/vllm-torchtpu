@@ -220,6 +220,11 @@ def test_install_if_enabled_selects_the_client(monkeypatch):
     assert core_client.DPLBAsyncMPClient is ReleaseDPLBAsyncMPClient
 
 
+def test_refuses_more_than_one_api_server():
+    with pytest.raises(NotImplementedError, match="--api-server-count=1"):
+        ReleaseDPLBAsyncMPClient(None, None, False, None, 2, 0)
+
+
 def _block_first_send(c):
     """Make the client's first send block until `finish` is set."""
     started, finish = asyncio.Event(), asyncio.Event()

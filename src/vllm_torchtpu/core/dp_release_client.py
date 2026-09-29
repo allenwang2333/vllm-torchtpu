@@ -17,10 +17,13 @@ import asyncio
 import time
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any
 
+from vllm.config import VllmConfig
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import DPLBAsyncMPClient, EngineIdentity
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.executor import Executor
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 
 from vllm_torchtpu.logger import init_logger
@@ -58,8 +61,30 @@ class ReleaseDPLBAsyncMPClient(DPLBAsyncMPClient):
     QUIET_S = 2.0
     POLL_S = 0.005
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        client_addresses: dict[str, Any] | None = None,
+        client_count: int = 1,
+        client_index: int = 0,
+    ) -> None:
+        if client_count > 1:
+            # TODO: hold one release group across API servers.
+            raise NotImplementedError(
+                "DP_PLACEMENT=release groups the arrivals of one API server, "
+                f"but {client_count} API servers would each hold a fraction of "
+                "them. Pass --api-server-count=1, or unset DP_PLACEMENT."
+            )
+        super().__init__(
+            vllm_config,
+            executor_class,
+            log_stats,
+            client_addresses,
+            client_count,
+            client_index,
+        )
         self._held: list[_Held] = []
         self._assigned: Counter[int] = Counter()
         self._next_engine = 0
