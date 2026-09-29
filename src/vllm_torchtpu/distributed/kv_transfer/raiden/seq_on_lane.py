@@ -366,6 +366,12 @@ def lower_fa_spans_sol(
     are dealt no copy still register their local bytes and participate in
     GDN state transfer.
 
+    The controller requires equal coverage on all destination lanes. In
+    the final DCP stripe, copy the last source page into missing lanes as
+    padding. Those bytes are outside the real sequence length and are
+    overwritten before decode can attend to them. Source block ownership
+    and the request's token count remain unchanged.
+
     TP1/DCP1 use the same ownership intersection. total_kv_heads is required
     for a TP producer because its local shape cannot distinguish sharding
     from replication.
@@ -425,6 +431,7 @@ def lower_fa_spans_sol(
         interleave_tokens=interleave_tokens,
     )
     spans: list[PoolByteSpan] = []
+    final_kp = (num_tokens - 1) // kp_tokens
     local_kp = 0
     for start, end in ranges:
         if start % kp_tokens:
@@ -438,10 +445,13 @@ def lower_fa_spans_sol(
             block_ordinal, in_block_kp = divmod(local_kp, kps_per_block)
             for shard, (dst_start, dst_end) in enumerate(destinations):
                 head_start, head_end = max(src_start, dst_start), min(src_end, dst_end)
+                lane = shard % dst_dcp_size
+                owns_page = lane == global_kp % dst_dcp_size
+                pads_tail = global_kp == final_kp and lane > final_kp % dst_dcp_size
                 if (
                     not is_copy_owner[shard]
                     or head_start >= head_end
-                    or global_kp % dst_dcp_size != shard % dst_dcp_size
+                    or not (owns_page or pads_tail)
                 ):
                     continue
                 dst_page_bytes = (dst_end - dst_start) * geometry.pair_bytes
@@ -473,7 +483,7 @@ def lower_fa_spans_sol(
         tag=TAG_FA,
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=tuple(spans),
-        declared_bytes=local_kp * geometry.kernel_page_bytes,
+        declared_bytes=sum(span.size_bytes * span.count for span in spans),
         dst_space_version=1,
     )
 
