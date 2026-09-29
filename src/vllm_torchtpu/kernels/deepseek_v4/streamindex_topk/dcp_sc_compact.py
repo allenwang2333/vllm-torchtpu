@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Left-pack the merged DCP top-k winners one rank owns, on SparseCore.
-
-One ``plsc.store_compressed`` scan replaces a scatter that TPU serializes.
+"""Left-pack the merged DCP top-k winners that one rank owns, on SparseCore.
+And convert from global -> local indices for consumption by Sparse MLA kernel.
 """
 
 import functools
