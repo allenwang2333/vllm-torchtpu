@@ -219,7 +219,6 @@ def ragged_paged_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=k_scale or 1.0,
             cache_layout=cache_layout,
-            gather_and_attention_chunk_size=envs.TPU_MLA_SC_GATHER_CHUNK,
         )
 
     if not enable_masked_dense:

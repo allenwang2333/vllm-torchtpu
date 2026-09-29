@@ -1053,35 +1053,6 @@ class MaskedDenseLimitResolutionTest(parameterized.TestCase):
             del os.environ[self.ENV]
 
 
-class SparseGatherChunkKnobTest(parameterized.TestCase):
-    """`TPU_MLA_SC_GATHER_CHUNK` defaults to the incumbent and reaches the kernel."""
-
-    ENV = "TPU_MLA_SC_GATHER_CHUNK"
-
-    def test_unset_is_the_incumbent_64(self):
-        getter = envs.environment_variables[self.ENV]
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(self.ENV, None)
-            self.assertEqual(getter(), 64)
-
-    @parameterized.parameters(64, 128)
-    def test_dispatch_passes_the_chunk(self, value):
-        seen = {}
-
-        def fake(*args, **kwargs):
-            seen.update(kwargs)
-            return args[0]
-
-        q = jnp.zeros((8, 4, 16), jnp.bfloat16)
-        with mock.patch.dict(os.environ, {self.ENV: str(value)}), mock.patch.object(
-            mla_dispatch, "sparse_ragged_paged_attention", fake
-        ):
-            mla_dispatch.ragged_paged_attention(
-                q, q, q, None, None, None, None, None, cache_layout="sparsecore"
-            )
-        self.assertEqual(seen["gather_and_attention_chunk_size"], value)
-
-
 class MaskedDenseProfileTest(parameterized.TestCase):
     @staticmethod
     def _operands(*, tokens=512, heads=64, topk=2048, page_size=1024):

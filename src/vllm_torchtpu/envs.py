@@ -56,7 +56,6 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_ENABLED: bool = False
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
-    TPU_MLA_SC_GATHER_CHUNK: int = 64
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
@@ -571,12 +570,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_MLA_MASKED_DENSE_MAX_KV_LEN": env_optional_int(
         "TPU_MLA_MASKED_DENSE_MAX_KV_LEN"
-    ),
-    # Query-token chunk (gcz) of the sparse-MLA gather+attention kernel. 64 is
-    # the incumbent; 128 measured bit-exact and -2.8% steady state on GLM-5.2
-    # prefill (probe 11, j-787e0ac9).
-    "TPU_MLA_SC_GATHER_CHUNK": lambda: int(
-        os.getenv("TPU_MLA_SC_GATHER_CHUNK", "64")
     ),
     # Most model length cap for TPU compile bucketing
     "VLLM_TPU_MOST_MODEL_LEN": lambda: int(val)
