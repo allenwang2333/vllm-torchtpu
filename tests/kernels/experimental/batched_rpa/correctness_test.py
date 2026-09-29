@@ -414,6 +414,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             4: 0.2,
         }
         tol = tols[dtype_bits]
+        self.assertFalse(
+            jnp.any(jnp.isnan(output)).item(),
+            "output contains NaNs",
+        )
         self.assertAllClose(output, expected, atol=tol, rtol=tol)
         self.assertTrue(
             _assert_cache_equal(updated_kv_cache, expected_kv_cache).item(),
@@ -794,6 +798,49 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             num_pages,
             soft_cap=soft_cap,
+        )
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        dtype=[jnp.float32, jnp.bfloat16],
+        test_case=["decode", "partial_query_block"],
+    )
+    def test_ragged_paged_attention_unattended_nan_in_v(
+        self,
+        kv_layout: configs.KVLayout,
+        dtype: Any,
+        test_case: str,
+    ):
+        """Regression test for unattended V masking with NaNs.
+
+        Verifies that NaNs in unattended KV page tails and unused batch slots
+        do not poison attention output with NaNs via 0.0 * NaN = NaN.
+        Covers both pure decode and partial query blocks (q_len < bq_sz).
+        """
+        num_heads = (16, 2)
+        head_dim = 128
+        page_size = 128 if kv_layout == configs.KVLayout.SEQ_ALONG_LANE else 16
+        num_pages = 100
+
+        seq_lens = (
+            [(1, 10), (1, 25), (1, 80)]
+            if test_case == "decode"
+            else [(37, 50)]  # Partial query block where q_len < bq_sz (e.g. 37 < 64)
+        )
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            kv_layout=kv_layout,
+            bkv_sz=128,
         )
 
 

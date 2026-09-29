@@ -329,6 +329,49 @@ def generate_mask(
     return masks
 
 
+def _mask_unattended_v(
+    v: jax.Array,
+    v_scale: jax.Array | float | None,
+    step_meta: StepMetadata,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> tuple[jax.Array, jax.Array | float | None]:
+    """Zeroes unattended rows of V and v_scale to prevent FP8 NaNs in PV matmul."""
+    seq_along_lane = cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
+    kv_iota = lax.broadcasted_iota(jnp.int32, (cfgs.bkv_sz,), 0)
+    has_per_token_v_scale = (
+        isinstance(v_scale, jax.Array) and cfgs.serve.per_token_scale
+    )
+
+    masked_v = []
+    masked_v_scale: list[jax.Array] = []
+
+    for b in range(cfgs.batch_size):
+        n_valid = step_meta.bkv_sz_frm_cache[b] + step_meta.bkv_sz_frm_new[b]
+        keep = kv_iota < n_valid
+        if step_meta.local_k_start is not None:
+            keep = jnp.logical_and(keep, kv_iota >= step_meta.local_k_start[b])
+        if step_meta.local_k_end is not None:
+            keep = jnp.logical_and(keep, kv_iota < step_meta.local_k_end[b])
+
+        v_b = v[b]
+        keep_v = keep[None, None, :] if seq_along_lane else keep[None, :, None]
+        masked_v.append(jnp.where(keep_v, v_b, jnp.zeros_like(v_b)))
+
+        if has_per_token_v_scale:
+            assert isinstance(v_scale, jax.Array)
+            keep_sc = keep[None, :]
+            masked_v_scale.append(
+                jnp.where(keep_sc, v_scale[b], jnp.zeros_like(v_scale[b]))
+            )
+
+    new_v = jnp.stack(masked_v, axis=0)
+    new_v_scale = (
+        jnp.stack(masked_v_scale, axis=0) if has_per_token_v_scale else v_scale
+    )
+    return new_v, new_v_scale
+
+
 def rpa_body(
     # Inputs.
     q_vref: jax.Ref,
@@ -463,6 +506,14 @@ def rpa_body(
     v = jnp.stack(v_b, axis=0)
 
     k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
+
+    # Zero V and v_scale rows that no query of the lane attends to. Score
+    # masking only zeroes their softmax weights, but 0 * NaN = NaN in the PV
+    # matmul, and those rows can hold anything: page tails past the (rank-local)
+    # KV length, lanes with no sequence, or unfetched VMEM. In the unified
+    # hybrid pool a recycled page's tail still holds Mamba state bytes, many of
+    # which decode to fp8 NaN.
+    v, v_scale = _mask_unattended_v(v, v_scale, step_meta, cfgs=cfgs)
 
     # Step 3: Perform compute.
     m_val = m_scratch_ref[...]
