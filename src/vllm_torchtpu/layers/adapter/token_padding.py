@@ -24,19 +24,13 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
-    # This rank's valid-token count, int32 [1], for the fused EP v3 op.
-    local_valid_tokens: torch.Tensor | None = None
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        local_valid_tokens = torch.zeros(1, dtype=torch.int32, device=device)
-        return cls(
-            local_padding_mask=local_padding_mask,
-            local_valid_tokens=local_valid_tokens,
-        )
+        return cls(local_padding_mask=local_padding_mask)
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
@@ -44,10 +38,6 @@ class TokenPaddingState:
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
-        if self.local_valid_tokens is not None:
-            self.local_valid_tokens.copy_(
-                torch.tensor([local_valid_tokens], dtype=torch.int32)
-            )
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
@@ -58,11 +48,11 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
-def get_local_valid_tokens() -> torch.Tensor | None:
-    """This rank's valid-token count for the step, or None without state."""
+def local_padding_mask(num_tokens: int) -> torch.Tensor | None:
+    """This rank's padding mask for `num_tokens` rows, or None without state."""
     if _padding_state is None:
         return None
-    return _padding_state.local_valid_tokens
+    return _padding_state.get_local_padding_mask(num_tokens)
 
 
 def zero_routing_weights_for_padding(

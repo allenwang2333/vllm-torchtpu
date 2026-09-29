@@ -61,4 +61,5 @@ def apply(method, layer, x: torch.Tensor, router_logits: torch.Tensor) -> torch.
         layer.w13_weight_scale_inv,
         layer.w2_weight_scale_inv,
         router_logits,
+        layer._experts_start,
     )

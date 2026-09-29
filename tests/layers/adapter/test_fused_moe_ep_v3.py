@@ -62,10 +62,13 @@ def _layer(experts=4, hidden=512, inter=256, **overrides):
     layer.apply_router_weight_on_input = False
     layer.moe_config = SimpleNamespace(
         experts_per_token=2,
+        ep_rank=0,
+        ep_size=_EP,
         moe_parallel_config=SimpleNamespace(
             use_ep=True, pcp_size=1, is_sequence_parallel=False
         ),
     )
+    layer.register_buffer("_experts_start", torch.tensor(0, dtype=torch.int32))
     for name, value in overrides.items():
         setattr(layer, name, value)
     return layer
@@ -314,6 +317,7 @@ def test_fp8_method_loads_and_forwards_through_v3(fp8_load, monkeypatch):
     assert method.apply_monolithic(layer, x, torch.ones(3, 32)) is x
     call = op.call_args.args
     assert len(call) == 7
+    assert call[6].shape == (1, 1)
     assert call[3].shape == (4, 512) and call[4].shape == (4, 512)
 
 
@@ -329,7 +333,7 @@ def test_fp8_method_keeps_the_grouped_path_for_a_declined_layer(fp8_load, monkey
     assert method.apply_monolithic(layer, x, torch.ones(3, 32)) == "gmm"
 
 
-def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_valid_count(
+def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_padding_mask(
     monkeypatch,
 ):
     monkeypatch.setattr(bridge, "_OPS", {})
@@ -353,17 +357,19 @@ def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_valid_count(
         layer.w13_weight_scale_inv,
         layer.w2_weight_scale_inv,
         torch.ones(8, 32),
+        layer._experts_start,
     )
     assert len(call) == 8
-    assert call[7].tolist() == [5]
+    assert call[6].shape == (1, 1)
+    assert call[7].tolist() == [0] * 5 + [1] * 3
 
 
 def test_mask_padded_rows_routes_the_suffix_nowhere():
     ep, t_local, hidden, experts = 2, 4, 8, 4
     x = jnp.ones((ep * t_local, hidden), jnp.bfloat16)
     gating = jnp.zeros((ep * t_local, experts), jnp.float32)
-    valid = jnp.asarray([3, 1], jnp.int32)
-    x, gating = bridge.mask_padded_rows(x, gating, valid, ep)
+    padded = jnp.asarray([0, 0, 0, 1, 0, 1, 1, 1], jnp.int32)
+    x, gating = bridge.mask_padded_rows(x, gating, padded)
     keep = np.array([1, 1, 1, 0, 1, 0, 0, 0], bool)
     assert np.all(np.isnan(np.asarray(gating)[~keep]))
     assert not np.any(np.isnan(np.asarray(gating)[keep]))

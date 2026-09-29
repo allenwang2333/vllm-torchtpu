@@ -228,13 +228,20 @@ def _run(mesh, x, w1, w2, w1_scale, w2_scale, gating, *, topk, fmt, valid_tokens
     constraints need an enclosing jit)."""
     drop = valid_tokens is not None
     scales = () if w1_scale is None else (w1_scale, w2_scale)
+    if drop:
+        # The runner's padding mask: each rank's rows past its valid count.
+        local = x.shape[0] // EP
+        padded = jnp.asarray(
+            np.concatenate([np.arange(local) >= n for n in np.asarray(valid_tokens)]),
+            jnp.int32,
+        )
 
     @jax.jit
     def run(x, gating, w1, w2, *scales):
         s1, s2 = scales if scales else (None, None)
         gating = gating.astype(jnp.float32)
         if drop:
-            x, gating = mask_padded_rows(x, gating, valid_tokens, EP, mesh=mesh)
+            x, gating = mask_padded_rows(x, gating, padded)
         return fused_ep_moe(
             x,
             w1,

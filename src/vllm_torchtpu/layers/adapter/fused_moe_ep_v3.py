@@ -22,10 +22,14 @@ per-channel fp8 weights and a plain softmax top-k router. A deployment outside
 that raises at weight load; a layer outside it (shape, routing, weights) is
 declined on its own and keeps the grouped-matmul path.
 
-Padded rows: with TPU_MOE_SKIP_PADDED_TOKENS the op takes the rank's valid-row
-count and hands the kernel a NaN logit row for every row past it, which the
-kernel's selector routes nowhere (`drop_nan_rows`); the input row is zeroed so
-nothing of it travels, and the kernel returns zero for it.
+The op reads only buffers the grouped-matmul path reads too -- the layer's
+`experts_start`, from which it derives the shard index, and with
+TPU_MOE_SKIP_PADDED_TOKENS the runner's padding mask -- so a trace that takes
+one path and a trace that takes the other lift the same inputs.
+
+Padded rows: the kernel gets a NaN logit row for every row the padding mask
+marks, which its selector routes nowhere (`drop_nan_rows`); the input row is
+zeroed so nothing of it travels, and the kernel returns zero for it.
 """
 
 from typing import Any
@@ -69,44 +73,12 @@ _OPS: dict[tuple, Any] = {}
 # The attribute prebuild's op is recorded under, on the layer's quant method.
 FUSED_MOE_EP_V3_OP_ATTR = "_fused_moe_ep_v3_op"
 
-# This rank's mesh index, as a device tensor: the kernel takes it as data,
-# because `lax.axis_index` lowers to a partition-id the export path refuses.
-_RANK_BUFFER: Any = None
 
-
-def mask_local_rows(x: jax.Array, gating: jax.Array, valid_tokens: jax.Array):
-    """One rank's rows: row r is valid when r < valid_tokens[0]. An invalid
-    row gets NaN logits and a zero input row."""
-    local = jnp.arange(x.shape[0], dtype=jnp.int32)
-    valid = (local < valid_tokens.astype(jnp.int32)[0])[:, None]
-    gating = jnp.where(valid, gating, jnp.nan)
-    x = jnp.where(valid, x, jnp.zeros_like(x))
-    return x, gating
-
-
-def mask_padded_rows(
-    x: jax.Array, gating: jax.Array, valid_tokens: jax.Array, ep: int, mesh=None
-):
-    """Rows past each rank's valid prefix route nowhere and carry nothing.
-
-    `x` and `gating` are the global arrays, `ep * t_local` rows in rank order;
-    `valid_tokens` is int32 [ep]. With `mesh`, each rank masks its own rows in
-    a shard_map: the global form's iota over the token axis partitions into a
-    partition-id, which the torch bridge's export refuses.
-    """
-    if mesh is not None:
-        spec = PartitionSpec(MESH_AXIS)
-        return jax.shard_map(
-            mask_local_rows,
-            mesh=mesh,
-            in_specs=(spec, spec, spec),
-            out_specs=(spec, spec),
-        )(x, gating, valid_tokens)
-    tokens = x.shape[0]
-    t_local = tokens // ep
-    local = jnp.arange(tokens, dtype=jnp.int32) % t_local
-    limit = jnp.repeat(valid_tokens.astype(jnp.int32), t_local)
-    valid = (local < limit)[:, None]
+def mask_padded_rows(x: jax.Array, gating: jax.Array, padded: jax.Array):
+    """Padded rows route nowhere and carry nothing: a row whose `padded`
+    entry is nonzero gets NaN logits and a zero input row. Elementwise, so
+    it partitions over the token axis without a partition-id."""
+    valid = (padded == 0)[:, None]
     gating = jnp.where(valid, gating, jnp.nan)
     x = jnp.where(valid, x, jnp.zeros_like(x))
     return x, gating
@@ -147,16 +119,18 @@ def run_moe_v3(
             f"the v3 kernel splits the experts over the mesh axis named "
             f"{MESH_AXIS!r}; the adapter's mesh has {mesh.axis_names}"
         )
-    ep = mesh.shape[MESH_AXIS]
     config = served_config(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=topk
     )
 
-    def run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
+    def run_moe(x, w1, w2, w1_scale, w2_scale, gating, experts_start, padded):
         gating = gating.astype(jnp.float32)
-        drop_nan_rows = valid_tokens is not None
+        drop_nan_rows = padded is not None
         if drop_nan_rows:
-            x, gating = mask_padded_rows(x, gating, valid_tokens, ep, mesh=mesh)
+            x, gating = mask_padded_rows(x, gating, padded)
+        # experts_start is int32 [num_shards, 1], each shard's first global
+        # expert: with equal contiguous blocks it is shard * experts_per_shard.
+        rank = experts_start.astype(jnp.int32) // experts_per_shard
         return fused_ep_moe(
             x,
             w1,
@@ -233,9 +207,9 @@ def _build_op(
         w1_scale: jax.Array,
         w2_scale: jax.Array,
         gating: jax.Array,
-        rank: jax.Array,
+        experts_start: jax.Array,
     ) -> jax.Array:
-        return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, None)
+        return run_moe(x, w1, w2, w1_scale, w2_scale, gating, experts_start, None)
 
     def moe_skip_padded(
         x: jax.Array,
@@ -244,14 +218,14 @@ def _build_op(
         w1_scale: jax.Array,
         w2_scale: jax.Array,
         gating: jax.Array,
-        rank: jax.Array,
-        valid_tokens: jax.Array,
+        experts_start: jax.Array,
+        padded: jax.Array,
     ) -> jax.Array:
-        return run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens)
+        return run_moe(x, w1, w2, w1_scale, w2_scale, gating, experts_start, padded)
 
     fn = moe_skip_padded if skip_padded_tokens else moe
     spec = PartitionSpec(EP_AXIS_NAME)
-    # x, w1, w2, w1_scale, w2_scale, gating, rank [, valid_tokens] -- every
+    # x, w1, w2, w1_scale, w2_scale, gating, experts_start [, padded] -- every
     # operand and the single output are sharded on axis 0 over the EP axis.
     op = jax_op(
         name,
@@ -269,14 +243,15 @@ def _build_op(
     run = op
     if skip_padded_tokens:
         # Decided here, at weight load, so the forward reads no env.
-        def run(*args):
-            valid_tokens = token_padding.get_local_valid_tokens()
-            if valid_tokens is None:
+        def run(x, *args):
+            # The same mask slice the grouped path's padding zeroing reads.
+            padded = token_padding.local_padding_mask(x.shape[0])
+            if padded is None:
                 raise RuntimeError(
                     "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "
                     "install padding state"
                 )
-            return op(*args, valid_tokens)
+            return op(x, *args, padded.to(torch.int32))
 
     _OPS[key] = run
     return run
@@ -298,6 +273,7 @@ def fused_moe_ep_v3(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    experts_start: torch.Tensor,
 ) -> torch.Tensor:
     """Run one MoE layer through the v3 kernel.
 
@@ -313,7 +289,7 @@ def fused_moe_ep_v3(
         _squeeze_channel_scale_checked(w1_scale),
         _squeeze_channel_scale_checked(w2_scale),
         router_logits,
-        _RANK_BUFFER,
+        experts_start.reshape(1, 1),
     )
 
 
@@ -370,7 +346,6 @@ def prebuild_fused_moe_ep_v3(
     deployment v3 cannot serve; returns None for a layer it declines, which
     keeps the grouped-matmul path.
     """
-    global _RANK_BUFFER
     _check_deployment(layer)
     mesh = build_ep_mesh()
     if mesh is None:
@@ -408,10 +383,17 @@ def prebuild_fused_moe_ep_v3(
         return None
 
     # The mesh is rank-ordered (google-pytorch/torch_tpu#3522), so this rank's
-    # mesh index is its EP rank and its expert block needs no reordering.
-    _RANK_BUFFER = torch.tensor(
-        [[ep_mesh_index()]], dtype=torch.int32, device=w1.device
-    )
+    # mesh index is its EP rank, its expert block needs no reordering, and its
+    # first expert is its index times the block.
+    if moe_routing.get_experts_start(layer) != ep_mesh_index() * local_experts:
+        logger.warning_once(
+            "Fused EP MoE v3 not engaged for a layer: its first expert %s is "
+            "not mesh index %d times %d local experts",
+            moe_routing.get_experts_start(layer),
+            ep_mesh_index(),
+            local_experts,
+        )
+        return None
     skip_padded_tokens = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
     op = _build_op(
         mesh,
