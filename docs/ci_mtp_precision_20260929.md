@@ -7,9 +7,13 @@
 配置以 R11 发布记录为基准；当前源码的 CUSTOM attention 已合并 longctx batched RPA，
 无需恢复已删除的 `USE_BATCHED_RPA_LONGCTX`。
 
-已有 dense Qwen3.5 MTP 精度测试现在检查每轮每个 draft 的全词表 logits，并增加 K3。
-新增三个 nightly 自然语言长度用例，覆盖长 prefill、长 decode 及两者组合。
-本次环境无 TPU：CPU 契约和启动参数检查不代表设备数值验收通过。
+本次仅保留部署配置对齐。PR 新增的 Qwen3.5-4B dense 逐 draft logits、K3 和
+长上下文测试已撤回，main 原有测试保持不变。PCP8 的新增用例、logits 采集和
+验证暂不实施。
+
+下一步只在本机以 `Qwen/Qwen3.5-35B-A3B-FP8` 运行 PCP4→TP2/DP2，记录该轮
+真实 logits，再冻结为候选基准。当前会话无法访问 Docker/TPU 和 GitHub，尚未生成
+基准，也不能宣称已完成实机精度验收。
 
 ## 配置与证据
 
@@ -46,106 +50,40 @@ PCP8 则得到 `[4096] * 8`。这不是所有 PCP 输入的通用均分公式。
 显式 `PREFILL_SPECULATIVE_CONFIG=''` / `DECODE_SPECULATIVE_CONFIG=''` 可关闭 MTP。
 独立使用 launcher 时保持原有默认值；其他多机消费者（如 DSv4）保留原外层默认值。
 
-## 精度检查的边界
+## 本机基准的执行范围
 
-`tests/entrypoints/llm/mtp_precision.py` 使用 vLLM `worker_extension_cls` 和
-`collective_rpc`，在模型启动之后安装采集器，避开 warmup。生产 `src` 不增加测试开关。
-采集每个实际调用的真实请求行，包含输入、逻辑位置、step 和全词表 logits；
-临时文件逐条重放并删除。编译的 logits head 返回 logits 和原有 argmax 结果。
+使用本 PR 的 PCP4→TP2/DP2 配置，模型为 `Qwen3.5-35B-A3B-FP8`，P K1 / D K3。
+测试输入使用自然语言。冻结该轮每个 draft 的全词表 logits，并记录原文、精确
+input token IDs、request/逻辑位置/draft step、接受拒绝轨迹、模型 revision、镜像
+或运行库版本、代码 commit、实际启动参数和数据 SHA256。
 
-参考路径复用已加载的 MTP 权重、projection 和 MLP，以独立 CPU causal SDPA
-和按 request/逻辑位置维护的 KV 代替 paged attention。FP8 KV 使用实际静态 scale
-独立量化、解量化；拒绝分支覆盖后截断历史。每轮首步以 target hidden 为输入，
-后续步骤使用参考路径自己的 hidden carry，并以实际 draft token 对齐输入轨迹。
-因此不会把 target model logits 当作 MTP logits，也不读取被测 paged KV 来构造参考。
+采集必须来自实际 TPU 模型运行；历史接受率、最终输出文本、CPU 参考重算或
+合成数据均不能代替该轮 logits。只有真实运行完成且数据完整性检查通过后，
+才生成候选基准 manifest；未运行或中断的采集不能标记为基准完成。
+冻结一次结果可用于后续回归，但数值容差和基准质量仍需单独验证。
 
-检查要求所有 request-round 都有完整的 `0..K-1` 步骤，缺失记录、非有限值和
-任一词表项超过 `abs(error) <= 0.5 + 0.03 * abs(reference)` 都失败。
-日志 `MTP_DRAFT_PRECISION` 输出覆盖计数、最大绝对误差和最大容差比例。
-上述阈值是尚待 TPU 校准的候选值，不能因失败自动放宽。
+PCP8 因设备不足，本次不增加采集与 logits 检查，不套用 PCP4 的基准。
+撤回的 4B 测试结果不能作为 35B MoE 的验证证据。
 
-适用范围为 dense Qwen3.5、单 MTP 层、无权重量化、关闭 prefix caching、
-DP=PP=PCP=DCP=1，支持 TP。
-已有 MoE/DP 精度用例继续保留原有输出一致性检查，本次没有声称逐 logits oracle
-覆盖这些配置。参考计算复用部分模型算子，因此不能独立验证权重、MLP 或 target hidden。
-CPU 采集会同步设备，不能用于证明 async 时序正确，也不能用于性能结论。
+## 配置复现
 
-## 长度用例
-
-| nightly ID | 精确输入 tokens | 强制输出 tokens |
-| --- | --- | --- |
-| long-prefill | 65536 | 128 |
-| long-decode | 512 | 1024 |
-| long-prefill-long-decode | 65536 | 1024 |
-
-每档使用两篇原创河流修复调查材料及不同写作视角，由地点、调查事件和访谈人物
-组合成自然语言段落。句式可以复用，但完整段落不重复，不使用重复单 token 或数字串。
-直接传 token IDs 保证输入长度，并保留末尾完整写作指令；`ignore_eos` 和实际返回
-token 数量断言保证长输出不被提前结束掩盖。
-
-三档均为 Qwen3.5-4B、TP2、K3、HND、FP8 KV、BF16 SSM、CUSTOM attention。
-4096 token scheduler budget 强制 64K 输入经历多个 prefill chunk；prefix caching
-关闭，避免第二篇材料命中前缀而掩盖 prefill 覆盖。分别运行无 MTP 与有 MTP，
-检查最终 greedy 文本一致性，再检查所有已捕获 draft logits。
-
-## 复现与验收
-
-在安装了本分支、匹配版本 vLLM/torch-tpu 的环境中，从仓库根目录运行。
-设备测试需可加载 `Qwen/Qwen3.5-4B` 权重和 tokenizer；长度用例至少需要两个
-可见 TPU logical devices。两组 disagg CI 使用 `Qwen/Qwen3.5-35B-A3B-FP8`，
-可通过 `MODEL_PATH` 指定本地模型目录。
+在具备本机 Docker/TPU 访问的执行环境中，从本分支仓库根目录运行：
 
 ```bash
-# CPU 契约：精确长度、完整指令、拒绝回滚、causal mask、逐步覆盖及故障注入。
-PYTHONPATH=src:tests python -m pytest tests/test_mtp_prompts.py tests/test_mtp_precision.py -q
-
-# 已有短精度用例，包括 batch/sync/async 和 K2/K3。
-PYTHONPATH=src:tests python -m pytest tests/entrypoints/llm/test_speculative_decoding.py \
-  -k 'qwen35_mtp_correctness_greedy' -sv
-
-# 三种长度形态；默认 pytest marker 将它们交给已有 speculative nightly lane。
-PYTHONPATH=src:tests python -m pytest tests/entrypoints/llm/test_speculative_decoding.py \
-  -k 'qwen35_mtp_natural_language_lengths' -sv
-
-# 单机 8-device CI。
-bash scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
-
-# 多机：在 decode/head 两台机器分别执行，设置双方可达地址。
-ROLE=decode PREFILL_HOST=<prefill-ip> DECODE_HOST=<decode-ip> \
-  bash scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
-ROLE=head PREFILL_HOST=<prefill-ip> DECODE_HOST=<decode-ip> \
-  bash scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh
+MODEL_PATH=/mnt/data/yanzecheng_yzc/models/Qwen3.5-35B-A3B-FP8 \
+  PREFILL_PCP=4 DECODE_TP=2 DECODE_DP=2 \
+  bash scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
 ```
 
-逐 logits 临时数据位于 `TMPDIR`（默认系统临时目录），长输出可能占用每 rank 数 GB；
-需预留容量。参考 KV 随上下文增长，CPU attention 计算量也随上下文增长；
-查询分块避免显式分配完整 64K×64K mask。单条长度测试超时为 4 小时，
-实际耗时、设备内存及误差分布需要首次 nightly 运行确认。
+上述命令运行已有 CI 正确性测试，本身不会导出完整 draft logits；采集入口需要在
+可运行环境中接入并验证后才能用于冻结基准。先核对 `launch_params.txt`、
+`prefill_cmd.sh`、`decode_cmd.sh` 和两端日志中的实际拓扑，再记录采集结果。
 
-CI 启动证据保存在各 `RUN_ROOT/run` 的 `launch_params.txt`、
-`prefill_cmd.sh`、`decode_cmd.sh` 和 `logs/`。验收应核对这些实际启动参数，
-要求既有正确性断言通过、`MTP_DRAFT_PRECISION` 中 failures 为空、
-checked_request_steps 等于 request_rounds×K 且大于零。
+## 验证状态
 
-## 本机验证记录
+配置实现此前通过 6 组 launcher 参数检查和 4 组 Docker/SSH 环境转发检查，
+并通过 shellcheck、YAML 和 pre-commit 检查；它们不代表设备模型测试通过。
 
-- 6 组 launcher 参数捕获：两种拓扑的 CI 默认、显式覆盖/空 MTP、standalone 默认。
-- 4 组容器环境传递：本机 Docker 与 SSH 一致、空值/JSON/空格正确、DSv4 默认保留。
-- PCP 容量边界及反例、shell 语法、shellcheck 和 YAML 检查通过。
-- 本地 Qwen3.5 tokenizer 构造的两组 512/65536 输入严格匹配；65K 文档各含
-  712 个完整且唯一段落，末尾指令完整。
-- 初始分支测试文件收集得到 57 个用例。首次收集因系统 libstdc++ 缺少 `CXXABI_1.3.15`
-  失败，使用 conda 环境自身 `lib` 的 `LD_LIBRARY_PATH` 后通过。
-- 12 个 CPU 契约测试通过。pre-commit 的 Pyrefly 项在被忽略的 worktree 中不能
-  展开 `src`，改用等价显式文件集合
-  `pyrefly check --use-ignore-files=false 'src/**/*.py'` 得到 0 errors；其余 hooks
-  使用 `SKIP=pyrefly pre-commit run --files <改动文件>` 验证。
-- 未运行 TPU E2E；设备精度、容差校准、长上下文资源与耗时验收仍待执行。
-
-## 基于 main 的 PR 验证
-
-在 `250958522` 上重新执行：12 个 CPU 契约测试通过，61 个设备用例收集成功，
-6 组 launcher 参数检查、4 组容器环境转发检查通过，全部适用的 pre-commit
-hooks（包括 Pyrefly）通过。移植审查确认 `src` 零修改，main 新增测试和
-服务进程清理逻辑保留；oracle 依赖的 draft 方法与初始审查版本一致。
-未执行 TPU E2E，不能据此认定设备数值、长上下文资源或 acceptance 阈值已验收。
+当前会话的设备视图没有暴露 TPU；Docker socket 连接返回 `operation not permitted`，
+GitHub API 不可达。历史本机 PCP4→TP2/DP2 实验记录证明宿主机曾可运行该拓扑，
+不能将当前沙箱限制表述成宿主机没有 TPU。本次没有生成真实 logits 基准。
