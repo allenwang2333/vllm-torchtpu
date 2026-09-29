@@ -516,11 +516,10 @@ def test_tp_is_served_for_a_sequence_parallel_layer(v3):
     assert _prebuild(layer) is not None
 
 
-def test_a_replicated_draft_layer_under_sequence_parallelism_is_declined(
-    v3, monkeypatch
-):
-    """draft_tensor_parallel_size=1 builds the MTP draft unsharded next to a
-    TP8 sequence-parallel target: its MoE layer is declined, not refused."""
+def test_a_draft_layer_outside_sequence_parallelism_is_declined(v3, monkeypatch):
+    """The MTP draft next to a TP8 sequence-parallel target runs the plain TP
+    form: its MoE layer is declined, not refused. Here the replicated draft
+    (draft_tensor_parallel_size=1), built without expert parallelism."""
     monkeypatch.setenv("TPU_SEQUENCE_PARALLEL_PREFILL", "1")
     monkeypatch.setattr(bridge, "_ARMING", bridge.Counter())
     v3.config.parallel_config.tensor_parallel_size = 8
@@ -529,7 +528,7 @@ def test_a_replicated_draft_layer_under_sequence_parallelism_is_declined(
     layer.moe_config.moe_parallel_config.use_ep = False
     assert _prebuild(layer) is None
     assert not v3.built
-    assert bridge._ARMING == {"a replicated MTP draft under TP": 1}
+    assert bridge._ARMING == {"an MTP draft under TP, outside sequence parallelism": 1}
 
 
 @pytest.mark.parametrize(

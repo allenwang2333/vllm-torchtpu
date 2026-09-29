@@ -396,8 +396,8 @@ def prebuild_fused_moe_ep_v3(
     deployment v3 cannot serve; returns None for a layer it declines, which
     keeps the grouped-matmul path.
     """
-    if _replicated_draft_layer(layer):
-        armed = "a replicated MTP draft under TP"
+    if _draft_layer_outside_sequence_parallelism(layer):
+        armed = "an MTP draft under TP, outside sequence parallelism"
     else:
         _check_deployment(layer)
         armed = _prebuild(layer, topk, renormalize, activation)
@@ -405,10 +405,10 @@ def prebuild_fused_moe_ep_v3(
     return armed if isinstance(armed, ArmedOp) else None
 
 
-def _replicated_draft_layer(layer) -> bool:
-    """Whether this is the MoE layer of an MTP draft built unsharded
-    (draft_tensor_parallel_size=1) next to a sequence-parallel target: every
-    rank holds all its rows, so the grouped-matmul path serves it."""
+def _draft_layer_outside_sequence_parallelism(layer) -> bool:
+    """Whether this is the MoE layer of an MTP draft next to a TP
+    sequence-parallel target: the draft runs the plain TP form (its rows
+    replicated), so the grouped-matmul path serves it."""
     from vllm.config import get_current_vllm_config
 
     from vllm_torchtpu.layers.adapter import sequence_parallel
