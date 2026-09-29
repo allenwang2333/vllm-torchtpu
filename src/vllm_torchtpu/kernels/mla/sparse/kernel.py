@@ -635,7 +635,7 @@ def sparse_ragged_paged_attention(
     small_chunk_batch_size: int | None = 1,
     small_chunk_live_gather: bool = True,
     small_chunk_gather_atoms: int = 1,
-    live_gather_all_chunks: bool = True,
+    live_gather_all_chunks: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -684,6 +684,8 @@ def sparse_ragged_paged_attention(
         `sparsecore_atoms_per_batch` (live granularity: one owner round).
         Fully dead chunks issue no gather; an all-live chunk traces the same
         grid length as the unbounded gather.
+        Default False on this branch (PR 1273 defaults to True): unmeasured
+        with the packed ROPE layout; full c16 prefill chunks gain nothing.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.

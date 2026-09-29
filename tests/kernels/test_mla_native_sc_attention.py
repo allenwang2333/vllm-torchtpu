@@ -326,7 +326,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         """A DP-padded mixed step: the T=1024 bucket with `real_tokens` live.
 
         Chunks larger than `small_chunk_tokens` also bound the SparseCore
-        gather to the live rows by default (`live_gather_all_chunks`), so fully
+        gather to the live rows when `live_gather_all_chunks` (opt-in), so fully
         dead chunks issue no gather. The real rows must match both the
         TensorCore layout and the SparseCore path with that bound disabled.
         """
@@ -366,7 +366,13 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
         tensorcore_out = run(problem["tensorcore_nope"], problem["tensorcore_rope"])
         sc = {"cache_layout": sparse_mla.SPARSECORE_CACHE_LAYOUT}
-        bounded_out = run(problem["sparsecore_nope"], problem["sparsecore_rope"], **sc)
+        # live_gather_all_chunks is opt-in on this branch.
+        bounded_out = run(
+            problem["sparsecore_nope"],
+            problem["sparsecore_rope"],
+            live_gather_all_chunks=True,
+            **sc,
+        )
         unbounded_out = run(
             problem["sparsecore_nope"],
             problem["sparsecore_rope"],
