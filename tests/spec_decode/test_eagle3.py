@@ -1144,6 +1144,125 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(
     assert first["chunk"].attn_ctx.position_ids_override.shape == (64, )
 
 
+def _draft_warmup_proposer(monkeypatch, paddings, groups, hand_over=True):
+    """Proposer whose fake draft compile follows `groups` of token buckets.
+
+    The first forward of every trace stands in for vLLM's compile_all_ranges:
+    it builds the group holding its own bucket (plus, with `hand_over`, the
+    buckets earlier traces built) and leaves the rest refused.
+    """
+    import vllm.compilation.backends as vllm_backends
+
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.compilation import shape_variants
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        num_reqs_max_model_len=16,
+        num_tokens_paddings=list(paddings),
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=False,
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+    )
+    draft_config = object()
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8), vllm_config=draft_config)
+    state = {"tracing": True, "built": set()}
+    fwd, retraces = [], []
+
+    def fake_retrace(model, vllm_config):
+        retraces.append((vllm_backends.model_tag, model, vllm_config))
+        session = shape_variants._session
+        session.traces += 1
+        session.refused.clear()
+        state["tracing"] = True
+
+    def fake_forward(**kw):
+        n = kw["num_tokens_padded"]
+        if state["tracing"]:
+            state["tracing"] = False
+            group = next(g for g in groups if n in g)
+            built = (state["built"] | set(group)) if hand_over else set(group)
+            state["built"] = built
+            shape_variants._session.refused.update(
+                p for p in paddings if p not in built)
+        fwd.append(kw)
+        return torch.zeros((n, 8)), None
+
+    monkeypatch.setattr(shape_variants, "retrace", fake_retrace)
+    proposer._forward_draft = fake_forward
+    return proposer, draft_config, fwd, retraces
+
+
+def test_precompile_draft_forward_retraces_refused_buckets(monkeypatch):
+    """A draft that forks on the token count gets one trace per bucket group.
+
+    Only the bucket that starts a trace runs a forward; every retrace builds
+    its backend under the "eagle_head" tag against the draft's own config.
+    """
+    paddings = [16, 32, 64, 128, 256, 512]
+    proposer, draft_config, fwd, retraces = _draft_warmup_proposer(
+        monkeypatch, paddings, groups=[(16, 32), (64, 128, 256), (512, )])
+
+    proposer._precompile_draft_forward()
+
+    assert [f["num_tokens_padded"] for f in fwd] == [16, 64, 512]
+    assert all(f["step_idx"] == 0 for f in fwd)
+    assert [f["chunk"].attn_ctx.position_ids_override.shape[0]
+            for f in fwd] == [16, 64, 512]
+    assert retraces == [("eagle_head", proposer.draft_model, draft_config)] * 2
+
+
+def test_precompile_draft_forward_single_trace_without_fork(monkeypatch):
+    """A draft that serves every bucket from one trace runs one forward."""
+    paddings = [16, 32, 64]
+    proposer, _, fwd, retraces = _draft_warmup_proposer(
+        monkeypatch, paddings, groups=[tuple(paddings)])
+
+    proposer._precompile_draft_forward()
+
+    assert [f["num_tokens_padded"] for f in fwd] == [16]
+    assert retraces == []
+
+
+def test_precompile_draft_forward_fails_start_on_uncompiled_bucket(
+        monkeypatch):
+    """A refused bucket no later trace builds fails the start, not a request.
+    """
+    from vllm_torchtpu.compilation import shape_variants
+    paddings = [16, 32, 64]
+    proposer, _, _, _ = _draft_warmup_proposer(monkeypatch,
+                                               paddings,
+                                               groups=[(16, ), (32, 64)],
+                                               hand_over=False)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError,
+                       match=r"uncompiled: \[16\]"):
+        proposer._precompile_draft_forward()
+
+
+@pytest.mark.parametrize("pcp_mtp_k1", [False, True])
+def test_precompile_traces_draft_forward_first(pcp_mtp_k1):
+    """The draft forward is traced before the other draft precompiles,
+    except for PCP MTP K1, whose draft forward keeps its real-path warmup."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(enforce_eager=False,
+                                      _pcp_mtp_k1_enabled=pcp_mtp_k1)
+    calls = []
+    proposer._precompile_draft_forward = lambda: calls.append("forward")
+    proposer._precompile_combine_hidden_states = lambda: calls.append(
+        "combine")
+    proposer._precompile_draft_seed = lambda: calls.append("seed")
+    proposer._precompile_compute_logits = lambda: calls.append("logits")
+
+    proposer.precompile()
+
+    rest = ["combine", "seed", "logits"]
+    assert calls == (rest if pcp_mtp_k1 else ["forward"] + rest)
+
+
 def test_build_draft_attn_metadata_loop_cache(device):
     """Loop iterations >= 2 must reuse the step-1 metadata objects with only
     seq_lens swapped (advanced by +1), value-identical to a full rebuild."""

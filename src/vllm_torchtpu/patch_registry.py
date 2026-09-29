@@ -66,6 +66,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_disable_sequence_parallel_moe", _ACTIVE),
     Patch("vllm_torchtpu:_patch_qwen3_next_sequence_parallel_by_rows",
           _ACTIVE),
+    Patch("vllm_torchtpu:_patch_mtp_draft_token_count_symbol", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
     Patch("vllm_torchtpu:_patch_qwen3_next_fused_qk_norm_rope_gate", _ACTIVE),
     Patch("vllm_torchtpu:_patch_moe_explicit_pcp_collectives", _ACTIVE),

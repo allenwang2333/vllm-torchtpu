@@ -16,6 +16,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.common.attention_metadata import \
     AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
@@ -947,16 +948,83 @@ class Eagle3Proposer:
         Warms the wrappers across their bucket shapes so they don't recompile on
         the first real propose(): combine_hidden_states (token-count buckets),
         seed_input_ids ((token, index) buckets), and the lm-head/argmax
-        compute_logits (num_reqs buckets). The draft forward and the per-step
-        fused propose/verify programs are warmed by a real-path lifecycle
-        warmup, not here (a zeros-precompile of those emits programs that never
-        match the runtime eager fusion).
+        compute_logits (num_reqs buckets). The draft forward is only traced
+        here (_precompile_draft_forward), so that it is compiled for every
+        token bucket inside a shape-specialization warmup. Running it at the
+        runtime shapes, and the per-step fused propose/verify programs, are
+        left to a real-path lifecycle warmup (a zeros-precompile of those emits
+        programs that never match the runtime eager fusion).
         """
         if self.runner.enforce_eager:
             return
+        # PCP MTP K1 drafts on a PCP sequence layout the zero chunk below does
+        # not reproduce; its draft forward stays with its real-path warmup.
+        if not self.runner._pcp_mtp_k1_enabled:
+            self._precompile_draft_forward()
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
         self._precompile_compute_logits()
+
+    def _precompile_draft_forward(self) -> None:
+        """Trace the draft forward for every token bucket, one trace per group.
+
+        The first draft forward traces the draft model once and compiles that
+        graph for every token bucket (PiecewiseBackend.compile_all_ranges). A
+        draft whose structure depends on the token count -- an MTP head is the
+        target's own decoder layer, MoE block and sequence-parallel split
+        included, so TPU_MOE_FUSED_EP_STEP_MIN_TOKENS, TPU_MOE_LOWTOK_MAX_TOKENS
+        and TPU_SP_MIN_ROWS fork it exactly as they fork the backbone -- can
+        only serve the buckets its trace's guards accept. Outside a
+        shape_variants warmup the first bucket it refuses raises
+        ShapeSpecializationError, which the spec-decode warmup logs and
+        swallows, and the first live proposal then fails on the same compile.
+
+        So take the first trace here, inside shape_variants.warmup(), and give
+        every refused bucket a trace of its own, as _precompile_backbone does
+        for the target. Only the buckets that start a trace run a forward:
+        compile_all_ranges builds every bucket's executable when its trace is
+        compiled. Anything left uncompiled fails the start.
+        """
+        runner = self.runner
+        self._draft_md_cache.clear()
+        with runner._precompile_timed("drafter forward"), \
+                shape_variants.warmup() as buckets:
+            for i, num_tokens in enumerate(runner.num_tokens_paddings):
+                retrace = buckets.needs_retrace(num_tokens)
+                if i > 0 and not retrace:
+                    continue
+                if retrace:
+                    # VllmBackend takes its cache prefix from the model tag
+                    # when it is built, so the new backend must be built under
+                    # "eagle_head", apart from the target's "backbone" cache.
+                    # _forward_draft sets the tag itself for the forward.
+                    # retrace() pins the compile cache dirs of the config it
+                    # is given: the one the draft's compile wrapper holds (only
+                    # a vLLM compile wrapper can refuse a bucket).
+                    with set_model_tag("eagle_head"):
+                        shape_variants.retrace(self.draft_model,
+                                               self.draft_model.vllm_config)
+                chunk, input_ids, positions, target_hidden_states = (
+                    self._dummy_draft_chunk(num_tokens))
+                last_hidden, _ = self._forward_draft(
+                    chunk=chunk,
+                    input_ids=input_ids,
+                    positions=positions,
+                    target_hidden_states=target_hidden_states,
+                    step_idx=0,
+                    seq_lens_delta=0,
+                    num_rejected_np=None,
+                    num_tokens_padded=num_tokens,
+                )
+                synchronize_tensors(last_hidden)
+                logger.info("  -- drafter forward num_tokens: %d (trace %d)",
+                            num_tokens, buckets.traces)
+            if buckets.refused:
+                # Same contract as _precompile_backbone: a refused bucket no
+                # trace picked up would fail its first live proposal.
+                raise shape_variants.ShapeSpecializationError(
+                    "drafter warmup left token buckets uncompiled: "
+                    f"{sorted(buckets.refused)}")
 
     def _draft_hidden_size(self) -> int:
         return self.draft_model.config.hidden_size
@@ -1108,26 +1176,19 @@ class Eagle3Proposer:
                 synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)
 
-    def run_dp_dummy_draft(self, num_chunks: int) -> None:
-        """Replay a busy rank's DRAFT collective trace on an idle/padding rank,
-        for `num_chunks` padding chunks (EP-DP lockstep).
+    def _dummy_draft_chunk(
+        self, bucket: int
+    ) -> tuple[DraftChunkInputs, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Zero first-pass draft inputs for a `bucket`-token forward.
 
-        SHARDED draft (draft_tp == target tp): the draft's collectives are matched
-        across ranks by graph-structure channel IDs, so each padding chunk must
-        replay the REAL propose trace, channel IDs attach to collectives only.
+        Shaped for `num_reqs_max_model_len` requests on the dummy-safe
+        attention-metadata branch, so it needs no live request: an idle DP
+        rank replays it (run_dp_dummy_draft), and the startup warmup traces
+        the draft forward with it (_precompile_draft_forward).
 
-        REPLICATED draft (draft_tp=1): entirely local — it emits no
-        collectives, so there is nothing for an idle rank to pair with and the
-        forwards would be pure wasted device time.
+        Returns (chunk, input_ids, positions, target_hidden_states).
         """
-        if not self._dp_lockstep_sharded():
-            return
-        self._draft_md_cache.clear()
         runner = self.runner
-        K = self.speculative_config.num_speculative_tokens
-        if num_chunks * K == 0:
-            return
-        bucket = runner._dp_target_bucket
         num_reqs = runner.num_reqs_max_model_len
         input_ids = torch.zeros(bucket,
                                 dtype=torch.int32,
@@ -1178,6 +1239,32 @@ class Eagle3Proposer:
             num_reqs=num_reqs,
             aux_hidden_states=[],
         )
+        return chunk, input_ids, positions, target_hidden_states
+
+    def run_dp_dummy_draft(self, num_chunks: int) -> None:
+        """Replay a busy rank's DRAFT collective trace on an idle/padding rank,
+        for `num_chunks` padding chunks (EP-DP lockstep).
+
+        SHARDED draft (draft_tp == target tp): the draft's collectives are matched
+        across ranks by graph-structure channel IDs, so each padding chunk must
+        replay the REAL propose trace, channel IDs attach to collectives only.
+
+        REPLICATED draft (draft_tp=1): entirely local — it emits no
+        collectives, so there is nothing for an idle rank to pair with and the
+        forwards would be pure wasted device time.
+        """
+        if not self._dp_lockstep_sharded():
+            return
+        self._draft_md_cache.clear()
+        runner = self.runner
+        K = self.speculative_config.num_speculative_tokens
+        if num_chunks * K == 0:
+            return
+        bucket = runner._dp_target_bucket
+        num_reqs = runner.num_reqs_max_model_len
+        chunk, input_ids, positions, target_hidden_states = (
+            self._dummy_draft_chunk(bucket))
+        actual_num_reqs = min(bucket, num_reqs)
         # Replay the real propose trace per padding chunk.
         p = self._loop_bucket(num_reqs)
         draft_hidden = self._draft_hidden_size()

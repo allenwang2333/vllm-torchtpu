@@ -855,6 +855,69 @@ def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
                 _sp.min_rows())
 
 
+def _patch_mtp_draft_token_count_symbol() -> None:
+    """One symbol for the token count of the MTP draft forward.
+
+    The draft forward is handed the step's token count three times: the rows
+    of input_ids and of the target's hidden_states, which its torch.cat ties
+    together, and the length of positions, which nothing ties to them ahead
+    of the decoder layer. vLLM marks each one dynamic on its own
+    (dynamic_arg_dims), so Dynamo gives positions one symbol and the rows
+    another, and only some of the paths the head's decoder layer takes by row
+    count (its MoE block's) equate the two. The traces
+    compilation/shape_variants makes per token-bucket group then lift
+    different SymInt inputs, and handing a bucket from one trace to the next
+    fails the start: "... cannot be handed over: the trace that compiled it
+    takes different inputs than this one ... Only in the earlier trace: 1x
+    ('s47', 'SymInt')". Comparing the two sizes before the forward leaves an
+    equality guard, on which Dynamo replaces one symbol by the other in every
+    trace, as the backbone's graph already has it. The comparison only runs
+    while tracing; vLLM drops the guard.
+    """
+    import functools
+    import importlib
+
+    from vllm.distributed.parallel_state import get_pp_group
+
+    def with_one_token_count(original_forward):
+
+        @functools.wraps(original_forward)
+        def forward(self, input_ids, positions, hidden_states, *args,
+                    **kwargs):
+            # Only the first pipeline rank reads hidden_states (the others
+            # take intermediate_tensors), as in the forward it wraps.
+            if (get_pp_group().is_first_rank
+                    and hidden_states.shape[0] != positions.shape[-1]):
+                raise ValueError(
+                    "MTP draft forward: the target hidden-state rows and the "
+                    "positions disagree on the token count")
+            return original_forward(self, input_ids, positions,
+                                    hidden_states, *args, **kwargs)
+
+        return forward
+
+    patched = []
+    for module_name, class_name in (
+        ("vllm.model_executor.models.qwen3_5_mtp",
+         "Qwen3_5MultiTokenPredictor"),
+        ("vllm.model_executor.models.qwen3_next_mtp",
+         "Qwen3NextMultiTokenPredictor"),
+    ):
+        try:
+            cls = getattr(importlib.import_module(module_name), class_name)
+        except (ImportError, AttributeError):
+            continue
+        if cls.__dict__.get("_tpu_draft_token_count_patch", False):
+            continue
+        cls.forward = with_one_token_count(cls.forward)
+        cls._tpu_draft_token_count_patch = True
+        patched.append(class_name)
+    if patched:
+        logger.info(
+            "Applied TPU patch: one token-count symbol for the MTP draft "
+            "forward (%s).", ", ".join(patched))
+
+
 def _patch_multiproc_worker_global_rank_env() -> None:
     """Set TorchTPU binding env on spawned workers before torch_tpu import.
 
