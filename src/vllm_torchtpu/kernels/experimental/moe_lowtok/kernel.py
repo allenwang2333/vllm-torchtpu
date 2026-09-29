@@ -216,7 +216,7 @@ def _stream(
     for ahead in range(slots - 1):
 
         @pl.when(ahead < n_units)
-        def _prime():
+        def _prime(ahead=ahead):
             start(jnp.int32(0), jnp.int32(ahead))
 
     def body(u, carry):
