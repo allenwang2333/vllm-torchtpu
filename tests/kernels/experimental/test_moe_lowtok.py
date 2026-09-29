@@ -311,25 +311,57 @@ def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
         wrapper.fused_moe_func.clear_cache()
 
 
+def _oracle(x, ids, weights, w13, s13, w2, s2, experts_start):
+    """Float64 routed MoE over the dequantized FP8 weights."""
+    x = np.asarray(x, np.float64)
+    w13 = np.asarray(w13, np.float64) * np.asarray(s13, np.float64)[:, 0]
+    w2 = np.asarray(w2, np.float64) * np.asarray(s2, np.float64)[:, 0]
+    local = np.asarray(ids) - experts_start
+    weights = np.asarray(weights, np.float64)
+    inter = w2.shape[1]
+    out = np.zeros(x.shape)
+    for expert in range(w13.shape[0]):
+        w = np.sum(np.where(local == expert, weights, 0), axis=1)
+        h = x @ w13[expert]
+        a = h[:, :inter] / (1 + np.exp(-h[:, :inter])) * h[:, inter:]
+        out += w[:, None] * (a @ w2[expert])
+    return out
+
+
+def _rel_l2(got, want):
+    got = np.asarray(got, np.float64)
+    assert np.isfinite(got).all()
+    return np.linalg.norm(got - want) / np.linalg.norm(want)
+
+
 @pytest.mark.parametrize("m", [16, 128])
-def test_fused_moe_func_selects_kernel_and_matches_gmm(monkeypatch, m):
+def test_fused_moe_func_selects_kernel_and_matches_oracle(monkeypatch, m):
     _needs("tpu")
     rng = np.random.default_rng(m)
-    e, h, i = 8, 512, 256
+    e, h, i, topk, start = 8, 512, 256, 4, 64
     x = jnp.asarray(rng.standard_normal((m, h)), jnp.bfloat16)
     w13, s13, w2, s2 = _weights(rng, e, h, i)
-    ids = jnp.asarray(rng.integers(60, 76, size=(m, 4)), jnp.int32)
-    weights = jnp.full((m, 4), 0.25, jnp.bfloat16)
+    # Distinct ids over 16 global experts, half of them on this shard.
+    ids = np.stack([rng.choice(16, size=topk, replace=False) for _ in range(m)])
+    ids = jnp.asarray(ids + start - 4, jnp.int32)
+    weights = rng.random((m, topk))
+    weights = jnp.asarray(weights / weights.sum(axis=1, keepdims=True), jnp.bfloat16)
     args = (x, w13, w2, s13, s2, None, None, weights, ids)
-    kwargs = dict(experts_start=jnp.array(64, jnp.int32), topk=4, use_ep=True)
+    kwargs = dict(experts_start=jnp.array(start, jnp.int32), topk=topk, use_ep=True)
+    want = _oracle(x, ids, weights, w13, s13, w2, s2, start)
     monkeypatch.setattr(wrapper, "_MOE_LOWTOK", False)
     wrapper.fused_moe_func.clear_cache()
-    expected = wrapper.fused_moe_func(*args, **kwargs)
+    gmm_err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
     monkeypatch.setattr(wrapper, "_MOE_LOWTOK", True)
     wrapper.fused_moe_func.clear_cache()
     try:
-        actual = wrapper.fused_moe_func(*args, **kwargs)
         assert "moe_lowtok" in wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
-        _assert_close(actual, expected, 3e-2)
+        err = _rel_l2(wrapper.fused_moe_func(*args, **kwargs), want)
     finally:
         wrapper.fused_moe_func.clear_cache()
+    # An E4M3 operand has rel-L2 error ~2^-3 / sqrt(12 * 7/3) = 0.024; x's enters
+    # both silu(h1) and h3, then `a` is requantized: ~sqrt(3) * 0.024 = 0.041,
+    # bounded at 1.5x. GMM's 512-column blocks and lowtok's whole rows round
+    # differently, so each is compared with the oracle, not with the other.
+    assert err < 0.06, (err, gmm_err)
+    assert err < gmm_err + 0.005, (err, gmm_err)
