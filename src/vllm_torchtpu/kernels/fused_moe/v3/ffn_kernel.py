@@ -358,6 +358,7 @@ def build_ffn_kernel(
     intermediate="fp8",
     sorted_rows=False,
     token_rows="fp8",
+    shard_operand=False,
 ):
     """Builds the program for one layer shape and returns the function that
     runs it (see `run` below). pallas_transport: the token buffer is the
@@ -375,7 +376,9 @@ def build_ffn_kernel(
     in the weight slots; a count streams each expert in column blocks of
     that many intermediate columns, with a group of stream_rows rows and
     their float32 running sum resident, the intermediate rounded per
-    activation block (Config.stream_block, Config.stream_rows)."""
+    activation block (Config.stream_block, Config.stream_rows).
+    shard_operand: the shard's index arrives as an operand (`shard_index`)
+    instead of lax.axis_index."""
     form = weight_form(weight_format)
     if elementwise_dtype not in ("float32", "bfloat16"):
         raise ValueError(
@@ -481,8 +484,8 @@ def build_ffn_kernel(
             f"experts of {hidden}x{inter} at tile {tile_rows}"
         )
     # One more scalar-prefetch table under the operand mode: the shard's
-    # own index (layout.SHARD_INDEX_OPERAND), read instead of the mesh axis.
-    n_tables = len(dataclasses.fields(Tables)) + int(layout.SHARD_INDEX_OPERAND)
+    # own index, read instead of the mesh axis.
+    n_tables = len(dataclasses.fields(Tables)) + int(shard_operand)
     # Which optional operands and scratch buffers this build carries, in
     # the dataclasses' field order; the unpack below reads the flat ref
     # list by these, never by a count.
@@ -534,7 +537,7 @@ def build_ffn_kernel(
     def unpack(refs):
         it = iter(refs)
         tables = Tables(*(next(it) for _ in dataclasses.fields(Tables)))
-        shard_ref = next(it) if layout.SHARD_INDEX_OPERAND else None
+        shard_ref = next(it) if shard_operand else None
         operands = Operands(**take_fields(it, operand_present))
         if form.packed:
             # The four-bit weights as packed 32-bit words, so the DMA moves
@@ -594,6 +597,7 @@ def build_ffn_kernel(
         scale_planes=scale_planes,
         scale_lanes=scale_lanes,
         window_rows=window_rows,
+        shard_operand=shard_operand,
     )
     step = streamed if stream_block else whole
 
@@ -621,7 +625,7 @@ def build_ffn_kernel(
         # ---- prologue: the resident tables, the first weight refills ----
         body.resident_copies(ctx)
         step.first_refills(ctx)
-        transport.all_shards_barrier(num_shards, build.mesh_axes)
+        transport.all_shards_barrier(num_shards, build.mesh_axes, shard_operand)
         # ---- the program ----
         if pallas_transport:
             transport.finish(
@@ -633,6 +637,7 @@ def build_ffn_kernel(
                     operands.tokens.shape[0] // num_shards,
                     num_shards,
                     mesh_axes=build.mesh_axes,
+                    shard_operand=shard_operand,
                 )
             )
         step.issue_first(ctx)
@@ -643,7 +648,7 @@ def build_ffn_kernel(
             step.initial_carry(ctx),
         )
         body.drain_transport(ctx)
-        transport.all_shards_barrier(num_shards, build.mesh_axes)
+        transport.all_shards_barrier(num_shards, build.mesh_axes, shard_operand)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
@@ -792,9 +797,9 @@ def build_ffn_kernel(
                 "the pallas transport takes the start call's "
                 "semaphore pair, and only it does"
             )
-        if (shard_index is not None) != layout.SHARD_INDEX_OPERAND:
+        if (shard_index is not None) != shard_operand:
             raise ValueError(
-                "shard_index goes with layout.SHARD_INDEX_OPERAND and only then"
+                "shard_index goes with a build with shard_operand and only then"
             )
         if token_of_row.shape != (table_rows,):
             raise ValueError(

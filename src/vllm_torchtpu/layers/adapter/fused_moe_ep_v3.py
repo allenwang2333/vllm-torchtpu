@@ -43,8 +43,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
 )
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
-from vllm_torchtpu.kernels.fused_moe.v3 import layer as _v3_layer
-from vllm_torchtpu.kernels.fused_moe.v3 import layout as _v3_layout
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     _max_node_tokens,
@@ -144,13 +142,6 @@ def run_moe_v3(
 ):
     """The `run_moe` the op wraps: global arrays sharded on the EP axis in,
     one [tokens, hidden] array sharded like x out."""
-    # The torch bridge exports the op as one jitted function: the layer's own
-    # inner jit is what the export path's SPMD partitioner refuses, it wants a
-    # sharding on every side-effecting custom call, and it refuses
-    # `lax.axis_index`, so the shard's index goes in as data.
-    _v3_layer.WRAP_IN_JIT = False
-    _v3_layout.SIDE_EFFECTS = False
-    _v3_layout.SHARD_INDEX_OPERAND = True
     if MESH_AXIS not in mesh.axis_names:
         raise ValueError(
             f"the v3 kernel splits the experts over the mesh axis named "
@@ -181,8 +172,14 @@ def run_moe_v3(
             activation=activation,
             drop_nan_rows=drop_nan_rows,
             config=config,
-            shard_index=rank,
             experts_per_shard=experts_per_shard,
+            # The torch bridge exports the op as one jitted function: its SPMD
+            # partitioner refuses the layer's own inner jit, a side-effecting
+            # custom call without a sharding, and `lax.axis_index`, so the
+            # shard's index goes in as data.
+            shard_index=rank,
+            jit=False,
+            side_effects=False,
         )
 
     return run_moe

@@ -344,8 +344,7 @@ def _shard_tables_body(
     the first steps. With `hosts_transport`, the transport's middle step
     (wait round A, issue round B) on the last step."""
     it = iter(refs)
-    # The shard's index: an SMEM operand (layout.SHARD_INDEX_OPERAND) or
-    # the mesh axis.
+    # The shard's index: an SMEM operand or the mesh axis.
     shard_ref = next(it) if shard_operand else None
 
     def shard_of():
@@ -594,6 +593,7 @@ def _shard_tables_body(
                     shard,
                     gathered_rows_out.shape[0] // num_shards,
                     num_shards,
+                    shard_operand=shard_operand,
                 )
             )
 
@@ -615,6 +615,7 @@ def shard_tables_kernel(
     blocks_per_step=BLOCKS_PER_STEP,
     zero_words_per_step=TABLES_ZERO_WORDS_DEFAULT,
     shard_index=None,
+    side_effects=True,
 ):
     """The pallas mode's front end, from the gathered routing messages
     (`routing messages` [num_shards, rows, LANES] int32: shard s's pair indices
@@ -781,9 +782,7 @@ def shard_tables_kernel(
             if hosts
             else {}
         ),
-        compiler_params=pltpu.CompilerParams(
-            has_side_effects=hosts and layout.SIDE_EFFECTS
-        ),
+        compiler_params=pltpu.CompilerParams(has_side_effects=hosts and side_effects),
         interpret=interpret,
         name="fused_ep_shard_tables",
     )(

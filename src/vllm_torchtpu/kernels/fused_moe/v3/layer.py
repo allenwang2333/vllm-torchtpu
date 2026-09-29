@@ -36,7 +36,6 @@ from vllm_torchtpu.kernels.fused_moe.v3 import combine as combine_lib
 from vllm_torchtpu.kernels.fused_moe.v3 import (
     device,
     ffn,
-    layout,
     row_tables_kernel,
     transport,
     vmem,
@@ -416,6 +415,7 @@ def _pallas_step(
     sorted_rows,
     mesh_axes,
     token_dtype,
+    side_effects,
     shard_index=None,
 ):
     """One shard of the pallas mode. `config` supplies the programs'
@@ -477,6 +477,7 @@ def _pallas_step(
             activation_block=token_block,
             elementwise=elementwise,
             shard_index=shard_index,
+            side_effects=side_effects,
         )
     )
     scale_rows = scale_table_rows(routed_rows_per_shard)
@@ -499,6 +500,7 @@ def _pallas_step(
         blocks_per_step=blocks_per_step,
         zero_words_per_step=config.tables_zero_words,
         shard_index=shard_index,
+        side_effects=side_effects,
     )
     (
         _,
@@ -564,6 +566,7 @@ def _pallas_step(
             mesh_axes=mesh_axes,
             rows_per_shard=gathered_rows.shape[0] // num_shards,
             shard_index=shard_index,
+            side_effects=side_effects,
         )
         landed, done = lax.optimization_barrier((gathered_rows, done))
         index = jnp.where(done[0, 0] > 0, index, 0)
@@ -675,8 +678,6 @@ def _pallas_step(
 _LAYER_CACHE = {}
 _LAYER_CACHE_LOCK = threading.Lock()
 
-WRAP_IN_JIT = True
-
 
 def _cached_layer_program(key, build):
     """The jitted shard_map for one layer shape, built once per process.
@@ -719,6 +720,8 @@ def fused_ep_moe(
     config=None,
     shard_index=None,
     experts_per_shard=None,
+    jit=True,
+    side_effects=True,
 ):
     """One MoE layer under expert parallelism, through the fused kernel.
 
@@ -769,6 +772,17 @@ def fused_ep_moe(
       no_gate: a single projection with no gate half.
       config: a Config. None takes Config.for_shape: the defaults, with the
         fields TUNED_BY_SHAPE holds for this shape on top.
+      shard_index: int32 [num_shards, 1], each shard's own index handed to
+        the collective programs as data instead of `lax.axis_index`; for a
+        mesh whose only axis is the expert-parallel one.
+      experts_per_shard: experts each shard routes over; the weights'
+        per-shard count when None.
+      jit: wrap the layer in its own jit. False for a caller already inside
+        one whose export the nested jit trips (the torch bridge).
+      side_effects: whether the collective programs declare themselves
+        side-effecting to XLA. False under the torch bridge, whose SPMD
+        partitioner refuses a side-effecting custom call without a sharding;
+        every such program's output is consumed downstream anyway.
 
     Returns:
       [tokens, hidden] in x's dtype, sharded like x.
@@ -860,20 +874,13 @@ def fused_ep_moe(
         # shard's block, the rest of the block is never read
         num_experts = num_shards * experts_per_shard
     tokens_per_shard = tokens // (num_shards * replicas)
-    # shard_index: int32 [num_shards, 1], the shard's own index handed to the
-    # transport and shard-tables programs as data (layout.SHARD_INDEX_OPERAND,
-    # the torch bridge's path); None takes an arange, which is fine under a
-    # plain jit with a mesh and not under the bridge (a jit-internal
-    # constant sharded over the axis compiles to a partition-id there).
-    with_shard = layout.SHARD_INDEX_OPERAND or shard_index is not None
+    with_shard = shard_index is not None
     if with_shard:
         if replicas != 1:
             raise ValueError(
                 "the shard-index operand takes a mesh whose only "
                 f"axis is {axis!r}; this one has {mesh.axis_names}"
             )
-        if shard_index is None:
-            shard_index = jnp.arange(num_shards, dtype=jnp.int32).reshape(num_shards, 1)
         if tuple(shard_index.shape) != (num_shards, 1):
             raise ValueError(
                 f"shard_index is {tuple(shard_index.shape)}; "
@@ -1044,6 +1051,7 @@ def fused_ep_moe(
         intermediate=config.intermediate,
         sorted_rows=sorted_rows,
         token_rows=config.token_rows,
+        shard_operand=with_shard,
     )
     # The arrival buffer: every routed pair of this shard's tokens plus the
     # row-block padding of every expert's run, in whole blocks.
@@ -1075,6 +1083,7 @@ def fused_ep_moe(
         sorted_rows=sorted_rows,
         mesh_axes=tuple(mesh.axis_names),
         token_dtype=token_dtype,
+        side_effects=bool(side_effects),
     )
 
     handed_in = routing is not None
@@ -1148,6 +1157,8 @@ def fused_ep_moe(
         config,
         bool(drop_nan_rows),
         bool(with_shard),
+        bool(jit),
+        bool(side_effects),
         x.dtype,
         w1.dtype,
         w2.dtype,
@@ -1155,11 +1166,10 @@ def fused_ep_moe(
         tuple(r.dtype for r in router),
     ) + bias_dtypes
 
-    # WRAP_IN_JIT: the layer's own callers get one compiled program per shape.
-    # A caller that is already inside a jit -- the torch bridge exports the
-    # whole op as one jitted function -- sets it False: the nested jit is what
-    # XLA's SPMD partitioner trips over on the export path ("Side-effect HLO
-    # must have sharding" on the transport's program).
+    # With `jit` the layer's own callers get one compiled program per shape.
+    # The torch bridge exports the whole op as one jitted function and passes
+    # jit=False: the nested jit is what XLA's SPMD partitioner trips over on
+    # the export path ("Side-effect HLO must have sharding").
     def build():
         sm = jax.shard_map(
             shard_body,
@@ -1168,7 +1178,7 @@ def fused_ep_moe(
             out_specs=rows_spec,
             check_vma=False,
         )
-        return jax.jit(sm) if WRAP_IN_JIT else sm
+        return jax.jit(sm) if jit else sm
 
     body = _cached_layer_program(key, build)
     return body(*args)

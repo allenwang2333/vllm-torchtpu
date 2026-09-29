@@ -236,10 +236,6 @@ def test_ops_are_shared_per_closure_and_named_apart_from_v2(monkeypatch):
     shares the target's when it matches; no two closures share a name."""
     monkeypatch.setattr(bridge, "_OPS", {})
     monkeypatch.setattr(bridge, "jax_op", _FakeOp)
-    # run_moe_v3 sets these on the kernel package; keep them out of later tests.
-    monkeypatch.setattr(bridge._v3_layer, "WRAP_IN_JIT", True)
-    monkeypatch.setattr(bridge._v3_layout, "SIDE_EFFECTS", True)
-    monkeypatch.setattr(bridge._v3_layout, "SHARD_INDEX_OPERAND", False)
     mesh = SimpleNamespace(
         shape={bridge.MESH_AXIS: _EP}, axis_names=(bridge.MESH_AXIS,)
     )

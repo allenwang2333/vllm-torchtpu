@@ -40,34 +40,18 @@ MIB = 2**20
 # kernel use.
 MESH_AXIS = "d"
 
-# Whether the programs that issue remote DMAs declare themselves side-effecting
-# to XLA. True for the layer's own callers. Under torch_tpu's export bridge the
-# SPMD partitioner refuses a side-effecting custom call that carries no sharding
-# ("Side-effect HLO must have sharding"), and every such program's
-# outputs are consumed downstream (the finish program's `done` word gates the
-# combine's index), so the flag is not what keeps them alive; the bridge's
-# caller sets it False.
-SIDE_EFFECTS = True
 
-# Whether the shard's own index reaches the transport and shard-tables
-# programs as an operand (an int32 [1] in SMEM, from a [num_shards, 1] array
-# the layer shards over the mesh axis) instead of `lax.axis_index`. False
-# for the layer's own callers. Under torch_tpu's export bridge `axis_index`
-# lowers to a partition-id that XLA's SPMD partitioner refuses ("partitionId
-# instruction is not supported for SPMD partitioning"), so the
-# bridge's caller sets it True and hands the
-# index in as data; the kernel tree's tests set it on the module.
-SHARD_INDEX_OPERAND = False
-
-
-def device_coords(peer, mesh_axes=(MESH_AXIS,)):
+def device_coords(peer, mesh_axes=(MESH_AXIS,), shard_operand=False):
     """The mesh coordinates of shard `peer` of the expert-parallel axis, as
     a remote copy or signal takes them (pl.DeviceIdType.MESH): `peer` on
     MESH_AXIS and this core's own index on every other axis, so the cores
-    of one replica only ever address each other."""
+    of one replica only ever address each other. `shard_operand`: the
+    program takes its shard index as an operand instead of
+    `lax.axis_index` (the torch bridge's export, where axis_index lowers to
+    a partition-id XLA's SPMD partitioner refuses)."""
     from jax import lax
 
-    if SHARD_INDEX_OPERAND:
+    if shard_operand:
         # The dict form, keyed by axis name: it names the mesh axis to Pallas
         # (a NamedAxisEffect) without an axis lookup, so the program's mesh
         # context is built even though nothing else references the axis --
