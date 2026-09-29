@@ -33,10 +33,13 @@ import pytest
 from tpu_release import wait_for_tpu_release
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.inputs import TokensPrompt
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.metrics.reader import Counter
 
 from vllm_torchtpu import tpu_info
+
+from .mtp_prompts import build_mtp_prompts
 
 
 @pytest.fixture(autouse=True)
@@ -380,14 +383,28 @@ class _InProcessEngine:
         self._llm = llm
 
     def generate(
-        self, prompts: list[str], sampling_config: SamplingParams
+        self,
+        prompts: list[str] | list[TokensPrompt],
+        sampling_config: SamplingParams,
+        *,
+        expected_output_tokens: int | None = None,
     ) -> list[str]:
         outputs = self._llm.generate(prompts, sampling_config)
+        if expected_output_tokens is not None:
+            for output in outputs:
+                count = len(output.outputs[0].token_ids)
+                assert count == expected_output_tokens, (
+                    f"request {output.request_id}: generated {count} tokens, "
+                    f"expected {expected_output_tokens}; long-output coverage truncated"
+                )
         return [output.outputs[0].text for output in outputs]
 
     def generate_outputs(self, prompts: list[str], sampling_config: SamplingParams):
         """The full RequestOutputs, for callers that need more than text."""
         return self._llm.generate(prompts, sampling_config)
+
+    def collective_rpc(self, method: str):
+        return self._llm.collective_rpc(method, timeout=14400)
 
     def spec_counters(self) -> tuple[float, float, dict[str, float]]:
         num_draft_tokens = num_accepted_tokens = 0.0
@@ -442,9 +459,13 @@ def _test_correctness_helper(
     max_num_seqs: int = 4,
     async_scheduling: bool | None = None,
     extra_kwargs: dict | None = None,
+    test_prompts: list[str] | list[TokensPrompt] | None = None,
+    check_draft_logits: bool = False,
+    expected_output_tokens: int | None = None,
 ):
     with monkeypatch.context():
-        test_prompts = get_test_prompts(speculative_config)
+        if test_prompts is None:
+            test_prompts = get_test_prompts(speculative_config)
 
         kwargs = {
             "max_model_len": 256,
@@ -457,13 +478,46 @@ def _test_correctness_helper(
 
         # 1. Reference Run (no speculation)
         with _engine(model_name, None, kwargs) as ref_engine:
-            ref_texts = ref_engine.generate(test_prompts, sampling_config)
+            ref_texts = ref_engine.generate(
+                test_prompts,
+                sampling_config,
+                expected_output_tokens=expected_output_tokens,
+            )
 
         # 2. Speculative Run
-        with _engine(model_name, speculative_config, kwargs) as spec_engine:
-            spec_texts = spec_engine.generate(test_prompts, sampling_config)
+        spec_kwargs = dict(kwargs)
+        if check_draft_logits:
+            spec_kwargs["worker_extension_cls"] = (
+                "tests.entrypoints.llm.mtp_precision.MTPPrecisionWorkerExtension"
+            )
+        with _engine(model_name, speculative_config, spec_kwargs) as spec_engine:
+            if check_draft_logits:
+                spec_engine.collective_rpc("enable_mtp_precision")
+            spec_texts = spec_engine.generate(
+                test_prompts,
+                sampling_config,
+                expected_output_tokens=expected_output_tokens,
+            )
+            if check_draft_logits:
+                reports = spec_engine.collective_rpc("finish_mtp_precision")
+                assert reports, "MTP precision check returned no worker reports"
+                print("MTP_DRAFT_PRECISION " + json.dumps(reports, sort_keys=True))
+                for report in reports:
+                    assert not report["failures"], report["failures"]
+                    assert (
+                        report["checked_request_steps"]
+                        == (
+                            report["request_rounds"]
+                            * speculative_config["num_speculative_tokens"]
+                        )
+                        > 0
+                    ), report
 
-        _assert_no_spec_divergence(test_prompts, ref_texts, spec_texts)
+        prompt_keys = [
+            p if isinstance(p, str) else json.dumps(p["prompt_token_ids"])
+            for p in test_prompts
+        ]
+        _assert_no_spec_divergence(prompt_keys, ref_texts, spec_texts)
 
 
 @pytest.mark.timeout(1800)
@@ -627,17 +681,20 @@ def test_qwen35_mtp_correctness_greedy(
         max_num_seqs=max_num_seqs,
         async_scheduling=async_scheduling,
         extra_kwargs=QWEN35_KWARGS,
+        check_draft_logits=True,
     )
 
 
 @pytest.mark.timeout(1800)
+@pytest.mark.parametrize("num_speculative_tokens", [2, 3], ids=["k2", "k3"])
 def test_qwen35_mtp_correctness_greedy_multi_step(
     monkeypatch: pytest.MonkeyPatch,
     sampling_config: SamplingParams,
+    num_speculative_tokens: int,
 ):
-    """Same correctness guarantee with K=2 draft tokens per step.
+    """Same correctness guarantee with K=2/3 draft tokens per step.
 
-    Qwen3.5-4B has a single MTP layer, so K=2 runs that layer twice per step
+    Qwen3.5-4B has a single MTP layer, so K=2/3 reuses that layer per step
     and exercises the drafter's multi-step loop (per-step draft attention
     metadata, GDN state advance/rollback across >1 speculated token) that the
     K=1 configuration never reaches.
@@ -646,10 +703,62 @@ def test_qwen35_mtp_correctness_greedy_multi_step(
         monkeypatch,
         sampling_config,
         QWEN35_MTP_MODEL,
-        _qwen35_mtp_speculative_config(num_speculative_tokens=2),
+        _qwen35_mtp_speculative_config(num_speculative_tokens),
         max_num_seqs=4,
         async_scheduling=False,
         extra_kwargs=QWEN35_KWARGS,
+        check_draft_logits=True,
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(14400)
+@pytest.mark.parametrize(
+    "prompt_tokens,output_tokens",
+    [(65536, 128), (512, 1024), (65536, 1024)],
+    ids=["long-prefill", "long-decode", "long-prefill-long-decode"],
+)
+def test_qwen35_mtp_natural_language_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_tokens: int,
+    output_tokens: int,
+):
+    """Natural-language K3 generation checks every draft, not only first decode.
+
+    Token prompts fix the input length; ignore_eos plus a returned-token count
+    assertion fixes the output length. A 4096-token scheduler budget forces
+    the 64K prompts through multiple prefill chunks. The private draft oracle
+    does not share the serving KV cache. This instrumented run is a numerical
+    check, not an asynchronous timing or performance test.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(QWEN35_MTP_MODEL)
+    prompts = build_mtp_prompts(tokenizer, prompt_tokens)
+    assert all(len(p["prompt_token_ids"]) == prompt_tokens for p in prompts)
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    _test_correctness_helper(
+        monkeypatch,
+        _make_sampling_config(max_tokens=output_tokens),
+        QWEN35_MTP_MODEL,
+        _qwen35_mtp_speculative_config(3),
+        max_num_seqs=1,
+        async_scheduling=True,
+        extra_kwargs={
+            **QWEN35_KWARGS,
+            "tensor_parallel_size": 2,
+            "max_model_len": prompt_tokens + output_tokens + 3,
+            "max_num_batched_tokens": 4096,
+            "attention_backend": "CUSTOM",
+            "kv_cache_dtype": "fp8",
+            "mamba_ssm_cache_dtype": "bfloat16",
+            "compilation_config": {
+                "compile_sizes": [32, 64, 128, 256, 512, 1024, 2048, 4096]
+            },
+        },
+        test_prompts=prompts,
+        check_draft_logits=True,
+        expected_output_tokens=output_tokens,
     )
 
 
@@ -1803,7 +1912,11 @@ class _ServedEngine:
         self._model = model_name
 
     def generate(
-        self, prompts: list[str], sampling_config: SamplingParams
+        self,
+        prompts: list[str],
+        sampling_config: SamplingParams,
+        *,
+        expected_output_tokens: int | None = None,
     ) -> list[str]:
         """Send the prompts concurrently and return their texts.
 
@@ -1833,6 +1946,8 @@ class _ServedEngine:
                 request, timeout=DP_REQUEST_TIMEOUT_S
             ) as response:
                 body = json.loads(response.read().decode())
+            if expected_output_tokens is not None:
+                assert body["usage"]["completion_tokens"] == expected_output_tokens
             return body["choices"][0]["text"]
 
         with ThreadPoolExecutor(max_workers=DP_CONCURRENCY) as pool:
