@@ -106,10 +106,6 @@ class PcpStaticSupportValidator:
                 raise NotImplementedError(
                     "PCP speculative decoding currently requires method=mtp."
                 )
-            if config.num_speculative_tokens != 1:
-                raise NotImplementedError(
-                    "PCP MTP currently requires num_speculative_tokens=1."
-                )
         if config.interleave_size <= 0:
             raise ValueError(
                 "PCP runner path requires cp_kv_cache_interleave_size > 0."

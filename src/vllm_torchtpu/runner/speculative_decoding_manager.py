@@ -41,6 +41,9 @@ class SpecDecodeMetadata:
     segment_ids: torch.Tensor
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
+    # Host copy of final_logits_indices (padded). Partial sequence layouts
+    # (PCP) use it to pick the logits rows each rank owns.
+    final_logits_indices_cpu: np.ndarray | None = None
 
 
 class SpeculativeDecodingManager:
@@ -205,6 +208,7 @@ class SpeculativeDecodingManager:
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
+        all_token_ids: np.ndarray | None = None,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and
         rejection sampling.
@@ -213,6 +217,9 @@ class SpeculativeDecodingManager:
           num_draft_tokens: The number of draft tokens for each request.
           cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
           padded_num_reqs: The padded number of requests.
+          all_token_ids: Request-major token ids of this chunk. Defaults to
+            the runner's input_ids_cpu, which a partial sequence layout (PCP)
+            has already repacked by the time this runs.
 
         Returns:
           A SpecDecodeMetadata object containing the necessary indices for
@@ -231,7 +238,8 @@ class SpeculativeDecodingManager:
             )
             # draft_token_ids depends on this step's input_ids_cpu content —
             # always re-extracted and re-transferred.
-            all_token_ids = self.runner.input_ids_cpu.numpy()
+            if all_token_ids is None:
+                all_token_ids = self.runner.input_ids_cpu.numpy()
             draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
@@ -246,6 +254,7 @@ class SpeculativeDecodingManager:
                 final_logits_indices=self._meta_cache.final_logits_indices,
                 segment_ids=self._meta_cache.segment_ids,
                 group_indices=self._meta_cache.group_indices,
+                final_logits_indices_cpu=self._meta_cache.final_logits_indices_cpu,
             )
 
         # [num_reqs]
@@ -289,7 +298,8 @@ class SpeculativeDecodingManager:
         )
 
         # Compute the draft token ids for validation.
-        all_token_ids = self.runner.input_ids_cpu.numpy()
+        if all_token_ids is None:
+            all_token_ids = self.runner.input_ids_cpu.numpy()
         draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
 
         # Padding
@@ -361,6 +371,7 @@ class SpeculativeDecodingManager:
             group_indices=torch.from_numpy(padded_group_indices).to(
                 device, non_blocking=True
             ),
+            final_logits_indices_cpu=padded_logits_indices,
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.

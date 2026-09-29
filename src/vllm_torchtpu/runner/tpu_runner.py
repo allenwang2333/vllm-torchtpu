@@ -98,8 +98,9 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilderContext,
     stage_block_table_uploads,
 )
+from vllm_torchtpu.layers.core.pcp_dcp_token_remap import gather_to_request_major
 from vllm_torchtpu.layers.core.sequence_layout import (
-    SequenceLayoutKind, create_sequence_layout_planner,
+    SequenceLayoutKind, SequenceLayoutPlan, create_sequence_layout_planner,
     is_pcp_streaming_sequence_layout_descriptor)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -1971,6 +1972,30 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
+    def _pcp_request_major_device_ids(
+        self,
+        local_input_ids: torch.Tensor,
+        fallback: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Gather this chunk's substituted local input ids to request-major."""
+        plan = self._last_sequence_layout_plan
+        if plan is None or plan._request_major_to_packed_token_indices is None:
+            return fallback
+        remap = self._attn_metadata_builder_ctx.pcp_request_major_to_packed_token_indices
+        if remap is None:
+            # PCP without the PCP+DCP remap: build the permutation here.
+            request_to_packed = plan._request_major_to_packed_token_indices
+            num_global = int(plan.global_padded_num_tokens)
+            raw = request_to_packed[:num_global]
+            valid = raw >= 0
+            used = np.zeros(num_global, dtype=bool)
+            used[raw[valid]] = True
+            perm = np.concatenate(
+                [raw[valid], np.flatnonzero(~used)]
+            ).astype(np.int32)
+            remap = torch.from_numpy(perm).to(self.device, non_blocking=True)
+        return gather_to_request_major(local_input_ids, remap)
+
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -2838,8 +2863,18 @@ class TPUModelRunner(GPUModelRunner):
                         num_draft_tokens,
                         self.query_start_loc_np[1 : num_reqs + 1],
                         padded_num_reqs,
+                        all_token_ids=(
+                            request_major_input_ids_cpu.numpy()
+                            if self._pcp_enabled and self._mtp_enabled
+                            else None
+                        ),
                     )
                 )
+                if layout_plan._request_major_to_packed_token_indices is not None:
+                    layout_plan = _with_pcp_spec_logits_rows(
+                        layout_plan, spec_decode_metadata.final_logits_indices_cpu
+                    )
+                    self._last_sequence_layout_plan = layout_plan
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -3241,24 +3276,6 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-        if self._pcp_enabled and self._mtp_enabled:
-            # Validate the actual scheduled span before any forward/collective.
-            # Ending exactly at the prompt boundary produces the first output;
-            # consuming any generated token would enter unsupported decode or
-            # target verification. Let the engine's fatal-error path handle it.
-            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
-                req_index = self.input_batch.req_id_to_index[req_id]
-                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
-                num_prompt = int(self.input_batch.num_prompt_tokens[req_index])
-                if num_computed + num_tokens > num_prompt:
-                    raise RuntimeError(
-                        "PCP + MTP only supports prefill and the first output "
-                        "token; refusing decode/verify for "
-                        f"request {req_id!r}: num_computed_tokens={num_computed}, "
-                        f"num_scheduled_tokens={num_tokens}, "
-                        f"num_prompt_tokens={num_prompt}. "
-                        "Set SamplingParams(max_tokens=1) at the service entry."
-                    )
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
         # explicitly, otherwise the encoder never runs, image placeholder
@@ -3397,6 +3414,13 @@ class TPUModelRunner(GPUModelRunner):
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
             )
+            if self._pcp_enabled and self._mtp_enabled:
+                # The host request-major copy predates async substitution, so
+                # decode/verify slots still hold placeholders there. Rebuild
+                # request-major ids from the substituted local inputs.
+                request_major_input_ids = self._pcp_request_major_device_ids(
+                    input_ids, request_major_input_ids
+                )
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
@@ -3410,7 +3434,11 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
                 spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
-                    input_ids,
+                    (
+                        request_major_input_ids
+                        if request_major_input_ids is not None
+                        else input_ids
+                    ),
                     spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices,
                 )
@@ -5205,11 +5233,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
-            # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
-            # we skip it here as well.
-            if self.speculative_config is None or (
-                self._pcp_enabled and self._mtp_enabled
-            ):
+            if self.speculative_config is None:
                 return
             # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = (
@@ -5520,20 +5544,15 @@ class TPUModelRunner(GPUModelRunner):
             if self._is_async_drafter:
                 self.drafter.precompile()
                 if self._pcp_enabled and self._mtp_enabled:
-                    logger.info(
-                        "Skipping rejection replay and decode/verify warmup "
-                        "for prefill-only PCP MTP K1"
-                    )
                     self._warmup_pcp_mtp_prefill()
-                else:
-                    self._precompile_rejection_sampler()
-                    self._precompile_spec_logprobs()
-                    # The isolated precompiles above emit standalone fused
-                    # programs; the real per-step propose+verify+sampling
-                    # dispatch fuses them differently, so the first real
-                    # request would otherwise compile new graphs. Warm those
-                    # through the real two-phase spec-decode path.
-                    self._warmup_spec_decode()
+                self._precompile_rejection_sampler()
+                self._precompile_spec_logprobs()
+                # The isolated precompiles above emit standalone fused
+                # programs; the real per-step propose+verify+sampling
+                # dispatch fuses them differently, so the first real
+                # request would otherwise compile new graphs. Warm those
+                # through the real two-phase spec-decode path.
+                self._warmup_spec_decode()
 
     def _warmup_pcp_mtp_prefill(self) -> None:
         """Warm the real PCP MTP K1 prefill proposal and nothing else.
@@ -6568,6 +6587,32 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
         logger.info("    %d", num)
         num = _get_padded_num_reqs_with_upper_limit(num + 1, max_req_size)
     return paddings
+
+
+def _with_pcp_spec_logits_rows(
+    plan: SequenceLayoutPlan, final_logits_indices: np.ndarray
+) -> SequenceLayoutPlan:
+    """Point a partial layout's logits selection at every spec-verify row.
+
+    The PCP plan selects one logits row per request (its last token). A verify
+    step needs a row for each draft + bonus position, given request-major in
+    ``final_logits_indices``; map those to this rank's local rows and mark
+    which ones it owns, so ``maybe_select_logits_hidden_states`` all-reduces
+    exactly the rows ``compute_selected_logits`` would pick without PCP.
+    """
+    request_to_packed = plan._request_major_to_packed_token_indices
+    assert request_to_packed is not None
+    local_start = int(plan.token_slice.start or 0)
+    local_end = int(plan.token_slice.stop)
+    rows = np.asarray(final_logits_indices, dtype=np.int64)
+    packed = request_to_packed[rows]
+    owner = (packed >= local_start) & (packed < local_end)
+    local = np.where(owner, packed - local_start, 0).astype(np.int32)
+    return dataclasses.replace(
+        plan,
+        logits_local_indices_cpu=torch.from_numpy(local),
+        logits_owner_mask_cpu=torch.from_numpy(owner),
+    )
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:

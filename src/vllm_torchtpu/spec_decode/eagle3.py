@@ -18,6 +18,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    SequenceLayoutKind,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -1020,22 +1024,54 @@ class Eagle3Proposer:
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
             owner_mask = last_token_indices.ge(0)
             safe_gather_indices = last_token_indices.clamp_min(0)
+            is_partial = chunk.sequence_layout_plan.kind is SequenceLayoutKind.PARTIAL
             if self._share_mtp_indices:
                 # Clamped, not raw: a PCP-localized index is -1 for a row this
                 # rank does not own, and -1 would wrap to the buffer's last row.
+                # Under PCP+DCP the top-k buffer is request-major, so compact
+                # it with the request-major indices instead of local ones.
+                compact_indices = safe_gather_indices
+                if is_partial and runner._pcp_dcp_compatible:
+                    compact_indices = self._request_major_gather_indices.clamp_min(0)
                 saved_topk_per_chunk.append(
-                    self._mtp_compact_and_save(safe_gather_indices)
+                    self._mtp_compact_and_save(compact_indices)
                 )
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(
                     hidden, positions, last_hidden, safe_gather_indices
                 )
             )
-            last_hidden_carry = (
+            aggregated_last_hidden_carry = (
                 chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
                     last_hidden_carry, owner_mask
                 )
             )
+            if is_partial and K > 1:
+                # Loop steps replicate one query per request on every PCP
+                # rank, so each rank needs every request's carries, not just
+                # the rows it owned in step 0.
+                if hidden is last_hidden:
+                    hidden_carry = aggregated_last_hidden_carry
+                else:
+                    hidden_carry = (
+                        chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
+                            hidden_carry, owner_mask
+                        )
+                    )
+                if positions_carry.ndim != 1:
+                    raise NotImplementedError(
+                        "PCP MTP with num_speculative_tokens > 1 does not "
+                        "support M-RoPE positions."
+                    )
+                # Positions stay below 2**24, so a float32 sum is exact.
+                positions_carry = (
+                    chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
+                        positions_carry.to(torch.float32).unsqueeze(-1), owner_mask
+                    )
+                    .squeeze(-1)
+                    .to(positions_carry.dtype)
+                )
+            last_hidden_carry = aggregated_last_hidden_carry
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -1362,6 +1398,8 @@ class Eagle3Proposer:
                 padded_lti_np[:num_reqs] = last_token_indices_np
                 gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
 
+        # Request-major last-token rows, kept for the PCP+DCP top-k compaction.
+        self._request_major_gather_indices = gather_indices
         draft_input_ids, gather_indices = (
             chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
                 draft_input_ids,
@@ -1506,7 +1544,27 @@ class Eagle3Proposer:
             # positions so the block-table build uses the zeroed-table branch
             # instead of slicing the real (idle-rank) block table.
             position_ids_override=chunk.attn_ctx.position_ids_override,
-            sequence_layout_descriptor=(chunk.attn_ctx.sequence_layout_descriptor),
+            # Step 0 runs the target's partial (PCP) token layout, so it needs
+            # the same PCP+DCP token remap the target forward used. Loop steps
+            # carry one replicated query per request: plain layout, no remap.
+            **(
+                dict(
+                    sequence_layout_descriptor=(
+                        chunk.attn_ctx.sequence_layout_descriptor
+                    ),
+                    pcp_request_major_to_packed_token_indices=(
+                        chunk_ctx.pcp_request_major_to_packed_token_indices
+                    ),
+                    pcp_packed_to_request_major_token_indices=(
+                        chunk_ctx.pcp_packed_to_request_major_token_indices
+                    ),
+                    pcp_local_token_slice=chunk_ctx.pcp_local_token_slice,
+                )
+                if step_idx == 0
+                else dict(
+                    sequence_layout_descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+                )
+            ),
         )
         try:
             slot_mappings = runner.empty_slot_mappings
