@@ -54,10 +54,20 @@ def fp8_gather() -> bool:
     return enabled() and envs.TPU_SEQUENCE_PARALLEL_FP8_GATHER
 
 
-def check_fp8_gather() -> None:
+def check_flags() -> None:
+    """Raise on flags that cannot be combined with sequence parallelism."""
     if envs.TPU_SEQUENCE_PARALLEL_FP8_GATHER and not enabled():
         raise ValueError(
             "TPU_SEQUENCE_PARALLEL_FP8_GATHER needs TPU_SEQUENCE_PARALLEL_PREFILL=1."
+        )
+    if not enabled():
+        return
+    # Chunk pipelining owns the MoE exchange, over DP.
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
+        raise NotImplementedError(
+            "TPU_SEQUENCE_PARALLEL_PREFILL exchanges MoE rows over the EP group, "
+            "which TPU_MOE_COLLECTION_CHUNK_SIZE (DP chunk pipelining) does not "
+            "serve. Unset one of them."
         )
 
 
