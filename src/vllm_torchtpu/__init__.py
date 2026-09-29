@@ -357,9 +357,15 @@ def _patch_moe_fused_ep_threshold_contract() -> None:
                 input_ids,
             )
 
-        # Run the baseline external-dispatch path for small shapes.
+        # Run the baseline external-dispatch path for small shapes: vLLM's
+        # `_forward_impl` with its dispatch and combine forced on, since the
+        # quant method claims them for the fused shapes.
         self.routed_experts._ensure_moe_quant_config_init()
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        shared_experts_overlapping = False
+        if self._shared_experts is not None:
+            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                shared_experts_input
+            )
         if self.gate is not None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
@@ -387,10 +393,8 @@ def _patch_moe_fused_ep_threshold_contract() -> None:
                 router_logits=router_logits,
                 input_ids=input_ids,
             )
-            self._maybe_apply_shared_experts(
-                shared_experts_input,
-                moe_runner.SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-            )
+            if shared_experts_overlapping:
+                self._shared_experts.wait()
 
             fused_output = ep_group.combine(
                 fused_output,

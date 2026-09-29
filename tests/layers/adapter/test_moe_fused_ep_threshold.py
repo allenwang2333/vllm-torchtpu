@@ -78,7 +78,6 @@ def test_small_fused_ep_bucket_restores_external_dispatch(monkeypatch):
         routed_experts=routed_experts,
         gate=None,
         _shared_experts=None,
-        _maybe_sync_shared_experts_stream=lambda value: None,
         _maybe_apply_shared_experts=lambda value, order: shared_orders.append(order),
         _sequence_parallel_context=lambda: nullcontext(),
     )
@@ -96,10 +95,9 @@ def test_small_fused_ep_bucket_restores_external_dispatch(monkeypatch):
     assert ep_group.combine_args[0].shape == (128, 3)
     assert ep_group.combine_args[1] is False
     assert actual.shape == hidden_states.shape
-    assert shared_orders == [
-        moe_runner_mod.SharedExpertsOrder.NO_OVERLAP,
-        moe_runner_mod.SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
-    ]
+    # vLLM's `_apply_quant_method` applies the shared experts once, in the
+    # NO_OVERLAP order, and waits on a stream it launched earlier.
+    assert shared_orders == [moe_runner_mod.SharedExpertsOrder.NO_OVERLAP]
 
     large_hidden = torch.empty(256, 3)
     large_logits = torch.empty(256, 8)
