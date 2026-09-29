@@ -730,3 +730,27 @@ def test_a_replicated_mtp_draft_is_built_without_it(enabled, monkeypatch):
     assert getattr(layer, patch.SP_LAYER_ATTR) is False
     assert layer.use_attn_reduce_scatter_for_moe is False
     assert sp._layers_built == 0
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("MOE_FUSED_EP_KERNEL_IMPL", "adaptive"),
+        ("TPU_MOE_COLLECTION_CHUNK_SIZE", "4096"),
+    ],
+)
+def test_moe_paths_that_own_a_dp_exchange_are_refused(
+    enabled, monkeypatch, name, value
+):
+    """The adaptive kernel takes a sequence-parallel layer's rows as always
+    sliced, and chunk pipelining exchanges over the DP group: neither serves a
+    step whose rows are replicated one step and sliced the next."""
+    from vllm.model_executor.models import qwen3_next
+
+    # Were it not refused, stop before patching vLLM for the rest of the session.
+    monkeypatch.setattr(
+        qwen3_next.Qwen3NextDecoderLayer, "_tpu_sp_by_rows_patch", True, raising=False
+    )
+    monkeypatch.setenv(name, value)
+    with pytest.raises(NotImplementedError, match=name):
+        patch.install()

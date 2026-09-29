@@ -33,7 +33,7 @@ SP_RANK_ATTR = "_tpu_sp_rank"
 
 def install() -> None:
     """Patch the decoder layers and the forwards around them, if selected."""
-    sequence_parallel.check_fp8_gather()
+    sequence_parallel.check_flags()
     if not sequence_parallel.enabled():
         return
     from vllm.model_executor.models import (

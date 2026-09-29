@@ -54,10 +54,27 @@ def fp8_gather() -> bool:
     return enabled() and envs.TPU_SEQUENCE_PARALLEL_FP8_GATHER
 
 
-def check_fp8_gather() -> None:
+def check_flags() -> None:
+    """Raise on flags that cannot be combined with sequence parallelism."""
     if envs.TPU_SEQUENCE_PARALLEL_FP8_GATHER and not enabled():
         raise ValueError(
             "TPU_SEQUENCE_PARALLEL_FP8_GATHER needs TPU_SEQUENCE_PARALLEL_PREFILL=1."
+        )
+    if not enabled():
+        return
+    # Both own the MoE exchange: the adaptive kernel takes a sequence-parallel
+    # layer's rows as always sliced, and chunk pipelining exchanges over DP.
+    if envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive":
+        raise NotImplementedError(
+            "TPU_SEQUENCE_PARALLEL_PREFILL slices a step's rows only above "
+            f"{MIN_ROWS} rows, which MOE_FUSED_EP_KERNEL_IMPL=adaptive does not "
+            "serve. Use MOE_FUSED_EP_KERNEL_IMPL=v3 or unset it."
+        )
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
+        raise NotImplementedError(
+            "TPU_SEQUENCE_PARALLEL_PREFILL exchanges MoE rows over the EP group, "
+            "which TPU_MOE_COLLECTION_CHUNK_SIZE (DP chunk pipelining) does not "
+            "serve. Unset one of them."
         )
 
 
