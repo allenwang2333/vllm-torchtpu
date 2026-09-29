@@ -98,13 +98,19 @@ if [[ "${block_size}" != "${PREFILL_CHUNK_TOKENS}" ]]; then
 fi
 echo "KV block and prefill chunk: ${block_size} tokens"
 
-# metric <base url> <name> [label]: a counter summed over its series, 0 when
-# absent. The label is a substring of the series' label set.
+# metric <base url> <name> [label]: a counter summed over its series. The label
+# is a substring of the series' label set. -1 when the engine does not answer
+# or has no such series, so that a counter nobody could read is never taken for
+# one that reads 0.
 metric() {
-  curl -sf --max-time 30 "$1/metrics" \
-    | awk -v name="$2" -v label="${3:-}" '
-        index($0, name) == 1 && (label == "" || index($0, label)) {s += $NF}
-        END {printf "%d", s}'
+  local body
+  if ! body="$(curl -sf --max-time 30 "$1/metrics")"; then
+    echo -1
+    return
+  fi
+  awk -v name="$2" -v label="${3:-}" '
+    index($0, name) == 1 && (label == "" || index($0, label)) {s += $NF; n++}
+    END {if (n) printf "%d", s; else printf "-1"}' <<<"${body}"
 }
 
 declare -A stage_rc=()
@@ -118,7 +124,7 @@ stage() {
 }
 
 check_counters() {
-  local rc=0 name value
+  local rc=0 name value unread=0
   local by_source=vllm:prompt_tokens_by_source_total
   local -A must_be_positive=(
     [decode_external_kv_transfer_tokens]="$(metric "${DECODE_URL}" \
@@ -132,34 +138,47 @@ check_counters() {
     [prefill_preemptions]="$(metric "${PREFILL_URL}" vllm:num_preemptions_total)"
     [decode_preemptions]="$(metric "${DECODE_URL}" vllm:num_preemptions_total)"
   )
-  for name in "${!must_be_positive[@]}"; do
-    value="${must_be_positive[${name}]}"
+  local computed
+  computed="$(metric "${DECODE_URL}" "${by_source}" 'source="local_compute"')"
+
+  for name in "${!must_be_positive[@]}" "${!must_be_zero[@]}"; do
+    value="${must_be_positive[${name}]:-${must_be_zero[${name}]:-}}"
     echo "COUNTER ${name} ${value}"
-    if [[ "${value}" -le 0 ]]; then
+    if [[ "${value}" -lt 0 ]]; then
+      echo "COUNTER_FAIL ${name} could not be read"
+      unread=1
+    fi
+  done
+  echo "COUNTER decode_local_compute_tokens ${computed}"
+  if [[ "${computed}" -lt 0 ]]; then
+    echo "COUNTER_FAIL decode_local_compute_tokens could not be read"
+    unread=1
+  fi
+  # What follows compares counters, which means nothing if one is missing.
+  [[ "${unread}" -eq 0 ]] || return 1
+
+  for name in "${!must_be_positive[@]}"; do
+    if [[ "${must_be_positive[${name}]}" -eq 0 ]]; then
       echo "COUNTER_FAIL ${name} is 0: no request took that path"
       rc=1
     fi
   done
-  local computed transferred reused share
-  computed="$(metric "${DECODE_URL}" "${by_source}" 'source="local_compute"')"
+  for name in "${!must_be_zero[@]}"; do
+    if [[ "${must_be_zero[${name}]}" -ne 0 ]]; then
+      echo "COUNTER_FAIL ${name} is ${must_be_zero[${name}]}, expected 0"
+      rc=1
+    fi
+  done
+  local transferred reused share
   transferred="${must_be_positive[decode_external_kv_transfer_tokens]}"
   reused="${must_be_positive[decode_local_cache_hit_tokens]}"
   share="$(awk -v c="${computed}" -v t="$((computed + transferred + reused))" \
     'BEGIN {printf "%d", (t > 0) ? 100 * c / t : 100}')"
-  echo "COUNTER decode_local_compute_tokens ${computed} (${share}% of its prompt tokens)"
+  echo "decode computed ${share}% of its prompt tokens itself"
   if [[ "${share}" -gt "${MAX_DECODE_COMPUTE_PCT}" ]]; then
-    echo "COUNTER_FAIL decode computed ${share}% of its prompt tokens itself," \
-      "over ${MAX_DECODE_COMPUTE_PCT}%"
+    echo "COUNTER_FAIL that is over ${MAX_DECODE_COMPUTE_PCT}%"
     rc=1
   fi
-  for name in "${!must_be_zero[@]}"; do
-    value="${must_be_zero[${name}]}"
-    echo "COUNTER ${name} ${value}"
-    if [[ "${value}" -ne 0 ]]; then
-      echo "COUNTER_FAIL ${name} is ${value}, expected 0"
-      rc=1
-    fi
-  done
   return "${rc}"
 }
 
