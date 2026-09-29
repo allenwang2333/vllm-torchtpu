@@ -98,6 +98,7 @@ def test_sample_tokens_preserves_connector_lifecycle(
         ),
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
         _is_async_drafter=method == "mtp",
+        _stage_timing=MagicMock(),
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),
@@ -123,6 +124,7 @@ def test_sample_tokens_preserves_connector_lifecycle(
         _update_placeholder=lambda *args: {"r0": 0},
         finalize_kv_connector=TPUModelRunner.finalize_kv_connector,
     )
+    runner._stage_timing.take_samples.return_value = ([], [])
     for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
