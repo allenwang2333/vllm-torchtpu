@@ -13,7 +13,7 @@
 # limitations under the License.
 """Row-gated sequence parallelism on the CPU.
 
-The decoder, model and MTP forwards run on two simulated TP ranks (threads
+The decoder and model forwards run on two simulated TP ranks (threads
 exchanging through fake collectives) against a one-device reference; the
 MoE block goes through the real communicator.
 """
@@ -257,31 +257,6 @@ class _Model(torch.nn.Module):
         return hidden_states
 
 
-class _Predictor(torch.nn.Module):
-    """vLLM 0.29's MTP predictor forward, likewise."""
-
-    def __init__(self, layer):
-        super().__init__()
-        self.layers = torch.nn.ModuleList([layer])
-        self.num_mtp_layers = 1
-        self.norm = _Norm()
-
-    def forward(
-        self,
-        input_ids,
-        positions,
-        hidden_states,
-        intermediate_tensors=None,
-        inputs_embeds=None,
-        spec_step_idx=0,
-    ):
-        hidden_states = hidden_states + inputs_embeds
-        layer = self.layers[spec_step_idx % self.num_mtp_layers]
-        hidden_states, residual = layer(hidden_states, None, positions)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-
 @pytest.fixture
 def tp(monkeypatch, enabled):
     """Two TP ranks whose TP and EP groups are the fake."""
@@ -366,68 +341,6 @@ def test_the_target_model_matches_one_device(tp, monkeypatch, rows, fp8_gather):
         torch.testing.assert_close(out, expected)
 
 
-@pytest.mark.parametrize("rows", [4, 2 * _MIN_ROWS], ids=lambda r: f"{r}rows")
-def test_the_mtp_draft_matches_one_device(tp, rows):
-    ((w, s),) = _weights(1, seed=2)
-    g = torch.Generator().manual_seed(3)
-    target_hidden = torch.randn(rows, _H, generator=g)
-    embeds = torch.randn(rows, _H, generator=g)
-    positions = torch.arange(rows)
-
-    reference = _Predictor(
-        _bind(_layer(w, s, None, 0, "full_attention"), _reference_layer)
-    )
-    expected = reference(None, positions, target_hidden, inputs_embeds=embeds)
-
-    predictor_forward = patch._gather_mtp_rows(_Predictor.forward)
-    sp.set_active(sp.step_is_sequence_parallel(rows))
-
-    def rank_forward(rank):
-        communicator = comm.TpuDeviceCommunicator()
-        layer = _layer(
-            _shares(w, rank), _shares(s, rank), communicator, rank, "full_attention"
-        )
-        predictor = _Predictor(_bind(layer, tp.forward))
-        return predictor_forward(
-            predictor, None, positions, target_hidden, inputs_embeds=embeds
-        )
-
-    for out in tp.group.run(rank_forward):
-        torch.testing.assert_close(out, expected)
-
-
-def test_a_stale_step_form_breaks_the_draft(tp):
-    """What the draft's own `set_active` prevents: a sequence-parallel draft
-    step run under a smaller target step's record combines other ranks' rows."""
-    ((w, s),) = _weights(1, seed=2)
-    rows = 2 * _MIN_ROWS
-    g = torch.Generator().manual_seed(3)
-    target_hidden, embeds = torch.randn(rows, _H, generator=g), torch.randn(rows, _H)
-    positions = torch.arange(rows)
-    reference = _Predictor(
-        _bind(_layer(w, s, None, 0, "full_attention"), _reference_layer)
-    )
-    expected = reference(None, positions, target_hidden, inputs_embeds=embeds)
-    predictor_forward = patch._gather_mtp_rows(_Predictor.forward)
-    sp.set_active(False)
-
-    def rank_forward(rank):
-        communicator = comm.TpuDeviceCommunicator()
-        layer = _layer(
-            _shares(w, rank), _shares(s, rank), communicator, rank, "full_attention"
-        )
-        return predictor_forward(
-            _Predictor(_bind(layer, tp.forward)),
-            None,
-            positions,
-            target_hidden,
-            inputs_embeds=embeds,
-        )
-
-    for out in tp.group.run(rank_forward):
-        assert not torch.allclose(out, expected)
-
-
 @pytest.mark.parametrize("fp8_gather", [False, True], ids=["bf16", "fp8"])
 def test_both_forms_lift_the_same_inputs(enabled, monkeypatch, fp8_gather):
     """A bucket compiled by one form's trace is handed to the other's
@@ -480,9 +393,7 @@ def test_install_patches_the_vllm_classes_once(enabled, monkeypatch):
 
     from vllm.model_executor.models import (
         qwen3_5,
-        qwen3_5_mtp,
         qwen3_next,
-        qwen3_next_mtp,
     )
 
     layer_cls = qwen3_next.Qwen3NextDecoderLayer
@@ -491,8 +402,6 @@ def test_install_patches_the_vllm_classes_once(enabled, monkeypatch):
         (layer_cls, "forward"),
         (qwen3_5.Qwen3_5DecoderLayer, "__init__"),
         (qwen3_next.Qwen3NextModel, "forward"),
-        (qwen3_next_mtp.Qwen3NextMultiTokenPredictor, "forward"),
-        (qwen3_5_mtp.Qwen3_5MultiTokenPredictor, "forward"),
     ]
     originals = [vars(cls)[name] for cls, name in targets]
     for (cls, name), original in zip(targets, originals):
@@ -698,14 +607,17 @@ def test_the_attention_projects_the_gathered_rows(monkeypatch):
     )
 
 
-def test_a_replicated_mtp_draft_is_built_without_it(enabled, monkeypatch):
-    """draft_tensor_parallel_size=1 builds the draft under a TP group
-    collapsed to one rank (spec_decode.utils._force_draft_tp1) while the
-    parallel config still says TP8; its layers run unsharded, so a
-    collective in their forward would sum eight full copies."""
+@pytest.mark.parametrize("draft_tp", [8, 1], ids=["sharded-draft", "replicated-draft"])
+def test_the_mtp_draft_is_built_outside_it(enabled, monkeypatch, draft_tp):
+    """The draft ("eagle_head" graph) compiles every bucket from one trace,
+    which cannot carry both forms, so it runs vLLM's plain TP form. A
+    replicated draft (draft_tensor_parallel_size=1) is built under a TP group
+    collapsed to one rank while the parallel config still says TP8."""
+    from vllm.compilation import backends
+
     monkeypatch.setattr(vllm_distributed, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
-        vllm_distributed, "get_tensor_model_parallel_world_size", lambda: 1
+        vllm_distributed, "get_tensor_model_parallel_world_size", lambda: draft_tp
     )
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
@@ -724,12 +636,18 @@ def test_a_replicated_mtp_draft_is_built_without_it(enabled, monkeypatch):
             self.use_attn_reduce_scatter_for_moe = sp.use_sequence_parallel_moe(
                 vllm_config.parallel_config
             )
+            self.input_layernorm = torch.nn.Linear(1, 1)
 
     Layer.__init__ = patch._build_row_gated(Layer.__init__)
-    layer = Layer(vllm_config, "full_attention", prefix="mtp.layers.0")
+    with backends.set_model_tag("eagle_head"):
+        layer = Layer(vllm_config, "full_attention", prefix="mtp.layers.0")
     assert getattr(layer, patch.SP_LAYER_ATTR) is False
     assert layer.use_attn_reduce_scatter_for_moe is False
     assert sp._layers_built == 0
+    if draft_tp > 1:
+        # The same layer in the backbone takes the row-gated form.
+        backbone = Layer(vllm_config, "full_attention", prefix="model.layers.0")
+        assert getattr(backbone, patch.SP_LAYER_ATTR) is True
 
 
 def test_moe_chunk_pipelining_is_refused(enabled, monkeypatch):
@@ -744,3 +662,40 @@ def test_moe_chunk_pipelining_is_refused(enabled, monkeypatch):
     monkeypatch.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "4096")
     with pytest.raises(NotImplementedError, match="TPU_MOE_COLLECTION_CHUNK_SIZE"):
         patch.install()
+
+
+@pytest.mark.parametrize("row_gated", [False, True], ids=["draft", "backbone"])
+def test_only_a_row_gated_layer_leaves_a_row_count_guard(
+    enabled, monkeypatch, row_gated
+):
+    """The draft graph is traced once for every bucket, so a layer built
+    outside the row-gated form must leave no guard on the row count: one
+    trace serves both sides of MIN_ROWS. The backbone's layer is the control."""
+    for name, fn in dict(
+        tensor_model_parallel_all_gather=lambda x, dim=0: x,
+        tensor_model_parallel_reduce_scatter=lambda x, dim=0: x,
+        tensor_model_parallel_all_reduce=lambda x: x,
+        get_tensor_model_parallel_world_size=lambda: 1,
+    ).items():
+        monkeypatch.setattr(vllm_distributed, name, fn)
+    ((w, s),) = _weights(1)
+    forward = patch._row_gated_forward(_reference_layer)
+    layer = _bind(_layer(w, s, None, 0, "full_attention"), forward)
+    setattr(layer, patch.SP_LAYER_ATTR, row_gated)
+    traces = []
+
+    def backend(graph, example_inputs):
+        traces.append(graph)
+        return graph.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        lambda x, p: layer(x, None, p), backend=backend, fullgraph=True
+    )
+    for rows in (4, 2 * _MIN_ROWS):
+        x, p = torch.randn(rows, _H), torch.arange(rows)
+        torch._dynamo.mark_dynamic(x, 0)
+        torch._dynamo.mark_dynamic(p, 0)
+        compiled(x, p)
+    torch._dynamo.reset()
+    assert len(traces) == (2 if row_gated else 1)

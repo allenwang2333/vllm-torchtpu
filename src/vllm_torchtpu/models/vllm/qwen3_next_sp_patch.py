@@ -10,10 +10,14 @@ own trace; a Python flag would be frozen at the first trace.
 
 The layer is still built for vLLM's form (projections without their
 all-reduce, the MoE block and experts sequence parallel), then its
-`use_attn_reduce_scatter_for_moe` is cleared so the model and MTP forwards
-neither chunk the input nor gather the output; the first layer of a
+`use_attn_reduce_scatter_for_moe` is cleared so the model forward neither
+chunks the input nor gathers the output; the first layer of a
 sequence-parallel step slices its own rows after the reduce-scatter, and the
-model forwards gather the rows back after the final norm.
+model forward gathers the rows back after the final norm.
+
+Only the backbone takes it. The MTP draft ("eagle_head" graph) is compiled
+for every bucket from one trace, which cannot carry both forms, so it is
+built and run as vLLM's plain TP form.
 """
 
 import functools
@@ -36,12 +40,7 @@ def install() -> None:
     sequence_parallel.check_flags()
     if not sequence_parallel.enabled():
         return
-    from vllm.model_executor.models import (
-        qwen3_5,
-        qwen3_5_mtp,
-        qwen3_next,
-        qwen3_next_mtp,
-    )
+    from vllm.model_executor.models import qwen3_5, qwen3_next
 
     layer_cls = qwen3_next.Qwen3NextDecoderLayer
     if getattr(layer_cls, "_tpu_sp_by_rows_patch", False):
@@ -56,11 +55,6 @@ def install() -> None:
         attention_cls.forward = _attention_forward(attention_cls.forward)
     model_cls = qwen3_next.Qwen3NextModel
     model_cls.forward = _gather_model_rows(model_cls.forward)
-    for cls in (
-        qwen3_next_mtp.Qwen3NextMultiTokenPredictor,
-        qwen3_5_mtp.Qwen3_5MultiTokenPredictor,
-    ):
-        cls.forward = _gather_mtp_rows(cls.forward)
     layer_cls._tpu_sp_by_rows_patch = True
     logger.info(
         "Applied TPU patch: sequence parallelism for steps of at least %d rows.",
@@ -71,14 +65,19 @@ def install() -> None:
 def _build_row_gated(original_init):
     @functools.wraps(original_init)
     def __init__(self, vllm_config, *args, **kwargs):
+        # Read at call time: `set_model_tag` rebinds the module global.
+        from vllm.compilation import backends
         from vllm.distributed import (
             get_tensor_model_parallel_rank,
             get_tensor_model_parallel_world_size,
         )
 
-        # A replicated MTP draft (draft_tensor_parallel_size=1) is built under
-        # a TP group collapsed to one rank and runs unsharded.
-        if get_tensor_model_parallel_world_size() > 1:
+        # Backbone only (module docstring). A replicated draft is also built
+        # under a TP group collapsed to one rank.
+        if (
+            backends.model_tag == "backbone"
+            and get_tensor_model_parallel_world_size() > 1
+        ):
             with sequence_parallel.building_layer():
                 original_init(self, vllm_config, *args, **kwargs)
         else:
@@ -244,37 +243,6 @@ def _gather_model_rows(original_forward):
         first = self.layers[self.start_layer]
         if (
             getattr(first, SP_LAYER_ATTR, False)
-            and positions.shape[-1] >= sequence_parallel.MIN_ROWS
-        ):
-            return _gather_rows(out, positions.shape[-1])
-        return out
-
-    return forward
-
-
-def _gather_mtp_rows(original_forward):
-    @functools.wraps(original_forward)
-    def forward(
-        self,
-        input_ids,
-        positions,
-        hidden_states,
-        intermediate_tensors=None,
-        inputs_embeds=None,
-        spec_step_idx=0,
-    ):
-        out = original_forward(
-            self,
-            input_ids,
-            positions,
-            hidden_states,
-            intermediate_tensors,
-            inputs_embeds,
-            spec_step_idx,
-        )
-        layer = self.layers[spec_step_idx % self.num_mtp_layers]
-        if (
-            getattr(layer, SP_LAYER_ATTR, False)
             and positions.shape[-1] >= sequence_parallel.MIN_ROWS
         ):
             return _gather_rows(out, positions.shape[-1])

@@ -22,8 +22,9 @@ four.
 
 The decoder layers (models/vllm/qwen3_next_sp_patch) take the form from the
 row count, a shape, so each form is its own trace (compilation/shape_variants).
-The communicator cannot see the row count, so the caller of each compiled
-model records the form here first (`set_active`); a trace reads it once.
+The communicator cannot see the row count, so the runner records the form
+here before each backbone call (`set_active`); a trace reads it once. Only
+the backbone takes it: the MTP draft runs the plain TP form.
 """
 
 import contextlib
