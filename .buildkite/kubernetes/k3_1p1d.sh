@@ -65,6 +65,7 @@ head_ip() {
 # starts the engine's workers here; see warm_remote_code.py for why.
 warm_remote_code() {
   local uri
+  # shellcheck source=/dev/null
   uri=$(source "$REPO_DIR/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh" \
     >/dev/null && echo "$MODEL_URI") || return 1
   timeout 600 python3 "$HERE/warm_remote_code.py" "$uri"
@@ -173,9 +174,10 @@ served() {
     "$run_dir/config.json" "$1"
 }
 
-# Both run even if the first fails: the pair holds 32 chips, and there is no
-# sense spending them to learn one fact.
-rc=0
+# The eval runs even if a stage fails: the pair holds 32 chips, and there is no
+# sense spending them to learn one fact. Not if the stages could not start,
+# though, which is this script's fault or the config's and not the pair's.
+stages_rc=0
 
 echo "--- Correctness stages through the proxy"
 PROXY_PORT="$PROXY_PORT" \
@@ -183,7 +185,12 @@ PREFILL_URL="http://127.0.0.1:${PORT}" \
 DECODE_URL="http://${DECODE_HOST}:${PORT}" \
 PREFILL_CHUNK_TOKENS="$(served max_num_batched_tokens)" \
 LOG_DIR="${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness" \
-  bash scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh || rc=1
+  bash scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh || stages_rc=$?
+if [[ "$stages_rc" -gt 1 ]]; then
+  echo "ERROR: the correctness stages did not start (exit ${stages_rc})"
+  exit 1
+fi
+rc="$stages_rc"
 
 # No benchmark: what the pair serves is set by the stages above, one KV block
 # to a prefill chunk, and its latency describes nothing a reader tracks. The

@@ -54,6 +54,9 @@
 # Stages 4 and 5 compare tokens, which needs a prefill chunk to be one KV block
 # (configs/kimi-k3-tp32-ep-1p1d.sh); this refuses to start otherwise.
 #
+# Exit status: 0 every stage passed, 1 a stage failed, anything else no stage
+# was run.
+#
 # Environment:
 #   PROXY_HOST, PROXY_PORT   the proxy in front of the pair
 #   PREFILL_URL, DECODE_URL  the engines, for /metrics
@@ -66,9 +69,12 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-moonshotai/Kimi-K3}"
 PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
 PROXY_PORT="${PROXY_PORT:-8100}"
-: "${PREFILL_URL:?PREFILL_URL must name the prefill engine}"
-: "${DECODE_URL:?DECODE_URL must name the decode engine}"
-: "${PREFILL_CHUNK_TOKENS:?PREFILL_CHUNK_TOKENS must be the served chunk size}"
+for name in PREFILL_URL DECODE_URL PREFILL_CHUNK_TOKENS; do
+  if [[ -z "${!name:-}" ]]; then
+    echo "ERROR: ${name} must be set" >&2
+    exit 2
+  fi
+done
 LOG_DIR="${LOG_DIR:-${TMPDIR:-/tmp}/k3_1p1d_disagg_ci}"
 
 K3_PD_CONCURRENCY="${K3_PD_CONCURRENCY:-8}"
@@ -76,7 +82,7 @@ CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS:-{\"thinking\":false\}}"
 DIVERGENCE_LOGPROB_ATOL="${DIVERGENCE_LOGPROB_ATOL:-0.2}"
 MAX_DECODE_COMPUTE_PCT="${MAX_DECODE_COMPUTE_PCT:-5}"
 
-mkdir -p "${LOG_DIR}" || exit 1
+mkdir -p "${LOG_DIR}" || exit 2
 
 # The block size the engine settled on, which may not be the one asked for.
 # From /metrics: the workers log it, and their logs stay on their own hosts.
@@ -88,7 +94,7 @@ if [[ "${block_size}" != "${PREFILL_CHUNK_TOKENS}" ]]; then
   echo "ERROR: the engine chose a '${block_size}'-token block but prefill" \
     "chunks are ${PREFILL_CHUNK_TOKENS} tokens; the token-equality stages" \
     "need them equal"
-  exit 1
+  exit 2
 fi
 echo "KV block and prefill chunk: ${block_size} tokens"
 
