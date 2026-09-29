@@ -341,6 +341,8 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         }
         sc = {
             "cache_layout": sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            # The bounded small-chunk path is opt-in on this branch.
+            "small_chunk_tokens": 16,
             **kwargs,
         }
 
