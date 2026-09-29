@@ -263,8 +263,21 @@ def fused_ep_moe_v2(
     score_bias=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    expert_map=None,
+    return_expert_load=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
+
+    expert_map (int32 [experts], replicated) is the online expert load
+    balancer's logical -> physical table: a selected logical expert e is
+    computed by the expert stored at EP-rank-order slot expert_map[e]. It is
+    applied to the selected ids after top-k, so selection, weights and tie
+    order are those of the logical router, and the combine sums a token's
+    experts in top-k slot order, so a table that matches where the weights
+    actually sit changes no output bit. return_expert_load additionally
+    returns the step's global routed pairs per physical slot in device-mesh
+    order, int32 [experts], the same on every shard (it is the column sum of
+    the count table every shard already all-gathers), as a second output.
 
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
     inter, hidden] and gating [tokens, experts], all sharded over the mesh
@@ -405,6 +418,12 @@ def fused_ep_moe_v2(
     has_w1_bias = w1_bias is not None
     has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
+    has_expert_map = expert_map is not None
+    if has_expert_map and expert_map.shape != (e_total,):
+        raise ValueError(
+            f"expert_map must be one slot per global expert, [{e_total}]; "
+            f"got {tuple(expert_map.shape)}"
+        )
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -437,6 +456,7 @@ def fused_ep_moe_v2(
         w2s_l = next(operands) if form.has_scales else None
         gate_l = next(operands)
         score_bias_l = next(operands) if has_score_bias else None
+        expert_map_l = next(operands) if has_expert_map else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
@@ -477,6 +497,11 @@ def fused_ep_moe_v2(
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=scores,
+            )
+        if expert_map_l is not None:
+            # Logical -> physical (EP-rank order), on the [t, topk] ids only.
+            topk_idx = jnp.take(
+                expert_map_l.astype(jnp.int32), topk_idx, axis=0, mode="clip"
             )
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
@@ -681,7 +706,10 @@ def fused_ep_moe_v2(
         # A dead row's positions point at arrival rows nothing wrote for it,
         # which can hold fp8 NaN, and a zero weight does not cancel NaN.
         combined = jnp.where(dead_row[:, None], jnp.zeros((), combined.dtype), combined)
-        return token_layout.restore(combined, ax)
+        out = token_layout.restore(combined, ax)
+        if return_expert_load:
+            return out, rows_by_dest.sum(axis=0).astype(jnp.int32)
+        return out
 
     # The biases ride the same expert-axis sharding as the weights they
     # belong to, so no shard ever holds a bias for an expert it does not own.
@@ -703,12 +731,21 @@ def fused_ep_moe_v2(
     # Sharding it would give each shard a 1/ep slice of the experts and
     # silently bias the wrong ones.
     score_bias_args = (score_bias,) if has_score_bias else ()
+    # The expert map is indexed by global logical id, replicated like the bias.
+    expert_map_args = (expert_map,) if has_expert_map else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args))
-        + (P(),) * len(score_bias_args)
+        + (P(),) * (len(score_bias_args) + len(expert_map_args))
         + (P(ax),) * len(bias_args)
     )
-    args = (x, rank, w1, w2) + scale_args + (gating,) + score_bias_args + bias_args
+    args = (
+        (x, rank, w1, w2)
+        + scale_args
+        + (gating,)
+        + score_bias_args
+        + expert_map_args
+        + bias_args
+    )
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -740,6 +777,8 @@ def fused_ep_moe_v2(
         scoring_fn,
         has_score_bias and score_bias.dtype,
         float(routed_scaling_factor),
+        has_expert_map,
+        bool(return_expert_load),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
@@ -750,7 +789,7 @@ def fused_ep_moe_v2(
                     local_fn,
                     mesh=mesh,
                     in_specs=in_specs,
-                    out_specs=P(ax),
+                    out_specs=(P(ax), P()) if return_expert_load else P(ax),
                     check_vma=False,
                 )
                 _LAYER_SM_CACHE[key] = sm

@@ -3009,14 +3009,21 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        t = torch.tensor(
-            [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        # EPLB (VLLM_TPU_EPLB, created on every rank or none) rides this same
+        # all-reduce: MAX of [count, -count] gives the DP-wide max and min of
+        # the forward counter, so the rebalance trigger is a global quantity.
+        eplb = getattr(self, "_tpu_eplb", None)
+        vals = [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)]
+        if eplb is not None:
+            # [count, -count, -tokens]: max/min forward count, and min tokens
+            # (0 when any rank is idle) for the rebalance busy gate.
+            vals += [int(eplb.count), -int(eplb.count), -int(local_num_tokens)]
+        t = torch.tensor(vals, dtype=torch.int64, device="cpu")
+        t_ar = time.perf_counter()
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
+        ar_ms = (time.perf_counter() - t_ar) * 1e3
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         # Every rank reads the same reduced values, so every rank takes the
         # same branch -- which the megakernel's in-kernel collectives require.
@@ -3030,6 +3037,18 @@ class TPUModelRunner(GPUModelRunner):
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
+        if eplb is not None:
+            # Both the busy path (execute_model) and the idle path
+            # (execute_dummy_batch) come through here once per step, before
+            # the step's forwards, so a rebalance runs at the same point on
+            # every rank. A megakernel decode step runs no counted forward.
+            eplb.on_step(
+                int(t[3].item()),
+                -int(t[4].item()),
+                0 if self._mk_decode_step else int(t[1].item()),
+                allreduce_ms=ar_ms,
+                min_tokens=-int(t[5].item()),
+            )
         return bucket, int(t[1].item())
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
@@ -3097,6 +3116,8 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        self._probe_route_real = scheduler_output.total_num_scheduled_tokens
+        self._probe_route_req = next(iter(scheduler_output.num_scheduled_tokens), None)
         if self._pcp_enabled and self._mtp_enabled:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
@@ -4311,6 +4332,17 @@ class TPUModelRunner(GPUModelRunner):
 
         self._glm5_mk = Glm5Megakernel.maybe_create(self)
 
+        # Online expert load balancing (VLLM_TPU_EPLB): None unless armed and
+        # at least one MoE layer took the fused EP path with the map operand.
+        from vllm_torchtpu.distributed import tpu_eplb
+
+        self._tpu_eplb = tpu_eplb.create(self.model, self._glm5_mk)
+        if self._tpu_eplb is not None and not self._dp_lockstep_enabled():
+            # The trigger rides the DP lockstep all-reduce; without DP-EP
+            # there is no cross-rank placement to balance.
+            logger.warning("VLLM_TPU_EPLB ignored: needs DP>1 with expert parallel")
+            self._tpu_eplb = None
+
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
         )
@@ -5180,6 +5212,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        self._capture_model()
+        eplb = getattr(self, "_tpu_eplb", None)
+        if eplb is not None:
+            # Warmup routed nothing real; count serving traffic from here.
+            eplb.arm()
+
+    def _capture_model(self) -> None:
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
@@ -5951,6 +5990,29 @@ class TPUModelRunner(GPUModelRunner):
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        from vllm_torchtpu import probe_route
+
+        if not probe_route.BUFS:
+            return self._forward_model_timed(
+                input_ids, positions, inputs_embeds, intermediate_tensors
+            )
+        real = getattr(self, "_probe_route_real", 0)
+        self._probe_route_real = 0
+        out = self._forward_model_timed(
+            input_ids, positions, inputs_embeds, intermediate_tensors
+        )
+        if real and not getattr(self, "_mk_decode_step", False):
+            try:
+                probe_route.after_forward(
+                    self, int(real), self.positions_np, self._probe_route_req
+                )
+            except Exception as e:  # diagnostic only
+                print(f"PROBE_ROUTE error {e!r}", file=sys.stderr, flush=True)
+        return out
+
+    def _forward_model_timed(
+        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+    ):
         every = envs.GLM5_STEP_TIMING
         if not every:
             return self._forward_model(input_ids, positions, inputs_embeds, intermediate_tensors)
@@ -5983,6 +6045,19 @@ class TPUModelRunner(GPUModelRunner):
     def _forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        eplb = getattr(self, "_tpu_eplb", None)
+        if eplb is not None and eplb.trace_fwd_left > 0 and not getattr(self, "_eplb_tracing", False):
+            # VLLM_TPU_EPLB_TRACE: time the first forwards after a rebalance alone.
+            self._eplb_tracing = True
+            try:
+                return eplb.traced_forward(
+                    lambda: self._forward_model(
+                        input_ids, positions, inputs_embeds, intermediate_tensors),
+                    mk=bool(getattr(self, "_mk_decode_step", False)),
+                    n=int(input_ids.shape[0]),
+                )
+            finally:
+                self._eplb_tracing = False
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         if getattr(self, "_mk_decode_step", False):

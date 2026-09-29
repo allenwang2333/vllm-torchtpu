@@ -175,8 +175,15 @@ def _build_op(
     routed_scaling_factor=1.0,
     *,
     token_replica_groups=None,
+    eplb=False,
 ):
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+
+    ``eplb`` (VLLM_TPU_EPLB) adds one replicated operand after the score bias,
+    the layer's int32 [E] logical->physical expert map, and one replicated
+    output, the step's int32 [E] global routed pairs per physical slot. With
+    it off the op, its name and its program are what they always were.
+    """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     key = (
@@ -191,7 +198,7 @@ def _build_op(
         has_score_bias,
         routed_scaling_factor,
         token_replica_groups,
-    )
+    ) + (("eplb",) if eplb else ())
     cached = _OPS.get(key)
     if cached is not None:
         return cached
@@ -230,6 +237,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            return_expert_load=eplb,
             **bias_kw,
             **routing_kw,
         )
@@ -268,6 +276,43 @@ def _build_op(
             score_bias=score_bias.astype(jnp.float32),
         )
 
+    def moe_eplb(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        expert_map: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return call(
+            x, w1, w2, w1_scale, w2_scale, gating, rank, expert_map=expert_map
+        )
+
+    def moe_eplb_with_score_bias(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        expert_map: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            expert_map=expert_map,
+        )
+
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
@@ -276,18 +321,23 @@ def _build_op(
     # bias is NOT closed over as a constant because it differs per layer and
     # `_OPS` would then key one exported program per MoE layer.
     input_specs = (spec,) * 7 + ((PartitionSpec(),) if has_score_bias else ())
+    if eplb:
+        input_specs = input_specs + (PartitionSpec(),)
+        fn = moe_eplb_with_score_bias if has_score_bias else moe_eplb
+    else:
+        fn = moe_with_score_bias if has_score_bias else moe
     # Not stock `pallas.jax_op`: it sizes its outputs from the export's avals,
     # where a shard_map result is recorded as replicated, so this rank's 2048
     # rows come back claiming the mesh-wide 16384. `sharded_jax_op` is stock
     # with only that line replaced.
     op = sharded_jax_op(
         name,
-        moe_with_score_bias if has_score_bias else moe,
+        fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias] -- and
         # the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
-        output_partition_specs=spec,
+        output_partition_specs=(spec, PartitionSpec()) if eplb else spec,
     )
 
     # Deliberately replaces the shard-aware fake `sharded_jax_op` installed,
@@ -297,7 +347,11 @@ def _build_op(
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
 
-    op.register_fake(_fake)
+    def _fake_eplb(x, *args, **_kwargs):
+        e_total = args[-1].shape[0]
+        return torch.empty_like(x), x.new_empty((e_total,), dtype=torch.int32)
+
+    op.register_fake(_fake_eplb if eplb else _fake)
     _OPS[key] = op
     return op
 
@@ -335,9 +389,31 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    if score_bias is None:
-        return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER)
-    return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, score_bias)
+    bias_args = () if score_bias is None else (score_bias,)
+    expert_map = getattr(owner, FUSED_MOE_EP_EPLB_ATTR, None)
+    if expert_map is None:
+        return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *bias_args)
+    # Online EPLB: the map is a runtime operand, the load comes back beside
+    # the rows and is accumulated here, in the compiled graph.
+    layer = expert_map[0]
+    out, load = op(
+        hidden_states,
+        w1,
+        w2,
+        *scales,
+        router_logits,
+        _RANK_BUFFER,
+        *bias_args,
+        layer._tpu_eplb_map,
+    )
+    layer._tpu_eplb_load.add_(load)
+    return out
+
+
+# Set on the quant method by prebuild when VLLM_TPU_EPLB armed the layer: a
+# one-element list holding the layer module (a list so the method does not
+# register the layer as a child module).
+FUSED_MOE_EP_EPLB_ATTR = "_tpu_fused_eplb_layer"
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and
@@ -575,6 +651,7 @@ def prebuild_fused_moe_ep(
         has_score_bias,
         routed_scale,
         token_replica_groups=token_replica_groups,
+        eplb=envs.VLLM_TPU_EPLB,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
