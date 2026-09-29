@@ -988,7 +988,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 activation=activation_str,
             )
-            return
+            if not layer.moe_config.moe_parallel_config.is_sequence_parallel:
+                return
+            # A sequence-parallel layer's replicated steps take the grouped path.
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -1042,14 +1044,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
         if self._use_adaptive_fused_moe:
-            return adaptive_moe.run_adaptive_fused_moe(
-                self,
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
-                router_logits,
+            return adaptive_moe.apply_adaptive_fused_moe(
+                self, layer, x, router_logits, self._apply_grouped
             )
 
         # `score_bias_operand` is not optional, and omitting it is silent on
@@ -1080,6 +1076,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        return self._apply_grouped(layer, x, router_logits)
+
+    def _apply_grouped(
+        self, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """The grouped-matmul path: route, then fused_moe_gmm."""
+        activation_str = self._tpu_activation_str
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

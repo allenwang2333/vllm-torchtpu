@@ -209,30 +209,26 @@ def test_prebuild_passes_native_token_groups(context, monkeypatch):
     assert "sliced_rows" not in context[1].call_args.kwargs
 
 
-def test_a_sequence_parallel_layer_prebuilds_an_op_per_step_form(context, monkeypatch):
-    """Sliced steps give each rank its own rows (singleton groups); smaller
-    steps keep the rows replicated over TP (layers/adapter/sequence_parallel)."""
-    from vllm_torchtpu.layers.adapter import sequence_parallel
-
+def test_a_sequence_parallel_layer_prebuilds_the_sliced_op(context, monkeypatch):
+    """Only a sliced step (each rank's own rows, singleton groups) runs the
+    kernel; replicated steps take the grouped path."""
     _, build = context
-    build.side_effect = lambda *a, **kw: lambda: (
-        kw["token_replica_groups"],
-        kw.get("sliced_rows", False),
-    )
-    replicas = {True: ((0,), (1,)), False: ((0, 1),)}
-    monkeypatch.setattr(
-        bridge,
-        "ep_token_replica_groups",
-        lambda is_sequence_parallel: replicas[is_sequence_parallel],
-    )
+    discover = Mock(return_value=((0,), (1,)))
+    monkeypatch.setattr(bridge, "ep_token_replica_groups", discover)
     value = layer()
     value.moe_config.moe_parallel_config.is_sequence_parallel = True
-    ops = prebuild(value)
-    assert build.call_count == 2
-    monkeypatch.setattr(sequence_parallel, "_active", True)
-    assert ops() == (((0,), (1,)), True)
-    monkeypatch.setattr(sequence_parallel, "_active", False)
-    assert ops() == (((0, 1),), False)
+    prebuild(value)
+    discover.assert_called_once_with(is_sequence_parallel=True)
+    assert build.call_count == 1
+    assert build.call_args.kwargs["token_replica_groups"] == ((0,), (1,))
+    assert build.call_args.kwargs["sliced_rows"] is True
+
+
+def test_a_sequence_parallel_fp4_layer_is_refused(context):
+    value = layer(True)
+    value.moe_config.moe_parallel_config.is_sequence_parallel = True
+    with pytest.raises(ValueError, match="fp8 weights only"):
+        prebuild(value)
 
 
 def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch):

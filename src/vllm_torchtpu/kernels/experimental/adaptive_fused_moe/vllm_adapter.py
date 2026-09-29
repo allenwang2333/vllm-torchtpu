@@ -179,14 +179,17 @@ def prebuild_adaptive_fused_moe(
         skip_padded_tokens=skip_padded_tokens,
     )
     if parallel.is_sequence_parallel:
-        op = _by_step_form(
-            sliced=build(
-                token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
-                sliced_rows=True,
-            ),
-            replicated=build(
-                token_replica_groups=ep_token_replica_groups(is_sequence_parallel=False)
-            ),
+        if weight_format != "fp8":
+            raise ValueError(
+                "adaptive fused MoE serves a sequence-parallel layer with fp8 "
+                "weights only: its replicated steps take the fp8 grouped path"
+            )
+        # Only the sliced steps (each rank's own rows) run the kernel;
+        # `apply_adaptive_fused_moe` sends replicated steps to the grouped path.
+        op = build(
+            token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
+            sliced_rows=True,
+            experts_per_rank=local_experts,
         )
     else:
         op = build(
@@ -207,22 +210,6 @@ def prebuild_adaptive_fused_moe(
         skip_padded_tokens,
     )
     return op
-
-
-def _by_step_form(
-    *, sliced: Callable[..., torch.Tensor], replicated: Callable[..., torch.Tensor]
-) -> Callable[..., torch.Tensor]:
-    """The op of a sequence-parallel layer: `sliced` on a step whose rows are
-    sliced over the ranks, `replicated` on a smaller step whose rows every rank
-    holds whole (layers/adapter/sequence_parallel).
-
-    Each form is its own trace; both take the same operands.
-    """
-
-    def run(*args):
-        return (sliced if sequence_parallel.is_active() else replicated)(*args)
-
-    return run
 
 
 def _in_backbone_graph() -> bool:
@@ -469,11 +456,14 @@ def _build_op(
     token_replica_groups: tuple[tuple[int, ...], ...] | None = None,
     skip_padded_tokens: bool = False,
     sliced_rows: bool = False,
+    experts_per_rank: int = 1,
 ) -> Callable[..., torch.Tensor]:
     """The op for this closure, built once per distinct closure and reused.
 
     `sliced_rows`: each rank holds a contiguous slice of the step's rows (a
     sequence-parallel step), so it skips that slice of the step's padding mask.
+    Its rank operand is the layer's `experts_start`, divided here by
+    `experts_per_rank`.
     """
     key = (
         mesh,
@@ -486,6 +476,7 @@ def _build_op(
         token_replica_groups,
         skip_padded_tokens,
         sliced_rows,
+        experts_per_rank,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -497,6 +488,8 @@ def _build_op(
     name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
     def run_kernel(x, w1, w2, w1_scale, w2_scale, gating, rank, padded):
+        if experts_per_rank > 1:
+            rank = rank // experts_per_rank
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -584,11 +577,9 @@ def _build_op(
 
         def run(x, *args):
             if sliced_rows:
-                # The rank operand is this rank's mesh index, which is its EP
-                # rank and, with sequence parallelism, its TP rank.
-                padded = token_padding.rank_padding_mask(
-                    x.shape[0], ep, args[-1].reshape(1)
-                )
+                # EP rank = mesh index = TP rank with sequence parallelism.
+                rank = (args[-1] // experts_per_rank).reshape(1)
+                padded = token_padding.rank_padding_mask(x.shape[0], ep, rank)
             else:
                 # This rank's rows: the op takes each rank's own tokens.
                 padded = token_padding.local_padding_mask(x.shape[0])
@@ -603,6 +594,44 @@ def _build_op(
     return run
 
 
+def apply_adaptive_fused_moe(
+    owner: Any,
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    grouped: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """The FP8 layer's forward when the adaptive kernel owns its exchange.
+
+    A sequence-parallel layer runs the kernel only on a sliced step, where
+    each rank holds its own rows. A replicated step (below
+    sequence_parallel.MIN_ROWS rows) runs `grouped`, the method's
+    grouped-matmul path, between the dispatch and combine vLLM's MoERunner
+    would have issued. Each side is its own trace; both lift the weights,
+    `experts_start` and the padding mask, so a bucket compiled by one can be
+    handed to the other.
+    """
+    weights = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+    )
+    is_sequence_parallel = layer.moe_config.moe_parallel_config.is_sequence_parallel
+    if not is_sequence_parallel:
+        return run_adaptive_fused_moe(owner, x, *weights, router_logits)
+    if sequence_parallel.rows_are_sliced(is_sequence_parallel):
+        # The op divides `experts_start` into the rank inside the kernel
+        # program (EP rank = mesh index: ep_mesh.ep_rank_order is the identity).
+        rank = layer._experts_start.reshape(1, 1)
+        return run_adaptive_fused_moe(owner, x, *weights, router_logits, rank=rank)
+    from vllm.distributed.parallel_state import get_ep_group
+
+    ep = get_ep_group()
+    x, router_logits = ep.dispatch_router_logits(x, router_logits, True)
+    return ep.combine(grouped(layer, x, router_logits), True)
+
+
 def run_adaptive_fused_moe(
     owner: Any,
     hidden_states: torch.Tensor,
@@ -611,8 +640,16 @@ def run_adaptive_fused_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    *,
+    rank: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Execute a successfully prebuilt experimental op, or raise."""
+    """Execute a successfully prebuilt experimental op, or raise.
+
+    `rank` is the op's rank operand as device data (`experts_start` for a
+    sliced-rows op); the prebuild's mesh-index buffer by default.
+    """
+    if rank is None:
+        rank = _RANK_BUFFER
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR, None)
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
@@ -633,7 +670,7 @@ def run_adaptive_fused_moe(
             block_scale(w1_scale),
             block_scale(w2_scale),
             router_logits,
-            _RANK_BUFFER,
+            rank,
         )
     return op(
         hidden_states,
@@ -642,5 +679,5 @@ def run_adaptive_fused_moe(
         _squeeze_channel_scale_checked(w1_scale),
         _squeeze_channel_scale_checked(w2_scale),
         router_logits,
-        _RANK_BUFFER,
+        rank,
     )

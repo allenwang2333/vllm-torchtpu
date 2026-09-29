@@ -18,6 +18,7 @@ exchanging through fake collectives) against a one-device reference; the
 MoE block goes through the real communicator.
 """
 
+import functools
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -810,26 +811,56 @@ def adaptive(monkeypatch, enabled):
     op = bridge.prebuild_adaptive_fused_moe(
         layer, topk=_TOPK, renormalize=True, activation="silu"
     )
-    return SimpleNamespace(op=op, group=group, experts=experts, layer=layer)
+    # A replicated step's grouped path is exchanged by the real communicator.
+    monkeypatch.setattr(comm, "get_ep_group", lambda: group)
+    monkeypatch.setattr(
+        comm.DeviceCommunicatorBase,
+        "__init__",
+        lambda instance, *a, **k: setattr(instance, "use_all2all", False),
+    )
+    import vllm.distributed.parallel_state as parallel_state
+
+    communicator = comm.TpuDeviceCommunicator()
+    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: communicator)
+    owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: op})
+    return SimpleNamespace(
+        bridge=bridge, owner=owner, group=group, experts=experts, layer=layer
+    )
+
+
+def _rank_layer(layer, rank):
+    """`layer` as rank `rank` loads it: its first expert in `experts_start`."""
+    ns = SimpleNamespace(**vars(layer))
+    ns._experts_start = torch.tensor(rank * (_E // _TP), dtype=torch.int32)
+    return ns
+
+
+def _grouped(experts):
+    """The grouped path's contract: this rank's experts over the rows it is
+    given, padded rows (this rank's mask) routed nowhere."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    def grouped(layer, x, router_logits):
+        first = int(layer._experts_start)
+        local = [
+            w if first <= e < first + _E // _TP else None for e, w in enumerate(experts)
+        ]
+        mask = token_padding.local_padding_mask(x.shape[0])
+        return _moe(x, router_logits, local, mask)
+
+    return grouped
 
 
 def _adaptive_forward(adaptive, x, gating, sliced):
-    """Each fake rank's MoE output: its slice of the rows on a sliced step,
-    the rows whole on a replicated one."""
-    layer = adaptive.layer
+    """Each fake rank's MoE output through `apply_adaptive_fused_moe`: its
+    slice of the rows on a sliced step, the rows whole on a replicated one."""
+    grouped = _grouped(adaptive.experts)
 
     def rank_forward(rank):
         rows = x.chunk(_TP)[rank] if sliced else x
         logits = gating.chunk(_TP)[rank] if sliced else gating
-        rank_operand = torch.tensor([[rank]], dtype=torch.int32)
-        return adaptive.op(
-            rows,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            logits,
-            rank_operand,
+        return adaptive.bridge.apply_adaptive_fused_moe(
+            adaptive.owner, _rank_layer(adaptive.layer, rank), rows, logits, grouped
         )
 
     return adaptive.group.run(rank_forward)
@@ -844,11 +875,11 @@ def _adaptive_forward(adaptive, x, gating, sliced):
 def test_adaptive_on_a_sequence_parallel_layer_matches_one_device(
     adaptive, monkeypatch, rows, valid, wrong_form
 ):
-    """The adaptive op of a sequence-parallel layer runs on two fake ranks
-    against a one-device reference: sliced steps take singleton replica
-    groups and the rank's slice of the step's padding mask, replicated steps
-    the TP replica group and the whole mask. Taking the other form's op
-    (positive control) must fail the comparison."""
+    """A sequence-parallel layer's MoE on two fake ranks against a one-device
+    reference: a sliced step runs the adaptive op (singleton replica groups,
+    the rank's slice of the step's padding mask), a replicated step the
+    grouped path between the communicator's dispatch and combine. Taking the
+    other form (positive control) must fail the comparison."""
     from vllm_torchtpu.layers.adapter import token_padding
 
     g = torch.Generator().manual_seed(3)
@@ -867,8 +898,8 @@ def test_adaptive_on_a_sequence_parallel_layer_matches_one_device(
         if sliced:
             assert not torch.allclose(actual, expected, atol=1e-5)
         else:
-            # Singleton groups on replicated rows are redundant, not wrong;
-            # their mask is the rank slice of rows it does not hold.
+            # The adaptive op on replicated rows computes them whole, but its
+            # mask is the rank slice of rows it does not hold.
             assert not all(torch.allclose(o, expected, atol=1e-5) for o in outs)
         return
     if sliced:
@@ -900,28 +931,60 @@ def _(x, *args):
 def test_both_adaptive_forms_lift_the_same_inputs(adaptive, monkeypatch):
     """The decoder forks on the row count, and a bucket compiled by one side's
     trace is handed to the other's (compilation/shape_variants): the sliced
-    and the replicated adaptive op must lift the same inputs."""
+    step's adaptive op and the replicated step's grouped path (the FP8
+    method's own, routing stubbed) must lift the same inputs."""
     from vllm_torchtpu.compilation import shape_variants
-    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
-        vllm_adapter as bridge,
-    )
-    from vllm_torchtpu.layers.adapter import token_padding
+    from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+    from vllm_torchtpu.layers.adapter.quantization import fp8
 
+    bridge = adaptive.bridge
     monkeypatch.setattr(bridge, "_OPS", {})
     monkeypatch.setattr(bridge, "jax_op", lambda *a, **k: _fused_stub)
-    layer = adaptive.layer
+    layer = _rank_layer(adaptive.layer, 1)
+    layer.moe_config.experts_per_token = _TOPK
+    layer.renormalize = True
     owner = SimpleNamespace(
         **{
             bridge.FUSED_MOE_EP_OP_ATTR: bridge.prebuild_adaptive_fused_moe(
                 layer, topk=_TOPK, renormalize=True, activation="silu"
             )
-        }
+        },
+        _tpu_activation_str="silu",
     )
-    monkeypatch.setattr(bridge, "_RANK_BUFFER", torch.tensor([[1]], dtype=torch.int32))
+    monkeypatch.setattr(
+        moe_routing,
+        "route",
+        lambda layer, x, logits: torch.softmax(logits.float(), -1).topk(_TOPK, -1),
+    )
+    monkeypatch.setattr(
+        fp8,
+        "fused_moe_gmm",
+        lambda **kw: _gmm_stub(
+            kw["hidden_states"],
+            kw["w1"],
+            kw["w2"],
+            kw["w1_scale"],
+            kw["w2_scale"],
+            kw["topk_weights"],
+            kw["topk_ids"],
+            kw["experts_start"],
+        ),
+    )
+    monkeypatch.setattr(fp8, "enable_pipelined_collective_and_compute", lambda: False)
+    monkeypatch.setattr(fp8.envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    comm_ = SimpleNamespace(
+        dispatch_router_logits=lambda x, g, sp_: (x, g), combine=lambda x, sp_: x
+    )
+    import vllm.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: comm_)
+    dp = SimpleNamespace(world_size=1)
+    monkeypatch.setattr(parallel_state, "get_dp_group", lambda: dp)
     state = token_padding.TokenPaddingState.create(4 * _MIN_ROWS, device="cpu")
     monkeypatch.setattr(token_padding, "_padding_state", state)
-    w1, w2 = torch.zeros(2, 512, 512), torch.zeros(2, 256, 512)
-    s1, s2 = torch.ones(2, 1, 1, 512), torch.ones(2, 1, 1, 512)
+    for name in ("w13_weight", "w2_weight"):
+        setattr(layer, name, torch.zeros(getattr(layer, name).shape))
+    grouped = functools.partial(fp8.VllmFp8MoEMethodTPU._apply_grouped, owner)
     traces = []
 
     def backend(graph, example_inputs):
@@ -930,7 +993,7 @@ def test_both_adaptive_forms_lift_the_same_inputs(adaptive, monkeypatch):
 
     torch._dynamo.reset()
     compiled = torch.compile(
-        lambda x, g: bridge.run_adaptive_fused_moe(owner, x, w1, w2, s1, s2, g),
+        lambda x, g: bridge.apply_adaptive_fused_moe(owner, layer, x, g, grouped),
         backend=backend,
         fullgraph=True,
     )
@@ -943,4 +1006,25 @@ def test_both_adaptive_forms_lift_the_same_inputs(adaptive, monkeypatch):
     torch._dynamo.reset()
     assert len(traces) == 2
     replicated, sliced = traces
+    assert any("experts_start" in name for name, _ in sliced)
+    assert any("padding_mask" in name for name, _ in replicated)
     assert sorted(replicated) == sorted(sliced)
+
+
+@torch.library.custom_op("sp_adaptive_test::gmm", mutates_args=())
+def _gmm_stub(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts_start: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@_gmm_stub.register_fake
+def _(x, *args):
+    return torch.empty_like(x)
