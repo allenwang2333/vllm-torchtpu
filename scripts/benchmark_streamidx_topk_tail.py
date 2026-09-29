@@ -96,7 +96,7 @@ def problem_from_dump(path, seed=0, mla_tokens=262144):
     z = np.load(path)
     meta = z["meta"]
     seq_len, n_tok = int(meta[0]), int(z["num_tokens"])
-    p = problem(n_tok, seq_len, seed=seed, idx_pages=8, mla_tokens=mla_tokens)
+    p = problem(n_tok, seq_len, seed=seed, idx_pages=-(-seq_len // PAGE), mla_tokens=mla_tokens)
     k = z["k"]
     npg = k.shape[0]
     pi = np.zeros((257,), np.int32)
