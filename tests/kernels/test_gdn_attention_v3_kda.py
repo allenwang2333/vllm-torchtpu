@@ -64,8 +64,7 @@ def kda_attention_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
+    states: tuple[jnp.ndarray, jnp.ndarray],
     conv_weight: jnp.ndarray,
     conv_bias: jnp.ndarray | None,
     a_log: jnp.ndarray,
@@ -94,6 +93,7 @@ def kda_attention_ref(
     num_valid_seqs = int(distribution[2])
 
     out_mixed_qkv = jnp.zeros_like(qkv)
+    conv_state, recurrent_state = states
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
     output = np.zeros((num_tokens, n_v * d_v), np.float64)
@@ -191,8 +191,7 @@ def kda_attention_spec_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
-    conv_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
+    states: tuple[jnp.ndarray, jnp.ndarray],
     conv_weight: jnp.ndarray,
     conv_bias: jnp.ndarray | None,
     a_log: jnp.ndarray,
@@ -212,6 +211,7 @@ def kda_attention_spec_ref(
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Token reference for KDA verify windows and their checkpoints."""
     del distribution
+    conv_state, recurrent_state = states
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
     output = np.zeros((qkv.shape[0], n_v * d_v), np.float64)
@@ -391,8 +391,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=a_log,
@@ -512,8 +511,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=None,
             a_log=a_log,
@@ -588,8 +586,10 @@ class KdaAttentionV3Test(parameterized.TestCase):
             qkv=jnp.zeros((8, dim_size)),
             b=jnp.zeros((8, n_v)),
             a=jnp.zeros((8, n_v * d_k)),
-            conv_state=jnp.zeros((9, kernel_size - 1, dim_size)),
-            recurrent_state=jnp.zeros((9, n_v, d_k, d_v)),
+            states=(
+                jnp.zeros((9, kernel_size - 1, dim_size)),
+                jnp.zeros((9, n_v, d_k, d_v)),
+            ),
             conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
             conv_bias=None,
             a_log=jnp.zeros((n_v,)),
