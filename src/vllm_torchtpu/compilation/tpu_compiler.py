@@ -6,6 +6,7 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -13,6 +14,10 @@ import importlib.util
 import json
 import os
 import pickle
+import re
+import socket
+import threading
+import time
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -59,6 +64,49 @@ class TpuCompilationHandle:
 
 
 _tpu_backend = TpuBackend()
+
+# A bucket claim nobody has touched for this long belongs to a rank that died
+# mid-compile; the owner refreshes its claim every heartbeat while compiling.
+_CLAIM_STALE_S = 600.0
+_CLAIM_HEARTBEAT_S = 30.0
+_CLAIM_POLL_S = 5.0
+
+_defer_state = threading.local()
+
+
+class DeferCompile(Exception):  # noqa: N818 - control flow, not an error
+    """Another rank is compiling this bucket; compile a different one first."""
+
+
+@contextlib.contextmanager
+def defer_claimed_buckets():
+    """Within this block, `compile` raises DeferCompile instead of waiting on a
+    bucket another rank has claimed, so the caller can go compile the
+    buckets nobody has claimed yet and come back for this one later."""
+    _defer_state.on = True
+    try:
+        yield
+    finally:
+        _defer_state.on = False
+
+
+@contextlib.contextmanager
+def _heartbeat(path: str):
+    """Keep refreshing the claim at `path` so waiters know its owner is alive."""
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(_CLAIM_HEARTBEAT_S):
+            with contextlib.suppress(OSError):
+                os.utime(path)
+
+    thread = threading.Thread(target=beat, name="tpu-claim-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -541,6 +589,125 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
+    def _claim_path(self, key: str) -> str | None:
+        """The file every rank of this DP rank races for to compile `key`.
+
+        It sits beside vLLM's `rank_<rank>_<dp_rank>` cache dirs, so on a
+        shared cache it is shared by the ranks of every host. It is only a
+        lock: no artifact is read from or written to it.
+        """
+        if self.cache_dir is None:
+            return None
+        own = Path(self.cache_dir)
+        match = re.fullmatch(r"rank_(\d+)_(\d+)", own.parent.name)
+        if match is None:
+            return None
+        return str(own.parent.parent / "_claims" / f"{match[2]}-{own.name}-{key}")
+
+    @staticmethod
+    def _try_claim(path: str) -> bool:
+        """Atomically become the one rank that compiles this bucket."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(f"compiling {socket.gethostname()}:{os.getpid()}\n")
+        return True
+
+    @staticmethod
+    def _read_claim(path: str) -> tuple[str, str, float] | None:
+        """(state, owner, seconds since last touched), or None if unclaimed."""
+        try:
+            age = time.time() - os.stat(path).st_mtime
+            with open(path) as f:
+                state, _, owner = f.read().strip().partition(" ")
+        except FileNotFoundError:
+            return None
+        return state, owner, age
+
+    @staticmethod
+    def _release_claim(path: str) -> None:
+        """Mark the bucket done, whether or not its compile succeeded."""
+        tmp_path = f"{path}.{socket.gethostname()}.{os.getpid()}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write("done\n")
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not release claim %s: %s", path, e
+            )
+
+    @staticmethod
+    def _take_over(path: str) -> None:
+        """Retire a claim whose owner stopped refreshing it."""
+        stale = f"{path}.{socket.gethostname()}.{os.getpid()}.stale"
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(path, stale)
+            os.unlink(stale)
+
+    def _claim_bucket(self, key: str, compile_range: Range) -> str | None:
+        """Share one XLA compile of this bucket among all ranks.
+
+        Returns the claim path when this rank is the one to compile the bucket
+        and must release the claim afterwards. Returns None once another rank
+        has finished it: the caller then compiles as usual, and the compile
+        finds that rank's executable in torch_tpu's Tier-2 cache instead of
+        building it again. If it is not there after all, the bucket is simply
+        compiled a second time; a claim never changes what gets run.
+
+        Without this, a rank reaching a bucket a peer is still compiling
+        compiles it from scratch as well: for GLM-5.2 that was six ranks each
+        spending ~30 min on the 4096 bucket.
+        """
+        path = self._claim_path(key)
+        if path is None:
+            return None
+        waited_since = None
+        while True:
+            if self._try_claim(path):
+                return path
+            claim = self._read_claim(path)
+            if claim is None:
+                continue  # released between the two calls; race for it again
+            state, owner, age = claim
+            if state == "done":
+                if waited_since is not None:
+                    logger.info(
+                        "[TpuCompilerAdaptor] Range %s is done after %.0f s",
+                        compile_range,
+                        time.monotonic() - waited_since,
+                    )
+                return None
+            if age > _CLAIM_STALE_S:
+                logger.warning(
+                    "[TpuCompilerAdaptor] Claim on range %s by %s is %.0f s "
+                    "stale; taking it over",
+                    compile_range,
+                    owner,
+                    age,
+                )
+                self._take_over(path)
+                continue
+            if getattr(_defer_state, "on", False):
+                logger.info(
+                    "[TpuCompilerAdaptor] Range %s is being compiled by %s; "
+                    "deferring it",
+                    compile_range,
+                    owner,
+                )
+                raise DeferCompile
+            if waited_since is None:
+                waited_since = time.monotonic()
+                logger.info(
+                    "[TpuCompilerAdaptor] Waiting for %s to finish range %s",
+                    owner,
+                    compile_range,
+                )
+            time.sleep(_CLAIM_POLL_S)
+
     def compile(
         self,
         graph: fx.GraphModule,
@@ -582,7 +749,22 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        caching = (
+            key is not None and self.cache_dir is not None and not self._disable_cache
+        )
+        claim = (
+            self._claim_bucket(key, compile_range)
+            if caching and key is not None and envs.TPU_PARALLEL_PRECOMPILE
+            else None
+        )
+        if claim is not None:
+            try:
+                with _heartbeat(claim):
+                    compiled_fn, entry = self._run_backend(graph, example_inputs)
+            finally:
+                self._release_claim(claim)
+        else:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -602,9 +784,6 @@ class TpuCompilerAdaptor(CompilerInterface):
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
         handle = None
-        caching = (
-            key is not None and self.cache_dir is not None and not self._disable_cache
-        )
         if caching and entry is not None:
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(key, save_path, entry, graph, was_wrapped):

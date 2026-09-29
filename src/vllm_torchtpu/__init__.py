@@ -497,10 +497,13 @@ def _patch_vllm_disable_compile_ranges() -> None:
 
 
 def _patch_vllm_compile_all_ranges() -> None:
-    """Patch vllm compile all ranges to support compilation rotation.
+    """Patch vllm compile all ranges to support parallel precompile.
 
-    Compilation rotation allows vllm to compile multiple sizes at the same time,
-    which greatly reduce the vllm startup time.
+    Each rank starts on a different range, biggest first, and a range another
+    rank is already compiling is put off until every unclaimed one is done;
+    compiling it then finds that rank's executable in torch_tpu's Tier-2 cache
+    (see TpuCompilerAdaptor._claim_bucket). Startup then takes about as long
+    as the slowest single range instead of the sum over ranges.
     """
     import os
 
@@ -520,6 +523,29 @@ def _patch_vllm_compile_all_ranges() -> None:
         except Exception:
             return int(os.environ.get("LOCAL_RANK", "0"))
 
+    def _compile_entry(self, range_entry) -> None:
+        self._log_compile_start(range_entry.compile_range)
+
+        if range_entry.compile_range.is_single_size():
+            args_list = create_concrete_args(
+                self.graph, range_entry.compile_range.start
+            )
+        else:
+            args_list = get_fake_args_from_graph(self.graph)
+
+        range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+            self.graph,
+            args_list,
+            self.vllm_backend.inductor_config,
+            self.compilation_config,
+            compile_range=range_entry.compile_range,
+            graph_index=self.piecewise_compile_index,
+            num_graphs=self.total_piecewise_compiles,
+            is_encoder=self.vllm_backend.is_encoder,
+        )
+
+        range_entry.compiled = True
+
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
         assert self.graph is not None, (
@@ -527,43 +553,33 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called."
         )
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            DeferCompile,
+            defer_claimed_buckets,
+        )
 
-        # Biggest first, so the range that bounds startup starts right away,
-        # and each rank starts on a different range.
+        # Biggest first, so the range that bounds startup starts right away.
         entries = sorted(
-            self.range_entries.values(),
+            (e for e in self.range_entries.values() if not e.compiled),
             key=lambda e: e.compile_range.end,
             reverse=True,
         )
         if not entries:
             return
         start = _global_rank() % len(entries)
+        entries = entries[start:] + entries[:start]
 
-        for range_entry in entries[start:] + entries[:start]:
-            if range_entry.compiled:
-                continue
-
-            self._log_compile_start(range_entry.compile_range)
-
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
-                )
-            else:
-                args_list = get_fake_args_from_graph(self.graph)
-
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
-            )
-
-            range_entry.compiled = True
+        deferred = []
+        with defer_claimed_buckets():
+            for range_entry in entries:
+                try:
+                    _compile_entry(self, range_entry)
+                except DeferCompile:
+                    deferred.append(range_entry)
+        # Everything left is being built by a peer: wait for it, then compile
+        # it again, which hits the peer's executable in the Tier-2 cache.
+        for range_entry in deferred:
+            _compile_entry(self, range_entry)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
