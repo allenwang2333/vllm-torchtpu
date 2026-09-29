@@ -179,6 +179,16 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs: jax.Array) -> bool:
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -191,13 +201,7 @@ def gmm_wrapper(
     preferred_element_type=None,
     rhs_quant_dtype=None,
 ):
-    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
-    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
-    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
+    is_fp4_weight = _is_fp4_weight(rhs)
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -213,9 +217,10 @@ def gmm_wrapper(
     )
 
 
-# Rows per block of the rank contraction: the triangular matmul is B x B, so this
-# trades that against the number of blocks.
-_COUNTING_SORT_BLOCK = 512
+# The rank matmul is m * block * num_buckets MACs, so a block above 512 costs
+# more for no return, and below 256 the cost per row grows; the smaller steps
+# avoid padding when 512 does not divide m.
+_COUNTING_SORT_BLOCKS = (512, 256, 128)
 
 
 def _counting_sort_positions(
@@ -231,7 +236,11 @@ def _counting_sort_positions(
     fall out of the same histogram, which is exactly `group_sizes`.
     """
     m = sort_keys.shape[0]
-    block = min(_COUNTING_SORT_BLOCK, m)
+    block = min(_COUNTING_SORT_BLOCKS[0], m)
+    for size in _COUNTING_SORT_BLOCKS:
+        if size <= block and m % size == 0:
+            block = size
+            break
     if num_buckets > block:
         # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
         # 0.0.44.1: under jit the positions come back not a permutation. Only
@@ -261,6 +270,9 @@ def _counting_sort_positions(
     counts = hist.sum(axis=0)
     base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    # Pad rows sort after every real one, so only that bucket's total is off;
+    # pad is static, so a masked subtraction beats an indexed update.
+    counts -= jnp.where(jnp.arange(num_buckets) == num_buckets - 1, float(pad), 0.0)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
@@ -300,7 +312,9 @@ def prepare_routed_gmm_inputs(
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort.
-    # Ragged permute only: under the one-hot permute these positions break MTP.
+    # Ragged permute by default: under the one-hot permute these positions
+    # break MTP. USE_MOE_COUNTING_SORT=1 opts the one-hot permute in as well,
+    # for serving without multi-token prediction (Qwen3.5 InferenceX, PR #989).
     ragged_permute = (
         use_ep
         and use_sparse_core
@@ -308,7 +322,7 @@ def prepare_routed_gmm_inputs(
     )
     argsort_revert_indices, bucket_counts = (
         _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if ragged_permute
+        if ragged_permute or envs.USE_MOE_COUNTING_SORT
         else (None, None)
     )
     token_bits = max(1, (num_tokens_local - 1).bit_length())
@@ -318,11 +332,22 @@ def prepare_routed_gmm_inputs(
         if argsort_revert_indices is None or not packable
         else None
     )
-
     if argsort_revert_indices is not None:
         group_sizes_local = bucket_counts[:local_num_experts]
+
+        token_bits = (num_tokens_local - 1).bit_length()
+        # (key, token) packed: no payload, no gather, and token_indices_flat is
+        # non-decreasing so this IS the stable order by row.
+        packed = jax.lax.sort(
+            jnp.left_shift(sort_keys.astype(jnp.int32), token_bits)
+            | token_indices_flat,
+            is_stable=False,
+        )
+        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
     else:
+        sorted_indices = jnp.argsort(sort_keys)
         argsort_revert_indices = jnp.argsort(sorted_indices)
+        token_indices_sorted = token_indices_flat[sorted_indices]
         topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
         group_sizes_local = jax.nn.one_hot(
             topk_indices_for_count, local_num_experts, dtype=jnp.int32
@@ -540,6 +565,16 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def _local_expert_routing(topk_ids, topk_weights, experts_start, num_primary_experts):
+    """Route only to this shard's primary interval; trailing slots may be copies."""
+    local_ids = topk_ids - experts_start
+    valid = (local_ids >= 0) & (local_ids < num_primary_experts)
+    return (
+        jnp.where(valid, local_ids, jnp.full_like(local_ids, -1)),
+        jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights)),
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -550,6 +585,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -570,6 +606,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -616,10 +653,51 @@ def fused_moe_func(
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
     if use_ep and experts_start is not None:
-        local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
-        topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
-        topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+        owned = w1.shape[0] if num_primary_experts is None else num_primary_experts
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError("num_primary_experts must fit the local weight slots")
+        topk_ids, topk_weights = _local_expert_routing(
+            topk_ids, topk_weights, experts_start, owned
+        )
+
+    # A few tokens under expert parallelism: one Pallas call that walks the
+    # shard's hit experts with the routing weights as the row mask
+    # (kernels/moe_lowtok), instead of the sort, permute, grouped matmuls,
+    # pad and unpermute below. Per-channel fp8 scales, no bias, the hidden
+    # width unpadded; the caller's all-reduce combines the shards as before.
+    lowtok_max = envs.TPU_MOE_LOWTOK_MAX_TOKENS
+    if (
+        use_ep
+        and experts_start is not None
+        and lowtok_max
+        and num_tokens <= lowtok_max
+        and activation == "silu"
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and w1_scale is not None
+        and w2_scale is not None
+        and w1.dtype == jnp.float8_e4m3fn
+        and w2.dtype == jnp.float8_e4m3fn
+        and hidden_states.dtype == jnp.bfloat16
+        and w1_scale.ndim == 4
+        and w1_scale.shape[1] == 1
+        and w1_scale.shape[2] == 1
+        and w2_scale.ndim == 4
+        and w2_scale.shape[1] == 1
+        and w2_scale.shape[2] == 1
+        and w1.shape[1] == hidden_size
+        # the kernel's own limits: a routing table of one lane tile of
+        # experts, and an intermediate width that splits into two
+        # lane-aligned halves; anything else takes the grouped path
+        and w1.shape[0] <= 128
+        and w1.shape[2] % 512 == 0
+    ):
+        from vllm_torchtpu.kernels.moe_lowtok.kernel import moe_lowtok
+
+        return moe_lowtok(
+            hidden_states, topk_ids, topk_weights, w1, w1_scale, w2, w2_scale
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.

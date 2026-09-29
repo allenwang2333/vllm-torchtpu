@@ -240,13 +240,12 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     instead. So `moe_runner.py` all-reduces the already-combined output
     whenever `tp_size > 1 or ep_size > 1`.
 
-    Today it changes no answer, and the reason is worth stating exactly rather
-    than calling it luck: `prebuild_fused_moe_ep` refuses tp_size > 1, so the
-    kernel only ever arms with a tensor-parallel group of world size one, where
-    all three all-reduces this flag gates are `return input_`. The patch is the
-    guard that keeps that true if the TP refusal is ever lifted, at which point
-    the unpatched path would silently multiply every routed MoE output by
-    tp_size, with no test to catch it and no log to mention it.
+    Under data parallelism the tensor-parallel group has world size one and
+    all three all-reduces this flag gates are `return input_`, so the patch
+    changes no answer there. Under tensor parallelism the kernel arms for the
+    sequence-parallel steps and returns each rank's own rows; the patch keeps
+    the unpatched path, which would multiply every routed MoE output by
+    tp_size, from ever running.
 
     Reporting True here is the correct signal rather than deleting the
     all-reduce, because the SHARED expert genuinely is TP-partial
@@ -277,7 +276,12 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         if getattr(self.moe_config, "skip_final_all_reduce", False):
             return original.fget(self)
         try:
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+                fused_moe_ep_supported as fused_moe_ep_v2_supported,
+            )
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+                fused_moe_ep_supported,
+            )
         except ImportError:
             return original.fget(self)
         # Asked of the layer's own quant method, because arming is per layer:
@@ -290,6 +294,7 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
         owner = getattr(self, "_quant_method", None)
         return (
             fused_moe_ep_supported(owner)
+            or fused_moe_ep_v2_supported(owner)
             or adaptive_fused_moe_supported(owner)
             or original.fget(self)
         )
@@ -297,6 +302,109 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     _mr.MoERunner._fused_output_is_reduced = patched
     _mr.MoERunner._tpu_fused_output_reduced_patch = True
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
+
+
+def _patch_moe_fused_ep_threshold_contract() -> None:
+    """Use external DP dispatch below the fused-EP threshold."""
+    from torch.nn import functional as F
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    threshold = envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+    # `apply_monolithic_external_dispatch` is the v3 owning dispatch's small-
+    # shape half; the v2 and adaptive paths never claim those shapes.
+    if envs.MOE_FUSED_EP_KERNEL_IMPL != "v3" or threshold <= 0:
+        return
+
+    runner_cls = moe_runner.MoERunner
+    if getattr(runner_cls, "_tpu_fused_ep_threshold_patch", False):
+        return
+    original_forward_impl = runner_cls._forward_impl
+
+    def forward_impl(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+    ):
+        config = self.moe_config
+        # Prefill context parallelism adds its own collectives to vLLM's
+        # dispatch and combine; this copy of the small-shape path carries
+        # none of them, so it stays out of that case.
+        if (
+            config.dp_size <= 1
+            or getattr(config, "pcp_size", 1) > 1
+            or hidden_states.shape[0] >= threshold
+        ):
+            return original_forward_impl(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        quant_method = self.routed_experts.quant_method
+        external_apply = getattr(
+            quant_method, "apply_monolithic_external_dispatch", None
+        )
+        if external_apply is None:
+            return original_forward_impl(
+                self,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
+        # Run the baseline external-dispatch path for small shapes.
+        self.routed_experts._ensure_moe_quant_config_init()
+        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        if self.gate is not None:
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+
+        with self._sequence_parallel_context():
+            ep_group = moe_runner.get_ep_group()
+            result = ep_group.dispatch_router_logits(
+                hidden_states,
+                router_logits,
+                config.is_sequence_parallel,
+            )
+            assert len(result) == 2
+            hidden_states, router_logits = result
+
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                moe_runner.SharedExpertsOrder.NO_OVERLAP,
+            )
+            fused_output = external_apply(
+                layer=self.routed_experts,
+                x=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                moe_runner.SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            )
+
+            fused_output = ep_group.combine(
+                fused_output,
+                config.is_sequence_parallel,
+            )
+            if self._shared_experts is None:
+                return fused_output
+            return self._shared_experts.output, fused_output
+
+    runner_cls._forward_impl = forward_impl
+    runner_cls._tpu_fused_ep_threshold_patch = True
+    logger.info(
+        "Applied TPU patch: use external MoE dispatch below %d tokens.", threshold
+    )
 
 
 def _patch_moe_explicit_pcp_collectives() -> None:
@@ -352,10 +460,19 @@ def _patch_moe_explicit_pcp_collectives() -> None:
             from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (  # noqa: E501
                 adaptive_fused_moe_supported,
             )
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+                fused_moe_ep_supported as fused_moe_ep_v2_supported,
+            )
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+                fused_moe_ep_supported,
+            )
 
             owner = getattr(self, "_quant_method", None)
-            return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
+            return (
+                fused_moe_ep_supported(owner)
+                or fused_moe_ep_v2_supported(owner)
+                or adaptive_fused_moe_supported(owner)
+            )
 
         def maybe_dispatch(self, hidden_states, router_logits):
             if fused_ep_owns_pcp_collectives(self):
@@ -383,6 +500,86 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         "Applied TPU patch: use explicit PCP collectives unless MoE "
         "chunk pipelining or an armed fused EP layer owns them."
     )
+
+
+def _patch_qwen3_next_fused_qk_norm_rope_gate() -> None:
+    """Route the Qwen3-Next attention's split + QK-RMSNorm + RoPE + gate to
+    the TPU kernel (kernels/qk_norm_rope_gate) for the small decode buckets
+    when TPU_FUSED_QK_NORM_ROPE is set. vLLM enables its fusion on CUDA only;
+    the eager path it replaces is about forty small operations per attention
+    layer at a few rows. Above the row cap (prefill) the eager path stays: the
+    kernel holds its rows whole in VMEM.
+    """
+    from vllm_torchtpu import envs as _envs
+
+    if not _envs.TPU_FUSED_QK_NORM_ROPE:
+        return
+    from vllm.model_executor.models import qwen3_next as _qn
+
+    from vllm_torchtpu.layers.adapter import fused_qk_norm_rope_tpu as _tpu
+
+    if getattr(_qn, "_tpu_fused_qk_norm_rope_patch", False):
+        return
+    row_cap = 64
+    cls = _qn.Qwen3NextAttention
+    original_init = cls.__init__
+    original_project = cls._project_qkv_gate
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        model_config = kwargs.get("model_config")
+        mm_config = (
+            getattr(model_config, "multimodal_config", None) if model_config else None
+        )
+        text_only = mm_config is None or getattr(
+            mm_config, "language_model_only", False
+        )
+        self._tpu_fused_qk = bool(
+            getattr(self, "attn_output_gate", False)
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and text_only
+        )
+        if self._tpu_fused_qk:
+            _tpu.prebuild(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+            )
+
+    def _norm_weight_plus_one(norm):
+        hoisted = getattr(norm, "_tpu_weight_plus_one", None)
+        return hoisted if hoisted is not None else norm.weight.float() + 1.0
+
+    def _project_qkv_gate(self, qkv, positions):
+        if getattr(self, "_tpu_fused_qk", False) and qkv.shape[0] <= row_cap:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            pos = positions[0] if positions.ndim == 2 else positions
+            # the norms' (1 + w): the hoisted f32 buffer when TPU_NORM_WEIGHT_HOIST installed one (the row
+            # buckets above the cap run the norm modules, which read the same buffer, so every trace lifts the
+            # same inputs), else computed here as upstream does
+            q, k, gate = _tpu.fused_qk_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                _norm_weight_plus_one(self.q_norm),
+                _norm_weight_plus_one(self.k_norm),
+                self.rotary_emb.cos_sin_cache,
+                pos,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+            )
+            return q, k, v, gate
+        return original_project(self, qkv, positions)
+
+    cls.__init__ = __init__
+    cls._project_qkv_gate = _project_qkv_gate
+    _qn._tpu_fused_qk_norm_rope_patch = True
 
 
 def _patch_expert_map_host_lookup() -> None:
@@ -576,9 +773,222 @@ def _patch_disable_sequence_parallel_moe() -> None:
     if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
         return
 
+    if envs.TPU_SP_MIN_ROWS > 0:
+        # The row-gated form (layers/adapter/sequence_parallel,
+        # _patch_qwen3_next_sequence_parallel_by_rows): expert parallelism
+        # with tensor parallelism and no data parallelism, where the
+        # replicated rows make the norms, router and shared expert eight-fold
+        # redundant on the prompt steps.
+        def use_sequence_parallel_moe(self) -> bool:
+            return bool(
+                self.enable_expert_parallel
+                and self.tensor_parallel_size > 1
+                and self.data_parallel_size == 1
+            )
+
+        ParallelConfig.use_sequence_parallel_moe = property(use_sequence_parallel_moe)
+        ParallelConfig._tpu_no_sp_moe_patch = True
+        logger.info(
+            "Applied TPU patch: sequence-parallel MoE for steps of at least %d rows.",
+            envs.TPU_SP_MIN_ROWS,
+        )
+        return
+
     ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
     logger.info("Applied TPU patch: disable sequence-parallel MoE.")
+
+
+def _patch_qwen3_next_sequence_parallel_by_rows() -> None:
+    """Sequence parallelism for the tensor-parallel prefill, by row count.
+
+    Upstream's ``use_attn_reduce_scatter_for_moe`` form of the Qwen3-Next
+    decoder layer, taken only by the steps with at least TPU_SP_MIN_ROWS rows;
+    the smaller steps keep the all-reduce form (two collectives per layer,
+    latency-bound at decode). The residual's chunk is an index-select through
+    the layer's rank buffer so every rank compiles one program, and the steps
+    above the threshold are the token buckets, multiples of the tensor-parallel
+    width, so no row padding is needed.
+    """
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    if not _sp.enabled():
+        return
+    import torch
+
+    from vllm_torchtpu.layers.adapter import linear_common as _lc
+
+    if _sp.fp8_gather():
+        _lc.prebuild_prequant_ops()
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+        tensor_model_parallel_all_gather,
+        tensor_model_parallel_all_reduce,
+        tensor_model_parallel_reduce_scatter,
+    )
+    from vllm.model_executor.models import qwen3_next as _qn
+
+    cls = _qn.Qwen3NextDecoderLayer
+    if getattr(cls, "_tpu_sp_by_rows_patch", False):
+        return
+
+    attention_cls = _qn.Qwen3NextAttention
+    original_attention_forward = attention_cls.forward
+
+    def attention_forward(self, positions, hidden_states, prequant=None):
+        # Sequence parallelism supplies this interface independently of the
+        # optional Q/K fusion. Ordinary rows retain the upstream forward.
+        if prequant is None:
+            return original_attention_forward(self, positions, hidden_states)
+        proj = self.qkv_proj
+        bias = None if proj.skip_bias_add else proj.bias
+        qkv = proj.quant_method.apply_prequant(proj, prequant[0], prequant[1], bias)
+        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        attn_output = self.attn(q, k, v)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    attention_cls.forward = attention_forward
+
+    def with_rank_buffer(original_init):
+
+        def __init__(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            # this rank's index as device data, so the residual chunk's
+            # offset is an operand and not a per-rank constant in the
+            # compiled program
+            device = self.input_layernorm.weight.device
+            self._tpu_sp_rank = torch.tensor(
+                [get_tensor_model_parallel_rank()], dtype=torch.int32, device=device
+            )
+
+        __init__._tpu_sp_rank_init = True
+        return __init__
+
+    # Qwen3.5's layer defines its own __init__ and skips this class's, so
+    # every layer class with an __init__ of its own gets the buffer.
+    from vllm.model_executor.models import qwen3_5 as _q35
+
+    layer_classes = [cls, _q35.Qwen3_5DecoderLayer]
+
+    def forward(self, hidden_states, residual, positions=None, **kwargs):
+        # The decision comes from a tensor shape, which leaves a shape guard
+        # behind: the compile flow traces the model once with the token count
+        # dynamic and re-traces only the buckets a trace's guards refuse
+        # (compilation/shape_variants); a Python value would be frozen at
+        # the first trace. The runner set the same decision for the
+        # communicator before calling the model. Within one trace every
+        # layer takes the same form: the first layer's input is the full
+        # rows (no residual yet), every later layer's input is this rank's
+        # slice.
+        sp = False
+        if (
+            self.use_attn_reduce_scatter_for_moe
+            and positions.shape[-1] >= _sp.min_rows()
+        ):
+            sp = True
+        input_is_sequence_parallel = sp and residual is not None
+        # Every trace group lifts the rank buffer in every layer: the compile
+        # flow hands a bucket's executable between traces and refuses a
+        # differing set of lifted inputs (the residual slice below uses it
+        # only in the first layer of the sequence-parallel trace). A zero
+        # rides on the positions, which the compiler folds.
+        positions = positions + (self._tpu_sp_rank * 0)[0]
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        prequant = None
+        if input_is_sequence_parallel and _sp.fp8_gather():
+            # the rows reach the projections quantised: this rank quantises
+            # its own rows once (the rows and scales the projections would
+            # compute), the all-gather carries fp8 rows and float32 scales
+            # instead of bf16 rows, and the projections take them as they
+            # are. The gathered fp8 rows stand in for hidden_states, of
+            # which the attention modules read only the row count.
+            x_q, x_s = _lc.quantize_rows(hidden_states)
+            x_q = tensor_model_parallel_all_gather(x_q, 0)
+            x_s = tensor_model_parallel_all_gather(x_s, 0)
+            prequant = (x_q, x_s)
+            hidden_states = x_q
+        elif input_is_sequence_parallel:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states, prequant=prequant
+            )
+        elif self.layer_type == "full_attention":
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states, positions=positions, prequant=prequant
+            )
+        else:
+            raise ValueError("Invalid layer_type")
+
+        if self.layer_scale:
+            if len(hidden_states.shape) == 2:
+                hidden_states = hidden_states * (
+                    self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
+                )
+            else:
+                hidden_states = hidden_states * (
+                    self.attn_layer_scale.to(hidden_states.dtype) + 1
+                )
+
+        if self.use_attn_reduce_scatter_for_moe:
+            if sp:
+                # the steps above the row threshold are token buckets, whole
+                # multiples of the tensor-parallel width
+                hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+                if not input_is_sequence_parallel:
+                    # this rank's slice of the residual: the rank rides in as
+                    # data, so every rank compiles one program
+                    tp = get_tensor_model_parallel_world_size()
+                    residual = (
+                        residual.reshape(tp, -1, residual.shape[-1])
+                        .index_select(0, self._tpu_sp_rank)
+                        .squeeze(0)
+                    )
+            else:
+                # the projections were built without their all-reduce
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.use_attn_reduce_scatter_for_moe:
+            # own rows above the threshold, replicated rows below: the
+            # communicator gathers and combines accordingly, and the block
+            # neither chunks nor gathers on its own
+            hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
+        else:
+            hidden_states = self.mlp(hidden_states)
+
+        if self.layer_scale:
+            if len(hidden_states.shape) == 2:
+                hidden_states = hidden_states * (
+                    self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
+                )
+            else:
+                assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape)
+                hidden_states = hidden_states * (
+                    self.ffn_layer_scale.to(hidden_states.dtype) + 1
+                )
+
+        return hidden_states, residual
+
+    for layer_cls in layer_classes:
+        if "__init__" in vars(layer_cls):
+            layer_cls.__init__ = with_rank_buffer(layer_cls.__init__)
+    cls.forward = forward
+    cls._tpu_sp_by_rows_patch = True
+    logger.info(
+        "Applied TPU patch: sequence parallelism by rows (>= %d).", _sp.min_rows()
+    )
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:

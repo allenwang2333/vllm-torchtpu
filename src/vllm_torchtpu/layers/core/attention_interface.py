@@ -51,6 +51,28 @@ MAX_ALLOWED_PAGE_INDICES_N = 128 * 1024
 
 ragged_paged_attention = rpa_default.ragged_paged_attention
 ragged_paged_attention_batched = rpa_batched.ragged_paged_attention
+# programs of up to this many query rows are decode programs: with TPU_RPA_DECODE_VMEM_MIB set, the batched
+# attention kernel there takes that VMEM limit and a decode batch of min(8, slots)
+RPA_DECODE_PROGRAM_ROWS = 64
+
+
+def batched_rpa_decode_overrides(num_q_rows: int, num_seqs: int) -> dict[str, int]:
+    """The batched kernel's static arguments for a decode program under TPU_RPA_DECODE_VMEM_MIB ({} otherwise);
+    the runner's schedule-capacity check mirrors them."""
+    mib = envs.TPU_RPA_DECODE_VMEM_MIB
+    if mib <= 0 or num_q_rows > RPA_DECODE_PROGRAM_ROWS:
+        return {}
+    # the slot count the wrapper sees is vLLM's padded one (8 at 4 users), so the real batch comes from the env
+    batch = envs.TPU_RPA_DECODE_BATCH or min(8, num_seqs)
+    if batch > 8:
+        # the measured tile; a silent clamp would test nothing
+        raise ValueError(
+            f"TPU_RPA_DECODE_BATCH={batch}: the batched attention kernel's "
+            "decode batch is capped at 8 here"
+        )
+    return {"vmem_limit_bytes": mib << 20, "decode_batch_size": max(1, batch)}
+
+
 get_kv_cache_shape = rpa_default.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
@@ -415,6 +437,9 @@ def sharded_ragged_paged_attention(
         block_kwargs["m_block_sizes"] = _capped(rpa_default.RpaCase.MIXED)
         if attention_chunk_size is not None:
             block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
+
+    if rpa_func is ragged_paged_attention_batched and not use_hd64:
+        block_kwargs.update(batched_rpa_decode_overrides(q.shape[0], kv_lens.shape[0]))
 
     def _ragged_paged_attention(*args):
         return func(

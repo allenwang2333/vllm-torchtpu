@@ -1,11 +1,14 @@
 import torch
 
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import fused_moe_ep_v3, token_padding
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
 
 
 def test_local_suffix_update():
-    mask = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    mask = TokenPaddingState(
+        local_padding_mask=torch.zeros(8, dtype=torch.bool),
+        local_valid_tokens=torch.zeros(1, dtype=torch.int32),
+    )
     mask.update(3, 6)
     assert mask.get_local_padding_mask(6).tolist() == [
         False,
@@ -15,18 +18,49 @@ def test_local_suffix_update():
         True,
         True,
     ]
+    assert mask.get_local_valid_tokens().tolist() == [3]
     mask.update(2, 2)
     assert mask.get_local_padding_mask(8).sum().item() == 0
+    assert mask.get_local_valid_tokens().tolist() == [2]
+
+
+def test_gmm_graph_retains_fused_ep_valid_token_buffer(monkeypatch):
+    valid_tokens = torch.tensor([3], dtype=torch.int32)
+    calls = 0
+
+    def get_local_valid_tokens():
+        nonlocal calls
+        calls += 1
+        return valid_tokens
+
+    monkeypatch.setattr(fused_moe_ep_v3, "_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(
+        fused_moe_ep_v3, "_RANK_BUFFER", torch.tensor([[0]], dtype=torch.int32)
+    )
+    monkeypatch.setattr(fused_moe_ep_v3, "_EXPERT_ORDER", None)
+    monkeypatch.setattr(token_padding, "get_local_valid_tokens", get_local_valid_tokens)
+
+    output = torch.ones(2, dtype=torch.float32)
+    retained = fused_moe_ep_v3.retain_fused_ep_graph_inputs(output)
+
+    assert calls == 1
+    assert torch.equal(retained, output)
 
 
 def test_dummy_batch_is_all_padding():
-    state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    state = TokenPaddingState(
+        local_padding_mask=torch.zeros(8, dtype=torch.bool),
+        local_valid_tokens=torch.zeros(1, dtype=torch.int32),
+    )
     state.update(0, 6)
     assert state.get_local_padding_mask(6).tolist() == [True] * 6
 
 
 def test_zero_routing_weights_for_padding_zeroes_weights_keeps_ids(monkeypatch):
-    provider = TokenPaddingState(local_padding_mask=torch.zeros(4, dtype=torch.bool))
+    provider = TokenPaddingState(
+        local_padding_mask=torch.zeros(4, dtype=torch.bool),
+        local_valid_tokens=torch.zeros(1, dtype=torch.int32),
+    )
     token_padding.set_padding_state(provider)
 
     class _FakeGroup:
@@ -53,7 +87,10 @@ def test_zero_routing_weights_for_padding_zeroes_weights_keeps_ids(monkeypatch):
 def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
     # Rank-local mask [F, T]; fake DP group of 2 whose all_gather stacks
     # rank0 then rank1 masks -> gathered [F, T, T, F].
-    provider = TokenPaddingState(local_padding_mask=torch.tensor([False, True]))
+    provider = TokenPaddingState(
+        local_padding_mask=torch.tensor([False, True]),
+        local_valid_tokens=torch.zeros(1, dtype=torch.int32),
+    )
     token_padding.set_padding_state(provider)
 
     class _FakeGroup:
@@ -82,7 +119,10 @@ def test_zero_routing_weights_for_padding_dp_gather_rank_order(monkeypatch):
 
 
 def test_zero_routing_weights_for_padding_is_local_tensor(monkeypatch):
-    provider = TokenPaddingState(local_padding_mask=torch.tensor([False, True]))
+    provider = TokenPaddingState(
+        local_padding_mask=torch.tensor([False, True]),
+        local_valid_tokens=torch.zeros(1, dtype=torch.int32),
+    )
     token_padding.set_padding_state(provider)
 
     class _FakeGroup:

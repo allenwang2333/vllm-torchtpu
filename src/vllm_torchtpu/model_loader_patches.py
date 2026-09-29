@@ -56,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -75,6 +75,12 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if expert_placement.enabled():
+        # A per-layer placement (TPU_EXPERT_PLACEMENT): this rank fetches the
+        # experts the placement gives it for that layer.
+        layer = expert_placement.layer_index(name)
+        if layer is not None:
+            return expert_id not in expert_placement.local_ids(layer, _ep_rank())
     return expert_id not in local_expert_ids
 
 
@@ -89,6 +95,24 @@ def _should_skip_weight_tpu(name: str, local_expert_ids: set[int] | None) -> boo
     if local_expert_ids is None:
         return False
     return _should_skip(name, local_expert_ids)
+
+
+def _ep_rank() -> int:
+    from vllm.config import get_current_vllm_config
+    from vllm.distributed import (
+        get_dp_group,
+        get_pcp_group,
+        get_tensor_model_parallel_rank,
+    )
+
+    parallel_config = get_current_vllm_config().parallel_config
+    dp_size = parallel_config.data_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+    tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+    pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+    return dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -117,20 +141,11 @@ def _compute_local_expert_ids() -> set[int] | None:
     if num_experts <= 0:
         return None
 
-    from vllm.distributed import (
-        get_dp_group,
-        get_pcp_group,
-        get_tensor_model_parallel_rank,
-    )
-
     dp_size = parallel_config.data_parallel_size
     tp_size = parallel_config.tensor_parallel_size
     pcp_size = parallel_config.prefill_context_parallel_size
-    dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
-    tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
-    pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
-    ep_size = dp_size * pcp_size * tp_size
-    ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+    ep_size = dp_size * tp_size * pcp_size
+    ep_rank = _ep_rank()
 
     # Use the loader's symbol instead of importing the base helper directly.
     # Hierarchical EP replaces this symbol with its chip-aware ownership map,

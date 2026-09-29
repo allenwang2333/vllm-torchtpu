@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
+    USE_MOE_COUNTING_SORT: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    TPU_SHARDED_LM_HEAD: bool = False
+    TPU_NORM_WEIGHT_HOIST: bool = False
+    TPU_GDN_FUSED_NORM_QUANT: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -74,12 +78,27 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS: int = 0
+    TPU_MOE_LOWTOK_MAX_TOKENS: int = 0
+    TPU_FUSED_QK_NORM_ROPE: int = 0
+    TPU_RPA_DECODE_VMEM_MIB: int = 0
+    TPU_RPA_DECODE_BATCH: int = 0
+    TPU_MOE_LOWTOK_FROM_SCORES: int = 0
+    TPU_MOE_LOWTOK_SCORES_STRICT: int = 0
+    TPU_SP_MIN_ROWS: int = 0
+    TPU_SP_FP8_GATHER: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
+    DP_PLACEMENT: str = ""
+    DP_SCHED_BUFFER_THRESHOLD: int = 0
+    DP_SCHED_BUFFER_FLUSH_MS: int = 5000
+    DP_SCHED_BUFFER_IDLE_TRIGGER: bool = True
+    DP_SCHED_BUFFER_QUIET_MS: int = 0
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -416,9 +435,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
     # Runtime block size for dense linear weight requantization.
-    "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # Runtime dtype for dense linear weight requantization.
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -432,9 +453,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
     # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
-    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
@@ -517,6 +540,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE": lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    # Build the MoE routing permutations with a counting sort instead of the
+    # comparison sorts. Off by default; set to 1 to enable.
+    "USE_MOE_COUNTING_SORT": env_bool("USE_MOE_COUNTING_SORT"),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value
@@ -558,6 +584,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Split the vocabulary projection across the expert-parallel ranks: each
+    # rank keeps its share of the rows, the hidden rows of every rank are
+    # gathered, and the logits are exchanged back.
+    "TPU_SHARDED_LM_HEAD": env_bool("TPU_SHARDED_LM_HEAD"),
+    # Run a gated-delta-net layer's output gated RMS norm and the per-token
+    # fp8 quantisation of the following projection as one kernel.
+    "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT"),
+    # Keep each GemmaRMSNorm's (1 + weight) as a buffer computed once after
+    # loading instead of recomputing it in every forward.
+    "TPU_NORM_WEIGHT_HOIST": env_bool("TPU_NORM_WEIGHT_HOIST"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -587,12 +623,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_MASKED_DENSE_MAX_KV_LEN"
     ),
     # Most model length cap for TPU compile bucketing
-    "VLLM_TPU_MOST_MODEL_LEN": lambda: int(val)
-    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
-    else None,
+    "VLLM_TPU_MOST_MODEL_LEN": lambda: (
+        int(val) if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None
+    ),
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # A JSON table giving, per MoE layer, the global experts each
+    # expert-parallel rank holds; empty keeps the checkpoint's order.
+    "TPU_EXPERT_PLACEMENT": lambda: os.getenv("TPU_EXPERT_PLACEMENT", ""),
+    # DP_PLACEMENT=release: the API server's router holds new requests and
+    # releases them as a group across the engines, at DP_SCHED_BUFFER_THRESHOLD
+    # requests, after DP_SCHED_BUFFER_FLUSH_MS, when an engine is idle
+    # (DP_SCHED_BUFFER_IDLE_TRIGGER), or after DP_SCHED_BUFFER_QUIET_MS without
+    # a new arrival.
+    "DP_PLACEMENT": lambda: os.getenv("DP_PLACEMENT", ""),
+    "DP_SCHED_BUFFER_THRESHOLD": lambda: int(
+        os.getenv("DP_SCHED_BUFFER_THRESHOLD") or 0
+    ),
+    "DP_SCHED_BUFFER_FLUSH_MS": lambda: int(
+        os.getenv("DP_SCHED_BUFFER_FLUSH_MS") or 5000
+    ),
+    "DP_SCHED_BUFFER_IDLE_TRIGGER": env_bool(
+        "DP_SCHED_BUFFER_IDLE_TRIGGER", default=True
+    ),
+    "DP_SCHED_BUFFER_QUIET_MS": lambda: int(os.getenv("DP_SCHED_BUFFER_QUIET_MS") or 0),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -615,9 +670,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
-    # admission, automatically supports FP4 and never falls back to GMM.
+    # admission, automatically supports FP4 and never falls back to GMM. v3 is
+    # the FP8 method's owning dispatch (kernels/fused_moe/v3): the fused kernel
+    # from TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows per rank, the few-token kernel
+    # or the grouped path below it; other quantization methods keep v2.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -646,6 +704,45 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # time at TP=32; halving the bytes each core reads costs two on-package
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    # Compiled token shapes of at least this many rows per rank run the fused
+    # expert-parallel kernel; smaller shapes take the few-token kernel or the
+    # grouped-matmul path. 0 sends every shape to the kernel.
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "0")
+    ),
+    # Expert-parallel MoE calls of at most this many tokens run the few-token
+    # kernel (kernels/moe_lowtok): the shard's hit experts walked with the
+    # routing weights as the row mask, no sort, permute, pad or unpermute.
+    # 0 keeps the grouped-matmul path for every count.
+    "TPU_MOE_LOWTOK_MAX_TOKENS": lambda: int(
+        os.getenv("TPU_MOE_LOWTOK_MAX_TOKENS", "0")
+    ),
+    "TPU_FUSED_QK_NORM_ROPE": lambda: int(os.getenv("TPU_FUSED_QK_NORM_ROPE", "0")),
+    # Batched attention in programs of up to RPA_DECODE_PROGRAM_ROWS query
+    # rows: this VMEM limit (MiB) and a decode batch of min(8, slots), so the
+    # attention layers' weights can be prefetched across the kernel.
+    "TPU_RPA_DECODE_VMEM_MIB": lambda: int(os.getenv("TPU_RPA_DECODE_VMEM_MIB", "0")),
+    # The decode batch (sequences the batched attention kernel works on
+    # concurrently) for the decode programs; 0 = min(8, the slot count the
+    # wrapper sees, which is the padded count).
+    "TPU_RPA_DECODE_BATCH": lambda: int(os.getenv("TPU_RPA_DECODE_BATCH", "0")),
+    "TPU_MOE_LOWTOK_FROM_SCORES": lambda: int(
+        os.getenv("TPU_MOE_LOWTOK_FROM_SCORES", "0")
+    ),
+    # Refuse to boot when the scores entry's static terms fail on the loaded
+    # layer (the term is in the error).
+    "TPU_MOE_LOWTOK_SCORES_STRICT": lambda: int(
+        os.getenv("TPU_MOE_LOWTOK_SCORES_STRICT", "0")
+    ),
+    # Sequence parallelism for the tensor-parallel prefill: steps with at
+    # least this many rows reduce-scatter the attention output and run the
+    # residual, norms, router and shared expert on each rank's own rows;
+    # smaller steps keep the all-reduce form. 0 = off.
+    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "0")),
+    # With sequence parallelism: the all-gather before the attention and GDN
+    # in-projections carries fp8 rows and per-row scales (each rank
+    # quantises its own rows once) instead of bf16 rows. 0 = bf16 rows.
+    "TPU_SP_FP8_GATHER": lambda: int(os.getenv("TPU_SP_FP8_GATHER", "0")),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
@@ -682,16 +779,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
-    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1")
-    .strip()
-    .lower()
-    not in ("0", "false", "off", "no"),
+    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: (
+        os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower()
+        not in ("0", "false", "off", "no")
+    ),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
-    "USE_RPA_PIPELINED_DMA_STAGING": lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_PIPELINED_DMA_STAGING")(),
-    "USE_PIPELINED_DMA_STAGING": lambda: env_bool("USE_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    "USE_RPA_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_PIPELINED_DMA_STAGING")()
+    ),
+    "USE_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+    ),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.

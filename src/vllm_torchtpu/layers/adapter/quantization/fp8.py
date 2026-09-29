@@ -42,6 +42,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
@@ -723,6 +724,198 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         return None
 
 
+_LOWTOK_ARMED_LOGGED = False
+
+
+def _lowtok_scores_static_refusal(layer, activation_str):
+    """The term on which the few-token kernel's scores entry refuses this layer, or None when the layer's
+    static terms all hold (the per-call terms are the row count and the activation dtype). Evaluated at weight
+    loading for the boot log, and on the traced path, where it must stay free of logging and other side effects
+    (Dynamo refuses a logging call inside the compiled forward)."""
+    w13_scale = getattr(
+        layer, "w13_weight_scale_inv", getattr(layer, "w13_weight_scale", None)
+    )
+    w2_scale = getattr(
+        layer, "w2_weight_scale_inv", getattr(layer, "w2_weight_scale", None)
+    )
+    if not envs.TPU_MOE_LOWTOK_FROM_SCORES:
+        return "TPU_MOE_LOWTOK_FROM_SCORES unset"
+    if not envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+        return "TPU_MOE_LOWTOK_MAX_TOKENS unset"
+    if getattr(layer, "_lowtok_gid", None) is None:
+        return "no holder tables"
+    if activation_str != "silu":
+        return f"activation {activation_str}"
+    if not layer.renormalize:
+        return "no renormalisation"
+    if getattr(layer, "scoring_func", "softmax") != "softmax":
+        return f"scoring {getattr(layer, 'scoring_func', None)}"
+    if getattr(layer, "custom_routing_function", None) is not None:
+        return "custom routing"
+    # The kernel's router is the plain softmax top-k with renormalised weights
+    # on the output; the routing options moe_routing.route applies (an
+    # expert-selection bias, a routed scaling of the weights, grouped top-k,
+    # the weights on the input) keep the layer on that path.
+    if getattr(layer, "e_score_correction_bias", None) is not None:
+        return "expert-selection bias"
+    if getattr(layer, "routed_scaling_factor", 1.0) != 1.0:
+        return f"routed scaling {getattr(layer, 'routed_scaling_factor', 1.0)}"
+    if getattr(layer, "use_grouped_topk", False):
+        return "grouped top-k"
+    if getattr(layer, "apply_router_weight_on_input", False):
+        return "router weight on input"
+    if (
+        getattr(layer, "w13_bias", None) is not None
+        or getattr(layer, "w2_bias", None) is not None
+    ):
+        return "expert bias"
+    if (
+        layer.w13_weight.dtype != torch.float8_e4m3fn
+        or layer.w2_weight.dtype != torch.float8_e4m3fn
+    ):
+        return f"weights {layer.w13_weight.dtype}"
+    if w13_scale is None or w2_scale is None:
+        return "no scales under weight_scale / weight_scale_inv"
+    if w13_scale.dim() != 4 or w13_scale.shape[1] != 1 or w13_scale.shape[2] != 1:
+        return f"w13 scale shape {tuple(w13_scale.shape)}"
+    if w2_scale.dim() != 4 or w2_scale.shape[1] != 1 or w2_scale.shape[2] != 1:
+        return f"w2 scale shape {tuple(w2_scale.shape)}"
+    if layer.w13_weight.shape[0] > 128:
+        return f"{layer.w13_weight.shape[0]} local experts"
+    if layer.w13_weight.shape[2] % 512:
+        return f"gate|up width {layer.w13_weight.shape[2]}"
+    if (
+        getattr(layer, "_lowtok_prim", None) is None
+        or layer._lowtok_prim.shape[-1] != 512
+    ):
+        return "holder tables not 512 wide"
+    return None
+
+
+def _lowtok_ids_static_refusal(layer, activation_str):
+    """The term on which the few-token kernel's ids hook (the grouped path's
+    entry inside fused_moe_func) refuses this layer, or None when its static
+    terms hold; the per-call terms are the row count and the activation
+    dtype. The terms mirror the hook's own condition in fused_moe_gmm on the
+    layer as it will be served, so the boot log shows the decision."""
+    w13_scale = getattr(layer, "w13_weight_scale_inv", None)
+    w2_scale = getattr(layer, "w2_weight_scale_inv", None)
+    if not envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+        return "TPU_MOE_LOWTOK_MAX_TOKENS unset"
+    if not layer.moe_config.moe_parallel_config.use_ep:
+        return "no expert parallelism"
+    if getattr(layer, "_experts_start", None) is None:
+        return "no experts_start buffer"
+    if activation_str != "silu":
+        return f"activation {activation_str}"
+    if (
+        getattr(layer, "w13_bias", None) is not None
+        or getattr(layer, "w2_bias", None) is not None
+    ):
+        return "expert bias"
+    if (
+        layer.w13_weight.dtype != torch.float8_e4m3fn
+        or layer.w2_weight.dtype != torch.float8_e4m3fn
+    ):
+        return f"weights {layer.w13_weight.dtype}"
+    if w13_scale is None or w2_scale is None:
+        return "no scales under weight_scale_inv"
+    if w13_scale.dim() != 4 or w13_scale.shape[1] != 1 or w13_scale.shape[2] != 1:
+        return f"w13 scale shape {tuple(w13_scale.shape)}"
+    if w2_scale.dim() != 4 or w2_scale.shape[1] != 1 or w2_scale.shape[2] != 1:
+        return f"w2 scale shape {tuple(w2_scale.shape)}"
+    in_dtype = getattr(layer.moe_config, "in_dtype", torch.bfloat16)
+    if in_dtype != torch.bfloat16:
+        return f"activations {in_dtype}"
+    hidden = getattr(layer, "hidden_size", layer.w13_weight.shape[1])
+    if layer.w13_weight.shape[1] != hidden:
+        return f"gate|up rows {layer.w13_weight.shape[1]} against hidden size {hidden}"
+    if layer.w13_weight.shape[0] > 128:
+        return f"{layer.w13_weight.shape[0]} local experts"
+    if layer.w13_weight.shape[2] % 512:
+        return f"gate|up width {layer.w13_weight.shape[2]}"
+    return None
+
+
+def _lowtok_lift_tables(layer, topk_ids):
+    """Reference the scores entry's holder tables on the grouped-matmul side of the row-count fork, so both traces
+    of a token bucket lift the same buffers: the compile flow hands a bucket's executable between traces, and
+    refuses when their lifted inputs differ. The ids pick up a zero; the compiler folds it."""
+    gid = getattr(layer, "_lowtok_gid", None)
+    if gid is None:
+        return topk_ids
+    zero = (
+        gid[:1]
+        + layer._lowtok_prim[:1]
+        + layer._lowtok_copy[:1]
+        + layer._lowtok_hot[:1]
+        + layer._lowtok_hprim[:1]
+        + layer._lowtok_hcopy[:1]
+        + layer._lowtok_hot1h[0, :1].to(torch.int32)
+        + layer._lowtok_slot[:1]
+    ) * 0  # int32 [1]; no sum(): it would widen to int64
+    return topk_ids + zero
+
+
+def _lowtok_scores_output(layer, x, router_logits, activation_str):
+    """The few-token kernel's scores entry for this call, or None when the
+    call is outside its terms: a few tokens under expert parallelism, silu,
+    per-channel fp8 scales, no bias, the softmax router with renormalised
+    weights on the output and no custom routing, expert-selection bias,
+    routed scaling or grouped top-k, 512 experts. The router's top-k and the
+    holder assignment run inside the kernel (kernels/moe_lowtok), so the
+    router_topk call, the renormalisation and the table build leave the step;
+    the layer's all-reduce follows as for every other path. No logging here:
+    this runs inside the compiled forward (the boot log line comes from
+    weight loading)."""
+    if (
+        x.shape[0] > envs.TPU_MOE_LOWTOK_MAX_TOKENS
+        or router_logits.shape[-1] != 512
+        or _lowtok_scores_static_refusal(layer, activation_str) is not None
+    ):
+        return None
+    x = x.to(
+        torch.bfloat16
+    )  # the kernel's row dtype (a no-op for the served bf16 activations)
+    w13_scale = getattr(
+        layer, "w13_weight_scale_inv", getattr(layer, "w13_weight_scale", None)
+    )
+    w2_scale = getattr(
+        layer, "w2_weight_scale_inv", getattr(layer, "w2_weight_scale", None)
+    )
+    from vllm_torchtpu.layers.adapter.moe_lowtok_scores_op import moe_lowtok_scores_op
+
+    scores = torch.softmax(router_logits.float(), dim=-1)
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        # a padded row's scores go to zero: the kernel's router then selects nothing for it (zero
+        # weights, no hits), as the grouped path's zeroed routing weights do
+        scores = token_padding.zero_scores_for_padding(
+            scores, is_local_tensor=enable_pipelined_collective_and_compute()
+        )
+    # the rank comes as the layer's experts_start buffer, untouched (the grouped path lifts the same buffer, and
+    # torch-side integer arithmetic would reach the kernel as int64); the kernel divides by the owned count
+    return moe_lowtok_scores_op(
+        x,
+        scores,
+        layer._experts_start,
+        layer._lowtok_gid,
+        layer._lowtok_prim,
+        layer._lowtok_copy,
+        layer._lowtok_hot,
+        layer._lowtok_hprim,
+        layer._lowtok_hcopy,
+        layer._lowtok_hot1h,
+        layer._lowtok_slot,
+        layer.w13_weight,
+        w13_scale,
+        layer.w2_weight,
+        w2_scale,
+        topk=layer.moe_config.experts_per_token,
+        ranks=int(layer.moe_config.ep_size),
+        owned=layer._lowtok_owned,
+    )
+
+
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     """
     TPU-native FP8 MoE method.
@@ -736,6 +929,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     """
 
     _use_adaptive_fused_moe: bool = False
+    _use_fused_ep_v3: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
 
     def __init__(self, quant_config: Fp8Config, moe_config):
@@ -773,6 +967,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         refuses -- TP, over the SMEM bound, under the token threshold, or
         a weight or routing layout the kernel cannot serve.
         """
+        if getattr(self, "_use_fused_ep_v3", False):
+            # MOE_FUSED_EP_KERNEL_IMPL=v3 (PR #989's dispatch): ownership is
+            # claimed whenever the kernel is enabled. Shapes at or above
+            # TPU_MOE_FUSED_EP_STEP_MIN_TOKENS run the kernel, and the runner
+            # patch `_patch_moe_fused_ep_threshold_contract` hands the smaller
+            # shapes to `apply_monolithic_external_dispatch` between vLLM's own
+            # dispatch and combine. MoE chunk pipelining is refused together
+            # with it at weight loading.
+            return True
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
         return (
@@ -911,10 +1114,58 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         For BF16 checkpoints (online quantization): quantize BF16 → FP8
         directly using the same requantization path.
         """
+        if envs.TPU_MOE_LOWTOK_FROM_SCORES:
+            # the scores entry's op, registered outside any traced region, and
+            # the layer's holder tables (from the placement file when it
+            # carries copies, else the served contiguous placement)
+            from vllm_torchtpu import expert_placement
+            from vllm_torchtpu.layers.adapter.moe_lowtok_scores_op import prebuild
+
+            ranks = int(layer.moe_config.ep_size)
+            # (the op is built after the tables below, once the owned count is known)
+            dev = layer.w13_weight.device
+            n_global = int(layer.moe_config.num_experts)
+            rank = int(layer.moe_config.ep_rank)
+            if expert_placement.has_copies():
+                n = expert_placement.layer_index(
+                    getattr(layer, "layer_name", "") or getattr(layer, "prefix", "")
+                )
+                gid, prim, copy = expert_placement.holder_tables(n, rank)
+                owned = int(expert_placement.owned())
+                order = expert_placement.hot_order(n)
+            else:
+                per_core = n_global // ranks
+                owned = per_core
+                gid = list(range(rank * per_core, (rank + 1) * per_core))
+                prim = [e // per_core for e in range(n_global)]
+                copy = [-1] * n_global
+                order = []
+            from vllm_torchtpu.kernels.moe_lowtok.kernel import hot_tables
+
+            hot, hprim, hcopy = (np.asarray(t) for t in hot_tables(prim, copy, order))
+            layer._lowtok_owned = int(owned)
+            prebuild(layer.moe_config.experts_per_token, ranks, int(owned))
+            layer._lowtok_gid = torch.tensor(gid, dtype=torch.int32, device=dev)
+            layer._lowtok_prim = torch.tensor(prim, dtype=torch.int32, device=dev)
+            layer._lowtok_copy = torch.tensor(copy, dtype=torch.int32, device=dev)
+            layer._lowtok_hot = torch.tensor(hot, dtype=torch.int32, device=dev)
+            layer._lowtok_hprim = torch.tensor(hprim, dtype=torch.int32, device=dev)
+            layer._lowtok_hcopy = torch.tensor(hcopy, dtype=torch.int32, device=dev)
+            from vllm_torchtpu.kernels.moe_lowtok.kernel import hot_onehot, slot_table
+
+            layer._lowtok_hot1h = torch.tensor(
+                np.asarray(hot_onehot(hot)).astype(np.float32),
+                dtype=torch.bfloat16,
+                device=dev,
+            )
+            layer._lowtok_slot = torch.tensor(
+                np.asarray(slot_table(gid, len(gid))), dtype=torch.int32, device=dev
+            )
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        self._use_fused_ep_v3 = envs.MOE_FUSED_EP_KERNEL_IMPL == "v3"
         activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
@@ -981,6 +1232,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        # Copy slots follow the primary interval. The grouped fallback must
+        # mask them after dispatch, while retaining the complete weight buffers.
+        from vllm_torchtpu import expert_placement
+
+        layer._gmm_primary_experts = (
+            int(expert_placement.owned()) if expert_placement.has_copies() else None
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -990,40 +1248,101 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
             return
         prebuild_fused_moe_kernel(
+            num_primary_experts=layer._gmm_primary_experts,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if envs.TPU_MOE_LOWTOK_MAX_TOKENS:
+            # The evidence line for the grouped path's few-token entry: the
+            # hook decides inside the jitted function, so its verdict on the
+            # served layer is stated here, once.
+            ids_refusal = _lowtok_ids_static_refusal(layer, activation_str)
+            logger.info_once(
+                "few-token MoE ids hook %s (cap %d rows per call, %d local experts)",
+                "armed" if ids_refusal is None else f"refused: {ids_refusal}",
+                envs.TPU_MOE_LOWTOK_MAX_TOKENS,
+                layer.w13_weight.shape[0],
+            )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
         # method, which vLLM builds one of per MoE layer, so a layer the kernel
         # cannot serve is refused on its own rather than for the process.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR,
-            prebuild_fused_moe_ep,
-            register_score_bias_buffer,
-        )
+        if self._use_fused_ep_v3:
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+                prebuild_fused_moe_ep as prebuild_fused_moe_ep_v3,
+            )
 
-        _ep_op = prebuild_fused_moe_ep(
-            layer,
-            topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=activation_str,
-        )
-        setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
-        if _ep_op is not None:
-            # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
-            # is the other half of the arity contract: `_routing_config`
-            # decides the op's operand count from
-            # `layer.e_score_correction_bias`, while the call site reads the
-            # STAGED buffer via `score_bias_operand`. Register nothing and the
-            # two disagree -- the op is built with eight operands and
-            # `fused_moe_ep` takes its `score_bias is None` branch and passes
-            # seven, which Dynamo rejects with `missing value for argument
-            # 'score_bias'`. Passing the operand at the call site is not
-            # sufficient on its own; it has to exist.
-            register_score_bias_buffer(layer)
+            if enable_pipelined_collective_and_compute():
+                raise ValueError(
+                    "MOE_FUSED_EP_KERNEL_IMPL=v3 and MoE chunk pipelining both "
+                    "claim the expert-parallel exchange; enable one of them."
+                )
+            prebuild_fused_moe_ep_v3(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            # The runner patches ask the layer's quant method, so it carries
+            # the layer's answer.
+            self._tpu_fused_ep_eligible = bool(
+                getattr(layer, "_tpu_fused_ep_eligible", False)
+            )
+        else:
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+                FUSED_MOE_EP_OP_ATTR,
+                prebuild_fused_moe_ep,
+                register_score_bias_buffer,
+            )
+
+            _ep_op = prebuild_fused_moe_ep(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
+            if _ep_op is not None:
+                # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
+                # is the other half of the arity contract: `_routing_config`
+                # decides the op's operand count from
+                # `layer.e_score_correction_bias`, while the call site reads the
+                # STAGED buffer via `score_bias_operand`. Register nothing and the
+                # two disagree -- the op is built with eight operands and
+                # `fused_moe_ep` takes its `score_bias is None` branch and passes
+                # seven, which Dynamo rejects with `missing value for argument
+                # 'score_bias'`. Passing the operand at the call site is not
+                # sufficient on its own; it has to exist.
+                register_score_bias_buffer(layer)
+        if envs.TPU_MOE_LOWTOK_FROM_SCORES:
+            # The scores entry's static terms, on the layer as it will be
+            # served (after the requantisation and the tables): the boot log
+            # shows the path that will serve the step, and
+            # TPU_MOE_LOWTOK_SCORES_STRICT=1 refuses to boot on a refusal (the
+            # traced guard itself cannot log).
+            global _LOWTOK_ARMED_LOGGED
+            refusal = _lowtok_scores_static_refusal(layer, activation_str)
+            if not _LOWTOK_ARMED_LOGGED:
+                _LOWTOK_ARMED_LOGGED = True
+                from vllm_torchtpu import expert_placement
+
+                logger.info(
+                    "few-token MoE scores entry %s (cap %d rows, activation %s, "
+                    "%d local experts, copies %s, %s global experts)",
+                    "armed" if refusal is None else f"refused: {refusal}",
+                    envs.TPU_MOE_LOWTOK_MAX_TOKENS,
+                    activation_str,
+                    layer.w13_weight.shape[0],
+                    expert_placement.has_copies(),
+                    getattr(layer.moe_config, "num_experts", None),
+                )
+            if refusal is not None and envs.TPU_MOE_LOWTOK_SCORES_STRICT:
+                raise RuntimeError(
+                    f"few-token MoE scores entry refused: {refusal} "
+                    "(TPU_MOE_LOWTOK_SCORES_STRICT)"
+                )
 
     def apply_monolithic(
         self,
@@ -1033,10 +1352,21 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        del input_ids
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        if self._use_fused_ep_v3:
+            return self._apply_owning_dispatch(
+                layer,
+                x,
+                router_logits,
+                activation_str,
+                use_fused_kernel=_fused_kernel_takes(
+                    x.shape[0], envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+                ),
+            )
         # The fused EP kernel takes this rank's own tokens and returns this
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
@@ -1080,12 +1410,23 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        # A few tokens under expert parallelism, with the router inside the
+        # few-token kernel: the softmax scores go straight to the kernel, which
+        # does the served router's own top-k selection (kernels/moe_lowtok,
+        # moe_lowtok_scores), so the router_topk call, the renormalisation and
+        # the routing-table build leave the step. Same guards as the kernel's
+        # ids hook in fused_moe_gmm, plus the routing semantics the kernel
+        # reproduces: softmax scoring, renormalised weights, no custom router.
+        lowtok_out = _lowtok_scores_output(layer, x, router_logits, activation_str)
+        if lowtok_out is not None:
+            return lowtok_out
+
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
-
+        topk_ids = _lowtok_lift_tables(layer, topk_ids)
         if envs.TPU_MOE_SKIP_PADDED_TOKENS:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids,
@@ -1106,6 +1447,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
             "experts_start": layer._experts_start,
+            "num_primary_experts": layer._gmm_primary_experts,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
@@ -1113,6 +1455,130 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
+
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run GMM after external dispatch for small token shapes."""
+        del input_ids
+        lowtok_out = _lowtok_scores_output(
+            layer, x, router_logits, self._tpu_activation_str
+        )
+        if lowtok_out is not None:
+            return lowtok_out
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_ids = _lowtok_lift_tables(layer, topk_ids)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights
+            )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            retain_fused_ep_graph_inputs,
+        )
+
+        out = fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            num_primary_experts=layer._gmm_primary_experts,
+            topk=layer.moe_config.experts_per_token,
+            activation=self._tpu_activation_str,
+        )
+        return retain_fused_ep_graph_inputs(out)
+
+    def _apply_owning_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation_str: str,
+        *,
+        use_fused_kernel: bool = True,
+    ) -> torch.Tensor:
+        """Run the layer when this method owns the EP exchange.
+
+        `x` and `router_logits` are this rank's own tokens. Shapes the fused
+        kernel serves go through it whole; the rest reproduce exactly what
+        vLLM's naive dispatch/combine would have done, so the two paths differ
+        only in who issues the collectives.
+        """
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep,
+            fused_moe_ep_supported,
+            retain_fused_ep_graph_inputs,
+        )
+
+        if use_fused_kernel and fused_moe_ep_supported(layer):
+            # under a copies placement the rank's weight tensors carry the copy slots after its primaries; the
+            # kernel was built for the primaries alone (experts_per_shard) and never reads the copy slots, so the
+            # tensors go in whole to avoid materializing a slice of every weight tensor
+            w13, w2, s13, s2 = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            )
+            # the scores entry's tables ride along as inputs here too: the compile flow hands a bucket's
+            # executable between traces and refuses when their lifted inputs differ
+            if getattr(layer, "_lowtok_gid", None) is not None:
+                router_logits = router_logits + _lowtok_lift_tables(
+                    layer, router_logits.new_zeros((1,))
+                ).to(router_logits.dtype)
+            out = fused_moe_ep(x, w13, w2, s13, s2, router_logits)
+            experts_start = layer._experts_start
+            if experts_start is not None:
+                value = experts_start.to(out.dtype)
+                # (value - value) is zero, and it makes this program read
+                # `value`: both sides of a row-count fork must lift the same
+                # buffers or the compile flow refuses the hand-over.
+                out = out + (value - value)
+            return token_padding.retain_padding_graph_input(out)
+
+        # Below the threshold: vLLM's own dispatch and combine around the
+        # grouped-matmul path (the runner patch takes this route for those
+        # shapes; this branch serves a caller that reached apply_monolithic
+        # directly).
+        ep = get_ep_group()
+        sequence_parallel = layer.moe_config.is_sequence_parallel
+        dispatched = ep.dispatch_router_logits(x, router_logits, sequence_parallel)
+        assert len(dispatched) == 2
+        gathered_x, gathered_logits = dispatched
+        out = self.apply_monolithic_external_dispatch(
+            layer, gathered_x, gathered_logits
+        )
+        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel))
+
+
+def _fused_kernel_takes(rows: int, gate: int) -> bool:
+    """Whether the fused EP kernel takes a step of `rows` rows as this rank
+    sees them. The kernel needs each rank's own rows: under tensor
+    parallelism the rows reach the layer replicated on every rank unless the
+    step is sequence parallel, so `rows` is a per-rank count only once
+    sequence parallelism has split them. A replicated step stays with the
+    few-token kernel or the grouped path whatever its count; under data
+    parallelism every step's rows are the rank's own."""
+    if rows < gate:
+        return False
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import tensor_parallel_size
+
+    if tensor_parallel_size() <= 1:
+        return True
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+    return _sp.is_active()
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
@@ -1402,6 +1868,28 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
         out = quantized_matmul(x, weight, layer.weight_scale)
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """apply with the activation already quantised per row: the
+        sequence-parallel fp8 all-gather hands the projections fp8 rows
+        and their scales (layers/adapter/sequence_parallel)."""
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            quantized_matmul_prequant,
+        )
+
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul_prequant(x_q, x_s, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
         return out

@@ -84,6 +84,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
+    "DP_PLACEMENT",
+    "DP_SCHED_BUFFER_THRESHOLD",
+    "DP_SCHED_BUFFER_FLUSH_MS",
+    "DP_SCHED_BUFFER_IDLE_TRIGGER",
+    "DP_SCHED_BUFFER_QUIET_MS",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
@@ -175,6 +180,13 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    "vllm_torchtpu/layers/adapter/fused_moe_ep_v3.py",
+    # The layer pieces that change compiled graphs when their switch is on.
+    "vllm_torchtpu/layers/adapter/sharded_lm_head.py",
+    "vllm_torchtpu/layers/adapter/norm_weight_hoist.py",
+    "vllm_torchtpu/layers/adapter/gated_norm_quant_op.py",
+    "vllm_torchtpu/layers/adapter/moe_lowtok_scores_op.py",
+    "vllm_torchtpu/layers/adapter/fused_qk_norm_rope_tpu.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",

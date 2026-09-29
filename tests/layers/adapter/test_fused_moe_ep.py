@@ -498,8 +498,6 @@ def test_supports_internal_mk_tracks_both_owners():
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     prop = VllmFp8MoEMethodTPU.supports_internal_mk
-    armed = SimpleNamespace()
-    setattr(armed, bridge.FUSED_MOE_EP_OP_ATTR, "op")
 
     with patch(
         "vllm_torchtpu.layers.adapter.quantization.fp8."
@@ -507,7 +505,6 @@ def test_supports_internal_mk_tracks_both_owners():
         return_value=False,
     ):
         assert prop.fget(SimpleNamespace()) is False
-        assert prop.fget(armed) is True
 
     with patch(
         "vllm_torchtpu.layers.adapter.quantization.fp8."
@@ -531,6 +528,23 @@ def test_env_flag_alone_does_not_claim_the_collectives():
         ),
     ):
         assert prop.fget(SimpleNamespace()) is False
+
+
+def test_impl_v3_claims_the_collectives():
+    """MOE_FUSED_EP_KERNEL_IMPL=v3 selects the FP8 method's owning dispatch
+    (PR #989): it serves every shape itself -- the fused kernel from
+    TPU_MOE_FUSED_EP_STEP_MIN_TOKENS rows, the few-token kernel or the grouped
+    path below it, with vLLM's dispatch and combine around the latter -- so it
+    claims the exchange without an armed per-layer v2 op."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    prop = VllmFp8MoEMethodTPU.supports_internal_mk
+    with patch(
+        "vllm_torchtpu.layers.adapter.quantization.fp8."
+        "enable_pipelined_collective_and_compute",
+        return_value=False,
+    ):
+        assert prop.fget(SimpleNamespace(_use_fused_ep_v3=True)) is True
 
 
 class TestFusedOutputIsReducedPatch:

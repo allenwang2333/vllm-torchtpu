@@ -33,6 +33,23 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
+# Test files that need no chip. A session of nothing but these (or tests
+# marked cpu_test) runs with JAX pinned to the CPU.
+HOST_ONLY_TEST_FILES = (
+    "tests/core/test_dp_placement.py",
+    "tests/kernels/test_gated_norm_quant.py",
+    "tests/layers/adapter/test_moe_fused_ep_threshold.py",
+    "tests/layers/adapter/test_norm_weight_hoist.py",
+    "tests/layers/adapter/test_sharded_lm_head.py",
+    "tests/test_expert_placement.py",
+)
+
+
+def _needs_no_chip(item):
+    return item.get_closest_marker("cpu_test") is not None or str(item.path).endswith(
+        HOST_ONLY_TEST_FILES
+    )
+
 
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
@@ -48,6 +65,20 @@ def pytest_collection_modifyitems(items):
     items.sort(
         key=lambda item: 0 if item.get_closest_marker("spawns_tpu_workers") else 1
     )
+    # A session of tests that need no chip runs with JAX pinned to the CPU,
+    # unless JAX_PLATFORMS is set already. JAX does not fall back to the CPU
+    # when the chips are busy (it raises), and the pin must not leak into a
+    # session with device tests, which would then skip; so it is decided
+    # here, over the whole collection, and applied to the loaded jax config
+    # as well (jax reads JAX_PLATFORMS once, at import).
+    if (
+        items
+        and not os.environ.get("JAX_PLATFORMS")
+        and all(_needs_no_chip(item) for item in items)
+    ):
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        if "jax" in sys.modules:
+            sys.modules["jax"].config.update("jax_platforms", "cpu")
 
 
 def pytest_addoption(parser):
@@ -73,6 +104,26 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
     yield
     vllm.logger._print_warning_once.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _unpin_lazy_envs():
+    """`vllm_torchtpu.envs` resolves its variables lazily through a module
+    `__getattr__`. `monkeypatch.setattr(envs, NAME, ...)` undoes itself by
+    setting the value it read back as a real module attribute, which then
+    shadows the lazy lookup for every later test in the process. Drop any
+    variable name a test left pinned so the next test reads the environment."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        yield
+        return
+
+    before = set(vars(envs))
+    yield
+    for name in set(vars(envs)) - before:
+        if name in envs.environment_variables:
+            delattr(envs, name)
 
 
 @pytest.fixture

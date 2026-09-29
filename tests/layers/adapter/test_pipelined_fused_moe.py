@@ -349,6 +349,7 @@ class TestMoEForwardPrecisionBranches:
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
         # Exercise GMM dispatch; an unset mock attribute would be truthy.
         method._use_adaptive_fused_moe = False
+        method._use_fused_ep_v3 = False
         method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
@@ -511,6 +512,7 @@ class TestMoEForwardPrecisionBranches:
         method = MagicMock(spec=VllmNvfp4MoEMethod)
         # Exercise GMM dispatch; an unset mock attribute would be truthy.
         method._use_adaptive_fused_moe = False
+        method._use_fused_ep_v3 = False
         method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)

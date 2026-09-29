@@ -813,6 +813,15 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
+        if envs.TPU_SHARDED_LM_HEAD:
+            # The sharded head runs at one fixed row count. One request
+            # bucket keeps the compiled graph from padding rows before the
+            # head's exchange and trimming them after, which the compiler
+            # gets wrong above one row tile.
+            self.num_reqs_paddings = [self.max_num_reqs]
+            logger.info(
+                "TPU_SHARDED_LM_HEAD: one request bucket, %d rows", self.max_num_reqs
+            )
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (
@@ -2668,9 +2677,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             target_num_reqs = self.num_reqs_most_model_len
-        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs
-        )
+        padded_num_reqs = _get_padded_token_len(self.num_reqs_paddings, num_reqs)
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -4447,6 +4454,22 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        # TPU_SHARDED_LM_HEAD: the projection split across the engines. With
+        # it on the runner runs one request bucket (set above), so every
+        # engine calls the op with one shape and the compiled graph pads and
+        # trims nothing around the op's exchange.
+        from vllm_torchtpu.layers.adapter import (
+            gated_norm_quant_op,
+            norm_weight_hoist,
+            sharded_lm_head,
+        )
+
+        sharded_lm_head.install_if_enabled(model, list(self.num_reqs_paddings))
+        # TPU_NORM_WEIGHT_HOIST: the norms' (1 + w) computed once after loading.
+        norm_weight_hoist.install_if_enabled(model)
+        # TPU_GDN_FUSED_NORM_QUANT: the GDN output's gated norm and fp8
+        # quantisation as one op, built here.
+        gated_norm_quant_op.install_if_enabled(model)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -6190,6 +6213,15 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        # The step's form under the row-gated sequence parallelism, set here
+        # outside the compiled region: inside a traced forward the write would
+        # become a graph output. The row count is static per compiled shape,
+        # so the decoder layers and the communicator read a constant.
+        from vllm_torchtpu.layers.adapter import sequence_parallel
+
+        sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(positions.shape[-1])
+        )
         out = self.model(
             input_ids=input_ids,
             positions=positions,

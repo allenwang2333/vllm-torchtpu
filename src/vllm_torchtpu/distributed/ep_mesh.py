@@ -44,7 +44,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # The fused MoE kernel body calls `lax.axis_index` on its own module constant
-# (`kernels.fused_moe.v2.AXIS`) rather than on a name from the mesh it is
+# (the kernel package's own axis-name constant) rather than on a name from the mesh it is
 # handed, so a mesh axis named anything else traces the whole kernel and then
 # dies on an unbound axis name. Any consumer that cares asserts against that
 # constant; this default is what makes it work.
@@ -159,8 +159,9 @@ def ep_rank_order() -> tuple[int, ...] | None:
     `build_ep_mesh` orders the mesh by rank to match, and mesh index i holds EP
     rank i's experts again.
 
-    Kept rather than deleted so `fused_moe_ep._mesh_expert_order` keeps a
-    single place to ask, and so a future ordering change has somewhere to live.
+    Kept rather than deleted so `fused_moe_ep._mesh_expert_order` and
+    `fused_moe_ep_v3._expert_block_permutation` keep a single place to ask,
+    and so a future ordering change has somewhere to live.
     """
     group = get_ep_group()
     if group is None:

@@ -345,6 +345,26 @@ def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> An
     return op
 
 
+def _project(layer, x, prequant):
+    """A column-parallel projection of the rows: from the fp8 rows and their
+    scales when the caller gathered them quantised, else from `x`."""
+    if prequant is None:
+        out, _ = layer(x)
+        return out
+    apply_prequant = getattr(layer.quant_method, "apply_prequant", None)
+    bias = (
+        None if getattr(layer, "skip_bias_add", False) else getattr(layer, "bias", None)
+    )
+    if apply_prequant is None:
+        # a linear method without the pre-quantised entry (the checkpoint
+        # leaves the small b/a projection unquantised, bf16): dequantise the
+        # rows for it, back to the activation dtype
+        rows = (prequant[0].to(torch.float32) * prequant[1]).to(torch.bfloat16)
+        out, _ = layer(rows)
+        return out
+    return apply_prequant(layer, prequant[0], prequant[1], bias)
+
+
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Whether pooled ops consume the merged block-major unified pool, along
@@ -357,8 +377,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
-        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
+        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in];
+        # that fusion runs only with prefill context parallelism. Without it
+        # the weight takes the linear method's (k, n) layout like every other
+        # projection, which the compiler prefetches into VMEM and contracts
+        # without a transposed read.
+        if hasattr(self, "in_proj_qkvz") and self._pcp_streaming_enabled():
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
@@ -1055,6 +1079,32 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
+        # TPU_GDN_FUSED_NORM_QUANT: the gated norm and the out-projection's fp8
+        # quantisation in one pass; the out-projection then runs on the
+        # pre-quantised rows.
+        from vllm_torchtpu.layers.adapter import gated_norm_quant_op
+
+        out_proj = self.out_proj
+        out_scale = getattr(out_proj, "weight_scale", None)
+        # The fused path runs the projection's matmul itself: only for a
+        # per-channel fp8 projection in the [in, out] layout. Under tensor
+        # parallelism it computes this shard's partial and then the
+        # all-reduce the projection's own forward would have done.
+        if (
+            gated_norm_quant_op.enabled()
+            and out_proj.weight.dtype == torch.float8_e4m3fn
+            and out_scale is not None
+            and out_scale.ndim == 1
+            and not getattr(out_proj, KEEP_VLLM_LAYOUT_ATTR, False)
+        ):
+            output = gated_norm_quant_op.output_projection(
+                core_attn_out, z, self.norm, out_proj
+            )
+            if self.tp_size > 1 and getattr(out_proj, "reduce_results", True):
+                from vllm.distributed import tensor_model_parallel_all_reduce
+
+                output = tensor_model_parallel_all_reduce(output)
+            return output
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
@@ -1105,7 +1155,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        # `prequant`: the rows already quantised per row (fp8 rows, float32
+        # scales) by the sequence-parallel all-gather; the in-projections take
+        # them as they are and `hidden_states` only gives the row count.
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
@@ -1120,16 +1174,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
+            mixed_qkv = _project(self.in_proj_qkv, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
+            z = _project(self.in_proj_z, hidden_states, prequant)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _project(self.in_proj_qkvz, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(

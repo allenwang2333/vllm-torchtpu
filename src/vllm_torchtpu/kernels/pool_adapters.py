@@ -498,8 +498,9 @@ def v3_state_source(
 
     The SSM region is the whole kernel blocks at the start of the manager
     window (one contiguous DMA per slot), viewed in the configured storage
-    dtype. FP32 uses a ``d_v``-wide typed view; BF16 preserves the raw pool
-    ref's full minormost width. The Conv region is ``conv_ntok`` token rows
+    dtype, through a ``d_v``-wide typed view (a 16-bit view of a byte-typed
+    pool goes through ``typed_ldst``'s packed route). The Conv region is
+    ``conv_ntok`` token rows
     inside a single kernel block, viewed as BF16 with the tail rows
     zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
