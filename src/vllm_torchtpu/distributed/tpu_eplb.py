@@ -66,6 +66,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+# Module-level on purpose: sharded_jax_callable resolves the string annotations
+# (``jax.Array``) of make_exchange_fn's closure against these globals.
+import jax
 import numpy as np
 
 

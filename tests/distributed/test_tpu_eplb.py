@@ -84,3 +84,18 @@ def test_ep_ids_round_trip_through_mesh_relabel():
     l2p0 = np.empty(E, np.int64)
     l2p0[p2l] = np.arange(E)
     assert np.array_equal(T.ep_ids_from_mesh(l2p0, order, G), np.arange(E))
+
+
+def test_exchange_fn_signature_resolves_for_sharded_jax_callable():
+    # sharded_jax_callable evaluates the closure's string annotations in the
+    # module's globals (eval_str=True); a function-local `import jax` is not
+    # enough (served run j-2b772a7a died with NameError at the first rebalance).
+    import inspect
+
+    import jax
+    from jax.sharding import Mesh
+
+    mesh = Mesh(np.array(jax.devices()[:1]), ("ep",))
+    fn = T.make_exchange_fn(mesh, "ep")
+    sig = inspect.signature(inspect.unwrap(fn), eval_str=True)
+    assert len(sig.parameters) == 6
