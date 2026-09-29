@@ -283,6 +283,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
+        from vllm_torchtpu import probe_topk
+        self._probe_buf = None
+        if probe_topk.enabled() and probe_topk.want_layer(self.k_cache.prefix):
+            self._probe_buf = torch.full_like(self.topk_indices_buffer, -1)
+            probe_topk.BUFS[probe_topk.layer_of(self.k_cache.prefix)] = self._probe_buf
+            print(f"PROBE_TOPK buffer for {self.k_cache.prefix} "
+                  f"{tuple(self._probe_buf.shape)} {self._probe_buf.device}", flush=True)
 
         parallel_config = getattr(
             get_current_vllm_config_or_none(), "parallel_config", None
@@ -573,6 +580,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Both branches return `topk_tokens`-wide rows.
         topk = self.topk_tokens
         self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
+        if self._probe_buf is not None:
+            self._probe_buf[:num_out, :topk] = topk_indices[:num_out]
         return self.topk_indices_buffer
 
 
