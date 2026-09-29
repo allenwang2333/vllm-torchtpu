@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_SEQUENCE_PARALLEL_PREFILL: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -654,6 +655,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Sequence parallelism for the TP prefill (layers/adapter/sequence_parallel):
+    # steps above a row threshold reduce-scatter the attention output and run
+    # the norms, router and shared expert on each rank's own rows. Qwen3-Next
+    # and Qwen3.5 MoE decoders under TP>1 + EP, DP=1.
+    "TPU_SEQUENCE_PARALLEL_PREFILL": env_bool("TPU_SEQUENCE_PARALLEL_PREFILL"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

@@ -569,14 +569,22 @@ def _patch_disable_sequence_parallel_moe() -> None:
     """Disable vLLM's sequence-parallel MoE on TPU.
 
     The sequence-parallel path is tied to vLLM all2all MoE backends. The TPU
-    communicator handles EP with unsplit token buffers.
+    communicator handles EP with unsplit token buffers, except for the layers
+    built for TPU_SEQUENCE_PARALLEL_PREFILL (layers/adapter/sequence_parallel).
     """
     from vllm.config.parallel import ParallelConfig
 
     if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
         return
 
-    ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
+    def use_sequence_parallel_moe(self) -> bool:
+        if not envs.TPU_SEQUENCE_PARALLEL_PREFILL:
+            return False
+        from vllm_torchtpu.layers.adapter import sequence_parallel
+
+        return sequence_parallel.use_sequence_parallel_moe(self)
+
+    ParallelConfig.use_sequence_parallel_moe = property(use_sequence_parallel_moe)
     ParallelConfig._tpu_no_sp_moe_patch = True
     logger.info("Applied TPU patch: disable sequence-parallel MoE.")
 
