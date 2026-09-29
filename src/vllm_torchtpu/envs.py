@@ -717,9 +717,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the SparseCore stage 2 over all P * k_p candidate words of a row; "seg"
     # has stage 1 emit each slice's candidate count and stage 2 walk only those
     # (bit-identical indices, most candidate words are -inf pad); "segc" also
-    # folds the index remap (take_along_axis) into that stage-2 kernel.
+    # folds the index remap (take_along_axis) into that stage-2 kernel;
+    # "segc2" is "segc" copying only the live part of each slice into stage 2;
+    # "segcD" is "segc2" with chunk m-1's stage 2 fused into chunk m's stage-1
+    # SparseCore kernel, so the stage 2s run under the scoring instead of
+    # serially after the last chunk.
     "TPU_STREAMIDX_TOPK_TAIL": env_with_choices(
-        "TPU_STREAMIDX_TOPK_TAIL", "", ["", "seg", "segc"]
+        "TPU_STREAMIDX_TOPK_TAIL", "", ["", "seg", "segc", "segc2", "segcD"]
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

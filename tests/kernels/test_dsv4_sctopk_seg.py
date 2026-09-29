@@ -87,7 +87,12 @@ KINDS = ["iid", "hot_recent", "heavy_ties", "strict_desc", "all_neg_inf",
          "sparse_neg_inf"]
 
 
-TAILS = ["seg", "segc"]
+TAILS = ["seg", "segc", "segc2"]
+# Call-site: "segcD" (chain) and the barrier modes change the chunk loop.
+CALL_TAILS = TAILS + [
+    "segcD", "segcD:segc", "segcD:segc2g256", "segcB2", "segcB3:segc",
+    "segcL1", "segcL2:segc",
+]
 
 
 @pytest.mark.parametrize("tail", TAILS)
@@ -118,6 +123,91 @@ def test_seg_python_unrolled_segments_match(kind, tail):
     assert _first_diff(seg_s, inc_s) is None
 
 
+@pytest.mark.parametrize("granule", [16, 128, 512, 2048])
+@pytest.mark.parametrize("kind", ["iid", "hot_recent", "heavy_ties", "sparse_neg_inf"])
+def test_segc2_granules_bit_exact(kind, granule):
+    rng = np.random.default_rng(SEED + 43)
+    lens = _ragged_lengths(B, N_PROD, K)
+    scores = _scores(kind, B, N_PROD, rng, lens)
+    inc_i, inc_s = _impl(scores, lens)
+    g_i, g_s = _impl(scores, lens, topk_tail="segc2", seg_granule=granule)
+    assert _first_diff(g_i, inc_i) is None, _first_diff(g_i, inc_i)
+    assert _first_diff(g_s, inc_s) is None, _first_diff(g_s, inc_s)
+
+
+def _chain_inputs(kinds, seed):
+    rng = np.random.default_rng(seed)
+    chunks = []
+    for i, kind in enumerate(kinds):
+        lens = _ragged_lengths(B, N_PROD, K) if i % 2 else np.full(B, N_PROD, np.int32)
+        scores = _scores(kind, B, N_PROD, rng, lens)
+        bits = _as_bits(scores)
+        t_rows = l1.row_threshold_rows(bits, K, jnp.asarray(lens))
+        chunks.append((scores, lens, bits, t_rows))
+    return chunks
+
+
+CHAIN_KINDS = ["iid", "hot_recent", "heavy_ties", "sparse_neg_inf"]
+
+
+@pytest.mark.parametrize("tail", ["segc", "segc2", "segc2g2048"])
+def test_chain_fused_stage2_bit_exact(tail):
+    """Chained (chunk m-1's stage 2 + chunk m's stage 1 in one kernel) ==
+    the per-chunk segc path == the incumbent, on every chunk."""
+    chunks = _chain_inputs(CHAIN_KINDS, SEED + 44)
+    got = l1.sparsecore_topk_l1_chain(
+        [(bits, jnp.asarray(lens), t) for _, lens, bits, t in chunks], K, topk_tail=tail
+    )
+    assert len(got) == len(chunks)
+    for m, ((scores, lens, _, t), (gi, gs)) in enumerate(zip(chunks, got)):
+        inc_i, inc_s = _impl(scores, lens, t_rows=t)
+        gi, gs = np.asarray(gi), np.asarray(gs)
+        assert (err := _mismatch(scores, gi, K, lens)) is None, (m, err)
+        assert _first_diff(gi, inc_i) is None, (m, "idx", _first_diff(gi, inc_i))
+        assert _first_diff(gs, inc_s) is None, (m, "scores", _first_diff(gs, inc_s))
+
+
+def test_control_chain_faulty_stage2_goes_red():
+    """The chain comparison must catch a stage 2 that drops a live chunk, in
+    the fused part (chunks 0..n-2) and in the lone last stage 2 alike."""
+    chunks = _chain_inputs(["iid"] * 3, SEED + 45)
+    got = l1.sparsecore_topk_l1_chain(
+        [(bits, jnp.asarray(lens), t) for _, lens, bits, t in chunks], K,
+        topk_tail="segc", seg_fault="droplast",
+    )
+    red = []
+    for (scores, lens, _, t), (gi, _) in zip(chunks, got):
+        gi = np.asarray(gi)
+        red.append(sum(
+            _mismatch(scores[r : r + 1], gi[r : r + 1], K, lens[r : r + 1]) is not None
+            for r in range(B) if lens[r] > 0
+        ))
+    live = [int((c[1] > 0).sum()) for c in chunks]
+    print(f"CONTROL chain droplast: red rows per chunk {red} of live {live}")
+    assert red[0] == live[0] and red[-1] == live[-1] and all(r > 0 for r in red)
+
+
+@pytest.mark.parametrize("tail", [""] + TAILS)
+def test_write_empty_rows_is_inert(tail):
+    # Carried trap: seg/segc/segc2 never see `write_empty_rows`. It is also a
+    # no-op on the incumbent (`_sc_topk_direct` deletes it), so every path
+    # must give the same bits either way, empty rows included.
+    rng = np.random.default_rng(SEED + 44)
+    lens = _ragged_lengths(B, N_PROD, K)
+    assert (lens == 0).any()
+    scores = _scores("iid", B, N_PROD, rng, lens)
+    kw = dict(topk_tail=tail) if tail else {}
+    on_i, on_s = _impl(scores, lens, **kw)
+    off = l1._sparsecore_topk_l1_impl(
+        _as_bits(scores), K, jnp.asarray(lens), write_empty_rows=False,
+        scheduling_group_id=None, stage2_scheduling_group_id=None,
+        threshold_scheduling_group_id=None, **kw,
+    )
+    assert _first_diff(np.asarray(off[0]), on_i) is None
+    assert _first_diff(np.asarray(off[1]), on_s) is None
+    assert (on_i[lens == 0] == -1).all()
+
+
 # --------------------------------------------------------------------------- #
 # Positive controls.
 # --------------------------------------------------------------------------- #
@@ -125,8 +215,10 @@ def test_seg_python_unrolled_segments_match(kind, tail):
 CONTROL_KINDS = ["iid", "hot_recent", "heavy_ties", "sparse_neg_inf"]
 
 
-@pytest.mark.parametrize("tail", TAILS)
-@pytest.mark.parametrize("fault", ["floor", "droplast"])
+@pytest.mark.parametrize(
+    "tail,fault",
+    [(t, f) for t in TAILS for f in ("floor", "droplast")] + [("segc2", "dmashort")],
+)
 def test_control_faulty_segment_walk_goes_red(fault, tail):
     red = {}
     for kind in CONTROL_KINDS:
@@ -150,8 +242,9 @@ def test_control_faulty_segment_walk_goes_red(fault, tail):
     ))
     # droplast drops a live chunk of every segment with a candidate: every live
     # iid row must lose a winner. floor only bites where cnt % 16 != 0.
+    # dmashort leaves the last live granule of each segment stale.
     assert red[("iid", False)][0] > 0
-    if fault == "droplast":
+    if fault in ("droplast", "dmashort"):
         assert red[("iid", False)][0] == B
 
 
@@ -174,7 +267,7 @@ def test_control_faulty_segment_walk_goes_red(fault, tail):
 def test_call_site_seg_bit_exact(T_list, S_list, hot, extra):
     kw = _call_kwargs(T_list, S_list, hot=hot, **extra)
     inc = np.asarray(streamindex_topk(**kw, sctopk_l1=True))
-    for tail in TAILS:
+    for tail in CALL_TAILS:
         seg = np.asarray(streamindex_topk(**kw, sctopk_l1=True, topk_tail=tail))
         assert _first_diff(seg, inc) is None, (tail, _first_diff(seg, inc))
 

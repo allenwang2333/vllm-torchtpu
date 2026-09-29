@@ -49,6 +49,7 @@ tall for the T kernel's VMEM.
 """
 
 import functools
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -75,6 +76,14 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     _sc_topk_direct,
     sparsecore_topk,
 )
+
+# Stage-2 tails (`topk_tail`), see `_sparsecore_topk_l1_impl`.
+TOPK_TAILS = ("", "seg", "segc", "segc2")
+# Words per stage-2 copy under "segc2": one live segment moves
+# ceil(cnt / SEGC2_GRANULE) of these (scores and columns each). 2048 (= k_p,
+# whole segments) skips the dead segments past a row's keys, which is where
+# the measured saving is; 128/256 measured no better at layer scope.
+SEGC2_GRANULE = 2048
 
 # Widest stage-1 slice this path runs, in 32-bit words. On top of the
 # incumbent's double-buffered slice (2 x slice) plus its outputs, stage 1' keeps
@@ -633,6 +642,17 @@ def _topk_body_seg_idx(
     )
 
 
+def _topk_body_seg_dma(
+    scores_hbm, counts_hbm, lengths_hbm, idx_hbm, out_hbm, keys_hbm,
+    glob_vmem, rowbuf_vmem, keybuf_vmem, scores_sc, idx_sc, sem, **kw
+):
+    _topk_body_seg(
+        scores_hbm, counts_hbm, lengths_hbm, idx_hbm, out_hbm, keys_hbm,
+        glob_vmem, rowbuf_vmem, keybuf_vmem, None, dma=(scores_sc, idx_sc, sem),
+        **kw,
+    )
+
+
 def _topk_body_seg(
     scores_hbm,  # i32[padded_b, p * k_p]  stage-1 candidate score bits
     counts_hbm,  # i32[padded_b, p * LANES] lane 0 of block s = live slots of s
@@ -653,6 +673,8 @@ def _topk_body_seg(
     seg_loop: str,
     fault: str,
     idx_buf: int = 1,
+    dma=None,
+    dma_granule: int = 0,
 ):
     """Stage 2 over only the live prefix of each stage-1 segment.
 
@@ -670,8 +692,18 @@ def _topk_body_seg(
     each winner: the incumbent's `take_along_axis` remap folded in. Same
     values in the same slots as the incumbent's remapped output.
 
+    With `dma` (VMEM row scratches + a DMA semaphore; needs `idx_hbm`) the
+    rows are not pipelined whole: each step copies, per segment, only the
+    `ceil(cnt_s / dma_granule)` granules that hold its live prefix, scores and
+    columns, into the same offsets of the scratch rows, then runs the same
+    compaction. The compaction reads only chunks below `ceil(cnt_s / LANES)`,
+    all inside copied granules, so the words are the same as the whole-row
+    path's and so is the result. Dead segments and dead granules move no bytes.
+
     `fault` is test-only: "floor" walks `cnt_s // LANES` chunks per segment,
-    "droplast" one chunk fewer than needed; both lose candidates.
+    "droplast" one chunk fewer than needed; both lose candidates. "dmashort"
+    (with `dma`) copies one granule fewer than needed per live segment, so the
+    walk reads stale words.
     """
     num_subcores = 16
     num_sc_cores = 2
@@ -928,6 +960,71 @@ def _topk_body_seg(
     def rmap(w):
         return (w * cores_per_chip + flat,)
 
+    if dma is not None:
+        assert with_idx and k_p % dma_granule == 0 and dma_granule % LANES == 0
+        scores_sc, idx_sc, sem = dma
+        g_len = dma_granule
+        g_per_seg = k_p // g_len
+
+        def dma_step(cnt_vmem, len_slice_vmem, out_vmem, keys_vmem):
+            w = pl.program_id(0)
+            row = w * cores_per_chip + flat
+            eff_len = jnp.minimum(vec_at(len_slice_vmem, 0), slice_len)
+            live_row = (row < b) & (eff_len > 0)
+            rbase = row * slice_len
+
+            def start_seg(s, n):
+                cnt = cnt_vmem[pl.ds(pl.multiple_of(s * LANES, LANES), LANES)][0]
+                cnt = jnp.where(live_row, jnp.minimum(cnt, k_p), 0)
+                ng = (cnt + (g_len - 1)) // g_len
+                if fault == "dmashort":
+                    ng = jnp.maximum(ng - 1, 0)
+                for g in range(g_per_seg):
+
+                    @pl.when(g < ng)
+                    def _(g=g):
+                        off = pl.multiple_of(s * k_p + g * g_len, g_len)
+                        src = pl.multiple_of(rbase + off, g_len)
+                        pltpu.make_async_copy(
+                            scores_hbm.at[pl.ds(src, g_len)],
+                            scores_sc.at[pl.ds(off, g_len)],
+                            sem,
+                        ).start()
+                        pltpu.make_async_copy(
+                            idx_hbm.at[pl.ds(src, g_len)],
+                            idx_sc.at[pl.ds(off, g_len)],
+                            sem,
+                        ).start()
+
+                return n + ng
+
+            n_granules = lax.fori_loop(0, p, start_seg, jnp.int32(0))
+
+            def wait_one(i, c):
+                pltpu.make_async_copy(
+                    scores_hbm.at[pl.ds(0, g_len)], scores_sc.at[pl.ds(0, g_len)], sem
+                ).wait()
+                return c
+
+            lax.fori_loop(0, 2 * n_granules, wait_one, jnp.int32(0))
+            pipeline_step(
+                scores_sc, cnt_vmem, len_slice_vmem, idx_sc, out_vmem, keys_vmem
+            )
+
+        pltpu.emit_pipeline(
+            dma_step,
+            grid=(num_waves,),
+            in_specs=(
+                pl.BlockSpec((p * LANES,), rmap, pipeline_mode=pl.Buffered(buf_count)),
+                pl.BlockSpec((LANES,), rmap, pipeline_mode=pl.Buffered(buf_count)),
+            ),
+            out_specs=(
+                pl.BlockSpec((k,), rmap, pipeline_mode=pl.Buffered(buf_count)),
+                pl.BlockSpec((k,), rmap, pipeline_mode=pl.Buffered(buf_count)),
+            ),
+        )(counts_hbm, lengths_hbm, out_hbm, keys_hbm)
+        return
+
     in_specs = (
         pl.BlockSpec((slice_len,), rmap, pipeline_mode=pl.Buffered(buf_count)),
         pl.BlockSpec((p * LANES,), rmap, pipeline_mode=pl.Buffered(buf_count)),
@@ -953,7 +1050,16 @@ def _topk_body_seg(
     )(*ins, out_hbm, keys_hbm)
 
 
-def _sc_topk_stage2_seg(
+def _sc_topk_stage2_seg(*args, scheduling_group_id: int | None = None, **kw):
+    """`_sc_topk_direct` over stage-1 candidates, walking only live prefixes.
+
+    Returns (candidate slots, score bits); with `cand_idx`, (columns, score
+    bits), i.e. the remap is done in the kernel. Arguments: `_stage2_spec`.
+    """
+    return _run_sc_kernels((_stage2_spec(*args, **kw),), scheduling_group_id)[0]
+
+
+def _stage2_spec(
     cand_scores: jax.Array,  # i32/f32 [b, p * k_p]
     counts: jax.Array,  # i32[>= b * p * LANES] from stage 1 (emit_counts)
     k: int,
@@ -966,12 +1072,9 @@ def _sc_topk_stage2_seg(
     scheduling_group_id: int | None = None,
     cand_idx: jax.Array | None = None,  # i32[b, p * k_p] row-global columns
     idx_buf: int = 1,
-) -> tuple[jax.Array, jax.Array]:
-    """`_sc_topk_direct` over stage-1 candidates, walking only live prefixes.
-
-    Returns (candidate slots, score bits); with `cand_idx`, (columns, score
-    bits), i.e. the remap is done in the kernel.
-    """
+    dma_granule: int = 0,
+) -> "_ScKernel":
+    """The stage-2 kernel of `_sc_topk_stage2_seg`, unlaunched."""
     b, n = cand_scores.shape
     if n != p * k_p or k_p % LANES:
         raise ValueError(f"{cand_scores.shape=} is not {p} x {k_p}")
@@ -1014,9 +1117,24 @@ def _sc_topk_stage2_seg(
         if pad_b > 0:
             idx = jnp.pad(idx, ((0, pad_b), (0, 0)), constant_values=-1)
         ins += (idx.reshape(-1),)
-        body, extra, tag = _topk_body_seg_idx, dict(idx_buf=idx_buf), "_idx"
-    out = pl.kernel(
-        functools.partial(
+        if dma_granule:
+            scratch_types += (
+                pltpu.VMEM((n + LANES,), jnp.int32),
+                pltpu.VMEM((n + LANES,), jnp.int32),
+                pltpu.SemaphoreType.DMA,
+            )
+            body = _topk_body_seg_dma
+            extra, tag = dict(dma_granule=dma_granule), f"_dma{dma_granule}"
+        else:
+            body, extra, tag = _topk_body_seg_idx, dict(idx_buf=idx_buf), "_idx"
+    del mesh
+
+    def post(out):
+        slots, keys = out
+        return slots.reshape(padded_b, k)[:b], keys.reshape(padded_b, k)[:b]
+
+    return _ScKernel(
+        body=functools.partial(
             body,
             **extra,
             b=b,
@@ -1027,23 +1145,92 @@ def _sc_topk_stage2_seg(
             seg_loop=seg_loop,
             fault=fault,
         ),
+        ins=ins,
         out_type=(slot_type, slot_type),
+        scratch_types=scratch_types,
+        name=f"sc_topk_seg{tag}_b{b}_n{n}_k{k}{('_' + fault) if fault else ''}",
+        post=post,
+    )
+
+
+class _ScKernel(NamedTuple):
+    """One SparseCore kernel's body, inputs, outputs and scratch, unlaunched."""
+
+    body: Callable
+    ins: tuple
+    out_type: tuple
+    scratch_types: tuple
+    name: str
+    post: Callable
+
+
+def _run_sc_kernels(kernels, scheduling_group_id=None):
+    """Launch `kernels` as ONE SparseCore kernel that runs them in order.
+
+    Each part's scratch lives only for its part (`pl.run_scoped`), so VMEM
+    peaks at the largest part, not the sum. The parts must not depend on each
+    other's outputs: there is no barrier between them, and each subcore runs
+    its share of part i+1 as soon as its share of part i is done. One part is
+    exactly the plain `pl.kernel` launch. Returns each part's `post(outputs)`.
+    """
+    sc = pltpu.get_tpu_info().sparse_core
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc.num_cores,
+        num_subcores=sc.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    if len(kernels) == 1:
+        (kn,) = kernels
+        body, scratch_types, name = kn.body, kn.scratch_types, kn.name
+    else:
+        n_in = [len(kn.ins) for kn in kernels]
+        n_out = [len(kn.out_type) for kn in kernels]
+        name = "__".join(kn.name for kn in kernels)
+        scratch_types = ()
+
+        def body(*refs):
+            ins, outs = refs[: sum(n_in)], refs[sum(n_in) :]
+            i = o = 0
+            for kn, a, c in zip(kernels, n_in, n_out):
+                part_refs = (*ins[i : i + a], *outs[o : o + c])
+                pl.run_scoped(
+                    functools.partial(kn.body, *part_refs), *kn.scratch_types
+                )
+                i += a
+                o += c
+
+    out = pl.kernel(
+        body,
+        out_type=tuple(t for kn in kernels for t in kn.out_type),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True, needs_layout_passes=False
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_seg{tag}_b{b}_n{n}_k{k}{('_' + fault) if fault else ''}",
-    )(*ins)
+        name=name,
+    )(*(x for kn in kernels for x in kn.ins))
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
-    slots, keys = out
-    return slots.reshape(padded_b, k)[:b], keys.reshape(padded_b, k)[:b]
+    res, o = [], 0
+    for kn in kernels:
+        c = len(kn.out_type)
+        res.append(kn.post(tuple(out[o : o + c])))
+        o += c
+    return res
 
 
-def _sc_topk_stage1_l1(
+def _sc_topk_stage1_l1(*args, scheduling_group_id: int | None = None, **kw):
+    """Stage 1': threshold compaction with per-slice radix fallback.
+
+    Arguments and outputs: `_stage1_spec`.
+    """
+    return _run_sc_kernels((_stage1_spec(*args, **kw),), scheduling_group_id)[0]
+
+
+def _stage1_spec(
     scores: jax.Array,  # f32/i32 [b, n] (slices)
     k: int,
     row_lengths: jax.Array,  # i32[b]
@@ -1051,11 +1238,10 @@ def _sc_topk_stage1_l1(
     p: int,  # slices per T row
     *,
     fallback: bool = True,
-    scheduling_group_id: int | None = None,
     emit_counts: bool = False,
     global_cols: bool = False,
-):
-    """Stage 1': threshold compaction with per-slice radix fallback.
+) -> _ScKernel:
+    """The stage 1' kernel, unlaunched.
 
     `global_cols` writes each slot's row column (`(s % p) * n + local`)
     instead of the slice-local column; `-1` pad is unchanged.
@@ -1114,8 +1300,21 @@ def _sc_topk_stage1_l1(
         pltpu.VMEM((slice_len + LANES,), jnp.int32),
     )
     body = _topk_body_l1 if not emit_counts else _topk_body_l1_counts
-    out = pl.kernel(
-        functools.partial(
+    del mesh
+
+    def post(out):
+        if emit_counts:
+            slots, keys, counts = out
+            return (
+                slots.reshape(padded_b, k)[:b],
+                keys.reshape(padded_b, k)[:b],
+                counts,  # i32[padded_b * LANES], lane 0 of each LANES block
+            )
+        slots, keys = out
+        return slots.reshape(padded_b, k)[:b], keys.reshape(padded_b, k)[:b]
+
+    return _ScKernel(
+        body=functools.partial(
             body,
             b=b,
             n=n,
@@ -1127,30 +1326,19 @@ def _sc_topk_stage1_l1(
             t_rows=b // p,
             **(dict(global_cols=True) if global_cols else {}),
         ),
-        out_type=out_type,
-        compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True, needs_layout_passes=False
+        ins=(
+            words.reshape(-1),
+            lengths_2d.reshape(-1),
+            t_rows.astype(jnp.int32).reshape(-1),
         ),
+        out_type=out_type,
         scratch_types=scratch_types,
-        mesh=mesh,
         name=(
             f"sc_topk_l1_b{b}_n{n}_k{k}{'' if fallback else '_nofb'}"
             f"{'_cnt' if emit_counts else ''}{'_gcol' if global_cols else ''}"
         ),
-    )(words.reshape(-1), lengths_2d.reshape(-1), t_rows.astype(jnp.int32).reshape(-1))
-    if scheduling_group_id is not None:
-        out = xla_metadata.set_xla_metadata(
-            out, _scheduling_group_id=scheduling_group_id
-        )
-    if emit_counts:
-        slots, keys, counts = out
-        return (
-            slots.reshape(padded_b, k)[:b],
-            keys.reshape(padded_b, k)[:b],
-            counts,  # i32[padded_b * LANES], lane 0 of each LANES block
-        )
-    slots, keys = out
-    return slots.reshape(padded_b, k)[:b], keys.reshape(padded_b, k)[:b]
+        post=post,
+    )
 
 
 def _sparsecore_topk_l1_impl(
@@ -1168,6 +1356,8 @@ def _sparsecore_topk_l1_impl(
     topk_tail: str = "",
     seg_loop: str = "fori",
     seg_fault: str = "",
+    seg_granule: int = 0,
+    return_stage1: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """The threshold path.
 
@@ -1175,9 +1365,23 @@ def _sparsecore_topk_l1_impl(
     runs the TensorCore T kernel here. `t_keys` (i32[b]) / `fallback` are
     test-only overrides. `topk_tail="seg"` has stage 1 emit per-slice
     candidate counts and runs stage 2 over only those (`_sc_topk_stage2_seg`);
-    "" is the incumbent stage 2. `seg_loop` / `seg_fault` are test-only.
+    "" is the incumbent stage 2. "segc" also carries stage 1's columns and
+    emits them (no remap); "segc2" is "segc" copying only the live granules
+    of each segment into stage 2 (`SEGC2_GRANULE` words; `seg_granule`
+    overrides it; so does the test-only spelling "segc2g<N>").
+    `seg_loop` / `seg_fault` / `seg_granule` are test-only.
+    `return_stage1` appends stage 1's counts output (segc tails; the final
+    indices otherwise), so a caller can order later work after stage 1
+    without waiting for stage 2.
+
+    `write_empty_rows` only reaches the incumbent `_sc_topk_direct`, which
+    ignores it (`del write_empty`): every path writes -1 / -inf to the rows of
+    an empty (length 0) row, which is the `write_empty_rows=True` contract.
+    `test_write_empty_rows_is_inert` pins that.
     """
-    if topk_tail not in ("", "seg", "segc"):
+    if topk_tail.startswith("segc2g") and topk_tail[6:].isdigit():
+        topk_tail, seg_granule = "segc2", int(topk_tail[6:])
+    if topk_tail not in TOPK_TAILS:
         raise ValueError(f"unknown {topk_tail=}")
     b, n = scores.shape
     p = _pick_partition(b, n, k)
@@ -1204,8 +1408,11 @@ def _sparsecore_topk_l1_impl(
     offsets = jnp.arange(p, dtype=jnp.int32) * n_p
     lengths_p = jnp.clip(row_lengths[:, None] - offsets[None, :], 0, n_p).reshape(b * p)
 
-    seg = topk_tail in ("seg", "segc")
-    fold = topk_tail == "segc"
+    seg = topk_tail != ""
+    fold = topk_tail in ("segc", "segc2")
+    granule = 0
+    if topk_tail == "segc2":
+        granule = min(seg_granule or SEGC2_GRANULE, k_p)
     if fold and p & (p - 1):
         raise ValueError(f"segc needs a power-of-two partition, got {p=}")
     stage1 = _sc_topk_stage1_l1(
@@ -1225,7 +1432,7 @@ def _sparsecore_topk_l1_impl(
         local_slots, cand_scores = stage1
     if fold:
         # Stage 1 wrote row columns; stage 2 compacts and emits them.
-        return _sc_topk_stage2_seg(
+        out = _sc_topk_stage2_seg(
             cand_scores.reshape(b, p * k_p),
             counts,
             k,
@@ -1236,7 +1443,9 @@ def _sparsecore_topk_l1_impl(
             fault=seg_fault,
             scheduling_group_id=stage2_scheduling_group_id,
             cand_idx=local_slots.reshape(b, p * k_p),
+            dma_granule=granule,
         )
+        return (*out, counts) if return_stage1 else out
     local_indices = local_slots.reshape(b, p, k_p)
     cand_scores = cand_scores.reshape(b, p * k_p)
     global_cand_indices = jnp.where(
@@ -1270,6 +1479,9 @@ def _sparsecore_topk_l1_impl(
     safe_slots = jnp.maximum(final_cand_slots, 0)
     final_indices = jnp.take_along_axis(global_cand_indices, safe_slots, axis=1)
     final_indices = jnp.where(final_cand_slots >= 0, final_indices, -1)
+    if return_stage1:
+        # No separable stage 1 output here: the indices stand in (later).
+        return final_indices, final_cand_scores, final_indices
     return final_indices, final_cand_scores
 
 
@@ -1283,6 +1495,7 @@ def _sparsecore_topk_l1_impl(
         "threshold_scheduling_group_id",
         "return_scores",
         "topk_tail",
+        "return_stage1",
     ),
 )
 def sparsecore_topk_l1(
@@ -1297,7 +1510,8 @@ def sparsecore_topk_l1(
     return_scores: bool = False,
     t_rows: jax.Array | None = None,  # i32[b, 128], lane 0 = T key
     topk_tail: str = "",
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+    return_stage1: bool = False,
+) -> jax.Array | tuple[jax.Array, ...]:
     """`sparsecore_topk` with the threshold-gated stage 1.
 
     Same arguments, outputs and contract as `sparsecore_topk`, plus
@@ -1306,12 +1520,15 @@ def sparsecore_topk_l1(
     StreamIdxTC scoring epilogue's) that replaces the T kernel. Any
     `t_rows[r, 0] <= v_k(r)` keeps the result exact. Shapes outside
     `l1_supported` run `sparsecore_topk` and ignore `t_rows`.
+    `return_stage1` appends stage 1's per-slice counts as a last output
+    (segc tails); other tails and unsupported shapes append the top-k
+    indices instead, an output that exists no earlier than stage 1's.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     b, n = scores.shape
     if not l1_supported(b, n, k):
-        return sparsecore_topk(
+        out = sparsecore_topk(
             scores,
             k,
             row_lengths,
@@ -1320,6 +1537,10 @@ def sparsecore_topk_l1(
             stage2_scheduling_group_id=stage2_scheduling_group_id,
             return_scores=return_scores,
         )
+        if return_stage1:
+            # No stage 1 here; the top-k itself stands in for its output.
+            return (*out, out[0]) if return_scores else (out, out)
+        return out
     if scores.dtype not in (jnp.float32, jnp.int32):
         raise ValueError(f"scores must be f32 or i32, got {scores.dtype}")
     if row_lengths is None:
@@ -1327,7 +1548,7 @@ def sparsecore_topk_l1(
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
-    idx, cand_scores = _sparsecore_topk_l1_impl(
+    out = _sparsecore_topk_l1_impl(
         scores,
         k,
         row_lengths,
@@ -1337,7 +1558,110 @@ def sparsecore_topk_l1(
         threshold_scheduling_group_id=threshold_scheduling_group_id,
         t_rows=t_rows,
         topk_tail=topk_tail,
+        return_stage1=return_stage1,
     )
+    idx, cand_scores = out[:2]
+    extra = tuple(out[2:])
     if return_scores:
-        return idx, cand_scores
-    return idx
+        return (idx, cand_scores, *extra)
+    return (idx, *extra) if extra else idx
+
+
+def sparsecore_topk_l1_chain(
+    chunks,  # [(scores f32/i32[b, n], row_lengths i32[b], t_rows i32[b, 128])]
+    k: int,
+    *,
+    topk_tail: str = "segc",
+    seg_fault: str = "",
+) -> list[tuple[jax.Array, jax.Array]]:
+    """`sparsecore_topk_l1(..., return_scores=True)` of every chunk, with
+    chunk m-1's stage 2 and chunk m's stage 1 launched as ONE SparseCore
+    kernel (`TPU_STREAMIDX_TOPK_TAIL=segcD`).
+
+    The SparseCore runs kernels in issue order and XLA issues a stage 2 only
+    after its stage 1's `done`, which it places as late as it can, so as
+    separate kernels every stage 2 of a chunked prefill lands after the last
+    scoring, serially, with the TensorCore waiting. Fused, chunk m-1's stage 2
+    runs in the SparseCore time chunk m's stage 1 leaves free under chunk
+    m+1's scoring; only the last chunk's stage 2 runs alone. The two parts
+    share no data (chunk m-1's stage 1 finished in an earlier kernel), so the
+    fused kernel needs no barrier, and each part is the unfused kernel's body
+    over its own scoped scratch: bit-identical outputs.
+
+    `topk_tail` is the per-chunk tail ("segc", "segc2", "segc2g<N>"). Chunks
+    whose shape or T the fused path cannot take run `sparsecore_topk_l1`.
+    `seg_fault` is test-only (see `_sparsecore_topk_l1_impl`).
+    """
+    seg_granule = 0
+    if topk_tail.startswith("segc2g") and topk_tail[6:].isdigit():
+        topk_tail, seg_granule = "segc2", int(topk_tail[6:])
+    if topk_tail not in ("segc", "segc2"):
+        raise ValueError(f"chain needs a segc tail, got {topk_tail=}")
+    out: list = [None] * len(chunks)
+    pending = None  # (chunk index, stage-2 _ScKernel)
+
+    def flush():
+        nonlocal pending
+        if pending is not None:
+            m0, kn = pending
+            out[m0] = _run_sc_kernels((kn,))[0]
+            pending = None
+
+    for m, (scores, row_lengths, t_rows) in enumerate(chunks):
+        b, n = scores.shape
+        row_lengths = row_lengths.astype(jnp.int32)
+        p = _pick_partition(b, n, k) if l1_supported(b, n, k) else 0
+        if (
+            not p
+            or p & (p - 1)
+            or t_rows is None
+            or scores.dtype not in (jnp.float32, jnp.int32)
+        ):
+            flush()
+            out[m] = sparsecore_topk_l1(
+                scores,
+                k,
+                row_lengths,
+                return_scores=True,
+                t_rows=t_rows,
+                topk_tail=topk_tail if not seg_granule else f"segc2g{seg_granule}",
+            )
+            continue
+        n_p = n // p
+        k_p = min(k, n_p)
+        offsets = jnp.arange(p, dtype=jnp.int32) * n_p
+        lengths_p = jnp.clip(
+            row_lengths[:, None] - offsets[None, :], 0, n_p
+        ).reshape(b * p)
+        s1 = _stage1_spec(
+            scores.reshape(b * p, n_p),
+            k_p,
+            lengths_p,
+            t_rows,
+            p,
+            emit_counts=True,
+            global_cols=True,
+        )
+        if pending is None:
+            (s1_out,) = _run_sc_kernels((s1,))
+        else:
+            m0, kn = pending
+            out[m0], s1_out = _run_sc_kernels((kn, s1))
+        local_slots, cand_scores, counts = s1_out
+        granule = min(seg_granule or SEGC2_GRANULE, k_p) if topk_tail == "segc2" else 0
+        pending = (
+            m,
+            _stage2_spec(
+                cand_scores.reshape(b, p * k_p),
+                counts,
+                k,
+                jnp.where(row_lengths > 0, jnp.int32(p * k_p), jnp.int32(0)),
+                p,
+                k_p,
+                fault=seg_fault,
+                cand_idx=local_slots.reshape(b, p * k_p),
+                dma_granule=granule,
+            ),
+        )
+    flush()
+    return out
