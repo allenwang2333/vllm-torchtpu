@@ -32,23 +32,16 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 
 from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
+from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 _norm_ops: dict[float, Callable] = {}
-_matmul_op: Callable | None = None
-
-
-def _matmul(
-    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
-) -> jax.Array:
-    return gnq.prequant_matmul_in_out(x_q, x_scale, w_q, w_s)
 
 
 def _build_ops(eps: float) -> None:
-    global _matmul_op
     if eps not in _norm_ops:
 
         def norm(o: jax.Array, z: jax.Array, w: jax.Array):
@@ -64,14 +57,7 @@ def _build_ops(eps: float) -> None:
 
         op.register_fake(fake_norm)
         _norm_ops[eps] = op
-    if _matmul_op is None:
-        op = pallas.jax_op("pallas::gdn_prequant_matmul", _matmul)
-
-        def fake_matmul(x_q, x_scale, w_q, w_s):
-            return x_q.new_empty((x_q.shape[0], w_q.shape[1]), dtype=torch.bfloat16)
-
-        op.register_fake(fake_matmul)
-        _matmul_op = op
+    linear_common._get_prequant_matmul_op()
 
 
 def unsupported_reason(layer: QwenGatedDeltaNetAttention) -> str | None:
@@ -143,7 +129,7 @@ def output_projection(
     q, s = _norm_ops[float(layer.norm.eps)](
         core_attn_out, z.reshape(core_attn_out.shape), layer.norm.weight
     )
-    output = _matmul_op(
+    output = linear_common.quantized_matmul_prequant(
         q.reshape(tokens, -1), s, out_proj.weight, out_proj.weight_scale
     )
     if out_proj.reduce_results and out_proj.tp_size > 1:

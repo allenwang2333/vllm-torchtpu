@@ -21,7 +21,6 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
 from vllm_torchtpu.kernels.experimental.gated_norm_quant import kernel
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 pytestmark = pytest.mark.cpu_test
 
@@ -74,22 +73,3 @@ def test_zero_rows_get_unit_scale():
     q, s = gnq.gated_norm_quant(o, z, w, 1e-6, tile=16, interpret=True)
     assert float(s[3, 0]) == 1.0
     assert float(jnp.abs(q[3].astype(jnp.float32)).max()) == 0.0
-
-
-def test_prequant_matmul_equals_the_xla_path():
-    o, z, w = _inputs(tokens=32, heads=2)
-    q, s = gnq.reference(o, z, w, 1e-6)
-    x = o.astype(jnp.float32)
-    zz = z.astype(jnp.float32)
-    x = x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + 1e-6)
-    x = (x * w.astype(jnp.float32) * zz * jax.nn.sigmoid(zz)).astype(jnp.bfloat16)
-    x = x.reshape(x.shape[0], -1)
-    w_q = (jax.random.normal(jax.random.PRNGKey(7), (x.shape[1], 96)) * 0.05).astype(
-        kernel.FP8
-    )
-    w_s = jnp.full((96,), 0.02, jnp.float32)
-    out = gnq.prequant_matmul_in_out(q.reshape(x.shape), s, w_q, w_s)
-    np.testing.assert_array_equal(
-        np.asarray(out, np.float32),
-        np.asarray(xla_quantized_matmul(x, w_q, w_s), np.float32),
-    )

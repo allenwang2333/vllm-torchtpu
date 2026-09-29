@@ -15,8 +15,7 @@
 
 from vllm_torchtpu.kernels.experimental.gated_norm_quant.kernel import (
     gated_norm_quant,
-    prequant_matmul_in_out,
     reference,
 )
 
-__all__ = ["gated_norm_quant", "prequant_matmul_in_out", "reference"]
+__all__ = ["gated_norm_quant", "reference"]

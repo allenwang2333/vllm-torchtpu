@@ -25,6 +25,7 @@ import torch
 from einops import rearrange
 
 from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 from vllm_torchtpu.layers.adapter import gated_norm_quant_op, linear_common
 
 pytestmark = pytest.mark.cpu_test
@@ -63,7 +64,7 @@ class _HostOp:
 def host_ops(monkeypatch):
     """Call after constructing the layer, whose own ops stay mocked."""
     monkeypatch.setattr(gated_norm_quant_op, "_norm_ops", {})
-    monkeypatch.setattr(gated_norm_quant_op, "_matmul_op", None)
+    monkeypatch.setattr(linear_common, "_prequant_matmul_op", None)
     monkeypatch.setattr(linear_common, "_quantized_matmul_kernel_op", None)
     monkeypatch.setattr(
         gnq,
@@ -189,4 +190,18 @@ def test_norm_then_linear_is_unchanged_without_install(make_gdn_attention, host_
     want, _ = attention.out_proj(normed)
     torch.testing.assert_close(
         attention._apply_output_projection(core, z, core.shape[0]), want
+    )
+
+
+def test_prequant_matmul_equals_the_quantizing_matmul():
+    generator = torch.Generator().manual_seed(3)
+    x = jnp.asarray(torch.randn(16, 256, generator=generator).numpy(), jnp.bfloat16)
+    w_q = jnp.asarray(
+        (0.05 * torch.randn(256, 96, generator=generator)).numpy(), jnp.float8_e4m3fn
+    )
+    w_s = jnp.full((96,), 0.02, jnp.float32)
+    x_q, x_s = quantize_tensor(x, jnp.float8_e4m3fn)
+    np.testing.assert_array_equal(
+        np.asarray(linear_common._prequant_matmul_jax(x_q, x_s, w_q, w_s), np.float32),
+        np.asarray(linear_common._quantized_matmul_jax(x, w_q, w_s), np.float32),
     )

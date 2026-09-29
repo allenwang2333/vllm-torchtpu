@@ -101,24 +101,3 @@ def reference(
     scale = jnp.where(amax == 0, 1.0, amax / FP8_MAX)
     q = jnp.clip(flat.astype(jnp.float32) / scale, -FP8_MAX, FP8_MAX).astype(FP8)
     return q.reshape(o.shape), scale
-
-
-def prequant_matmul_in_out(
-    x_q: jax.Array,
-    x_scale: jax.Array,
-    w_q: jax.Array,
-    w_s: jax.Array,
-    out_dtype: jnp.dtype = jnp.bfloat16,
-) -> jax.Array:
-    """``xla_quantized_matmul``'s per-channel path on pre-quantized rows.
-
-    ``x_q`` [m, k] fp8 with ``x_scale`` [m, 1]; ``w_q`` [k, n] with ``w_s`` [n].
-    """
-    out = jax.lax.dot_general(
-        x_q,
-        w_q,
-        dimension_numbers=(((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
-    out = out * x_scale * jnp.expand_dims(w_s, 0)
-    return out.astype(out_dtype)
