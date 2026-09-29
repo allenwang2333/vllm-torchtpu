@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical correctness and component-wise unit tests for FLUX models on TPU hardware.
+"""Numerical correctness and component-wise tests for FLUX models on TPU hardware.
 
 Tested FLUX Components:
 =======================
@@ -105,20 +105,21 @@ class TestFluxTpuSDPAAttention:
         )
 
         query_cpu = torch.randn(
-            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
         )
         key_cpu = torch.randn(
-            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
         )
         value_cpu = torch.randn(
-            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
         )
 
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
+
         # TPU execution in bfloat16
-        q_tpu = query_cpu.to(device="tpu", dtype=torch.bfloat16)
-        k_tpu = key_cpu.to(device="tpu", dtype=torch.bfloat16)
-        v_tpu = value_cpu.to(device="tpu", dtype=torch.bfloat16)
-        ref_out = _sdpa_reference(q_tpu, k_tpu, v_tpu, scale)
+        q_tpu = query_cpu.to(device="tpu")
+        k_tpu = key_cpu.to(device="tpu")
+        v_tpu = value_cpu.to(device="tpu")
 
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
         assert tpu_out.device.type == "tpu"
@@ -156,19 +157,20 @@ class TestFluxTpuSDPAAttention:
         )
 
         query_cpu = torch.randn(
-            batch_size, q_len, num_heads, head_size, dtype=torch.float32
+            batch_size, q_len, num_heads, head_size, dtype=torch.bfloat16
         )
         key_cpu = torch.randn(
-            batch_size, kv_len, num_heads, head_size, dtype=torch.float32
+            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
         )
         value_cpu = torch.randn(
-            batch_size, kv_len, num_heads, head_size, dtype=torch.float32
+            batch_size, kv_len, num_heads, head_size, dtype=torch.bfloat16
         )
 
-        q_tpu = query_cpu.to(device="tpu", dtype=torch.bfloat16)
-        k_tpu = key_cpu.to(device="tpu", dtype=torch.bfloat16)
-        v_tpu = value_cpu.to(device="tpu", dtype=torch.bfloat16)
-        ref_out = _sdpa_reference(q_tpu, k_tpu, v_tpu, scale)
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
+
+        q_tpu = query_cpu.to(device="tpu")
+        k_tpu = key_cpu.to(device="tpu")
+        v_tpu = value_cpu.to(device="tpu")
 
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
         assert tpu_out.device.type == "tpu"
@@ -195,19 +197,20 @@ class TestFluxTpuSDPAAttention:
         )
 
         query_cpu = torch.randn(
-            batch_size, seq_len, num_heads, head_size, dtype=torch.float32
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
         )
         key_cpu = torch.randn(
-            batch_size, seq_len, num_kv_heads, head_size, dtype=torch.float32
+            batch_size, seq_len, num_kv_heads, head_size, dtype=torch.bfloat16
         )
         value_cpu = torch.randn(
-            batch_size, seq_len, num_kv_heads, head_size, dtype=torch.float32
+            batch_size, seq_len, num_kv_heads, head_size, dtype=torch.bfloat16
         )
 
-        q_tpu = query_cpu.to(device="tpu", dtype=torch.bfloat16)
-        k_tpu = key_cpu.to(device="tpu", dtype=torch.bfloat16)
-        v_tpu = value_cpu.to(device="tpu", dtype=torch.bfloat16)
-        ref_out = _sdpa_reference(q_tpu, k_tpu, v_tpu, scale)
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
+
+        q_tpu = query_cpu.to(device="tpu")
+        k_tpu = key_cpu.to(device="tpu")
+        v_tpu = value_cpu.to(device="tpu")
 
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
         assert tpu_out.device.type == "tpu"
