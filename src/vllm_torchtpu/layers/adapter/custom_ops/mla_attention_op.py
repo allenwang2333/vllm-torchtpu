@@ -318,6 +318,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         sctopk_l1 = envs.TPU_STREAMIDX_SCTOPK_L1
         score_bf16_group = envs.TPU_STREAMIDX_SCORE_BF16_GROUP
         topk_tail = envs.TPU_STREAMIDX_TOPK_TAIL or ""
+        l1_live = envs.TPU_STREAMIDX_L1_LIVE
         enable_early_exit = (
             STREAMIDX_ENABLE_EARLY_EXIT and envs.TPU_STREAMIDX_EARLY_EXIT
         )
@@ -371,6 +372,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 sctopk_l1=sctopk_l1,
                 score_bf16_group=score_bf16_group,
                 topk_tail=topk_tail,
+                l1_live=l1_live,
             )
             return cache_kv, topk_indices
 

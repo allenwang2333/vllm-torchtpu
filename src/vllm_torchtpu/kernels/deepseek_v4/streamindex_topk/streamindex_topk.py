@@ -752,6 +752,7 @@ SEGCD_BASE = "segc2"
         "sctopk_l1",
         "score_bf16_group",
         "topk_tail",
+        "l1_live",
     ),
 )
 def streamindex_topk(
@@ -783,6 +784,7 @@ def streamindex_topk(
     sctopk_l1: bool = False,
     score_bf16_group: int = 0,
     topk_tail: str = "",
+    l1_live: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -858,6 +860,9 @@ def streamindex_topk(
         with chunk m-1's stage 2 fused into chunk m's stage-1 SparseCore
         kernel (`sparsecore_topk_l1_chain`), so only the last chunk's stage 2
         runs after scoring. "" (default) is the incumbent stage 2.
+      l1_live: with `sctopk_l1`, stage 1 DMAs only each slice's live columns
+        (align16 of its length) and nothing for slices past a row's context,
+        instead of every slice of the full-width score row. Bit-identical.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -1374,6 +1379,7 @@ def streamindex_topk(
                     t_rows=t_rows,
                     topk_tail=l1_tail,
                     return_stage1=dep_on == "l1",
+                    live=l1_live,
                 )
                 chunk_topk_idxs, chunk_topk_scores = l1_out[:2]
                 if dep_on == "l1":
@@ -1394,7 +1400,7 @@ def streamindex_topk(
 
         if chain_chunks:
             for chunk_topk_idxs, chunk_topk_scores in sparsecore_topk_l1_chain(
-                chain_chunks, k, topk_tail=l1_tail
+                chain_chunks, k, topk_tail=l1_tail, live=l1_live
             ):
                 topk_idxs.append(chunk_topk_idxs)
                 if need_scores:

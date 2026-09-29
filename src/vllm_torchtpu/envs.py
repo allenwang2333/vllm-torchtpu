@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SCORE_BF16_GROUP: int = 0
     TPU_STREAMIDX_EARLY_EXIT: bool = True
     TPU_STREAMIDX_TOPK_TAIL: str = ""
+    TPU_STREAMIDX_L1_LIVE: bool = False
     TPU_STREAMIDX_DECODE_KV_PAGES: int = 2
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -732,6 +733,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_TOPK_TAIL": env_with_choices(
         "TPU_STREAMIDX_TOPK_TAIL", "", ["", "seg", "segc", "segc2", "segcD"]
     ),
+    # StreamIndex top-k, with TPU_STREAMIDX_SCTOPK_L1: SparseCore stage 1
+    # copies only each slice's live columns (align16 of its length) into VMEM,
+    # and nothing for slices past a row's context, instead of every slice of
+    # the full-width (page-table-wide) score row. Bit-identical indices; the
+    # saving is the dead-context DMA, largest at short context. PR 1273's
+    # length-bounded stage 1, on the L1 kernel.
+    "TPU_STREAMIDX_L1_LIVE": env_bool("TPU_STREAMIDX_L1_LIVE"),
     # KV pages per block on the decode pass of the GLM-5.2 StreamIndex top-k
     # kernel (the first entry of `num_kv_pages_per_block`). Larger blocks mean
     # fewer, bigger KV DMAs per decode token; 8 measured -14% decode indexer

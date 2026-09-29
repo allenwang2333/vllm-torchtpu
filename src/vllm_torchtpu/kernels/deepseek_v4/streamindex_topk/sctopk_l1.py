@@ -53,6 +53,7 @@ from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
@@ -302,9 +303,22 @@ def _topk_body_l1(
     t_rows: int,
     counts_hbm=None,  # i32[padded_b, LANES]  lane 0 = slots emitted (seg tail)
     global_cols: bool = False,
+    live_refs=None,  # (tab_hbm, ring_vmem, tab_vmem, ring_sem): live-slice DMA
+    tab_stride: int = 0,
+    live_fault: str = "",
 ):
     # `fallback=False` exists only for the test's positive control: it copies the
     # first k survivors out of an overflowing slice, which is wrong.
+    #
+    # `live_refs` (TPU_STREAMIDX_L1_LIVE): `scores_hbm` is the flat i32[b * n]
+    # score words with n % LANES == 0, and each slice moves only
+    # align16(len) words, through a manual 2-slot VMEM ring, instead of the
+    # pipelined full-slice BlockSpec; a length-0 slice (past its row's live
+    # context, or padding) issues no DMA. `tab_hbm` is i32[32 * tab_stride]:
+    # worker f's wave w entry is the length of the slice it takes at wave w
+    # (`slot_of`). Every word the body reads lies below align16(len), so the
+    # output is bit-identical to the full-slice path. `live_fault` is
+    # test-only: "shift" reads each slice LANES words early (wrong columns).
     num_subcores = 16
     num_sc_cores = 2
     cores_per_chip = num_sc_cores * num_subcores
@@ -581,6 +595,61 @@ def _topk_body_l1(
 
     buf_count = 1 if num_waves == 1 else 2
 
+    if live_refs is not None:
+        tab_hbm, ring_vmem, tab_vmem, ring_sem = live_refs
+        pltpu.sync_copy(tab_hbm.at[pl.ds(flat * tab_stride, tab_stride)], tab_vmem)
+
+        def live_ext(wv):
+            # Slice lengths are pre-clipped to [0, n] and n % LANES == 0, so
+            # the aligned extent never crosses into the next slice.
+            return jnp.bitwise_and(vec_at(tab_vmem, wv) + (LANES - 1), -LANES)
+
+        def in_copy(wv, slot, ext):
+            off = (wv * cores_per_chip + slot_of(wv)) * n
+            if live_fault == "shift":
+                off = jnp.maximum(off - LANES, 0)
+            off = pl.multiple_of(off, LANES)
+            ext = pl.multiple_of(ext, LANES)
+            base = pl.multiple_of(jnp.asarray(slot, jnp.int32) * slice_len, LANES)
+            return pltpu.make_async_copy(
+                scores_hbm.at[pl.ds(off, ext)],
+                ring_vmem.at[pl.ds(base, ext)],
+                ring_sem.at[slot],
+            )
+
+        def start_in(wv, slot):
+            ext = live_ext(wv)
+
+            @pl.when(ext > 0)
+            def _():
+                in_copy(wv, slot, ext).start()
+
+        def wait_in(wv, slot):
+            # Rebuilt with the same traced extent as its start.
+            ext = live_ext(wv)
+
+            @pl.when(ext > 0)
+            def _():
+                in_copy(wv, slot, ext).wait()
+
+        start_in(0, 0)
+
+        def live_step(len_slice_vmem, t_vmem, *outs):
+            w = pl.program_id(0)
+            slot = jnp.int32(0) if buf_count == 1 else lax.rem(w, 2)
+            if buf_count == 2:
+                # The other slot last held wave w - 1, consumed by the previous
+                # step, so wave w + 1 can land there under this step's work.
+                @pl.when(w + 1 < num_waves)
+                def _():
+                    start_in(w + 1, 1 - slot)
+
+            wait_in(w, slot)
+            scores_vmem = ring_vmem.at[
+                pl.ds(pl.multiple_of(slot * slice_len, LANES), slice_len)
+            ]
+            pipeline_step(scores_vmem, len_slice_vmem, t_vmem, *outs)
+
     def imap(w):
         return (w * cores_per_chip + slot_of(w),)
 
@@ -591,10 +660,17 @@ def _topk_body_l1(
         return (r * (128 // LANES),)
 
     in_specs = (
-        pl.BlockSpec((slice_len,), imap, pipeline_mode=pl.Buffered(buf_count)),
         pl.BlockSpec((LANES,), imap, pipeline_mode=pl.Buffered(buf_count)),
         pl.BlockSpec((LANES,), tmap, pipeline_mode=pl.Buffered(buf_count)),
     )
+    ins = (lengths_hbm, t_hbm)
+    step = live_step if live_refs is not None else pipeline_step
+    if live_refs is None:
+        in_specs = (
+            pl.BlockSpec((slice_len,), imap, pipeline_mode=pl.Buffered(buf_count)),
+            *in_specs,
+        )
+        ins = (scores_hbm, *ins)
     out_specs = (
         pl.BlockSpec((k,), imap, pipeline_mode=pl.Buffered(buf_count)),
         pl.BlockSpec((k,), imap, pipeline_mode=pl.Buffered(buf_count)),
@@ -606,11 +682,11 @@ def _topk_body_l1(
         )
         outs += (counts_hbm,)
     pltpu.emit_pipeline(
-        pipeline_step,
+        step,
         grid=(num_waves,),
         in_specs=in_specs,
         out_specs=out_specs,
-    )(scores_hbm, lengths_hbm, t_hbm, *outs)
+    )(*ins, *outs)
 
 
 def _topk_body_l1_counts(
@@ -619,6 +695,24 @@ def _topk_body_l1_counts(
     _topk_body_l1(
         scores_hbm, lengths_hbm, t_hbm, out_hbm, keys_hbm, *scratch,
         counts_hbm=counts_hbm, **kw,
+    )
+
+
+def _topk_body_l1_live(
+    scores_hbm, lengths_hbm, t_hbm, tab_hbm, out_hbm, keys_hbm, *rest,
+    emit_counts: bool, **kw,
+):
+    """`_topk_body_l1` with the live-slice DMA: one more input (the per-worker
+    length table) and three more scratches (ring, table row, ring sems)."""
+    counts_hbm = None
+    if emit_counts:
+        counts_hbm, *rest = rest
+    *scratch, ring_vmem, tab_vmem, ring_sem = rest
+    _topk_body_l1(
+        scores_hbm, lengths_hbm, t_hbm, out_hbm, keys_hbm, *scratch,
+        counts_hbm=counts_hbm,
+        live_refs=(tab_hbm, ring_vmem, tab_vmem, ring_sem),
+        **kw,
     )
 
 
@@ -1240,8 +1334,15 @@ def _stage1_spec(
     fallback: bool = True,
     emit_counts: bool = False,
     global_cols: bool = False,
+    live: bool = False,
+    live_fault: str = "",
 ) -> _ScKernel:
     """The stage 1' kernel, unlaunched.
+
+    `live` (TPU_STREAMIDX_L1_LIVE) DMAs only each slice's align16(length)
+    words and none for an empty slice, instead of the whole slice
+    (bit-identical output; `_topk_body_l1`). Needs n % LANES == 0; other
+    widths keep the full-slice copy. `live_fault` is test-only.
 
     `global_cols` writes each slot's row column (`(s % p) * n + local`)
     instead of the slice-local column; `-1` pad is unchanged.
@@ -1276,7 +1377,10 @@ def _stage1_spec(
     padded_b = num_waves * 32
     pad_b = padded_b - b
     pad_n = slice_len - n
-    if pad_b > 0 or pad_n > 0:
+    live = live and pad_n == 0
+    # The live path reads the unpadded words: padding slices have length 0
+    # and issue no DMA.
+    if not live and (pad_b > 0 or pad_n > 0):
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, pad_b))
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
@@ -1300,6 +1404,27 @@ def _stage1_spec(
         pltpu.VMEM((slice_len + LANES,), jnp.int32),
     )
     body = _topk_body_l1 if not emit_counts else _topk_body_l1_counts
+    live_kw = {}
+    live_ins = ()
+    if live:
+        # Worker f's wave-w entry: the slice `_topk_body_l1.slot_of` gives it.
+        tab_stride = _align_to(num_waves, LANES) + LANES  # vec_at reads LANES
+        f_ids = np.arange(32, dtype=np.int32)[:, None]
+        w_ids = np.arange(num_waves, dtype=np.int32)[None, :]
+        tab_idx = w_ids * 32 + ((f_ids + w_ids) & 31)
+        tab = jnp.clip(lengths, 0, n)[tab_idx]
+        tab = jnp.pad(tab, ((0, 0), (0, tab_stride - num_waves))).reshape(-1)
+        live_ins = (tab,)
+        nbuf = 1 if num_waves == 1 else 2
+        scratch_types += (
+            pltpu.VMEM((nbuf * slice_len,), jnp.int32),
+            pltpu.VMEM((tab_stride,), jnp.int32),
+            pltpu.SemaphoreType.DMA((nbuf,)),
+        )
+        body = functools.partial(_topk_body_l1_live, emit_counts=emit_counts)
+        live_kw = dict(tab_stride=tab_stride)
+        if live_fault:
+            live_kw["live_fault"] = live_fault
     del mesh
 
     def post(out):
@@ -1325,17 +1450,20 @@ def _stage1_spec(
             p=p,
             t_rows=b // p,
             **(dict(global_cols=True) if global_cols else {}),
+            **live_kw,
         ),
         ins=(
             words.reshape(-1),
             lengths_2d.reshape(-1),
             t_rows.astype(jnp.int32).reshape(-1),
+            *live_ins,
         ),
         out_type=out_type,
         scratch_types=scratch_types,
         name=(
             f"sc_topk_l1_b{b}_n{n}_k{k}{'' if fallback else '_nofb'}"
             f"{'_cnt' if emit_counts else ''}{'_gcol' if global_cols else ''}"
+            f"{'_live' if live else ''}{('_' + live_fault) if live_fault else ''}"
         ),
         post=post,
     )
@@ -1358,8 +1486,13 @@ def _sparsecore_topk_l1_impl(
     seg_fault: str = "",
     seg_granule: int = 0,
     return_stage1: bool = False,
+    live: bool = False,
+    live_fault: str = "",
 ) -> tuple[jax.Array, jax.Array]:
     """The threshold path.
+
+    `live` runs stage 1 with the live-slice DMA (`_stage1_spec`); `live_fault`
+    is test-only.
 
     `t_rows` (i32[b, 128], lane 0 = T) is T from the scoring epilogue; None
     runs the TensorCore T kernel here. `t_keys` (i32[b]) / `fallback` are
@@ -1425,6 +1558,8 @@ def _sparsecore_topk_l1_impl(
         scheduling_group_id=scheduling_group_id,
         emit_counts=seg,
         global_cols=fold,
+        live=live,
+        live_fault=live_fault,
     )
     if seg:
         local_slots, cand_scores, counts = stage1
@@ -1496,6 +1631,7 @@ def _sparsecore_topk_l1_impl(
         "return_scores",
         "topk_tail",
         "return_stage1",
+        "live",
     ),
 )
 def sparsecore_topk_l1(
@@ -1511,8 +1647,12 @@ def sparsecore_topk_l1(
     t_rows: jax.Array | None = None,  # i32[b, 128], lane 0 = T key
     topk_tail: str = "",
     return_stage1: bool = False,
+    live: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """`sparsecore_topk` with the threshold-gated stage 1.
+
+    `live` (TPU_STREAMIDX_L1_LIVE): stage 1 DMAs only each slice's live
+    columns, align16(length) words, and none past a row's length; same output.
 
     Same arguments, outputs and contract as `sparsecore_topk`, plus
     `threshold_scheduling_group_id`, the XLA scheduling group of the
@@ -1559,6 +1699,7 @@ def sparsecore_topk_l1(
         t_rows=t_rows,
         topk_tail=topk_tail,
         return_stage1=return_stage1,
+        live=live,
     )
     idx, cand_scores = out[:2]
     extra = tuple(out[2:])
@@ -1573,6 +1714,8 @@ def sparsecore_topk_l1_chain(
     *,
     topk_tail: str = "segc",
     seg_fault: str = "",
+    live: bool = False,
+    live_fault: str = "",
 ) -> list[tuple[jax.Array, jax.Array]]:
     """`sparsecore_topk_l1(..., return_scores=True)` of every chunk, with
     chunk m-1's stage 2 and chunk m's stage 1 launched as ONE SparseCore
@@ -1590,7 +1733,9 @@ def sparsecore_topk_l1_chain(
 
     `topk_tail` is the per-chunk tail ("segc", "segc2", "segc2g<N>"). Chunks
     whose shape or T the fused path cannot take run `sparsecore_topk_l1`.
-    `seg_fault` is test-only (see `_sparsecore_topk_l1_impl`).
+    `seg_fault` is test-only (see `_sparsecore_topk_l1_impl`). `live` runs
+    each stage 1 with the live-slice DMA (`_stage1_spec`); `live_fault` is
+    test-only.
     """
     seg_granule = 0
     if topk_tail.startswith("segc2g") and topk_tail[6:].isdigit():
@@ -1625,6 +1770,7 @@ def sparsecore_topk_l1_chain(
                 return_scores=True,
                 t_rows=t_rows,
                 topk_tail=topk_tail if not seg_granule else f"segc2g{seg_granule}",
+                live=live,
             )
             continue
         n_p = n // p
@@ -1641,6 +1787,8 @@ def sparsecore_topk_l1_chain(
             p,
             emit_counts=True,
             global_cols=True,
+            live=live,
+            live_fault=live_fault,
         )
         if pending is None:
             (s1_out,) = _run_sc_kernels((s1,))
