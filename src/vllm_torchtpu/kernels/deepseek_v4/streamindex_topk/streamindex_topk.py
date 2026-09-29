@@ -855,9 +855,9 @@ def streamindex_topk(
         the live candidates stage 1 emitted per slice (bit-identical output);
         "segc" also folds the index remap into that kernel; "segc2" also
         copies only the live part of each slice into it; "segcD" is "segc2"
-        with each chunk's stage 2 ordered before a later chunk's scoring by
-        a data dependency. "" (default)
-        is the incumbent stage 2.
+        with chunk m-1's stage 2 fused into chunk m's stage-1 SparseCore
+        kernel (`sparsecore_topk_l1_chain`), so only the last chunk's stage 2
+        runs after scoring. "" (default) is the incumbent stage 2.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
