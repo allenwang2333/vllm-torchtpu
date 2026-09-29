@@ -525,6 +525,9 @@ def test_a_layer_is_built_for_the_row_gated_form(
     """vLLM's layer reads `use_sequence_parallel_moe` while it is built; the
     wrapper then takes the form over from it."""
     monkeypatch.setattr(vllm_distributed, "get_tensor_model_parallel_rank", lambda: 3)
+    monkeypatch.setattr(
+        vllm_distributed, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
     parallel_config = SimpleNamespace(
         tensor_parallel_size=tp_size,
         enable_expert_parallel=True,
@@ -693,3 +696,37 @@ def test_the_attention_projects_the_gathered_rows(monkeypatch):
     torch.testing.assert_close(
         forward(attn, positions, x, prequant=(x, None)), torch.full((4, 8), 12.0)
     )
+
+
+def test_a_replicated_mtp_draft_is_built_without_it(enabled, monkeypatch):
+    """draft_tensor_parallel_size=1 builds the draft under a TP group
+    collapsed to one rank (spec_decode.utils._force_draft_tp1) while the
+    parallel config still says TP8; its layers run unsharded, so a
+    collective in their forward would sum eight full copies."""
+    monkeypatch.setattr(vllm_distributed, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_distributed, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            enable_expert_parallel=True,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        compilation_config=SimpleNamespace(compile_sizes=[16, 512]),
+    )
+
+    class Layer(torch.nn.Module):
+        def __init__(self, vllm_config, layer_type, prefix=""):
+            super().__init__()
+            self.use_attn_reduce_scatter_for_moe = sp.use_sequence_parallel_moe(
+                vllm_config.parallel_config
+            )
+
+    Layer.__init__ = patch._build_row_gated(Layer.__init__)
+    layer = Layer(vllm_config, "full_attention", prefix="mtp.layers.0")
+    assert getattr(layer, patch.SP_LAYER_ATTR) is False
+    assert layer.use_attn_reduce_scatter_for_moe is False
+    assert sp._layers_built == 0
