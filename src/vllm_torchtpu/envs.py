@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_DECODE_KV_PAGES: int = 2
+    TPU_STREAMIDX_SC2_OVERLAP: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -654,6 +655,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fewer, bigger KV DMAs per decode token; 8 measured -14% decode indexer
     # time at 256K context. The prefill passes keep 2.
     "TPU_STREAMIDX_DECODE_KV_PAGES": env_int("TPU_STREAMIDX_DECODE_KV_PAGES", 2),
+    # With chunking on, order each chunk's SparseCore top-k stage 1 behind the
+    # stage 2 of the chunk two earlier, so stage 2 overlaps TensorCore scoring
+    # instead of running serially after the last chunk. Bit-identical output.
+    "TPU_STREAMIDX_SC2_OVERLAP": env_bool("TPU_STREAMIDX_SC2_OVERLAP", default=False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

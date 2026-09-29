@@ -619,6 +619,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "sc2_overlap",
     ),
 )
 def streamindex_topk(
@@ -647,6 +648,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    sc2_overlap: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -706,6 +708,10 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      sc2_overlap: with `>= 3` chunks, add a data dependency that makes chunk
+        m's SparseCore stage 1 wait for chunk m - 2's stage 2, so stage 2 runs
+        under TensorCore scoring instead of after the last chunk. Bit-identical
+        output; only the schedule changes.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -1108,6 +1114,19 @@ def streamindex_topk(
                 out_dtype,
                 tc_group,
             )
+            if sc2_overlap and m >= 2:
+                # The scheduling groups are metadata only, and the scheduler
+                # sinks every stage-1 done to the end of the layer, so all
+                # stage-2 calls run after the last scoring call. Tie chunk
+                # m - 2's stage-2 outputs to chunk m's scores: stage 1 of chunk
+                # m cannot start until stage 2 of chunk m - 2 has finished,
+                # which pulls s2(m - 2) under the scoring of chunks m - 1 / m.
+                # Same values, only the schedule changes.
+                scores, topk_idxs[m - 2], topk_scores_list[m - 2] = (
+                    lax.optimization_barrier(
+                        (scores, topk_idxs[m - 2], topk_scores_list[m - 2])
+                    )
+                )
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1126,8 +1145,7 @@ def streamindex_topk(
                 return_scores=True,
             )
             topk_idxs.append(chunk_topk_idxs)
-            if need_scores:
-                topk_scores_list.append(chunk_topk_scores)
+            topk_scores_list.append(chunk_topk_scores)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
