@@ -205,3 +205,12 @@ def test_prequant_matmul_equals_the_quantizing_matmul():
         np.asarray(linear_common._prequant_matmul_jax(x_q, x_s, w_q, w_s), np.float32),
         np.asarray(linear_common._quantized_matmul_jax(x, w_q, w_s), np.float32),
     )
+
+
+def test_build_ops_registers_with_the_real_op_bridge(monkeypatch):
+    """`pallas.jax_op` validates the JAX function's signature, including its
+    return annotation, at registration; the host stand-in above does not."""
+    monkeypatch.setattr(gated_norm_quant_op, "_norm_ops", {})
+    monkeypatch.setattr(linear_common, "_prequant_matmul_op", None)
+    gated_norm_quant_op._build_ops(1e-6)
+    assert list(gated_norm_quant_op._norm_ops) == [1e-6]

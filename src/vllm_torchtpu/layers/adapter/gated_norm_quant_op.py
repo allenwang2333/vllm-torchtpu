@@ -44,7 +44,9 @@ _norm_ops: dict[float, Callable] = {}
 def _build_ops(eps: float) -> None:
     if eps not in _norm_ops:
 
-        def norm(o: jax.Array, z: jax.Array, w: jax.Array):
+        def norm(
+            o: jax.Array, z: jax.Array, w: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
             return gnq.gated_norm_quant(o, z, w, eps)
 
         op = pallas.jax_op(f"pallas::gdn_gated_norm_quant_{len(_norm_ops)}", norm)
