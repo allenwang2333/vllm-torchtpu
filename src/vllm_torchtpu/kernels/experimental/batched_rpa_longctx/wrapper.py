@@ -794,8 +794,15 @@ def ragged_paged_attention(
     o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
         configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
     )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+    # Skip the mixed pass (metadata + kernel launch) on decode-only batches: it
+    # schedules no steps there, yet still costs a fixed ~10+us per call.
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
+        distribution[2] > distribution[1],
+        lambda o, kv, lse: run_rpa_kernel(configs.RpaCase.MIXED, o, kv, lse),
+        lambda o, kv, lse: (o, kv, lse),
+        o_hbm_alias_q_hbm,
+        kv_cache,
+        lse_hbm,
     )
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
