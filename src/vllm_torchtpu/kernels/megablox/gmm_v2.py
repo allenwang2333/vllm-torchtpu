@@ -1021,18 +1021,6 @@ def kernel_main(
     else:
         stream_ref.run[1] = num_runs
 
-        # Run 0 is in flight; queue run 1 behind it.
-        @pl.when(num_runs > 1)
-        def _():
-            for copy in rhs_stream_copies(
-                rhs_hbm_ref,
-                stream_ref,
-                stream_ref.run_to_group[1],
-                1,
-                num_chunks=num_chunks,
-            ):
-                copy.start()
-
         def slot_rhs_ref(slot) -> RhsRef:
             def view(lo, hi):
                 return WeightsRef(
@@ -1059,6 +1047,19 @@ def kernel_main(
             def _():
                 run = jnp.where(gm_id == 0, 0, stream_ref.run[0] + 1)
                 stream_ref.run[0] = run
+
+                # Queue run 1 only now, after the pipeline prologue's lhs copy,
+                # so that copy does not wait behind two slabs.
+                @pl.when(jnp.logical_and(gm_id == 0, stream_ref.run[1] > 1))
+                def _():
+                    for copy in rhs_stream_copies(
+                        rhs_hbm_ref,
+                        stream_ref,
+                        stream_ref.run_to_group[1],
+                        1,
+                        num_chunks=num_chunks,
+                    ):
+                        copy.start()
                 # The slot for run + 2 held run - 1, whose last step is done.
                 ahead = run + (RHS_STREAM_SLOTS - 1)
 
