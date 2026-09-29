@@ -3381,11 +3381,8 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
+                and len(cur_input_indices) > 0
             ):
-                assert len(cur_input_indices) > 0, (
-                    "spec_decode_metadata is present under async scheduling, "
-                    "but cur_input_indices is empty -- drafts cannot be extracted"
-                )
                 from vllm_torchtpu.runner.tpu_runner_async_output import (
                     extract_draft_token_ids,
                 )
