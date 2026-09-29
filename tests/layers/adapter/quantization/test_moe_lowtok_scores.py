@@ -127,6 +127,23 @@ def test_chunk_pipelining_keeps_the_ids_entry(enabled, monkeypatch):
     assert scores.prebuild(method(), make_layer(), "silu") is None
 
 
+def test_a_layer_outside_the_backbone_graph_keeps_the_ids_entry(enabled, monkeypatch):
+    """The MTP draft is loaded under the "eagle_head" tag and compiled from one
+    trace, which cannot carry both sides of the torch-side row fork."""
+    from vllm.compilation import backends
+
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+    with backends.set_model_tag("eagle_head"):
+        assert scores.prebuild(method(), make_layer(), "silu") is None
+    scores._build_op.assert_not_called()
+    assert scores.prebuild(method(), make_layer(), "silu") is enabled
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 2/2 MoE layers armed (scores 1, ids 1)")
+    assert "1 x scores declined, ids armed: the 'eagle_head' graph" in line
+
+
 def test_summary_counts_entries_and_declines(enabled, monkeypatch):
     info = Mock()
     monkeypatch.setattr(scores.logger, "info", info)

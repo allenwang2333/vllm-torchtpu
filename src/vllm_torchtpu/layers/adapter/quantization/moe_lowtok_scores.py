@@ -17,6 +17,11 @@ With TPU_MOE_LOWTOK=1, a layer whose routing is a plain softmax top-k with
 renormalized weights hands its router scores to `moe_lowtok`, which selects
 the experts itself. Other layers keep vLLM-side routing and reach the same
 kernel with a routing table through `fused_moe_func`.
+
+The scores entry forks on the row count in torch, which leaves a shape guard
+in the trace. Only the backbone is re-traced per bucket group, so a layer
+compiled outside it -- the MTP draft's -- keeps the ids entry, whose row test
+runs per compiled shape inside the JAX op.
 """
 
 from __future__ import annotations
@@ -126,6 +131,26 @@ def _routing_unsupported_reason(layer: RoutedExperts) -> str | None:
     return None
 
 
+def _graph_unsupported_reason() -> str | None:
+    """Why the graph this layer is compiled into cannot carry the row fork.
+
+    Only the backbone is re-traced per bucket group
+    (`TPUModelRunner._precompile_backbone`); a module loaded under another
+    model tag -- the MTP or EAGLE draft, "eagle_head" -- compiles every bucket
+    from its one trace, and the buckets past the row cap would raise
+    `ShapeSpecializationError` at its first forward.
+    """
+    # Read at call time: `set_model_tag` rebinds the module global.
+    from vllm.compilation import backends
+
+    if backends.model_tag != "backbone":
+        return (
+            f"the {backends.model_tag!r} graph is traced once for every "
+            "bucket, so the row cap cannot fork it"
+        )
+    return None
+
+
 def _build_op(topk: int) -> torch.library.CustomOpDef:
     op = _OPS.get(topk)
     if op is not None:
@@ -166,7 +191,9 @@ def prebuild(
     if not envs.TPU_MOE_LOWTOK:
         return None
     unsupported = _unsupported_reason(layer, activation)
-    routing = None if unsupported else _routing_unsupported_reason(layer)
+    routing = None
+    if not unsupported:
+        routing = _graph_unsupported_reason() or _routing_unsupported_reason(layer)
     entry = None if unsupported else ("ids" if routing else "scores")
     _LAYERS.append(_Verdict(method, layer.layer_name, entry, unsupported or routing))
     if entry != "scores":
