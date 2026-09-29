@@ -32,8 +32,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Rows per call at or below which the MoE entry selects this kernel.
-MOE_LOWTOK_MAX_TOKENS = 256
+# Rows per call at or below which the MoE entry selects this kernel: the
+# measured crossover vs dense-expert MoE (j-a6af2846, j-d8af40dc). At 128 rows
+# it wins 1.14x (scores) / 1.09x (ids) on recorded skew; at 256 it is parity
+# on recorded skew (1.01x / 0.93x) and loses on uniform routing (0.95x / 0.90x).
+MOE_LOWTOK_MAX_TOKENS = 128
 _MAX_LOCAL_EXPERTS = 128
 
 _ROW_TILE = 32  # FP8 sublane packing

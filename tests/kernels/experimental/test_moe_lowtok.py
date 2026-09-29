@@ -268,10 +268,10 @@ def test_unsupported_layouts_are_refused(unsupported):
     "m, enabled, use_ep, selected",
     [
         (1, True, True, True),
-        (256, True, True, True),
-        (257, True, True, False),
-        (256, False, True, False),
-        (256, True, False, False),
+        (128, True, True, True),
+        (129, True, True, False),
+        (128, False, True, False),
+        (128, True, False, False),
     ],
 )
 def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
@@ -311,7 +311,7 @@ def test_token_cap_dispatch(m, enabled, use_ep, selected, monkeypatch):
         wrapper.fused_moe_func.clear_cache()
 
 
-@pytest.mark.parametrize("m", [16, 256])
+@pytest.mark.parametrize("m", [16, 128])
 def test_fused_moe_func_selects_kernel_and_matches_gmm(monkeypatch, m):
     _needs("tpu")
     rng = np.random.default_rng(m)

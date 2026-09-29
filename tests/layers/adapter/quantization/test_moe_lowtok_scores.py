@@ -144,7 +144,7 @@ def test_summary_counts_entries_and_declines(enabled, monkeypatch):
     assert scores._LAYERS == []
 
 
-@pytest.mark.parametrize("rows, served", [(1, True), (256, True), (257, False)])
+@pytest.mark.parametrize("rows, served", [(1, True), (128, True), (129, False)])
 def test_row_cap_counts_every_row(rows, served):
     """Under MTP the rows include the draft tokens of every request."""
     x = torch.empty(rows, 8)
@@ -183,7 +183,7 @@ def test_apply_passes_softmax_scores_and_the_grouped_operand_order(
     )
 
 
-@pytest.mark.parametrize("rows, lowtok", [(256, True), (257, False)])
+@pytest.mark.parametrize("rows, lowtok", [(128, True), (129, False)])
 def test_fp8_forward_takes_the_scores_entry_below_the_cap(monkeypatch, rows, lowtok):
     monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False, raising=False)
     monkeypatch.setattr(fp8, "enable_pipelined_collective_and_compute", lambda: False)
