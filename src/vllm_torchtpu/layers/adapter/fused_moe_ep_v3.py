@@ -266,8 +266,20 @@ def _build_op(
         return torch.empty_like(x)
 
     op.register_fake(_fake)
-    _OPS[key] = op
-    return op
+    run = op
+    if skip_padded_tokens:
+        # Decided here, at weight load, so the forward reads no env.
+        def run(*args):
+            valid_tokens = token_padding.get_local_valid_tokens()
+            if valid_tokens is None:
+                raise RuntimeError(
+                    "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "
+                    "install padding state"
+                )
+            return op(*args, valid_tokens)
+
+    _OPS[key] = run
+    return run
 
 
 def fused_moe_ep_v3_supported(owner: Any) -> bool:
@@ -294,7 +306,7 @@ def fused_moe_ep_v3(
     call it when `fused_moe_ep_v3_supported(owner)` said yes.
     """
     op = getattr(owner, FUSED_MOE_EP_V3_OP_ATTR)
-    args = (
+    return op(
         hidden_states,
         w1,
         w2,
@@ -303,15 +315,6 @@ def fused_moe_ep_v3(
         router_logits,
         _RANK_BUFFER,
     )
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
-        valid_tokens = token_padding.get_local_valid_tokens()
-        if valid_tokens is None:
-            raise RuntimeError(
-                "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "
-                "install padding state"
-            )
-        return op(*args, valid_tokens)
-    return op(*args)
 
 
 def _check_deployment(layer) -> None:

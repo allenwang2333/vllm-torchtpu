@@ -221,6 +221,9 @@ def test_declined_without_an_ep_group(v3, monkeypatch):
     assert _prebuild(_layer()) is None
 
 
+_MESH = SimpleNamespace(shape={bridge.MESH_AXIS: _EP}, axis_names=(bridge.MESH_AXIS,))
+
+
 class _FakeOp:
     """What `jax_op` returns, recording the name it was registered under."""
 
@@ -230,29 +233,35 @@ class _FakeOp:
     def register_fake(self, fake):
         self.fake = fake
 
+    def __call__(self, *args):
+        return args
+
 
 def test_ops_are_shared_per_closure_and_named_apart_from_v2(monkeypatch):
     """The MTP draft's MoE layer builds its own op when its shape differs and
     shares the target's when it matches; no two closures share a name."""
     monkeypatch.setattr(bridge, "_OPS", {})
-    monkeypatch.setattr(bridge, "jax_op", _FakeOp)
-    mesh = SimpleNamespace(
-        shape={bridge.MESH_AXIS: _EP}, axis_names=(bridge.MESH_AXIS,)
-    )
+    created = []
+
+    class Op(_FakeOp):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(bridge, "jax_op", Op)
 
     def build(inter, skip=False):
         return bridge._build_op(
-            mesh, 2, True, "silu", skip, hidden=512, inter=inter, local_experts=4
+            _MESH, 2, True, "silu", skip, hidden=512, inter=inter, local_experts=4
         )
 
     target = build(256)
     assert build(256) is target
-    draft = build(512)
-    padded = build(256, skip=True)
-    assert target.name == "pallas::fused_moe_ep_v3"
-    assert len({target.name, draft.name, padded.name}) == 3
-    assert len(target.kwargs["input_partition_specs"]) == 7
-    assert len(padded.kwargs["input_partition_specs"]) == 8
+    build(512)
+    build(256, skip=True)
+    assert created[0].name == "pallas::fused_moe_ep_v3"
+    assert len({op.name for op in created}) == 3
+    assert [len(op.kwargs["input_partition_specs"]) for op in created] == [7, 7, 8]
 
 
 def _method():
@@ -320,25 +329,31 @@ def test_fp8_method_keeps_the_grouped_path_for_a_declined_layer(fp8_load, monkey
     assert method.apply_monolithic(layer, x, torch.ones(3, 32)) == "gmm"
 
 
-def test_skip_padded_tokens_passes_the_valid_count(v3, monkeypatch):
-    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
-    layer, owner = _layer(), SimpleNamespace()
-    setattr(owner, bridge.FUSED_MOE_EP_V3_OP_ATTR, _prebuild(layer))
-    assert v3.built[0][0][4] is True
+def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_valid_count(
+    monkeypatch,
+):
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", _FakeOp)
+    run = bridge._build_op(
+        _MESH, 2, True, "silu", True, hidden=512, inter=256, local_experts=4
+    )
+    owner = SimpleNamespace()
+    setattr(owner, bridge.FUSED_MOE_EP_V3_OP_ATTR, run)
+    layer = _layer()
     state = token_padding.TokenPaddingState.create(8, device="cpu")
     state.update(5, 8)
     monkeypatch.setattr(token_padding, "_padding_state", state)
-    x = torch.ones(8, 512, dtype=torch.bfloat16)
-    bridge.fused_moe_ep_v3(
+    # The forward follows the build, not the environment.
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    call = bridge.fused_moe_ep_v3(
         owner,
-        x,
+        torch.ones(8, 512, dtype=torch.bfloat16),
         layer.w13_weight,
         layer.w2_weight,
         layer.w13_weight_scale_inv,
         layer.w2_weight_scale_inv,
         torch.ones(8, 32),
     )
-    call = v3.built[0][2].call_args.args
     assert len(call) == 8
     assert call[7].tolist() == [5]
 
