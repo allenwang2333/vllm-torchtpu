@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,11 +40,37 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
-def find_head(model: torch.nn.Module) -> ParallelLMHead | None:
-    """The model's untied vocabulary projection, or None."""
+def _refuse(reason: str) -> NotImplementedError:
+    return NotImplementedError(
+        f"TPU_SHARDED_LM_HEAD: {reason}. Unset TPU_SHARDED_LM_HEAD to serve "
+        "this configuration."
+    )
+
+
+def request_buckets(vllm_config: VllmConfig, max_num_reqs: int) -> list[int]:
+    """The runner's request buckets while the head is sharded: exactly one.
+
+    The op's exchange is a collective every EP rank joins with one shape, so
+    it runs at a fixed row count. With a second, smaller bucket the compiled
+    graph pads rows before the op and trims them after, and above one row
+    tile the compiler reads the op's output at the wrong vocabulary positions.
+    """
+    if vllm_config.speculative_config is not None:
+        # TODO: size the op for max_num_reqs * (1 + k) verify rows and give
+        # the draft the full head.
+        raise _refuse(
+            "speculative decoding is not supported; verify steps project "
+            "max_num_reqs * (1 + num_speculative_tokens) rows and the draft "
+            "copies the target head, which keeps only a vocabulary slice"
+        )
+    return [max_num_reqs]
+
+
+def find_head(model: torch.nn.Module) -> ParallelLMHead:
+    """The model's untied vocabulary projection."""
     heads = [m for m in model.modules() if isinstance(m, ParallelLMHead)]
     if not heads:
-        return None
+        raise _refuse("the model has no ParallelLMHead on this rank")
     head = heads[0]
     for module in model.modules():
         if (
@@ -51,8 +78,7 @@ def find_head(model: torch.nn.Module) -> ParallelLMHead | None:
             and isinstance(module, VocabParallelEmbedding)
             and module.weight is head.weight
         ):
-            logger.warning("sharded LM head: the head is tied to the embedding")
-            return None
+            raise _refuse("the LM head is tied to the token embedding")
     return head
 
 
@@ -127,46 +153,23 @@ class ShardedLMHeadMethod:
         raise NotImplementedError("The sharded LM head is not an embedding.")
 
 
-def unsupported_reason(buckets: list[int]) -> str | None:
-    # The op's exchange is a collective every rank joins with one shape. With
-    # a second, smaller request bucket the compiled graph pads rows before the
-    # op and trims them after, and above one row tile the compiler reads the
-    # op's output at the wrong vocabulary positions.
-    if len(buckets) == 1:
-        return None
-    return f"request buckets {buckets}: the head needs exactly one"
-
-
-def install(model: torch.nn.Module, buckets: list[int]) -> bool:
+def install(model: torch.nn.Module, buckets: list[int]) -> None:
     """Replace the model's LM head with the sharded projection."""
+    assert len(buckets) == 1, f"{buckets=}: take them from request_buckets()"
     head = find_head(model)
-    if head is None:
-        logger.warning("sharded LM head: no untied head; left as is")
-        return False
-    reason = unsupported_reason(buckets)
-    if reason is not None:
-        logger.warning("sharded LM head: %s; left as is", reason)
-        return False
     if head.tp_size > 1:
-        logger.warning(
-            "sharded LM head: the head is already split over %d TP ranks; left as is",
-            head.tp_size,
+        raise _refuse(
+            f"the LM head is already split over {head.tp_size} tensor-parallel "
+            "ranks; run with tensor_parallel_size=1 and data parallelism"
         )
-        return False
     mesh = build_ep_mesh()
     if mesh is None:
-        logger.warning("sharded LM head: no expert-parallel group; left as is")
-        return False
+        raise _refuse("no expert-parallel group; pass --enable-expert-parallel")
     ep_size = mesh.shape[EP_AXIS_NAME]
     weight = head.weight.data
     vocab, hidden = weight.shape
     if vocab % ep_size:
-        logger.warning(
-            "sharded LM head: vocabulary %d does not split over %d ranks; left as is",
-            vocab,
-            ep_size,
-        )
-        return False
+        raise _refuse(f"the padded vocabulary {vocab} does not split {ep_size} ways")
     part = vocab // ep_size
     index = ep_mesh_index()
     # Sliced on the host: a device-side slice is a lazy strided view whose
@@ -191,4 +194,3 @@ def install(model: torch.nn.Module, buckets: list[int]) -> bool:
         (index + 1) * part,
         rows,
     )
-    return True

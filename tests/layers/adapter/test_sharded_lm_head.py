@@ -90,7 +90,7 @@ def test_install_keeps_this_ranks_vocabulary_rows(monkeypatch):
     _fake_ep(monkeypatch, ep_size=4, index=2)
     model = _model()
     weight = model.lm_head.weight.detach().clone()
-    assert sharded_lm_head.install(model, [16])
+    sharded_lm_head.install(model, [16])
     head = model.lm_head
     part = VOCAB // 4
     torch.testing.assert_close(head.weight_slice, weight[2 * part : 3 * part])
@@ -100,23 +100,30 @@ def test_install_keeps_this_ranks_vocabulary_rows(monkeypatch):
     torch.testing.assert_close(out, x @ weight[2 * part : 3 * part].T)
 
 
-def test_the_head_needs_one_request_bucket():
-    assert sharded_lm_head.unsupported_reason([40]) is None
-    assert "request buckets" in sharded_lm_head.unsupported_reason([8, 16, 32])
+def test_one_request_bucket_and_no_speculative_decoding():
+    config = SimpleNamespace(speculative_config=None)
+    assert sharded_lm_head.request_buckets(config, 40) == [40]
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    with pytest.raises(NotImplementedError, match="speculative decoding"):
+        sharded_lm_head.request_buckets(config, 40)
 
 
 @pytest.mark.parametrize(
-    "case", ["buckets", "tied", "tensor_parallel", "no_ep", "vocab_split"]
+    ("case", "match"),
+    [
+        ("no_head", "no ParallelLMHead"),
+        ("tied", "tied"),
+        ("tensor_parallel", "tensor-parallel"),
+        ("no_ep", "expert-parallel"),
+        ("vocab_split", "does not split"),
+    ],
 )
-def test_install_leaves_an_unsupported_head_alone(monkeypatch, case):
+def test_install_refuses_an_unsupported_head(monkeypatch, case, match):
     _fake_ep(monkeypatch, ep_size=3 if case == "vocab_split" else 4, index=0)
     if case == "no_ep":
         monkeypatch.setattr(sharded_lm_head, "build_ep_mesh", lambda: None)
-    model = _model(tied=case == "tied")
+    model = torch.nn.Module() if case == "no_head" else _model(tied=case == "tied")
     if case == "tensor_parallel":
         model.lm_head.tp_size = 2
-    method = model.lm_head.quant_method
-    buckets = [8, 16] if case == "buckets" else [16]
-    assert not sharded_lm_head.install(model, buckets)
-    assert model.lm_head.quant_method is method
-    assert model.lm_head.weight.shape == (VOCAB, HIDDEN)
+    with pytest.raises(NotImplementedError, match=match):
+        sharded_lm_head.install(model, [16])

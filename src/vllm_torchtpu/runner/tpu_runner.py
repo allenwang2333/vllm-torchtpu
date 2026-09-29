@@ -814,8 +814,9 @@ class TPUModelRunner(GPUModelRunner):
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
         if envs.TPU_SHARDED_LM_HEAD:
-            # The sharded head runs at one fixed row count.
-            self.num_reqs_paddings = [self.max_num_reqs]
+            self.num_reqs_paddings = sharded_lm_head.request_buckets(
+                self.vllm_config, self.max_num_reqs
+            )
 
         # Pallas SMEM-aware num_reqs caps.
         self.num_reqs_most_model_len = (
