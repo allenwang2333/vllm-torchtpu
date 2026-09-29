@@ -122,6 +122,21 @@ class Tiles:
     # short of a full tile), not on every tile -- resident tiles are compute-bound and the issue
     # cost adds there (j-a067267f: m_shared 7.7 -> 29.5 us). `gpre` rows per poll.
     gwait: bool = False
+    # ---- probe 27 arms (all off = the stack3b incumbent; er + hd on by default, bitwise-equal) ----
+    # er: MoE stream order sw13, gate, sw2, exp -- route before the shared expert's w2 so the routed
+    # expert tiles stream under sw2 instead of after routing (m_experts first-tile wait).
+    early_route: bool = True    # probe 27: -91 us @L40 R=8 [measured: j-098f75f1]
+    # kva: the KV-write rope-row read is issued at layer start, the row writes are waited one layer
+    # later (double-buffered rows) instead of a blocking RMW round trip in L_kvw.
+    kvw_async: bool = False
+    # r1: packed rope re-laid to ONE aligned segment (lanes 0..31): 2 rope dots instead of 8, no select.
+    rope1: bool = False
+    # hd: fp8 bytes decoded by the hardware fp8->bf16 convert (u8 truncate + bitcast) instead of
+    # the bit-twiddling fp8_decode; 0x7F/0xFF (NaN, never written: writes clip to +-448) -> +-448.
+    hwdec: bool = True          # probe 27: -46 us @L40 R=8 [measured: j-098f75f1]
+    # tb: top-k extraction per 128-row block over only the blocks each k chunk spans.
+    topk_blk: bool = False
+    topk_kc: int = 256
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank. tk doubles as the
@@ -221,6 +236,30 @@ def fp8_decode(b):
     normal = lax.bitcast_convert_type(bits, F32)
     sub = m.astype(F32) * (2.0 ** -9) * (1 - 2 * s).astype(F32)
     return jnp.where(e == 0, sub, normal)
+
+
+def fp8_decode_hw(b):
+    """probe 27 hd: int32 byte (0..255, e4m3fn bits) -> bf16 through the hardware fp8 convert.
+    0x7F / 0xFF (NaN in e4m3fn; fp8_decode reads them as +-480) become 0x7E / 0xFE (+-448) so no
+    NaN reaches a dot: the cache writer clips to +-448 and never emits them, so written bytes
+    decode identically; they only occur in garbage lanes that meet zero q lanes."""
+    b = jnp.where((b & 0x7F) == 0x7F, b ^ 1, b)
+    return lax.bitcast_convert_type(b.astype(U8), FP8).astype(BF16)
+
+
+def packed_rope_to_seg0(p, iv):
+    """probe 27 r1: gathered PACKED rope rows -> the token's key in lanes 0..31 of every row,
+    word j' = bytes (j', 32+j') -- quarter 0 of the padded layout whatever t_r & 3 is, so one
+    q0 / q1 dot pair serves every row. Lanes 32..127 hold finite fp8 garbage that only meets zero
+    q lanes (as in packed_rope_to_padded)."""
+    s8 = jnp.transpose(jnp.broadcast_to(iv & 7, (128, 128)))         # per-row (sublane) eighth
+    lane = lax.broadcasted_iota(I32, (128, 128), 1)
+    p = jnp.where((s8 & 4) == 4, pltpu.roll(p, 64, 1), p)             # lanes 16*s8 -> 16*(s8&3)
+    p = jnp.where((s8 & 2) == 2, pltpu.roll(p, 96, 1), p)             # -> 16*(s8&1)
+    p = jnp.where((s8 & 1) == 1, pltpu.roll(p, 112, 1), p)            # -> lanes 0..15
+    a = (p & 0xFF) | shl(shr(p, 16) & 0xFF, 8)                         # bytes (j, 32+j)
+    b = (shr(p, 8) & 0xFF) | shl(shr(p, 24) & 0xFF, 8)                 # bytes (16+j, 48+j)
+    return jnp.where(lane < 16, a, pltpu.roll(b, 16, 1))
 
 
 def mxu(a, b, tiles):
@@ -347,12 +386,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         "att": pltpu.VMEM((cfg.NH // G, 8, cfg.KL), F32),   # head group g in rows 0..G of [g]
         "orow": pltpu.VMEM((M, cfg.NH * cfg.DV), F32),
         "wrow": pltpu.VMEM((8, 128), U32), "rrow": pltpu.VMEM((8, 128), U32),
-        "kv_sem": pltpu.SemaphoreType.DMA((2,)),
+        "kv_sem": pltpu.SemaphoreType.DMA((3 if tiles.kvw_async else 2,)),
         "ih": pltpu.VMEM((M, cfg.IDIM), F32),
         "rec": pltpu.VMEM((M, 256), U8), "igrp": pltpu.VMEM((1, 4, 256), U8),
         "ipage": pltpu.VMEM((tiles.scan_depth, pg // 4, 4, 256), U8),
         "ip_sem": pltpu.SemaphoreType.DMA((tiles.scan_depth,)),
         "keys": pltpu.VMEM((ROWS, 128), I32),
+        **({"tk_vt": pltpu.VMEM((ROWS, 256), BF16),
+            "tk_acc": pltpu.VMEM((min(tiles.topk_kc, KT), 256), F32),
+            "tk_c": pltpu.VMEM((2, 128, 128), F32)} if tiles.topk_blk else {}),
         "idx_s": pltpu.SMEM((NC, 128), I32),
         "idx_v": pltpu.VMEM((NC, 128), I32),
         "misc_sem": pltpu.SemaphoreType.DMA(()),
@@ -414,6 +456,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     # --- the stream: one layer's tiles in consumption order, segment by segment ---
     SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2",
             "sw13", "sw2", "gate", "exp")
+    if tiles.early_route:                              # probe 27 er: route before the shared w2
+        SEGS = ("qkv_a", "q_b", "w_uk", "idx_wq", "idx_wk", "w_uv", "o_proj", "w13", "w2",
+                "sw13", "gate", "sw2", "exp")
     SID = {k: i for i, k in enumerate(SEGS)}
     EXP = SID["exp"]
     KSEG = {k: (EXP if k in ("ew13", "ew2") else SID[k]) for k in wshape}
@@ -893,10 +938,20 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 T = p ^ INT_MIN
                 # vectorized extraction: counting prefix sums + one one-hot matmul per k chunk, no scalar
                 # loop (topk_vec_probe j-5c210072, kc 512: thr+extract 90 -> 38 us rand, 106 -> 44 ties, exact)
-                vtopk.extract(keys, T, K, idx_v)
+                if tiles.topk_blk:
+                    vtopk.extract_blk(keys, T, K, idx_v, scr["tk_vt"], scr["tk_acc"], scr["tk_c"],
+                                      kc=tiles.topk_kc)
+                else:
+                    vtopk.extract(keys, T, K, idx_v, kc=tiles.topk_kc)
                 cp = pltpu.make_async_copy(idx_v, idx_s, scr["misc_sem"])
                 cp.start()
                 cp.wait()
+
+        KVA = tiles.kvw_async
+
+        def kv_wait_writes():
+            pltpu.make_async_copy(scr["wrow"], nrow_out.at[0], scr["kv_sem"].at[0]).wait()
+            pltpu.make_async_copy(scr["rrow"], rrow_out.at[0], scr["kv_sem"].at[1]).wait()
 
         # ---------------- one layer ----------------
         def layer(l, carry):
@@ -917,6 +972,20 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def _():
                 pltpu.make_async_copy(smalls.at[l + 1], scr["sm"].at[1 - slot],
                                       scr["sm_sem"].at[1 - slot]).start()
+
+            if KVA:
+                # probe 27 kva: last layer's row writes landed long ago (wrow / rrow are free), and
+                # this layer's rope row read flies under L_qkva
+                @pl.when(active)
+                def _():
+                    @pl.when(l > 0)
+                    def _():
+                        kv_wait_writes()
+                    page_ = bt[pos >> lg_pg]
+                    sl_ = pos & (pg - 1)
+                    bswitch(l, {ll: (lambda r=C["rope"][ll]: pltpu.make_async_copy(
+                        r.at[page_, pl.ds(sl_ >> RSH, 1)], scr["rrow"].at[pl.ds(0, 1)],
+                        scr["kv_sem"].at[2]).start()) for ll in range(L)})
 
             # input norm
             x = scr["h"][...] + scr["res"][...]
@@ -976,9 +1045,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
                 def kvw(ref_r):
                     def f():
-                        cr = pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> RSH, 1)],
-                                                   scr["rrow"].at[pl.ds(0, 1)], scr["kv_sem"].at[1])
-                        cr.start()
+                        if KVA:
+                            cr = pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> RSH, 1)],
+                                                       scr["rrow"].at[pl.ds(0, 1)],
+                                                       scr["kv_sem"].at[2])
+                        else:
+                            cr = pltpu.make_async_copy(ref_r.at[page, pl.ds(sl >> RSH, 1)],
+                                                       scr["rrow"].at[pl.ds(0, 1)],
+                                                       scr["kv_sem"].at[1])
+                            cr.start()
                         cr.wait()
                         old = lax.bitcast_convert_type(scr["rrow"][0:1, :], I32)
                         new = old
@@ -987,11 +1062,15 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                                             pltpu.roll(rw, RW * sg, 1) if sg else rw, new)
                         scr["rrow"][0:1, :] = lax.bitcast_convert_type(new, U32)
                     return f
-                bswitch(l, {ll: kvw(C["rope"][ll]) for ll in range(L)})
+                if KVA:                  # the read wait needs no layer switch (sem + bytes only)
+                    kvw(C["rope"][0])()
+                else:
+                    bswitch(l, {ll: kvw(C["rope"][ll]) for ll in range(L)})
                 cw = pltpu.make_async_copy(scr["rrow"], rrow_out.at[l], scr["kv_sem"].at[1])
                 cw.start()
-                cw.wait()
-                cn.wait()
+                if not KVA:              # kva: waited at the next layer's start / after the loop
+                    cw.wait()
+                    cn.wait()
 
             ph.mark("L_qb")
             # v9: q_b + W_UK absorb TP over heads (v3_tpa's q half). The owner quantizes its q_lora
@@ -1237,29 +1316,43 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             lane_h = lax.broadcasted_iota(I32, (cfg.NH, 128), 1)
             q0 = jnp.where(lane_h < 32, pltpu.roll(xr, 64, 1), 0.0).astype(BF16)
             q1 = jnp.where(lane_h < 32, pltpu.roll(xr, 32, 1), 0.0).astype(BF16)
-            q0s = [q0] + [pltpu.roll(q0.astype(F32), 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
-            q1s = [q1] + [pltpu.roll(q1.astype(F32), 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
+            R1 = tiles.rope1 and rope_packed
+            if not R1:
+                q0s = [q0] + [pltpu.roll(q0.astype(F32), 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
+                q1s = [q1] + [pltpu.roll(q1.astype(F32), 32 * sg, 1).astype(BF16) for sg in (1, 2, 3)]
+            if tiles.hwdec:
+                dec = fp8_decode_hw
+            else:
+                def dec(b_):
+                    return fp8_decode(b_).astype(BF16)
 
             def s_body(c, carry):
                 r0 = pl.multiple_of(c * 128, 128)
                 w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(r0, 128), :], I32)
                 s = jnp.zeros((cfg.NH, 128), F32)
                 for b in range(4):
-                    band = fp8_decode(shr(w, 8 * b) & 0xFF).astype(BF16)
+                    band = dec(shr(w, 8 * b) & 0xFF)
                     scr["kvb"][pl.ds(r0, 128), b * 128:(b + 1) * 128] = band
                     s = s + lax.dot_general(qn[:, b * 128:(b + 1) * 128], band, NT,
                                             preferred_element_type=F32)
                 rw_ = lax.bitcast_convert_type(scr["g_rope"][pl.ds(r0, 128), :], I32)
                 iv = scr["idx_v"][pl.ds(c, 1), :]                                  # [1,128]
-                if rope_packed:
-                    rw_ = packed_rope_to_padded(rw_, iv)
-                B0 = fp8_decode(rw_ & 0xFF).astype(BF16)
-                B1 = fp8_decode(shr(rw_, 8) & 0xFF).astype(BF16)
-                seg = iv & 3
-                for sg in range(4):
-                    ss = (lax.dot_general(q0s[sg], B0, NT, preferred_element_type=F32)
-                          + lax.dot_general(q1s[sg], B1, NT, preferred_element_type=F32))
-                    s = s + jnp.where(seg == sg, ss, 0.0)
+                if R1:
+                    rw_ = packed_rope_to_seg0(rw_, iv)
+                    B0 = dec(rw_ & 0xFF)
+                    B1 = dec(shr(rw_, 8) & 0xFF)
+                    s = s + (lax.dot_general(q0, B0, NT, preferred_element_type=F32)
+                             + lax.dot_general(q1, B1, NT, preferred_element_type=F32))
+                else:
+                    if rope_packed:
+                        rw_ = packed_rope_to_padded(rw_, iv)
+                    B0 = dec(rw_ & 0xFF)
+                    B1 = dec(shr(rw_, 8) & 0xFF)
+                    seg = iv & 3
+                    for sg in range(4):
+                        ss = (lax.dot_general(q0s[sg], B0, NT, preferred_element_type=F32)
+                              + lax.dot_general(q1s[sg], B1, NT, preferred_element_type=F32))
+                        s = s + jnp.where(seg == sg, ss, 0.0)
                 s = s * sm_scale
                 s = jnp.where(iv >= 0, s, jnp.finfo(F32).min)
                 scr["s_all"][c] = s
@@ -1385,10 +1478,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 scr["xq"][:, :H] = xq
                 a = matmul("sw13", l, scr["xq"], H, 2 * cfg.IS)
                 mid = silu_mul((a * sx * sm(slot, "sw13_s")).astype(BF16).astype(F32), cfg.IS) * row0
-                xq, sx = quant_rows(mid)
+                xq, sx_sh = quant_rows(mid)
                 scr["xq"][:, :cfg.IS] = xq
-                a = matmul("sw2", l, scr["xq"], cfg.IS, H)
-                scr["shared"][...] = (a * sx * sm(slot, "sw2_s")).astype(BF16).astype(F32)
+
+                def shared_w2():
+                    a_ = matmul("sw2", l, scr["xq"], cfg.IS, H)
+                    scr["shared"][...] = (a_ * sx_sh * sm(slot, "sw2_s")).astype(BF16).astype(F32)
+                if not tiles.early_route:
+                    shared_w2()
 
                 phm.mark("m_agwait")
                 ag_wait()
@@ -1446,6 +1543,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 st[6] = n_hit
                 st[5] = l
                 pump("gate")
+                if tiles.early_route:        # the routed tiles stream under the shared w2
+                    phm.mark("m_sw2")
+                    shared_w2()
 
                 phm.mark("m_experts")
                 pltpu.make_async_copy(next(iter(W["es13"].values())), scr["es13"],
@@ -1503,6 +1603,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             if len(tkinds) < len(wshape):
                 scr["pool"][...] = jnp.zeros(scr["pool"].shape, U8)
         lax.fori_loop(0, L, layer, 0)
+        if KVA:
+            @pl.when(active)
+            def _():
+                kv_wait_writes()
         x = (scr["h"][...] + scr["res"][...]).astype(BF16).astype(F32)
         lay_o = smalls_layout(cfg)[0]
         # final norm weight rides in the last smalls row's "in_ln" slot of an extra row
