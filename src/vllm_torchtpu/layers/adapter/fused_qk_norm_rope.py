@@ -16,7 +16,9 @@
 vLLM fuses these on CUDA only. With ``TPU_FUSED_QK_NORM_ROPE`` set, token
 buckets of at most :data:`MAX_ROWS` rows run the ``qk_norm_rope_gate`` kernel,
 which holds its rows whole in VMEM, instead of the eager split, per-head norms
-and rope; larger buckets keep the eager path.
+and rope; larger buckets keep the eager path. The fork needs a trace per side,
+and only the backbone is re-traced per bucket group, so a layer compiled
+outside it -- the MTP draft's -- keeps the eager path.
 """
 
 import functools
@@ -99,7 +101,31 @@ def _weight_plus_one(norm: torch.nn.Module) -> torch.Tensor:
     return norm.weight.float() + 1.0 if hoisted is None else hoisted
 
 
+def _unsupported_graph_reason() -> str | None:
+    """Why the graph this layer is compiled into cannot fork on the bucket.
+
+    The fork reads the token count, which leaves a shape guard in the trace.
+    Only the backbone is re-traced per bucket group
+    (`TPUModelRunner._precompile_backbone`); a module built under another model
+    tag -- the MTP or EAGLE draft, "eagle_head" -- compiles every bucket from
+    its one trace, and the buckets on the far side of the fork would raise
+    `ShapeSpecializationError` at its first forward.
+    """
+    # Read at call time: `set_model_tag` rebinds the module global.
+    from vllm.compilation import backends
+
+    if backends.model_tag != "backbone":
+        return (
+            f"the {backends.model_tag!r} graph is traced once for every bucket, "
+            "so it cannot carry the row fork"
+        )
+    return None
+
+
 def _unsupported_reason(layer: torch.nn.Module, model_config) -> str | None:
+    reason = _unsupported_graph_reason()
+    if reason is not None:
+        return reason
     mm_config = model_config.multimodal_config if model_config is not None else None
     if not layer.attn_output_gate:
         return "the attention has no output gate"

@@ -238,3 +238,21 @@ def test_prebuild_declines_what_the_kernel_cannot_compute(
     assert not fused._prebuild(layer, model_config)
     assert not fused._ops
     assert reason in warnings[0]
+
+
+def test_prebuild_declines_a_layer_outside_the_backbone_graph(monkeypatch):
+    """The MTP draft is built under the "eagle_head" tag and compiled from one
+    trace, which cannot carry both sides of the row fork."""
+    from vllm.compilation import backends
+
+    warnings = []
+    monkeypatch.setattr(
+        fused.logger, "warning_once", lambda msg, *args: warnings.append(msg % args)
+    )
+    layer = _layer(fused_qk_norm_rope=False)
+    with backends.set_model_tag("eagle_head"):
+        assert not fused._prebuild(layer, model_config=None)
+    assert not fused._ops
+    assert "'eagle_head' graph" in warnings[0]
+    with set_current_vllm_config(_vllm_config(16, 3)):
+        assert fused._prebuild(layer, model_config=None)
