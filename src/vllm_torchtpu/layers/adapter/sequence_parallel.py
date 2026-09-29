@@ -29,6 +29,8 @@ model records the form here first (`set_active`); a trace reads it once.
 import contextlib
 from collections.abc import Iterator, Sequence
 
+import torch
+
 from vllm_torchtpu import envs
 
 # Rows from which a step is sequence parallel. PR #989's value, kept pending a
@@ -45,6 +47,18 @@ _layers_built = 0
 def enabled() -> bool:
     """Whether the operator selected sequence parallelism."""
     return envs.TPU_SEQUENCE_PARALLEL_PREFILL
+
+
+def fp8_gather() -> bool:
+    """Whether the rows are gathered as fp8 before the in-projections."""
+    return enabled() and envs.TPU_SEQUENCE_PARALLEL_FP8_GATHER
+
+
+def check_fp8_gather() -> None:
+    if envs.TPU_SEQUENCE_PARALLEL_FP8_GATHER and not enabled():
+        raise ValueError(
+            "TPU_SEQUENCE_PARALLEL_FP8_GATHER needs TPU_SEQUENCE_PARALLEL_PREFILL=1."
+        )
 
 
 def use_sequence_parallel_moe(parallel_config) -> bool:
@@ -133,3 +147,42 @@ def rows_are_replicated(is_sequence_parallel: bool) -> bool:
     """Whether a sequence-parallel MoE layer sees the step's rows replicated
     on every rank (a step below `MIN_ROWS`)."""
     return is_sequence_parallel and not _active
+
+
+def project(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    prequant: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    """A column-parallel projection of the step's rows.
+
+    `prequant` is the rows gathered as fp8 with their per-row scales
+    (TPU_SEQUENCE_PARALLEL_FP8_GATHER), or None to project `x`. A per-channel
+    fp8 projection takes them as they are; any other is given the rows
+    dequantized.
+    """
+    if prequant is None:
+        out, _ = layer(x)
+        return out
+    from vllm_torchtpu.layers.adapter.linear_common import (
+        KEEP_VLLM_LAYOUT_ATTR,
+        quantized_matmul_prequant,
+    )
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    x_q, x_s = prequant
+    scale = getattr(layer, "weight_scale", None)
+    if (
+        isinstance(layer.quant_method, VllmFp8LinearMethodTPU)
+        and layer.weight.dtype == torch.float8_e4m3fn
+        and scale is not None
+        and scale.dim() == 1
+    ):
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul_prequant(x_q, x_s, weight, scale)
+        bias = None if layer.skip_bias_add else layer.bias
+        return out if bias is None else out + bias
+    out, _ = layer((x_q.to(torch.float32) * x_s).to(torch.bfloat16))
+    return out
