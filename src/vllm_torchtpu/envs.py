@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_KWRITE_DUS: bool = False
     TPU_STREAMIDX_SCTOPK_L1: bool = False
     TPU_STREAMIDX_SCORE_BF16_GROUP: int = 0
+    TPU_STREAMIDX_EARLY_EXIT: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -710,6 +711,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SCORE_BF16_GROUP": env_nonnegative_int(
         "TPU_STREAMIDX_SCORE_BF16_GROUP", 0
     ),
+    # StreamIndex top-k early exit: wrap scoring + top-k in a lax.cond that
+    # returns the identity top-k when every sequence is <= index_topk tokens.
+    # The HLO conditional is a scheduling barrier: nothing outside it (the MLA
+    # q path) can be scheduled into its SparseCore waits. 0 drops the cond and
+    # always runs the common path; same indices whenever any sequence is past
+    # index_topk, and it costs a full scoring pass on all-short batches.
+    "TPU_STREAMIDX_EARLY_EXIT": env_bool("TPU_STREAMIDX_EARLY_EXIT", True),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

@@ -65,7 +65,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
 # The guard is batch-wide, so this fires during warmup and on short-context
 # traffic and not at all once any request in the batch is past `index_topk`
-# tokens.
+# tokens. TPU_STREAMIDX_EARLY_EXIT=0 drops the cond (see envs.py).
 STREAMIDX_ENABLE_EARLY_EXIT = True
 
 
@@ -314,6 +314,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         kwrite_dus = envs.TPU_STREAMIDX_KWRITE_DUS
         sctopk_l1 = envs.TPU_STREAMIDX_SCTOPK_L1
         score_bf16_group = envs.TPU_STREAMIDX_SCORE_BF16_GROUP
+        enable_early_exit = (
+            STREAMIDX_ENABLE_EARLY_EXIT and envs.TPU_STREAMIDX_EARLY_EXIT
+        )
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -355,7 +358,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 # results.
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
-                enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                enable_early_exit=enable_early_exit,
                 chunk_tokens=chunk_tokens,
                 sctopk_l1=sctopk_l1,
                 score_bf16_group=score_bf16_group,
