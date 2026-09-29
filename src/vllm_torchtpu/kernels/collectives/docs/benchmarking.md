@@ -50,8 +50,8 @@ Use five warmups and 25 interleaved paired trials of 20- and 60-operation depend
 chains. A full-output dependency and completion wait keep every collective
 observable. Alternate native/custom and low/high ordering. Aggregate the slowest
 process outside the timing interval and report `(T60-T20)/40`. Retain the
-per-process raw durations, signed slopes and p10/median/p90 statistics. Record a
-dependency-only control without subtracting it from collective measurements.
+per-process raw durations, signed slopes and p10/median/p90 statistics. The reported
+slopes include dependency work and bridge overhead.
 
 Audit optimized HLO from the actual timed executable. Verify the expected custom
 call/native collective counts and reject folded-away communication or retracing.
