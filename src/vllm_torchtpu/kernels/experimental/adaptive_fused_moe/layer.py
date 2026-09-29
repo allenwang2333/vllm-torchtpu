@@ -492,12 +492,13 @@ def adaptive_fused_moe(
         # routed at full weight to expert zero. Mask it explicitly instead.
         row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
         if has_padded:
+            # With the skip armed, a row that routes nowhere takes the expert
+            # id one past the last. Every count, table and slab bins over
+            # arange(e_total), so its pairs get none of them and no expert
+            # computes it. After the relabel, which would map this id onto
+            # expert 0.
             row_routes = row_routes & (padded_l == 0)
-        # A row that routes nowhere takes the expert id one past the last.
-        # Every count, table and slab bins over arange(e_total), so its pairs
-        # get none of them and no expert computes it. After the relabel, which
-        # would map this id onto expert 0.
-        topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
+            topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         if renormalize:
             denom = topk_weights.sum(axis=-1, keepdims=True)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
@@ -657,9 +658,10 @@ def adaptive_fused_moe(
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
-        # A row that routes nowhere indexes arrival rows nothing wrote this
-        # step, and a zero weight times a NaN there is NaN: select, not scale.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if has_padded:
+            # Such a row indexes arrival rows nothing wrote this step, and a
+            # zero weight times a NaN there is NaN: select, not scale.
+            combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
