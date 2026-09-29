@@ -3009,11 +3009,14 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        t = torch.tensor(
-            [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)],
-            dtype=torch.int64,
-            device="cpu",
-        )
+        # EPLB (VLLM_TPU_EPLB, created on every rank or none) rides this same
+        # all-reduce: MAX of [count, -count] gives the DP-wide max and min of
+        # the forward counter, so the rebalance trigger is a global quantity.
+        eplb = getattr(self, "_tpu_eplb", None)
+        vals = [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)]
+        if eplb is not None:
+            vals += [int(eplb.count), -int(eplb.count)]
+        t = torch.tensor(vals, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
@@ -3030,6 +3033,16 @@ class TPUModelRunner(GPUModelRunner):
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
+        if eplb is not None:
+            # Both the busy path (execute_model) and the idle path
+            # (execute_dummy_batch) come through here once per step, before
+            # the step's forwards, so a rebalance runs at the same point on
+            # every rank. A megakernel decode step runs no counted forward.
+            eplb.on_step(
+                int(t[3].item()),
+                -int(t[4].item()),
+                0 if self._mk_decode_step else int(t[1].item()),
+            )
         return bucket, int(t[1].item())
 
     def _run_dp_dummy_chunk(self, bucket: int) -> None:
@@ -4318,6 +4331,11 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.distributed import tpu_eplb
 
         self._tpu_eplb = tpu_eplb.create(self.model, self._glm5_mk)
+        if self._tpu_eplb is not None and not self._dp_lockstep_enabled():
+            # The trigger rides the DP lockstep all-reduce; without DP-EP
+            # there is no cross-rank placement to balance.
+            logger.warning("VLLM_TPU_EPLB ignored: needs DP>1 with expert parallel")
+            self._tpu_eplb = None
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -6025,12 +6043,6 @@ class TPUModelRunner(GPUModelRunner):
         # supports torch.compile
         if getattr(self, "_mk_decode_step", False):
             return self._glm5_mk_forward(input_ids, positions, inputs_embeds), None
-        eplb = getattr(self, "_tpu_eplb", None)
-        if eplb is not None:
-            # Every rank runs every non-megakernel forward in lockstep (each
-            # one carries the fused MoE's EP collectives), so this count, and
-            # the rebalance it triggers, is the same on all of them.
-            eplb.before_forward()
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors

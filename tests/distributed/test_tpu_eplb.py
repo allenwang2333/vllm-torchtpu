@@ -99,3 +99,64 @@ def test_exchange_fn_signature_resolves_for_sharded_jax_callable():
     fn = T.make_exchange_fn(mesh, "ep")
     sig = inspect.signature(inspect.unwrap(fn), eval_str=True)
     assert len(sig.parameters) == 6
+
+
+def test_step_trigger_first_then_every_interval():
+    fired, nxt = [], 200
+    for count in range(0, 800, 7):  # counts advance in uneven jumps
+        due, nxt = T.step_trigger(count, nxt, 96)
+        if due:
+            fired.append(count)
+    assert fired[0] == 203  # first step at or past FIRST
+    assert all(b - a >= 96 for a, b in zip(fired, fired[1:]))
+    assert T.step_trigger(0, 0, 96) == (False, 0)  # never before any forward
+
+
+def _fake_rebalancer(first, interval):
+    r = object.__new__(T.EplbRebalancer)
+    r.first, r.interval, r.count, r.next_at, r.armed = first, interval, 0, first, True
+    r.fired = []
+    r.rebalance = lambda at, r=r: r.fired.append(at)
+    return r
+
+
+def _dp_step(ranks, local):
+    """One engine step as tpu_runner._dp_coordinated_step runs it: one MAX
+    all-reduce of [tokens, chunks, reqs, count, -count], then on_step on every
+    rank from the reduced values only. local[i] = (tokens, chunks); an idle rank
+    (execute_dummy_batch) contributes (0, 0)."""
+    red = [max(x) for x in zip(*[(tok, ch, 0, r.count, -r.count) for r, (tok, ch) in zip(ranks, local)])]
+    mk_decode = red[0] <= 1 and red[1] == 1
+    for r in ranks:
+        r.on_step(red[3], -red[4], 0 if mk_decode else red[1])
+
+
+def test_trigger_agrees_across_busy_and_idle_ranks():
+    # j-36147a83 hung at the first rebalance that fell in a 1-busy/15-idle
+    # step. Replay that mix of c16 prefill, c1 prefill (one busy rank), c1
+    # megakernel decode and fully idle waves, and require every rank -- busy or
+    # idle -- to fire at the same steps with the same count.
+    rng = np.random.default_rng(0)
+    ranks = [_fake_rebalancer(first=200, interval=96) for _ in range(EP)]
+    ranks[5].count = 3  # even a drifted local counter must follow the agreed max
+    fired_in_c1 = False
+    for step in range(3000):
+        phase = (step // 150) % 4
+        if phase == 0:  # c16 prefill: every rank busy, 1..2 chunks
+            local = [(1024, int(rng.integers(1, 3))) for _ in range(EP)]
+        elif phase == 1:  # c1 prefill: one rank busy, 15 idle
+            busy = int(rng.integers(EP))
+            local = [(1024, 1) if i == busy else (0, 0) for i in range(EP)]
+        elif phase == 2:  # c1 decode on the megakernel: not counted
+            busy = int(rng.integers(EP))
+            local = [(1, 1) if i == busy else (0, 0) for i in range(EP)]
+        else:
+            local = [(0, 0)] * EP
+        before = len(ranks[0].fired)
+        _dp_step(ranks, local)
+        if len(ranks[0].fired) > before and phase == 1:
+            fired_in_c1 = True
+    assert len(ranks[0].fired) >= 5
+    assert fired_in_c1
+    assert all(r.fired == ranks[0].fired for r in ranks)
+    assert all(r.count == ranks[0].count for r in ranks)

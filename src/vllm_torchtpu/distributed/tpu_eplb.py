@@ -393,6 +393,16 @@ def _expert_tensors(layer) -> list:
     return out
 
 
+def step_trigger(count: int, next_at: int, interval: int) -> tuple[bool, int]:
+    """Pure trigger rule: rebalance at the first step whose agreed count of
+    completed non-megakernel forwards reaches ``next_at``; the next one is due
+    ``interval`` forwards later. Every input is a DP-wide agreed value, so every
+    rank computes the same answer."""
+    if count > 0 and count >= next_at:
+        return True, count + interval
+    return False, next_at
+
+
 class EplbRebalancer:
     """Owns the placement of every registered fused-EP layer of one model."""
 
@@ -427,6 +437,7 @@ class EplbRebalancer:
         self.debug_skip = os.environ.get("VLLM_TPU_EPLB_DEBUG_SKIP", "")
         self.megakernel = megakernel
         self.count = 0
+        self.next_at = self.first
         self.armed = False
         self.epoch = 0
         self.topk = 8
@@ -440,23 +451,37 @@ class EplbRebalancer:
     # Counting --------------------------------------------------------------
 
     def arm(self) -> None:
-        """Start counting: after warmup, at the same forward index on every rank."""
+        """Start counting: after warmup, at the same step on every rank."""
         for layer in self.layers.values():
             getattr(layer, LOAD_ATTR).zero_()
         self.count = 0
+        self.next_at = self.first
         self.armed = True
         _log("counting from here (warmup loads discarded)")
 
-    def before_forward(self) -> None:
-        """Called before every non-megakernel forward on every rank."""
+    def on_step(self, agreed_count: int, min_count: int, n_forwards: int) -> None:
+        """Called once per engine step on every DP rank, right after the step's
+        CPU all-reduce and before any of the step's device work.
+
+        ``agreed_count``/``min_count`` are the MAX/MIN over ranks of
+        ``self.count`` riding that all-reduce, and ``n_forwards`` is the number
+        of non-megakernel forwards this step runs -- derived from the reduced
+        chunk count, so identical on every rank. The trigger therefore depends
+        only on globally agreed values, and the busy and the idle (DP dummy)
+        paths reach the rebalance at the same point, with no rank-specific
+        device work pending in front of it.
+        """
         if not self.armed:
             return
-        self.count += 1
-        c = self.count - 1  # forwards completed before this one
-        if c == 0:
-            return
-        if c == self.first or (c > self.first and (c - self.first) % self.interval == 0):
-            self.rebalance(c)
+        if agreed_count != min_count:
+            _log(
+                f"WARNING forward counts disagree across ranks: min={min_count} "
+                f"max={agreed_count} local={self.count}; following max"
+            )
+        due, self.next_at = step_trigger(agreed_count, self.next_at, self.interval)
+        if due:
+            self.rebalance(agreed_count)
+        self.count = agreed_count + n_forwards
 
     # Rebalance -------------------------------------------------------------
 
@@ -470,7 +495,14 @@ class EplbRebalancer:
     def rebalance(self, at: int) -> None:
         import torch
 
+        from vllm_torchtpu.utils import synchronize_tensors
+
         t0 = time.perf_counter()
+        # Drain everything this rank has queued (the step's input prep on a
+        # busy rank, nothing on an idle one) so the exchange programs below are
+        # compiled from the same ops on every rank.
+        synchronize_tensors()
+        _log(f"rebalance enter at_forward={at}")
         phys_loads = self._read_loads()  # mesh-order physical slot -> pairs
         t_read = time.perf_counter() - t0
         tokens = int(next(iter(phys_loads.values())).sum()) // self.topk
@@ -492,7 +524,6 @@ class EplbRebalancer:
             if new is not None:
                 plans[lid] = new
         t_plan = time.perf_counter() - t0 - t_read
-        from vllm_torchtpu.utils import synchronize_tensors
 
         moved_total = 0
         bytes_out_me = 0
