@@ -102,9 +102,12 @@ FROM ci AS dev
 # Pre-install test and benchmarking dependencies before copying full source tree
 # so that changes to folders like src/ or tests/ do not invalidate the
 # dependency installation layer cache.
+# --extra vllm keeps vLLM (already installed in base) in this resolution, so
+# the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
+      --extra vllm \
       --extra test \
       --extra benchmarking
 
