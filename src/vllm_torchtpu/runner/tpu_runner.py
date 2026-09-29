@@ -4451,6 +4451,10 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self.drafter.load_model(self.model)
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            from vllm_torchtpu.layers.adapter import fused_moe_ep_v3
+
+            fused_moe_ep_v3.log_arming_summary()
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache

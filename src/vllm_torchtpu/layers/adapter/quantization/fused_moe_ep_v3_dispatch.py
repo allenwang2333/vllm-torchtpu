@@ -16,10 +16,14 @@
 `VllmFp8MoEMethodTPU` calls into this module at three seams, as it does for
 the adaptive kernel: `prebuild` at weight load, `supported` in
 `supports_internal_mk`, and `apply` in `apply_monolithic`. A layer v3 declines
-keeps the method's grouped-matmul path and vLLM's own dispatch and combine.
+keeps the method's grouped-matmul path and vLLM's own dispatch and combine; an
+armed layer runs that path below its per-step token gate (`apply`).
 """
 
+from collections.abc import Callable
+
 import torch
+from vllm.distributed.parallel_state import get_ep_group
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
@@ -51,15 +55,37 @@ def supported(method) -> bool:
     return fused_moe_ep_v3_supported(method)
 
 
-def apply(method, layer, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-    """The layer's forward through v3: this rank's tokens in and out."""
-    return fused_moe_ep_v3(
-        method,
-        x,
-        layer.w13_weight,
-        layer.w2_weight,
-        layer.w13_weight_scale_inv,
-        layer.w2_weight_scale_inv,
-        router_logits,
-        layer._experts_start,
-    )
+def apply(
+    method,
+    layer,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    grouped: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """The layer's forward when v3 owns its exchange: this rank's tokens in
+    and out.
+
+    A step of at least the armed op's `step_min_tokens` rows runs v3. A
+    smaller one runs `grouped` (the method's grouped-matmul path) between
+    the dispatch and combine vLLM's MoERunner would have issued had the
+    method not claimed them. The fork reads the token count, so it leaves a
+    shape guard and each side is its own trace; both sides lift the same
+    buffers (the weights, `experts_start`, the padding mask), so a bucket
+    compiled by one trace can be handed to the other.
+    """
+    armed = getattr(method, FUSED_MOE_EP_V3_OP_ATTR)
+    if x.shape[0] >= armed.step_min_tokens:
+        return fused_moe_ep_v3(
+            method,
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            router_logits,
+            layer._experts_start,
+        )
+    ep = get_ep_group()
+    sequence_parallel = layer.moe_config.moe_parallel_config.is_sequence_parallel
+    x, router_logits = ep.dispatch_router_logits(x, router_logits, sequence_parallel)
+    return ep.combine(grouped(layer, x, router_logits), sequence_parallel)

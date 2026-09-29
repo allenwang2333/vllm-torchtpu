@@ -79,7 +79,6 @@ def v3(monkeypatch):
     """IMPL=v3 with the distributed lookups and the op build stubbed out."""
     monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v3")
     monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
-    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
     monkeypatch.setattr(bridge, "_OPS", {})
     monkeypatch.setattr(
         bridge,
@@ -87,7 +86,6 @@ def v3(monkeypatch):
         lambda: SimpleNamespace(shape={bridge.EP_AXIS_NAME: _EP}),
     )
     monkeypatch.setattr(bridge, "ep_mesh_index", lambda: 0)
-    monkeypatch.setattr(bridge, "_max_node_tokens", lambda ep: 4096)
     config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1))
     monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
     monkeypatch.setattr(
@@ -132,7 +130,9 @@ def test_the_op_name_does_not_clash_with_v2():
 
 
 def test_arms_on_a_supported_layer(v3):
-    assert _prebuild(_layer()) is v3.built[0][2]
+    armed = _prebuild(_layer())
+    assert armed.run is v3.built[0][2]
+    assert armed.step_min_tokens == bridge.STEP_MIN_TOKENS_DEFAULT == 33
     args, kwargs, _ = v3.built[0]
     assert args[1:5] == (2, True, "silu", False)
     assert kwargs == dict(hidden=512, inter=256, local_experts=4)
@@ -214,9 +214,14 @@ def test_a_block_scaled_weight_is_declined(v3):
     assert _prebuild(layer) is None
 
 
-def test_declined_below_the_token_threshold(v3, monkeypatch):
-    monkeypatch.setattr(bridge, "_max_node_tokens", lambda ep: 512)
-    assert _prebuild(_layer()) is None
+def test_the_per_step_gate_replaces_the_deployment_token_threshold(v3, monkeypatch):
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", str(1 << 30))
+    assert _prebuild(_layer()) is not None
+
+
+def test_a_tuned_shape_overrides_the_default_gate(v3, monkeypatch):
+    monkeypatch.setitem(bridge.STEP_MIN_TOKENS_BY_SHAPE, (512, 256, 4, 2), 64)
+    assert _prebuild(_layer()).step_min_tokens == 64
 
 
 def test_declined_without_an_ep_group(v3, monkeypatch):
@@ -310,11 +315,11 @@ def test_fp8_method_loads_and_forwards_through_v3(fp8_load, monkeypatch):
     assert not method.supports_internal_mk
     method.process_weights_after_loading(layer)
     op = fp8_load.built[0][2]
-    assert getattr(method, bridge.FUSED_MOE_EP_V3_OP_ATTR) is op
+    assert getattr(method, bridge.FUSED_MOE_EP_V3_OP_ATTR).run is op
     assert not legacy.fused_moe_ep_supported(method)
     assert method.supports_internal_mk
-    x = torch.ones(3, 512, dtype=torch.bfloat16)
-    assert method.apply_monolithic(layer, x, torch.ones(3, 32)) is x
+    x = torch.ones(64, 512, dtype=torch.bfloat16)
+    assert method.apply_monolithic(layer, x, torch.ones(64, 32)) is x
     call = op.call_args.args
     assert len(call) == 7
     assert call[6].shape == (1, 1)
@@ -342,7 +347,7 @@ def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_padding_mask(
         _MESH, 2, True, "silu", True, hidden=512, inter=256, local_experts=4
     )
     owner = SimpleNamespace()
-    setattr(owner, bridge.FUSED_MOE_EP_V3_OP_ATTR, run)
+    setattr(owner, bridge.FUSED_MOE_EP_V3_OP_ATTR, bridge.ArmedOp(run, 1))
     layer = _layer()
     state = token_padding.TokenPaddingState.create(8, device="cpu")
     state.update(5, 8)
@@ -394,3 +399,199 @@ def test_the_runner_reports_an_armed_v3_layer_reduced(monkeypatch):
     assert runner._fused_output_is_reduced is False
     setattr(runner._quant_method, bridge.FUSED_MOE_EP_V3_OP_ATTR, object())
     assert runner._fused_output_is_reduced is True
+
+
+class _FakeGroup:
+    """A two-rank DP/EP group: dispatch gathers, combine keeps this rank's."""
+
+    world_size = 2
+
+    def __init__(self):
+        self.calls = []
+
+    def dispatch_router_logits(self, x, logits, sequence_parallel):
+        self.calls.append(("dispatch", x.shape[0], sequence_parallel))
+        return torch.cat([x, x]), torch.cat([logits, logits])
+
+    def combine(self, x, sequence_parallel):
+        self.calls.append(("combine", x.shape[0], sequence_parallel))
+        return x[: x.shape[0] // 2]
+
+    def all_gather(self, x, dim=0):
+        return torch.cat([x, x], dim=dim)
+
+
+@pytest.fixture
+def armed_fp8(fp8_load, monkeypatch):
+    """An armed FP8 layer with the grouped path and the EP group stubbed."""
+    layer, method = _layer(), _method()
+    method.process_weights_after_loading(layer)
+    group = _FakeGroup()
+    monkeypatch.setattr(dispatch, "get_ep_group", lambda: group)
+    gmm = Mock(side_effect=lambda **kw: kw["hidden_states"])
+    monkeypatch.setattr(fp8, "fused_moe_gmm", gmm)
+    monkeypatch.setattr(
+        fp8.moe_routing,
+        "route",
+        lambda layer, x, logits: torch.topk(logits.float().softmax(-1), 2),
+    )
+    return SimpleNamespace(
+        layer=layer, method=method, group=group, gmm=gmm, v3=fp8_load.built[0][2]
+    )
+
+
+@pytest.mark.parametrize("rows,takes_v3", [(1, False), (32, False), (33, True)])
+def test_the_gate_picks_v3_or_the_grouped_path_per_step(armed_fp8, rows, takes_v3):
+    a = armed_fp8
+    x = torch.ones(rows, 512, dtype=torch.bfloat16)
+    out = a.method.apply_monolithic(a.layer, x, torch.ones(rows, 32))
+    assert out.shape == x.shape
+    assert a.v3.called is takes_v3
+    assert a.gmm.called is not takes_v3
+    if takes_v3:
+        assert a.group.calls == []
+    else:
+        # vLLM's own exchange around the grouped path, on the gathered rows.
+        assert a.group.calls == [
+            ("dispatch", rows, False),
+            ("combine", 2 * rows, False),
+        ]
+        assert a.gmm.call_args.kwargs["hidden_states"].shape[0] == 2 * rows
+
+
+@torch.library.custom_op("v3_gate_test::fused", mutates_args=())
+def _fused_stub(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    gating: torch.Tensor,
+    experts_start: torch.Tensor,
+) -> torch.Tensor:
+    return x.clone()
+
+
+@torch.library.custom_op("v3_gate_test::fused_padded", mutates_args=())
+def _fused_padded_stub(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    gating: torch.Tensor,
+    experts_start: torch.Tensor,
+    padded: torch.Tensor,
+) -> torch.Tensor:
+    return x.clone()
+
+
+@torch.library.custom_op("v3_gate_test::gmm", mutates_args=())
+def _gmm_stub(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    s1: torch.Tensor,
+    s2: torch.Tensor,
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+    experts_start: torch.Tensor,
+) -> torch.Tensor:
+    return x.clone()
+
+
+for _stub in (_fused_stub, _fused_padded_stub, _gmm_stub):
+    _stub.register_fake(lambda x, *args: torch.empty_like(x))
+
+
+class _StubOp:
+    """What the patched `jax_op` returns: the stub op of the built arity."""
+
+    def __init__(self, name, fn, **kwargs):
+        padded = len(kwargs["input_partition_specs"]) == 8
+        self.op = _fused_padded_stub if padded else _fused_stub
+
+    def register_fake(self, fake):
+        pass
+
+    def __call__(self, *args):
+        return self.op(*args)
+
+
+_REAL_BUILD_OP = bridge._build_op
+
+
+@pytest.mark.parametrize("skip_padded", [False, True], ids=["plain", "padded"])
+def test_both_sides_of_the_gate_lift_the_same_inputs(
+    armed_fp8, monkeypatch, skip_padded
+):
+    """A bucket compiled by the trace on one side of the gate is handed to
+    the trace on the other (compilation/shape_variants): their graphs must
+    take the same inputs by name, at most reordered."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    a = armed_fp8
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1" if skip_padded else "0")
+    monkeypatch.setattr(bridge, "jax_op", _StubOp)
+    monkeypatch.setattr(bridge, "_OPS", {})
+    run = _REAL_BUILD_OP(
+        _MESH, 2, True, "silu", skip_padded, hidden=512, inter=256, local_experts=4
+    )
+    setattr(a.method, bridge.FUSED_MOE_EP_V3_OP_ATTR, bridge.ArmedOp(run, 33))
+    monkeypatch.setattr(
+        fp8,
+        "fused_moe_gmm",
+        lambda **kw: _gmm_stub(
+            kw["hidden_states"],
+            kw["w1"],
+            kw["w2"],
+            kw["w1_scale"],
+            kw["w2_scale"],
+            kw["topk_weights"],
+            kw["topk_ids"],
+            kw["experts_start"],
+        ),
+    )
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_dp_group", lambda: a.group)
+    state = token_padding.TokenPaddingState.create(256, device="cpu")
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+
+    traces = []
+
+    def backend(graph, example_inputs):
+        traces.append(shape_variants._handover_inputs(graph))
+        return graph.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        lambda x, g: a.method.apply_monolithic(a.layer, x, g),
+        backend=backend,
+        fullgraph=True,
+    )
+    for rows in (16, 64):
+        # The token dimension is dynamic, as vLLM traces the backbone.
+        x, g = torch.ones(rows, 512, dtype=torch.bfloat16), torch.ones(rows, 32)
+        torch._dynamo.mark_dynamic(x, 0)
+        torch._dynamo.mark_dynamic(g, 0)
+        compiled(x, g)
+    torch._dynamo.reset()
+    assert len(traces) == 2
+    below, above = traces
+    names = {name for name, _ in below}
+    assert any("experts_start" in name for name in names)
+    assert any("padding_mask" in name for name in names) is skip_padded
+    assert sorted(below) == sorted(above)
+    assert shape_variants._input_permutation(below, above) is not None
+
+
+def test_the_boot_summary_counts_armed_and_declined_layers(v3, monkeypatch):
+    monkeypatch.setattr(bridge, "_ARMING", bridge.Counter())
+    for _ in range(3):
+        _prebuild(_layer())
+    _prebuild(_layer(scoring_func="sigmoid"))
+    info = Mock()
+    monkeypatch.setattr(bridge.logger, "info", info)
+    bridge.log_arming_summary()
+    message = info.call_args.args[0] % info.call_args.args[1:]
+    assert message.startswith("fused EP v3: 3/4 MoE layers armed; declined: 1x ")
+    assert "scoring_func 'sigmoid'" in message

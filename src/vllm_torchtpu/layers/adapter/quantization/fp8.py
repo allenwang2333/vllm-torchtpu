@@ -1057,7 +1057,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
             )
         if fused_moe_ep_v3_dispatch.supported(self):
-            return fused_moe_ep_v3_dispatch.apply(self, layer, x, router_logits)
+            return fused_moe_ep_v3_dispatch.apply(
+                self, layer, x, router_logits, self._apply_grouped
+            )
 
         # `score_bias_operand` is not optional, and omitting it is silent on
         # every model that does not have one. `prebuild_fused_moe_ep` builds
@@ -1087,6 +1089,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        return self._apply_grouped(layer, x, router_logits)
+
+    def _apply_grouped(
+        self, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """The grouped-matmul path: route, then fused_moe_gmm."""
+        activation_str = self._tpu_activation_str
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

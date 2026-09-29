@@ -22,6 +22,10 @@ per-channel fp8 weights and a plain softmax top-k router. A deployment outside
 that raises at weight load; a layer outside it (shape, routing, weights) is
 declined on its own and keeps the grouped-matmul path.
 
+Per step, an armed layer runs v3 only when this rank's step reaches
+`step_min_tokens` rows; smaller steps take the grouped-matmul path between
+vLLM's own dispatch and combine (`fused_moe_ep_v3_dispatch.apply`).
+
 The op reads only buffers the grouped-matmul path reads too -- the layer's
 `experts_start`, from which it derives the shard index, and with
 TPU_MOE_SKIP_PADDED_TOKENS the runner's padding mask -- so a trace that takes
@@ -32,7 +36,9 @@ marks, which its selector routes nowhere (`drop_nan_rows`); the input row is
 zeroed so nothing of it travels, and the kernel returns zero for it.
 """
 
-from typing import Any
+from collections import Counter
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -49,7 +55,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-    _max_node_tokens,
     _pcp_size,
     _squeeze_channel_scale,
     _squeeze_channel_scale_checked,
@@ -70,8 +75,34 @@ WEIGHT_FORMAT = "fp8"
 FUSED_MOE_EP_V3_OP_NAME = "pallas::fused_moe_ep_v3"
 _OPS: dict[tuple, Any] = {}
 
-# The attribute prebuild's op is recorded under, on the layer's quant method.
+# The attribute prebuild's `ArmedOp` is recorded under, on the layer's quant
+# method.
 FUSED_MOE_EP_V3_OP_ATTR = "_fused_moe_ep_v3_op"
+
+# Rows per rank from which a step runs v3; smaller steps take the grouped-matmul
+# path. The value PR #989 served with, pending the kernel probe's measured
+# crossover, which lands per shape in STEP_MIN_TOKENS_BY_SHAPE.
+STEP_MIN_TOKENS_DEFAULT = 33
+# (hidden, inter, experts_per_shard, top_k) -> rows per rank.
+STEP_MIN_TOKENS_BY_SHAPE: dict[tuple[int, int, int, int], int] = {}
+
+# Every prebuild's outcome, "armed" or the refusal, for the boot summary.
+_ARMING: Counter = Counter()
+
+
+class ArmedOp(NamedTuple):
+    """What prebuild records for an armed layer."""
+
+    run: Callable[..., torch.Tensor]
+    step_min_tokens: int
+
+
+def step_min_tokens(
+    *, hidden: int, inter: int, experts_per_shard: int, top_k: int
+) -> int:
+    """Rows per rank from which a step of this shape runs v3."""
+    key = (hidden, inter, experts_per_shard, top_k)
+    return STEP_MIN_TOKENS_BY_SHAPE.get(key, STEP_MIN_TOKENS_DEFAULT)
 
 
 def mask_padded_rows(x: jax.Array, gating: jax.Array, padded: jax.Array):
@@ -258,7 +289,7 @@ def _build_op(
 
 
 def fused_moe_ep_v3_supported(owner: Any) -> bool:
-    """Whether `prebuild_fused_moe_ep_v3` armed the v3 op for this layer.
+    """Whether `prebuild_fused_moe_ep_v3` armed v3 for this layer.
 
     `owner` is the layer's quant method, where the op was recorded.
     """
@@ -281,8 +312,7 @@ def fused_moe_ep_v3(
     caller must not all-gather the input or reduce-scatter the output. Only
     call it when `fused_moe_ep_v3_supported(owner)` said yes.
     """
-    op = getattr(owner, FUSED_MOE_EP_V3_OP_ATTR)
-    return op(
+    return getattr(owner, FUSED_MOE_EP_V3_OP_ATTR).run(
         hidden_states,
         w1,
         w2,
@@ -337,7 +367,7 @@ def _check_deployment(layer) -> None:
 
 def prebuild_fused_moe_ep_v3(
     layer, topk: int, renormalize: bool, activation: str
-) -> Any | None:
+) -> ArmedOp | None:
     """Resolve the mesh and build the v3 op for one layer.
 
     Called once per MoE layer -- the MTP draft's included -- from
@@ -347,29 +377,22 @@ def prebuild_fused_moe_ep_v3(
     keeps the grouped-matmul path.
     """
     _check_deployment(layer)
+    armed = _prebuild(layer, topk, renormalize, activation)
+    _ARMING["armed" if isinstance(armed, ArmedOp) else armed] += 1
+    return armed if isinstance(armed, ArmedOp) else None
+
+
+def _prebuild(layer, topk: int, renormalize: bool, activation: str) -> ArmedOp | str:
+    """The armed op, or why the layer is declined."""
     mesh = build_ep_mesh()
     if mesh is None:
-        logger.info_once(
-            "Fused EP MoE v3 requested but there is no EP group; the "
-            "grouped-matmul path serves every step."
-        )
-        return None
+        return "no EP group"
     ep = mesh.shape[EP_AXIS_NAME]
 
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     local_experts, hidden = w1.shape[0], w1.shape[1]
     inter = w1.shape[2] // 2
-
-    max_node_tokens = _max_node_tokens(ep)
-    if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
-        logger.info_once(
-            "Fused EP MoE v3 not engaged: the largest node-wide batch is %d "
-            "tokens, below MOE_FUSED_EP_KERNEL_MIN_TOKENS=%d.",
-            max_node_tokens,
-            envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS,
-        )
-        return None
 
     reason = (
         _unsupported_layer_reason(layer, local_experts, ep)
@@ -379,23 +402,15 @@ def prebuild_fused_moe_ep_v3(
         )
     )
     if reason is not None:
-        logger.warning_once("Fused EP MoE v3 not engaged for a layer: %s", reason)
-        return None
+        return reason
 
     # The mesh is rank-ordered (google-pytorch/torch_tpu#3522), so this rank's
     # mesh index is its EP rank, its expert block needs no reordering, and its
     # first expert is its index times the block.
     if moe_routing.get_experts_start(layer) != ep_mesh_index() * local_experts:
-        logger.warning_once(
-            "Fused EP MoE v3 not engaged for a layer: its first expert %s is "
-            "not mesh index %d times %d local experts",
-            moe_routing.get_experts_start(layer),
-            ep_mesh_index(),
-            local_experts,
-        )
-        return None
+        return "its first expert is not mesh index x local experts"
     skip_padded_tokens = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
-    op = _build_op(
+    run = _build_op(
         mesh,
         topk,
         bool(renormalize),
@@ -405,9 +420,12 @@ def prebuild_fused_moe_ep_v3(
         inter=inter,
         local_experts=local_experts,
     )
+    min_tokens = step_min_tokens(
+        hidden=hidden, inter=inter, experts_per_shard=local_experts, top_k=topk
+    )
     logger.info_once(
         "Fused EP MoE v3 armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "topk=%d tile_rows=%d skip_padded_tokens=%s",
+        "topk=%d tile_rows=%d skip_padded_tokens=%s step_min_tokens=%d",
         hidden,
         inter,
         local_experts,
@@ -415,8 +433,28 @@ def prebuild_fused_moe_ep_v3(
         topk,
         TILE_ROWS,
         skip_padded_tokens,
+        min_tokens,
     )
-    return op
+    return ArmedOp(run, min_tokens)
+
+
+def log_arming_summary() -> None:
+    """Log once, after every MoE layer (target and draft) has loaded, how many
+    run v3 and why the rest fall back."""
+    if not _ARMING:
+        return
+    total = sum(_ARMING.values())
+    declined = ", ".join(
+        f"{count}x {reason}"
+        for reason, count in _ARMING.most_common()
+        if reason != "armed"
+    )
+    logger.info(
+        "fused EP v3: %d/%d MoE layers armed%s",
+        _ARMING["armed"],
+        total,
+        f"; declined: {declined}" if declined else "",
+    )
 
 
 def _unsupported_layer_reason(layer, local_experts: int, ep: int) -> str | None:
