@@ -441,12 +441,18 @@ def _expert_tensors(layer) -> list:
     return out
 
 
-def step_trigger(count: int, next_at: int, interval: int) -> tuple[bool, int]:
+def step_trigger(
+    count: int, next_at: int, interval: int, all_busy: bool = True
+) -> tuple[bool, int]:
     """Pure trigger rule: rebalance at the first step whose agreed count of
     completed non-megakernel forwards reaches ``next_at``; the next one is due
     ``interval`` forwards later. Every input is a DP-wide agreed value, so every
-    rank computes the same answer."""
-    if count > 0 and count >= next_at:
+    rank computes the same answer.
+
+    ``all_busy`` (MIN over ranks of the step's tokens > 0, when the busy gate
+    is on) defers a due rebalance to the first step where no DP rank is idle:
+    with idle ranks the balance buys nothing and the exchange is pure stall."""
+    if count > 0 and count >= next_at and all_busy:
         return True, count + interval
     return False, next_at
 
@@ -456,6 +462,7 @@ class EplbRebalancer:
 
     # Diagnostics defaults (overridden in __init__ from the environment).
     trace = False
+    busy_gate = False
     trace_fwd_left = 0
     trace_steps_left = 0
     _last_step_t = None
@@ -494,6 +501,9 @@ class EplbRebalancer:
         # Diagnostics / stall fixes, all default off.
         self.trace = _flag("VLLM_TPU_EPLB_TRACE")
         self.warm_exchange = _flag("VLLM_TPU_EPLB_WARM_EXCHANGE")
+        # On whenever EPLB is: VLLM_TPU_EPLB_BUSY_GATE=0 restores the ungated trigger.
+        self.busy_gate = os.environ.get("VLLM_TPU_EPLB_BUSY_GATE", "1").strip().lower() not in (
+            "0", "false", "no")
         self.trace_fwd_left = 0
         self.trace_steps_left = 0
         self._last_step_t = None
@@ -509,7 +519,8 @@ class EplbRebalancer:
             f"armed layers={len(self.layers)} E={self.E} ep={self.ep} me={self.me} "
             f"order={'identity' if self.order is None else self.order} interval={self.interval} "
             f"first={self.first} min_tokens={self.min_tokens} min_gain={self.min_gain} decay={self.decay} "
-            f"debug_skip={self.debug_skip!r}"
+            f"debug_skip={self.debug_skip!r} busy_gate={self.busy_gate} "
+            f"warm={self.warm_exchange} trace={self.trace}"
         )
 
     # Counting --------------------------------------------------------------
@@ -550,10 +561,19 @@ class EplbRebalancer:
             outs.append(_exchange_op(self.mesh, tuple(t.shape), t.dtype)(t, *ops))
         synchronize_tensors(outs)
         del outs
-        _log(f"warm exchange programs={len(_EXCHANGE_OPS)} ms={(time.perf_counter() - t0) * 1e3:.1f}")
+        t1 = time.perf_counter()
+        if self.megakernel is not None and self.debug_skip != "map":
+            # Identity placement: the same router columns / expert tensors /
+            # smalls it already holds (initial_phys2log_mesh is the kernel's
+            # load-time perm), so this only compiles the rebuild's deferred
+            # graphs (1.2 s at the first all-layer rebalance in j-c03687df).
+            self.megakernel.set_expert_placement(dict(self.phys2log))
+        _log(f"warm exchange programs={len(_EXCHANGE_OPS)} ms={(t1 - t0) * 1e3:.1f} "
+             f"mk_placement_ms={(time.perf_counter() - t1) * 1e3:.1f}")
 
     def on_step(
-        self, agreed_count: int, min_count: int, n_forwards: int, allreduce_ms: float = 0.0
+        self, agreed_count: int, min_count: int, n_forwards: int, allreduce_ms: float = 0.0,
+        min_tokens: int = 1,
     ) -> None:
         """Called once per engine step on every DP rank, right after the step's
         CPU all-reduce and before any of the step's device work.
@@ -582,7 +602,10 @@ class EplbRebalancer:
                 _log(f"trace post_step epoch={self.epoch} k={k} count={agreed_count} "
                      f"n_fwd={n_forwards} period_ms={period:.1f} allreduce_ms={allreduce_ms:.1f}")
                 self.trace_steps_left -= 1
-        due, self.next_at = step_trigger(agreed_count, self.next_at, self.interval)
+        due, self.next_at = step_trigger(
+            agreed_count, self.next_at, self.interval,
+            all_busy=(min_tokens > 0) or not self.busy_gate,
+        )
         if due:
             if self.trace:
                 ring = " ".join(f"{c}:{p:.0f}/{a:.0f}/{n}" for c, p, a, n in self._step_ring)

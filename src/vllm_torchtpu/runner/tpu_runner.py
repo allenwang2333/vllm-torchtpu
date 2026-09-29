@@ -3015,7 +3015,9 @@ class TPUModelRunner(GPUModelRunner):
         eplb = getattr(self, "_tpu_eplb", None)
         vals = [int(local_num_tokens), int(local_num_chunks), int(local_num_reqs)]
         if eplb is not None:
-            vals += [int(eplb.count), -int(eplb.count)]
+            # [count, -count, -tokens]: max/min forward count, and min tokens
+            # (0 when any rank is idle) for the rebalance busy gate.
+            vals += [int(eplb.count), -int(eplb.count), -int(local_num_tokens)]
         t = torch.tensor(vals, dtype=torch.int64, device="cpu")
         t_ar = time.perf_counter()
         torch.distributed.all_reduce(
@@ -3045,6 +3047,7 @@ class TPUModelRunner(GPUModelRunner):
                 -int(t[4].item()),
                 0 if self._mk_decode_step else int(t[1].item()),
                 allreduce_ms=ar_ms,
+                min_tokens=-int(t[5].item()),
             )
         return bucket, int(t[1].item())
 

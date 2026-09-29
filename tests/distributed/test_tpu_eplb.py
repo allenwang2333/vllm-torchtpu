@@ -125,10 +125,11 @@ def _dp_step(ranks, local):
     all-reduce of [tokens, chunks, reqs, count, -count], then on_step on every
     rank from the reduced values only. local[i] = (tokens, chunks); an idle rank
     (execute_dummy_batch) contributes (0, 0)."""
-    red = [max(x) for x in zip(*[(tok, ch, 0, r.count, -r.count) for r, (tok, ch) in zip(ranks, local)])]
+    red = [max(x) for x in zip(*[(tok, ch, 0, r.count, -r.count, -tok)
+                                 for r, (tok, ch) in zip(ranks, local)])]
     mk_decode = red[0] <= 1 and red[1] == 1
     for r in ranks:
-        r.on_step(red[3], -red[4], 0 if mk_decode else red[1])
+        r.on_step(red[3], -red[4], 0 if mk_decode else red[1], min_tokens=-red[5])
 
 
 def test_trigger_agrees_across_busy_and_idle_ranks():
@@ -181,3 +182,35 @@ def test_async_save_writes_npz(tmp_path, monkeypatch):
     r._save_npz(path, epoch=1, x=np.arange(3))
     r._saver.shutdown(wait=True)
     assert np.load(path)["x"].tolist() == [0, 1, 2]
+
+
+def test_busy_gate_defers_to_first_all_busy_step():
+    assert T.step_trigger(10, 8, 4, all_busy=False) == (False, 8)
+    assert T.step_trigger(12, 8, 4, all_busy=True) == (True, 16)
+    EP = 16
+    ranks = [_fake_rebalancer(first=8, interval=8) for _ in range(EP)]
+    for r in ranks:
+        r.busy_gate = True
+    busy_at = []
+    for step in range(200):
+        if (step // 20) % 2:  # c1: rank 0 busy, the rest idle
+            local = [(1024, 1)] + [(0, 0)] * (EP - 1)
+        else:  # c16
+            local = [(1024, 1)] * EP
+        before = [len(r.fired) for r in ranks]
+        _dp_step(ranks, local)
+        if any(len(r.fired) > b for r, b in zip(ranks, before)):
+            busy_at.append(all(tok > 0 for tok, _ in local))
+    fired = [r.fired for r in ranks]
+    assert all(f == fired[0] for f in fired) and len(fired[0]) >= 3
+    assert all(busy_at)  # never fired with an idle rank
+    # Ungated: fires in c1 steps too.
+    ranks = [_fake_rebalancer(first=8, interval=8) for _ in range(EP)]
+    idle_fire = False
+    for step in range(200):
+        c1 = (step // 20) % 2
+        local = ([(1024, 1)] + [(0, 0)] * (EP - 1)) if c1 else [(1024, 1)] * EP
+        before = len(ranks[0].fired)
+        _dp_step(ranks, local)
+        idle_fire |= bool(c1 and len(ranks[0].fired) > before)
+    assert idle_fire
