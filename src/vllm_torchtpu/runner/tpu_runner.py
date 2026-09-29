@@ -3097,6 +3097,8 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        self._probe_route_real = scheduler_output.total_num_scheduled_tokens
+        self._probe_route_req = next(iter(scheduler_output.num_scheduled_tokens), None)
         if self._pcp_enabled and self._mtp_enabled:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
@@ -5962,6 +5964,29 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
+        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+    ):
+        from vllm_torchtpu import probe_route
+
+        if not probe_route.BUFS:
+            return self._forward_model_timed(
+                input_ids, positions, inputs_embeds, intermediate_tensors
+            )
+        real = getattr(self, "_probe_route_real", 0)
+        self._probe_route_real = 0
+        out = self._forward_model_timed(
+            input_ids, positions, inputs_embeds, intermediate_tensors
+        )
+        if real and not getattr(self, "_mk_decode_step", False):
+            try:
+                probe_route.after_forward(
+                    self, int(real), self.positions_np, self._probe_route_req
+                )
+            except Exception as e:  # diagnostic only
+                print(f"PROBE_ROUTE error {e!r}", file=sys.stderr, flush=True)
+        return out
+
+    def _forward_model_timed(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
         every = envs.GLM5_STEP_TIMING
