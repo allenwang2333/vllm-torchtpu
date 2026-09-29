@@ -1266,6 +1266,10 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
     ).astype(jnp.int32)  # [N_COUNTS, ep]
 
 
+P08_RB = 8
+P08_RS = 12
+
+
 def vmem_limit(info=None):
     """VMEM budget for the kernel, read from this generation's capacity.
 
@@ -1402,13 +1406,13 @@ def vmem_scratch_arrays(
         ]
     else:
         weights = [
-            ("w1_vm", (nbuf, hidden, 2 * inter), form.weight_dtype),
+            ("w1_vm", (P08_RS, hidden // P08_RB, 2 * inter), form.weight_dtype),  # probe 08 P5-K
             ("w2_vm", (nbuf, inter, hidden), form.weight_dtype),
         ]
         if form.has_scales:
             weights += [
-                ("w1s_vm", (nbuf, 2 * inter), jnp.float32),
-                ("w2s_vm", (nbuf, hidden), jnp.float32),
+                ("w1s_vm", (max(nbuf, 2), 2 * inter), jnp.float32),
+                ("w2s_vm", (max(nbuf, 2), hidden), jnp.float32),
             ]
     # The optional expert biases are resident for every local expert, one
     # row per expert on each matmul's output channels. They carry no block
