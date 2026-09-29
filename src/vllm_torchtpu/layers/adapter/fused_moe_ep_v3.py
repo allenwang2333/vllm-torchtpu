@@ -17,7 +17,8 @@ Selected with MOE_FUSED_EP_KERNEL_IMPL=v3. Like v2 (`fused_moe_ep.py`) the
 whole layer -- top-k, dispatch, both expert matmuls, combine -- runs as one
 SPMD program over the EP mesh, taking and returning this rank's own tokens.
 
-v3 serves data parallelism with expert parallelism only (TP=1, PCP=1), with
+v3 serves expert parallelism over each rank's own tokens: data parallelism
+(TP=1), or TP with sequence parallelism on its large steps (PCP=1), with
 per-channel fp8 weights and a plain softmax top-k router. A deployment outside
 that raises at weight load; a layer outside it (shape, routing, weights) is
 declined on its own and keeps the grouped-matmul path.
@@ -340,13 +341,17 @@ def _check_deployment(layer) -> None:
     # Read off the config, not `get_tp_group()`: a draft model's weight load
     # rewrites the group coordinator to width 1.
     tp = get_current_vllm_config().parallel_config.tensor_parallel_size
-    if tp > 1:
+    # A sequence-parallel layer's large steps hand each rank its own rows
+    # (layers/adapter/sequence_parallel); its replicated small steps stay off
+    # the kernel (`fused_moe_ep_v3_dispatch.apply`).
+    if tp > 1 and not layer.moe_config.moe_parallel_config.is_sequence_parallel:
         raise NotImplementedError(
-            f"MOE_FUSED_EP_KERNEL_IMPL=v3 serves data parallelism with expert "
-            f"parallelism only; tensor_parallel_size={tp} replicates every "
-            "token on each TP rank, so the kernel would do tp_size times the "
-            "expert work. Use --data-parallel-size with "
-            "--tensor-parallel-size=1, or MOE_FUSED_EP_KERNEL_IMPL=v2."
+            f"MOE_FUSED_EP_KERNEL_IMPL=v3 needs each rank's own tokens; "
+            f"tensor_parallel_size={tp} replicates every token on each TP rank, "
+            "so the kernel would do tp_size times the expert work. Use "
+            "--data-parallel-size with --tensor-parallel-size=1, "
+            "TPU_SEQUENCE_PARALLEL_PREFILL=1 (Qwen3-Next/Qwen3.5 under TP + EP), "
+            "or MOE_FUSED_EP_KERNEL_IMPL=v2."
         )
     pcp = _pcp_size(layer)
     if pcp > 1:

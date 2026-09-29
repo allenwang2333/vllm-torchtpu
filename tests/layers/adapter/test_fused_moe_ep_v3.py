@@ -473,6 +473,37 @@ def test_the_gate_picks_v3_or_the_grouped_path_per_step(armed_fp8, rows, takes_v
         assert a.gmm.call_args.kwargs["hidden_states"].shape[0] == 2 * rows
 
 
+def test_tp_is_served_for_a_sequence_parallel_layer(v3):
+    """Under TP a sequence-parallel layer's large steps give each rank its own
+    rows (layers/adapter/sequence_parallel)."""
+    v3.config.parallel_config.tensor_parallel_size = 8
+    layer = _layer()
+    layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    assert _prebuild(layer) is not None
+
+
+@pytest.mark.parametrize(
+    "active,rows,takes_v3",
+    [(True, 32, False), (True, 33, True), (False, 33, False), (False, 512, False)],
+    ids=["sliced-below-gate", "sliced", "replicated", "replicated-large"],
+)
+def test_a_sequence_parallel_layer_runs_v3_on_sliced_steps_only(
+    armed_fp8, monkeypatch, active, rows, takes_v3
+):
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    a = armed_fp8
+    a.layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    monkeypatch.setattr(sequence_parallel, "_active", active)
+    x = torch.ones(rows, 512, dtype=torch.bfloat16)
+    a.method.apply_monolithic(a.layer, x, torch.ones(rows, 32))
+    assert a.v3.called is takes_v3
+    assert a.gmm.called is not takes_v3
+    if not takes_v3:
+        # The communicator's sequence-parallel branches serve the exchange.
+        assert [call[2] for call in a.group.calls] == [True, True]
+
+
 @torch.library.custom_op("v3_gate_test::fused", mutates_args=())
 def _fused_stub(
     x: torch.Tensor,
