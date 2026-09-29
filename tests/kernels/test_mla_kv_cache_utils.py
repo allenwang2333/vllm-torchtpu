@@ -111,6 +111,12 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
             rope_layout=KVCacheLayout.SPARSECORE,
         ),
         dict(
+            testcase_name="nope_sc_rope_sc_packed",
+            nope_layout=KVCacheLayout.SPARSECORE,
+            rope_layout=KVCacheLayout.SPARSECORE,
+            rope_packed=True,
+        ),
+        dict(
             testcase_name="nope_tc_rope_sc",
             nope_layout=KVCacheLayout.TENSORCORE,
             rope_layout=KVCacheLayout.SPARSECORE,
@@ -121,15 +127,26 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
             rope_layout=KVCacheLayout.TENSORCORE,
         ),
     )
-    def test_rows_land_at_page_slot(self, nope_layout, rope_layout):
+    def test_rows_land_at_page_slot(self, nope_layout, rope_layout, rope_packed=False):
         """Every layout combination puts a token's bytes at the same
         (page, slot); only the address arithmetic differs."""
         nope_spec = SparseMLAKVCacheSpec.create(
             KVCacheType.NOPE, nope_layout, TOTAL_PAGES, PAGE_SIZE, LKV_DIM, KV_PACKING
         )
         rope_spec = SparseMLAKVCacheSpec.create(
-            KVCacheType.ROPE, rope_layout, TOTAL_PAGES, PAGE_SIZE, ROPE_DIM, KV_PACKING
+            KVCacheType.ROPE,
+            rope_layout,
+            TOTAL_PAGES,
+            PAGE_SIZE,
+            ROPE_DIM,
+            KV_PACKING,
+            rope_packed=rope_packed,
         )
+        self.assertEqual(rope_spec.rope_packed, rope_packed)
+        if rope_packed:
+            # 64 B per token, eight tokens per 128-word row: half the padded cache.
+            self.assertEqual(rope_spec.token_bytes, ROPE_DIM)
+            self.assertEqual(rope_spec.shape, (TOTAL_PAGES, PAGE_SIZE // 8, 128))
         rng = np.random.default_rng(7)
         q_lens, seq_lens = [5, 3], [37, 3]  # seq 0 appends across a page edge
         total = sum(q_lens)
@@ -310,9 +327,21 @@ class PackingTest(parameterized.TestCase):
     )
     def test_spec_shape_is_a_retiling_of_token_bytes(self, cache_type, head_dim):
         """Every layout reserves exactly `token_bytes` per token slot."""
-        for layout in KVCacheLayout:
+        for layout, rope_packed in [(l, False) for l in KVCacheLayout] + [
+            (KVCacheLayout.SPARSECORE, True)
+        ]:
             spec = SparseMLAKVCacheSpec.create(
-                cache_type, layout, TOTAL_PAGES, PAGE_SIZE, head_dim, KV_PACKING
+                cache_type,
+                layout,
+                TOTAL_PAGES,
+                PAGE_SIZE,
+                head_dim,
+                KV_PACKING,
+                rope_packed=rope_packed,
+            )
+            # The flag only ever applies to a SPARSECORE RoPE cache.
+            self.assertEqual(
+                spec.rope_packed, rope_packed and cache_type is KVCacheType.ROPE
             )
             cache = _empty(spec)
             self.assertEqual(
@@ -465,9 +494,20 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             interleave_size=16,
             layout=KVCacheLayout.SPARSECORE,
         ),
+        dict(
+            testcase_name="d4_i8_sc_rope_packed",
+            dcp_size=4,
+            interleave_size=8,
+            layout=KVCacheLayout.SPARSECORE,
+            rope_packed=True,
+        ),
     )
     def test_rows_land_where_the_interleave_says(
-        self, dcp_size, interleave_size, layout=KVCacheLayout.TENSORCORE
+        self,
+        dcp_size,
+        interleave_size,
+        layout=KVCacheLayout.TENSORCORE,
+        rope_packed=False,
     ):
         """Each row reaches exactly one rank, at the reference (page, slot).
 
@@ -480,8 +520,15 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             KVCacheType.NOPE, layout, TOTAL_PAGES, PAGE_SIZE, LKV_DIM, KV_PACKING
         )
         rope_spec = SparseMLAKVCacheSpec.create(
-            KVCacheType.ROPE, layout, TOTAL_PAGES, PAGE_SIZE, ROPE_DIM, KV_PACKING
+            KVCacheType.ROPE,
+            layout,
+            TOTAL_PAGES,
+            PAGE_SIZE,
+            ROPE_DIM,
+            KV_PACKING,
+            rope_packed=rope_packed,
         )
+        self.assertEqual(rope_spec.rope_packed, rope_packed)
         inputs = self._inputs(dcp_size, interleave_size)
         shards = self._run_group(
             inputs, dcp_size, interleave_size, nope_spec, rope_spec

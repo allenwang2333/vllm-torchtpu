@@ -67,22 +67,28 @@ def bytes_fp8(b):
     return jax.lax.bitcast_convert_type(jnp.asarray(b, jnp.uint8), FP8)
 
 
-def pack_caches(cfg, logical, block_tables, num_pages):
+def rope_words(rope_packed):
+    """u32 words per token of the served ROPE cache: 32 padded (128 B), 16 packed (64 B)."""
+    return 16 if rope_packed else 32
+
+
+def pack_caches(cfg, logical, block_tables, num_pages, rope_packed=False):
     """logical: reference cache dict for one layer, one rank (nope8 [C,512], rope8 [C,64],
     optional idx_k [C,128] fp8 / idx_e [C] int32). block_tables [P] int32 (logical page -> physical).
-    Returns dict of served arrays for that rank: nope u32 [nb, page, 128], rope u32 [nb, page/4, 128],
-    idx u8 [nb, page/4, 4, 256]."""
+    Returns dict of served arrays for that rank: nope u32 [nb, page, 128], rope u32 [nb, page/4, 128]
+    (padded) or [nb, page/8, 128] (rope_packed), idx u8 [nb, page/4, 4, 256]."""
     pg = cfg.page
+    rw = rope_words(rope_packed)
     C = logical["nope8"].shape[0]
     bt = np.asarray(block_tables)
     nope = np.zeros((num_pages * pg, 128), np.uint32)
-    rope = np.zeros((num_pages * pg, 32), np.uint32)
+    rope = np.zeros((num_pages * pg, rw), np.uint32)
     pos = np.arange(C)
     phys = bt[pos // pg] * pg + pos % pg
     nope[phys] = pack_bands(fp8_bytes(logical["nope8"]), 512)
-    rope[phys] = pack_bands(fp8_bytes(logical["rope8"]), 128)
+    rope[phys] = pack_bands(fp8_bytes(logical["rope8"]), 4 * rw)
     out = {"nope": jnp.asarray(nope.reshape(num_pages, pg, 128)),
-           "rope": jnp.asarray(rope.reshape(num_pages, pg // 4, 128))}
+           "rope": jnp.asarray(rope.reshape(num_pages, pg * rw // 128, 128))}
     if "idx_k" in logical:
         rec = np.zeros((num_pages * pg, 256), np.uint8)
         rec[phys, :128] = fp8_bytes(logical["idx_k"])
@@ -91,13 +97,13 @@ def pack_caches(cfg, logical, block_tables, num_pages):
     return out
 
 
-def unpack_caches(cfg, served, block_tables, C):
+def unpack_caches(cfg, served, block_tables, C, rope_packed=False):
     pg = cfg.page
     bt = np.asarray(block_tables)
     pos = np.arange(C)
     phys = bt[pos // pg] * pg + pos % pg
     nope = np.asarray(served["nope"]).reshape(-1, 128)[phys]
-    rope = np.asarray(served["rope"]).reshape(-1, 32)[phys]
+    rope = np.asarray(served["rope"]).reshape(-1, rope_words(rope_packed))[phys]
     out = {"nope8": bytes_fp8(unpack_bands(nope, 512)),
            "rope8": bytes_fp8(unpack_bands(rope, 64))}
     if "idx" in served:

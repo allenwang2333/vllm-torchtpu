@@ -23,6 +23,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
+from vllm_torchtpu.logger import init_logger
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
@@ -139,6 +140,7 @@ def _attention_kernel(
     batch_size: int = 1,
     return_lse: bool = False,
     sparsecore_layout: bool = False,
+    rope_packed: bool = False,
 ):
     if return_lse:
         (
@@ -355,7 +357,26 @@ def _attention_kernel(
         bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
-        if sparsecore_layout:
+        if sparsecore_layout and rope_packed:
+            # The PACKED native gather produces EIGHT-token grouped
+            # uint32[128] rows: bitcasting to uint8 keeps the LANE index and
+            # multiplies the SUBLANE count by four, giving one 128-byte row
+            # holding TWO 64-byte token records, half h at lanes
+            # [64h, 64h+64). Recovering one record per row is a LANE SPLIT,
+            # and a lane split must be spelled as slices you CONCATENATE:
+            # `bkv_rope.reshape(bkv_sz, 64)` is refused by Mosaic
+            # (`infer-vector-layout: unsupported shape cast` on
+            # vector<32x128xi8> -> vector<64x64xi8>). Do not "simplify" it.
+            rope_bytes = 4 * native_sc_gather.ROPE_WORDS_PACKED
+            bkv_rope = pltpu.bitcast(bkv_rope, jnp.uint8)
+            bkv_rope = jnp.concatenate(
+                [
+                    bkv_rope[:, h * rope_bytes : (h + 1) * rope_bytes]
+                    for h in range(native_sc_gather.ROPE_SUBROWS_PACKED)
+                ],
+                axis=0,
+            )
+        elif sparsecore_layout:
             # The native gather's delta-swap produces four-token grouped
             # uint32[128] rows. Expanding their byte lanes recovers one
             # contiguous 128-byte row per selected token.
@@ -369,13 +390,47 @@ def _attention_kernel(
         if bkv.shape[-1] < head_dim:
             bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
 
-        # Zero keys beyond kv_len: the "-1" tail is gathered from scattered
-        # pages and can decode to fp8 NaN; score masking zeroes the weights,
-        # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if not sparsecore_layout:
+            # Zero keys beyond kv_len: the "-1" tail is gathered from
+            # scattered pages and can decode to fp8 NaN; score masking zeroes
+            # the weights, but 0 * NaN = NaN in the PV einsum, so the data
+            # must be finite too. The sparsecore layout does this in VMEM
+            # instead, only when a tail exists (`zero_bkv_tail`).
+            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
+
+    def zero_bkv_tail(bkv_sem_idx, batch_idx, kv_len):
+        # Sparsecore layout only. The "-1" tail rows are real cache rows
+        # gathered from scattered pages and can hold fp8 NaN; the score mask
+        # zeroes their weights but 0 * NaN = NaN in the PV einsum. Zero them
+        # in the gathered scratch, and only when kv_len < topk: at long
+        # context every row is valid and the masking select disappears from
+        # the steady-state loop.
+        @pl.when(kv_len < bkv_sz)
+        def _():
+            nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
+            row = lax.broadcasted_iota(jnp.int32, nope_ref.shape, 0)
+            nope_ref[...] = jnp.where(row < kv_len, nope_ref[...], 0)
+
+            # Rope u32 row r, byte b holds token 4r + b (padded), or, for the
+            # packed layout, lanes [0, 64) hold tokens 4r + b and lanes
+            # [64, 128) tokens bkv_sz/2 + 4r + b. Keep the first
+            # clip(kv_len - 4r, 0, 4) bytes of each word.
+            rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
+            rrow = lax.broadcasted_iota(jnp.int32, rope_ref.shape, 0)
+            base = 4 * rrow
+            if rope_packed:
+                lane = lax.broadcasted_iota(jnp.int32, rope_ref.shape, 1)
+                base = base + jnp.where(lane >= 64, bkv_sz // 2, 0)
+            nkeep = jnp.clip(kv_len - base, 0, 4)
+            partial = (
+                jnp.left_shift(jnp.uint32(1), (8 * nkeep).astype(jnp.uint32))
+                - jnp.uint32(1)
+            )
+            mask = jnp.where(nkeep >= 4, jnp.uint32(0xFFFFFFFF), partial)
+            rope_ref[...] = rope_ref[...] & mask
 
     def process():
         def get_next_seq_ids(seq_idx, bi_sem_idx):
@@ -424,6 +479,8 @@ def _attention_kernel(
 
         for batch_idx in range(batch_size):
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            if sparsecore_layout:
+                zero_bkv_tail(bi_sem_idx, batch_idx, kv_len)
             bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
 
@@ -511,6 +568,21 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+logger = init_logger(__name__)
+_LOGGED_ROPE_LAYOUTS: set = set()
+
+
+def _log_rope_layout_once(rope_packed: bool, rope_shape: tuple) -> None:
+    """Trace-time record of which ROPE gather the SPARSECORE path compiled."""
+    if rope_packed not in _LOGGED_ROPE_LAYOUTS:
+        _LOGGED_ROPE_LAYOUTS.add(rope_packed)
+        logger.info(
+            "sparse MLA kernel: %s ROPE gather, rope cache %s",
+            "PACKED 64 B/token (_r16)" if rope_packed else "PADDED 128 B/token",
+            rope_shape,
+        )
+
+
 # Main attention kernel for GLM-5.2 DSA (top-k gather and attention).
 # The KV entries referenced by `topk_indices` (including the current batch's
 # own tokens) must already be resident in the caches before this call;
@@ -595,7 +667,12 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    # The PACKED 64 B/token ROPE cache is the sparsecore layout with a ROPE
+    # cache half the PADDED size; see `native_sc_gather.ROPE_WORDS_PACKED`.
+    rope_packed = sparsecore_layout and cache_kv_nope.size == 8 * cache_kv_rope.size
+    rope_group = 8 if rope_packed else 4
     if sparsecore_layout:
+        _log_rope_layout_once(rope_packed, tuple(cache_kv_rope.shape))
         if (
             cache_kv_nope.dtype != jnp.uint32
             or cache_kv_nope.ndim != 3
@@ -610,7 +687,8 @@ def sparse_ragged_paged_attention(
             or cache_kv_rope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+                "sparsecore ROPE cache must be uint32[pages,page_size/4,128] "
+                "(padded) or uint32[pages,page_size/8,128] (packed)"
             )
     else:
         if (
@@ -629,14 +707,14 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    if cache_kv_nope.size != rope_group * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{rope_group} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != rope_group * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -731,6 +809,7 @@ def sparse_ragged_paged_attention(
                     batch_size=batch_size,
                     return_lse=return_lse,
                     sparsecore_layout=sparsecore_layout,
+                    rope_packed=rope_packed,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -780,10 +859,10 @@ def sparse_ragged_paged_attention(
             f"({topk_indices.shape[0]})"
         )
     topk = topk_indices.shape[-1]
-    if sparsecore_layout and topk % native_sc_gather.ROPE_PACKING != 0:
+    if sparsecore_layout and topk % rope_group != 0:
         raise ValueError(
             f"topk ({topk}) must be a multiple of "
-            f"{native_sc_gather.ROPE_PACKING} for sparsecore ROPE packing"
+            f"{rope_group} for sparsecore ROPE packing"
         )
 
     # TODO: skip gather for padding tokens in topk_indices.
@@ -886,7 +965,7 @@ def sparse_ragged_paged_attention(
             )
             gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
             gathered_rope_buffer = gathered_rope_buffer.reshape(
-                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+                chunk_size, topk // rope_group, 128
             )
         else:
             gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(

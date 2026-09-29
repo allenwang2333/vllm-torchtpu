@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_ROPE_PACKED: bool = True
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -376,6 +377,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
     ),
+    # Store each token's fp8 RoPE key in its 64 B instead of a 128 B slot (the
+    # upper half was padding) when the RoPE layout is sparsecore. The prefill
+    # sparse MLA kernel and the GLM-5.2 decode megakernel read either layout;
+    # 0 restores the padded cache for A/B.
+    "TPU_SPARSE_MLA_ROPE_PACKED": env_bool("TPU_SPARSE_MLA_ROPE_PACKED", default=True),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")

@@ -795,6 +795,64 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
+_logged_rope_layouts: set[tuple[str, bool]] = set()
+
+
+def _check_sparse_mla_caches(
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+) -> int:
+    """Assert the head dims the gathers support, and that the kernel will pick
+    the RoPE layout the cache was allocated for. Returns rope_dim.
+
+    Both gathers move 512 NoPE bytes per token and the 64-dim fp8 RoPE key,
+    either in a padded 128 B slot or, for a packed SPARSECORE cache, in its own
+    64 B. The kernel reads the layout off the NOPE:ROPE size ratio (4 padded,
+    8 packed); checking it against the spec here means a packed allocation can
+    never silently take the padded path, or the reverse.
+    """
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    rope_bytes = (
+        kv_cache_utils.SC_ROPE_PACKED_BYTES if rope_spec.rope_packed else lane_bytes
+    )
+    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
+        "the sparse MLA gathers need the fp8 nope head dimension to be "
+        f"{word_bytes * lane_bytes} and the fp8 rope head dimension to be "
+        f"{lane_bytes // 2}, got {lkv_dim}+{rope_dim}"
+    )
+    assert rope_spec.token_bytes == rope_bytes >= rope_dim, (
+        f"rope spec reserves {rope_spec.token_bytes}B per token, expected "
+        f"{rope_bytes}B (rope_packed={rope_spec.rope_packed})"
+    )
+    ratio = nope_spec.token_bytes // rope_spec.token_bytes
+    got = (kv_cache_nope.size * kv_cache_nope.dtype.itemsize) / (
+        kv_cache_rope.size * kv_cache_rope.dtype.itemsize
+    )
+    assert got == ratio, (
+        f"NOPE:ROPE cache size ratio {got} does not match the spec's {ratio} "
+        f"(rope_packed={rope_spec.rope_packed}); the kernel would take the "
+        "wrong RoPE layout"
+    )
+    key = (rope_spec.layout.value, rope_spec.rope_packed)
+    if key not in _logged_rope_layouts:
+        _logged_rope_layouts.add(key)
+        logger.info(
+            "sparse MLA: %s RoPE cache %s, %d B/token, NOPE:ROPE = %d (%s path)",
+            rope_spec.layout.value,
+            tuple(kv_cache_rope.shape),
+            rope_spec.token_bytes,
+            ratio,
+            "packed" if rope_spec.rope_packed else "padded",
+        )
+    return rope_dim
+
+
 def sparse_mla_attention(
     ql_nope: jax.Array,
     q_pe: jax.Array | None,
@@ -854,17 +912,9 @@ def sparse_mla_attention(
       * Per-token kv_lens derive from the "-1" tail padding in
         `topk_indices`; every token must have at least one valid entry.
     """
-    # Both gather implementations move 512 NoPE bytes and one padded
-    # 128-byte RoPE row per token; other head dims do not fit their address
-    # arithmetic.
-    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
-    word_bytes = kv_cache_utils.WORD_BYTES
-    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
-    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
-        "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-        f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
-        f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-        f"{rope_dim}"
+    lkv_dim = kv_c_normed.shape[-1]
+    rope_dim = _check_sparse_mla_caches(
+        kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope, nope_spec, rope_spec
     )
 
     packed_q = q_pe is None
@@ -1038,14 +1088,8 @@ def sparse_mla_attention_dcp(
             f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}."
         )
 
-    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
-    word_bytes = kv_cache_utils.WORD_BYTES
-    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
-    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
-        "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-        f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
-        f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-        f"{rope_dim}"
+    _check_sparse_mla_caches(
+        kv_c_normed, k_pe, kv_cache_nope, kv_cache_rope, nope_spec, rope_spec
     )
 
     replicated_3d = P(None, None, None)

@@ -210,6 +210,7 @@ class Glm5Megakernel:
             self._install_layer_taps()
         self.op = None
         self.caches = None
+        self.rope_packed = False
         self._step = None
         from vllm_torchtpu.utils import synchronize_tensors
 
@@ -388,7 +389,13 @@ class Glm5Megakernel:
               f"MLA and indexer caches span KV cache groups {gids}; the kernel takes one block table")
         self.mla_layer_name = _attn_module(self.backbone.layers[0].self_attn).layer_name
         nb = per_layer[0]["nope"].shape[0]
-        ck = K.cache_kinds(cfg, nb)
+        # ROPE cache width follows the allocation (TPU_SPARSE_MLA_ROPE_PACKED): 64 B/token
+        # packed, [nb, page/8, 128], or 128 B/token padded, [nb, page/4, 128].
+        rshape = tuple(per_layer[0]["rope"].shape)
+        self.rope_packed = rshape == tuple(K.cache_kinds(cfg, nb, True)["rope"][1])
+        ck = K.cache_kinds(cfg, nb, self.rope_packed)
+        logger.info("GLM-5.2 megakernel: %s RoPE cache %s", "PACKED" if self.rope_packed
+                    else "padded", rshape)
         caches = []
         for kind, (layers, shape, dtype) in ck.items():
             for l in layers:
@@ -404,7 +411,7 @@ class Glm5Megakernel:
         cfg = self.cfg
         dbg = self.layerdiff and not skip
         call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE),
-                             debug=dbg, skip=skip)
+                             debug=dbg, skip=skip, rope_packed=self.rope_packed)
         self.info = info
         n_w = len(self.weights)
         n_c = len(self.caches)
@@ -550,6 +557,8 @@ class Glm5Megakernel:
         this token's rows, the worst layer, and whether ANY other row of the block changed."""
         blk, off = self._row_block(pos)
         g = off // 4
+        rseg = 8 if self.rope_packed else 4
+        rg, rw = off // rseg, 128 // rseg
         acc = {}
         for (kind, l), c, s in zip(self.info["c_names"], self.caches, snap):
             now = c[blk]
@@ -558,7 +567,8 @@ class Glm5Megakernel:
                 other = torch.cat([now[:off], now[off + 1:]]).ne(
                     torch.cat([s[:off], s[off + 1:]])).sum()
             elif kind == "rope":
-                a, b = now[g, (off % 4) * 32:(off % 4 + 1) * 32], s[g, (off % 4) * 32:(off % 4 + 1) * 32]
+                sl_ = slice((off % rseg) * rw, (off % rseg + 1) * rw)
+                a, b = now[rg, sl_], s[rg, sl_]
                 other = now.ne(s).sum() - a.ne(b).sum()
             else:  # idx: bytes only, the packed layout mixes fp8 and scales
                 a, b = now[g, off % 4], s[g, off % 4]

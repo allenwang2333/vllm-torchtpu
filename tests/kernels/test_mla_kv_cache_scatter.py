@@ -41,9 +41,11 @@ KV_PACKING = 4
 # but `scatter_rows` rejects it: its token is 128B, not the 512B the TC
 # sublane fold needs. See `test_rope_tensorcore_is_rejected`.
 _LIVE_SPECS = (
-    ("nope_tc", KVCacheType.NOPE, KVCacheLayout.TENSORCORE, LKV_DIM),
-    ("nope_sc", KVCacheType.NOPE, KVCacheLayout.SPARSECORE, LKV_DIM),
-    ("rope_sc", KVCacheType.ROPE, KVCacheLayout.SPARSECORE, ROPE_DIM),
+    ("nope_tc", KVCacheType.NOPE, KVCacheLayout.TENSORCORE, LKV_DIM, False),
+    ("nope_sc", KVCacheType.NOPE, KVCacheLayout.SPARSECORE, LKV_DIM, False),
+    ("rope_sc", KVCacheType.ROPE, KVCacheLayout.SPARSECORE, ROPE_DIM, False),
+    # PACKED 64 B/token RoPE: 16-word rows, eight tokens per 128-word row.
+    ("rope_sc_packed", KVCacheType.ROPE, KVCacheLayout.SPARSECORE, ROPE_DIM, True),
 )
 
 # (num_seqs, tokens_per_seq, max_seq_len, num_pages). The token counts span
@@ -120,9 +122,15 @@ class SparseMLAScatterTest(parameterized.TestCase):
 
         specs = {
             name: SparseMLAKVCacheSpec.create(
-                cache_type, layout, num_pages, page_size, head_dim, KV_PACKING
+                cache_type,
+                layout,
+                num_pages,
+                page_size,
+                head_dim,
+                KV_PACKING,
+                rope_packed=rope_packed,
             )
-            for name, cache_type, layout, head_dim in _LIVE_SPECS
+            for name, cache_type, layout, head_dim, rope_packed in _LIVE_SPECS
         }
         page, slot = kv_cache_utils.get_page_and_slot(
             num_tokens,
@@ -198,6 +206,16 @@ class SparseMLAScatterTest(parameterized.TestCase):
     def test_scatter_rope_sc(self, num_seqs, tokens_per_seq, max_seq_len, num_pages):
         inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
         self._check_scatter(inp, "rope_sc", inp["k_pe"], inp["k_pe_u8"])
+
+    @parameterized.named_parameters(*_SCENARIOS)
+    def test_scatter_rope_sc_packed(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        spec = inp["specs"]["rope_sc_packed"]
+        self.assertEqual(spec.token_bytes, ROPE_DIM)
+        self.assertEqual(spec.shape, (inp["num_pages"], PAGE_SIZE // 8, 128))
+        self._check_scatter(inp, "rope_sc_packed", inp["k_pe"], inp["k_pe_u8"])
 
     def test_nope_sparsecore_is_byte_identical_to_tensorcore(self):
         """`pack_tokens` reproduces the TC sublane fold, so the two nope
