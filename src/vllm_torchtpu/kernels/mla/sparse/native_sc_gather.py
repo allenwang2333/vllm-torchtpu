@@ -33,6 +33,32 @@ NUM_LANES = 16
 ROPE_PACKING = 4
 QUADS_PER_ATOM = 16
 OCCURRENCES_PER_ATOM = QUADS_PER_ATOM * ROPE_PACKING
+# A token's ROPE record, in uint32 words. The PADDED cache
+# (`kv_cache_utils.align_to(rope_dim=64, TILE_LANE_BYTES=128)`) reserves 128 B
+# per token, of which only the first 64 B carry data. The PACKED cache stores
+# the 64 B, i.e. 16 words, so the gather reads and writes 576 B/token instead
+# of 640. The layout is selected by the caches' size ratio (NOPE is 4x the
+# PADDED ROPE cache and 8x the PACKED one), so both layouts keep working.
+ROPE_WORDS_PADDED = 32
+ROPE_WORDS_PACKED = 16
+# PACKED: two ROPE_PACKING-groups (8 tokens) share one 128-lane output row.
+# An atom fills ONE 64-lane half of its 16 output rows rather than both halves
+# of 8, which is what makes the attention's two-slice/one-row-concat unpack
+# land in NATURAL token order with no remap.
+ROPE_SUBROWS_PACKED = 2
+
+
+def rope_words_for_caches(nope_cache: jax.Array, rope_cache: jax.Array) -> int:
+    """ROPE words per token implied by the caches' size ratio."""
+    ratio, rem = divmod(nope_cache.size, rope_cache.size)
+    if rem == 0 and ratio == 4:
+        return ROPE_WORDS_PADDED
+    if rem == 0 and ratio == 8:
+        return ROPE_WORDS_PACKED
+    raise ValueError(
+        f"NOPE cache size ({nope_cache.size}) must be 4x (padded 128 B ROPE) "
+        f"or 8x (packed 64 B ROPE) the ROPE cache size ({rope_cache.size})"
+    )
 
 
 def _delta_swap(x, y, shift, mask):
@@ -58,7 +84,11 @@ def _kernel(
     batches_per_owner: int,
     wait_mode: str,
     serve_pipelined: bool,
+    rope_words: int,
+    rope_atoms_per_row: int,
 ):
+    packed = rope_words == ROPE_WORDS_PACKED
+    rope_half = rope_atoms_per_row // 2
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
 
     def serve_batch(indices_ref):
@@ -101,7 +131,9 @@ def _kernel(
                     input_stream = logical_rank // NUM_LANES
                     input_lane = logical_rank % NUM_LANES
                     data.append(
-                        rope_inputs[input_stream][pl.ds(input_lane, 1), pl.ds(0, 32)]
+                        rope_inputs[input_stream][
+                            pl.ds(input_lane, 1), pl.ds(0, rope_words)
+                        ]
                     )
 
                 low_16 = jnp.uint32(0x0000FFFF)
@@ -111,7 +143,9 @@ def _kernel(
                 data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
                 data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
                 for band in range(ROPE_PACKING):
-                    rope_output[pl.ds(row, 1), pl.ds(band * 32, 32)] = data[band]
+                    rope_output[
+                        pl.ds(row, 1), pl.ds(band * rope_words, rope_words)
+                    ] = data[band]
 
             if wait_mode == "overlap_rope":
                 for copy in nope_copies:
@@ -126,15 +160,34 @@ def _kernel(
         )
         rope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 32),
+                (pl.Indirect(NUM_LANES), rope_words),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
             for stream in range(ROPE_PACKING)
         )
-        rope_out_spec = pl.BlockSpec(
-            (QUADS_PER_ATOM, 128),
-            lambda atom: (logical_batch * atoms_per_batch + atom, 0),
-        )
+        if packed:
+
+            def rope_out_blocks(atom):
+                # Atoms 0..apr/2-1 of a query row take the LOW 64-lane half
+                # of their 16 rows, atoms apr/2..apr-1 the HIGH half.
+                # HAZARD: at rope_atoms_per_row < 2 this computes `g % 0`,
+                # whose block indices are undefined and which wedged a shard
+                # for 40 minutes (j-ca91a6d1). `dsa_gather_native_sc` refuses
+                # that shape in Python before anything is dispatched.
+                g = logical_batch * atoms_per_batch + atom
+                return (
+                    g // rope_atoms_per_row * rope_half + g % rope_half,
+                    (g % rope_atoms_per_row) // rope_half,
+                )
+
+            rope_out_spec = pl.BlockSpec(
+                (QUADS_PER_ATOM, rope_words * ROPE_PACKING), rope_out_blocks
+            )
+        else:
+            rope_out_spec = pl.BlockSpec(
+                (QUADS_PER_ATOM, 128),
+                lambda atom: (logical_batch * atoms_per_batch + atom, 0),
+            )
         pltpu.emit_pipeline(
             body,
             grid=(atoms_per_batch,),
@@ -179,10 +232,15 @@ def dsa_gather_native_sc(
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
-    ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
-    128-word row per group of four tokens; each token owns a consecutive
-    32-word quarter. The returned ROPE is register-transposed into the grouped
-    TensorCore format expected by the shared attention consumer.
+    ``nope_cache`` has one 128-word row per token. ``rope_cache`` is either
+    PADDED -- one 128-word row per group of four tokens, each token owning a
+    consecutive 32-word quarter -- or PACKED -- one 128-word row per group of
+    eight tokens, each owning a consecutive 16-word (64 B) eighth. The layout
+    is read off the caches' size ratio. The returned ROPE is
+    register-transposed into the grouped TensorCore format expected by the
+    shared attention consumer; in the PACKED layout each atom writes one
+    64-lane half so that the consumer's two-slice unpack lands in natural
+    token order.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -194,6 +252,16 @@ def dsa_gather_native_sc(
         raise ValueError("indices must be int32[query, topk]")
     if indices.size != out_size:
         raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+    rope_words = rope_words_for_caches(nope_cache, rope_cache)
+    packed = rope_words == ROPE_WORDS_PACKED
+    if packed and indices.shape[1] < 2 * OCCURRENCES_PER_ATOM:
+        # SAFETY. With fewer than two atoms per query row `rope_half` is 0 and
+        # the half-split index map computes `g % 0`; that wedged a shard for
+        # 40 minutes at topk=64. Refuse it here, before anything is dispatched.
+        raise ValueError(
+            f"the packed half-split ROPE layout needs topk >= "
+            f"{2 * OCCURRENCES_PER_ATOM}, got {indices.shape[1]}"
+        )
 
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core if tpu_info is not None else None
@@ -235,10 +303,14 @@ def dsa_gather_native_sc(
             batches_per_owner=batches_per_owner,
             wait_mode=wait_mode,
             serve_pipelined=serve_pipelined,
+            rope_words=rope_words,
+            rope_atoms_per_row=indices.shape[1] // OCCURRENCES_PER_ATOM,
         ),
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
-            jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
+            jax.ShapeDtypeStruct(
+                (out_size * rope_words // 128, 128), jnp.uint32
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False,
@@ -248,11 +320,12 @@ def dsa_gather_native_sc(
         scratch_types={"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))},
         mesh=mesh,
         name=(
-            f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
+            f"sc_native_sc_gather{'_r16' if packed else ''}"
+            f"_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}"
         ),
     )(
         nope_cache.reshape(-1, 128),
-        rope_cache.reshape(-1, 32),
+        rope_cache.reshape(-1, rope_words),
         indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
     )
