@@ -16,6 +16,9 @@ import os
 import pickle
 import re
 import shutil
+import socket
+import threading
+import time
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -67,6 +70,52 @@ class TpuCompilationHandle:
 
 
 _tpu_backend = TpuBackend()
+
+# A bucket claim nobody has touched for this long belongs to a rank that died
+# mid-compile; the owner refreshes its claim every heartbeat while compiling.
+_CLAIM_STALE_S = 600.0
+_CLAIM_HEARTBEAT_S = 30.0
+_CLAIM_POLL_S = 5.0
+# How long a "done" claim may point at an artifact this rank cannot replay yet
+# (NFS visibility) before this rank gives up and compiles the bucket itself.
+_CLAIM_DONE_GRACE_S = 120.0
+
+_defer_state = threading.local()
+
+
+class DeferCompile(Exception):  # noqa: N818 - control flow, not an error
+    """Another rank is compiling this bucket; compile a different one first."""
+
+
+@contextlib.contextmanager
+def defer_claimed_buckets():
+    """Within this block, `compile` raises DeferCompile instead of waiting on a
+    bucket another rank has claimed, so the caller can go compile the
+    buckets nobody has claimed yet and come back for this one later."""
+    _defer_state.on = True
+    try:
+        yield
+    finally:
+        _defer_state.on = False
+
+
+@contextlib.contextmanager
+def _heartbeat(path: str):
+    """Keep refreshing the claim at `path` so waiters know its owner is alive."""
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(_CLAIM_HEARTBEAT_S):
+            with contextlib.suppress(OSError):
+                os.utime(path)
+
+    thread = threading.Thread(target=beat, name="tpu-claim-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -670,6 +719,139 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
+    def _claim_path(self, key: str, fingerprint: str) -> str | None:
+        """The file every rank of this DP rank races for to compile `key`.
+
+        It sits beside the `rank_*` dirs, so on a shared cache it is shared by
+        the ranks of every host. The fingerprint is in the name: only ranks
+        that trace the same program coordinate on it.
+        """
+        if self.cache_dir is None:
+            return None
+        own = Path(self.cache_dir)
+        match = re.fullmatch(r"rank_(\d+)_(\d+)", own.parent.name)
+        if match is None:
+            return None
+        return str(
+            own.parent.parent
+            / "_claims"
+            / f"{match[2]}-{own.name}-{key}-{fingerprint[:32]}"
+        )
+
+    @staticmethod
+    def _try_claim(path: str) -> bool:
+        """Atomically become the one rank that compiles this bucket."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(f"compiling {socket.gethostname()}:{os.getpid()}\n")
+        return True
+
+    @staticmethod
+    def _read_claim(path: str) -> tuple[str, str, float] | None:
+        """(state, argument, seconds since last touched), or None if unclaimed."""
+        try:
+            age = time.time() - os.stat(path).st_mtime
+            with open(path) as f:
+                state, _, arg = f.read().strip().partition(" ")
+        except FileNotFoundError:
+            return None
+        return state, arg, age
+
+    @staticmethod
+    def _settle_claim(path: str, text: str) -> None:
+        """Replace a claim's content in one step: "done <artifact>" or "failed"."""
+        tmp_path = f"{path}.{socket.gethostname()}.{os.getpid()}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(text + "\n")
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.warning("[TpuCompilerAdaptor] Could not settle claim %s: %s", path, e)
+
+    @staticmethod
+    def _take_over(path: str) -> None:
+        """Retire a claim whose owner stopped refreshing it."""
+        stale = f"{path}.{socket.gethostname()}.{os.getpid()}.stale"
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(path, stale)
+            os.unlink(stale)
+
+    def _wait_or_claim(
+        self,
+        key: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        fingerprint: str,
+        compile_range: Range,
+    ) -> tuple[tuple[Callable[..., Any], str] | None, str | None]:
+        """Share one XLA compile of this bucket among all ranks.
+
+        Returns `(peer, claim)`: `peer` is (runnable, artifact path) when
+        another rank built the bucket, `claim` the claim path when this rank
+        must build it and settle the claim afterwards. `(None, None)` means
+        build it without coordinating.
+
+        Without this, a rank reaching a bucket a peer is still compiling
+        recompiles it from scratch: for GLM-5.2 that was six ranks each
+        spending ~30 min on the 4096 bucket another rank was already building.
+        """
+        path = self._claim_path(key, fingerprint)
+        if path is None:
+            return None, None
+        waited_since = None
+        done_since = None
+        while True:
+            if self._try_claim(path):
+                return None, path
+            claim = self._read_claim(path)
+            if claim is None:
+                continue  # released between the two calls; race for it again
+            state, arg, age = claim
+            if state == "failed":
+                # Its owner built no shareable artifact; nobody will.
+                return None, None
+            if state == "done":
+                compiled_fn = (
+                    self._replay(arg, graph, was_wrapped, fingerprint)
+                    if os.path.isfile(arg)
+                    else None
+                )
+                if compiled_fn is not None:
+                    return (compiled_fn, arg), None
+                done_since = done_since or time.monotonic()
+                if time.monotonic() - done_since > _CLAIM_DONE_GRACE_S:
+                    return None, None
+            elif age > _CLAIM_STALE_S:
+                logger.warning(
+                    "[TpuCompilerAdaptor] Claim on range %s by %s is %.0f s "
+                    "stale; taking it over",
+                    compile_range,
+                    arg,
+                    age,
+                )
+                self._take_over(path)
+                continue
+            elif getattr(_defer_state, "on", False):
+                logger.info(
+                    "[TpuCompilerAdaptor] Range %s is being compiled by %s; "
+                    "deferring it",
+                    compile_range,
+                    arg,
+                )
+                raise DeferCompile
+            elif waited_since is None:
+                waited_since = time.monotonic()
+                logger.info(
+                    "[TpuCompilerAdaptor] Waiting for %s to finish range %s",
+                    arg,
+                    compile_range,
+                )
+            time.sleep(_CLAIM_POLL_S)
+
     def compile(
         self,
         graph: fx.GraphModule,
@@ -722,8 +904,13 @@ class TpuCompilerAdaptor(CompilerInterface):
             else None
         )
         peer = None
+        claim = None
         if fingerprint is not None:
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
+            if peer is None:
+                peer, claim = self._wait_or_claim(
+                    key, graph, was_wrapped, fingerprint, compile_range
+                )
 
         if peer is not None:
             compiled_fn, peer_path = peer
@@ -733,6 +920,13 @@ class TpuCompilerAdaptor(CompilerInterface):
                 compile_range,
                 peer_path,
             )
+        elif claim is not None:
+            try:
+                with _heartbeat(claim):
+                    compiled_fn, entry = self._run_backend(graph, example_inputs)
+            except BaseException:
+                self._settle_claim(claim, "failed")
+                raise
         else:
             compiled_fn, entry = self._run_backend(graph, example_inputs)
 
@@ -769,6 +963,13 @@ class TpuCompilerAdaptor(CompilerInterface):
                 "[TpuCompilerAdaptor] No serializable artifact for range %s; "
                 "it will be recompiled on the next start",
                 compile_range,
+            )
+
+        if claim is not None:
+            # Waiters replay the exact path named here, which an NFS client
+            # revalidates on open, rather than rescan directories it may cache.
+            self._settle_claim(
+                claim, f"done {handle[1]}" if handle is not None else "failed"
             )
 
         # Offer this bucket to later traces of the same model, so a graph that
