@@ -224,6 +224,20 @@ def test_a_tuned_shape_overrides_the_default_gate(v3, monkeypatch):
     assert _prebuild(_layer()).step_min_tokens == 64
 
 
+def test_a_layer_outside_the_backbone_graph_is_declined(v3, monkeypatch):
+    """The MTP draft is loaded under the "eagle_head" tag and compiled from one
+    trace, which cannot carry both sides of the step gate."""
+    from vllm.compilation import backends
+
+    monkeypatch.setattr(bridge, "_ARMING", bridge.Counter())
+    with backends.set_model_tag("eagle_head"):
+        assert _prebuild(_layer()) is None
+    assert not v3.built
+    assert _prebuild(_layer()) is not None
+    (reason,) = [r for r in bridge._ARMING if r != "armed"]
+    assert "'eagle_head' graph" in reason
+
+
 def test_declined_without_an_ep_group(v3, monkeypatch):
     monkeypatch.setattr(bridge, "build_ep_mesh", lambda: None)
     assert _prebuild(_layer()) is None

@@ -24,7 +24,9 @@ declined on its own and keeps the grouped-matmul path.
 
 Per step, an armed layer runs v3 only when this rank's step reaches
 `step_min_tokens` rows; smaller steps take the grouped-matmul path between
-vLLM's own dispatch and combine (`fused_moe_ep_v3_dispatch.apply`).
+vLLM's own dispatch and combine (`fused_moe_ep_v3_dispatch.apply`). The fork
+needs a trace per side, and only the backbone is re-traced per bucket group,
+so a layer compiled outside it -- the MTP draft's -- is declined.
 
 The op reads only buffers the grouped-matmul path reads too -- the layer's
 `experts_start`, from which it derives the shard index, and with
@@ -395,7 +397,8 @@ def _prebuild(layer, topk: int, renormalize: bool, activation: str) -> ArmedOp |
     inter = w1.shape[2] // 2
 
     reason = (
-        _unsupported_layer_reason(layer, local_experts, ep)
+        _unsupported_graph_reason()
+        or _unsupported_layer_reason(layer, local_experts, ep)
         or _unsupported_routing_reason(layer)
         or _unsupported_weights_reason(
             w1, w2, w1_scale, w2_scale, local_experts, hidden, inter, activation
@@ -455,6 +458,27 @@ def log_arming_summary() -> None:
         total,
         f"; declined: {declined}" if declined else "",
     )
+
+
+def _unsupported_graph_reason() -> str | None:
+    """Why the graph this layer is compiled into cannot fork at the step gate.
+
+    The gate reads the token count, which leaves a shape guard in the trace.
+    Only the backbone is re-traced per bucket group
+    (`TPUModelRunner._precompile_backbone`); a module loaded under another
+    model tag -- the MTP or EAGLE draft, "eagle_head" -- compiles every bucket
+    from its one trace, and the buckets on the far side of the gate would
+    raise `ShapeSpecializationError` at its first forward.
+    """
+    # Read at call time: `set_model_tag` rebinds the module global.
+    from vllm.compilation import backends
+
+    if backends.model_tag != "backbone":
+        return (
+            f"the {backends.model_tag!r} graph is traced once for every "
+            "bucket, so the per-step gate cannot fork it"
+        )
+    return None
 
 
 def _unsupported_layer_reason(layer, local_experts: int, ep: int) -> str | None:
