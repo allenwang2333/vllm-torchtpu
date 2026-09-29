@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import fused_moe_ep
 from vllm_torchtpu.layers.adapter.quantization import fp8
 from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores as scores
 
@@ -44,24 +45,34 @@ def make_layer(experts=64, hidden=512, inter=256, use_ep=True):
     )
 
 
+def method(owner=None):
+    return SimpleNamespace(_use_adaptive_fused_moe=owner == "adaptive", owner=owner)
+
+
 @pytest.fixture
 def enabled(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_LOWTOK", True, raising=False)
     monkeypatch.setattr(
         scores, "enable_pipelined_collective_and_compute", lambda: False
     )
+    monkeypatch.setattr(scores, "_LAYERS", [])
+    monkeypatch.setattr(
+        fused_moe_ep, "fused_moe_ep_supported", lambda m: m.owner == "v2"
+    )
     op = Mock(name="op")
     monkeypatch.setattr(scores, "_build_op", Mock(return_value=op))
     return op
 
 
-def test_disabled_builds_nothing(monkeypatch):
+def test_disabled_builds_and_logs_nothing(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_LOWTOK", False, raising=False)
-    assert scores.prebuild(make_layer(use_ep=False), "gelu") is None
+    monkeypatch.setattr(scores, "_LAYERS", [])
+    assert scores.prebuild(method(), make_layer(use_ep=False), "gelu") is None
+    scores.log_summary()
 
 
 def test_plain_softmax_router_moves_into_the_kernel(enabled):
-    assert scores.prebuild(make_layer(), "silu") is enabled
+    assert scores.prebuild(method(), make_layer(), "silu") is enabled
     scores._build_op.assert_called_once_with(10)
 
 
@@ -74,9 +85,18 @@ def test_plain_softmax_router_moves_into_the_kernel(enabled):
         (make_layer(), "gelu", "envelope"),
     ],
 )
-def test_layer_the_kernel_cannot_serve_is_refused(enabled, layer, activation, match):
+def test_layer_the_kernel_cannot_serve_is_refused_at_the_summary(
+    enabled, layer, activation, match
+):
+    assert scores.prebuild(method(), layer, activation) is None
     with pytest.raises(NotImplementedError, match=f"TPU_MOE_LOWTOK.*{match}"):
-        scores.prebuild(layer, activation)
+        scores.log_summary()
+
+
+@pytest.mark.parametrize("owner", ["adaptive", "v2"])
+def test_layer_a_fused_path_owns_is_declined_not_refused(enabled, owner):
+    scores.prebuild(method(owner), make_layer(use_ep=False), "silu")
+    scores.log_summary()
 
 
 @pytest.mark.parametrize(
@@ -99,12 +119,29 @@ def test_routing_the_kernel_does_not_reproduce_keeps_the_ids_entry(
     setattr(layer, option, value)
     if option == "use_grouped_topk":
         layer.num_expert_group, layer.topk_group = 8, 4
-    assert scores.prebuild(layer, "silu") is None
+    assert scores.prebuild(method(), layer, "silu") is None
 
 
 def test_chunk_pipelining_keeps_the_ids_entry(enabled, monkeypatch):
     monkeypatch.setattr(scores, "enable_pipelined_collective_and_compute", lambda: True)
-    assert scores.prebuild(make_layer(), "silu") is None
+    assert scores.prebuild(method(), make_layer(), "silu") is None
+
+
+def test_summary_counts_entries_and_declines(enabled, monkeypatch):
+    info = Mock()
+    monkeypatch.setattr(scores.logger, "info", info)
+    for _ in range(3):
+        scores.prebuild(method(), make_layer(), "silu")
+    biased = make_layer()
+    biased.e_score_correction_bias = torch.zeros(512)
+    scores.prebuild(method(), biased, "silu")
+    scores.prebuild(method("v2"), make_layer(), "silu")
+    scores.log_summary()
+    line = info.call_args.args[0] % info.call_args.args[1:]
+    assert line.startswith("moe_lowtok: 4/5 MoE layers armed (scores 3, ids 1)")
+    assert "1 x the fused EP kernel owns the layer" in line
+    assert "1 x scores declined, ids armed: e_score_correction_bias" in line
+    assert scores._LAYERS == []
 
 
 @pytest.mark.parametrize("rows, served", [(1, True), (256, True), (257, False)])

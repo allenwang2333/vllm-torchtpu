@@ -21,7 +21,8 @@ kernel with a routing table through `fused_moe_func`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections import Counter
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +46,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _OPS: dict[int, torch.library.CustomOpDef] = {}
+
+
+class _Verdict(NamedTuple):
+    method: Any
+    layer_name: str
+    entry: str | None  # "scores", "ids", or None when the kernel cannot serve it
+    reason: str | None
+
+
+_LAYERS: list[_Verdict] = []
 
 
 def _jax_dtype(dtype: torch.dtype) -> jnp.dtype:
@@ -145,35 +156,73 @@ def _build_op(topk: int) -> torch.library.CustomOpDef:
     return op
 
 
-def prebuild(layer: RoutedExperts, activation: str) -> torch.library.CustomOpDef | None:
-    """Check the layer under TPU_MOE_LOWTOK; the scores op if routing moves in.
-
-    Raises when the kernel cannot serve the layer. A layer whose routing the
-    kernel does not reproduce keeps vLLM-side routing and the ids entry.
+def prebuild(
+    method: Any, layer: RoutedExperts, activation: str
+) -> torch.library.CustomOpDef | None:
+    """Record the layer's entry under TPU_MOE_LOWTOK; the scores op if routing
+    moves into the kernel. log_summary() reports and refuses once all MoE
+    layers, draft included, are loaded.
     """
     if not envs.TPU_MOE_LOWTOK:
         return None
-    reason = _unsupported_reason(layer, activation)
-    if reason is not None:
-        raise NotImplementedError(
-            f"TPU_MOE_LOWTOK=1 cannot serve MoE layer {layer.layer_name}: "
-            f"{reason}. Unset TPU_MOE_LOWTOK for this model."
-        )
-    reason = _routing_unsupported_reason(layer)
-    if reason is not None:
-        logger.warning_once(
-            "Small-batch MoE keeps routing outside the kernel: %s", reason
-        )
+    unsupported = _unsupported_reason(layer, activation)
+    routing = None if unsupported else _routing_unsupported_reason(layer)
+    entry = None if unsupported else ("ids" if routing else "scores")
+    _LAYERS.append(_Verdict(method, layer.layer_name, entry, unsupported or routing))
+    if entry != "scores":
         return None
-    topk = layer.moe_config.experts_per_token
-    logger.info_once(
-        "Selected experimental small-batch MoE with in-kernel top-%d routing "
-        "| rows<=%d local_experts=%d",
-        topk,
+    return _build_op(layer.moe_config.experts_per_token)
+
+
+def _owner(method: Any) -> str | None:
+    """The fused path that takes the layer before either entry is reached."""
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    if method._use_adaptive_fused_moe:
+        return "adaptive fused MoE owns the layer"
+    if fused_moe_ep_supported(method):
+        return "the fused EP kernel owns the layer"
+    return None
+
+
+def log_summary() -> None:
+    """Log which entry each MoE layer armed; refuse layers nothing else owns.
+
+    Called once after the target and draft models are loaded.
+    """
+    if not _LAYERS:
+        return
+    armed: Counter[str] = Counter()
+    declined: Counter[str] = Counter()
+    unservable = []
+    for verdict in _LAYERS:
+        owner = _owner(verdict.method)
+        if owner is not None:
+            declined[owner] += 1
+        elif verdict.entry is None:
+            unservable.append(f"{verdict.layer_name}: {verdict.reason}")
+        else:
+            armed[verdict.entry] += 1
+            if verdict.reason is not None:
+                declined[f"scores declined, ids armed: {verdict.reason}"] += 1
+    total = len(_LAYERS)
+    _LAYERS.clear()
+    if unservable:
+        raise NotImplementedError(
+            "TPU_MOE_LOWTOK=1 cannot serve these MoE layers: "
+            + "; ".join(unservable)
+            + ". Unset TPU_MOE_LOWTOK for this model."
+        )
+    reasons = "".join(f"; {n} x {reason}" for reason, n in sorted(declined.items()))
+    logger.info(
+        "moe_lowtok: %d/%d MoE layers armed (scores %d, ids %d)%s | rows<=%d",
+        armed.total(),
+        total,
+        armed["scores"],
+        armed["ids"],
+        reasons,
         MOE_LOWTOK_MAX_TOKENS,
-        layer.w13_weight.shape[0],
     )
-    return _build_op(topk)
 
 
 def serves(op: torch.library.CustomOpDef | None, x: torch.Tensor) -> bool:
