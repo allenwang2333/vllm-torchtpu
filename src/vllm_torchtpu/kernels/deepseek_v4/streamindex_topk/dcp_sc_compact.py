@@ -27,41 +27,39 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
-LANES = 16
-# Rows are dealt one per subcore, so a wave covers every subcore on the chip.
-ROWS_PER_WAVE = 32
 SCAN_UNROLL = 8
 
 
 def _pack_body(
     merged_hbm,  # i32[padded_b * width]
-    rank_hbm,  # i32[padded_b * LANES]
+    rank_hbm,  # i32[padded_b * lanes]
     out_hbm,  # i32[padded_b * width]
-    rowbuf_vmem,  # i32[width + LANES]
+    rowbuf_vmem,  # i32[width + lanes]
     *,
     b: int,
     width: int,
     dcp_size: int,
     interleave_c: int,
     num_waves: int,
+    lanes: int,
+    num_cores: int,
+    num_subcores: int,
 ):
-    num_subcores = 16
-    num_sc_cores = 2
     flat = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
-    chunks = width // LANES
+    chunks = width // lanes
 
     def pipeline_step(merged_vmem, rank_vmem, out_vmem):
-        row = pl.program_id(0) * (num_sc_cores * num_subcores) + flat
-        rank = rank_vmem[pl.ds(0, LANES)][0]
+        row = pl.program_id(0) * (num_cores * num_subcores) + flat
+        rank = rank_vmem[pl.ds(0, lanes)][0]
 
         def fill(i):
-            rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
+            rowbuf_vmem[pl.ds(i * lanes, lanes)] = jnp.full((lanes,), -1, jnp.int32)
 
         # Pad up front; the scan below only overwrites the owned prefix.
         plsc.parallel_loop(0, chunks, unroll=4)(fill)
 
         def emit(i, woff):
-            g = merged_vmem[pl.ds(i * LANES, LANES)]
+            g = merged_vmem[pl.ds(i * lanes, lanes)]
             # `-1` needs its own test: floor-div of a negative can alias a real rank.
             owned = (g >= 0) & (
                 metadata.cp_owner_rank(g, dcp_size, interleave_c) == rank
@@ -69,7 +67,7 @@ def _pack_body(
             local = metadata.cp_global_to_local(
                 jnp.maximum(g, 0), dcp_size, interleave_c
             )
-            plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, LANES)], local, mask=owned)
+            plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, lanes)], local, mask=owned)
             return woff + plsc.all_reduce_population_count(owned)[0]
 
         # `woff` is carried, so this is a sequential scan: ascending column order,
@@ -79,11 +77,11 @@ def _pack_body(
         )(emit)
 
         def copy_out(i):
-            out_vmem[pl.ds(i * LANES, LANES)] = rowbuf_vmem[pl.ds(i * LANES, LANES)]
+            out_vmem[pl.ds(i * lanes, lanes)] = rowbuf_vmem[pl.ds(i * lanes, lanes)]
 
         plsc.parallel_loop(0, chunks, unroll=4)(copy_out)
 
-    cores_per_chip = num_sc_cores * num_subcores
+    cores_per_chip = num_cores * num_subcores
     buf_count = 1 if num_waves == 1 else 2
     in_specs = (
         pl.BlockSpec(
@@ -92,7 +90,7 @@ def _pack_body(
             pipeline_mode=pl.Buffered(buf_count),
         ),
         pl.BlockSpec(
-            (LANES,),
+            (lanes,),
             lambda w: (w * cores_per_chip + flat,),
             pipeline_mode=pl.Buffered(buf_count),
         ),
@@ -121,18 +119,22 @@ def pack_owned_winners(
     b, width = merged.shape
     if merged.dtype != jnp.int32:
         raise ValueError(f"merged must be int32, got {merged.dtype}")
-    if width % LANES != 0:
-        raise ValueError(f"width ({width}) must be a multiple of {LANES}")
     sc = pltpu.get_tpu_info().sparse_core
     if sc is None:
         raise NotImplementedError("SparseCore is not available")
 
-    num_waves = (b + ROWS_PER_WAVE - 1) // ROWS_PER_WAVE
-    padded_b = num_waves * ROWS_PER_WAVE
+    # Geometry off the chip: a row per subcore, a chunk per lane.
+    lanes = sc.num_lanes
+    rows_per_wave = sc.num_cores * sc.num_subcores
+    if width % lanes != 0:
+        raise ValueError(f"width ({width}) must be a multiple of {lanes}")
+
+    num_waves = (b + rows_per_wave - 1) // rows_per_wave
+    padded_b = num_waves * rows_per_wave
     if padded_b > b:
         # `-1`, not the default 0: 0 is a real position that rank 0 owns.
         merged = jnp.pad(merged, ((0, padded_b - b), (0, 0)), constant_values=-1)
-    rank = jnp.full((padded_b, LANES), dcp_rank, dtype=jnp.int32)
+    rank = jnp.full((padded_b, lanes), dcp_rank, dtype=jnp.int32)
 
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
@@ -148,12 +150,15 @@ def pack_owned_winners(
             dcp_size=dcp_size,
             interleave_c=interleave_c,
             num_waves=num_waves,
+            lanes=lanes,
+            num_cores=sc.num_cores,
+            num_subcores=sc.num_subcores,
         ),
         out_type=jax.ShapeDtypeStruct((padded_b * width,), jnp.int32),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True, needs_layout_passes=False
         ),
-        scratch_types=(pltpu.VMEM((width + LANES,), jnp.int32),),
+        scratch_types=(pltpu.VMEM((width + lanes,), jnp.int32),),
         mesh=mesh,
         name=f"sc_pack_owned_b{b}_w{width}_dcp{dcp_size}",
     )(merged.reshape(-1), rank.reshape(-1))
