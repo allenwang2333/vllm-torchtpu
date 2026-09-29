@@ -60,10 +60,23 @@ head_ip() {
   echo "$ip"
 }
 
+# warm_remote_code: import the model's remote code once on this host before Ray
+# starts the engine's workers here; see warm_remote_code.py for why.
+warm_remote_code() {
+  local uri
+  uri=$(source "$REPO_DIR/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh" \
+    >/dev/null && echo "$MODEL_URI") || return 1
+  timeout 600 python3 "$HERE/warm_remote_code.py" "$uri"
+}
+
 if [[ "$head" == "0" ]]; then
   # Set before Ray starts on every host: the engine's workers are Ray actors on
   # all four, and they inherit the raylet's environment, not the head's.
   export VLLM_HOST_IP="${POD_IP}"
+  # Best effort: without it the workers pull and import as they always have.
+  if [[ "${JOB_COMPLETION_INDEX:-0}" != "0" ]]; then
+    warm_remote_code || echo "WARNING: could not warm the model's remote code"
+  fi
   # The engine's Raiden store runs in its rank-0 worker, on index 0, and every
   # worker dials it at this host - so it is index 0's address on all four.
   if [[ "${JOB_COMPLETION_INDEX:-0}" == "0" ]]; then
