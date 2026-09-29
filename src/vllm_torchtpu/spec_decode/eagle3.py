@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import sequence_parallel
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilderContext
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -1617,6 +1618,10 @@ class Eagle3Proposer:
             kwargs["spec_step_idx"] = step_idx
 
         model = self._draft_model_for_step(step_idx)
+        # The draft's own row count, not the target step's.
+        sequence_parallel.set_active(
+            sequence_parallel.step_is_sequence_parallel(num_tokens)
+        )
         with (
             set_model_tag("eagle_head"),
             set_forward_context(
