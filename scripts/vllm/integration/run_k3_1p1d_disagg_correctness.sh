@@ -80,8 +80,9 @@ mkdir -p "${LOG_DIR}" || exit 1
 
 # The block size the engine settled on, which may not be the one asked for.
 # From /metrics: the workers log it, and their logs stay on their own hosts.
+# Anchored on the label's start: mamba_block_size sits on the same line.
 block_size="$(curl -sf --max-time 30 "${PREFILL_URL}/metrics" \
-  | grep -m1 '^vllm:cache_config_info' | grep -oE 'block_size="[0-9]+"' \
+  | grep -m1 '^vllm:cache_config_info' | grep -oE '[{,]block_size="[0-9]+"' \
   | grep -oE '[0-9]+')"
 if [[ "${block_size}" != "${PREFILL_CHUNK_TOKENS}" ]]; then
   echo "ERROR: the engine chose a '${block_size}'-token block but prefill" \
