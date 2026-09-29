@@ -677,7 +677,7 @@ def rpa_kernel(
         kv_cache_lens: [max_num_seqs]. Existing kv cache length of each sequence.
         kv_new_lens: [max_num_seqs]. New kv length of each sequence.
         page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
-            sequence.
+            sequence. Unused: the metadata kernel resolves it into schedule_hbm.
         schedule_hbm: Output of scheduler kernel. It informs which: 1. seqs 2. q
             block 3. kv block that should be processed at a given step.
         q_hbm: [max_num_tokens, num_q_heads_per_kv_heads, cdiv(num_kv_heads,
@@ -697,6 +697,7 @@ def rpa_kernel(
             head_dim]. Result of new kv cache.
         lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
     """
+    del page_indices
     return_lse = cfgs.serve.return_lse
 
     def ragged_paged_attention_pipeline(
@@ -705,7 +706,6 @@ def rpa_kernel(
         q_offsets_ref: jax.Ref,
         kv_cache_lens_ref: jax.Ref,
         kv_new_lens_ref: jax.Ref,
-        page_indices_ref: jax.Ref,
         # Inputs.
         schedule_hbm_ref: schedule.RpaSchedule,
         q_hbm_ref: jax.Ref,
@@ -831,7 +831,7 @@ def rpa_kernel(
                 )
                 pipeline_func(
                     (q_hbm_ref, schedule_ref),
-                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref, page_indices_ref),
+                    (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                     (o_hbm_ref, schedule_ref),
                     (lse_hbm_ref, schedule_ref) if return_lse else None,
                     scratches=(schedule_ref,) + scratches,
@@ -854,7 +854,6 @@ def rpa_kernel(
         q_offsets,
         kv_cache_lens,
         kv_new_lens,
-        page_indices,
     )
     num_scalar_prefetch = len(scalar_prefetches)
     num_active_scalers = len(scalar_prefetches)
@@ -898,7 +897,6 @@ def rpa_kernel(
         q_offsets,
         kv_cache_lens,
         kv_new_lens,
-        page_indices,
         schedule_hbm,
         q_hbm,
         new_kv_hbm,

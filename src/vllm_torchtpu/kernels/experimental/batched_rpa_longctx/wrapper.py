@@ -766,6 +766,7 @@ def ragged_paged_attention(
             kv_cache_lens,
             kv_new_lens,
             distribution,
+            page_indices,
             cfgs=cfgs,
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,

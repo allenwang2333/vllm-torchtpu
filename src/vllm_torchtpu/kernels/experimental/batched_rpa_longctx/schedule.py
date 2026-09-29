@@ -544,6 +544,7 @@ class BaseMetadataComputer:
         *,
         cfgs: configs.RpaConfigs,
         extra_refs: Sequence[jax.Ref] = (),
+        page_indices_ref: jax.Ref,
         **kwargs,
     ):
         self.schedule = schedule
@@ -551,6 +552,15 @@ class BaseMetadataComputer:
         self.dma_sem = dma_sem
         self.cfgs = cfgs
         self.extra_refs = extra_refs
+        self.page_indices_ref = page_indices_ref
+
+    def phys_page(self, idx):
+        """Physical KV cache page for position `idx` of page_indices.
+
+        The schedule stores physical pages, so the RPA kernel does not need the
+        page table (a large scalar prefetch paid on every call).
+        """
+        return self.page_indices_ref[idx]
 
     @jax.named_scope("k_loop")
     def k_loop(
@@ -593,7 +603,9 @@ class BaseMetadataComputer:
             dma_sz = kv_left_frm_cache - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
-            src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+            src_hbm = self.phys_page(
+                jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
+            )
 
             if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
                 dma_valid = jnp.where(dma_sz > 0, 1, 0)
@@ -643,7 +655,7 @@ class BaseMetadataComputer:
                     (kv_len_start + slot_start) >> cfgs.serve.page_size_log2,
                     cfgs.serve.pages_per_seq - 1,
                 )
-                dst_hbm = s_idx * cfgs.serve.pages_per_seq + p_idx
+                dst_hbm = self.phys_page(s_idx * cfgs.serve.pages_per_seq + p_idx)
                 wb_val = jnp.where(dma_sz > 0, 1, 0)
 
                 dma_entry.fetch_hbm[...] = new_page_start
@@ -658,7 +670,7 @@ class BaseMetadataComputer:
                 )
                 p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
                 dst_hbm = (
-                    (s_idx * cfgs.serve.pages_per_seq + p_idx)
+                    self.phys_page(s_idx * cfgs.serve.pages_per_seq + p_idx)
                     << cfgs.serve.page_size_log2
                 ) | p_off
 
@@ -818,6 +830,7 @@ def rpa_metadata_schedule_kernel(
     kv_new_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
     extra_scalars_ref: Sequence[jax.Ref],
+    page_indices_ref: jax.Ref,
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
     # Scratch.
@@ -852,6 +865,8 @@ def rpa_metadata_schedule_kernel(
         distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
             mixed
         extra_scalars_ref: Additional scalar refs for custom metadata computers.
+        page_indices_ref: [max_num_seqs * pages_per_seqs]. kv cache page table;
+            the schedule stores the physical pages it resolves to.
         schedule_hbm_ref: HBM memory that will store output of the kernel.
         schedule_ref: Scratch memory where schedule results gets written.
         dma_sem: Semaphore used for writing scheduler output to HBM.
@@ -866,6 +881,7 @@ def rpa_metadata_schedule_kernel(
         dma_sem=dma_sem,
         cfgs=cfgs,
         extra_refs=extra_scalars_ref,
+        page_indices_ref=page_indices_ref,
     )
     loop_carry = computer.compute(
         cu_q_lens_ref=cu_q_lens_ref,
@@ -895,6 +911,7 @@ def generate_rpa_metadata(
     kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
     distribution: jax.Array,
+    page_indices: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
     computer_cls: type[BaseMetadataComputer] = BaseMetadataComputer,
@@ -914,7 +931,7 @@ def generate_rpa_metadata(
         ),
         out_shape=schedule_hbm,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
+            num_scalar_prefetch=7,
             in_specs=[],
             out_specs=schedule_hbm.out_specs(),
             scratch_shapes=[
@@ -931,4 +948,5 @@ def generate_rpa_metadata(
         kv_new_lens,
         distribution,
         extra_scalars,
+        page_indices,
     )
