@@ -6,10 +6,9 @@ vLLM's real compile pipeline (``@support_torch_compile`` -> ``VllmBackend`` ->
 backend whose "executable" records the structure it was compiled from, so a test
 can tell which trace's executable served a bucket.
 
-Every case that compiles runs in a spawned child: driving torch.compile on a TPU
-host makes PJRT claim the chip for the life of the process, and the pytest parent
-holding it breaks every later test that starts a worker or an engine core. Same
-reason, and same shape, as tests/distributed/tpu_test_utils.py.
+Every case that compiles runs in a spawned child to isolate Dynamo and AOT cache
+state. Accelerator stream discovery is disabled for these CPU tensors and fake
+executables; otherwise Dynamo initializes the TPU runtime just to query a stream.
 """
 
 import dataclasses
@@ -248,7 +247,10 @@ MAX_REPORT = 32 * 1024
 
 def _child(target, result):
     try:
-        target()
+        # Dynamo queries the accelerator stream even for a CPU-only graph.
+        # These tests execute CPU tensors through FakeTpuBackend.
+        with patch("torch.accelerator.is_available", return_value=False):
+            target()
     except BaseException:
         result.put(traceback.format_exc()[-MAX_REPORT:])
     else:
@@ -511,3 +513,53 @@ def test_missing_guard_field_cannot_accept_a_bucket(field):
     delattr(env if field == "guards" else guard, field)
     with pytest.raises(AttributeError, match=field):
         unsupported_reason(env, 2048)
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class TwoShotAdmissionModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import (
+            KimiTwoShotAllReduce,
+        )
+
+        self.reduction = KimiTwoShotAllReduce(WAVE, (1, 4, 16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        projected = x.repeat(1, 7168 // HIDDEN).to(torch.bfloat16)
+        return self.reduction(projected, lambda value: WAVE(WAVE(value)))
+
+
+def _two_shot_exact_admission(cache_root, reverse):
+    from vllm.config.compilation import DynamicShapesType
+
+    buckets = [1, 3, 4, 16, 32]
+    config, backend = prepare(cache_root)
+    config.compilation_config.compile_sizes = buckets
+    config.compilation_config.dynamic_shapes_config.type = (
+        DynamicShapesType.BACKED_SIZE_OBLIVIOUS
+    )
+    order = list(reversed(buckets)) if reverse else buckets
+    model = build(TwoShotAdmissionModel, config)
+    warm(model, config, order)
+    expected = {size: 1 if size in (1, 4, 16) else 2 for size in buckets}
+    assert dict(backend.compiled) == expected
+    for size in order:
+        assert run(model, config, size).shape[0] == size
+    assert CALLS[-len(order) :] == [(size, expected[size]) for size in order]
+
+    torch._dynamo.reset()
+    backend.compiled.clear()
+    model = build(TwoShotAdmissionModel, config)
+    warm(model, config, order)
+    assert backend.compiled == []
+    CALLS.clear()
+    for size in reversed(order):
+        assert run(model, config, size).shape[0] == size
+    expected_calls = [(size, expected[size]) for size in reversed(order)]
+    assert expected_calls == CALLS
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_two_shot_exact_admission_survives_retrace_and_cache_reload(tmp_path, reverse):
+    in_child(partial(_two_shot_exact_admission, str(tmp_path), reverse))

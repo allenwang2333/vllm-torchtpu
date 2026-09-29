@@ -178,6 +178,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
+    "vllm_torchtpu/distributed/two_shot_qualification.py",
+    "vllm_torchtpu/distributed/two_shot_qualification.json",
     # And the mesh they export with. Since google-pytorch/torch_tpu#3522 the
     # order is the process group's rank order rather than something
     # `build_ep_mesh` chooses, but the file still decides the axis and the
@@ -307,6 +309,13 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+
+    if envs.TPU_K3_TWO_SHOT_ALL_REDUCE:
+        from vllm_torchtpu.distributed.two_shot_qualification import (
+            compilation_identity,
+        )
+
+        factors["two_shot"] = compilation_identity()
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(

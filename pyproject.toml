@@ -229,6 +229,9 @@ py-modules = ["sitecustomize"]
 [tool.setuptools.package-dir]
 "" = "src"
 
+[tool.setuptools.package-data]
+"vllm_torchtpu.distributed" = ["two_shot_qualification.json"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["vllm_torchtpu*"]

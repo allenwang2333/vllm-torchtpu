@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Torch bridges for K3's sequence-parallel prefill collectives."""
+"""Torch bridges for K3 collectives."""
 
+import hashlib
 from functools import lru_cache
 
 import jax
@@ -374,3 +375,215 @@ class FusedPrefillCollectives:
 
     def all_reduce(self, x):
         return self.base.all_reduce(x)
+
+
+_TWO_SHOT_CONTEXTS = {}
+_KIMI_TWO_SHOT_BATCHES = {}
+
+
+def prepare_two_shot_context(tp_group):
+    """Resolve physical placement once, before compiling any serving bucket."""
+    import torch.distributed as dist
+    from torch_tpu._internal.pallas import get_pallas_mesh
+
+    from vllm_torchtpu.distributed import two_shot_qualification as qualification
+
+    ranks = tuple(int(rank) for rank in tp_group.ranks)
+    if (
+        not dist.is_initialized()
+        or int(tp_group.world_size) != 32
+        or ranks != tuple(range(32))
+        or dist.get_world_size() != 32
+    ):
+        raise ValueError("K3 Two Shot requires a full-world, rank-ordered TP32 group")
+    key = (tp_group.unique_name, ranks)
+    if key in _TWO_SHOT_CONTEXTS:
+        result = _TWO_SHOT_CONTEXTS[key]
+        if isinstance(result, str):
+            raise ValueError(result)
+        return result
+
+    try:
+        device = torch.get_device_module("tpu").get_local_device_attributes()
+        report = {
+            "rank": dist.get_rank(),
+            "device": {
+                "id": int(device["id"]),
+                "device_kind": device["device_kind"],
+                "coords": tuple(device["coords"]),
+                "core_on_chip": int(device["core_on_chip"]),
+                "slice_index": int(device.get("slice_index", 0)),
+            },
+            "source": qualification.source_fingerprint(),
+            "runtime": qualification.runtime_identity(),
+            "manifest": qualification.compilation_identity()["manifest"],
+        }
+    except Exception as error:  # noqa: BLE001 - every rank must join the startup gather
+        report = {"rank": dist.get_rank(), "error": f"{type(error).__name__}: {error}"}
+    reports: list[dict | None] = [None] * 32
+    dist.all_gather_object(reports, report, group=tp_group.cpu_group)
+    try:
+        for index, item in enumerate(reports):
+            if item is None or "error" in item:
+                reason = "empty report" if item is None else item["error"]
+                raise ValueError(
+                    f"K3 Two Shot device discovery failed on rank {index}: {reason}"
+                )
+        valid_reports = [item for item in reports if item is not None]
+        if [item["rank"] for item in valid_reports] != list(ranks):
+            raise ValueError("K3 Two Shot device reports differ from TP rank order")
+        if any(
+            any(
+                item[field] != valid_reports[0][field]
+                for field in ("source", "runtime", "manifest")
+            )
+            for item in valid_reports
+        ):
+            raise ValueError(
+                "K3 Two Shot source, runtime, or qualification differs across ranks"
+            )
+        devices = [item["device"] for item in valid_reports]
+        identity = qualification.qualification_identity(
+            devices, tuple(device["id"] for device in devices)
+        )
+    except ValueError as error:
+        _TWO_SHOT_CONTEXTS[key] = str(error)
+        raise
+    mesh = get_pallas_mesh(axis_names=("k3_ar",))
+    if tuple(mesh.axis_names) != ("k3_ar",) or mesh.size != 32:
+        raise ValueError("K3 Two Shot bridge requires a flat 32-device mesh")
+    qualification.register_context(tp_group.unique_name, identity)
+    _TWO_SHOT_CONTEXTS[key] = mesh, identity
+    return mesh, identity
+
+
+def build_kimi_two_shot_all_reduce(prefix, tp_group):
+    """Build the uniform full-world KDA bridge used by hardware qualification.
+
+    Every rank must execute the same live collective graph. Repeated invocations
+    must be data-dependent or run in separate synchronized executions; independent
+    overlap and rank-dependent removal or merging of calls are unsupported.
+
+    TorchTPU partitions the JAX export, then partitions the containing Torch graph
+    again. The first pass removes the manual sharding required for side-effecting
+    calls in the second pass. The private uniform-SPMD entry uses functional
+    compiler semantics while retaining the kernel's barrier and all DMA waits.
+    """
+    from vllm_torchtpu.distributed.two_shot_qualification import COLLECTIVE_ID
+    from vllm_torchtpu.kernels.collectives.two_shot import (
+        _two_shot_all_reduce_uniform_spmd,
+    )
+
+    mesh, _ = prepare_two_shot_context(tp_group)
+    key = ("two_shot", prefix, tp_group.unique_name, tuple(tp_group.ranks))
+    if key in _OPS:
+        return _OPS[key]
+    spec = P("k3_ar", None, None)
+
+    def collective(x: jax.Array) -> jax.Array:
+        def local(part):
+            return _two_shot_all_reduce_uniform_spmd(
+                part[0], axis_name="k3_ar", axis_size=32, collective_id=COLLECTIVE_ID
+            )[None]
+
+        return jax.shard_map(
+            local, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False
+        )(x)
+
+    group_key = hashlib.sha256(repr(key[2:]).encode()).hexdigest()[:16]
+    name = f"pallas::kimi_two_shot_{prefix.replace('.', '_')}_{group_key}"
+    op = sharded_jax_op(
+        name,
+        collective,
+        mesh=mesh,
+        input_partition_specs=(spec,),
+        output_partition_specs=spec,
+    )
+    op.register_fake(lambda x: x.new_empty(x.shape))
+
+    def all_reduce(x):
+        return op(x[None])[0]
+
+    _OPS[key] = all_reduce
+    return all_reduce
+
+
+class KimiTwoShotAllReduce:
+    """Use the measured batch sizes; leave all other inputs on the native path."""
+
+    def __init__(self, op, batches):
+        self.op = op
+        self.batches = tuple(batches)
+
+    def __call__(self, x, native):
+        if (
+            x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.shape[1] == 7168
+            and x.shape[0] in self.batches
+        ):
+            return self.op(x)
+        return native(x)
+
+
+def _qualified_kimi_two_shot_batches(group, config):
+    """Agree on opt-in admission before any rank enters topology discovery."""
+    import torch.distributed as dist
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed import two_shot_qualification as qualification
+
+    key = (group.unique_name, tuple(group.ranks))
+    if key in _KIMI_TWO_SHOT_BATCHES:
+        return _KIMI_TWO_SHOT_BATCHES[key]
+    manifest = None
+    report: dict = {"eligible": False}
+    try:
+        if qualification.serving_context_supported(
+            config, sp_prefill=envs.TPU_K3_SP_PREFILL
+        ):
+            manifest = qualification.load_manifest()
+            if qualification.has_runtime_match(manifest):
+                report = {
+                    "eligible": True,
+                    "source": qualification.source_fingerprint(),
+                    "runtime": qualification.runtime_identity(),
+                    "manifest": qualification.compilation_identity()["manifest"],
+                }
+    except (OSError, ValueError):
+        # An unreadable or stale local installation must not strand peers in
+        # topology discovery. All participants take the native path together.
+        pass
+    reports = [None] * group.world_size
+    dist.all_gather_object(reports, report, group=group.cpu_group)
+    batches: tuple[int, ...] = ()
+    if report["eligible"] and all(item == report for item in reports):
+        try:
+            _, identity = prepare_two_shot_context(group)
+            batches = qualification.qualified_batches(identity, manifest)
+        except ValueError:
+            pass
+    if not batches:
+        qualification.register_context(group.unique_name, {"batches": []})
+    # The manifest, runtime and model configuration are immutable for this
+    # process-group lifetime; subsequent KDA layers reuse the startup decision.
+    _KIMI_TWO_SHOT_BATCHES[key] = batches
+    return batches
+
+
+def prepare_kimi_two_shot_all_reduce(prefix, config):
+    """Prepare opt-in admission at model construction, outside traced forwards.
+
+    The feature flag is a process-wide launch setting shared by all TP ranks.
+    When enabled, even unsupported model configurations join the CPU consensus.
+    Uniformly empty qualification never probes physical devices.
+    """
+    from vllm_torchtpu import envs
+
+    if not envs.TPU_K3_TWO_SHOT_ALL_REDUCE:
+        return None
+    group = get_tp_group()
+    batches = _qualified_kimi_two_shot_batches(group, config)
+    if not batches:
+        return None
+    return KimiTwoShotAllReduce(build_kimi_two_shot_all_reduce(prefix, group), batches)

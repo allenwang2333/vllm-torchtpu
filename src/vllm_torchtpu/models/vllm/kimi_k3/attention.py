@@ -49,7 +49,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 
-from .collective_ops import FusedPrefillCollectives
+from .collective_ops import FusedPrefillCollectives, prepare_kimi_two_shot_all_reduce
 
 logger = init_logger(__name__)
 
@@ -556,6 +556,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.prefill_group = (
             FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
         )
+        self.two_shot_all_reduce = prepare_kimi_two_shot_all_reduce(prefix, vllm_config)
         self.register_buffer("packed_prefill_weight", None, persistent=False)
         self.kv_cache = None
         # The dispatched op owns the short convolution as well: the fused
@@ -767,6 +768,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
             return group.project_reduce_scatter(output, self.o_proj)
         output, _ = self.o_proj(output)
+        if not sequence_parallel and self.two_shot_all_reduce is not None:
+            return self.two_shot_all_reduce(output, group.all_reduce)
         return (
             group.reduce_scatter(output, dim=0)
             if sequence_parallel

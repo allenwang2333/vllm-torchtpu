@@ -448,3 +448,23 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+
+def test_two_shot_compilation_hash_covers_resolved_admission(monkeypatch, tmp_path):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.compilation import tpu_compiler
+    from vllm_torchtpu.distributed import two_shot_qualification as qualification
+
+    manifest = tmp_path / "qualification.json"
+    manifest.write_text('{"schema_version": 1, "entries": []}')
+    monkeypatch.setattr(envs, "TPU_K3_TWO_SHOT_ALL_REDUCE", True)
+    monkeypatch.setattr(qualification, "_MANIFEST", manifest)
+    monkeypatch.setattr(qualification, "_CONTEXT_IDENTITIES", {})
+    monkeypatch.setattr(tpu_compiler, "_iter_runtime_cache_key_files", lambda root: [])
+    config = TestTpuCompilerCache._config()
+    original = tpu_compiler.compute_tpu_compilation_hash(config)
+    qualification.register_context("tp", {"rank_mapping": [1, 0]})
+    placement = tpu_compiler.compute_tpu_compilation_hash(config)
+    assert placement != original
+    manifest.write_text('{"schema_version": 1, "entries": [{"batches": [16]}]}')
+    assert tpu_compiler.compute_tpu_compilation_hash(config) != placement

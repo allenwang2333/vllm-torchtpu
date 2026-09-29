@@ -13,7 +13,10 @@
 # limitations under the License.
 """Register a torch custom op backed by a multi-device JAX/Pallas function.
 
-``torch_tpu``'s ``pallas.jax_op`` accepts ``mesh`` and
+Current ``torch_tpu`` accepts explicit output partition specs. Older versions
+need the output-placeholder adaptation below.
+
+Those versions' ``pallas.jax_op`` accepts ``mesh`` and
 ``input_partition_specs`` and exports a real multi-device SPMD module, but it
 sizes the torch output tensors from ``lowered.out_avals``, where ``jax.export``
 records ``shard_map`` results as *replicated*. A caller whose outputs are
@@ -101,6 +104,11 @@ def _build_sharded_callable_cls():
     The method source is recompiled inside a throwaway class so its original
     indentation -- and therefore the needle below -- survives verbatim.
     """
+    if (
+        "output_partition_specs"
+        in inspect.signature(pallas_impl.JaxCallable).parameters
+    ):
+        return pallas_impl.JaxCallable
     src = inspect.getsource(pallas_impl.JaxCallable.__call__)
     if _STOCK_PLACEHOLDER_LINE not in src:
         logger.warning(
@@ -191,6 +199,17 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
+    callable_options = {}
+    if (
+        "output_partition_specs"
+        in inspect.signature(pallas_impl.JaxCallable).parameters
+    ):
+        callable_options["output_partition_specs"] = tuple(
+            jax.tree.leaves(
+                output_partition_specs,
+                is_leaf=lambda spec: isinstance(spec, PartitionSpec),
+            )
+        )
     wrapped_fn = _SHARDED_CALLABLE_CLS(
         name=name,
         jit_fn=jit_fn,
@@ -199,6 +218,7 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
+        **callable_options,
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())

@@ -8,11 +8,16 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
+    TPU_K3_TWO_SHOT_ALL_REDUCE: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
     TPU_WORKER_ID: str | None = None
     TPU_MULTIHOST_BACKEND: str = ""
+    LIBTPU_INIT_ARGS: str = ""
+    XLA_FLAGS: str = ""
+    TORCH_TPU_INTERNAL_XLA_OPTIONS: str = ""
+    TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
     HOST_TRACER_LEVEL: int = 2
@@ -346,8 +351,19 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Preserve exact runtime flag strings in collective qualification identities.
+    "LIBTPU_INIT_ARGS": lambda: os.getenv("LIBTPU_INIT_ARGS", ""),
+    "XLA_FLAGS": lambda: os.getenv("XLA_FLAGS", ""),
+    "TORCH_TPU_INTERNAL_XLA_OPTIONS": lambda: os.getenv(
+        "TORCH_TPU_INTERNAL_XLA_OPTIONS", ""
+    ),
+    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": lambda: os.getenv(
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", ""
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
+    # Qualified small-batch sums after the K3 KDA output projection.
+    "TPU_K3_TWO_SHOT_ALL_REDUCE": env_bool("TPU_K3_TWO_SHOT_ALL_REDUCE", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
