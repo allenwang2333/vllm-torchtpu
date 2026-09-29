@@ -114,6 +114,7 @@ def test_one_request_bucket_and_no_speculative_decoding():
         ("no_head", "no ParallelLMHead"),
         ("tied", "tied"),
         ("tensor_parallel", "tensor-parallel"),
+        ("quantized", "unquantized"),
         ("no_ep", "expert-parallel"),
         ("vocab_split", "does not split"),
     ],
@@ -125,5 +126,7 @@ def test_install_refuses_an_unsupported_head(monkeypatch, case, match):
     model = torch.nn.Module() if case == "no_head" else _model(tied=case == "tied")
     if case == "tensor_parallel":
         model.lm_head.tp_size = 2
+    if case == "quantized":
+        model.lm_head.weight.data = model.lm_head.weight.data.to(torch.float8_e4m3fn)
     with pytest.raises(NotImplementedError, match=match):
         sharded_lm_head.install(model, [16])

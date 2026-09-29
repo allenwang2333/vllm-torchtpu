@@ -162,6 +162,10 @@ def install(model: torch.nn.Module, buckets: list[int]) -> None:
             f"the LM head is already split over {head.tp_size} tensor-parallel "
             "ranks; run with tensor_parallel_size=1 and data parallelism"
         )
+    if head.weight.element_size() < 2:
+        raise _refuse(
+            f"the LM head weight is {head.weight.dtype}; it must be unquantized"
+        )
     mesh = build_ep_mesh()
     if mesh is None:
         raise _refuse("no expert-parallel group; pass --enable-expert-parallel")
