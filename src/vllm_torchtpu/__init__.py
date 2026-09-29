@@ -503,13 +503,22 @@ def _patch_vllm_compile_all_ranges() -> None:
     which greatly reduce the vllm startup time.
     """
     import os
-    from collections import deque
 
     from vllm.compilation.piecewise_backend import (
         PiecewiseBackend,
         create_concrete_args,
         get_fake_args_from_graph,
     )
+
+    def _global_rank() -> int:
+        # The global rank, not LOCAL_RANK: ranks of different hosts share the
+        # cache and must not all start on the same range.
+        try:
+            from vllm.distributed.parallel_state import get_world_group
+
+            return int(get_world_group().rank_in_group)
+        except Exception:
+            return int(os.environ.get("LOCAL_RANK", "0"))
 
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
@@ -519,22 +528,18 @@ def _patch_vllm_compile_all_ranges() -> None:
             "compile_all_ranges should not be called."
         )
 
-        local_rank = int(os.environ["LOCAL_RANK"])
-        range_entry_list = list(self.range_entries.values())
+        # Biggest first, so the range that bounds startup starts right away,
+        # and each rank starts on a different range.
+        entries = sorted(
+            self.range_entries.values(),
+            key=lambda e: e.compile_range.end,
+            reverse=True,
+        )
+        if not entries:
+            return
+        start = _global_rank() % len(entries)
 
-        range_entry_len = len(range_entry_list)
-
-        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
-        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
-        d.rotate(-local_rank * (len(d) // 8))
-        indexes = list(d)
-
-        for i in indexes:
-            if i >= len(range_entry_list):
-                continue
-
-            range_entry = range_entry_list[i]
-
+        for range_entry in entries[start:] + entries[:start]:
             if range_entry.compiled:
                 continue
 
