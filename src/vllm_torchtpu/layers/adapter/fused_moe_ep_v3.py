@@ -56,7 +56,11 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
 )
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import (
+    moe_routing,
+    sequence_parallel,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     _pcp_size,
     _squeeze_channel_scale,
@@ -277,9 +281,18 @@ def _build_op(
     run = op
     if skip_padded_tokens:
         # Decided here, at weight load, so the forward reads no env.
+        ep = mesh.shape[MESH_AXIS]
+
         def run(x, *args):
-            # The same mask slice the grouped path's padding zeroing reads.
-            padded = token_padding.local_padding_mask(x.shape[0])
+            if sequence_parallel.is_active():
+                # This rank's rows of a sequence-parallel step: its slice of
+                # the step's mask, the rank read off `experts_start` (EP rank
+                # = TP rank there).
+                rank = (args[-1] // local_experts).reshape(1)
+                padded = token_padding.rank_padding_mask(x.shape[0], ep, rank)
+            else:
+                # The same mask slice the grouped path's padding zeroing reads.
+                padded = token_padding.local_padding_mask(x.shape[0])
             if padded is None:
                 raise RuntimeError(
                     "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "

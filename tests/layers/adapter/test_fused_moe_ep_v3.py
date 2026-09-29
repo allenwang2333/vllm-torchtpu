@@ -383,6 +383,40 @@ def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_padding_mask(
     assert call[7].tolist() == [0] * 5 + [1] * 3
 
 
+@pytest.mark.parametrize("rank", range(_EP))
+def test_sequence_parallel_rows_take_their_rank_slice_of_the_mask(monkeypatch, rank):
+    """On a sequence-parallel step each rank holds a contiguous slice of the
+    step's rows; the padded rows it skips are that slice of the step's mask."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", _FakeOp)
+    monkeypatch.setattr(sequence_parallel, "_active", True)
+    run = bridge._build_op(
+        _MESH, 2, True, "silu", True, hidden=512, inter=256, local_experts=4
+    )
+    owner = SimpleNamespace()
+    setattr(owner, bridge.FUSED_MOE_EP_V3_OP_ATTR, bridge.ArmedOp(run, 1))
+    layer = _layer()
+    local_rows, valid = 8, 37
+    state = token_padding.TokenPaddingState.create(_EP * local_rows, device="cpu")
+    state.update(valid, _EP * local_rows)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    call = bridge.fused_moe_ep_v3(
+        owner,
+        torch.ones(local_rows, 512, dtype=torch.bfloat16),
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+        torch.ones(local_rows, 32),
+        torch.tensor(rank * 4, dtype=torch.int32),
+    )
+    step_mask = state.local_padding_mask.to(torch.int32)
+    expected = step_mask[rank * local_rows : (rank + 1) * local_rows]
+    assert call[7].tolist() == expected.tolist()
+
+
 def test_mask_padded_rows_routes_the_suffix_nowhere():
     ep, t_local, hidden, experts = 2, 4, 8, 4
     x = jnp.ones((ep * t_local, hidden), jnp.bfloat16)
