@@ -3923,6 +3923,11 @@ class TPURaidenConnectorWorker:
                         f"for req_id={req_id}"
                     )
                 continue
+            # Scheduler and worker monotonic clocks may belong to different
+            # hosts. Start the lease locally, without renewing duplicate sends.
+            expiration_time = time.perf_counter() + float(
+                dist_utils.get_p2p_wait_pull_timeout()
+            )
             try:
                 # T3.1 sibling collapse: one registration carries the FA
                 # spans plus every GDN state class's spans under the SAME
@@ -4154,6 +4159,11 @@ class TPURaidenConnectorWorker:
                         f"for req_id={req_id}"
                     )
                 continue
+            # Scheduler and worker monotonic clocks may belong to different
+            # hosts. Start the lease locally, without renewing duplicate sends.
+            expiration_time = time.perf_counter() + float(
+                dist_utils.get_p2p_wait_pull_timeout()
+            )
             try:
                 with TraceAnnotation(
                     "KV_Cache_Prefill_Register_Blocks",
@@ -4344,6 +4354,11 @@ class TPURaidenConnectorWorker:
                         f"for req_id={req_id}"
                     )
                 continue
+            # Scheduler and worker monotonic clocks may belong to different
+            # hosts. Start the lease locally, without renewing duplicate sends.
+            expiration_time = time.perf_counter() + float(
+                dist_utils.get_p2p_wait_pull_timeout()
+            )
             try:
                 facade.register_request_blocks(
                     req_id=req_id,
