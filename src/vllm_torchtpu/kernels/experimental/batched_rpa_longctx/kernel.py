@@ -342,32 +342,34 @@ def rpa_body(
     step = pl.program_id(0)
 
     # Step 1: Fetch metadata.
-    step_meta = fetch_step_metadata(
-        step,
-        schedule_ref,
-        cu_q_lens_ref,
-        q_offsets_ref,
-        kv_cache_lens_ref,
-        kv_new_lens_ref,
-        cfgs=cfgs,
-    )
+    with jax.named_scope("rpa_meta"):
+        step_meta = fetch_step_metadata(
+            step,
+            schedule_ref,
+            cu_q_lens_ref,
+            q_offsets_ref,
+            kv_cache_lens_ref,
+            kv_new_lens_ref,
+            cfgs=cfgs,
+        )
     # Step 2: Fetch inputs.
-    q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
-    q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
-    q_loaded = utils.strided_load(
-        q_ref,
-        0,
-        cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
-        1,
-        dtype=cfgs.serve.dtype_q,
-    )
-    q = q_loaded.reshape(
-        cfgs.batch_size,
-        cfgs.model.num_kv_heads,
-        cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
-        cfgs.aligned_q_head_dim,
-    )
-    q = q[..., : cfgs.compute_kv_head_dim]
+    with jax.named_scope("rpa_load_q"):
+        q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
+        q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
+        q_loaded = utils.strided_load(
+            q_ref,
+            0,
+            cfgs.batch_size * cfgs.model.num_kv_heads * cfgs.bq_sz * q_p,
+            1,
+            dtype=cfgs.serve.dtype_q,
+        )
+        q = q_loaded.reshape(
+            cfgs.batch_size,
+            cfgs.model.num_kv_heads,
+            cfgs.bq_sz * cfgs.aligned_num_q_heads_per_kv_head,
+            cfgs.aligned_q_head_dim,
+        )
+        q = q[..., : cfgs.compute_kv_head_dim]
 
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing
@@ -376,82 +378,84 @@ def rpa_body(
     k_b = []
     v_b = []
 
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        stitch_results = []
-        for b_idx in range(cfgs.batch_size):
-            res = stitch_utils.stitch_new_kv_lane(
-                kv_in_vref,
-                b_idx,
-                step_meta.bkv_sz_frm_cache[b_idx],
-                step_meta.new_kv_len_start[b_idx],
-                step_meta.bkv_sz_frm_new[b_idx],
-                cfgs=cfgs,
-            )
-            stitch_results.append(res)
-        for b_idx in range(cfgs.batch_size):
-            stitch_utils.store_new_kv_lane(
-                kv_in_vref,
-                b_idx,
-                stitch_results[b_idx],
-                cfgs=cfgs,
-            )
-        for b_idx in range(cfgs.batch_size):
-            ks = []
-            vs = []
-            for kv_head in range(cfgs.model.num_kv_heads):
-                k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
-                v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
-                target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
-                k_head_ref = k_slice.reshape(target_shape)
-                v_head_ref = v_slice.reshape(target_shape)
-                pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
-
-                # Load as uint32 to avoid dtype conversion during strided load
-                k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
-                v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
-
-                if cfgs.serve.dtype_kv == jnp.uint8:
-                    fp4 = jnp.float4_e2m1fn
-                    k_head = pltpu.bitcast(k_head_u32, fp4)[:, : cfgs.bkv_sz]
-                    v_head = pltpu.bitcast(v_head_u32, fp4)[:, : cfgs.bkv_sz]
-                    ks.append(k_head)
-                    vs.append(v_head)
-                else:
-                    k_head_loaded = pltpu.bitcast(k_head_u32, cfgs.serve.dtype_kv)
-                    v_head_loaded = pltpu.bitcast(v_head_u32, cfgs.serve.dtype_kv)
-                    k_head = k_head_loaded[:, : cfgs.bkv_sz]
-                    v_head = v_head_loaded[:, : cfgs.bkv_sz]
-                    ks.append(k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
-                    vs.append(v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
-            k_b.append(jnp.stack(ks, axis=0))
-            v_b.append(jnp.stack(vs, axis=0))
-    else:
-        for b_idx in range(cfgs.batch_size):
-            heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
-            ks = []
-            vs = []
-            for kv_head_start in range(0, cfgs.model.num_kv_heads, heads_per_load):
-                bkv_lst = strided_load_bkv(
+    with jax.named_scope("rpa_load_kv"):
+        if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            stitch_results = []
+            for b_idx in range(cfgs.batch_size):
+                res = stitch_utils.stitch_new_kv_lane(
                     kv_in_vref,
                     b_idx,
-                    kv_head_start * 2,
+                    step_meta.bkv_sz_frm_cache[b_idx],
+                    step_meta.new_kv_len_start[b_idx],
+                    step_meta.bkv_sz_frm_new[b_idx],
                     cfgs=cfgs,
                 )
-                ks.append(jnp.stack([k for k, _ in bkv_lst], axis=0))
-                vs.append(jnp.stack([v for _, v in bkv_lst], axis=0))
-            k, v = jnp.concat(ks, axis=0), jnp.concat(vs, axis=0)
-            k = k.reshape(-1, cfgs.bkv_sz, cfgs.aligned_kv_head_dim)
-            v = v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_kv_head_dim)
+                stitch_results.append(res)
+            for b_idx in range(cfgs.batch_size):
+                stitch_utils.store_new_kv_lane(
+                    kv_in_vref,
+                    b_idx,
+                    stitch_results[b_idx],
+                    cfgs=cfgs,
+                )
+            for b_idx in range(cfgs.batch_size):
+                ks = []
+                vs = []
+                for kv_head in range(cfgs.model.num_kv_heads):
+                    k_slice = kv_in_vref.at[b_idx, kv_head * 2].bitcast(jnp.uint32)
+                    v_slice = kv_in_vref.at[b_idx, kv_head * 2 + 1].bitcast(jnp.uint32)
+                    target_shape = (-1, cfgs.bkv_sz + 2 * cfgs.serve.page_size)
+                    k_head_ref = k_slice.reshape(target_shape)
+                    v_head_ref = v_slice.reshape(target_shape)
+                    pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
 
-            k = k[: cfgs.model.num_kv_heads]
-            v = v[: cfgs.model.num_kv_heads]
-            k_b.append(k)
-            v_b.append(v)
+                    # Load as uint32 to avoid dtype conversion during strided load
+                    k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
+                    v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+
+                    if cfgs.serve.dtype_kv == jnp.uint8:
+                        fp4 = jnp.float4_e2m1fn
+                        k_head = pltpu.bitcast(k_head_u32, fp4)[:, : cfgs.bkv_sz]
+                        v_head = pltpu.bitcast(v_head_u32, fp4)[:, : cfgs.bkv_sz]
+                        ks.append(k_head)
+                        vs.append(v_head)
+                    else:
+                        k_head_loaded = pltpu.bitcast(k_head_u32, cfgs.serve.dtype_kv)
+                        v_head_loaded = pltpu.bitcast(v_head_u32, cfgs.serve.dtype_kv)
+                        k_head = k_head_loaded[:, : cfgs.bkv_sz]
+                        v_head = v_head_loaded[:, : cfgs.bkv_sz]
+                        ks.append(k_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+                        vs.append(v_head.reshape(cfgs.aligned_kv_head_dim, cfgs.bkv_sz))
+                k_b.append(jnp.stack(ks, axis=0))
+                v_b.append(jnp.stack(vs, axis=0))
+        else:
+            for b_idx in range(cfgs.batch_size):
+                heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
+                ks = []
+                vs = []
+                for kv_head_start in range(0, cfgs.model.num_kv_heads, heads_per_load):
+                    bkv_lst = strided_load_bkv(
+                        kv_in_vref,
+                        b_idx,
+                        kv_head_start * 2,
+                        cfgs=cfgs,
+                    )
+                    ks.append(jnp.stack([k for k, _ in bkv_lst], axis=0))
+                    vs.append(jnp.stack([v for _, v in bkv_lst], axis=0))
+                k, v = jnp.concat(ks, axis=0), jnp.concat(vs, axis=0)
+                k = k.reshape(-1, cfgs.bkv_sz, cfgs.aligned_kv_head_dim)
+                v = v.reshape(-1, cfgs.bkv_sz, cfgs.aligned_kv_head_dim)
+
+                k = k[: cfgs.model.num_kv_heads]
+                v = v[: cfgs.model.num_kv_heads]
+                k_b.append(k)
+                v_b.append(v)
     # Stack to (batch, num_heads, bkv_sz, num_lanes)
     k = jnp.stack(k_b, axis=0)
     v = jnp.stack(v_b, axis=0)
 
-    k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
+    with jax.named_scope("rpa_scale"):
+        k, v, k_scale, v_scale = get_scale_factors(k, v, cfgs=cfgs)
 
     # Step 3: Perform compute.
     m_val = m_scratch_ref[...]
@@ -468,64 +472,67 @@ def rpa_body(
         q_start = bq_start * cfgs.aligned_num_q_heads_per_kv_head
         q_end = bq_end * cfgs.aligned_num_q_heads_per_kv_head
         q_slice = slice(q_start, q_end)
-        custom_mask = generate_mask(
-            shape=(
-                cfgs.batch_size,
-                cfgs.model.num_kv_heads,
-                q_end - q_start,
-                cfgs.bkv_sz,
-            ),
-            bq_start=bq_start,
-            step_meta=step_meta,
-            cfgs=cfgs,
-        )
-        p, alpha_list, m_next, l_next, m_carry = (
-            flash_attention.flash_attention_qk_softmax(
-                step,
-                q[:, :, q_slice],
-                k,
-                m_val[:, q_slice],
-                l_val[:, q_slice],
-                schedule_ref.is_last_k,
-                custom_mask=custom_mask,
-                cfgs=cfgs,
+        with jax.named_scope("rpa_qk_softmax"):
+            custom_mask = generate_mask(
+                shape=(
+                    cfgs.batch_size,
+                    cfgs.model.num_kv_heads,
+                    q_end - q_start,
+                    cfgs.bkv_sz,
+                ),
                 bq_start=bq_start,
-                k_scale=k_scale,
+                step_meta=step_meta,
+                cfgs=cfgs,
             )
-        )
+            p, alpha_list, m_next, l_next, m_carry = (
+                flash_attention.flash_attention_qk_softmax(
+                    step,
+                    q[:, :, q_slice],
+                    k,
+                    m_val[:, q_slice],
+                    l_val[:, q_slice],
+                    schedule_ref.is_last_k,
+                    custom_mask=custom_mask,
+                    cfgs=cfgs,
+                    bq_start=bq_start,
+                    k_scale=k_scale,
+                )
+            )
         m_scratch_ref[:, q_slice] = m_carry
         l_scratch_ref[:, q_slice] = l_next[-1]
         if cfgs.serve.return_lse:
             m_new_list.append(m_next)
         l_new_list.append(l_next)
 
-        if prev_p is not None:
-            o_next = flash_attention.flash_attention_pv(
-                prev_p,
-                v,
-                prev_alpha_list,
-                acc_val[:, prev_q_slice],
-                cfgs=cfgs,
-                v_scale=v_scale,
-            )
-            acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-            acc_new_list.append(o_next)
+        with jax.named_scope("rpa_pv"):
+            if prev_p is not None:
+                o_next = flash_attention.flash_attention_pv(
+                    prev_p,
+                    v,
+                    prev_alpha_list,
+                    acc_val[:, prev_q_slice],
+                    cfgs=cfgs,
+                    v_scale=v_scale,
+                )
+                acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+                acc_new_list.append(o_next)
 
         prev_p = p
         prev_alpha_list = alpha_list
         prev_q_slice = q_slice
 
     assert prev_p is not None
-    o_next = flash_attention.flash_attention_pv(
-        prev_p,
-        v,
-        prev_alpha_list,
-        acc_val[:, prev_q_slice],
-        cfgs=cfgs,
-        v_scale=v_scale,
-    )
-    acc_scratch_ref[:, prev_q_slice] = o_next[-1]
-    acc_new_list.append(o_next)
+    with jax.named_scope("rpa_pv_last"):
+        o_next = flash_attention.flash_attention_pv(
+            prev_p,
+            v,
+            prev_alpha_list,
+            acc_val[:, prev_q_slice],
+            cfgs=cfgs,
+            v_scale=v_scale,
+        )
+        acc_scratch_ref[:, prev_q_slice] = o_next[-1]
+        acc_new_list.append(o_next)
     if cfgs.serve.return_lse:
         m_next = jnp.concatenate(m_new_list, axis=2)
 
@@ -533,16 +540,17 @@ def rpa_body(
     acc_next = jnp.concatenate(acc_new_list, axis=2)
 
     # Step 4: Write back outputs.
-    calculate_and_store_out(
-        step,
-        schedule_ref,
-        acc_next,
-        l_next,
-        m_next,
-        o_vref,
-        lse_o_vref,
-        cfgs=cfgs,
-    )
+    with jax.named_scope("rpa_store_out"):
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            acc_next,
+            l_next,
+            m_next,
+            o_vref,
+            lse_o_vref,
+            cfgs=cfgs,
+        )
 
 
 # Define main kernel.
@@ -756,19 +764,20 @@ def rpa_kernel(
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
 
-            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+            with jax.named_scope("rpa_init"):
+                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
-            num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = (
-                final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
-            kv_ref_flat = (
-                final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            )
+                num_lanes = pltpu.get_tpu_info().num_lanes
+                q_ref_flat = (
+                    final_allocs[0].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+                )
+                kv_ref_flat = (
+                    final_allocs[1].window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+                )
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                ref[...] = jnp.zeros_like(ref)
+                # Explicitly zero out scratches and Q/KV buffers.
+                for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
+                    ref[...] = jnp.zeros_like(ref)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
@@ -776,27 +785,28 @@ def rpa_kernel(
                 aligned_start_step = (start_step // 128) * 128
                 prefix_steps = start_step - aligned_start_step
 
-                flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-                flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-                dma_list = []
-                for h, s in zip(flat_hbm, flat_smem):
-                    if jax.typeof(h).memory_space == pltpu.HBM:
-                        element_size = s.shape[0] // cfgs.max_steps_ub
-                        read_size = element_size * (num_steps + prefix_steps)
-                        read_size = utils.align_to(read_size, 1024)
-                        read_size = jnp.minimum(read_size, s.shape[0])
+                with jax.named_scope("rpa_sched_dma"):
+                    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
+                    flat_smem = jax.tree_util.tree_leaves(schedule_ref)
+                    dma_list = []
+                    for h, s in zip(flat_hbm, flat_smem):
+                        if jax.typeof(h).memory_space == pltpu.HBM:
+                            element_size = s.shape[0] // cfgs.max_steps_ub
+                            read_size = element_size * (num_steps + prefix_steps)
+                            read_size = utils.align_to(read_size, 1024)
+                            read_size = jnp.minimum(read_size, s.shape[0])
 
-                        src_off = element_size * aligned_start_step
-                        src_off = pl.multiple_of(src_off, 128)
+                            src_off = element_size * aligned_start_step
+                            src_off = pl.multiple_of(src_off, 128)
 
-                        copy = pltpu.make_async_copy(
-                            h.at[pl.ds(src_off, read_size)],
-                            s.at[pl.ds(0, read_size)],
-                            dma_sem.at[0],
-                        )
-                        copy.start()
-                        dma_list.append(copy)
-                jax.tree.map(lambda x: x.wait(), dma_list)
+                            copy = pltpu.make_async_copy(
+                                h.at[pl.ds(src_off, read_size)],
+                                s.at[pl.ds(0, read_size)],
+                                dma_sem.at[0],
+                            )
+                            copy.start()
+                            dma_list.append(copy)
+                    jax.tree.map(lambda x: x.wait(), dma_list)
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(
