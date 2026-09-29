@@ -378,6 +378,268 @@ def tables_blocks_per_step_for(tokens_per_shard, top_k, num_shards, config):
     return max(c for c in counts if padded[c] == least)
 
 
+def _route_stage(
+    logits,
+    routing_indices,
+    routing_weights,
+    *,
+    real_tokens,
+    message_tokens,
+    message_rows,
+    pairs_per_shard,
+    top_k,
+    renormalize,
+    drop_nan_rows,
+    num_experts,
+):
+    """Select: (weights [message_tokens, top_k] f32, the routing message's
+    index half), from the router logits or the caller's routing. Padding
+    tokens carry no finite logit and route nowhere."""
+    if routing_indices is not None:
+        return _routing_from_caller(
+            routing_indices,
+            routing_weights,
+            num_experts=num_experts,
+            message_tokens=message_tokens,
+            message_rows=message_rows,
+            pair_rows=pairs_per_shard // LANES,
+        )
+    if message_tokens > real_tokens:
+        logits = jnp.pad(
+            logits,
+            ((0, message_tokens - real_tokens), (0, 0)),
+            constant_values=jnp.nan,
+        )
+    return _select(
+        logits,
+        top_k=top_k,
+        tokens_per_shard=message_tokens,
+        renormalize=renormalize,
+        drop_nan_rows=drop_nan_rows,
+        message_rows=message_rows,
+        pair_rows=pairs_per_shard // LANES,
+    )
+
+
+def _tables_stage(
+    routing_messages,
+    transport_refs,
+    *,
+    num_experts,
+    num_shards,
+    pairs_per_shard,
+    routed_rows_per_shard,
+    routing_block,
+    axis,
+    n_scales,
+    blocks_per_step,
+    config,
+    shard_index,
+    side_effects,
+):
+    """Routing tables: every shard table from the gathered routing messages,
+    with the transport's middle rounds hosted on the last grid step."""
+    scale_words = scale_table_rows(routed_rows_per_shard) * LANES
+    return tables_kernel.shard_tables_kernel(
+        routing_messages,
+        num_experts=num_experts,
+        num_shards=num_shards,
+        pairs_per_shard=pairs_per_shard,
+        routed_rows_per_shard=routed_rows_per_shard,
+        block=routing_block,
+        row_block=ROW_BLOCK,
+        slot_field=tables.alignment_slot_field(num_shards),
+        axis=axis,
+        transport_refs=transport_refs,
+        # The token table in whole LANES-row blocks: the FFN kernel reads it
+        # a block-aligned window at a time.
+        zero_tables=(align_up(routed_rows_per_shard, LANES), n_scales * scale_words),
+        blocks_per_step=blocks_per_step,
+        zero_words_per_step=config.tables_zero_words,
+        shard_index=shard_index,
+        side_effects=side_effects,
+    )
+
+
+def _scatter_stage(
+    routed_row,
+    routing_messages,
+    token_table,
+    scale_table,
+    *,
+    top_k,
+    tokens_per_shard,
+    message_tokens,
+    pairs_per_shard,
+    routed_rows_per_shard,
+    n_scales,
+    config,
+):
+    """Row tables: the token and activation scale of every routed row,
+    scattered on the SparseCores. Returns (token_of_row, token_scales
+    [n_scales, scale rows, LANES])."""
+    token_of_row, token_scales = row_tables_kernel.scatter_row_tables(
+        routed_row,
+        routing_messages.reshape(-1),
+        token_table,
+        scale_table,
+        top_k=top_k,
+        tokens_per_shard=tokens_per_shard,
+        message_words=routing_messages.shape[1] * routing_messages.shape[2],
+        scale_offset=(
+            transport.scale_row_offset(pairs_per_shard) * transport.MESSAGE_LANES
+        ),
+        n_scales=n_scales,
+        plane_words=transport.quant_tiles(tokens_per_shard) * LANES,
+        pairs_per_shard=pairs_per_shard,
+        message_tokens=message_tokens,
+        chunk_max=config.scatter_chunk_pairs,
+        ring=config.scatter_ring,
+    )
+    scale_rows = scale_table_rows(routed_rows_per_shard)
+    return token_of_row, token_scales.reshape(n_scales, scale_rows, LANES)
+
+
+def _sort_stage(
+    gathered_rows,
+    send_sem,
+    receive_sems,
+    token_of_row,
+    ffn_tables,
+    expert_rows,
+    expert_base,
+    *,
+    num_shards,
+    mesh_axes,
+    config,
+    shard_index,
+    side_effects,
+):
+    """Sorted rows: the routed rows gathered into expert order on the
+    SparseCores, so the FFN kernel fetches each tile as one copy.
+
+    The landing has to be complete before the gather reads the buffer, so the
+    exchange's finish runs here as its own program instead of in the kernel:
+    it reads the landing buffer where the arrivals land (without the
+    memory-space constraint the compiler prefetches a copy into its alternate
+    memory for the call, taken before the arrivals have landed), after the
+    scatter's wait (by then the arrivals have landed), and returns a
+    completion word the gather's index and rows depend on.
+    """
+    n_sorted = align_up(
+        token_of_row.shape[0], gather.gather_rows_multiple(config.gather_block_rows)
+    )
+    index = jnp.pad(
+        token_of_row.astype(jnp.int32), (0, n_sorted - token_of_row.shape[0])
+    )
+    landing = pltpu.with_memory_space_constraint(gathered_rows, pltpu.MemorySpace.HBM)
+    done = transport.finish_call(
+        landing,
+        send_sem,
+        receive_sems,
+        index[:LANES],
+        num_shards=num_shards,
+        mesh_axes=mesh_axes,
+        rows_per_shard=gathered_rows.shape[0] // num_shards,
+        shard_index=shard_index,
+        side_effects=side_effects,
+    )
+    landed, done = lax.optimization_barrier((gathered_rows, done))
+    index = jnp.where(done[0, 0] > 0, index, 0)
+    # A padding row (the tail of an (expert, shard) run, the tail slack, the
+    # alignment) carries token zero in the table; thousands of reads of one
+    # row serialize in the sparse cores, so every such row reads a row of its
+    # own. The live rows are the first push_rows of each run, the run
+    # starting run_start blocks into its expert's rows, which start at
+    # expert_base: +1 at each run's start, -1 at its end, summed along the
+    # rows, a row is live where the running sum is positive.
+    run_start, push_rows = ffn_tables[0], ffn_tables[5]
+    starts = (
+        expert_base.astype(jnp.int32)[:, None] + run_start.astype(jnp.int32) * ROW_BLOCK
+    ).reshape(-1)
+    ends = starts + push_rows.reshape(-1).astype(jnp.int32)
+    edges = (
+        jnp.zeros((n_sorted + 1,), jnp.int32)
+        .at[jnp.minimum(starts, n_sorted)]
+        .add(1)
+        .at[jnp.minimum(ends, n_sorted)]
+        .add(-1)
+    )
+    live = jnp.cumsum(edges)[:n_sorted] > 0
+    row = jnp.arange(n_sorted, dtype=jnp.int32)
+    index = jnp.where(live, index, row % gathered_rows.shape[0])
+    # The table is sized to its bound (every shard's pairs); the FFN kernel
+    # reads only the used prefix, so only that is sorted.
+    used = jnp.max(expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32))
+    return gather.gather_rows_prefix(
+        landed,
+        index,
+        gather.prefix_run(used, n_sorted, config.gather_block_rows),
+        block_rows=config.gather_block_rows,
+        ring=gather.ring_for(
+            landed.shape[1],
+            jnp.dtype(landed.dtype).itemsize,
+            ring=config.gather_ring,
+            block_rows=config.gather_block_rows,
+        ),
+    )
+
+
+def _combine_stage(
+    arrivals,
+    arrival_scales,
+    arrival_rows_own,
+    weights,
+    dtype,
+    *,
+    top_k,
+    message_tokens,
+    arrival_rows,
+    hidden,
+    combine_dtype,
+    config,
+):
+    """Combine: each token's arrival rows gathered on the SparseCores and
+    summed by its routing weights on the TensorCore."""
+    # The gather's index: the arrival row of every (token, slot) pair the
+    # combine sums, token-major (the tables hold it slot-major), in whole
+    # gather blocks. A pair that routes nowhere (a padding token, a dropped
+    # row, a padding pair) has weight zero and would take arrival row zero
+    # from the tables; thousands of reads of one row serialize in the
+    # sparse cores, so every such pair reads a row of its own instead.
+    n_pairs = top_k * message_tokens
+    n_gather = align_up(n_pairs, gather.gather_rows_multiple(config.gather_block_rows))
+    pair_index = (
+        arrival_rows_own.reshape(-1)[:n_pairs]
+        .reshape(top_k, message_tokens)
+        .T.reshape(-1)
+    )
+    pair_index = jnp.pad(pair_index, (0, n_gather - n_pairs))
+    live = weights.reshape(-1) > 0
+    live = jnp.pad(live, (0, n_gather - live.shape[0]))
+    pair_index = jnp.where(
+        live, pair_index, jnp.arange(n_gather, dtype=jnp.int32) % arrival_rows
+    )
+    return combine_lib.combine(
+        arrivals,
+        arrival_scales,
+        pair_index,
+        weights,
+        dtype,
+        hidden=hidden,
+        block_rows=config.gather_block_rows,
+        ring=gather.ring_for(
+            arrivals.shape[1],
+            jnp.dtype(arrivals.dtype).itemsize,
+            ring=config.gather_ring,
+            block_rows=config.gather_block_rows,
+        ),
+        tokens_per_tile=config.combine_tokens_per_tile,
+        unroll=config.combine_unroll,
+        dtype=combine_dtype,
+    )
+
+
 def _pallas_step(
     x,
     logits,
@@ -406,7 +668,6 @@ def _pallas_step(
     w1_cols,
     arrival_rows,
     blocks_per_step,
-    activation_block,
     token_block,
     result_rows,
     elementwise,
@@ -418,10 +679,10 @@ def _pallas_step(
     side_effects,
     shard_index=None,
 ):
-    """One shard of the pallas mode. `config` supplies the programs'
-    geometry (the gather, scatter and combine settings); `token_block` is
-    the token rows' rounding block (their scale planes), `activation_block`
-    the intermediate's."""
+    """One shard of the layer: select -> transport start -> routing tables
+    -> row tables -> (sorted rows) -> FFN -> combine. `config` supplies the
+    programs' geometry (the gather, scatter and combine settings);
+    `token_block` is the token rows' rounding block (their scale planes)."""
     real_tokens = tokens_per_shard
     n_scales = transport.scale_planes(hidden, token_block)
     tokens_per_shard, message_tokens, pairs_per_shard = pallas_geometry(
@@ -438,67 +699,30 @@ def _pallas_step(
     # the real tokens are sliced off.
     if tokens_per_shard > real_tokens:
         x = jnp.pad(x, ((0, tokens_per_shard - real_tokens), (0, 0)))
-    rows_bf16 = x.astype(jnp.bfloat16)
     message_rows = transport.message_rows(tokens_per_shard, pairs_per_shard, n_scales)
-    if routing_indices is not None:
-        weights, routing_message = _routing_from_caller(
-            routing_indices,
-            routing_weights,
-            num_experts=num_experts,
-            message_tokens=message_tokens,
-            message_rows=message_rows,
-            pair_rows=pairs_per_shard // LANES,
-        )
-    else:
-        if message_tokens > real_tokens:
-            logits = jnp.pad(
-                logits,
-                ((0, message_tokens - real_tokens), (0, 0)),
-                constant_values=jnp.nan,
-            )
-        weights, routing_message = _select(
-            logits,
-            top_k=top_k,
-            tokens_per_shard=message_tokens,
-            renormalize=renormalize,
-            drop_nan_rows=drop_nan_rows,
-            message_rows=message_rows,
-            pair_rows=pairs_per_shard // LANES,
-        )
-    (gathered_rows, send_sem, receive_sems, routing_messages) = (
-        transport.start_transport(
-            rows_bf16,
-            routing_message,
-            scale_base=transport.scale_row_offset(pairs_per_shard),
-            num_shards=num_shards,
-            mesh_axes=mesh_axes,
-            token_dtype=token_dtype,
-            scale_dtype=row_scale_dtype,
-            activation_block=token_block,
-            elementwise=elementwise,
-            shard_index=shard_index,
-            side_effects=side_effects,
-        )
-    )
-    scale_rows = scale_table_rows(routed_rows_per_shard)
-    scale_words = scale_rows * LANES
-    plane_words = transport.quant_tiles(tokens_per_shard) * LANES
-    shard_tables = tables_kernel.shard_tables_kernel(
-        routing_messages,
-        num_experts=num_experts,
-        num_shards=num_shards,
+    weights, routing_message = _route_stage(
+        logits,
+        routing_indices,
+        routing_weights,
+        real_tokens=real_tokens,
+        message_tokens=message_tokens,
+        message_rows=message_rows,
         pairs_per_shard=pairs_per_shard,
-        routed_rows_per_shard=routed_rows_per_shard,
-        block=routing_block,
-        row_block=ROW_BLOCK,
-        slot_field=tables.alignment_slot_field(num_shards),
-        axis=axis,
-        transport_refs=(gathered_rows, send_sem, receive_sems),
-        # The token table in whole LANES-row blocks: the FFN kernel reads it
-        # a block-aligned window at a time.
-        zero_tables=(align_up(routed_rows_per_shard, LANES), n_scales * scale_words),
-        blocks_per_step=blocks_per_step,
-        zero_words_per_step=config.tables_zero_words,
+        top_k=top_k,
+        renormalize=renormalize,
+        drop_nan_rows=drop_nan_rows,
+        num_experts=num_experts,
+    )
+    gathered_rows, send_sem, receive_sems, routing_messages = transport.start_transport(
+        x.astype(jnp.bfloat16),
+        routing_message,
+        scale_base=transport.scale_row_offset(pairs_per_shard),
+        num_shards=num_shards,
+        mesh_axes=mesh_axes,
+        token_dtype=token_dtype,
+        scale_dtype=row_scale_dtype,
+        activation_block=token_block,
+        elementwise=elementwise,
         shard_index=shard_index,
         side_effects=side_effects,
     )
@@ -514,103 +738,56 @@ def _pallas_step(
         gathered_rows,
         token_table,
         scale_table,
-    ) = shard_tables
-    token_of_row, token_scales = row_tables_kernel.scatter_row_tables(
+    ) = _tables_stage(
+        routing_messages,
+        (gathered_rows, send_sem, receive_sems),
+        num_experts=num_experts,
+        num_shards=num_shards,
+        pairs_per_shard=pairs_per_shard,
+        routed_rows_per_shard=routed_rows_per_shard,
+        routing_block=routing_block,
+        axis=axis,
+        n_scales=n_scales,
+        blocks_per_step=blocks_per_step,
+        config=config,
+        shard_index=shard_index,
+        side_effects=side_effects,
+    )
+    token_of_row, token_scales = _scatter_stage(
         routed_row,
-        routing_messages.reshape(-1),
+        routing_messages,
         token_table,
         scale_table,
         top_k=top_k,
         tokens_per_shard=tokens_per_shard,
-        message_words=routing_messages.shape[1] * routing_messages.shape[2],
-        scale_offset=(
-            transport.scale_row_offset(pairs_per_shard) * transport.MESSAGE_LANES
-        ),
-        n_scales=n_scales,
-        plane_words=plane_words,
-        pairs_per_shard=pairs_per_shard,
         message_tokens=message_tokens,
-        chunk_max=config.scatter_chunk_pairs,
-        ring=config.scatter_ring,
+        pairs_per_shard=pairs_per_shard,
+        routed_rows_per_shard=routed_rows_per_shard,
+        n_scales=n_scales,
+        config=config,
     )
-    token_scales = token_scales.reshape(n_scales, scale_rows, LANES)
     w1_bias, w2_bias = _shard_biases(
         w1_bias, w2_bias, experts_per_shard, w1_cols, hidden
     )
     if sorted_rows:
-        # The routed rows sorted into expert order on the sparse cores, so
-        # the FFN kernel fetches each tile as one copy. The landing has to
-        # be complete before the gather reads the buffer, so the exchange's
-        # finish runs here as its own program instead of in the kernel: it
-        # reads the landing buffer where the arrivals land (without the
-        # memory-space constraint the compiler prefetches a copy into its
-        # alternate memory for the call, taken before the arrivals have
-        # landed), after the scatter's wait (by then the arrivals have
-        # landed), and returns a completion word the gather's index and
-        # rows depend on.
-        n_sorted = align_up(
-            token_of_row.shape[0], gather.gather_rows_multiple(config.gather_block_rows)
-        )
-        index = jnp.pad(
-            token_of_row.astype(jnp.int32), (0, n_sorted - token_of_row.shape[0])
-        )
-        landing = pltpu.with_memory_space_constraint(
-            gathered_rows, pltpu.MemorySpace.HBM
-        )
-        done = transport.finish_call(
-            landing,
+        rows_in = _sort_stage(
+            gathered_rows,
             send_sem,
             receive_sems,
-            index[:LANES],
+            token_of_row,
+            ffn_tables,
+            expert_rows,
+            expert_base,
             num_shards=num_shards,
             mesh_axes=mesh_axes,
-            rows_per_shard=gathered_rows.shape[0] // num_shards,
+            config=config,
             shard_index=shard_index,
             side_effects=side_effects,
         )
-        landed, done = lax.optimization_barrier((gathered_rows, done))
-        index = jnp.where(done[0, 0] > 0, index, 0)
-        # A padding row (the tail of an (expert, shard) run, the tail slack,
-        # the alignment) carries token zero in the table; thousands of
-        # reads of one row serialize in the sparse cores, so every such row
-        # reads a row of its own. The
-        # live rows are the first push_rows of each run, the run starting
-        # run_start blocks into its expert's rows, which start at
-        # expert_base: +1 at each run's start, -1 at its end, summed along
-        # the rows, a row is live where the running sum is positive.
-        run_start, push_rows = ffn_tables[0], ffn_tables[5]
-        starts = (
-            expert_base.astype(jnp.int32)[:, None]
-            + run_start.astype(jnp.int32) * ROW_BLOCK
-        ).reshape(-1)
-        ends = starts + push_rows.reshape(-1).astype(jnp.int32)
-        edges = (
-            jnp.zeros((n_sorted + 1,), jnp.int32)
-            .at[jnp.minimum(starts, n_sorted)]
-            .add(1)
-            .at[jnp.minimum(ends, n_sorted)]
-            .add(-1)
-        )
-        live = jnp.cumsum(edges)[:n_sorted] > 0
-        row = jnp.arange(n_sorted, dtype=jnp.int32)
-        index = jnp.where(live, index, row % gathered_rows.shape[0])
-        # The table is sized to its bound (every shard's pairs); the FFN
-        # kernel reads only the used prefix, so only that is sorted.
-        used = jnp.max(expert_base.astype(jnp.int32) + expert_rows.astype(jnp.int32))
-        rows_in = gather.gather_rows_prefix(
-            landed,
-            index,
-            gather.prefix_run(used, n_sorted, config.gather_block_rows),
-            block_rows=config.gather_block_rows,
-            ring=gather.ring_for(
-                landed.shape[1],
-                jnp.dtype(landed.dtype).itemsize,
-                ring=config.gather_ring,
-                block_rows=config.gather_block_rows,
-            ),
-        )
         kernel_sems = None
     else:
+        # The FFN kernel takes the landing buffer itself and finishes the
+        # exchange in its prologue.
         rows_in, kernel_sems = gathered_rows, (send_sem, receive_sems)
     arrivals, arrival_scales = run_kernel(
         ffn_tables,
@@ -631,44 +808,18 @@ def _pallas_step(
         transport_sems=kernel_sems,
         shard_index=shard_index,
     )
-    if result_rows == "bf16":
-        arrival_scales = None
-    # The gather's index: the arrival row of every (token, slot) pair the
-    # combine sums, token-major (the tables hold it slot-major), in whole
-    # gather blocks. A pair that routes nowhere (a padding token, a dropped
-    # row, a padding pair) has weight zero and would take arrival row zero
-    # from the tables; thousands of reads of one row serialize in the
-    # sparse cores, so every such pair reads a row of its own instead.
-    n_pairs = top_k * message_tokens
-    n_gather = align_up(n_pairs, gather.gather_rows_multiple(config.gather_block_rows))
-    pair_index = (
-        arrival_rows_own.reshape(-1)[:n_pairs]
-        .reshape(top_k, message_tokens)
-        .T.reshape(-1)
-    )
-    pair_index = jnp.pad(pair_index, (0, n_gather - n_pairs))
-    live = weights.reshape(-1) > 0
-    live = jnp.pad(live, (0, n_gather - live.shape[0]))
-    pair_index = jnp.where(
-        live, pair_index, jnp.arange(n_gather, dtype=jnp.int32) % arrival_rows
-    )
-    out = combine_lib.combine(
+    out = _combine_stage(
         arrivals,
-        arrival_scales,
-        pair_index,
+        None if result_rows == "bf16" else arrival_scales,
+        arrival_rows_own,
         weights,
         x.dtype,
+        top_k=top_k,
+        message_tokens=message_tokens,
+        arrival_rows=arrival_rows,
         hidden=hidden,
-        block_rows=config.gather_block_rows,
-        ring=gather.ring_for(
-            arrivals.shape[1],
-            jnp.dtype(arrivals.dtype).itemsize,
-            ring=config.gather_ring,
-            block_rows=config.gather_block_rows,
-        ),
-        tokens_per_tile=config.combine_tokens_per_tile,
-        unroll=config.combine_unroll,
-        dtype=combine_dtype,
+        combine_dtype=combine_dtype,
+        config=config,
     )
     return out[:real_tokens]
 
@@ -1074,7 +1225,6 @@ def fused_ep_moe(
         w1_cols=w1_cols,
         arrival_rows=arrival_rows,
         blocks_per_step=blocks_per_step,
-        activation_block=activation_block,
         token_block=token_block,
         result_rows=config.result_rows,
         elementwise=config.elementwise,
