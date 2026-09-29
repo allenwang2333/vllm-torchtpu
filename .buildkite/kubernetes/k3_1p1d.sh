@@ -48,35 +48,7 @@ if [[ "$head" == "0" ]]; then
   # Set before Ray starts on every host: the engine's workers are Ray actors on
   # all four, and they inherit the raylet's environment, not the head's.
   export VLLM_HOST_IP="${POD_IP}"
-  export TPU_KV_RESHARD_TRANSPORT=raiden
-  export TPU_RAIDEN_RESHARD_IMPL=store
-  export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1
-  export TPU_RAIDEN_KIMIK3_ADMISSION=1
-  export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
-  export TPU_RAIDEN_TRANSFER_PARALLELISM=8
-  export TPU_KV_TRANSFER_PORT=9100
-  export TPU_SIDE_CHANNEL_PORT=9600
-  export TPU_KV_SHM_POOL_GB=8
-  export TPU_P2P_WAIT_PULL_TIMEOUT=600
-  export TPU_PREMAPPED_BUFFER_SIZE=17179869184
   export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-14400}"
-  # Identity and ports, which must differ so the two engines do not collide.
-  case "$role" in
-    prefill)
-      export TPU_KV_TRANSFER_NAMESPACE=k3_prefill
-      export TPU_RAIDEN_ENGINE_ID=k3-prefill-engine
-      export TPU_RAIDEN_JOB_NAME=prefill
-      export TPU_RAIDEN_RESHARD_PORT_BASE=27000
-      export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100
-      ;;
-    decode)
-      export TPU_KV_TRANSFER_NAMESPACE=k3_decode
-      export TPU_RAIDEN_ENGINE_ID=k3-decode-engine
-      export TPU_RAIDEN_JOB_NAME=decode
-      export TPU_RAIDEN_RESHARD_PORT_BASE=28000
-      export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100
-      ;;
-  esac
   exec bash "$HERE/multihost_entry.sh" bash "$HERE/k3_1p1d.sh" --head "$role"
 fi
 
@@ -90,8 +62,7 @@ kv_role=kv_producer
 kv_config="{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"${kv_role}\",\"kv_port\":14579}"
 
 serve() {
-  EXTRA_SERVE_ARGS="--kv-transfer-config ${kv_config}" \
-    bash scripts/vllm/benchmarking/run_benchmarks.sh \
+  bash scripts/vllm/benchmarking/run_benchmarks.sh \
     --config kimi-k3-tp32-ep --serve-only --port "$PORT" --results-dir "$run_dir"
 }
 
