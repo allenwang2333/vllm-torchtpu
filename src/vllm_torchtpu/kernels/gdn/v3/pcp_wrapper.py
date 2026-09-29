@@ -39,7 +39,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref, pcp_metadata, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    config,
+    legacy_unified,
+    memory_ref,
+    pcp_metadata,
+    wrapper,
+)
 from vllm_torchtpu.kernels.gdn.v3.projection_scale import normalize_projection_scale
 
 
@@ -128,11 +134,9 @@ def _all_rank_barrier(
 def _compute_gdn_tile(
     b_slot_ref: jax.Ref,
     a_slot_ref: jax.Ref,
-    conv_state_in_slot_ref: jax.Ref,
-    recurrent_in_slot_ref: jax.Ref,
+    conv_state_slot_ref: jax.Ref,
+    recurrent_slot_ref: jax.Ref,
     out_slot_ref: jax.Ref,
-    conv_state_out_slot_ref: jax.Ref,
-    recurrent_out_slot_ref: jax.Ref,
     metadata_ref: memory_ref.MetadataRef,
     stage_metadata_ref: pcp_metadata.PcpStageMetadata,
     weights_ref: memory_ref.WeightRefs,
@@ -198,11 +202,9 @@ def _compute_gdn_tile(
         compute_qkv_ref,
         b_slot_ref,
         a_slot_ref,
-        conv_state_in_slot_ref,
-        recurrent_in_slot_ref,
+        conv_state_slot_ref,
+        recurrent_slot_ref,
         out_slot_ref,
-        conv_state_out_slot_ref,
-        recurrent_out_slot_ref,
         metadata_ref,
         weights_ref,
         carry_conv_scratch_ref,
@@ -795,26 +797,19 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             unroll=False,
         )
 
-    (
-        _,
-        b_alloc,
-        a_alloc,
-        conv_in_alloc,
-        recurrent_in_alloc,
-        out_alloc,
-        conv_out_alloc,
-        recurrent_out_alloc,
-    ) = memory_ref.create_allocs(
-        metadata_ref=metadata_ref,
-        qkv_ref=compute_qkv_ref,
-        b_ref=b_ref,
-        a_ref=a_ref,
-        out_ref=gdn_out_ref,
-        conv_state_ref=state_source_ref,
-        recurrent_state_ref=state_source_ref,
-        cfg=cfg,
-        conv_state_output_ref=conv_state_updates_ref,
-        recurrent_state_output_ref=recurrent_state_updates_ref,
+    _, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
+        memory_ref.create_allocs(
+            metadata_ref=metadata_ref,
+            qkv_ref=compute_qkv_ref,
+            b_ref=b_ref,
+            a_ref=a_ref,
+            out_ref=gdn_out_ref,
+            conv_state_ref=state_source_ref,
+            recurrent_state_ref=state_source_ref,
+            cfg=cfg,
+            conv_state_output_ref=conv_state_updates_ref,
+            recurrent_state_output_ref=recurrent_state_updates_ref,
+        )
     )
 
     num_tiles = metadata_ref.num_tiles[...]
@@ -894,11 +889,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     def _compute_gdn_tile_and_exchange_output(
         b_slot_ref,
         a_slot_ref,
-        conv_state_in_slot_ref,
-        recurrent_in_slot_ref,
+        conv_state_slot_ref,
+        recurrent_slot_ref,
         out_slot_ref,
-        conv_state_out_slot_ref,
-        recurrent_out_slot_ref,
         metadata_ref,
         stage_metadata_ref,
         weights_ref,
@@ -958,11 +951,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         _compute_gdn_tile(
             b_slot_ref,
             a_slot_ref,
-            conv_state_in_slot_ref,
-            recurrent_in_slot_ref,
+            conv_state_slot_ref,
+            recurrent_slot_ref,
             out_slot_ref,
-            conv_state_out_slot_ref,
-            recurrent_out_slot_ref,
             metadata_ref,
             stage_metadata_ref,
             weights_ref,
@@ -1023,14 +1014,10 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         in_specs=(
             b_alloc.spec,
             a_alloc.spec,
-            conv_in_alloc.spec,
-            recurrent_in_alloc.spec,
+            conv_alloc.spec,
+            recurrent_alloc.spec,
         ),
-        out_specs=(
-            out_alloc.spec,
-            conv_out_alloc.spec,
-            recurrent_out_alloc.spec,
-        ),
+        out_specs=(out_alloc.spec,),
     )
 
     def _stage_prologue() -> None:
@@ -1069,11 +1056,9 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         allocations=(
             b_alloc,
             a_alloc,
-            conv_in_alloc,
-            recurrent_in_alloc,
+            conv_alloc,
+            recurrent_alloc,
             out_alloc,
-            conv_out_alloc,
-            recurrent_out_alloc,
         ),
     )
     def _run(
@@ -1102,8 +1087,6 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             state_source_ref,
             state_source_ref,
             gdn_out_ref,
-            state_source_ref,
-            state_source_ref,
             scratches=(
                 metadata_ref,
                 stage_metadata_ref,
@@ -1207,7 +1190,7 @@ def _scatter_compact_state_updates(
     num_active_seqs: jax.Array,
     *,
     state_stride: int,
-    region: config.StateRegion,
+    region: legacy_unified.StateRegion,
     whole_block_dma: bool,
 ) -> jax.Array:
     """Apply raw per-sequence state tiles to a donated unified pool.
@@ -1251,7 +1234,7 @@ def _scatter_compact_state_updates(
 def _compact_state_updates_shape(
     state_source: jax.Array,
     num_sequences: int,
-    region: config.StateRegion,
+    region: legacy_unified.StateRegion,
     *,
     whole_block_dma: bool,
 ) -> jax.ShapeDtypeStruct:
@@ -1259,8 +1242,7 @@ def _compact_state_updates_shape(
 
     NHD can address a token-row subregion directly. HND stores tokens on the
     minormost lane, so the V3 state seam copies complete source pages and keeps
-    all of their inner dimensions, matching ``ExternalStateInBufferedRef`` and
-    ``ExternalStateOutBufferedRef``.
+    all of their inner dimensions, matching ``ExternalStateBufferedRef``.
     """
     if whole_block_dma:
         region_shape = (region.nblocks, *state_source.shape[1:])
@@ -1269,7 +1251,9 @@ def _compact_state_updates_shape(
     return jax.ShapeDtypeStruct((num_sequences, *region_shape), state_source.dtype)
 
 
-def _validate_compact_state_writeback_plan(state_plan: config.StateSourcePlan) -> None:
+def _validate_compact_state_writeback_plan(
+    state_plan: legacy_unified.StateSourcePlan,
+) -> None:
     """Reject whole-page state plans that cannot be scattered independently.
 
     The PCP kernel emits separate compact Conv and recurrent updates. With HND
@@ -1343,7 +1327,7 @@ def fused_qkvz_projection_pcp_gdn(
     comm_chunk_size: int,
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
-    state_plan: config.StateSourcePlan,
+    state_plan: legacy_unified.StateSourcePlan,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
