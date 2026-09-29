@@ -28,6 +28,7 @@ from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
@@ -856,6 +857,55 @@ class VllmTPUMLAAttention(MLAAttention):
 VllmMLAAttention = VllmTPUMLAAttention
 
 
+# Prefill q/k RoPE fast path for plain GPT-J (interleaved) RoPE over the whole
+# rope head (GLM-5.2: qk_rope_head_dim 64). Bit-identical to
+# `RotaryEmbedding.forward_static` but lowers without the strided `x[..., ::2]`
+# views of q_pe, which XLA materializes over the whole q_b output.
+#   o[2i]   = x[2i]*cos_i - x[2i+1]*sin_i
+#   o[2i+1] = x[2i+1]*cos_i + x[2i]*sin_i
+# is computed as x*C + swap_pairs(x)*S with C = (cos_i, cos_i) and
+# S = (-sin_i, sin_i): `a + (-b)` rounds exactly like `a - b` and
+# `x * (-s) == -(x * s)`, so every element sees the same two bf16 products
+# and one bf16 add as the reference.
+
+
+def gptj_rope_fast_eligible(rotary_emb, q_pe: torch.Tensor, k_pe: torch.Tensor) -> bool:
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    return (
+        type(rotary_emb) is RotaryEmbedding
+        and not rotary_emb.is_neox_style
+        and rotary_emb.rotary_dim == rotary_emb.head_size == q_pe.shape[-1]
+        and k_pe.shape[-1] == q_pe.shape[-1]
+        and q_pe.shape[-1] % 2 == 0
+        and cache is not None
+        and cache.dtype == q_pe.dtype == k_pe.dtype
+    )
+
+
+def _swap_pairs(x: torch.Tensor) -> torch.Tensor:
+    """(x0, x1, x2, x3, ...) -> (x1, x0, x3, x2, ...).
+
+    Two lane rolls and a select; measured cheaper on TPU than the equivalent
+    unflatten/flip or a permutation matmul.
+    """
+    even = torch.arange(x.shape[-1], device=x.device) % 2 == 0
+    return torch.where(even, torch.roll(x, -1, -1), torch.roll(x, 1, -1))
+
+
+def gptj_rope_fast(
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,  # [T, H, D]
+    k_pe: torch.Tensor,  # [T, 1, D]
+    cos_sin_cache: torch.Tensor,  # [max_pos, D] = cos | sin
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos, sin = cos_sin_cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
+    c = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+    s = torch.stack((-sin, sin), dim=-1).flatten(-2).unsqueeze(-2)
+    q_pe = q_pe * c + _swap_pairs(q_pe) * s
+    k_pe = k_pe * c + _swap_pairs(k_pe) * s
+    return q_pe, k_pe
+
+
 @MultiHeadLatentAttentionWrapper.register_oot
 class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     def __init__(
@@ -1023,7 +1073,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if gptj_rope_fast_eligible(self.rotary_emb, q_pe, k_pe):
+                q_pe, k_pe = gptj_rope_fast(
+                    positions,
+                    q_pe,
+                    k_pe,
+                    self.rotary_emb.cos_sin_cache,
+                )
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             # RoPE caches/frequencies can be fp32 and promote the rotated
             # tensors.  Dense MLA requires new KV values to exactly match the
             # cache dtype, and queries should remain in the activation dtype.
