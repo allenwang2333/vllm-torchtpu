@@ -542,9 +542,6 @@ def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
         128,
         256,
         512,
-        1024,
-        2048,
-        4096,
     ]
 
 

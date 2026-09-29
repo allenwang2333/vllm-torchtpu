@@ -762,7 +762,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             and get_current_vllm_config().parallel_config.prefill_context_parallel_size
             > 1
         ):
-            return [128, 256, 512, 1024, 2048, 4096]
+            # The PCP streaming kernel copies a whole page into VMEM. Above 512
+            # tokens that overflows v7x's 64 MiB for a head_dim 256 model.
+            return [128, 256, 512]
         return [128, 256]
 
 
