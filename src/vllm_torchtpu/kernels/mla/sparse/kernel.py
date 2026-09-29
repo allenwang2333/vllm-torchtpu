@@ -389,13 +389,47 @@ def _attention_kernel(
         if bkv.shape[-1] < head_dim:
             bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
 
-        # Zero keys beyond kv_len: the "-1" tail is gathered from scattered
-        # pages and can decode to fp8 NaN; score masking zeroes the weights,
-        # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if not sparsecore_layout:
+            # Zero keys beyond kv_len: the "-1" tail is gathered from
+            # scattered pages and can decode to fp8 NaN; score masking zeroes
+            # the weights, but 0 * NaN = NaN in the PV einsum, so the data
+            # must be finite too. The sparsecore layout does this in VMEM
+            # instead, only when a tail exists (`zero_bkv_tail`).
+            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
+
+    def zero_bkv_tail(bkv_sem_idx, batch_idx, kv_len):
+        # Sparsecore layout only. The "-1" tail rows are real cache rows
+        # gathered from scattered pages and can hold fp8 NaN; the score mask
+        # zeroes their weights but 0 * NaN = NaN in the PV einsum. Zero them
+        # in the gathered scratch, and only when kv_len < topk: at long
+        # context every row is valid and the masking select disappears from
+        # the steady-state loop.
+        @pl.when(kv_len < bkv_sz)
+        def _():
+            nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
+            row = lax.broadcasted_iota(jnp.int32, nope_ref.shape, 0)
+            nope_ref[...] = jnp.where(row < kv_len, nope_ref[...], 0)
+
+            # Rope u32 row r, byte b holds token 4r + b (padded), or, for the
+            # packed layout, lanes [0, 64) hold tokens 4r + b and lanes
+            # [64, 128) tokens bkv_sz/2 + 4r + b. Keep the first
+            # clip(kv_len - 4r, 0, 4) bytes of each word.
+            rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
+            rrow = lax.broadcasted_iota(jnp.int32, rope_ref.shape, 0)
+            base = 4 * rrow
+            if rope_packed:
+                lane = lax.broadcasted_iota(jnp.int32, rope_ref.shape, 1)
+                base = base + jnp.where(lane >= 64, bkv_sz // 2, 0)
+            nkeep = jnp.clip(kv_len - base, 0, 4)
+            partial = (
+                jnp.left_shift(jnp.uint32(1), (8 * nkeep).astype(jnp.uint32))
+                - jnp.uint32(1)
+            )
+            mask = jnp.where(nkeep >= 4, jnp.uint32(0xFFFFFFFF), partial)
+            rope_ref[...] = rope_ref[...] & mask
 
     def process():
         def get_next_seq_ids(seq_idx, bi_sem_idx):
@@ -444,6 +478,8 @@ def _attention_kernel(
 
         for batch_idx in range(batch_size):
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            if sparsecore_layout:
+                zero_bkv_tail(bi_sem_idx, batch_idx, kv_len)
             bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
 
