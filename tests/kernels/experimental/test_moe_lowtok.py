@@ -180,7 +180,8 @@ def test_scores_entry_zero_score_rows_select_nothing():
         np.float32,
     )
     assert np.all(got[2] == 0)
-    want = np.asarray(_scores_want(x, scores, weights, topk, start, experts))
+    # A copy: np.asarray of a device array is a read-only view.
+    want = np.array(_scores_want(x, scores, weights, topk, start, experts))
     want[2] = 0
     _assert_close(np.delete(got, 2, 0), np.delete(want, 2, 0))
 
