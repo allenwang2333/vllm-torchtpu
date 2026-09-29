@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.sctopk_l1 import (
     _monotone_key,
     epilogue_t_supported,
     sparsecore_topk_l1,
+    sparsecore_topk_l1_chain,
 )
 
 MlaCase = config.MlaCase
@@ -711,6 +712,27 @@ def _effective_row_lengths(
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 
+def _split_topk_tail(topk_tail: str) -> tuple[str, int, str]:
+    """`topk_tail` -> (per-chunk tail for the top-k, dependency lag, mode).
+
+    "segcD" (mode "chain") runs `sparsecore_topk_l1_chain` over `SEGCD_BASE`:
+    chunk m-1's stage 2 is fused into chunk m's stage 1 kernel. Test-only
+    spellings: "segcD:<tail>" (chain over <tail>); "segcB<lag>[:<tail>]" /
+    "segcL<lag>[:<tail>]" order chunk m's scoring after chunk m-lag's stage 2
+    / stage 1 through an optimization_barrier (modes "s2" / "l1"; both
+    measured slower than or equal to segc, kept to reproduce that).
+    """
+    if topk_tail.startswith("segcD"):
+        return topk_tail.partition(":")[2] or SEGCD_BASE, 0, "chain"
+    if topk_tail[:5] not in ("segcB", "segcL"):
+        return topk_tail, 0, ""
+    rest, _, base = topk_tail[5:].partition(":")
+    return base or "segc2", int(rest), "s2" if topk_tail[4] == "B" else "l1"
+
+
+SEGCD_BASE = "segc2"
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -831,8 +853,11 @@ def streamindex_topk(
         Decode steps are unchanged.
       topk_tail: with `sctopk_l1`, "seg" runs the SparseCore stage 2 over only
         the live candidates stage 1 emitted per slice (bit-identical output);
-        "segc" also folds the index remap into that kernel. "" (default)
-        is the incumbent stage 2.
+        "segc" also folds the index remap into that kernel; "segc2" also
+        copies only the live part of each slice into it; "segcD" is "segc2"
+        with chunk m-1's stage 2 fused into chunk m's stage-1 SparseCore
+        kernel (`sparsecore_topk_l1_chain`), so only the last chunk's stage 2
+        runs after scoring. "" (default) is the incumbent stage 2.
 
     Returns:
       Top-K indices in global compressed space, or `(indices, scores)` if
@@ -1170,6 +1195,7 @@ def streamindex_topk(
         out_dtype,
         scheduling_group_id,
         emit_t=False,
+        q=q,
     ):
         """Scores for one window of the flat token axis, in a private buffer.
 
@@ -1283,6 +1309,14 @@ def streamindex_topk(
         )
         topk_idxs = []
         topk_scores_list = []
+        # "segcD" (dep_on "chain"): the chunks' top-k runs after the loop as
+        # one `sparsecore_topk_l1_chain`; data flow still starts chunk m's
+        # fused kernel right after chunk m's scoring. The test-only barrier
+        # modes ("s2" / "l1") pass chunk m's q through an
+        # optimization_barrier with chunk m-lag's top-k / stage 1 counts.
+        l1_tail, dep_lag, dep_on = _split_topk_tail(topk_tail)
+        stage1_outs = []
+        chain_chunks = []
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
@@ -1294,6 +1328,10 @@ def streamindex_topk(
             sc2_group = None if m >= num_chunks - 2 else group_base + m + 1
 
             start = m * chunk_len
+            q_m = q
+            if dep_lag and m >= dep_lag:
+                dep = (topk_idxs if dep_on == "s2" else stage1_outs)[m - dep_lag]
+                q_m, _ = jax.lax.optimization_barrier((q, dep))
             scores = _scores_for_chunk(
                 passes,
                 m,
@@ -1302,6 +1340,7 @@ def streamindex_topk(
                 out_dtype,
                 tc_group,
                 **(dict(emit_t=True) if emit_t else {}),
+                q=q_m,
             )
             t_rows = None
             if emit_t:
@@ -1314,11 +1353,16 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
+            if sctopk_l1 and dep_on == "chain":
+                chain_chunks.append(
+                    (scores, eff_row_lengths[start : start + chunk_len], t_rows)
+                )
+                continue
             if sctopk_l1:
                 # T comes from this chunk's scoring epilogue (`t_rows`), so
                 # stage 1' depends only on its own chunk, like stage 1. The
                 # standalone T pass (t_rows=None) joins the scoring group.
-                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk_l1(
+                l1_out = sparsecore_topk_l1(
                     scores,
                     k,
                     row_lengths=eff_row_lengths[start : start + chunk_len],
@@ -1328,8 +1372,12 @@ def streamindex_topk(
                     threshold_scheduling_group_id=tc_group,
                     return_scores=True,
                     t_rows=t_rows,
-                    topk_tail=topk_tail,
+                    topk_tail=l1_tail,
+                    return_stage1=dep_on == "l1",
                 )
+                chunk_topk_idxs, chunk_topk_scores = l1_out[:2]
+                if dep_on == "l1":
+                    stage1_outs.append(l1_out[2])
             else:
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
@@ -1343,6 +1391,14 @@ def streamindex_topk(
             topk_idxs.append(chunk_topk_idxs)
             if need_scores:
                 topk_scores_list.append(chunk_topk_scores)
+
+        if chain_chunks:
+            for chunk_topk_idxs, chunk_topk_scores in sparsecore_topk_l1_chain(
+                chain_chunks, k, topk_tail=l1_tail
+            ):
+                topk_idxs.append(chunk_topk_idxs)
+                if need_scores:
+                    topk_scores_list.append(chunk_topk_scores)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]

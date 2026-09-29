@@ -3,6 +3,11 @@
   python scripts/benchmark_streamidx_topk_tail.py time    interleaved inc/seg arms, bit-exact diffs
   python scripts/benchmark_streamidx_topk_tail.py trace   xprof trace of L_inc / L_seg (needs jax>=0.11)
   python scripts/benchmark_streamidx_topk_tail.py hlo     StableHLO text of the incumbent layer (fidelity diff)
+  python scripts/benchmark_streamidx_topk_tail.py counts  per-slice stage-1 live counts (synthetic + P18_DUMPS)
+
+P18_DUMP=<npz> (time/trace) replaces the synthetic indexer inputs with a server dump
+(probe_topk IDXIN: q bytes, weights, gathered K pages, meta); MLA inputs stay synthetic.
+P18_BF16G sets score_bf16_group (default 0; serving uses 4).
 
 Same layer as probe 16 (benchmark_streamidx_early_exit_overlap.py): indexer + q-glue +
 sparse-MLA attention, 1024 query tokens, one sequence of P18_SEQ tokens, chunk_tokens=128,
@@ -83,12 +88,37 @@ IDX_KEYS = ("iq", "w", "cache", "seq_lens", "pi", "cu", "dist")
 LAYER_KEYS = IDX_KEYS + ("qb", "wuk", "cos", "sin", "nope", "rope")
 
 
+BF16G = int(os.environ.get("P18_BF16G", "0"))
+
+
+def problem_from_dump(path, seed=0, mla_tokens=262144):
+    """Server dump -> the same dict as problem(); indexer inputs real, MLA synthetic."""
+    z = np.load(path)
+    meta = z["meta"]
+    seq_len, n_tok = int(meta[0]), int(z["num_tokens"])
+    p = problem(n_tok, seq_len, seed=seed, idx_pages=-(-seq_len // PAGE), mla_tokens=mla_tokens)
+    k = z["k"]
+    npg = k.shape[0]
+    pi = np.zeros((257,), np.int32)
+    pi[:npg] = np.arange(npg)
+    wd = str(z["wdtype"])
+    p.update(
+        iq=jnp.asarray(z["q"]).view(jnp.float8_e4m3fn),
+        w=jnp.asarray(z["w"], jnp.bfloat16 if wd == "bfloat16" else jnp.float32),
+        cache=jnp.asarray(k), seq_lens=jnp.array([seq_len], jnp.int32), pi=jnp.asarray(pi),
+        cu=jnp.array([0, n_tok], jnp.int32), dist=jnp.asarray(meta[3:6].astype(np.int32)))
+    p["server_topk"] = z["topk"]
+    log("DUMP", os.path.basename(path), "seq", seq_len, "n", n_tok, "npg", npg, "wdtype", wd,
+        "meta", meta.tolist(), "q", z["q"].shape, "w", z["w"].shape)
+    return p
+
+
 def _topk(iq, w, cache, seq_lens, pi, cu, dist, ee, tail=""):
     kw = {} if tail is None else dict(topk_tail=tail)
     return streamindex_topk(
         iq, w, cache, seq_lens, pi, cu, dist, k=TOPK, compression_ratio=1,
         num_kv_pages_per_block=(2, 2, 2), num_queries_per_block=(1, 128, 128),
-        enable_early_exit=ee, chunk_tokens=128, sctopk_l1=True, score_bf16_group=0, **kw)
+        enable_early_exit=ee, chunk_tokens=128, sctopk_l1=True, score_bf16_group=BF16G, **kw)
 
 
 def _qglue(qb, wuk, cos, sin):
@@ -175,8 +205,9 @@ TAILS = os.environ.get("P18_TAILS", "seg").split(",")
 
 def run_time():
     import hashlib
-    log("jax", jax.__version__, jax.devices()[0], "SEQ", SEQ, "TAILS", TAILS)
-    p = problem(1024, SEQ)
+    log("jax", jax.__version__, jax.devices()[0], "SEQ", SEQ, "TAILS", TAILS, "BF16G", BF16G,
+        "DUMP", os.environ.get("P18_DUMP"))
+    p = problem_from_dump(os.environ["P18_DUMP"]) if os.environ.get("P18_DUMP") else problem(1024, SEQ)
     LA, IA = args_of(p, LAYER_KEYS), args_of(p, IDX_KEYS)
     fns = {"inc": layer_fn(True, "")}
     for t in TAILS:
@@ -206,15 +237,77 @@ def run_time():
             h = hashlib.sha256(np.asarray(jax.device_get(a)).tobytes()).hexdigest()[:16]
             RES[f"sha_inc_out{i}"] = h
             log(f"SHA inc {SEQ} out{i} {h}")
-    json.dump(RES, open(os.path.join(OUT, f"results_{SEQ}.json"), "w"), indent=1)
+    tag = os.path.basename(os.environ.get("P18_DUMP", "")).replace(".npz", "") or str(SEQ)
+    json.dump(RES, open(os.path.join(OUT, f"results_{tag}_g{BF16G}.json"), "w"), indent=1)
     log("RESULTS", json.dumps(RES))
     bad = [k for k, v in RES.items() if isinstance(v, dict) and "error" in v]
     log("errors:", bad)
     sys.exit(1 if bad else 0)
 
 
+def run_counts():
+    """Per-slice stage-1 live counts, recorded from inside the segc stage 2 call."""
+    import glob
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import sctopk_l1 as l1
+    rec = []
+    orig = l1._sc_topk_stage2_seg
+
+    def wrapped(cand_scores, counts, k, cand_lengths, p, k_p, **kw):
+        b = cand_scores.shape[0]
+
+        def cb(c, ln):
+            rec.append((np.asarray(c)[: b * p * 16 : 16].reshape(b, p).astype(np.int64),
+                        np.asarray(ln)[:b].copy(), p, k_p))
+        jax.debug.callback(cb, counts, cand_lengths)
+        return orig(cand_scores, counts, k, cand_lengths, p, k_p, **kw)
+
+    l1._sc_topk_stage2_seg = wrapped
+    cases = [(f"synthetic_{s}", None, s) for s in (32768, 98304, 262144)]
+    for d in sorted(glob.glob(os.path.join(os.environ.get("P18_DUMPS", "/nonexistent"), "*.npz"))):
+        cases.append((os.path.basename(d).replace(".npz", ""), d, None))
+    out = {}
+    for name, path, s in cases:
+        try:
+            p = problem_from_dump(path) if path else problem(1024, s)
+        except Exception as e:  # noqa: BLE001
+            log("COUNTS load error", name, repr(e)); continue
+        IA = args_of(p, IDX_KEYS)
+        for g in (0, 4):
+            global BF16G
+            BF16G = g
+            rec.clear()
+            f = jax.jit(lambda *a: _topk(*a, True, "segc"))
+            topk = np.asarray(jax.block_until_ready(f(*IA)))
+            jax.effects_barrier()
+            if not rec:
+                log("COUNTS none", name, g); continue
+            cnt = np.concatenate([np.minimum(r[0][r[1] > 0], r[3]) for r in rec])
+            p_, k_p = rec[0][2], rec[0][3]
+            seq = int(np.asarray(p["seq_lens"])[0])
+            words = p_ * k_p
+            r = dict(rows=int(cnt.shape[0]), p=p_, k_p=k_p, seq=seq, calls=len(rec),
+                     live_frac=float(cnt.sum() / (cnt.shape[0] * words)),
+                     live_slices=float((cnt > 0).mean()),
+                     cnt_mean_live_slice=float(cnt[cnt > 0].mean()) if (cnt > 0).any() else 0.0,
+                     cnt_p50_live_slice=float(np.median(cnt[cnt > 0])) if (cnt > 0).any() else 0.0,
+                     full_slices=float((cnt >= k_p).mean()),
+                     row_sum_mean=float(cnt.sum(1).mean()), row_sum_max=int(cnt.sum(1).max()))
+            for G in (16, 128, 256, 512, 2048):
+                r[f"dma_frac_g{G}"] = float((-(-cnt // G) * G).sum() / (cnt.shape[0] * words))
+            if "server_topk" in p and g == 4 and p["server_topk"].size:
+                st = p["server_topk"]
+                n = min(st.shape[0], topk.shape[0])
+                same = sum(np.array_equal(np.sort(st[i]), np.sort(topk[i])) for i in range(n))
+                r["server_topk_rows_equal"] = f"{same}/{n}"
+                r["server_topk_slot_equal"] = int((st[:n] == topk[:n]).all(1).sum())
+            out[f"{name}_g{g}"] = r
+            log("COUNTS", name, "g", g, json.dumps(r))
+    json.dump(out, open(os.path.join(OUT, "counts.json"), "w"), indent=1)
+    log("COUNTS_ALL", json.dumps(out))
+
+
 def run_trace():
-    p = problem(1024, SEQ)
+    p = problem_from_dump(os.environ["P18_DUMP"]) if os.environ.get("P18_DUMP") else problem(1024, SEQ)
     LA = args_of(p, LAYER_KEYS)
     fns = {"L_inc": layer_fn(True, "")}
     for t in TAILS:
@@ -245,4 +338,4 @@ def run_hlo():
 
 
 if __name__ == "__main__":
-    {"time": run_time, "trace": run_trace, "hlo": run_hlo}[MODE]()
+    {"time": run_time, "trace": run_trace, "hlo": run_hlo, "counts": run_counts}[MODE]()
