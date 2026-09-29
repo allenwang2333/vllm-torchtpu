@@ -6,6 +6,7 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -13,6 +14,11 @@ import importlib.util
 import json
 import os
 import pickle
+import re
+import shutil
+import socket
+import threading
+import time
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -47,6 +53,10 @@ class TpuCompilationHandle:
     `signature` pins the graph the entry was built from, so a replay against a
     structurally different graph is refused instead of silently executing.
 
+    `fingerprint` pins the graph's code and small constants (see
+    `_graph_fingerprint`). Only a replay of another rank's artifact checks it;
+    None means the entry is never handed to another rank.
+
     Defaults are deliberately "unusable": an older pickle restored into this
     class keeps its own __dict__ and picks up these class defaults for the
     fields it lacks, so it fails the version check rather than being replayed.
@@ -56,9 +66,56 @@ class TpuCompilationHandle:
     entry: Any | None = None
     signature: tuple | None = None
     was_wrapped: bool = False
+    fingerprint: str | None = None
 
 
 _tpu_backend = TpuBackend()
+
+# A bucket claim nobody has touched for this long belongs to a rank that died
+# mid-compile; the owner refreshes its claim every heartbeat while compiling.
+_CLAIM_STALE_S = 600.0
+_CLAIM_HEARTBEAT_S = 30.0
+_CLAIM_POLL_S = 5.0
+# How long a "done" claim may point at an artifact this rank cannot replay yet
+# (NFS visibility) before this rank gives up and compiles the bucket itself.
+_CLAIM_DONE_GRACE_S = 120.0
+
+_defer_state = threading.local()
+
+
+class DeferCompile(Exception):  # noqa: N818 - control flow, not an error
+    """Another rank is compiling this bucket; compile a different one first."""
+
+
+@contextlib.contextmanager
+def defer_claimed_buckets():
+    """Within this block, `compile` raises DeferCompile instead of waiting on a
+    bucket another rank has claimed, so the caller can go compile the
+    buckets nobody has claimed yet and come back for this one later."""
+    _defer_state.on = True
+    try:
+        yield
+    finally:
+        _defer_state.on = False
+
+
+@contextlib.contextmanager
+def _heartbeat(path: str):
+    """Keep refreshing the claim at `path` so waiters know its owner is alive."""
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(_CLAIM_HEARTBEAT_S):
+            with contextlib.suppress(OSError):
+                os.utime(path)
+
+    thread = threading.Thread(target=beat, name="tpu-claim-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -358,6 +415,44 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
+# A get_attr tensor larger than this is not hashed; its graph is not shared
+# between ranks instead.
+_FINGERPRINT_MAX_CONSTANT_NUMEL = 4096
+
+
+def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
+    """What another rank's graph must match for its artifact to be replayed here.
+
+    The generated code carries every op and every python literal the trace
+    baked in, so a rank id or rank-derived offset read while tracing shows up
+    in it. Tensor constants reached by get_attr are hashed by value. None when
+    the graph holds something that cannot be compared cheaply, which keeps the
+    graph out of the peer hand-over.
+    """
+    try:
+        digest = hashlib.sha256(graph.code.encode())
+        for node in graph.graph.nodes:
+            if node.op != "get_attr":
+                continue
+            value: Any = graph
+            for atom in str(node.target).split("."):
+                value = getattr(value, atom)
+            digest.update(str(node.target).encode())
+            if isinstance(value, fx.GraphModule):
+                digest.update(value.code.encode())
+            elif isinstance(value, torch.Tensor):
+                if value.numel() > _FINGERPRINT_MAX_CONSTANT_NUMEL:
+                    return None
+                cpu = value.detach().to("cpu").contiguous().reshape(-1)
+                digest.update(f"{cpu.dtype}{tuple(value.shape)}".encode())
+                digest.update(cpu.view(torch.uint8).numpy().tobytes())
+            else:
+                return None
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
@@ -459,6 +554,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         entry: Any,
         graph: fx.GraphModule,
         was_wrapped: bool,
+        fingerprint: str | None = None,
     ) -> bool:
         """Write the bundled entry for `graph` to `path`. True if it landed."""
         try:
@@ -468,6 +564,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 entry=entry,
                 signature=shape_variants.graph_signature(graph),
                 was_wrapped=was_wrapped,
+                fingerprint=fingerprint,
             )
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
@@ -489,12 +586,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         path: str,
         graph: fx.GraphModule,
         was_wrapped: bool,
+        fingerprint: str | None = None,
     ) -> Callable[..., Any] | None:
         """Rebuild the runnable saved at `path`, or None to recompile.
 
         Every rejection here costs one recompile and nothing else, so this is
         deliberately strict: an artifact is replayed only if it is the current
         format and was built from a graph with this one's input signature.
+        `fingerprint`, when given, must also match the one saved with it (the
+        peer hand-over, see `_replay_from_peer`).
         """
         try:
             with open(path, "rb") as f:
@@ -525,6 +625,8 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
         elif payload.was_wrapped != was_wrapped:
             reason = "output-tuple wrapping differs from the saved graph"
+        elif fingerprint is not None and payload.fingerprint != fingerprint:
+            reason = "built from a graph with different code or constants"
         if reason is not None:
             logger.warning(
                 "[TpuCompilerAdaptor] Ignoring artifact %s: %s", path, reason
@@ -540,6 +642,217 @@ class TpuCompilerAdaptor(CompilerInterface):
                 e,
             )
             return None
+
+    def _peer_artifact_paths(self, key: str) -> list[str]:
+        """Where the other ranks of this host save the artifact for `key`.
+
+        vLLM keys the cache dir by config hash, then `rank_<rank>_<dp_rank>`,
+        then the compiled module's prefix. Only ranks of the same DP rank are
+        looked at.
+        """
+        if self.cache_dir is None:
+            return []
+        own = Path(self.cache_dir)
+        match = re.fullmatch(r"rank_(\d+)_(\d+)", own.parent.name)
+        if match is None:
+            return []
+        paths = []
+        for rank_dir in sorted(own.parent.parent.glob(f"rank_*_{match[2]}")):
+            path = rank_dir / own.name / key
+            if rank_dir != own.parent and path.is_file():
+                paths.append(str(path))
+        return paths
+
+    def _replay_from_peer(
+        self,
+        key: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        fingerprint: str,
+    ) -> tuple[Callable[..., Any], str] | None:
+        """Replay an artifact another rank already built for this bucket.
+
+        Under TPU_PARALLEL_PRECOMPILE each rank walks the buckets in a rotated
+        order, so every bucket is XLA-compiled once by some rank and served to
+        the others from the shared Tier-2 cache. That still leaves each rank
+        tracing every bucket itself (aot_autograd and the FX->MLIR lowering,
+        ~20 s for the backbone) only to find the executable in the cache.
+        Replaying the peer's bundled entry skips the trace too, the same way
+        `load` does on a warm start.
+
+        That is only right if the ranks compile the same program, which is
+        what the Tier-2 hits already rely on. The fingerprint checks it on the
+        side we can see without tracing: identical graph code and constants.
+        Returns (runnable, path) or None.
+        """
+        for path in self._peer_artifact_paths(key):
+            compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
+            if compiled_fn is not None:
+                return compiled_fn, path
+        return None
+
+    def _adopt_peer_artifact(self, key: str, peer_path: str) -> str | None:
+        """Give this rank its own copy of a replayed peer artifact.
+
+        vLLM records the handle `compile` returns and hands it back to `load`
+        on the next start, so it has to name a file under this rank's cache
+        dir. A hard link costs nothing; a copy is the fallback.
+        """
+        assert self.cache_dir is not None
+        path = os.path.join(self.cache_dir, key)
+        tmp_path = f"{path}.tmp"
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
+            try:
+                os.link(peer_path, tmp_path)
+            except OSError:
+                shutil.copyfile(peer_path, tmp_path)
+            os.replace(tmp_path, path)
+            return path
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not keep peer artifact %s: %s",
+                peer_path,
+                e,
+            )
+            return None
+
+    def _claim_path(self, key: str, fingerprint: str) -> str | None:
+        """The file every rank of this DP rank races for to compile `key`.
+
+        It sits beside the `rank_*` dirs, so on a shared cache it is shared by
+        the ranks of every host. The fingerprint is in the name: only ranks
+        that trace the same program coordinate on it.
+        """
+        if self.cache_dir is None:
+            return None
+        own = Path(self.cache_dir)
+        match = re.fullmatch(r"rank_(\d+)_(\d+)", own.parent.name)
+        if match is None:
+            return None
+        return str(
+            own.parent.parent
+            / "_claims"
+            / f"{match[2]}-{own.name}-{key}-{fingerprint[:32]}"
+        )
+
+    @staticmethod
+    def _try_claim(path: str) -> bool:
+        """Atomically become the one rank that compiles this bucket."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w") as f:
+            f.write(f"compiling {socket.gethostname()}:{os.getpid()}\n")
+        return True
+
+    @staticmethod
+    def _read_claim(path: str) -> tuple[str, str, float] | None:
+        """(state, argument, seconds since last touched), or None if unclaimed."""
+        try:
+            age = time.time() - os.stat(path).st_mtime
+            with open(path) as f:
+                state, _, arg = f.read().strip().partition(" ")
+        except FileNotFoundError:
+            return None
+        return state, arg, age
+
+    @staticmethod
+    def _settle_claim(path: str, text: str) -> None:
+        """Replace a claim's content in one step: "done <artifact>" or "failed"."""
+        tmp_path = f"{path}.{socket.gethostname()}.{os.getpid()}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(text + "\n")
+            os.replace(tmp_path, path)
+        except OSError as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not settle claim %s: %s", path, e
+            )
+
+    @staticmethod
+    def _take_over(path: str) -> None:
+        """Retire a claim whose owner stopped refreshing it."""
+        stale = f"{path}.{socket.gethostname()}.{os.getpid()}.stale"
+        with contextlib.suppress(FileNotFoundError):
+            os.rename(path, stale)
+            os.unlink(stale)
+
+    def _wait_or_claim(
+        self,
+        key: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        fingerprint: str,
+        compile_range: Range,
+    ) -> tuple[tuple[Callable[..., Any], str] | None, str | None]:
+        """Share one XLA compile of this bucket among all ranks.
+
+        Returns `(peer, claim)`: `peer` is (runnable, artifact path) when
+        another rank built the bucket, `claim` the claim path when this rank
+        must build it and settle the claim afterwards. `(None, None)` means
+        build it without coordinating.
+
+        Without this, a rank reaching a bucket a peer is still compiling
+        recompiles it from scratch: for GLM-5.2 that was six ranks each
+        spending ~30 min on the 4096 bucket another rank was already building.
+        """
+        path = self._claim_path(key, fingerprint)
+        if path is None:
+            return None, None
+        waited_since = None
+        done_since = None
+        while True:
+            if self._try_claim(path):
+                return None, path
+            claim = self._read_claim(path)
+            if claim is None:
+                continue  # released between the two calls; race for it again
+            state, arg, age = claim
+            if state == "failed":
+                # Its owner built no shareable artifact; nobody will.
+                return None, None
+            if state == "done":
+                compiled_fn = (
+                    self._replay(arg, graph, was_wrapped, fingerprint)
+                    if os.path.isfile(arg)
+                    else None
+                )
+                if compiled_fn is not None:
+                    return (compiled_fn, arg), None
+                done_since = done_since or time.monotonic()
+                if time.monotonic() - done_since > _CLAIM_DONE_GRACE_S:
+                    return None, None
+            elif age > _CLAIM_STALE_S:
+                logger.warning(
+                    "[TpuCompilerAdaptor] Claim on range %s by %s is %.0f s "
+                    "stale; taking it over",
+                    compile_range,
+                    arg,
+                    age,
+                )
+                self._take_over(path)
+                continue
+            elif getattr(_defer_state, "on", False):
+                logger.info(
+                    "[TpuCompilerAdaptor] Range %s is being compiled by %s; "
+                    "deferring it",
+                    compile_range,
+                    arg,
+                )
+                raise DeferCompile
+            elif waited_since is None:
+                waited_since = time.monotonic()
+                logger.info(
+                    "[TpuCompilerAdaptor] Waiting for %s to finish range %s",
+                    arg,
+                    compile_range,
+                )
+            time.sleep(_CLAIM_POLL_S)
 
     def compile(
         self,
@@ -582,7 +895,43 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        caching = (
+            key is not None and self.cache_dir is not None and not self._disable_cache
+        )
+        # Only a graph that may be handed between ranks is fingerprinted; the
+        # rest save no fingerprint and are never replayed on another rank.
+        fingerprint = (
+            _graph_fingerprint(graph)
+            if caching and envs.TPU_PARALLEL_PRECOMPILE
+            else None
+        )
+        peer = None
+        claim = None
+        if fingerprint is not None:
+            assert key is not None  # implied by `caching`
+            peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
+            if peer is None:
+                peer, claim = self._wait_or_claim(
+                    key, graph, was_wrapped, fingerprint, compile_range
+                )
+
+        if peer is not None:
+            compiled_fn, peer_path = peer
+            entry = None
+            logger.info(
+                "[TpuCompilerAdaptor] Replayed range %s from peer artifact %s",
+                compile_range,
+                peer_path,
+            )
+        elif claim is not None:
+            try:
+                with _heartbeat(claim):
+                    compiled_fn, entry = self._run_backend(graph, example_inputs)
+            except BaseException:
+                self._settle_claim(claim, "failed")
+                raise
+        else:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -602,18 +951,29 @@ class TpuCompilerAdaptor(CompilerInterface):
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
         handle = None
-        caching = (
-            key is not None and self.cache_dir is not None and not self._disable_cache
-        )
-        if caching and entry is not None:
+        if peer is not None:
+            assert key is not None  # a peer is only found when `caching`
+            save_path = self._adopt_peer_artifact(key, peer[1])
+            if save_path is not None:
+                handle = (key, save_path, was_wrapped)
+        elif caching and entry is not None:
             save_path = os.path.join(self.cache_dir, key)
-            if self._save_handle(key, save_path, entry, graph, was_wrapped):
+            if self._save_handle(
+                key, save_path, entry, graph, was_wrapped, fingerprint
+            ):
                 handle = (key, save_path, was_wrapped)
         elif caching:
             logger.info(
                 "[TpuCompilerAdaptor] No serializable artifact for range %s; "
                 "it will be recompiled on the next start",
                 compile_range,
+            )
+
+        if claim is not None:
+            # Waiters replay the exact path named here, which an NFS client
+            # revalidates on open, rather than rescan directories it may cache.
+            self._settle_claim(
+                claim, f"done {handle[1]}" if handle is not None else "failed"
             )
 
         # Offer this bucket to later traces of the same model, so a graph that
