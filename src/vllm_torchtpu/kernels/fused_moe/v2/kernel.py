@@ -1650,6 +1650,14 @@ def _build_fused_ep_moe_kernel(
                         next_shift + next_within * tile_m,
                     )
 
+                if not push_from_vmem:
+                    # Per-tile push (probe 08 P6-T): tile t-2's commit was
+                    # waited by this tile's output-buffer reuse guard, so its
+                    # rows can go on the wire now instead of after the drain.
+                    @pl.when(t >= 2)
+                    def _():
+                        push_tile(e, t - 2)
+
                 # The next expert's index window, a tile early. This is the
                 # only arrival the kernel waits for with nothing issued
                 # behind it, so a tile of compute is what it costs to hide.
@@ -1928,68 +1936,83 @@ def _build_fused_ep_moe_kernel(
         def _():
             prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
 
-        def push_expert(e):
-            """Push expert e's remote regions and hop its own-dest region."""
-            # Remote pushes go per (expert, dest) at true length; run starts
-            # stay aligned, so recv positions are unchanged. Each is predicated
-            # on its own length: a zero-length REMOTE DMA must never issue.
-            for d in range(ep):
-                region_blocks = commit_len_sm[e, d]
-                src_block = contrib_off_sm[e, d]
-                dst_block = push_dst_sm[e, d]
-                is_me = jnp.int32(d) == me
+        def push_tile(e, tp):
+            """Push tile tp's remote rows and scale-mirror sublanes (probe 08
+            P6-X), over only the (e, d) runs that overlap it: runs are laid
+            out in d order, so those are a contiguous d-range [a, b). A
+            zero-length remote DMA is never issued."""
+            tb = tp * tile_blocks
+            live = jnp.minimum(expert_rows_sm[e] - tp * tile_m, tile_m) // ROWBLK
+            te = tb + live
+            a = jnp.int32(0)
+            b = jnp.int32(0)
+            for _d in range(ep):
+                s0 = commit_start_sm[e, _d]
+                a = a + (s0 + commit_len_sm[e, _d] <= tb).astype(jnp.int32)
+                b = b + (s0 < te).astype(jnp.int32)
 
-                @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
+            def body(d, c):
+                run_start = commit_start_sm[e, d]
+                run_len = commit_len_sm[e, d]
+                lo = jnp.maximum(run_start, tb)
+                hi = jnp.minimum(run_start + run_len, te)
+                pred = jnp.logical_and(hi > lo, d != me)
+
+                @pl.when(pred)
                 def _():
-                    # One expert per push, so the region IS expert e's run.
-                    true_rows = true_rows_sm[e, d]
+                    tr = true_rows_sm[e, d]
+                    r_lo = (lo - run_start) * ROWBLK
+                    r_hi = jnp.minimum((hi - run_start) * ROWBLK, tr)
+                    n = r_hi - r_lo
 
-                    def push_run():
-                        """The rows themselves, at their true length."""
+                    @pl.when(n > 0)
+                    def _():
                         pltpu.make_async_remote_copy(
                             src_ref=contrib_hbm.at[
-                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                                pl.ds(contrib_off_sm[e, d] * ROWBLK + r_lo, n)
                             ],
-                            dst_ref=recv_hbm.at[
-                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
-                            ],
+                            dst_ref=recv_hbm.at[pl.ds(push_dst_sm[e, d] * ROWBLK + r_lo, n)],
                             send_sem=send_sem,
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
+                            device_id=(d,),
                             device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
-                    # A nonempty region can hold an empty (e, d) run.
-                    pl.when(true_rows > 0)(push_run)
-                    # Scale mirror: the source tiles this run's rows
-                    # fall in, landing at the base the destination's own
-                    # plan gave the run.
-                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                    _, dst_sub, _ = _run_tiles(e, d, run_len)
+                    lo_tile = jnp.right_shift(run_start, tile_block_shift)
                     pltpu.make_async_remote_copy(
-                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        src_ref=cscl_hbm.at[pl.ds(_mirror_base(e) + tp, 1)],
+                        dst_ref=rscl_hbm.at[pl.ds(dst_sub + tp - lo_tile, 1)],
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
-                        device_id=(jnp.int32(d),),
+                        device_id=(d,),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
-                # Safe to defer: recv is read only after the drain.
-                @pl.when(_and_nonempty(is_me, region_blocks))
-                def _():
-                    pltpu.make_async_copy(
-                        contrib_hbm.at[
-                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                        ],
-                        recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
-                        mehop_sem,
-                    ).start()
-                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
-                    pltpu.make_async_copy(
-                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
-                        mehop_scl_sem,
-                    ).start()
+                return c
+
+            lax.fori_loop(a, b, body, jnp.int32(0))
+
+        def push_own_region(e):
+            """The own-destination hop, once per expert after its drain."""
+            d = me
+            region_blocks = commit_len_sm[e, d]
+
+            @pl.when(region_blocks > 0)
+            def _():
+                src_block = contrib_off_sm[e, d]
+                dst_block = push_dst_sm[e, d]
+                pltpu.make_async_copy(
+                    contrib_hbm.at[pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)],
+                    recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
+                    mehop_sem,
+                ).start()
+                src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                pltpu.make_async_copy(
+                    cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                    rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                    mehop_scl_sem,
+                ).start()
 
         def visit_step(visit_i, carry):
             """One step of the visit list: compute, then drain and push."""
@@ -1999,7 +2022,16 @@ def _build_fused_ep_moe_kernel(
                 # Each tile shipped itself; there is nothing left to flush.
                 return carry
             carry = drain_commits(carry)
-            push_expert(e)
+            # Tiles before the last two went out from the tile loop; the
+            # drain above landed the last two.
+            n_tiles_e = -(-expert_rows_sm[e] // tile_m)
+            for _j in (2, 1):
+
+                @pl.when(n_tiles_e >= _j)
+                def _(_j=_j):
+                    push_tile(e, n_tiles_e - _j)
+
+            push_own_region(e)
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(6 if push_from_vmem else 4))
