@@ -26,13 +26,14 @@ pytestmark = pytest.mark.cpu_test
 MIB = 1 << 20
 
 
-def _vllm_config(max_num_seqs, num_speculative_tokens=0):
+def _vllm_config(max_num_seqs, num_speculative_tokens=0, max_model_len=9216):
     spec = (
         SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
         if num_speculative_tokens
         else None
     )
     return SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         speculative_config=spec,
     )
@@ -62,6 +63,24 @@ def test_tuning_halves_vmem_and_caps_the_batch(monkeypatch, v7x, max_num_seqs, b
     assert tuning == batched_rpa_decode.DecodeTuning(
         vmem_limit_bytes=32 * MIB, decode_batch_size=batch
     )
+
+
+# An 8k/1k deployment takes the decode settings; a long-context one (AgentX
+# serves max_model_len 262144) keeps the default, larger KV blocks.
+@pytest.mark.parametrize(
+    "max_model_len, takes",
+    [(9216, True), (16384, True), (16385, False), (262144, False)],
+)
+def test_tuning_refused_past_the_model_length_bound(
+    monkeypatch, v7x, max_model_len, takes
+):
+    monkeypatch.setenv("TPU_RPA_DECODE_BATCHED", "1")
+    tuning = batched_rpa_decode.decode_tuning(
+        _vllm_config(8, 3, max_model_len=max_model_len)
+    )
+    assert (tuning is not None) == takes
+    kwargs = batched_rpa_decode.kernel_kwargs(tuning, 32)
+    assert ("vmem_limit_bytes" in kwargs) == takes
 
 
 @pytest.mark.parametrize(

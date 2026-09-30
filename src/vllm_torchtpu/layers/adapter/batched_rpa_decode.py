@@ -17,6 +17,11 @@ A program of at most :data:`DECODE_PROGRAM_MAX_ROWS` query rows runs the
 batched attention kernel with half the chip's VMEM, leaving the rest for the
 compiler to prefetch the next layers' weights across the kernel, and with a
 decode batch no larger than the requests the engine can hold.
+
+Half the VMEM also halves the KV block the kernel streams, so a sequence takes
+twice the blocks. That cost grows with the sequence's length and the gain does
+not, so the settings are taken only while ``max_model_len`` is at most
+:data:`DECODE_MAX_MODEL_LEN`.
 """
 
 import dataclasses
@@ -33,6 +38,9 @@ logger = init_logger(__name__)
 DECODE_PROGRAM_MAX_ROWS = 64
 # The wrapper's default decode batch, and the cap here.
 MAX_DECODE_BATCH = 8
+# The longest max_model_len that takes the decode settings: on tpu7x (Qwen3.5
+# TP8, fp8 KV) they are neutral at 8k tokens of context and slower from 32k.
+DECODE_MAX_MODEL_LEN = 16384
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,6 +52,16 @@ class DecodeTuning:
 def decode_tuning(vllm_config: VllmConfig) -> DecodeTuning | None:
     """The decode programs' kernel settings, or None when the flag is off."""
     if not envs.TPU_RPA_DECODE_BATCHED:
+        return None
+    max_model_len = vllm_config.model_config.max_model_len
+    if max_model_len > DECODE_MAX_MODEL_LEN:
+        logger.warning_once(
+            "[Attention] TPU_RPA_DECODE_BATCHED: max_model_len %d > %d; batched "
+            "RPA keeps its default settings, whose larger KV blocks serve long "
+            "sequences faster.",
+            max_model_len,
+            DECODE_MAX_MODEL_LEN,
+        )
         return None
     max_num_seqs = vllm_config.scheduler_config.max_num_seqs
     tuning = DecodeTuning(

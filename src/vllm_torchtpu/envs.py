@@ -665,7 +665,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # as one kernel on token buckets of up to 64 rows.
     "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE"),
     # Run batched RPA in token buckets of up to 64 rows with half the chip's
-    # VMEM and a decode batch of min(8, max_num_seqs).
+    # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 16k.
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
