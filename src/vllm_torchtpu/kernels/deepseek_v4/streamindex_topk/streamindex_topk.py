@@ -548,10 +548,14 @@ def kernel(
         mrows = hs * gi_tg
         n_groups = bq_sz // gi_tg
         pairs = bkv_sz // (256 * nm)
-        # Accumulator slice i of an MXU starts at i * mrows: disjoint whether
-        # the address unit is a row or a vreg.
+        # The acc address unit is an MRB slot (a
+        # [mrows, 256] f32 block spans mrows // 4 slots in the LLO); an MXU has
+        # 256 slots, so up to 256 // (mrows // 4) blocks can be in flight.
+        slots = mrows // 4
+        if gi_depth * slots > 256:
+            raise ValueError(f"mx depth {gi_depth} x {slots} slots > 256")
         def acc_addr(i):
-            return (i % gi_depth) * mrows
+            return (i % gi_depth) * slots
         zq = jnp.zeros((mrows, 128), q_gi_ref.dtype)
         zk = jnp.zeros((256, 128), kfp8.dtype)
 
