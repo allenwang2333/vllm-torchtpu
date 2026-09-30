@@ -386,7 +386,10 @@ class TPUWorker(WorkerBase):
         # point the answer can still be applied.
         group_ranks_by_name = resolve_pcp_topology_order(self.vllm_config)
         with set_current_vllm_config(self.vllm_config), \
-                pcp_topology_order(group_ranks_by_name):
+                pcp_topology_order(
+                    group_ranks_by_name,
+                    preserve_dcp_order=(pcp_size > 1 and self.parallel_config.
+                                        decode_context_parallel_size > 1)):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.
                 tensor_parallel_size,
