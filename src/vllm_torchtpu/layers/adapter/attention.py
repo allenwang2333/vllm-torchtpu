@@ -1788,6 +1788,38 @@ def _w_uv_bmm(outputs: torch.Tensor, w_uv: torch.Tensor) -> torch.Tensor:
     return torch.bmm(outputs.transpose(0, 1), w_uv)
 
 
+def _w_uv_bmm_stacked(layer, outputs: torch.Tensor) -> torch.Tensor:
+    """`_w_uv_bmm(outputs, W_UV)` with W_UV read from a stack: GLM5_MK_STACK_W serves w_uv only
+    as the megakernel's [n_layers, H, K, V] operand and sets `layer.W_UV_stack = (stack, row)`.
+
+    The row select and the bmm are one jax op on the whole stack (a static slice feeding the dot).
+    A torch view `stack[row]` passed to an op is materialized by torch_tpu's execute_as_strided as
+    a copy of `stack[:row + 1]` on every call (probe 35, j-1f77eaac), so the view is never used."""
+    stack, row = layer.W_UV_stack
+    op = layer.__dict__.get("_w_uv_stack_op")
+    if op is None:
+        import jax.numpy as jnp
+
+        def w_uv_bmm(o: jax.Array, stk: jax.Array) -> jax.Array:
+            w = stk[row].astype(o.dtype)
+            extra = o.shape[-1] - w.shape[1]
+            if extra:
+                w = jnp.pad(w, ((0, 0), (0, extra), (0, 0)))
+            return jax.lax.dot_general(
+                jnp.swapaxes(o, 0, 1), w, (((2,), (1,)), ((0,), (0,)))
+            )
+
+        name = str(getattr(layer, "layer_name", row)).replace(".", "_")
+        op = pallas.jax_op(f"pallas::w_uv_stack_{name}_r{row}", w_uv_bmm)
+        op.register_fake(
+            lambda o, stk: torch.empty(
+                (o.shape[1], o.shape[0], stk.shape[-1]), dtype=o.dtype, device=o.device
+            )
+        )
+        layer.__dict__["_w_uv_stack_op"] = op
+    return op(outputs, stack)
+
+
 def _run_sparse_mla_on_layer_cache(layer, run, kv_cache_nope, kv_cache_rope, block_tables):
     """`run(nope, rope, block_tables, nope_spec, rope_spec) -> (new_nope, new_rope, out)` on this
     layer's cache.
@@ -2515,12 +2547,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Packed sparse path: the op hands back the kernel's full width.
         width = outputs.shape[-1] if packed_q else layer.kv_lora_rank
         outputs = outputs.reshape(-1, layer.num_heads, width)
-        w_uv = (
-            layer.W_UV.to(outputs.dtype)
-            if layer.W_UV.dtype != outputs.dtype
-            else layer.W_UV
-        )
-        out_proj = _w_uv_bmm(outputs, w_uv)
+        if getattr(layer, "W_UV_stack", None) is not None:
+            out_proj = _w_uv_bmm_stacked(layer, outputs)
+        else:
+            w_uv = (
+                layer.W_UV.to(outputs.dtype)
+                if layer.W_UV.dtype != outputs.dtype
+                else layer.W_UV
+            )
+            out_proj = _w_uv_bmm(outputs, w_uv)
         if hasattr(layer, "W_UV_scale"):
             out_proj = out_proj * layer.W_UV_scale
         outputs = (

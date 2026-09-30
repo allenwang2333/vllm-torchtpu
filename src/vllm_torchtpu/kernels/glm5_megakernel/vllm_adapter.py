@@ -67,8 +67,8 @@ SHARDED_KINDS = EXPERT_KINDS + ("o_proj", "q_b", "w_uk") + tuple(REPLICA_KINDS)
 # N = 2624 to 2688, so it was always a copy (1.2 GiB/rank already duplicated per layer).
 OWNED_KINDS = ("qkv_a", "q_b", "w_uk", "o_proj", "idx_wk", "gate") + tuple(REPLICA_KINDS)
 # Kinds that alias a stock parameter but are stacked with NO duplicate: the stack replaces the
-# stock parameter, which is rebound to its row view (layer.W_UV = stack[row]); the stock
-# prefill path reads the row (a slice feeding its bmm). Every other kind (idx_wq, the experts
+# stock parameter: the stock layer gets layer.W_UV_stack = (stack, row) and reads the row inside
+# one jax op (attention._w_uv_bmm_stacked: a static slice feeding its bmm). Every other kind (idx_wq, the experts
 # and their scales, the shared and dense MLPs) aliases a stock parameter and stays per layer.
 VIEW_KINDS = ("w_uv",)
 
@@ -559,8 +559,12 @@ class Glm5Megakernel:
                 old = at.W_UV
                 _need(tuple(old.shape) == tuple(stk.shape[1:]) and old.dtype == stk.dtype,
                       f"W_UV[{l}] {tuple(old.shape)} {old.dtype} vs stack row {tuple(stk.shape[1:])}")
+                # the stock layer reads (stack, row) in one jax op (_w_uv_bmm_stacked); W_UV
+                # stays as a row view for shape / VERIFY readers only: a view passed to an op is
+                # materialized by torch_tpu as a copy of stack[:row + 1] (probe 35, j-1f77eaac)
                 at.W_UV = torch.nn.Parameter(stk[row], requires_grad=False)
-            logger.info("GLM-5.2 megakernel: %s stacked %s; stock W_UV rebound to its rows",
+                at.W_UV_stack = (stk, row)
+            logger.info("GLM-5.2 megakernel: %s stacked %s; stock W_UV reads its row of the stack",
                         kind, tuple(stk.shape))
 
     def _build_smalls(self) -> torch.Tensor:
