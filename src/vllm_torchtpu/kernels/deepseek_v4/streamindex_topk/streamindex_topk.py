@@ -54,13 +54,29 @@ _TEST_SCORE_EPI_FAULT = None
 _GI_SLAB = 256
 
 
+_KLOADS = ("kA", "kB", "kC")
+
+
+def _split_kload(score_epilogue: str) -> tuple[str, str]:
+    """"gi16-slab+kA" -> ("gi16-slab", "kA"): gi epilogue, key-block load variant."""
+    epi, _, kload = score_epilogue.partition("+")
+    if kload and kload not in _KLOADS:
+        raise ValueError(f"bad score_epilogue key load {kload!r}")
+    return epi, kload
+
+
 def _parse_score_epilogue(score_epilogue: str) -> tuple[int, str]:
-    """"gi{TG}-{mode}" -> (TG, mode); "" -> (0, "")."""
+    """"gi{TG}-{mode}[+k*]" -> (TG, mode); "" -> (0, "")."""
+    score_epilogue, _ = _split_kload(score_epilogue)
     if not score_epilogue:
         return 0, ""
     head, _, mode = score_epilogue.partition("-")
     modes = ("full", "slab", "loop", "loopslab")
-    if not head.startswith("gi") or mode not in modes:
+    base = mode.rstrip("0123456789")
+    width = mode[len(base):]
+    if width and (base not in ("slab", "loopslab") or int(width) not in (128, 256, 512)):
+        raise ValueError(f"bad score_epilogue slab width {score_epilogue!r}")
+    if not head.startswith("gi") or base not in modes:
         raise ValueError(f"bad score_epilogue {score_epilogue!r}")
     tg = int(head[2:])
     if tg not in (8, 16, 32, 64):
@@ -345,6 +361,11 @@ def kernel(
         return acc
 
     gi_tg, gi_mode = _parse_score_epilogue(score_epilogue)
+    gi_kload = _split_kload(score_epilogue)[1]
+    gi_slab = _GI_SLAB
+    if gi_mode.rstrip("0123456789") != gi_mode:  # "slab128": slab width suffix
+        gi_slab = int(gi_mode[len(gi_mode.rstrip("0123456789")):])
+        gi_mode = gi_mode.rstrip("0123456789")
     # Token-group-interleaved q rows: (group g of gi_tg tokens, head h, token t)
     # instead of head-major (h, token). Consecutive MXU pops then belong to the
     # heads of the same gi_tg tokens, so the head sum can accumulate in a few
@@ -418,8 +439,8 @@ def kernel(
         """One token group's [gi_tg, bkv_sz] head sum."""
         if gi_mode in ("slab", "loopslab"):
             parts = []
-            for c in range(0, bkv_sz, _GI_SLAB):
-                parts.append(gi_head_sum(qk_has(q_rows, bkv[c : c + _GI_SLAB]), w_rows))
+            for c in range(0, bkv_sz, gi_slab):
+                parts.append(gi_head_sum(qk_has(q_rows, bkv[c : c + gi_slab]), w_rows))
             return jnp.concatenate(parts, axis=1)
         st = qk_has(q_rows, bkv) if st_full is None else st_full
         return gi_head_sum(st, w_rows)
@@ -570,6 +591,32 @@ def kernel(
             copy.start()
             copy.wait()
 
+    def gi_load_kv(bkv_vmem):
+        """Key operand [bkv_sz, D] fp8 and scale row [1, bkv_sz] bf16 read as
+        32-bit words, so each vreg is 8 word rows (4 tokens each) of the
+        (4,128)(4,1)-tiled u8 block instead of a register relayout."""
+        n = bkv_sz_per_kv_packing
+        lanes = bkv_vmem.shape[-1]
+        if gi_kload == "kC":
+            v = pltpu.bitcast(bkv_vmem[0, :n][...], jnp.int32)  # [n, 1, lanes]
+            w = v.reshape(n, lanes)
+            kw, sw = w[:, :head_dim], w[:, head_dim : head_dim + 1]
+        else:
+            wref = bkv_vmem.bitcast(jnp.int32)  # [1, n', 1, lanes]
+            wref = wref.reshape(wref.shape[1], lanes)
+            if gi_kload == "kA":
+                kw = wref[:n, :head_dim]
+                sw = wref[:n, head_dim : head_dim + 1]
+            else:  # kB: 128-lane word rows, row 2r + lane_tile
+                nt = lanes // 128
+                wref = wref.reshape(wref.shape[0] * nt, 128)
+                kw = wref[pl.ds(0, n, stride=nt), :]
+                sw = wref[pl.ds(head_dim // 128, n, stride=nt), 0:1]
+        fp8_val = pltpu.bitcast(kw, jnp.float8_e4m3fn)  # [bkv_sz, D]
+        sb = pltpu.bitcast(sw, jnp.uint8)  # [bkv_sz, 1]
+        scale_val = pltpu.bitcast(sb.T, jnp.float8_e8m0fnu).astype(jnp.bfloat16)
+        return fp8_val, scale_val
+
     def step_body(
         q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, t_refs=None,
         w_gi_ref=None,
@@ -592,14 +639,17 @@ def kernel(
             q_l = cu_q_lens_ref[batch_start_seq_idx + 1] - q_s
             block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
             q_pos_base = s_l - q_l + block_start
-            bkv = bkv_vmem[0, :bkv_sz_per_kv_packing][...]
-            flat_bkv = bkv.reshape(-1, bkv.shape[-1])
-            fp8_val = pltpu.bitcast(
-                flat_bkv[:, :head_dim], jnp.float8_e4m3fn
-            ).reshape(bkv_sz, head_dim)
-            scale_val = pltpu.bitcast(
-                flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
-            ).astype(jnp.bfloat16)
+            if gi_kload:
+                fp8_val, scale_val = gi_load_kv(bkv_vmem)
+            else:
+                bkv = bkv_vmem[0, :bkv_sz_per_kv_packing][...]
+                flat_bkv = bkv.reshape(-1, bkv.shape[-1])
+                fp8_val = pltpu.bitcast(
+                    flat_bkv[:, :head_dim], jnp.float8_e4m3fn
+                ).reshape(bkv_sz, head_dim)
+                scale_val = pltpu.bitcast(
+                    flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
+                ).astype(jnp.bfloat16)
             scores = gi_scores(
                 q_hm_ref, w_gi_ref, fp8_val, scale_val, bkv_idx, s_l, q_pos_base,
                 cp_rank, scores_vmem,
