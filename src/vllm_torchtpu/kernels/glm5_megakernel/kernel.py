@@ -145,6 +145,15 @@ class Tiles:
     # tb: top-k extraction per 128-row block over only the blocks each k chunk spans.
     topk_blk: bool = False
     topk_kc: int = 256
+    # ---- probe 33 arms (all off = stack6, bitwise-equal) ----
+    # rl: the router (gate dot, top-k, local columns) on the rup(R, 8) live rows, not all M=32
+    # (rows >= R are zero-padding: their routing is masked to 0 anyway).
+    router_rows: bool = False
+    # rv: local expert columns and hit counts by one one-hot [E, 128] dot each instead of ER
+    # masked reductions (exact: one nonzero term per sum).
+    router_onehot: bool = False
+    # rsub: with trace, split m_router into sub-regions r_gate/r_topk/r_loc/r_hits (m_router = gate).
+    router_sub: bool = False
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank. tk doubles as the
@@ -378,6 +387,14 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     sm_scale = cfg.DQ ** -0.5
     # decode replicas: KREP slots per rank; the hit list names a replica as j = ER + q
     KREP = getattr(cfg, "KREP", 0)
+    # probe 33 speculative first expert (cfg.SPEC, smalls "spec_g"): the guessed local expert's
+    # tiles stream from m_shared start; routing then confirms (it goes first in the list) or
+    # voids them (the issued tiles are drained unused). Bitwise either way.
+    SPEC = getattr(cfg, "SPEC", 0)
+    assert not (SPEC and KREP), "SPEC with KREP: not built"
+    # yspec rows: only part rows < R are ever sent (reduce_scatter_rows), so the parked term keeps
+    # rup(R, 8) rows, not M (768K -> 192K VMEM at R=8, H=6144)
+    MY = min(M, rup(R, 8))
     NS = R * KREP                                    # replica table entries
     ER_S = cfg.ER + KREP                             # es13 / es2 scratch rows
     if KREP:
@@ -504,7 +521,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     if len(tkinds) < len(wshape):
         scratch["pool"] = pltpu.VMEM((NB * BROWS, 128), U8)
     scratch["pool_sem"] = pltpu.SemaphoreType.DMA((NB,))
-    scratch["st"] = pltpu.SMEM((8,), I32)              # stream cursor, see `pump`
+    scratch["st"] = pltpu.SMEM((16 if SPEC else 8,), I32)   # stream cursor, see `pump`
+    if SPEC:
+        scratch["yspec"] = pltpu.VMEM((MY, H), F32)    # the speculated expert's weighted output
+        scratch["spec_sem"] = pltpu.SemaphoreType.DMA(())  # the guess read (own sem: no sharing)
     scratch["gst"] = pltpu.SMEM((2,), I32)             # gather prefetch: rows issued, target layer
     GPRE = 0 if "gather" in skip else tiles.gpre
     NOIDX = [l for l in range(L) if not cfg.full_indexer(l)]
@@ -529,6 +549,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     NTS = {k: ntiles(k) for k in SEGS if k != "exp"}
     T13, T2 = ntiles("ew13"), ntiles("ew2")
     TE = T13 + T2                                      # tiles per routed expert
+    # SPEC=1: the whole guessed expert may issue early; SPEC=n>1: at most n of its tiles (a miss
+    # then voids <= n tiles, which must also clear HBM before the real first tile lands)
+    SPK = TE if SPEC <= 1 else min(SPEC, TE)
 
     def bits(ks):
         return sum(1 << SID[k] for k in ks)
@@ -644,6 +667,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
         def nt_dyn(sg):
             v = st[6] * TE                             # exp: this layer's hits x tiles per expert
+            if SPEC:     # st[7] provisional (TE + 1: never completes the segment), st[8] voided tiles
+                v = jnp.where(st[7] == 1, TE + 1, v + st[8])
             for k, n in NTS.items():
                 v = jnp.where(sg == SID[k], n, v)
             return v
@@ -653,6 +678,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             if kind != "exp":
                 wsel(kind, l, lambda r: copy(kind, src_of(kind, r, t), slot).start())
                 return
+            if SPEC:
+                t = t - st[8]                          # past the voided speculative tiles
             i = t // TE
             u = t - i * TE
             j = scr["hits"][1, i]
@@ -691,7 +718,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 l, sg = st[2], st[3]
                 ok = jnp.logical_and(st[0] - st[1] < NB, l < L)
                 ok = jnp.logical_and(ok, (lax.shift_right_logical(amask, sg) & 1) == 1)
-                return jnp.logical_and(ok, jnp.logical_or(sg != EXP, st[5] == l))
+                ok = jnp.logical_and(ok, jnp.logical_or(sg != EXP, st[5] == l))
+                if SPEC:          # provisional list: at most SPK of the guessed expert's tiles
+                    ok = jnp.logical_and(ok, jnp.logical_not(jnp.logical_and(
+                        sg == EXP, jnp.logical_and(st[7] == 1, st[4] >= SPK))))
+                return ok
 
             def body(c):
                 l, sg, t = st[2], st[3], st[4]
@@ -805,8 +836,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             o, n = lay[name]
             return scr["sm"][slot, :, o:o + n]
 
+        def spec_copy():
+            return pltpu.make_async_copy(scr["hitv"].at[pl.ds(1, 1)], scr["hits"].at[pl.ds(1, 1)],
+                                         scr["spec_sem"])
+
         # the stream starts before anything else (upstream Qwen: first fetches precede the barrier)
-        for i_, v_ in enumerate((0, 0, 0, 0, 0, -1, 0, 0)):
+        for i_, v_ in enumerate((0, 0, 0, 0, 0, -1, 0, 0) + ((0,) * 8 if SPEC else ())):
             st[i_] = jnp.int32(v_)
         scr["gst"][0] = jnp.int32(0)
         scr["gst"][1] = jnp.int32(-1)
@@ -1066,6 +1101,17 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def _():
                 pltpu.make_async_copy(smalls.at[l + 1], scr["sm"].at[1 - slot],
                                       scr["sm_sem"].at[1 - slot]).start()
+
+            if SPEC:
+                # the guess read (vector -> SMEM hits row 1) starts here and is waited at m_shared
+                # start: a synchronous start+wait there queued behind the in-flight weight tiles
+                # (probe 33 job 7). hits row 1 is free: the last layer's experts are all consumed.
+                @pl.when(is_moe)
+                def _():
+                    gv = jnp.sum(jnp.where(lane128 == me, sm(slot, "spec_g"), 0.0), axis=1,
+                                 keepdims=True).astype(I32)
+                    scr["hitv"][1:2, :] = jnp.broadcast_to(gv, (1, 128))
+                    spec_copy().start()
 
             if KVA:
                 # probe 27 kva: last layer's row writes landed long ago (wrow / rrow are free), and
@@ -1582,6 +1628,19 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     ldes(None)()
                 else:
                     bswitch(l, {ll: ldes(ll) for ll in W["es13"]})
+                if SPEC:
+                    # speculative publish: hit list [g] (provisional) from the smalls guess,
+                    # read since the layer top
+                    spec_copy().wait()
+                    g_ = scr["hits"][1, 0]
+                    st[9] = g_
+                    st[8] = jnp.int32(0)
+
+                    @pl.when(jnp.logical_and(g_ >= 0, g_ < cfg.ER))
+                    def _():
+                        st[6] = jnp.int32(1)
+                        st[7] = jnp.int32(1)
+                        st[5] = l
                 # an idle rank publishes a zero row: routing drops it (below), so its dummy token
                 # no longer pulls experts onto the busy ranks' critical path
                 scr["hrow"][...] = jnp.where(active, scr["hn"][0:1, :], 0.0).astype(BF16)
@@ -1610,12 +1669,28 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 scr["xqm"][...] = xqm
 
                 phm.mark("m_router")
+                rsub = tiles.router_sub and tiles.trace
                 # router: sigmoid, +bias, top-k (ties -> lowest id), renorm
-                logits = matmul("gate", l, scr["xbf"], H, cfg.E)
+                MR = min(M, rup(R, 8)) if tiles.router_rows else M
+                if MR == M:
+                    logits = matmul("gate", l, scr["xbf"], H, cfg.E)
+                else:
+                    def gbody_(t, c):
+                        if not tiles.gwait:
+                            gpump()
+                        w_ = take("gate", poll=tiles.gwait)
+                        k0 = pl.multiple_of(t * tk["gate"], tk["gate"])
+                        xs, ws = mxu(scr["xbf"][0:MR, pl.ds(k0, tk["gate"])], w_[...], tiles)
+                        c = c + lax.dot_general(xs, ws, NN, preferred_element_type=F32)
+                        give("gate")
+                        return c
+                    logits = lax.fori_loop(0, ntiles("gate"), gbody_, jnp.zeros((MR, cfg.E), F32))
+                if rsub:
+                    phm.mark("r_topk")
                 scv = jax.nn.sigmoid(logits)
                 choice = scv + sm(slot, "gate_bias")
-                eio = lax.broadcasted_iota(I32, (M, cfg.E), 1)
-                wsel = jnp.zeros((M, cfg.E), F32)
+                eio = lax.broadcasted_iota(I32, (MR, cfg.E), 1)
+                wsel = jnp.zeros((MR, cfg.E), F32)
                 for _ in range(cfg.TOPK):
                     mxv = jnp.max(choice, axis=1, keepdims=True)
                     am = jnp.min(jnp.where(choice == mxv, eio, cfg.E), axis=1, keepdims=True)
@@ -1624,18 +1699,37 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     choice = jnp.where(sel, -jnp.inf, choice)
                 wsum = jnp.sum(wsel, axis=1, keepdims=True)
                 wn = (wsel / jnp.maximum(wsum, 1e-20)).astype(BF16).astype(F32)
-                live = jnp.max(jnp.abs(xall), axis=1, keepdims=True) > 0
-                valid_tok = jnp.logical_and(row_iota < R, live)
+                live = jnp.max(jnp.abs(xall[0:MR]), axis=1, keepdims=True) > 0
+                valid_tok = jnp.logical_and(row_iota[0:MR] < R, live)
                 wn = jnp.where(valid_tok, wn, 0.0)
+                if rsub:
+                    phm.mark("r_loc")
                 # local expert columns -> wloc lanes j, hit counts -> SMEM
-                wloc = jnp.zeros((M, 128), F32)
-                hitv = jnp.zeros((1, 128), I32)
-                for j in range(cfg.ER):
-                    e = me * cfg.ER + j
-                    col = jnp.sum(jnp.where(eio == e, wn, 0.0), axis=1, keepdims=True)
-                    cnt = jnp.sum(jnp.where(eio == e, (wsel > 0).astype(I32), 0) * valid_tok.astype(I32))
-                    wloc = jnp.where(lane128 == j, col, wloc)
-                    hitv = jnp.where(lane128 == j, cnt, hitv)
+                if tiles.router_onehot:
+                    EP = max(cfg.E, 128)
+                    ecol = lax.broadcasted_iota(I32, (EP, 128), 0)
+                    jcol = lax.broadcasted_iota(I32, (EP, 128), 1)
+                    oh = ((ecol == me * cfg.ER + jcol) & (jcol < cfg.ER)).astype(BF16)
+                    hsel = jnp.where(jnp.logical_and(valid_tok, wsel > 0), 1.0, 0.0)
+
+                    def padE(x):
+                        return x if EP == cfg.E else jnp.concatenate(
+                            [x, jnp.zeros((MR, EP - cfg.E), F32)], axis=1)
+                    wloc = lax.dot_general(padE(wn).astype(BF16), oh, NN,
+                                           preferred_element_type=F32)
+                    hitv = jnp.sum(lax.dot_general(padE(hsel).astype(BF16), oh, NN,
+                                                   preferred_element_type=F32),
+                                   axis=0, keepdims=True).astype(I32)
+                else:
+                    wloc = jnp.zeros((MR, 128), F32)
+                    hitv = jnp.zeros((1, 128), I32)
+                    for j in range(cfg.ER):
+                        e = me * cfg.ER + j
+                        col = jnp.sum(jnp.where(eio == e, wn, 0.0), axis=1, keepdims=True)
+                        cnt = jnp.sum(jnp.where(eio == e, (wsel > 0).astype(I32), 0)
+                                      * valid_tok.astype(I32))
+                        wloc = jnp.where(lane128 == j, col, wloc)
+                        hitv = jnp.where(lane128 == j, cnt, hitv)
                 if KREP:
                     # replica table -> hits rows 2..7: 2-3 expert hit bits (all E), 4 rep_e, 5 rep_s,
                     # 6 per-rank distinct-expert loads, 7 moved flags (0). Routing is replicated
@@ -1673,7 +1767,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                                      axis=1, keepdims=True)                      # [1, 1]
                         col = jnp.sum(jnp.where(eio == eq, wn, 0.0), axis=1, keepdims=True)
                         wloc = jnp.where(lane128 == cfg.ER + q_, col, wloc)
+                if MR < M:
+                    wloc = jnp.concatenate([wloc, jnp.zeros((M - MR, 128), F32)], axis=0)
                 scr["wloc"][...] = wloc
+                if rsub:
+                    phm.mark("r_hits")
                 scr["hitv"][0:1, :] = hitv
                 cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
                 cp.start()
@@ -1687,7 +1785,33 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     def _():
                         scr["hits"][1, n] = j
                     return n + h_.astype(I32)
-                if not KREP:
+                if SPEC:
+                    prov = st[7] == 1
+                    g_ = jnp.maximum(st[9], 0)
+                    k_d = jnp.where(jnp.logical_and(prov, jnp.logical_and(st[2] == l, st[3] == EXP)),
+                                    st[4], 0)
+                    hitg = jnp.logical_and(prov, scr["hits"][0, g_] > 0)
+
+                    def sbody(j, c):                   # g first (if hit), the rest ascending
+                        n, pg_ = c
+                        h_ = jnp.logical_and(scr["hits"][0, j] > 0,
+                                             jnp.logical_not(jnp.logical_and(hitg, j == g_)))
+
+                        @pl.when(h_)
+                        def _():
+                            scr["hits"][1, n] = j
+                        return (n + h_.astype(I32),
+                                pg_ + jnp.logical_and(h_, j < g_).astype(I32))
+
+                    @pl.when(hitg)
+                    def _():
+                        scr["hits"][1, 0] = g_
+                    n_hit, p_g = lax.fori_loop(0, cfg.ER, sbody,
+                                               (hitg.astype(I32), jnp.int32(0)))
+                    # voided tiles: the issued speculative ones, if g is not hit
+                    st[8] = jnp.where(hitg, 0, k_d)
+                    st[7] = jnp.int32(0)
+                elif not KREP:
                     n_hit = lax.fori_loop(0, cfg.ER, cbody, jnp.int32(0))
                 else:
                     hs = scr["hits"]
@@ -1742,6 +1866,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 if "experts" in skip:
                     n_hit = jnp.int32(0)
                 # publish the hit list: the producer may now stream this layer's experts
+                if rsub:
+                    phm.mark("r_pub")
                 st[6] = n_hit
                 st[5] = l
                 pump("gate")
@@ -1760,6 +1886,19 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     pltpu.make_async_copy(next(iter(W["rs2"].values())), es_dst("es2", True),
                                           scr["es_sem"].at[1]).wait()
                 scr["part"][...] = jnp.zeros((M, H), F32)
+                if SPEC:
+                    def dbody(t, c):                   # drain the voided speculative tiles
+                        @pl.when(t < T13)
+                        def _():
+                            take("ew13")
+                            give("ew13")
+
+                        @pl.when(t >= T13)
+                        def _():
+                            take("ew2")
+                            give("ew2")
+                        return c
+                    lax.fori_loop(0, st[8], dbody, 0)
 
                 def ebody(i, c):
                     j = scr["hits"][1, i]
@@ -1772,9 +1911,28 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     y = a * sx * scr["es2"][pl.ds(j, 1), :]
                     wcol = jnp.sum(jnp.where(lane128 == j, scr["wloc"][...], 0.0), axis=1,
                                    keepdims=True)
-                    scr["part"][...] += y * wcol
+                    if not SPEC:
+                        scr["part"][...] += y * wcol
+                        return c
+                    # a confirmed guess ran first; its term joins the sum at its ascending place
+                    first = jnp.logical_and(hitg, i == 0)
+
+                    @pl.when(first)
+                    def _():
+                        scr["yspec"][...] = (y * wcol)[:MY]
+
+                    @pl.when(jnp.logical_not(first))
+                    def _():
+                        @pl.when(jnp.logical_and(hitg, i - 1 == p_g))
+                        def _():
+                            scr["part"][:MY, :] += scr["yspec"][...]
+                        scr["part"][...] += y * wcol
                     return c
                 lax.fori_loop(0, n_hit, ebody, 0)
+                if SPEC:
+                    @pl.when(jnp.logical_and(hitg, p_g == n_hit - 1))
+                    def _():
+                        scr["part"][:MY, :] += scr["yspec"][...]
 
                 phm.mark("m_rs")
                 reduce_scatter_rows()
@@ -1888,4 +2046,6 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     vmem = sum(vmem_by.values())
     info = dict(s_names=s_names, w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck,
                 vmem_scratch_bytes=vmem, vmem_by=vmem_by, stack_w=SW, stack_c=SC)
+    if SPEC:
+        info["spec_tiles"] = (SPK, TE)                 # (speculative cap, tiles per expert)
     return step, info

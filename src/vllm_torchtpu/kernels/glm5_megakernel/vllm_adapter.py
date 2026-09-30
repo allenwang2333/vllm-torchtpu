@@ -181,7 +181,7 @@ class Glm5Megakernel:
             idx_freq=hf.index_topk_freq, idx_skip=hf.index_skip_topk_offset,
             rope_theta=float(rp.get("rope_theta", FULL.rope_theta)), eps=hf.rms_norm_eps,
             routed_scale=float(hf.routed_scaling_factor),
-            KREP=int(envs.GLM5_MK_DECODE_REPLICAS))
+            KREP=int(envs.GLM5_MK_DECODE_REPLICAS), SPEC=int(envs.GLM5_MK_SPEC))
         for got, want, what in (
             (hf.kv_lora_rank, cfg.KL, "kv_lora_rank"), (hf.qk_nope_head_dim, cfg.DN, "qk_nope"),
             (hf.qk_rope_head_dim, cfg.DR, "qk_rope"), (hf.v_head_dim, cfg.DV, "v_head_dim"),
@@ -195,6 +195,11 @@ class Glm5Megakernel:
         _need(cfg.NH % R == 0 and cfg.E % R == 0, f"{R} ranks do not divide heads/experts")
         _need(cfg.KREP >= 0 and R * cfg.KREP <= 64 and cfg.ER + cfg.KREP <= 128,
               f"GLM5_MK_DECODE_REPLICAS={cfg.KREP} at R={R}")
+        _need(cfg.SPEC >= 0 and R <= 128, f"GLM5_MK_SPEC={cfg.SPEC} at R={R}")
+        # SPEC with decode replicas is not in this kernel (probe 33: it was built and measured
+        # +190..+290 us/step slower than GLM5_MK_DECODE_REPLICAS alone, j-d5808b4c)
+        _need(not (cfg.SPEC and cfg.KREP),
+              "GLM5_MK_SPEC with GLM5_MK_DECODE_REPLICAS: not supported (pick one)")
         self.cfg = cfg
         self.rank = ep_mesh_index()
         order = ep_rank_order()
@@ -208,13 +213,20 @@ class Glm5Megakernel:
         # once it has rebalanced, else the offline profile, else none = uniform), and the table
         # in kernel expert space that load gives under the layer's current permutation.
         self.krep = cfg.KREP
+        # Speculative first expert: the guesses follow the same logical load (see _spec_guess)
+        self.spec = cfg.SPEC
         self.rep_load: dict[int, Any] = {}
         self.rep_entries: dict[int, list] = {}
         self._gather_ops: dict = {}
-        if self.krep:
-            prof = envs.GLM5_MK_DECODE_REPLICAS_PROFILE
+        if self.krep or self.spec:
+            prof = envs.GLM5_MK_DECODE_REPLICAS_PROFILE or (
+                envs.GLM5_MK_SPEC_PROFILE if self.spec else "")
             if prof:
                 self.rep_load = REP.load_profile(prof)
+        if self.spec:
+            logger.info("GLM-5.2 megakernel: speculative first expert, <= %d tiles, guesses %s",
+                        self.spec, f"from profile {prof}" if prof else "none until EPLB has a load")
+        if self.krep:
             for l in range(cfg.L):
                 if cfg.is_moe(l):
                     self.rep_entries[l] = self._rep_place(l)
@@ -431,25 +443,43 @@ class Glm5Megakernel:
         """Online EPLB, at every rebalance (after set_expert_placement), on every rank: re-place
         from the window's logical load {layer: [E]} and re-copy the layers whose table changed.
         Collective. Returns the number of layers re-copied."""
-        if not self.krep:
+        if not self.krep and not self.spec:
             return 0
         from vllm_torchtpu.utils import synchronize_tensors
 
-        redo = []
+        redo, guess_moved = [], False
         for l, ll in logical_load.items():
             l = int(l)
+            if not self.cfg.is_moe(l):
+                continue
+            g0 = self._spec_guess(l) if self.spec else None
+            self.rep_load[l] = np.asarray(ll, np.float64)
+            if self.spec and not np.array_equal(g0, self._spec_guess(l)):
+                guess_moved = True
             if l not in self.rep_entries:
                 continue
-            self.rep_load[l] = np.asarray(ll, np.float64)
             new = self._rep_place(l)
             if new != self.rep_entries[l]:
                 self.rep_entries[l] = new
                 redo.append(l)
         if redo:
             self._gather_replicas(redo)
+        if redo or guess_moved:
             self.smalls = self._build_smalls().detach()
             synchronize_tensors(self.weights + [self.smalls])
         return len(redo)
+
+    def _spec_guess(self, l: int) -> np.ndarray:
+        """[R] kernel-space local expert each rank speculates on in layer l (-1 = none): the
+        rank's primary with the highest hit probability under the layer's logical load (probe 33's
+        proxy guess, "hot"). No load (uniform) -> -1: every guess is equally likely to miss."""
+        cfg = self.cfg
+        ll = self.rep_load.get(l)
+        if ll is None or float(np.sum(ll)) <= 0:
+            return np.full(cfg.R, -1, np.int64)
+        kl = np.asarray(ll, np.float64)[self._perm(l).numpy()]
+        q = REP.hit_probability(kl, cfg.E, cfg.R)
+        return q.reshape(cfg.R, cfg.ER).argmax(axis=1).astype(np.int64)
 
     def _gather_op(self, src_shape, dst_shape, dtype):
         key = (tuple(src_shape), tuple(dst_shape), str(dtype))
@@ -621,6 +651,10 @@ class Glm5Megakernel:
                 rep_e, rep_s = REP.table(self.rep_entries[l])
                 f["rep_e"] = torch.from_numpy(rep_e).to(b.device)
                 f["rep_s"] = torch.from_numpy(rep_s).to(b.device)
+            if cfg.SPEC:                 # lane r = rank r's guess; the rest -1 (a zero lane = expert 0)
+                g = np.full(128, -1.0, np.float32)
+                g[:cfg.R] = self._spec_guess(l)
+                f["spec_g"] = torch.from_numpy(g).to(b.device)
         else:
             f["w2_s"] = _scale(mlp.down_proj, cfg.H, "dense.down_proj")
         return f

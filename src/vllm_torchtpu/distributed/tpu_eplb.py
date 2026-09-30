@@ -732,7 +732,8 @@ class EplbRebalancer:
             mk_t = getattr(self.megakernel, "last_placement_timing", None)
             if mk_t:
                 tm["mk_rebuild"], tm["mk_sync"] = mk_t
-        if getattr(self.megakernel, "krep", 0) and self.debug_skip != "map":
+        if ((getattr(self.megakernel, "krep", 0) or getattr(self.megakernel, "spec", 0))
+                and self.debug_skip != "map"):
             # megakernel decode replicas follow the same load window, every rebalance (also one
             # that moved no layer): collective, identical inputs on every rank
             tr = time.perf_counter()
