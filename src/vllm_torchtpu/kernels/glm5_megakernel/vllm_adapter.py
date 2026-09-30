@@ -61,6 +61,13 @@ EXPERT_KINDS = ("ew13", "ew2", "es13", "es2")
 # decode replica slots (GLM5_MK_DECODE_REPLICAS): kind -> the expert kind it copies
 REPLICA_KINDS = {"rw13": "ew13", "rw2": "ew2", "rs13": "es13", "rs2": "es2"}
 SHARDED_KINDS = EXPERT_KINDS + ("o_proj", "q_b", "w_uk") + tuple(REPLICA_KINDS)
+# GLM5_MK_STACK_W: the kinds whose operand is this adapter's own load-time buffer (a copy, clone,
+# column permutation or zeros), so one [n_layers, ...] tensor per kind replaces the per-layer
+# tensors byte for byte and the KV pool is sized against the same HBM. Every other kind aliases a
+# stock parameter (qkv_a, w_uv, idx_wq, the experts and their scales, the shared and dense MLPs):
+# stacking it would duplicate it (qkv_a + w_uv alone are 2.4 GiB/rank, ~44 KV blocks) or leave
+# the stock layers reading strided views of the stack.
+OWNED_KINDS = ("q_b", "w_uk", "o_proj", "idx_wk", "gate") + tuple(REPLICA_KINDS)
 
 
 class Unsupported(Exception):
@@ -224,6 +231,8 @@ class Glm5Megakernel:
         _need(self.rotary.cos_sin_cache.shape[-1] == cfg.DR, "rope cache width")
 
         self.wk = K.weight_kinds(cfg)
+        self.stack_w = self._stack_knobs()
+        self._put_ops: dict = {}
         with torch.no_grad():
             self.weights = [w.detach() for w in self._collect_weights()]
             if self.krep:
@@ -253,6 +262,59 @@ class Glm5Megakernel:
                     len(self.weights), self.rank, R)
 
     # ---------------------------------------------------------------- weights
+
+    def _stack_knobs(self) -> frozenset:
+        """GLM5_MK_STACK_W / _C (kernel.stack_kinds syntax: 1 or a kind list) -> the weight kinds
+        served stacked. Only OWNED_KINDS are stackable in place; caches are refused: vLLM allocates
+        each layer's MLA and indexer cache separately, and one tensor per kind with per-layer
+        views would make every stock sparse-MLA / indexer call slice-copy its layer out of the
+        stack and scatter it back (torch_tpu passes a view as base + static as_strided). Stacked
+        caches need those stock kernels to take (bundle, layer), as VLLM_TPU_BLOCK_MAJOR_KV's
+        bundled RPA does."""
+        # the replica kinds are valid knob values at GLM5_MK_DECODE_REPLICAS=0 too (no operand)
+        sw = K.stack_kinds(None, "GLM5_MK_STACK_W", set(self.wk) | set(REPLICA_KINDS)) & set(self.wk)
+        sc = K.stack_kinds(None, "GLM5_MK_STACK_C", K.cache_kinds(self.cfg, 1, True))
+        alias = sorted(sw - set(OWNED_KINDS))
+        if alias:
+            logger.warning("GLM5_MK_STACK_W: %s alias stock parameters; served per layer", alias)
+        if sc:
+            logger.warning("GLM5_MK_STACK_C=%s ignored: the served caches are per-layer vLLM "
+                           "allocations (no zero-copy stack); caches served per layer", sorted(sc))
+        sw = frozenset(sw & set(OWNED_KINDS))
+        if sw:
+            logger.info("GLM-5.2 megakernel: stacked weight operands %s", sorted(sw))
+        return sw
+
+    def _put_op(self, kind: str):
+        """(stack [n, ...], x, [row]) -> stack with row `row` = x; the stack is donated (an in-place
+        DUS: no second copy of the stack at load or at an EPLB rebalance)."""
+        op = self._put_ops.get(kind)
+        if op is None:
+            sh = kind in SHARDED_KINDS
+
+            def put(stk: jax.Array, x: jax.Array, row: jax.Array) -> jax.Array:
+                return jax.lax.dynamic_update_index_in_dim(stk, x, row[0], 0)
+
+            op = sharded_jax_callable(
+                f"glm5_megakernel::stack_put_{kind}", put, mesh=self.mesh,
+                input_partition_specs=(P(None, EP_AXIS_NAME) if sh else P(),
+                                       P(EP_AXIS_NAME) if sh else P(), P()),
+                output_partition_specs=P(None, EP_AXIS_NAME) if sh else P(),
+                donate_argnums=(0,))
+            self._put_ops[kind] = op
+        return op
+
+    def _row_t(self, row: int, dev) -> torch.Tensor:
+        return torch.tensor([row], dtype=torch.int32, device=dev)
+
+    def _set_weight(self, kind: str, l: int, x: torch.Tensor) -> None:
+        """Replace layer l's `kind` operand: the per-layer tensor, or its row of the stack."""
+        i, row = self._w_pos[(kind, l)]
+        if row is None:
+            self.weights[i] = x.detach()
+        else:
+            self.weights[i] = self._put_op(kind)(self.weights[i], x,
+                                                 self._row_t(row, x.device)).detach()
 
     def _layer_weights(self, l: int) -> dict[str, torch.Tensor]:
         cfg = self.cfg
@@ -290,8 +352,10 @@ class Glm5Megakernel:
             d["ew2"] = r.w2_weight
             d["es13"] = _expert_scale(r, "w13_weight", (cfg.ER, 2 * cfg.I))
             d["es2"] = _expert_scale(r, "w2_weight", (cfg.ER, H))
-            if cfg.KREP:                 # filled by _gather_replicas
+            if cfg.KREP:                 # filled by _gather_replicas (stacked: zeroed whole, below)
                 for k_, src in REPLICA_KINDS.items():
+                    if k_ in self.stack_w:
+                        continue
                     shp = self.wk[k_][1]
                     d[k_] = torch.zeros(shp, dtype=d[src].dtype, device=d[src].device)
             se = mlp.shared_experts
@@ -326,14 +390,15 @@ class Glm5Megakernel:
         for l, p2l in phys2log_mesh.items():
             self.layer_perm[int(l)] = torch.as_tensor(p2l, dtype=torch.long)
         changed = {int(l) for l in phys2log_mesh}
-        for i, (kind, l) in enumerate(self._w_index):
+        for (kind, l), (i, row) in list(self._w_pos.items()):
             if l not in changed:
                 continue
             if kind == "gate":
                 L = self.backbone.layers[l]
                 g = _kn(L.mlp.gate.weight, self.cfg.H, self.cfg.E, "gate")
-                self.weights[i] = g[:, self._perm(l).to(g.device)].contiguous().detach()
-            elif kind in EXPERT_KINDS:
+                self._set_weight("gate", l, g[:, self._perm(l).to(g.device)].contiguous())
+            elif kind in EXPERT_KINDS:      # never stacked (aliases, not in OWNED_KINDS)
+                assert row is None, kind
                 r = _routed(self.backbone.layers[l].mlp)
                 new = {"ew13": lambda: r.w13_weight, "ew2": lambda: r.w2_weight,
                        "es13": lambda: _expert_scale(r, "w13_weight", (self.cfg.ER, 2 * self.cfg.I)),
@@ -402,38 +467,83 @@ class Glm5Megakernel:
     def _gather_replicas(self, layers) -> None:
         """Copy each slot's expert rows from its owner's shard (collective, same on every rank)."""
         cfg = self.cfg
-        pos = {kl: i for i, kl in enumerate(self._w_index)}
         dev = self.weights[0].device
         for l in layers:
             plans = REP.gather_plans(self.rep_entries[l], cfg.R, cfg.ER, cfg.KREP)
             ops = [[torch.tensor(a[self.rank:self.rank + 1], dtype=torch.int32, device=dev)
                     for a in p] for p in plans]
             for k_, src in REPLICA_KINDS.items():
-                w = self.weights[pos[(src, l)]]
-                i = pos[(k_, l)]
+                si, srow = self._w_pos[(src, l)]
+                assert srow is None, src           # expert kinds alias: never stacked
+                w = self.weights[si]
+                i, row = self._w_pos[(k_, l)]
                 out = self.weights[i]
-                op = self._gather_op(w.shape, out.shape, w.dtype)
-                for q_ops in ops:
-                    out = op(w, out, *q_ops)
+                if row is None:
+                    op = self._gather_op(w.shape, out.shape, w.dtype)
+                    for q_ops in ops:
+                        out = op(w, out, *q_ops)
+                else:          # the slot rows of layer l inside the donated [n, ...] stack
+                    op = self._gather_stk_op(w.shape, out.shape, w.dtype)
+                    rt = self._row_t(row, dev)
+                    for q_ops in ops:
+                        out = op(out, w, rt, *q_ops)
                 self.weights[i] = out.detach()
 
+    def _gather_stk_op(self, src_shape, stk_shape, dtype):
+        key = ("stk", tuple(src_shape), tuple(stk_shape), str(dtype))
+        op = self._gather_ops.get(key)
+        if op is None:
+            spec, sspec = P(EP_AXIS_NAME), P(None, EP_AXIS_NAME)
+            op = sharded_jax_callable(
+                f"glm5_megakernel::replica_gather_stk_{len(self._gather_ops)}",
+                REP.make_gather_stk_fn(self.mesh, EP_AXIS_NAME), mesh=self.mesh,
+                input_partition_specs=(sspec, spec, P()) + (spec,) * 4,
+                output_partition_specs=sspec, donate_argnums=(0,))
+            self._gather_ops[key] = op
+        return op
+
     def _collect_weights(self) -> list[torch.Tensor]:
+        """Operands in kernel.build's w_names order: per layer, or one [n_layers, ...] tensor for a
+        kind in self.stack_w. _w_pos[(kind, l)] = (operand index, row in the stack or None)."""
         per_layer = {}
         out = []
         self.w_specs = []
         self._w_index = []
+        self._w_pos = {}
         for kind, (layers, shape, dtype) in self.wk.items():
-            for l in layers:
-                self._w_index.append((kind, l))
+            want = {"float8_e4m3fn": torch.float8_e4m3fn, "bfloat16": torch.bfloat16,
+                    "float32": torch.float32}[jax.numpy.dtype(dtype).name]
+            spec = P(EP_AXIS_NAME) if kind in SHARDED_KINDS else P()
+            stk = None
+            if kind in self.stack_w and kind in REPLICA_KINDS:   # zeros; _gather_replicas fills
+                stk = torch.zeros((len(layers),) + tuple(shape), dtype=want,
+                                  device=self.embed.device)
+            for row, l in enumerate(layers):
+                if kind in self.stack_w:
+                    self._w_pos[(kind, l)] = (len(out), row)
+                    if kind in REPLICA_KINDS:
+                        continue
+                else:
+                    self._w_pos[(kind, l)] = (len(out), None)
+                    self._w_index.append((kind, l))
                 if l not in per_layer:
                     per_layer[l] = self._layer_weights(l)
-                t = per_layer[l][kind]
+                # pop: a stacked kind's per-layer copy is freed once its row is written
+                t = per_layer[l].pop(kind)
                 _need(tuple(t.shape) == tuple(shape), f"{kind}[{l}]: {tuple(t.shape)} != {shape}")
-                want = {"float8_e4m3fn": torch.float8_e4m3fn, "bfloat16": torch.bfloat16,
-                        "float32": torch.float32}[jax.numpy.dtype(dtype).name]
                 _need(t.dtype == want, f"{kind}[{l}]: {t.dtype} != {want}")
-                out.append(t)
-                self.w_specs.append(P(EP_AXIS_NAME) if kind in SHARDED_KINDS else P())
+                if kind in self.stack_w:
+                    if stk is None:
+                        stk = torch.zeros((len(layers),) + tuple(shape), dtype=want, device=t.device)
+                    stk = self._put_op(kind)(stk, t, self._row_t(row, t.device))
+                    del t
+                else:
+                    out.append(t)
+                    self.w_specs.append(spec)
+            if kind in self.stack_w:
+                self._w_index.append((kind, "stk"))
+                out.append(stk)
+                self.w_specs.append(P(None, *spec) if kind in SHARDED_KINDS else P())
         return out
 
     def _build_smalls(self) -> torch.Tensor:
@@ -570,10 +680,10 @@ class Glm5Megakernel:
         dbg = self.layerdiff and not skip
         call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE),
                              debug=dbg, skip=skip, rope_packed=self.rope_packed,
-                             # stacked [L,...] operands (GLM5_MK_STACK_W/_C) need stacked weight
-                             # loading + one KV tensor per kind here; not wired yet -> pin off.
-                             stack_w=False, stack_c=False)
+                             # the served kinds (_stack_knobs): owned weights only, caches per layer
+                             stack_w=self.stack_w, stack_c=frozenset())
         self.info = info
+        assert list(info["w_names"]) == self._w_index, "weight operand order"
         n_w = len(self.weights)
         n_c = len(self.caches)
         assert n_w == len(info["w_names"]) and n_c == len(info["c_names"])
