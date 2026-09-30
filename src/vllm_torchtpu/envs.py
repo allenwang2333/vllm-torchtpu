@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
+    USE_FUSED_UNPERMUTE_GMM: bool = False
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
@@ -517,6 +518,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # upstream vLLM's VLLM_USE_FLASHINFER_MOE_* style of env-gated MoE kernel
     # selection (vLLM 0.19.0 has no --moe-backend; see fused_moe.py TODO).
     "USE_MOE_SPARSE_CORE": lambda: bool(int(os.getenv("USE_MOE_SPARSE_CORE") or "1")),
+    "USE_FUSED_UNPERMUTE_GMM": env_bool("USE_FUSED_UNPERMUTE_GMM", False),
     # Use one-hot matmuls for MoE permute and unpermute when the routed row
     # count (num_tokens * topk) is <= this threshold. Unset or empty means
     # auto: fused_moe_gmm.resolve_onehot_permute_threshold derives the value

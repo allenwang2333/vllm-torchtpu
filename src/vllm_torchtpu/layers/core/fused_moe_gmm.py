@@ -40,6 +40,12 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
+from vllm_torchtpu.kernels.experimental.fused_unpermute_gmm import (
+    ragged_dma_reduce,
+)
+from vllm_torchtpu.kernels.experimental.fused_unpermute_gmm import (
+    wrapper as fused_permute,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.logger import init_logger
 
@@ -639,6 +645,98 @@ def fused_moe_func(
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
+
+    if (
+        envs.USE_FUSED_UNPERMUTE_GMM
+        and rhs_quant_dtype is None
+        and not use_ep
+        and hidden_size % 256 == 0
+        and (num_tokens * topk) % 16 == 0
+    ):
+        logger.info_once("Selected fused permute + unpermute GMM MoE")
+        if padded_hidden_size != hidden_size:
+            hidden_states = jnp.pad(
+                hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size))
+            )
+        batch_size, model_dim = hidden_states.shape
+        x_blocked = hidden_states.reshape(batch_size, model_dim // 256, 2, 128)
+
+        topk_indices_flat = topk_ids.flatten()
+        topk_argsort_indices = jnp.argsort(topk_indices_flat)
+        group_sizes = jnp.bincount(topk_indices_flat, length=w1.shape[0])
+        group_offset = jnp.zeros((1,), dtype=jnp.int32)
+
+        inter_dim = w2.shape[1]
+        target_inter_dim = -(-inter_dim // 256) * 256
+        pad_size = target_inter_dim - inter_dim
+
+        w1_in = w1
+        w2_in = w2
+        w1_scale_in = w1_scale
+        w2_scale_in = w2_scale
+
+        if pad_size > 0:
+            gate = w1[..., :inter_dim]
+            up = w1[..., inter_dim:]
+            gate_padded = jnp.pad(gate, ((0, 0), (0, 0), (0, pad_size)))
+            up_padded = jnp.pad(up, ((0, 0), (0, 0), (0, pad_size)))
+            w1_in = jnp.concatenate([gate_padded, up_padded], axis=-1)
+            w2_in = jnp.pad(w2, ((0, 0), (0, pad_size), (0, 0)))
+
+        if w1_scale is not None:
+            if w1_scale.ndim == 2:
+                w1_scale_in = w1_scale[:, None, None, :]
+            elif w1_scale.ndim == 3:
+                w1_scale_in = jnp.expand_dims(w1_scale, 2)
+            if pad_size > 0:
+                scale_gate = w1_scale_in[..., :inter_dim]
+                scale_up = w1_scale_in[..., inter_dim:]
+                scale_gate_padded = jnp.pad(
+                    scale_gate,
+                    ((0, 0), (0, 0), (0, 0), (0, pad_size)),
+                    constant_values=1.0,
+                )
+                scale_up_padded = jnp.pad(
+                    scale_up,
+                    ((0, 0), (0, 0), (0, 0), (0, pad_size)),
+                    constant_values=1.0,
+                )
+                w1_scale_in = jnp.concatenate(
+                    [scale_gate_padded, scale_up_padded], axis=-1
+                )
+
+        if w2_scale is not None:
+            if w2_scale.ndim == 2:
+                w2_scale_in = w2_scale[:, None, None, :]
+            elif w2_scale.ndim == 3:
+                w2_scale_in = jnp.expand_dims(w2_scale, 2)
+
+        gmm1_res = fused_permute.fused_permute_gmm(
+            x_blocked,
+            w1_in,
+            w1_scale_in,
+            group_sizes,
+            topk_argsort_indices // topk,
+            fuse_act=activation,
+            group_offset=group_offset,
+        )
+
+        gmm2_res = fused_permute.fused_unpermute_gmm(
+            gmm1_res,
+            w2_in,
+            w2_scale_in,
+            group_sizes,
+            topk_argsort_indices,
+            group_offset=group_offset,
+        )
+
+        out = ragged_dma_reduce.ragged_dma_reduce(
+            gmm2_res,
+            topk_weights,
+        )
+        if w2_bias is not None:
+            out = out + w2_bias
+        return out[:num_tokens, :hidden_size]
 
     (
         x,
