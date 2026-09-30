@@ -192,6 +192,57 @@ def test_async_sub_indices_skips_new_req():
     assert src == [0, 1, 2, 3]
 
 
+def _spec_bucket_runner(spec_k):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=spec_k),
+        num_tokens_paddings=[32, 64, 128, 256, 384, 512, 768],
+        num_reqs_paddings=[8, 16, 32, 64, 128, 192],
+    )
+
+
+@pytest.mark.parametrize("spec_k", [1, 3, 7])
+def test_spec_verify_bucket_reachable_keeps_every_real_step(spec_k):
+    # n requests sample between n and n * (K + 1) logits positions; the
+    # padded bucket pair of every such step must survive the pruning.
+    runner = _spec_bucket_runner(spec_k)
+
+    def pad(value, paddings):
+        return next((p for p in paddings if p >= value), None)
+
+    for n in range(1, runner.num_reqs_paddings[-1] + 1):
+        for length in range(n, n * (spec_k + 1) + 1):
+            num_tokens = pad(length, runner.num_tokens_paddings)
+            if num_tokens is None:
+                break
+            num_reqs = pad(n, runner.num_reqs_paddings)
+            assert TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            ), (n, length, num_tokens, num_reqs)
+
+
+def test_spec_verify_bucket_reachable_prunes_impossible_pairs():
+    runner = _spec_bucket_runner(3)
+    reachable = {
+        num_tokens: [
+            num_reqs
+            for num_reqs in runner.num_reqs_paddings
+            if TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            )
+        ]
+        for num_tokens in runner.num_tokens_paddings
+    }
+    assert reachable == {
+        32: [8, 16, 32],
+        64: [16, 32, 64],
+        128: [32, 64, 128],
+        256: [64, 128, 192],
+        384: [128, 192],
+        512: [128, 192],
+        768: [192],
+    }
+
+
 def test_get_finished_kv_transfers_drains_invalid_block_ids():
     connector = MagicMock()
     connector.get_finished.return_value = ({"sent"}, {"loaded"})
@@ -844,16 +895,10 @@ class TestAttentionMetadataBuilder:
             dtypes=[torch.bfloat16],
             page_size_padded=256,
         )
-        with (
-            patch(
-                "vllm_torchtpu.layers.core.attention_metadata.get_dcp_group"
-            ) as mock_dcp,
-            patch(
-                "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
-            ) as mock_pcp,
-        ):
-            mock_dcp.return_value.world_size = 4
-            mock_pcp.return_value.world_size = 1
+        with patch(
+            "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
+        ) as mock_pcp:
+            mock_pcp.return_value.world_size = 4
             builder = self._make_builder(runner, spec=mamba_spec)
 
         runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
@@ -872,6 +917,28 @@ class TestAttentionMetadataBuilder:
             meta.mamba_state_indices, torch.tensor([0, 5, 0, 0], dtype=torch.int32)
         )
 
+    def test_unified_mamba_state_indices_dcp_does_not_scale_block_size(self):
+        """Regression test for #1233: DCP must not scale mamba target_block_size."""
+        runner = self._make_runner_mock(max_num_blocks_per_req=4)
+        runner._unified_kv_layout = True
+        mamba_spec = MambaSpec(
+            block_size=16,
+            shapes=[(2, 8)],
+            dtypes=[torch.bfloat16],
+            page_size_padded=256,
+        )
+        with (
+            patch("vllm.distributed.get_dcp_group") as mock_dcp,
+            patch(
+                "vllm_torchtpu.layers.core.attention_metadata.get_pcp_group"
+            ) as mock_pcp,
+        ):
+            mock_dcp.return_value.world_size = 4
+            mock_pcp.return_value.world_size = 1
+            builder = self._make_builder(runner, spec=mamba_spec)
+
+        assert builder.target_block_size == 16
+
 
 class TestCompactMambaSlotPool:
     """Unit tests for the compact-mamba recurrent-slot allocator
@@ -884,6 +951,7 @@ class TestCompactMambaSlotPool:
         runner.max_num_reqs = max_num_reqs
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
+        runner._mamba_offset_seeded = set()
         runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
         runner.input_batch = MagicMock()
         # Bind the real methods.
@@ -1093,8 +1161,15 @@ class TestReorderBatchForRpa:
 
 
 class TestInitializeAttentionKernelsThreshold:
-    """`reorder_batch_threshold` is the smallest DECODE query width across the
-    kernels `_initialize_attention_kernels` builds, draft layers included."""
+    """`reorder_batch_threshold` is the smallest DECODE query width across all
+    target and draft kernels `_initialize_attention_kernels` builds.
+
+    The drafter's first pass (`step_idx == 0`) reuses the target's
+    `request_distribution`, so every draft layer must be at least as wide as
+    `reorder_batch_threshold`. Sharded drafts keep their K+1-wide decode tile;
+    replicated (`draft_tensor_parallel_size == 1`) drafts relocated to the
+    local RPA kernel are pinned to 1, which pulls the shared threshold down
+    to 1."""
 
     def _make_runner(self, widths, draft_names=(), draft_tp=2):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -1139,21 +1214,40 @@ class TestInitializeAttentionKernelsThreshold:
         self._run(runner, layers)
         assert runner.reorder_batch_threshold == 1
 
-    def test_relocated_draft_forces_one_token_decode(self):
+    def test_replicated_draft_relocated_and_pinned_to_one_token(self):
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1
         )
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1
         assert layers["target"].impl.decode_query_size == 4
+        # The drafter's first pass attends with the target's distribution, so
+        # a 1-wide draft must hold the threshold at 1: K+1-token verify windows
+        # must not reach its DECODE stage.
         assert runner.reorder_batch_threshold == 1
 
-    def test_sharded_draft_keeps_width(self):
+    def test_sharded_draft_keeps_verify_width(self):
+        """Regression: pinning a sharded draft to 1 while the threshold stayed
+        at K+1 sent K+1-token verify windows into the draft's 1-wide DECODE
+        stage on the drafter's first pass (it reuses the target's
+        request_distribution). Qwen3.5 DCP4 + MTP3 acceptance fell to ~0.5%."""
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=2
         )
         self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 4
+        assert layers["target"].impl.decode_query_size == 4
         assert runner.reorder_batch_threshold == 4
+
+    def test_narrow_draft_caps_threshold(self):
+        """A draft whose tile is narrower than the target's (e.g. an impl that
+        never widens) caps the threshold at the draft's width."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 1}, draft_names=("draft",), draft_tp=2
+        )
+        self._run(runner, layers)
+        assert layers["target"].impl.decode_query_size == 4
+        assert runner.reorder_batch_threshold == 1
 
     def test_no_pallas_layers(self):
         runner, layers = self._make_runner({})
@@ -1253,11 +1347,12 @@ class TestReadOffsetsClearedOnReallocation:
     the previous conversation: silent GDN state corruption, no crash.
     """
 
-    def _make_runner(self, num_blocks=8, width=2):
+    def _make_runner(self, num_blocks=8, width=2, lockstep=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._mamba_offset_seeded = set()
         runner._read_offset_scratch = {}
+        runner._dp_lockstep_enabled = lambda: lockstep
         runner.input_batch = MagicMock()
         runner._mamba_state_index_groups = (
             TPUModelRunner._mamba_state_index_groups.__get__(runner)
@@ -1273,6 +1368,7 @@ class TestReadOffsetsClearedOnReallocation:
     def _set_batch(self, runner, req_ids, state_indices):
         runner.input_batch.req_ids = list(req_ids)
         runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+        runner.requests = dict.fromkeys(req_ids)
         ctx = MagicMock()
         ctx.mamba_state_indices = torch.tensor(state_indices, dtype=torch.int32)
         ctx.unified_mamba_state_indices = None
@@ -1318,6 +1414,46 @@ class TestReadOffsetsClearedOnReallocation:
         assert int(runner.mamba_slot_read_offsets[5]) == 2  # untouched
         assert int(runner.mamba_slot_read_offsets[6]) == 0  # cleared
         assert int(runner.mamba_slot_read_offsets[0]) == 0  # null stays 0
+
+    @pytest.mark.parametrize("lockstep", [False, True])
+    def test_all_seen_batch_skips_device_work_unless_lockstep(
+        self, monkeypatch, lockstep
+    ):
+        """A batch with no new request has nothing to reset. One engine's TP
+        ranks all see that batch, so they skip the upload and launches
+        together. Under EP-DP lockstep, where "new" is rank-local, every rank
+        still issues them."""
+        calls = []
+        real = tpu_runner._reset_read_offsets
+
+        def counting(*args):
+            calls.append(args)
+            real(*args)
+
+        monkeypatch.setattr(tpu_runner, "_reset_read_offsets", counting)
+        runner = self._make_runner(lockstep=lockstep)
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (2 if lockstep else 1)
+
+        # A new request is always reset.
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (3 if lockstep else 2)
+
+        # "a" leaves; the all-old batch is skipped without lockstep.
+        self._set_batch(runner, ["b"], [6, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (4 if lockstep else 2)
+
+        # "a" comes back on a recycled slot carrying a stale offset. It was
+        # forgotten when it left, so it counts as new and its slot is cleared.
+        runner.mamba_slot_read_offsets[5] = 2
+        self._set_batch(runner, ["b", "a"], [6, 5])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (5 if lockstep else 3)
+        assert int(runner.mamba_slot_read_offsets[5]) == 0
 
 
 class TestUnifiedReadOffsetMigration:
@@ -1484,6 +1620,10 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
             hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=8),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+        ),
         kv_transfer_config=None,
     )
     resolve_kv_cache_layout(vllm_config, [["LBNHC", "LBHNC"]])
@@ -1670,3 +1810,313 @@ class TestInputStagingFence:
         runner = SimpleNamespace(_input_staging_fence=None)
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None
+
+
+class TestAsyncSpecDecodeTokenAccounting:
+    """Verifies that async speculative decoding token accounting properly rolls
+    back optimistic draft counts, writes accepted tokens contiguously to token_ids_cpu
+    without holes or overwriting prior tokens, and prevents runaway drift of
+    num_tokens_no_spec across multi-step sequences."""
+
+    def _setup_runner(self, max_num_reqs=4, max_model_len=64):
+        runner = MagicMock()
+        runner.max_model_len = max_model_len
+        runner.input_batch = SimpleNamespace(
+            token_ids_cpu=np.zeros((max_num_reqs, max_model_len), dtype=np.int32),
+            num_tokens_no_spec=np.zeros((max_num_reqs,), dtype=np.int32),
+            req_id_to_index={},
+        )
+        runner.requests = {}
+        return runner
+
+    def test_single_request_multi_step_acceptance_and_rejection(self):
+        """Simulate a 4-step sequence:
+        Step 0: Prefill 10 tokens -> proposes K=3 drafts. Prefill bonus 100 sampled.
+        Step 1: Prefill token committed (100). Step 1 proposes K=3 drafts.
+        Step 2: Step 1 drafts verified -> 2 drafts accepted (101, 102) +
+            1 bonus (103) = 3 tokens committed.
+        Step 3: Step 2 drafts verified -> all drafts rejected, 1 bonus (108) committed.
+        """
+        runner = self._setup_runner()
+        req_id = "req-0"
+        prompt_len = 10
+        prompt_tokens = list(range(1, 11))
+
+        req_state = SimpleNamespace(
+            req_id=req_id,
+            output_token_ids=[],
+            num_computed_tokens=prompt_len,
+        )
+        runner.requests[req_id] = req_state
+        runner.input_batch.req_id_to_index[req_id] = 0
+        runner.input_batch.num_tokens_no_spec[0] = prompt_len
+        runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
+
+        # Step 0: Prefill proposes K=3 drafts for the next step, but verifies
+        # none in this step: only its sampled bonus gets an output placeholder.
+        request_seq_lens_0 = [(0, req_state, prompt_len, req_id)]
+        num_draft_0 = {0: 0}
+        next_token_indices = {0: 0}
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=request_seq_lens_0,
+            next_token_indices=next_token_indices,
+            num_draft_per_req=num_draft_0,
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        assert req_state.output_token_ids == [0]
+
+        # Step 1: Start of Decode Step 1. _modify_prev_results for Prefill result.
+        # Prefill only had 1 sampled bonus token: [100].
+        copy_mock_0 = MagicMock()
+        copy_mock_0.wait_for_copy.return_value = torch.tensor(
+            [[100]], dtype=torch.int32
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=request_seq_lens_0,
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=num_draft_0,
+            wait_for_copy=copy_mock_0.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Rollback check:
+        # Replace the single placeholder with the sampled bonus.
+        assert req_state.output_token_ids == [100]
+        # num_tokens_no_spec stays at 11 - 1 + 1 = 11.
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        # token_ids_cpu slot 10 should be 100
+        assert runner.input_batch.token_ids_cpu[0, 10] == 100
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, :11], prompt_tokens + [100]
+        )
+
+        # Step 1: End of Decode Step 1. _update_placeholder called with K=3 drafts
+        request_seq_lens_1 = [(0, req_state, 14, req_id)]
+        num_draft_1 = {0: 3}
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=request_seq_lens_1,
+            next_token_indices=next_token_indices,
+            num_draft_per_req=num_draft_1,
+        )
+        # num_tokens_no_spec should advance from committed (11) + 4 = 15,
+        # NOT seq_len (14) + 4 = 18!
+        assert runner.input_batch.num_tokens_no_spec[0] == 15
+        assert req_state.output_token_ids == [100, 0, 0, 0, 0]
+
+        # Step 2: Start of Decode Step 2. _modify_prev_results for Step 1 result.
+        # Step 1 accepted 2 drafts (101, 102) + bonus (103) = 3 tokens.
+        copy_mock_1 = MagicMock()
+        copy_mock_1.wait_for_copy.return_value = torch.tensor(
+            [[101, 102, 103, INVALID_TOKEN_ID]], dtype=torch.int32
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=request_seq_lens_1,
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=num_draft_1,
+            wait_for_copy=copy_mock_1.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Rollback check:
+        # output_token_ids should drop 4 zeros and add [101, 102, 103]
+        assert req_state.output_token_ids == [100, 101, 102, 103]
+        # num_tokens_no_spec: 15 - 4 + 3 = 14
+        assert runner.input_batch.num_tokens_no_spec[0] == 14
+        # token_ids_cpu should have contiguous committed tokens at [10, 11, 12, 13]
+        # Previous token 100 at index 10 MUST NOT BE OVERWRITTEN!
+        # Slots 11, 12, 13 must contain 101, 102, 103!
+        expected_committed = prompt_tokens + [100, 101, 102, 103]
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, :14], expected_committed
+        )
+
+        # Step 2: End of Decode Step 2. _update_placeholder with K=3 drafts
+        request_seq_lens_2 = [(0, req_state, 18, req_id)]
+        num_draft_2 = {0: 3}
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=request_seq_lens_2,
+            next_token_indices=next_token_indices,
+            num_draft_per_req=num_draft_2,
+        )
+        # Advance from committed 14 + 4 = 18
+        assert runner.input_batch.num_tokens_no_spec[0] == 18
+        assert req_state.output_token_ids == [100, 101, 102, 103, 0, 0, 0, 0]
+
+        # Step 3: Start of Decode Step 3. _modify_prev_results for Step 2 result.
+        # Step 2 rejected all 3 drafts, only bonus token produced: [108].
+        copy_mock_2 = MagicMock()
+        copy_mock_2.wait_for_copy.return_value = torch.tensor(
+            [[108, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+            dtype=torch.int32,
+        )
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=request_seq_lens_2,
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=num_draft_2,
+            wait_for_copy=copy_mock_2.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Rollback check:
+        # output_token_ids: drops 4 zeros and adds [108]
+        assert req_state.output_token_ids == [100, 101, 102, 103, 108]
+        # num_tokens_no_spec: 18 - 4 + 1 = 15
+        assert runner.input_batch.num_tokens_no_spec[0] == 15
+        # token_ids_cpu slots 10..15 must be [100, 101, 102, 103, 108]
+        expected_committed_step3 = prompt_tokens + [100, 101, 102, 103, 108]
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, :15], expected_committed_step3
+        )
+
+    def test_multi_request_concurrency_accounting(self):
+        """Test two requests in flight with different acceptance lengths."""
+        runner = self._setup_runner(max_num_reqs=2)
+        req_id_0 = "req-0"
+        req_id_1 = "req-1"
+
+        state_0 = SimpleNamespace(req_id=req_id_0, output_token_ids=[0] * 4)
+        state_1 = SimpleNamespace(req_id=req_id_1, output_token_ids=[0] * 4)
+
+        runner.requests = {req_id_0: state_0, req_id_1: state_1}
+        runner.input_batch.req_id_to_index = {req_id_0: 0, req_id_1: 1}
+        # Both staged at 14
+        runner.input_batch.num_tokens_no_spec[0] = 14
+        runner.input_batch.num_tokens_no_spec[1] = 14
+
+        # Req 0 accepted 4 tokens [10, 11, 12, 13]
+        # Req 1 accepted 1 token [20]
+        copy_mock = MagicMock()
+        copy_mock.wait_for_copy.return_value = torch.tensor(
+            [
+                [10, 11, 12, 13],
+                [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            ],
+            dtype=torch.int32,
+        )
+
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id_0, req_id_1],
+            request_seq_lens=[(0, state_0, 10, req_id_0), (1, state_1, 10, req_id_1)],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req={0: 3, 1: 3},
+            wait_for_copy=copy_mock.wait_for_copy,
+        )
+
+        TPUModelRunner._modify_prev_results(runner)
+
+        assert runner.input_batch.num_tokens_no_spec[0] == 14  # 14 - 4 + 4
+        assert runner.input_batch.num_tokens_no_spec[1] == 11  # 14 - 4 + 1
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[0, 10:14], [10, 11, 12, 13]
+        )
+        assert np.array_equal(runner.input_batch.token_ids_cpu[1, 10:11], [20])
+
+    def test_non_spec_async_decode_preserved(self):
+        """Test non-speculative async single-token decode is preserved."""
+        runner = self._setup_runner(max_num_reqs=1)
+        req_id = "req-0"
+        state = SimpleNamespace(req_id=req_id, output_token_ids=[0])
+        runner.requests = {req_id: state}
+        runner.input_batch.req_id_to_index = {req_id: 0}
+        runner.input_batch.num_tokens_no_spec[0] = 11
+
+        copy_mock = MagicMock()
+        copy_mock.wait_for_copy.return_value = torch.tensor([[42]], dtype=torch.int32)
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=[(0, state, 10, req_id)],
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req=None,
+            wait_for_copy=copy_mock.wait_for_copy,
+        )
+
+        TPUModelRunner._modify_prev_results(runner)
+
+        assert state.output_token_ids == [42]
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        assert runner.input_batch.token_ids_cpu[0, 10] == 42
+
+        # Staging next non-spec placeholder
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=[(0, state, 11, req_id)],
+            next_token_indices={0: 0},
+            num_draft_per_req=None,
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 12
+        assert state.output_token_ids == [42, 0]
+
+    def test_request_row_reordering_across_steps(self):
+        """Test a request changing row index in input_batch across decode steps."""
+        runner = self._setup_runner(max_num_reqs=2)
+        req_id = "req-dynamic"
+        prompt_len = 10
+        prompt_tokens = list(range(1, 11))
+
+        req_state = SimpleNamespace(
+            req_id=req_id,
+            output_token_ids=[],
+            num_computed_tokens=prompt_len,
+        )
+        runner.requests[req_id] = req_state
+
+        # Step 0: Request starts at row 0
+        runner.input_batch.req_id_to_index = {req_id: 0}
+        runner.input_batch.num_tokens_no_spec[0] = prompt_len
+        runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
+
+        # Prefill finishes, stages 4 placeholders at row 0
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=[(0, req_state, prompt_len, req_id)],
+            next_token_indices={0: 0},
+            num_draft_per_req={0: 3},
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 14
+
+        # Step 1: Request moves to row 1 (another request was assigned row 0)
+        # Prefill token 100 commits
+        runner.input_batch.req_id_to_index = {req_id: 1, "other-req": 0}
+        runner.input_batch.num_tokens_no_spec[1] = 14
+        runner.input_batch.token_ids_cpu[1, :prompt_len] = prompt_tokens
+
+        copy_mock = MagicMock()
+        copy_mock.wait_for_copy.return_value = torch.tensor([[100]], dtype=torch.int32)
+        runner._pre_async_results = SimpleNamespace(
+            req_ids=[req_id],
+            request_seq_lens=[(0, req_state, prompt_len, req_id)],  # pre_req_idx was 0
+            discard_sampled_tokens_req_indices=[],
+            num_draft_per_req={0: 3},
+            wait_for_copy=copy_mock.wait_for_copy,
+        )
+        TPUModelRunner._modify_prev_results(runner)
+
+        # Committed correctly at row 1, NOT row 0
+        assert runner.input_batch.num_tokens_no_spec[1] == 11
+        assert runner.input_batch.token_ids_cpu[1, 10] == 100
+        assert np.array_equal(
+            runner.input_batch.token_ids_cpu[1, :11], prompt_tokens + [100]
+        )
+        assert runner.input_batch.num_tokens_no_spec[0] == 14
+        assert runner.input_batch.token_ids_cpu[0, 10] == 0
+
+        # Stage next step at row 1 (req_idx in request_seq_lens is now 1)
+        TPUModelRunner._update_placeholder(
+            runner,
+            discard_sampled_tokens_req_indices=[],
+            request_seq_lens=[(1, req_state, 14, req_id)],
+            next_token_indices={1: 0},
+            num_draft_per_req={1: 3},
+        )
+        assert runner.input_batch.num_tokens_no_spec[1] == 15

@@ -52,6 +52,7 @@ import functools
 import gc
 import os
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -366,29 +367,37 @@ def patch_default_loader_ep_weight_filter() -> None:
     )
 
 
+def _evict_one_checkpoint_file(fpath: str) -> float | None:
+    if not os.path.isfile(fpath):
+        return None
+    try:
+        file_size_gb = os.path.getsize(fpath) / (1024**3)
+        with open(fpath, "rb") as f:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        logger.info(
+            "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
+            fpath,
+            file_size_gb,
+        )
+        return file_size_gb
+    except Exception as e:
+        logger.warning(
+            "[tpu-model-loader] Failed to evict page cache for %s: %s",
+            fpath,
+            e,
+        )
+        return None
+
+
 def _evict_checkpoint_page_cache(files: list[str]) -> None:
     """Drop clean host page cache for weight files via posix_fadvise."""
-    evicted_count = 0
-    evicted_gb = 0.0
-    for fpath in files:
-        if os.path.isfile(fpath):
-            try:
-                file_size_gb = os.path.getsize(fpath) / (1024**3)
-                with open(fpath, "rb") as f:
-                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                evicted_gb += file_size_gb
-                evicted_count += 1
-                logger.info(
-                    "[tpu-model-loader] Evicted %s (%.2f GB) from host page cache.",
-                    fpath,
-                    file_size_gb,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[tpu-model-loader] Failed to evict page cache for %s: %s",
-                    fpath,
-                    e,
-                )
+    if not files:
+        return
+    max_workers = min(len(files), os.cpu_count() or 32)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        sizes = list(executor.map(_evict_one_checkpoint_file, files))
+    evicted_count = sum(s is not None for s in sizes)
+    evicted_gb = sum(s for s in sizes if s is not None)
     gc.collect()
     logger.info(
         "[tpu-model-loader] Evicted %d weight files (%.2f GB) from host page cache.",
@@ -402,9 +411,14 @@ def patch_default_model_loader_page_cache() -> None:
 
     Reading large models from local disk leaves significant clean page cache
     in host memory. Evicting via posix_fadvise(DONTNEED) drops this
-    immediately after weights are loaded into TPU HBM, freeing host memory
-    for runtime allocations such as large KV cache offloading.
+    once weights are loaded into TPU HBM, freeing host memory for runtime
+    allocations such as large KV cache offloading.
     Guarded by TPU_EVICT_WEIGHTS_PAGE_CACHE (default: False).
+
+    ``load_weights`` only records the files; the eviction itself runs from
+    ``evict_loaded_weights_page_cache`` once the runner has loaded every
+    model. A draft model that reads the same checkpoint (e.g. MTP) would
+    otherwise re-read it from cold disk right after it was evicted.
     """
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
         return
@@ -426,17 +440,8 @@ def patch_default_model_loader_page_cache() -> None:
 
     def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
         original_load_weights(self, model, model_config)
-
-        if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE:
-            return
-
-        # Host page cache is shared across ranks; only local rank 0 issues the eviction
-        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-        if local_rank == 0 and hasattr(self, "_loaded_weight_files"):
-            try:
-                _evict_checkpoint_page_cache(self._loaded_weight_files)
-            except Exception as e:
-                logger.warning("[tpu-model-loader] Page cache eviction skipped: %s", e)
+        if hasattr(self, "_loaded_weight_files"):
+            _loaded_weight_files.update(dict.fromkeys(self._loaded_weight_files))
 
     dl.DefaultModelLoader._prepare_weights = _prepare_weights
     dl.DefaultModelLoader.load_weights = load_weights
@@ -444,6 +449,29 @@ def patch_default_model_loader_page_cache() -> None:
     logger.info(
         "Applied TPU patch: DefaultModelLoader page cache eviction on load completion."
     )
+
+
+# Weight files loaded by DefaultModelLoader and not yet evicted, in load order.
+_loaded_weight_files: dict[str, None] = {}
+
+
+def evict_loaded_weights_page_cache() -> None:
+    """Evict host page cache for every weight file loaded so far.
+
+    Called by the runner after the target and any draft model are loaded.
+    """
+    if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
+        return
+    files = list(_loaded_weight_files)
+    _loaded_weight_files.clear()
+    # Host page cache is shared across ranks; only local rank 0 issues the eviction
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    if local_rank != 0:
+        return
+    try:
+        _evict_checkpoint_page_cache(files)
+    except Exception as e:
+        logger.warning("[tpu-model-loader] Page cache eviction skipped: %s", e)
 
 
 # Shards every expert of a parameter receives, keyed by the shard written.

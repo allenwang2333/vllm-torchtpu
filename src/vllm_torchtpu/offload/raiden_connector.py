@@ -46,7 +46,9 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import VllmConfig
@@ -90,6 +92,9 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
 )
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_events import KVCacheEvent
 
 logger = init_logger(__name__)
 
@@ -152,7 +157,8 @@ class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
 
 @dataclass
 class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
-    """Worker -> scheduler metadata: contains completed-job echoes and per-rank fence acks."""
+    """Worker -> scheduler metadata: contains completed-job echoes and
+    per-rank fence acks."""
 
     fenced_jobs: dict[int, int] = field(default_factory=dict)
 
@@ -243,7 +249,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
         # - Cancel fence-pending stores before they start.
-        # - Synchronously drain launched stores so DMA finishes before blocks are overwritten.
+        # - Synchronously drain launched stores so DMA finishes before blocks
+        #   are overwritten.
         finished_store_ids: list[int] = []
         finished_loads: dict[int, str] = {}
         failed_load_block_ids: list[int] = []
@@ -257,8 +264,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
                 logger.debug(
-                    "TPURaidenOffloadingConnector: cancelled fence-pending store job %d "
-                    "(source blocks reused)",
+                    "TPURaidenOffloadingConnector: cancelled fence-pending "
+                    "store job %d (source blocks reused)",
                     job_id,
                 )
             elif manager.is_job_launched(job_id):
@@ -319,9 +326,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
-        # Opt in to uniform cross-layer KV cache allocation when block-major layout is enabled.
-        # Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()` preconditions to enable
-        # bundled tensor allocation in the TPU model runner.
+        # Opt in to uniform cross-layer KV cache allocation when block-major layout is
+        # enabled. Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()`
+        # preconditions to enable bundled tensor allocation in the TPU model runner.
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
 
     def __init__(
@@ -361,11 +368,13 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 spec, vllm_config, kv_cache_config
             )
         elif role == KVConnectorRole.WORKER:
-            # Worker wrapper is only used for KV buffer registration; job dicts remain empty.
+            # Worker wrapper is only used for KV buffer registration; job dicts
+            # remain empty.
             self.connector_worker = OffloadingConnectorWorker(
                 spec, vllm_config, kv_cache_config
             )
-            # Track per-step fence acknowledgments and completion echoes for worker metadata.
+            # Track per-step fence acknowledgments and completion echoes for
+            # worker metadata.
             self._fenced_jobs: dict[int, int] = {}
             self._completed_jobs: dict[int, int] = {}
             self._load_error_block_ids: set[int] = set()
@@ -379,12 +388,18 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report
-        # failure through the endpoint's documented channel instead of raising an exception here
+        # failure through the endpoint's documented channel instead of raising an
+        # exception here
         logger.warning(
             "TPURaidenOffloadingConnector: external cache reset is not "
             "supported by the Raiden offload store; reporting failure."
         )
         return False
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.take_events()
+        return []
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(

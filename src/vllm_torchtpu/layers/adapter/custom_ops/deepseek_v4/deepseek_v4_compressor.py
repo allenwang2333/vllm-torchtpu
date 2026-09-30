@@ -69,7 +69,8 @@ def _run_compressor(
     rms_eps: float,
     quant_block: int,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
-    """Shared body of the three op variants, for CSA compressor, HCA compressor, and CSA indexer compressor respectively."""
+    """Shared body of the three op variants, for CSA compressor, HCA compressor,
+    and CSA indexer compressor respectively."""
     return compressor_forward(
         hidden_states=hidden_states,
         wkv_wgate=wkv_wgate,
@@ -501,11 +502,14 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
         Every candidate dtype is one byte wide, so `.view` is a lossless
         bitcast that shares storage -- assigning would convert instead, and
-        the writes would not land in the real cache.
+        the writes would not land in the real cache. The int32 CSA arrays (see
+        `csa_cache_layout`) are already what the kernels take.
         """
         if cache is None or cache.numel() == 0:
             return None
-        return cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
+        if cache.dtype in (torch.uint8, torch.int32):
+            return cache
+        return cache.view(torch.uint8)
 
     def forward(
         self,
