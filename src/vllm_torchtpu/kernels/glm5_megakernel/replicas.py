@@ -157,6 +157,42 @@ def make_gather_fn(mesh, axis_name):
     return gather
 
 
+def make_gather_stk_fn(mesh, axis_name):
+    """make_gather_fn into row `row` of a stacked [n_layers, k, ...] slot tensor (GLM5_MK_STACK_W):
+    (stack, shard [ER, ...], row [1], in_off, send_sz, out_off, recv_sz) -> stack with that row's
+    plan rows written. Donate the stack: the update is an in-place DUS of one row."""
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    spec, sspec = P(axis_name), P(None, axis_name)
+
+    def body(s_l, w_l, row, io, ss, oo, rs):
+        dt = w_l.dtype
+        if jnp.dtype(dt).itemsize == 1 and dt != jnp.int8:       # bits, not values
+            w_l = lax.bitcast_convert_type(w_l, jnp.int8)
+            s_l = lax.bitcast_convert_type(s_l, jnp.int8)
+        o_l = lax.dynamic_index_in_dim(s_l, row[0], 0, keepdims=False)
+        out = lax.ragged_all_to_all(w_l, o_l, io[0], ss[0], oo[0], rs[0], axis_name=axis_name)
+        s_l = lax.dynamic_update_index_in_dim(s_l, out, row[0], 0)
+        return s_l if s_l.dtype == dt else lax.bitcast_convert_type(s_l, dt)
+
+    def gather_stk(
+        stk: jax.Array,
+        w: jax.Array,
+        row: jax.Array,
+        in_off: jax.Array,
+        send_sz: jax.Array,
+        out_off: jax.Array,
+        recv_sz: jax.Array,
+    ) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(sspec, spec, P()) + (spec,) * 4, out_specs=sspec,
+            check_vma=False)(stk, w, row, in_off, send_sz, out_off, recv_sz)
+
+    return gather_stk
+
+
 def load_profile(path: str) -> dict[int, np.ndarray]:
     """EPLB log npz (`layers`, `logical_load` [n, E]) -> {layer: logical load}."""
     d = np.load(path)
