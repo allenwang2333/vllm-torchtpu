@@ -15,7 +15,7 @@
 VMEM accounting and the layout constants a caller has to match.
 """
 
-from vllm_torchtpu.kernels.fused_moe.v3 import device, layout, vmem
+from vllm_torchtpu.kernels.fused_moe.v3 import device, ffn, layout, vmem
 from vllm_torchtpu.kernels.fused_moe.v3.config import Config
 from vllm_torchtpu.kernels.fused_moe.v3.formats import (
     PACKED_ROW_TILE,
@@ -34,6 +34,7 @@ supported_on = device.supported_on
 
 __all__ = [
     "device",
+    "ffn",
     "layout",
     "vmem",
     "Config",
