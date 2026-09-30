@@ -585,6 +585,78 @@ def test_mla_forward_sparse_packed_q_bf16():
     assert not q[..., 576:].any()
 
 
+def _sparse_q_fuse_inputs(num_tokens=4):
+    """A bf16 sparse layer whose wrapper deferred q RoPE: (q_b output, c, s)."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        gptj_rope_cos_sin,
+    )
+
+    impl, layer, inputs, op_out = _make_impl_and_layer(num_tokens=num_tokens)
+    layer.W_UK_T = layer.W_UK_T.to(torch.bfloat16)
+    layer.W_UV = layer.W_UV.to(torch.bfloat16)
+    g = torch.Generator().manual_seed(3)
+    q_flat = (torch.randn(num_tokens, 16 * 192, generator=g) * 2).to(torch.bfloat16)
+    q_nope, q_pe = q_flat.view(num_tokens, 16, 192).split([128, 64], dim=-1)
+    inputs["q"] = (q_nope, q_pe)
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    table = _gptj_rope_table(64, 64)
+    positions = torch.arange(num_tokens) * 3 + 1
+    c, s = gptj_rope_cos_sin(positions, table)
+    layer.sparse_mla_op.return_value = op_out.to(torch.bfloat16)
+    return impl, layer, inputs, (q_flat, c, s)
+
+
+def test_mla_forward_sparse_q_fuse_fallback_applies_rope():
+    """q_fuse without a fused op (shapes outside the kernel): the impl applies
+    the deferred RoPE itself, and the op sees exactly the non-fused packed q."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        gptj_rope_fast,
+    )
+
+    impl, layer, inputs, q_fuse = _sparse_q_fuse_inputs()
+    q_nope, q_pe = inputs["q"]
+    topk = torch.zeros((4, 8), dtype=torch.int32)
+    impl.forward(layer=layer, **inputs, topk_indices=topk, q_fuse=q_fuse)
+    got = layer.sparse_mla_op.call_args.args[1]
+
+    table = _gptj_rope_table(64, 64)
+    positions = torch.arange(4) * 3 + 1
+    q_pe_rot, _ = gptj_rope_fast(positions, q_pe, q_pe[:, :1], table)
+    layer.sparse_mla_op.reset_mock()
+    impl.forward(layer=layer, **dict(inputs, q=(q_nope, q_pe_rot)), topk_indices=topk)
+    want = layer.sparse_mla_op.call_args.args[1]
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    # Positive control: the unrotated q_pe differs.
+    assert not torch.equal(got[..., 512:576], q_pe)
+
+
+def test_mla_forward_sparse_q_fuse_uses_fused_op():
+    """With the fused op built, the impl hands it the q_b output, the RoPE
+    multipliers and W_UK_T, and passes its result to the op as the packed q."""
+    impl, layer, inputs, (q_flat, c, s) = _sparse_q_fuse_inputs()
+    fused = torch.randn(4, 16, 640).to(torch.bfloat16)
+    layer.sparse_q_fuse_op = MagicMock(return_value=fused)
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((4, 8), dtype=torch.int32),
+        q_fuse=(q_flat, c, s),
+    )
+    layer.sparse_q_fuse_op.assert_called_once()
+    fq, fc, fs, fw = layer.sparse_q_fuse_op.call_args.args
+    assert torch.equal(fq, q_flat)
+    assert fc.shape == fs.shape == (4, 64)
+    assert torch.equal(fc, c.reshape(4, 64)) and torch.equal(fs, s.reshape(4, 64))
+    assert fw is layer.W_UK_T
+    args = layer.sparse_mla_op.call_args.args
+    assert args[1] is fused and args[2] is None
+
+
 def test_mla_forward_sparse_packed_full_width_output_bf16():
     """The packed op returns the kernel's full [T, H, 640] output; W_UV is
     zero-padded on K so columns >= kv_lora_rank never reach the result, and

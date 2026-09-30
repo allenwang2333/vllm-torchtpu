@@ -2134,6 +2134,57 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_impl
 
+    def _build_sparse_q_fuse_op(self, layer: Any):
+        """TPU_SPARSE_Q_FUSE: (q_b output [T, H*(nope+rope)], c, s [T, rope],
+        W_UK_T) -> the packed sparse kernel q [T, H, 640], one Pallas pass
+        (`kernels/mla/sparse/fused_q.py`). None when the layer's shapes are
+        outside the kernel's (the impl then applies RoPE and packs in XLA)."""
+        import jax.numpy as jnp
+        from jax.experimental import shard_map
+
+        from vllm_torchtpu.kernels.mla.sparse.fused_q import FusedQConfig, fused_sparse_q
+
+        nope = layer.W_UK_T.shape[1]
+        lkv, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
+        if (
+            (nope + rope) % 128
+            or lkv % 128
+            or rope > 64
+            or cdiv(lkv + rope, 128) * 128 != lkv + 128
+            or layer.W_UK_T.dtype != torch.bfloat16
+            or hasattr(layer, "W_UK_T_scale")
+        ):
+            return None
+        cfg = FusedQConfig.parse(envs.TPU_SPARSE_Q_FUSE_OPTS)
+        vllm_context = get_vllm_model_wrapper_context()
+
+        def sparse_q_fuse_core_tpu(
+            q: jax.Array, c: jax.Array, s: jax.Array, w_uk_t: jax.Array
+        ) -> jax.Array:
+            pad = ((0, 0), (0, 128 - c.shape[-1]))
+            fn = functools.partial(fused_sparse_q, cfg=cfg)
+            return jax.jit(
+                shard_map.shard_map(
+                    fn,
+                    mesh=vllm_context.mesh,
+                    in_specs=(P(None, None), P(None, None), P(None, None), P(None, None, None)),
+                    out_specs=P(None, None, None),
+                    check_rep=False,
+                )
+            )(q, jnp.pad(c, pad), jnp.pad(s, pad), w_uk_t)
+
+        op_name = f"pallas::sparse_q_fuse_{layer.layer_name.replace('.', '_')}"
+        fuse_op = pallas.jax_op(op_name, sparse_q_fuse_core_tpu)
+
+        def _fake_fuse(q, c, s, w_uk_t):
+            width = cdiv(lkv + rope, 128) * 128
+            return torch.empty(
+                (q.size(0), layer.num_heads, width), dtype=q.dtype, device=q.device
+            )
+
+        fuse_op.register_fake(_fake_fuse)
+        return fuse_op
+
     def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int, interleave_size: int):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2297,7 +2348,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             and q_pe.dtype == input_dtype
         )
 
-        if packed_q:
+        # TPU_SPARSE_Q_FUSE: the wrapper deferred q RoPE; (q_b output, c, s).
+        q_fuse = kwargs.get("q_fuse")
+        fuse_op = getattr(layer, "sparse_q_fuse_op", None)
+        if q_fuse is not None and not (packed_q and fuse_op is not None):
+            from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+                apply_gptj_rope,
+            )
+
+            _, rope_c, rope_s = q_fuse
+            q_pe = apply_gptj_rope(q_pe, rope_c, rope_s).to(input_dtype)
+            q_fuse = None
+
+        if packed_q and q_fuse is not None:
+            q_flat, rope_c, rope_s = q_fuse
+            num_tokens = q_flat.shape[0]
+            q_packed = fuse_op(
+                q_flat.reshape(num_tokens, -1),
+                rope_c.reshape(num_tokens, -1),
+                rope_s.reshape(num_tokens, -1),
+                layer.W_UK_T,
+            )
+        elif packed_q:
             q_packed = _packed_sparse_q(layer, q_nope, q_pe)
         else:
             # Evaluate projection matrices directly across input precision (`bfloat16`/`float16`/`fp8`)

@@ -839,6 +839,9 @@ class VllmTPUMLAAttention(MLAAttention):
             self, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
         self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
+        self.sparse_q_fuse_op = (
+            self.impl._build_sparse_q_fuse_op(self) if envs.TPU_SPARSE_Q_FUSE else None
+        )
 
         dcp_size = getattr(self.impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
@@ -866,6 +869,7 @@ class VllmTPUMLAAttention(MLAAttention):
             attn_metadata=attn_metadata,
             output=output,
             topk_indices=kwargs.get("topk_indices"),
+            q_fuse=kwargs.get("q_fuse"),
         )
 
 
@@ -945,6 +949,28 @@ def gptj_rope_fast(
     q_pe = q_pe * c + _swap_pairs(q_pe) * s
     k_pe = k_pe * c + _swap_pairs(k_pe) * s
     return q_pe, k_pe
+
+
+def gptj_rope_cos_sin(
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pair_cache: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`gptj_rope_fast`'s per-token multipliers, [T, 1, D] each:
+    `rope(x) = x * c + _swap_pairs(x) * s` (see `apply_gptj_rope`)."""
+    positions = positions.flatten()
+    if pair_cache is not None:
+        cos, sin = _gather_cos_sin_pairs(positions, pair_cache)
+    else:
+        cos, sin = cos_sin_cache.index_select(0, positions).chunk(2, dim=-1)
+    c = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+    s = torch.stack((-sin, sin), dim=-1).flatten(-2).unsqueeze(-2)
+    return c, s
+
+
+def apply_gptj_rope(x: torch.Tensor, c: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """The exact `gptj_rope_fast` expression for one tensor."""
+    return x * c + _swap_pairs(x) * s
 
 
 @MultiHeadLatentAttentionWrapper.register_oot
@@ -1120,16 +1146,33 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )
             kv_c_normed = self.kv_a_layernorm(kv_c)
 
+        q_flat = q
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
+        # TPU_SPARSE_Q_FUSE: q RoPE is deferred to the attention impl, which
+        # fuses it with the W_UK absorb (or applies `apply_gptj_rope` itself).
+        q_fuse = None
         if self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
-            if gptj_rope_fast_eligible(self.rotary_emb, q_pe, k_pe):
+            if (
+                envs.TPU_SPARSE_Q_FUSE
+                and self.is_sparse
+                and llama_4_scaling is None
+                and gptj_rope_fast_eligible(self.rotary_emb, q_pe, k_pe)
+            ):
+                c, s = gptj_rope_cos_sin(
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    getattr(self.rotary_emb, _ROPE_PAIR_CACHE_ATTR, None),
+                )
+                k_pe = apply_gptj_rope(k_pe, c, s)
+                q_fuse = (q_flat, c, s)
+            elif gptj_rope_fast_eligible(self.rotary_emb, q_pe, k_pe):
                 q_pe, k_pe = gptj_rope_fast(
                     positions,
                     q_pe,
@@ -1168,6 +1211,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             k_pe,
             output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
+            **({"q_fuse": q_fuse} if q_fuse is not None else {}),
         )
 
         if output_gate is not None:
