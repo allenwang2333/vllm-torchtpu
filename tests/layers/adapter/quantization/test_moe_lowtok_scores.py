@@ -7,7 +7,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import fused_moe_ep
 from vllm_torchtpu.layers.adapter.quantization import fp8
 from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores as scores
@@ -51,7 +50,7 @@ def method(owner=None):
 
 @pytest.fixture
 def enabled(monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MOE_LOWTOK", True, raising=False)
+    monkeypatch.setenv("TPU_MOE_LOWTOK", "1")
     monkeypatch.setattr(
         scores, "enable_pipelined_collective_and_compute", lambda: False
     )
@@ -65,7 +64,7 @@ def enabled(monkeypatch):
 
 
 def test_disabled_builds_and_logs_nothing(monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MOE_LOWTOK", False, raising=False)
+    monkeypatch.setenv("TPU_MOE_LOWTOK", "0")
     monkeypatch.setattr(scores, "_LAYERS", [])
     assert scores.prebuild(method(), make_layer(use_ep=False), "gelu") is None
     scores.log_summary()
@@ -173,7 +172,7 @@ def test_row_cap_counts_every_row(rows, served):
 def test_apply_passes_softmax_scores_and_the_grouped_operand_order(
     monkeypatch, skip_padded
 ):
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded, raising=False)
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1" if skip_padded else "0")
     padded = torch.tensor([False, True, False])
     monkeypatch.setattr(
         scores.token_padding,
@@ -202,7 +201,7 @@ def test_apply_passes_softmax_scores_and_the_grouped_operand_order(
 
 @pytest.mark.parametrize("rows, lowtok", [(128, True), (129, False)])
 def test_fp8_forward_takes_the_scores_entry_below_the_cap(monkeypatch, rows, lowtok):
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False, raising=False)
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
     monkeypatch.setattr(fp8, "enable_pipelined_collective_and_compute", lambda: False)
     monkeypatch.setattr(scores, "apply", Mock(return_value="lowtok"))
     monkeypatch.setattr(fp8.moe_routing, "route", Mock(return_value=(None, None)))
