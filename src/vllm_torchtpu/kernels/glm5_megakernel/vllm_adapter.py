@@ -181,7 +181,8 @@ class Glm5Megakernel:
             idx_freq=hf.index_topk_freq, idx_skip=hf.index_skip_topk_offset,
             rope_theta=float(rp.get("rope_theta", FULL.rope_theta)), eps=hf.rms_norm_eps,
             routed_scale=float(hf.routed_scaling_factor),
-            KREP=int(envs.GLM5_MK_DECODE_REPLICAS), SPEC=int(envs.GLM5_MK_SPEC))
+            KREP=int(envs.GLM5_MK_DECODE_REPLICAS), SPEC=int(envs.GLM5_MK_SPEC),
+            SPEC_LEAN=int(envs.GLM5_MK_SPEC_LEAN))
         for got, want, what in (
             (hf.kv_lora_rank, cfg.KL, "kv_lora_rank"), (hf.qk_nope_head_dim, cfg.DN, "qk_nope"),
             (hf.qk_rope_head_dim, cfg.DR, "qk_rope"), (hf.v_head_dim, cfg.DV, "v_head_dim"),

@@ -33,6 +33,7 @@ class MKConfig:
     routed_scale: float = 2.5
     KREP: int = 0          # decode replica slots per rank per MoE layer (0: off, program unchanged)
     SPEC: int = 0          # speculative first expert: at most SPEC tiles issued early (0: off)
+    SPEC_LEAN: int = 0     # with SPEC: drain voided tiles with bare waits + one pump (smaller code)
 
     @property
     def HR(self):          # heads per rank

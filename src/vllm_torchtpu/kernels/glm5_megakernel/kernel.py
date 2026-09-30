@@ -391,6 +391,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     # tiles stream from m_shared start; routing then confirms (it goes first in the list) or
     # voids them (the issued tiles are drained unused). Bitwise either way.
     SPEC = getattr(cfg, "SPEC", 0)
+    # SPEC_LEAN: drain the voided tiles with bare waits and one pump after the loop, instead of a
+    # take/give per tile (each inlines pump + issue_seg: about +54k Mosaic lines at L78). The voided
+    # tiles are already issued (st[0] - st[1] >= st[8]), so take's pump never fires there; the tile
+    # sequence and slots are unchanged, only when the refill issues moves. Bitwise either way.
+    SPEC_LEAN = getattr(cfg, "SPEC_LEAN", 0)
     # yspec rows: only part rows < R are ever sent (reduce_scatter_rows), so the parked term keeps
     # rup(R, 8) rows, not M (768K -> 192K VMEM at R=8, H=6144: SPEC with KREP fits at full size)
     MY = min(M, rup(R, 8))
@@ -1912,7 +1917,24 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     pltpu.make_async_copy(next(iter(W["rs2"].values())), es_dst("es2", True),
                                           scr["es_sem"].at[1]).wait()
                 scr["part"][...] = jnp.zeros((M, H), F32)
-                if SPEC:
+                if SPEC and SPEC_LEAN:
+                    def dbody(t, c):                   # drain the voided speculative tiles (lean)
+                        slot = st[1] % NB
+
+                        @pl.when(jnp.logical_and(t < T13, "weights" not in skip))
+                        def _():
+                            copy("ew13", src_of("ew13", next(iter(W["ew13"].values())), 0, 0),
+                                 slot).wait()
+
+                        @pl.when(jnp.logical_and(t >= T13, "weights" not in skip))
+                        def _():
+                            copy("ew2", src_of("ew2", next(iter(W["ew2"].values())), 0, 0),
+                                 slot).wait()
+                        st[1] = st[1] + 1
+                        return c
+                    lax.fori_loop(0, st[8], dbody, 0)
+                    pump("exp")
+                elif SPEC:
                     def dbody(t, c):                   # drain the voided speculative tiles
                         @pl.when(t < T13)
                         def _():

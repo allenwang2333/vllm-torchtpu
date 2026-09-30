@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     GLM5_MK_DECODE_REPLICAS_PROFILE: str = ""
     GLM5_MK_SPEC: int = 0
     GLM5_MK_SPEC_PROFILE: str = ""
+    GLM5_MK_SPEC_LEAN: int = 0
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -667,6 +668,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With GLM5_MK_SPEC: an EPLB log npz (as GLM5_MK_DECODE_REPLICAS_PROFILE; that one wins if both
     # are set) whose load picks the guesses at load time and whenever EPLB has not run.
     "GLM5_MK_SPEC_PROFILE": env_str("GLM5_MK_SPEC_PROFILE", ""),
+    # With GLM5_MK_SPEC: 1 drains the voided speculative tiles with bare waits and one pump after
+    # the loop (probe 35 job 19: about -5k bundles; same tile order, bitwise).
+    "GLM5_MK_SPEC_LEAN": env_int("GLM5_MK_SPEC_LEAN", 0),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
