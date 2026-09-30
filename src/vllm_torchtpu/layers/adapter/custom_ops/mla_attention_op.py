@@ -325,6 +325,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         topk_tail = envs.TPU_STREAMIDX_TOPK_TAIL or ""
         l1_live = envs.TPU_STREAMIDX_L1_LIVE
         score_epilogue = envs.TPU_STREAMIDX_SCORE_EPI or ""
+        fill_scores = envs.TPU_STREAMIDX_SCORES_FILL
         enable_early_exit = (
             STREAMIDX_ENABLE_EARLY_EXIT and envs.TPU_STREAMIDX_EARLY_EXIT
         )
@@ -388,6 +389,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 topk_tail=topk_tail,
                 l1_live=l1_live,
                 score_epilogue=score_epilogue,
+                fill_scores=fill_scores,
             )
             if kv_stack is not None:
                 cache_kv = split_kv_stack(cache_kv, stacked_shape)

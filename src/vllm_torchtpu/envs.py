@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_TOPK_TAIL: str = ""
     TPU_STREAMIDX_L1_LIVE: bool = False
     TPU_STREAMIDX_SCORE_EPI: str = ""
+    TPU_STREAMIDX_SCORES_FILL: bool = False
     TPU_STREAMIDX_DECODE_KV_PAGES: int = 2
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -770,6 +771,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MXU pops in order instead of materializing the f32 qk tile. Bit-identical
     # scores (same per-element arithmetic, same order).
     "TPU_STREAMIDX_SCORE_EPI": env_str("TPU_STREAMIDX_SCORE_EPI", ""),
+    # StreamIndex top-k: pre-fill each chunk's HBM score buffer with -inf before
+    # the scoring passes (default off: the buffer is left unwritten where no
+    # pass writes, and `row_lengths` is trusted to bound the top-k reads).
+    "TPU_STREAMIDX_SCORES_FILL": env_bool("TPU_STREAMIDX_SCORES_FILL"),
     # KV pages per block on the decode pass of the GLM-5.2 StreamIndex top-k
     # kernel (the first entry of `num_kv_pages_per_block`). Larger blocks mean
     # fewer, bigger KV DMAs per decode token; 8 measured -14% decode indexer

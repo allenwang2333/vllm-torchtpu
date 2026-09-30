@@ -1209,6 +1209,7 @@ def streamindex_topk(
     topk_tail: str = "",
     l1_live: bool = False,
     score_epilogue: str = "",
+    fill_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1641,7 +1642,13 @@ def streamindex_topk(
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
+        # `fill_scores` (TPU_STREAMIDX_SCORES_FILL) pre-fills with -inf anyway: a
+        # control for whether any read reaches a position no pass wrote.
         scores = None
+        if fill_scores:
+            scores = jnp.full(
+                (chunk_tokens, num_sublanes_total, 128), BITS_NEG_INF, out_dtype
+            )
         t_rows = None
         for spec, pass_meta in passes:
             if emit_t:
