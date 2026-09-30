@@ -87,70 +87,99 @@ def _require_sparsecore():
     pytest.skip("needs SparseCore")
 
 
-def _xla_pack_reference(merged, dcp_size, interleave_c, dcp_rank):
+def _xla_pack_reference(vals):
     """The scatter the kernel replaced, unreachable in `src`, kept as an oracle."""
-    num_rows, width = merged.shape
-    mine = (merged >= 0) & (
-        metadata.cp_owner_rank(merged, dcp_size, interleave_c) == dcp_rank
-    )
-    local = metadata.cp_global_to_local(jnp.maximum(merged, 0), dcp_size, interleave_c)
+    num_rows, width = vals.shape
+    keep = vals >= 0
 
-    # Exclusive prefix count of owned winners gives each entry's destination slot.
-    # At most `width` entries can be `mine`, so `slot <= width - 1`.
-    slot = jnp.cumsum(mine, axis=1, dtype=jnp.int32) - mine
+    # Exclusive prefix count of kept entries gives the destination slot, < width.
+    slot = jnp.cumsum(keep, axis=1, dtype=jnp.int32) - keep
     rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
 
-    # An extra column past the end (`width`) absorbs entries owned by other ranks;
-    # they all write -1 to the dump column, which is sliced off at the end.
+    # Column `width` is a dump for the dropped entries, sliced off at the end.
     out = jnp.full((num_rows, width + 1), -1, dtype=jnp.int32)
-    out = out.at[rows, jnp.where(mine, slot, width)].set(jnp.where(mine, local, -1))
+    out = out.at[rows, jnp.where(keep, slot, width)].set(jnp.where(keep, vals, -1))
     return out[:, :width]
 
 
-def _merged_fixture(num_rows=16, k=128, span=4096, seed=20260906):
-    """A global winner list: distinct positions per row, `-1` padded in row 0."""
+def _sparse_fixture(num_rows=16, width=128, keep_rate=0.5, seed=20260906):
+    """Non-negative values with `-1` holes; row 0 is full and row 1 is empty."""
     rng = np.random.default_rng(seed)
-    merged = np.stack(
-        [
-            rng.choice(span, size=k, replace=False).astype(np.int32)
-            for _ in range(num_rows)
-        ]
-    )
-    merged[0, -5:] = -1
-    return merged
+    vals = rng.integers(0, 1 << 20, size=(num_rows, width)).astype(np.int32)
+    vals[rng.random((num_rows, width)) > keep_rate] = -1
+    vals[0] = rng.integers(0, 1 << 20, size=width).astype(np.int32)
+    if num_rows > 1:
+        vals[1] = -1
+    return vals
 
 
-def _filter_all_ranks(
-    merged, dcp_size, interleave_c, fn=dcp_sc_compact.pack_owned_winners
-):
-    """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
-    return np.stack(
+@pytest.mark.parametrize("num_rows,width", [(16, 128), (1, 16), (33, 256)])
+@pytest.mark.parametrize("keep_rate", [0.1, 0.5, 0.9])
+def test_sparsecore_pack_matches_xla(num_rows, width, keep_rate):
+    """Elementwise, not just as a set: both packs must emit in ascending order."""
+    _require_sparsecore()
+    vals = _sparse_fixture(num_rows, width, keep_rate)
+
+    want = np.asarray(_xla_pack_reference(jnp.asarray(vals)))
+    got = np.asarray(dcp_sc_compact.pack_nonnegative(jnp.asarray(vals)))
+
+    np.testing.assert_array_equal(got, want)
+
+
+def _simulate_merge(num_rows, k, span, dcp_size, interleave_c, seed=20260929):
+    """Stages 1-3 of `streamindex_topk_dcp` in numpy, as `resolve` receives them.
+
+    Returns each rank's rank-local candidate list, the merged flat slot columns,
+    and the true global top-k the ranks must reassemble between them.
+    """
+    rng = np.random.default_rng(seed)
+    # Distinct scores, so the top-k is unambiguous and the partition is exact.
+    scores = rng.permutation(num_rows * span).reshape(num_rows, span).astype(np.float32)
+    owner = (np.arange(span) // interleave_c) % dcp_size
+
+    local_idxs = np.full((dcp_size, num_rows, k), -1, np.int32)
+    local_scores = np.full((dcp_size, num_rows, k), -np.inf, np.float32)
+    for r in range(dcp_size):
+        owned = np.flatnonzero(owner == r)
+        for t in range(num_rows):
+            best = owned[np.argsort(-scores[t, owned])][:k]
+            local_idxs[r, t, : len(best)] = np.asarray(
+                metadata.cp_global_to_local(jnp.asarray(best), dcp_size, interleave_c)
+            )
+            local_scores[r, t, : len(best)] = scores[t, best]
+
+    # Stage 2 is rank-major, so rank r's k candidates land at columns [r*k, r*k+k).
+    gathered = np.concatenate(list(local_scores), axis=1)
+    slots = np.full((num_rows, k), -1, np.int32)
+    for t in range(num_rows):
+        order = np.argsort(-gathered[t])[:k]
+        order = order[np.isfinite(gathered[t, order])]
+        slots[t, : len(order)] = order
+
+    want = [set(np.argsort(-scores[t])[:k].tolist()) for t in range(num_rows)]
+    return local_idxs, slots, want
+
+
+@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
+def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
+    """The ranks' packed outputs reassemble the global top-k, each entry once."""
+    _require_sparsecore()
+    num_rows, k, span = 8, 32, 4096
+    local_idxs, slots, want = _simulate_merge(num_rows, k, span, dcp_size, interleave_c)
+
+    lists = np.stack(
         [
-            np.asarray(fn(jnp.asarray(merged), dcp_size, interleave_c, jnp.int32(r)))
+            np.asarray(
+                dcp_sc_compact.resolve_owned_winners(
+                    jnp.asarray(local_idxs[r]), jnp.asarray(slots), k, jnp.int32(r)
+                )
+            )
             for r in range(dcp_size)
         ]
     )
-
-
-# The XLA scatter is the reference, and the only pack that runs off a
-# SparseCore-bearing chip.
-@pytest.mark.parametrize(
-    "pack_fn,needs_sc",
-    [(_xla_pack_reference, False), (dcp_sc_compact.pack_owned_winners, True)],
-    ids=["xla", "sc"],
-)
-@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
-def test_owner_filters_partition_the_list(pack_fn, needs_sc, dcp_size, interleave_c):
-    if needs_sc:
-        _require_sparsecore()
-    merged = _merged_fixture()
-    num_rows, k = merged.shape
-
-    lists = _filter_all_ranks(merged, dcp_size, interleave_c, pack_fn)
     assert lists.shape == (dcp_size, num_rows, k)
 
     for t in range(num_rows):
-        want = set(merged[t][merged[t] >= 0].tolist())
         got = []
         for r in range(dcp_size):
             row = lists[r, t]
@@ -162,21 +191,7 @@ def test_owner_filters_partition_the_list(pack_fn, needs_sc, dcp_size, interleav
         # Multiplicity, not just set equality: the LSE merge double-counts a
         # position delivered to two ranks.
         assert len(got) == len(set(got))
-        assert set(got) == want
-
-
-@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
-def test_sparsecore_pack_matches_xla(dcp_size, interleave_c):
-    """Elementwise, not just as a set: both packs must emit in ascending order."""
-    _require_sparsecore()
-    merged = _merged_fixture()
-
-    want = _filter_all_ranks(merged, dcp_size, interleave_c, _xla_pack_reference)
-    got = _filter_all_ranks(
-        merged, dcp_size, interleave_c, dcp_sc_compact.pack_owned_winners
-    )
-
-    np.testing.assert_array_equal(got, want)
+        assert set(got) == want[t]
 
 
 # ===================================================================== #

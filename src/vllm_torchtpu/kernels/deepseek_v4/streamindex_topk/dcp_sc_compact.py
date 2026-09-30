@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Left-pack the merged DCP top-k winners that one rank owns, on SparseCore.
-And convert from global -> local indices for consumption by Sparse MLA kernel.
+
+The winners are rank-local already: only scores cross the all-gather, so the
+indices never leave the rank that produced them.
 """
 
 import functools
@@ -24,21 +26,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
-
 SCAN_UNROLL = 8
 
 
 def _pack_body(
-    merged_hbm,  # i32[padded_b * width]
-    rank_hbm,  # i32[padded_b * lanes]
+    vals_hbm,  # i32[padded_b * width]
     out_hbm,  # i32[padded_b * width]
     rowbuf_vmem,  # i32[width + lanes]
     *,
     b: int,
     width: int,
-    dcp_size: int,
-    interleave_c: int,
     num_waves: int,
     lanes: int,
     num_cores: int,
@@ -47,30 +44,22 @@ def _pack_body(
     flat = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
     chunks = width // lanes
 
-    def pipeline_step(merged_vmem, rank_vmem, out_vmem):
+    def pipeline_step(vals_vmem, out_vmem):
         row = pl.program_id(0) * (num_cores * num_subcores) + flat
-        rank = rank_vmem[pl.ds(0, lanes)][0]
 
         def fill(i):
             rowbuf_vmem[pl.ds(i * lanes, lanes)] = jnp.full((lanes,), -1, jnp.int32)
 
-        # Pad up front; the scan below only overwrites the owned prefix.
+        # Pad up front; the scan below only overwrites the kept prefix.
         plsc.parallel_loop(0, chunks, unroll=4)(fill)
 
         def emit(i, woff):
-            g = merged_vmem[pl.ds(i * lanes, lanes)]
-            # `-1` needs its own test: floor-div of a negative can alias a real rank.
-            owned = (g >= 0) & (
-                metadata.cp_owner_rank(g, dcp_size, interleave_c) == rank
-            )
-            local = metadata.cp_global_to_local(
-                jnp.maximum(g, 0), dcp_size, interleave_c
-            )
-            plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, lanes)], local, mask=owned)
-            return woff + plsc.all_reduce_population_count(owned)[0]
+            v = vals_vmem[pl.ds(i * lanes, lanes)]
+            keep = v >= 0
+            plsc.store_compressed(rowbuf_vmem.at[pl.ds(woff, lanes)], v, mask=keep)
+            return woff + plsc.all_reduce_population_count(keep)[0]
 
-        # `woff` is carried, so this is a sequential scan: ascending column order,
-        # and `woff <= width` since at most every entry is owned, so no truncation.
+        # Carried `woff` makes this sequential: ascending order, and `woff <= width`.
         plsc.parallel_loop(
             0, jnp.where(row < b, chunks, 0), unroll=SCAN_UNROLL, carry=jnp.int32(0)
         )(emit)
@@ -88,11 +77,6 @@ def _pack_body(
             lambda w: (w * cores_per_chip + flat,),
             pipeline_mode=pl.Buffered(buf_count),
         ),
-        pl.BlockSpec(
-            (lanes,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
     )
     out_specs = pl.BlockSpec(
         (width,),
@@ -101,23 +85,18 @@ def _pack_body(
     )
     pltpu.emit_pipeline(
         pipeline_step, grid=(num_waves,), in_specs=in_specs, out_specs=out_specs
-    )(merged_hbm, rank_hbm, out_hbm)
+    )(vals_hbm, out_hbm)
 
 
-def pack_owned_winners(
-    merged: jax.Array,  # i32[num_rows, width]
-    dcp_size: int,
-    interleave_c: int,
-    dcp_rank: jax.Array | int,
-) -> jax.Array:
-    """Compacts the winners `dcp_rank` owns into a prefix of rank-local indices.
+def pack_nonnegative(vals: jax.Array) -> jax.Array:  # i32[num_rows, width]
+    """Left-packs each row's non-negative entries into a `-1` padded prefix.
 
-    `cp_owner_rank` partitions `merged`, so the ranks' outputs partition the
-    global top-k and a rank owns at most all `width` entries: never truncates.
+    Relative order is preserved, and a row of all non-negatives fills exactly
+    `width`, so this never truncates.
     """
-    b, width = merged.shape
-    if merged.dtype != jnp.int32:
-        raise ValueError(f"merged must be int32, got {merged.dtype}")
+    b, width = vals.shape
+    if vals.dtype != jnp.int32:
+        raise ValueError(f"vals must be int32, got {vals.dtype}")
     sc = pltpu.get_tpu_info().sparse_core
     if sc is None:
         raise NotImplementedError("SparseCore is not available")
@@ -131,9 +110,8 @@ def pack_owned_winners(
     num_waves = (b + rows_per_wave - 1) // rows_per_wave
     padded_b = num_waves * rows_per_wave
     if padded_b > b:
-        # `-1`, not the default 0: 0 is a real position that rank 0 owns.
-        merged = jnp.pad(merged, ((0, padded_b - b), (0, 0)), constant_values=-1)
-    rank = jnp.full((padded_b, lanes), dcp_rank, dtype=jnp.int32)
+        # `-1`, not the default 0: 0 is a real position.
+        vals = jnp.pad(vals, ((0, padded_b - b), (0, 0)), constant_values=-1)
 
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
@@ -146,8 +124,6 @@ def pack_owned_winners(
             _pack_body,
             b=b,
             width=width,
-            dcp_size=dcp_size,
-            interleave_c=interleave_c,
             num_waves=num_waves,
             lanes=lanes,
             num_cores=sc.num_cores,
@@ -159,6 +135,26 @@ def pack_owned_winners(
         ),
         scratch_types=(pltpu.VMEM((width + lanes,), jnp.int32),),
         mesh=mesh,
-        name=f"sc_pack_owned_b{b}_w{width}_dcp{dcp_size}",
-    )(merged.reshape(-1), rank.reshape(-1))
+        name=f"sc_pack_nonneg_b{b}_w{width}",
+    )(vals.reshape(-1))
     return out.reshape(padded_b, width)[:b]
+
+
+def resolve_owned_winners(
+    local_idxs: jax.Array,  # i32[num_rows, k], this rank's rank-local candidates
+    slots: jax.Array,  # i32[num_rows, k], flat columns of the merged score list
+    k: int,
+    dcp_rank: jax.Array | int,
+) -> jax.Array:
+    """Picks the merged winners this rank produced out of its own list, packed.
+
+    The candidate all-gather is rank-major, so flat column `c` came from rank
+    `c // k` at that rank's own slot `c % k`; both are functions of the chunk
+    width alone, not of the order the chunks arrived in. Every surviving entry
+    is rank-local already, because `local_idxs` never crossed the gather --
+    which is also why this is the only place ownership is decided.
+    """
+    safe = jnp.maximum(slots, 0)
+    ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
+    mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
+    return pack_nonnegative(jnp.where(ours, mine, -1))
