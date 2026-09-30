@@ -38,9 +38,10 @@ logger = init_logger(__name__)
 DECODE_PROGRAM_MAX_ROWS = 64
 # The wrapper's default decode batch, and the cap here.
 MAX_DECODE_BATCH = 8
-# The longest max_model_len that takes the decode settings: on tpu7x (Qwen3.5
-# TP8, fp8 KV) they are neutral at 8k tokens of context and slower from 32k.
-DECODE_MAX_MODEL_LEN = 16384
+# The longest max_model_len that takes the decode settings, placed on tpu7x
+# (Qwen3.5 TP8, fp8 KV): the slowdown of MTP decode passes grows with context,
+# and past 12k tokens it exceeds the 8k slowdown by more than ~2% of a step.
+DECODE_MAX_MODEL_LEN = 12288
 
 
 @dataclasses.dataclass(frozen=True)

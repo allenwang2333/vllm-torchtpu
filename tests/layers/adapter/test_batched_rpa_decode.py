@@ -69,7 +69,7 @@ def test_tuning_halves_vmem_and_caps_the_batch(monkeypatch, v7x, max_num_seqs, b
 # serves max_model_len 262144) keeps the default, larger KV blocks.
 @pytest.mark.parametrize(
     "max_model_len, takes",
-    [(9216, True), (16384, True), (16385, False), (262144, False)],
+    [(9216, True), (12288, True), (12289, False), (262144, False)],
 )
 def test_tuning_refused_past_the_model_length_bound(
     monkeypatch, v7x, max_model_len, takes
