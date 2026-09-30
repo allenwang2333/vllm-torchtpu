@@ -57,11 +57,43 @@ _GI_SLAB = 256
 _KLOADS = ("kA", "kB", "kC")
 
 
+def _epi_opts(score_epilogue: str) -> tuple[str, str, int, bool, bool, str, int]:
+    """"gi16-slab+kB+h4+rs" -> ("gi16-slab", "kB", 4, True).
+
+    Options after the gi epilogue: a key-block load variant (kA/kB/kC); hN
+    splits each slab dot into per-N-head dots, each followed at once by its
+    head-sum part (so its pops are consumed before the next dot's arrive); rs
+    writes the [bq, bkv_sz] scores through a VMEM row buffer and sublane-strided
+    loads instead of a register reshape to [bq, bkv_sz // 128, 128]; pb asks
+    the dot for bf16 directly (with score_bf16_group, which narrows it anyway);
+    mx / mxt drive the MXUs explicitly (push each 256-token key slab once per
+    MXU, stream hN-head q row blocks against it, pop and reduce each block
+    before the next lands), mx pushing the slab with transpose=True, mxt
+    transposing it in registers; dN is the number of blocks in flight (2).
+    """
+    epi, *opts = score_epilogue.split("+")
+    kload, hsub, rs, pb, mx, depth = "", 0, False, False, "", 2
+    for o in opts:
+        if o in _KLOADS:
+            kload = o
+        elif o == "rs":
+            rs = True
+        elif o == "pb":
+            pb = True
+        elif o in ("mx", "mxt"):
+            mx = o
+        elif o[:1] == "d" and o[1:].isdigit():
+            depth = int(o[1:])
+        elif o[:1] == "h" and o[1:].isdigit():
+            hsub = int(o[1:])
+        else:
+            raise ValueError(f"bad score_epilogue option {o!r}")
+    return epi, kload, hsub, rs, pb, mx, depth
+
+
 def _split_kload(score_epilogue: str) -> tuple[str, str]:
     """"gi16-slab+kA" -> ("gi16-slab", "kA"): gi epilogue, key-block load variant."""
-    epi, _, kload = score_epilogue.partition("+")
-    if kload and kload not in _KLOADS:
-        raise ValueError(f"bad score_epilogue key load {kload!r}")
+    epi, kload, *_ = _epi_opts(score_epilogue)
     return epi, kload
 
 
@@ -361,7 +393,7 @@ def kernel(
         return acc
 
     gi_tg, gi_mode = _parse_score_epilogue(score_epilogue)
-    gi_kload = _split_kload(score_epilogue)[1]
+    _, gi_kload, gi_hsub, gi_rs, gi_pb, gi_mx, gi_depth = _epi_opts(score_epilogue)
     gi_slab = _GI_SLAB
     if gi_mode.rstrip("0123456789") != gi_mode:  # "slab128": slab width suffix
         gi_slab = int(gi_mode[len(gi_mode.rstrip("0123456789")):])
@@ -380,9 +412,23 @@ def kernel(
         and bq_sz % gi_tg == 0
     )
     gi_rows = gi_tg * num_q_heads
+    if use_gi and gi_mx and (
+        gi_mode != "slab" or bkv_sz % 512 or not gi_kload or gi_depth < 1
+    ):
+        raise ValueError(f"bad score_epilogue mx {score_epilogue!r}")
+    if use_gi and gi_hsub and not gi_mx and (
+        gi_mode not in ("slab", "loopslab")
+        or num_q_heads % gi_hsub
+        or (score_bf16_group and gi_hsub % score_bf16_group)
+    ):
+        raise ValueError(f"bad score_epilogue head split {score_epilogue!r}")
+    gi_rs = gi_rs and use_gi
+    if gi_rs and (gi_mode in ("loop", "loopslab") or num_sublanes_bkv % 8 or bq_sz % 8):
+        raise ValueError(f"bad score_epilogue rs {score_epilogue!r}")
 
     def qk_has(rows, bkv):
-        return jnp.einsum("nd,md->nm", rows, bkv, preferred_element_type=jnp.float32)
+        out_t = jnp.bfloat16 if gi_pb and score_bf16_group else jnp.float32
+        return jnp.einsum("nd,md->nm", rows, bkv, preferred_element_type=out_t)
 
     def gi_fill(q_vmem, weights_vmem, q_gi_ref, w_gi_ref):
         """Writes the gi-ordered q rows and lane-broadcast weights, once per q block."""
@@ -398,22 +444,23 @@ def kernel(
                     w[g * gi_tg : (g + 1) * gi_tg, h : h + 1], (gi_tg, 128)
                 )
 
-    def gi_head_sum(st, wv):
-        """[H*gi_tg, S] f32 (rows (h, t)) -> [gi_tg, S] weighted relu head sum."""
+    def gi_head_sum(st, wv, h0=0, acc=None):
+        """[nh*gi_tg, S] f32 (rows (h, t), heads h0..h0+nh) -> [gi_tg, S] weighted
+        relu head sum, added (in head order) onto `acc`, the sum of heads < h0."""
         reps = st.shape[1] // 128
+        nh = st.shape[0] // gi_tg
 
         def wrow(h):
             v = wv[h * gi_tg : (h + 1) * gi_tg]
             return v if reps == 1 else jnp.concatenate([v] * reps, axis=1)
 
         def rows(x, h):
-            return x[h * gi_tg : (h + 1) * gi_tg]
+            return x[(h - h0) * gi_tg : (h - h0 + 1) * gi_tg]
 
         if score_bf16_group:
             stb = st.astype(jnp.bfloat16)
             zero = jnp.bfloat16(0)
-            acc = None
-            for g0 in range(0, num_q_heads, score_bf16_group):
+            for g0 in range(h0, h0 + nh, score_bf16_group):
                 terms = [
                     jnp.maximum(rows(stb, h), zero) * wrow(h)
                     for h in range(g0, g0 + score_bf16_group)
@@ -427,12 +474,12 @@ def kernel(
                 part = terms[0].astype(jnp.float32)
                 acc = part if acc is None else acc + part
             return acc
-        order = list(range(num_q_heads))
+        order = list(range(h0, h0 + nh))
         if _TEST_SCORE_EPI_FAULT == "assoc":
             order = order[::-1]
-        acc = jnp.maximum(rows(st, order[0]), 0.0) * wrow(order[0])
-        for h in order[1:]:
-            acc = acc + jnp.maximum(rows(st, h), 0.0) * wrow(h)
+        for h in order:
+            t = jnp.maximum(rows(st, h), 0.0) * wrow(h)
+            acc = t if acc is None else acc + t
         return acc
 
     def gi_group_sum(q_rows, w_rows, bkv, st_full=None):
@@ -440,12 +487,22 @@ def kernel(
         if gi_mode in ("slab", "loopslab"):
             parts = []
             for c in range(0, bkv_sz, gi_slab):
-                parts.append(gi_head_sum(qk_has(q_rows, bkv[c : c + gi_slab]), w_rows))
+                kc = bkv[c : c + gi_slab]
+                if not gi_hsub:
+                    parts.append(gi_head_sum(qk_has(q_rows, kc), w_rows))
+                    continue
+                acc = None
+                for h0 in range(0, num_q_heads, gi_hsub):
+                    r = q_rows[h0 * gi_tg : (h0 + gi_hsub) * gi_tg]
+                    acc = gi_head_sum(qk_has(r, kc), w_rows, h0, acc)
+                parts.append(acc)
             return jnp.concatenate(parts, axis=1)
         st = qk_has(q_rows, bkv) if st_full is None else st_full
         return gi_head_sum(st, w_rows)
 
-    def finish_scores(s_summed, scale_val, bkv_idx, seq_len, q_pos_compressed, cp_rank):
+    def finish_scores(
+        s_summed, scale_val, bkv_idx, seq_len, q_pos_compressed, cp_rank, flat=False
+    ):
         """Scale, mask and lay out a [rows, bkv_sz] head sum (as compute_scores)."""
         s_summed = s_summed * scale_val
         k_local = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s_summed.shape, 1)
@@ -455,13 +512,107 @@ def kernel(
         causal_mask = k_span <= q_pos_compressed[:, None]
         mask = jnp.logical_and(valid_mask, causal_mask)
         s_summed = jnp.where(mask, s_summed, -jnp.inf)
+        if flat:
+            return s_summed
         return s_summed.reshape(-1, num_sublanes_bkv, 128)
+
+    def rs_store(s2d, rs_ref, scores_vmem):
+        """scores_vmem[t, j, l] = s2d[t, 128 j + l] without a register relayout.
+
+        Each (8 tokens, 128 lanes) vreg of s2d is stored whole to rs_ref; a
+        token's (8 chunks, 128 lanes) output vreg is then 8 rows at stride 8
+        of rs_ref, one sublane-strided load."""
+        si = pltpu.bitcast(s2d, jnp.int32)
+        nsub = num_sublanes_bkv
+        for k in range(s2d.shape[0] // 8):
+            for c in range(nsub):
+                r = (k * nsub + c) * 8
+                rs_ref[r : r + 8, :] = si[8 * k : 8 * k + 8, c * 128 : (c + 1) * 128]
+        for k in range(s2d.shape[0] // 8):
+            for jj in range(nsub // 8):
+                for i in range(8):
+                    scores_vmem[8 * k + i, jj * 8 : (jj + 1) * 8, :] = rs_ref[
+                        pl.ds(k * nsub * 8 + jj * 64 + i, 8, stride=8), :
+                    ]
+
+    def gi_mx_sums(q_gi_ref, w_all, kfp8):
+        """[bq, bkv_sz] head sums via explicit MXU ops (see `_epi_opts` mx).
+
+        Both MXUs hold one 256-token key slab each (zero-padded to the 256-deep
+        contraction); every (token group, head block) q row block is streamed
+        through both, and each popped [hs*gi_tg, 256] f32 block is reduced into
+        its (group, slab) running sum in head order, so the arithmetic and its
+        order are exactly `gi_group_sum`'s."""
+        nm = 2
+        hs = gi_hsub or score_bf16_group or 4
+        mrows = hs * gi_tg
+        n_groups = bq_sz // gi_tg
+        pairs = bkv_sz // (256 * nm)
+        # Accumulator slice i of an MXU starts at i * mrows: disjoint whether
+        # the address unit is a row or a vreg.
+        def acc_addr(i):
+            return (i % gi_depth) * mrows
+        zq = jnp.zeros((mrows, 128), q_gi_ref.dtype)
+        zk = jnp.zeros((256, 128), kfp8.dtype)
+
+        def rhs(p, m):
+            c = (p * nm + m) * 256
+            r = jnp.concatenate([kfp8[c : c + 256], zk], axis=1)  # [N, K]
+            return r if gi_mx == "mx" else r.T
+
+        def push(p):
+            for m in range(nm):
+                pltpu.matmul_push_rhs(
+                    rhs(p, m), staging_register=0, mxu_index=m,
+                    transpose=gi_mx == "mx",
+                )
+
+        blocks = [
+            (p, g, h0)
+            for p in range(pairs)
+            for g in range(n_groups)
+            for h0 in range(0, num_q_heads, hs)
+        ]
+
+        def issue(i):
+            p, g, h0 = blocks[i]
+            r0 = g * gi_rows + h0 * gi_tg
+            lhs = jnp.concatenate([q_gi_ref[r0 : r0 + mrows, :], zq], axis=1)
+            first = g == 0 and h0 == 0
+            for m in range(nm):
+                pltpu.matmul_acc_lhs(
+                    acc_addr(i), lhs, m, load_staged_rhs=0 if first else None
+                )
+            if first and p + 1 < pairs:
+                push(p + 1)
+
+        sums = {}
+        push(0)
+        for i in range(min(gi_depth - 1, len(blocks))):
+            issue(i)
+        for i, (p, g, h0) in enumerate(blocks):
+            if i + gi_depth - 1 < len(blocks):
+                issue(i + gi_depth - 1)
+            w_rows = w_all[g * gi_rows : (g + 1) * gi_rows]
+            for m in range(nm):
+                st = pltpu.matmul_pop(acc_addr(i), (mrows, 256), jnp.float32, m)
+                key = (g, p * nm + m)
+                sums[key] = gi_head_sum(st, w_rows, h0, sums.get(key))
+        slabs = bkv_sz // 256
+        return jnp.concatenate(
+            [
+                jnp.concatenate([sums[(g, c)] for c in range(slabs)], axis=1)
+                for g in range(n_groups)
+            ],
+            axis=0,
+        )
 
     def gi_scores(
         q_gi_ref, w_gi_ref, bkv, scale_val, bkv_idx, seq_len, q_pos_base, cp_rank,
-        scores_vmem,
+        scores_vmem, rs_ref=None,
     ):
-        """gi scoring for one step; writes scores_vmem and returns the f32 scores."""
+        """gi scoring for one step; writes scores_vmem and returns the f32 scores
+        ([bq, bkv_sz] with `rs_ref`, else in scores_vmem's shape)."""
         n_groups = bq_sz // gi_tg
         if gi_mode in ("loop", "loopslab"):
 
@@ -480,9 +631,13 @@ def kernel(
 
             lax.fori_loop(0, n_groups, body, 0)
             return pltpu.bitcast(scores_vmem[...], jnp.float32)
-        q_all = q_gi_ref[...]
         w_all = w_gi_ref[...]
-        st_all = qk_has(q_all, bkv) if gi_mode == "full" else None
+        if gi_mx:
+            acc = gi_mx_sums(q_gi_ref, w_all, bkv)
+            n_groups = 0
+        else:
+            q_all = q_gi_ref[...]
+            st_all = qk_has(q_all, bkv) if gi_mode == "full" else None
         accs = []
         for g in range(n_groups):
             sl = slice(g * gi_rows, (g + 1) * gi_rows)
@@ -492,8 +647,13 @@ def kernel(
                     st_full=None if st_all is None else st_all[sl],
                 )
             )
-        acc = jnp.concatenate(accs, axis=0)
+        if not gi_mx:
+            acc = jnp.concatenate(accs, axis=0)
         q_pos = (q_pos_base + jnp.arange(bq_sz, dtype=jnp.int32)) >> shift_comp
+        if rs_ref is not None:
+            s = finish_scores(acc, scale_val, bkv_idx, seq_len, q_pos, cp_rank, flat=True)
+            rs_store(s, rs_ref, scores_vmem)
+            return s
         s = finish_scores(acc, scale_val, bkv_idx, seq_len, q_pos, cp_rank)
         scores_vmem[...] = pltpu.bitcast(s, jnp.int32)
         return s
@@ -572,7 +732,10 @@ def kernel(
             key = _monotone_key(pltpu.bitcast(acc_ref[...], jnp.int32))
             if _TEST_EPILOGUE_T_FAULT == "inflate":
                 key = key + jnp.int32(1 << 23)
-            t = jnp.min(jnp.min(key, axis=1), axis=1, keepdims=True)
+            if key.ndim == 2:  # rs: [rows, bkv_sz]
+                t = jnp.min(key, axis=1, keepdims=True)
+            else:
+                t = jnp.min(jnp.min(key, axis=1), axis=1, keepdims=True)
             stage_ref[...] = jnp.broadcast_to(t, stage_ref.shape)
             token_start, total_sz = bref_override._token_window(
                 (scores_hbm_ref, cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref),
@@ -619,7 +782,7 @@ def kernel(
 
     def step_body(
         q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None, t_refs=None,
-        w_gi_ref=None,
+        w_gi_ref=None, rs_ref=None,
     ):
         p_id = pl.program_id(0)
         batch_start_seq_idx = seq_tile(p_id)
@@ -652,7 +815,7 @@ def kernel(
                 ).astype(jnp.bfloat16)
             scores = gi_scores(
                 q_hm_ref, w_gi_ref, fp8_val, scale_val, bkv_idx, s_l, q_pos_base,
-                cp_rank, scores_vmem,
+                cp_rank, scores_vmem, rs_ref=rs_ref,
             )
             if t_refs is not None:
                 t_epilogue(p_id, bkv_idx, scores, *t_refs)
@@ -732,13 +895,14 @@ def kernel(
         if t_refs is not None:
             t_epilogue(p_id, bkv_idx, scores, *t_refs)
 
-    def _run_all(q_hm_ref=None, w_gi_ref=None, t_refs=None):
+    def _run_all(q_hm_ref=None, w_gi_ref=None, t_refs=None, rs_ref=None):
         @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
         def _run_pipeline(final_allocs):
             q_buf, weights_buf, kv_buf, o_buf = final_allocs
             pipeline_fn = pltpu.emit_pipeline(
                 functools.partial(
-                    step_body, q_hm_ref=q_hm_ref, t_refs=t_refs, w_gi_ref=w_gi_ref
+                    step_body, q_hm_ref=q_hm_ref, t_refs=t_refs, w_gi_ref=w_gi_ref,
+                    rs_ref=rs_ref,
                 ),
                 grid=(metadata_ref.num_steps[chunk_idx],),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
@@ -760,11 +924,18 @@ def kernel(
         # tile keeps the cached block unambiguous.
         if use_gi:
             pl.run_scoped(
-                lambda q_ref, w_ref: _run_all(q_ref, w_ref, t_refs=t_refs),
+                lambda q_ref, w_ref, *rs: _run_all(
+                    q_ref, w_ref, t_refs=t_refs, rs_ref=rs[0] if rs else None
+                ),
                 pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
                 pltpu.VMEM(
                     (num_q_heads * bq_sz, 128),
                     jnp.bfloat16 if score_bf16_group else jnp.float32,
+                ),
+                *(
+                    (pltpu.VMEM((bq_sz * num_sublanes_bkv, 128), jnp.int32),)
+                    if gi_rs
+                    else ()
                 ),
             )
         elif seq_batch_size == 1 and bq_sz > 1:
@@ -779,7 +950,11 @@ def kernel(
         tile_rows = seq_batch_size * bq_sz
         pl.run_scoped(
             lambda *t_refs: _dispatch(t_refs),
-            pltpu.VMEM((tile_rows, num_sublanes_bkv, 128), jnp.float32),
+            pltpu.VMEM(
+                (tile_rows, bkv_sz) if use_gi and gi_rs
+                else (tile_rows, num_sublanes_bkv, 128),
+                jnp.float32,
+            ),
             pltpu.VMEM((tile_rows, 128), jnp.int32),
             pltpu.SemaphoreType.DMA,
         )
