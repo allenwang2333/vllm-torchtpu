@@ -28,8 +28,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @property
     def dist_backend(self) -> str:
-        # torch_tpu findings doc: https://docs.google.com/document/d/1lqp-3dspybK62XaDFiAj2cO_OVCpQchiLKqCfBn36Sc
-        # Tracked there as FR4.
+        # TODO(go/torchtpu-diffusion-findings, FR4): Remove the _worker_world_size
+        # fallback once vLLM-Omni's DiffusionWorker keeps WORLD_SIZE set after
+        # building its per-worker VllmConfig (check_and_update_config pops it today).
+        #
         # DiffusionWorker exports WORLD_SIZE before set_device, but building
         # the worker's VllmConfig afterwards runs check_and_update_config,
         # which pops WORLD_SIZE for that world_size=1 vLLM config. Fall back
@@ -96,10 +98,12 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         the slice bootstrap never completes. The workers already share
         MASTER_PORT (DiffusionWorker exports od_config.master_port), so the
         list is derived from it.
-
-        # Tracked there as S5 (one addressable device per process -> one process
-        # per chip -> shared slicebuilder list).
         """
+        # TODO(go/torchtpu-diffusion-findings, S5): Remove once vLLM-Omni calls a
+        # platform hook in the parent before spawning diffusion workers, so every
+        # rank inherits one address list, or torch_tpu allows more than one
+        # addressable device per process.
+        #
         addresses = os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES")
         if addresses and len(addresses.split(",")) == world_size:
             return
