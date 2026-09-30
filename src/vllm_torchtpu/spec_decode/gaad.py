@@ -538,3 +538,29 @@ def patch_vllm_grammar_jump_decoding() -> None:
 
     Scheduler._tpu_grammar_jump_patched = True
     logger.info("Applied TPU patch: grammar jump decoding draft top-up.")
+
+
+def patch_vllm_speculative_config_gaad() -> None:
+    """Allows SpeculativeConfig to accept method='gaad' without raising ValueError."""
+    try:
+        from vllm.config.speculative import SpeculativeConfig
+    except (ImportError, ModuleNotFoundError):
+        return
+
+    if getattr(SpeculativeConfig, "_tpu_gaad_patched", False):
+        return
+
+    original_init = SpeculativeConfig.__init__
+
+    def patched_init(self, *args, **kwargs):
+        method = kwargs.get("method")
+        if method == "gaad":
+            kwargs["method"] = "ngram"
+            original_init(self, *args, **kwargs)
+            self.method = "gaad"
+        else:
+            original_init(self, *args, **kwargs)
+
+    SpeculativeConfig.__init__ = patched_init
+    SpeculativeConfig._tpu_gaad_patched = True
+    logger.info("Applied TPU patch: SpeculativeConfig supports method='gaad'.")
