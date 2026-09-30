@@ -95,6 +95,29 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     )
 
 
+# GLM5_MK_STACK_C (kernel.stack_kinds syntax: "1" or a kind list): the cache kinds allocated as ONE
+# [n_layers_of_kind, num_blocks, ...] tensor instead of one tensor per layer. Default off.
+GLM5_STACKABLE_KV_KINDS = ("nope", "rope", "idx")
+
+
+def glm5_stacked_kv_kinds() -> frozenset[str]:
+    """GLM5_MK_STACK_C -> the stacked GLM-5.2 cache kinds (nope and rope go together: the stock
+    sparse-MLA op takes the pair)."""
+    import os
+
+    v = os.environ.get("GLM5_MK_STACK_C", "")
+    if v == "1":
+        kinds = frozenset(GLM5_STACKABLE_KV_KINDS)
+    else:
+        kinds = frozenset(x for x in v.split(",") if x and x != "0")
+    bad = kinds - set(GLM5_STACKABLE_KV_KINDS)
+    if bad:
+        raise ValueError(f"GLM5_MK_STACK_C: unknown cache kinds {sorted(bad)}")
+    if ("nope" in kinds) != ("rope" in kinds):
+        raise ValueError("GLM5_MK_STACK_C: nope and rope are stacked together or not at all")
+    return kinds
+
+
 def check_kv_caches_cover_block_ids(
     kv_caches: dict[str, torch.Tensor],
     kv_cache_tensors: Iterable[KVCacheTensor],
@@ -505,6 +528,129 @@ class KVCacheManager:
             kv_cache_config.kv_cache_groups,
             runner_only_attn_layers,
         )
+
+    def _allocate_glm5_stacked_kv(
+        self,
+        kv_cache_config: KVCacheConfig,
+        per_layer_spec: Callable[[str], KVCacheSpec],
+        kinds: frozenset[str],
+    ) -> dict[str, object]:
+        """GLM5_MK_STACK_C: allocate the sparse-MLA (nope, rope) and/or indexer K caches as one
+        tensor per kind, [n_layers_of_kind, num_blocks, *per-layer page shape], byte-identical to
+        the per-layer allocations it replaces. Returns layer name -> the object to bind as that
+        layer's kv_cache (the shared (nope, rope) pair or the shared indexer tensor) and sets
+        `module.kv_stack = (row, num_blocks)`; rows follow the layer index. Also records
+        `runner.glm5_kv_stack = {kind: (tensor, [layer names by row])}` for the megakernel."""
+        from vllm.v1.worker.utils import extract_layer_index
+
+        fwd = self.runner.vllm_config.compilation_config.static_forward_context
+        num_blocks = kv_cache_config.num_blocks
+        sparse: list[str] = []
+        indexer: list[str] = []
+        regions: dict[tuple[int, int], str] = {}
+        for tensor in kv_cache_config.kv_cache_tensors:
+            for index, name in enumerate(tensor.layers):
+                spec = per_layer_spec(name)
+                if not isinstance(spec, MLAAttentionSpec):
+                    continue
+                module = fwd.get(name)
+                if getattr(module, "use_sparse", False):
+                    if "nope" not in kinds:
+                        continue
+                    sparse.append(name)
+                elif isinstance(module, DeepseekV32IndexerCache):
+                    if "idx" not in kinds:
+                        continue
+                    indexer.append(name)
+                else:
+                    continue
+                region = (tensor.offset + index * tensor.layer_stride, tensor.block_stride)
+                if region in regions:
+                    raise ValueError(
+                        f"GLM5_MK_STACK_C: {name} shares KV region {region} with "
+                        f"{regions[region]}; stacked caches need one region per layer"
+                    )
+                regions[region] = name
+        if "nope" in kinds and not sparse:
+            raise ValueError("GLM5_MK_STACK_C: no sparse MLA layers to stack")
+        if "idx" in kinds and not indexer:
+            raise ValueError("GLM5_MK_STACK_C: no indexer K caches to stack")
+        sparse.sort(key=extract_layer_index)
+        indexer.sort(key=extract_layer_index)
+        stride = {name: region[1] for region, name in regions.items()}
+
+        def check_budget(names: list[str], per_layer_bytes: int) -> None:
+            # the per-layer allocation's budget (allocate_attention_region): a stacked row must
+            # not take more than the block stride the scheduler sized the pool with
+            for name in names:
+                if per_layer_bytes > num_blocks * stride[name]:
+                    raise ValueError(
+                        f"GLM5_MK_STACK_C: {name} needs {per_layer_bytes} B, its region "
+                        f"holds {num_blocks * stride[name]}"
+                    )
+
+        dev = self.runner.device
+        bound: dict[str, object] = {}
+        record: dict[str, tuple[torch.Tensor, list[str]]] = {}
+        total = 0
+        if sparse:
+            spec0 = per_layer_spec(sparse[0])
+            specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                num_blocks, spec0.block_size, spec0.head_size, spec0.dtype
+            )
+            for name in sparse:
+                s = per_layer_spec(name)
+                if (s.block_size, s.head_size, s.dtype) != (
+                    spec0.block_size, spec0.head_size, spec0.dtype
+                ):
+                    raise ValueError(f"GLM5_MK_STACK_C: {name} spec {s} != {spec0}")
+            check_budget(
+                sparse,
+                sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs),
+            )
+            n = len(sparse)
+            nope, rope = (
+                torch.zeros((n, *spec.shape), dtype=spec.torch_dtype, device=dev)
+                for spec in specs
+            )
+            for row, name in enumerate(sparse):
+                module = fwd[name]
+                module.mla_kv_spec = specs
+                module.kv_stack = (row, num_blocks)
+                bound[name] = (nope, rope)
+            record["nope"] = (nope, sparse)
+            record["rope"] = (rope, sparse)
+            total += nope.nbytes + rope.nbytes
+        if indexer:
+            spec0 = per_layer_spec(indexer[0])
+            shape = tuple(
+                PallasMLAttentionBackend.get_kv_cache_shape(
+                    num_blocks, spec0.block_size, spec0.num_kv_heads, spec0.head_size,
+                    spec0.dtype,
+                )
+            )
+            for name in indexer:
+                s = per_layer_spec(name)
+                if (s.block_size, s.num_kv_heads, s.head_size, s.dtype) != (
+                    spec0.block_size, spec0.num_kv_heads, spec0.head_size, spec0.dtype
+                ):
+                    raise ValueError(f"GLM5_MK_STACK_C: {name} spec {s} != {spec0}")
+            check_budget(indexer, math.prod(shape) * spec0.dtype.itemsize)
+            idx = torch.zeros((len(indexer), *shape), dtype=spec0.dtype, device=dev)
+            for row, name in enumerate(indexer):
+                fwd[name].kv_stack = (row, num_blocks)
+                bound[name] = idx
+            record["idx"] = (idx, indexer)
+            total += idx.nbytes
+        self.runner.glm5_kv_stack = record
+        logger.info(
+            "GLM5_MK_STACK_C: stacked KV %s, %.3f GiB/rank (== the per-layer total), "
+            "%d blocks",
+            {k: tuple(t.shape) for k, (t, _) in record.items()},
+            total / 2**30,
+            num_blocks,
+        )
+        return bound
 
     def _add_shared_kv_cache_aliases(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if not self.runner.shared_kv_cache_layers:
@@ -1449,12 +1595,27 @@ class KVCacheManager:
                     device=self.runner.device,
                 )
 
+        # GLM5_MK_STACK_C: one [n_layers, num_blocks, ...] tensor per stacked cache kind; every
+        # layer of the kind is bound to the SAME tensor and carries `kv_stack = (row, num_blocks)`,
+        # which its stock op turns into a page offset (no per-layer view ever enters a graph).
+        stacked_kv: dict[str, object] = {}
+        stack_kinds = (
+            frozenset() if (_is_ds_v4 or use_block_major) else glm5_stacked_kv_kinds()
+        )
+        if stack_kinds:
+            stacked_kv = self._allocate_glm5_stacked_kv(
+                kv_cache_config, _per_layer_spec, stack_kinds
+            )
+
         for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
             # Each descriptor names layers within the whole backing allocation;
             # its size is not a per-layer budget. TPU's separate typed caches
             # use the scheduler's block count and the normalized page geometry.
             num_blocks = kv_cache_config.num_blocks
             for layer_index, layer_name in enumerate(kv_cache_tensor.layers):
+                if layer_name in stacked_kv:
+                    kv_caches[layer_name] = stacked_kv[layer_name]
+                    continue
                 kv_cache_spec = _per_layer_spec(layer_name)
                 region = (
                     kv_cache_tensor.offset + layer_index * kv_cache_tensor.layer_stride,

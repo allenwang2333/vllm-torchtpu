@@ -1788,6 +1788,36 @@ def _w_uv_bmm(outputs: torch.Tensor, w_uv: torch.Tensor) -> torch.Tensor:
     return torch.bmm(outputs.transpose(0, 1), w_uv)
 
 
+def _run_sparse_mla_on_layer_cache(layer, run, kv_cache_nope, kv_cache_rope, block_tables):
+    """`run(nope, rope, block_tables, nope_spec, rope_spec) -> (new_nope, new_rope, out)` on this
+    layer's cache.
+
+    GLM5_MK_STACK_C: when the runner bound a stacked [n_layers, num_blocks, ...] pair
+    (`layer.kv_stack = (row, num_blocks)`), `run` sees the pair merged to [n_layers *
+    num_blocks, ...] (a bitcast) with the page table offset to this layer's rows, and the
+    returned caches are reshaped back: the writers and kernels are unchanged and nothing is
+    sliced out of the stack. Without `kv_stack` this is `run` on the per-layer caches."""
+    nope_spec, rope_spec = layer.mla_kv_spec
+    stack = getattr(layer, "kv_stack", None)
+    if stack is None:
+        return run(kv_cache_nope, kv_cache_rope, block_tables, nope_spec, rope_spec)
+    pages = kv_cache_nope.shape[0] * stack[1]
+    nope, merged_tables = kv_cache_utils.merge_kv_stack(kv_cache_nope, block_tables, stack)
+    rope, _ = kv_cache_utils.merge_kv_stack(kv_cache_rope, block_tables, stack)
+    new_nope, new_rope, out = run(
+        nope,
+        rope,
+        merged_tables,
+        dataclasses.replace(nope_spec, num_pages=pages),
+        dataclasses.replace(rope_spec, num_pages=pages),
+    )
+    return (
+        kv_cache_utils.split_kv_stack(new_nope, kv_cache_nope.shape),
+        kv_cache_utils.split_kv_stack(new_rope, kv_cache_rope.shape),
+        out,
+    )
+
+
 class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def __init__(
         self,
@@ -2000,24 +2030,29 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            nope_spec, rope_spec = layer.mla_kv_spec
-            return sparse_mla_attention(
-                ql_nope,
-                q_pe,
-                kv_c_normed,
-                k_pe,
+            return _run_sparse_mla_on_layer_cache(
+                layer,
+                lambda nope, rope, tables, nope_spec, rope_spec: sparse_mla_attention(
+                    ql_nope,
+                    q_pe,
+                    kv_c_normed,
+                    k_pe,
+                    nope,
+                    rope,
+                    topk_indices,
+                    seq_lens,
+                    tables,
+                    query_start_loc,
+                    request_distribution,
+                    vllm_context.mesh,
+                    nope_spec,
+                    rope_spec,
+                    sm_scale=layer.scale,
+                    k_scale=k_scale,
+                ),
                 kv_cache_nope,
                 kv_cache_rope,
-                topk_indices,
-                seq_lens,
                 block_tables,
-                query_start_loc,
-                request_distribution,
-                vllm_context.mesh,
-                nope_spec,
-                rope_spec,
-                sm_scale=layer.scale,
-                k_scale=k_scale,
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
@@ -2060,25 +2095,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            nope_spec, rope_spec = layer.mla_kv_spec
-            return sparse_mla_attention(
-                q,
-                None,
-                kv_c_normed,
-                k_pe,
+            return _run_sparse_mla_on_layer_cache(
+                layer,
+                lambda nope, rope, tables, nope_spec, rope_spec: sparse_mla_attention(
+                    q,
+                    None,
+                    kv_c_normed,
+                    k_pe,
+                    nope,
+                    rope,
+                    topk_indices,
+                    seq_lens,
+                    tables,
+                    query_start_loc,
+                    request_distribution,
+                    vllm_context.mesh,
+                    nope_spec,
+                    rope_spec,
+                    sm_scale=layer.scale,
+                    k_scale=k_scale,
+                    full_width_output=True,
+                ),
                 kv_cache_nope,
                 kv_cache_rope,
-                topk_indices,
-                seq_lens,
                 block_tables,
-                query_start_loc,
-                request_distribution,
-                vllm_context.mesh,
-                nope_spec,
-                rope_spec,
-                sm_scale=layer.scale,
-                k_scale=k_scale,
-                full_width_output=True,
             )
 
         sparse_mla_packed_jax_op = pallas.jax_op(
@@ -2407,6 +2447,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 f"cache; got {type(kv_cache)}"
             )
             if self.dcp_size > 1:
+                assert getattr(layer, "kv_stack", None) is None, (
+                    "GLM5_MK_STACK_C stacked caches are not wired into the DCP sparse MLA op"
+                )
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first."

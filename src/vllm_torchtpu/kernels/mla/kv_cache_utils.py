@@ -104,6 +104,30 @@ def get_kv_cache_shape(
     )
 
 
+def merge_kv_stack(
+    cache: jax.Array, page_table: jax.Array, kv_stack: tuple[int, int]
+) -> tuple[jax.Array, jax.Array]:
+    """GLM5_MK_STACK_C: one layer's view of a stacked cache, with no copy.
+
+    `cache` is [n_layers, num_blocks, *page] and `kv_stack` = (this layer's row, num_blocks).
+    Returns the cache as [n_layers * num_blocks, *page] (merging two untiled leading dims is a
+    bitcast) and `page_table` with row * num_blocks added to every valid (>= 0) entry, so the
+    unchanged paged writers and kernels address this layer's pages. Undo with
+    `split_kv_stack`.
+    """
+    row, num_blocks = kv_stack
+    assert cache.shape[1] == num_blocks and 0 <= row < cache.shape[0], (
+        cache.shape, kv_stack)
+    merged = cache.reshape(cache.shape[0] * num_blocks, *cache.shape[2:])
+    offset = jnp.int32(row * num_blocks)
+    return merged, jnp.where(page_table >= 0, page_table + offset, page_table)
+
+
+def split_kv_stack(merged: jax.Array, like_shape: tuple[int, ...]) -> jax.Array:
+    """Inverse of `merge_kv_stack`'s cache reshape."""
+    return merged.reshape(like_shape)
+
+
 @dataclasses.dataclass(frozen=True)
 class SparseMLAKVCacheSpec:
     cache_type: KVCacheType

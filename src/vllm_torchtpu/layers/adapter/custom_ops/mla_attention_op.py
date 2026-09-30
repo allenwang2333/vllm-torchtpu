@@ -53,7 +53,12 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.k_cache_insert import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    OOB_PAGE,
+    _row_positions,
+    merge_kv_stack,
+    split_kv_stack,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     VllmTPUDeepseekV32IndexerBackend,
@@ -324,6 +329,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             STREAMIDX_ENABLE_EARLY_EXIT and envs.TPU_STREAMIDX_EARLY_EXIT
         )
         decode_kv_pages = envs.TPU_STREAMIDX_DECODE_KV_PAGES
+        k_cache_module = self.k_cache
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -335,6 +341,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
+            # GLM5_MK_STACK_C: the runner bound one [n_layers, num_blocks, ...] indexer cache
+            # shared by every indexer layer; address this layer's rows through the page table
+            # (a bitcast of the stack plus an offset, no slice) -- see merge_kv_stack.
+            kv_stack = getattr(k_cache_module, "kv_stack", None)
+            stacked_shape = cache_kv.shape
+            if kv_stack is not None:
+                cache_kv, page_indices = merge_kv_stack(cache_kv, page_indices, kv_stack)
             lkv_dim = cache_kv.shape[-1]
             # Cache rows are padded to the 128-lane HBM width; pad the packed
             # fp8+scale rows to match before scattering.
@@ -376,6 +389,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 l1_live=l1_live,
                 score_epilogue=score_epilogue,
             )
+            if kv_stack is not None:
+                cache_kv = split_kv_stack(cache_kv, stacked_shape)
             return cache_kv, topk_indices
 
         op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
@@ -558,6 +573,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         if self.topk_op_dcp is not None:
+            assert getattr(self.k_cache, "kv_stack", None) is None, (
+                "GLM5_MK_STACK_C stacked indexer caches are not wired into the DCP indexer"
+            )
             # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
             # comes back is not global positions but this rank's own local
