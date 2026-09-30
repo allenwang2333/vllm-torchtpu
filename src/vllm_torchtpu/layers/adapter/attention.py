@@ -5,6 +5,7 @@ import dataclasses
 import functools
 import inspect
 import math
+import os
 from typing import Any, ClassVar
 
 import jax
@@ -1807,11 +1808,18 @@ def _build_w_uv_stack_op(layer):
     import jax.numpy as jnp
 
     row = layer.W_UV_stack[1]
+    # GLM5_MK_WUV_PAD (probe 35 job 13): "w" pads the stack row to o's width (the per-layer
+    # `_w_uv_bmm` math); XLA then relayouts the row out of the stack (a slice_bitcast_fusion copy,
+    # 16.8 MB per layer, j-bf3ef2c0). "o" drops o's extra columns instead (they meet the zero pad
+    # rows, so they add nothing): the row slice fuses into the dot (TPU7x AOT, no copy).
+    pad_o = getattr(layer, "w_uv_pad", os.environ.get("GLM5_MK_WUV_PAD", "w")) == "o"
 
     def w_uv_bmm(o: jax.Array, stk: jax.Array) -> jax.Array:
         w = stk[row].astype(o.dtype)
         extra = o.shape[-1] - w.shape[1]
-        if extra:
+        if extra and pad_o:
+            o = o[..., : w.shape[1]]
+        elif extra:
             w = jnp.pad(w, ((0, 0), (0, extra), (0, 0)))
         return jax.lax.dot_general(jnp.swapaxes(o, 0, 1), w, (((2,), (1,)), ((0,), (0,))))
 
@@ -1839,6 +1847,19 @@ def _run_sparse_mla_on_layer_cache(layer, run, kv_cache_nope, kv_cache_rope, blo
     stack = getattr(layer, "kv_stack", None)
     if stack is None:
         return run(kv_cache_nope, kv_cache_rope, block_tables, nope_spec, rope_spec)
+    # GLM5_MK_STACK_C_ACCESS (probe 35 job 13): "merge" (default) is the bitcast view below.
+    # "slice" runs on a static slice of this layer's row and writes it back with a static-offset
+    # update, so each layer's accesses sit in a region XLA can see is disjoint from the others'.
+    if getattr(layer, "kv_stack_access", os.environ.get("GLM5_MK_STACK_C_ACCESS", "merge")) == "slice":
+        row = stack[0]
+        new_nope, new_rope, out = run(
+            kv_cache_nope[row], kv_cache_rope[row], block_tables, nope_spec, rope_spec
+        )
+        return (
+            jax.lax.dynamic_update_index_in_dim(kv_cache_nope, new_nope, row, 0),
+            jax.lax.dynamic_update_index_in_dim(kv_cache_rope, new_rope, row, 0),
+            out,
+        )
     pages = kv_cache_nope.shape[0] * stack[1]
     nope, merged_tables = kv_cache_utils.merge_kv_stack(kv_cache_nope, block_tables, stack)
     rope, _ = kv_cache_utils.merge_kv_stack(kv_cache_rope, block_tables, stack)
