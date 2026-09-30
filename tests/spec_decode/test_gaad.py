@@ -4,6 +4,8 @@
 
 from unittest.mock import MagicMock
 
+import torch
+
 from vllm_torchtpu.spec_decode.gaad import (
     DRAFT_FLAG_EMPTY,
     DRAFT_FLAG_GRAMMAR,
@@ -215,3 +217,130 @@ class TestGaadProposer:
         assert batch_proposals[0] == [10, 20]
         # Second unconstrained request emitted empty list
         assert batch_proposals[1] == []
+
+
+class TestGaadRuntimeFlagsAndRejectionSampler:
+    """Tests for RejectionSampler forced acceptance and zero-target-logits bypass."""
+
+    def test_rejection_sampler_forced_acceptance_flag2(self):
+        """Tokens with flag == 2 are forced accepted even on argmax mismatch."""
+        from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+            RejectionSampler,
+        )
+
+        sampler = RejectionSampler()
+        device = torch.device("cpu")
+
+        # 1 request with 2 draft tokens
+        num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+        vocab_size = 50
+        # target logits predict token 0 at step 0, and token 0 at step 1
+        target_logits = torch.zeros((2, vocab_size), dtype=torch.float32, device=device)
+        target_logits[0, 0] = 10.0
+        target_logits[1, 0] = 10.0
+
+        bonus_token_ids = torch.tensor([42], dtype=torch.int32, device=device)
+        segment_ids = torch.tensor([0, 0], dtype=torch.int64, device=device)
+        group_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+        # Draft tokens are 10, 20 (mismatch with target argmax 0, 0)
+        draft_token_ids = torch.tensor([10, 20], dtype=torch.int32, device=device)
+
+        # Both tokens are GRAMMAR (flag == 2) -> forced accept!
+        draft_flags = torch.tensor(
+            [DRAFT_FLAG_GRAMMAR, DRAFT_FLAG_GRAMMAR],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        output = sampler(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            target_logits=target_logits,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=segment_ids,
+            group_indices=group_indices,
+            max_draft_tokens=2,
+            draft_flags=draft_flags,
+        )
+
+        # Both draft tokens forced accepted plus bonus token [10, 20, 42]
+        assert output[0].tolist() == [10, 20, 42]
+
+    def test_rejection_sampler_causal_cascade_truncation(self):
+        """Model mismatch at slot 0 truncates subsequent grammar tokens at slot 1."""
+        from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+            RejectionSampler,
+        )
+
+        sampler = RejectionSampler()
+        device = torch.device("cpu")
+
+        num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+        vocab_size = 50
+        target_logits = torch.zeros((2, vocab_size), dtype=torch.float32, device=device)
+        # Target argmax is 99 (say 5) at slot 0, and 20 at slot 1
+        target_logits[0, 5] = 10.0
+        target_logits[1, 20] = 10.0
+
+        bonus_token_ids = torch.tensor([42], dtype=torch.int32, device=device)
+        segment_ids = torch.tensor([0, 0], dtype=torch.int64, device=device)
+        group_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+        # Draft is [10, 20]. Slot 0 has flag MODEL (1), Slot 1 has flag GRAMMAR (2)
+        draft_token_ids = torch.tensor([10, 20], dtype=torch.int32, device=device)
+        draft_flags = torch.tensor(
+            [DRAFT_FLAG_MODEL, DRAFT_FLAG_GRAMMAR],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        output = sampler(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            target_logits=target_logits,
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=segment_ids,
+            group_indices=group_indices,
+            max_draft_tokens=2,
+            draft_flags=draft_flags,
+        )
+
+        # Slot 0 rejected -> recovers target argmax (5),
+        # slot 1 truncated to PLACEHOLDER (-1)
+        assert output[0, 0].item() == 5
+        assert output[0, 1].item() == -1
+
+    def test_rejection_sampler_zero_target_logits_bypass(self):
+        """When target_logits is None and all drafts are GRAMMAR,
+        execute zero-logits bypass."""
+        from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+            RejectionSampler,
+        )
+
+        sampler = RejectionSampler()
+        device = torch.device("cpu")
+
+        num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+        bonus_token_ids = torch.tensor([42], dtype=torch.int32, device=device)
+        segment_ids = torch.tensor([0, 0], dtype=torch.int64, device=device)
+        group_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        draft_token_ids = torch.tensor([10, 20], dtype=torch.int32, device=device)
+        draft_flags = torch.tensor(
+            [DRAFT_FLAG_GRAMMAR, DRAFT_FLAG_GRAMMAR],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        output = sampler(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            target_logits=None,  # Zero-Target-Logits Bypass!
+            bonus_token_ids=bonus_token_ids,
+            segment_ids=segment_ids,
+            group_indices=group_indices,
+            max_draft_tokens=2,
+            draft_flags=draft_flags,
+        )
+
+        assert output[0].tolist() == [10, 20, 42]
