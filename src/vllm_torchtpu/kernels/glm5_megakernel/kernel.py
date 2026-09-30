@@ -371,6 +371,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     # voids them (the issued tiles are drained unused). Bitwise either way.
     SPEC = getattr(cfg, "SPEC", 0)
     assert not (SPEC and KREP), "SPEC with KREP: not built"
+    # yspec rows: only part rows < R are ever sent (reduce_scatter_rows), so the parked term keeps
+    # rup(R, 8) rows, not M (768K -> 192K VMEM at R=8, H=6144)
+    MY = min(M, rup(R, 8))
     NS = R * KREP                                    # replica table entries
     ER_S = cfg.ER + KREP                             # es13 / es2 scratch rows
     if KREP:
@@ -477,7 +480,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     scratch["pool_sem"] = pltpu.SemaphoreType.DMA((NB,))
     scratch["st"] = pltpu.SMEM((16 if SPEC else 8,), I32)   # stream cursor, see `pump`
     if SPEC:
-        scratch["yspec"] = pltpu.VMEM((M, H), F32)     # the speculated expert's weighted output
+        scratch["yspec"] = pltpu.VMEM((MY, H), F32)    # the speculated expert's weighted output
         scratch["spec_sem"] = pltpu.SemaphoreType.DMA(())  # the guess read (own sem: no sharing)
     scratch["gst"] = pltpu.SMEM((2,), I32)             # gather prefetch: rows issued, target layer
     GPRE = 0 if "gather" in skip else tiles.gpre
@@ -1841,20 +1844,20 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
                     @pl.when(first)
                     def _():
-                        scr["yspec"][...] = y * wcol
+                        scr["yspec"][...] = (y * wcol)[:MY]
 
                     @pl.when(jnp.logical_not(first))
                     def _():
                         @pl.when(jnp.logical_and(hitg, i - 1 == p_g))
                         def _():
-                            scr["part"][...] += scr["yspec"][...]
+                            scr["part"][:MY, :] += scr["yspec"][...]
                         scr["part"][...] += y * wcol
                     return c
                 lax.fori_loop(0, n_hit, ebody, 0)
                 if SPEC:
                     @pl.when(jnp.logical_and(hitg, p_g == n_hit - 1))
                     def _():
-                        scr["part"][...] += scr["yspec"][...]
+                        scr["part"][:MY, :] += scr["yspec"][...]
 
                 phm.mark("m_rs")
                 reduce_scatter_rows()
