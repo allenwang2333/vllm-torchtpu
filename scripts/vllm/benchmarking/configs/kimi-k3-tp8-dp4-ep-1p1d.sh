@@ -46,3 +46,6 @@ export TPU_P2P_WAIT_PULL_TIMEOUT=900
 export TPU_PARALLEL_PRECOMPILE=1
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=10800
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
+
+# Sample branch only: /reset_prefix_cache for k3_dp_pair_matrix.py.
+export VLLM_SERVER_DEV_MODE=1

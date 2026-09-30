@@ -283,6 +283,21 @@ if [[ "$stages_rc" -gt 1 ]]; then
 fi
 rc="$stages_rc"
 
+# Diagnostic: every prefill-DP x decode-DP pair on the same prompts, cold on
+# both sides, against the prompt served locally on each decode rank. Resets the
+# prefix caches (VLLM_SERVER_DEV_MODE, from the config), so after the stages.
+if [[ "${K3_DP_MATRIX:-1}" == "1" ]]; then
+  echo "--- Prefill-DP x decode-DP pair matrix"
+  mkdir -p "${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness"
+  python3 scripts/vllm/integration/k3_dp_pair_matrix.py \
+    --prefill-url "http://127.0.0.1:${PORT}" \
+    --decode-url "http://${DECODE_HOST}:${PORT}" \
+    --model moonshotai/Kimi-K3 --prefill-dp "$DATA_PARALLELISM" \
+    --decode-dp "$DATA_PARALLELISM" --reset \
+    2>&1 | tee "${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness/pair_matrix.log" \
+    || echo "WARNING: the pair matrix failed to run"
+fi
+
 if [[ "${K3_DP_SKIP_EVAL:-0}" != "1" ]]; then
   echo "--- lm_eval through the proxy"
   bash scripts/vllm/benchmarking/run_eval_flow.sh \
