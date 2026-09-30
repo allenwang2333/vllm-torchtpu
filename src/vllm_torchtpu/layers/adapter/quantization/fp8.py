@@ -81,6 +81,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
+from vllm_torchtpu.layers.adapter.quantization import fused_moe_ep_v3_dispatch
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
@@ -779,6 +780,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or fused_moe_ep_v3_dispatch.supported(self)
         )
 
     def maybe_roundup_sizes(
@@ -1002,6 +1004,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # A sequence-parallel layer's replicated steps and a layer outside
             # sequence parallelism take the grouped path; v2 never runs.
             return
+        if fused_moe_ep_v3_dispatch.enabled():
+            fused_moe_ep_v3_dispatch.prebuild(self, layer, activation_str)
+            return
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
@@ -1051,6 +1056,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # so ownership and the path that exercises it cannot disagree.
         if self._use_adaptive_fused_moe:
             return adaptive_moe.apply_adaptive_fused_moe(
+                self, layer, x, router_logits, self._apply_grouped
+            )
+        if fused_moe_ep_v3_dispatch.supported(self):
+            return fused_moe_ep_v3_dispatch.apply(
                 self, layer, x, router_logits, self._apply_grouped
             )
 
