@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     GLM5_STEP_TIMING: int = 0
     GLM5_MEGAKERNEL_BISECT: str = ""
     GLM5_LIBTPU_EXTRA_ARGS: str = ""
+    GLM5_MK_DECODE_REPLICAS: int = 0
+    GLM5_MK_DECODE_REPLICAS_PROFILE: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -635,6 +637,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "GLM5_MEGAKERNEL_BISECT": env_str("GLM5_MEGAKERNEL_BISECT", ""),
     # appended to LIBTPU_INIT_ARGS (which itself does not reach Ray workers); serving-hang diag
     "GLM5_LIBTPU_EXTRA_ARGS": env_str("GLM5_LIBTPU_EXTRA_ARGS", ""),
+    # Megakernel decode: k redundant routed-expert slots per MoE layer on every rank (0 = off,
+    # the kernel program is then unchanged). Each step the kernel moves hit experts from the
+    # busiest ranks onto replica holders (greedy, deterministic on every rank). Placement follows
+    # the online EPLB load window when VLLM_TPU_EPLB=1, else the offline profile below.
+    "GLM5_MK_DECODE_REPLICAS": env_int("GLM5_MK_DECODE_REPLICAS", 0),
+    # With GLM5_MK_DECODE_REPLICAS: an EPLB log npz (VLLM_TPU_EPLB_LOG_DIR format: `layers`,
+    # `logical_load`) whose load places the replicas at load time and whenever EPLB has not run.
+    "GLM5_MK_DECODE_REPLICAS_PROFILE": env_str("GLM5_MK_DECODE_REPLICAS_PROFILE", ""),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.

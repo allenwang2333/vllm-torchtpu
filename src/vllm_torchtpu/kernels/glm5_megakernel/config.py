@@ -31,6 +31,7 @@ class MKConfig:
     rope_theta: float = 8e6
     eps: float = 1e-5
     routed_scale: float = 2.5
+    KREP: int = 0          # decode replica slots per rank per MoE layer (0: off, program unchanged)
 
     @property
     def HR(self):          # heads per rank

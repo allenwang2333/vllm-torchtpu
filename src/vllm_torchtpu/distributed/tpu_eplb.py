@@ -670,12 +670,14 @@ class EplbRebalancer:
         plans = {}
         infos = {}
         log_loads = {}
+        plan_loads = {}  # the load each plan saw (window + this window), logical space
         for lid, pl in phys_loads.items():
             p2l = self.phys2log[lid]
             ll = np.zeros(self.E, np.int64)
             ll[p2l] = pl  # physical slot q holds logical p2l[q]
             log_loads[lid] = ll
             w = self.window[lid] + ll
+            plan_loads[lid] = w
             new, info = plan_layer(w, p2l, self.ep, self.min_gain)
             self.window[lid] = self.decay * w
             infos[lid] = info
@@ -730,6 +732,13 @@ class EplbRebalancer:
             mk_t = getattr(self.megakernel, "last_placement_timing", None)
             if mk_t:
                 tm["mk_rebuild"], tm["mk_sync"] = mk_t
+        if getattr(self.megakernel, "krep", 0) and self.debug_skip != "map":
+            # megakernel decode replicas follow the same load window, every rebalance (also one
+            # that moved no layer): collective, identical inputs on every rank
+            tr = time.perf_counter()
+            n_rep = self.megakernel.refresh_replicas(plan_loads)
+            tm["mk_replicas"] = time.perf_counter() - tr
+            _log(f"megakernel replicas re-placed layers={n_rep}")
         td = time.perf_counter()
         for layer in self.layers.values():
             getattr(layer, LOAD_ATTR).zero_()
