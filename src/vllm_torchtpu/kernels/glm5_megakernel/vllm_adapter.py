@@ -569,7 +569,10 @@ class Glm5Megakernel:
         cfg = self.cfg
         dbg = self.layerdiff and not skip
         call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE),
-                             debug=dbg, skip=skip, rope_packed=self.rope_packed)
+                             debug=dbg, skip=skip, rope_packed=self.rope_packed,
+                             # stacked [L,...] operands (GLM5_MK_STACK_W/_C) need stacked weight
+                             # loading + one KV tensor per kind here; not wired yet -> pin off.
+                             stack_w=False, stack_c=False)
         self.info = info
         n_w = len(self.weights)
         n_c = len(self.caches)

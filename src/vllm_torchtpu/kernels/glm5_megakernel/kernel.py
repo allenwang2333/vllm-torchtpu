@@ -324,14 +324,22 @@ COLLECTIVE_ID = int(os.environ.get("MK_COLLECTIVE_ID", "37"))
 
 
 def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset(),
-          axis_name=None, rope_packed=False):
+          axis_name=None, rope_packed=False, stack_w=None, stack_c=None):
     """Returns (step_fn, operand names). step_fn(meta, bt, h0, rope_tab, smalls, *weights,
     *caches) -> (out [M, H] bf16, *caches) for ONE rank; wrap in shard_map.
     skip: timing ablations only (numerics are garbage), a subset of ABLATIONS.
     rope_packed: the ROPE caches are the 64 B/token PACKED layout (see cache_kinds). The gather,
     the KV write and the post-call scatter address row sl >> 3; attention re-lays each gathered
-    chunk into the padded lane layout first, so the score math is unchanged (bit-exact)."""
+    chunk into the padded lane layout first, so the score math is unchanged (bit-exact).
+    stack_w / stack_c (probe 35, default env GLM5_MK_STACK_W / GLM5_MK_STACK_C, off = stack6):
+    one stacked HBM operand per weight / cache kind, [n_layers_of_kind, *per-layer shape], indexed
+    by the traced layer id, instead of one operand per (kind, layer) reached through a bswitch
+    cascade over the layers. Same bytes moved (bit-exact); the program no longer grows by L DMA
+    leaves per issue site (probe 32/35: the L=78 program pages the TensorCore instruction memory,
+    ~5.6 us at every layer-loop back-edge). Operand names become (kind, "stk")."""
     assert set(skip) <= set(ABLATIONS), skip
+    STK_W = (os.environ.get("GLM5_MK_STACK_W") == "1") if stack_w is None else bool(stack_w)
+    STK_C = (os.environ.get("GLM5_MK_STACK_C") == "1") if stack_c is None else bool(stack_c)
     typed = interpret or os.environ.get("MK_TYPED") == "1"   # diag: typed banks, no pool_alias
     R, L, H = cfg.R, cfg.L, cfg.H
     pg = cfg.page
@@ -381,8 +389,28 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     assert KR % 128 == 0
 
     # --- operand lists ---
-    w_names = [(k, l) for k, (ls, _, _) in wk.items() for l in ls]
-    c_names = [(k, l) for k, (ls, _, _) in ck.items() for l in ls]
+    w_names = ([(k, "stk") for k in wk] if STK_W
+               else [(k, l) for k, (ls, _, _) in wk.items() for l in ls])
+    c_names = ([(k, "stk") for k in ck] if STK_C
+               else [(k, l) for k, (ls, _, _) in ck.items() for l in ls])
+
+    def lpos_fn(ls):
+        """Traced layer id -> index into a stacked operand holding layers `ls` (clamped; the
+        stream only ever asks a kind for one of its own layers)."""
+        ls = list(ls)
+        n = len(ls)
+        if ls == list(range(ls[0], ls[0] + n)):
+            a = ls[0]
+            f = (lambda l: l) if a == 0 else (lambda l: l - a)
+        else:
+            fr, sk = cfg.idx_freq, cfg.idx_skip
+            assert ls == [l for l in range(L) if cfg.full_indexer(l)], ls
+            f = lambda l: jnp.where(l < sk, l, sk + (l - sk) // fr)
+        for i, l in enumerate(ls):                     # the formula names the right row
+            assert int(f(jnp.int32(l))) == i, (ls, l)
+        return lambda l: jnp.clip(f(l), 0, n - 1)
+    WPOS = {k: lpos_fn(ls) for k, (ls, _, _) in wk.items()}
+    CPOS = {k: lpos_fn(ls) for k, (ls, _, _) in ck.items()}
     n_fixed = 5
     n_w = len(w_names)
 
@@ -525,12 +553,34 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             dbg_h, dbg_idx = rest[:2]
             rest = rest[2:]
         scr = dict(zip(s_names, rest))
-        W = {}
-        for (k, l), r in zip(w_names, w_in):
-            W.setdefault(k, {})[l] = r
-        C = {}
-        for (k, l), r in zip(c_names, c_in):
-            C.setdefault(k, {})[l] = r
+        W, C, WS, CS = {}, {}, {}, {}
+        if STK_W:     # static per-layer views: shapes for the waits (sem + bytes only)
+            WS = {k: r for (k, _), r in zip(w_names, w_in)}
+            W = {k: {l: WS[k].at[i] for i, l in enumerate(wk[k][0])} for k in wk}
+        else:
+            for (k, l), r in zip(w_names, w_in):
+                W.setdefault(k, {})[l] = r
+        if STK_C:
+            CS = {k: r for (k, _), r in zip(c_names, c_in)}
+            C = {k: {l: CS[k].at[i] for i, l in enumerate(ck[k][0])} for k in ck}
+        else:
+            for (k, l), r in zip(c_names, c_in):
+                C.setdefault(k, {})[l] = r
+
+        def wsel(kind, l, fn):
+            """fn(this layer's `kind` weight ref): a stacked row, or stack6's layer cascade."""
+            if STK_W:
+                fn(WS[kind].at[WPOS[kind](l)])
+            else:
+                bswitch(l, {ll: (lambda r=r: fn(r)) for ll, r in W[kind].items()})
+
+        def csel(kinds, l, fn, layers=None):
+            """fn(*this layer's cache refs of `kinds`); layers: stack6's cascade keys."""
+            if STK_C:
+                fn(*[CS[k].at[CPOS[k](l)] for k in kinds])
+            else:
+                ks = sorted(C[kinds[0]]) if layers is None else layers
+                bswitch(l, {ll: (lambda ll=ll: fn(*[C[k][ll] for k in kinds])) for ll in ks})
 
         # axis_name: the rank from Mosaic's device id (upstream collectives32.py), not meta[0] -- the
         # served torch graph must not carry a rank constant (j-c4e6dce4), and XLA's partition-id is
@@ -581,8 +631,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         def issue_seg(a, l, t, slot):
             kind = SEGS[a]
             if kind != "exp":
-                bswitch(l, {ll: (lambda r=r: copy(kind, src_of(kind, r, t), slot).start())
-                            for ll, r in W[kind].items()})
+                wsel(kind, l, lambda r: copy(kind, src_of(kind, r, t), slot).start())
                 return
             i = t // TE
             u = t - i * TE
@@ -591,14 +640,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def exp_tiles(k13, k2, jj):
                 @pl.when(u < T13)
                 def _():
-                    bswitch(l, {ll: (lambda r=r: copy("ew13", src_of("ew13", r, u, jj), slot).start())
-                                for ll, r in W[k13].items()})
+                    wsel(k13, l, lambda r: copy("ew13", src_of("ew13", r, u, jj), slot).start())
 
                 @pl.when(u >= T13)
                 def _():
-                    bswitch(l, {ll: (lambda r=r: copy("ew2", src_of("ew2", r, u - T13, jj),
-                                                      slot).start())
-                                for ll, r in W[k2].items()})
+                    wsel(k2, l, lambda r: copy("ew2", src_of("ew2", r, u - T13, jj),
+                                                   slot).start())
             if not KREP:
                 exp_tiles("ew13", "ew2", j)
                 return
@@ -710,8 +757,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             @pl.when(jnp.logical_and(gst[1] >= 0, gst[0] < KT))
             def _():
                 i0 = gst[0]
-                bswitch(gst[1], {ll: (lambda ll=ll: gather_rows(C["nope"][ll], C["rope"][ll], i0,
-                                                                 GPRE)) for ll in NOIDX})
+                csel(("nope", "rope"), gst[1], lambda rn, rr: gather_rows(rn, rr, i0, GPRE),
+                     layers=NOIDX)
                 gst[0] = i0 + GPRE
 
         def matmul(kind, l, xref, K, N, j=None):
@@ -1010,9 +1057,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         kv_wait_writes()
                     page_ = bt[pos >> lg_pg]
                     sl_ = pos & (pg - 1)
-                    bswitch(l, {ll: (lambda r=C["rope"][ll]: pltpu.make_async_copy(
+                    csel(("rope",), l, lambda r: pltpu.make_async_copy(
                         r.at[page_, pl.ds(sl_ >> RSH, 1)], scr["rrow"].at[pl.ds(0, 1)],
-                        scr["kv_sem"].at[2]).start()) for ll in range(L)})
+                        scr["kv_sem"].at[2]).start(), layers=list(range(L)))
 
             # input norm
             x = scr["h"][...] + scr["res"][...]
@@ -1092,7 +1139,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 if KVA:                  # the read wait needs no layer switch (sem + bytes only)
                     kvw(C["rope"][0])()
                 else:
-                    bswitch(l, {ll: kvw(C["rope"][ll]) for ll in range(L)})
+                    csel(("rope",), l, lambda r: kvw(r)(), layers=list(range(L)))
                 cw = pltpu.make_async_copy(scr["rrow"], rrow_out.at[l], scr["kv_sem"].at[1])
                 cw.start()
                 if not KVA:              # kva: waited at the next layer's start / after the loop
@@ -1285,7 +1332,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             stage2(npages - 1, *carry)
                     return f
                 phi.mark("i_scan")
-                bswitch(l, {ll: scan(r) for ll, r in C["idx"].items()})
+                csel(("idx",), l, lambda r: scan(r)())
                 phi.mark("i_topk")
                 if "topk" not in skip:
                     topk()
@@ -1308,7 +1355,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 # were the slowest rank's gather in the one-busy proxy, stalling o_proj everywhere
                 @pl.when(active)
                 def _():
-                    bswitch(l, {ll: rest(C["nope"][ll], C["rope"][ll]) for ll in range(L)})
+                    csel(("nope", "rope"), l, lambda rn, rr: rest(rn, rr)(), layers=list(range(L)))
                     pltpu.make_async_copy(scr["g_nope"], scr["g_nope"], scr["g_sem"].at[0]).wait()
                     pltpu.make_async_copy(scr["g_rope"], scr["g_rope"], scr["g_sem"].at[1]).wait()
                 if GPRE:
@@ -1471,7 +1518,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
 
                 def ld(ref):
                     return lambda: pltpu.make_async_copy(ref, scr["w13s"], scr["misc_sem"]).start()
-                bswitch(l, {ll: ld(r) for ll, r in W["w13_s"].items()})
+                wsel("w13_s", l, lambda r: ld(r)())
                 pltpu.make_async_copy(next(iter(W["w13_s"].values())), scr["w13s"],
                                       scr["misc_sem"]).wait()
                 xq, sx = quant_rows(scr["hn"][...])
@@ -1495,18 +1542,24 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     return scr[k].at[pl.ds(cfg.ER, KREP)] if rep_ else scr[k].at[pl.ds(0, cfg.ER)]
 
                 def ldes(ll):
+                    def wr(k):            # ll None: the stacked row of this (MoE) layer
+                        return W[k][ll] if ll is not None else WS[k].at[WPOS[k](l)]
+
                     def f():
-                        pltpu.make_async_copy(W["es13"][ll], es_dst("es13", False),
+                        pltpu.make_async_copy(wr("es13"), es_dst("es13", False),
                                               scr["es_sem"].at[0]).start()
-                        pltpu.make_async_copy(W["es2"][ll], es_dst("es2", False),
+                        pltpu.make_async_copy(wr("es2"), es_dst("es2", False),
                                               scr["es_sem"].at[1]).start()
                         if KREP:
-                            pltpu.make_async_copy(W["rs13"][ll], es_dst("es13", True),
+                            pltpu.make_async_copy(wr("rs13"), es_dst("es13", True),
                                                   scr["es_sem"].at[0]).start()
-                            pltpu.make_async_copy(W["rs2"][ll], es_dst("es2", True),
+                            pltpu.make_async_copy(wr("rs2"), es_dst("es2", True),
                                                   scr["es_sem"].at[1]).start()
                     return f
-                bswitch(l, {ll: ldes(ll) for ll in W["es13"]})
+                if STK_W:
+                    ldes(None)()
+                else:
+                    bswitch(l, {ll: ldes(ll) for ll in W["es13"]})
                 # an idle rank publishes a zero row: routing drops it (below), so its dummy token
                 # no longer pulls experts onto the busy ranks' critical path
                 scr["hrow"][...] = jnp.where(active, scr["hn"][0:1, :], 0.0).astype(BF16)
@@ -1787,20 +1840,30 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
         sl = pos & (pg - 1)
         z = jnp.int32(0)
         new = []
-        for (k, l), x in zip(c_names, rest[n_w:]):
+        def scat(k, l, x):
+            """l: a layer id, or (stacked caches) the static array of this kind's layers -> one
+            [n_l, 1, ...] row block at (0, page, sl, ...): a single read-then-DUS per kind, which
+            XLA keeps in place (a chain of per-layer DUS copied the whole stacked u8 idx cache,
+            2 x 911 us/step, j-aa6e9d0a)."""
             if k == "nope":
-                row, at = nrow[l, 0:1][None], (page, sl, z)
+                row, at = nrow[l, 0:1], (page, sl, z)
             elif k == "rope":
-                row, at = rrow[l, 0:1][None], (page, sl >> RSH, z)
+                row, at = rrow[l, 0:1], (page, sl >> RSH, z)
             else:
-                row, at = irow[l][None, None], (page, sl >> 2, z, z)
+                row, at = irow[l][..., None, :, :], (page, sl >> 2, z, z)
+            if STK_C:
+                row, at = row[:, None], (z,) + at
+            else:
+                row = row[None]
             old = lax.dynamic_slice(x, at, row.shape)
-            new.append(lax.dynamic_update_slice(x, jnp.where(active, row, old), at))
+            return lax.dynamic_update_slice(x, jnp.where(active, row, old), at)
+        for (k, l), x in zip(c_names, rest[n_w:]):
+            new.append(scat(k, np.asarray(ck[k][0], np.int32) if STK_C else l, x))
         return (out, *new, *outs[4:])
 
     vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
                if str(getattr(v, "memory_space", "")) == "vmem"}
     vmem = sum(vmem_by.values())
     info = dict(s_names=s_names, w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck,
-                vmem_scratch_bytes=vmem, vmem_by=vmem_by)
+                vmem_scratch_bytes=vmem, vmem_by=vmem_by, stack_w=STK_W, stack_c=STK_C)
     return step, info
