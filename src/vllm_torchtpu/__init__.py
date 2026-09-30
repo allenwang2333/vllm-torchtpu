@@ -499,11 +499,12 @@ def _patch_vllm_disable_compile_ranges() -> None:
 def _patch_vllm_compile_all_ranges() -> None:
     """Patch vllm compile all ranges to support parallel precompile.
 
-    Each rank starts on a different range, biggest first, and a range another
-    rank is already compiling is put off until every unclaimed one is done;
-    compiling it then finds that rank's executable in torch_tpu's Tier-2 cache
-    (see TpuCompilerAdaptor._claim_bucket). Startup then takes about as long
-    as the slowest single range instead of the sum over ranges.
+    Each rank of a host starts on a different range, biggest first, and a
+    range another rank of the host is already compiling is put off until every
+    unclaimed one is done; compiling it then finds that rank's executable in
+    torch_tpu's host-local Tier-2 cache (see TpuCompilerAdaptor._claim_bucket).
+    Startup then takes about as long as the slowest single range instead of
+    the sum over ranges.
     """
     import os
 
@@ -512,16 +513,6 @@ def _patch_vllm_compile_all_ranges() -> None:
         create_concrete_args,
         get_fake_args_from_graph,
     )
-
-    def _global_rank() -> int:
-        # The global rank, not LOCAL_RANK: ranks of different hosts share the
-        # cache and must not all start on the same range.
-        try:
-            from vllm.distributed.parallel_state import get_world_group
-
-            return int(get_world_group().rank_in_group)
-        except Exception:
-            return int(os.environ.get("LOCAL_RANK", "0"))
 
     def _compile_entry(self, range_entry) -> None:
         self._log_compile_start(range_entry.compile_range)
@@ -566,7 +557,9 @@ def _patch_vllm_compile_all_ranges() -> None:
         )
         if not entries:
             return
-        start = _global_rank() % len(entries)
+        # By LOCAL_RANK: claims are per host (Tier-2 is host-local), so the
+        # ranks of each host split the ranges among themselves.
+        start = int(os.environ.get("LOCAL_RANK", "0")) % len(entries)
         entries = entries[start:] + entries[:start]
 
         deferred = []

@@ -14,6 +14,7 @@
 
 import importlib
 import os
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -472,7 +473,8 @@ class TestTpuCompilerCache:
 
         owner, peer = self._claiming_compilers(tmp_path)
         claim = owner._claim_bucket("k", compile_range="(4096, 4096)")
-        assert claim == str(tmp_path / "_claims" / "0-backbone-k")
+        host = socket.gethostname()
+        assert claim == str(tmp_path / "_claims" / f"{host}-0-backbone-k")
 
         with defer_claimed_buckets(), pytest.raises(DeferCompile):
             peer._claim_bucket("k", compile_range="(4096, 4096)")
@@ -499,3 +501,33 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir=str(tmp_path / "somewhere"))
         assert compiler._claim_bucket("k", compile_range="(16, 16)") is None
+
+    def test_bucket_claim_is_per_host(self, tmp_path, monkeypatch):
+        """Tier-2 is host-local, so a rank on another host compiles the bucket
+        itself instead of waiting for an executable it cannot reuse."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        owner, peer = self._claiming_compilers(tmp_path)
+        monkeypatch.setattr(tpu_compiler.socket, "gethostname", lambda: "host-a")
+        assert owner._claim_bucket("k", compile_range="(4096, 4096)") is not None
+        monkeypatch.setattr(tpu_compiler.socket, "gethostname", lambda: "host-b")
+        assert peer._claim_bucket("k", compile_range="(4096, 4096)") is not None
+
+    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
+        """A bucket's HLO, and so its cache key, must not depend on what the
+        rank compiled before it."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        firsts = []
+
+        def fake_backend(graph, example_inputs):
+            firsts.append(config.reserve_scheduling_group_ids(3))
+            return lambda *args: args
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        compiler = TpuCompilerAdaptor()
+        compiler._run_backend(None, [])
+        compiler._run_backend(None, [])
+        assert firsts == [1, 1]

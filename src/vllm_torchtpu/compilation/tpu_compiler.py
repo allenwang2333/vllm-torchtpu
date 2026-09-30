@@ -481,6 +481,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         tracing_ctx = (
             torch._guards.TracingContext(fake_mode) if fake_mode is not None else None
         )
+        # Each call builds one program. Kernels number their scheduling groups
+        # from 1 within it, so the HLO, and with it torch_tpu's cache key, does
+        # not depend on what this process compiled before: every rank then
+        # builds the same key for a bucket, and a waiting rank finds the
+        # owner's executable in the Tier-2 cache.
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        config.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
@@ -590,11 +598,13 @@ class TpuCompilerAdaptor(CompilerInterface):
             return None
 
     def _claim_path(self, key: str) -> str | None:
-        """The file every rank of this DP rank races for to compile `key`.
+        """The file every rank of this host and DP rank races for to compile `key`.
 
-        It sits beside vLLM's `rank_<rank>_<dp_rank>` cache dirs, so on a
-        shared cache it is shared by the ranks of every host. It is only a
-        lock: no artifact is read from or written to it.
+        It sits beside vLLM's `rank_<rank>_<dp_rank>` cache dirs and is named
+        after the host: torch_tpu's Tier-2 cache is local to the host, so a
+        rank can only reuse an executable built on its own host, and each host
+        compiles every bucket once. It is only a lock: no artifact is read from
+        or written to it.
         """
         if self.cache_dir is None:
             return None
@@ -602,7 +612,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         match = re.fullmatch(r"rank_(\d+)_(\d+)", own.parent.name)
         if match is None:
             return None
-        return str(own.parent.parent / "_claims" / f"{match[2]}-{own.name}-{key}")
+        name = f"{socket.gethostname()}-{match[2]}-{own.name}-{key}"
+        return str(own.parent.parent / "_claims" / name)
 
     @staticmethod
     def _try_claim(path: str) -> bool:
@@ -649,7 +660,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             os.unlink(stale)
 
     def _claim_bucket(self, key: str, compile_range: Range) -> str | None:
-        """Share one XLA compile of this bucket among all ranks.
+        """Share one XLA compile of this bucket among the ranks of this host.
 
         Returns the claim path when this rank is the one to compile the bucket
         and must release the claim afterwards. Returns None once another rank
