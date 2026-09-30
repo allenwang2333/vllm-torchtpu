@@ -478,6 +478,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     scratch["st"] = pltpu.SMEM((16 if SPEC else 8,), I32)   # stream cursor, see `pump`
     if SPEC:
         scratch["yspec"] = pltpu.VMEM((M, H), F32)     # the speculated expert's weighted output
+        scratch["spec_sem"] = pltpu.SemaphoreType.DMA(())  # the guess read (own sem: no sharing)
     scratch["gst"] = pltpu.SMEM((2,), I32)             # gather prefetch: rows issued, target layer
     GPRE = 0 if "gather" in skip else tiles.gpre
     NOIDX = [l for l in range(L) if not cfg.full_indexer(l)]
@@ -765,6 +766,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             o, n = lay[name]
             return scr["sm"][slot, :, o:o + n]
 
+        def spec_copy():
+            return pltpu.make_async_copy(scr["hitv"].at[pl.ds(1, 1)], scr["hits"].at[pl.ds(1, 1)],
+                                         scr["spec_sem"])
+
         # the stream starts before anything else (upstream Qwen: first fetches precede the barrier)
         for i_, v_ in enumerate((0, 0, 0, 0, 0, -1, 0, 0) + ((0,) * 8 if SPEC else ())):
             st[i_] = jnp.int32(v_)
@@ -1026,6 +1031,17 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             def _():
                 pltpu.make_async_copy(smalls.at[l + 1], scr["sm"].at[1 - slot],
                                       scr["sm_sem"].at[1 - slot]).start()
+
+            if SPEC:
+                # the guess read (vector -> SMEM hits row 1) starts here and is waited at m_shared
+                # start: a synchronous start+wait there queued behind the in-flight weight tiles
+                # (probe 33 job 7). hits row 1 is free: the last layer's experts are all consumed.
+                @pl.when(is_moe)
+                def _():
+                    gv = jnp.sum(jnp.where(lane128 == me, sm(slot, "spec_g"), 0.0), axis=1,
+                                 keepdims=True).astype(I32)
+                    scr["hitv"][1:2, :] = jnp.broadcast_to(gv, (1, 128))
+                    spec_copy().start()
 
             if KVA:
                 # probe 27 kva: last layer's row writes landed long ago (wrow / rrow are free), and
@@ -1535,14 +1551,9 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     return f
                 bswitch(l, {ll: ldes(ll) for ll in W["es13"]})
                 if SPEC:
-                    # speculative publish: hit list [g] (provisional) from the smalls guess
-                    gv = jnp.sum(jnp.where(lane128 == me, sm(slot, "spec_g"), 0.0), axis=1,
-                                 keepdims=True).astype(I32)
-                    scr["hitv"][1:2, :] = jnp.broadcast_to(gv, (1, 128))
-                    cpg = pltpu.make_async_copy(scr["hitv"].at[pl.ds(1, 1)],
-                                                scr["hits"].at[pl.ds(1, 1)], scr["misc_sem"])
-                    cpg.start()
-                    cpg.wait()
+                    # speculative publish: hit list [g] (provisional) from the smalls guess,
+                    # read since the layer top
+                    spec_copy().wait()
                     g_ = scr["hits"][1, 0]
                     st[9] = g_
                     st[8] = jnp.int32(0)
