@@ -72,6 +72,8 @@ if TYPE_CHECKING:
     GLM5_LIBTPU_EXTRA_ARGS: str = ""
     GLM5_MK_DECODE_REPLICAS: int = 0
     GLM5_MK_DECODE_REPLICAS_PROFILE: str = ""
+    GLM5_MK_SPEC: int = 0
+    GLM5_MK_SPEC_PROFILE: str = ""
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -645,6 +647,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With GLM5_MK_DECODE_REPLICAS: an EPLB log npz (VLLM_TPU_EPLB_LOG_DIR format: `layers`,
     # `logical_load`) whose load places the replicas at load time and whenever EPLB has not run.
     "GLM5_MK_DECODE_REPLICAS_PROFILE": env_str("GLM5_MK_DECODE_REPLICAS_PROFILE", ""),
+    # Megakernel decode: speculative first expert (0 = off, the kernel program is then unchanged).
+    # N > 0: per MoE layer each rank guesses one local expert (smalls `spec_g`) and streams at most
+    # N of its weight tiles during the shared expert / router, before routing publishes; a hit keeps
+    # them (bitwise: the f32 sum order is preserved), a miss voids them. The guess is the rank's
+    # local expert with the highest hit probability under the logical load that also places decode
+    # replicas (online EPLB window, else the profile below); no load -> no guess (-1). 8 = probe 33.
+    "GLM5_MK_SPEC": env_int("GLM5_MK_SPEC", 0),
+    # With GLM5_MK_SPEC: an EPLB log npz (as GLM5_MK_DECODE_REPLICAS_PROFILE; that one wins if both
+    # are set) whose load picks the guesses at load time and whenever EPLB has not run.
+    "GLM5_MK_SPEC_PROFILE": env_str("GLM5_MK_SPEC_PROFILE", ""),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.

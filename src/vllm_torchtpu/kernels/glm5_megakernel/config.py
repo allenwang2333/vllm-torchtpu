@@ -32,6 +32,7 @@ class MKConfig:
     eps: float = 1e-5
     routed_scale: float = 2.5
     KREP: int = 0          # decode replica slots per rank per MoE layer (0: off, program unchanged)
+    SPEC: int = 0          # speculative first expert: at most SPEC tiles issued early (0: off)
 
     @property
     def HR(self):          # heads per rank
