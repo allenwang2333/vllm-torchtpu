@@ -31,6 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 from vllm.config import get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_world_size
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -75,6 +76,27 @@ def _max_node_tokens(ep: int, pcp: int) -> int:
             "adaptive fused MoE requires a valid scheduler cap and PCP size"
         )
     return cap * (ep // pcp)
+
+
+def adaptive_fused_moe_declined(layer: RoutedExperts) -> bool:
+    """Whether this layer keeps the grouped-matmul path under adaptive.
+
+    Without MoE sequence parallelism every rank of a TP group holds the same
+    tokens. The kernel splits them across the group, but its fixed per-call
+    cost stays above the grouped path's at every replicated step size, so
+    such a layer is not armed. Decided at weight load, before the strict
+    prebuild, which would otherwise raise or arm.
+    """
+    tp = get_tensor_model_parallel_world_size()
+    if tp == 1 or layer.moe_config.moe_parallel_config.is_sequence_parallel:
+        return False
+    logger.info_once(
+        "Experimental adaptive fused MoE not engaged: tp=%d replicates the "
+        "tokens across the TP group without sequence parallelism; the "
+        "grouped-matmul path serves this layer.",
+        tp,
+    )
+    return True
 
 
 def prebuild_adaptive_fused_moe(
