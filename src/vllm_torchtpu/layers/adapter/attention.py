@@ -1751,20 +1751,27 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
 def _packed_sparse_q(
     layer: Any, q_nope: torch.Tensor, q_pe: torch.Tensor
 ) -> torch.Tensor:
-    """The sparse MLA kernel's q, [T, H, align_to(lkv + rope, 128)], in one pass.
+    """The sparse MLA kernel's q, [T, H, align_to(lkv + rope, 128)], as one bmm.
 
-    W_UK_T is zero-padded on N (K is unchanged, so every real output column is
-    the same dot product as the unpadded bmm) and q_pe is written into columns
-    [lkv, lkv + rope) of the bmm output; the rest of the pad stays exactly zero.
-    Bit-identical to `prepare_q_inputs(concat(ql_nope, q_pe))`, without the
-    separate concat + pad pass over the whole q.
+    q_pe rides through the W_UK absorb instead of being written into the bmm
+    output afterwards: K grows from qk_nope to qk_nope + rope, and the extra
+    rope rows of the weight are an identity into columns [lkv, lkv + rope)
+    (every other column of those rows, and the pad columns, stay exactly zero).
+    Each real column is the unpadded dot product plus exact-zero products, and
+    each q_pe column is 1.0 * q_pe, so this is bit-identical to
+    `prepare_q_inputs(concat(ql_nope, q_pe))`. Writing q_pe into the T-major
+    bmm output instead (slice_scatter) cost a whole-q DUS pass per layer.
     """
     lkv, rope = layer.kv_lora_rank, layer.qk_rope_head_dim
     width = cdiv(lkv + rope, 128) * 128
-    w_uk_t = torch.nn.functional.pad(layer.W_UK_T, (0, width - lkv))
-    q = torch.bmm(q_nope.transpose(0, 1), w_uk_t).transpose(0, 1)
-    q_pe = q_pe.reshape(q.shape[0], layer.num_heads, rope)
-    return torch.slice_scatter(q, q_pe, dim=-1, start=lkv, end=lkv + rope)
+    w_uk_t = layer.W_UK_T
+    w_uk_t = torch.nn.functional.pad(w_uk_t, (0, width - lkv))
+    eye = torch.eye(rope, dtype=w_uk_t.dtype, device=w_uk_t.device)
+    w_pe = torch.nn.functional.pad(eye, (lkv, width - lkv - rope))
+    w = torch.cat([w_uk_t, w_pe.expand(layer.num_heads, -1, -1)], dim=1)
+    q_pe = q_pe.reshape(q_nope.shape[0], layer.num_heads, rope)
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    return torch.bmm(q.transpose(0, 1), w).transpose(0, 1)
 
 
 def _w_uv_bmm(outputs: torch.Tensor, w_uv: torch.Tensor) -> torch.Tensor:
