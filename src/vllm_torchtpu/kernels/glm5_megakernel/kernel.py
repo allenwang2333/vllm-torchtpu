@@ -323,6 +323,19 @@ AGDIAG_TAG0 = 9
 COLLECTIVE_ID = int(os.environ.get("MK_COLLECTIVE_ID", "37"))
 
 
+def stack_kinds(v, env, kinds):
+    """build()'s stack_w / stack_c -> the frozenset of stacked kinds (None: the env knob)."""
+    if v is None:
+        v = os.environ.get(env, "")
+    if isinstance(v, str):
+        v = True if v == "1" else frozenset(x for x in v.split(",") if x and x != "0")
+    if isinstance(v, bool):
+        v = kinds if v else ()
+    v = frozenset(v)
+    assert v <= set(kinds), (env, sorted(v - set(kinds)))
+    return v
+
+
 def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, skip=frozenset(),
           axis_name=None, rope_packed=False, stack_w=None, stack_c=None):
     """Returns (step_fn, operand names). step_fn(meta, bt, h0, rope_tab, smalls, *weights,
@@ -336,10 +349,10 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     by the traced layer id, instead of one operand per (kind, layer) reached through a bswitch
     cascade over the layers. Same bytes moved (bit-exact); the program no longer grows by L DMA
     leaves per issue site (probe 32/35: the L=78 program pages the TensorCore instruction memory,
-    ~5.6 us at every layer-loop back-edge). Operand names become (kind, "stk")."""
+    ~5.6 us at every layer-loop back-edge). Operand names become (kind, "stk").
+    Each knob is a bool (all kinds / none) or a set of kinds (env: "1", or a comma list), so the
+    served adapter can stack the operands it owns and keep the ones shared with the stock layers."""
     assert set(skip) <= set(ABLATIONS), skip
-    STK_W = (os.environ.get("GLM5_MK_STACK_W") == "1") if stack_w is None else bool(stack_w)
-    STK_C = (os.environ.get("GLM5_MK_STACK_C") == "1") if stack_c is None else bool(stack_c)
     typed = interpret or os.environ.get("MK_TYPED") == "1"   # diag: typed banks, no pool_alias
     R, L, H = cfg.R, cfg.L, cfg.H
     pg = cfg.page
@@ -389,10 +402,12 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     assert KR % 128 == 0
 
     # --- operand lists ---
-    w_names = ([(k, "stk") for k in wk] if STK_W
-               else [(k, l) for k, (ls, _, _) in wk.items() for l in ls])
-    c_names = ([(k, "stk") for k in ck] if STK_C
-               else [(k, l) for k, (ls, _, _) in ck.items() for l in ls])
+    SW = stack_kinds(stack_w, "GLM5_MK_STACK_W", wk)
+    SC = stack_kinds(stack_c, "GLM5_MK_STACK_C", ck)
+    w_names = [x for k, (ls, _, _) in wk.items()
+               for x in ([(k, "stk")] if k in SW else [(k, l) for l in ls])]
+    c_names = [x for k, (ls, _, _) in ck.items()
+               for x in ([(k, "stk")] if k in SC else [(k, l) for l in ls])]
 
     def lpos_fn(ls):
         """Traced layer id -> index into a stacked operand holding layers `ls` (clamped; the
@@ -553,31 +568,36 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
             dbg_h, dbg_idx = rest[:2]
             rest = rest[2:]
         scr = dict(zip(s_names, rest))
+        # W / C: per-layer refs (static views of a stacked operand: shapes for the waits, which
+        # need sem + bytes only); WS / CS: the stacked operands
         W, C, WS, CS = {}, {}, {}, {}
-        if STK_W:     # static per-layer views: shapes for the waits (sem + bytes only)
-            WS = {k: r for (k, _), r in zip(w_names, w_in)}
-            W = {k: {l: WS[k].at[i] for i, l in enumerate(wk[k][0])} for k in wk}
-        else:
-            for (k, l), r in zip(w_names, w_in):
+        for (k, l), r in zip(w_names, w_in):
+            if l == "stk":
+                WS[k] = r
+                W[k] = {ll: r.at[i] for i, ll in enumerate(wk[k][0])}
+            else:
                 W.setdefault(k, {})[l] = r
-        if STK_C:
-            CS = {k: r for (k, _), r in zip(c_names, c_in)}
-            C = {k: {l: CS[k].at[i] for i, l in enumerate(ck[k][0])} for k in ck}
-        else:
-            for (k, l), r in zip(c_names, c_in):
+        for (k, l), r in zip(c_names, c_in):
+            if l == "stk":
+                CS[k] = r
+                C[k] = {ll: r.at[i] for i, ll in enumerate(ck[k][0])}
+            else:
                 C.setdefault(k, {})[l] = r
 
         def wsel(kind, l, fn):
             """fn(this layer's `kind` weight ref): a stacked row, or stack6's layer cascade."""
-            if STK_W:
+            if kind in SW:
                 fn(WS[kind].at[WPOS[kind](l)])
             else:
                 bswitch(l, {ll: (lambda r=r: fn(r)) for ll, r in W[kind].items()})
 
         def csel(kinds, l, fn, layers=None):
             """fn(*this layer's cache refs of `kinds`); layers: stack6's cascade keys."""
-            if STK_C:
+            if all(k in SC for k in kinds):
                 fn(*[CS[k].at[CPOS[k](l)] for k in kinds])
+            elif any(k in SC for k in kinds):     # mixed: cascade, stacked kinds by static row
+                ks = sorted(C[kinds[0]]) if layers is None else layers
+                bswitch(l, {ll: (lambda ll=ll: fn(*[C[k][ll] for k in kinds])) for ll in ks})
             else:
                 ks = sorted(C[kinds[0]]) if layers is None else layers
                 bswitch(l, {ll: (lambda ll=ll: fn(*[C[k][ll] for k in kinds])) for ll in ks})
@@ -1541,6 +1561,8 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                         return scr[k]
                     return scr[k].at[pl.ds(cfg.ER, KREP)] if rep_ else scr[k].at[pl.ds(0, cfg.ER)]
 
+                es_kinds = ("es13", "es2") + (("rs13", "rs2") if KREP else ())
+
                 def ldes(ll):
                     def wr(k):            # ll None: the stacked row of this (MoE) layer
                         return W[k][ll] if ll is not None else WS[k].at[WPOS[k](l)]
@@ -1556,7 +1578,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             pltpu.make_async_copy(wr("rs2"), es_dst("es2", True),
                                                   scr["es_sem"].at[1]).start()
                     return f
-                if STK_W:
+                if all(k in SW for k in es_kinds):
                     ldes(None)()
                 else:
                     bswitch(l, {ll: ldes(ll) for ll in W["es13"]})
@@ -1851,19 +1873,19 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                 row, at = rrow[l, 0:1], (page, sl >> RSH, z)
             else:
                 row, at = irow[l][..., None, :, :], (page, sl >> 2, z, z)
-            if STK_C:
+            if k in SC:
                 row, at = row[:, None], (z,) + at
             else:
                 row = row[None]
             old = lax.dynamic_slice(x, at, row.shape)
             return lax.dynamic_update_slice(x, jnp.where(active, row, old), at)
         for (k, l), x in zip(c_names, rest[n_w:]):
-            new.append(scat(k, np.asarray(ck[k][0], np.int32) if STK_C else l, x))
+            new.append(scat(k, np.asarray(ck[k][0], np.int32) if l == "stk" else l, x))
         return (out, *new, *outs[4:])
 
     vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
                if str(getattr(v, "memory_space", "")) == "vmem"}
     vmem = sum(vmem_by.values())
     info = dict(s_names=s_names, w_names=w_names, c_names=c_names, tk=tk, S=S, ROWS=ROWS, wk=wk, ck=ck,
-                vmem_scratch_bytes=vmem, vmem_by=vmem_by, stack_w=STK_W, stack_c=STK_C)
+                vmem_scratch_bytes=vmem, vmem_by=vmem_by, stack_w=SW, stack_c=SC)
     return step, info
