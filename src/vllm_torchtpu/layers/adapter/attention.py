@@ -1795,29 +1795,35 @@ def _w_uv_bmm_stacked(layer, outputs: torch.Tensor) -> torch.Tensor:
     The row select and the bmm are one jax op on the whole stack (a static slice feeding the dot).
     A torch view `stack[row]` passed to an op is materialized by torch_tpu's execute_as_strided as
     a copy of `stack[:row + 1]` on every call (probe 35, j-1f77eaac), so the view is never used."""
-    stack, row = layer.W_UV_stack
-    op = layer.__dict__.get("_w_uv_stack_op")
+    op = getattr(layer, "_w_uv_stack_op", None)
     if op is None:
-        import jax.numpy as jnp
+        op = _build_w_uv_stack_op(layer)
+    return op(outputs, layer.W_UV_stack[0])
 
-        def w_uv_bmm(o: jax.Array, stk: jax.Array) -> jax.Array:
-            w = stk[row].astype(o.dtype)
-            extra = o.shape[-1] - w.shape[1]
-            if extra:
-                w = jnp.pad(w, ((0, 0), (0, extra), (0, 0)))
-            return jax.lax.dot_general(
-                jnp.swapaxes(o, 0, 1), w, (((2,), (1,)), ((0,), (0,)))
-            )
 
-        name = str(getattr(layer, "layer_name", row)).replace(".", "_")
-        op = pallas.jax_op(f"pallas::w_uv_stack_{name}_r{row}", w_uv_bmm)
-        op.register_fake(
-            lambda o, stk: torch.empty(
-                (o.shape[1], o.shape[0], stk.shape[-1]), dtype=o.dtype, device=o.device
-            )
+def _build_w_uv_stack_op(layer):
+    """The jax op behind `_w_uv_bmm_stacked` for `layer.W_UV_stack = (stack, row)`; built once, at
+    bind time (outside any traced region), and cached on the layer."""
+    import jax.numpy as jnp
+
+    row = layer.W_UV_stack[1]
+
+    def w_uv_bmm(o: jax.Array, stk: jax.Array) -> jax.Array:
+        w = stk[row].astype(o.dtype)
+        extra = o.shape[-1] - w.shape[1]
+        if extra:
+            w = jnp.pad(w, ((0, 0), (0, extra), (0, 0)))
+        return jax.lax.dot_general(jnp.swapaxes(o, 0, 1), w, (((2,), (1,)), ((0,), (0,))))
+
+    name = str(getattr(layer, "layer_name", row)).replace(".", "_")
+    op = pallas.jax_op(f"pallas::w_uv_stack_{name}_r{row}", w_uv_bmm)
+    op.register_fake(
+        lambda o, stk: torch.empty(
+            (o.shape[1], o.shape[0], stk.shape[-1]), dtype=o.dtype, device=o.device
         )
-        layer.__dict__["_w_uv_stack_op"] = op
-    return op(outputs, stack)
+    )
+    layer._w_uv_stack_op = op
+    return op
 
 
 def _run_sparse_mla_on_layer_cache(layer, run, kv_cache_nope, kv_cache_rope, block_tables):

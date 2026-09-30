@@ -549,6 +549,8 @@ class Glm5Megakernel:
     def _rebind_views(self) -> None:
         """VIEW_KINDS in stack_w: the stock parameter becomes its row of the stack, so the per-layer
         tensor is freed (before profile_run sizes the KV pool) and no byte is duplicated."""
+        from vllm_torchtpu.layers.adapter.attention import _build_w_uv_stack_op
+
         for kind in sorted(set(VIEW_KINDS) & self.stack_w):
             assert kind == "w_uv", kind
             layers = self.wk[kind][0]
@@ -564,6 +566,7 @@ class Glm5Megakernel:
                 # materialized by torch_tpu as a copy of stack[:row + 1] (probe 35, j-1f77eaac)
                 at.W_UV = torch.nn.Parameter(stk[row], requires_grad=False)
                 at.W_UV_stack = (stk, row)
+                _build_w_uv_stack_op(at)
             logger.info("GLM-5.2 megakernel: %s stacked %s; stock W_UV reads its row of the stack",
                         kind, tuple(stk.shape))
 
