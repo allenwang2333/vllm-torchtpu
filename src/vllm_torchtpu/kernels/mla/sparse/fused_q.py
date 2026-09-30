@@ -210,7 +210,13 @@ def fused_sparse_q(
     assert c.shape == s.shape == (t, LANES), (c.shape, t)
     hb = min(cfg.head_block, h_total)
     assert h_total % hb == 0, (h_total, hb)
-    assert not cfg.out.startswith("p") or hb % 2 == 0, (cfg.out, hb)
+    if cfg.out != "flat" and (
+        (hb % 8 and hb != h_total) or (cfg.out.startswith("p") and hb % 2)
+    ):
+        # A (tT, hb, width) out block needs hb % 8 == 0 or hb == H (Mosaic's
+        # second-minor rule), and the pack variants pair heads. The flat
+        # (tT, hb * width) block is legal for any hb.
+        cfg = dataclasses.replace(cfg, out="flat")
     tt = min(cfg.t_tile, t)
     grid = (h_total // hb, pl.cdiv(t, tt))
     scratch = []
