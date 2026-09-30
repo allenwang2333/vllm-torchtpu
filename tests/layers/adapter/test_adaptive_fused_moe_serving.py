@@ -191,6 +191,21 @@ def test_single_selector_load_and_forward(setup, monkeypatch, fp4):
     setup[1].assert_not_called()
 
 
+def test_sequence_parallel_layer_prebuilds_grouped_not_v2(setup, monkeypatch):
+    """A sequence-parallel layer's replicated steps take the grouped path; the
+    v2 op is never built, since MOE_FUSED_EP_KERNEL_IMPL=adaptive owns fused EP."""
+    layer, method = make_layer(fp4=False), make_method(fp4=False)
+    layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    mock_conversion(monkeypatch, fp4=False)
+    grouped = Mock()
+    monkeypatch.setattr(fp8, "prebuild_fused_moe_kernel", grouped)
+    method.process_weights_after_loading(layer)
+    grouped.assert_called_once()
+    setup[1].assert_not_called()
+    assert getattr(method, bridge.FUSED_MOE_EP_OP_ATTR) is setup[0]
+    assert not legacy.fused_moe_ep_supported(method)
+
+
 @pytest.mark.parametrize("fp4", [False, True])
 @pytest.mark.parametrize("failure", ["no_ep", "old_chip"])
 def test_admission_failure_never_falls_back(setup, monkeypatch, fp4, failure):

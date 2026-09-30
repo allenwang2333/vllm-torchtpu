@@ -990,12 +990,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             )
             if not layer.moe_config.moe_parallel_config.is_sequence_parallel:
                 return
-            # A sequence-parallel layer's replicated steps take the grouped path.
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if self._use_adaptive_fused_moe:
+            # A sequence-parallel layer's replicated steps take the grouped
+            # path; v2 never runs.
+            return
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
