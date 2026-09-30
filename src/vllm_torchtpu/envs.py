@@ -396,7 +396,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T-major [T, H, 640] layout) in one Pallas pass from the q_b output
     # (kernels/mla/sparse/fused_q.py) instead of the XLA slice/roll/bmm chain.
     "TPU_SPARSE_Q_FUSE": env_bool("TPU_SPARSE_Q_FUSE", default=False),
-    # FusedQConfig overrides, e.g. "rope=roll,round=a,k=256,tt=256,hb=8".
+    # FusedQConfig overrides, e.g. "out=einshape,rope=roll,tt=512,hb=8".
     "TPU_SPARSE_Q_FUSE_OPTS": lambda: os.getenv("TPU_SPARSE_Q_FUSE_OPTS", ""),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),

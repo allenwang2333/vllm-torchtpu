@@ -56,6 +56,7 @@ class FusedSparseQTest(parameterized.TestCase):
     @parameterized.product(
         opts=[
             "",
+            "out=flat,hb=8",
             "rope=roll",
             "round=a",
             "k=256",

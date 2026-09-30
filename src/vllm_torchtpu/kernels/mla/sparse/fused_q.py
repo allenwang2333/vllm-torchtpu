@@ -52,7 +52,7 @@ class FusedQConfig:
     # (the whole per-head q row against a zero-padded weight).
     k: int = 192
     t_tile: int = 256
-    head_block: int = 8
+    head_block: int = 16
     # Output layout. "flat": [T, H * 640] tiles over (T, lanes) -- its reshape
     # to [T, H, 640] is a (T, H) sublane relayout XLA runs as an extra SC
     # data-format pass. The others write [T, H, 640] tiles over (H, lanes)
@@ -62,7 +62,9 @@ class FusedQConfig:
     # one u32 row -- the bf16 (2, 1) sublane packing of the [T, H, 640] tile --
     # then writes through a u32 view of the block: "pack" (swapaxes),
     # "packes" (einshape), "psst" (per-pair 32-bit sublane-strided stores).
-    out: str = "flat"
+    # Default "pack": fastest standalone at T=1024, H=64 (84.6 us vs 88.2 swap,
+    # 106-112 einshape, 125.9 flat + its relayout; copy floor 63.8), probe 36 j3.
+    out: str = "pack"
 
     @classmethod
     def parse(cls, opts: str | None) -> "FusedQConfig":
