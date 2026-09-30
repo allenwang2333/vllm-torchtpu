@@ -63,6 +63,10 @@ class FusedSparseQTest(parameterized.TestCase):
             "out=swap,hb=16",
             "out=einshape,hb=16",
             "out=sst",
+            "out=pack,hb=16",
+            "out=packes,hb=16",
+            "out=psst,hb=16",
+            "out=psst,hb=8,tt=128",
         ],
         t=[256, 200],
     )

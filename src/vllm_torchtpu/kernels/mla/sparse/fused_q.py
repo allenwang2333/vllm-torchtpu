@@ -58,7 +58,10 @@ class FusedQConfig:
     # data-format pass. The others write [T, H, 640] tiles over (H, lanes)
     # directly: "swap" (jnp.swapaxes of the stacked [hb, tT, 640] heads),
     # "einshape" (pltpu.einshape htd->thd), "sst" (per-head o_ref[:, h, :]
-    # sublane-strided stores).
+    # sublane-strided stores). "pack*" first packs head pairs (2k, 2k+1) into
+    # one u32 row -- the bf16 (2, 1) sublane packing of the [T, H, 640] tile --
+    # then writes through a u32 view of the block: "pack" (swapaxes),
+    # "packes" (einshape), "psst" (per-pair 32-bit sublane-strided stores).
     out: str = "flat"
 
     @classmethod
@@ -83,6 +86,14 @@ def rope_swap_matrix(dtype=jnp.bfloat16) -> jax.Array:
     e = e.at[64 + idx, idx].set(1)
     e = e.at[64 + (idx ^ 1), LANES + idx].set(1)
     return e
+
+
+def _pack_pair(lo: jax.Array, hi: jax.Array) -> jax.Array:
+    """bf16 rows (lo, hi) -> u32 with lo in bits 0:16, hi in 16:32 (the layout
+    `pltpu.bitcast` / a u32 ref view gives two adjacent bf16 rows)."""
+    lo32 = jax.lax.bitcast_convert_type(lo.astype(jnp.float32), jnp.uint32)
+    hi32 = jax.lax.bitcast_convert_type(hi.astype(jnp.float32), jnp.uint32)
+    return (lo32 >> 16) | (hi32 & jnp.uint32(0xFFFF0000))
 
 
 def _kernel(
@@ -110,6 +121,7 @@ def _kernel(
     lane = jax.lax.broadcasted_iota(jnp.int32, c.shape, 1)
     keep = lane < rope
     rows = []
+    packed = []
     for h in range(hb):
         base = h * head_in
         if cfg.k == 256:
@@ -142,10 +154,31 @@ def _kernel(
         elif cfg.out == "sst":
             o_ref[:, h, :lkv] = acc.astype(o_ref.dtype)
             o_ref[:, h, lkv:] = rot.astype(o_ref.dtype)
+        elif cfg.out.startswith("p"):
+            rows.append((acc.astype(o_ref.dtype), rot.astype(o_ref.dtype)))
+            if h % 2:
+                (a0, r0), (a1, r1) = rows.pop(-2), rows.pop(-1)
+                packed.append(
+                    jnp.concatenate([_pack_pair(a0, a1), _pack_pair(r0, r1)], axis=-1)
+                )
         else:
             rows.append(
                 jnp.concatenate([acc.astype(o_ref.dtype), rot.astype(o_ref.dtype)], axis=-1)
             )
+    if packed and f32_dot:
+        # Interpreter: no ref bitcast; unpack with pltpu.bitcast's convention
+        # (row 2k in the low half) and store bf16.
+        u = jax.lax.bitcast_convert_type(jnp.stack(packed, axis=1), o_ref.dtype)
+        o_ref[...] = jnp.swapaxes(u, -1, -2).reshape(o_ref.shape)
+    elif packed:
+        o32 = o_ref.bitcast(jnp.uint32)  # (tT, hb // 2, width)
+        if cfg.out == "psst":
+            for k, row in enumerate(packed):
+                o32[:, k, :] = row
+        elif cfg.out == "packes":
+            o32[...] = pltpu.einshape("htd->thd", jnp.stack(packed, axis=0))
+        else:
+            o32[...] = jnp.swapaxes(jnp.stack(packed, axis=0), 0, 1)
     if rows:
         hm = jnp.stack(rows, axis=0)  # [hb, tT, width]
         if cfg.out == "einshape":
@@ -175,6 +208,7 @@ def fused_sparse_q(
     assert c.shape == s.shape == (t, LANES), (c.shape, t)
     hb = min(cfg.head_block, h_total)
     assert h_total % hb == 0, (h_total, hb)
+    assert not cfg.out.startswith("p") or hb % 2 == 0, (cfg.out, hb)
     tt = min(cfg.t_tile, t)
     grid = (h_total // hb, pl.cdiv(t, tt))
     scratch = []
