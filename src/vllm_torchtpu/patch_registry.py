@@ -97,6 +97,7 @@ PATCHES = (
         "vllm_torchtpu.model_loader_patches:patch_runai_sharded_expert_streaming",
         _ACTIVE,
     ),
+    Patch("vllm_torchtpu.model_loader_patches:patch_object_storage_pull_once", _ACTIVE),
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,

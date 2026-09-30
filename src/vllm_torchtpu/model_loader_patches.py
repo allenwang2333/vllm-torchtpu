@@ -406,6 +406,46 @@ def _evict_checkpoint_page_cache(files: list[str]) -> None:
     )
 
 
+def patch_object_storage_pull_once() -> None:
+    """Serialize ``ObjectStorageModel.pull_files`` across processes.
+
+    Every API server process on a host (one per DP rank by default) pulls a
+    ``gs://`` model's config and tokenizer files into the same
+    ``model_streamer/<hash>`` directory at startup. The concurrent rewrites
+    let a process read a truncated ``config.json`` and die in ``VllmConfig``
+    with ``Expecting value: line 1 column 1``. Take a file lock around the
+    pull and skip a pull that another process already completed.
+    """
+    import fcntl
+    import hashlib
+    import json
+
+    from vllm.transformers_utils import runai_utils
+
+    cls = runai_utils.ObjectStorageModel
+    if getattr(cls, "_tpu_pull_once_patch", False):
+        return
+    original_pull_files = cls.pull_files
+
+    def pull_files(self, model_path="", allow_pattern=None, ignore_pattern=None):
+        key = hashlib.sha256(
+            json.dumps([model_path, allow_pattern, ignore_pattern]).encode()
+        ).hexdigest()[:16]
+        marker = os.path.join(self.dir, f".pulled-{key}")
+        with open(f"{self.dir}.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.exists(marker):
+                return
+            original_pull_files(self, model_path, allow_pattern, ignore_pattern)
+            open(marker, "w").close()
+
+    cls.pull_files = pull_files
+    cls._tpu_pull_once_patch = True
+    logger.info(
+        "Applied TPU patch: object-storage model file pulls run once per host."
+    )
+
+
 def patch_default_model_loader_page_cache() -> None:
     """Evict host page cache for weight files once loaded into TPU HBM.
 
