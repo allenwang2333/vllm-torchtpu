@@ -54,7 +54,16 @@ def _reference(q, w, c, s, rounding, f32_dot):
 
 class FusedSparseQTest(parameterized.TestCase):
     @parameterized.product(
-        opts=["", "rope=roll", "round=a", "k=256", "tt=64,hb=4"],
+        opts=[
+            "",
+            "rope=roll",
+            "round=a",
+            "k=256",
+            "tt=64,hb=4",
+            "out=swap,hb=16",
+            "out=einshape,hb=16",
+            "out=sst",
+        ],
         t=[256, 200],
     )
     def test_matches_reference(self, opts, t):

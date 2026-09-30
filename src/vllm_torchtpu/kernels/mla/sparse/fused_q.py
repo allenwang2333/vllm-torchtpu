@@ -53,6 +53,13 @@ class FusedQConfig:
     k: int = 192
     t_tile: int = 256
     head_block: int = 8
+    # Output layout. "flat": [T, H * 640] tiles over (T, lanes) -- its reshape
+    # to [T, H, 640] is a (T, H) sublane relayout XLA runs as an extra SC
+    # data-format pass. The others write [T, H, 640] tiles over (H, lanes)
+    # directly: "swap" (jnp.swapaxes of the stacked [hb, tT, 640] heads),
+    # "einshape" (pltpu.einshape htd->thd), "sst" (per-head o_ref[:, h, :]
+    # sublane-strided stores).
+    out: str = "flat"
 
     @classmethod
     def parse(cls, opts: str | None) -> "FusedQConfig":
@@ -102,6 +109,7 @@ def _kernel(
     s = s_ref[...].astype(jnp.float32)
     lane = jax.lax.broadcasted_iota(jnp.int32, c.shape, 1)
     keep = lane < rope
+    rows = []
     for h in range(hb):
         base = h * head_in
         if cfg.k == 256:
@@ -127,9 +135,23 @@ def _kernel(
             ps = (sw * s).astype(jnp.bfloat16).astype(jnp.float32)
             rot = pc + ps
         rot = jnp.where(keep, rot, 0.0)
-        ob = h * width
-        o_ref[:, ob : ob + lkv] = acc.astype(o_ref.dtype)
-        o_ref[:, ob + lkv : ob + width] = rot.astype(o_ref.dtype)
+        if cfg.out == "flat":
+            ob = h * width
+            o_ref[:, ob : ob + lkv] = acc.astype(o_ref.dtype)
+            o_ref[:, ob + lkv : ob + width] = rot.astype(o_ref.dtype)
+        elif cfg.out == "sst":
+            o_ref[:, h, :lkv] = acc.astype(o_ref.dtype)
+            o_ref[:, h, lkv:] = rot.astype(o_ref.dtype)
+        else:
+            rows.append(
+                jnp.concatenate([acc.astype(o_ref.dtype), rot.astype(o_ref.dtype)], axis=-1)
+            )
+    if rows:
+        hm = jnp.stack(rows, axis=0)  # [hb, tT, width]
+        if cfg.out == "einshape":
+            o_ref[...] = pltpu.einshape("htd->thd", hm)
+        else:
+            o_ref[...] = jnp.swapaxes(hm, 0, 1)
 
 
 @functools.partial(jax.jit, static_argnames=("cfg", "interpret"))
@@ -159,6 +181,12 @@ def fused_sparse_q(
     if cfg.k == 256:
         assert head_in == 256
         scratch.append(pltpu.VMEM((hb, head_in, lkv), w_uk_t.dtype))
+    if cfg.out == "flat":
+        out_spec = pl.BlockSpec((tt, hb * width), lambda g, i: (i, g))
+        out_shape = jax.ShapeDtypeStruct((t, h_total * width), q.dtype)
+    else:
+        out_spec = pl.BlockSpec((tt, hb, width), lambda g, i: (i, g, 0))
+        out_shape = jax.ShapeDtypeStruct((t, h_total, width), q.dtype)
     e = rope_swap_matrix(q.dtype)
     kernel = functools.partial(
         _kernel,
@@ -180,8 +208,8 @@ def fused_sparse_q(
             pl.BlockSpec((hb, nope, lkv), lambda g, i: (g, 0, 0)),
             pl.BlockSpec((LANES, 2 * LANES), lambda g, i: (0, 0)),
         ],
-        out_specs=pl.BlockSpec((tt, hb * width), lambda g, i: (i, g)),
-        out_shape=jax.ShapeDtypeStruct((t, h_total * width), q.dtype),
+        out_specs=out_spec,
+        out_shape=out_shape,
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", "arbitrary"),
