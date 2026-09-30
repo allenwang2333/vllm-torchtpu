@@ -286,14 +286,18 @@ rc="$stages_rc"
 # Diagnostic: every prefill-DP x decode-DP pair on the same prompts, cold on
 # both sides, against the prompt served locally on each decode rank. Resets the
 # prefix caches (VLLM_SERVER_DEV_MODE, from the config), so after the stages.
-if [[ "${K3_DP_MATRIX:-1}" == "1" ]]; then
+# K3_DP_MATRIX=pinned skips the matrix and runs only the state-contamination
+# check pinned to single pairs, the stage's intent under DP.
+if [[ "${K3_DP_MATRIX:-1}" != "0" ]]; then
+  matrix_args=(--pinned-pairs "0:0,1:1,2:3,3:2")
+  [[ "${K3_DP_MATRIX:-1}" == "pinned" ]] && matrix_args+=(--skip-matrix)
   echo "--- Prefill-DP x decode-DP pair matrix"
   mkdir -p "${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness"
   python3 scripts/vllm/integration/k3_dp_pair_matrix.py \
     --prefill-url "http://127.0.0.1:${PORT}" \
     --decode-url "http://${DECODE_HOST}:${PORT}" \
     --model moonshotai/Kimi-K3 --prefill-dp "$DATA_PARALLELISM" \
-    --decode-dp "$DATA_PARALLELISM" --reset \
+    --decode-dp "$DATA_PARALLELISM" --reset "${matrix_args[@]}" \
     2>&1 | tee "${ARTIFACTS_DIR:-$run_dir}/k3_1p1d_correctness/pair_matrix.log" \
     || echo "WARNING: the pair matrix failed to run"
 fi
