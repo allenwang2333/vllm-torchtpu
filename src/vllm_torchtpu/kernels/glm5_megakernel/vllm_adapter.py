@@ -34,6 +34,7 @@ import time
 from typing import Any
 
 import jax
+import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
@@ -46,6 +47,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
 from vllm_torchtpu.kernels.glm5_megakernel import kernel as K
+from vllm_torchtpu.kernels.glm5_megakernel import replicas as REP
 from vllm_torchtpu.kernels.glm5_megakernel.config import FULL
 from vllm_torchtpu.kernels.glm5_megakernel.layout import rup, smalls_layout
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -56,7 +58,9 @@ logger = init_logger(__name__)
 EXPERT_KINDS = ("ew13", "ew2", "es13", "es2")
 # operands sharded over the EP axis (the local tensor is this rank's shard): experts, and
 # the per-head projections that are TP over heads: o_proj's rows, q_b's columns, W_UK's heads
-SHARDED_KINDS = EXPERT_KINDS + ("o_proj", "q_b", "w_uk")
+# decode replica slots (GLM5_MK_DECODE_REPLICAS): kind -> the expert kind it copies
+REPLICA_KINDS = {"rw13": "ew13", "rw2": "ew2", "rs13": "es13", "rs2": "es2"}
+SHARDED_KINDS = EXPERT_KINDS + ("o_proj", "q_b", "w_uk") + tuple(REPLICA_KINDS)
 
 
 class Unsupported(Exception):
@@ -166,7 +170,8 @@ class Glm5Megakernel:
             H=hf.hidden_size, NH=hf.num_attention_heads, QL=hf.q_lora_rank,
             idx_freq=hf.index_topk_freq, idx_skip=hf.index_skip_topk_offset,
             rope_theta=float(rp.get("rope_theta", FULL.rope_theta)), eps=hf.rms_norm_eps,
-            routed_scale=float(hf.routed_scaling_factor))
+            routed_scale=float(hf.routed_scaling_factor),
+            KREP=int(envs.GLM5_MK_DECODE_REPLICAS))
         for got, want, what in (
             (hf.kv_lora_rank, cfg.KL, "kv_lora_rank"), (hf.qk_nope_head_dim, cfg.DN, "qk_nope"),
             (hf.qk_rope_head_dim, cfg.DR, "qk_rope"), (hf.v_head_dim, cfg.DV, "v_head_dim"),
@@ -178,6 +183,8 @@ class Glm5Megakernel:
             (hf.index_topk, cfg.KT, "index_topk")):
             _need(got == want, f"{what} {got} != kernel {want}")
         _need(cfg.NH % R == 0 and cfg.E % R == 0, f"{R} ranks do not divide heads/experts")
+        _need(cfg.KREP >= 0 and R * cfg.KREP <= 64 and cfg.ER + cfg.KREP <= 128,
+              f"GLM5_MK_DECODE_REPLICAS={cfg.KREP} at R={R}")
         self.cfg = cfg
         self.rank = ep_mesh_index()
         order = ep_rank_order()
@@ -187,6 +194,22 @@ class Glm5Megakernel:
         # Online EPLB (distributed/tpu_eplb.py) moves experts between ranks; a
         # moved layer's router columns and bias follow the layer's own table.
         self.layer_perm: dict[int, torch.Tensor] = {}
+        # Decode replicas: per MoE layer the LOGICAL expert load that places them (EPLB's window
+        # once it has rebalanced, else the offline profile, else none = uniform), and the table
+        # in kernel expert space that load gives under the layer's current permutation.
+        self.krep = cfg.KREP
+        self.rep_load: dict[int, Any] = {}
+        self.rep_entries: dict[int, list] = {}
+        self._gather_ops: dict = {}
+        if self.krep:
+            prof = envs.GLM5_MK_DECODE_REPLICAS_PROFILE
+            if prof:
+                self.rep_load = REP.load_profile(prof)
+            for l in range(cfg.L):
+                if cfg.is_moe(l):
+                    self.rep_entries[l] = self._rep_place(l)
+            logger.info("GLM-5.2 megakernel: %d decode replica slots/rank/MoE layer, placement %s",
+                        self.krep, f"profile {prof}" if prof else "uniform (no load yet)")
 
         bb = _find_backbone(runner.model)
         self.backbone = bb
@@ -203,6 +226,14 @@ class Glm5Megakernel:
         self.wk = K.weight_kinds(cfg)
         with torch.no_grad():
             self.weights = [w.detach() for w in self._collect_weights()]
+            if self.krep:
+                # allocated here, at load_model, so profile_run's HBM accounting sees them before
+                # the KV pool is sized: k * (ew13 + ew2 + scales) per MoE layer per rank
+                self._gather_replicas(sorted(self.rep_entries))
+                rb = sum(t.numel() * t.element_size() for (k_, _), t in
+                         zip(self._w_index, self.weights) if k_ in REPLICA_KINDS)
+                logger.info("GLM-5.2 megakernel: decode replicas hold %.3f GiB per rank",
+                            rb / 2 ** 30)
             self.smalls = self._build_smalls().detach()
             # a runtime input, not a graph constant: see _build_op
             self.rank_t = torch.tensor([self.rank], dtype=torch.int32, device=self.smalls.device)
@@ -259,6 +290,10 @@ class Glm5Megakernel:
             d["ew2"] = r.w2_weight
             d["es13"] = _expert_scale(r, "w13_weight", (cfg.ER, 2 * cfg.I))
             d["es2"] = _expert_scale(r, "w2_weight", (cfg.ER, H))
+            if cfg.KREP:                 # filled by _gather_replicas
+                for k_, src in REPLICA_KINDS.items():
+                    shp = self.wk[k_][1]
+                    d[k_] = torch.zeros(shp, dtype=d[src].dtype, device=d[src].device)
             se = mlp.shared_experts
             d["sw13"] = _kn(se.gate_up_proj.weight, H, 2 * cfg.IS, "shared.gate_up_proj")
             d["sw2"] = _kn(se.down_proj.weight, cfg.IS, H, "shared.down_proj")
@@ -304,11 +339,83 @@ class Glm5Megakernel:
                        "es13": lambda: _expert_scale(r, "w13_weight", (self.cfg.ER, 2 * self.cfg.I)),
                        "es2": lambda: _expert_scale(r, "w2_weight", (self.cfg.ER, self.cfg.H))}[kind]()
                 self.weights[i] = new.detach()
+        if self.krep:
+            # kernel slot j now holds another logical expert: re-place from the logical load and
+            # re-copy the slots (the owners' rows moved even where the table did not)
+            for l in sorted(changed):
+                if l in self.rep_entries:
+                    self.rep_entries[l] = self._rep_place(l)
+            self._gather_replicas(sorted(changed & set(self.rep_entries)))
         self.smalls = self._build_smalls().detach()
         t1 = time.perf_counter()
         synchronize_tensors(self.weights + [self.smalls])
         # (host rebuild s, device sync s), read by the EPLB stall trace.
         self.last_placement_timing = (t1 - t0, time.perf_counter() - t1)
+
+    # ------------------------------------------------------------ replicas
+
+    def _rep_place(self, l: int) -> list:
+        """Replica entries of layer l from its logical load, mapped to kernel expert space."""
+        cfg = self.cfg
+        ll = self.rep_load.get(l)
+        kl = None if ll is None else np.asarray(ll, np.float64)[self._perm(l).numpy()]
+        return REP.place(REP.hit_probability(kl, cfg.E, cfg.R), cfg.R, cfg.ER, cfg.KREP)
+
+    @torch.no_grad()
+    def refresh_replicas(self, logical_load: dict) -> int:
+        """Online EPLB, at every rebalance (after set_expert_placement), on every rank: re-place
+        from the window's logical load {layer: [E]} and re-copy the layers whose table changed.
+        Collective. Returns the number of layers re-copied."""
+        if not self.krep:
+            return 0
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        redo = []
+        for l, ll in logical_load.items():
+            l = int(l)
+            if l not in self.rep_entries:
+                continue
+            self.rep_load[l] = np.asarray(ll, np.float64)
+            new = self._rep_place(l)
+            if new != self.rep_entries[l]:
+                self.rep_entries[l] = new
+                redo.append(l)
+        if redo:
+            self._gather_replicas(redo)
+            self.smalls = self._build_smalls().detach()
+            synchronize_tensors(self.weights + [self.smalls])
+        return len(redo)
+
+    def _gather_op(self, src_shape, dst_shape, dtype):
+        key = (tuple(src_shape), tuple(dst_shape), str(dtype))
+        op = self._gather_ops.get(key)
+        if op is None:
+            spec = P(EP_AXIS_NAME)
+            op = sharded_jax_callable(
+                f"glm5_megakernel::replica_gather_{len(self._gather_ops)}",
+                REP.make_gather_fn(self.mesh, EP_AXIS_NAME), mesh=self.mesh,
+                input_partition_specs=(spec,) * 6, output_partition_specs=spec)
+            self._gather_ops[key] = op
+        return op
+
+    @torch.no_grad()
+    def _gather_replicas(self, layers) -> None:
+        """Copy each slot's expert rows from its owner's shard (collective, same on every rank)."""
+        cfg = self.cfg
+        pos = {kl: i for i, kl in enumerate(self._w_index)}
+        dev = self.weights[0].device
+        for l in layers:
+            plans = REP.gather_plans(self.rep_entries[l], cfg.R, cfg.ER, cfg.KREP)
+            ops = [[torch.tensor(a[self.rank:self.rank + 1], dtype=torch.int32, device=dev)
+                    for a in p] for p in plans]
+            for k_, src in REPLICA_KINDS.items():
+                w = self.weights[pos[(src, l)]]
+                i = pos[(k_, l)]
+                out = self.weights[i]
+                op = self._gather_op(w.shape, out.shape, w.dtype)
+                for q_ops in ops:
+                    out = op(w, out, *q_ops)
+                self.weights[i] = out.detach()
 
     def _collect_weights(self) -> list[torch.Tensor]:
         per_layer = {}
@@ -376,6 +483,10 @@ class Glm5Megakernel:
             f["gate_bias"] = b.float()[self._perm(l).to(b.device)]
             f["sw13_s"] = _scale(mlp.shared_experts.gate_up_proj, 2 * cfg.IS, "shared.gate_up_proj")
             f["sw2_s"] = _scale(mlp.shared_experts.down_proj, cfg.H, "shared.down_proj")
+            if cfg.KREP:
+                rep_e, rep_s = REP.table(self.rep_entries[l])
+                f["rep_e"] = torch.from_numpy(rep_e).to(b.device)
+                f["rep_s"] = torch.from_numpy(rep_s).to(b.device)
         else:
             f["w2_s"] = _scale(mlp.down_proj, cfg.H, "dense.down_proj")
         return f

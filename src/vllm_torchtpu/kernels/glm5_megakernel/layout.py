@@ -26,6 +26,11 @@ def smalls_layout(cfg):
         ("gate_bias", cfg.E), ("sw13_s", 2 * cfg.IS), ("sw2_s", cfg.H),
         ("w2_s", cfg.H),
     ]
+    if getattr(cfg, "KREP", 0):
+        # decode replica table, one entry per replica slot in greedy order (-1 = empty):
+        # rep_e = kernel expert index, rep_s = slot = holder * KREP + q. Appended last, so the
+        # KREP=0 layout (and program) is the incumbent's.
+        fields += [("rep_e", 128), ("rep_s", 128)]
     off, lay = 0, {}
     for name, n in fields:
         lay[name] = (off, n)
