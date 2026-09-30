@@ -62,12 +62,15 @@ EXPERT_KINDS = ("ew13", "ew2", "es13", "es2")
 REPLICA_KINDS = {"rw13": "ew13", "rw2": "ew2", "rs13": "es13", "rs2": "es2"}
 SHARDED_KINDS = EXPERT_KINDS + ("o_proj", "q_b", "w_uk") + tuple(REPLICA_KINDS)
 # GLM5_MK_STACK_W: the kinds whose operand is this adapter's own load-time buffer (a copy, clone,
-# column permutation or zeros), so one [n_layers, ...] tensor per kind replaces the per-layer
-# tensors byte for byte and the KV pool is sized against the same HBM. Every other kind aliases a
-# stock parameter (qkv_a, w_uv, idx_wq, the experts and their scales, the shared and dense MLPs):
-# stacking it would duplicate it (qkv_a + w_uv alone are 2.4 GiB/rank, ~44 KV blocks) or leave
-# the stock layers reading strided views of the stack.
-OWNED_KINDS = ("q_b", "w_uk", "o_proj", "idx_wk", "gate") + tuple(REPLICA_KINDS)
+# column permutation, pad or zeros), so one [n_layers, ...] tensor per kind replaces the per-layer
+# tensors byte for byte and the KV pool is sized against the same HBM. qkv_a is one: _kn_pad pads
+# N = 2624 to 2688, so it was always a copy (1.2 GiB/rank already duplicated per layer).
+OWNED_KINDS = ("qkv_a", "q_b", "w_uk", "o_proj", "idx_wk", "gate") + tuple(REPLICA_KINDS)
+# Kinds that alias a stock parameter but are stacked with NO duplicate: the stack replaces the
+# stock parameter, which is rebound to its row view (layer.W_UV = stack[row]); the stock
+# prefill path reads the row (a slice feeding its bmm). Every other kind (idx_wq, the experts
+# and their scales, the shared and dense MLPs) aliases a stock parameter and stays per layer.
+VIEW_KINDS = ("w_uv",)
 
 
 class Unsupported(Exception):
@@ -235,6 +238,7 @@ class Glm5Megakernel:
         self._put_ops: dict = {}
         with torch.no_grad():
             self.weights = [w.detach() for w in self._collect_weights()]
+            self._rebind_views()
             if self.krep:
                 # allocated here, at load_model, so profile_run's HBM accounting sees them before
                 # the KV pool is sized: k * (ew13 + ew2 + scales) per MoE layer per rank
@@ -253,6 +257,8 @@ class Glm5Megakernel:
             self._install_layer_taps()
         self.op = None
         self.caches = None
+        self.stack_c = frozenset()
+        self.cache_rows: dict = {}
         self.rope_packed = False
         self._step = None
         from vllm_torchtpu.utils import synchronize_tensors
@@ -264,23 +270,17 @@ class Glm5Megakernel:
     # ---------------------------------------------------------------- weights
 
     def _stack_knobs(self) -> frozenset:
-        """GLM5_MK_STACK_W / _C (kernel.stack_kinds syntax: 1 or a kind list) -> the weight kinds
-        served stacked. Only OWNED_KINDS are stackable in place; caches are refused: vLLM allocates
-        each layer's MLA and indexer cache separately, and one tensor per kind with per-layer
-        views would make every stock sparse-MLA / indexer call slice-copy its layer out of the
-        stack and scatter it back (torch_tpu passes a view as base + static as_strided). Stacked
-        caches need those stock kernels to take (bundle, layer), as VLLM_TPU_BLOCK_MAJOR_KV's
-        bundled RPA does."""
+        """GLM5_MK_STACK_W (kernel.stack_kinds syntax: 1 or a kind list) -> the weight kinds
+        served stacked: OWNED_KINDS in place, VIEW_KINDS by rebinding the stock parameter to its
+        row of the stack (_rebind_views). GLM5_MK_STACK_C is the runner's: it allocates the
+        cache kinds stacked (kv_cache_manager) and bind_caches passes those stacks through."""
         # the replica kinds are valid knob values at GLM5_MK_DECODE_REPLICAS=0 too (no operand)
         sw = K.stack_kinds(None, "GLM5_MK_STACK_W", set(self.wk) | set(REPLICA_KINDS)) & set(self.wk)
-        sc = K.stack_kinds(None, "GLM5_MK_STACK_C", K.cache_kinds(self.cfg, 1, True))
-        alias = sorted(sw - set(OWNED_KINDS))
+        K.stack_kinds(None, "GLM5_MK_STACK_C", K.cache_kinds(self.cfg, 1, True))  # validate
+        alias = sorted(sw - set(OWNED_KINDS) - set(VIEW_KINDS))
         if alias:
             logger.warning("GLM5_MK_STACK_W: %s alias stock parameters; served per layer", alias)
-        if sc:
-            logger.warning("GLM5_MK_STACK_C=%s ignored: the served caches are per-layer vLLM "
-                           "allocations (no zero-copy stack); caches served per layer", sorted(sc))
-        sw = frozenset(sw & set(OWNED_KINDS))
+        sw = frozenset(sw & (set(OWNED_KINDS) | set(VIEW_KINDS)))
         if sw:
             logger.info("GLM-5.2 megakernel: stacked weight operands %s", sorted(sw))
         return sw
@@ -546,6 +546,23 @@ class Glm5Megakernel:
                 self.w_specs.append(P(None, *spec) if kind in SHARDED_KINDS else P())
         return out
 
+    def _rebind_views(self) -> None:
+        """VIEW_KINDS in stack_w: the stock parameter becomes its row of the stack, so the per-layer
+        tensor is freed (before profile_run sizes the KV pool) and no byte is duplicated."""
+        for kind in sorted(set(VIEW_KINDS) & self.stack_w):
+            assert kind == "w_uv", kind
+            layers = self.wk[kind][0]
+            i = self._w_index.index((kind, "stk"))
+            stk = self.weights[i]
+            for row, l in enumerate(layers):
+                at = _attn_module(self.backbone.layers[l].self_attn)
+                old = at.W_UV
+                _need(tuple(old.shape) == tuple(stk.shape[1:]) and old.dtype == stk.dtype,
+                      f"W_UV[{l}] {tuple(old.shape)} {old.dtype} vs stack row {tuple(stk.shape[1:])}")
+                at.W_UV = torch.nn.Parameter(stk[row], requires_grad=False)
+            logger.info("GLM-5.2 megakernel: %s stacked %s; stock W_UV rebound to its rows",
+                        kind, tuple(stk.shape))
+
     def _build_smalls(self) -> torch.Tensor:
         cfg = self.cfg
         lay, S = smalls_layout(cfg)
@@ -637,8 +654,18 @@ class Glm5Megakernel:
         cfg = self.cfg
         groups = runner.kv_cache_config.kv_cache_groups
         group_of = {n: g for g, grp in enumerate(groups) for n in grp.layer_names}
+        # GLM5_MK_STACK_C: the runner allocated these kinds as one [n_layers, nb, ...] tensor
+        # each (kv_cache_manager._allocate_glm5_stacked_kv) and bound it to every layer of the
+        # kind with module.kv_stack = (row, nb); the kernel takes the stack as one operand
+        stk = getattr(runner, "glm5_kv_stack", None) or {}
+        self.stack_c = frozenset(stk)
+        if self.stack_c:
+            logger.info("GLM-5.2 megakernel: stacked cache operands %s", sorted(self.stack_c))
         per_layer = []
         names = set()
+        lname: dict[str, dict[int, str]] = {"nope": {}, "rope": {}, "idx": {}}
+        rows: dict[str, dict[int, int]] = {"nope": {}, "rope": {}, "idx": {}}
+        shapes = []
         for l in range(cfg.L):
             sa = self.backbone.layers[l].self_attn
             at = _attn_module(sa)
@@ -646,29 +673,56 @@ class Glm5Megakernel:
             _need(isinstance(kv, (tuple, list)) and len(kv) == 2,
                   f"layer {l}: MLA cache is not the (nope, rope) SPARSECORE pair")
             d = {"nope": kv[0], "rope": kv[1]}
+            sh = {"nope": tuple(kv[0].shape), "rope": tuple(kv[1].shape)}
+            lname["nope"][l] = lname["rope"][l] = at.layer_name
+            if "nope" in self.stack_c:
+                row = getattr(at, "kv_stack", (None,))[0]
+                rows["nope"][l] = rows["rope"][l] = row
+                sh = {"nope": sh["nope"][1:], "rope": sh["rope"][1:]}
             names.add(at.layer_name)
             idx = getattr(sa, "indexer", None)
             if idx is not None:
                 d["idx"] = _unwrap(idx.k_cache.kv_cache)
+                sh["idx"] = tuple(d["idx"].shape)
+                lname["idx"][l] = idx.k_cache.prefix
+                if "idx" in self.stack_c:
+                    rows["idx"][l] = getattr(idx.k_cache, "kv_stack", (None,))[0]
+                    sh["idx"] = sh["idx"][1:]
                 names.add(idx.k_cache.prefix)
             per_layer.append(d)
+            shapes.append(sh)
         gids = {group_of.get(n) for n in names}
         _need(len(gids) == 1 and None not in gids,
               f"MLA and indexer caches span KV cache groups {gids}; the kernel takes one block table")
         self.mla_layer_name = _attn_module(self.backbone.layers[0].self_attn).layer_name
-        nb = per_layer[0]["nope"].shape[0]
+        nb = shapes[0]["nope"][0]
         # ROPE cache width follows the allocation (TPU_SPARSE_MLA_ROPE_PACKED): 64 B/token
         # packed, [nb, page/8, 128], or 128 B/token padded, [nb, page/4, 128].
-        rshape = tuple(per_layer[0]["rope"].shape)
+        rshape = tuple(shapes[0]["rope"])
         self.rope_packed = rshape == tuple(K.cache_kinds(cfg, nb, True)["rope"][1])
         ck = K.cache_kinds(cfg, nb, self.rope_packed)
         logger.info("GLM-5.2 megakernel: %s RoPE cache %s", "PACKED" if self.rope_packed
                     else "padded", rshape)
         caches = []
+        self.cache_rows = {}
         for kind, (layers, shape, dtype) in ck.items():
+            if kind in self.stack_c:
+                # the runner's stacked tensor itself (never a view): row i is layers[i]
+                t, row_names = stk[kind]
+                _need(tuple(t.shape) == (len(layers),) + tuple(shape),
+                      f"stacked cache {kind}: {tuple(t.shape)} != {(len(layers),) + tuple(shape)}")
+                _need(list(row_names) == [lname[kind][l] for l in layers],
+                      f"stacked cache {kind}: row order {row_names[:4]}... is not the kernel's")
+                for i, l in enumerate(layers):
+                    _need(per_layer[l][kind] is t and rows[kind][l] == i,
+                          f"layer {l}: {kind} is not bound to row {i} of the stack")
+                    self.cache_rows[(kind, l)] = (len(caches), i)
+                caches.append(t)
+                continue
             for l in layers:
                 t = per_layer[l][kind]
                 _need(tuple(t.shape) == tuple(shape), f"cache {kind}[{l}]: {tuple(t.shape)} != {shape}")
+                self.cache_rows[(kind, l)] = (len(caches), None)
                 caches.append(t)
         self.caches = caches
         self.nb = nb
@@ -680,8 +734,9 @@ class Glm5Megakernel:
         dbg = self.layerdiff and not skip
         call, info = K.build(cfg, nb=self.nb, max_pages=self.max_pages, tiles=K.Tiles(trace=envs.GLM5_MEGAKERNEL_TRACE),
                              debug=dbg, skip=skip, rope_packed=self.rope_packed,
-                             # the served kinds (_stack_knobs): owned weights only, caches per layer
-                             stack_w=self.stack_w, stack_c=frozenset())
+                             # the served kinds: owned weights (_stack_knobs), and the caches
+                             # the runner allocated stacked (bind_caches)
+                             stack_w=self.stack_w, stack_c=self.stack_c)
         self.info = info
         assert list(info["w_names"]) == self._w_index, "weight operand order"
         n_w = len(self.weights)
@@ -812,11 +867,20 @@ class Glm5Megakernel:
         bt = md.block_tables.reshape(md.seq_lens.shape[0], -1)[0]
         return int(bt[pos // self.cfg.page].item()), pos % self.cfg.page
 
+    def _layer_caches(self):
+        """[((kind, layer), that layer's cache)] in c_names order, a stacked kind expanded to its
+        rows (VERIFY only: row views, never passed to a compiled graph)."""
+        out = []
+        for (kind, l), (i, row) in self.cache_rows.items():
+            c = self.caches[i]
+            out.append(((kind, l), c if row is None else c[row]))
+        return out
+
     @torch.no_grad()
     def snapshot_block(self, pos: int) -> list[torch.Tensor]:
         """VERIFY: every cache's block holding `pos`, after the stock forward wrote row `pos`."""
         blk, _ = self._row_block(pos)
-        return [c[blk].clone() for c in self.caches]
+        return [c[blk].clone() for _, c in self._layer_caches()]
 
     @torch.no_grad()
     def diff_block(self, snap: list[torch.Tensor], pos: int) -> str:
@@ -831,7 +895,7 @@ class Glm5Megakernel:
         rseg = 8 if self.rope_packed else 4
         rg, rw = off // rseg, 128 // rseg
         acc = {}
-        for (kind, l), c, s in zip(self.info["c_names"], self.caches, snap):
+        for ((kind, l), c), s in zip(self._layer_caches(), snap):
             now = c[blk]
             if kind == "nope":
                 a, b = now[off], s[off]
