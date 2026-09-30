@@ -11,41 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run ``fused_ep_moe_v2`` at the four shapes served in ``profiles/dsv4_dumps/``.
-
-Each profile there is a PyTorch trace of a real serving process, and the HLO it
-carries names the kernel's custom call in full -- operand shapes, operand
-dtypes and the Pallas build's own name -- so these shapes are read off a run
-rather than guessed. The two captures on the 16-way slice carry::
-
-    %fused_ep_moe_v2_fp4w_silu_and_mul_with_clamp_g24_c128_nb1 = ... custom-call(
-        s32[24,16] x5, s32[24] x3, s32[8,16], s32[1,1], s32[99072],
-        f8e4m3fn[16384,56,128], f32[773,128],
-        f4e2m1fn[24,7168,6144], f4e2m1fn[24,3072,7168],
-        f32[24,14,6144], f32[24,6,7168])
-
-and the two on the 8-way slice the same thing at ``g32_c128_nb3``, hidden 4096.
-
-Those are the operands of the Pallas call, not of the layer, so the layer's
-parameters are recovered from them: ``w1 [G, hidden, 2 * inter]`` gives the
-local expert count, the hidden size and the intermediate size, and
-``f4e2m1fn`` names the weight format; the transport tables are ``[G, ep]``, so
-their minor axis is the mesh width and ``e_total = G * ep``; the gathered
-activation slab's leading axis is the mesh-wide token count; ``c128`` is the
-capacity. ``topk`` is the last unknown and two profiles at one geometry and two
-token counts pin it, since ``recv_rows = align_up(t_local * topk + (ROWBLK - 1)
-* e_total, ROWBLK)`` and differencing the pair kills the ``e_total`` term --
-``topk = 6`` on all four. Each case below reproduces every one of the eleven
-operand shapes its profile carries.
-
-``nb{1,3}`` is the weight-slot count ``fit_weight_slots`` picked for the chip
-the profile was captured on, so it is a property of the host rather than of the
-shape and is not part of a case.
-
-Two things a profile cannot state are set to the DeepSeek defaults:
-``renormalize=True`` and ``routed_scaling_factor=1.0``. The profiles score with
-sigmoid plus the score-correction bias, which is what runs here; the two 8-way
-captures also run 30 hash-routed layers a step against the identical build.
+"""Run fused_ep_moe_v2 using the input shapes/dtypes captured in real inference workload.
 """
 
 import json
@@ -57,21 +23,18 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from google3.experimental.users.xiowei.pallas.optimize.fused_moe_v2.kernel import host
-from google3.experimental.users.xiowei.pallas.optimize.fused_moe_v2.kernel.host import WeightFormat
-from google3.experimental.users.xiowei.pallas.optimize.fused_moe_v2.kernel.kernel import AXIS
-from google3.experimental.users.xiowei.pallas.optimize.fused_moe_v2.kernel.layer import fused_ep_moe_v2
+from vllm_torchtpu.kernels.fused_moe.v2 import (
+    AXIS,
+    WeightFormat,
+    fused_ep_moe_v2,
+    host,
+)
 
 jax.config.parse_flags_with_absl()
 
 # The Pallas call's name prefix; the full name adds the weight format, the
 # activation and the g/c/nb geometry.
 KERNEL_NAME = "fused_ep_moe_v2"
-
-
-
-
-
 
 FP4 = jnp.float4_e2m1fn
 # Contraction rows one weight scale covers, which is the middle axis of the
