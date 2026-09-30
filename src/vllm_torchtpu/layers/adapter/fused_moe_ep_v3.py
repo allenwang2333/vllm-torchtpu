@@ -17,7 +17,8 @@ Selected with MOE_FUSED_EP_KERNEL_IMPL=v3. Like v2 (`fused_moe_ep.py`) the
 whole layer -- top-k, dispatch, both expert matmuls, combine -- runs as one
 SPMD program over the EP mesh, taking and returning this rank's own tokens.
 
-v3 serves data parallelism with expert parallelism only (TP=1, PCP=1), with
+v3 serves expert parallelism over each rank's own tokens: data parallelism
+(TP=1), or TP with sequence parallelism on its large steps (PCP=1), with
 per-channel fp8 weights and a plain softmax top-k router. A deployment outside
 that raises at weight load; a layer outside it (shape, routing, weights) is
 declined on its own and keeps the grouped-matmul path.
@@ -55,7 +56,11 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
 )
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import (
+    moe_routing,
+    sequence_parallel,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     _pcp_size,
     _squeeze_channel_scale,
@@ -276,9 +281,18 @@ def _build_op(
     run = op
     if skip_padded_tokens:
         # Decided here, at weight load, so the forward reads no env.
+        ep = mesh.shape[MESH_AXIS]
+
         def run(x, *args):
-            # The same mask slice the grouped path's padding zeroing reads.
-            padded = token_padding.local_padding_mask(x.shape[0])
+            if sequence_parallel.is_active():
+                # This rank's rows of a sequence-parallel step: its slice of
+                # the step's mask, the rank read off `experts_start` (EP rank
+                # = TP rank there).
+                rank = (args[-1] // local_experts).reshape(1)
+                padded = token_padding.rank_padding_mask(x.shape[0], ep, rank)
+            else:
+                # The same mask slice the grouped path's padding zeroing reads.
+                padded = token_padding.local_padding_mask(x.shape[0])
             if padded is None:
                 raise RuntimeError(
                     "TPU_MOE_SKIP_PADDED_TOKENS is set but the runner did not "
@@ -340,13 +354,17 @@ def _check_deployment(layer) -> None:
     # Read off the config, not `get_tp_group()`: a draft model's weight load
     # rewrites the group coordinator to width 1.
     tp = get_current_vllm_config().parallel_config.tensor_parallel_size
-    if tp > 1:
+    # A sequence-parallel layer's large steps hand each rank its own rows
+    # (layers/adapter/sequence_parallel); its replicated small steps stay off
+    # the kernel (`fused_moe_ep_v3_dispatch.apply`).
+    if tp > 1 and not layer.moe_config.moe_parallel_config.is_sequence_parallel:
         raise NotImplementedError(
-            f"MOE_FUSED_EP_KERNEL_IMPL=v3 serves data parallelism with expert "
-            f"parallelism only; tensor_parallel_size={tp} replicates every "
-            "token on each TP rank, so the kernel would do tp_size times the "
-            "expert work. Use --data-parallel-size with "
-            "--tensor-parallel-size=1, or MOE_FUSED_EP_KERNEL_IMPL=v2."
+            f"MOE_FUSED_EP_KERNEL_IMPL=v3 needs each rank's own tokens; "
+            f"tensor_parallel_size={tp} replicates every token on each TP rank, "
+            "so the kernel would do tp_size times the expert work. Use "
+            "--data-parallel-size with --tensor-parallel-size=1, "
+            "TPU_SEQUENCE_PARALLEL_PREFILL=1 (Qwen3-Next/Qwen3.5 under TP + EP), "
+            "or MOE_FUSED_EP_KERNEL_IMPL=v2."
         )
     pcp = _pcp_size(layer)
     if pcp > 1:
@@ -378,10 +396,29 @@ def prebuild_fused_moe_ep_v3(
     deployment v3 cannot serve; returns None for a layer it declines, which
     keeps the grouped-matmul path.
     """
-    _check_deployment(layer)
-    armed = _prebuild(layer, topk, renormalize, activation)
+    if _draft_layer_outside_sequence_parallelism(layer):
+        armed = "an MTP draft under TP, outside sequence parallelism"
+    else:
+        _check_deployment(layer)
+        armed = _prebuild(layer, topk, renormalize, activation)
     _ARMING["armed" if isinstance(armed, ArmedOp) else armed] += 1
     return armed if isinstance(armed, ArmedOp) else None
+
+
+def _draft_layer_outside_sequence_parallelism(layer) -> bool:
+    """Whether this is the MoE layer of an MTP draft next to a TP
+    sequence-parallel target: the draft runs the plain TP form (its rows
+    replicated), so the grouped-matmul path serves it."""
+    from vllm.config import get_current_vllm_config
+
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    tp = get_current_vllm_config().parallel_config.tensor_parallel_size
+    return (
+        tp > 1
+        and sequence_parallel.enabled()
+        and not layer.moe_config.moe_parallel_config.is_sequence_parallel
+    )
 
 
 def _prebuild(layer, topk: int, renormalize: bool, activation: str) -> ArmedOp | str:

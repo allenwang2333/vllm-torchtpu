@@ -383,6 +383,40 @@ def test_skip_padded_tokens_is_fixed_at_build_and_passes_the_padding_mask(
     assert call[7].tolist() == [0] * 5 + [1] * 3
 
 
+@pytest.mark.parametrize("rank", range(_EP))
+def test_sequence_parallel_rows_take_their_rank_slice_of_the_mask(monkeypatch, rank):
+    """On a sequence-parallel step each rank holds a contiguous slice of the
+    step's rows; the padded rows it skips are that slice of the step's mask."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "jax_op", _FakeOp)
+    monkeypatch.setattr(sequence_parallel, "_active", True)
+    run = bridge._build_op(
+        _MESH, 2, True, "silu", True, hidden=512, inter=256, local_experts=4
+    )
+    owner = SimpleNamespace()
+    setattr(owner, bridge.FUSED_MOE_EP_V3_OP_ATTR, bridge.ArmedOp(run, 1))
+    layer = _layer()
+    local_rows, valid = 8, 37
+    state = token_padding.TokenPaddingState.create(_EP * local_rows, device="cpu")
+    state.update(valid, _EP * local_rows)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    call = bridge.fused_moe_ep_v3(
+        owner,
+        torch.ones(local_rows, 512, dtype=torch.bfloat16),
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+        torch.ones(local_rows, 32),
+        torch.tensor(rank * 4, dtype=torch.int32),
+    )
+    step_mask = state.local_padding_mask.to(torch.int32)
+    expected = step_mask[rank * local_rows : (rank + 1) * local_rows]
+    assert call[7].tolist() == expected.tolist()
+
+
 def test_mask_padded_rows_routes_the_suffix_nowhere():
     ep, t_local, hidden, experts = 2, 4, 8, 4
     x = jnp.ones((ep * t_local, hidden), jnp.bfloat16)
@@ -471,6 +505,52 @@ def test_the_gate_picks_v3_or_the_grouped_path_per_step(armed_fp8, rows, takes_v
             ("combine", 2 * rows, False),
         ]
         assert a.gmm.call_args.kwargs["hidden_states"].shape[0] == 2 * rows
+
+
+def test_tp_is_served_for_a_sequence_parallel_layer(v3):
+    """Under TP a sequence-parallel layer's large steps give each rank its own
+    rows (layers/adapter/sequence_parallel)."""
+    v3.config.parallel_config.tensor_parallel_size = 8
+    layer = _layer()
+    layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    assert _prebuild(layer) is not None
+
+
+def test_a_draft_layer_outside_sequence_parallelism_is_declined(v3, monkeypatch):
+    """The MTP draft next to a TP8 sequence-parallel target runs the plain TP
+    form: its MoE layer is declined, not refused. Here the replicated draft
+    (draft_tensor_parallel_size=1), built without expert parallelism."""
+    monkeypatch.setenv("TPU_SEQUENCE_PARALLEL_PREFILL", "1")
+    monkeypatch.setattr(bridge, "_ARMING", bridge.Counter())
+    v3.config.parallel_config.tensor_parallel_size = 8
+    layer = _layer()
+    # Built under a one-rank TP group: no expert parallelism either.
+    layer.moe_config.moe_parallel_config.use_ep = False
+    assert _prebuild(layer) is None
+    assert not v3.built
+    assert bridge._ARMING == {"an MTP draft under TP, outside sequence parallelism": 1}
+
+
+@pytest.mark.parametrize(
+    "active,rows,takes_v3",
+    [(True, 32, False), (True, 33, True), (False, 33, False), (False, 512, False)],
+    ids=["sliced-below-gate", "sliced", "replicated", "replicated-large"],
+)
+def test_a_sequence_parallel_layer_runs_v3_on_sliced_steps_only(
+    armed_fp8, monkeypatch, active, rows, takes_v3
+):
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    a = armed_fp8
+    a.layer.moe_config.moe_parallel_config.is_sequence_parallel = True
+    monkeypatch.setattr(sequence_parallel, "_active", active)
+    x = torch.ones(rows, 512, dtype=torch.bfloat16)
+    a.method.apply_monolithic(a.layer, x, torch.ones(rows, 32))
+    assert a.v3.called is takes_v3
+    assert a.gmm.called is not takes_v3
+    if not takes_v3:
+        # The communicator's sequence-parallel branches serve the exchange.
+        assert [call[2] for call in a.group.calls] == [True, True]
 
 
 @torch.library.custom_op("v3_gate_test::fused", mutates_args=())

@@ -665,6 +665,14 @@ def test_moe_chunk_pipelining_is_refused(enabled, monkeypatch):
         patch.install()
 
 
+@pytest.mark.parametrize("impl", ["adaptive", "v3"])
+def test_both_fused_ep_kernels_that_serve_it_are_accepted(enabled, monkeypatch, impl):
+    """The adaptive kernel and fused EP v3 each serve sliced steps and take the
+    grouped path on replicated ones, so either may sit behind the selector."""
+    monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", impl)
+    sp.check_flags()
+
+
 @pytest.mark.parametrize("row_gated", [False, True], ids=["draft", "backbone"])
 def test_only_a_row_gated_layer_leaves_a_row_count_guard(
     enabled, monkeypatch, row_gated
