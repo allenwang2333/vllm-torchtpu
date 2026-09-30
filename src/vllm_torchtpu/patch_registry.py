@@ -97,7 +97,12 @@ PATCHES = (
         "vllm_torchtpu.model_loader_patches:patch_runai_sharded_expert_streaming",
         _ACTIVE,
     ),
-    Patch("vllm_torchtpu.model_loader_patches:patch_object_storage_pull_once", _ACTIVE),
+    # "import" runs from EngineArgs.__post_init__, before ModelConfig pulls
+    # config/tokenizer files; platform_activation comes too late for that.
+    Patch(
+        "vllm_torchtpu.model_loader_patches:patch_object_storage_pull_once",
+        ("import", *_ACTIVE),
+    ),
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,
