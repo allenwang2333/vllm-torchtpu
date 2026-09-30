@@ -68,6 +68,8 @@ class FusedSparseQTest(parameterized.TestCase):
             "out=packes,hb=16",
             "out=psst,hb=16",
             "out=psst,hb=8,tt=128",
+            "out=sst,hb=4",
+            "out=psst,hb=2",
         ],
         t=[256, 200],
     )
@@ -101,6 +103,21 @@ class FusedSparseQTest(parameterized.TestCase):
             q_bad, jnp.pad(c, pad), jnp.pad(s, pad), w, cfg=cfg, interpret=interpret
         )
         self.assertFalse(np.array_equal(np.asarray(bad), np.asarray(got)))
+
+    @parameterized.parameters(
+        "", "tt=64,hb=4", "out=sst,hb=4", "out=pack,hb=4", "out=psst,hb=2",
+        "out=einshape,hb=16", "out=psst,hb=8,tt=128",
+    )
+    def test_lowers_for_tpu(self, opts):
+        # Mosaic block-shape rules are only checked when lowering for TPU;
+        # the CPU interpreter accepts any block. Lowering needs no device.
+        t, h = 256, 16
+        q = jax.ShapeDtypeStruct((t, h * (NOPE + ROPE)), jnp.bfloat16)
+        cs = jax.ShapeDtypeStruct((t, 128), jnp.bfloat16)
+        w = jax.ShapeDtypeStruct((h, NOPE, LKV), jnp.bfloat16)
+        cfg = FusedQConfig.parse(opts)
+        fn = jax.jit(lambda q, c, s, w: fused_sparse_q(q, c, s, w, cfg=cfg))
+        fn.trace(q, cs, cs, w).lower(lowering_platforms=("tpu",))
 
 
 if __name__ == "__main__":
