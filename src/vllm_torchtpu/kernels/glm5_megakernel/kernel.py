@@ -391,10 +391,11 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
     # tiles stream from m_shared start; routing then confirms (it goes first in the list) or
     # voids them (the issued tiles are drained unused). Bitwise either way.
     SPEC = getattr(cfg, "SPEC", 0)
-    assert not (SPEC and KREP), "SPEC with KREP: not built"
     # yspec rows: only part rows < R are ever sent (reduce_scatter_rows), so the parked term keeps
-    # rup(R, 8) rows, not M (768K -> 192K VMEM at R=8, H=6144)
+    # rup(R, 8) rows, not M (768K -> 192K VMEM at R=8, H=6144: SPEC with KREP fits at full size)
     MY = min(M, rup(R, 8))
+    # SPEC with KREP: the guess is a hit-list entry j (a primary j < ER or a replica slot ER + q);
+    # the greedy list is built as usual, then g (if in it) is rotated to the front.
     NS = R * KREP                                    # replica table entries
     ER_S = cfg.ER + KREP                             # es13 / es2 scratch rows
     if KREP:
@@ -1636,7 +1637,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     st[9] = g_
                     st[8] = jnp.int32(0)
 
-                    @pl.when(jnp.logical_and(g_ >= 0, g_ < cfg.ER))
+                    @pl.when(jnp.logical_and(g_ >= 0, g_ < cfg.ER + KREP))
                     def _():
                         st[6] = jnp.int32(1)
                         st[7] = jnp.int32(1)
@@ -1785,7 +1786,7 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                     def _():
                         scr["hits"][1, n] = j
                     return n + h_.astype(I32)
-                if SPEC:
+                if SPEC and not KREP:
                     prov = st[7] == 1
                     g_ = jnp.maximum(st[9], 0)
                     k_d = jnp.where(jnp.logical_and(prov, jnp.logical_and(st[2] == l, st[3] == EXP)),
@@ -1863,6 +1864,31 @@ def build(cfg, *, nb, max_pages, tiles=Tiles(), interpret=False, debug=False, sk
                             hs[1, n] = cfg.ER + sl % KREP
                         return n + h_.astype(I32)
                     n_hit = lax.fori_loop(0, NS, rbody, n_hit)
+                    if SPEC:
+                        # g first (if in the list), the rest in greedy order; p_g = g's place in
+                        # that order, where its parked term joins the sum (f32 order kept)
+                        prov = st[7] == 1
+                        g_ = jnp.maximum(st[9], 0)
+                        k_d = jnp.where(jnp.logical_and(prov, jnp.logical_and(st[2] == l,
+                                                                              st[3] == EXP)),
+                                        st[4], 0)
+
+                        def fbody(i, p):
+                            return jnp.where(jnp.logical_and(p == n_hit, hs[1, i] == g_), i, p)
+                        p_g = lax.fori_loop(0, n_hit, fbody, n_hit)
+                        hitg = jnp.logical_and(prov, p_g < n_hit)
+
+                        @pl.when(hitg)
+                        def _():
+                            def shbody(t, c):          # shift [0, p_g) up by one, from the top
+                                i = p_g - 1 - t
+                                hs[1, i + 1] = hs[1, i]
+                                return c
+                            lax.fori_loop(0, p_g, shbody, 0)
+                            hs[1, 0] = g_
+                        p_g = jnp.where(hitg, p_g, 0)
+                        st[8] = jnp.where(hitg, 0, k_d)
+                        st[7] = jnp.int32(0)
                 if "experts" in skip:
                     n_hit = jnp.int32(0)
                 # publish the hit list: the producer may now stream this layer's experts
