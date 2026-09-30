@@ -31,6 +31,10 @@ def smalls_layout(cfg):
         # rep_e = kernel expert index, rep_s = slot = holder * KREP + q. Appended last, so the
         # KREP=0 layout (and program) is the incumbent's.
         fields += [("rep_e", 128), ("rep_s", 128)]
+    if getattr(cfg, "SPEC", 0):
+        # speculative first expert: lane r = rank r's guessed local expert (-1 = none) for this
+        # layer. Appended last, so the SPEC=0 layout is unchanged.
+        fields += [("spec_g", 128)]
     off, lay = 0, {}
     for name, n in fields:
         lay[name] = (off, n)
@@ -46,6 +50,8 @@ def build_smalls(cfg, layers):
         for name, (o, n) in lay.items():
             if name in lw:
                 out[l, 0, o:o + n] = np.asarray(lw[name], np.float32).reshape(-1)
+            elif name == "spec_g":
+                out[l, 0, o:o + n] = -1.0
     return jnp.asarray(out)
 
 
