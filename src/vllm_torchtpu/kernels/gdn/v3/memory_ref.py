@@ -466,11 +466,23 @@ def create_allocs(
             1,
             cfg.dim_size,
         )
+        # EXPERIMENT(tsunlin): a bf16 SSM window is held as uint32 pairs
+        # (two sublane-adjacent bf16 rows per word, as pltpu.bitcast packs
+        # them); vmem_ldst / the store unpack and repack in registers.
+        # Observed: with a bf16 window, granule_view's bitcast-to-u32 +
+        # reshape fails in Mosaic ("Expected the 2nd minor dimension is
+        # aligned to the tile" on tpu.memref_reshape); a native u32 window of
+        # the same logical shape compiles. Root cause not yet confirmed.
+        recurrent_vmem_dtype = jnp.dtype(cfg.dtypes.recurrent_state)
+        recurrent_rows = cfg.kq_head_dim
+        if recurrent_vmem_dtype == jnp.bfloat16:
+            recurrent_vmem_dtype = jnp.dtype(jnp.uint32)
+            recurrent_rows //= 2
         recurrent_shape = (
             cfg.seq_tile_size,
             cfg.window_size,
             cfg.num_v_heads,
-            cfg.kq_head_dim,
+            recurrent_rows,
             cfg.v_head_dim,
         )
         state_buffered_partial = functools.partial(
@@ -487,7 +499,7 @@ def create_allocs(
         )
         recurrent_alloc = state_buffered_partial(
             spec=block_spec_partial(block_shape=recurrent_shape),
-            dtype_or_type=cfg.dtypes.recurrent_state,
+            dtype_or_type=recurrent_vmem_dtype,
             offset=cfg.recurrent_hbm_offset,
         )
     else:

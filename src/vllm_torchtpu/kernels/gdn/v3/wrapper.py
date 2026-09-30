@@ -207,7 +207,15 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
-        recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
+        if recurrent_slot_ref.dtype == jnp.uint32:
+            # bf16 SSM held as uint32 pairs (see memory_ref.create_allocs).
+            recurrent_slot_ref[...] = pltpu.bitcast(
+                new_recurrent_state.astype(jnp.bfloat16), jnp.uint32
+            )
+        else:
+            recurrent_slot_ref[...] = new_recurrent_state.astype(
+                recurrent_slot_ref.dtype
+            )
     else:
         # TODO: Delete this after unified pool migration completes.
         legacy_unified.store_external_state(
@@ -447,10 +455,19 @@ def fused_conv1d_gdn(
         recurrent_dtype = states[1].dtype
         conv_dtype = states[0].dtype
     if conv_dtype != jnp.float32 or recurrent_dtype != jnp.float32:
-        raise NotImplementedError(
-            f"GDN v3 state must be fp32; got conv={conv_dtype} "
-            f"recurrent={recurrent_dtype}."
+        # EXPERIMENT(tsunlin): the shared pool may hold a bf16 SSM state. The
+        # VMEM window, the HBM conv offset and the write-back cast all follow
+        # cfg.dtypes.recurrent_state already; the kernel upcasts on load and
+        # computes in fp32. Conv stays fp32 (compact layout), and dense
+        # (non-shared) states keep the strict fp32 contract.
+        bf16_pooled_ssm = (
+            is_shared and conv_dtype == jnp.float32 and recurrent_dtype == jnp.bfloat16
         )
+        if not bf16_pooled_ssm:
+            raise NotImplementedError(
+                f"GDN v3 state must be fp32; got conv={conv_dtype} "
+                f"recurrent={recurrent_dtype}."
+            )
 
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)

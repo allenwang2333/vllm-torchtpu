@@ -165,7 +165,13 @@ def load_and_select_states(
                     is_first_tile, prev_conv_state, prev_tile_conv
                 )
 
+            # Compute in fp32 whatever the storage dtype. A bf16 SSM window is
+            # held as uint32 pairs (see memory_ref.create_allocs); unpack it
+            # in registers first.
             hbm_recurrent_state = recurrent_slot_ref[idx, 0]
+            if hbm_recurrent_state.dtype == jnp.uint32:
+                hbm_recurrent_state = pltpu.bitcast(hbm_recurrent_state, jnp.bfloat16)
+            hbm_recurrent_state = hbm_recurrent_state.astype(jnp.float32)
             prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
             if carry_recurrent_scratch_ref is not None:
