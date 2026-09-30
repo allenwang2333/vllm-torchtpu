@@ -1176,6 +1176,7 @@ SEGCD_BASE = "segc2"
         "topk_tail",
         "l1_live",
         "score_epilogue",
+        "fill_scores",
     ),
 )
 def streamindex_topk(
