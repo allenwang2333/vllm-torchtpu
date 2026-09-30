@@ -226,6 +226,17 @@ def _in_backbone_graph() -> bool:
     return backends.model_tag == "backbone"
 
 
+def outside_sequence_parallelism(layer: RoutedExperts) -> bool:
+    """Whether this layer runs the plain TP form next to a TP sequence-parallel
+    target (the MTP draft's MoE layer). Its rows are replicated over TP, so it
+    keeps the grouped-matmul path, as below the V3 gate."""
+    if not sequence_parallel.enabled():
+        return False
+    if layer.moe_config.moe_parallel_config.is_sequence_parallel:
+        return False
+    return get_current_vllm_config().parallel_config.tensor_parallel_size > 1
+
+
 def adaptive_fused_moe_supported(owner: Any) -> bool:
     """Only a successfully prebuilt op owns vLLM's dispatch/combine."""
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None

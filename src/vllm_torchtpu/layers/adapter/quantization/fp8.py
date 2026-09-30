@@ -914,7 +914,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias, "TPU FP8 MoE path does not support bias."
 
-        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        use_adaptive = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        self._use_adaptive_fused_moe = (
+            use_adaptive and not adaptive_moe.outside_sequence_parallelism(layer)
+        )
         activation_str = self._set_tpu_activation(layer)
 
         is_fp8_serialized = self.quant_config.is_checkpoint_fp8_serialized
@@ -995,9 +998,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
-        if self._use_adaptive_fused_moe:
-            # A sequence-parallel layer's replicated steps take the grouped
-            # path; v2 never runs.
+        if use_adaptive:
+            # A sequence-parallel layer's replicated steps and a layer outside
+            # sequence parallelism take the grouped path; v2 never runs.
             return
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
