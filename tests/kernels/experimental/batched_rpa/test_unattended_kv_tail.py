@@ -48,7 +48,7 @@ _SEQ_LENS = ((1, 300), (1, 129), (200, 457), (256, 512), (64, 1000))
 _DISTRIBUTION = (2, 2, len(_SEQ_LENS))
 
 
-def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
+def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value, skip_kv_update=False):
     rng = np.random.default_rng(0)
     q_lens = np.array([q for q, _ in _SEQ_LENS], np.int32)
     kv_lens = np.array([kv for _, kv in _SEQ_LENS], np.int32)
@@ -118,10 +118,30 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
     padded_kv_lens = np.zeros(_MAX_NUM_SEQS, np.int32)
     padded_kv_lens[:num_seqs] = kv_lens
 
+    if skip_kv_update:
+        # Cross-layer KV sharing: the source layer already wrote this step's
+        # tokens, so the kernel reads all of them from the cache.
+        for i in range(num_seqs):
+            q0 = int(cu_q_lens[i])
+            for t in range(int(q_lens[i])):
+                pos = int(cache_lens[i]) + t
+                page = page_indices[i, pos // _PAGE_SIZE]
+                slot = pos % _PAGE_SIZE
+                for h in range(_NUM_KV_HEADS):
+                    cache[page, 2 * h, :, :, slot] = new_k[q0 + t, h].reshape(
+                        d_per_pack, packing
+                    )
+                    cache[page, 2 * h + 1, :, :, slot] = new_v[q0 + t, h].reshape(
+                        d_per_pack, packing
+                    )
+    # With KV sharing the kernel must not read the new-token inputs at all.
+    kernel_k = np.full_like(new_k, fill_value) if skip_kv_update else new_k
+    kernel_v = np.full_like(new_v, fill_value) if skip_kv_update else new_v
+
     output, _, lse = wrapper.ragged_paged_attention(
         jnp.asarray(query, jnp.bfloat16),
-        jnp.asarray(new_k, kv_dtype),
-        jnp.asarray(new_v, kv_dtype),
+        jnp.asarray(kernel_k, kv_dtype),
+        jnp.asarray(kernel_v, kv_dtype),
         jnp.asarray(cache, kv_dtype),
         jnp.asarray(padded_kv_lens),
         jnp.asarray(page_indices.reshape(-1)),
@@ -137,6 +157,7 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         attention_scope=scope,
         return_lse=True,
+        skip_kv_update=skip_kv_update,
     )
     output = np.asarray(output[:num_tokens].astype(jnp.float32))
     lse = np.asarray(lse[:num_tokens].astype(jnp.float32))
@@ -181,12 +202,27 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
 # full-roll prefill stitch.
 @pytest.mark.parametrize("prefill_bq_sz", [128, 256])
 def test_unattended_kv_tail_does_not_leak(scope, kv_dtype, prefill_bq_sz):
+    _check(scope, kv_dtype, prefill_bq_sz, skip_kv_update=False)
+
+
+@pytest.mark.parametrize("kv_dtype", [jnp.float8_e4m3fn, jnp.bfloat16])
+@pytest.mark.parametrize("prefill_bq_sz", [128, 256])
+def test_kv_sharing_keeps_current_tokens(kv_dtype, prefill_bq_sz):
+    """With skip_kv_update (the MTP draft's shared KV) every valid token comes
+    from the cache and nothing is fetched as new. Zeroing past the valid range
+    must still keep the current step's tokens."""
+    _check(configs.AttentionScope.FULL, kv_dtype, prefill_bq_sz, skip_kv_update=True)
+
+
+def _check(scope, kv_dtype, prefill_bq_sz, *, skip_kv_update):
     if not jtu.is_device_tpu_at_least(version=5):
         pytest.skip("Expect TPUv5+")
     out_nan, lse_nan, ref_out, ref_lse = _run_case(
-        scope, kv_dtype, prefill_bq_sz, np.nan
+        scope, kv_dtype, prefill_bq_sz, np.nan, skip_kv_update
     )
-    out_zero, lse_zero, _, _ = _run_case(scope, kv_dtype, prefill_bq_sz, 0.0)
+    out_zero, lse_zero, _, _ = _run_case(
+        scope, kv_dtype, prefill_bq_sz, 0.0, skip_kv_update
+    )
 
     assert np.isfinite(out_zero).all()
     assert np.isfinite(out_nan).all(), (
