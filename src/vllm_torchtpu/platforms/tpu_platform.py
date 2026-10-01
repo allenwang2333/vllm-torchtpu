@@ -93,7 +93,8 @@ TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
 
 # Multi-host TPU slice mesh topologies for TPU v8i, which uses a hierarchical
 # BoardFly topology: (Chips per Board) x (Boards per Group) x (Groups per Slice),
-# noted as C x B x G (4 chips per board, up to 8 boards per group, up to 32 groups per slice).
+# noted as C x B x G (4 chips per board, up to 8 boards per group,
+# up to 32 groups per slice).
 TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
     4: "4,1,1",
     8: "4,2,1",
@@ -111,7 +112,8 @@ TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
 }
 
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
-# TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects (4-tuple mesh geometry: X,Y,Z,T).
+# TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects
+# (4-tuple mesh geometry: X,Y,Z,T).
 _TPU_2D_TORUS_GENERATIONS = ("v5e", "v6e")
 
 # 3D Torus generations that expose two devices per chip. The device name
@@ -319,10 +321,12 @@ def _register_tpu_kv_connectors() -> None:
     Required for the API server metrics pipeline: TPUMultiConnector aggregates child
     connector statistics by looking up classes via get_connector_class_by_name().
     Without registry registration, the first metrics collection triggers an unhandled
-    exception in the AsyncLLM output handler, causing HTTP 500 errors on subsequent requests.
+    exception in the AsyncLLM output handler, causing HTTP 500 errors on
+    subsequent requests.
 
     Invoked from check_and_update_config() in every process that builds a VllmConfig
-    (including the API server). Defers imports lazily until connector names are accessed.
+    (including the API server). Defers imports lazily until connector names
+    are accessed.
     """
     global _tpu_kv_connectors_registered
     if _tpu_kv_connectors_registered:
@@ -504,6 +508,11 @@ class TpuPlatform(Platform):
     ) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        # Ensure TPU attention backends (such as CUSTOM, which has no upstream
+        # default) are registered in the scheduler process, which resolves the
+        # backend for KV offloading without instantiating model layers.
+        import vllm_torchtpu.layers.adapter.attention  # noqa: F401
+
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
@@ -623,6 +632,7 @@ class TpuPlatform(Platform):
             get_flashinfer_layout_string,
             resolve_kv_cache_layout,
         )
+        from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
@@ -641,6 +651,17 @@ class TpuPlatform(Platform):
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
+        # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
+        if (
+            layout is VllmKVCacheLayout.LBHNC
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.get_head_size() == 64
+        ):
+            raise NotImplementedError(
+                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
+                "layout, which the head_dim==64 RPA kernel does not "
+                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+            )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,

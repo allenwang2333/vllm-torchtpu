@@ -919,9 +919,11 @@ class TestKVCacheManager:
             self.runner.initialize_kv_cache(kv_cache_config)
 
     def test_initialize_kv_cache_block_major(self):
-        """Verifies that block-major initialization allocates a single shared bundle backing all layer views."""
+        """Verifies that block-major initialization allocates a single shared bundle
+        backing all layer views."""
         num_blocks = 4
-        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact uniform tiling.
+        # Byte-consistent page size: 16*4*1*128 bf16 elements = 16384 B to ensure exact
+        # uniform tiling.
         per_layer_shape = (16, 4, 1, 128)
         # FullAttentionSpec.real_page_size_bytes for (16, 2, 128, bf16) is
         # block_size * (k+v) * head_size * itemsize = 16 * 4 * 128 * 2 = 16384.
@@ -993,7 +995,8 @@ class TestKVCacheManager:
         ):
             self.runner.initialize_kv_cache(kv_cache_config)
 
-        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and layer index mappings.
+        # Verify bundle tensor shape (num_blocks, num_layers, *per_layer_shape) and
+        # layer index mappings.
         assert isinstance(self.runner._kv_cache_bundle, torch.Tensor)
         expected_bundle_shape = (num_blocks, len(layer_names)) + per_layer_shape
         assert tuple(self.runner._kv_cache_bundle.shape) == expected_bundle_shape
@@ -1004,7 +1007,8 @@ class TestKVCacheManager:
             "attn.2": 2,
         }
 
-        # Verify that bound per-layer views alias the underlying bundle storage via strided slices.
+        # Verify that bound per-layer views alias the underlying bundle storage via
+        # strided slices.
         created = mock_bind.call_args[0][0]
         for idx, name in enumerate(layer_names):
             view = created[name]
@@ -1016,7 +1020,8 @@ class TestKVCacheManager:
                 == self.runner._kv_cache_bundle.untyped_storage().data_ptr()
             )
 
-        # Verify that mutating a per-layer strided view modifies the bundle in-place while isolating other layers.
+        # Verify that mutating a per-layer strided view modifies the bundle in-place
+        # while isolating other layers.
         target = 1
         created[layer_names[target]].fill_(7)
         assert torch.all(self.runner._kv_cache_bundle[:, target] == 7), (
@@ -1031,7 +1036,8 @@ class TestKVCacheManager:
             )
 
     def test_initialize_kv_cache_block_major_rejects_mamba(self):
-        """Verifies that standard dense block-major initialization fails closed on unsupported multi-group configurations."""
+        """Verifies that standard dense block-major initialization fails closed on
+        unsupported multi-group configurations."""
         attn_spec = FullAttentionSpec(
             block_size=16,
             num_kv_heads=2,
@@ -1886,6 +1892,94 @@ def test_dsv4_state_cache_overlays_its_own_compressed_kv_array():
             SimpleNamespace(kv_cache_groups=clash),
             {**kv_caches, "m.layers.0.attn.swa_cache": csa_nope},
         )
+
+
+def test_dsv4_csa_allocates_int32_nope_and_rope_arrays():
+    """A CSA layer gets int32 NoPE and RoPE arrays (see `csa_cache_layout`).
+
+    NoPE keeps one 128-word row per token, RoPE packs four tokens' 32 words
+    per row, so the sparse gather can fetch a token's own 128 RoPE bytes. The
+    bytes are the uint8 pair's; overflow overlay hosts copy the NoPE host.
+    """
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    def mla(compress_ratio, head_size=640):
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=head_size,
+            dtype=torch.uint8,
+            tokens_per_state=compress_ratio,
+            alignment=None,
+        )
+
+    def swa():
+        return SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        )
+
+    specs = {
+        "m.layers.0.attn": mla(4),
+        "m.layers.0.attn.indexer.k_cache": mla(4, head_size=256),
+        "m.layers.1.attn": mla(128),
+        "m.layers.0.attn.compressor.state_cache": swa(),
+        "m.layers.1.attn.compressor.state_cache": swa(),
+        "m.layers.0.attn.swa_cache": swa(),
+        "m.layers.1.attn.swa_cache": swa(),
+    }
+    groups = [
+        SimpleNamespace(
+            layer_names=[
+                "m.layers.0.attn",
+                "m.layers.0.attn.indexer.k_cache",
+                "m.layers.1.attn",
+            ]
+        ),
+        SimpleNamespace(layer_names=["m.layers.0.attn.compressor.state_cache"]),
+        SimpleNamespace(layer_names=["m.layers.1.attn.compressor.state_cache"]),
+        SimpleNamespace(
+            layer_names=["m.layers.0.attn.swa_cache", "m.layers.1.attn.swa_cache"]
+        ),
+    ]
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner.device = "cpu"
+    kv_caches: dict = {}
+    num_blocks = 3
+
+    DsV4KVCacheAllocator(runner)._initialize_ds_v4_kv_cache(
+        SimpleNamespace(kv_cache_groups=groups),
+        specs.__getitem__,
+        kv_caches,
+        num_blocks,
+    )
+
+    # T = 256 / 4 = 64 compressed tokens per page.
+    nope, rope = kv_caches["m.layers.0.attn"]
+    assert nope.dtype == rope.dtype == torch.int32
+    assert tuple(nope.shape) == (num_blocks, 64, 128)
+    assert tuple(rope.shape) == (num_blocks, 16, 128)
+    assert nope.numel() * nope.element_size() == num_blocks * 64 * 512
+    assert rope.numel() * rope.element_size() == num_blocks * 64 * 128
+    # The CSA state rides its own layer's entry; the HCA state overlays the
+    # CSA NoPE array.
+    assert (
+        kv_caches["m.layers.0.attn.compressor.state_cache"]
+        is (kv_caches["m.layers.0.attn"])
+    )
+    assert kv_caches["m.layers.1.attn.compressor.state_cache"] is nope
+    # Two SWA layers of one group: the first overlays the CSA NoPE array, the
+    # second gets a standalone host of the same shape and dtype.
+    assert kv_caches["m.layers.0.attn.swa_cache"] is nope
+    overflow = kv_caches["m.layers.1.attn.swa_cache"]
+    assert overflow is not nope
+    assert overflow.dtype == torch.int32
+    assert tuple(overflow.shape) == tuple(nope.shape)
 
 
 class TestUpdateAttentionPageSizePadded:

@@ -49,6 +49,13 @@ _ENGINE: tuple[Stage, ...] = (*_ACTIVE, "engine_core")
 PATCHES = (
     # Environment setup and custom-op registration.
     Patch("vllm_torchtpu.env_override:_patch_jax_pallas_fori_lowering", ("import",)),
+    # TODO(https://github.com/vllm-project/vllm-torchtpu/pull/1182): Remove
+    # this patch once the pinned TorchTPU supports tuple-axis PartitionSpecs
+    # in both get_global_shape and get_local_shape.
+    Patch(
+        "vllm_torchtpu.distributed.pallas_shapes:install_pallas_shape_conversion",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
@@ -69,6 +76,12 @@ PATCHES = (
         "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
+    ),
+    # After hybrid PCP: wraps the resolve it installed and rebinds its refs.
+    Patch(
+        "vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
+        _ENGINE,
+        refresh="vllm_torchtpu:_patch_vllm_dcp_fine_prefix_hits",
     ),
     Patch("vllm_torchtpu:_patch_vllm_mamba_split_scheduler_block_size", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_offloading_config_build", _ENGINE),
@@ -112,8 +125,9 @@ PATCHES = (
         _ACTIVE,
     ),
     # Model-specific patches.
-    # Append patches for new models here with stages=("platform_activation", "model_load")
-    # and model_config=True. See docs/tpu_patch_mechanism.md for details.
+    # Append patches for new models here with
+    # stages=("platform_activation", "model_load") and model_config=True.
+    # See docs/tpu_patch_mechanism.md for details.
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
         ("platform_activation", "model_load"),

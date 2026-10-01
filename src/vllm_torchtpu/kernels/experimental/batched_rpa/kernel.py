@@ -21,7 +21,6 @@ import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 from jax import lax
 
-# yapf: disable
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     bref_override,
     configs,
@@ -30,8 +29,6 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     stitch_utils,
     utils,
 )
-
-# yapf: enable
 
 # Define inner kernel.
 
@@ -230,7 +227,8 @@ def fetch_step_metadata(
     *,
     cfgs: configs.RpaConfigs,
 ) -> StepMetadata:
-    """Fetches metadata and handles scalar & mask interval values for the current step."""
+    """Fetches metadata and handles scalar & mask interval values for
+    the current step."""
     causal_offset_list = []
     bkv_sz_frm_cache_list = []
     bkv_sz_frm_new_list = []

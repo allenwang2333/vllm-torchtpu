@@ -46,8 +46,10 @@ Key components and mechanisms:
 
 - Directory as the single source of truth: `prepare_store` probes Raiden per
   key to decide what to offer, so a key displaced from the LRU is re-offered
-  on its next appearance. The connector emits no eviction events, and
-  configurations that expect KV cache events are refused at startup.
+  on its next appearance. Displacements are also reported back: the manager
+  registers an eviction callback with the store and turns host LRU evictions
+  into `OffloadingEvent`s, which the connector surfaces as `BlockRemoved`
+  KV cache events.
 
 - Fault tolerance and recovery: Failed saves retry once. Timed-out drains
   poison in-flight jobs to prevent committing torn bytes from reused blocks.
@@ -70,14 +72,17 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
+    Locality,
     LookupResult,
+    Medium,
+    OffloadingEvent,
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
@@ -91,6 +96,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.block_major_pool import unified_block_major_enabled
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
@@ -239,8 +245,8 @@ class RaidenOffloadingManager(OffloadingManager):
         kv_pool_group: str = "",
         key_namespace: bytes = b"",
         # Test overrides: allow injecting mock store instance and type bindings.
-        store: object | None = None,
-        store_types: object | None = None,
+        store: Any = None,
+        store_types: Any = None,
     ):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
@@ -302,8 +308,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 expected_worker_count=world_size,
             )
             logger.info(
-                "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d kernel blocks "
-                "(%d offloaded blocks x %d), namespace=%s, controller at "
+                "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d "
+                "kernel blocks (%d offloaded blocks x %d), namespace=%s, controller at "
                 "%s, all %d workers registered%s",
                 kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity,
@@ -326,6 +332,22 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_status = store_types.BlockStatus
         self._block_id_cls = store_types.RaidenBlockId
         self._raiden_id = self._store.raiden_id
+
+        # Eviction tracking and callback registration with host LRU cache.
+        self._eviction_lock = threading.Lock()
+        self._evicted_sub_hashes: dict[OffloadKey, set[int]] = {}
+        self._evicted_keys_queue: list[OffloadKey] = []
+        # `set_eviction_callback` landed in a recent Raiden wheel; on older
+        # wheels the manager still works, it just never reports removals.
+        # Say so rather than silently dropping BlockRemoved events.
+        self._supports_eviction_callback = hasattr(self._store, "set_eviction_callback")
+        if self._supports_eviction_callback:
+            self._store.set_eviction_callback(self._on_eviction)
+        else:
+            logger.warning(
+                "Raiden store predates set_eviction_callback(); host LRU "
+                "evictions will not be reported as KV cache events."
+            )
 
         # The connector's only cache-state bookkeeping, and it is
         # load-bearing: it bars a second admission of a key whose store job is
@@ -376,7 +398,7 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def _probe(
         self, sub_hashes: list[bytes], *, enable_global: bool = False
-    ) -> list[tuple[bytes, object]]:
+    ) -> list[tuple[bytes, Any]]:
         """Read the directory without laying claim to what it reports.
 
         `lookup` pins its hits by default so the answer cannot be evicted
@@ -436,8 +458,8 @@ class RaidenOffloadingManager(OffloadingManager):
         matched = self._probe(sub_hashes)
         if len(matched) < len(sub_hashes):
             logger.error(
-                "TPURaidenOffloadingConnector: admitted sub-hash vanished under its own "
-                "pin (%d of %d resident); failing the store job",
+                "TPURaidenOffloadingConnector: admitted sub-hash vanished under "
+                "its own pin (%d of %d resident); failing the store job",
                 len(matched),
                 len(sub_hashes),
             )
@@ -577,8 +599,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 if local_hashes:
                     self._store.release(local_hashes)
                 logger.warning(
-                    "TPURaidenOffloadingConnector: prepare_load lost sub-block %d of %d "
-                    "for request %s to eviction; the load job will fail "
+                    "TPURaidenOffloadingConnector: prepare_load lost sub-block "
+                    "%d of %d for request %s to eviction; the load job will fail "
                     "cleanly and the blocks recompute",
                     idx + 1,
                     len(sub_hashes),
@@ -625,13 +647,57 @@ class RaidenOffloadingManager(OffloadingManager):
             evicted_keys=[],
         )
 
-    def take_events(self):
-        # This manager produces no offloading events: Raiden's admission API
-        # does not report which entries an insert displaced, and `prepare_store`
-        # rediscovers them by probing the directory. Configurations that
-        # consume the event stream are refused at startup (see
-        # `TPURaidenStoreOffloadingSpec.__init__`).
-        return []
+    def _sub_hash_to_offload_key(
+        self, sub_hash: bytes
+    ) -> tuple[OffloadKey, int] | None:
+        """Helper to reverse a Raiden C++ sub_hash to (OffloadKey, sub_idx).
+
+        Structure of sub_hash:
+          [key_namespace] + [OffloadKey] + [4-byte sub_idx (big endian)]
+        """
+        ns_len = len(self._key_namespace)
+        if len(sub_hash) < ns_len + 5:
+            return None
+        if self._key_namespace and not sub_hash.startswith(self._key_namespace):
+            return None
+        key_bytes = sub_hash[ns_len:-4]
+        sub_idx = int.from_bytes(sub_hash[-4:], "big")
+        if sub_idx < 0 or sub_idx >= self._device_block_size_factor:
+            return None
+        return OffloadKey(key_bytes), sub_idx
+
+    def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
+        """Callback invoked by Raiden C++ store upon host LRU cache eviction."""
+        with self._eviction_lock:
+            for sub_hash in evicted_hashes:
+                parsed = self._sub_hash_to_offload_key(sub_hash)
+                if parsed is None:
+                    continue
+                key, sub_idx = parsed
+                sub_indices = self._evicted_sub_hashes.setdefault(key, set())
+                if not sub_indices:
+                    # Report eviction on the first sub-block loss: the logical
+                    # block is no longer intact or retrievable from host cache.
+                    self._evicted_keys_queue.append(key)
+                sub_indices.add(sub_idx)
+                if len(sub_indices) >= self._device_block_size_factor:
+                    self._evicted_sub_hashes.pop(key, None)
+
+    def take_events(self) -> list[OffloadingEvent]:
+        with self._eviction_lock:
+            if not self._evicted_keys_queue:
+                return []
+            evicted = list(self._evicted_keys_queue)
+            self._evicted_keys_queue.clear()
+
+        return [
+            OffloadingEvent(
+                keys=evicted,
+                medium=Medium.CPU,
+                removed=True,
+                locality=Locality.LOCAL,
+            )
+        ]
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         # Remote slices stashed by lookup() are consumed by prepare_load()
@@ -659,6 +725,10 @@ class RaidenOffloadingManager(OffloadingManager):
         return bool(self._admissions)
 
     def shutdown(self) -> None:
+        # Unregister first: the callback runs on a Raiden-owned thread and
+        # must not fire into a half-torn-down manager while jobs drain.
+        if self._supports_eviction_callback:
+            self._store.set_eviction_callback(None)
         if self._admissions:
             self.drain_jobs(set(self._admissions.keys()))
 
@@ -667,7 +737,8 @@ class RaidenOffloadingManager(OffloadingManager):
     def submit_store_job(
         self, job_id: int, keys: list[OffloadKey], device_block_ids: list[int]
     ) -> None:
-        """Admit and launch a store job after all worker ranks acknowledge the save fence.
+        """Admit and launch a store job after all worker ranks acknowledge
+        the save fence.
 
         Atomically admits the batch via insert (pinning pre-existing entries
         in-place, reserving capacity, rolling back on failure), then a
@@ -677,6 +748,9 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        with self._eviction_lock:
+            for key in keys:
+                self._evicted_sub_hashes.pop(key, None)
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_device_blocks(device_block_ids)
         slices = [
@@ -724,8 +798,8 @@ class RaidenOffloadingManager(OffloadingManager):
             # Synchronous launch failure: finalize immediately to revert the
             # admitted entries.
             logger.error(
-                "TPURaidenOffloadingConnector: store job %d: save() launch failed for %d "
-                "sub-blocks",
+                "TPURaidenOffloadingConnector: store job %d: save() launch failed "
+                "for %d sub-blocks",
                 job_id,
                 len(to_save),
             )
@@ -999,8 +1073,8 @@ class RaidenOffloadingManager(OffloadingManager):
         admission.retries_left -= 1
         if not self._store.save(retry_hashes):
             logger.error(
-                "TPURaidenOffloadingConnector: store job %d: save() retry launch failed "
-                "for %d sub-blocks; job fails",
+                "TPURaidenOffloadingConnector: store job %d: save() retry launch "
+                "failed for %d sub-blocks; job fails",
                 admission.job_id,
                 len(retry_hashes),
             )
@@ -1060,8 +1134,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 for job_id in live:
                     self._admissions[job_id].poisoned = True
                 logger.error(
-                    "TPURaidenOffloadingConnector: drain timed out after %.1fs; poisoned "
-                    "jobs %s (%d keys): their transfers are still in flight "
+                    "TPURaidenOffloadingConnector: drain timed out after %.1fs; "
+                    "poisoned jobs %s (%d keys): their transfers are still in flight "
                     "while their blocks are reused, so they will finalize "
                     "as failures and uncommitted entries revert",
                     _DRAIN_TIMEOUT_S,
@@ -1085,7 +1159,8 @@ def derive_offload_namespace(
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
 ) -> bytes:
-    """Derive a deterministic compatibility namespace prefixed to every store and registry key.
+    """Derive a deterministic compatibility namespace prefixed to every store and
+    registry key.
 
     Ensures cache keys never collide across incompatible engine deployments by
     hashing all configuration parameters that alter binary KV cache layout:
@@ -1188,21 +1263,19 @@ def _resolve_multi_shapes_kv_geometry(
     return block_size, per_block_shapes, kv_dtypes, block_size
 
 
-def resolve_kernel_geometry(
+def resolve_attention_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
-    """Resolve physical TPU kernel geometry: (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
+) -> tuple[AttentionSpec, int, tuple[int, ...]]:
+    """Resolves the attention KV cache geometry from `VllmConfig` and `KVCacheConfig`.
 
-    Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
-    (device view reconstruction) to guarantee exact geometry parity.
+    Returns `(attention_spec, kernel_block_size, per_block_shape)`.
 
     Supported architectures:
     - Dense models: Defined directly by the single group's full-attention spec.
     - Hybrid (Attention + Mamba) models: Requires TPU's unified block pool, where all
       groups share uniform, attention-sized page rows. Attention geometry defines the
       common row unit, allowing the dense sub-hash expansion to apply uniformly.
-    - Multi-kv-shape models: a model whose kv cache consists of multiple tensors with
-      different shapes, it's handled by `_resolve_multi_shapes_kv_geometry`.
+    Multi-kv-shape models are handled by `resolve_kernel_geometry`.
     """
     from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker.utils import select_common_block_size
@@ -1211,9 +1284,6 @@ def resolve_kernel_geometry(
 
     groups = kv_cache_config.kv_cache_groups
     assert groups, "TPURaidenOffloadingConnector: no KV cache groups"
-
-    if has_multi_shapes_kv_caches(vllm_config):
-        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
 
     if len(groups) == 1:
         spec0 = groups[0].kv_cache_spec
@@ -1228,8 +1298,8 @@ def resolve_kernel_geometry(
         )
 
         assert unified_kv_layout_enabled(vllm_config), (
-            "TPURaidenOffloadingConnector: hybrid models require the unified block pool "
-            "(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)"
+            "TPURaidenOffloadingConnector: hybrid models require the unified "
+            "block pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)"
         )
         attn_specs = [
             g.kv_cache_spec
@@ -1272,7 +1342,7 @@ def resolve_kernel_geometry(
         with set_current_vllm_config(vllm_config):
             attn_backend = get_attn_backend(
                 head_size=model_config.get_head_size(),
-                dtype=model_config.dtype,
+                dtype=cast("torch.dtype", model_config.dtype),
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
                 use_mla=model_config.use_mla,
             )
@@ -1295,11 +1365,42 @@ def resolve_kernel_geometry(
             cache_dtype_str=spec0.dtype,
         )
     per_block_shape = tuple(full_5d_shape[1:])
+    return spec0, kernel_block_size, per_block_shape
+
+
+def resolve_kernel_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
+    """Resolve physical TPU kernel geometry:
+    (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
+
+    Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
+    (device view reconstruction) to guarantee exact geometry parity.
+    """
+    if has_multi_shapes_kv_caches(vllm_config):
+        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
+    spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(
+        vllm_config, kv_cache_config
+    )
+    if unified_block_major_enabled(vllm_config):
+        # Register the block-major unified pool at scheduler-block granularity:
+        # each Raiden block corresponds to one manager block containing `split`
+        # kernel blocks per region so each block transfers as a single DMA.
+        from vllm_torchtpu.kv_cache_materializer import resolve_block_major_pool_layout
+
+        layout = resolve_block_major_pool_layout(kv_cache_config, kernel_block_size)
+        return (
+            spec0.block_size,
+            (layout.split,) + per_block_shape,
+            spec0.dtype,
+            spec0.block_size,
+        )
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
 class RaidenStoreOffloadingWorker(OffloadingWorker):
-    """Worker-side endpoint that registers local TPU HBM device buffers with the Controller.
+    """Worker-side endpoint that registers local TPU HBM device buffers with
+    the Controller.
 
     Acts as a passive DMA target for controller-driven transfers. Offload jobs are
     managed centrally by the controller and never dispatched to workers directly;
@@ -1362,20 +1463,25 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             )
             return
 
+        assert isinstance(per_block_shape, tuple)
+        assert isinstance(kv_dtype, torch.dtype)
         bytes_per_kernel_block = (
             int(np.prod(per_block_shape))
             * torch.empty(0, dtype=kv_dtype).element_size()
         )
 
         if block_major_contract is not None:
-            # Block-major registration: Register the entire multi-layer bundle as a single
-            # canonical storage ([kernel_blocks, F, *R]). Raiden views the bundle as 1 block array,
-            # executing 1 hardware DMA per block transfer rather than F DMAs.
+            # Block-major registration: Register the entire multi-layer bundle as a
+            # single canonical storage ([kernel_blocks, F, *R]). Raiden views the bundle
+            # as 1 block array, executing 1 hardware DMA per block transfer rather than
+            # F DMAs.
             #
             # Safety invariants:
-            # - Consistent row geometry: Validates that fragment_row_bytes matches physical row bytes.
-            # - Deployment protection: Layer-major peers registering fragment_row_bytes are rejected
-            #   by Raiden's block_array_bytes consistency check against our bundle_row_bytes.
+            # - Consistent row geometry: Validates that fragment_row_bytes matches
+            #   physical row bytes.
+            # - Deployment protection: Layer-major peers registering fragment_row_bytes
+            #   are rejected by Raiden's block_array_bytes consistency check against
+            #   our bundle_row_bytes.
             assert block_major_contract.fragment_row_bytes == bytes_per_kernel_block, (
                 "block-major contract kernel-row bytes "
                 f"{block_major_contract.fragment_row_bytes} != "
@@ -1525,8 +1631,8 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
 
     def submit_store(self, job_id, src_spec, dst_spec) -> bool:
         raise AssertionError(
-            "TPURaidenOffloadingConnector: submit_store reached a worker; transfers are "
-            "controller-driven and jobs must be stripped scheduler-side"
+            "TPURaidenOffloadingConnector: submit_store reached a worker; "
+            "transfers are controller-driven and jobs must be stripped scheduler-side"
         )
 
     def submit_load(self, job_id, src_spec, dst_spec) -> bool:
@@ -1549,7 +1655,8 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
 
 
 class TPURaidenStoreOffloadingSpec(OffloadingSpec):
-    """Configuration specification wiring the Raiden offloading manager and per-rank workers.
+    """Configuration specification wiring the Raiden offloading manager and
+    per-rank workers.
 
     Constructed directly by TPURaidenOffloadingConnector to encapsulate full engine
     and KV cache configurations, compute hardware block capacities, and configure
@@ -1562,30 +1669,19 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ):
-        # This connector emits no OffloadingEvents — displaced keys are
-        # rediscovered by `prepare_store`'s directory probe. Refuse
-        # configurations that expect KV cache events rather than silently
-        # dropping BlockRemoved notifications.
-        kv_events = vllm_config.kv_events_config
-        if kv_events is not None and kv_events.enable_kv_cache_events:
-            raise ValueError(
-                "TPURaidenOffloadingConnector: enable_kv_cache_events is not "
-                "supported: the Raiden offload manager does not emit "
-                "offloading events."
-            )
-
         super().__init__(config)
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
 
         assert config.cache.blocks_per_chunk == 1, (
-            "TPURaidenOffloadingConnector: requires blocks_per_chunk == 1 (one OffloadKey "
-            "= one scheduler device block); got "
+            "TPURaidenOffloadingConnector: requires blocks_per_chunk == 1 "
+            "(one OffloadKey = one scheduler device block); got "
             f"{config.cache.blocks_per_chunk}"
         )
         parallel = config.parallel
-        assert parallel.dcp_size == 1, (
-            "TPURaidenOffloadingConnector: does not support decode context parallelism"
+        assert not (parallel.pcp_size > 1 and parallel.dcp_size > 1), (
+            "TPURaidenOffloadingConnector: concurrent PCP and DCP is not "
+            f"supported: got pcp={parallel.pcp_size}, dcp={parallel.dcp_size}"
         )
         # Count all ranks in the distributed execution group (TP * PP * PCP)
         # for registration barriers, save fanout, and total host capacity sizing.
@@ -1620,30 +1716,32 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         self.device_block_size_factor = device_block_size // kernel_block_size
 
         # Derive the block-major layout contract (returns None if disabled).
-        # Ensures scheduler and worker ranks agree on namespace salt and bundle geometry ahead of tensor allocation.
+        # Ensures scheduler and worker ranks agree on namespace salt and bundle geometry
+        # ahead of tensor allocation.
         self.block_major_contract = resolve_block_major_contract(
             vllm_config, kv_cache_config
         )
 
-        # Verify PCP scaling invariant: scheduler chunks at the logical all-PCP-rank
+        # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
-        # scales by pcp_size so OffloadKey spans match scheduler blocks.
+        # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
         for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
+                expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (
-                    group.kv_cache_spec.block_size * parallel.pcp_size
+                    group.kv_cache_spec.block_size * expected_cp_scale
                 ), (
                     "TPURaidenOffloadingConnector: offloading group tokens_per_block="
                     f"{group_config.tokens_per_block} != rank-local "
                     f"block_size={group.kv_cache_spec.block_size} x "
-                    f"pcp={parallel.pcp_size}; the PCP-aware "
+                    f"cp={expected_cp_scale}; the CP-aware "
                     "OffloadingConfig build patch did not run"
                 )
 
         # Include context parallelism dimensions in key namespace only when CP
         # is active, preserving namespace compatibility for standard pcp=1 runs.
         cp_geometry: tuple[int, ...] = ()
-        if parallel.pcp_size > 1:
+        if parallel.pcp_size > 1 or parallel.dcp_size > 1:
             cp_geometry = (
                 parallel.pcp_size,
                 parallel.dcp_size,

@@ -210,6 +210,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
+        "_patch_vllm_dcp_fine_prefix_hits",
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
@@ -253,7 +254,7 @@ import vllm_torchtpu
 assert seen == ["jax._src.pallas.mosaic"]
 assert "vllm" not in sys.modules
 assert "torch_tpu" not in sys.modules
-"""
+"""  # noqa: E501
     result = subprocess.run(
         [sys.executable, "-c", code],
         env=env,

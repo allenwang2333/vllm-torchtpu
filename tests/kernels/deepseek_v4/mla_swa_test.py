@@ -19,6 +19,7 @@ import numpy as np
 from absl.testing import absltest, parameterized
 
 # Import the kernels
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import mla_swa
 
 
@@ -57,7 +58,8 @@ def get_dtype_packing(dtype):
 @jax.jit(donate_argnames="cache_kv")
 def update_kv_cache(
     new_kv: jax.Array,  # [num_tokens, actual_lkv_dim]
-    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -124,7 +126,8 @@ def reformat_swc_cache(swc_cache):
 def ref_implementation(
     q: jax.Array,  # [num_tokens, actual_num_q_heads, actual_lkv_dim]
     new_kv: jax.Array,  # [num_tokens, actual_lkv_dim]
-    cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    # [total_num_pages, page_size_per_kv_packing, kv_packing, lkv_dim]
+    cache_kv: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_seqs]
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -292,6 +295,13 @@ class CorrectnessTest(parameterized.TestCase):
         self.swc_page_indices = self.ref_page_indices
         self.kv_lens = jnp.zeros((self.batch_size,), dtype=jnp.int32)
 
+    # The uint8 slab cache as the kernel receives it; see Int32HostTest.
+    def to_host(self, cache):
+        return cache
+
+    def from_host(self, cache):
+        return cache
+
     def compare_cache(self, kv_lens):
         print("Comparing output cache...")
         # Construct valid token mask for cache comparison
@@ -352,25 +362,24 @@ class CorrectnessTest(parameterized.TestCase):
             non_causal_block=non_causal_block,
         )
 
-        out, self.swc_cache, l_sum, m = (
-            mla_swa.mla_sliding_window_ragged_paged_attention(
-                q,
-                new_kv,
-                self.swc_cache,
-                kv_lens,
-                self.swc_page_indices,
-                cu_q_lens,
-                distribution,
-                self.attention_sinks,
-                sm_scale=1.0,
-                sliding_window=self.sliding_window,
-                num_queries_per_block=num_queries_per_block,
-                num_kv_pages_per_block=num_kv_pages_per_block,
-                q_compute_block_size=2,
-                logical_page_size=self.page_size,
-                non_causal_block=non_causal_block,
-            )
+        out, swc_cache, l_sum, m = mla_swa.mla_sliding_window_ragged_paged_attention(
+            q,
+            new_kv,
+            self.to_host(self.swc_cache),
+            kv_lens,
+            self.swc_page_indices,
+            cu_q_lens,
+            distribution,
+            self.attention_sinks,
+            sm_scale=1.0,
+            sliding_window=self.sliding_window,
+            num_queries_per_block=num_queries_per_block,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            q_compute_block_size=2,
+            logical_page_size=self.page_size,
+            non_causal_block=non_causal_block,
         )
+        self.swc_cache = self.from_host(swc_cache)
 
         # Compare output
         print("Comparing output attention...")
@@ -519,6 +528,17 @@ class CorrectnessTest(parameterized.TestCase):
             num_queries_per_block=num_queries_per_block,
             num_kv_pages_per_block=num_kv_pages_per_block,
         )
+
+
+class Int32HostTest(CorrectnessTest):
+    """The SWA cache overlaid on the int32 CSA NoPE host array."""
+
+    def to_host(self, cache):
+        return csa_cache_layout.slabs_to_words(cache)
+
+    def from_host(self, cache):
+        assert cache.dtype == jnp.int32
+        return csa_cache_layout.words_to_slabs(cache)
 
 
 if __name__ == "__main__":

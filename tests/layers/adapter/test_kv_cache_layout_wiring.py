@@ -296,9 +296,10 @@ def test_head_dim_64_delegates_whatever_the_layout(monkeypatch, layout):
     HEAD_ALONG_SUBLANE pages, so the shape comes from the base class.
 
     HND + head_dim 64 is refused at config time instead (#825): the pages are
-    fine for the hd64 kernel, but `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()` still answers "HND"
-    process-wide, so `forward` reads a head width of 2 for a 64-wide head and
-    skips the padding it owes."""
+    fine for the hd64 kernel, but
+    `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()` still
+    answers "HND" process-wide, so `forward` reads a head width of 2 for a 64-wide head
+    and skips the padding it owes."""
     with _layout_env(monkeypatch, layout):
         assert BATCHED.get_kv_cache_shape(
             7, 128, 2, 64, BF16
@@ -402,7 +403,8 @@ def test_page_carries_head_width_where_forward_reads_it(monkeypatch, layout, hea
 
 
 def test_no_layout_lookup_on_the_compiled_forward_path():
-    """Nothing on the forward path may call `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()`.
+    """Nothing on the forward path may call
+    `get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()`.
 
     It asks the KV connector, which needs a current vLLM config; a compiled
     forward has none, and Dynamo traces into the accessor so its `lru_cache`
@@ -430,11 +432,8 @@ def test_no_layout_lookup_on_the_compiled_forward_path():
 
 
 def test_raiden_geometry_resolves_the_layout_under_a_config():
-    """`resolve_kernel_geometry` runs in the EngineCore, where no config is set.
-
-    Both calls resolve the KV cache layout, which falls through to the KV
-    connector and asserts without one.
-    """
+    """Verify `resolve_attention_geometry` sets the vLLM config context before
+    querying KV cache layout in the EngineCore process."""
     import ast
     import inspect
     import textwrap
@@ -442,7 +441,7 @@ def test_raiden_geometry_resolves_the_layout_under_a_config():
     from vllm_torchtpu.offload import raiden_store
 
     tree = ast.parse(
-        textwrap.dedent(inspect.getsource(raiden_store.resolve_kernel_geometry))
+        textwrap.dedent(inspect.getsource(raiden_store.resolve_attention_geometry))
     )
     guarded = set()
     for node in ast.walk(tree):
@@ -513,3 +512,86 @@ def test_shape_needs_no_config_for_the_probe_and_hd64(monkeypatch):
     assert BATCHED.get_kv_cache_shape(4, 128, 1, 64, BF16) == BASE.get_kv_cache_shape(
         4, 128, 1, 64, BF16
     )
+
+
+# The bound kernel must read the layout the layer allocated
+
+
+def _batched_impl():
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasBatchedRPAAttentionBackendImpl,
+    )
+
+    return PallasBatchedRPAAttentionBackendImpl(
+        num_heads=2,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bfloat16",
+    )
+
+
+def _build_rpa_kernel(impl, monkeypatch):
+    """Run `_build_rpa_kernel` without compiling; return the bound entry."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    captured = {}
+
+    class FakeOp:
+        def register_fake(self, _fake_impl):
+            pass
+
+    def fake_jax_op(_name, wrapped_fn, **_kwargs):
+        captured["fn"] = wrapped_fn
+        return FakeOp()
+
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(
+        PallasAttentionBackendImpl,
+        "_select_kernel_mesh",
+        staticmethod(lambda _mesh, _pcp: (object(), object(), None)),
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.attention.pallas.jax_op", fake_jax_op
+    )
+    mesh = SimpleNamespace(shape={"attn_dp": 1, "expert": 1, "model": 1})
+    with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=None):
+        impl._build_rpa_kernel(None, None, None)
+    return captured["fn"]
+
+
+def test_hnd_refuses_a_kernel_entry_that_ignores_the_layout(hnd, monkeypatch):
+    """A tp=1 speculative draft runs `_pallas_rpa_kernel_local`, which takes no
+    `kv_layout`."""
+    from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
+    impl = _batched_impl()
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    with pytest.raises(NotImplementedError, match="takes no kv_layout"):
+        _build_rpa_kernel(impl, monkeypatch)
+
+
+def test_hnd_binds_kv_layout_into_the_batched_kernel_entry(hnd, monkeypatch):
+    impl = _batched_impl()
+    assert impl._pool_is_seq_along_lane
+    bound = _build_rpa_kernel(impl, monkeypatch)
+    assert bound.keywords["kv_layout"] is KVLayout.SEQ_ALONG_LANE
+
+
+def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
+    """`_pallas_rpa_kernel_local` reads HEAD_ALONG_SUBLANE, the default layout."""
+    from vllm_torchtpu.layers.adapter.attention import _pallas_rpa_kernel_local
+
+    impl = _batched_impl()
+    impl._kernel_entry = _pallas_rpa_kernel_local
+    impl._kernel_op_prefix = "pallas::rpa_kernel_local"
+    bound = _build_rpa_kernel(impl, monkeypatch)
+    assert "kv_layout" not in bound.keywords

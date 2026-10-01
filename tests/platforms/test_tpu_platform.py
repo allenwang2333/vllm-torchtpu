@@ -399,6 +399,33 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_hnd_refuses_head_dim_64(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        head_size,
+        refused,
+    ):
+        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND."""
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
+        vllm_config.model_config.get_head_size = lambda: head_size
+
+        if refused:
+            with pytest.raises(NotImplementedError, match="head_dim==64"):
+                TpuPlatform.check_and_update_config(vllm_config)
+        else:
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
@@ -722,8 +749,8 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
     """Verify TPU KV connectors are registered in the factory by name idempotently.
 
     When loaded dynamically via module paths, connectors are not registered by name
-    in KVConnectorFactory. However, the API server's multi-connector metrics path resolves
-    child connectors via get_connector_class_by_name().
+    in KVConnectorFactory. However, the API server's multi-connector metrics path
+    resolves child connectors via get_connector_class_by_name().
 
     This test verifies that _register_tpu_kv_connectors() populates the name registry
     safely across repeated invocations without raising duplicate-registration errors.
