@@ -572,16 +572,13 @@ def fused_conv1d_gdn(
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
-    # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
-    conv_state_shape = None
-    recurrent_state_shape = None
     if not is_shared:
-        conv_state_shape = states[0].shape
-        rec_state = states[1]
-        if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
-            recurrent_state_shape = rec_state.shape
-            rec_state = rec_state.reshape(-1, n_v * (d_k // 2), 2, d_v)
-        states = (states[0].reshape(-1, kernel_size - 1, 1, dim), rec_state)
+        # Callers pass the layout the kernel moves: conv ends in (1, dim) and
+        # recurrent in (packing, lanes), one block per row.
+        packing = 4 // jnp.dtype(recurrent_dtype).itemsize
+        assert states[0].shape[-2:] == (1, dim), states[0].shape
+        assert states[1].shape[-2:] == (packing, num_lanes), states[1].shape
+        assert states[0].shape[0] == states[1].shape[0], (states[0].shape, states[1].shape)
 
     # Step 3: Weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
@@ -724,9 +721,4 @@ def fused_conv1d_gdn(
         out_act, out_states = call_kernel(out_states, out_act, config.GDNMode.PER_SEQ)
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-    # TODO(kyuyeunk): Ensure no reshape is needed and convert to assertion.
-    if conv_state_shape is not None:
-        out_states = (out_states[0].reshape(conv_state_shape), out_states[1])
-    if recurrent_state_shape is not None:
-        out_states = (out_states[0], out_states[1].reshape(recurrent_state_shape))
     return out_states, out_act

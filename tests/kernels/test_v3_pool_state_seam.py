@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """GDN V3 pooled state seam: plan math, byte compatibility, equivalence.
 
 `TestV3StateSourcePlan` and the source-hygiene test are pure Python/CPU.
@@ -241,9 +255,14 @@ def _run_roundtrip(pool, idx, kwargs):
     """The pre-seam pooled V3 path."""
     ssm, conv = _read_states(pool, idx)
     identity = jnp.arange(idx.shape[0], dtype=jnp.int32)
+    conv_4d = jnp.expand_dims(conv, axis=2)
+    packing = 4 // jnp.dtype(ssm.dtype).itemsize
+    ssm_packed = ssm.reshape(ssm.shape[0], -1, packing, 128)
     (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
-        states=(conv, ssm), state_indices=identity, **kwargs
+        states=(conv_4d, ssm_packed), state_indices=identity, **kwargs
     )
+    new_conv = new_conv.reshape(conv.shape)
+    new_ssm = new_ssm.reshape(ssm.shape)
     return _write_states(pool, new_ssm, new_conv, idx), out
 
 
@@ -604,9 +623,16 @@ class TestPooledSpecWindows:
                 num_spec_tokens=self.NUM_SPEC,
                 read_offsets=step["read_offsets"],
             )
+            dense_conv_4d = jnp.expand_dims(dense_conv, axis=2)
+            packing = 4 // jnp.dtype(dense_rec.dtype).itemsize
+            dense_rec_packed = dense_rec.reshape(dense_rec.shape[0], -1, packing, 128)
             (dense_conv, dense_rec), out_dense = wrapper.fused_conv1d_gdn(
-                states=(dense_conv, dense_rec), state_indices=dense_base, **kwargs
+                states=(dense_conv_4d, dense_rec_packed),
+                state_indices=dense_base,
+                **kwargs,
             )
+            dense_conv = dense_conv.reshape(dense_conv.shape[0], KERNEL_SIZE - 1, DIM)
+            dense_rec = dense_rec.reshape(dense_rec.shape[0], N_V, D_K, D_V)
             pool_shape = pool.shape
             pool, out_pooled = wrapper.fused_conv1d_gdn(
                 states=_merge(pool, split),
@@ -698,9 +724,14 @@ class TestPooledBf16Recurrent:
 
     def _tuple(self, ssm, conv, kwargs):
         ident = jnp.arange(ssm.shape[0], dtype=jnp.int32)
+        conv_4d = jnp.expand_dims(conv, axis=2)
+        packing = 4 // jnp.dtype(ssm.dtype).itemsize
+        ssm_packed = ssm.reshape(ssm.shape[0], -1, packing, 128)
         (new_conv, new_ssm), out = wrapper.fused_conv1d_gdn(
-            states=(conv, ssm), state_indices=ident, **kwargs
+            states=(conv_4d, ssm_packed), state_indices=ident, **kwargs
         )
+        new_conv = new_conv.reshape(conv.shape)
+        new_ssm = new_ssm.reshape(ssm.shape)
         return new_ssm, new_conv, out
 
     def _pooled(self, ssm, conv, idx, kwargs, write=_write_states_bf16):
@@ -793,12 +824,21 @@ class TestPooledBf16Recurrent:
                 num_spec_tokens=spec.NUM_SPEC,
                 read_offsets=step["read_offsets"],
             )
+            conv16_4d = jnp.expand_dims(conv16, axis=2)
+            rec16_packed = rec16.reshape(num_slots, -1, 2, 128)
             (conv16, rec16), out16 = wrapper.fused_conv1d_gdn(
-                states=(conv16, rec16), state_indices=base, **kwargs
+                states=(conv16_4d, rec16_packed), state_indices=base, **kwargs
             )
+            conv16 = conv16.reshape(conv16_4d.shape[:2] + (DIM,))
+            rec16 = rec16.reshape(num_slots, N_V, D_K, D_V)
+
+            conv32_4d = jnp.expand_dims(conv32, axis=2)
+            rec32_packed = rec32.reshape(num_slots, -1, 1, 128)
             (conv32, rec32), out32 = wrapper.fused_conv1d_gdn(
-                states=(conv32, rec32), state_indices=base, **kwargs
+                states=(conv32_4d, rec32_packed), state_indices=base, **kwargs
             )
+            conv32 = conv32.reshape(conv32_4d.shape[:2] + (DIM,))
+            rec32 = rec32.reshape(num_slots, N_V, D_K, D_V)
             rec32 = rec32.astype(jnp.bfloat16)
             self._assert_same((rec16, conv16, out16), (rec32, conv32, out32))
             rec32 = rec32.astype(jnp.float32)
@@ -829,6 +869,7 @@ class TestPooledBf16Recurrent:
         assert not np.array_equal(np.asarray(got[2]), np.asarray(want[2]))
 
     def test_bf16_conv_state_is_rejected(self):
+        idx = jnp.array([1], dtype=jnp.int32)
         ssm, conv = self._states(50, 1)
         kwargs = _rand_inputs(51, 1) | dict(
             query_start_loc=jnp.arange(2),
@@ -836,7 +877,14 @@ class TestPooledBf16Recurrent:
             seq_lens=jnp.array([3], dtype=jnp.int32),
         )
         with pytest.raises(NotImplementedError, match="fp32 conv state"):
-            self._tuple(ssm, conv.astype(jnp.bfloat16), kwargs)
+            pool = _write_states_bf16(_garbage_pool(0), ssm, conv, idx)
+            wrapper.fused_conv1d_gdn(
+                states=_merge(pool),
+                state_indices=idx,
+                conv_dtype=jnp.bfloat16,
+                recurrent_dtype=jnp.bfloat16,
+                **kwargs,
+            )
 
 
 class TestPooledCallerV3:
@@ -864,9 +912,12 @@ class TestPooledCallerV3:
         )
 
         conv_init, recurrent_init = conv.copy(), recurrent.copy()
+        conv_4d = jnp.expand_dims(conv, axis=2)
+        rec_packed = recurrent.reshape(n, -1, 1, 128)
         (_, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
-            states=(conv, recurrent), state_indices=dense_idx, **kwargs
+            states=(conv_4d, rec_packed), state_indices=dense_idx, **kwargs
         )
+        dense_ssm = dense_ssm.reshape(recurrent.shape)
         pooled = functools.partial(
             gdn_attention.run_jax_gdn_attention_pooled_local,
             mixed_qkv=kwargs["qkv"],
@@ -918,9 +969,12 @@ class TestPooledCallerV3:
             return _unpack_bf16_rows(words.reshape(n, N_V, D_K // 2, D_V))
 
         pool16 = _on_cpu(_seed16, jnp.zeros_like(pool), recurrent16, pool_idx)
+        conv_init_4d = jnp.expand_dims(conv_init, axis=2)
+        rec16_packed = recurrent16.reshape(n, -1, 2, 128)
         (_, dense_ssm16), dense_out16 = wrapper.fused_conv1d_gdn(
-            states=(conv_init, recurrent16), state_indices=dense_idx, **kwargs
+            states=(conv_init_4d, rec16_packed), state_indices=dense_idx, **kwargs
         )
+        dense_ssm16 = dense_ssm16.reshape(recurrent16.shape)
         new_pool16, pooled_out16 = pooled(
             recurrent_state=pool16, recurrent_state_dtype=jnp.bfloat16
         )
@@ -1010,8 +1064,10 @@ class TestPooledCallerV3:
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
             seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
         )
+        conv_4d = jnp.expand_dims(conv, axis=2)
+        rec_packed = recurrent_f32.reshape(n, -1, 1, 128)
         (dense_conv, dense_ssm), dense_out = wrapper.fused_conv1d_gdn(
-            states=(conv, recurrent_f32),
+            states=(conv_4d, rec_packed),
             state_indices=dense_idx,
             **kwargs,
         )

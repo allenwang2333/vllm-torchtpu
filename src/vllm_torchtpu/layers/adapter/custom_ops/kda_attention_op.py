@@ -368,13 +368,20 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         read_offsets = slot_read_offsets[state_indices] if num_spec_tokens > 0 else None
 
         def run_kernel(conv_in, rec_in, *, batched_only=False, prefill_only=False):
-            return gdn_wrapper.fused_conv1d_gdn(
+            packing = 4 // rec_in.dtype.itemsize
+            conv_packed = conv_in[:, :, None, :] if conv_in.ndim == 3 else conv_in
+            rec_packed = (
+                rec_in.reshape(rec_in.shape[0], -1, packing, 128)
+                if rec_in.ndim == 4
+                else rec_in
+            )
+            (new_conv, new_rec), out = gdn_wrapper.fused_conv1d_gdn(
                 qkv=mixed_qkv,
                 # Raw: the kernel applies sigmoid to `b` and the gate activation
                 # to `a` itself.
                 b=beta,
                 a=raw_gate,
-                states=(conv_in, rec_in),
+                states=(conv_packed, rec_packed),
                 conv_weight=conv_weight_flat,
                 # Kimi's short convolution is bias-free.
                 conv_bias=None,
@@ -400,6 +407,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 batched_only=batched_only,
                 prefill_only=prefill_only,
             )
+            return (new_conv.reshape(conv_in.shape), new_rec.reshape(rec_in.shape)), out
 
         if num_spec_tokens > 0:
             window_end = window_distribution[0]
@@ -422,7 +430,13 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 prefill_out,
             )
         else:
-            (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
+            packing = 4 // recurrent_state.dtype.itemsize
+            (new_conv, new_rec), out = run_kernel(
+                conv_state[:, :, None, :],
+                recurrent_state.reshape(recurrent_state.shape[0], -1, packing, 128),
+            )
+            new_conv_state = new_conv.reshape(conv_state.shape)
+            new_pool = new_rec.reshape(recurrent_state.shape)
 
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(

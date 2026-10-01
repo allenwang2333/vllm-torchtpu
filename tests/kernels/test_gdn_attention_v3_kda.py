@@ -387,11 +387,17 @@ class KdaAttentionV3Test(parameterized.TestCase):
             q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
         )
 
+        packing = 4 // jnp.dtype(recurrent_state.dtype).itemsize
+        conv_state_4d = jnp.expand_dims(conv_state, axis=2)
+        rec_state_packed = recurrent_state.reshape(
+            num_blocks, -1, packing, 128
+        )
+
         common_kwargs = dict(
             qkv=qkv,
             b=b,
             a=a,
-            states=(conv_state, recurrent_state),
+            states=(conv_state_4d, rec_state_packed),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=a_log,
@@ -409,7 +415,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
             gate_lower_bound=gate_lower_bound,
         )
 
-        (_, ref_state), ref_out = kda_attention_ref(**common_kwargs)
+        ref_kwargs = dict(common_kwargs, states=(conv_state, recurrent_state))
+        (_, ref_state), ref_out = kda_attention_ref(**ref_kwargs)
 
         kda_jitted = jax.jit(
             wrapper.fused_conv1d_gdn,
@@ -438,7 +445,7 @@ class KdaAttentionV3Test(parameterized.TestCase):
         # d_k**-0.5 scale to damp it, and `v - prediction` cancels hard on a
         # handful of entries. Still 2x tighter than the GDN v3 suite.
         np.testing.assert_allclose(
-            np.asarray(out_state, np.float64),
+            np.asarray(out_state.reshape(ref_state.shape), np.float64),
             np.asarray(ref_state, np.float64),
             rtol=2e-2,
             atol=1e-2,
@@ -508,11 +515,17 @@ class KdaAttentionV3Test(parameterized.TestCase):
         a_log = jax.random.normal(next(rngs), (n_v,))
         dt_bias = jax.random.normal(next(rngs), (n_v, d_k))
 
+        packing = 4 // jnp.dtype(recurrent_state.dtype).itemsize
+        conv_state_4d = jnp.expand_dims(conv_state, axis=2)
+        rec_state_packed = recurrent_state.reshape(
+            num_blocks, -1, packing, 128
+        )
+
         common_kwargs = dict(
             qkv=qkv,
             b=b,
             a=a,
-            states=(conv_state, recurrent_state),
+            states=(conv_state_4d, rec_state_packed),
             conv_weight=conv_weight,
             conv_bias=None,
             a_log=a_log,
@@ -529,8 +542,9 @@ class KdaAttentionV3Test(parameterized.TestCase):
             gate_lower_bound=-5.0,
         )
 
+        ref_kwargs = dict(common_kwargs, states=(conv_state, recurrent_state))
         (ref_conv, ref_rec), ref_out = kda_attention_spec_ref(
-            **common_kwargs,
+            **ref_kwargs,
             read_offsets=read_offsets_arr,
             num_spec_seqs=num_seqs,
         )
@@ -544,6 +558,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
             batched_only=True,
             attention_mode=config.AttentionMode.KDA,
         )
+        new_conv = new_conv.reshape(conv_state.shape)
+        new_rec = new_rec.reshape(recurrent_state.shape)
 
         np.testing.assert_allclose(out, ref_out, rtol=2e-2, atol=5e-3)
         for slot in range(num_blocks):
@@ -588,8 +604,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
             b=jnp.zeros((8, n_v)),
             a=jnp.zeros((8, n_v * d_k)),
             states=(
-                jnp.zeros((9, kernel_size - 1, dim_size)),
-                jnp.zeros((9, n_v, d_k, d_v)),
+                jnp.zeros((9, kernel_size - 1, 1, dim_size)),
+                jnp.zeros((9, n_v * d_k * d_v // 128, 1, 128)),
             ),
             conv_weight=jnp.zeros((dim_size, 1, kernel_size)),
             conv_bias=None,

@@ -251,21 +251,22 @@ class TestProductionShapeDenseVsUnifiedPool:
             0.01,
         ).astype(jnp.float32)
 
+        packing = 4 // jnp.dtype(jnp.float32).itemsize
         dense_conv = (
             jnp.zeros(
-                (BENCH_NUM_MGR, BENCH_KERNEL_SIZE - 1, BENCH_DIM),
+                (BENCH_NUM_MGR, BENCH_KERNEL_SIZE - 1, 1, BENCH_DIM),
                 dtype=jnp.float32,
             )
-            .at[1]
+            .at[1, :, 0, :]
             .set(initial_conv[0])
         )
         dense_recurrent = (
             jnp.zeros(
-                (BENCH_NUM_MGR, BENCH_N_V, BENCH_D_K, BENCH_D_V),
+                (BENCH_NUM_MGR, BENCH_N_V * BENCH_D_K * BENCH_D_V // (128 * packing), packing, 128),
                 dtype=jnp.float32,
             )
             .at[1]
-            .set(initial_recurrent[0])
+            .set(initial_recurrent[0].reshape(-1, packing, 128))
         )
         pool = _benchmark_write_states(
             jnp.zeros(BENCH_POOL_SHAPE, dtype=jnp.int8),
@@ -298,6 +299,8 @@ class TestProductionShapeDenseVsUnifiedPool:
         )
 
         (dense_final_conv, dense_final_recurrent), dense_outputs = dense_result
+        dense_final_conv = dense_final_conv.reshape(BENCH_NUM_MGR, BENCH_KERNEL_SIZE - 1, BENCH_DIM)
+        dense_final_recurrent = dense_final_recurrent.reshape(BENCH_NUM_MGR, BENCH_N_V, BENCH_D_K, BENCH_D_V)
         pooled_final, pooled_outputs = pooled_result
         pooled_final_conv, pooled_final_recurrent = _benchmark_read_states(pooled_final)
         _block_until_ready((pooled_final_conv, pooled_final_recurrent))

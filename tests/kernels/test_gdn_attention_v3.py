@@ -399,11 +399,17 @@ class GDNAttentionTest(parameterized.TestCase):
             q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
         )
 
+        packing = 4 // jnp.dtype(recurrent_state.dtype).itemsize
+        conv_state_4d = jnp.expand_dims(conv_state, axis=2)
+        recurrent_state_packed = recurrent_state.reshape(
+            num_blocks, -1, packing, 128
+        )
+
         common_kwargs = dict(
             qkv=mixed_qkv,
             b=b,
             a=a,
-            states=(conv_state, recurrent_state),
+            states=(conv_state_4d, recurrent_state_packed),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=A_log,
@@ -420,7 +426,8 @@ class GDNAttentionTest(parameterized.TestCase):
         )
 
         # Run ref
-        new_states_ref, output_ref = gdn_attention_ref(**common_kwargs)
+        ref_kwargs = dict(common_kwargs, states=(conv_state, recurrent_state))
+        new_states_ref, output_ref = gdn_attention_ref(**ref_kwargs)
 
         # Run chunked
         new_states_chunked, output_chunked = gdn_attention_jitted(**common_kwargs)
@@ -428,10 +435,16 @@ class GDNAttentionTest(parameterized.TestCase):
         # Compare results
         np.testing.assert_allclose(output_chunked, output_ref, rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(
-            new_states_chunked[0], new_states_ref[0], rtol=2e-2, atol=2e-2
+            new_states_chunked[0].reshape(new_states_ref[0].shape),
+            new_states_ref[0],
+            rtol=2e-2,
+            atol=2e-2,
         )
         np.testing.assert_allclose(
-            new_states_chunked[1], new_states_ref[1], rtol=2e-2, atol=2e-2
+            new_states_chunked[1].reshape(new_states_ref[1].shape),
+            new_states_ref[1],
+            rtol=2e-2,
+            atol=2e-2,
         )
 
     @parameterized.named_parameters(
@@ -527,11 +540,17 @@ class GDNAttentionTest(parameterized.TestCase):
             ],
         )
 
+        packing = 4 // jnp.dtype(recurrent_state.dtype).itemsize
+        conv_state_4d = jnp.expand_dims(conv_state, axis=2)
+        recurrent_state_packed = recurrent_state.reshape(
+            num_blocks, -1, packing, 128
+        )
+
         (new_conv, new_rec), output = run_jitted(
             mixed_qkv,
             b,
             a,
-            (conv_state, recurrent_state),
+            (conv_state_4d, recurrent_state_packed),
             conv_weight,
             conv_bias,
             A_log,
@@ -548,6 +567,8 @@ class GDNAttentionTest(parameterized.TestCase):
             kernel_size=kernel_size,
             num_spec_tokens=num_spec_tokens,
         )
+        new_conv = new_conv.reshape(conv_state.shape)
+        new_rec = new_rec.reshape(recurrent_state.shape)
 
         # Reference: spec windows token-by-token with checkpoints.
         (ref_conv, ref_rec), ref_output = gdn_attention_spec_ref(
@@ -711,9 +732,19 @@ class GDNAttentionTest(parameterized.TestCase):
             kernel_size=kernel_size,
         )
 
+        conv_fresh_4d = jnp.expand_dims(conv_state_fresh, axis=2)
+        conv_stale_4d = jnp.expand_dims(conv_state_stale, axis=2)
+        packing = 4 // jnp.dtype(recurrent_state_fresh.dtype).itemsize
+        rec_fresh_packed = recurrent_state_fresh.reshape(
+            num_blocks, -1, packing, 128
+        )
+        rec_stale_packed = recurrent_state_stale.reshape(
+            num_blocks, -1, packing, 128
+        )
+
         # Reference run: fresh-zero slots.
         (new_conv_fresh, new_rec_fresh), output_fresh = run_jitted(
-            states=(conv_state_fresh, recurrent_state_fresh),
+            states=(conv_fresh_4d, rec_fresh_packed),
             **common_kwargs,
         )
         # Stale-slot run: same inputs, but the slots already contain a
@@ -721,7 +752,7 @@ class GDNAttentionTest(parameterized.TestCase):
         # masks that out; outputs and the writeback at the active slots
         # must match the fresh-zero run.
         (new_conv_stale, new_rec_stale), output_stale = run_jitted(
-            states=(conv_state_stale, recurrent_state_stale),
+            states=(conv_stale_4d, rec_stale_packed),
             **common_kwargs,
         )
 
@@ -785,8 +816,11 @@ class GDNAttentionTest(parameterized.TestCase):
         mixed_qkv_a = mixed_qkv_full[:half]
         mixed_qkv_b = mixed_qkv_full[half:]
 
-        conv_state_zero = jnp.zeros((num_blocks, kernel_size - 1, conv_dim))
-        recurrent_state_zero = jnp.zeros((num_blocks, n_v, kq_head_dim, v_head_dim))
+        conv_state_zero = jnp.zeros((num_blocks, kernel_size - 1, 1, conv_dim))
+        packing = 4 // jnp.dtype(jnp.float32).itemsize
+        recurrent_state_zero = jnp.zeros(
+            (num_blocks, n_v * kq_head_dim * v_head_dim // (128 * packing), packing, 128)
+        )
 
         run_jitted = jax.jit(
             wrapper.fused_conv1d_gdn,
