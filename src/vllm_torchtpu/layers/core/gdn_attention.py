@@ -38,7 +38,10 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_mesh_shape_product
+
+logger = init_logger(__name__)
 
 _GDN_TP_AXIS_NAME = "tp"
 
@@ -845,6 +848,14 @@ def _build_v3_pool_state_plan(
     )
 
 
+@functools.cache
+def gdn_pooled_form() -> str:
+    """The V3 pooled kernel form selected by `TPU_GDN_TABLES_IN_KERNEL`."""
+    form = "tables" if tpu_envs.TPU_GDN_TABLES_IN_KERNEL else "two_calls"
+    logger.info("GDN pooled kernel form: %s", form)
+    return form
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -869,6 +880,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    gdn_form: str = "two_calls",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -921,6 +933,7 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        gdn_form=gdn_form,
     )
     return recurrent_state, output
 
@@ -950,6 +963,7 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    gdn_form: str = "two_calls",
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -982,6 +996,7 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        gdn_form: V3 pooled kernel form, from `gdn_pooled_form()`.
 
     Returns:
         A tuple containing:
@@ -1033,6 +1048,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        gdn_form=gdn_form,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

@@ -532,6 +532,31 @@ class TestVllmGatedDeltaNetAttention:
             expected_dtype
         )
 
+    @pytest.mark.parametrize("form", ["two_calls", "tables"])
+    def test_pooled_op_binds_the_gdn_form_at_build(self, form, cpu_vllm_config_context):
+        """The kernel form is resolved outside jit and keys the shared op."""
+        attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+        captured = {}
+
+        def fake_jax_op(_name, wrapped_fn, **_kwargs):
+            captured["wrapped_fn"] = wrapped_fn
+            return MagicMock()
+
+        module = "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch.dict(gdn_attention_op._shared_gdn_ops, clear=True),
+            patch(module + "pallas.jax_op", side_effect=fake_jax_op),
+            patch(module + "gdn_pooled_form", return_value=form),
+        ):
+            attn._build_pooled_gdn_op()
+            [(_kind, key)] = gdn_attention_op._shared_gdn_ops
+        with patch(module + "gdn_attention_pooled_core_tpu") as mock_core:
+            captured["wrapped_fn"](*([MagicMock()] * 12))
+
+        assert mock_core.call_args.kwargs["gdn_form"] == form
+        assert form in key
+
     def test_pooled_impl_forwards_every_operand_the_forward_passes(
         self, cpu_vllm_config_context
     ):
@@ -1626,3 +1651,18 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+@pytest.mark.parametrize(("env", "form"), [(None, "two_calls"), ("1", "tables")])
+def test_gdn_pooled_form_follows_the_tables_in_kernel_flag(monkeypatch, env, form):
+    from vllm_torchtpu.layers.core import gdn_attention
+
+    if env is None:
+        monkeypatch.delenv("TPU_GDN_TABLES_IN_KERNEL", raising=False)
+    else:
+        monkeypatch.setenv("TPU_GDN_TABLES_IN_KERNEL", env)
+    gdn_attention.gdn_pooled_form.cache_clear()
+    try:
+        assert gdn_attention.gdn_pooled_form() == form
+    finally:
+        gdn_attention.gdn_pooled_form.cache_clear()
