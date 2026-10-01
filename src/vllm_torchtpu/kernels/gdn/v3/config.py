@@ -122,6 +122,11 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Stream states through separate refill and write-back VMEM buffers
+    # (the refill holding only window position 0) instead of one shared
+    # input_output buffer, so a tile's refill never waits for the write-back
+    # of the tile two before it. Costs VMEM; see `split_state_fits`.
+    split_state: bool = False
 
     @property
     def chunk_size(self) -> int:
