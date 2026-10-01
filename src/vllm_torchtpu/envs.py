@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_SC_TOPK_FUSED_PAYLOAD: bool = False
+    TPU_INDEXER_TOPK_SINGLE_WRITE: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
@@ -673,6 +675,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Fold the SparseCore top-k's index gathers (the two-stage candidate map
+    # and, under DCP, `resolve_owned_winners`' take_along_axis) into the top-k
+    # kernel's emit instead of separate offloaded gathers. Same indices.
+    "TPU_SC_TOPK_FUSED_PAYLOAD": env_bool("TPU_SC_TOPK_FUSED_PAYLOAD", default=False),
+    # Indexer writes its top-k into the shared `topk_indices_buffer` with one
+    # full-width row update and hands the fresh rows to attention, instead of
+    # a -1 fill plus a partial-width write whose result attention re-reads.
+    "TPU_INDEXER_TOPK_SINGLE_WRITE": env_bool(
+        "TPU_INDEXER_TOPK_SINGLE_WRITE", default=False
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
