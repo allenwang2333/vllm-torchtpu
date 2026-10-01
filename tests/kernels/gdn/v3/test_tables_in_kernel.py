@@ -636,6 +636,42 @@ class TestTablesFormVmem:
         assert limit == batched + _carry_bytes(shard)
         assert limit <= capacity
 
+    @pytest.mark.parametrize(("rows", "max_seqs"), [(8, 8), (48, 48)])
+    def test_split_state_fits_the_one_call_at_tp8(self, monkeypatch, rows, max_seqs):
+        # The rows and local v-heads `gdn_pooled_form_for_step` selects the
+        # tables form at. Both passes keep split buffers and the decode tile;
+        # each pass's buffers fit its own share, the batched pass's beside
+        # the carry.
+        from vllm_torchtpu.kernels.gdn.v3 import memory_ref
+
+        seen = []
+        original = tables_in_kernel.vmem_limit_bytes
+
+        def capture(cfg_b, cfg_p):
+            seen.append((cfg_b, cfg_p))
+            return original(cfg_b, cfg_p)
+
+        monkeypatch.setattr(tables_in_kernel, "vmem_limit_bytes", capture)
+        fits = []
+        original_fits = memory_ref.split_state_fits
+
+        def capture_fits(cfg, conv_state, recurrent_state):
+            ok = original_fits(cfg, conv_state, recurrent_state)
+            fits.append((cfg.mode, cfg.tile_size, ok))
+            return ok
+
+        monkeypatch.setattr(memory_ref, "split_state_fits", capture_fits)
+        [(name, limit)] = _prod_tables_calls(monkeypatch, "TP8", rows, max_seqs)
+        assert name == "fused_conv1d_gdn_batched_tables_in_kernel"
+        [(cfg_b, cfg_p)] = seen
+        assert cfg_b.split_state and cfg_b.tile_size == 4
+        assert cfg_p.split_state
+        assert (config.GDNMode.BATCHED, 4, True) in fits
+        assert (config.GDNMode.PER_SEQ, cfg_p.tile_size, True) in fits
+        assert limit == cfg_b.get_vmem_limit_bytes() + _carry_bytes("TP8")
+        assert limit >= cfg_p.get_vmem_limit_bytes()
+        assert limit <= pltpu.get_tpu_info().vmem_capacity_bytes
+
     def test_spec_keeps_one_call(self, monkeypatch):
         [(name, limit)] = _prod_tables_calls(monkeypatch, "DP8", 32, 8, 3)
         assert name == "fused_conv1d_gdn_batched_w4_tables_in_kernel"

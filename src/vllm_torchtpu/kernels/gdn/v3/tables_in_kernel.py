@@ -111,6 +111,11 @@ def vmem_limit_bytes(cfg_b: config.GDNConfig, cfg_p: config.GDNConfig) -> int:
     Each pass's pipeline buffers are scoped to that pass, so the call peaks at
     one pass's limit plus what of the other pass stays live across it: the
     per-sequence carry scratch, held through the batched pass.
+
+    Each pass's `cfg.split_state` is chosen against that pass's own limit
+    (`memory_ref.split_state_fits`, which counts the per-sequence pass's
+    carry), and the carry is added on top of the batched pass's limit here,
+    so split buffers fit inside the one call wherever they fit in two.
     """
     info = pltpu.get_tpu_info()
     carry = sum(
