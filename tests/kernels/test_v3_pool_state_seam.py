@@ -768,6 +768,39 @@ class TestTablesFormMatchesTwoCalls:
         )
         self._compare(pool, ckpt_indices[:, 0], kwargs)
 
+    def test_spec_checkpoints_repeat_exactly(self):
+        # The tables form of TestPooledSpecWindows' repeat test: several tiles
+        # of verify windows with non-zero read offsets, where four sequences
+        # per tile wrote nondeterministic checkpoint-0 states.
+        num_spec, window, n = 3, 4, 16
+        ckpt_indices = (
+            jnp.arange(1, n * window + 1, dtype=jnp.int32).reshape(window, n).T
+        )
+        pool = self._spec_pool(65, ckpt_indices, n * window + 1)
+        kwargs = _rand_inputs(66, n * window) | dict(
+            query_start_loc=jnp.arange(0, n * window + 1, window, dtype=jnp.int32),
+            distribution=jnp.array([n, n, n], dtype=jnp.int32),
+            seq_lens=jnp.full((n,), 9, dtype=jnp.int32),
+            read_offsets=jnp.asarray([i % window for i in range(n)], jnp.int32),
+            ckpt_indices=ckpt_indices,
+            num_spec_tokens=num_spec,
+        )
+        runs = [
+            wrapper.fused_conv1d_gdn(
+                conv_state=None,
+                recurrent_state=None,
+                state_indices=ckpt_indices[:, 0],
+                state_source=jnp.copy(pool),
+                state_plan=_plan(pool),
+                gdn_form="tables",
+                **kwargs,
+            )[0]
+            for _ in range(3)
+        ]
+        first = np.asarray(runs[0].view(jnp.int16))
+        for again in runs[1:]:
+            np.testing.assert_array_equal(np.asarray(again.view(jnp.int16)), first)
+
 
 class TestPooledCallerV3:
     def test_bf16_ssm_round_trips_through_fp8_pool(self):
