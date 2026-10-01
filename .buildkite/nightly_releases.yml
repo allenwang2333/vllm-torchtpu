@@ -45,7 +45,7 @@ steps:
       queue: cpu_64_core
     env:
       # TODO(docker-hub): the Docker Hub repository, e.g. vllm/vllm-torchtpu.
-      # The script stops before building while this is still a placeholder.
+      # Docker rejects this uppercase placeholder, so the build fails at once.
       DOCKERHUB_REPO: "REPLACE_WITH_DOCKERHUB_REPO"
     # TODO(docker-hub): the secret name configured in the Buildkite cluster.
     secrets:
