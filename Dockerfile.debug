@@ -1,0 +1,11 @@
+FROM us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu:e9df2f85ccf72056440c70e20ffe3aa337636205-v0.29.0
+
+# Copy instrumented tpu_compiler.py and tpu_worker.py and patch into the exact import location
+COPY src/vllm_torchtpu/compilation/tpu_compiler.py /tmp/tpu_compiler.py
+COPY src/vllm_torchtpu/worker/tpu_worker.py /tmp/tpu_worker.py
+RUN python3 -c "import vllm_torchtpu.compilation.tpu_compiler as m; import shutil; shutil.copy('/tmp/tpu_compiler.py', m.__file__); print('Successfully patched:', m.__file__)" && \
+    python3 -c "import vllm_torchtpu.worker.tpu_worker as m; import shutil; shutil.copy('/tmp/tpu_worker.py', m.__file__); print('Successfully patched:', m.__file__)" && \
+    rm /tmp/tpu_compiler.py /tmp/tpu_worker.py
+
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_and_profiler.so.4
+

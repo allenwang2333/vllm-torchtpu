@@ -58,6 +58,85 @@ class TpuCompilationHandle:
     was_wrapped: bool = False
 
 
+def _get_proc_mem_mb() -> tuple[float, float, float]:
+    """Get VmRSS, RssAnon, and VmSize from /proc/self/status in MB."""
+    vm_rss = 0.0
+    rss_anon = 0.0
+    vm_size = 0.0
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    vm_rss = float(line.split()[1]) / 1024.0
+                elif line.startswith("RssAnon:"):
+                    rss_anon = float(line.split()[1]) / 1024.0
+                elif line.startswith("VmSize:"):
+                    vm_size = float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return vm_rss, rss_anon, vm_size
+
+
+_tcm_profiler_lib = None
+_tcm_profiler_active = False
+
+
+def _is_worker_0() -> bool:
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    rank_env = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or os.environ.get("TPU_WORKER_ID")
+    if rank_env is not None:
+        return str(rank_env) in ("0", "")
+    return True
+
+
+def _get_tcm_profiler():
+    global _tcm_profiler_lib
+    if _tcm_profiler_lib is None:
+        import ctypes
+        for p in [
+            "/usr/lib/x86_64-linux-gnu/libtcmalloc_and_profiler.so.4",
+            "libtcmalloc_and_profiler.so.4",
+        ]:
+            try:
+                lib = ctypes.CDLL(p)
+                lib.HeapProfilerStart.argtypes = [ctypes.c_char_p]
+                lib.HeapProfilerStart.restype = ctypes.c_int
+                lib.HeapProfilerDump.argtypes = [ctypes.c_char_p]
+                lib.HeapProfilerStop.restype = None
+                _tcm_profiler_lib = lib
+                break
+            except Exception:
+                pass
+    return _tcm_profiler_lib
+
+
+def _dump_tcm_heap(reason: str):
+    if not _is_worker_0():
+        return
+    tcm = _get_tcm_profiler()
+    if tcm is None:
+        logger.warning(f"[HEAP_DUMP] TCMalloc profiler library not found, skipping {reason}")
+        return
+    global _tcm_profiler_active
+    dump_prefix = os.environ.get("HEAP_DUMP_PREFIX", "/cdk-outputs/worker0_heap")
+    try:
+        os.makedirs(os.path.dirname(dump_prefix), exist_ok=True)
+    except Exception:
+        dump_prefix = "/tmp/worker0_heap"
+        os.makedirs(os.path.dirname(dump_prefix), exist_ok=True)
+    if not _tcm_profiler_active:
+        res = tcm.HeapProfilerStart(dump_prefix.encode("utf-8"))
+        _tcm_profiler_active = True
+        logger.info(f"[HEAP_DUMP] Started HeapProfiler with prefix {dump_prefix} (res={res})")
+    tcm.HeapProfilerDump(reason.encode("utf-8"))
+    logger.info(f"[HEAP_DUMP] Dumped heap profile snapshot: {reason}")
+
+
 _tpu_backend = TpuBackend()
 
 
@@ -433,8 +512,25 @@ class TpuCompilerAdaptor(CompilerInterface):
         tracing_ctx = (
             torch._guards.TracingContext(fake_mode) if fake_mode is not None else None
         )
+        import gc
+        gc.collect()
+        rss_0, anon_0, vms_0 = _get_proc_mem_mb()
+        node_count = len(graph.nodes) if hasattr(graph, "nodes") else 0
+        logger.info(
+            f"[COMPILE_MEM_TRACE][PRE] Graph nodes={node_count} | "
+            f"VmRSS={rss_0:.2f} MB, RssAnon={anon_0:.2f} MB, VmSize={vms_0:.2f} MB"
+        )
+
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
+
+        rss_1, anon_1, vms_1 = _get_proc_mem_mb()
+        logger.info(
+            f"[COMPILE_MEM_TRACE][POST_TPU_BACKEND] "
+            f"VmRSS={rss_1:.2f} MB (+{rss_1 - rss_0:.2f} MB), "
+            f"RssAnon={anon_1:.2f} MB (+{anon_1 - anon_0:.2f} MB), "
+            f"VmSize={vms_1:.2f} MB (+{vms_1 - vms_0:.2f} MB)"
+        )
 
         # Read `serialize` off the object TpuBackend returned, before any
         # wrapping: the unwrap below replaces it with a plain closure that does
@@ -444,12 +540,28 @@ class TpuCompilerAdaptor(CompilerInterface):
         if serialize is not None:
             try:
                 entry = serialize()
+                rss_2, anon_2, vms_2 = _get_proc_mem_mb()
+                entry_size = len(entry) if hasattr(entry, "__len__") else 0
+                logger.info(
+                    f"[COMPILE_MEM_TRACE][POST_SERIALIZE] "
+                    f"VmRSS={rss_2:.2f} MB (+{rss_2 - rss_1:.2f} MB), "
+                    f"RssAnon={anon_2:.2f} MB (+{anon_2 - anon_1:.2f} MB), "
+                    f"EntrySize={entry_size}"
+                )
             except Exception as e:
                 logger.warning(
                     "[TpuCompilerAdaptor] serialize() failed, this graph will "
                     "not be cached: %s",
                     e,
                 )
+
+        gc.collect()
+        rss_3, anon_3, vms_3 = _get_proc_mem_mb()
+        logger.info(
+            f"[COMPILE_MEM_TRACE][SETTLED_POST_GC] "
+            f"VmRSS={rss_3:.2f} MB (Net change: {rss_3 - rss_0:+.2f} MB), "
+            f"RssAnon={anon_3:.2f} MB (Net change: {anon_3 - anon_0:+.2f} MB)"
+        )
         return compiled_fn, entry
 
     def _save_handle(
