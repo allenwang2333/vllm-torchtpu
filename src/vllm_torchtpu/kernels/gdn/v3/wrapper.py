@@ -31,6 +31,17 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     vmem_ldst,
 )
 
+# The chunked pass inverts its triangular matrix in blocks of this many rows
+# (compute_gdn.invert_triangular_matrix), so a longer tile must be a multiple.
+_CHUNK_BLOCK_SIZE = 16
+
+
+def _default_mixed_tile_size(batch_size: int, n_v: int, num_spec_tokens: int) -> int:
+    tile = min(128 if num_spec_tokens == 0 and n_v <= 8 else 64, batch_size)
+    if tile > _CHUNK_BLOCK_SIZE:
+        tile -= tile % _CHUNK_BLOCK_SIZE
+    return tile
+
 
 def inner_kernel(
     # Inputs.
@@ -504,7 +515,7 @@ def fused_conv1d_gdn(
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    mixed_tile_size: int | None = None,
     gdn_form: str = "two_calls",
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
@@ -576,7 +587,9 @@ def fused_conv1d_gdn(
         compute_precision: Computation precision dtype.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
-            sequences.
+            sequences. None selects 128 for at most 8 value heads without
+            speculative decoding, else 64, capped at the step's rows and
+            rounded down to a tile the chunked pass accepts.
         gdn_form: Pooled path only. "two_calls" runs the batched and the
             per-sequence pass as two calls over XLA-built routing tables;
             "tables" runs both in one call that builds the tables in SMEM
@@ -661,6 +674,8 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    if mixed_tile_size is None:
+        mixed_tile_size = _default_mixed_tile_size(batch_size, n_v, num_spec_tokens)
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes

@@ -677,8 +677,9 @@ class TestTablesFormMatchesTwoCalls:
     def test_mixed_decode_and_prefill(self):
         idx = jnp.array([1, 2, 3, 4, 0, 0], dtype=jnp.int32)
         pool = self._pool_with_states(52, idx[:4])
-        # Two decodes, a fresh 70-token prefill, a 41-token continuation.
-        kwargs = _rand_inputs(53, 120) | dict(
+        # Two decodes, a fresh 70-token prefill, a 41-token continuation,
+        # padded to 128 rows (row buckets are multiples of 16).
+        kwargs = _rand_inputs(53, 128) | dict(
             query_start_loc=jnp.array([0, 1, 2, 72, 113, 113, 113]),
             distribution=jnp.array([2, 4, 4], dtype=jnp.int32),
             seq_lens=jnp.array([7, 9, 70, 60, 0, 0], dtype=jnp.int32),

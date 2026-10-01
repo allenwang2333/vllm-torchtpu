@@ -264,6 +264,22 @@ _DIM = _N_KQ * _D_K * 2 + _N_V * _D_V
 _POOL_SPLIT = 3
 
 
+def _pallas_eqns(closed_jaxpr):
+    eqns = []
+
+    def walk(jaxpr):
+        for eqn in jaxpr.eqns:
+            if eqn.primitive.name == "pallas_call":
+                eqns.append(eqn)
+            for param in eqn.params.values():
+                inner = getattr(param, "jaxpr", None)
+                if inner is not None:
+                    walk(getattr(inner, "jaxpr", inner))
+
+    walk(closed_jaxpr.jaxpr)
+    return eqns
+
+
 @pytest.fixture
 def _v7x_info(monkeypatch):
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
@@ -321,19 +337,7 @@ def _pallas_call_names(rows, gdn_form, num_spec_tokens=0, **kwargs):
             **kwargs,
         )
 
-    names = []
-
-    def walk(jaxpr):
-        for eqn in jaxpr.eqns:
-            if eqn.primitive.name == "pallas_call":
-                names.append(eqn.params["name"])
-            for param in eqn.params.values():
-                inner = getattr(param, "jaxpr", None)
-                if inner is not None:
-                    walk(getattr(inner, "jaxpr", inner))
-
-    walk(jax.make_jaxpr(run)(pool).jaxpr)
-    return names
+    return [eqn.params["name"] for eqn in _pallas_eqns(jax.make_jaxpr(run)(pool))]
 
 
 _TWO_CALLS = ["fused_conv1d_gdn_batched", "fused_conv1d_gdn_per_seq"]
@@ -373,3 +377,61 @@ class TestWrapperForm:
     def test_unknown_form_is_rejected(self):
         with pytest.raises(ValueError, match="gdn_form"):
             _pallas_call_names(8, "fused")
+
+
+def _per_seq_tile_size(n_v, num_spec_tokens, rows=512):
+    from vllm_torchtpu.kernels.gdn.v3 import wrapper
+
+    n = 4
+    dim = _N_KQ * _D_K * 2 + n_v * _D_V
+
+    def run():
+        return wrapper.fused_conv1d_gdn(
+            jnp.zeros((rows, dim)),
+            jnp.zeros((rows, n_v)),
+            jnp.zeros((rows, n_v)),
+            jnp.zeros((n + 1, _KERNEL_SIZE - 1, dim)),
+            jnp.zeros((n + 1, n_v, _D_K, _D_V)),
+            jnp.zeros((dim, 1, _KERNEL_SIZE)),
+            None,
+            jnp.zeros((n_v,)),
+            jnp.zeros((n_v,)),
+            jnp.zeros((n + 1,), jnp.int32),
+            jnp.zeros((n,), jnp.int32),
+            jnp.zeros((3,), jnp.int32),
+            jnp.zeros((n,), jnp.int32),
+            jnp.zeros((n,), jnp.int32),
+            n_kq=_N_KQ,
+            n_v=n_v,
+            d_k=_D_K,
+            d_v=_D_V,
+            kernel_size=_KERNEL_SIZE,
+            num_spec_tokens=num_spec_tokens,
+        )
+
+    [per_seq] = [
+        eqn
+        for eqn in _pallas_eqns(jax.make_jaxpr(run)())
+        if eqn.params["name"].endswith("per_seq")
+    ]
+    return per_seq.params["metadata"]["tile_size"]
+
+
+@pytest.mark.usefixtures("_v7x_info")
+@pytest.mark.parametrize(
+    ("n_v", "num_spec_tokens", "tile_size"),
+    [(8, 0, 128), (16, 0, 64), (8, 3, 64)],
+)
+def test_mixed_tile_size_default(n_v, num_spec_tokens, tile_size):
+    assert _per_seq_tile_size(n_v, num_spec_tokens) == tile_size
+
+
+@pytest.mark.usefixtures("_v7x_info")
+@pytest.mark.parametrize(
+    ("rows", "num_spec_tokens", "tile_size"),
+    [(72, 0, 64), (120, 0, 112), (128, 0, 128), (20, 0, 16), (8, 0, 8), (40, 3, 32)],
+)
+def test_mixed_tile_size_default_traces_for_any_rows(rows, num_spec_tokens, tile_size):
+    # The chunked pass only accepts tiles of at most 16 rows or a multiple of
+    # 16; tracing fails otherwise.
+    assert _per_seq_tile_size(8, num_spec_tokens, rows=rows) == tile_size
