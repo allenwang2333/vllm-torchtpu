@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """PCP+DCP compatibility gate for TPU, mirroring upstream vLLM's
-``check_attention_cp_compatibility`` 
+``check_attention_cp_compatibility``
 """
 
 from __future__ import annotations
@@ -30,8 +30,50 @@ def is_pcp_dcp_compatible(pcp_size: int, dcp_size: int) -> bool:
     return pcp_size > 1 and dcp_size > 1
 
 
-def validate_pcp_dcp_ratio(pcp_size: int, dcp_size: int,
-                           tp_size: int) -> None:
+def pcp_max_local_tokens(num_tokens: int, pcp_size: int,
+                         interleave_size: int) -> int:
+    """Upper bound on the tokens one PCP rank holds when `num_tokens` are
+    scheduled.
+
+    A step's tokens are dealt to the PCP ranks as one flat stream in
+    `interleave_size` chunks, so no rank gets more than an even share rounded
+    up to a whole chunk. With `num_tokens = max_num_batched_tokens` this is the
+    largest per-rank bucket any real step can pick: every layer the backbone
+    compiles runs on this rank's chunk, so buckets above it are never used.
+    """
+    if pcp_size <= 1:
+        return num_tokens
+    interleave_size = max(interleave_size, 1)
+    per_rank = -(-num_tokens // pcp_size)
+    return -(-per_rank // interleave_size) * interleave_size
+
+
+def validate_pcp_dcp_token_budget(max_num_batched_tokens: int,
+                                  max_local_bucket: int, pcp_size: int,
+                                  dcp_size: int) -> None:
+    """The request-major rows of the largest bucket must fit in
+    max_num_batched_tokens.
+
+    Under PCP x DCP the sparse-MLA indexer gathers every rank's chunk and pads
+    to a DCP multiple, then writes one top-k row per token into
+    `topk_indices_buffer`, which the model allocates with
+    max_num_batched_tokens rows. No-op unless both CP axes are enabled.
+    """
+    if not is_pcp_dcp_compatible(pcp_size, dcp_size):
+        return
+    rows = -(-(pcp_size * max_local_bucket) // dcp_size) * dcp_size
+    if rows > max_num_batched_tokens:
+        raise ValueError(
+            f"max_num_batched_tokens={max_num_batched_tokens} does not fit "
+            f"the PCP x DCP top-k rows of the largest per-rank bucket: "
+            f"{pcp_size} x {max_local_bucket} padded to a multiple of "
+            f"dcp_size={dcp_size} is {rows}. Use a max_num_batched_tokens "
+            "that is a multiple of dcp_size and of pcp_size x "
+            "cp_kv_cache_interleave_size, and no compile size above "
+            "max_num_batched_tokens / pcp_size.")
+
+
+def validate_pcp_dcp_ratio(pcp_size: int, dcp_size: int, tp_size: int) -> None:
     """With both CP axes on, DCP must span the PCP axis or all of TP x PCP.
 
     The same rule vLLM's own `ParallelConfig` applies, restated here so a

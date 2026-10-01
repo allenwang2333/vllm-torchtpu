@@ -80,7 +80,8 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import \
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.cp_utils import (check_pcp_dcp_backend_compatibility,
-                                           is_pcp_dcp_compatible)
+                                           is_pcp_dcp_compatible,
+                                           pcp_max_local_tokens)
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import \
     maybe_create_mm_encoder_manager
@@ -2799,7 +2800,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output)
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
+            # The buckets are per PCP rank; bound this rank's chunk.
+            pcp_max_local_tokens(
+                scheduler_output.total_num_scheduled_tokens,
+                self.parallel_config.prefill_context_parallel_size,
+                self.parallel_config.cp_kv_cache_interleave_size),
             local_num_chunks,
             # Exact per-chunk request bound on this rank; the DP-wide MAX of
             # it sizes every rank's draft forwards.

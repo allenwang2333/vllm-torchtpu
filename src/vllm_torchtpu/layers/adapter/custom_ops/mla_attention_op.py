@@ -440,7 +440,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
+        num_out = topk_indices.shape[0]
+        if num_out > self.topk_indices_buffer.shape[0]:
+            # Truncating would silently drop tokens' top-k rows. The platform
+            # caps the buckets so this cannot happen; see
+            # `validate_pcp_dcp_token_budget`.
+            raise ValueError(f"The indexer produced {num_out} top-k rows but "
+                             "topk_indices_buffer holds only "
+                             f"{self.topk_indices_buffer.shape[0]} "
+                             "(max_num_batched_tokens).")
         # Under pcp_size == dcp_size the rows are request-major, so there are
         # more of them than this rank has hidden states; clear whichever span
         # is longer so no stale row survives either way.

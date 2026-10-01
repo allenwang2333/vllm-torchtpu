@@ -24,6 +24,8 @@ from vllm_torchtpu.platforms.pp_validation import \
     validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled, update_tpu_block_size_and_slot_config)
+from vllm_torchtpu.runner.cp_utils import (pcp_max_local_tokens,
+                                           validate_pcp_dcp_token_budget)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -850,14 +852,25 @@ class TpuPlatform(Platform):
         # will compile for.
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
+            # max_num_batched_tokens is the step's global token budget. Under
+            # PCP every compiled layer runs on one rank's chunk of it, so the
+            # buckets stop at that chunk; the request-major tensors the
+            # PCP x DCP path gathers then stay at max_num_batched_tokens rows
+            # instead of pcp_size times it.
             compilation_config.compile_sizes = _get_token_paddings(
                 min_token_size=16,
-                max_token_size=scheduler_config.max_num_batched_tokens,
+                max_token_size=pcp_max_local_tokens(
+                    scheduler_config.max_num_batched_tokens, pcp_size,
+                    pcp_config.interleave_size),
                 extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
             )
         else:
             compilation_config.compile_sizes = sorted(
                 compilation_config.compile_sizes)
+        validate_pcp_dcp_token_budget(
+            scheduler_config.max_num_batched_tokens,
+            compilation_config.compile_sizes[-1], pcp_size,
+            parallel_config.decode_context_parallel_size)
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
