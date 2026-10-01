@@ -55,6 +55,7 @@ from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
@@ -1594,6 +1595,9 @@ class KVCacheManager:
                             kv_cache_spec.head_size,
                             kv_cache_spec.dtype,
                         )
+                        mla_dispatch.admit_layer(
+                            self.runner, attn_module, specs, kv_cache_spec.block_size
+                        )
                         attn_module.mla_kv_spec = specs
                         kv_caches[layer_name] = allocate_attention_region(
                             region,
@@ -1704,6 +1708,11 @@ class KVCacheManager:
                             self.runner._kv_cache_bundle.device,
                             attn_layer,
                         )
+
+        # No-op unless DCP fine-grained prefix hits can emit CoW copies on
+        # these per-layer caches (same gate as the runtime path); compile
+        # before any forward runs.
+        self.runner._precompile_dense_kv_cache_block_copies()
 
         if self.runner.use_spmd:
             # Shard KV Cache
