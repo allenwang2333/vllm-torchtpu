@@ -374,7 +374,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # collective). "pre_absorb" concatenates the *unabsorbed* q_nope and q_pe
     # [T, h, nope + rope], runs one all-gather of that (kv_lora_rank + rope)
     # / (nope + rope) times fewer bytes, then absorbs locally against a
-    # group-wide W_UK_T built once at load (as query replication does).
+    # group-wide W_UK_T built once at load (as query replication does; one
+    # extra [64, nope, kv_lora_rank] weight per layer). Device microbench
+    # (8 ranks, 64 heads, bit-exact in all modes): T=16 split 57 / fused 44 /
+    # pre_absorb 43 us; T=4096 split 2401 / fused 2817 / pre_absorb 1850 us.
     "TPU_DCP_Q_GATHER_MODE": env_with_choices(
         "TPU_DCP_Q_GATHER_MODE",
         "split",

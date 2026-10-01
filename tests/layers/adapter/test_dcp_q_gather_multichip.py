@@ -40,8 +40,9 @@ NOPE, ROPE, LATENT = 192, 64, 512
 # Served decode step and the mixed twin step's token count.
 TOKEN_COUNTS = (16, 4096)
 MODES = ("split", "fused", "pre_absorb")
-# Independent copies per compiled call, so host dispatch is amortized.
-REPS = 4
+# Chained copies per compiled call, so host dispatch is amortized; more at
+# decode, where one copy is tens of microseconds.
+REPS = {16: 32, 4096: 4}
 ITERS = 10
 LAUNCH_TIMEOUT_SECONDS = 1200
 
@@ -123,12 +124,27 @@ def _q_path(mode, q_nope, q_pe, w_uk_local, w_uk_group):
 def _measure(rank: int) -> dict[str, object]:
     import torch
     from torch_tpu._internal import compile as tpu_compile
-    from vllm.distributed.parallel_state import get_world_group
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import (
+        get_world_group,
+        init_model_parallel_group,
+    )
 
     from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+    from vllm_torchtpu.utils import synchronize_tensors
 
-    world = get_world_group()
-    cp_mla.get_dcp_group = lambda: world  # the world group is the DCP group
+    # The world group carries no device communicator; build an all-ranks
+    # group that does, the way the intra-chip group is built, and stand it in
+    # for the DCP group.
+    world_group = get_world_group()
+    world = init_model_parallel_group(
+        [list(range(WORLD_SIZE))],
+        world_group.local_rank,
+        dist.get_backend(world_group.device_group),
+        group_name="dcp_q_gather_test",
+    )
+    assert int(world.rank_in_group) == rank
+    cp_mla.get_dcp_group = lambda: world
     group_heads = LOCAL_HEADS * WORLD_SIZE
     heads = slice(rank * LOCAL_HEADS, (rank + 1) * LOCAL_HEADS)
 
@@ -139,19 +155,26 @@ def _measure(rank: int) -> dict[str, object]:
 
     out: dict[str, object] = {"rank": rank, "cases": []}
     for tokens in TOKEN_COUNTS:
-        q_nope_all = torch.randn(REPS, tokens, group_heads, NOPE).to(torch.bfloat16)
-        q_pe_all = torch.randn(REPS, tokens, group_heads, ROPE).to(torch.bfloat16)
+        reps = REPS[tokens]
+        q_nope_all = torch.randn(reps, tokens, group_heads, NOPE).to(torch.bfloat16)
+        q_pe_all = torch.randn(reps, tokens, group_heads, ROPE).to(torch.bfloat16)
         q_nope = q_nope_all[:, :, heads].contiguous().to("tpu")
         q_pe = q_pe_all[:, :, heads].contiguous().to("tpu")
 
         results = {}
         for mode in MODES:
 
-            def step(qn, qp, mode=mode):
-                return [
-                    _q_path(mode, qn[i], qp[i], w_uk_local_tpu, w_uk_group_tpu)
-                    for i in range(REPS)
-                ]
+            def step(qn, qp, mode=mode, reps=reps):
+                # Each copy waits on the previous one through a one-element
+                # dependency, so the collectives run back to back the way one
+                # layer follows another, not overlapped across copies.
+                outs, dep = [], None
+                for i in range(reps):
+                    qn_i = qn[i] if dep is None else qn[i] + dep * 0
+                    o = _q_path(mode, qn_i, qp[i], w_uk_local_tpu, w_uk_group_tpu)
+                    outs.append(o)
+                    dep = o[:1, :1, :1]
+                return outs
 
             fn = torch.compile(
                 step, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend()
@@ -161,12 +184,11 @@ def _measure(rank: int) -> dict[str, object]:
             torch.accelerator.synchronize()
             times = []
             for _ in range(ITERS):
-                world.barrier()
+                world_group.barrier()
                 t0 = time.perf_counter()
                 res = fn(q_nope, q_pe)
-                res[-1].cpu()
-                torch.accelerator.synchronize()
-                times.append((time.perf_counter() - t0) / REPS * 1e6)
+                synchronize_tensors(res)
+                times.append((time.perf_counter() - t0) / reps * 1e6)
             times.sort()
             results[mode] = (first_cpu, times[len(times) // 2], times[0])
 
@@ -247,6 +269,7 @@ def test_dcp_q_gather_modes_bit_exact_on_device(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
         start_new_session=True,
     )
     try:
