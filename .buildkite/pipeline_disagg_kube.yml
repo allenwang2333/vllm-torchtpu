@@ -103,6 +103,7 @@ steps:
       K3_DP_SKIP_EVAL: "${K3_DP_SKIP_EVAL:-0}"
       K3_DP_BLOCK_TOKENS: "${K3_DP_BLOCK_TOKENS:-648}"
       K3_DP_MATRIX: "${K3_DP_MATRIX:-1}"
+      K3_DP_PROFILE: "${K3_DP_PROFILE:-0}"
     commands:
       - >-
         /opt/launcher/launch
@@ -110,3 +111,4 @@ steps:
         --env K3_DP_SKIP_EVAL
         --env K3_DP_BLOCK_TOKENS
         --env K3_DP_MATRIX
+        --env K3_DP_PROFILE

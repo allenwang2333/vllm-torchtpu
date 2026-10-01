@@ -198,6 +198,28 @@ vllm serve "${SERVE_ARGS[@]}" --api-server-count=1 --host 0.0.0.0 --port "$PORT"
 serve_pid=$!
 
 if [[ "$role" == "decode" ]]; then
+  if [[ "${K3_DP_PROFILE:-0}" == "1" ]]; then
+    # The prefill head drives /start_profile and /stop_profile on this engine
+    # too, then fetches the capture: once the head host's eight ranks have
+    # merged their xplanes and the files have stopped growing, pack them and
+    # serve the run directory over HTTP until the JobSet ends this pod.
+    (
+      profile_root="$run_dir/profile"
+      until [[ "$(find "$profile_root" -path '*/plugins/profile/*' -name '*.xplane.pb' 2>/dev/null | wc -l)" -ge 8 ]]; do
+        sleep 15
+      done
+      size=0
+      while :; do
+        sleep 30
+        now="$(du -sb "$profile_root" | cut -f1)"
+        [[ "$now" == "$size" ]] && break
+        size="$now"
+      done
+      tar -C "$run_dir" -czf "$run_dir/profile.tgz.part" profile && mv "$run_dir/profile.tgz.part" "$run_dir/profile.tgz"
+      echo "decode profile packed: $(du -h "$run_dir/profile.tgz" | cut -f1)"
+    ) &
+    python3 -m http.server 8200 --directory "$run_dir" >"$run_dir/http.log" 2>&1 &
+  fi
   wait "$serve_pid"
   exit $?
 fi
@@ -267,6 +289,13 @@ python3 "$HERE/check_completions.py" \
   tail -50 "$run_dir/proxy.log" || true
   exit 1
 }
+
+if [[ "${K3_DP_PROFILE:-0}" == "1" ]]; then
+  bash "$HERE/k3_1p1d_dp_profile.sh" "$run_dir" "$PORT" "$PROXY_PORT" "$DECODE_HOST" "$MODEL" "$MODEL_URI"
+  rc=$?
+  publish_results
+  exit "$rc"
+fi
 
 stages_rc=0
 echo "--- Correctness stages through the proxy"

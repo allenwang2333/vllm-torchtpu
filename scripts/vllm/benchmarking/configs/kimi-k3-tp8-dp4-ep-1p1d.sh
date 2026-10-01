@@ -25,13 +25,24 @@ GPU_MEMORY_UTILIZATION="${K3_DP_GPU_MEMORY_UTILIZATION:-0.80}"
 # checks the block the engine chose against this and refuses to run otherwise.
 K3_DP_BLOCK_TOKENS="${K3_DP_BLOCK_TOKENS:-648}"
 MAX_NUM_BATCHED_TOKENS="$K3_DP_BLOCK_TOKENS"
+# K3_DP_PROFILE=1: an xprof capture of a benchmark rather than the correctness
+# stages, so the prefill chunk is the nightly's 8192 and the server carries
+# the profiler, with its traces under this role's run directory.
+if [ "${K3_DP_PROFILE:-0}" = "1" ]; then
+    MAX_NUM_BATCHED_TOKENS=8192
+fi
 _before="$EXTRA_SERVE_ARGS"
-EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed "s/\"compile_sizes\":\[1,8,256\]/\"compile_sizes\":[1,8,${K3_DP_BLOCK_TOKENS}]/")
+EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed "s/\"compile_sizes\":\[1,8,256\]/\"compile_sizes\":[1,8,${MAX_NUM_BATCHED_TOKENS}]/")
 if [ "$EXTRA_SERVE_ARGS" = "$_before" ]; then
     echo "ERROR: kimi-k3-tp8-dp4-ep-1p1d.sh: the TP32 pair no longer sets compile_sizes [1,8,256]; update the substitution above" >&2
     return 1
 fi
 EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --distributed-executor-backend mp"
+if [ "${K3_DP_PROFILE:-0}" = "1" ]; then
+    # As run_benchmarks.sh arms it; ignore_frontend skips the AsyncLLM CPU
+    # profiler, only the TPU xplane is read.
+    EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --profiler-config.profiler torch --profiler-config.torch_profiler_dir /tmp/k3_1p1d/${K3_1P1D_ROLE}/profile --profiler-config.ignore_frontend true"
+fi
 
 # Kimi admission: producer TP here, decode TP here, on both engines.
 export TPU_RAIDEN_TRANSFER_PARALLELISM="$TENSOR_PARALLELISM"
