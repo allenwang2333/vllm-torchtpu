@@ -47,9 +47,11 @@ def _kernel(
     nope_hbm_ref: Any,
     rope_hbm_ref: Any,
     indices_hbm_ref: Any,
+    batch_live_hbm_ref: Any,
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
     sem_ref: Any,
+    live_smem_ref: Any,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -61,7 +63,7 @@ def _kernel(
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
 
-    def serve_batch(indices_ref):
+    def serve_batch(indices_ref, live_ref):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
@@ -135,27 +137,63 @@ def _kernel(
             (QUADS_PER_ATOM, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
-        pltpu.emit_pipeline(
-            body,
-            grid=(atoms_per_batch,),
-            in_specs=nope_specs + rope_specs,
-            out_specs=(rope_out_spec,),
-            no_pipelining=not serve_pipelined,
-        )(
-            *([nope_hbm_ref] * ROPE_PACKING),
-            *([rope_hbm_ref] * ROPE_PACKING),
-            rope_out_hbm_ref,
-        )
+
+        # Every lane carries the same flag, so take lane 0. Going via SMEM
+        # avoids a vector reduction, which the SC layout pass cannot lower.
+        live_lanes = live_ref[...]
+        live_smem_ref[0] = live_lanes[0]
+
+        # Skipping has to wrap the pipeline, not sit inside `body`: the
+        # cache reads are issued by the `pl.Indirect` index maps during
+        # prefetch, so a guard inside the body would still pay for them.
+        @pl.when(live_smem_ref[0] != 0)
+        def _serve():
+            pltpu.emit_pipeline(
+                body,
+                grid=(atoms_per_batch,),
+                in_specs=nope_specs + rope_specs,
+                out_specs=(rope_out_spec,),
+                no_pipelining=not serve_pipelined,
+            )(
+                *([nope_hbm_ref] * ROPE_PACKING),
+                *([rope_hbm_ref] * ROPE_PACKING),
+                rope_out_hbm_ref,
+            )
 
     indices_spec = pl.BlockSpec(
         (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
         lambda batch: (owner + batch * num_owners, 0, 0, 0),
     )
+    # One flag per batch, broadcast across the 16 SIMD lanes: the SC
+    # lowering only loads int32 vectors of shape (16,).
+    live_spec = pl.BlockSpec((NUM_LANES,), lambda batch: (owner + batch * num_owners,))
     pltpu.emit_pipeline(
         serve_batch,
         grid=(batches_per_owner,),
-        in_specs=(indices_spec,),
-    )(indices_hbm_ref)
+        in_specs=(indices_spec, live_spec),
+    )(indices_hbm_ref, batch_live_hbm_ref)
+
+
+def batch_live_mask(
+    live: jax.Array | None,
+    num_batches: int,
+    occurrences_per_batch: int,
+) -> jax.Array:
+    """Per-batch liveness, broadcast across the 16 SIMD lanes.
+
+    A batch is `occurrences_per_batch` consecutive flat indices -- exactly how
+    `indices` is reshaped for the gather -- so a batch is dead only when every
+    one of its occurrences is padding. The lane broadcast is forced by the SC
+    lowering, which loads int32 vectors of shape `(16,)` and nothing else.
+    """
+    if live is None:
+        return jnp.ones((num_batches * NUM_LANES,), jnp.int32)
+    per_batch = jnp.max(
+        live.reshape(num_batches, occurrences_per_batch).astype(jnp.int32),
+        axis=1,
+        keepdims=True,
+    )
+    return jnp.broadcast_to(per_batch, (num_batches, NUM_LANES)).reshape(-1)
 
 
 @functools.partial(
@@ -173,6 +211,7 @@ def dsa_gather_native_sc(
     indices: jax.Array,
     *,
     out_size: int,
+    live: jax.Array | None = None,
     atoms_per_batch: int = 16,
     wait_mode: str = "overlap_rope",
     serve_pipelined: bool = True,
@@ -219,6 +258,9 @@ def dsa_gather_native_sc(
         )
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
+    if live is not None and live.size != out_size:
+        raise ValueError(f"live has {live.size} values, expected {out_size}")
+    batch_live = batch_live_mask(live, num_batches, occurrences_per_batch)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
@@ -245,7 +287,10 @@ def dsa_gather_native_sc(
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
-        scratch_types={"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))},
+        scratch_types={
+            "sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,)),
+            "live_smem_ref": pltpu.SMEM((1,), jnp.int32),
+        },
         mesh=mesh,
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
@@ -255,4 +300,5 @@ def dsa_gather_native_sc(
         nope_cache.reshape(-1, 128),
         rope_cache.reshape(-1, 32),
         indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+        batch_live,
     )

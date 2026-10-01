@@ -925,11 +925,15 @@ def sparse_ragged_paged_attention(
 
     def run_all_chunks(width, q_cur, lse_cur):
         physical_indices = physical_indices_for(width)
+        # Taken before the hot-spot scatter above rewrites every `-1`
+        # into a real address: by gather time the sentinels are gone.
+        live_columns = (topk_indices[:, :width] != -1).astype(jnp.int32)
         for i in range(num_chunks):
             start_pos = i * gather_and_attention_chunk_size
             end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
             chunk_size = end_pos - start_pos
             indices = physical_indices[start_pos:end_pos]
+            live = live_columns[start_pos:end_pos]
 
             # Batching
             kernel_batch_size = _largest_divisor(
@@ -973,6 +977,7 @@ def sparse_ragged_paged_attention(
                         cache_kv_rope,
                         indices,
                         out_size=chunk_size * width,
+                        live=live,
                         atoms_per_batch=sparsecore_atoms_per_batch,
                         wait_mode=sparsecore_gather_wait_mode,
                         serve_pipelined=sparsecore_gather_pipelined,
