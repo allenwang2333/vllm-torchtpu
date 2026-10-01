@@ -66,6 +66,7 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 )
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
+    all_gather_heads_packed,
     merge_lse_partials_scatter_heads,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
@@ -2299,18 +2300,46 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             and self.dcp_size > 1
             and topk_indices is not None
         )
+        # Without qrep the sparse DCP path widens q to the group's heads
+        # itself; TPU_DCP_Q_GATHER_MODE picks how (see envs.py). Both
+        # non-default modes run one all-gather instead of two, which only
+        # works when the two halves share a dtype.
+        q_gather_mode = "split"
+        if (
+            not use_qrep
+            and self.dcp_size > 1
+            and topk_indices is not None
+            and q_nope.dtype == q_pe.dtype
+        ):
+            q_gather_mode = str(envs.TPU_DCP_Q_GATHER_MODE).lower()
+        # "pre_absorb": gather the unabsorbed [T, h, nope + rope] q -- the
+        # narrowest point between q_b_proj and the kernel -- and absorb all
+        # the group's heads locally, exactly as qrep does from there on.
+        q_pre_gathered = q_gather_mode == "pre_absorb"
+        if q_pre_gathered:
+            assert getattr(layer, "W_UK_T_dcp_qrep", None) is not None, (
+                "TPU_DCP_Q_GATHER_MODE=pre_absorb needs the group-wide "
+                "W_UK_T_dcp_qrep; `process_weights_after_loading` must run "
+                "with the same setting."
+            )
+            q_nope, q_pe = all_gather_heads_packed(
+                q_nope.reshape(q_nope.shape[0], layer.num_heads, -1),
+                q_pe.reshape(q_pe.shape[0], layer.num_heads, -1),
+            )
         if use_qrep:
             assert layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
                 "built; `process_weights_after_loading` must run first."
             )
             q_nope, q_pe = q_dcp_replicated
+        if use_qrep or q_pre_gathered:
             w_uk_t_src = layer.W_UK_T_dcp_qrep
             w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
         else:
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
-        attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+        group_heads_local = use_qrep or q_pre_gathered
+        attn_heads = layer.num_heads * (self.dcp_size if group_heads_local else 1)
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
@@ -2355,12 +2384,17 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # heads, so attention runs at `tp // dcp` head sharding: every
                 # rank attends with the whole DCP group's heads over its own
                 # KV shard, and the head axis is scattered back after the
-                # merge. Under qrep the group's heads are already local, so
-                # the gather is the identity and is skipped outright.
-                ql_nope_dcp = (
-                    ql_nope_flat if use_qrep else all_gather_heads(ql_nope_flat)
-                )
-                q_pe_dcp = q_pe_flat if use_qrep else all_gather_heads(q_pe_flat)
+                # merge. Under qrep (or a pre-absorb gather) the group's heads
+                # are already local, so the gather is skipped outright.
+                if group_heads_local:
+                    ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
+                elif q_gather_mode == "fused":
+                    ql_nope_dcp, q_pe_dcp = all_gather_heads_packed(
+                        ql_nope_flat, q_pe_flat
+                    )
+                else:
+                    ql_nope_dcp = all_gather_heads(ql_nope_flat)
+                    q_pe_dcp = all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.

@@ -702,10 +702,19 @@ class VllmTPUMLAAttention(MLAAttention):
         # Query replication attends with the whole DCP group's heads, so the
         # absorbed W_UK_T has to span them too. Gathered once here rather than
         # gathering q every step -- that trade is the point of qrep.
+        # TPU_DCP_Q_GATHER_MODE=pre_absorb gathers the unabsorbed q instead
+        # and absorbs the group's heads locally, so it needs the same weight.
+        # Sparse layers only: the gather it replaces lives on that path.
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
-        if self.dcp_q_replicate:
-            dcp_group = get_dcp_group()
+        dcp_group = get_dcp_group()
+        pre_absorb = (
+            str(envs.TPU_DCP_Q_GATHER_MODE).lower() == "pre_absorb"
+            and getattr(self, "use_sparse", False)
+            and dcp_group is not None
+            and int(dcp_group.world_size) > 1
+        )
+        if self.dcp_q_replicate or pre_absorb:
             if dcp_group is None or int(dcp_group.world_size) <= 1:
                 raise RuntimeError(
                     "dcp_q_replicate is set but no DCP group is initialized, "
