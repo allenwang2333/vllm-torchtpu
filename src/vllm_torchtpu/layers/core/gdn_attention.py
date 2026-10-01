@@ -856,6 +856,37 @@ def gdn_pooled_form() -> str:
     return form
 
 
+# Tables form minus two calls per layer call at Qwen3.5-397B TP8 (8 local
+# value heads): -1.1..-2.5 us at 8-32 decode rows for every max_seqs 8-64 and
+# -2.6..-3.0 us under speculation (j-3dd2292f), -1.1/-2.0 us at 48 rows, and
+# +2..+3 us at 64 rows, where the one call carrying a 64-row per-sequence tile
+# is 8 us slower every second call (j-90103bc4).
+_TABLES_FORM_MAX_ROWS = 48
+# At 64 local value heads (DP8) it is -2..-5 us at 8 and 64-256 rows but +5 us
+# at 16 and 32 (j-82796d57), which no row bound separates: two calls there.
+_TABLES_FORM_MAX_LOCAL_V_HEADS = 8
+
+
+@functools.cache
+def gdn_pooled_form_for_step(form: str, rows: int, n_v: int) -> str:
+    """`form` narrowed to the steps where the tables form measured faster.
+
+    `rows` is the step's padded row bucket and `n_v` the local value heads,
+    both static per compiled step.
+    """
+    if form != "tables":
+        return form
+    if rows > _TABLES_FORM_MAX_ROWS or n_v > _TABLES_FORM_MAX_LOCAL_V_HEADS:
+        form = "two_calls"
+    logger.info(
+        "GDN pooled kernel form at %d rows, %d local value heads: %s",
+        rows,
+        n_v,
+        form,
+    )
+    return form
+
+
 def run_jax_gdn_attention_pooled_local(
     mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -933,7 +964,7 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
-        gdn_form=gdn_form,
+        gdn_form=gdn_pooled_form_for_step(gdn_form, mixed_qkv.shape[0], n_v),
     )
     return recurrent_state, output
 
@@ -996,7 +1027,8 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
-        gdn_form: V3 pooled kernel form, from `gdn_pooled_form()`.
+        gdn_form: V3 pooled kernel form, from `gdn_pooled_form()`, narrowed per
+          step by `gdn_pooled_form_for_step`.
 
     Returns:
         A tuple containing:
