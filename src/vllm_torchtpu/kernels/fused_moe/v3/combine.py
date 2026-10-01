@@ -67,7 +67,10 @@ def _weighted_sum_body(
         weights_ref, rows_ref, out_ref, coef_vmem, sum_vmem = refs
     coef = weights_ref[...]
     if with_scales:
-        coef = coef * scales_ref[...]
+        # A route of weight zero has an unwritten scale as well as an
+        # unwritten row, and zero times a NaN or Inf scale is NaN, which
+        # the per-term test below keeps: select, not scale.
+        coef = jnp.where(coef != 0, coef * scales_ref[...], jnp.zeros_like(coef))
     coef_vmem[...] = coef
 
     def token(t, carry):
