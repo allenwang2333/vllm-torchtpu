@@ -41,7 +41,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
-from vllm_torchtpu.kernels.megablox.gmm_v2 import swigluoai
+from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import swigluoai
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
