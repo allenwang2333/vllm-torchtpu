@@ -199,7 +199,7 @@ def _attention_kernel(
     def attention_step1_qk_softmax(
         q,  # [num_q_heads, head_dim]
         kv,  # [slice_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
-        kv_len=0,  # i32[] number of valid (non "-1") top-k rows in kv
+        kv_len,  # i32[] number of valid (non "-1") top-k rows in kv
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
@@ -216,12 +216,11 @@ def _attention_kernel(
         if k_scale != 1.0:
             s *= k_scale
 
-        if is_dcp_mode:
-            # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
-            # not enough -- a zeroed key still scores 0 and inflates the softmax
-            # denominator whenever kv_len << topk.
-            kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-            s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        # Mask scores past kv_len (the "-1" tail): zeroing the keys alone is
+        # not enough -- a zeroed key still scores 0 and inflates the softmax
+        # denominator whenever kv_len << topk.
+        kv_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
 
         m = jnp.max(s, axis=1, keepdims=True)
         p = jnp.exp(s - m)
@@ -512,6 +511,12 @@ def _attention_kernel(
 
             if bkv.shape[-1] < head_dim:
                 bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+
+            # Zero keys beyond kv_len: the tail decodes to fp8 NaN and
+            # 0 * NaN = NaN in the PV einsum, so masking the scores is not enough.
+            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
             return bkv
 
     def process():
@@ -655,6 +660,7 @@ def _attention_kernel(
             prev_out = None
 
             for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
                 bkv = load_bkv(bi_sem_idx, batch_idx)
                 bq = load_bq(bi_sem_idx, batch_idx)
 
@@ -665,7 +671,7 @@ def _attention_kernel(
                     # prev_out won't be inf in practice.
                     bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
-                p, l_sum, m = attention_step1_qk_softmax(bq, bkv)
+                p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
                 if prev_p is not None:
                     assert prev_bkv is not None
