@@ -299,6 +299,62 @@ def _patch_moe_runner_fused_output_is_reduced() -> None:
     logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
 
 
+_SHARED_EXPERT_BARRIER_OP = None
+
+
+def _shared_expert_barrier(t):
+    """Identity on ``t`` that XLA may not fuse across (``optimization_barrier``)."""
+    global _SHARED_EXPERT_BARRIER_OP
+    if _SHARED_EXPERT_BARRIER_OP is None:
+        import jax
+        import torch
+        from torch_tpu._internal import pallas
+
+        def _barrier_jax(x: jax.Array) -> jax.Array:
+            return jax.lax.optimization_barrier(x)
+
+        op = pallas.jax_op("tpu::shared_expert_ag_window_barrier", _barrier_jax)
+        op.register_fake(lambda x: torch.empty_like(x))
+        _SHARED_EXPERT_BARRIER_OP = op
+    return _SHARED_EXPERT_BARRIER_OP(t)
+
+
+def _patch_moe_runner_shared_expert_ag_window() -> None:
+    """Fence the shared-expert output of an armed fused-EP layer (probe 43).
+
+    Without a fence XLA output-fuses the shared down-proj into the add +
+    RMSnorm after the routed combine, so it runs after the fused EP kernel.
+    Behind ``optimization_barrier`` it is a standalone dot that the
+    latency-hiding scheduler places under the token all-gather (verified in
+    the 2x2x2 and 2x2x1 compiled schedules). Same arithmetic; only the
+    fusion boundary moves. Default off (MOE_SHARED_EXPERT_AG_WINDOW).
+    """
+    if not (envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_SHARED_EXPERT_AG_WINDOW):
+        return
+
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
+
+    if getattr(_mr.MoERunner, "_tpu_shared_expert_ag_window_patch", False):
+        return
+    original = _mr.MoERunner._apply_quant_method
+
+    def _apply_quant_method(self, *args, **kwargs):
+        shared_out, fused_out = original(self, *args, **kwargs)
+        if shared_out is None:
+            return shared_out, fused_out
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+        if fused_moe_ep_supported(getattr(self, "_quant_method", None)):
+            shared_out = _shared_expert_barrier(shared_out)
+        return shared_out, fused_out
+
+    _mr.MoERunner._apply_quant_method = _apply_quant_method
+    _mr.MoERunner._tpu_shared_expert_ag_window_patch = True
+    logger.info(
+        "Applied TPU patch: shared-expert output fenced into the token AG window."
+    )
+
+
 def _patch_moe_explicit_pcp_collectives() -> None:
     """Give each PCP MoE implementation exactly one collective owner.
 
